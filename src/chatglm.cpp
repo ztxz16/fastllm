@@ -87,19 +87,28 @@ namespace fastllm {
             RotatePosition2D(q, positionIds);
             RotatePosition2D(k, positionIds);
 //printf("rot %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
-            Data pastKey = pastKeyValues[i].first, pastValue = pastKeyValues[i].second;
-            Cat(pastKey, k, 0, pastKeyValues[i].first);
-            Cat(pastValue, v, 0, pastKeyValues[i].second);
+            Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
+            if (pastKey.Count(0) + k.Count(0) > pastKey.expansionSize) {
+                pastKey.Expansion(pastKey.Count(0) + k.Count(1) * 100);
+            }
+            if (pastValue.Count(0) + v.Count(0) > pastValue.expansionSize) {
+                pastValue.Expansion(pastValue.Count(0) + v.Count(1) * 100);
+            }
+            CatDirectAxis0(pastKey, k);
+            CatDirectAxis0(pastValue, v);
 
-            k.CopyFrom(pastKeyValues[i].first);
-            v.CopyFrom(pastKeyValues[i].second);
 //printf("cat %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
-            std::vector <int> outputSize = {q.dims[1], q.dims[2], q.dims[0], k.dims[0]};
+            std::vector <int> outputSize = {q.dims[1], q.dims[2], q.dims[0], pastKeyValues[i].first.dims[0]};
 
             q.Reshape({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
-            k.Reshape({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
             q.Permute({1, 0, 2});
-            k.Permute({1, 0, 2});
+
+            std::vector <int> tempDims = pastKeyValues[i].first.dims;
+            pastKeyValues[i].first.Reshape({pastKeyValues[i].first.dims[0],
+                       pastKeyValues[i].first.dims[1] * pastKeyValues[i].first.dims[2],
+                       pastKeyValues[i].first.dims[3]});
+            Permute(pastKeyValues[i].first, {1, 0, 2}, k);
+            pastKeyValues[i].first.Reshape(tempDims);
 
             // 1.2 Attention
             // 1.2.0 q * k^T
@@ -124,15 +133,23 @@ namespace fastllm {
             // 1.2.2 softmax
             Mul(attnProbs, i + 1, attnProbs);
             Softmax(attnProbs, attnProbs, -1);
-            outputSize = {v.dims[1], v.dims[2], q.dims[1], v.dims[3]};
-            v.Reshape({v.dims[0], outputSize[0] * outputSize[1], -1});
-            v.Permute({1, 2, 0});
+
+            outputSize = {pastKeyValues[i].second.dims[1],
+                          pastKeyValues[i].second.dims[2],
+                          q.dims[1],
+                          pastKeyValues[i].second.dims[3]};
+
+            tempDims = pastKeyValues[i].second.dims;
+            pastKeyValues[i].second.Reshape({pastKeyValues[i].second.dims[0], outputSize[0] * outputSize[1], -1});
+            Permute(pastKeyValues[i].second, {1, 2, 0}, v);
+            pastKeyValues[i].second.Reshape(tempDims);
+
             attnProbs.Reshape({outputSize[0] * outputSize[1], outputSize[2], -1});
             // 1.2.3 prob * v
-            Data contextLayer;
-            MatMulTransB(attnProbs, v, contextLayer);
-            contextLayer.Reshape(outputSize);
-            contextLayer.Permute({2, 0, 1, 3});
+            Data tempCL, contextLayer;
+            MatMulTransB(attnProbs, v, tempCL);
+            tempCL.Reshape(outputSize);
+            Permute(tempCL, {2, 0, 1, 3}, contextLayer);
             contextLayer.Reshape({contextLayer.dims[0], contextLayer.dims[1], embed_dim});
 //printf("qkv %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
             // 1.2.4 dense
@@ -202,7 +219,8 @@ namespace fastllm {
 
         std::vector <std::pair <Data, Data> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(), Data()));
+            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
+                                                   Data(DataType::FLOAT32)));
         }
 
         std::string retString = "";

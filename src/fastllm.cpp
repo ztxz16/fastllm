@@ -118,6 +118,11 @@ namespace fastllm {
         }
     };
 
+    Data::Data(fastllm::DataType type) {
+        this->dataType = type;
+        this->UpdateUnitSize();
+    }
+
     Data::Data(fastllm::DataType type, const std::vector<int> &dims) {
         this->dataType = type;
         Resize(dims);
@@ -137,8 +142,9 @@ namespace fastllm {
     void Data::CopyFrom(const Data &ori) {
         if (ori.dims != this->dims || this->cpuData == nullptr) {
             if (ori.dims.size() == 0) {
-                delete this->cpuData;
+                delete[] this->cpuData;
                 this->dataType = ori.dataType;
+                this->UpdateUnitSize();
                 this->dims.resize(0);
                 this->cpuData = nullptr;
                 return;
@@ -157,8 +163,7 @@ namespace fastllm {
         return this->dims[i] * this->strides[i];
     }
 
-    void Data::Resize(const std::vector<int> &dims) {
-        this->dims = dims;
+    void Data::UpdateUnitSize() {
         if (this->dataType == DataType::FLOAT32) {
             this->unitSize = 4;
         } else if (this->dataType == DataType::FLOAT16 || this->dataType == DataType::INT16) {
@@ -175,6 +180,11 @@ namespace fastllm {
             this->unitSize = 1;
             this->unitSizeDiv = 8;
         }
+    }
+
+    void Data::Resize(const std::vector<int> &dims) {
+        this->dims = dims;
+        this->UpdateUnitSize();
 
         this->strides.resize(dims.size(), 1);
         this->strides.back() = 1;
@@ -218,8 +228,10 @@ namespace fastllm {
     }
 
     void Data::Allocate() {
-        delete[] this->cpuData;
-        this->cpuData = new uint8_t[GetBytes()];
+        if (GetBytes() > expansionSize) {
+            delete[] this->cpuData;
+            this->cpuData = new uint8_t[GetBytes()];
+        }
     }
 
     void Data::Allocate(float v) {
@@ -227,6 +239,20 @@ namespace fastllm {
         this->Allocate();
         float *f = (float*)cpuData;
         std::fill(f, f + Count(0), v);
+    }
+
+    void Data::Expansion(uint64_t size) {
+        AssertInFastLLM(Count(0) <= size, "Expansion error: real size should <= expansion size.\n");
+        this->expansionSize = size;
+
+        if (this->cpuData != nullptr) {
+            uint8_t *old = this->cpuData;
+            this->cpuData = new uint8_t[(size * unitSize - 1) / unitSizeDiv + 1];
+            memcpy(this->cpuData, old, GetBytes());
+            delete[] old;
+        } else {
+            this->cpuData = new uint8_t[(size * unitSize - 1) / unitSizeDiv + 1];
+        }
     }
 
     Data::~Data() {
@@ -272,31 +298,42 @@ namespace fastllm {
     void Data::Permute(const std::vector<int> &axis) {
         AssertInFastLLM(this->dataType == DataType::FLOAT32, "Permute error: datatype should be float32.");
         AssertInFastLLM(axis.size() == this->dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
-        std::vector<int> new_dims;
-        for (int i = 0; i < axis.size(); i++) {
-            new_dims.push_back(this->dims[axis[i]]);
-        }
 
         auto tmp = new Data();
-        tmp->dataType = this->dataType;
-        tmp->Resize(new_dims);
-        tmp->Allocate();
+        fastllm::Permute(*this, axis, *tmp);
 
-        float *tmpData = (float *) tmp->cpuData;
-        float *curData = (float *) this->cpuData;
+        memcpy(this->cpuData, tmp->cpuData, unitSize * this->Count(0));
+        this->Resize(tmp->dims);
+        delete tmp;
+    }
+
+    void Permute(const Data &input, const std::vector<int> &axis, Data &output) {
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Permute error: datatype should be float32.");
+        AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
+        std::vector<int> new_dims;
+        for (int i = 0; i < axis.size(); i++) {
+            new_dims.push_back(input.dims[axis[i]]);
+        }
+
+        output.dataType = input.dataType;
+        output.Resize(new_dims);
+        output.Allocate();
+
+        float *tmpData = (float *) output.cpuData;
+        float *curData = (float *) input.cpuData;
 
         if (axis == std::vector <int> {1, 2, 0}) {
-            int n = this->dims[0];
-            int m = this->Count(1);
+            int n = input.dims[0];
+            int m = input.Count(1);
             for (int i = 0; i < n; i++) {
                 for (int j = 0; j < m; j++) {
                     tmpData[j * n + i] = curData[i * m + j];
                 }
             }
         } else if (axis == std::vector <int> {1, 0, 2}) {
-            int n = this->dims[0];
-            int m = this->dims[1];
-            int k = this->dims[2];
+            int n = input.dims[0];
+            int m = input.dims[1];
+            int k = input.dims[2];
             for (int i = 0; i < n; i++) {
                 for (int j = 0; j < m; j++) {
                     memcpy(tmpData + (j * n + i) * k, curData + (i * m + j) * k, k * sizeof(float));
@@ -305,11 +342,11 @@ namespace fastllm {
         } else {
             std::vector<int> oldSteps;
             std::vector<int> newSteps;
-            int count = this->Count(0);
+            int count = input.Count(0);
             auto oldPos = new int[count];
             for (int i = 0; i < axis.size(); i++) {
-                oldSteps.push_back(this->Count(i + 1));
-                newSteps.push_back(tmp->Count(i + 1));
+                oldSteps.push_back(input.Count(i + 1));
+                newSteps.push_back(output.Count(i + 1));
             }
 
             for (int i = 0; i < count; ++i) {
@@ -328,10 +365,6 @@ namespace fastllm {
 
             delete[] oldPos;
         }
-
-        memcpy(this->cpuData, tmp->cpuData, unitSize * this->Count(0));
-        this->Resize(new_dims);
-        delete tmp;
     }
 
     void Data::CalcWeightSum() {
@@ -1215,6 +1248,58 @@ namespace fastllm {
         }
     }
 
+    void CatDirectAxis0(Data &input0, const Data &input1) {
+        if (input0.dims.size() == 0) {
+            input0.Resize(input1.dims);
+            AssertInFastLLM(input0.Count(0) <= input0.expansionSize, "CatDirectAxis0 Error: input0's expansion size is not enough.\n");
+            memcpy(input0.cpuData, input1.cpuData, input1.GetBytes());
+            return;
+        }
+
+        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
+                        "Cat's input's type should be float32.\n");
+        AssertInFastLLM(input0.dims.size() == input1.dims.size(), "Cat Error: input's shape's size should be same.\n");
+        for (int i = 1; i < input0.dims.size(); i++) {
+            AssertInFastLLM(input0.dims[i] == input1.dims[i],
+                            "CatDirectAxis0 Error: shape error.\n");
+        }
+
+        uint64_t input0Bytes = input0.GetBytes();
+        uint64_t input1Bytes = input1.GetBytes();
+        std::vector <int> dims = input0.dims;
+        dims[0] += input1.dims[0];
+        input0.Resize(dims);
+        AssertInFastLLM(input0.Count(0) <= input0.expansionSize, "CatDirectAxis0 Error: input0's expansion size is not enough.\n");
+        memcpy(input0.cpuData + input0Bytes, input1.cpuData, input1Bytes);
+    }
+
+    void MatMulSingle(float *input0Base, float *input1Base, float *outputBase,
+                      int input0Spatial, int input1Spatial, int outputSpatial,
+                      int n, int m, int k, float alpha, int st, int end) {
+        for (int b = st; b < end; b++) {
+            float *input0Data = input0Base + b * input0Spatial;
+            float *input1Data = input1Base + b * input1Spatial;
+            float *outputData = outputBase + b * outputSpatial;
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j < k; j++) {
+                    float now = 0.0f;
+                    int l = 0;
+#ifdef __aarch64__
+                    float32x4_t sum = {0, 0, 0, 0};
+                    for (; l + 3 < m; l += 4) {
+                        sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(input0Data + i * m + l), vld1q_f32(input1Data + j * m + l)));
+                    }
+                    now += sum[0] + sum[1] + sum[2] + sum[3];
+#endif
+                    for (; l < m; l++) {
+                        now += input0Data[i * m + l] * input1Data[j * m + l];
+                    }
+                    outputData[i * k + j] = now * alpha;
+                }
+            }
+        }
+    }
+
     void MatMulTransB(const Data &input0, const Data &input1, Data &output, float alpha) {
         AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
                         "MatMulTransB's input's type should be float32.\n");
@@ -1239,27 +1324,24 @@ namespace fastllm {
 
         int outputSpatial = output.Count(output.dims.size() - 2);
 
-        for (int b = 0; b < batch0; b++) {
-            float *input0Data = ((float*)input0.cpuData) + b * input0Spatial;
-            float *input1Data = ((float*)input1.cpuData) + b * input1Spatial;
-            float *outputData = ((float*)output.cpuData) + b * outputSpatial;
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j < k; j++) {
-                    float now = 0.0f;
-                    int l = 0;
-#ifdef __aarch64__
-                    float32x4_t sum = {0, 0, 0, 0};
-                    for (; l + 3 < m; l += 4) {
-                        sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(input0Data + i * m + l), vld1q_f32(input1Data + j * m + l)));
-                    }
-                    now += sum[0] + sum[1] + sum[2] + sum[3];
-#endif
-                    for (; l < m; l++) {
-                        now += input0Data[i * m + l] * input1Data[j * m + l];
-                    }
-                    outputData[i * k + j] = now * alpha;
-                }
-            }
+        int threadNum = threads;
+        int per = batch0 / threadNum;
+        int cur = 0;
+        std::vector<std::thread *> threads;
+        for (int i = 0; i < threadNum - 1; i++) {
+            int end = cur + per + (per * (threadNum - i) < batch0);
+            threads.push_back(new std::thread(&MatMulSingle,
+                                              (float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
+                                              input0Spatial, input1Spatial, outputSpatial,
+                                              n, m, k, alpha, cur, end));
+            cur = end;
+        }
+        MatMulSingle((float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
+                input0Spatial, input1Spatial, outputSpatial,
+                n, m, k, alpha, cur, batch0);
+        for (int i = 0; i < threadNum - 1; i++) {
+            threads[i]->join();
+            delete threads[i];
         }
     }
 

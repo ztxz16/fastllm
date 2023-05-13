@@ -77,6 +77,7 @@ namespace fastllm {
         std::vector <int> dims; // 数据形状
         std::vector <uint64_t> strides; // 跨度
 
+        uint64_t expansionSize = 0; // 扩容后的尺寸
         uint8_t *cpuData = nullptr; // 数据指针
 
         // 这两个参数用于量化，对FLOAT数据不适用
@@ -85,6 +86,8 @@ namespace fastllm {
         std::vector <int> weightSum; // 作为权重时，有时候需要存一些和加速计算
 
         Data () {};
+
+        Data (DataType type);
 
         Data (DataType type, const std::vector <int> &dims); // 构造函数
 
@@ -103,6 +106,10 @@ namespace fastllm {
         void Allocate(); // 分配内存
 
         void Allocate(float v); // 分配内存并初始化
+
+        void Expansion(uint64_t size); // 将尺寸扩容为size * unitSize，并保留之前的数据；之后分配内存时如果未达到扩容的尺寸，则直接复用
+
+        void UpdateUnitSize(); // 更新unitSize
 
         void Resize(const std::vector <int> &dims); // 更改尺寸
 
@@ -164,6 +171,8 @@ namespace fastllm {
 
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 
+    void CatDirectAxis0(Data &input0, const Data &input1); // 直接把input1的数据拷贝到input0后面（axis = 0的Cat操作，需要input0提前扩容了足够的空间）
+
     void MatMulTransB(const Data &input0, const Data &input1, Data &output, float alpha = 1.0);
 
     void Softmax(const Data &input, Data &output, int axis);
@@ -175,6 +184,8 @@ namespace fastllm {
     void AddTo(Data &input0, const Data &input1); // input0 += input1
 
     void AddTo(Data &input0, const Data &input1, float alpha); // input0 += input1 * alpha
+
+    void Permute(const Data &input, const std::vector<int> &axis, Data &output); // 转置
 }
 
 #endif //TEST_FASTLLM_H
