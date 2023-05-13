@@ -806,7 +806,7 @@ namespace fastllm {
         int cur = 0;
         std::vector <std::thread*> threads;
         for (int i = 0; i < threadNum - 1; i++) {
-            int end = cur + per + (per * (threadNum - i) < k);
+            int end = cur + per + (cur + per * (threadNum - i) < k);
             threads.push_back(new std::thread(&Multiply, a, b + cur * m, c + cur, n, m, end - cur, k));
             cur = end;
         }
@@ -823,7 +823,7 @@ namespace fastllm {
         int cur = 0;
         std::vector <std::thread*> threads;
         for (int i = 0; i < threadNum - 1; i++) {
-            int end = cur + per + (per * (threadNum - i) < k);
+            int end = cur + per + (cur + per * (threadNum - i) < k);
             threads.push_back(new std::thread(&MultiplyInt4, a, b + cur * m / 2, c + cur, n, m, end - cur, k));
             cur = end;
         }
@@ -1078,7 +1078,7 @@ namespace fastllm {
             int cur = 0;
             std::vector<std::thread *> threads;
             for (int i = 0; i < threadNum - 1; i++) {
-                int end = cur + per + (per * (threadNum - i) < k);
+                int end = cur + per + (cur + per * (threadNum - i) < k);
                 threads.push_back(new std::thread(&FloatLinearPart, inputData, weightData, biasData, outputData,
                                                   n, m, k, cur, end));
                 cur = end;
@@ -1130,7 +1130,7 @@ namespace fastllm {
             int cur = 0;
             std::vector<std::thread *> threads;
             for (int i = 0; i < threadNum - 1; i++) {
-                int end = cur + per + (per * (threadNum - i) < k);
+                int end = cur + per + (cur + per * (threadNum - i) < k);
                 threads.push_back(new std::thread(&Int8LinearPart, inputData, weightData, biasData, outputData,
                                                   weight.perChannelsConfigs.data(), n, m, k, cur, end));
                 cur = end;
@@ -1184,7 +1184,7 @@ namespace fastllm {
             int cur = 0;
             std::vector<std::thread *> threads;
             for (int i = 0; i < threadNum - 1; i++) {
-                int end = cur + per + (per * (threadNum - i) < k);
+                int end = cur + per + (cur + per * (threadNum - i) < k);
                 threads.push_back(new std::thread(&Int4LinearPart, inputData, weightData, biasData, outputData,
                                                   weight.perChannelsConfigs.data(), n, m, k, cur, end));
                 cur = end;
@@ -1357,7 +1357,7 @@ namespace fastllm {
         int cur = 0;
         std::vector<std::thread *> threads;
         for (int i = 0; i < threadNum - 1; i++) {
-            int end = cur + per + (per * (threadNum - i) < batch0);
+            int end = cur + per + (cur + per * (threadNum - i) < batch0);
             threads.push_back(new std::thread(&MatMulSingle,
                                               (float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
                                               input0Spatial, input1Spatial, outputSpatial,
