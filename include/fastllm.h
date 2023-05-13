@@ -61,11 +61,11 @@ namespace fastllm {
     };
 
     enum DataType {
-        FLOAT32 = 0, FLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6
+        FLOAT32 = 0, BFLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6
     };
 
     enum WeightType {
-        NONE = 0, LINEAR = 1
+        NONE = 0, LINEAR = 1, EMBEDDING = 2
     };
 
     struct Data {
@@ -161,7 +161,7 @@ namespace fastllm {
         Data &operator [] (const std::string &key);
     };
 
-    void Embedding(const Data &input, const Data &weight, Data &output);
+    void Embedding(const Data &input, Data &weight, Data &output);
 
     void LayerNorm(const Data &input, const Data &gamma, const Data &beta, int axis, Data &output);
 

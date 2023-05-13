@@ -166,7 +166,7 @@ namespace fastllm {
     void Data::UpdateUnitSize() {
         if (this->dataType == DataType::FLOAT32) {
             this->unitSize = 4;
-        } else if (this->dataType == DataType::FLOAT16 || this->dataType == DataType::INT16) {
+        } else if (this->dataType == DataType::BFLOAT16 || this->dataType == DataType::INT16) {
             this->unitSize = 2;
         } else if (this->dataType == DataType::INT8) {
             this->unitSize = 1;
@@ -532,7 +532,7 @@ namespace fastllm {
             weight[name] = Data(dataType, dims);
             weight[name].Allocate();
 
-            if (dataType == DataType::FLOAT32) {
+            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16) {
                 buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
             } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
                 int bit = (dataType == DataType::INT4 ? 4 : 8);
@@ -556,6 +556,7 @@ namespace fastllm {
     }
 
     void WeightMap::SaveLowBitModel(const std::string &fileName, int bit) {
+        AssertInFastLLM(fileName != "", "Error: output's name shouldn't be empty.\n");
         AssertInFastLLM(bit == 4 || bit == 8, "Error: only support 8 bit or 4 bit model.\n");
         FileWriter buffer(fileName);
         buffer.WriteInt(this->versionId);
@@ -584,6 +585,16 @@ namespace fastllm {
                 // 普通权重，直接写入浮点数据
                 buffer.WriteInt((int)DataType::FLOAT32);
                 buffer.WriteBytes(data.cpuData, data.GetBytes());
+            } else if (data.weightType == WeightType::EMBEDDING) {
+                // Embedding权重，存储成BF16
+                buffer.WriteInt((int)DataType::BFLOAT16);
+                int len = data.Count(0);
+                std::vector <uint16_t> uDatas;
+                uDatas.resize(len);
+                for (int i = 0; i < len; i++) {
+                    uDatas[i] = ((uint16_t *)data.cpuData)[i * 2 + 1];
+                }
+                buffer.WriteBytes((uint8_t*)uDatas.data(), len * sizeof(uint16_t));
             } else if (data.weightType == WeightType::LINEAR) {
                 // Linear层权重，分通道量化之
                 int k = data.dims[0], m = data.dims[1];
@@ -823,10 +834,14 @@ namespace fastllm {
         }
     }
 
-    void Embedding(const Data &input, const Data &weight, Data &output) {
+    void Embedding(const Data &input, Data &weight, Data &output) {
         AssertInFastLLM(weight.dims.size() == 2, "Embedding's weight's dim should be 2.\n");
-        AssertInFastLLM(weight.dataType == DataType::FLOAT32, "Embedding's weight's type should be float32.\n");
+        AssertInFastLLM(weight.dataType == DataType::FLOAT32 ||
+                        weight.dataType == DataType::BFLOAT16, "Embedding's weight's type should be float32 or bfloat16.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32, "Embedding's input's type should be float32.\n");
+
+        weight.weightType = WeightType::EMBEDDING;
+
         int vocabSize = weight.dims[0], embSize = weight.dims[1];
         std::vector <int> dims = input.dims;
         dims.push_back(embSize);
@@ -835,11 +850,24 @@ namespace fastllm {
         output.Allocate();
         uint64_t inputLen = input.Count(0);
         float *inputData = (float*)input.cpuData;
-        float *outputData = (float*)output.cpuData;
-        float *weightData = (float*)weight.cpuData;
-        for (int i = 0; i < inputLen; i++) {
-            int token = (int)(inputData[i] + 1e-9);
-            memcpy(outputData + i * embSize, weightData + token * embSize, embSize * sizeof(float));
+
+        if (weight.dataType == DataType::FLOAT32) {
+            float *outputData = (float *) output.cpuData;
+            float *weightData = (float *) weight.cpuData;
+            for (int i = 0; i < inputLen; i++) {
+                int token = (int) (inputData[i] + 1e-9);
+                memcpy(outputData + i * embSize, weightData + token * embSize, embSize * sizeof(float));
+            }
+        } else {
+            uint16_t *outputData = (uint16_t *) output.cpuData;
+            uint16_t *weightData = (uint16_t *) weight.cpuData;
+            for (int i = 0; i < inputLen; i++) {
+                int token = (int) (inputData[i] + 1e-9);
+                for (int j = 0; j < embSize; j++) {
+                    outputData[i * embSize * 2 + j * 2] = 0;
+                    outputData[i * embSize * 2 + j * 2 + 1] = weightData[token * embSize + j];
+                }
+            }
         }
     }
 

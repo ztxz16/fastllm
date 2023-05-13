@@ -177,18 +177,18 @@ namespace fastllm {
         Data inputIds = this->weight.tokenizer.Encode(input);
         Data attentionMask = inputIds;
         Data positionIds = inputIds;
-        std::vector <std::pair <Data, Data> > pastKeyValues;
+        std::vector<std::pair<Data, Data> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
             pastKeyValues.push_back(std::make_pair(Data(), Data()));
         }
 
         int len = inputIds.dims[1];
         for (int i = 0; i < len; i++) {
-            ((float*)attentionMask.cpuData)[i] = 1;
-            ((float*)positionIds.cpuData)[i] = i;
+            ((float *) attentionMask.cpuData)[i] = 1;
+            ((float *) positionIds.cpuData)[i] = i;
         }
 
-        std::vector <float> results;
+        std::vector<float> results;
         std::string retString = "";
         while (true) {
             int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues);
@@ -197,20 +197,33 @@ namespace fastllm {
             }
 
             results.push_back(ret);
-            std::string current = weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str();
+            std::string current = weight.tokenizer.Decode(
+                    Data(DataType::FLOAT32, {(int) results.size()}, results)).c_str();
             retString += current;
             printf("%s", current.c_str());
             fflush(stdout);
             results.clear();
 
             len++;
-            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)ret}));
-            attentionMask.CopyFrom(Data(DataType::FLOAT32, {1, len}, std::vector <float> (len, 1.0f)));
-            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)(len - 1)}));
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float) ret}));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {1, len}, std::vector<float>(len, 1.0f)));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float) (len - 1)}));
         }
 
         printf("\n");
         // printf("%s\n", weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str());
         return retString;
+    }
+
+    void MOSSModel::SaveLowBitModel(const std::string &fileName, int bit) {
+        Data inputIds = Data(DataType::FLOAT32, {1, 1}, {(float) 1});
+        Data attentionMask = Data(DataType::FLOAT32, {1, 1}, std::vector<float>(1, 1.0f));
+        Data positionIds = Data(DataType::FLOAT32, {1, 1}, {(float) (0)});
+        std::vector<std::pair<Data, Data> > pastKeyValues;
+        for (int i = 0; i < block_cnt; i++) {
+            pastKeyValues.push_back(std::make_pair(Data(), Data()));
+        }
+        Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+        this->weight.SaveLowBitModel(fileName, bit);
     }
 }

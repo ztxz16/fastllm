@@ -35,6 +35,8 @@ namespace fastllm {
                 std::vector <std::pair <Data, Data> > &pastKeyValues);
 
         std::string Response(const std::string &input); // 根据给出的内容回复
+
+        void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
     private:
         void RotatePosition2D(Data &data, const Data &positionIds); // 二维位置编码
 

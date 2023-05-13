@@ -255,4 +255,18 @@ namespace fastllm {
         printf("\n");
         return retString;
     }
+
+    void ChatGLMModel::SaveLowBitModel(const std::string &fileName, int bit) {
+        Data inputIds = Data(DataType::FLOAT32, {1, 1}, {130004});
+        Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});
+        Data positionIds = Data(DataType::FLOAT32, {2, 1}, {0, 0});
+
+        std::vector <std::pair <Data, Data> > pastKeyValues;
+        for (int i = 0; i < block_cnt; i++) {
+            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
+                                                   Data(DataType::FLOAT32)));
+        }
+        Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+        this->weight.SaveLowBitModel(fileName, bit);
+    }
 }

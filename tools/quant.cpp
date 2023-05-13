@@ -1,3 +1,7 @@
+//
+// Created by huangyuyang on 5/13/23.
+//
+
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -6,17 +10,19 @@
 #include "moss.h"
 #include "chatglm.h"
 
-struct RunConfig {
+struct QuantConfig {
     std::string model = "chatglm"; // 模型类型, chatglm或moss
     std::string path; // 模型文件路径
-    int threads = 4; // 使用的线程数
+    std::string output; // 输出文件路径
+    int bits; // 量化位数
 };
 
 static struct option long_options[] = {
         {"help",               no_argument,       nullptr, 'h'},
         {"model",              required_argument, nullptr, 'm'},
         {"path",               required_argument, nullptr, 'p'},
-        {"threads",            required_argument, nullptr, 't'},
+        {"bits",               required_argument, nullptr, 'b'},
+        {"output",             required_argument, nullptr, 'o'},
         {nullptr, 0,                              nullptr, 0},
 };
 
@@ -25,13 +31,14 @@ void Usage() {
     std::cout << "[-h|--help]:                      显示帮助" << std::endl;
     std::cout << "<-m|--model> <args>:              模型类型，默认为chatglm, 可以设置为chatglm, moss" << std::endl;
     std::cout << "<-p|--path> <args>:               模型文件的路径" << std::endl;
-    std::cout << "<-t|--threads> <args>:            使用的线程数量" << std::endl;
+    std::cout << "<-b|--bits> <args>:               量化位数" << std::endl;
+    std::cout << "<-o|--output> <args>:             输出文件路径" << std::endl;
 }
 
-void ParseArgs(int argc, char **argv, RunConfig &config) {
+void ParseArgs(int argc, char **argv, QuantConfig &config) {
     int opt;
     int option_index = 0;
-    const char *opt_string = "h:m:p:t:";
+    const char *opt_string = "h:m:p:b:o:";
 
     while ((opt = getopt_long_only(argc, argv, opt_string, long_options, &option_index)) != -1) {
         switch (opt) {
@@ -44,8 +51,11 @@ void ParseArgs(int argc, char **argv, RunConfig &config) {
             case 'p':
                 config.path = argv[optind - 1];
                 break;
-            case 't':
-                config.threads = atoi(argv[optind - 1]);
+            case 'b':
+                config.bits = atoi(argv[optind - 1]);
+                break;
+            case 'o':
+                config.output = argv[optind - 1];
                 break;
             default:
                 Usage();
@@ -55,39 +65,17 @@ void ParseArgs(int argc, char **argv, RunConfig &config) {
 }
 
 int main(int argc, char **argv) {
-    RunConfig config;
+    QuantConfig config;
     ParseArgs(argc, argv, config);
-    fastllm::SetThreads(config.threads);
 
     if (config.model == "moss") {
         fastllm::MOSSModel moss;
         moss.LoadFromFile(config.path);
-
-        while (true) {
-            printf("用户: ");
-            std::string input;
-            std::getline(std::cin, input);
-            if (input == "stop") {
-                break;
-            }
-            std::string ret = moss.Response("You are an AI assistant whose name is MOSS. <|Human|>: " + input + "<eoh>");
-        }
+        moss.SaveLowBitModel(config.output, config.bits);
     } else if (config.model == "chatglm") {
         fastllm::ChatGLMModel chatGlm;
         chatGlm.LoadFromFile(config.path);
-
-        while (true) {
-            printf("用户: ");
-            std::string input;
-            std::getline(std::cin, input);
-            if (input == "stop") {
-                break;
-            }
-            printf("ChatGLM: ");
-            std::string ret = chatGlm.Response(input);
-        }
-
-        //chatGlm.weight.SaveLowBitModel("/root/chatglm-6b-int4.bin", 4);
+        chatGlm.SaveLowBitModel(config.output, config.bits);
     } else {
         Usage();
         exit(-1);
