@@ -76,6 +76,8 @@ int main(int argc, char **argv) {
         fastllm::ChatGLMModel chatGlm;
         chatGlm.LoadFromFile(config.path);
 
+        int round = 0;
+        std::string history;
         while (true) {
             printf("用户: ");
             std::string input;
@@ -83,8 +85,12 @@ int main(int argc, char **argv) {
             if (input == "stop") {
                 break;
             }
+            history += ("[Round " + std::to_string(round++) + "]\n问：" + input);
+            auto prompt = round > 1 ? history : input;
+            std::cout << prompt << std::endl;
             printf("ChatGLM: ");
-            std::string ret = chatGlm.Response(input);
+            std::string ret = chatGlm.Response(prompt);
+            history += ("\n答：" + ret + "\n");
         }
 
         //chatGlm.weight.SaveLowBitModel("/root/chatglm-6b-int4.bin", 4);
