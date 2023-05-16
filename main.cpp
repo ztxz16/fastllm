@@ -85,9 +85,13 @@ int main(int argc, char **argv) {
             if (input == "stop") {
                 break;
             }
+            if (input == "reset") {
+                history = "";
+                round = 0;
+                continue;
+            }
             history += ("[Round " + std::to_string(round++) + "]\n问：" + input);
             auto prompt = round > 1 ? history : input;
-            std::cout << prompt << std::endl;
             printf("ChatGLM: ");
             std::string ret = chatGlm.Response(prompt);
             history += ("\n答：" + ret + "\n");
