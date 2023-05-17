@@ -88,11 +88,11 @@ namespace fastllm {
             RotatePosition2D(k, positionIds);
 //printf("rot %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
             Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
-            if (pastKey.Count(0) + k.Count(0) > pastKey.expansionSize) {
-                pastKey.Expansion(pastKey.Count(0) + k.Count(1) * 100);
+            while (pastKey.Count(0) + k.Count(0) > pastKey.expansionSize) {
+                pastKey.Expansion(pastKey.Count(0) + k.Count(1) * ((k.dims[0] - 1) / 100 + 1) * 100);
             }
-            if (pastValue.Count(0) + v.Count(0) > pastValue.expansionSize) {
-                pastValue.Expansion(pastValue.Count(0) + v.Count(1) * 100);
+            while (pastValue.Count(0) + v.Count(0) > pastValue.expansionSize) {
+                pastValue.Expansion(pastValue.Count(0) + v.Count(1) * ((v.dims[0] - 1) / 100 + 1) * 100);
             }
             CatDirectAxis0(pastKey, k);
             CatDirectAxis0(pastValue, v);
