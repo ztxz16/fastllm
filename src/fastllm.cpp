@@ -738,6 +738,7 @@ namespace fastllm {
         return weight[key];
     }
 
+#ifdef __AVX__
     static inline int I32sum(const __m256i a) {
         const __m128i sum128 = _mm_add_epi32(_mm256_extractf128_si256(a, 0), _mm256_extractf128_si256(a, 1));
         const __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
@@ -804,6 +805,7 @@ namespace fastllm {
 
         return ans + I32sum(acc);
     };
+#endif
 
     //a = [n, m], b = [k, m], c = aT(b') = [n, k]
     void Multiply(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride) {
