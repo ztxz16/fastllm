@@ -13,6 +13,10 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef __AVX__
+#include "immintrin.h"
+#endif
+
 namespace fastllm {
     double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
         auto duration = std::chrono::duration_cast<std::chrono::microseconds> (time2 - time1);
@@ -667,6 +671,73 @@ namespace fastllm {
         return weight[key];
     }
 
+    static inline int I32sum(const __m256i a) {
+        const __m128i sum128 = _mm_add_epi32(_mm256_extractf128_si256(a, 0), _mm256_extractf128_si256(a, 1));
+        const __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+        const __m128i sum64 = _mm_add_epi32(hi64, sum128);
+        const __m128i hi32  = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+        return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+    }
+
+    int DotU8U8(uint8_t *a, uint8_t *b, int n) {
+        __m256i acc = _mm256_setzero_si256();
+
+        int i = 0;
+        int ans = 0;
+        for (; i + 31 < n; i += 32) {
+            __m256i bx = _mm256_loadu_si256((const __m256i *) (a + i));
+            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
+
+            __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
+            __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
+
+            __m256i my0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 0));
+            __m256i my1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 1));
+
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, my0));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, my1));
+        }
+        for (; i < n; i++) {
+            ans += a[i] * b[i];
+        }
+
+        return ans + I32sum(acc);
+    };
+
+    int DotU4U8(uint8_t *a, uint8_t *b, int n) {
+        int value = 0, j = 0;
+        for (; j + 1 < n; j += 2) {
+            value += (a[j / 2] >> 4) * b[j];
+            value += (a[j / 2] & 0xF) * b[j + 1];
+        }
+        //return value;
+
+        __m256i acc = _mm256_setzero_si256();
+
+        int i = 0;
+        int ans = 0;
+        const __m256i lowMask = _mm256_set1_epi8(0xf);
+        for (; i + 31 < n; i += 32) {
+            __m128i orix = _mm_loadu_si128((const __m128i *) (a + i / 2));
+            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+            __m256i bx = _mm256_and_si256(lowMask, bytex);
+            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
+            __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
+            __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
+
+            __m256i my0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 0));
+            __m256i my1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 1));
+
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, my0));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, my1));
+        }
+        for (; i < n; i++) {
+            ans += a[i] * b[i];
+        }
+
+        return ans + I32sum(acc);
+    };
+
     //a = [n, m], b = [k, m], c = aT(b') = [n, k]
     void Multiply(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride) {
 #ifdef __aarch64__
@@ -724,7 +795,7 @@ namespace fastllm {
                 c[block * kstride + i] = value;
             }
         }
-#elif defined(X86)
+#elif defined(__AVX__)
         int block = 0;
 	    for (; block < n; block++) {
 		    uint8_t *weightWalk = b;
@@ -733,11 +804,10 @@ namespace fastllm {
 		    for (int i = 0; i < k; i++) {
 			    int value = 0;
 			    uint8_t *inputWalk = inputStart;
-			    for (int j = 0; j < m; j++) {
-				    value += (int)(*(weightWalk++)) * (*(inputWalk++));
-			    }
 
-			    c[block * kstride + i] = value;
+                c[block * kstride + i] = DotU8U8(inputWalk, weightWalk, m);
+                inputWalk += m;
+                weightWalk += m;
 		    }
 	    }
 #else
@@ -785,7 +855,16 @@ namespace fastllm {
                     sum0 = vpadalq_u16(sum0, vmull_u8(vb, in.val[0]));
                 }
                 value += sum0[0] + sum0[1] + sum0[2] + sum0[3];
+#elif defined(__AVX__)
+                value += DotU4U8(weightWalk + i * m / 2, inputWalk, m);
+                j += m;
 #endif
+                for (; j + 1 < m; j += 2) {
+                    int id = (i * m + j) / 2;
+                    value += (weightWalk[id] >> 4) * inputWalk[j];
+                    value += (weightWalk[id] & 0xF) * inputWalk[j + 1];
+                }
+
                 for (; j < m; j++) {
                     int id = (i * m + j) / 2;
                     if ((i * m + j) % 2) {
@@ -1159,6 +1238,20 @@ namespace fastllm {
             for (int i = 0; i < n * m; i++) {
                 uinput[i] = inputConfig.quantization(inputData[i]);
             }
+#ifdef __AVX__
+            uint8_t *temp = new uint8_t[32];
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j + 31 < m; j += 32) {
+                    memcpy(temp, uinput.data() + i * m + j, 32);
+                    for (int k = 0; k < 16; k++) {
+                        uinput[i * m + j + k] = temp[k * 2 + 1];
+                        uinput[i * m + j + k + 16] = temp[k * 2];
+                    }
+                }
+            }
+            delete[] temp;
+#endif
+
             MultiplyInt4MultiThread(uinput.data(), weightData, (int32_t*)outputData, n, m, k, threads);
             for (int i = 0; i < n; i++) {
                 uint32_t inputSum = 0;
