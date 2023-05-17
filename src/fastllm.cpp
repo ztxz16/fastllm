@@ -311,6 +311,63 @@ namespace fastllm {
         delete tmp;
     }
 
+    void Transpose4x4(float *pDst, float *pSrc, int dstStride, int srcStride, int n, int m) {
+        if (n < 4 || m < 4) {
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j < m; j++) {
+                    pDst[j * dstStride + i] = pSrc[i * srcStride + j];
+                }
+            }
+
+            return;
+        }
+
+#ifdef __aarch64__
+        float32x4x2_t q01 = vtrnq_f32(vld1q_f32(pSrc), vld1q_f32(pSrc + srcStride));
+        float32x4x2_t q23 = vtrnq_f32(vld1q_f32(pSrc + 2 * srcStride), vld1q_f32(pSrc + 3 * srcStride));
+
+        float32x4_t qq0 = q01.val[0];
+        float32x2_t d00 = vget_low_f32(qq0);
+        float32x2_t d01 = vget_high_f32(qq0);
+
+        float32x4_t qq1 = q01.val[1];
+        float32x2_t d10 = vget_low_f32(qq1);
+        float32x2_t d11 = vget_high_f32(qq1);
+
+        float32x4_t qq2 = q23.val[0];
+        float32x2_t d20 = vget_low_f32(qq2);
+        float32x2_t d21 = vget_high_f32(qq2);
+
+        float32x4_t qq3 = q23.val[1];
+        float32x2_t d30 = vget_low_f32(qq3);
+        float32x2_t d31 = vget_high_f32(qq3);
+
+        vst1q_f32(pDst, vcombine_f32(d00, d20));
+        vst1q_f32(pDst + 1 * dstStride, vcombine_f32(d10, d30));
+        vst1q_f32(pDst + 2 * dstStride, vcombine_f32(d01, d21));
+        vst1q_f32(pDst + 3 * dstStride, vcombine_f32(d11, d31));
+#else
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < m; j++) {
+                pDst[j * dstStride + i] = pSrc[i * srcStride + j];
+            }
+        }
+#endif
+    }
+
+    void Transpose(float *pDst, float *pSrc, int dstStride, int srcStride, int n, int m) {
+        int per = 4;
+        for (int i = 0; i < n; i += per) {
+            for (int j = 0; j < m; j += per) {
+                Transpose4x4(pDst + j * dstStride + i,
+                             pSrc + i * srcStride + j,
+                             dstStride, srcStride,
+                             std::min(per, n - i),
+                             std::min(per, m - j));
+            }
+        }
+    }
+
     void Permute(const Data &input, const std::vector<int> &axis, Data &output) {
         AssertInFastLLM(input.dataType == DataType::FLOAT32, "Permute error: datatype should be float32.");
         AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
@@ -329,10 +386,20 @@ namespace fastllm {
         if (axis == std::vector <int> {1, 2, 0}) {
             int n = input.dims[0];
             int m = input.Count(1);
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j < m; j++) {
-                    tmpData[j * n + i] = curData[i * m + j];
-                }
+
+            int threadNum = 2;
+            int per = m / threadNum;
+            int cur = 0;
+            std::vector <std::thread*> threads;
+            for (int i = 0; i < threadNum - 1; i++) {
+                int end = cur + per + (cur + per * (threadNum - i) < m);
+                threads.push_back(new std::thread(&Transpose, tmpData + cur * n, curData + cur, n, m, n, end - cur));
+                cur = end;
+            }
+            Transpose(tmpData + cur * n, curData + cur, n, m, n, m - cur);
+            for (int i = 0; i < threadNum - 1; i++) {
+                threads[i]->join();
+                delete threads[i];
             }
         } else if (axis == std::vector <int> {1, 0, 2}) {
             int n = input.dims[0];
