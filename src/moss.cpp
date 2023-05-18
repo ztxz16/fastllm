@@ -24,7 +24,7 @@ namespace fastllm {
         for (int i = 0; i < max_positions; i++) {
             sin[i].resize(rotary_dim);
             cos[i].resize(rotary_dim);
-            for (int j = 0; j < rotary_dim; j++) {
+            for (int j = 0; j < invFreq.size(); j++) {
                 sin[i][j] = ::sin((float)i * invFreq[j]);
                 cos[i][j] = ::cos((float)i * invFreq[j]);
             }
