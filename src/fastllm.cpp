@@ -122,6 +122,75 @@ namespace fastllm {
         }
     };
 
+#ifdef __AVX__
+	static inline int I32sum(const __m256i a) {
+		const __m128i sum128 = _mm_add_epi32(_mm256_extractf128_si256(a, 0), _mm256_extractf128_si256(a, 1));
+		const __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+		const __m128i sum64 = _mm_add_epi32(hi64, sum128);
+		const __m128i hi32  = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+		return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+	}
+
+	int DotU8U8(uint8_t *a, uint8_t *b, int n) {
+		__m256i acc = _mm256_setzero_si256();
+
+		int i = 0;
+		int ans = 0;
+		for (; i + 31 < n; i += 32) {
+			__m256i bx = _mm256_loadu_si256((const __m256i *) (a + i));
+			__m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
+
+			__m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
+			__m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
+
+			__m256i my0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 0));
+			__m256i my1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 1));
+
+			acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, my0));
+			acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, my1));
+		}
+		for (; i < n; i++) {
+			ans += a[i] * b[i];
+		}
+
+		return ans + I32sum(acc);
+	};
+
+	int DotU4U8(uint8_t *a, uint8_t *b, int n) {
+		int value = 0, j = 0;
+		for (; j + 1 < n; j += 2) {
+			value += (a[j / 2] >> 4) * b[j];
+			value += (a[j / 2] & 0xF) * b[j + 1];
+		}
+		//return value;
+
+		__m256i acc = _mm256_setzero_si256();
+
+		int i = 0;
+		int ans = 0;
+		const __m256i lowMask = _mm256_set1_epi8(0xf);
+		for (; i + 31 < n; i += 32) {
+			__m128i orix = _mm_loadu_si128((const __m128i *) (a + i / 2));
+			__m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+			__m256i bx = _mm256_and_si256(lowMask, bytex);
+			__m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
+			__m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
+			__m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
+
+			__m256i my0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 0));
+			__m256i my1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 1));
+
+			acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, my0));
+			acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, my1));
+		}
+		for (; i < n; i++) {
+			ans += a[i] * b[i];
+		}
+
+		return ans + I32sum(acc);
+	};
+#endif
+
     Data::Data(fastllm::DataType type) {
         this->dataType = type;
         this->UpdateUnitSize();
@@ -471,6 +540,27 @@ namespace fastllm {
                 }
                 weightSum[i] += sum0[0] + sum0[1] + sum0[2] + sum0[3];
 #endif
+#ifdef __AVX__
+	            __m256i acc = _mm256_setzero_si256();
+	            const __m256i lowMask = _mm256_set1_epi8(0xf);
+	            const __m256i ones = _mm256_set1_epi16(1);
+	            for (; j + 31 < m; j += 32) {
+		            __m128i orix = _mm_loadu_si128((const __m128i *) (cpuData + (i * m + j) / 2));
+		            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+		            __m256i bx = _mm256_and_si256(lowMask, bytex);
+
+		            __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
+		            __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
+
+		            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, ones));
+		            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, ones));
+	            }
+	            weightSum[i] += I32sum(acc);
+#endif
+                for (; j + 1 < m; j += 2) {
+	                int id = (i * m + j) / 2;
+	                weightSum[i] += (cpuData[id] & 0xF) + (cpuData[id] >> 4);
+                }
                 for (; j < m; j++) {
                     int id = (i * m + j) / 2;
                     if ((i * m + j) % 2) {
@@ -737,75 +827,6 @@ namespace fastllm {
     Data &WeightMap::operator[](const std::string &key) {
         return weight[key];
     }
-
-#ifdef __AVX__
-    static inline int I32sum(const __m256i a) {
-        const __m128i sum128 = _mm_add_epi32(_mm256_extractf128_si256(a, 0), _mm256_extractf128_si256(a, 1));
-        const __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
-        const __m128i sum64 = _mm_add_epi32(hi64, sum128);
-        const __m128i hi32  = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
-        return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
-    }
-
-    int DotU8U8(uint8_t *a, uint8_t *b, int n) {
-        __m256i acc = _mm256_setzero_si256();
-
-        int i = 0;
-        int ans = 0;
-        for (; i + 31 < n; i += 32) {
-            __m256i bx = _mm256_loadu_si256((const __m256i *) (a + i));
-            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
-
-            __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
-            __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
-
-            __m256i my0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 0));
-            __m256i my1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 1));
-
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, my0));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, my1));
-        }
-        for (; i < n; i++) {
-            ans += a[i] * b[i];
-        }
-
-        return ans + I32sum(acc);
-    };
-
-    int DotU4U8(uint8_t *a, uint8_t *b, int n) {
-        int value = 0, j = 0;
-        for (; j + 1 < n; j += 2) {
-            value += (a[j / 2] >> 4) * b[j];
-            value += (a[j / 2] & 0xF) * b[j + 1];
-        }
-        //return value;
-
-        __m256i acc = _mm256_setzero_si256();
-
-        int i = 0;
-        int ans = 0;
-        const __m256i lowMask = _mm256_set1_epi8(0xf);
-        for (; i + 31 < n; i += 32) {
-            __m128i orix = _mm_loadu_si128((const __m128i *) (a + i / 2));
-            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
-            __m256i bx = _mm256_and_si256(lowMask, bytex);
-            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
-            __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
-            __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
-
-            __m256i my0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 0));
-            __m256i my1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 1));
-
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, my0));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, my1));
-        }
-        for (; i < n; i++) {
-            ans += a[i] * b[i];
-        }
-
-        return ans + I32sum(acc);
-    };
-#endif
 
     //a = [n, m], b = [k, m], c = aT(b') = [n, k]
     void Multiply(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride) {
