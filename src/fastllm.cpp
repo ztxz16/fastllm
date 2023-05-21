@@ -659,6 +659,11 @@ namespace fastllm {
                 ret.replace(pos, blank.length(), " ");
             else break;
         }
+	    int pos = ret.find("<|blank_");
+	    if (pos != -1) {
+		    int space_num = atoi(ret.substr(8, ret.size() - 10).c_str());
+		    return std::string(space_num, ' ');
+	    }
         return ret;
     }
 
