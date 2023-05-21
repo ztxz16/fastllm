@@ -17,6 +17,10 @@
 #include "immintrin.h"
 #endif
 
+#ifdef USE_CUDA
+#include "fastllm-cuda.h"
+#endif
+
 namespace fastllm {
     double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
         auto duration = std::chrono::duration_cast<std::chrono::microseconds> (time2 - time1);
@@ -123,6 +127,14 @@ namespace fastllm {
     };
 
 #ifdef __AVX__
+	static inline float Floatsum(const __m256 a) {
+		__m128 res = _mm256_extractf128_ps(a, 1);
+		res = _mm_add_ps(res, _mm256_castps256_ps128(a));
+		res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+		res = _mm_add_ss(res, _mm_movehdup_ps(res));
+		return _mm_cvtss_f32(res);
+	}
+
 	static inline int I32sum(const __m256i a) {
 		const __m128i sum128 = _mm_add_epi32(_mm256_extractf128_si256(a, 0), _mm256_extractf128_si256(a, 1));
 		const __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
@@ -1268,6 +1280,70 @@ namespace fastllm {
             float *outputData = (float *) output.cpuData;
             float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
             weight.CalcWeightSum();
+
+#ifdef USE_CUDA
+	        {
+		        if (weight.cudaData == nullptr) {
+			        weight.cudaData = (int8_t *) FastllmCudaMalloc(weight.Count(0));
+			        int8_t *bb = new int8_t[k * m];
+			        for (int i = 0; i < k * m; i++) {
+				        bb[i] = (int) weight.cpuData[i] - 128;
+			        }
+			        FastllmCudaCopyFromHostToDevice(weight.cudaData, bb, k * m);
+			        delete[] bb;
+		        }
+
+		        //printf("n = %d, m = %d, k = %d, start spend %f s.\n", n, m, k, GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
+		        int8_t *aa = new int8_t[n * m];
+		        int32_t *cc = new int32_t[n * k];
+		        float minValue = 1e9, maxValue = -1e9;
+		        for (int i = 0; i < n * m; i++) {
+			        minValue = std::min(minValue, inputData[i]);
+			        maxValue = std::max(maxValue, inputData[i]);
+		        }
+		        LowBitConfig inputConfig = LowBitConfig(minValue, maxValue, 8);
+		        for (int i = 0; i < n * m; i++) {
+			        aa[i] = (int)inputConfig.quantization(inputData[i]) - 128;
+		        }
+
+		        int8_t *cudaa = (int8_t *) FastllmCudaMalloc(n * m);
+		        int32_t *cudac = (int32_t *) FastllmCudaMalloc(output.GetBytes());
+
+		        //printf("n = %d, m = %d, k = %d, ready spend %f s.\n", n, m, k, GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
+		        FastllmCudaCopyFromHostToDevice(cudaa, aa, n * m);
+		        //printf("n = %d, m = %d, k = %d, copy spend %f s.\n", n, m, k, GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
+		        FastllmMatMulInt8((int8_t*)cudaa, (int8_t*)weight.cudaData, cudac, n, m, k);
+		        //printf("n = %d, m = %d, k = %d, mul spend %f s.\n", n, m, k, GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
+		        FastllmCudaCopyFromDeviceToHost(cc, cudac, n * k * sizeof(int32_t));
+		        FastllmCudaFree(cudaa);
+		        FastllmCudaFree(cudac);
+
+		        for (int i = 0; i < n; i++) {
+			        int inputSum = 0;
+			        for (int j = 0; j < m; j++) {
+				        inputSum += (aa[i * m + j] + 128);
+			        }
+
+			        for (int j = 0; j < k; j++) {
+				        int value = cc[j * n + i];
+				        value += 128 * weight.weightSum[j];
+				        value += 128 * inputSum;
+				        value -= 128 * 128 * m;
+
+				        value -= weight.weightSum[j] * inputConfig.zeroPoint;
+				        value -= inputSum * weight.perChannelsConfigs[j].zeroPoint;
+				        value += (int) inputConfig.zeroPoint * weight.perChannelsConfigs[j].zeroPoint * m;
+
+				        outputData[i * k + j] = weight.perChannelsConfigs[j].scale * inputConfig.scale * value +
+				                                (biasData == nullptr ? 0.0 : biasData[j]);
+			        }
+		        }
+		        //printf("n = %d, m = %d, k = %d, get ans spend %f s.\n", n, m, k, GetSpan(st, std::chrono::system_clock::now()));st = std::chrono::system_clock::now();
+		        delete[] aa;
+		        delete[] cc;
+		        //printf("n = %d, m = %d, k = %d, delete spend %f s.\n", n, m, k, GetSpan(st, std::chrono::system_clock::now()));st = std::chrono::system_clock::now();
+	        }
+#else
             float minValue = 1e9, maxValue = -1e9;
             for (int i = 0; i < n * m; i++) {
                 minValue = std::min(minValue, inputData[i]);
@@ -1296,7 +1372,7 @@ namespace fastllm {
                             (biasData == nullptr ? 0.0 : biasData[j]);
                 }
             }
-
+#endif
             /*
             这部分是float输入，float输出
             int threadNum = threads;
@@ -1506,6 +1582,14 @@ namespace fastllm {
                         sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(input0Data + i * m + l), vld1q_f32(input1Data + j * m + l)));
                     }
                     now += sum[0] + sum[1] + sum[2] + sum[3];
+#elif defined(__AVX__)
+                    __m256 vsum = _mm256_set1_ps(0.0f);
+                    for (; l + 7 < m; l += 8) {
+	                    __m256 vx = _mm256_loadu_ps((const float *) (input0Data + i * m + l));
+	                    __m256 vy = _mm256_loadu_ps((const float *) (input1Data + j * m + l));
+	                    vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
+                    }
+                    now += Floatsum(vsum);
 #endif
                     for (; l < m; l++) {
                         now += input0Data[i * m + l] * input1Data[j * m + l];
@@ -1541,6 +1625,9 @@ namespace fastllm {
         int outputSpatial = output.Count(output.dims.size() - 2);
 
         int threadNum = threads;
+#ifdef _WIN64
+        threadNum = 1;
+#endif
         int per = batch0 / threadNum;
         int cur = 0;
         std::vector<std::thread *> threads;
