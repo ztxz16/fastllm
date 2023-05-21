@@ -1,7 +1,6 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
-#include <getopt.h>
 
 #include "moss.h"
 #include "chatglm.h"
@@ -10,14 +9,6 @@ struct RunConfig {
     std::string model = "chatglm"; // 模型类型, chatglm或moss
     std::string path; // 模型文件路径
     int threads = 4; // 使用的线程数
-};
-
-static struct option long_options[] = {
-        {"help",               no_argument,       nullptr, 'h'},
-        {"model",              required_argument, nullptr, 'm'},
-        {"path",               required_argument, nullptr, 'p'},
-        {"threads",            required_argument, nullptr, 't'},
-        {nullptr, 0,                              nullptr, 0},
 };
 
 void Usage() {
@@ -29,29 +20,25 @@ void Usage() {
 }
 
 void ParseArgs(int argc, char **argv, RunConfig &config) {
-    int opt;
-    int option_index = 0;
-    const char *opt_string = "h:m:p:t:";
-
-    while ((opt = getopt_long_only(argc, argv, opt_string, long_options, &option_index)) != -1) {
-        switch (opt) {
-            case 'h':
-                Usage();
-                exit (0);
-            case 'm':
-                config.model = argv[optind - 1];
-                break;
-            case 'p':
-                config.path = argv[optind - 1];
-                break;
-            case 't':
-                config.threads = atoi(argv[optind - 1]);
-                break;
-            default:
-                Usage();
-                exit (-1);
-        }
-    }
+	std::vector <std::string> sargv;
+	for (int i = 0; i < argc; i++) {
+		sargv.push_back(std::string(argv[i]));
+	}
+	for (int i = 1; i < argc; i++) {
+		if (sargv[i] == "-h" || sargv[i] == "--help") {
+			Usage();
+			exit(0);
+		} else if (sargv[i] == "-m" || sargv[i] == "--model") {
+			config.model = sargv[++i];
+		} else if (sargv[i] == "-p" || sargv[i] == "--path") {
+			config.path = sargv[++i];
+		} else if (sargv[i] == "-t" || sargv[i] == "--threads") {
+			config.threads = atoi(sargv[++i].c_str());
+		} else {
+			Usage();
+			exit(-1);
+		}
+	}
 }
 
 int main(int argc, char **argv) {

@@ -5,7 +5,6 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
-#include <getopt.h>
 
 #include "moss.h"
 #include "chatglm.h"
@@ -15,15 +14,6 @@ struct QuantConfig {
     std::string path; // 模型文件路径
     std::string output; // 输出文件路径
     int bits; // 量化位数
-};
-
-static struct option long_options[] = {
-        {"help",               no_argument,       nullptr, 'h'},
-        {"model",              required_argument, nullptr, 'm'},
-        {"path",               required_argument, nullptr, 'p'},
-        {"bits",               required_argument, nullptr, 'b'},
-        {"output",             required_argument, nullptr, 'o'},
-        {nullptr, 0,                              nullptr, 0},
 };
 
 void Usage() {
@@ -36,32 +26,27 @@ void Usage() {
 }
 
 void ParseArgs(int argc, char **argv, QuantConfig &config) {
-    int opt;
-    int option_index = 0;
-    const char *opt_string = "h:m:p:b:o:";
-
-    while ((opt = getopt_long_only(argc, argv, opt_string, long_options, &option_index)) != -1) {
-        switch (opt) {
-            case 'h':
-                Usage();
-                exit (0);
-            case 'm':
-                config.model = argv[optind - 1];
-                break;
-            case 'p':
-                config.path = argv[optind - 1];
-                break;
-            case 'b':
-                config.bits = atoi(argv[optind - 1]);
-                break;
-            case 'o':
-                config.output = argv[optind - 1];
-                break;
-            default:
-                Usage();
-                exit (-1);
-        }
-    }
+	std::vector <std::string> sargv;
+	for (int i = 0; i < argc; i++) {
+		sargv.push_back(std::string(argv[i]));
+	}
+	for (int i = 1; i < argc; i++) {
+		if (sargv[i] == "-h" || sargv[i] == "--help") {
+			Usage();
+			exit(0);
+		} else if (sargv[i] == "-m" || sargv[i] == "--model") {
+			config.model = sargv[++i];
+		} else if (sargv[i] == "-p" || sargv[i] == "--path") {
+			config.path = sargv[++i];
+		} else if (sargv[i] == "-b" || sargv[i] == "--bits") {
+			config.bits = atoi(sargv[++i].c_str());
+		} else if (sargv[i] == "-o" || sargv[i] == "--output") {
+			config.output = sargv[++i];
+		} else {
+			Usage();
+			exit(-1);
+		}
+	}
 }
 
 int main(int argc, char **argv) {
