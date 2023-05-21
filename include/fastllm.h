@@ -80,6 +80,8 @@ namespace fastllm {
         uint64_t expansionSize = 0; // 扩容后的尺寸
         uint8_t *cpuData = nullptr; // 数据指针
 
+	    void *cudaData = nullptr;
+
         // 这两个参数用于量化，对FLOAT数据不适用
         int perChannelAxis = -1; // 沿哪个轴分通道量化，-1代表没有分通道
         std::vector <LowBitConfig> perChannelsConfigs; // perChannelsConfigs[i]代表第i个通道的min, max; 如果没有分通道，perChannelsConfigs[0]代表全局min, max
