@@ -11,6 +11,7 @@
 
 #ifdef __aarch64__
 #include <arm_neon.h>
+#include "armMath.h"
 #endif
 
 #ifdef __AVX__
@@ -527,7 +528,20 @@ namespace fastllm {
         if (this->dataType == DataType::INT8) {
             weightSum.resize(n);
             for (int i = 0; i < n; i++) {
-                for (int j = 0; j < m; j++) {
+                int j = 0;
+#ifdef __AVX__
+                __m256i acc = _mm256_setzero_si256();
+                const __m256i ones = _mm256_set1_epi16(1);
+                for (; j + 31 < m; j += 32) {
+                    __m256i ax = _mm256_loadu_si256((const __m256i *) (cpuData + i * m + j));
+                    __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(ax, 0));
+                    __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(ax, 1));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, ones));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, ones));
+                }
+                weightSum[i] += I32sum(acc);
+#endif
+                for (; j < m; j++) {
                     weightSum[i] += cpuData[i * m + j];
                 }
             }
@@ -1704,9 +1718,27 @@ namespace fastllm {
         float *inputData = (float*)input.cpuData;
         float *outputData = (float*)output.cpuData;
         int len = input.Count(0);
-        for (int i = 0; i < len; i++) {
+        int i = 0;
+#ifdef __aarch64__
+        float32x4_t c0 = vdupq_n_f32(0.044715f);
+        float32x4_t c1 = vdupq_n_f32(1.0f);
+        float32x4_t c2 = vdupq_n_f32(0.7978845608028654f);
+        float32x4_t c3 = vdupq_n_f32(0.5f);
+
+        for (; i + 3 < len; i += 4) {
+            float32x4_t vx = vld1q_f32(inputData + i);
+            float32x4_t v1 = vaddq_f32(c1, vmulq_f32(vmulq_f32(c0, vx), vx));
+            float32x4_t v2 = vmulq_f32(vmulq_f32(c2, vx), v1);
+            float32x4_t vex = exp_ps(v2);
+            float32x4_t venegx = exp_ps(vnegq_f32(v2));
+            float32x4_t vtan = vdivq_f32(vsubq_f32(vex, venegx), vaddq_f32(vex, venegx));
+            float32x4_t vout = vmulq_f32(vmulq_f32(c3, vx), vaddq_f32(c1, vtan));
+            vst1q_f32(outputData + i, vout);
+        }
+#endif
+        for (; i < len; i++) {
             float x = inputData[i];
-            outputData[i] = 0.5 * x * (1.0 + tanh(0.7978845608028654 * x * (1.0 + 0.044715 * x * x)));
+            outputData[i] = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * x * (1.0f + 0.044715f * x * x)));
         }
     }
 
