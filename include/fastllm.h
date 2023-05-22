@@ -78,6 +78,7 @@ namespace fastllm {
         std::vector <uint64_t> strides; // 跨度
 
         uint64_t expansionSize = 0; // 扩容后的尺寸
+        std::vector <int> expansionDims; // 预扩容的形状
         uint8_t *cpuData = nullptr; // 数据指针
 
 	    void *cudaData = nullptr;
@@ -110,6 +111,8 @@ namespace fastllm {
         void Allocate(float v); // 分配内存并初始化
 
         void Expansion(uint64_t size); // 将尺寸扩容为size * unitSize，并保留之前的数据；之后分配内存时如果未达到扩容的尺寸，则直接复用
+
+        void Expansion(const std::vector <int> &dims); // 预扩容到相应尺寸
 
         void UpdateUnitSize(); // 更新unitSize
 
@@ -172,6 +175,8 @@ namespace fastllm {
     void Split(const Data &input, int axis, int start, int end, Data &output);
 
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
+
+	void CatDirect(Data &input0, const Data &input1, int axis); // 直接把input1的数据拷贝到input0后面（需要input0提前扩容了足够的空间）
 
     void CatDirectAxis0(Data &input0, const Data &input1); // 直接把input1的数据拷贝到input0后面（axis = 0的Cat操作，需要input0提前扩容了足够的空间）
 

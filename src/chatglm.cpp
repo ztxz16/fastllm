@@ -10,8 +10,38 @@
 
 #include <algorithm>
 
+#include <map>
+
 namespace fastllm {
     extern double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2);
+
+    struct TimeRecord {
+        std::map <std::string, float> v;
+        std::chrono::system_clock::time_point t;
+
+        void Clear() {
+            v.clear();
+        }
+
+        void Record() {
+            t = std::chrono::system_clock::now();
+        }
+
+        void Record(const std::string &key) {
+            auto now = std::chrono::system_clock::now();
+            v[key] += GetSpan(t, now);
+            t = now;
+        }
+
+        void Print() {
+            float s = 0;
+            for (auto &it : v) {
+                printf("%s: %f s.\n", it.first.c_str(), it.second);
+                s += it.second;
+            }
+            printf("Total: %f s.\n", s);
+        }
+    };
 
     ChatGLMModel::ChatGLMModel() {
         sin.resize(max_positions);
@@ -60,24 +90,29 @@ namespace fastllm {
 
     int ChatGLMModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                               const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues) {
+TimeRecord timeRecord;
+timeRecord.Clear();
+//timeRecord.Record();
+
         Data inputEmbeddings;
         Embedding(inputIds, this->weight["transformer.word_embeddings.weight"], inputEmbeddings);
         Data hiddenStates = inputEmbeddings;
         hiddenStates.Permute({1, 0, 2});
 
+        //timeRecord.Record("embedding");
         // ChatGLMBlock
         for (int i = 0; i < block_cnt; i++) {
-//auto st = std::chrono::system_clock::now();
+//timeRecord.Record("next block");
             std::string inputLNWeightName = "transformer.layers." + std::to_string(i) + ".input_layernorm.weight";
             std::string inputLNBiasName = "transformer.layers." + std::to_string(i) + ".input_layernorm.bias";
             Data attenInput;
             LayerNorm(hiddenStates, weight[inputLNWeightName], weight[inputLNBiasName], -1, attenInput);
-//printf("input.ln %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
+//timeRecord.Record("layernorm");
             std::string qkvWeightName = "transformer.layers." + std::to_string(i) + ".attention.query_key_value.weight";
             std::string qkvBiasName = "transformer.layers." + std::to_string(i) + ".attention.query_key_value.bias";
             Data qkv, q, k, v;
             Linear(attenInput, weight[qkvWeightName], weight[qkvBiasName], qkv);
-//printf("qkv %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
+//timeRecord.Record("linear");
             qkv.Reshape({qkv.dims[0], qkv.dims[1], num_attention_heads, -1});
             int per = qkv.dims.back() / 3;
             Split(qkv, -1, 0, per, q);
@@ -86,37 +121,52 @@ namespace fastllm {
 
             RotatePosition2D(q, positionIds);
             RotatePosition2D(k, positionIds);
-//printf("rot %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
+//timeRecord.Record("rot");
             Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
-            while (pastKey.Count(0) + k.Count(0) > pastKey.expansionSize) {
-                pastKey.Expansion(pastKey.Count(0) + k.Count(1) * ((k.dims[0] - 1) / 100 + 1) * 100);
-            }
-            while (pastValue.Count(0) + v.Count(0) > pastValue.expansionSize) {
-                pastValue.Expansion(pastValue.Count(0) + v.Count(1) * ((v.dims[0] - 1) / 100 + 1) * 100);
-            }
-            CatDirectAxis0(pastKey, k);
-            CatDirectAxis0(pastValue, v);
+            k.Resize({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
+            k.Permute({1, 0, 2});
+            v.Resize({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
+            v.Permute({1, 2, 0});
 
-//printf("cat %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
-            std::vector <int> outputSize = {q.dims[1], q.dims[2], q.dims[0], pastKeyValues[i].first.dims[0]};
+            int unitLen = 100;
+            while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
+                || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
+                std::vector <int> newDims;
+                if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                    newDims = std::vector <int> {k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
+                } else {
+                    newDims = pastKey.dims;
+                    newDims[1] += ((k.dims[1] - 1) / unitLen + 1) * unitLen;
+                }
+                pastKey.Expansion(newDims);
+            }
+
+            while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[2] > pastValue.expansionDims[2]))
+                   || (pastValue.dims.size() > 0 && pastValue.dims[2] + v.dims[2] > pastValue.expansionDims[2])) {
+                std::vector <int> newDims;
+                if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                    newDims = std::vector <int> {v.dims[0], v.dims[1], ((v.dims[2] - 1) / unitLen + 1) * unitLen};
+                } else {
+                    newDims = pastValue.dims;
+                    newDims[2] += ((v.dims[2] - 1) / unitLen + 1) * unitLen;
+                }
+                pastValue.Expansion(newDims);
+            }
+            CatDirect(pastKey, k, 1);
+            CatDirect(pastValue, v, 2);
+//timeRecord.Record("cat");
+            std::vector <int> outputSize = {q.dims[1], q.dims[2], q.dims[0], pastKey.dims[1]};
 
             q.Reshape({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
             q.Permute({1, 0, 2});
 
-            std::vector <int> tempDims = pastKeyValues[i].first.dims;
-            pastKeyValues[i].first.Reshape({pastKeyValues[i].first.dims[0],
-                       pastKeyValues[i].first.dims[1] * pastKeyValues[i].first.dims[2],
-                       pastKeyValues[i].first.dims[3]});
-            Permute(pastKeyValues[i].first, {1, 0, 2}, k);
-            pastKeyValues[i].first.Reshape(tempDims);
-
             // 1.2 Attention
             // 1.2.0 q * k^T
             Data attnProbs;
-//printf("qk0 %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
-            MatMulTransB(q, k, attnProbs, 1.0 / (scale_attn * (i + 1)));
+//timeRecord.Record("qk0");
+            MatMulTransB(q, pastKey, attnProbs, 1.0 / (scale_attn * (i + 1)));
             attnProbs.Reshape(outputSize);
-//printf("qk1 %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
+//timeRecord.Record("qk1");
             // 1.2.1 Mask
             if (attentionMask.dims.size() != 0) {
                 float *maskData = (float *) attentionMask.cpuData;
@@ -133,31 +183,24 @@ namespace fastllm {
             // 1.2.2 softmax
             Mul(attnProbs, i + 1, attnProbs);
             Softmax(attnProbs, attnProbs, -1);
-
-            outputSize = {pastKeyValues[i].second.dims[1],
-                          pastKeyValues[i].second.dims[2],
-                          q.dims[1],
-                          pastKeyValues[i].second.dims[3]};
-
-            tempDims = pastKeyValues[i].second.dims;
-            pastKeyValues[i].second.Reshape({pastKeyValues[i].second.dims[0], outputSize[0] * outputSize[1], -1});
-            Permute(pastKeyValues[i].second, {1, 2, 0}, v);
-            pastKeyValues[i].second.Reshape(tempDims);
-
+            
+            outputSize = {1, pastValue.dims[0], q.dims[1], pastValue.dims[1]};
             attnProbs.Reshape({outputSize[0] * outputSize[1], outputSize[2], -1});
             // 1.2.3 prob * v
             Data tempCL, contextLayer;
-            MatMulTransB(attnProbs, v, tempCL);
+//timeRecord.Record("qkv prepare");
+            MatMulTransB(attnProbs, pastValue, tempCL);
+//timeRecord.Record("MatMulTransB");
             tempCL.Reshape(outputSize);
             Permute(tempCL, {2, 0, 1, 3}, contextLayer);
             contextLayer.Reshape({contextLayer.dims[0], contextLayer.dims[1], embed_dim});
-//printf("qkv %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
             // 1.2.4 dense
             std::string denseWeightName = "transformer.layers." + std::to_string(i) + ".attention.dense.weight";
             std::string denseBiasName = "transformer.layers." + std::to_string(i) + ".attention.dense.bias";
             Data attnOutput;
+//timeRecord.Record("qkv");
             Linear(contextLayer, weight[denseWeightName], weight[denseBiasName], attnOutput);
-//printf("dense %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
+//timeRecord.Record("linear");
             // 1.3
             float alpha = sqrt(2 * block_cnt);
             Mul(attenInput, alpha, hiddenStates);
@@ -166,32 +209,35 @@ namespace fastllm {
             std::string postLNBiasName = "transformer.layers." + std::to_string(i) + ".post_attention_layernorm.bias";
             Data mlpInput;
             LayerNorm(hiddenStates, weight[postLNWeightName], weight[postLNBiasName], -1, mlpInput);
-//printf("postln %f\n", GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
             // 1.4 MLP
             std::string fcInKeyName = "transformer.layers." + std::to_string(i) + ".mlp.dense_h_to_4h";
             std::string fcOutKeyName = "transformer.layers." + std::to_string(i) + ".mlp.dense_4h_to_h";
             Data middle, mlpOutput;
+//timeRecord.Record("post ln");
             Linear(mlpInput, weight[fcInKeyName + ".weight"], weight[fcInKeyName + ".bias"], middle);
+//timeRecord.Record("linear");
             GeluNew(middle, middle);
+//timeRecord.Record("gelu");
             Linear(middle, weight[fcOutKeyName + ".weight"], weight[fcOutKeyName + ".bias"], mlpOutput);
+//timeRecord.Record("linear");
             AddTo(mlpOutput, mlpInput, alpha);
             hiddenStates.CopyFrom(mlpOutput);
-//printf("mlp %f\n", GetSpan(st, std::chrono::system_clock::now()));
+//timeRecord.Record("mlp");
         }
 
         LayerNorm(hiddenStates, weight["transformer.final_layernorm.weight"], weight["transformer.final_layernorm.bias"], -1, hiddenStates);
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
-
-        std::vector <std::pair <float, int> > v;
+        //timeRecord.Record("logits");
+        std::pair <float, int> ret = std::make_pair(-1e9, -1);
         int base = logits.dims[0] - 1;
         for (int i = 0; i < logits.dims.back(); i++) {
-            v.push_back(std::make_pair(((float*)logits.cpuData)[base * logits.dims.back() + i], i));
+            ret = max(ret, std::make_pair(((float*)logits.cpuData)[base * logits.dims.back() + i], i));
         }
-        std::sort(v.begin(), v.end());
-        std::reverse(v.begin(), v.end());
+//timeRecord.Record("get max");
 
-        return v[0].second;
+//timeRecord.Print();
+        return ret.second;
     }
 
     std::string ChatGLMModel::Response(const std::string &input) {
@@ -249,7 +295,7 @@ namespace fastllm {
             attentionMask = Data();
             positionIds.CopyFrom(Data(DataType::FLOAT32, {2, 1}, {(float)maskIds, (float)(len)}));
 
-            //printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            //printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
         }
 
         printf("\n");
