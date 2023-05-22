@@ -246,6 +246,9 @@ namespace fastllm {
         if (i >= this->dims.size()) {
             return 1;
         }
+        if (i - 1 >= 0 && i - 1 < this->strides.size()) {
+            return this->strides[i - 1];
+        }
         return this->dims[i] * this->strides[i];
     }
 
@@ -272,10 +275,12 @@ namespace fastllm {
         this->dims = dims;
         this->UpdateUnitSize();
 
-        this->strides.resize(dims.size(), 1);
-        this->strides.back() = 1;
-        for (int i = this->dims.size() - 2; i >= 0; i--) {
-            this->strides[i] = this->dims[i + 1] * this->strides[i + 1];
+        if (this->expansionDims.size() == 0) {
+            this->strides.resize(dims.size(), 1);
+            this->strides.back() = 1;
+            for (int i = this->dims.size() - 2; i >= 0; i--) {
+                this->strides[i] = this->dims[i + 1] * this->strides[i + 1];
+            }
         }
     }
 
@@ -341,6 +346,61 @@ namespace fastllm {
         }
     }
 
+    void Data::Expansion(const std::vector<int> &dims) {
+        if (this->dims.size() == 0) {
+            this->strides.resize(dims.size(), 1);
+            this->strides.back() = 1;
+            for (int i = dims.size() - 2; i >= 0; i--) {
+                this->strides[i] = dims[i + 1] * this->strides[i + 1];
+            }
+            this->expansionSize = this->strides[0] * dims[0];
+            this->expansionDims = dims;
+            this->cpuData = new uint8_t[(this->expansionSize * unitSize - 1) / unitSizeDiv + 1];
+            return;
+        }
+
+        AssertInFastLLM(dims.size() == this->dims.size(), "Expansion error: real dims's size should equal to expansion dims's size.\n");
+        for (int i = 0; i < dims.size(); i++) {
+            AssertInFastLLM(dims[i] == -1 || dims[i] >= this->dims[i], "Expansion error: real size should <= expansion size.\n");
+        }
+
+        int axis = -1;
+        for (int i = 0; i < this->dims.size(); i++) {
+            if (this->dims[i] < dims[i]) {
+                axis = i;
+                break;
+            }
+        }
+
+        uint64_t oldBytes = GetBytes();
+        int input1Stride = this->Count(axis);
+
+        this->strides.resize(dims.size(), 1);
+        this->strides.back() = 1;
+        for (int i = this->dims.size() - 2; i >= 0; i--) {
+            this->strides[i] = std::max(this->dims[i + 1], dims[i + 1]) * this->strides[i + 1];
+        }
+        this->expansionSize = this->strides[0] * std::max(this->dims[0], dims[0]);
+        this->expansionDims = dims;
+        if (this->cpuData != nullptr) {
+            uint8_t *old = this->cpuData;
+            this->cpuData = new uint8_t[(this->expansionSize * unitSize - 1) / unitSizeDiv + 1];
+            int outer = this->Count(0) / this->Count(axis);
+            int input0Stride = this->Count(axis);
+            int inner = this->strides[axis];
+            int unitSize = this->unitSize;
+            for (int o = 0; o < outer; o++) {
+                memcpy(this->cpuData + o * input0Stride * unitSize,
+                       old + o * input1Stride * unitSize,
+                       this->dims[axis] * inner * unitSize);
+            }
+
+            delete[] old;
+        } else {
+            this->cpuData = new uint8_t[(this->expansionSize * unitSize - 1) / unitSizeDiv + 1];
+        }
+    }
+
     Data::~Data() {
         delete[] this->cpuData;
     }
@@ -384,6 +444,15 @@ namespace fastllm {
     void Data::Permute(const std::vector<int> &axis) {
         AssertInFastLLM(this->dataType == DataType::FLOAT32, "Permute error: datatype should be float32.");
         AssertInFastLLM(axis.size() == this->dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
+
+        if ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && this->dims[0] == 1) {
+            std::vector<int> new_dims;
+            for (int i = 0; i < axis.size(); i++) {
+                new_dims.push_back(this->dims[axis[i]]);
+            }
+            this->Resize(new_dims);
+            return;
+        }
 
         auto tmp = new Data();
         fastllm::Permute(*this, axis, *tmp);
@@ -469,7 +538,7 @@ namespace fastllm {
             int n = input.dims[0];
             int m = input.Count(1);
 
-            int threadNum = 2;
+            int threadNum = 1;
             int per = m / threadNum;
             int cur = 0;
             std::vector <std::thread*> threads;
@@ -487,6 +556,15 @@ namespace fastllm {
             int n = input.dims[0];
             int m = input.dims[1];
             int k = input.dims[2];
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j < m; j++) {
+                    memcpy(tmpData + (j * n + i) * k, curData + (i * m + j) * k, k * sizeof(float));
+                }
+            }
+        } else if (axis == std::vector <int> {2, 0, 1, 3}) {
+            int n = input.dims[0] * input.dims[1];
+            int m = input.dims[2];
+            int k = input.dims[3];
             for (int i = 0; i < n; i++) {
                 for (int j = 0; j < m; j++) {
                     memcpy(tmpData + (j * n + i) * k, curData + (i * m + j) * k, k * sizeof(float));
@@ -1563,6 +1641,56 @@ namespace fastllm {
         }
     }
 
+    void CatDirect(Data &input0, const Data &input1, int axis) {
+        if (input0.dims.size() == 0) {
+            input0.Resize(input1.dims);
+            AssertInFastLLM(input0.expansionDims.size() == input1.dims.size() &&
+                            input1.dims[axis] <= input0.expansionDims[axis],
+                            "CatDirect Error: input0's expansion size is not enough.\n");
+            int outer = input1.Count(0) / input1.Count(axis);
+            int input0Stride = input0.Count(axis);
+            int input1Stride = input1.Count(axis);
+            int inner = input0.strides[axis];
+            int unitSize = input0.unitSize;
+            for (int o = 0; o < outer; o++) {
+                memcpy(input0.cpuData + o * input0Stride * unitSize,
+                       input1.cpuData + o * input1Stride * unitSize,
+                       input1.dims[axis] * inner * unitSize);
+            }
+
+            return;
+        }
+
+        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
+                        "Cat's input's type should be float32.\n");
+        AssertInFastLLM(input0.dims.size() == input1.dims.size(), "Cat Error: input's shape's size should be same.\n");
+        int dimsLen = input0.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        for (int i = 0; i < dimsLen; i++) {
+            if (i != axis) {
+                AssertInFastLLM(input0.dims[i] == input1.dims[i], "Cat Error: input's shape doesn't match.");
+            }
+        }
+
+        std::vector <int> dims = input0.dims;
+        std::vector <int> oldDims = dims;
+        dims[axis] += input1.dims[axis];
+        input0.Resize(dims);
+        int outer = input0.Count(0) / input0.Count(axis);
+        int input0Stride = input0.Count(axis);
+        int input1Stride = input1.Count(axis);
+
+        int inner = input0.strides[axis];
+        int unitSize = input0.unitSize;
+
+        for (int o = 0; o < outer; o++) {
+            memcpy(input0.cpuData + o * input0Stride * unitSize + oldDims[axis] * inner * unitSize,
+                   input1.cpuData + (o * input1Stride) * unitSize,
+                   input1.dims[axis] * inner * unitSize);
+        }
+    }
+
     void CatDirectAxis0(Data &input0, const Data &input1) {
         if (input0.dims.size() == 0) {
             input0.Resize(input1.dims);
@@ -1590,6 +1718,7 @@ namespace fastllm {
 
     void MatMulSingle(float *input0Base, float *input1Base, float *outputBase,
                       int input0Spatial, int input1Spatial, int outputSpatial,
+                      int input0Stride, int input1Stride,
                       int n, int m, int k, float alpha, int st, int end) {
         for (int b = st; b < end; b++) {
             float *input0Data = input0Base + b * input0Spatial;
@@ -1602,20 +1731,21 @@ namespace fastllm {
 #ifdef __aarch64__
                     float32x4_t sum = {0, 0, 0, 0};
                     for (; l + 3 < m; l += 4) {
-                        sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(input0Data + i * m + l), vld1q_f32(input1Data + j * m + l)));
+                        sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(input0Data + i * input0Stride + l),
+                                                       vld1q_f32(input1Data + j * input1Stride + l)));
                     }
                     now += sum[0] + sum[1] + sum[2] + sum[3];
 #elif defined(__AVX__)
                     __m256 vsum = _mm256_set1_ps(0.0f);
                     for (; l + 7 < m; l += 8) {
-	                    __m256 vx = _mm256_loadu_ps((const float *) (input0Data + i * m + l));
-	                    __m256 vy = _mm256_loadu_ps((const float *) (input1Data + j * m + l));
-	                    vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
+                        __m256 vx = _mm256_loadu_ps((const float *) (input0Data + i * input0Stride + l));
+                        __m256 vy = _mm256_loadu_ps((const float *) (input1Data + j * input1Stride + l));
+                        vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
                     }
                     now += Floatsum(vsum);
 #endif
                     for (; l < m; l++) {
-                        now += input0Data[i * m + l] * input1Data[j * m + l];
+                        now += input0Data[i * input0Stride + l] * input1Data[j * input1Stride + l];
                     }
                     outputData[i * k + j] = now * alpha;
                 }
@@ -1632,6 +1762,8 @@ namespace fastllm {
                         "MatMulTransB's shape error.\n");
         int input0Spatial = input0.Count(input0.dims.size() - 2);
         int input1Spatial = input1.Count(input1.dims.size() - 2);
+        int input0Stride = input0.strides[input0.dims.size() - 2];
+        int input1Stride = input1.strides[input1.dims.size() - 2];
         int n = input0.dims[input0.dims.size() - 2];
         int m = input0.dims.back();
         int k = input1.dims[input1.dims.size() - 2];
@@ -1651,6 +1783,10 @@ namespace fastllm {
 #ifdef _WIN64
         threadNum = 1;
 #endif
+        if (batch0 * n * m * k < 64 * 4096) {
+            threadNum = 1;
+        }
+
         int per = batch0 / threadNum;
         int cur = 0;
         std::vector<std::thread *> threads;
@@ -1658,13 +1794,13 @@ namespace fastllm {
             int end = cur + per + (cur + per * (threadNum - i) < batch0);
             threads.push_back(new std::thread(&MatMulSingle,
                                               (float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
-                                              input0Spatial, input1Spatial, outputSpatial,
+                                              input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                                               n, m, k, alpha, cur, end));
             cur = end;
         }
         MatMulSingle((float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
-                input0Spatial, input1Spatial, outputSpatial,
-                n, m, k, alpha, cur, batch0);
+                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                     n, m, k, alpha, cur, batch0);
         for (int i = 0; i < threadNum - 1; i++) {
             threads[i]->join();
             delete threads[i];
