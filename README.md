@@ -2,18 +2,33 @@
 
 ## 介绍
 
-fastllm是纯c++实现，无第三方依赖的大模型库，目前支持国产大模型ChatGLM-6B，MOSS; 可以在安卓设备上流畅运行ChatGLM-6B
+fastllm是纯c++实现，无第三方依赖的大模型库，目前支持国产大模型ChatGLM-6B，MOSS;
+
+可以在安卓设备上流畅运行ChatGLM-6B
+
+可以在支持CUDA的设备上加速计算
 
 ## 编译
 
 fastllm使用c++编写，建议使用cmake编译，需要提前安装c++编译器，make, cmake
 
-### PC
+如果需要使用GPU（目前仅int8模型支持GPU加速），需要提前安装好CUDA编译环境
+
+### PC (CPU)
 
 ```
 mkdir build
 cd build
 cmake ..
+make -j4
+```
+
+### PC (CPU + GPU)
+
+```
+mkdir build-cuda
+cd build-cuda
+cmake .. -DUSE_CUDA=ON
 make -j4
 ```
 
@@ -60,7 +75,7 @@ make -j4
 
 如果使用原生的ChatGLM-6B模型或者MOSS模型，可以在百度网盘中直接获得量化的模型：
 
-[原始模型](https://pan.baidu.com/s/15ZjhxmA9viSrVYhN935lBg) 提取码：ah5w
+[原始模型](https://pan.baidu.com/s/1DyGOWqKFbpBSSi93PJe6Ug) 提取码：pk7q
 
 如果需要导出自己的模型，可参照如下步骤
 
@@ -92,8 +107,10 @@ cd ../build
 
 ## TODO
 
-1、各种算子NEON优化
+1、各种算子NEON优化, AVX指令集优化
 
-2、AVX指令集优化
+2、CUDA优化
 
-3、支持更多模型
+3、CUDA模式下，当显存不够时使用显存+内存混合计算模式
+
+4、支持更多模型
