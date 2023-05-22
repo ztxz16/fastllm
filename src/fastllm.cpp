@@ -1296,7 +1296,16 @@ namespace fastllm {
             weight.CalcWeightSum();
 
 #ifdef USE_CUDA
-	        {
+            if (false) {
+		        if (weight.cudaData == nullptr) {
+			        weight.cudaData = (int8_t *) FastllmCudaMalloc(weight.Count(0));
+			        FastllmCudaCopyFromHostToDevice(weight.cudaData, weight.cpuData, k * m);
+		        }
+
+                FastllmMatMulFloatInt8(input, weight, bias, output, n, m, k);
+	        }
+
+	        if (true) {
 		        if (weight.cudaData == nullptr) {
 			        weight.cudaData = (int8_t *) FastllmCudaMalloc(weight.Count(0));
 			        int8_t *bb = new int8_t[k * m];
@@ -1383,7 +1392,7 @@ namespace fastllm {
                     value += (int)inputConfig.zeroPoint * weight.perChannelsConfigs[j].zeroPoint * m;
 
                     outputData[i * k + j] = weight.perChannelsConfigs[j].scale * inputConfig.scale * value +
-                            (biasData == nullptr ? 0.0 : biasData[j]);
+                                            (biasData == nullptr ? 0.0 : biasData[j]);
                 }
             }
 #endif
