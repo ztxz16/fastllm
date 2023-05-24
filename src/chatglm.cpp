@@ -240,7 +240,7 @@ timeRecord.Clear();
         return ret.second;
     }
 
-    std::string ChatGLMModel::Response(const std::string &input) {
+    std::string ChatGLMModel::Response(const std::string& input, std::ostream* ost, bool cli) {
         Data inputIds = this->weight.tokenizer.Encode(input);
         std::vector <float> ids;
         for (int i = 0; i < inputIds.Count(0); i++) {
@@ -283,7 +283,13 @@ timeRecord.Clear();
             results.push_back(ret);
             std::string curString = weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str();
             retString += curString;
-            printf("%s", curString.c_str());
+            if (cli) {
+                printf("%s", curString.c_str());
+            }
+            else {
+                *ost << curString;
+                ost->flush();
+            }
             fflush(stdout);
             results.clear();
 
@@ -298,7 +304,13 @@ timeRecord.Clear();
             //printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
         }
 
-        printf("\n");
+        if (cli) {
+            printf("\n");
+        }
+        else {
+            *ost << std::string("<eop>");
+        }
+
         return retString;
     }
 
