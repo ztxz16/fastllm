@@ -818,10 +818,14 @@ namespace fastllm {
                 weight[name].perChannelAxis = buffer.ReadInt();
                 int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
                 weight[name].perChannelsConfigs.resize(k);
+                weight[name].zeros.resize(k);
+                weight[name].scales.resize(k);
                 for (int i = 0; i < k; i++) {
                     float minValue = buffer.ReadFloat();
                     float maxValue = buffer.ReadFloat();
                     weight[name].perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit);
+                    weight[name].zeros[i] = weight[name].perChannelsConfigs[i].zeroPoint;
+                    weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
                 }
                 buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
             }
@@ -1067,9 +1071,12 @@ namespace fastllm {
     }
 
     //a = [n, m], b = [k, m], c = aT(b') = [n, k]
-    void MultiplyInt4(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride) {
+    void MultiplyInt4(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride,
+                      int *weightSums, int *weightZeros, float *scales, float *bias, LowBitConfig *config,
+                      int *inputSums) {
         int block = 0;
         for (; block < n; block++) {
+            uint32_t inputSum = inputSums[block];
             uint8_t *weightWalk = b;
             uint8_t *inputStart = a + block * m;
 
@@ -1101,7 +1108,6 @@ namespace fastllm {
                     uint8x8x2_t in = vld2_u8(inputWalk + j);
                     uint8x8_t va = vand_u8(ori, maskLow);
                     uint8x8_t vb = vshr_n_u8(vand_u8(ori, maskHigh), 4);
-
                     sum0 = vpadalq_u16(sum0, vmull_u8(va, in.val[1]));
                     sum0 = vpadalq_u16(sum0, vmull_u8(vb, in.val[0]));
                 }
@@ -1125,7 +1131,12 @@ namespace fastllm {
                     }
                 }
 
-                c[block * kstride + i] = value;
+                value -= weightSums[i] * config->zeroPoint;
+                value -= inputSum * weightZeros[i];
+                value += (int)config->zeroPoint * weightZeros[i] * m;
+
+                ((float*)c)[block * kstride + i] = scales[i] * config->scale * value +
+                                               (bias == nullptr ? 0.0 : bias[i]);
             }
         }
     }
@@ -1148,16 +1159,29 @@ namespace fastllm {
     }
 
     //a = [n, m], b = [k, m], c = aT(b') = [n, k]
-    void MultiplyInt4MultiThread(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int threadNum) {
+    void MultiplyInt4MultiThread(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k,
+                                 int *weightSums, int *weightZeros, float *scales, float *bias, LowBitConfig &config, int threadNum) {
+        std::vector <int> inputSums;
+        for (int i = 0; i < n; i++) {
+            int sum = 0;
+            for (int j = 0; j < m; j++) {
+                sum += a[i * m + j];
+            }
+            inputSums.push_back(sum);
+        }
         int per = k / threadNum;
         int cur = 0;
         std::vector <std::thread*> threads;
         for (int i = 0; i < threadNum - 1; i++) {
             int end = cur + per + (cur + per * (threadNum - i) < k);
-            threads.push_back(new std::thread(&MultiplyInt4, a, b + cur * m / 2, c + cur, n, m, end - cur, k));
+            threads.push_back(new std::thread(&MultiplyInt4, a, b + cur * m / 2, c + cur, n, m, end - cur, k,
+                                              weightSums + cur, weightZeros + cur, scales + cur,
+                                              (bias == nullptr ? (float*)nullptr : bias + cur), &config, inputSums.data()));
             cur = end;
         }
-        MultiplyInt4(a, b + cur * m / 2, c + cur, n, m, k - cur, k);
+        MultiplyInt4(a, b + cur * m / 2, c + cur, n, m, k - cur, k,
+                     weightSums + cur, weightZeros + cur, scales + cur,
+                     (bias == nullptr ? (float*)nullptr : bias + cur), &config, inputSums.data());
         for (int i = 0; i < threadNum - 1; i++) {
             threads[i]->join();
             delete threads[i];
@@ -1619,25 +1643,9 @@ namespace fastllm {
             }
             delete[] temp;
 #endif
-
-            MultiplyInt4MultiThread(uinput.data(), weightData, (int32_t*)outputData, n, m, k, threads);
-            for (int i = 0; i < n; i++) {
-                uint32_t inputSum = 0;
-                for (int j = 0; j < m; j++) {
-                    inputSum += uinput[i * m + j];
-                }
-
-                for (int j = 0; j < k; j++) {
-                    int value = ((int32_t*)outputData)[i * k + j];
-                    value -= weight.weightSum[j] * inputConfig.zeroPoint;
-                    value -= inputSum * weight.perChannelsConfigs[j].zeroPoint;
-                    value += (int)inputConfig.zeroPoint * weight.perChannelsConfigs[j].zeroPoint * m;
-
-                    outputData[i * k + j] = weight.perChannelsConfigs[j].scale * inputConfig.scale * value +
-                                            (biasData == nullptr ? 0.0 : biasData[j]);
-                }
-            }
-
+            MultiplyInt4MultiThread(uinput.data(), weightData, (int32_t*)outputData, n, m, k,
+                                    weight.weightSum.data(), weight.zeros.data(), weight.scales.data(), biasData,
+                                    inputConfig, threads);
             /*
             这部分是float输入，float输出
             int threadNum = threads;
@@ -1882,6 +1890,7 @@ namespace fastllm {
         if (batch0 * n * m * k < 64 * 4096) {
             threadNum = 1;
         }
+        threadNum = std::min(threadNum, 4);
 
         int per = batch0 / threadNum;
         int cur = 0;

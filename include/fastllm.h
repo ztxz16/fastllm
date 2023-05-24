@@ -86,6 +86,8 @@ namespace fastllm {
         // 这两个参数用于量化，对FLOAT数据不适用
         int perChannelAxis = -1; // 沿哪个轴分通道量化，-1代表没有分通道
         std::vector <LowBitConfig> perChannelsConfigs; // perChannelsConfigs[i]代表第i个通道的min, max; 如果没有分通道，perChannelsConfigs[0]代表全局min, max
+        std::vector <float> scales;
+        std::vector <int> zeros;
         std::vector <int> weightSum; // 作为权重时，有时候需要存一些和加速计算
 
         Data () {};
