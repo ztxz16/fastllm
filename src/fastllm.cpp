@@ -619,6 +619,15 @@ namespace fastllm {
                 }
                 weightSum[i] += I32sum(acc);
 #endif
+#ifdef __aarch64__
+                uint32x4_t sum0 = {0, 0, 0, 0};
+                for (; j + 7 < m; j += 8) {
+                    uint8x8_t ori = vld1_u8(cpuData + (i * m + j));
+                    uint16x4_t sa = vpaddl_u8 (ori);
+                    sum0 = vaddw_u16(sum0, sa);
+                }
+                weightSum[i] += sum0[0] + sum0[1] + sum0[2] + sum0[3];
+#endif
                 for (; j < m; j++) {
                     weightSum[i] += cpuData[i * m + j];
                 }
@@ -939,7 +948,36 @@ namespace fastllm {
 
     //a = [n, m], b = [k, m], c = aT(b') = [n, k]
     void Multiply(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride) {
-#ifdef __aarch64__
+#ifdef __ARM_FEATURE_DOTPROD
+        int block = 0;
+        for (; block < n; block++) {
+            uint8_t *weightWalk = b;
+            uint8_t *inputStart = a + block * m;
+
+            for (int i = 0; i < k; i++) {
+                int value = 0;
+                uint8_t *inputWalk = inputStart;
+                int j = 0;
+                uint32x4_t sum0 = {0, 0, 0, 0};
+                for (; j + 31 < m; j += 32) {
+                    uint8x16_t vi = vld1q_u8(inputWalk);
+                    uint8x16_t vi0 = vld1q_u8(inputWalk + 16);
+                    uint8x16_t vw = vld1q_u8(weightWalk);
+                    uint8x16_t vw0 = vld1q_u8(weightWalk + 16);
+                    sum0 = vdotq_u32(sum0, vi, vw);
+                    sum0 = vdotq_u32(sum0, vi0, vw0);
+                    inputWalk += 32;
+                    weightWalk += 32;
+                }
+
+                value += sum0[0] + sum0[1] + sum0[2] + sum0[3];
+                for (; j < m; j++) {
+				    value += (int)(*(weightWalk++)) * (*(inputWalk++));
+			    }
+                c[block * kstride + i] = value;
+            }
+        }
+#elif defined(__aarch64__)
         int block = 0;
         for (; block < n; block++) {
             uint8_t *weightWalk = b;
@@ -1039,7 +1077,21 @@ namespace fastllm {
                 int value = 0;
                 uint8_t *inputWalk = inputStart;
                 int j = 0;
-#ifdef __aarch64__
+#ifdef __ARM_FEATURE_DOTPROD
+                uint8x8_t maskHigh = vdup_n_u8(0xF0);
+                uint8x8_t maskLow = vdup_n_u8(0xF);
+                uint32x2_t sum0 = {0, 0};
+
+                for (; j + 15 < m; j += 16) {
+                    uint8x8_t ori = vld1_u8(weightWalk + (i * m + j) / 2);
+                    uint8x8x2_t in = vld2_u8(inputWalk + j);
+                    uint8x8_t va = vand_u8(ori, maskLow);
+                    uint8x8_t vb = vshr_n_u8(vand_u8(ori, maskHigh), 4);
+                    sum0 = vdot_u32(sum0, va, in.val[1]);
+                    sum0 = vdot_u32(sum0, vb, in.val[0]);
+                }
+                value += sum0[0] + sum0[1];
+#elif defined(__aarch64__)
                 uint8x8_t maskHigh = vdup_n_u8(0xF0);
                 uint8x8_t maskLow = vdup_n_u8(0xF);
                 uint32x4_t sum0 = {0, 0, 0, 0};
@@ -1167,43 +1219,87 @@ namespace fastllm {
         float *gammaData = (float*)gamma.cpuData;
         float *betaData = (float*)beta.cpuData;
 
-        for (int i = 0; i < outer; i++) {
-            std::fill(mean, mean + inner, 0.f);
-            std::fill(var, var + inner, 0.f);
-            float * inputWalk = inputData;
-            for (int j = 0; j < channels; j++) {
-                for (int k = 0; k < inner; k++) {
-                    mean[k] += *inputWalk++;
+        if (inner == 1) {
+            for (int i = 0; i < outer; i++) {
+                float mean = 0.f, s2 = 0.f, var = 0.f;
+                int j = 0;
+#ifdef __aarch64__
+                float32x4_t sums = vdupq_n_f32(0.0);
+                float32x4_t sums2 = vdupq_n_f32(0.0);
+                for (; j + 3 < channels; j += 4) {
+                    float32x4_t vi = vld1q_f32(inputData + j);
+                    sums = vaddq_f32(sums, vi);
+                    sums2 = vaddq_f32(sums2, vmulq_f32(vi, vi));
                 }
-            }
-            for (int k = 0; k < inner; k++) {
-                mean[k] /= channels;
-            }
-            inputWalk = inputData;
-            for (int j = 0; j < channels; j++) {
-                for (int k = 0; k < inner; k++) {
-                    float x = (*inputWalk++) - mean[k];
-                    var[k] += x * x;
+                mean = sums[0] + sums[1] + sums[2] + sums[3];
+                s2 = sums2[0] + sums2[1] + sums2[2] + sums2[3];
+#endif
+                for (; j < channels; j++) {
+                    mean += inputData[j];
+                    s2 += inputData[j] * inputData[j];
                 }
-            }
-            for (int k = 0; k < inner; k++) {
-                var[k] = sqrt(var[k] / channels + 1e-5);
-            }
+                mean /= channels;
+                var = s2 + mean * mean * channels - 2 * mean * channels * mean;
+                var = sqrt(var / channels + 1e-10);
+                j = 0;
+#ifdef __aarch64__
+                float32x4_t means = vdupq_n_f32(mean);
+                float32x4_t vars = vdupq_n_f32(1.0 / var);
+                for (; j + 3 < channels; j += 4) {
+                    float32x4_t va = vld1q_f32(gammaData + j), vb = vld1q_f32(betaData + j);
+                    float32x4_t vi = vld1q_f32(inputData + j);
+                    float32x4_t vo = vaddq_f32(vmulq_f32(vmulq_f32(vsubq_f32(vi, means), vars), va), vb);
+                    vst1q_f32(outputData + j, vo);
+                }
+#endif
+                for (; j < channels; j++) {
+                    float a = gammaData[j], b = betaData[j];
+                    outputData[j] = (inputData[j] - mean) / var * a + b;
+                }
 
-            inputWalk = inputData;
-            float *outputWalk = outputData;
-            for (int j = 0; j < channels; j++) {
-                float a = gammaData[j], b = betaData[j];
-                for (int k = 0; k < inner; k++) {
-                    *outputWalk++ = ((*inputWalk++) - mean[k]) / var[k] * a + b;
-                }
+                inputData += channels;
+                outputData += channels;
             }
+            return;
+        } else {
+            for (int i = 0; i < outer; i++) {
+                std::fill(mean, mean + inner, 0.f);
+                std::fill(var, var + inner, 0.f);
+                float *inputWalk = inputData;
+                for (int j = 0; j < channels; j++) {
+                    for (int k = 0; k < inner; k++) {
+                        mean[k] += *inputWalk++;
+                    }
+                }
+                for (int k = 0; k < inner; k++) {
+                    mean[k] /= channels;
+                }
+                inputWalk = inputData;
+                for (int j = 0; j < channels; j++) {
+                    for (int k = 0; k < inner; k++) {
+                        float x = (*inputWalk++) - mean[k];
+                        var[k] += x * x;
+                    }
+                }
+                for (int k = 0; k < inner; k++) {
+                    var[k] = sqrt(var[k] / channels + 1e-5);
+                }
 
-            inputData += channels * inner;
-            outputData += channels * inner;
+                inputWalk = inputData;
+                float *outputWalk = outputData;
+                for (int j = 0; j < channels; j++) {
+                    float a = gammaData[j], b = betaData[j];
+                    for (int k = 0; k < inner; k++) {
+                        *outputWalk++ = ((*inputWalk++) - mean[k]) / var[k] * a + b;
+                    }
+                }
+
+                inputData += channels * inner;
+                outputData += channels * inner;
+            }
+            delete[] mean;
+            delete[] var;
         }
-        delete[] mean;
-        delete[] var;
     }
 
     void FloatLinearPart(float *inputData, float *weightData, float *biasData, float *outputData,
@@ -1888,7 +1984,7 @@ namespace fastllm {
     }
 
     void Mul(const fastllm::Data &input, float v, fastllm::Data &output) {
-        AssertInFastLLM(input.dataType == DataType::FLOAT32, "GeluNew error: Data's type should be float32.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Mul error: Data's type should be float32.\n");
 
         if (output.dims != input.dims || output.dataType != input.dataType || output.cpuData == nullptr) {
             output.dataType = input.dataType;
