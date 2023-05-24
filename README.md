@@ -72,6 +72,12 @@ make -j4
 
 可以在Android设备上安装termux软件，并在其中执行termux-setup-storage获得读取手机文件的权限。然后将NDK编译出的main文件和模型存入手机，然后在termux中运行main文件（需要把main文件拷贝到termux的根目录下，否则无权限运行）
 
+### 运行webui
+
+webui 由 [Jacques CHEN](http://whchen.net/index.php/About.html) 提供
+
+编译出webui后，需要在运行目录中放入example/webui/web文件夹以及模型文件（默认为chatglm-6b-v1.1-int4.bin文件)，然后运行既可部署网页端服务
+
 ## 模型获取
 
 ### 原始模型
