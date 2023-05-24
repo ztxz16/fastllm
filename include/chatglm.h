@@ -8,6 +8,8 @@
 #include "fastllm.h"
 #include "cmath"
 
+#include <iostream>
+
 namespace fastllm {
     struct ChatGLMModel {
         const int embed_dim = 4096;
@@ -34,7 +36,7 @@ namespace fastllm {
                 const Data &positionIds,
                 std::vector <std::pair <Data, Data> > &pastKeyValues);
 
-        std::string Response(const std::string &input); // 根据给出的内容回复
+        std::string Response(const std::string& input, std::ostream* ost = nullptr, bool cli = true); // 根据给出的内容回复
 
         void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
     private:
