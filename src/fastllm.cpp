@@ -319,9 +319,10 @@ namespace fastllm {
     }
 
     void Data::Allocate() {
-        if (GetBytes() > expansionSize) {
+        if (Count(0) > expansionSize) {
             delete[] this->cpuData;
             this->cpuData = new uint8_t[GetBytes()];
+            expansionSize = Count(0);
         }
     }
 
@@ -1494,77 +1495,9 @@ namespace fastllm {
             weight.CalcWeightSum();
 
 #ifdef USE_CUDA
-            if (false) {
-		        if (weight.cudaData == nullptr) {
-			        weight.cudaData = (int8_t *) FastllmCudaMalloc(weight.Count(0));
-			        FastllmCudaCopyFromHostToDevice(weight.cudaData, weight.cpuData, k * m);
-		        }
-
-                FastllmMatMulFloatInt8(input, weight, bias, output, n, m, k);
-	        }
-
-	        if (true) {
-		        if (weight.cudaData == nullptr) {
-			        weight.cudaData = (int8_t *) FastllmCudaMalloc(weight.Count(0));
-			        int8_t *bb = new int8_t[k * m];
-			        for (int i = 0; i < k * m; i++) {
-				        bb[i] = (int) weight.cpuData[i] - 128;
-			        }
-			        FastllmCudaCopyFromHostToDevice(weight.cudaData, bb, k * m);
-			        delete[] bb;
-		        }
-
-		        //printf("n = %d, m = %d, k = %d, start spend %f s.\n", n, m, k, GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
-		        int8_t *aa = new int8_t[n * m];
-		        int32_t *cc = new int32_t[n * k];
-		        float minValue = 1e9, maxValue = -1e9;
-		        for (int i = 0; i < n * m; i++) {
-			        minValue = std::min(minValue, inputData[i]);
-			        maxValue = std::max(maxValue, inputData[i]);
-		        }
-		        LowBitConfig inputConfig = LowBitConfig(minValue, maxValue, 8);
-		        for (int i = 0; i < n * m; i++) {
-			        aa[i] = (int)inputConfig.quantization(inputData[i]) - 128;
-		        }
-
-		        int8_t *cudaa = (int8_t *) FastllmCudaMalloc(n * m);
-		        int32_t *cudac = (int32_t *) FastllmCudaMalloc(output.GetBytes());
-
-		        //printf("n = %d, m = %d, k = %d, ready spend %f s.\n", n, m, k, GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
-		        FastllmCudaCopyFromHostToDevice(cudaa, aa, n * m);
-		        //printf("n = %d, m = %d, k = %d, copy spend %f s.\n", n, m, k, GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
-		        FastllmMatMulInt8((int8_t*)cudaa, (int8_t*)weight.cudaData, cudac, n, m, k);
-		        //printf("n = %d, m = %d, k = %d, mul spend %f s.\n", n, m, k, GetSpan(st, std::chrono::system_clock::now())); st = std::chrono::system_clock::now();
-		        FastllmCudaCopyFromDeviceToHost(cc, cudac, n * k * sizeof(int32_t));
-		        FastllmCudaFree(cudaa);
-		        FastllmCudaFree(cudac);
-
-		        for (int i = 0; i < n; i++) {
-			        int inputSum = 0;
-			        for (int j = 0; j < m; j++) {
-				        inputSum += (aa[i * m + j] + 128);
-			        }
-
-			        for (int j = 0; j < k; j++) {
-				        int value = cc[j * n + i];
-				        value += 128 * weight.weightSum[j];
-				        value += 128 * inputSum;
-				        value -= 128 * 128 * m;
-
-				        value -= weight.weightSum[j] * inputConfig.zeroPoint;
-				        value -= inputSum * weight.perChannelsConfigs[j].zeroPoint;
-				        value += (int) inputConfig.zeroPoint * weight.perChannelsConfigs[j].zeroPoint * m;
-
-				        outputData[i * k + j] = weight.perChannelsConfigs[j].scale * inputConfig.scale * value +
-				                                (biasData == nullptr ? 0.0 : biasData[j]);
-			        }
-		        }
-		        //printf("n = %d, m = %d, k = %d, get ans spend %f s.\n", n, m, k, GetSpan(st, std::chrono::system_clock::now()));st = std::chrono::system_clock::now();
-		        delete[] aa;
-		        delete[] cc;
-		        //printf("n = %d, m = %d, k = %d, delete spend %f s.\n", n, m, k, GetSpan(st, std::chrono::system_clock::now()));st = std::chrono::system_clock::now();
-	        }
-#else
+            FastllmMatMulFloatInt8(input, weight, bias, output, n, m, k);
+            return;
+#endif
             float minValue = 1e9, maxValue = -1e9;
             for (int i = 0; i < n * m; i++) {
                 minValue = std::min(minValue, inputData[i]);
@@ -1593,7 +1526,7 @@ namespace fastllm {
                                             (biasData == nullptr ? 0.0 : biasData[j]);
                 }
             }
-#endif
+
             /*
             这部分是float输入，float输出
             int threadNum = threads;
@@ -1930,6 +1863,56 @@ namespace fastllm {
 
         float *inputData = (float*)input.cpuData;
         float *outputData = (float*)output.cpuData;
+
+        if (inner == 1) {
+            for (int i = 0; i < outer; i++) {
+                float maxValue = 0;
+                int j = 0;
+#ifdef ARM
+                float32x4_t vmax = vdupq_n_f32(-1e9);
+                for (; j + 3 < channels; j += 4) {
+                    vmax = vmaxq_f32(vmax, vld1q_f32(inputData + j));
+                }
+                for (int k = 0; k < 4; k++) {
+                    maxValue = max(maxValue, vmax[k]);
+                }
+#endif
+                for (; j < channels; j++) {
+                    maxValue = std::max(maxValue, inputData[j]);
+                }
+
+                j = 0;
+#ifdef ARM
+                vmax = vdupq_n_f32(maxValue);
+                for (; j + 3 < channels; j += 4) {
+                    vst1q_f32(outputData + j, exp_ps(vsubq_f32(vld1q_f32(inputData + j), vmax)));
+                }
+#endif
+                for (; j < channels; j++) {
+                    outputData[j] = exp(inputData[j] - maxValue);
+                }
+                float sum = 0.0;
+                j = 0;
+                for (; j < channels; j++) {
+                    sum += outputData[j];
+                }
+
+                j = 0;
+#ifdef ARM
+                float32x4_t fsum = vdupq_n_f32(sum);
+                for (j = 0; j + 3 < channels; j += 4) {
+                    vst1q_f32(outputData + j, vdivq_f32(vld1q_f32(outputData + j), fsum));
+                }
+#endif
+                for (; j < channels; j++) {
+                    outputData[j] = outputData[j] / sum;
+                }
+                inputData += channels;
+                outputData += channels;
+            }
+            return;
+        }
+
         for (int i = 0; i < outer; i++) {
             std::vector<float> maxValue(inner, -FLT_MAX);
             for (int j = 0; j < channels; j++) {
@@ -1969,6 +1952,12 @@ namespace fastllm {
         float *outputData = (float*)output.cpuData;
         int len = input.Count(0);
         int i = 0;
+#ifdef USE_CUDA
+        if (FastllmGelu(input, output)) {
+            return;
+        }
+#endif
+
 #ifdef __aarch64__
         float32x4_t c0 = vdupq_n_f32(0.044715f);
         float32x4_t c1 = vdupq_n_f32(1.0f);
