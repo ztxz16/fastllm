@@ -1550,8 +1550,13 @@ namespace fastllm {
             uint8_t *weightData = (uint8_t *) weight.cpuData;
             float *outputData = (float *) output.cpuData;
             float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
-
             weight.CalcWeightSum();
+
+#ifdef USE_CUDA
+	        FastllmMatMulFloatInt4(input, weight, bias, output, n, m, k);
+	        return;
+#endif
+
             float minValue = 1e9, maxValue = -1e9;
             for (int i = 0; i < n * m; i++) {
                 minValue = std::min(minValue, inputData[i]);
