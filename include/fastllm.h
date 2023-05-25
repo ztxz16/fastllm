@@ -9,12 +9,14 @@
 #include <cstdint>
 #include <string>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <cmath>
 #include <algorithm>
 
 namespace fastllm {
     void SetThreads(int t);
+    void SetLowMemMode(bool m);
 
     struct LowBitConfig {
         int bit;
@@ -91,6 +93,9 @@ namespace fastllm {
         std::vector <int> zeros;
         std::vector <int> weightSum; // 作为权重时，有时候需要存一些和加速计算
 
+        std::string fileName;
+        long long filePos;
+
         Data () {};
 
         Data (DataType type);
@@ -161,6 +166,8 @@ namespace fastllm {
         Tokenizer tokenizer;
 
         std::map <std::string, Data> weight;
+
+        std::set <std::string> embeddingNames;
 
         void LoadFromFile(const std::string &fileName); // 从文件读取
 

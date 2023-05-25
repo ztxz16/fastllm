@@ -40,9 +40,14 @@ namespace fastllm {
     }
 
     static int threads = 4;
+    static bool lowMemMode = false;
 
     void SetThreads(int t) {
         threads = t;
+    }
+
+    void SetLowMemMode(bool m) {
+    	lowMemMode = m;
     }
 
     struct FileBuffer {
@@ -810,25 +815,35 @@ namespace fastllm {
             }
             DataType dataType = (DataType)buffer.ReadInt();
             weight[name] = Data(dataType, dims);
-            weight[name].Allocate();
 
-            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16) {
-                buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
-            } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
-                int bit = (dataType == DataType::INT4 ? 4 : 8);
-                weight[name].perChannelAxis = buffer.ReadInt();
-                int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
-                weight[name].perChannelsConfigs.resize(k);
-                weight[name].zeros.resize(k);
-                weight[name].scales.resize(k);
-                for (int i = 0; i < k; i++) {
-                    float minValue = buffer.ReadFloat();
-                    float maxValue = buffer.ReadFloat();
-                    weight[name].perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit);
-                    weight[name].zeros[i] = weight[name].perChannelsConfigs[i].zeroPoint;
-                    weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
-                }
-                buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+            if (lowMemMode && this->embeddingNames.find(name) != this->embeddingNames.end()) {
+	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16) {
+	            	weight[name].fileName = fileName;
+	            	weight[name].filePos = _ftelli64(buffer.f);
+	            	fseek(buffer.f, weight[name].GetBytes(), SEEK_CUR);
+	            } else {
+	            	ErrorInFastLLM("Error: embedding's type should be float32 or bfloat16.\n");
+	            }
+            } else {
+	            weight[name].Allocate();
+	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16) {
+		            buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+	            } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
+		            int bit = (dataType == DataType::INT4 ? 4 : 8);
+		            weight[name].perChannelAxis = buffer.ReadInt();
+		            int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
+		            weight[name].perChannelsConfigs.resize(k);
+		            weight[name].zeros.resize(k);
+		            weight[name].scales.resize(k);
+		            for (int i = 0; i < k; i++) {
+			            float minValue = buffer.ReadFloat();
+			            float maxValue = buffer.ReadFloat();
+			            weight[name].perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit);
+			            weight[name].zeros[i] = weight[name].perChannelsConfigs[i].zeroPoint;
+			            weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
+		            }
+		            buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+	            }
             }
 
             printf("Load (%d / %d) \r", (i + 1), len);
@@ -1206,23 +1221,49 @@ namespace fastllm {
         uint64_t inputLen = input.Count(0);
         float *inputData = (float*)input.cpuData;
 
-        if (weight.dataType == DataType::FLOAT32) {
-            float *outputData = (float *) output.cpuData;
-            float *weightData = (float *) weight.cpuData;
-            for (int i = 0; i < inputLen; i++) {
-                int token = (int) (inputData[i] + 1e-9);
-                memcpy(outputData + i * embSize, weightData + token * embSize, embSize * sizeof(float));
-            }
+        if (lowMemMode) {
+        	FILE *fi = fopen(weight.fileName.c_str(), "rb");
+	        if (weight.dataType == DataType::FLOAT32) {
+		        float *outputData = (float *) output.cpuData;
+		        for (int i = 0; i < inputLen; i++) {
+			        int token = (int) (inputData[i] + 1e-9);
+			        _fseeki64(fi, (long long)token * embSize * sizeof(float) + weight.filePos, 0);
+			        fread(outputData + i * embSize, sizeof(float), embSize, fi);
+		        }
+	        } else {
+		        uint16_t *outputData = (uint16_t *) output.cpuData;
+		        uint16_t *weightData = new uint16_t[embSize];
+		        for (int i = 0; i < inputLen; i++) {
+			        int token = (int) (inputData[i] + 1e-9);
+			        _fseeki64(fi, (long long)token * embSize * sizeof(uint16_t) + weight.filePos, 0);
+			        fread(weightData, sizeof(uint16_t), embSize, fi);
+			        for (int j = 0; j < embSize; j++) {
+				        outputData[i * embSize * 2 + j * 2] = 0;
+				        outputData[i * embSize * 2 + j * 2 + 1] = weightData[j];
+			        }
+		        }
+		        delete[] weightData;
+	        }
+	        fclose(fi);
         } else {
-            uint16_t *outputData = (uint16_t *) output.cpuData;
-            uint16_t *weightData = (uint16_t *) weight.cpuData;
-            for (int i = 0; i < inputLen; i++) {
-                int token = (int) (inputData[i] + 1e-9);
-                for (int j = 0; j < embSize; j++) {
-                    outputData[i * embSize * 2 + j * 2] = 0;
-                    outputData[i * embSize * 2 + j * 2 + 1] = weightData[token * embSize + j];
-                }
-            }
+	        if (weight.dataType == DataType::FLOAT32) {
+		        float *outputData = (float *) output.cpuData;
+		        float *weightData = (float *) weight.cpuData;
+		        for (int i = 0; i < inputLen; i++) {
+			        int token = (int) (inputData[i] + 1e-9);
+			        memcpy(outputData + i * embSize, weightData + token * embSize, embSize * sizeof(float));
+		        }
+	        } else {
+		        uint16_t *outputData = (uint16_t *) output.cpuData;
+		        uint16_t *weightData = (uint16_t *) weight.cpuData;
+		        for (int i = 0; i < inputLen; i++) {
+			        int token = (int) (inputData[i] + 1e-9);
+			        for (int j = 0; j < embSize; j++) {
+				        outputData[i * embSize * 2 + j * 2] = 0;
+				        outputData[i * embSize * 2 + j * 2 + 1] = weightData[token * embSize + j];
+			        }
+		        }
+	        }
         }
     }
 
