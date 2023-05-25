@@ -9,6 +9,7 @@ struct RunConfig {
     std::string model = "chatglm"; // 模型类型, chatglm或moss
     std::string path; // 模型文件路径
     int threads = 4; // 使用的线程数
+    bool lowMemMode = false; // 是否使用低内存模式
 };
 
 void Usage() {
@@ -17,6 +18,7 @@ void Usage() {
     std::cout << "<-m|--model> <args>:              模型类型，默认为chatglm, 可以设置为chatglm, moss" << std::endl;
     std::cout << "<-p|--path> <args>:               模型文件的路径" << std::endl;
     std::cout << "<-t|--threads> <args>:            使用的线程数量" << std::endl;
+	std::cout << "<-l|--low> <args>:                使用低内存模式" << std::endl;
 }
 
 void ParseArgs(int argc, char **argv, RunConfig &config) {
@@ -34,6 +36,8 @@ void ParseArgs(int argc, char **argv, RunConfig &config) {
 			config.path = sargv[++i];
 		} else if (sargv[i] == "-t" || sargv[i] == "--threads") {
 			config.threads = atoi(sargv[++i].c_str());
+		} else if (sargv[i] == "-l" || sargv[i] == "--low") {
+			config.lowMemMode = true;
 		} else {
 			Usage();
 			exit(-1);
@@ -45,6 +49,7 @@ int main(int argc, char **argv) {
     RunConfig config;
     ParseArgs(argc, argv, config);
     fastllm::SetThreads(config.threads);
+    fastllm::SetLowMemMode(config.lowMemMode);
 
     if (config.model == "moss") {
         fastllm::MOSSModel moss;
