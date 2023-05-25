@@ -25,7 +25,7 @@ if (USE_CUDA)
     enable_language(CUDA)
     add_compile_definitions(USE_CUDA)
     set(FASTLLM_CUDA_SOURCES src/fastllm-cuda.cu)
-    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
+    #set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
 endif()
 
 add_library(fastllm OBJECT
