@@ -15,6 +15,8 @@ void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size);
 void FastllmCudaFree(void *ret);
 
+bool FastllmGelu(const fastllm::Data &input, fastllm::Data &output);
+
 #ifdef  __cplusplus
 }
 #endif
