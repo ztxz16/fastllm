@@ -29,6 +29,7 @@ namespace fastllm {
                 cos[i][j] = ::cos((float)i * invFreq[j]);
             }
         }
+        this->weight.embeddingNames.insert("transformer.wte.weight");
     }
 
     void MOSSModel::LoadFromFile(const std::string &fileName) {

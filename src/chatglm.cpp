@@ -58,6 +58,7 @@ namespace fastllm {
                 cos[i][j] = ::cos((float)i * invFreq[j]);
             }
         }
+        weight.embeddingNames.insert("transformer.word_embeddings.weight");
     }
 
     void ChatGLMModel::RotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds) {
