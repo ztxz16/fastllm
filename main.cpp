@@ -62,6 +62,7 @@ int main(int argc, char **argv) {
     } else if (config.model == "chatglm") {
         fastllm::ChatGLMModel chatGlm;
         chatGlm.LoadFromFile(config.path);
+        chatGlm.WarmUp();
 
         int round = 0;
         std::string history;

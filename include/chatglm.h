@@ -39,6 +39,8 @@ namespace fastllm {
         std::string Response(const std::string& input, std::ostream* ost = nullptr, bool cli = true); // 根据给出的内容回复
 
         void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
+
+        void WarmUp(); // 预热
     private:
         void RotatePosition2D(Data &data, const Data &positionIds); // 二维位置编码
 
