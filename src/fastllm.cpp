@@ -819,7 +819,11 @@ namespace fastllm {
             if (lowMemMode && this->embeddingNames.find(name) != this->embeddingNames.end()) {
 	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16) {
 	            	weight[name].fileName = fileName;
+#if defined(_WIN32) or defined(_WIN64)
 	            	weight[name].filePos = _ftelli64(buffer.f);
+#else
+                    weight[name].filePos = ftell(buffer.f);
+#endif
 	            	fseek(buffer.f, weight[name].GetBytes(), SEEK_CUR);
 	            } else {
 	            	ErrorInFastLLM("Error: embedding's type should be float32 or bfloat16.\n");
@@ -1227,16 +1231,24 @@ namespace fastllm {
 		        float *outputData = (float *) output.cpuData;
 		        for (int i = 0; i < inputLen; i++) {
 			        int token = (int) (inputData[i] + 1e-9);
+#if defined(_WIN32) or defined(_WIN64)
 			        _fseeki64(fi, (long long)token * embSize * sizeof(float) + weight.filePos, 0);
-			        fread(outputData + i * embSize, sizeof(float), embSize, fi);
+#else
+                    fseek(fi, (long long)token * embSize * sizeof(float) + weight.filePos, 0);
+#endif
+			        int ret = fread(outputData + i * embSize, sizeof(float), embSize, fi);
 		        }
 	        } else {
 		        uint16_t *outputData = (uint16_t *) output.cpuData;
 		        uint16_t *weightData = new uint16_t[embSize];
 		        for (int i = 0; i < inputLen; i++) {
 			        int token = (int) (inputData[i] + 1e-9);
+#if defined(_WIN32) or defined(_WIN64)
 			        _fseeki64(fi, (long long)token * embSize * sizeof(uint16_t) + weight.filePos, 0);
-			        fread(weightData, sizeof(uint16_t), embSize, fi);
+#else
+                    fseek(fi, (long long)token * embSize * sizeof(uint16_t) + weight.filePos, 0);
+#endif
+			        int ret = fread(weightData, sizeof(uint16_t), embSize, fi);
 			        for (int j = 0; j < embSize; j++) {
 				        outputData[i * embSize * 2 + j * 2] = 0;
 				        outputData[i * embSize * 2 + j * 2 + 1] = weightData[j];
