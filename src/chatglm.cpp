@@ -124,12 +124,16 @@ timeRecord.Clear();
             RotatePosition2D(k, positionIds);
 //timeRecord.Record("rot");
             Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
+
+            pastKey.ToDevice(DataDevice::CUDA);
+            pastValue.ToDevice(DataDevice::CUDA);
+
             k.Resize({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
             k.Permute({1, 0, 2});
             v.Resize({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
             v.Permute({1, 2, 0});
 
-            int unitLen = 100;
+            int unitLen = 64;
             while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
                 || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
                 std::vector <int> newDims;
@@ -153,9 +157,14 @@ timeRecord.Clear();
                 }
                 pastValue.Expansion(newDims);
             }
-            CatDirect(pastKey, k, 1);
-            CatDirect(pastValue, v, 2);
+
+            k.ToDevice(DataDevice::CUDA);
+            v.ToDevice(DataDevice::CUDA);
 //timeRecord.Record("cat");
+            CatDirect(pastKey, k, 1);
+//timeRecord.Record("catk");
+            CatDirect(pastValue, v, 2);
+//timeRecord.Record("catv");
             std::vector <int> outputSize = {q.dims[1], q.dims[2], q.dims[0], pastKey.dims[1]};
 
             q.Reshape({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
@@ -165,11 +174,15 @@ timeRecord.Clear();
             // 1.2.0 q * k^T
             Data attnProbs;
 //timeRecord.Record("qk0");
+
+            q.ToDevice(DataDevice::CUDA);
             MatMulTransB(q, pastKey, attnProbs, 1.0 / (scale_attn * (i + 1)));
             attnProbs.Reshape(outputSize);
 //timeRecord.Record("qk1");
             // 1.2.1 Mask
             if (attentionMask.dims.size() != 0) {
+                attnProbs.ToDevice(DataDevice::CPU);
+
                 float *maskData = (float *) attentionMask.cpuData;
                 float *attnData = (float *) attnProbs.cpuData;
                 int spatial = attnProbs.Count(2), outer = attnProbs.Count(0) / spatial;;
@@ -184,13 +197,15 @@ timeRecord.Clear();
             // 1.2.2 softmax
             Mul(attnProbs, i + 1, attnProbs);
             Softmax(attnProbs, attnProbs, -1);
-            
+
             outputSize = {1, pastValue.dims[0], q.dims[1], pastValue.dims[1]};
             attnProbs.Reshape({outputSize[0] * outputSize[1], outputSize[2], -1});
             // 1.2.3 prob * v
             Data tempCL, contextLayer;
 //timeRecord.Record("qkv prepare");
+            attnProbs.ToDevice(DataDevice::CUDA);
             MatMulTransB(attnProbs, pastValue, tempCL);
+            tempCL.ToDevice(DataDevice::CPU);
 //timeRecord.Record("MatMulTransB");
             tempCL.Reshape(outputSize);
             Permute(tempCL, {2, 0, 1, 3}, contextLayer);
@@ -215,12 +230,15 @@ timeRecord.Clear();
             std::string fcOutKeyName = "transformer.layers." + std::to_string(i) + ".mlp.dense_4h_to_h";
             Data middle, mlpOutput;
 //timeRecord.Record("post ln");
+            mlpInput.ToDevice(DataDevice::CUDA);
             Linear(mlpInput, weight[fcInKeyName + ".weight"], weight[fcInKeyName + ".bias"], middle);
 //timeRecord.Record("linear");
             GeluNew(middle, middle);
 //timeRecord.Record("gelu");
             Linear(middle, weight[fcOutKeyName + ".weight"], weight[fcOutKeyName + ".bias"], mlpOutput);
 //timeRecord.Record("linear");
+            mlpInput.ToDevice(DataDevice::CPU);
+            mlpOutput.ToDevice(DataDevice::CPU);
             AddTo(mlpOutput, mlpInput, alpha);
             hiddenStates.CopyFrom(mlpOutput);
 //timeRecord.Record("mlp");
@@ -307,7 +325,7 @@ timeRecord.Clear();
     }
 
     void ChatGLMModel::WarmUp() {
-    	printf("Warmup... ");
+    	printf("Warmup...\n");
 	    Data inputIds = Data(DataType::FLOAT32, {1, 1}, {130004});
 	    Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});
 	    Data positionIds = Data(DataType::FLOAT32, {2, 1}, {0, 0});
@@ -318,7 +336,7 @@ timeRecord.Clear();
 		                                           Data(DataType::FLOAT32)));
 	    }
 	    Forward(inputIds, attentionMask, positionIds, pastKeyValues);
-	    printf(" finish.\n");
+	    printf("finish.\n");
     }
 
     void ChatGLMModel::SaveLowBitModel(const std::string &fileName, int bit) {
