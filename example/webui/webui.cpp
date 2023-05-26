@@ -48,7 +48,9 @@ int main(int argc, char** argv) {
             std::string ret = chatGlm.Response(prompt, [](int index, const char* content) {
 				if (index == -1) {
 					printf("\n");
-					ss = std::string(content);
+					ss += "<eop>\n";
+				} else {
+					ss += std::string(content);
 				}
 				});
             waiting = false;
