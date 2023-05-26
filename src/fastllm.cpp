@@ -323,11 +323,38 @@ namespace fastllm {
         return (this->strides[0] * this->dims[0] * this->unitSize - 1) / this->unitSizeDiv + 1;
     }
 
+    void Data::MallocSpace(uint64_t size) {
+        this->expansionSize = size;
+        this->expansionBytes = (size * this->unitSize - 1) / this->unitSizeDiv + 1;
+        if (this->dataDevice == DataDevice::CPU) {
+            this->cpuData = new uint8_t[this->expansionBytes];
+        } else if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+            this->cudaData = FastllmCudaMalloc(this->expansionBytes);
+#else
+            ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
+        }
+    }
+
+    void Data::FreeSpace() {
+        this->expansionSize = 0;
+        this->expansionBytes = 0;
+        if (this->dataDevice == DataDevice::CPU) {
+            delete[] this->cpuData;
+        } else if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+            FastllmCudaFree(this->cudaData);
+#else
+            ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
+        }
+    }
+
     void Data::Allocate() {
         if (Count(0) > expansionSize) {
-            delete[] this->cpuData;
-            this->cpuData = new uint8_t[GetBytes()];
-            expansionSize = Count(0);
+            FreeSpace();
+            MallocSpace(Count(0));
         }
     }
 
@@ -335,20 +362,10 @@ namespace fastllm {
         AssertInFastLLM(this->dataType == DataType::FLOAT32, "Allocate error: Data's type should be float32.\n");
         this->Allocate();
         float *f = (float*)cpuData;
-        std::fill(f, f + Count(0), v);
-    }
-
-    void Data::Expansion(uint64_t size) {
-        AssertInFastLLM(Count(0) <= size, "Expansion error: real size should <= expansion size.\n");
-        this->expansionSize = size;
-
-        if (this->cpuData != nullptr) {
-            uint8_t *old = this->cpuData;
-            this->cpuData = new uint8_t[(size * unitSize - 1) / unitSizeDiv + 1];
-            memcpy(this->cpuData, old, GetBytes());
-            delete[] old;
+        if (this->dataDevice == DataDevice::CPU) {
+            std::fill(f, f + Count(0), v);
         } else {
-            this->cpuData = new uint8_t[(size * unitSize - 1) / unitSizeDiv + 1];
+            // TODO: 别的设备上的初始化
         }
     }
 
@@ -359,9 +376,8 @@ namespace fastllm {
             for (int i = dims.size() - 2; i >= 0; i--) {
                 this->strides[i] = dims[i + 1] * this->strides[i + 1];
             }
-            this->expansionSize = this->strides[0] * dims[0];
             this->expansionDims = dims;
-            this->cpuData = new uint8_t[(this->expansionSize * unitSize - 1) / unitSizeDiv + 1];
+            this->MallocSpace(this->strides[0] * dims[0]);
             return;
         }
 
@@ -386,29 +402,48 @@ namespace fastllm {
         for (int i = this->dims.size() - 2; i >= 0; i--) {
             this->strides[i] = std::max(this->dims[i + 1], dims[i + 1]) * this->strides[i + 1];
         }
-        this->expansionSize = this->strides[0] * std::max(this->dims[0], dims[0]);
         this->expansionDims = dims;
-        if (this->cpuData != nullptr) {
-            uint8_t *old = this->cpuData;
-            this->cpuData = new uint8_t[(this->expansionSize * unitSize - 1) / unitSizeDiv + 1];
-            int outer = this->Count(0) / this->Count(axis);
-            int input0Stride = this->Count(axis);
-            int inner = this->strides[axis];
-            int unitSize = this->unitSize;
-            for (int o = 0; o < outer; o++) {
-                memcpy(this->cpuData + o * input0Stride * unitSize,
-                       old + o * input1Stride * unitSize,
-                       this->dims[axis] * inner * unitSize);
+        if (this->expansionBytes != 0) {
+            if (this->dataDevice == DataDevice::CPU) {
+                uint8_t *old = this->cpuData;
+                MallocSpace(this->strides[0] * std::max(this->dims[0], dims[0]));
+                int outer = this->Count(0) / this->Count(axis);
+                int input0Stride = this->Count(axis);
+                int inner = this->strides[axis];
+                int unitSize = this->unitSize;
+                for (int o = 0; o < outer; o++) {
+                    memcpy(this->cpuData + o * input0Stride * unitSize,
+                           old + o * input1Stride * unitSize,
+                           this->dims[axis] * inner * unitSize);
+                }
+                delete[] old;
+            } else if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+                uint8_t *old = (uint8_t*)this->cudaData;
+                MallocSpace(this->strides[0] * std::max(this->dims[0], dims[0]));
+                int outer = this->Count(0) / this->Count(axis);
+                int input0Stride = this->Count(axis);
+                int inner = this->strides[axis];
+                int unitSize = this->unitSize;
+                FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)this->cudaData, input0Stride * unitSize,
+                                            (uint8_t*)old, input1Stride * unitSize, this->dims[axis] * inner * unitSize, outer);
+                FastllmCudaFree(old);
+#else
+                ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
             }
-
-            delete[] old;
         } else {
-            this->cpuData = new uint8_t[(this->expansionSize * unitSize - 1) / unitSizeDiv + 1];
+            MallocSpace(this->strides[0] * std::max(this->dims[0], dims[0]));
         }
     }
 
     Data::~Data() {
         delete[] this->cpuData;
+#ifdef USE_CUDA
+        if (this->cudaData != nullptr) {
+            FastllmCudaFree(this->cudaData);
+        }
+#endif
     }
 
     void Data::Print() const {
@@ -690,6 +725,37 @@ namespace fastllm {
                 }
             }
         }
+    }
+
+    void Data::ToDevice(fastllm::DataDevice device) {
+#ifndef USE_CUDA
+        // TODO: 这里先直接跳过了
+        return;
+#endif
+        if (this->dataDevice == device) {
+            return;
+        }
+
+        if (this->expansionBytes != 0) {
+#ifdef USE_CUDA
+            if (this->dataDevice == DataDevice::CPU) {
+                if (device == DataDevice::CUDA) {
+                    this->cudaData = FastllmCudaMalloc(expansionBytes);
+                    FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, expansionBytes);
+                    delete[] this->cpuData;
+                    this->cpuData = nullptr;
+                }
+            } else if (this->dataDevice == DataDevice::CUDA) {
+                if (device == DataDevice::CPU) {
+                    this->cpuData = new uint8_t[expansionBytes];
+                    FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
+                    FastllmCudaFree(this->cudaData);
+                    this->cudaData = nullptr;
+                }
+            }
+#endif
+        }
+        this->dataDevice = device;
     }
 
     Tokenizer::TrieNode::TrieNode() {
@@ -1512,6 +1578,7 @@ namespace fastllm {
 
         std::vector <int> dims = input.dims;
         dims.back() = weight.dims[0];
+        output.dataDevice = input.dataDevice;
         output.Resize(dims);
         output.Allocate(0.0f);
 
@@ -1548,7 +1615,7 @@ namespace fastllm {
             weight.CalcWeightSum();
 
 #ifdef USE_CUDA
-            FastllmMatMulFloatInt8(input, weight, bias, output, n, m, k);
+            FastllmCudaMatMulFloatInt8(input, weight, bias, output, n, m, k);
             return;
 #endif
             float minValue = 1e9, maxValue = -1e9;
@@ -1606,7 +1673,7 @@ namespace fastllm {
             weight.CalcWeightSum();
 
 #ifdef USE_CUDA
-	        FastllmMatMulFloatInt4(input, weight, bias, output, n, m, k);
+	        FastllmCudaMatMulFloatInt4(input, weight, bias, output, n, m, k);
 	        return;
 #endif
 
@@ -1737,6 +1804,10 @@ namespace fastllm {
     }
 
     void CatDirect(Data &input0, const Data &input1, int axis) {
+        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
+                        "Cat's input's type should be float32.\n");
+        AssertInFastLLM(input0.dataDevice == input1.dataDevice, "CatDirect error: inputs should use same device.\n");
+
         if (input0.dims.size() == 0) {
             input0.Resize(input1.dims);
             AssertInFastLLM(input0.expansionDims.size() == input1.dims.size() &&
@@ -1747,17 +1818,31 @@ namespace fastllm {
             int input1Stride = input1.Count(axis);
             int inner = input0.strides[axis];
             int unitSize = input0.unitSize;
+
+#ifdef USE_CUDA
+            if (input0.dataDevice == DataDevice::CUDA) {
+                for (int o = 0; o < outer; o++) {
+                    FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)input0.cudaData, input0Stride * unitSize,
+                                                      (uint8_t*)input1.cudaData, input1Stride * unitSize,
+                                                      input1.dims[axis] * inner * unitSize, outer);
+                }
+                return;
+            }
+#endif
+
             for (int o = 0; o < outer; o++) {
-                memcpy(input0.cpuData + o * input0Stride * unitSize,
-                       input1.cpuData + o * input1Stride * unitSize,
-                       input1.dims[axis] * inner * unitSize);
+                if (input0.dataDevice == DataDevice::CPU) {
+                    memcpy(input0.cpuData + o * input0Stride * unitSize,
+                           input1.cpuData + o * input1Stride * unitSize,
+                           input1.dims[axis] * inner * unitSize);
+                } else if (input0.dataDevice == DataDevice::CUDA) {
+                    ErrorInFastLLM("Error: cuda is not supported.\n");
+                }
             }
 
             return;
         }
 
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
-                        "Cat's input's type should be float32.\n");
         AssertInFastLLM(input0.dims.size() == input1.dims.size(), "Cat Error: input's shape's size should be same.\n");
         int dimsLen = input0.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
@@ -1779,10 +1864,21 @@ namespace fastllm {
         int inner = input0.strides[axis];
         int unitSize = input0.unitSize;
 
+#ifdef USE_CUDA
+        if (input0.dataDevice == DataDevice::CUDA) {
+            FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)input0.cudaData + oldDims[axis] * inner * unitSize, input0Stride * unitSize,
+                                            (uint8_t*)input1.cudaData, input1Stride * unitSize, input1.dims[axis] * inner * unitSize, outer);
+            return;
+        }
+#endif
         for (int o = 0; o < outer; o++) {
-            memcpy(input0.cpuData + o * input0Stride * unitSize + oldDims[axis] * inner * unitSize,
-                   input1.cpuData + (o * input1Stride) * unitSize,
-                   input1.dims[axis] * inner * unitSize);
+            if (input0.dataDevice == DataDevice::CPU) {
+                memcpy(input0.cpuData + o * input0Stride * unitSize + oldDims[axis] * inner * unitSize,
+                       input1.cpuData + (o * input1Stride) * unitSize,
+                       input1.dims[axis] * inner * unitSize);
+            } else if (input0.dataDevice == DataDevice::CUDA) {
+                ErrorInFastLLM("Error: cuda is not supported.\n");
+            }
         }
     }
 
@@ -1849,6 +1945,7 @@ namespace fastllm {
     }
 
     void MatMulTransB(const Data &input0, const Data &input1, Data &output, float alpha) {
+        AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMulTransB error: inputs should use same device.\n");
         AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
                         "MatMulTransB's input's type should be float32.\n");
         AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
@@ -1869,11 +1966,11 @@ namespace fastllm {
         std::vector <int> dims = input0.dims;
         dims.back() = input1.dims[input1.dims.size() - 2];
         output.dataType = input0.dataType;
+        output.dataDevice = input0.dataDevice;
         output.Resize(dims);
         output.Allocate();
 
         int outputSpatial = output.Count(output.dims.size() - 2);
-
         int threadNum = threads;
 #ifdef _WIN64
         threadNum = 1;
@@ -1883,6 +1980,11 @@ namespace fastllm {
         }
         threadNum = std::min(threadNum, 4);
 
+#ifdef USE_CUDA
+        FastllmCudaBatchMatMulTransB(input0, input1, output,
+                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                     batch0, n, m, k, alpha);
+#else
         int per = batch0 / threadNum;
         int cur = 0;
         std::vector<std::thread *> threads;
@@ -1901,6 +2003,10 @@ namespace fastllm {
             threads[i]->join();
             delete threads[i];
         }
+#endif
+//float spend = GetSpan(st, std::chrono::system_clock::now());
+//float gops = (float)batch0 * n * m * k / spend / 1e9;
+//printf("%d %d %d %d, spend = %f, gops = %f\n", batch0, n, m, k, spend, gops);
     }
 
     void Softmax(const Data &input, Data &output, int axis) {
@@ -1919,6 +2025,11 @@ namespace fastllm {
         int channels = input.dims[axis];
         int inner = input.Count(axis + 1);
 
+#ifdef USE_CUDA
+        FastllmCudaSoftmax(input, output, axis);
+        return;
+#endif
+
         float *inputData = (float*)input.cpuData;
         float *outputData = (float*)output.cpuData;
 
@@ -1926,13 +2037,13 @@ namespace fastllm {
             for (int i = 0; i < outer; i++) {
                 float maxValue = 0;
                 int j = 0;
-#ifdef ARM
+#ifdef __aarch64__
                 float32x4_t vmax = vdupq_n_f32(-1e9);
                 for (; j + 3 < channels; j += 4) {
                     vmax = vmaxq_f32(vmax, vld1q_f32(inputData + j));
                 }
                 for (int k = 0; k < 4; k++) {
-                    maxValue = max(maxValue, vmax[k]);
+                    maxValue = std::max(maxValue, vmax[k]);
                 }
 #endif
                 for (; j < channels; j++) {
@@ -1940,7 +2051,7 @@ namespace fastllm {
                 }
 
                 j = 0;
-#ifdef ARM
+#ifdef __aarch64__
                 vmax = vdupq_n_f32(maxValue);
                 for (; j + 3 < channels; j += 4) {
                     vst1q_f32(outputData + j, exp_ps(vsubq_f32(vld1q_f32(inputData + j), vmax)));
@@ -1956,7 +2067,7 @@ namespace fastllm {
                 }
 
                 j = 0;
-#ifdef ARM
+#ifdef __aarch64__
                 float32x4_t fsum = vdupq_n_f32(sum);
                 for (j = 0; j + 3 < channels; j += 4) {
                     vst1q_f32(outputData + j, vdivq_f32(vld1q_f32(outputData + j), fsum));
@@ -2011,7 +2122,7 @@ namespace fastllm {
         int len = input.Count(0);
         int i = 0;
 #ifdef USE_CUDA
-        if (FastllmGelu(input, output)) {
+        if (FastllmCudaGeluNew(input, output)) {
             return;
         }
 #endif
@@ -2051,6 +2162,13 @@ namespace fastllm {
         float *inputData = (float*)input.cpuData;
         float *outputData = (float*)output.cpuData;
         int len = input.Count(0);
+
+#ifdef USE_CUDA
+        if (FastllmCudaMul(input, v, output)) {
+            return;
+        }
+#endif
+
         for (int i = 0; i < len; i++) {
             outputData[i] = inputData[i] * v;
         }
