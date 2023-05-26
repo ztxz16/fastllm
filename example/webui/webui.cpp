@@ -28,7 +28,7 @@ int main(int argc, char** argv) {
 
     std::string history = "";
     int round = 0;
-    std::stringstream ss;
+    static std::string ss = "";
 
     httplib::Server svr;
     std::atomic_bool waiting;
@@ -39,13 +39,18 @@ int main(int argc, char** argv) {
         if (input == "reset" || input == "stop") {
             history = "";
             round = 0;
-            ss << "<eop>\n";
+            ss = "<eop>\n";
         } else {
             history += ("[Round " + std::to_string(round++) + "]\n问：" + input);
             auto prompt = round > 1 ? history : input;
 
             waiting = true;
-            std::string ret = chatGlm.Response(prompt, &ss, false);
+            std::string ret = chatGlm.Response(prompt, [](int index, const char* content) {
+				if (index == -1) {
+					printf("\n");
+					ss = std::string(content);
+				}
+				});
             waiting = false;
 
             history += ("答：" + ret + "\n");
@@ -54,13 +59,13 @@ int main(int argc, char** argv) {
 
     svr.Post("/chat", [&](const httplib::Request &req, httplib::Response &res) {
         if (req.body == last_request) {
-            res.set_content(ss.str(), "text/plain");
+            res.set_content(ss, "text/plain");
             return;
         }
         if (waiting) {
-            res.set_content(ss.str(), "text/plain");
+            res.set_content(ss, "text/plain");
         } else {
-            ss.str("");
+            ss = "";
             last_request = req.body;
             std::thread chat_thread(chat, last_request);
             chat_thread.detach();
@@ -68,7 +73,7 @@ int main(int argc, char** argv) {
     });
 
     svr.set_mount_point("/", "web");
-    std::cout << ">>> please open http://0.0.0.0:8081\n";
+    std::cout << ">>> please open http://127.0.0.1:8081\n";
     svr.listen("0.0.0.0", 8081);
 
     return 0;

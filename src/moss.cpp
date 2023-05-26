@@ -15,6 +15,11 @@ namespace fastllm {
 
     MOSSModel::MOSSModel() {
         // 初始化sin, cos
+		embed_dim = 6144;
+		num_attention_heads = 24;
+		head_dim = embed_dim / num_attention_heads;
+		block_cnt = 34;
+
         sin.resize(max_positions);
         cos.resize(max_positions);
         std::vector <float> invFreq;
@@ -174,7 +179,7 @@ namespace fastllm {
         return v[0].second;
     }
 
-    std::string MOSSModel::Response(const std::string &input) {
+    std::string MOSSModel::Response(const std::string &input, RuntimeResult retCb) {
         Data inputIds = this->weight.tokenizer.Encode(input);
         Data attentionMask = inputIds;
         Data positionIds = inputIds;
@@ -191,6 +196,7 @@ namespace fastllm {
 
         std::vector<float> results;
         std::string retString = "";
+		int index = 0;
         while (true) {
             int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues);
             if (ret == 106068) {
@@ -201,7 +207,8 @@ namespace fastllm {
             std::string current = weight.tokenizer.Decode(
                     Data(DataType::FLOAT32, {(int) results.size()}, results)).c_str();
             retString += current;
-            printf("%s", current.c_str());
+			if (retCb)
+				retCb(index++, current.c_str());
             fflush(stdout);
             results.clear();
 
@@ -211,7 +218,8 @@ namespace fastllm {
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float) (len - 1)}));
         }
 
-        printf("\n");
+		if (retCb)
+			retCb(index++, retString.c_str());
         // printf("%s\n", weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str());
         return retString;
     }
