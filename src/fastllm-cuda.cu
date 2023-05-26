@@ -342,25 +342,20 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
         weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
-    float *inputData = (float *) input.cpuData;
-    float *outputData = (float *) output.cpuData;
-
     float *cudaScales = (float*)weight.extraCudaData[0];
     uint8_t *cudaZeropoints = (uint8_t*)weight.extraCudaData[1];
     float *cudaBiasData = (float*)weight.extraCudaData[2];
 
-    float *cudaInput = (float*)FastllmCudaMalloc(n * m * sizeof(float));
-    float *cudaOutput = (float*)FastllmCudaMalloc(n * k * sizeof(float));
+    float *cudaInput = (float*)FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
-    cudaMemcpy(cudaInput, inputData, n * m * sizeof(float), cudaMemcpyHostToDevice);
     for (int i = 0; i < n; i++) {
         FastllmGemvInt4Kernel0 <256> <<< k, 256 >>> (cudaInput + i * m, (uint8_t *) weight.cudaData,
             cudaOutput + i * k, cudaBiasData, cudaScales, cudaZeropoints, m, k);
     }
     cudaDeviceSynchronize();
-    cudaMemcpy(outputData, cudaOutput, n * k * sizeof(float), cudaMemcpyDeviceToHost);
-    FastllmCudaFree(cudaInput);
-    FastllmCudaFree(cudaOutput);
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
     return true;
 }
 
