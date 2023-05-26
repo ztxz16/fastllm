@@ -59,6 +59,7 @@ int initLLMConf(int model,bool isLowMem, const char* modelPath, int threads) {
 	//printf("@@init llm:type:%d,path:%s\n", model, modelPath);
 	if (modeltype == 0) {
 		chatGlm->LoadFromFile(modelPath);
+        chatGlm->WarmUp();
 	}
 	if (modeltype == 1) {
 		moss->LoadFromFile(modelPath);

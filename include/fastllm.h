@@ -66,6 +66,10 @@ namespace fastllm {
         FLOAT32 = 0, BFLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6
     };
 
+    enum DataDevice {
+        CPU = 0, CUDA = 1
+    };
+
     enum WeightType {
         NONE = 0, LINEAR = 1, EMBEDDING = 2
     };
@@ -80,11 +84,14 @@ namespace fastllm {
         std::vector <uint64_t> strides; // 跨度
 
         uint64_t expansionSize = 0; // 扩容后的尺寸
+        uint64_t expansionBytes = 0; // 扩容后的字节数
         std::vector <int> expansionDims; // 预扩容的形状
         uint8_t *cpuData = nullptr; // 数据指针
 
 	    void *cudaData = nullptr;
         std::vector <void*> extraCudaData;
+
+        DataDevice dataDevice = DataDevice::CPU;
 
         // 这两个参数用于量化，对FLOAT数据不适用
         int perChannelAxis = -1; // 沿哪个轴分通道量化，-1代表没有分通道
@@ -118,9 +125,11 @@ namespace fastllm {
 
         void Allocate(float v); // 分配内存并初始化
 
-        void Expansion(uint64_t size); // 将尺寸扩容为size * unitSize，并保留之前的数据；之后分配内存时如果未达到扩容的尺寸，则直接复用
-
         void Expansion(const std::vector <int> &dims); // 预扩容到相应尺寸
+
+        void MallocSpace(uint64_t size); // 在设备上分配
+
+        void FreeSpace(); // 回收设备上的内存
 
         void UpdateUnitSize(); // 更新unitSize
 
@@ -135,6 +144,8 @@ namespace fastllm {
         void Permute(const std::vector <int> &axis); // 转置
 
         void CalcWeightSum(); // 计算WeightSum
+
+        void ToDevice(DataDevice device); // 移动到指定device
     };
 
     struct Tokenizer {
