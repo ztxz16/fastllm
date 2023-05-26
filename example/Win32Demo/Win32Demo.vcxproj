@@ -167,6 +167,7 @@
     <ClInclude Include="..\..\include\fastllm-cuda.h" />
     <ClInclude Include="..\..\include\fastllm.h" />
     <ClInclude Include="..\..\include\moss.h" />
+    <ClInclude Include="httplib.h" />
     <ClInclude Include="StringUtils.h" />
   </ItemGroup>
   <ItemGroup>
