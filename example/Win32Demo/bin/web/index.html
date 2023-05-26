@@ -1059,7 +1059,7 @@
             resStr = "";
             while(true) {
                 await reqWord(isRefresh)
-                await sleep(0)
+                await sleep(1000)
                 if (resStr.indexOf("<eop>") > -1) {
                     break;
                 }
