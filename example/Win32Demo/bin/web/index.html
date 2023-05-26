@@ -1,0 +1,1143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="description" content="ChatGLM Web Interface" />
+
+<head>
+    <meta charset="utf-8">
+    <title>ChatGLM Web Interface</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            font-family: system-ui,-apple-system,BlinkMacSystemFont,segoe ui,Roboto, Helvetica,Arial, sans-serif,apple color emoji,segoe ui emoji,segoe ui symbol;
+        }
+
+        body {
+            background-color: #edeff2;
+        }
+
+        .chat_window {
+            position: absolute;
+            width: calc(100% - 6px);
+            max-width: 1100px;
+            height: calc(100% - 6px);
+            max-height: 888px;
+            border-radius: 8px;
+            background-color: #fff;
+            left: 50%;
+            top: 50%;
+            overflow: hidden;
+            transform: translate(-50%, -50%);
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.15);
+        }
+
+        .top_menu {
+            background-color: #f6f6f6;
+            width: 100%;
+            height: 50px;
+            padding: 12px 0;
+        }
+
+        .top_menu .buttons {
+            margin: 5px 0 0 20px;
+            position: absolute;
+            font-size: 0;
+        }
+
+        .top_menu .buttons .button {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 10px;
+            position: relative;
+        }
+
+        .top_menu .buttons .button.close {
+            background-color: #e15b64;
+        }
+
+        .top_menu .buttons .button.minimize {
+            background-color: #f8b26a;
+        }
+
+        .top_menu .buttons .button.maximize {
+            background-color: #99c959;
+        }
+
+        .top_menu .title {
+            text-align: center;
+            color: #909090;
+            font-size: 20px;
+            line-height: 26px;
+        }
+
+        .messages {
+            position: relative;
+            height: calc(100% - 117px);
+            overflow-x: hidden;
+            overflow-y: auto;
+        }
+
+        .messages::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+
+        .messages::-webkit-scrollbar-track {
+            background-clip: padding-box;
+            background: transparent;
+            border: solid transparent;
+            border-width: 1px;
+        }
+
+        .messages::-webkit-scrollbar-corner {
+            background-color: transparent;
+        }
+
+        .messages::-webkit-scrollbar-thumb {
+            background-color: rgba(0, 0, 0, 0.1);
+            background-clip: padding-box;
+            border: solid transparent;
+            border-radius: 10px;
+        }
+
+        .messages::-webkit-scrollbar-thumb:hover {
+            background-color: rgba(0, 0, 0, 0.4);
+        }
+
+        .messages .message {
+            clear: both;
+            overflow: hidden;
+            margin-bottom: 20px;
+            transition: all 0.5s linear;
+            opacity: 0;
+        }
+
+        .messages .message.left .avatar {
+            background-color: #f5886e;
+            float: left;
+        }
+
+        .messages .message.left .text {
+            color: #c48843;
+        }
+
+        .messages .message.right .avatar {
+            background-color: #fdbf68;
+            float: right;
+        }
+
+        .messages .message.right .text {
+            color: #45829b;
+        }
+
+        .messages .message.appeared {
+            opacity: 1;
+        }
+
+        .messages .message .avatar {
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .messages {
+            font-size: 16px;
+            color: #343541;
+            text-align: center;
+        }
+
+        #chatlog {
+            word-wrap: break-word;
+            text-align: start;
+        }
+
+        #chatlog>div {
+            padding: 18px 25px;
+        }
+
+        #chatlog .request {
+            position: relative;
+        }
+
+        #chatlog .response {
+            background: #f7f7f8;
+            position: relative;
+        }
+
+        .response .markdown-body {
+            background: #f7f7f8 !important;
+        }
+
+        #chatlog .markdown-body>pre {
+            overflow-x: auto;
+            padding: 10px;
+            position: relative;
+            background: rgba(180, 180, 180, 0.1);
+        }
+
+        #chatlog .markdown-body>pre::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+
+        #chatlog .response>pre::-webkit-scrollbar-track {
+            background-clip: padding-box;
+            background: transparent;
+            border: solid transparent;
+            border-width: 1px;
+        }
+
+        #chatlog .response>pre::-webkit-scrollbar-corner {
+            background-color: transparent;
+        }
+
+        #chatlog .response>pre::-webkit-scrollbar-thumb {
+            background-color: rgba(0, 0, 0, 0.1);
+            background-clip: padding-box;
+            border: solid transparent;
+            border-radius: 10px;
+        }
+
+        #chatlog .response>pre::-webkit-scrollbar-thumb:hover {
+            background-color: rgba(0, 0, 0, 0.4);
+        }
+
+        .m-mdic-copy-wrapper {
+            position: absolute;
+            top: 5px;
+            right: 16px;
+        }
+
+        .m-mdic-copy-wrapper span.u-mdic-copy-code_lang {
+            position: absolute;
+            top: 3px;
+            right: calc(100% + 4px);
+            font-family: system-ui;
+            font-size: 12px;
+            line-height: 18px;
+            color: #555;
+            opacity: 0.3;
+        }
+
+        .m-mdic-copy-wrapper div.u-mdic-copy-notify {
+            position: absolute;
+            top: 0;
+            right: 0;
+            padding: 3px 6px;
+            border: 0;
+            border-radius: 3px;
+            background: none;
+            font-family: system-ui;
+            font-size: 12px;
+            line-height: 18px;
+            color: #555;
+            opacity: 0.3;
+            outline: none;
+            opacity: 1;
+            right: 100%;
+            padding-right: 4px;
+        }
+
+        .m-mdic-copy-wrapper button.u-mdic-copy-btn {
+            position: relative;
+            top: 0;
+            right: 0;
+            padding: 3px 6px;
+            border: 0;
+            border-radius: 3px;
+            background: none;
+            font-family: system-ui;
+            font-size: 12px;
+            line-height: 18px;
+            color: #555;
+            opacity: 0.3;
+            outline: none;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        .m-mdic-copy-wrapper button.u-mdic-copy-btn:hover {
+            opacity: 1;
+        }
+
+        #stopChat {
+            display: none;
+            margin: 0 auto;
+            margin-top: 3px;
+            width: 80px;
+            height: 32px;
+            text-align: center;
+            line-height: 32px;
+            color: white;
+            background: #f8b26a;
+            cursor: pointer;
+            border-radius: 3px;
+            position: sticky;
+            bottom: 2px;
+            justify-content: center;
+            align-items: center;
+        }
+
+        #stopChat>svg {
+            margin-right: 8px;
+        }
+
+        #stopChat:hover {
+            background: #f0aa60;
+        }
+
+        .bottom_wrapper {
+            position: relative;
+            width: 100%;
+            background-color: #fff;
+            padding: 10px 10px;
+            position: absolute;
+            bottom: 0;
+        }
+
+        .bottom_wrapper .message_input_wrapper {
+            border: none;
+            width: calc(100% - 143px);
+            position: relative;
+            text-align: left;
+        }
+
+        .bottom_wrapper .message_input_wrapper .message_input_text {
+            border-radius: 4px;
+            border: none;
+            outline: none;
+            resize: none;
+            background: #eff1f1;
+            color: #24292f;
+            height: 47px;
+            font-size: 16px;
+            max-height: 200px;
+            padding: 13px 0 13px 16px;
+            width: 100%;
+            display: block;
+            transition: background 0.3s;
+        }
+
+        .bottom_wrapper .message_input_wrapper .message_input_text:focus {
+            background: #e7e9eb;
+        }
+
+        .bottom_wrapper .message_input_wrapper .message_input_text::-webkit-scrollbar {
+            display: none;
+            width: 0;
+            height: 0;
+        }
+
+        #sendbutton {
+            width: 80px;
+            height: 47px;
+            font-size: 18px;
+            font-weight: bold;
+            border-radius: 3px;
+            background-color: #b8da8b;
+            border: none;
+            padding: 0;
+            color: #fff;
+            cursor: pointer;
+            transition: all 0.2s linear;
+            text-align: center;
+            float: right;
+            position: absolute;
+            right: 65px;
+            bottom: 10px;
+            cursor: not-allowed;
+        }
+
+        .activeSendBtn {
+            background-color: #99c959 !important;
+            cursor: pointer !important;
+        }
+
+        .activeSendBtn:hover {
+            background-color: #90c050 !important;
+        }
+
+        #clearConv {
+            position: absolute;
+            right: 10px;
+            bottom: 10px;
+            width: 47px;
+            height: 47px;
+            font-size: 16px;
+            display: inline-block;
+            border-radius: 3px;
+            background-color: #909090;
+            border: 2px solid #909090;
+            color: #fff;
+            cursor: pointer;
+            transition: all 0.2s linear;
+            text-align: center;
+        }
+
+        #clearConv:hover {
+            background-color: gray;
+            border: 2px solid gray;
+        }
+
+        .loaded>span {
+            display: inline-block;
+        }
+
+        .loaded>svg {
+            display: none;
+        }
+
+        .loading {
+            background: #e7e7e8 !important;
+        }
+
+        .loading>span {
+            display: none;
+        }
+
+        .loading>svg {
+            display: block;
+        }
+
+        .switch-slide {
+            display: inline-block;
+            vertical-align: middle;
+        }
+
+        .switch-slide-label {
+            display: block;
+            width: 38px;
+            height: 18px;
+            background: #909090;
+            border-radius: 30px;
+            cursor: pointer;
+            position: relative;
+            -webkit-transition: 0.3s ease;
+            transition: 0.3s ease;
+        }
+
+        .switch-slide-label:after {
+            content: "";
+            display: block;
+            width: 16px;
+            height: 16px;
+            border-radius: 100%;
+            background: #fff;
+            box-shadow: 0 1px 1px rgba(0, 0, 0, .1);
+            position: absolute;
+            left: 1px;
+            top: 1px;
+            -webkit-transform: translateZ(0);
+            transform: translateZ(0);
+            -webkit-transition: 0.3s ease;
+            transition: 0.3s ease;
+        }
+
+        .switch-slide input:checked+label {
+            background: #99c959;
+            transition: 0.3s ease;
+        }
+
+        .switch-slide input:checked+label:after {
+            left: 21px;
+        }
+
+        #setting {
+            position: absolute;
+            right: 15px;
+            top: 5px;
+            cursor: pointer;
+            padding: 5px;
+            border: none;
+            background-color: transparent;
+            border-radius: 4px;
+        }
+
+        #setting:hover {
+            background: #e7e7e8;
+        }
+
+        .showSetting {
+            background: #b0b0b0 !important;
+        }
+
+        #setDialog {
+            color: #303030;
+            position: absolute;
+            z-index: 2;
+            background: #f4f4f4;
+            width: 320px;
+            right: 6px;
+            top: 46px;
+            -webkit-user-select: none;
+            user-select: none;
+            border-radius: 5px;
+            padding: 8px 12px 8px 12px;
+        }
+
+        #setDialog>div {
+            margin-bottom: 4px;
+        }
+
+        #setDialog input {
+            width: 100%;
+        }
+
+        #setDialog .inlineTitle {
+            display: inline-block;
+            line-height: 16px;
+            vertical-align: middle;
+        }
+
+        #speechOption {
+            margin-top: 6px;
+        }
+
+        #speechOption>div {
+            margin-bottom: 4px;
+        }
+
+        .inputTextClass {
+            outline: none;
+            border-radius: 2px;
+            margin-top: 2px;
+            height: 32px;
+            font-size: 15px;
+            padding-left: 6px;
+            background: white;
+            border: none;
+        }
+
+        .areaTextClass {
+            width: 100%;
+            height: 80px;
+            display: block;
+            resize: none;
+            padding: 6px;
+        }
+
+        input[type="range"] {
+            -webkit-appearance: none;
+            display: block;
+            margin: 6px 0 3px 0;
+            height: 8px;
+            background: #909090;
+            border-radius: 5px;
+            background-image: linear-gradient(#99c959, #99c959);
+            background-size: 100% 100%;
+            background-repeat: no-repeat;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 15px;
+            width: 15px;
+            border-radius: 50%;
+            background: #99c959;
+            cursor: ew-resize;
+            box-shadow: 0 0 2px 0 #555;
+        }
+
+        input[type=range]::-webkit-slider-runnable-track {
+            -webkit-appearance: none;
+            box-shadow: none;
+            border: none;
+            background: transparent;
+        }
+
+        .justSetLine {
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .presetSelect>div {
+            display: inline-block;
+        }
+
+        .presetSelect select {
+            outline: none;
+            border-radius: 3px;
+            width: 100px;
+            border-color: rgba(0, 0, 0, .3);
+        }
+
+        .selectDef {
+            display: flex;
+            justify-content: space-between;
+            font-size: 13px;
+            color: #707070;
+        }
+
+        #preSetSpeech {
+            width: 100%;
+            outline: none;
+            margin-top: 5px;
+            border-radius: 3px;
+            border-color: rgba(0, 0, 0, .3);
+        }
+
+        .mdOption {
+            position: absolute;
+            right: 5px;
+            bottom: 0px;
+            pointer-events: none;
+        }
+
+        .mdOption>div {
+            margin-top: 4px;
+            pointer-events: auto;
+            cursor: pointer;
+        }
+
+        .mdOption>div>svg {
+            color: #e3e3e3;
+            display: block;
+        }
+
+        .mdOption svg:hover {
+            color: #989898;
+        }
+
+        .mdOption svg * {
+            pointer-events: none;
+        }
+
+        .refreshReq svg:not(:first-child) {
+            display: none;
+        }
+
+        .halfRefReq svg:not(:nth-child(2)) {
+            display: none;
+        }
+
+        .moreOption {
+            position: relative;
+        }
+
+        .optionItems {
+            position: absolute;
+            top: -8px;
+            display: flex;
+            justify-content: space-between;
+            visibility: hidden;
+            z-index: 1;
+            color: #808080;
+        }
+
+        .moreOptionHidden>div {
+            display: none !important;
+        }
+
+        .optionItems:hover {
+            visibility: visible;
+        }
+
+        .optionItems:hover .optionItem {
+            transform: scale(1);
+            visibility: visible;
+        }
+
+        .optionTrigger:hover+.optionItems .optionItem:nth-of-type(3) {
+            transform: scale(1);
+            visibility: visible;
+            transition-delay: 50ms;
+            transition-duration: 60ms;
+        }
+
+        .optionTrigger:hover+.optionItems .optionItem:nth-of-type(2) {
+            visibility: visible;
+            transition-delay: 80ms;
+            transform: scale(1);
+            transition-duration: 60ms;
+        }
+
+        .optionTrigger:hover+.optionItems .optionItem:nth-of-type(1) {
+            visibility: visible;
+            transition-delay: 110ms;
+            transform: scale(1);
+            transition-duration: 60ms;
+        }
+
+        .optionItem {
+            border-radius: 3px;
+            height: 30px;
+            width: 30px;
+            background-color: #f7f7f8;
+            visibility: hidden;
+            transform: scale(0);
+            display: flex !important;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .optionItem * {
+            pointer-events: none;
+        }
+
+        .optionItem:hover {
+            background: #e0e0e0;
+        }
+    </style>
+</head>
+
+<body>
+    <div>
+        <div class="chat_window">
+            <div class="top_menu">
+                <div class="buttons">
+                    <div class="button close"></div>
+                    <div class="button minimize"></div>
+                    <div class="button maximize"></div>
+                </div>
+                <div class="title">ChatGLM</div>
+            </div>
+            <div class="messages">
+                <div id="chatlog"></div>
+                <div id="stopChat"><svg width="24" height="24">
+                        <use xlink:href="#stopResIcon" />
+                    </svg>停止</div>
+            </div>
+            <div class="bottom_wrapper clearfix">
+                <div class="message_input_wrapper">
+                    <textarea class="message_input_text" spellcheck="false" placeholder="来问点什么吧"
+                        id="chatinput"></textarea>
+                </div>
+                <button class="loaded" id="sendbutton">
+                    <span>发送</span>
+                    <svg style="margin:0 auto;height:40px;" viewBox="0 0 200 100" preserveAspectRatio="xMidYMid">
+                        <g transform="translate(50 50)">
+                            <circle cx="0" cy="0" r="15" fill="#e15b64">
+                                <animateTransform attributeName="transform" type="scale" begin="-0.3333333333333333s"
+                                    calcMode="spline" keySplines="0.3 0 0.7 1;0.3 0 0.7 1" values="0;1;0"
+                                    keyTimes="0;0.5;1" dur="1s" repeatCount="indefinite"></animateTransform>
+                            </circle>
+                        </g>
+                        <g transform="translate(100 50)">
+                            <circle cx="0" cy="0" r="15" fill="#f8b26a">
+                                <animateTransform attributeName="transform" type="scale" begin="-0.16666666666666666s"
+                                    calcMode="spline" keySplines="0.3 0 0.7 1;0.3 0 0.7 1" values="0;1;0"
+                                    keyTimes="0;0.5;1" dur="1s" repeatCount="indefinite"></animateTransform>
+                            </circle>
+                        </g>
+                        <g transform="translate(150 50)">
+                            <circle cx="0" cy="0" r="15" fill="#99c959">
+                                <animateTransform attributeName="transform" type="scale" begin="0s" calcMode="spline"
+                                    keySplines="0.3 0 0.7 1;0.3 0 0.7 1" values="0;1;0" keyTimes="0;0.5;1" dur="1s"
+                                    repeatCount="indefinite"></animateTransform>
+                            </circle>
+                        </g>
+                    </svg>
+                </button>
+                <button id="clearConv"><svg style="margin:0 auto;display:block" role="img" width="20px" height="20px"
+                        viewBox="0 0 24 24">
+                        <title>失忆</title>
+                        <path fill="currentColor"
+                            d="M8 20v-5h2v5h9v-7H5v7h3zm-4-9h16V8h-6V4h-4v4H4v3zM3 21v-8H2V7a1 1 0 0 1 1-1h5V3a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v3h5a1 1 0 0 1 1 1v6h-1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z">
+                        </path>
+                    </svg></button>
+            </div>
+        </div>
+        <div style="display: none">
+            <svg>
+                <symbol viewBox="0 0 24 24" id="optionIcon">
+                    <path fill="currentColor"
+                        d="M12 3c-1.1 0-2 .9-2 2s.9 2 2 2s2-.9 2-2s-.9-2-2-2zm0 14c-1.1 0-2 .9-2 2s.9 2 2 2s2-.9 2-2s-.9-2-2-2zm0-7c-1.1 0-2 .9-2 2s.9 2 2 2s2-.9 2-2s-.9-2-2-2z">
+                    </path>
+                </symbol>
+                <symbol viewBox="0 0 24 24" id="refreshIcon">
+                    <path fill="currentColor"
+                        d="M18.537 19.567A9.961 9.961 0 0 1 12 22C6.477 22 2 17.523 2 12S6.477 2 12 2s10 4.477 10 10c0 2.136-.67 4.116-1.81 5.74L17 12h3a8 8 0 1 0-2.46 5.772l.997 1.795z">
+                    </path>
+                </symbol>
+                <symbol viewBox="0 0 24 24" id="halfRefIcon">
+                    <path fill="currentColor"
+                        d="M 4.009 12.163 C 4.012 12.206 2.02 12.329 2 12.098 C 2 6.575 6.477 2 12 2 C 17.523 2 22 6.477 22 12 C 22 14.136 21.33 16.116 20.19 17.74 L 17 12 L 20 12 C 19.999 5.842 13.333 1.993 7.999 5.073 C 3.211 8.343 4.374 12.389 4.009 12.163 Z" />
+                </symbol>
+                <symbol viewBox="-2 -2 20 20" id="copyIcon">
+                    <path fill="currentColor"
+                        d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z">
+                    </path>
+                    <path fill="currentColor"
+                        d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z">
+                    </path>
+                </symbol>
+                <symbol viewBox="0 0 24 24" id="delIcon">
+                    <path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"
+                        stroke-width="2"
+                        d="M9 7v0a3 3 0 0 1 3-3v0a3 3 0 0 1 3 3v0M9 7h6M9 7H6m9 0h3m2 0h-2M4 7h2m0 0v11a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7">
+                    </path>
+                </symbol>
+            </svg>
+        </div>
+    </div>
+    <script>
+        const messagsEle = document.getElementsByClassName("messages")[0];
+        const chatlog = document.getElementById("chatlog");
+        const stopEle = document.getElementById("stopChat");
+        const sendBtnEle = document.getElementById("sendbutton");
+        const textarea = document.getElementById("chatinput");
+        const dialogEle = document.getElementById("setDialog");
+        const speechOptionEle = document.getElementById("speechOption");
+        textarea.focus();
+        textarea.oninput = (e) => {
+            if (textarea.value.trim().length) {
+                sendBtnEle.classList.add("activeSendBtn");
+            } else {
+                sendBtnEle.classList.remove("activeSendBtn");
+            }
+            textarea.style.height = "47px";
+            textarea.style.height = textarea.scrollHeight + "px";
+        };
+    </script>
+    <script src="js/markdown-it.min.js"></script>
+    <script src="js/highlight.min.js"></script>
+    <script src="js/katex.min.js"></script>
+    <script src="js/texmath.js"></script>
+    <script src="js/markdown-it-link-attributes.min.js"></script>
+    <script>
+        const API_URL = "chat";
+        let data = [];
+        let input_str;
+        let loading = false;
+        const scrollToBottom = () => {
+            if (messagsEle.scrollHeight - messagsEle.scrollTop - messagsEle.clientHeight < 128) {
+                messagsEle.scrollTo(0, messagsEle.scrollHeight)
+            }
+        }
+        const scrollToBottomLoad = (ele) => {
+            if (messagsEle.scrollHeight - messagsEle.scrollTop - messagsEle.clientHeight < ele.clientHeight + 128) {
+                messagsEle.scrollTo(0, messagsEle.scrollHeight)
+            }
+        }
+        const closeEvent = (ev) => {
+            if (!dialogEle.contains(ev.target)) {
+                dialogEle.style.display = "none";
+                document.removeEventListener("mousedown", closeEvent, true);
+            }
+        }
+        const md = markdownit({
+            linkify: true, // 识别链接
+            highlight: function (str, lang) { // markdown高亮
+                try {
+                    return hljs.highlightAuto(str).value;
+                } catch (e) { }
+                return ""; // use external default escaping
+            }
+        });
+        md.use(texmath, {engine: katex, delimiters: "dollars", katexOptions: {macros: {"\\RR": "\\mathbb{R}"}}})
+            .use(markdownitLinkAttributes, {attrs: {target: "_blank", rel: "noopener"}});
+        const x = {
+            getCodeLang(str = "") {
+                const res = str.match(/ class="language-(.*?)"/);
+                return (res && res[1]) || "";
+            },
+            getFragment(str = "") {
+                return str ? `<span class="u-mdic-copy-code_lang">${str}</span>` : "";
+            },
+        };
+        const strEncode = (str = "") => {
+            if (!str || str.length === 0) return "";
+            return str
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/'/g, '\'')
+                .replace(/"/g, '&quot;');
+        };
+        const getCodeLangFragment = (oriStr = "") => {
+            return x.getFragment(x.getCodeLang(oriStr));
+        };
+        const copyClickCode = (ele) => {
+            const input = document.createElement("textarea");
+            input.value = ele.dataset.mdicContent;
+            const nDom = ele.previousElementSibling;
+            const nDelay = ele.dataset.mdicNotifyDelay;
+            const cDom = nDom.previousElementSibling;
+            document.body.appendChild(input);
+            input.select();
+            input.setSelectionRange(0, 9999);
+            document.execCommand("copy");
+            document.body.removeChild(input);
+            if (nDom.style.display === "none") {
+                nDom.style.display = "block";
+                cDom && (cDom.style.display = "none");
+                setTimeout(() => {
+                    nDom.style.display = "none";
+                    cDom && (cDom.style.display = "block");
+                }, nDelay);
+            }
+        };
+        const copyClickMd = (idx) => {
+            const input = document.createElement("textarea");
+            input.value = data[idx].content;
+            document.body.appendChild(input);
+            input.select();
+            input.setSelectionRange(0, 9999);
+            document.execCommand("copy");
+            document.body.removeChild(input);
+        }
+        const enhanceCode = (render, options = {}) => (...args) => {
+            /* args = [tokens, idx, options, env, slf] */
+            const {
+                btnText = "复制代码", // button text
+                successText = "复制成功", // copy-success text
+                successTextDelay = 2000, // successText show time [ms]
+                showCodeLanguage = true, // false | show code language
+            } = options;
+            const [tokens = {}, idx = 0] = args;
+            const cont = strEncode(tokens[idx].content || "");
+            const originResult = render.apply(this, args);
+            const langFrag = showCodeLanguage ? getCodeLangFragment(originResult) : "";
+            const tpls = [
+                '<div class="m-mdic-copy-wrapper">',
+                `${langFrag}`,
+                `<div class="u-mdic-copy-notify" style="display:none;">${successText}</div>`,
+                '<button ',
+                'class="u-mdic-copy-btn j-mdic-copy-btn" ',
+                `data-mdic-content="${cont}" `,
+                `data-mdic-notify-delay="${successTextDelay}" `,
+                `onclick="copyClickCode(this)">${btnText}</button>`,
+                '</div>',
+            ];
+            const LAST_TAG = "</pre>";
+            const newResult = originResult.replace(LAST_TAG, `${tpls.join("")}${LAST_TAG}`);
+            return newResult;
+        };
+        const codeBlockRender = md.renderer.rules.code_block;
+        const fenceRender = md.renderer.rules.fence;
+        md.renderer.rules.code_block = enhanceCode(codeBlockRender);
+        md.renderer.rules.fence = enhanceCode(fenceRender);
+        md.renderer.rules.image = function (tokens, idx, options, env, slf) {
+            var token = tokens[idx];
+            token.attrs[token.attrIndex("alt")][1] = slf.renderInlineAsText(token.children, options, env);
+            token.attrSet("onload", "scrollToBottomLoad(this);this.removeAttribute('onload')");
+            return slf.renderToken(tokens, idx, options)
+        }
+        let delayId;
+        const delay = () => {
+            return new Promise((resolve) => delayId = setTimeout(resolve, 100));
+        }
+        const confirmAction = (prompt) => {
+            if (window.confirm(prompt)) {
+                return true;
+            }
+            else {
+                return false;
+            }
+        }
+        const mdOptionEvent = (ev) => {
+            let id = ev.target.dataset.id;
+            if (id) {
+                let parent = ev.target.parentElement;
+                let idxEle = parent.parentElement;
+                let idx = Array.prototype.indexOf.call(chatlog.children, (id === "refreshMd") ? idxEle.parentElement : idxEle.parentElement.parentElement);
+                if (id === "refreshMd") {
+                    if (!loading && chatlog.children[idx].dataset.loading !== "true") {
+                        let className = parent.className;
+                        if (className == "refreshReq") {
+                            chatlog.children[idx].children[0].innerHTML = "<br />";
+                            chatlog.children[idx].dataset.loading = true;
+                            data[idx].content = "";
+                            if (idx === currentVoiceIdx) {endSpeak()};
+                            loadAction(true);
+                            refreshIdx = idx;
+                            streamGen();
+                        } else {
+                            chatlog.children[idx].dataset.loading = true;
+                            progressData = data[idx].content;
+                            loadAction(true);
+                            refreshIdx = idx;
+                            streamGen();
+                        }
+                    }
+                } else if (id === "copyMd") {
+                    idxEle.classList.add("moreOptionHidden");
+                    copyClickMd(idx);
+                } else if (id === "delMd") {
+                    idxEle.classList.add("moreOptionHidden");
+                    if (!loading) {
+                        if (confirmAction("是否删除此消息?")) {
+                            if (currentVoiceIdx) {
+                                if (currentVoiceIdx === idx) {endSpeak()}
+                                else if (currentVoiceIdx > idx) {currentVoiceIdx -= 1}
+                            }
+                            chatlog.removeChild(chatlog.children[idx]);
+                            data.splice(idx, 1);
+                        }
+                    }
+                }
+            }
+        }
+        const moreOption = (ele) => {
+            ele.classList.remove("moreOptionHidden");
+        }
+        const formatMdEle = (ele) => {
+            let realMd = document.createElement("div");
+            realMd.className = "markdown-body";
+            ele.appendChild(realMd);
+            let mdOption = document.createElement("div");
+            mdOption.className = "mdOption";
+            ele.appendChild(mdOption);
+            if (ele.className !== "request") {
+                mdOption.innerHTML = `<div class="refreshReq">
+                    <svg data-id="refreshMd" width="16" height="16" role="img"><title>刷新</title><use xlink:href="#refreshIcon" /></svg>
+                    <svg data-id="refreshMd" width="16" height="16" role="img"><title>继续</title><use xlink:href="#halfRefIcon" /></svg>
+                </div>`
+            }
+            mdOption.innerHTML += `<div class="moreOption" onmouseenter="moreOption(this)">
+            <svg class="optionTrigger" width="16" height="16" role="img"><title>选项</title><use xlink:href="#optionIcon" /></svg>
+            <div class="optionItems" style="width:63px;left:-63px">` + `<div data-id="delMd" class="optionItem" title="删除">
+                <svg width="20" height="20"><use xlink:href="#delIcon" /></svg>
+            </div>
+            <div data-id="copyMd" class="optionItem" title="复制">
+                <svg width="20" height="20"><use xlink:href="#copyIcon" /></svg>
+            </div></div></div>`;
+            mdOption.onclick = mdOptionEvent;
+        }
+        let controller;
+        let controllerId;
+        let refreshIdx;
+        let currentResEle;
+        let progressData = "";
+        let resStr = "";
+        const reqWord = async (refresh) => {
+            let headers = {"Content-Type": "application/json"};
+            let idx = refresh ? refreshIdx : data.length;
+            let dataSlice = [data[idx - 1]];
+            const res = await fetch(API_URL, {
+                method: "POST",
+                headers,
+                body: input_str,
+                signal: controller.signal
+            });
+            clearTimeout(controllerId);
+            controllerId = void 0;
+            if (res.status !== 200) {
+                alert("请先启动服务！");
+                stopLoading();
+                return;
+            }
+            const decoder = new TextDecoder();
+            const reader = res.body.getReader();
+            const readChunk = async () => {
+                return reader.read().then(async ({value, done}) => {
+                    if (!done) {
+                        resStr = decoder.decode(value);
+                        let end = resStr.indexOf("<eop>");
+                        value = resStr;
+                        if (end > -1) {
+                            value = resStr.substr(0, end)
+                        }
+                        currentResEle.children[0].innerHTML = md.render(value);
+                        return;
+                    }
+                });
+            };
+            await readChunk();
+        };
+        const streamGen = async () => {
+            controller = new AbortController();
+            controllerId = setTimeout(() => {
+                alert("请求超时，请稍后重试！");
+                stopLoading();
+            }, 30000);
+            let isRefresh = refreshIdx !== void 0;
+            if (isRefresh) {
+                currentResEle = chatlog.children[refreshIdx];
+            } else if (!currentResEle) {
+                currentResEle = document.createElement("div");
+                currentResEle.className = "response";
+                chatlog.appendChild(currentResEle);
+                formatMdEle(currentResEle);
+                currentResEle.children[0].innerHTML = "<br />";
+                currentResEle.dataset.loading = true;
+                scrollToBottom();
+            }
+            resStr = "";
+            while(true) {
+                await reqWord(isRefresh)
+                await sleep(1000)
+                if (resStr.indexOf("<eop>") > -1) {
+                    break;
+                }
+            }
+            stopLoading(false);
+        };
+        const loadAction = (bool) => {
+            loading = bool;
+            sendBtnEle.disabled = bool;
+            sendBtnEle.className = bool ? " loading" : "loaded";
+            stopEle.style.display = bool ? "flex" : "none";
+        }
+        const stopLoading = (abort = true) => {
+            stopEle.style.display = "none";
+            if (abort) {
+                controller.abort();
+                if (controllerId) clearTimeout(controllerId);
+                if (delayId) clearTimeout(delayId);
+                if (refreshIdx !== void 0) {data[refreshIdx].content = progressData}
+                else if (data[data.length - 1].role === "assistant") {data[data.length - 1].content = progressData}
+                else {data.push({role: "assistant", content: progressData})}
+            }
+            controllerId = delayId = refreshIdx = void 0;
+            currentResEle.dataset.loading = false;
+            currentResEle = null;
+            progressData = "";
+            loadAction(false);
+        }
+        function sleep(time) {
+            return new Promise(resolve => {
+                setTimeout(() => {
+                resolve();
+                }, time);
+            });
+        }
+        const generateText = async (message) => {
+            loadAction(true);
+            let request = document.createElement("div");
+            request.className = "request";
+            chatlog.appendChild(request);
+            formatMdEle(request);
+            request.children[0].innerHTML = md.render(message);
+            data.push({role: "user", content: message});
+            input_str = message;
+            scrollToBottom();
+            await streamGen();
+        };
+        textarea.onkeydown = (e) => {
+            if (e.keyCode === 13) {
+                if (!e.shiftKey) {
+                    e.preventDefault();
+                    genFunc();
+                }
+            }
+        };
+        const genFunc = function () {
+            let message = textarea.value.trim();
+            if (message.length !== 0) {
+                if (loading === true) return;
+                textarea.value = "";
+                textarea.style.height = "47px";
+                generateText(message);
+            }
+        };
+        sendBtnEle.onclick = genFunc;
+        stopEle.onclick = stopLoading;
+        document.getElementById("clearConv").onclick = () => {
+            if (!loading) {
+				input_str = "reset";
+				streamGen();
+				chatlog.innerHTML = "<div></div>"
+				scrollToBottom();
+            }
+        }
+    </script>
+    <link href="css/github-markdown-light.min.css" rel="stylesheet">
+    <link href="css/github.min.css" rel="stylesheet">
+    <link href="css/katex.min.css" rel="stylesheet">
+    <link href="css/texmath.css" rel="stylesheet">
+</body>
+</html>
