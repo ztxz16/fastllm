@@ -1,4 +1,9 @@
-﻿#include "factoryllm.h"
+﻿#include <cstdio>
+#include <cstring>
+#include <iostream>
+
+#include "StringUtils.h"
+#include "factoryllm.h"
 
 static factoryllm fllm;
 static int modeltype = 0;
@@ -10,18 +15,18 @@ static std::string history;
 
 struct RunConfig {
 	int model = LLM_TYPE_CHATGLM; // 模型类型, 0 chatglm,1 moss,2 alpaca 参考LLM_TYPE
-	std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
+	std::string path = "C:\\huqb\\AI\\ChatGLM\\chatglm-6b-int4.bin"; // 模型文件路径
 	int threads = 4; // 使用的线程数
 	bool lowMemMode = false; // 是否使用低内存模式
 };
 
 void Usage() {
 	std::cout << "Usage:" << std::endl;
-	std::cout << "[-h|--help]:                  显示帮助" << std::endl;
-	std::cout << "<-m|--model> <args>:          模型类型，默认为0, 可以设置为0(chatglm),1(moss),2(alpaca)" << std::endl;
-	std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
-	std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
-	std::cout << "<-l|--low> <args>:            使用低内存模式" << std::endl;
+	std::cout << "[-h|--help]:                      显示帮助" << std::endl;
+	std::cout << "<-m|--model> <args>:              模型类型，默认为0, 可以设置为0(chatglm),1(moss),2(alpaca)" << std::endl;
+	std::cout << "<-p|--path> <args>:               模型文件的路径" << std::endl;
+	std::cout << "<-t|--threads> <args>:            使用的线程数量" << std::endl;
+	std::cout << "<-l|--low> <args>:				使用低内存模式" << std::endl;
 }
 
 void ParseArgs(int argc, char **argv, RunConfig &config) {
@@ -42,17 +47,18 @@ void ParseArgs(int argc, char **argv, RunConfig &config) {
 		}
 		else if (sargv[i] == "-t" || sargv[i] == "--threads") {
 			config.threads = atoi(sargv[++i].c_str());
-
-		} else if (sargv[i] == "-l" || sargv[i] == "--low") {
+		}
+		else if (sargv[i] == "-l" || sargv[i] == "--low") {
 			config.lowMemMode = true;
-		} else {
+		}
+		else {
 			Usage();
 			exit(-1);
 		}
 	}
 }
 
-int initLLMConf(int model,bool isLowMem, const char* modelPath, int threads) {
+int initLLMConf(int model, bool isLowMem, const char* modelPath, int threads) {
 	fastllm::SetThreads(threads);
 	fastllm::SetLowMemMode(isLowMem);
 	modeltype = model;
@@ -78,12 +84,13 @@ int chat(const char* prompt) {
 		}
 		history += ("[Round " + std::to_string(sRound++) + "]\n问：" + input);
 		auto prompt = sRound > 1 ? history : input;
-		ret = chatGlm->Response((prompt), [](int index, const char* content) {
+		ret = chatGlm->Response(Gb2utf(prompt), [](int index, const char* content) {
+			std::string result = utf2Gb(content);
 			if (index == 0) {
-				printf("ChatGLM:%s", content);
+				printf("ChatGLM:%s", result.c_str());
 			}
 			if (index > 0) {
-				printf("%s", content);
+				printf("%s", result.c_str());
 			}
 			if (index == -1) {
 				printf("\n");
@@ -94,13 +101,14 @@ int chat(const char* prompt) {
 	}
 
 	if (modeltype == LLM_TYPE_MOSS) {
-		auto prompt = "You are an AI assistant whose name is MOSS. <|Human|>: " + (input) + "<eoh>";
+		auto prompt = "You are an AI assistant whose name is MOSS. <|Human|>: " + Gb2utf(input) + "<eoh>";
 		ret = moss->Response(prompt, [](int index, const char* content) {
+			std::string result = utf2Gb(content);
 			if (index == 0) {
-				printf("MOSS:%s", content);
+				printf("MOSS:%s", result.c_str());
 			}
 			if (index > 0) {
-				printf("%s", content);
+				printf("%s", result.c_str());
 			}
 			if (index == -1) {
 				printf("\n");
@@ -128,7 +136,7 @@ void uninitLLM()
 int main(int argc, char **argv) {
 	RunConfig config;
 	ParseArgs(argc, argv, config);
-	initLLMConf(config.model,config.lowMemMode, config.path.c_str(), config.threads);
+	initLLMConf(config.model, config.lowMemMode, config.path.c_str(), config.threads);
 
 	if (config.model == LLM_TYPE_MOSS) {
 
@@ -152,6 +160,7 @@ int main(int argc, char **argv) {
 			}
 			chat(input.c_str());
 		}
+
 	}
 	else {
 		Usage();
