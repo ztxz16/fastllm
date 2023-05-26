@@ -3,3 +3,7 @@
 /build-android/
 /build/
 /.idea/
+/example/Win32Demo/bin
+/example/Win32Demo/x64
+/example/Win32Demo/*.filters
+/example/Win32Demo/*.user
