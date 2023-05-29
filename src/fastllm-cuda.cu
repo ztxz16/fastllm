@@ -18,23 +18,30 @@ double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_
     return double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
 };
 
-__global__ void FastllmGeluKernel(float* a, int len) {
+__global__ void FastllmGeluKernel(float* a, float *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    float x = a[idx];
     if (idx < len) {
-        a[idx] = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * x * (1.0f + 0.044715f * x * x)));
+        float x = a[idx];
+        b[idx] = 0.5f * x * (1.0f + tanhf(0.7978845608028654f * x * (1.0f + 0.044715f * x * x)));
     }
 }
 
-__global__ void FastllmMulKernel(float* a, float v, int len) {
+__global__ void FastllmMulKernel(float* a, float *b, float v, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
-        a[idx] = a[idx] * v;
+        b[idx] = a[idx] * v;
+    }
+}
+
+__global__ void FastllmAddToKernel(float* a, float *b, float alpha, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        a[idx] += b[idx] * alpha;
     }
 }
 
 template <int THREAD_PER_BLOCK>
-__global__ void SoftmaxKernelInner1(float* input, float *output, int outer, int channels) {
+__global__ void FastllmSoftmaxKernelInner1(float* input, float *output, int outer, int channels) {
     int o = blockIdx.x;
     input = input + o * channels;
     output = output + o * channels;
@@ -89,6 +96,56 @@ __global__ void SoftmaxKernelInner1(float* input, float *output, int outer, int 
 
     for (int i = 0; i < len; i++) {
         output[id + i] /= sdata[0];
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmLayerNormKernelInner1(float *input, float *gamma, float *beta, float *output, int outer, int channels) {
+    int o = blockIdx.x;
+    input = input + o * channels;
+    output = output + o * channels;
+
+    __shared__ float sdata[THREAD_PER_BLOCK];
+    __shared__ float sdata2[THREAD_PER_BLOCK];
+    __shared__ float mean;
+    __shared__ float var;
+
+    // 1. 每个线程计算一部分
+    unsigned int tid = threadIdx.x;
+    unsigned int per = (channels / THREAD_PER_BLOCK);
+    unsigned int id = threadIdx.x * per;
+    unsigned int len = per;
+    if (tid == blockDim.x - 1) {
+        len += (channels - per * THREAD_PER_BLOCK);
+    }
+    float sum = 0.0, sum2 = 0.0;
+    for (int i = 0; i < len; i++) {
+        sum += input[id + i];
+        sum2 += input[id + i] * input[id + i];
+    }
+    sdata[tid] = sum;
+    sdata2[tid] = sum2;
+    __syncthreads();
+
+    // 2. 求和
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+            sdata2[tid] += sdata2[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // 3. 计算参数
+    if (tid == 0) {
+        mean = sdata[0] / channels;
+        var = sdata2[0] + mean * mean * channels - 2 * mean * channels * mean;
+        var = sqrt(var / channels + 1e-10);
+    }
+    __syncthreads();
+
+    for (int i = 0; i < len; i++) {
+        output[id + i] = (input[id + i] - mean) / var * gamma[id + i] + beta[id + i];
     }
 }
 
@@ -305,8 +362,6 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
                     cudaOutput + i * k, cudaBiasData, cudaScales, cudaZeropoints, m, k);
         }
     }
-    cudaDeviceSynchronize();
-
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
@@ -353,7 +408,6 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
         FastllmGemvInt4Kernel0 <256> <<< k, 256 >>> (cudaInput + i * m, (uint8_t *) weight.cudaData,
             cudaOutput + i * k, cudaBiasData, cudaScales, cudaZeropoints, m, k);
     }
-    cudaDeviceSynchronize();
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
@@ -372,6 +426,11 @@ struct CudaMemoryBuffer {
 std::vector <CudaMemoryBuffer> cudaBuffers;
 
 void * FastllmCudaMalloc(size_t size) {
+    if (size > 1024 * 1024) {
+        void * ret;
+        cudaMalloc(&ret, size);
+        return ret;
+    }
     for (int i = 0; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy) {
             cudaBuffers[i].busy = true;
@@ -388,24 +447,25 @@ void FastllmCudaFree(void *ret) {
     for (int i = 0; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].data == ret) {
             cudaBuffers[i].busy = false;
-            break;
+            return;
         }
     }
+    cudaFree(ret);
 }
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size) {
     cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice);
-    cudaDeviceSynchronize();
+    //cudaDeviceSynchronize();
 }
 
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size) {
     cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
+    //cudaDeviceSynchronize();
 }
 
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
     cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
-    cudaDeviceSynchronize();
+    //cudaDeviceSynchronize();
 }
 
 void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void * 	src,
@@ -415,19 +475,35 @@ void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void *
 
 bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output) {
     int len = input.Count(0);
-    float *cudaData = (float *) FastllmCudaPrepareInput(input);
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     int threadPerBlock = min(256, len);
-    FastllmGeluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, len);
-    FastllmCudaFinishOutput(output, cudaData);
+    FastllmGeluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
     return true;
 }
 
 bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output) {
     int len = input.Count(0);
-    float *cudaData = (float *) FastllmCudaPrepareInput(input);
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     int threadPerBlock = min(256, len);
-    FastllmMulKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, v, len);
-    FastllmCudaFinishOutput(output, cudaData);
+    FastllmMulKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, v, len);
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float alpha) {
+    int len = input0.Count(0);
+    float *cudaData = (float *) FastllmCudaPrepareInput(input0);
+    float *input1Data = (float *) FastllmCudaPrepareInput(input1);
+
+    int threadPerBlock = min(256, len);
+    FastllmAddToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
+    FastllmCudaFinishInput(input1, input1Data);
+    FastllmCudaFinishOutput(input0, cudaData);
     return true;
 }
 
@@ -443,15 +519,52 @@ bool FastllmCudaSoftmax(const fastllm::Data &input, fastllm::Data &output, int a
 
     if (inner == 1) {
         if (channels < 8) {
-            SoftmaxKernelInner1 <1> <<< outer, 1 >>> (cudaInput, cudaOutput, outer, channels);
+            FastllmSoftmaxKernelInner1 <1> <<< outer, 1 >>> (cudaInput, cudaOutput, outer, channels);
         } else if (channels < 64) {
-            SoftmaxKernelInner1 <8> <<< outer, 8 >>> (cudaInput, cudaOutput, outer, channels);
+            FastllmSoftmaxKernelInner1 <8> <<< outer, 8 >>> (cudaInput, cudaOutput, outer, channels);
         } else if (channels < 512) {
-            SoftmaxKernelInner1 <64> <<< outer, 64 >>> (cudaInput, cudaOutput, outer, channels);
+            FastllmSoftmaxKernelInner1 <64> <<< outer, 64 >>> (cudaInput, cudaOutput, outer, channels);
         } else {
-            SoftmaxKernelInner1 <256> <<< outer, 256 >>> (cudaInput, cudaOutput, outer, channels);
+            FastllmSoftmaxKernelInner1 <256> <<< outer, 256 >>> (cudaInput, cudaOutput, outer, channels);
         }
 
+    } else {
+        printf("softmax error.\n");
+        exit(0);
+    }
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fastllm::Data &beta, fastllm::Data &output, int axis) {
+    gamma.ToDevice(fastllm::DataDevice::CUDA);
+    beta.ToDevice(fastllm::DataDevice::CUDA);
+
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareInput(output);
+
+    int dimsLen = input.dims.size();
+    axis = (axis % dimsLen + dimsLen) % dimsLen;
+    int outer = input.Count(0) / input.Count(axis);
+    int channels = input.dims[axis];
+    int inner = input.strides[axis];
+
+    if (inner == 1) {
+        if (channels < 64) {
+            FastllmLayerNormKernelInner1<1> <<< outer, 1 >>>(cudaInput, (float *) gamma.cudaData,
+                                                             (float *) beta.cudaData, cudaOutput,
+                                                             outer, channels);
+        } else if (channels < 512) {
+            FastllmLayerNormKernelInner1<64> <<< outer, 64 >>>(cudaInput, (float *) gamma.cudaData,
+                                                             (float *) beta.cudaData, cudaOutput,
+                                                             outer, channels);
+        } else {
+            FastllmLayerNormKernelInner1<256> <<< outer, 256 >>>(cudaInput, (float *) gamma.cudaData,
+                                                             (float *) beta.cudaData, cudaOutput,
+                                                             outer, channels);
+        }
     } else {
         printf("softmax error.\n");
         exit(0);
@@ -476,6 +589,8 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
 
     float beta = 0;
     cublasStatus_t status;
+
+    cudaDeviceSynchronize();
     status = cublasSgemmStridedBatched(fastllmCublasHandle,
                                        CUBLAS_OP_T, CUBLAS_OP_N,
                                        k, n, m, &alpha,
@@ -483,15 +598,14 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
                                        cudaInput0, input0Stride, input0Spatial,
                                        &beta,
                                        cudaOutput, k, k * n, batch);
-
+    cudaDeviceSynchronize();
     if (status != CUBLAS_STATUS_SUCCESS) {
-        printf("status = %d", status);
+        printf("status = %d\n", (int)status);
         printf("%d %d %d\n", k, n, m);
         printf("Error: cublas error.\n");
+        throw("cublas error");
         exit(0);
     }
-    cudaDeviceSynchronize();
-
     FastllmCudaFinishInput(input0, cudaInput0);
     FastllmCudaFinishInput(input1, cudaInput1);
     FastllmCudaFinishOutput(output, cudaOutput);

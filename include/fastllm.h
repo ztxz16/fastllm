@@ -189,7 +189,7 @@ namespace fastllm {
 
     void Embedding(const Data &input, Data &weight, Data &output);
 
-    void LayerNorm(const Data &input, const Data &gamma, const Data &beta, int axis, Data &output);
+    void LayerNorm(const Data &input, Data &gamma, Data &beta, int axis, Data &output);
 
     void Linear(const Data &input, Data &weight, const Data &bias, Data &output);
 
