@@ -1032,6 +1032,7 @@
                             value = resStr.substr(0, end)
                         }
                         currentResEle.children[0].innerHTML = md.render(value);
+                        scrollToBottom();
                         return;
                     }
                 });
