@@ -92,14 +92,14 @@ namespace fastllm {
     int ChatGLMModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                               const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues) {
 TimeRecord timeRecord;
-timeRecord.Clear();
+//timeRecord.Clear();
 //timeRecord.Record();
 
         Data inputEmbeddings;
         Embedding(inputIds, this->weight["transformer.word_embeddings.weight"], inputEmbeddings);
         Data hiddenStates = inputEmbeddings;
         hiddenStates.Permute({1, 0, 2});
-
+        hiddenStates.ToDevice(DataDevice::CUDA);
         //timeRecord.Record("embedding");
         // ChatGLMBlock
         for (int i = 0; i < block_cnt; i++) {
@@ -120,6 +120,12 @@ timeRecord.Clear();
             Split(qkv, -1, per, per * 2, k);
             Split(qkv, -1, per * 2, per * 3, v);
 
+            if (q.dims[0] != 1) {
+                v.ToDevice(DataDevice::CPU);
+            }
+            q.ToDevice(DataDevice::CPU);
+            k.ToDevice(DataDevice::CPU);
+
             RotatePosition2D(q, positionIds);
             RotatePosition2D(k, positionIds);
 //timeRecord.Record("rot");
@@ -134,6 +140,9 @@ timeRecord.Clear();
             v.Permute({1, 2, 0});
 
             int unitLen = 64;
+#ifdef USE_CUDA
+            unitLen = 128;
+#endif
             while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
                 || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
                 std::vector <int> newDims;
@@ -201,20 +210,23 @@ timeRecord.Clear();
             outputSize = {1, pastValue.dims[0], q.dims[1], pastValue.dims[1]};
             attnProbs.Reshape({outputSize[0] * outputSize[1], outputSize[2], -1});
             // 1.2.3 prob * v
-            Data tempCL, contextLayer;
+            Data contextLayer;
 //timeRecord.Record("qkv prepare");
             attnProbs.ToDevice(DataDevice::CUDA);
-            MatMulTransB(attnProbs, pastValue, tempCL);
-            tempCL.ToDevice(DataDevice::CPU);
+            MatMulTransB(attnProbs, pastValue, contextLayer);
+            if (contextLayer.dims[2] != 1) {
+                contextLayer.ToDevice(DataDevice::CPU);
+            }
 //timeRecord.Record("MatMulTransB");
-            tempCL.Reshape(outputSize);
-            Permute(tempCL, {2, 0, 1, 3}, contextLayer);
+            contextLayer.Reshape(outputSize);
+            contextLayer.Permute({2, 0, 1, 3});
             contextLayer.Reshape({contextLayer.dims[0], contextLayer.dims[1], embed_dim});
             // 1.2.4 dense
             std::string denseWeightName = "transformer.layers." + std::to_string(i) + ".attention.dense.weight";
             std::string denseBiasName = "transformer.layers." + std::to_string(i) + ".attention.dense.bias";
             Data attnOutput;
 //timeRecord.Record("qkv");
+            contextLayer.ToDevice(DataDevice::CUDA);
             Linear(contextLayer, weight[denseWeightName], weight[denseBiasName], attnOutput);
 //timeRecord.Record("linear");
             // 1.3
@@ -228,25 +240,22 @@ timeRecord.Clear();
             // 1.4 MLP
             std::string fcInKeyName = "transformer.layers." + std::to_string(i) + ".mlp.dense_h_to_4h";
             std::string fcOutKeyName = "transformer.layers." + std::to_string(i) + ".mlp.dense_4h_to_h";
-            Data middle, mlpOutput;
+            Data middle;
 //timeRecord.Record("post ln");
-            mlpInput.ToDevice(DataDevice::CUDA);
             Linear(mlpInput, weight[fcInKeyName + ".weight"], weight[fcInKeyName + ".bias"], middle);
 //timeRecord.Record("linear");
             GeluNew(middle, middle);
 //timeRecord.Record("gelu");
-            Linear(middle, weight[fcOutKeyName + ".weight"], weight[fcOutKeyName + ".bias"], mlpOutput);
+            Linear(middle, weight[fcOutKeyName + ".weight"], weight[fcOutKeyName + ".bias"], hiddenStates);
 //timeRecord.Record("linear");
-            mlpInput.ToDevice(DataDevice::CPU);
-            mlpOutput.ToDevice(DataDevice::CPU);
-            AddTo(mlpOutput, mlpInput, alpha);
-            hiddenStates.CopyFrom(mlpOutput);
+            AddTo(hiddenStates, mlpInput, alpha);
 //timeRecord.Record("mlp");
         }
 
         LayerNorm(hiddenStates, weight["transformer.final_layernorm.weight"], weight["transformer.final_layernorm.bias"], -1, hiddenStates);
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
+        logits.ToDevice(DataDevice::CPU);
         //timeRecord.Record("logits");
         std::pair <float, int> ret = std::make_pair(-1e9, -1);
         int base = logits.dims[0] - 1;

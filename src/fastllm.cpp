@@ -486,7 +486,10 @@ namespace fastllm {
         AssertInFastLLM(this->dataType == DataType::FLOAT32, "Permute error: datatype should be float32.");
         AssertInFastLLM(axis.size() == this->dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
 
-        if ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && this->dims[0] == 1) {
+        bool same = false;
+        same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && this->dims[0] == 1);
+        same |= ((axis == std::vector <int>{2, 0, 1, 3}) && this->dims[2] == 1);
+        if (same) {
             std::vector<int> new_dims;
             for (int i = 0; i < axis.size(); i++) {
                 new_dims.push_back(this->dims[axis[i]]);
@@ -1345,9 +1348,10 @@ namespace fastllm {
         }
     }
 
-    void LayerNorm(const Data &input, const Data &gamma, const Data &beta, int axis, Data &output) {
+    void LayerNorm(const Data &input, Data &gamma, Data &beta, int axis, Data &output) {
         int dimsLen = input.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
+        output.dataDevice = input.dataDevice;
         if (output.dims != input.dims || output.dataType != input.dataType || output.cpuData == nullptr) {
             output.dataType = input.dataType;
             output.Resize(input.dims);
@@ -1356,6 +1360,11 @@ namespace fastllm {
         int outer = input.Count(0) / input.Count(axis);
         int channels = input.dims[axis];
         int inner = input.strides[axis];
+
+#ifdef USE_CUDA
+        FastllmCudaLayerNorm(input, gamma, beta, output, axis);
+        return;
+#endif
 
         float *mean = new float[inner], *var = new float[inner];
         float *inputData = (float*)input.cpuData;
@@ -1739,6 +1748,7 @@ namespace fastllm {
         dims[axis] = end - start;
 
         output.dataType = input.dataType;
+        output.dataDevice = input.dataDevice;
         output.Resize(dims);
         output.Allocate();
 
@@ -1749,6 +1759,12 @@ namespace fastllm {
         int inner = input.strides[axis];
         int unitSize = input.unitSize;
 
+#ifdef USE_CUDA
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)output.cudaData, outputStride * unitSize,
+                                          (uint8_t*)input.cudaData + start * inner * unitSize, inputStride * unitSize,
+                                          (end - start) * inner * unitSize, outer);
+        return;
+#endif
         for (int o = 0; o < outer; o++) {
             memcpy(output.cpuData + o * outputStride * unitSize,
                    input.cpuData + (o * inputStride + start * inner) * unitSize,
@@ -1821,11 +1837,9 @@ namespace fastllm {
 
 #ifdef USE_CUDA
             if (input0.dataDevice == DataDevice::CUDA) {
-                for (int o = 0; o < outer; o++) {
-                    FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)input0.cudaData, input0Stride * unitSize,
-                                                      (uint8_t*)input1.cudaData, input1Stride * unitSize,
-                                                      input1.dims[axis] * inner * unitSize, outer);
-                }
+                FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)input0.cudaData, input0Stride * unitSize,
+                                                  (uint8_t*)input1.cudaData, input1Stride * unitSize,
+                                                  input1.dims[axis] * inner * unitSize, outer);
                 return;
             }
 #endif
@@ -2179,6 +2193,12 @@ namespace fastllm {
                         "AddTo error: Data's type should be float32.\n");
         AssertInFastLLM(input0.dims == input1.dims, "AddTo error: input's shape should be same.\n");
 
+#ifdef USE_CUDA
+        if (FastllmCudaAddTo(input0, input1, 1.0)) {
+            return;
+        }
+#endif
+
         float *input0Data = (float*)input0.cpuData;
         float *input1Data = (float*)input1.cpuData;
 
@@ -2195,6 +2215,11 @@ namespace fastllm {
 
         float *input0Data = (float*)input0.cpuData;
         float *input1Data = (float*)input1.cpuData;
+#ifdef USE_CUDA
+        if (FastllmCudaAddTo(input0, input1, alpha)) {
+            return;
+        }
+#endif
 
         int len = input0.Count(0);
         for (int i = 0; i < len; i++) {
