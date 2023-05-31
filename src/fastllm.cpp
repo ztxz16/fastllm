@@ -497,7 +497,11 @@ namespace fastllm {
             this->Resize(new_dims);
             return;
         }
-
+#ifdef USE_CUDA
+        if (this->dataDevice == DataDevice::CUDA && FastllmCudaPermute(*this, axis)) {
+            return;
+        }
+#endif
         auto tmp = new Data();
         fastllm::Permute(*this, axis, *tmp);
 
@@ -597,6 +601,7 @@ namespace fastllm {
                 delete threads[i];
             }
         } else if (axis == std::vector <int> {1, 0, 2}) {
+printf("%f\n", ((float*)curData)[0]);
             int n = input.dims[0];
             int m = input.dims[1];
             int k = input.dims[2];
@@ -952,6 +957,7 @@ namespace fastllm {
             for (int i : data.dims) {
                 buffer.WriteInt(i);
             }
+            data.ToDevice(DataDevice::CPU);
 
             if (data.weightType == WeightType::NONE) {
                 // 普通权重，直接写入浮点数据
@@ -1579,7 +1585,7 @@ namespace fastllm {
         }
     }
 
-    void Linear(const Data &input, Data &weight, const Data &bias, Data &output) {
+    void Linear(Data &input, Data &weight, const Data &bias, Data &output) {
         AssertInFastLLM(weight.dims.size() == 2, "Linear's weight's shape's size should be 2.\n");
         AssertInFastLLM(input.dims.back() == weight.dims[1], "Linear's weight's shape error.\n");
 //auto st = std::chrono::system_clock::now();
@@ -1596,6 +1602,10 @@ namespace fastllm {
         int k = output.dims.back();
 
         if (weight.dataType == DataType::FLOAT32) {
+#ifdef USE_CUDA
+            input.ToDevice(DataDevice::CPU);
+            output.ToDevice(DataDevice::CPU);
+#endif
             float *inputData = (float *) input.cpuData;
             float *weightData = (float *) weight.cpuData;
             float *outputData = (float *) output.cpuData;
@@ -1611,11 +1621,16 @@ namespace fastllm {
                                                   n, m, k, cur, end));
                 cur = end;
             }
+
             FloatLinearPart(inputData, weightData, biasData, outputData, n, m, k, cur, k);
             for (int i = 0; i < threadNum - 1; i++) {
                 threads[i]->join();
                 delete threads[i];
             }
+#ifdef USE_CUDA
+            input.ToDevice(DataDevice::CUDA);
+            output.ToDevice(DataDevice::CUDA);
+#endif
         } else if (weight.dataType == DataType::INT8) {
             float *inputData = (float *) input.cpuData;
             uint8_t *weightData = (uint8_t *) weight.cpuData;
@@ -2224,6 +2239,25 @@ namespace fastllm {
         int len = input0.Count(0);
         for (int i = 0; i < len; i++) {
             input0Data[i] += input1Data[i] * alpha;
+        }
+    }
+
+    void AttentionMask(Data &input, const Data &mask, float maskValue) {
+#ifdef USE_CUDA
+        if (FastllmCudaAttentionMask(input, mask, maskValue)) {
+            return;
+        }
+#endif
+
+        float *maskData = (float *) mask.cpuData;
+        float *attnData = (float *) input.cpuData;
+        int spatial = input.Count(2), outer = input.Count(0) / spatial;
+        for (int o = 0; o < outer; o++) {
+            for (int i = 0; i < spatial; i++) {
+                if (maskData[i] > 0.99) {
+                    attnData[o * spatial + i] = -10000;
+                }
+            }
         }
     }
 }
