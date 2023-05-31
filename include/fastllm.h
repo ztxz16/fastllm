@@ -191,7 +191,7 @@ namespace fastllm {
 
     void LayerNorm(const Data &input, Data &gamma, Data &beta, int axis, Data &output);
 
-    void Linear(const Data &input, Data &weight, const Data &bias, Data &output);
+    void Linear(Data &input, Data &weight, const Data &bias, Data &output);
 
     void Split(const Data &input, int axis, int start, int end, Data &output);
 
@@ -212,6 +212,8 @@ namespace fastllm {
     void AddTo(Data &input0, const Data &input1); // input0 += input1
 
     void AddTo(Data &input0, const Data &input1, float alpha); // input0 += input1 * alpha
+
+    void AttentionMask(Data &input, const Data &mask, float maskValue); // 把input里对应位置mask中为1的部分变成maskValue
 
     void Permute(const Data &input, const std::vector<int> &axis, Data &output); // 转置
 }
