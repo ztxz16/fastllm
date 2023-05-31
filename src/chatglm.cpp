@@ -12,6 +12,10 @@
 
 #include <map>
 
+#ifdef USE_CUDA
+#include "fastllm-cuda.h"
+#endif
+
 namespace fastllm {
     extern double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2);
 
@@ -94,6 +98,17 @@ namespace fastllm {
 TimeRecord timeRecord;
 //timeRecord.Clear();
 //timeRecord.Record();
+        std::vector <float> fsin, fcos;
+        for (int i = 0; i < sin.size(); i++) {
+            for (int j = 0; j < sin[0].size(); j++) {
+                fsin.push_back(sin[i][j]);
+                fcos.push_back(cos[i][j]);
+            }
+        }
+        Data sinData = Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, fsin);
+        Data cosData = Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, fcos);
+        sinData.ToDevice(DataDevice::CUDA);
+        cosData.ToDevice(DataDevice::CUDA);
 
         Data inputEmbeddings;
         Embedding(inputIds, this->weight["transformer.word_embeddings.weight"], inputEmbeddings);
@@ -120,14 +135,13 @@ TimeRecord timeRecord;
             Split(qkv, -1, per, per * 2, k);
             Split(qkv, -1, per * 2, per * 3, v);
 
-            if (q.dims[0] != 1) {
-                v.ToDevice(DataDevice::CPU);
-            }
-            q.ToDevice(DataDevice::CPU);
-            k.ToDevice(DataDevice::CPU);
-
+#ifdef USE_CUDA
+            FastllmCudaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
+            FastllmCudaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
+#else
             RotatePosition2D(q, positionIds);
             RotatePosition2D(k, positionIds);
+#endif
 //timeRecord.Record("rot");
             Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
 
@@ -167,8 +181,6 @@ TimeRecord timeRecord;
                 pastValue.Expansion(newDims);
             }
 
-            k.ToDevice(DataDevice::CUDA);
-            v.ToDevice(DataDevice::CUDA);
 //timeRecord.Record("cat");
             CatDirect(pastKey, k, 1);
 //timeRecord.Record("catk");
@@ -184,24 +196,12 @@ TimeRecord timeRecord;
             Data attnProbs;
 //timeRecord.Record("qk0");
 
-            q.ToDevice(DataDevice::CUDA);
             MatMulTransB(q, pastKey, attnProbs, 1.0 / (scale_attn * (i + 1)));
             attnProbs.Reshape(outputSize);
 //timeRecord.Record("qk1");
             // 1.2.1 Mask
             if (attentionMask.dims.size() != 0) {
-                attnProbs.ToDevice(DataDevice::CPU);
-
-                float *maskData = (float *) attentionMask.cpuData;
-                float *attnData = (float *) attnProbs.cpuData;
-                int spatial = attnProbs.Count(2), outer = attnProbs.Count(0) / spatial;;
-                for (int o = 0; o < outer; o++) {
-                    for (int i = 0; i < spatial; i++) {
-                        if (maskData[i] > 0.99) {
-                            attnData[o * spatial + i] = -10000;
-                        }
-                    }
-                }
+                AttentionMask(attnProbs, attentionMask, -10000);
             }
             // 1.2.2 softmax
             Mul(attnProbs, i + 1, attnProbs);
@@ -212,11 +212,7 @@ TimeRecord timeRecord;
             // 1.2.3 prob * v
             Data contextLayer;
 //timeRecord.Record("qkv prepare");
-            attnProbs.ToDevice(DataDevice::CUDA);
             MatMulTransB(attnProbs, pastValue, contextLayer);
-            if (contextLayer.dims[2] != 1) {
-                contextLayer.ToDevice(DataDevice::CPU);
-            }
 //timeRecord.Record("MatMulTransB");
             contextLayer.Reshape(outputSize);
             contextLayer.Permute({2, 0, 1, 3});
@@ -226,7 +222,6 @@ TimeRecord timeRecord;
             std::string denseBiasName = "transformer.layers." + std::to_string(i) + ".attention.dense.bias";
             Data attnOutput;
 //timeRecord.Record("qkv");
-            contextLayer.ToDevice(DataDevice::CUDA);
             Linear(contextLayer, weight[denseWeightName], weight[denseBiasName], attnOutput);
 //timeRecord.Record("linear");
             // 1.3
@@ -304,6 +299,8 @@ TimeRecord timeRecord;
         while (true) {
             auto st = std::chrono::system_clock::now();
 
+            attentionMask.ToDevice(DataDevice::CUDA);
+            positionIds.ToDevice(DataDevice::CUDA);
             int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues);
             if (ret == 130005) {
                 break;
@@ -321,6 +318,9 @@ TimeRecord timeRecord;
             if (maskIds == -1) {
                 maskIds = (int)ids.size() - 2;
             }
+
+            attentionMask.ToDevice(DataDevice::CPU);
+            positionIds.ToDevice(DataDevice::CPU);
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)ret}));
             attentionMask = Data();
             positionIds.CopyFrom(Data(DataType::FLOAT32, {2, 1}, {(float)maskIds, (float)(len)}));
