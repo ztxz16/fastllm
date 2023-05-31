@@ -601,7 +601,6 @@ namespace fastllm {
                 delete threads[i];
             }
         } else if (axis == std::vector <int> {1, 0, 2}) {
-printf("%f\n", ((float*)curData)[0]);
             int n = input.dims[0];
             int m = input.dims[1];
             int k = input.dims[2];
