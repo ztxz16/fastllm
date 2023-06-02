@@ -2,6 +2,8 @@
 // Created by huangyuyang on 5/11/23.
 //
 
+#include "utils.h"
+
 #include "fastllm.h"
 
 #include <cstring>
@@ -23,11 +25,6 @@
 #endif
 
 namespace fastllm {
-    double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds> (time2 - time1);
-        return double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
-    };
-
     void ErrorInFastLLM(const std::string &error) {
         printf("FastLLM Error: %s\n", error.c_str());
         throw error;
@@ -856,12 +853,37 @@ namespace fastllm {
 		    int space_num = atoi(ret.substr(8, ret.size() - 10).c_str());
 		    return std::string(space_num, ' ');
 	    }
+        if (ret.size() == 6 && ret.substr(0, 3) == "<0x" && ret.back() == '>') {
+            int c = 0;
+            for (int i = 3; i < 5; i++) {
+                c *= 16;
+                if (ret[i] >= '0' && ret[i] <= '9') {
+                    c += (ret[i] - '0');
+                } else {
+                    c += (ret[i] - 'A' + 10);
+                }
+            }
+
+            ret = " ";
+            ret[0] = c;
+        }
         return ret;
     }
 
     void WeightMap::LoadFromFile(const std::string &fileName) {
         FileBuffer buffer(fileName);
         this->versionId = buffer.ReadInt();
+
+        if (this->versionId == 1) {
+            // versionId = 1, 前置了一个key-value表
+            int keyValueLen = buffer.ReadInt();
+            for (int i = 0; i < keyValueLen; i++) {
+                std::string key = buffer.ReadString();
+                std::string value = buffer.ReadString();
+                //printf("%s %s\n", key.c_str(), value.c_str());
+                this->dicts[key] = value;
+            }
+        }
 
         int vocabLen = buffer.ReadInt();
         for (int i = 0; i < vocabLen; i++) {
@@ -936,6 +958,14 @@ namespace fastllm {
         AssertInFastLLM(bit == 4 || bit == 8, "Error: only support 8 bit or 4 bit model.\n");
         FileWriter buffer(fileName);
         buffer.WriteInt(this->versionId);
+        if (this->versionId == 1) {
+            // versionId = 1, 前置了一个key-value表
+            buffer.WriteInt((int)dicts.size());
+            for (auto &it : dicts) {
+                buffer.WriteString(it.first);
+                buffer.WriteString(it.second);
+            }
+        }
 
         // 写入词表
         buffer.WriteInt((int)tokenizer.tokenToStringDict.size());
@@ -1350,6 +1380,60 @@ namespace fastllm {
 			        }
 		        }
 	        }
+        }
+    }
+
+    void RMSNorm(const Data &input, const Data &weight, float eps, Data &output) {
+        int dimsLen = input.dims.size();
+        int axis = dimsLen - 1;
+        output.dataDevice = input.dataDevice;
+        if (output.dims != input.dims || output.dataType != input.dataType || output.cpuData == nullptr) {
+            output.dataType = input.dataType;
+            output.Resize(input.dims);
+            output.Allocate();
+        }
+        int outer = input.Count(0) / input.Count(axis);
+        int channels = input.dims[axis];
+
+        float *inputData = (float *) input.cpuData;
+        float *outputData = (float *) output.cpuData;
+        float *weightData = (float *) weight.cpuData;
+
+        for (int i = 0; i < outer; i++) {
+            float mean = 0.f;
+            int j = 0;
+#ifdef __aarch64__X
+            float32x4_t sums = vdupq_n_f32(0.0);
+            float32x4_t sums2 = vdupq_n_f32(0.0);
+            for (; j + 3 < channels; j += 4) {
+                float32x4_t vi = vld1q_f32(inputData + j);
+                sums = vaddq_f32(sums, vi);
+                sums2 = vaddq_f32(sums2, vmulq_f32(vi, vi));
+            }
+            mean = sums[0] + sums[1] + sums[2] + sums[3];
+            s2 = sums2[0] + sums2[1] + sums2[2] + sums2[3];
+#endif
+            for (; j < channels; j++) {
+                mean += inputData[j] * inputData[j];
+            }
+            float scale = 1.0 / sqrt(mean / channels + eps);
+            j = 0;
+#ifdef __aarch64__X
+            float32x4_t means = vdupq_n_f32(mean);
+            float32x4_t vars = vdupq_n_f32(1.0 / var);
+            for (; j + 3 < channels; j += 4) {
+                float32x4_t va = vld1q_f32(gammaData + j), vb = vld1q_f32(betaData + j);
+                float32x4_t vi = vld1q_f32(inputData + j);
+                float32x4_t vo = vaddq_f32(vmulq_f32(vmulq_f32(vsubq_f32(vi, means), vars), va), vb);
+                vst1q_f32(outputData + j, vo);
+            }
+#endif
+            for (; j < channels; j++) {
+                outputData[j] = inputData[j] * scale * weightData[j];
+            }
+
+            inputData += channels;
+            outputData += channels;
         }
     }
 
@@ -2136,6 +2220,26 @@ namespace fastllm {
         }
     }
 
+    void Silu(const fastllm::Data &input, fastllm::Data &output) {
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Silu error: Data's type should be float32.\n");
+
+        if (output.dims != input.dims || output.dataType != input.dataType || output.cpuData == nullptr) {
+            output.dataType = input.dataType;
+            output.Resize(input.dims);
+            output.Allocate();
+        }
+
+        float *inputData = (float*)input.cpuData;
+        float *outputData = (float*)output.cpuData;
+        int len = input.Count(0);
+        int i = 0;
+
+        for (; i < len; i++) {
+            float x = inputData[i];
+            outputData[i] = x / (1.0 + expf(-x));
+        }
+    }
+
     void GeluNew(const fastllm::Data &input, fastllm::Data &output) {
         AssertInFastLLM(input.dataType == DataType::FLOAT32, "GeluNew error: Data's type should be float32.\n");
 
@@ -2202,6 +2306,20 @@ namespace fastllm {
         }
     }
 
+    void MulTo(Data &input0, const Data &input1) {
+        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
+                        "MulTo error: Data's type should be float32.\n");
+        AssertInFastLLM(input0.dims == input1.dims, "AddTo error: input's shape should be same.\n");
+
+        float *input0Data = (float*)input0.cpuData;
+        float *input1Data = (float*)input1.cpuData;
+
+        int len = input0.Count(0);
+        for (int i = 0; i < len; i++) {
+            input0Data[i] *= input1Data[i];
+        }
+    }
+
     void AddTo(Data &input0, const Data &input1) {
         AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
                         "AddTo error: Data's type should be float32.\n");
@@ -2254,7 +2372,7 @@ namespace fastllm {
         for (int o = 0; o < outer; o++) {
             for (int i = 0; i < spatial; i++) {
                 if (maskData[i] > 0.99) {
-                    attnData[o * spatial + i] = -10000;
+                    attnData[o * spatial + i] = maskValue;
                 }
             }
         }

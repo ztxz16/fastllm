@@ -19,7 +19,7 @@ endif()
 include_directories(include)
 
 message(STATUS "CMAKE_CXX_FLAGS" ${CMAKE_CXX_FLAGS})
-set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/chatglm.cpp src/moss.cpp)
+set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/chatglm.cpp src/moss.cpp src/vicuna.cpp)
 
 if (USE_CUDA)
     enable_language(CUDA)

@@ -176,6 +176,8 @@ namespace fastllm {
 
         Tokenizer tokenizer;
 
+        std::map <std::string, std::string> dicts;
+
         std::map <std::string, Data> weight;
 
         std::set <std::string> embeddingNames;
@@ -188,6 +190,8 @@ namespace fastllm {
     };
 
     void Embedding(const Data &input, Data &weight, Data &output);
+
+    void RMSNorm(const Data &input, const Data &weight, float eps, Data &output);
 
     void LayerNorm(const Data &input, Data &gamma, Data &beta, int axis, Data &output);
 
@@ -205,9 +209,13 @@ namespace fastllm {
 
     void Softmax(const Data &input, Data &output, int axis);
 
+    void Silu(const fastllm::Data &input, fastllm::Data &output);
+
     void GeluNew(const Data &input, Data &output);
 
     void Mul(const Data &input, float v, Data &output);
+
+    void MulTo(Data &input0, const Data &input1); // input0 *= input1
 
     void AddTo(Data &input0, const Data &input1); // input0 += input1
 

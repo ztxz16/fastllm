@@ -1,44 +1,44 @@
 #pragma once
 #include "fastllm.h"
 
-typedef void(*RuntimeResult) (int index, const char* content);//ÊµÊ±Éú³ÉµÄÄÚÈİ»Øµ÷ index: 0¿ªÊ¼»Ø¸´£¬-1±¾´Î»Ø¸´½áÊø
+typedef void(*RuntimeResult) (int index, const char* content);//å®æ—¶ç”Ÿæˆçš„å†…å®¹å›è°ƒ index: 0å¼€å§‹å›å¤ï¼Œ-1æœ¬æ¬¡å›å¤ç»“æŸ
 
 namespace fastllm {
-	class basellm {
-	public:
-		basellm() {};
-		~basellm() {};
+    class basellm {
+    public:
+        basellm() {};
+        ~basellm() {};
 
-		virtual void LoadFromFile(const std::string &fileName) = 0; // ´ÓÎÄ¼ş¶ÁÈ¡
-		// ÍÆÀí
-		virtual int Forward(
-			const Data &inputIds,
-			const Data &attentionMask,
-			const Data &positionIds,
-			std::vector <std::pair <Data, Data> > &pastKeyValues) = 0;
+        virtual void LoadFromFile(const std::string &fileName) = 0; // ä»æ–‡ä»¶è¯»å–
+        // æ¨ç†
+        virtual int Forward(
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector <std::pair <Data, Data> > &pastKeyValues) = 0;
 
-		virtual std::string Response(const std::string& input, RuntimeResult retCb) = 0; // ¸ù¾İ¸ø³öµÄÄÚÈİ»Ø¸´
+        virtual std::string Response(const std::string& input, RuntimeResult retCb) = 0; // æ ¹æ®ç»™å‡ºçš„å†…å®¹å›å¤
 
-		virtual void SaveLowBitModel(const std::string &fileName, int bit) {}; // ´æ´¢³ÉÁ¿»¯Ä£ĞÍ
+        virtual void SaveLowBitModel(const std::string &fileName, int bit) {}; // å­˜å‚¨æˆé‡åŒ–æ¨¡å‹
 
-		virtual void WarmUp() {}; // Ô¤ÈÈ
+        virtual void WarmUp() {}; // é¢„çƒ­
 
-		virtual void RotatePosition2D(Data &data, const Data &positionIds) {}; // ¶şÎ¬Î»ÖÃ±àÂë
+        virtual void RotatePosition2D(Data &data, const Data &positionIds) {}; // äºŒç»´ä½ç½®ç¼–ç 
 
-		virtual void CausalMask(Data &data, int start) {}; // Òò¹ûmask
+        virtual void CausalMask(Data &data, int start) {}; // å› æœmask
 
-		int embed_dim = 4096;
-		int num_attention_heads = 32;
-		int head_dim = embed_dim / num_attention_heads;
-		const int max_positions = 2048;
-		const int rotary_dim = 64;
-		const float scale_attn = sqrt(head_dim);
+        int embed_dim = 4096;
+        int num_attention_heads = 32;
+        int head_dim = embed_dim / num_attention_heads;
+        const int max_positions = 2048;
+        int rotary_dim = 64;
+        const float scale_attn = sqrt(head_dim);
 
-		int block_cnt = 28;
+        int block_cnt = 28;
 
-		std::vector <std::vector <float> > sin, cos;
+        std::vector <std::vector <float> > sin, cos;
 
-		WeightMap weight; // È¨ÖØ
+        WeightMap weight; // æƒé‡
 
-	};
+    };
 }
