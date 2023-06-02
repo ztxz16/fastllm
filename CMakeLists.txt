@@ -32,25 +32,13 @@ add_library(fastllm OBJECT
             ${FASTLLM_CXX_SOURCES}
             ${FASTLLM_CUDA_SOURCES}
             )
-if (USE_CUDA)
-    target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS})
-endif()
-
-add_library(fastllm-shared
-  SHARED
-    $<TARGET_OBJECTS:fastllm>
-  )
- 
-set_target_properties(fastllm-shared
-  PROPERTIES
-    OUTPUT_NAME "message"
-  )
+target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS})
 
 add_executable(main main.cpp)
-target_link_libraries(main fastllm-shared)
+target_link_libraries(main fastllm)
 
 add_executable(quant tools/quant.cpp)
-target_link_libraries(quant fastllm-shared)
+target_link_libraries(quant fastllm)
 
 add_executable(webui example/webui/webui.cpp)
-target_link_libraries(webui fastllm-shared)
+target_link_libraries(webui fastllm)
