@@ -2,6 +2,8 @@
 // Created by huangyuyang on 5/11/23.
 //
 
+#include "utils.h"
+
 #include "chatglm.h"
 
 #include <cmath>
@@ -17,36 +19,6 @@
 #endif
 
 namespace fastllm {
-    extern double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2);
-
-    struct TimeRecord {
-        std::map <std::string, float> v;
-        std::chrono::system_clock::time_point t;
-
-        void Clear() {
-            v.clear();
-        }
-
-        void Record() {
-            t = std::chrono::system_clock::now();
-        }
-
-        void Record(const std::string &key) {
-            auto now = std::chrono::system_clock::now();
-            v[key] += GetSpan(t, now);
-            t = now;
-        }
-
-        void Print() {
-            float s = 0;
-            for (auto &it : v) {
-                printf("%s: %f s.\n", it.first.c_str(), it.second);
-                s += it.second;
-            }
-            printf("Total: %f s.\n", s);
-        }
-    };
-
     ChatGLMModel::ChatGLMModel() {
         sin.resize(max_positions);
         cos.resize(max_positions);

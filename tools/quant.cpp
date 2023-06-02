@@ -8,6 +8,7 @@
 
 #include "moss.h"
 #include "chatglm.h"
+#include "vicuna.h"
 
 struct QuantConfig {
     std::string model = "chatglm"; // 模型类型, chatglm或moss
@@ -19,7 +20,7 @@ struct QuantConfig {
 void Usage() {
     std::cout << "Usage:" << std::endl;
     std::cout << "[-h|--help]:                      显示帮助" << std::endl;
-    std::cout << "<-m|--model> <args>:              模型类型，默认为chatglm, 可以设置为chatglm, moss" << std::endl;
+    std::cout << "<-m|--model> <args>:              模型类型，默认为chatglm, 可以设置为chatglm, moss, vicuna" << std::endl;
     std::cout << "<-p|--path> <args>:               模型文件的路径" << std::endl;
     std::cout << "<-b|--bits> <args>:               量化位数" << std::endl;
     std::cout << "<-o|--output> <args>:             输出文件路径" << std::endl;
@@ -61,6 +62,10 @@ int main(int argc, char **argv) {
         fastllm::ChatGLMModel chatGlm;
         chatGlm.LoadFromFile(config.path);
         chatGlm.SaveLowBitModel(config.output, config.bits);
+    } else if (config.model == "vicuna") {
+        fastllm::VicunaModel vicuna;
+        vicuna.LoadFromFile(config.path);
+        vicuna.SaveLowBitModel(config.output, config.bits);
     } else {
         Usage();
         exit(-1);
