@@ -257,7 +257,9 @@ namespace fastllm {
     void Data::UpdateUnitSize() {
         if (this->dataType == DataType::FLOAT32) {
             this->unitSize = 4;
-        } else if (this->dataType == DataType::BFLOAT16 || this->dataType == DataType::INT16) {
+        } else if (this->dataType == DataType::BFLOAT16 ||
+                this->dataType == DataType::INT16 ||
+                this->dataType == DataType::FLOAT16) {
             this->unitSize = 2;
         } else if (this->dataType == DataType::INT8) {
             this->unitSize = 1;
@@ -912,7 +914,7 @@ namespace fastllm {
             weight[name] = Data(dataType, dims);
 
             if (lowMemMode && this->embeddingNames.find(name) != this->embeddingNames.end()) {
-	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16) {
+	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
 	            	weight[name].fileName = fileName;
 #if defined(_WIN32) or defined(_WIN64)
 	            	weight[name].filePos = _ftelli64(buffer.f);
@@ -925,7 +927,7 @@ namespace fastllm {
 	            }
             } else {
 	            weight[name].Allocate();
-	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16) {
+	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
 		            buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
 	            } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
 		            int bit = (dataType == DataType::INT4 ? 4 : 8);
@@ -955,7 +957,7 @@ namespace fastllm {
 
     void WeightMap::SaveLowBitModel(const std::string &fileName, int bit) {
         AssertInFastLLM(fileName != "", "Error: output's name shouldn't be empty.\n");
-        AssertInFastLLM(bit == 4 || bit == 8, "Error: only support 8 bit or 4 bit model.\n");
+        AssertInFastLLM(bit == 4 || bit == 8 || bit == 16, "Error: only support 16 bit or 8 bit or 4 bit model.\n");
         FileWriter buffer(fileName);
         buffer.WriteInt(this->versionId);
         if (this->versionId == 1) {
@@ -1003,67 +1005,79 @@ namespace fastllm {
                 }
                 buffer.WriteBytes((uint8_t*)uDatas.data(), len * sizeof(uint16_t));
             } else if (data.weightType == WeightType::LINEAR) {
-                // Linear层权重，分通道量化之
-                int k = data.dims[0], m = data.dims[1];
-                int threadNum = 8;
-                int per = k / threadNum;
-                int cur = 0;
-                std::vector <std::thread*> threads;
-                std::vector <LowBitConfig> configs;
-                std::vector <uint8_t> uDatas;
-                configs.resize(k);
-
-                int bytes = k * m;
-                if (bit == 4) {
-                    bytes = (k * m + 1) / 2;
-                }
-                uDatas.resize(bytes);
-                for (int i = 0; i < threadNum; i++) {
-                    int end = cur + per;
-                    if (i == threadNum - 1) {
-                        end = k;
+                if (bit == 16) {
+                    // fp16, 直接转换
+                    buffer.WriteInt((int)DataType::FLOAT16);
+                    int len = data.Count(0);
+                    std::vector <uint16_t> uDatas;
+                    uDatas.resize(len);
+                    for (int i = 0; i < len; i++) {
+                        uDatas[i] = float_to_half(((float *)data.cpuData)[i]);
                     }
-                    threads.push_back(new std::thread([&bit] (int st, int end, int m,
-                            float *f, uint8_t *u8, LowBitConfig *configs) {
-                        for (int i = st; i < end; i++) {
-                            float minValue = 1e9, maxValue = -1e9;
-                            for (int j = 0; j < m; j++) {
-                                minValue = std::min(minValue, f[i * m + j]);
-                                maxValue = std::max(maxValue, f[i * m + j]);
-                            }
-                            if (bit == 8) {
-                                configs[i] = LowBitConfig(minValue, maxValue, 8);
+                    buffer.WriteBytes((uint8_t*)uDatas.data(), len * sizeof(uint16_t));
+                } else {
+                    // Linear层权重，分通道量化之
+                    int k = data.dims[0], m = data.dims[1];
+                    int threadNum = 8;
+                    int per = k / threadNum;
+                    int cur = 0;
+                    std::vector<std::thread *> threads;
+                    std::vector<LowBitConfig> configs;
+                    std::vector<uint8_t> uDatas;
+                    configs.resize(k);
+
+                    int bytes = k * m;
+                    if (bit == 4) {
+                        bytes = (k * m + 1) / 2;
+                    }
+                    uDatas.resize(bytes);
+                    for (int i = 0; i < threadNum; i++) {
+                        int end = cur + per;
+                        if (i == threadNum - 1) {
+                            end = k;
+                        }
+                        threads.push_back(new std::thread([&bit](int st, int end, int m,
+                                                                 float *f, uint8_t *u8, LowBitConfig *configs) {
+                            for (int i = st; i < end; i++) {
+                                float minValue = 1e9, maxValue = -1e9;
                                 for (int j = 0; j < m; j++) {
-                                    u8[i * m + j] = configs[i].quantization(f[i * m + j]);
+                                    minValue = std::min(minValue, f[i * m + j]);
+                                    maxValue = std::max(maxValue, f[i * m + j]);
                                 }
-                            } else {
-                                configs[i] = LowBitConfig(minValue, maxValue, 4);
-                                for (int j = 0; j < m; j++) {
-                                    int id = (i * m + j) / 2;
-                                    uint8_t value = configs[i].quantization(f[i * m + j]);
-                                    if ((i * m + j) % 2) {
-                                        u8[id] = (u8[id] & 0xF0) | value;
-                                    } else {
-                                        u8[id] = (u8[id] & 0xF) | (value << 4);
+                                if (bit == 8) {
+                                    configs[i] = LowBitConfig(minValue, maxValue, 8);
+                                    for (int j = 0; j < m; j++) {
+                                        u8[i * m + j] = configs[i].quantization(f[i * m + j]);
+                                    }
+                                } else {
+                                    configs[i] = LowBitConfig(minValue, maxValue, 4);
+                                    for (int j = 0; j < m; j++) {
+                                        int id = (i * m + j) / 2;
+                                        uint8_t value = configs[i].quantization(f[i * m + j]);
+                                        if ((i * m + j) % 2) {
+                                            u8[id] = (u8[id] & 0xF0) | value;
+                                        } else {
+                                            u8[id] = (u8[id] & 0xF) | (value << 4);
+                                        }
                                     }
                                 }
                             }
-                        }
-                    }, cur, end, m, (float*)data.cpuData, uDatas.data(), configs.data()));
-                    cur = end;
-                }
-                for (int i = 0; i < threadNum; i++) {
-                    threads[i]->join();
-                    delete threads[i];
-                }
+                        }, cur, end, m, (float *) data.cpuData, uDatas.data(), configs.data()));
+                        cur = end;
+                    }
+                    for (int i = 0; i < threadNum; i++) {
+                        threads[i]->join();
+                        delete threads[i];
+                    }
 
-                buffer.WriteInt(bit == 8 ? (int)DataType::INT8 : (int)DataType::INT4);
-                buffer.WriteInt(0); // 按通道0分通道量化
-                for (int i = 0; i < k; i++) {
-                    buffer.WriteFloat(configs[i].min);
-                    buffer.WriteFloat(configs[i].max);
+                    buffer.WriteInt(bit == 8 ? (int) DataType::INT8 : (int) DataType::INT4);
+                    buffer.WriteInt(0); // 按通道0分通道量化
+                    for (int i = 0; i < k; i++) {
+                        buffer.WriteFloat(configs[i].min);
+                        buffer.WriteFloat(configs[i].max);
+                    }
+                    buffer.WriteBytes(uDatas.data(), bytes);
                 }
-                buffer.WriteBytes(uDatas.data(), bytes);
             }
         }
 
@@ -1565,6 +1579,21 @@ namespace fastllm {
         }
     }
 
+    // float的input, float16的weight, 直接计算得到float的output
+    void Float16LinearPart(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
+                         int n, int m, int k, int st, int end) {
+        for (int i = 0; i < n; i++) {
+            for (int j = st; j < end; j++) {
+                float now = biasData ? biasData[j] : 0.0f;
+                int l = 0;
+                for (; l < m; l++) {
+                    now += inputData[i * m + l] * half_to_float(weightData[j * m + l]);
+                }
+                outputData[i * k + j] = now;
+            }
+        }
+    }
+
     // float的input, int8的weight, 直接计算得到float的output
     void Int8LinearPart(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         LowBitConfig *configs, int n, int m, int k, int st, int end) {
@@ -1714,6 +1743,32 @@ namespace fastllm {
             input.ToDevice(DataDevice::CUDA);
             output.ToDevice(DataDevice::CUDA);
 #endif
+        } else if (weight.dataType == DataType::FLOAT16) {
+#ifdef USE_CUDA
+            FastllmCudaMatMulFloat16(input, weight, bias, output, n, m, k);
+            return;
+#endif
+            float *inputData = (float *) input.cpuData;
+            uint16_t *weightData = (uint16_t *) weight.cpuData;
+            float *outputData = (float *) output.cpuData;
+            float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+
+            int threadNum = threads;
+            int per = k / threadNum;
+            int cur = 0;
+            std::vector<std::thread *> threads;
+            for (int i = 0; i < threadNum - 1; i++) {
+                int end = cur + per + (cur + per * (threadNum - i) < k);
+                threads.push_back(new std::thread(&Float16LinearPart, inputData, weightData, biasData, outputData,
+                                                  n, m, k, cur, end));
+                cur = end;
+            }
+
+            Float16LinearPart(inputData, weightData, biasData, outputData, n, m, k, cur, k);
+            for (int i = 0; i < threadNum - 1; i++) {
+                threads[i]->join();
+                delete threads[i];
+            }
         } else if (weight.dataType == DataType::INT8) {
             float *inputData = (float *) input.cpuData;
             uint8_t *weightData = (uint8_t *) weight.cpuData;
