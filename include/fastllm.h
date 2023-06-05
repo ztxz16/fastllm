@@ -63,7 +63,7 @@ namespace fastllm {
     };
 
     enum DataType {
-        FLOAT32 = 0, BFLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6
+        FLOAT32 = 0, BFLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6, FLOAT16 = 7
     };
 
     enum DataDevice {
