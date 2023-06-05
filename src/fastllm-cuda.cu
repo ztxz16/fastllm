@@ -18,6 +18,20 @@ double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_
     return double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
 };
 
+__global__ void FastllmCudaFloat2HalfKernel(float* a, half *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        b[idx] = __float2half(a[idx]);
+    }
+}
+
+__global__ void FastllmCudaHalf2FlotaKernel(half* a, float *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        b[idx] = __half2float(a[idx]);
+    }
+}
+
 __global__ void FastllmGeluKernel(float* a, float *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -528,6 +542,67 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
         FastllmGemvInt4Kernel0 <256> <<< k, 256 >>> (cudaInput + i * m, (uint8_t *) weight.cudaData,
             cudaOutput + i * k, cudaBiasData, cudaScales, cudaZeropoints, m, k);
     }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    if (weight.cudaData == nullptr) {
+        weight.ToDevice(fastllm::DataDevice::CUDA);
+        float *cudaBiasData;
+        cudaMalloc(&cudaBiasData, k * sizeof(float));
+        if (bias.dims.size() > 0) {
+            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cpuData, k * sizeof(float), cudaMemcpyHostToDevice);
+        } else {
+            cudaMemset(cudaBiasData, 0, k * sizeof(float));
+        }
+        weight.extraCudaData.push_back((void*)cudaBiasData);
+    }
+    float *cudaBiasData = (float*)weight.extraCudaData[0];
+    float *cudaInput = (float*)FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
+
+    half *cudaFp16Input, *cudaFp16Output;
+    cudaFp16Input = (half*)FastllmCudaMalloc(n * m * sizeof(half));
+    cudaFp16Output = (half*)FastllmCudaMalloc(n * k * sizeof(half));
+
+    __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
+    if (fastllmCublasHandle == nullptr) {
+        cublasCreate(&fastllmCublasHandle);
+    }
+    //cudaDeviceSynchronize();
+    cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+    cublasStatus_t status;
+
+    int len = n * m;
+    int threadPerBlock = min(256, len);
+    FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaFp16Input, len);
+
+    status = cublasGemmEx(fastllmCublasHandle,
+                          CUBLAS_OP_T, CUBLAS_OP_N,
+                          k, n, m,
+                          &h_alpha, (half *)weight.cudaData, AType,
+                          m, cudaFp16Input, BType,
+                          m, &h_beta,
+                          cudaFp16Output, CType,
+                          k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("Error: cublas error.\n");
+        exit(0);
+    }
+
+    len = n * k;
+    FastllmCudaHalf2FlotaKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput, len);
+    for (int i = 0; i < n; i++) {
+        len = k;
+        FastllmAddToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>> (cudaOutput + i * k, (float*)weight.extraCudaData[0], 1.0f, k);
+    }
+
+    //cudaDeviceSynchronize();
+
+    FastllmCudaFree(cudaFp16Input);
+    FastllmCudaFree(cudaFp16Output);
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
