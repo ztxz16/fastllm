@@ -79,18 +79,17 @@ __global__ void FastllmPermuteKernel(float *dst, float *ori, int *temp, int axis
 
 __global__ void FastllmRotatePosition2DKernel(float *data, float *positionIds, float *sin, float *cos,
                                               int outer, int spatial, int n, int m, int partStride, int sinCosStride, int rotateDim) {
-    int o = blockIdx.x / 2;
-    int part = blockIdx.x % 2;
+    int o = (blockIdx.x / n) / 2;
+    int part = (blockIdx.x / n) % 2;
     int j = threadIdx.x;
     int index = (int) (positionIds[part * partStride + o]);
     float curSin = sin[index * sinCosStride + j];
     float curCos = cos[index * sinCosStride + j];
     float *d = (float *) data + o * spatial + part * m / 2 + j;
-    for (int i = 0; i < n; i++) {
-        float a = d[i * m], b = d[i * m + m / 4];
-        d[i * m] = a * curCos - b * curSin;
-        d[i * m + m / 4] = a * curSin + b * curCos;
-    }
+    int i = blockIdx.x % n;
+    float a = d[i * m], b = d[i * m + m / 4];
+    d[i * m] = a * curCos - b * curSin;
+    d[i * m + m / 4] = a * curSin + b * curCos;
 }
 
 template <int THREAD_PER_BLOCK>
@@ -896,7 +895,7 @@ bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fast
                                                              outer, channels);
         }
     } else {
-        printf("softmax error.\n");
+        printf("layernorm error.\n");
         exit(0);
     }
 
@@ -951,7 +950,6 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
     float *cudaInput0 = (float *) FastllmCudaPrepareInput(input0);
     float *cudaInput1 = (float *) FastllmCudaPrepareInput(input1);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
-
     if (fastllmCublasHandle == nullptr) {
         cublasCreate(&fastllmCublasHandle);
     }
@@ -989,8 +987,7 @@ bool FastllmCudaRotatePosition2D(fastllm::Data &data, const fastllm::Data &posit
     int outer = data.dims[0] * data.dims[1];
     int spatial = data.Count(2);
     int n = data.dims[2], m = data.dims[3];
-
-    FastllmRotatePosition2DKernel <<< outer * 2, min(rotaryDim, m / 4) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
+    FastllmRotatePosition2DKernel <<< outer * 2 * n, min(rotaryDim, m / 4) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
                                              outer, spatial, n, m,
                                              (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
 
