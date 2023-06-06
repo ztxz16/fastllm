@@ -34,6 +34,16 @@ namespace fastllm {
                 cos[i][j] = ::cos((float)i * invFreq[j]);
             }
         }
+
+        std::vector <float> fsin, fcos;
+        for (int i = 0; i < sin.size(); i++) {
+            for (int j = 0; j < sin[0].size(); j++) {
+                fsin.push_back(sin[i][j]);
+                fcos.push_back(cos[i][j]);
+            }
+        }
+        sinData.CopyFrom(Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, fsin));
+        cosData.CopyFrom(Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, fcos));
         weight.embeddingNames.insert("transformer.word_embeddings.weight");
     }
 
@@ -70,18 +80,8 @@ namespace fastllm {
 TimeRecord timeRecord;
 //timeRecord.Clear();
 //timeRecord.Record();
-        std::vector <float> fsin, fcos;
-        for (int i = 0; i < sin.size(); i++) {
-            for (int j = 0; j < sin[0].size(); j++) {
-                fsin.push_back(sin[i][j]);
-                fcos.push_back(cos[i][j]);
-            }
-        }
-        Data sinData = Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, fsin);
-        Data cosData = Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, fcos);
         sinData.ToDevice(DataDevice::CUDA);
         cosData.ToDevice(DataDevice::CUDA);
-
         Data inputEmbeddings;
         Embedding(inputIds, this->weight["transformer.word_embeddings.weight"], inputEmbeddings);
         Data hiddenStates = inputEmbeddings;
@@ -107,6 +107,7 @@ TimeRecord timeRecord;
             Split(qkv, -1, per, per * 2, k);
             Split(qkv, -1, per * 2, per * 3, v);
 
+//timeRecord.Record("split");
 #ifdef USE_CUDA
             FastllmCudaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
             FastllmCudaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
@@ -121,8 +122,9 @@ TimeRecord timeRecord;
             pastValue.ToDevice(DataDevice::CUDA);
 
             k.Resize({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
-            k.Permute({1, 0, 2});
             v.Resize({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
+
+            k.Permute({1, 0, 2});
             v.Permute({1, 2, 0});
 
             int unitLen = 64;
@@ -188,6 +190,7 @@ TimeRecord timeRecord;
 //timeRecord.Record("MatMulTransB");
             contextLayer.Reshape(outputSize);
             contextLayer.Permute({2, 0, 1, 3});
+
             contextLayer.Reshape({contextLayer.dims[0], contextLayer.dims[1], embed_dim});
             // 1.2.4 dense
             std::string denseWeightName = "transformer.layers." + std::to_string(i) + ".attention.dense.weight";
@@ -303,6 +306,12 @@ TimeRecord timeRecord;
 			retCb(-1, retString.c_str());
 
         return retString;
+    }
+
+    void ChatGLMModel::ResponseBatch(const std::vector <std::string> &inputs,
+                               std::vector <std::string> &outputs,
+                               RuntimeResult retCb) {
+
     }
 
     void ChatGLMModel::WarmUp() {
