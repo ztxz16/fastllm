@@ -24,6 +24,14 @@ namespace fastllm {
                 const Data &positionIds,
                 std::vector <std::pair <Data, Data> > &pastKeyValues);
 
+        std::vector <int> ForwardBatch(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data> &attentionMask,
+                const Data &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data, Data> > &pastKeyValues);
+
 		virtual std::string Response(const std::string& input, RuntimeResult retCb); // 根据给出的内容回复
 
         virtual void ResponseBatch(const std::vector <std::string> &inputs,
