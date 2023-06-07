@@ -445,6 +445,14 @@ namespace fastllm {
 #endif
     }
 
+    void Data::PrintShape() const {
+        printf("shape: ");
+        for (int i : this->dims) {
+            printf("%d ", i);
+        }
+        printf("\n");
+    }
+
     void Data::Print() const {
         printf("shape: ");
         for (int i : this->dims) {
