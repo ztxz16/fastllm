@@ -139,6 +139,8 @@ namespace fastllm {
 
         uint64_t Count(int i) const; // dims[i] * strides[i]
 
+        void PrintShape() const; // 输出形状
+
         void Print() const; // 输出
 
         void Permute(const std::vector <int> &axis); // 转置
