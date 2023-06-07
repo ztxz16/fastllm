@@ -238,6 +238,188 @@ TimeRecord timeRecord;
         return ret.second;
     }
 
+    std::vector <int> ChatGLMModel::ForwardBatch(
+            int batch,
+            const Data &inputIds,
+            const std::vector <Data> &attentionMask,
+            const Data &positionIds,
+            const std::vector <int> &seqLens,
+            std::vector <std::pair <Data, Data> > &pastKeyValues) {
+        sinData.ToDevice(DataDevice::CUDA);
+        cosData.ToDevice(DataDevice::CUDA);
+        Data inputEmbeddings;
+        Embedding(inputIds, this->weight["transformer.word_embeddings.weight"], inputEmbeddings);
+        Data hiddenStates = inputEmbeddings;
+        hiddenStates.Permute({1, 0, 2});
+        hiddenStates.ToDevice(DataDevice::CUDA);
+        for (int i = 0; i < block_cnt; i++) {
+            std::string inputLNWeightName = "transformer.layers." + std::to_string(i) + ".input_layernorm.weight";
+            std::string inputLNBiasName = "transformer.layers." + std::to_string(i) + ".input_layernorm.bias";
+            Data attenInput;
+            LayerNorm(hiddenStates, weight[inputLNWeightName], weight[inputLNBiasName], -1, attenInput);
+            std::string qkvWeightName = "transformer.layers." + std::to_string(i) + ".attention.query_key_value.weight";
+            std::string qkvBiasName = "transformer.layers." + std::to_string(i) + ".attention.query_key_value.bias";
+            Data qkv, q, k, v;
+            Linear(attenInput, weight[qkvWeightName], weight[qkvBiasName], qkv);
+            qkv.Reshape({qkv.dims[0], qkv.dims[1], num_attention_heads, -1});
+            int per = qkv.dims.back() / 3;
+            Split(qkv, -1, 0, per, q);
+            Split(qkv, -1, per, per * 2, k);
+            Split(qkv, -1, per * 2, per * 3, v);
+
+#ifdef USE_CUDA
+            FastllmCudaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
+            FastllmCudaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
+#else
+            RotatePosition2D(q, positionIds);
+            RotatePosition2D(k, positionIds);
+#endif
+            k.Resize({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
+            v.Resize({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
+            q.Reshape({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
+
+            Data contextLayer = Data(DataType::FLOAT32);
+
+            int totalLen = 0;
+            for (int b = 0; b < batch; b++) {
+                totalLen += seqLens[b];
+            }
+
+            int total = 0;
+            std::vector <Data> curKs, curVs, curQs;
+            curKs.resize(batch);
+            curVs.resize(batch);
+            curQs.resize(batch);
+            for (int b = 0; b < batch; b++) {
+                Split(k, 0, total, total + seqLens[b], curKs[b]);
+                Split(v, 0, total, total + seqLens[b], curVs[b]);
+                Split(q, 0, total, total + seqLens[b], curQs[b]);
+                total += seqLens[b];
+            }
+            for (int b = 0; b < batch; b++) {
+                curKs[b].Permute({1, 0, 2});
+                curVs[b].Permute({1, 2, 0});
+                curQs[b].Permute({1, 0, 2});
+            }
+
+            for (int b = 0; b < batch ; b++) {
+                Data &k = curKs[b], &v = curVs[b], &q = curQs[b];
+                Data &pastKey = pastKeyValues[b * block_cnt + i].first, &pastValue = pastKeyValues[b * block_cnt + i].second;
+
+                pastKey.ToDevice(DataDevice::CUDA);
+                pastValue.ToDevice(DataDevice::CUDA);
+
+                int unitLen = 64;
+#ifdef USE_CUDA
+                unitLen = 128;
+#endif
+                while ((pastKey.dims.size() == 0 &&
+                        (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
+                       || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
+                    std::vector<int> newDims;
+                    if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                        newDims = std::vector<int>{k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
+                    } else {
+                        newDims = pastKey.dims;
+                        newDims[1] += ((k.dims[1] - 1) / unitLen + 1) * unitLen;
+                    }
+                    pastKey.Expansion(newDims);
+                }
+
+                while ((pastValue.dims.size() == 0 &&
+                        (pastValue.expansionDims.size() == 0 || v.dims[2] > pastValue.expansionDims[2]))
+                       || (pastValue.dims.size() > 0 && pastValue.dims[2] + v.dims[2] > pastValue.expansionDims[2])) {
+                    std::vector<int> newDims;
+                    if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                        newDims = std::vector<int>{v.dims[0], v.dims[1], ((v.dims[2] - 1) / unitLen + 1) * unitLen};
+                    } else {
+                        newDims = pastValue.dims;
+                        newDims[2] += ((v.dims[2] - 1) / unitLen + 1) * unitLen;
+                    }
+                    pastValue.Expansion(newDims);
+                }
+
+                CatDirect(pastKey, k, 1);
+                CatDirect(pastValue, v, 2);
+
+                std::vector<int> outputSize = {1, q.dims[0], q.dims[1], pastKey.dims[1]};
+
+                // 1.2 Attention
+                // 1.2.0 q * k^T
+                Data attnProbs;
+                MatMulTransB(q, pastKey, attnProbs, 1.0 / (scale_attn * (i + 1)));
+                attnProbs.Reshape(outputSize);
+
+                // 1.2.1 Mask
+                if (attentionMask.size() != 0) {
+                    AttentionMask(attnProbs, attentionMask[b], -10000);
+                }
+                // 1.2.2 softmax
+                Mul(attnProbs, i + 1, attnProbs);
+                Softmax(attnProbs, attnProbs, -1);
+
+                outputSize = {1, pastValue.dims[0], q.dims[1], pastValue.dims[1]};
+                attnProbs.Reshape({outputSize[0] * outputSize[1], outputSize[2], -1});
+                // 1.2.3 prob * v
+                Data curContextLayer;
+                MatMulTransB(attnProbs, pastValue, curContextLayer);
+                curContextLayer.Reshape(outputSize);
+                curContextLayer.Permute({2, 0, 1, 3});
+                curContextLayer.Reshape({curContextLayer.dims[0], curContextLayer.dims[1], embed_dim});
+
+                if (contextLayer.dims.size() == 0) {
+                    std::vector <int> dims = curContextLayer.dims;
+                    dims[0] = totalLen;
+                    contextLayer.Expansion(dims);
+                }
+                contextLayer.ToDevice(DataDevice::CUDA);
+                CatDirect(contextLayer, curContextLayer, 0);
+            }
+
+            // 1.2.4 dense
+            std::string denseWeightName = "transformer.layers." + std::to_string(i) + ".attention.dense.weight";
+            std::string denseBiasName = "transformer.layers." + std::to_string(i) + ".attention.dense.bias";
+            Data attnOutput;
+            Linear(contextLayer, weight[denseWeightName], weight[denseBiasName], attnOutput);
+
+            // 1.3
+            float alpha = sqrt(2 * block_cnt);
+            Mul(attenInput, alpha, hiddenStates);
+            AddTo(hiddenStates, attnOutput);
+            std::string postLNWeightName = "transformer.layers." + std::to_string(i) + ".post_attention_layernorm.weight";
+            std::string postLNBiasName = "transformer.layers." + std::to_string(i) + ".post_attention_layernorm.bias";
+            Data mlpInput;
+            LayerNorm(hiddenStates, weight[postLNWeightName], weight[postLNBiasName], -1, mlpInput);
+            // 1.4 MLP
+            std::string fcInKeyName = "transformer.layers." + std::to_string(i) + ".mlp.dense_h_to_4h";
+            std::string fcOutKeyName = "transformer.layers." + std::to_string(i) + ".mlp.dense_4h_to_h";
+            Data middle;
+            Linear(mlpInput, weight[fcInKeyName + ".weight"], weight[fcInKeyName + ".bias"], middle);
+            GeluNew(middle, middle);
+            Linear(middle, weight[fcOutKeyName + ".weight"], weight[fcOutKeyName + ".bias"], hiddenStates);
+            AddTo(hiddenStates, mlpInput, alpha);
+        }
+
+        LayerNorm(hiddenStates, weight["transformer.final_layernorm.weight"], weight["transformer.final_layernorm.bias"], -1, hiddenStates);
+        Data logits;
+        Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
+        logits.ToDevice(DataDevice::CPU);
+
+        std::vector <int> lastRet;
+        int total = 0;
+        for (int b = 0; b < batch; b++) {
+            std::pair<float, int> ret = std::make_pair(-1e9, -1);
+            int base = (total + seqLens[b] - 1);
+            total += seqLens[b];
+            for (int i = 0; i < logits.dims.back(); i++) {
+                ret = max(ret, std::make_pair(((float *) logits.cpuData)[base * logits.dims.back() + i], i));
+            }
+            lastRet.push_back(ret.second);
+        }
+
+        return lastRet;
+    }
+
     std::string ChatGLMModel::Response(const std::string& input, RuntimeResult retCb) {
         Data inputIds = this->weight.tokenizer.Encode(input);
         std::vector <float> ids;
@@ -311,7 +493,122 @@ TimeRecord timeRecord;
     void ChatGLMModel::ResponseBatch(const std::vector <std::string> &inputs,
                                std::vector <std::string> &outputs,
                                RuntimeResult retCb) {
+        // 1. first
+        int batch = inputs.size();
+        outputs.clear();
+        outputs.resize(batch, "");
 
+        std::vector <float> ids;
+        std::vector <int> seqLens;
+        for (int i = 0; i < inputs.size(); i++) {
+            Data inputIds = this->weight.tokenizer.Encode(inputs[i]);
+            seqLens.push_back(inputIds.Count(0) + 2);
+            for (int i = 0; i < inputIds.Count(0); i++) {
+                ids.push_back(((float*)inputIds.cpuData)[i]);
+            }
+            ids.push_back(130001);
+            ids.push_back(130004);
+        }
+        Data inputIds = Data(DataType::FLOAT32, {1, (int)ids.size()}, ids);
+
+        std::vector <float> vpids = std::vector <float> (2 * (int)ids.size(), 0);
+        std::vector <Data> attentionMasks;
+        attentionMasks.resize(seqLens.size());
+        int total = 0;
+        for (int i = 0; i < seqLens.size(); i++) {
+            int curLen = seqLens[i];
+
+            std::vector <float> vmask = std::vector <float> (curLen * curLen, 0);
+            for (int i = 0; i < curLen - 1; i++) {
+                vmask[i * curLen + curLen - 1] = 1;
+            }
+            attentionMasks[i].CopyFrom(Data(DataType::FLOAT32, {curLen, curLen}, vmask));
+
+            for (int j = 0; j < curLen - 1; j++) {
+                vpids[total + j] = j;
+            }
+            vpids[total + curLen - 1] = curLen - 2;
+            vpids[(int)ids.size() + total + curLen - 1] = 1;
+            total += curLen;
+        }
+        Data positionIds = Data(DataType::FLOAT32, {2, (int)ids.size()}, vpids);
+
+        std::vector <std::pair <Data, Data> > pastKeyValues;
+        for (int i = 0; i < batch * block_cnt; i++) {
+            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
+                                                   Data(DataType::FLOAT32)));
+        }
+
+        int len = 1;
+        std::vector <int> maskIds = std::vector <int> (batch, -1);
+        std::vector <float> results;
+        std::vector <bool> isEnding = std::vector <bool> (batch, false);
+        int index = 0;
+        while (true) {
+            auto st = std::chrono::system_clock::now();
+
+            for (int i = 0; i < attentionMasks.size(); i++) {
+                attentionMasks[i].ToDevice(DataDevice::CUDA);
+            }
+            positionIds.ToDevice(DataDevice::CUDA);
+            std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMasks, positionIds,
+                                                          seqLens, pastKeyValues);
+            std::vector <float> fret;
+            int endingCount = 0;
+            for (int i = 0; i < batch; i++) {
+                fret.push_back(ret[i]);
+                if (ret[i] == 130005) {
+                    isEnding[i] = true;
+                }
+                if (isEnding[i]) {
+                    endingCount++;
+                    continue;
+                }
+                results.push_back(ret[i]);
+                std::string curString = weight.tokenizer.Decode(
+                        Data(DataType::FLOAT32, {(int) results.size()}, results)).c_str();
+                printf("%d %s\n", i, curString.c_str());
+                outputs[i] += curString;
+                results.clear();
+
+                if (maskIds[i] == -1) {
+                    maskIds[i] = seqLens[i] - 2;
+                }
+
+                /*
+                if (retCb)
+                    retCb(index++, curString.c_str());
+                fflush(stdout);
+*/
+            }
+
+            if (endingCount == batch) {
+                break;
+            }
+
+            len++;
+
+            std::vector <float> pids = std::vector <float> (2 * batch);
+            for (int i = 0; i < batch; i++) {
+                pids[i] = maskIds[i];
+                pids[i + batch] = len;
+                seqLens[i] = 1;
+            }
+            positionIds.ToDevice(DataDevice::CPU);
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, batch}, fret));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {2, batch}, pids));
+            attentionMasks.clear();
+
+            printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
+
+            if (len == 8) {
+                break;
+            }
+        }
+/*
+        if (retCb)
+            retCb(-1, retString.c_str());
+*/
     }
 
     void ChatGLMModel::WarmUp() {

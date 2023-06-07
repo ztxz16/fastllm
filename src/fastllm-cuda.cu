@@ -500,6 +500,24 @@ __global__ void FastllmGemvInt4Kernel0(float *A, uint8_t *B, float *C,
     }
 }
 
+__global__ void FastllmCudaBatchMatMulTransBKernel(float *input0, int input0Stride, int input0Spatial,
+                                                   float *input1, int input1Stride, int input1Spatial,
+                                                   int n, int m, int k, float alpha, float *output) {
+    int batch = blockIdx.x;
+    float *A = input0 + input0Spatial * batch;
+    float *B = input1 + input1Spatial * batch;
+    float *C = output + n * k * batch;
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < k; j++) {
+            float sum = 0;
+            for (int l = 0; l < m; l++) {
+                sum += A[i * input0Stride + l] * B[j * input1Stride + l];
+            }
+            C[i * k + j] = sum * alpha;
+        }
+    }
+}
+
 void *FastllmCudaPrepareInput(const fastllm::Data &input) {
     void *ret;
     if (input.dataDevice == fastllm::DataDevice::CUDA) {
@@ -950,11 +968,16 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
     float *cudaInput0 = (float *) FastllmCudaPrepareInput(input0);
     float *cudaInput1 = (float *) FastllmCudaPrepareInput(input1);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
+/*
+    FastllmCudaBatchMatMulTransBKernel <<<batch, 1>>> (cudaInput0, input0Stride, input0Spatial,
+                                       cudaInput1, input1Stride, input1Spatial,
+                                       n, m, k, alpha, cudaOutput);
+    cudaDeviceSynchronize();
+*/
+    float beta = 0;
     if (fastllmCublasHandle == nullptr) {
         cublasCreate(&fastllmCublasHandle);
     }
-
-    float beta = 0;
     cublasStatus_t status;
 
     status = cublasSgemmStridedBatched(fastllmCublasHandle,
@@ -971,6 +994,7 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
         throw("cublas error");
         exit(0);
     }
+
     FastllmCudaFinishInput(input0, cudaInput0);
     FastllmCudaFinishInput(input1, cudaInput1);
     FastllmCudaFinishOutput(output, cudaOutput);
