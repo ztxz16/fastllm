@@ -35,7 +35,7 @@ namespace fastllm {
 
         virtual void ResponseBatch(const std::vector <std::string> &inputs,
                                    std::vector <std::string> &outputs,
-                                   RuntimeResult retCb);
+                                   RuntimeResultBatch retCb);
 
 		virtual void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
 
