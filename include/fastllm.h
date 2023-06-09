@@ -226,6 +226,8 @@ namespace fastllm {
     void AttentionMask(Data &input, const Data &mask, float maskValue); // 把input里对应位置mask中为1的部分变成maskValue
 
     void Permute(const Data &input, const std::vector<int> &axis, Data &output); // 转置
+
+    void TopK(const Data &input, Data &output, int topK); // 求topk
 }
 
 #endif //TEST_FASTLLM_H
