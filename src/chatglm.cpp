@@ -469,7 +469,7 @@ TimeRecord batchRecord;
 
     void ChatGLMModel::ResponseBatch(const std::vector <std::string> &inputs,
                                std::vector <std::string> &outputs,
-                               RuntimeResult retCb) {
+                               RuntimeResultBatch retCb) {
         // 1. first
         int batch = inputs.size();
         outputs.clear();
@@ -539,36 +539,34 @@ TimeRecord batchRecord;
             std::vector <float> fret;
             std::vector <float> results;
             int endingCount = 0;
+            std::vector <std::string> curStrings;
             for (int i = 0; i < batch; i++) {
                 fret.push_back(ret[i]);
                 if (ret[i] == 130005) {
                     isEnding[i] = true;
                 }
                 if (isEnding[i]) {
+                    curStrings.push_back("");
                     endingCount++;
                     continue;
                 }
                 results.push_back(ret[i]);
                 std::string curString = weight.tokenizer.Decode(
                         Data(DataType::FLOAT32, {(int) results.size()}, results)).c_str();
-//printf("%d %s\n", i, curString.c_str());
                 outputs[i] += curString;
+                curStrings.push_back(curString);
                 results.clear();
 
                 if (maskIds[i] == -1) {
                     maskIds[i] = seqLens[i];
                 }
-
-/*
-                if (retCb)
-                    retCb(index++, curString.c_str());
-                fflush(stdout);
-*/
             }
 
             if (endingCount == batch) {
                 break;
             }
+            if (retCb)
+                retCb(index++, curStrings);
 
             len++;
             std::vector <float> pids = std::vector <float> (batch * 2);
@@ -582,16 +580,11 @@ TimeRecord batchRecord;
             inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, fret));
             positionIds.CopyFrom(Data(DataType::FLOAT32, {batch * 2, 1}, pids));
 
-            printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
-
-            if (len == 8) {
-                break;
-            }
+            //printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
         }
-/*
+
         if (retCb)
-            retCb(-1, retString.c_str());
-*/
+            retCb(-1, outputs);
     }
 
     void ChatGLMModel::WarmUp() {
