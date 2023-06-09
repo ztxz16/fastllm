@@ -477,13 +477,15 @@ namespace fastllm {
         printf("\n");
          */
         int n = Count(0) / dims.back(), m = dims.back();
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < n && i < 10; i++) {
             for (int j = 0; j < 10 && j < m; j++) {
                 printf("%f ", ((float*)cpuData)[i * m + j]);
             }
-            printf("... ");
-            for (int j = 0; j < 10 && j < m; j++) {
-                printf("%f ", ((float*)cpuData)[i * m + (m - 10 + j)]);
+            if (m > 10) {
+                printf("... ");
+                for (int j = 0; j < 10 && j < m; j++) {
+                    printf("%f ", ((float *) cpuData)[i * m + (m - 10 + j)]);
+                }
             }
             printf("\n");
         }
@@ -2431,13 +2433,59 @@ namespace fastllm {
 
         float *maskData = (float *) mask.cpuData;
         float *attnData = (float *) input.cpuData;
-        int spatial = input.Count(2), outer = input.Count(0) / spatial;
-        for (int o = 0; o < outer; o++) {
-            for (int i = 0; i < spatial; i++) {
-                if (maskData[i] > 0.99) {
-                    attnData[o * spatial + i] = maskValue;
+        int spatial = input.Count(2), n = input.dims[0], m = input.dims[1];
+        for (int on = 0; on < n; on++) {
+            for (int om = 0; om < m; om++) {
+                int o = on * m + om;
+                for (int i = 0; i < spatial; i++) {
+                    if (maskData[on * spatial + i] > 0.99) {
+                        attnData[o * spatial + i] = maskValue;
+                    }
                 }
             }
         }
     }
+
+    void TopK(const Data &input, Data &output, int topk) {
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "TopK error: Data's type should be float32.\n");
+        AssertInFastLLM(topk == 1, "Unsupport topk > 1.");
+
+        int dimsLen = input.dims.size();
+        std::vector <int> dims = input.dims;
+        dims[dimsLen - 1] = topk * 2;
+        if (output.dims != dims || output.dataType != input.dataType || output.cpuData == nullptr) {
+            output.dataType = input.dataType;
+            output.Resize(dims);
+            output.Allocate();
+        }
+
+        int outer = input.Count(0) / input.Count(dimsLen - 1);
+        int channels = input.dims[dimsLen - 1];
+
+#ifdef USE_CUDA
+        FastllmCudaTopK(input, output, topk);
+        return;
+#endif
+
+        float *inputData = (float*)input.cpuData;
+        float *outputData = (float*)output.cpuData;
+
+        if (topk == 1) {
+            for (int o = 0; o < outer; o++) {
+                float maxValue = -1e100, idx = -1;
+                for (int j = 0; j < channels; j++) {
+                    if (inputData[j] > maxValue) {
+                        maxValue = inputData[j];
+                        idx = j;
+                    }
+                }
+                outputData[0] = idx;
+                outputData[1] = maxValue;
+                inputData += channels;
+                outputData += 2;
+            }
+        } else {
+            ErrorInFastLLM("Unsupport topk > 1.");
+        }
+    };
 }
