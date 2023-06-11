@@ -42,3 +42,6 @@ target_link_libraries(quant fastllm)
 
 add_executable(webui example/webui/webui.cpp)
 target_link_libraries(webui fastllm)
+
+add_executable(benchmark example/benchmark/benchmark.cpp)
+target_link_libraries(benchmark fastllm)
