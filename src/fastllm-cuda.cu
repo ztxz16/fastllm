@@ -547,24 +547,6 @@ __global__ void FastllmGemvInt4Kernel0(float *A, uint8_t *B, float *C,
     }
 }
 
-__global__ void FastllmCudaBatchMatMulTransBKernel(float *input0, int input0Stride, int input0Spatial,
-                                                   float *input1, int input1Stride, int input1Spatial,
-                                                   int n, int m, int k, float alpha, float *output) {
-    int batch = blockIdx.x;
-    float *A = input0 + input0Spatial * batch;
-    float *B = input1 + input1Spatial * batch;
-    float *C = output + n * k * batch;
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < k; j++) {
-            float sum = 0;
-            for (int l = 0; l < m; l++) {
-                sum += A[i * input0Stride + l] * B[j * input1Stride + l];
-            }
-            C[i * k + j] = sum * alpha;
-        }
-    }
-}
-
 void *FastllmCudaPrepareInput(const fastllm::Data &input) {
     void *ret;
     if (input.dataDevice == fastllm::DataDevice::CUDA) {
@@ -798,11 +780,20 @@ struct CudaMemoryBuffer {
         data(data), size(size), busy(busy) {}
 };
 std::vector <CudaMemoryBuffer> cudaBuffers;
+std::vector <CudaMemoryBuffer> bigBuffers;
 
 void * FastllmCudaMalloc(size_t size) {
-    if (size > 32 * 1024 * 1024) {
+    if (size > 1024 * 1024) {
+        for (int i = 0; i < bigBuffers.size(); i++) {
+            if (bigBuffers[i].size >= size && !bigBuffers[i].busy) {
+                bigBuffers[i].busy = true;
+                return bigBuffers[i].data;
+            }
+        }
+
         void * ret;
         cudaMalloc(&ret, size);
+        bigBuffers.push_back(CudaMemoryBuffer(ret, size, true));
         return ret;
     }
     for (int i = 0; i < cudaBuffers.size(); i++) {
@@ -824,7 +815,28 @@ void FastllmCudaFree(void *ret) {
             return;
         }
     }
+    for (int i = 0; i < bigBuffers.size(); i++) {
+        if (bigBuffers[i].data == ret) {
+            bigBuffers[i].busy = false;
+            return;
+        }
+    }
     cudaFree(ret);
+}
+
+void FastllmCudaMallocBigBuffer(size_t size) {
+    void * ret;
+    cudaMalloc(&ret, size);
+    bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
+}
+
+void FastllmCudaClearBigBuffer() {
+    for (int i = 0; i < bigBuffers.size(); i++) {
+        if (!bigBuffers[i].busy) {
+            cudaFree(bigBuffers[i].data);
+        }
+    }
+    bigBuffers.clear();
 }
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size) {
@@ -1020,6 +1032,40 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
     return true;
 }
 
+bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &input1, fastllm::Data &output,
+                                  int input0Spatial, int input1Spatial, int outputSpatial,
+                                  int input0Stride, int input1Stride,
+                                  int batch, int n, int m, int k, float alpha) {
+    float *cudaInput0 = (float *) FastllmCudaPrepareInput(input0);
+    float *cudaInput1 = (float *) FastllmCudaPrepareInput(input1);
+    float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
+    float beta = 0;
+    if (fastllmCublasHandle == nullptr) {
+        cublasCreate(&fastllmCublasHandle);
+    }
+    cublasStatus_t status;
+
+    status = cublasSgemmStridedBatched(fastllmCublasHandle,
+                                       CUBLAS_OP_N, CUBLAS_OP_N,
+                                       k, n, m, &alpha,
+                                       cudaInput1, input1Stride, input1Spatial,
+                                       cudaInput0, input0Stride, input0Spatial,
+                                       &beta,
+                                       cudaOutput, k, k * n, batch);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("status = %d\n", (int)status);
+        printf("%d %d %d\n", k, n, m);
+        printf("Error: cublas error.\n");
+        throw("cublas error");
+        exit(0);
+    }
+
+    FastllmCudaFinishInput(input0, cudaInput0);
+    FastllmCudaFinishInput(input1, cudaInput1);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
 bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Data &input1, fastllm::Data &output,
                               int input0Spatial, int input1Spatial, int outputSpatial,
                               int input0Stride, int input1Stride,
@@ -1027,12 +1073,6 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
     float *cudaInput0 = (float *) FastllmCudaPrepareInput(input0);
     float *cudaInput1 = (float *) FastllmCudaPrepareInput(input1);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
-/*
-    FastllmCudaBatchMatMulTransBKernel <<<batch, 1>>> (cudaInput0, input0Stride, input0Spatial,
-                                       cudaInput1, input1Stride, input1Spatial,
-                                       n, m, k, alpha, cudaOutput);
-    cudaDeviceSynchronize();
-*/
     float beta = 0;
     if (fastllmCublasHandle == nullptr) {
         cublasCreate(&fastllmCublasHandle);

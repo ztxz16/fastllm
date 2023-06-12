@@ -23,7 +23,7 @@ struct BenchmarkConfig {
     int model = LLM_TYPE_CHATGLM; // 模型类型, 0 chatglm,1 moss,2 vicuna
     std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
     int threads = 4; // 使用的线程数
-    bool lowMemMode = false; // 是否使用低内存模式
+    int limit = -1; // 输出token数限制，如果 < 0 则代表无限制
     int batch = -1; // batch数, -1时使用文件中的行数作为batch
     std::string file; // 输入文件
     std::string output; // 输出文件，如果不设定则输出到屏幕
@@ -35,7 +35,7 @@ void Usage() {
     std::cout << "<-m|--model> <args>:          模型类型，默认为0, 可以设置为0(chatglm),1(moss),2(vicuna)" << std::endl;
     std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
     std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
-    std::cout << "<-l|--low> <args>:            使用低内存模式" << std::endl;
+    std::cout << "<-l|--limit> <args>:          输出token数限制" << std::endl;
     std::cout << "<-b|--batch> <args>:          batch数"      << std::endl;
     std::cout << "<-f|--file> <args>:           输入文件，文件中每行一个prompt，如果行数不足batch则用之前的prompt补充"      << std::endl;
 }
@@ -62,8 +62,8 @@ void ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
         }
         else if (sargv[i] == "-t" || sargv[i] == "--threads") {
             config.threads = atoi(sargv[++i].c_str());
-        } else if (sargv[i] == "-l" || sargv[i] == "--low") {
-            config.lowMemMode = true;
+        } else if (sargv[i] == "-l" || sargv[i] == "--limit") {
+            config.limit = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "-b" || sargv[i] == "--batch") {
             config.batch = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "-f" || sargv[i] == "--file") {
@@ -77,9 +77,8 @@ void ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
     }
 }
 
-int initLLMConf(int model,bool isLowMem, const char* modelPath, int threads) {
+int initLLMConf(int model, const char* modelPath, int threads) {
     fastllm::SetThreads(threads);
-    fastllm::SetLowMemMode(isLowMem);
     modeltype = model;
     //printf("@@init llm:type:%d,path:%s\n", model, modelPath);
     if (modeltype == 0) {
@@ -117,7 +116,8 @@ void uninitLLM()
 int main(int argc, char **argv) {
     BenchmarkConfig config;
     ParseArgs(argc, argv, config);
-    initLLMConf(config.model, config.lowMemMode, config.path.c_str(), config.threads);
+    initLLMConf(config.model, config.path.c_str(), config.threads);
+    chatGlm->output_token_limit = config.limit;
 
     std::vector <std::string> inputs;
     if (config.file != "") {
@@ -145,8 +145,10 @@ int main(int argc, char **argv) {
     static int tokens = 0;
     auto st = std::chrono::system_clock::now();
     chatGlm->ResponseBatch(inputs, outputs, [](int index, std::vector <std::string> &contents) {
-        for (int i = 0; i < contents.size(); i++) {
-            tokens += (contents[i].size() > 0);
+        if (index != -1) {
+            for (int i = 0; i < contents.size(); i++) {
+                tokens += (contents[i].size() > 0);
+            }
         }
     });
     float spend = fastllm::GetSpan(st, std::chrono::system_clock::now());

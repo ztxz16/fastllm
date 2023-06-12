@@ -241,8 +241,8 @@ TimeRecord timeRecord;
             const Data &positionIds,
             std::vector <std::pair <Data, Data> > &pastKeyValues) {
 TimeRecord batchRecord;
-//batchrecord.Clear();
-//batchrecord.Record();
+//batchRecord.Clear();
+//batchRecord.Record();
         int maxLen = inputIds.dims[1];
         sinData.ToDevice(DataDevice::CUDA);
         cosData.ToDevice(DataDevice::CUDA);
@@ -251,25 +251,33 @@ TimeRecord batchRecord;
         Data hiddenStates = inputEmbeddings;
         hiddenStates.Permute({1, 0, 2});
         hiddenStates.ToDevice(DataDevice::CUDA);
+
+        Data attenInput;
+        Data qkv, q, k, v;
+        Data attnProbs;
+        Data attnOutput;
+        Data contextLayer;
+        Data mlpInput;
+        Data middle;
+
         // ChatGLMBlock
-//batchrecord.Record("Pre");
+//batchRecord.Record("Pre");
         for (int i = 0; i < block_cnt; i++) {
             std::string inputLNWeightName = "transformer.layers." + std::to_string(i) + ".input_layernorm.weight";
             std::string inputLNBiasName = "transformer.layers." + std::to_string(i) + ".input_layernorm.bias";
-            Data attenInput;
             LayerNorm(hiddenStates, weight[inputLNWeightName], weight[inputLNBiasName], -1, attenInput);
             std::string qkvWeightName = "transformer.layers." + std::to_string(i) + ".attention.query_key_value.weight";
             std::string qkvBiasName = "transformer.layers." + std::to_string(i) + ".attention.query_key_value.bias";
-            Data qkv, q, k, v;
-//batchrecord.Record("LayerNorm");
+
+//batchRecord.Record("LayerNorm");
             Linear(attenInput, weight[qkvWeightName], weight[qkvBiasName], qkv);
-//batchrecord.Record("Linear");
+//batchRecord.Record("Linear");
             qkv.Reshape({qkv.dims[0], qkv.dims[1], num_attention_heads, -1});
             int per = qkv.dims.back() / 3;
             Split(qkv, -1, 0, per, q);
             Split(qkv, -1, per, per * 2, k);
             Split(qkv, -1, per * 2, per * 3, v);
-
+//batchRecord.Record("SplitQKV");
 #ifdef USE_CUDA
             FastllmCudaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
             FastllmCudaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
@@ -277,6 +285,7 @@ TimeRecord batchRecord;
             RotatePosition2D(q, positionIds);
             RotatePosition2D(k, positionIds);
 #endif
+//batchRecord.Record("RotateQKV");
             Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
 
             pastKey.ToDevice(DataDevice::CUDA);
@@ -286,7 +295,7 @@ TimeRecord batchRecord;
             v.Resize({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
 
             k.Permute({1, 0, 2});
-            v.Permute({1, 2, 0});
+            v.Permute({1, 0, 2});
 
             int unitLen = 64;
 #ifdef USE_CUDA
@@ -297,6 +306,9 @@ TimeRecord batchRecord;
                 std::vector <int> newDims;
                 if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
                     newDims = std::vector <int> {k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
+                    if (this->output_token_limit > 0) {
+                        newDims[1] = std::min(newDims[1], k.dims[1] + this->output_token_limit);
+                    }
                 } else {
                     newDims = pastKey.dims;
                     newDims[1] += ((k.dims[1] - 1) / unitLen + 1) * unitLen;
@@ -304,20 +316,25 @@ TimeRecord batchRecord;
                 pastKey.Expansion(newDims);
             }
 
-            while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[2] > pastValue.expansionDims[2]))
-                   || (pastValue.dims.size() > 0 && pastValue.dims[2] + v.dims[2] > pastValue.expansionDims[2])) {
+            while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[1] > pastValue.expansionDims[1]))
+                   || (pastValue.dims.size() > 0 && pastValue.dims[1] + v.dims[1] > pastValue.expansionDims[1])) {
                 std::vector <int> newDims;
                 if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
-                    newDims = std::vector <int> {v.dims[0], v.dims[1], ((v.dims[2] - 1) / unitLen + 1) * unitLen};
+                    newDims = std::vector <int> {v.dims[0], ((v.dims[1] - 1) / unitLen + 1) * unitLen, v.dims[2]};
+                    if (this->output_token_limit > 0) {
+                        newDims[1] = std::min(newDims[1], k.dims[1] + this->output_token_limit);
+                    }
                 } else {
                     newDims = pastValue.dims;
-                    newDims[2] += ((v.dims[2] - 1) / unitLen + 1) * unitLen;
+                    newDims[1] += ((v.dims[1] - 1) / unitLen + 1) * unitLen;
                 }
                 pastValue.Expansion(newDims);
             }
-
+//batchRecord.Record("PermuteQKV");
             CatDirect(pastKey, k, 1);
-            CatDirect(pastValue, v, 2);
+//batchRecord.Record("CatK");
+            CatDirect(pastValue, v, 1);
+//batchRecord.Record("CatV");
             std::vector <int> outputSize = {q.dims[1], q.dims[2], q.dims[0], pastKey.dims[1]};
 
             q.Reshape({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
@@ -325,10 +342,9 @@ TimeRecord batchRecord;
 
             // 1.2 Attention
             // 1.2.0 q * k^T
-            Data attnProbs;
-//batchrecord.Record("GetQKV");
+//batchRecord.Record("GetQKV");
             MatMulTransB(q, pastKey, attnProbs, 1.0 / (scale_attn * (i + 1)));
-//batchrecord.Record("MatMulTransB");
+//batchRecord.Record("MatMulTransB");
             attnProbs.Reshape(outputSize);
             // 1.2.1 Mask
             if (attentionMask.dims.size() != 0) {
@@ -341,10 +357,9 @@ TimeRecord batchRecord;
             outputSize = {1, pastValue.dims[0], q.dims[1], pastValue.dims[1]};
             attnProbs.Reshape({outputSize[0] * outputSize[1], outputSize[2], -1});
             // 1.2.3 prob * v
-            Data contextLayer;
-//batchrecord.Record("Softmax");
-            MatMulTransB(attnProbs, pastValue, contextLayer);
-//batchrecord.Record("MatMulTransB");
+//batchRecord.Record("Softmax");
+            MatMul(attnProbs, pastValue, contextLayer);
+//batchRecord.Record("MatMulTransB");
             contextLayer.Reshape({batch, num_attention_heads, maxLen, -1});
             contextLayer.Permute({2, 0, 1, 3});
 
@@ -352,52 +367,52 @@ TimeRecord batchRecord;
             // 1.2.4 dense
             std::string denseWeightName = "transformer.layers." + std::to_string(i) + ".attention.dense.weight";
             std::string denseBiasName = "transformer.layers." + std::to_string(i) + ".attention.dense.bias";
-            Data attnOutput;
-//batchrecord.Record("contextLayer");
+//batchRecord.Record("contextLayer");
             Linear(contextLayer, weight[denseWeightName], weight[denseBiasName], attnOutput);
-//batchrecord.Record("Linear");
+//batchRecord.Record("Linear");
             // 1.3
             float alpha = sqrt(2 * block_cnt);
             Mul(attenInput, alpha, hiddenStates);
             AddTo(hiddenStates, attnOutput);
-//batchrecord.Record("Add");
+//batchRecord.Record("Add");
             std::string postLNWeightName = "transformer.layers." + std::to_string(i) + ".post_attention_layernorm.weight";
             std::string postLNBiasName = "transformer.layers." + std::to_string(i) + ".post_attention_layernorm.bias";
-            Data mlpInput;
             LayerNorm(hiddenStates, weight[postLNWeightName], weight[postLNBiasName], -1, mlpInput);
             // 1.4 MLP
             std::string fcInKeyName = "transformer.layers." + std::to_string(i) + ".mlp.dense_h_to_4h";
             std::string fcOutKeyName = "transformer.layers." + std::to_string(i) + ".mlp.dense_4h_to_h";
-            Data middle;
-//batchrecord.Record("LayerNorm");
+//batchRecord.Record("LayerNorm");
             Linear(mlpInput, weight[fcInKeyName + ".weight"], weight[fcInKeyName + ".bias"], middle);
-//batchrecord.Record("Linear");
+//batchRecord.Record("Linear");
             GeluNew(middle, middle);
-//batchrecord.Record("Gelu");
+//batchRecord.Record("Gelu");
             Linear(middle, weight[fcOutKeyName + ".weight"], weight[fcOutKeyName + ".bias"], hiddenStates);
-//batchrecord.Record("Linear");
+//batchRecord.Record("Linear");
             AddTo(hiddenStates, mlpInput, alpha);
-//batchrecord.Record("Add");
+//batchRecord.Record("Add");
         }
         LayerNorm(hiddenStates, weight["transformer.final_layernorm.weight"], weight["transformer.final_layernorm.bias"], -1, hiddenStates);
         Data logits, topk;
-//batchrecord.Record("LayerNorm");
+//batchRecord.Record("LayerNorm");
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
-//batchrecord.Record("Linear");
+//batchRecord.Record("Linear");
         TopK(logits, topk, 1);
         topk.ToDevice(DataDevice::CPU);
-//batchrecord.Record("logit to cpu");
+//batchRecord.Record("logit to cpu");
         std::vector <int> lastRet;
         for (int b = 0; b < batch; b++) {
             int base = (maxLen - 1) * batch + b;
             lastRet.push_back((int)(((float *) topk.cpuData)[base * 2] + 1e-3));
         }
-//batchrecord.Record("last");
-//batchrecord.Print();
+//batchRecord.Record("last");
+//batchRecord.Print();
         return lastRet;
     }
 
     std::string ChatGLMModel::Response(const std::string& input, RuntimeResult retCb) {
+#ifdef USE_CUDA
+        FastllmCudaClearBigBuffer();
+#endif
         Data inputIds = this->weight.tokenizer.Encode(input);
         std::vector <float> ids;
         for (int i = 0; i < inputIds.Count(0); i++) {
@@ -463,13 +478,15 @@ TimeRecord batchRecord;
         }
 		if (retCb)
 			retCb(-1, retString.c_str());
-
         return retString;
     }
 
     void ChatGLMModel::ResponseBatch(const std::vector <std::string> &inputs,
                                std::vector <std::string> &outputs,
                                RuntimeResultBatch retCb) {
+#ifdef USE_CUDA
+        FastllmCudaClearBigBuffer();
+#endif
         // 1. first
         int batch = inputs.size();
         outputs.clear();
@@ -580,7 +597,11 @@ TimeRecord batchRecord;
             inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, fret));
             positionIds.CopyFrom(Data(DataType::FLOAT32, {batch * 2, 1}, pids));
 
-            //printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
+            // printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
+
+            if (index == this->output_token_limit) {
+                break;
+            }
         }
 
         if (retCb)
