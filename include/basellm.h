@@ -32,6 +32,8 @@ namespace fastllm {
 
         virtual void CausalMask(Data &data, int start) {}; // 因果mask
 
+        int output_token_limit = -1;
+
         int embed_dim = 4096;
         int num_attention_heads = 32;
         int head_dim = embed_dim / num_attention_heads;

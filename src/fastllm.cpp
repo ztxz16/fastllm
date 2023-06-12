@@ -2121,6 +2121,64 @@ namespace fastllm {
         }
     }
 
+    void MatMul(const Data &input0, const Data &input1, Data &output, float alpha) {
+        AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMulTransB error: inputs should use same device.\n");
+        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
+                        "MatMulTransB's input's type should be float32.\n");
+        AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
+                        "MatMulTransB's input's shape's size should be >= 2.\n");
+        AssertInFastLLM(input0.dims.back() == input1.dims[input1.dims.size() - 2],
+                        "MatMulTransB's shape error.\n");
+        int input0Spatial = input0.Count(input0.dims.size() - 2);
+        int input1Spatial = input1.Count(input1.dims.size() - 2);
+        int input0Stride = input0.strides[input0.dims.size() - 2];
+        int input1Stride = input1.strides[input1.dims.size() - 2];
+        int n = input0.dims[input0.dims.size() - 2];
+        int m = input0.dims.back();
+        int k = input1.dims[input1.dims.size() - 1];
+        int batch0 = input0.Count(0) / input0Spatial;
+        int batch1 = input1.Count(0) / input1Spatial;
+        AssertInFastLLM(batch0 == batch1, "MatMulTransB's shape error.\n");
+
+        std::vector <int> dims = input0.dims;
+        dims.back() = input1.dims[input1.dims.size() - 1];
+        output.dataType = input0.dataType;
+        output.dataDevice = input0.dataDevice;
+        output.Resize(dims);
+        output.Allocate();
+
+        int outputSpatial = output.Count(output.dims.size() - 2);
+        int threadNum = threads;
+#ifdef _WIN64
+        threadNum = 1;
+#endif
+        if (batch0 * n * m * k < 64 * 4096) {
+            threadNum = 1;
+        }
+        threadNum = std::min(threadNum, 4);
+
+#ifdef USE_CUDA
+        FastllmCudaBatchMatMul(input0, input1, output,
+                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                     batch0, n, m, k, alpha);
+#else
+        for (int b = 0; b < batch0; b++) {
+            float *input0Data = ((float*)input0.cpuData) + b * input0Spatial;
+            float *input1Data = ((float*)input1.cpuData) + b * input1Spatial;
+            float *outputData = ((float*)output.cpuData) + b * outputSpatial;
+            std::fill(outputData, outputData + n * k, 0.0f);
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j < m; j++) {
+                    float now = input0Data[i * input0Stride + j] * alpha;
+                    for (int l = 0; l < k; l++) {
+                        outputData[i * k + l] += (now * input1Data[j * k + l]);
+                    }
+                }
+            }
+        }
+#endif
+    }
+
     void MatMulTransB(const Data &input0, const Data &input1, Data &output, float alpha) {
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMulTransB error: inputs should use same device.\n");
         AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
