@@ -486,14 +486,9 @@ __global__ void FastllmGemvInt4Kernel2(float *A, uint8_t *B, float *C,
     for (int p = st; p < end; p++) {
         sdata[tid] = 0;
         uint8_t zero = zeros[p];
-        if (tid % 2 == 0) {
-            for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
-                sdata[tid] += A[i] * ((B[(p * m + i) / 2] >> 4) - zero);
-            }
-        } else {
-            for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
-                sdata[tid] += A[i] * ((B[(p * m + i) / 2] & 15) - zero);
-            }
+        for (int i = tid; i < m / 2; i += THREAD_PER_BLOCK) {
+            uint8_t now = B[p * m / 2 + i];
+            sdata[tid] += (A[i * 2] * ((now >> 4) - zero) + A[i * 2 + 1] * ((now & 15) - zero));
         }
         __syncthreads();
         for (unsigned int s = 1; s < THREAD_PER_BLOCK; s *= 2) {
