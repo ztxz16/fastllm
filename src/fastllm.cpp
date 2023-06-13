@@ -2092,6 +2092,26 @@ namespace fastllm {
             float *input0Data = input0Base + b * input0Spatial;
             float *input1Data = input1Base + b * input1Spatial;
             float *outputData = outputBase + b * outputSpatial;
+            std::fill(outputData, outputData + n * k, 0.0f);
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j < m; j++) {
+                    float now = input0Data[i * input0Stride + j] * alpha;
+                    for (int l = 0; l < k; l++) {
+                        outputData[i * k + l] += (now * input1Data[j * k + l]);
+                    }
+                }
+            }
+        }
+    }
+
+    void MatMulTransBSingle(float *input0Base, float *input1Base, float *outputBase,
+                      int input0Spatial, int input1Spatial, int outputSpatial,
+                      int input0Stride, int input1Stride,
+                      int n, int m, int k, float alpha, int st, int end) {
+        for (int b = st; b < end; b++) {
+            float *input0Data = input0Base + b * input0Spatial;
+            float *input1Data = input1Base + b * input1Spatial;
+            float *outputData = outputBase + b * outputSpatial;
             for (int i = 0; i < n; i++) {
                 for (int j = 0; j < k; j++) {
                     float now = 0.0f;
@@ -2156,25 +2176,29 @@ namespace fastllm {
             threadNum = 1;
         }
         threadNum = std::min(threadNum, 4);
-
 #ifdef USE_CUDA
         FastllmCudaBatchMatMul(input0, input1, output,
                      input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                      batch0, n, m, k, alpha);
 #else
-        for (int b = 0; b < batch0; b++) {
-            float *input0Data = ((float*)input0.cpuData) + b * input0Spatial;
-            float *input1Data = ((float*)input1.cpuData) + b * input1Spatial;
-            float *outputData = ((float*)output.cpuData) + b * outputSpatial;
-            std::fill(outputData, outputData + n * k, 0.0f);
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j < m; j++) {
-                    float now = input0Data[i * input0Stride + j] * alpha;
-                    for (int l = 0; l < k; l++) {
-                        outputData[i * k + l] += (now * input1Data[j * k + l]);
-                    }
-                }
-            }
+        // TODO: 汇编优化
+        int per = batch0 / threadNum;
+        int cur = 0;
+        std::vector<std::thread *> threads;
+        for (int i = 0; i < threadNum - 1; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < batch0);
+            threads.push_back(new std::thread(&MatMulSingle,
+                                              (float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
+                                              input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                                              n, m, k, alpha, cur, end));
+            cur = end;
+        }
+        MatMulSingle((float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
+                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                     n, m, k, alpha, cur, batch0);
+        for (int i = 0; i < threadNum - 1; i++) {
+            threads[i]->join();
+            delete threads[i];
         }
 #endif
     }
@@ -2225,13 +2249,13 @@ namespace fastllm {
         std::vector<std::thread *> threads;
         for (int i = 0; i < threadNum - 1; i++) {
             int end = cur + per + (cur + per * (threadNum - i) < batch0);
-            threads.push_back(new std::thread(&MatMulSingle,
+            threads.push_back(new std::thread(&MatMulTransBSingle,
                                               (float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
                                               input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                                               n, m, k, alpha, cur, end));
             cur = end;
         }
-        MatMulSingle((float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
+        MatMulTransBSingle((float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
                      input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                      n, m, k, alpha, cur, batch0);
         for (int i = 0; i < threadNum - 1; i++) {
