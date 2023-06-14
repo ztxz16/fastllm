@@ -4,7 +4,11 @@ project(fastllm LANGUAGES CXX)
 
 option(USE_CUDA "use cuda" OFF)
 
+option(PY_API "python api" OFF)
+
 message(STATUS "USE_CUDA: ${USE_CUDA}")
+
+message(STATUS "PYTHON_API: ${PY_API}")
 
 set(CMAKE_BUILD_TYPE "Release")
 
@@ -16,7 +20,16 @@ else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2 -march=native")
 endif()
 
-include_directories(include)
+if (PY_API)
+    # add_compile_definitions(PY_API)
+    add_definitions(-DPY_API)
+    set(PYBIND third_party/pybind11)
+    add_subdirectory(${PYBIND})
+    pybind11_add_module(pyfastllm src/pybinding.cpp src/chatglm.cpp src/moss.cpp src/vicuna.cpp src/fastllm.cpp src/fastllm.cpp include/basellm.h include/chatglm.h include/factoryllm.h include/fastllm.h include/utils.h) 
+endif()
+
+find_package(Python3 REQUIRED)
+include_directories(include third_party/pybind11/include)
 
 message(STATUS "CMAKE_CXX_FLAGS" ${CMAKE_CXX_FLAGS})
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/chatglm.cpp src/moss.cpp src/vicuna.cpp)
@@ -42,3 +55,5 @@ target_link_libraries(quant fastllm)
 
 add_executable(webui example/webui/webui.cpp)
 target_link_libraries(webui fastllm)
+
+

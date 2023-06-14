@@ -1,7 +1,9 @@
 #pragma once
 #include "fastllm.h"
 
-typedef void(*RuntimeResult) (int index, const char* content);//实时生成的内容回调 index: 0开始回复，-1本次回复结束
+// typedef void(*RuntimeResult) (int index, const char* content);//实时生成的内容回调 index: 0开始回复，-1本次回复结束
+
+using RuntimeResult = std::function<void(int index, const char* content)>;
 
 namespace fastllm {
     class basellm {
