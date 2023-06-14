@@ -17,6 +17,8 @@
 namespace fastllm {
     void SetThreads(int t);
     void SetLowMemMode(bool m);
+    bool GetLowMemMode();
+    int GetThreads();
 
     struct LowBitConfig {
         int bit;
@@ -63,7 +65,8 @@ namespace fastllm {
     };
 
     enum DataType {
-        FLOAT32 = 0, BFLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6, FLOAT16 = 7
+        FLOAT32 = 0, BFLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6, FLOAT16 = 7,
+        INT32PARAM = 100 // int32的参数，这种类型的数据永远存在CPU上
     };
 
     enum DataDevice {
@@ -90,6 +93,9 @@ namespace fastllm {
 
 	    void *cudaData = nullptr;
         std::vector <void*> extraCudaData;
+
+        void *deviceData = nullptr;
+        std::vector <void*> extraDeviceData;
 
         DataDevice dataDevice = DataDevice::CPU;
 
@@ -139,13 +145,15 @@ namespace fastllm {
 
         uint64_t Count(int i) const; // dims[i] * strides[i]
 
-        void Print() const; // 输出
+        void PrintShape() const; // 输出形状
 
-        void Permute(const std::vector <int> &axis); // 转置
+        void Print() const; // 输出
 
         void CalcWeightSum(); // 计算WeightSum
 
         void ToDevice(DataDevice device); // 移动到指定device
+
+        void ToDevice(void *device);
     };
 
     struct Tokenizer {
@@ -193,7 +201,7 @@ namespace fastllm {
 
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output);
 
-    void LayerNorm(const Data &input, Data &gamma, Data &beta, int axis, Data &output);
+    void LayerNorm(Data &input, Data &gamma, Data &beta, int axis, Data &output);
 
     void Linear(Data &input, Data &weight, const Data &bias, Data &output);
 
@@ -203,7 +211,7 @@ namespace fastllm {
 
 	void CatDirect(Data &input0, const Data &input1, int axis); // 直接把input1的数据拷贝到input0后面（需要input0提前扩容了足够的空间）
 
-    void CatDirectAxis0(Data &input0, const Data &input1); // 直接把input1的数据拷贝到input0后面（axis = 0的Cat操作，需要input0提前扩容了足够的空间）
+    void MatMul(const Data &input0, const Data &input1, Data &output, float alpha = 1.0);
 
     void MatMulTransB(const Data &input0, const Data &input1, Data &output, float alpha = 1.0);
 
@@ -217,13 +225,17 @@ namespace fastllm {
 
     void MulTo(Data &input0, const Data &input1); // input0 *= input1
 
-    void AddTo(Data &input0, const Data &input1); // input0 += input1
-
-    void AddTo(Data &input0, const Data &input1, float alpha); // input0 += input1 * alpha
+    void AddTo(Data &input0, const Data &input1, float alpha = 1.0); // input0 += input1 * alpha
 
     void AttentionMask(Data &input, const Data &mask, float maskValue); // 把input里对应位置mask中为1的部分变成maskValue
 
     void Permute(const Data &input, const std::vector<int> &axis, Data &output); // 转置
+
+    void PermuteSelf(const Data &input, const std::vector<int> &axis); // 转置
+
+    void TopK(const Data &input, Data &output, int topK); // 求topk
+
+    void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position
 }
 
 #endif //TEST_FASTLLM_H
