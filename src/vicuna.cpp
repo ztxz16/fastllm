@@ -55,16 +55,16 @@ namespace fastllm {
 
     int VicunaModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                               const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues) {
-//timerecord //timerecord;
-//timerecord.Clear();
-//timerecord.Record();
+TimeRecord timeRecord;
+timeRecord.Clear();
+timeRecord.Record();
         Data hiddenStates;
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         for (int i = 0; i < block_cnt; i++) {
             Data attenInput;
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
-//timerecord.Record("rms");
+timeRecord.Record("rms");
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
             std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
@@ -82,7 +82,7 @@ namespace fastllm {
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
-//timerecord.Record("qkv");
+timeRecord.Record("qkv");
             RotatePosition2D(q, positionIds);
             RotatePosition2D(k, positionIds);
 
@@ -91,9 +91,9 @@ namespace fastllm {
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
 
-            q.Permute({1, 0, 2});
-            k.Permute({1, 0, 2});
-            v.Permute({1, 2, 0});
+            PermuteSelf(q, {1, 0, 2});
+            PermuteSelf(k, {1, 0, 2});
+            PermuteSelf(v, {1, 2, 0});
 
             Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
             int unitLen = 64;
@@ -138,36 +138,36 @@ namespace fastllm {
             MatMulTransB(attenWeights, pastValue, attenOutput);
 
             attenOutput.Reshape({attenOutput.dims[1], attenOutput.dims[2], attenOutput.dims[3]});
-            attenOutput.Permute({1, 0, 2});
+            PermuteSelf(attenOutput, {1, 0, 2});
             attenOutput.Reshape({bsz, seqlen, -1});
 
             Data attenLastOutput;
             Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
-//timerecord.Record("attn");
+timeRecord.Record("attn");
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
-//timerecord.Record("rms");
+timeRecord.Record("rms");
             Data w1, w2, w3;
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
-//timerecord.Record("mlp linerar");
+timeRecord.Record("mlp linerar");
             Silu(w1, w1);
-//timerecord.Record("mlp silu");
+timeRecord.Record("mlp silu");
             MulTo(w1, w3);
-//timerecord.Record("mlp mul");
+timeRecord.Record("mlp mul");
             Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
-//timerecord.Record("mlp linerar");
+timeRecord.Record("mlp linerar");
             AddTo(hiddenStates, w2);
-//timerecord.Record("mlp add");
+timeRecord.Record("mlp add");
         }
 
         RMSNorm(hiddenStates, weight["model.norm.weight"], 1e-6, hiddenStates);
-//timerecord.Record("rms");
+timeRecord.Record("rms");
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
-//timerecord.Record("logits");
-//timerecord.Print();
+timeRecord.Record("logits");
+timeRecord.Print();
         std::pair <float, int> ret = std::make_pair(-1e9, -1);
         int base = logits.dims[1] - 1;
         for (int i = 0; i < logits.dims.back(); i++) {
