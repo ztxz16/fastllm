@@ -12,7 +12,22 @@
 #include <cstdio>
 #include <cstdint>
 
+#ifdef __AVX__
+#include "immintrin.h"
+#endif
+
 namespace fastllm {
+    static void ErrorInFastLLM(const std::string &error) {
+        printf("FastLLM Error: %s\n", error.c_str());
+        throw error;
+    }
+
+    static void AssertInFastLLM(bool condition, const std::string &error) {
+        if (!condition) {
+            ErrorInFastLLM(error);
+        }
+    }
+
     static uint32_t as_uint(const float x) {
         return *(uint32_t*)&x;
     }
@@ -70,6 +85,24 @@ namespace fastllm {
             printf("Total: %f s.\n", s);
         }
     };
+
+#ifdef __AVX__
+    static inline float Floatsum(const __m256 a) {
+        __m128 res = _mm256_extractf128_ps(a, 1);
+        res = _mm_add_ps(res, _mm256_castps256_ps128(a));
+        res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+        res = _mm_add_ss(res, _mm_movehdup_ps(res));
+        return _mm_cvtss_f32(res);
+    }
+
+    static inline int I32sum(const __m256i a) {
+        const __m128i sum128 = _mm_add_epi32(_mm256_extractf128_si256(a, 0), _mm256_extractf128_si256(a, 1));
+        const __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+        const __m128i sum64 = _mm_add_epi32(hi64, sum128);
+        const __m128i hi32  = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+        return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+    }
+#endif
 }
 
 #endif //FASTLLM_UTILS_H

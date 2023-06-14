@@ -41,8 +41,6 @@ namespace fastllm {
 
 		virtual void WarmUp(); // 预热
     private:
-		virtual void RotatePosition2D(Data &data, const Data &positionIds); // 二维位置编码
-
 		virtual void CausalMask(Data &data, int start) {}; // 因果mask？
     };
 }
