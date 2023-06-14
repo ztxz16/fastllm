@@ -24,18 +24,23 @@ namespace fastllm {
                 const Data &positionIds,
                 std::vector <std::pair <Data, Data> > &pastKeyValues);
 
+        std::vector <int> ForwardBatch(
+                int batch,
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector <std::pair <Data, Data> > &pastKeyValues);
+
 		virtual std::string Response(const std::string& input, RuntimeResult retCb); // 根据给出的内容回复
 
         virtual void ResponseBatch(const std::vector <std::string> &inputs,
                                    std::vector <std::string> &outputs,
-                                   RuntimeResult retCb);
+                                   RuntimeResultBatch retCb);
 
 		virtual void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
 
 		virtual void WarmUp(); // 预热
     private:
-		virtual void RotatePosition2D(Data &data, const Data &positionIds); // 二维位置编码
-
 		virtual void CausalMask(Data &data, int start) {}; // 因果mask？
     };
 }
