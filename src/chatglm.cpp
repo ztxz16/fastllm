@@ -102,6 +102,10 @@ TimeRecord batchRecord;
 
 //batchRecord.Record("RotateQKV");
             Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
+
+            pastKey.ToDevice(DataDevice::CUDA);
+            pastValue.ToDevice(DataDevice::CUDA);
+
             k.Resize({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
             v.Resize({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
 
