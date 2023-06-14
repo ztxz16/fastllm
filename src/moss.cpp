@@ -112,9 +112,9 @@ namespace fastllm {
             RotatePosition2D(q, positionIds);
             RotatePosition2D(k, positionIds);
 
-            q.Permute({0, 2, 1, 3});
-            k.Permute({0, 2, 1, 3});
-            v.Permute({0, 2, 1, 3});
+            PermuteSelf(q, {0, 2, 1, 3});
+            PermuteSelf(k, {0, 2, 1, 3});
+            PermuteSelf(v, {0, 2, 1, 3});
 
             Data pastKey = pastKeyValues[i].first, pastValue = pastKeyValues[i].second;
             Cat(pastKey, k, -2, pastKeyValues[i].first);
@@ -142,11 +142,11 @@ namespace fastllm {
 
             // 1.2.5 attention_weights * v
             Data attnOutput;
-            v.Permute({0, 1, 3, 2});
+            PermuteSelf(v, {0, 1, 3, 2});
             MatMulTransB(attnWeights, v, attnOutput);
 
             // 1.3
-            attnOutput.Permute({0, 2, 1, 3});
+            PermuteSelf(attnOutput, {0, 2, 1, 3});
             attnOutput.Reshape({attnOutput.dims[0], attnOutput.dims[1], -1});
             std::string outProjName = "transformer.h." + std::to_string(i) + ".attn.out_proj.weight";
             Data realOutput;
