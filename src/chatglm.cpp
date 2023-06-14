@@ -47,32 +47,6 @@ namespace fastllm {
         weight.embeddingNames.insert("transformer.word_embeddings.weight");
     }
 
-    void ChatGLMModel::RotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds) {
-        // ChatGLM的Rotate，比较神奇，把key和value切成两半，分别和positionIds[0]和positionIds[1]旋转
-        int len = data.dims[0], bs = data.dims[1];
-        int spatial = data.Count(2);
-        int n = data.dims[2], m = data.dims[3];
-        for (int l = 0; l < len; l++) {
-            for (int b = 0; b < bs; b++) {
-                for (int part = 0; part < 2; part++) {
-                    int index = (int) ((float *) positionIds.cpuData)[(b * 2 + part) * positionIds.dims.back() + l];
-                    std::vector<float> &sin = this->sin[index];
-                    std::vector<float> &cos = this->cos[index];
-                    float *d = (float *) data.cpuData + (l * bs + b) * spatial + part * m / 2;
-                    for (int i = 0; i < n; i++) {
-                        for (int j = 0; j < rotary_dim && j < m / 4; j++) {
-                            float a = d[j], b = d[j + m / 4];
-                            d[j] = a * cos[j] - b * sin[j];
-                            d[j + m / 4] = a * sin[j] + b * cos[j];
-                        }
-
-                        d += m;
-                    }
-                }
-            }
-        }
-    }
-
     void ChatGLMModel::LoadFromFile(const std::string &fileName) {
         this->weight.LoadFromFile(fileName);
     }
@@ -92,13 +66,10 @@ TimeRecord batchRecord;
 //batchRecord.Clear();
 //batchRecord.Record();
         int maxLen = inputIds.dims[1];
-        sinData.ToDevice(DataDevice::CUDA);
-        cosData.ToDevice(DataDevice::CUDA);
         Data inputEmbeddings;
         Embedding(inputIds, this->weight["transformer.word_embeddings.weight"], inputEmbeddings);
         Data hiddenStates = inputEmbeddings;
-        hiddenStates.Permute({1, 0, 2});
-        hiddenStates.ToDevice(DataDevice::CUDA);
+        PermuteSelf(hiddenStates, {1, 0, 2});
 
         Data attenInput;
         Data qkv, q, k, v;
@@ -126,24 +97,16 @@ TimeRecord batchRecord;
             Split(qkv, -1, per, per * 2, k);
             Split(qkv, -1, per * 2, per * 3, v);
 //batchRecord.Record("SplitQKV");
-#ifdef USE_CUDA
-            FastllmCudaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
-            FastllmCudaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
-#else
-            RotatePosition2D(q, positionIds);
-            RotatePosition2D(k, positionIds);
-#endif
+            fastllm::RotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
+            fastllm::RotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
+
 //batchRecord.Record("RotateQKV");
             Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
-
-            pastKey.ToDevice(DataDevice::CUDA);
-            pastValue.ToDevice(DataDevice::CUDA);
-
             k.Resize({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
             v.Resize({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
 
-            k.Permute({1, 0, 2});
-            v.Permute({1, 0, 2});
+            PermuteSelf(k, {1, 0, 2});
+            PermuteSelf(v, {1, 0, 2});
 
             int unitLen = 64;
 #ifdef USE_CUDA
@@ -186,7 +149,7 @@ TimeRecord batchRecord;
             std::vector <int> outputSize = {q.dims[1], q.dims[2], q.dims[0], pastKey.dims[1]};
 
             q.Reshape({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
-            q.Permute({1, 0, 2});
+            PermuteSelf(q, {1, 0, 2});
 
             // 1.2 Attention
             // 1.2.0 q * k^T
@@ -209,7 +172,7 @@ TimeRecord batchRecord;
             MatMul(attnProbs, pastValue, contextLayer);
 //batchRecord.Record("MatMulTransB");
             contextLayer.Reshape({batch, num_attention_heads, maxLen, -1});
-            contextLayer.Permute({2, 0, 1, 3});
+            PermuteSelf(contextLayer, {2, 0, 1, 3});
 
             contextLayer.Reshape({contextLayer.dims[0], contextLayer.dims[1], embed_dim});
             // 1.2.4 dense
@@ -295,9 +258,6 @@ TimeRecord batchRecord;
 		int index = 0;
         while (true) {
             auto st = std::chrono::system_clock::now();
-
-            attentionMask.ToDevice(DataDevice::CUDA);
-            positionIds.ToDevice(DataDevice::CUDA);
             int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues);
             if (ret == 130005) {
                 break;
@@ -397,9 +357,6 @@ TimeRecord batchRecord;
         int index = 0;
         while (true) {
             auto st = std::chrono::system_clock::now();
-
-            attentionMask.ToDevice(DataDevice::CUDA);
-            positionIds.ToDevice(DataDevice::CUDA);
             std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, pastKeyValues);
             std::vector <float> fret;
             std::vector <float> results;
