@@ -32,6 +32,11 @@ namespace fastllm {
 
     static int threads = 4;
     static bool lowMemMode = false;
+    static bool kvCacheInCPU = false;
+
+    void SetKVCacheInCPU(bool v) {
+        kvCacheInCPU = v;
+    }
 
     void SetThreads(int t) {
         threads = t;
@@ -39,6 +44,10 @@ namespace fastllm {
 
     void SetLowMemMode(bool m) {
     	lowMemMode = m;
+    }
+
+    bool GetKVCacheInCPU() {
+        return kvCacheInCPU;
     }
 
     bool GetLowMemMode() {
