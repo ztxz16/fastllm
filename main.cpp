@@ -6,11 +6,12 @@ static char* modelpath = NULL;
 static fastllm::basellm* chatGlm = fllm.createllm(LLM_TYPE_CHATGLM);
 static fastllm::basellm* moss = fllm.createllm(LLM_TYPE_MOSS);
 static fastllm::basellm* vicuna = fllm.createllm(LLM_TYPE_VICUNA);
+static fastllm::basellm* baichuan = fllm.createllm(LLM_TYPE_BAICHUAN);
 static int sRound = 0;
 static std::string history;
 
 std::map <std::string, int> modelDict = {
-        {"chatglm", 0}, {"moss", 1}, {"vicuna", 2}
+        {"chatglm", 0}, {"moss", 1}, {"vicuna", 2}, {"baichuan", 3}
 };
 
 struct RunConfig {
@@ -75,6 +76,9 @@ int initLLMConf(int model,bool isLowMem, const char* modelPath, int threads) {
 	}
     if (modeltype == 2) {
         vicuna->LoadFromFile(modelPath);
+    }
+    if (modeltype == 3) {
+        baichuan->LoadFromFile(modelPath);
     }
 	return 0;
 }
@@ -141,6 +145,29 @@ int chat(const char* prompt) {
         history += (ret + "</s>");
     }
 
+    if (modeltype == LLM_TYPE_BAICHUAN) {
+        if (history == "") {
+            history = "ASSISTANT: A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. ";
+        }
+
+        auto prompt = history + "USER: " + input + " ASSISTANT: ";
+
+        prompt = "登鹳雀楼->王之涣\n夜雨寄北->\n";
+        printf("prompt: %s\n", prompt.c_str());
+        ret = baichuan->Response(prompt, [](int index, const char* content) {
+            if (index == 0) {
+                printf("BAICHUAN: %s", content);
+            }
+            if (index > 0) {
+                printf("%s", content);
+            }
+            if (index == -1) {
+                printf("\n");
+            }
+        });
+        history += (ret + "</s>");
+    }
+
 	long len = ret.length();
 	return len;
 }
@@ -160,6 +187,10 @@ void uninitLLM()
     if (vicuna) {
         delete vicuna;
         vicuna = NULL;
+    }
+    if (baichuan) {
+        delete baichuan;
+        baichuan = NULL;
     }
 }
 
@@ -188,11 +219,12 @@ int main(int argc, char **argv) {
 			}
 			chat(input.c_str());
 		}
-	} else if (config.model == LLM_TYPE_VICUNA) {
+	} else if (config.model == LLM_TYPE_VICUNA || config.model == LLM_TYPE_BAICHUAN) {
         while (true) {
             printf("用户: ");
             std::string input;
-            std::getline(std::cin, input);
+            //std::getline(std::cin, input);
+            input = "登鹳雀楼->王之涣\n夜雨寄北->";
             if (input == "stop") {
                 break;
             }

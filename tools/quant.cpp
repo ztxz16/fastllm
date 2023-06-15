@@ -9,6 +9,7 @@
 #include "moss.h"
 #include "chatglm.h"
 #include "vicuna.h"
+#include "baichuan.h"
 
 struct QuantConfig {
     std::string model = "chatglm"; // 模型类型, chatglm或moss
@@ -66,6 +67,10 @@ int main(int argc, char **argv) {
         fastllm::VicunaModel vicuna;
         vicuna.LoadFromFile(config.path);
         vicuna.SaveLowBitModel(config.output, config.bits);
+    } else if (config.model == "baichuan") {
+        fastllm::BaichuanModel baichuan;
+        baichuan.LoadFromFile(config.path);
+        baichuan.SaveLowBitModel(config.output, config.bits);
     } else {
         Usage();
         exit(-1);
