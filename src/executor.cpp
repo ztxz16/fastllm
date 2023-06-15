@@ -35,7 +35,14 @@ namespace fastllm {
 
     void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                        const fastllm::IntDict &intParams) {
+        bool lockInCPU = false;
+        for (auto &it : datas) {
+            lockInCPU |= it.second->lockInCPU;
+        }
         for (auto device : devices) {
+            if (lockInCPU && device->deviceType != "cpu") {
+                continue;
+            }
             if (device->CanRun(opType, datas, floatParams, intParams)) {
                 for (auto &it : datas) {
                     it.second->ToDevice((void*)device);
