@@ -408,7 +408,7 @@ namespace fastllm {
         printf("\n");
          */
         int n = Count(0) / dims.back(), m = dims.back();
-        for (int i = 0; i < n && i < 10; i++) {
+        for (int i = 0; i < n; i++) {
             for (int j = 0; j < 10 && j < m; j++) {
                 printf("%f ", ((float*)cpuData)[i * m + j]);
             }
@@ -884,8 +884,8 @@ namespace fastllm {
     }
 
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output) {
-        curExecutor->Run("LayerNorm", {
-                {"input", (Data*)&input}, {"wegiht", (Data*)&weight}, {"output", &output}
+        curExecutor->Run("RMSNorm", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight}, {"output", &output}
         }, {{"eps", eps}}, {});
     }
 
