@@ -52,8 +52,9 @@ namespace fastllm {
     }
 
     int ChatGLMModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
-                              const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues) {
-        return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues)[0];
+                              const fastllm::Data &positionIds, const Data &penaltyFactor,
+                              std::vector<std::pair<Data, Data>> &pastKeyValues) {
+        return ForwardBatch(1, inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues)[0];
     }
 
     std::vector <int> ChatGLMModel::ForwardBatch(
@@ -61,6 +62,7 @@ namespace fastllm {
             const Data &inputIds,
             const Data &attentionMask,
             const Data &positionIds,
+            const Data &penaltyFactor,
             std::vector <std::pair <Data, Data> > &pastKeyValues) {
 TimeRecord batchRecord;
 //batchRecord.Clear();
@@ -266,7 +268,7 @@ TimeRecord batchRecord;
 		int index = 0;
         while (true) {
             auto st = std::chrono::system_clock::now();
-            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+            int ret = Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
             if (ret == 130005) {
                 break;
             }
@@ -365,7 +367,7 @@ TimeRecord batchRecord;
         int index = 0;
         while (true) {
             auto st = std::chrono::system_clock::now();
-            std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, pastKeyValues);
+            std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, Data(), pastKeyValues);
             std::vector <float> fret;
             std::vector <float> results;
             int endingCount = 0;
@@ -432,7 +434,7 @@ TimeRecord batchRecord;
 		    pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
 		                                           Data(DataType::FLOAT32)));
 	    }
-	    Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+	    Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
 	    printf("finish.\n");
     }
 

@@ -40,6 +40,7 @@ namespace fastllm {
         this->ops["Permute"] = (BaseOperator*)(new CpuPermuteOp());
         this->ops["PermuteSelf"] = (BaseOperator*)(new CpuPermuteSelfOp());
         this->ops["RotatePosition2D"] = (BaseOperator*)(new CpuRotatePosition2DOp());
+        this->ops["RepeatPenalty"] = (BaseOperator*)(new CpuRepeatPenaltyOp());
     }
 
     bool CpuDevice::Malloc(void **ret, size_t size) {
@@ -1805,6 +1806,21 @@ namespace fastllm {
                     }
                 }
             }
+        }
+    }
+
+    void CpuRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &penalty = *(datas.find("penalty")->second);
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 && penalty.dataType == DataType::FLOAT32,
+                        "Repeat Penalty error: Data's type should be float32.\n");
+        float *inputData = (float*)input.cpuData;
+        float *penaltyData = (float*)penalty.cpuData;
+
+        int len = input.Count(0);
+        for (int i = 0; i < len; i++) {
+            inputData[i] = inputData[i] < 0 ? inputData[i] * penaltyData[i] : inputData[i] / penaltyData[i];
         }
     }
 }
