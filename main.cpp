@@ -79,6 +79,7 @@ int initLLMConf(int model,bool isLowMem, const char* modelPath, int threads) {
     }
     if (modeltype == 3) {
         baichuan->LoadFromFile(modelPath);
+        baichuan->WarmUp();
     }
 	return 0;
 }
@@ -130,7 +131,7 @@ int chat(const char* prompt) {
         }
 
         auto prompt = history + "USER: " + input + " ASSISTANT: ";
-        printf("prompt: %s\n", prompt.c_str());
+        // printf("prompt: %s\n", prompt.c_str());
         ret = vicuna->Response(prompt, [](int index, const char* content) {
             if (index == 0) {
                 printf("VICUNA:%s", content);
@@ -146,14 +147,10 @@ int chat(const char* prompt) {
     }
 
     if (modeltype == LLM_TYPE_BAICHUAN) {
-        if (history == "") {
-            history = "ASSISTANT: A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. ";
-        }
+        auto prompt = history + "<human>:" + input + "\n<bot>:";
 
-        auto prompt = history + "USER: " + input + " ASSISTANT: ";
-
-        prompt = "登鹳雀楼->王之涣\n夜雨寄北->\n";
-        printf("prompt: %s\n", prompt.c_str());
+        //printf("prompt: %s\n", prompt.c_str());
+        history = prompt;
         ret = baichuan->Response(prompt, [](int index, const char* content) {
             if (index == 0) {
                 printf("BAICHUAN: %s", content);
@@ -165,7 +162,7 @@ int chat(const char* prompt) {
                 printf("\n");
             }
         });
-        history += (ret + "</s>");
+        history += (ret + '\n');
     }
 
 	long len = ret.length();
@@ -223,8 +220,8 @@ int main(int argc, char **argv) {
         while (true) {
             printf("用户: ");
             std::string input;
-            //std::getline(std::cin, input);
-            input = "登鹳雀楼->王之涣\n夜雨寄北->";
+            std::getline(std::cin, input);
+            //input = "晚上睡不着怎么办";
             if (input == "stop") {
                 break;
             }

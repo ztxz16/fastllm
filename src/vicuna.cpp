@@ -54,7 +54,8 @@ namespace fastllm {
     }
 
     int VicunaModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
-                              const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues) {
+                              const fastllm::Data &positionIds, const Data &penaltyFactor,
+                              std::vector<std::pair<Data, Data>> &pastKeyValues) {
 TimeRecord timeRecord;
 timeRecord.Clear();
 timeRecord.Record();
@@ -83,8 +84,13 @@ timeRecord.Record("rms");
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
 timeRecord.Record("qkv");
+
+            q.ToDevice(DataDevice::CPU);
+            k.ToDevice(DataDevice::CPU);
             RotatePosition2D(q, positionIds);
             RotatePosition2D(k, positionIds);
+            q.ToDevice(DataDevice::CUDA);
+            k.ToDevice(DataDevice::CUDA);
 
             qkvSize = {bsz * seqlen, num_attention_heads, -1};
             q.Reshape(qkvSize);
@@ -166,8 +172,9 @@ timeRecord.Record("mlp add");
 timeRecord.Record("rms");
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
+        logits.ToDevice(DataDevice::CPU);
 timeRecord.Record("logits");
-timeRecord.Print();
+//timeRecord.Print();
         std::pair <float, int> ret = std::make_pair(-1e9, -1);
         int base = logits.dims[1] - 1;
         for (int i = 0; i < logits.dims.back(); i++) {
@@ -215,7 +222,7 @@ timeRecord.Print();
         while (true) {
             auto st = std::chrono::system_clock::now();
 
-            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+            int ret = Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
             if (ret == eos) {
                 break;
             }
@@ -228,6 +235,8 @@ timeRecord.Print();
             fflush(stdout);
             results.clear();
 
+            attentionMask.ToDevice(DataDevice::CPU);
+            positionIds.ToDevice(DataDevice::CPU);
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)ret}));
             attentionMask = Data();
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)len}));
@@ -252,7 +261,7 @@ timeRecord.Print();
             pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
                                                    Data(DataType::FLOAT32)));
         }
-        Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+        Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
         printf("finish.\n");
     }
 

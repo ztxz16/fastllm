@@ -106,6 +106,10 @@ namespace fastllm {
     class CpuRotatePosition2DOp : BaseOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
+
+    class CpuRepeatPenaltyOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
 }
 
 #endif //FASTLLM_CPUDEVICE_H

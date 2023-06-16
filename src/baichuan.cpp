@@ -11,6 +11,9 @@ namespace fastllm {
         block_cnt = 32;
         rotary_dim = 128;
 
+        do_sample = true;
+        repeat_penalty = 1.1;
+
         sin.resize(max_positions);
         cos.resize(max_positions);
         std::vector <float> invFreq;
@@ -54,7 +57,8 @@ namespace fastllm {
     }
 
     int BaichuanModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
-                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues) {
+                             const fastllm::Data &positionIds, const Data &penaltyFactor,
+                             std::vector<std::pair<Data, Data>> &pastKeyValues) {
         Data hiddenStates;
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         for (int i = 0; i < block_cnt; i++) {
@@ -159,6 +163,9 @@ namespace fastllm {
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         logits.ToDevice(DataDevice::CPU);
+        if (this->do_sample && penaltyFactor.dims == logits.dims) {
+            RepeatPenalty(logits, penaltyFactor);
+        }
 
         std::pair <float, int> ret = std::make_pair(-1e9, -1);
         int base = logits.dims[1] - 1;
@@ -178,10 +185,6 @@ namespace fastllm {
         for (int i = 0; i < inputIds.Count(0); i++) {
             ids.push_back(((float*)inputIds.cpuData)[i]);
         }
-
-        ids = std::vector <float> {31106, 32040, 36988, 33888, 31914,  3817, 31702, 31278, 36161,     5,
-                                   32010, 31963, 32953, 31505,  3817};
-
         int seqLen = ids.size();
         inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, ids));
 
@@ -207,10 +210,20 @@ namespace fastllm {
         int len = seqLen;
         std::vector <float> results;
         int index = 0;
+
+        int vocabSize = this->weight.tokenizer.tokenToStringDict.size();
+        TokenPenaltyManager tokenPenaltyManager;
+        if (this->do_sample) {
+            tokenPenaltyManager.Init(vocabSize, this->last_n, this->repeat_penalty);
+            /*for (int i = std::max(0, (int)ids.size() - this->last_n); i < ids.size(); i++) {
+                tokenPenaltyManager.InsertToken((int)(ids[i] + 1e-6));
+            }*/
+        }
+
         while (true) {
             auto st = std::chrono::system_clock::now();
 
-            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+            int ret = Forward(inputIds, attentionMask, positionIds, tokenPenaltyManager.penalty, pastKeyValues);
             if (ret == eos) {
                 break;
             }
@@ -228,6 +241,9 @@ namespace fastllm {
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)ret}));
             attentionMask = Data();
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)len}));
+            if (do_sample) {
+                tokenPenaltyManager.InsertToken(ret);
+            }
             len++;
 
             //printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
@@ -249,7 +265,7 @@ namespace fastllm {
             pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
                                                    Data(DataType::FLOAT32)));
         }
-        Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+        Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
         printf("finish.\n");
     }
 
