@@ -24,7 +24,7 @@ struct RunConfig {
 void Usage() {
 	std::cout << "Usage:" << std::endl;
 	std::cout << "[-h|--help]:                  显示帮助" << std::endl;
-	std::cout << "<-m|--model> <args>:          模型类型，默认为0, 可以设置为0(chatglm),1(moss),2(vicuna)" << std::endl;
+	std::cout << "<-m|--model> <args>:          模型类型，默认为0, 可以设置为0(chatglm),1(moss),2(vicuna),3(baichuan)" << std::endl;
 	std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
 	std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
 	std::cout << "<-l|--low> <args>:            使用低内存模式" << std::endl;
