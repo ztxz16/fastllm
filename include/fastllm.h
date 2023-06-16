@@ -17,8 +17,10 @@
 namespace fastllm {
     void SetThreads(int t);
     void SetLowMemMode(bool m);
+    void SetKVCacheInCPU(bool kvCacheInCPU);
     bool GetLowMemMode();
     int GetThreads();
+    bool GetKVCacheInCPU();
 
     struct LowBitConfig {
         int bit;
@@ -78,6 +80,7 @@ namespace fastllm {
     };
 
     struct Data {
+        bool lockInCPU = false; // 如果lock在CPU上，那么不允许移动到其余设备
         WeightType weightType = WeightType::NONE; // 权重类型，NONE代表非权重（或未知权重）
 
         DataType dataType = DataType::FLOAT32; // 数据类型
