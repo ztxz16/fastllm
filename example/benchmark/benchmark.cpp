@@ -134,6 +134,9 @@ int main(int argc, char **argv) {
     } else {
         inputs.push_back("Hello！");
     }
+    if (config.batch < 0) {
+        config.batch = inputs.size();
+    }
     while (inputs.size() < config.batch) {
         inputs.push_back(inputs[rand() % inputs.size()]);
     }

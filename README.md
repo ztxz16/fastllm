@@ -12,11 +12,24 @@ fastllm是纯c++实现，无第三方依赖的大模型库，目前支持国产�
 
 ## 推理速度
 
-|              模型 | 平台               | 推理速度（ms / token） |
-|----------------:|------------------|-----------------:|
-| ChatGLM-6b-int8 | RTX 4090         |               9.1 |
-| ChatGLM-6b-int8 | RTX 3090         |             14.1 |
-| ChatGLM-6b-int4 | Xiaomi 10 Pro - 4 Threads |              230 |
+可以使用benchmark程序进行测速，根据不同配置、不同输入，推理速度也会有一些差别
+
+例如:
+
+``` sh
+./benchmark -p ~/chatglm-6b-int4.bin -f ../example/benchmark/prompts/beijing.txt -b 1
+./benchmark -p ~/chatglm-6b-int8.bin -f ../example/benchmark/prompts/beijing.txt -b 1
+./benchmark -p ~/chatglm-6b-fp16.bin -f ../example/benchmark/prompts/hello.txt -b 512 -l 18
+```
+
+|              模型 | Data精度 | 平台               | Batch    | 最大推理速度(token / s) |
+|-----------------:|---------|--------------------|-----------|---------------------:|
+| ChatGLM-6b-int4  | float32 |  RTX 4090          |         1 |                  176 |
+| ChatGLM-6b-int8  | float32 |  RTX 4090          |         1 |                  121 |
+| ChatGLM-6b-fp16  | float32 |  RTX 4090          |        64 |                 2919 |
+| ChatGLM-6b-fp16  | float32 |  RTX 4090          |       256 |                 7871 |
+| ChatGLM-6b-fp16  | float32 |  RTX 4090          |       512 |                10209 |
+| ChatGLM-6b-int4  | float32 |  Xiaomi 10 Pro - 4 Threads | 1 |                4 ~ 5 |
 
 
 ## 编译
@@ -71,6 +84,12 @@ make -j4
 ./main -m chatglm -p chatglm-6b-int8.bin
 ```
 
+### 运行baichuan模型
+
+```
+./main -m baichuan -p baichuan-int8.bin
+```
+
 ### 运行MOSS模型
 
 ```
@@ -106,8 +125,23 @@ webui 由 [Jacques CHEN](http://whchen.net/index.php/About.html) 提供
 cd tools
 python3 chatglm_export.py ../chatglm-6b.bin # 导出浮点模型
 cd ../build
+./quant -m chatglm -p ../chatglm-6b.bin -o ../chatglm-6b-fp16.bin -b 16 #导出float16模型
 ./quant -m chatglm -p ../chatglm-6b.bin -o ../chatglm-6b-int8.bin -b 8 #导出int8模型
 ./quant -m chatglm -p ../chatglm-6b.bin -o ../chatglm-6b-int4.bin -b 4 #导出int4模型
+```
+
+### baichuan模型导出
+
+```
+# 需要先安装baichuan环境
+# 默认使用的是经过sft训练的对话模型，如果使用其余模型需要修改导出文件
+# 如果使用量化模型，需要先编译好quant文件，这里假设已经存在build/quant文件
+cd tools
+python3 baichuan_peft2flm.py ../baichuan.bin # 导出浮点模型
+cd ../build
+./quant -m baichuan -p ../baichuan.bin -o ../baichuan-fp16.bin -b 16 #导出float16模型
+./quant -m baichuan -p ../baichuan.bin -o ../baichuan-int8.bin -b 8 #导出int8模型
+./quant -m baichuan -p ../baichuan.bin -o ../baichuan-int4.bin -b 4 #导出int4模型
 ```
 
 ### MOSS模型导出
@@ -119,16 +153,13 @@ cd ../build
 cd tools
 python3 moss_export.py ../moss.bin # 导出浮点模型
 cd ../build
+./quant -m moss -p ../moss.bin -o ../moss-fp16.bin -b 16 #导出float16模型
 ./quant -m moss -p ../moss.bin -o ../moss-int8.bin -b 8 #导出int8模型
 ./quant -m moss -p ../moss.bin -o ../moss-int4.bin -b 4 #导出int4模型
 ```
 
 ## TODO
 
-1、各种算子NEON优化, AVX指令集优化
+1、opencl支持
 
-2、CUDA优化
-
-3、CUDA模式下，当显存不够时使用显存+内存混合计算模式
-
-4、支持更多模型
+2、完善Sample功能
