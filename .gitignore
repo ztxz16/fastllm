@@ -1,3 +1,5 @@
+*.log
+token
 /cmake-build-debug/
 /build-tfacc/
 /build-android/
