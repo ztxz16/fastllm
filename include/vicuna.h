@@ -22,6 +22,7 @@ namespace fastllm {
                 const Data &inputIds,
                 const Data &attentionMask,
                 const Data &positionIds,
+                const Data &penaltyFactor,
                 std::vector <std::pair <Data, Data> > &pastKeyValues);
 
         virtual std::string Response(const std::string& input, RuntimeResult retCb); // 根据给出的内容回复

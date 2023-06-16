@@ -886,6 +886,37 @@ namespace fastllm {
         return weight[key];
     }
 
+    void TokenPenaltyManager::Init(int vocabSize, int lastN, float value) {
+        this->vocabSize = vocabSize;
+        this->lastN = lastN;
+        this->value = value;
+        this->Clear();
+    }
+
+    void TokenPenaltyManager::Clear() {
+        cnt.clear();
+        while (!q.empty()) {
+            q.pop();
+        }
+        penalty.CopyFrom(Data(DataType::FLOAT32, {1, 1, vocabSize}, std::vector <float> (vocabSize, 1.0f)));
+    }
+
+    void TokenPenaltyManager::InsertToken(int token) {
+        if (q.size() >= this->lastN) {
+            int now = q.front();
+            if ((--cnt[now]) == 0) {
+                cnt.erase(now);
+                ((float*)penalty.cpuData)[now] = 1.0f;
+            }
+            q.pop();
+        }
+
+        q.push(token);
+        if ((++cnt[token]) == 1) {
+            ((float *) penalty.cpuData)[token] = this->value;
+        }
+    }
+
     void Embedding(const Data &input, Data &weight, Data &output) {
         curExecutor->Run("Embedding", {
                 {"input", (Data*)&input}, {"weight", &weight}, {"output", &output}
@@ -1014,5 +1045,11 @@ namespace fastllm {
         curExecutor->Run("RotatePosition2D", {
                 {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
         }, {}, {{"rotaryDim", rotaryDim}});
+    }
+
+    void RepeatPenalty(Data &input, const Data &penalty) {
+        curExecutor->Run("RepeatPenalty", {
+                {"input", &input}, {"penalty", (Data*)&penalty}
+        }, {}, {});
     }
 }
