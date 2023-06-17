@@ -6,11 +6,12 @@ static char* modelpath = NULL;
 static fastllm::basellm* chatGlm = fllm.createllm(LLM_TYPE_CHATGLM);
 static fastllm::basellm* moss = fllm.createllm(LLM_TYPE_MOSS);
 static fastllm::basellm* vicuna = fllm.createllm(LLM_TYPE_VICUNA);
+static fastllm::basellm* baichuan = fllm.createllm(LLM_TYPE_BAICHUAN);
 static int sRound = 0;
 static std::string history;
 
 std::map <std::string, int> modelDict = {
-        {"chatglm", 0}, {"moss", 1}, {"vicuna", 2}
+        {"chatglm", 0}, {"moss", 1}, {"vicuna", 2}, {"baichuan", 3}
 };
 
 struct RunConfig {
@@ -23,7 +24,7 @@ struct RunConfig {
 void Usage() {
 	std::cout << "Usage:" << std::endl;
 	std::cout << "[-h|--help]:                  显示帮助" << std::endl;
-	std::cout << "<-m|--model> <args>:          模型类型，默认为0, 可以设置为0(chatglm),1(moss),2(vicuna)" << std::endl;
+	std::cout << "<-m|--model> <args>:          模型类型，默认为0, 可以设置为0(chatglm),1(moss),2(vicuna),3(baichuan)" << std::endl;
 	std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
 	std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
 	std::cout << "<-l|--low> <args>:            使用低内存模式" << std::endl;
@@ -76,6 +77,10 @@ int initLLMConf(int model,bool isLowMem, const char* modelPath, int threads) {
     if (modeltype == 2) {
         vicuna->LoadFromFile(modelPath);
     }
+    if (modeltype == 3) {
+        baichuan->LoadFromFile(modelPath);
+        baichuan->WarmUp();
+    }
 	return 0;
 }
 
@@ -126,7 +131,7 @@ int chat(const char* prompt) {
         }
 
         auto prompt = history + "USER: " + input + " ASSISTANT: ";
-        printf("prompt: %s\n", prompt.c_str());
+        // printf("prompt: %s\n", prompt.c_str());
         ret = vicuna->Response(prompt, [](int index, const char* content) {
             if (index == 0) {
                 printf("VICUNA:%s", content);
@@ -139,6 +144,25 @@ int chat(const char* prompt) {
             }
         });
         history += (ret + "</s>");
+    }
+
+    if (modeltype == LLM_TYPE_BAICHUAN) {
+        auto prompt = history + "<human>:" + input + "\n<bot>:";
+
+        //printf("prompt: %s\n", prompt.c_str());
+        history = prompt;
+        ret = baichuan->Response(prompt, [](int index, const char* content) {
+            if (index == 0) {
+                printf("BAICHUAN: %s", content);
+            }
+            if (index > 0) {
+                printf("%s", content);
+            }
+            if (index == -1) {
+                printf("\n");
+            }
+        });
+        history += (ret + '\n');
     }
 
 	long len = ret.length();
@@ -160,6 +184,10 @@ void uninitLLM()
     if (vicuna) {
         delete vicuna;
         vicuna = NULL;
+    }
+    if (baichuan) {
+        delete baichuan;
+        baichuan = NULL;
     }
 }
 
@@ -188,11 +216,12 @@ int main(int argc, char **argv) {
 			}
 			chat(input.c_str());
 		}
-	} else if (config.model == LLM_TYPE_VICUNA) {
+	} else if (config.model == LLM_TYPE_VICUNA || config.model == LLM_TYPE_BAICHUAN) {
         while (true) {
             printf("用户: ");
             std::string input;
             std::getline(std::cin, input);
+            //input = "晚上睡不着怎么办";
             if (input == "stop") {
                 break;
             }

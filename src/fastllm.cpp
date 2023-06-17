@@ -32,6 +32,11 @@ namespace fastllm {
 
     static int threads = 4;
     static bool lowMemMode = false;
+    static bool kvCacheInCPU = false;
+
+    void SetKVCacheInCPU(bool v) {
+        kvCacheInCPU = v;
+    }
 
     void SetThreads(int t) {
         threads = t;
@@ -39,6 +44,10 @@ namespace fastllm {
 
     void SetLowMemMode(bool m) {
     	lowMemMode = m;
+    }
+
+    bool GetKVCacheInCPU() {
+        return kvCacheInCPU;
     }
 
     bool GetLowMemMode() {
@@ -408,7 +417,7 @@ namespace fastllm {
         printf("\n");
          */
         int n = Count(0) / dims.back(), m = dims.back();
-        for (int i = 0; i < n && i < 10; i++) {
+        for (int i = 0; i < n; i++) {
             for (int j = 0; j < 10 && j < m; j++) {
                 printf("%f ", ((float*)cpuData)[i * m + j]);
             }
@@ -877,6 +886,37 @@ namespace fastllm {
         return weight[key];
     }
 
+    void TokenPenaltyManager::Init(int vocabSize, int lastN, float value) {
+        this->vocabSize = vocabSize;
+        this->lastN = lastN;
+        this->value = value;
+        this->Clear();
+    }
+
+    void TokenPenaltyManager::Clear() {
+        cnt.clear();
+        while (!q.empty()) {
+            q.pop();
+        }
+        penalty.CopyFrom(Data(DataType::FLOAT32, {1, 1, vocabSize}, std::vector <float> (vocabSize, 1.0f)));
+    }
+
+    void TokenPenaltyManager::InsertToken(int token) {
+        if (q.size() >= this->lastN) {
+            int now = q.front();
+            if ((--cnt[now]) == 0) {
+                cnt.erase(now);
+                ((float*)penalty.cpuData)[now] = 1.0f;
+            }
+            q.pop();
+        }
+
+        q.push(token);
+        if ((++cnt[token]) == 1) {
+            ((float *) penalty.cpuData)[token] = this->value;
+        }
+    }
+
     void Embedding(const Data &input, Data &weight, Data &output) {
         curExecutor->Run("Embedding", {
                 {"input", (Data*)&input}, {"weight", &weight}, {"output", &output}
@@ -884,8 +924,8 @@ namespace fastllm {
     }
 
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output) {
-        curExecutor->Run("LayerNorm", {
-                {"input", (Data*)&input}, {"wegiht", (Data*)&weight}, {"output", &output}
+        curExecutor->Run("RMSNorm", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight}, {"output", &output}
         }, {{"eps", eps}}, {});
     }
 
@@ -1005,5 +1045,11 @@ namespace fastllm {
         curExecutor->Run("RotatePosition2D", {
                 {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
         }, {}, {{"rotaryDim", rotaryDim}});
+    }
+
+    void RepeatPenalty(Data &input, const Data &penalty) {
+        curExecutor->Run("RepeatPenalty", {
+                {"input", &input}, {"penalty", (Data*)&penalty}
+        }, {}, {});
     }
 }

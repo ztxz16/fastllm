@@ -3,11 +3,13 @@
 #include "moss.h"
 #include "basellm.h"
 #include "vicuna.h"
+#include "baichuan.h"
 
 enum LLM_TYPE {
 	LLM_TYPE_CHATGLM = 0,
 	LLM_TYPE_MOSS = 1,
 	LLM_TYPE_VICUNA = 2,
+	LLM_TYPE_BAICHUAN = 3,
 };
 
 class factoryllm {
@@ -25,6 +27,9 @@ public:
 			break;
 		case LLM_TYPE_VICUNA:
             pLLM = new fastllm::VicunaModel;
+			break;
+		case LLM_TYPE_BAICHUAN:
+			pLLM = new fastllm::BaichuanModel;
 			break;
 		default:
 			break;
