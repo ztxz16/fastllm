@@ -10,6 +10,7 @@
 #include <string>
 #include <map>
 #include <set>
+#include <queue>
 #include <unordered_map>
 #include <cmath>
 #include <algorithm>
@@ -19,8 +20,10 @@
 namespace fastllm {
     void SetThreads(int t);
     void SetLowMemMode(bool m);
+    void SetKVCacheInCPU(bool kvCacheInCPU);
     bool GetLowMemMode();
     int GetThreads();
+    bool GetKVCacheInCPU();
 
     struct LowBitConfig {
         int bit;
@@ -80,6 +83,7 @@ namespace fastllm {
     };
 
     struct Data {
+        bool lockInCPU = false; // 如果lock在CPU上，那么不允许移动到其余设备
         WeightType weightType = WeightType::NONE; // 权重类型，NONE代表非权重（或未知权重）
 
         DataType dataType = DataType::FLOAT32; // 数据类型
@@ -199,6 +203,20 @@ namespace fastllm {
         Data &operator [] (const std::string &key);
     };
 
+    struct TokenPenaltyManager {
+        Data penalty = Data();
+        std::map <int, int> cnt;
+        std::queue <int> q;
+        int vocabSize, lastN;
+        float value;
+
+        void Init (int vocabSize, int lastN, float value);
+
+        void Clear();
+
+        void InsertToken(int token);
+    };
+
     void Embedding(const Data &input, Data &weight, Data &output);
 
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output);
@@ -238,6 +256,8 @@ namespace fastllm {
     void TopK(const Data &input, Data &output, int topK); // 求topk
 
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position
+
+    void RepeatPenalty(Data &input, const Data &penalty); // 惩罚，input[i] = input[i] < 0 ? input[i] * penalty[i] : input[i] / penalty[i];
 }
 
 #endif //TEST_FASTLLM_H

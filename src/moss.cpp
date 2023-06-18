@@ -79,7 +79,8 @@ namespace fastllm {
     }
 
     int MOSSModel::Forward(const Data &inputIds, const Data &attentionMask,
-                            const Data &positionIds, std::vector <std::pair <Data, Data> > &pastKeyValues) {
+                            const Data &positionIds, const Data &penaltyFactor,
+                            std::vector <std::pair <Data, Data> > &pastKeyValues) {
         auto st = std::chrono::system_clock::now();
 
         Data inputEmbeddings;
@@ -200,7 +201,7 @@ namespace fastllm {
         std::string retString = "";
 		int index = 0;
         while (true) {
-            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+            int ret = Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
             if (ret == 106068) {
                 break;
             }
@@ -234,7 +235,7 @@ namespace fastllm {
         for (int i = 0; i < block_cnt; i++) {
             pastKeyValues.push_back(std::make_pair(Data(), Data()));
         }
-        Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+        Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
         this->weight.SaveLowBitModel(fileName, bit);
     }
 }
