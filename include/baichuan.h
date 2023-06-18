@@ -1,9 +1,9 @@
 //
-// Created by huangyuyang on 6/1/23.
+// Created by huangyuyang on 6/15/23.
 //
 
-#ifndef FASTLLM_VICUNA_H
-#define FASTLLM_VICUNA_H
+#ifndef FASTLLM_BAICHUAN_H
+#define FASTLLM_BAICHUAN_H
 
 #include "basellm.h"
 #include "cmath"
@@ -11,9 +11,9 @@
 #include <iostream>
 
 namespace fastllm {
-    class VicunaModel: public basellm {
+    class BaichuanModel: public basellm {
     public:
-        VicunaModel (); // 构造函数
+        BaichuanModel (); // 构造函数
 
         virtual void LoadFromFile(const std::string &fileName); // 从文件读取
 
@@ -37,4 +37,4 @@ namespace fastllm {
     };
 }
 
-#endif //FASTLLM_VICUNA_H
+#endif //FASTLLM_BAICHUAN_H

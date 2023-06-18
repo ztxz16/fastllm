@@ -22,7 +22,8 @@ endif()
 
 
 message(STATUS "CMAKE_CXX_FLAGS" ${CMAKE_CXX_FLAGS})
-set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/devices/cpu/cpudevice.cpp src/executor.cpp src/chatglm.cpp src/moss.cpp src/vicuna.cpp)
+set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/devices/cpu/cpudevice.cpp src/executor.cpp
+        src/chatglm.cpp src/moss.cpp src/vicuna.cpp src/baichuan.cpp)
 
 if (USE_CUDA)
     enable_language(CUDA)

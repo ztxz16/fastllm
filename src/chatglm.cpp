@@ -52,8 +52,9 @@ namespace fastllm {
     }
 
     int ChatGLMModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
-                              const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues) {
-        return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues)[0];
+                              const fastllm::Data &positionIds, const Data &penaltyFactor,
+                              std::vector<std::pair<Data, Data>> &pastKeyValues) {
+        return ForwardBatch(1, inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues)[0];
     }
 
     std::vector <int> ChatGLMModel::ForwardBatch(
@@ -61,6 +62,7 @@ namespace fastllm {
             const Data &inputIds,
             const Data &attentionMask,
             const Data &positionIds,
+            const Data &penaltyFactor,
             std::vector <std::pair <Data, Data> > &pastKeyValues) {
 TimeRecord batchRecord;
 //batchRecord.Clear();
@@ -102,9 +104,13 @@ TimeRecord batchRecord;
 
 //batchRecord.Record("RotateQKV");
             Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
-
-            pastKey.ToDevice(DataDevice::CUDA);
-            pastValue.ToDevice(DataDevice::CUDA);
+            if (GetKVCacheInCPU()) {
+                pastKey.lockInCPU = true;
+                pastValue.lockInCPU = true;
+            } else {
+                pastKey.ToDevice(DataDevice::CUDA);
+                pastValue.ToDevice(DataDevice::CUDA);
+            };
 
             k.Resize({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
             v.Resize({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
@@ -262,7 +268,7 @@ TimeRecord batchRecord;
 		int index = 0;
         while (true) {
             auto st = std::chrono::system_clock::now();
-            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+            int ret = Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
             if (ret == 130005) {
                 break;
             }
@@ -361,7 +367,7 @@ TimeRecord batchRecord;
         int index = 0;
         while (true) {
             auto st = std::chrono::system_clock::now();
-            std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, pastKeyValues);
+            std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, Data(), pastKeyValues);
             std::vector <float> fret;
             std::vector <float> results;
             int endingCount = 0;
@@ -428,7 +434,7 @@ TimeRecord batchRecord;
 		    pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
 		                                           Data(DataType::FLOAT32)));
 	    }
-	    Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+	    Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
 	    printf("finish.\n");
     }
 

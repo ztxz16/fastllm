@@ -1,15 +1,18 @@
 //
-// Created by huangyuyang on 6/1/23.
+// Created by huangyuyang on 6/15/23.
 //
 
 #include "utils.h"
 
-#include "vicuna.h"
+#include "baichuan.h"
 
 namespace fastllm {
-    VicunaModel::VicunaModel() {
+    BaichuanModel::BaichuanModel() {
         block_cnt = 32;
         rotary_dim = 128;
+
+        do_sample = true;
+        repeat_penalty = 1.1;
 
         sin.resize(max_positions);
         cos.resize(max_positions);
@@ -28,7 +31,7 @@ namespace fastllm {
         weight.embeddingNames.insert("model.embed_tokens.weight");
     }
 
-    void VicunaModel::RotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds) {
+    void BaichuanModel::RotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds) {
         int outer = data.dims[0] * data.dims[1];
         int spatial = data.Count(2);
         int n = data.dims[2], m = data.dims[3];
@@ -49,41 +52,36 @@ namespace fastllm {
         }
     }
 
-    void VicunaModel::LoadFromFile(const std::string &fileName) {
+    void BaichuanModel::LoadFromFile(const std::string &fileName) {
         this->weight.LoadFromFile(fileName);
     }
 
-    int VicunaModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
-                              const fastllm::Data &positionIds, const Data &penaltyFactor,
-                              std::vector<std::pair<Data, Data>> &pastKeyValues) {
-TimeRecord timeRecord;
-timeRecord.Clear();
-timeRecord.Record();
+    int BaichuanModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+                             const fastllm::Data &positionIds, const Data &penaltyFactor,
+                             std::vector<std::pair<Data, Data>> &pastKeyValues) {
         Data hiddenStates;
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         for (int i = 0; i < block_cnt; i++) {
             Data attenInput;
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
-timeRecord.Record("rms");
-            std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
-            std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
-            std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string qkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.W_pack.weight";
             std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
 
             // 1.1 Get q, k, v
-            Data q, k, v;
+            Data qkv, q, k, v;
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
 
-            Linear(attenInput, weight[qWeightName], Data(), q);
-            Linear(attenInput, weight[kWeightName], Data(), k);
-            Linear(attenInput, weight[vWeightName], Data(), v);
+            Linear(attenInput, weight[qkvWeightName], Data(), qkv);
+            int per = qkv.dims.back() / 3;
+            Split(qkv, -1, 0, per, q);
+            Split(qkv, -1, per, per * 2, k);
+            Split(qkv, -1, per * 2, per * 3, v);
 
             std::vector <int> qkvSize = {bsz, seqlen, num_attention_heads, -1};
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
-timeRecord.Record("qkv");
 
             q.ToDevice(DataDevice::CPU);
             k.ToDevice(DataDevice::CPU);
@@ -142,7 +140,6 @@ timeRecord.Record("qkv");
             }
             Softmax(attenWeights, attenWeights, -1);
             MatMulTransB(attenWeights, pastValue, attenOutput);
-
             attenOutput.Reshape({attenOutput.dims[1], attenOutput.dims[2], attenOutput.dims[3]});
             PermuteSelf(attenOutput, {1, 0, 2});
             attenOutput.Reshape({bsz, seqlen, -1});
@@ -150,31 +147,26 @@ timeRecord.Record("qkv");
             Data attenLastOutput;
             Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
-timeRecord.Record("attn");
+
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
-timeRecord.Record("rms");
             Data w1, w2, w3;
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
-timeRecord.Record("mlp linerar");
             Silu(w1, w1);
-timeRecord.Record("mlp silu");
             MulTo(w1, w3);
-timeRecord.Record("mlp mul");
             Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
-timeRecord.Record("mlp linerar");
             AddTo(hiddenStates, w2);
-timeRecord.Record("mlp add");
         }
 
         RMSNorm(hiddenStates, weight["model.norm.weight"], 1e-6, hiddenStates);
-timeRecord.Record("rms");
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         logits.ToDevice(DataDevice::CPU);
-timeRecord.Record("logits");
-//timeRecord.Print();
+        if (this->do_sample && penaltyFactor.dims == logits.dims) {
+            RepeatPenalty(logits, penaltyFactor);
+        }
+
         std::pair <float, int> ret = std::make_pair(-1e9, -1);
         int base = logits.dims[1] - 1;
         for (int i = 0; i < logits.dims.back(); i++) {
@@ -183,7 +175,7 @@ timeRecord.Record("logits");
         return ret.second;
     }
 
-    std::string VicunaModel::Response(const std::string& input, RuntimeResult retCb) {
+    std::string BaichuanModel::Response(const std::string& input, RuntimeResult retCb) {
         int bos = atoi(this->weight.dicts["bos"].c_str());
         int eos = atoi(this->weight.dicts["eos"].c_str());
 
@@ -193,7 +185,6 @@ timeRecord.Record("logits");
         for (int i = 0; i < inputIds.Count(0); i++) {
             ids.push_back(((float*)inputIds.cpuData)[i]);
         }
-
         int seqLen = ids.size();
         inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, ids));
 
@@ -219,10 +210,20 @@ timeRecord.Record("logits");
         int len = seqLen;
         std::vector <float> results;
         int index = 0;
+
+        int vocabSize = this->weight.tokenizer.tokenToStringDict.size();
+        TokenPenaltyManager tokenPenaltyManager;
+        if (this->do_sample) {
+            tokenPenaltyManager.Init(vocabSize, this->last_n, this->repeat_penalty);
+            /*for (int i = std::max(0, (int)ids.size() - this->last_n); i < ids.size(); i++) {
+                tokenPenaltyManager.InsertToken((int)(ids[i] + 1e-6));
+            }*/
+        }
+
         while (true) {
             auto st = std::chrono::system_clock::now();
 
-            int ret = Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
+            int ret = Forward(inputIds, attentionMask, positionIds, tokenPenaltyManager.penalty, pastKeyValues);
             if (ret == eos) {
                 break;
             }
@@ -240,6 +241,9 @@ timeRecord.Record("logits");
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)ret}));
             attentionMask = Data();
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)len}));
+            if (do_sample) {
+                tokenPenaltyManager.InsertToken(ret);
+            }
             len++;
 
             //printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
@@ -250,7 +254,7 @@ timeRecord.Record("logits");
         return retString;
     }
 
-    void VicunaModel::WarmUp() {
+    void BaichuanModel::WarmUp() {
         printf("Warmup...\n");
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
         Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});
@@ -265,7 +269,7 @@ timeRecord.Record("logits");
         printf("finish.\n");
     }
 
-    void VicunaModel::SaveLowBitModel(const std::string &fileName, int bit) {
+    void BaichuanModel::SaveLowBitModel(const std::string &fileName, int bit) {
         WarmUp();
         this->weight.SaveLowBitModel(fileName, bit);
     }
