@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import sys
 import platform
 import logging
@@ -6,7 +7,7 @@ import pyfastllm
 
 logging.info(f"python gcc version:{platform.python_compiler()}")
 
-sys.path.append('./build')
+sys.path.append('./build-py')
 
 def args_parser():
     parser = argparse.ArgumentParser(description='pyfastllm')
@@ -28,14 +29,17 @@ def print_back(idx:int, content: str):
     sys.stdout.flush()
 
 def main(args):
-    prompt = "写一篇500字关于我的妈妈的作文"
-    # prompt = "hello"
-    model_path = "/home/wildkid1024/Code/Cpp/fastllm/build/chatglm-6b-int8.bin"
     model_path = args.path
     model = pyfastllm.ChatGLMModel()
     model.load_weights(model_path)
     model.warmup()
-    model.response(prompt, print_back)
+
+    prompt = ""
+    while prompt != "exit":
+        prompt = input("User: ")
+        model.response(prompt, print_back)
+        print()
+        sys.stdout.flush()
 
 if __name__ == "__main__":
     args = args_parser()

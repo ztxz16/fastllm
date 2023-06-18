@@ -1,14 +1,12 @@
 #pragma once
 #include "fastllm.h"
 
-<<<<<<< HEAD
-// typedef void(*RuntimeResult) (int index, const char* content);//实时生成的内容回调 index: 0开始回复，-1本次回复结束
+
+// typedef void(*RuntimeResult) (int index, const char* content); //实时生成的内容回调 index: 0开始回复，-1本次回复结束
+// typedef void(*RuntimeResultBatch) (int index, std::vector <std::string> &contents); //实时生成的内容回调 index: 0开始回复，-1本次回复结束
 
 using RuntimeResult = std::function<void(int index, const char* content)>;
-=======
-typedef void(*RuntimeResult) (int index, const char* content); //实时生成的内容回调 index: 0开始回复，-1本次回复结束
-typedef void(*RuntimeResultBatch) (int index, std::vector <std::string> &contents); //实时生成的内容回调 index: 0开始回复，-1本次回复结束
->>>>>>> dev/master
+using RuntimeResultBatch = std::function<void(int index, std::vector <std::string> &contents)>;
 
 namespace fastllm {
     class basellm {
