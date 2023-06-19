@@ -4,7 +4,11 @@ project(fastllm LANGUAGES CXX)
 
 option(USE_CUDA "use cuda" OFF)
 
+option(PY_API "python api" OFF)
+
 message(STATUS "USE_CUDA: ${USE_CUDA}")
+
+message(STATUS "PYTHON_API: ${PY_API}")
 
 set(CMAKE_BUILD_TYPE "Release")
 
@@ -16,7 +20,6 @@ else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2 -march=native")
 endif()
 
-include_directories(include)
 
 message(STATUS "CMAKE_CXX_FLAGS" ${CMAKE_CXX_FLAGS})
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/devices/cpu/cpudevice.cpp src/executor.cpp
@@ -27,8 +30,23 @@ if (USE_CUDA)
     add_compile_definitions(USE_CUDA)
     set(FASTLLM_CUDA_SOURCES src/fastllm-cuda.cu src/devices/cuda/cudadevice.cpp)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
-    #set(CMAKE_CUDA_ARCHITECTURES "70")
+    set(CMAKE_CUDA_ARCHITECTURES "70")
 endif()
+
+if (PY_API)
+    set(PYBIND third_party/pybind11)
+    add_subdirectory(${PYBIND})
+    add_compile_definitions(PY_API)
+    
+    set(Python3_ROOT_DIR "/usr/local/python3.10.6/bin/")
+    find_package(Python3 REQUIRED)
+
+    include_directories(include third_party/pybind11/include)
+    file(GLOB FASTLLM_CXX_HEADERS include/*.h)
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES})
+    target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
+    pybind11_extension(pyfastllm)
+else()
 
 add_library(fastllm OBJECT
             ${FASTLLM_CXX_SOURCES}
@@ -47,3 +65,5 @@ target_link_libraries(webui fastllm)
 
 add_executable(benchmark example/benchmark/benchmark.cpp)
 target_link_libraries(benchmark fastllm)
+
+endif()

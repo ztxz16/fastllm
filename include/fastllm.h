@@ -14,6 +14,8 @@
 #include <unordered_map>
 #include <cmath>
 #include <algorithm>
+#include <iostream>
+#include <functional>
 
 namespace fastllm {
     void SetThreads(int t);

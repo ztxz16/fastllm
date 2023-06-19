@@ -3,8 +3,10 @@ token
 /cmake-build-debug/
 /build-tfacc/
 /build-android/
+/build-py/
 /build/
 /.idea/
+/.vscode/
 /example/Win32Demo/bin/*.*
 /example/Win32Demo/x64
 /example/Win32Demo/*.filters
