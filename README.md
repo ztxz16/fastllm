@@ -70,7 +70,7 @@ make -j4
 
 ### python-binding
 ```
-mddir build-py
+mkdir build-py
 cd build-py
 cmake .. -DUSE_CUDA=ON -DPY_API=ON
 make -j4
