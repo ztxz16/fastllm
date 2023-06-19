@@ -30,7 +30,7 @@ if (USE_CUDA)
     add_compile_definitions(USE_CUDA)
     set(FASTLLM_CUDA_SOURCES src/fastllm-cuda.cu src/devices/cuda/cudadevice.cpp)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
-    set(CMAKE_CUDA_ARCHITECTURES "70")
+    #set(CMAKE_CUDA_ARCHITECTURES "70")
 endif()
 
 if (PY_API)
@@ -48,6 +48,7 @@ if (PY_API)
     pybind11_extension(pyfastllm)
 else()
 
+include_directories(include)
 add_library(fastllm OBJECT
             ${FASTLLM_CXX_SOURCES}
             ${FASTLLM_CUDA_SOURCES}
