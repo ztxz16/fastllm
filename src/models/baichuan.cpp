@@ -3,13 +3,20 @@
 //
 
 #include "utils.h"
-
 #include "baichuan.h"
 
 namespace fastllm {
     BaichuanModel::BaichuanModel() {
+        this->model_type = "baichuan";
+        bos_token_id = 1;
+        eos_token_id = 2;
         block_cnt = 32;
         rotary_dim = 128;
+
+        this->pre_prompt = "";
+        this->user_role = "<human>:";
+        this->bot_role = "\n<bot>:";
+        this->history_sep = "\n";
 
         do_sample = true;
         repeat_penalty = 1.1;
@@ -50,10 +57,6 @@ namespace fastllm {
                 d += m;
             }
         }
-    }
-
-    void BaichuanModel::LoadFromFile(const std::string &fileName) {
-        this->weight.LoadFromFile(fileName);
     }
 
     int BaichuanModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
@@ -176,12 +179,9 @@ namespace fastllm {
     }
 
     std::string BaichuanModel::Response(const std::string& input, RuntimeResult retCb) {
-        int bos = atoi(this->weight.dicts["bos"].c_str());
-        int eos = atoi(this->weight.dicts["eos"].c_str());
-
         Data inputIds = this->weight.tokenizer.Encode(input);
         std::vector <float> ids;
-        ids.push_back(bos);
+        ids.push_back(bos_token_id);
         for (int i = 0; i < inputIds.Count(0); i++) {
             ids.push_back(((float*)inputIds.cpuData)[i]);
         }
@@ -224,7 +224,7 @@ namespace fastllm {
             auto st = std::chrono::system_clock::now();
 
             int ret = Forward(inputIds, attentionMask, positionIds, tokenPenaltyManager.penalty, pastKeyValues);
-            if (ret == eos) {
+            if (ret == eos_token_id) {
                 break;
             }
 
@@ -254,6 +254,14 @@ namespace fastllm {
         return retString;
     }
 
+    std::string BaichuanModel::MakeInput(const std::string &history, int round, const std::string &input) {
+        return (round == 0 ? pre_prompt : history) + user_role + input + bot_role;
+    }
+
+    std::string BaichuanModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
+        return (round == 0 ? pre_prompt : history) + user_role + input + bot_role + output + history_sep;
+    }
+
     void BaichuanModel::WarmUp() {
         printf("Warmup...\n");
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
@@ -267,10 +275,5 @@ namespace fastllm {
         }
         Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
         printf("finish.\n");
-    }
-
-    void BaichuanModel::SaveLowBitModel(const std::string &fileName, int bit) {
-        WarmUp();
-        this->weight.SaveLowBitModel(fileName, bit);
     }
 }

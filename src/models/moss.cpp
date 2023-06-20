@@ -16,6 +16,12 @@ namespace fastllm {
     extern double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2);
 
     MOSSModel::MOSSModel() {
+        this->model_type = "moss";
+        this->pre_prompt = "You are an AI assistant whose name is MOSS. ";
+        this->user_role = "<|Human|>: ";
+        this->bot_role = "<eoh>";
+        this->history_sep = "";
+
         // 初始化sin, cos
 		embed_dim = 6144;
 		num_attention_heads = 24;
@@ -37,10 +43,6 @@ namespace fastllm {
             }
         }
         this->weight.embeddingNames.insert("transformer.wte.weight");
-    }
-
-    void MOSSModel::LoadFromFile(const std::string &fileName) {
-        this->weight.LoadFromFile(fileName);
     }
 
     void MOSSModel::CausalMask(Data &data, int start) {
@@ -222,20 +224,16 @@ namespace fastllm {
         }
 
 		if (retCb)
-			retCb(index++, retString.c_str());
+			retCb(-1, retString.c_str());
         // printf("%s\n", weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str());
         return retString;
     }
 
-    void MOSSModel::SaveLowBitModel(const std::string &fileName, int bit) {
-        Data inputIds = Data(DataType::FLOAT32, {1, 1}, {(float) 1});
-        Data attentionMask = Data(DataType::FLOAT32, {1, 1}, std::vector<float>(1, 1.0f));
-        Data positionIds = Data(DataType::FLOAT32, {1, 1}, {(float) (0)});
-        std::vector<std::pair<Data, Data> > pastKeyValues;
-        for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(), Data()));
-        }
-        Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
-        this->weight.SaveLowBitModel(fileName, bit);
+    std::string MOSSModel::MakeInput(const std::string &history, int round, const std::string &input) {
+        return (round == 0 ? pre_prompt : history) + user_role + input + bot_role;
+    }
+
+    std::string MOSSModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
+        return (round == 0 ? pre_prompt : history) + user_role + input + bot_role + output + history_sep;
     }
 }
