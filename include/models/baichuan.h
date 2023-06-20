@@ -1,9 +1,9 @@
 //
-// Created by huangyuyang on 6/1/23.
+// Created by huangyuyang on 6/15/23.
 //
 
-#ifndef FASTLLM_VICUNA_H
-#define FASTLLM_VICUNA_H
+#ifndef FASTLLM_BAICHUAN_H
+#define FASTLLM_BAICHUAN_H
 
 #include "basellm.h"
 #include "cmath"
@@ -11,11 +11,9 @@
 #include <iostream>
 
 namespace fastllm {
-    class VicunaModel: public basellm {
+    class BaichuanModel: public basellm {
     public:
-        VicunaModel (); // 构造函数
-
-        virtual void LoadFromFile(const std::string &fileName); // 从文件读取
+        BaichuanModel (); // 构造函数
 
         // 推理
         virtual int Forward(
@@ -27,9 +25,11 @@ namespace fastllm {
 
         virtual std::string Response(const std::string& input, RuntimeResult retCb); // 根据给出的内容回复
 
-        virtual void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
-
         virtual void WarmUp(); // 预热
+
+        virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
+
+        virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
     private:
         virtual void RotatePosition2D(Data &data, const Data &positionIds); // 二维位置编码
 
@@ -37,4 +37,4 @@ namespace fastllm {
     };
 }
 
-#endif //FASTLLM_VICUNA_H
+#endif //FASTLLM_BAICHUAN_H

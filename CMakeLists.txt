@@ -22,15 +22,17 @@ endif()
 
 
 message(STATUS "CMAKE_CXX_FLAGS" ${CMAKE_CXX_FLAGS})
-set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/devices/cpu/cpudevice.cpp src/executor.cpp
-        src/chatglm.cpp src/moss.cpp src/vicuna.cpp src/baichuan.cpp)
+set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executor.cpp
+        src/devices/cpu/cpudevice.cpp
+        src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/baichuan.cpp)
 
 if (USE_CUDA)
     enable_language(CUDA)
     add_compile_definitions(USE_CUDA)
-    set(FASTLLM_CUDA_SOURCES src/fastllm-cuda.cu src/devices/cuda/cudadevice.cpp)
+    include_directories(include/devices/cuda)
+    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/fastllm-cuda.cu)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
-    # set(CMAKE_CUDA_ARCHITECTURES "70")
+    #set(CMAKE_CUDA_ARCHITECTURES "70")
 endif()
 
 if (PY_API)
@@ -47,6 +49,10 @@ if (PY_API)
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
+
+include_directories(include)
+include_directories(include/utils)
+include_directories(include/models)
 
 add_library(fastllm OBJECT
             ${FASTLLM_CXX_SOURCES}
