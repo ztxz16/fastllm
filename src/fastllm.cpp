@@ -562,6 +562,37 @@ namespace fastllm {
         this->dataDevice = device;
     }
 
+    std::string GetModelTypeFromFile(const std::string &fileName) {
+        std::string ret = "unknown";
+        FileBuffer buffer(fileName);
+        int versionId = buffer.ReadInt();
+        std::map <std::string, std::string> dicts;
+        if (versionId >= 1) {
+            int keyValueLen = buffer.ReadInt();
+            for (int i = 0; i < keyValueLen; i++) {
+                std::string key = buffer.ReadString();
+                std::string value = buffer.ReadString();
+                dicts[key] = value;
+            }
+        }
+        if (versionId <= 1) {
+            // 老旧的模型，直接通过vocab_size判定模型类型
+            int vocabLen = buffer.ReadInt();
+            if (vocabLen == 106072) {
+                ret = "moss";
+            } else if (vocabLen == 64000) {
+                ret = "baichuan";
+            } else {
+                ret = "chatglm";
+            }
+        } else {
+            if (dicts.find("model_type") != dicts.end()) {
+                ret = dicts["model_type"];
+            }
+        }
+        return ret;
+    }
+
     Tokenizer::TrieNode::TrieNode() {
         this->tokenId = -999999;
     }
@@ -674,8 +705,8 @@ namespace fastllm {
         FileBuffer buffer(fileName);
         this->versionId = buffer.ReadInt();
 
-        if (this->versionId == 1) {
-            // versionId = 1, 前置了一个key-value表
+        if (this->versionId >= 1) {
+            // versionId >= 1, 前置了一个key-value表
             int keyValueLen = buffer.ReadInt();
             for (int i = 0; i < keyValueLen; i++) {
                 std::string key = buffer.ReadString();
@@ -758,8 +789,8 @@ namespace fastllm {
         AssertInFastLLM(bit == 4 || bit == 8 || bit == 16, "Error: only support 16 bit or 8 bit or 4 bit model.\n");
         FileWriter buffer(fileName);
         buffer.WriteInt(this->versionId);
-        if (this->versionId == 1) {
-            // versionId = 1, 前置了一个key-value表
+        if (this->versionId >= 1) {
+            // versionId >= 1, 前置了一个key-value表
             buffer.WriteInt((int)dicts.size());
             for (auto &it : dicts) {
                 buffer.WriteString(it.first);
@@ -779,6 +810,7 @@ namespace fastllm {
 
         // 写入权重
         buffer.WriteInt((int)weight.size());
+        int tot = 0;
         for (auto &it : weight) {
             buffer.WriteString(it.first);
             Data &data = it.second;
@@ -877,8 +909,10 @@ namespace fastllm {
                     buffer.WriteBytes(uDatas.data(), bytes);
                 }
             }
+            printf("output (%d / %d)\r", ++tot, (int)weight.size());
+            fflush(stdout);
         }
-
+        printf("\n");
         return;
     }
 

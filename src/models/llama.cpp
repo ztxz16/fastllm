@@ -4,10 +4,18 @@
 
 #include "utils.h"
 
-#include "vicuna.h"
+#include "llama.h"
 
 namespace fastllm {
-    VicunaModel::VicunaModel() {
+    LlamaModel::LlamaModel() {
+        this->model_type = "llama";
+
+        // 默认使用alpaca的提示词和instruction
+        this->pre_prompt = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n";
+        this->user_role = "### Instruction:\n";
+        this->bot_role = "\n\n### Response:";
+        this->history_sep = "</s>";
+
         block_cnt = 32;
         rotary_dim = 128;
 
@@ -28,7 +36,7 @@ namespace fastllm {
         weight.embeddingNames.insert("model.embed_tokens.weight");
     }
 
-    void VicunaModel::RotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds) {
+    void LlamaModel::RotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds) {
         int outer = data.dims[0] * data.dims[1];
         int spatial = data.Count(2);
         int n = data.dims[2], m = data.dims[3];
@@ -49,23 +57,15 @@ namespace fastllm {
         }
     }
 
-    void VicunaModel::LoadFromFile(const std::string &fileName) {
-        this->weight.LoadFromFile(fileName);
-    }
-
-    int VicunaModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+    int LlamaModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                               const fastllm::Data &positionIds, const Data &penaltyFactor,
                               std::vector<std::pair<Data, Data>> &pastKeyValues) {
-TimeRecord timeRecord;
-timeRecord.Clear();
-timeRecord.Record();
         Data hiddenStates;
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         for (int i = 0; i < block_cnt; i++) {
             Data attenInput;
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
-timeRecord.Record("rms");
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
             std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
@@ -83,7 +83,6 @@ timeRecord.Record("rms");
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
-timeRecord.Record("qkv");
 
             q.ToDevice(DataDevice::CPU);
             k.ToDevice(DataDevice::CPU);
@@ -150,31 +149,21 @@ timeRecord.Record("qkv");
             Data attenLastOutput;
             Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
-timeRecord.Record("attn");
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
-timeRecord.Record("rms");
             Data w1, w2, w3;
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
-timeRecord.Record("mlp linerar");
             Silu(w1, w1);
-timeRecord.Record("mlp silu");
             MulTo(w1, w3);
-timeRecord.Record("mlp mul");
             Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
-timeRecord.Record("mlp linerar");
             AddTo(hiddenStates, w2);
-timeRecord.Record("mlp add");
         }
 
         RMSNorm(hiddenStates, weight["model.norm.weight"], 1e-6, hiddenStates);
-timeRecord.Record("rms");
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         logits.ToDevice(DataDevice::CPU);
-timeRecord.Record("logits");
-//timeRecord.Print();
         std::pair <float, int> ret = std::make_pair(-1e9, -1);
         int base = logits.dims[1] - 1;
         for (int i = 0; i < logits.dims.back(); i++) {
@@ -183,9 +172,9 @@ timeRecord.Record("logits");
         return ret.second;
     }
 
-    std::string VicunaModel::Response(const std::string& input, RuntimeResult retCb) {
-        int bos = atoi(this->weight.dicts["bos"].c_str());
-        int eos = atoi(this->weight.dicts["eos"].c_str());
+    std::string LlamaModel::Response(const std::string& input, RuntimeResult retCb) {
+        int bos = atoi(this->weight.dicts["bos_token_id"].c_str());
+        int eos = atoi(this->weight.dicts["eos_token_id"].c_str());
 
         Data inputIds = this->weight.tokenizer.Encode(input);
         std::vector <float> ids;
@@ -242,7 +231,7 @@ timeRecord.Record("logits");
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)len}));
             len++;
 
-            //printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            // printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         }
         if (retCb)
             retCb(-1, retString.c_str());
@@ -250,7 +239,15 @@ timeRecord.Record("logits");
         return retString;
     }
 
-    void VicunaModel::WarmUp() {
+    std::string LlamaModel::MakeInput(const std::string &history, int round, const std::string &input) {
+        return (round == 0 ? pre_prompt : history) + user_role + input + bot_role;
+    }
+
+    std::string LlamaModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
+        return (round == 0 ? pre_prompt : history) + user_role + input + bot_role + output + history_sep;
+    }
+
+    void LlamaModel::WarmUp() {
         printf("Warmup...\n");
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
         Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});
@@ -263,10 +260,5 @@ timeRecord.Record("logits");
         }
         Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
         printf("finish.\n");
-    }
-
-    void VicunaModel::SaveLowBitModel(const std::string &fileName, int bit) {
-        WarmUp();
-        this->weight.SaveLowBitModel(fileName, bit);
     }
 }
