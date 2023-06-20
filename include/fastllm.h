@@ -185,6 +185,8 @@ namespace fastllm {
         std::string Decode(const Data &data); // 解码
     };
 
+    std::string GetModelTypeFromFile(const std::string &fileName);
+
     struct WeightMap {
         int versionId;
 
