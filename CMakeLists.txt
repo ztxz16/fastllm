@@ -30,7 +30,7 @@ if (USE_CUDA)
     add_compile_definitions(USE_CUDA)
     set(FASTLLM_CUDA_SOURCES src/fastllm-cuda.cu src/devices/cuda/cudadevice.cpp)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
-    set(CMAKE_CUDA_ARCHITECTURES "70")
+    # set(CMAKE_CUDA_ARCHITECTURES "70")
 endif()
 
 if (PY_API)
@@ -38,7 +38,7 @@ if (PY_API)
     add_subdirectory(${PYBIND})
     add_compile_definitions(PY_API)
     
-    set(Python3_ROOT_DIR "/usr/local/python3.10.6/bin/")
+    # set(Python3_ROOT_DIR "/usr/local/python3.10.6/bin/")
     find_package(Python3 REQUIRED)
 
     include_directories(include third_party/pybind11/include)

@@ -3,7 +3,7 @@ import sys
 import platform
 import logging
 import argparse
-import pyfastllm
+import pyfastllm # 或fastllm
 
 logging.info(f"python gcc version:{platform.python_compiler()}")
 
@@ -11,7 +11,7 @@ sys.path.append('./build-py')
 
 def args_parser():
     parser = argparse.ArgumentParser(description='pyfastllm')
-    parser.add_argument('-m', '--model', type=int, required=False, default=0, help='模型类型，默认为0, 可以设置为0(chatglm),1(moss),2(vicuna)')
+    parser.add_argument('-m', '--model', type=int, required=False, default=0, help='模型类型，默认为0, 可以设置为0(chatglm),1(moss),2(vicuna),3(baichuan)')
     parser.add_argument('-p', '--path', type=str, required=True, default='', help='模型文件的路径')
     parser.add_argument('-t', '--threads', type=int, default=4,  help='使用的线程数量')
     parser.add_argument('-l', '--low', action='store_true', help='使用低内存模式')
