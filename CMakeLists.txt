@@ -26,6 +26,10 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executo
         src/devices/cpu/cpudevice.cpp
         src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/baichuan.cpp)
 
+include_directories(include)
+include_directories(include/utils)
+include_directories(include/models)
+
 if (USE_CUDA)
     enable_language(CUDA)
     add_compile_definitions(USE_CUDA)
@@ -40,19 +44,17 @@ if (PY_API)
     add_subdirectory(${PYBIND})
     add_compile_definitions(PY_API)
     
-    # set(Python3_ROOT_DIR "/usr/local/python3.10.6/bin/")
+    set(Python3_ROOT_DIR "/usr/local/python3.10.6/bin/")
     find_package(Python3 REQUIRED)
 
-    include_directories(include third_party/pybind11/include)
-    file(GLOB FASTLLM_CXX_HEADERS include/*.h)
+    include_directories(third_party/pybind11/include)
+    file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
     add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
 
-include_directories(include)
-include_directories(include/utils)
-include_directories(include/models)
+
 
 add_library(fastllm OBJECT
             ${FASTLLM_CXX_SOURCES}
