@@ -15,8 +15,6 @@ namespace fastllm {
 	public:
         ChatGLMModel (); // 构造函数
 
-		virtual void LoadFromFile(const std::string &fileName); // 从文件读取
-
         // 推理
 		virtual int Forward(
                 const Data &inputIds,
@@ -39,9 +37,11 @@ namespace fastllm {
                                    std::vector <std::string> &outputs,
                                    RuntimeResultBatch retCb);
 
-		virtual void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
-
 		virtual void WarmUp(); // 预热
+
+        virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
+
+        virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
     private:
 		virtual void CausalMask(Data &data, int start) {}; // 因果mask？
     };

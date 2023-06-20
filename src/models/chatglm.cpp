@@ -20,6 +20,11 @@
 
 namespace fastllm {
     ChatGLMModel::ChatGLMModel() {
+        this->model_type = "chatglm";
+
+        this->bos_token_id = 130004;
+        this->eos_token_id = 130005;
+
         sin.resize(max_positions);
         cos.resize(max_positions);
         std::vector <float> invFreq;
@@ -45,10 +50,6 @@ namespace fastllm {
         sinData.CopyFrom(Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, fsin));
         cosData.CopyFrom(Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, fcos));
         weight.embeddingNames.insert("transformer.word_embeddings.weight");
-    }
-
-    void ChatGLMModel::LoadFromFile(const std::string &fileName) {
-        this->weight.LoadFromFile(fileName);
     }
 
     int ChatGLMModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
@@ -231,6 +232,8 @@ TimeRecord batchRecord;
     }
 
     std::string ChatGLMModel::Response(const std::string& input, RuntimeResult retCb) {
+        int gmask_token_id = this->weight.dicts.find("gmask_token_id") != this->weight.dicts.end() ?
+                             atoi(this->weight.dicts["gmask_token_id"].c_str()) : 130001;
 #ifdef USE_CUDA
         FastllmCudaClearBigBuffer();
 #endif
@@ -239,8 +242,8 @@ TimeRecord batchRecord;
         for (int i = 0; i < inputIds.Count(0); i++) {
             ids.push_back(((float*)inputIds.cpuData)[i]);
         }
-        ids.push_back(130001);
-        ids.push_back(130004);
+        ids.push_back(gmask_token_id);
+        ids.push_back(bos_token_id);
         int seqLen = ids.size();
         inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, ids));
 
@@ -269,7 +272,7 @@ TimeRecord batchRecord;
         while (true) {
             auto st = std::chrono::system_clock::now();
             int ret = Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
-            if (ret == 130005) {
+            if (ret == eos_token_id) {
                 break;
             }
 
@@ -305,6 +308,8 @@ TimeRecord batchRecord;
 #ifdef USE_CUDA
         FastllmCudaClearBigBuffer();
 #endif
+        int gmask_token_id = this->weight.dicts.find("gmask_token_id") != this->weight.dicts.end() ?
+                             atoi(this->weight.dicts["gmask_token_id"].c_str()) : 130001;
         // 1. first
         int batch = inputs.size();
         outputs.clear();
@@ -330,8 +335,8 @@ TimeRecord batchRecord;
             for (int j = 0; j < len; j++) {
                 ids[i * maxLen + base + j] = ((float*)tokens.cpuData)[j];
             }
-            ids[i * maxLen + base + len] = 130001;
-            ids[i * maxLen + base + len + 1] = 130004;
+            ids[i * maxLen + base + len] = gmask_token_id;
+            ids[i * maxLen + base + len + 1] = bos_token_id;
             len += 2;
 
             for (int j = 0; j < len - 1; j++) {
@@ -374,7 +379,7 @@ TimeRecord batchRecord;
             std::vector <std::string> curStrings;
             for (int i = 0; i < batch; i++) {
                 fret.push_back(ret[i]);
-                if (ret[i] == 130005) {
+                if (ret[i] == eos_token_id) {
                     isEnding[i] = true;
                 }
                 if (isEnding[i]) {
@@ -425,7 +430,7 @@ TimeRecord batchRecord;
 
     void ChatGLMModel::WarmUp() {
     	printf("Warmup...\n");
-	    Data inputIds = Data(DataType::FLOAT32, {1, 1}, {130004});
+	    Data inputIds = Data(DataType::FLOAT32, {1, 1}, {(float)bos_token_id});
 	    Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});
 	    Data positionIds = Data(DataType::FLOAT32, {2, 1}, {0, 0});
 
@@ -438,8 +443,15 @@ TimeRecord batchRecord;
 	    printf("finish.\n");
     }
 
-    void ChatGLMModel::SaveLowBitModel(const std::string &fileName, int bit) {
-        WarmUp();
-        this->weight.SaveLowBitModel(fileName, bit);
+    std::string ChatGLMModel::MakeInput(const std::string &history, int round, const std::string &input) {
+        if (round == 0) {
+            return input;
+        } else {
+            return history + ("[Round " + std::to_string(round) + "]\n问：" + input + "\n答：");
+        }
+    }
+
+    std::string ChatGLMModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
+        return (history + ("[Round " + std::to_string(round) + "]\n问：" + input + "\n答：" + output + "\n"));
     }
 }
