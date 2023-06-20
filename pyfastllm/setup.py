@@ -11,7 +11,21 @@ parser.add_argument('--cuda', dest='cuda', action='store_true', default=False,
 args, unknown = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + unknown
 
-__VERSION__ = "0.0.1"
+__VERSION__ = "'0.1.0'"
+
+def get_version():
+    root_dir = os.getenv('PROJECT_ROOT', os.path.dirname(os.path.dirname(os.getcwd())))
+    version_header = os.path.join(root_dir, 'include/MNN/MNNDefine.h')
+    version_major = version_minor = version_patch = 'x'
+    for line in open(version_header, 'rt').readlines():
+        if '#define FASTLLM_VERSION_MAJOR' in line:
+            version_major = int(line.strip().split(' ')[-1])
+        if '#define FASTLLM_VERSION_MINOR' in line:
+            version_minor = int(line.strip().split(' ')[-1])
+        if '#define FASTLLM_VERSION_PATCH' in line:
+            version_patch = int(line.strip().split(' ')[-1])
+    return '{}.{}.{}'.format(version_major, version_minor, version_patch)
+
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 
@@ -26,13 +40,14 @@ try:
     # could only be relative paths, otherwise the `build` command would fail if you use a MANIFEST.in to distribute your package
     # only source files (.cpp, .c, .cc) are needed
     # 
-    source_files = glob.glob(os.path.join(BASE_DIR, "src/*.cpp"), recursive=False)
-    source_files.append(os.path.join(BASE_DIR, "src/devices/cpu/cpudevice.cpp"))
+    source_files = glob.glob(os.path.join(BASE_DIR, "src/**/*.cpp"), recursive=True)
+    # source_files.append(os.path.join(BASE_DIR, "src/devices/cpu/cpudevice.cpp"))
+    source_files.remove('/public/Code/Cpp/fastllm/src/devices/cuda/cudadevice.cpp')
     print(source_files)
 
     extra_compile_args = ["-w", "-DPY_API"]
     # If any libraries are used, e.g. libabc.so
-    include_dirs = [os.path.join(BASE_DIR, "include/")]
+    include_dirs = [os.path.join(BASE_DIR, "include/"), os.path.join(BASE_DIR, "include/device/cpu/"), os.path.join(BASE_DIR, "include/models"), os.path.join(BASE_DIR, "include/utils")]
     library_dirs = []
     # (optional) if the library is not in the dir like `/usr/lib/`
     # either to add its dir to `runtime_library_dirs` or to the env variable "LD_LIBRARY_PATH"

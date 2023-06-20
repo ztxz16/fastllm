@@ -18,9 +18,10 @@ def args_parser():
     args = parser.parse_args()
     return args
 
+LLM_TYPE = ""
 def print_back(idx:int, content: str):
     if idx == 0:
-        print(f"ChatGLM:{content}", end='')
+        print(f"{LLM_TYPE}:{content}", end='')
     elif idx > 0:
         print(f"{content}", end='')
     elif idx == -1:
@@ -30,9 +31,17 @@ def print_back(idx:int, content: str):
 
 def main(args):
     model_path = args.path
-    model = pyfastllm.ChatGLMModel()
-    model.load_weights(model_path)
-    model.warmup()
+    OLD_API = False
+    if OLD_API:
+        model = pyfastllm.ChatGLMModel()
+        model.load_weights(model_path)
+        model.warmup()
+    else:
+        global LLM_TYPE 
+        LLM_TYPE = pyfastllm.get_llm_type(model_path)
+        print(f"llm model: {LLM_TYPE}")
+        model = pyfastllm.create_llm(model_path)
+        
 
     prompt = ""
     while prompt != "exit":
