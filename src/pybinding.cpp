@@ -43,6 +43,14 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("response", &fastllm::VicunaModel::Response)
     .def("warmup", &fastllm::VicunaModel::WarmUp)
     .def("save_lowbit_model", &fastllm::VicunaModel::SaveLowBitModel);
+  
+  py::class_<fastllm::BaichuanModel>(m, "BaichuanModel")
+    .def(py::init<>())
+    .def("load_weights", &fastllm::BaichuanModel::LoadFromFile)
+    .def("response", &fastllm::BaichuanModel::Response)
+    .def("warmup", &fastllm::BaichuanModel::WarmUp)
+    .def("save_lowbit_model", &fastllm::BaichuanModel::SaveLowBitModel);
+
 
 #ifdef VERSION_INFO
     m.attr("__version__") = VERSION_INFO;
