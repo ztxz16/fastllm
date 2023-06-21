@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <vector>
 
-#include "fastllm-cuda.h"
+#include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
 static cublasHandle_t fastllmCublasHandle = nullptr;
