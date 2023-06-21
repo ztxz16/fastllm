@@ -3,7 +3,6 @@
 #include "moss.h"
 #include "basellm.h"
 #include "llama.h"
-#include "baichuan.h"
 #include "fastllm.h"
 
 enum LLM_TYPE {
@@ -30,9 +29,6 @@ public:
                 break;
             case LLM_TYPE_VICUNA:
                 pLLM = new fastllm::LlamaModel();
-                break;
-            case LLM_TYPE_BAICHUAN:
-                pLLM = new fastllm::BaichuanModel();
                 break;
             default:
                 break;

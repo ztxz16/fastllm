@@ -2,6 +2,8 @@
 // Created by huangyuyang on 6/13/23.
 //
 
+#include "utils.h"
+
 #include "executor.h"
 
 #include "devices/cpu/cpudevice.h"
@@ -35,6 +37,7 @@ namespace fastllm {
 
     void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                        const fastllm::IntDict &intParams) {
+//auto st = std::chrono::system_clock::now();
         bool lockInCPU = false;
         for (auto &it : datas) {
             lockInCPU |= it.second->lockInCPU;
@@ -52,5 +55,6 @@ namespace fastllm {
                 break;
             }
         }
+//printf("%s spend %f s.\n", opType.c_str(), GetSpan(st, std::chrono::system_clock::now()));
     }
 }

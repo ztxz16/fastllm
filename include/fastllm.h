@@ -260,6 +260,8 @@ namespace fastllm {
 
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position
 
+    void LlamaRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position for llama
+
     void RepeatPenalty(Data &input, const Data &penalty); // 惩罚，input[i] = input[i] < 0 ? input[i] * penalty[i] : input[i] / penalty[i];
 }
 
