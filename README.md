@@ -68,14 +68,6 @@ cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_
 make -j4
 ```
 
-### python-binding
-```
-mkdir build-py
-cd build-py
-cmake .. -DUSE_CUDA=ON -DPY_API=ON
-make -j4
-python cli.py -p chatglm-6b-int8.bin -t 8  # 与cpp编译的运行结果保持一致
-```
 
 编译后会在build目录下生成：
 
