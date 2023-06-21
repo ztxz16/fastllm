@@ -1,7 +1,13 @@
 #pragma once
 #include "fastllm.h"
 
+#ifdef PY_API
+#include "Python.h"
+#include <pybind11/pytypes.h>
+using RuntimeResult = std::function<void(int index, pybind11::bytes content)>;
+#else
 using RuntimeResult = std::function<void(int index, const char* content)>;
+#endif
 using RuntimeResultBatch = std::function<void(int index, std::vector <std::string> &contents)>;
 
 namespace fastllm {

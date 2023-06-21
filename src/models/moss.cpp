@@ -213,7 +213,11 @@ namespace fastllm {
                     Data(DataType::FLOAT32, {(int) results.size()}, results)).c_str();
             retString += current;
 			if (retCb)
+#ifdef PY_API
+				retCb(index++, pybind11::bytes(retString));
+#else
 				retCb(index++, current.c_str());
+#endif
             fflush(stdout);
             results.clear();
 
@@ -224,7 +228,11 @@ namespace fastllm {
         }
 
 		if (retCb)
+#ifdef PY_API
+			retCb(-1, pybind11::bytes(retString));
+#else
 			retCb(-1, retString.c_str());
+#endif
         // printf("%s\n", weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str());
         return retString;
     }
