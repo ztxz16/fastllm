@@ -29,7 +29,7 @@ namespace fastllm {
         this->weight.SaveLowBitModel(fileName, bit);
     }
 
-    basellm* CreateLLMModelFromFile(const std::string &fileName) {
+    std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
         std::string modelType = GetModelTypeFromFile(fileName);
         basellm *model;
         if (modelType == "chatglm") {
@@ -45,6 +45,6 @@ namespace fastllm {
         }
         model->LoadFromFile(fileName);
         model->WarmUp();
-        return model;
+        return std::unique_ptr<fastllm::basellm>(model);
     }
 }

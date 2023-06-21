@@ -8,7 +8,7 @@
 #include "basellm.h"
 
 namespace fastllm {
-    basellm* CreateLLMModelFromFile(const std::string &fileName);
+    std::unique_ptr<basellm> CreateLLMModelFromFile(const std::string &fileName);
 }
 
 #endif //FASTLLM_MODEL_H

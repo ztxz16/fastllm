@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <iostream>
 #include <functional>
+#include <memory>
 
 namespace fastllm {
     void SetThreads(int t);
