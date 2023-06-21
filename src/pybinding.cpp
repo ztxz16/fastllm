@@ -51,15 +51,6 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("batch_response", &fastllm::LlamaModel::ResponseBatch)
     .def("warmup", &fastllm::LlamaModel::WarmUp)
     .def("save_lowbit_model", &fastllm::LlamaModel::SaveLowBitModel);
-  
-  py::class_<fastllm::BaichuanModel, fastllm::basellm>(m, "BaichuanModel")
-    .def(py::init<>())
-    .def("load_weights", &fastllm::BaichuanModel::LoadFromFile)
-    .def("response", &fastllm::BaichuanModel::Response)
-    .def("batch_response", &fastllm::BaichuanModel::ResponseBatch)
-    .def("warmup", &fastllm::BaichuanModel::WarmUp)
-    .def("save_lowbit_model", &fastllm::BaichuanModel::SaveLowBitModel);
-
 
 #ifdef VERSION_INFO
     m.attr("__version__") = VERSION_INFO;
