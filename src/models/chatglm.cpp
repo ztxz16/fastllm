@@ -280,7 +280,11 @@ TimeRecord batchRecord;
             std::string curString = weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str();
             retString += curString;
 			if (retCb)
+#ifdef PY_API
+				retCb(index++, pybind11::bytes(retString));
+#else
 				retCb(index++, curString.c_str());
+#endif
             fflush(stdout);
             results.clear();
 
@@ -298,7 +302,11 @@ TimeRecord batchRecord;
             // printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
         }
 		if (retCb)
+#ifdef PY_API
+			retCb(-1, pybind11::bytes(retString));
+#else
 			retCb(-1, retString.c_str());
+#endif
         return retString;
     }
 

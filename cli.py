@@ -3,11 +3,11 @@ import sys
 import platform
 import logging
 import argparse
+sys.path.append('./build-py')
 import pyfastllm # 或fastllm
 
 logging.info(f"python gcc version:{platform.python_compiler()}")
 
-sys.path.append('./build-py')
 
 def args_parser():
     parser = argparse.ArgumentParser(description='pyfastllm')
@@ -19,11 +19,12 @@ def args_parser():
     return args
 
 LLM_TYPE = ""
-def print_back(idx:int, content: str):
+def print_back(idx:int, content: bytearray):
+    content = content.decode(encoding="utf-8", errors="replace")
     if idx == 0:
         print(f"{LLM_TYPE}:{content}", end='')
     elif idx > 0:
-        print(f"{content}", end='')
+        print(f"{content}", end='\n')
     elif idx == -1:
         print()
 
