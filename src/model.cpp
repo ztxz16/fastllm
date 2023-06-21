@@ -4,7 +4,6 @@
 
 #include "chatglm.h"
 #include "moss.h"
-#include "baichuan.h"
 #include "llama.h"
 
 namespace fastllm {
@@ -37,7 +36,14 @@ namespace fastllm {
         } else if (modelType == "moss") {
             model = (basellm*)(new MOSSModel());
         } else if (modelType == "baichuan") {
-            model = (basellm*)(new BaichuanModel());
+            model = (basellm*)(new LlamaModel());
+            model->model_type = "baichuan";
+            model->pre_prompt = "";
+            model->user_role = "<human>:";
+            model->bot_role = "\n<bot>:";
+            model->history_sep = "\n";
+            model->do_sample = true;
+            model->repeat_penalty = 1.1;
         } else if (modelType == "llama") {
             model = (basellm*)(new LlamaModel());
         } else {
