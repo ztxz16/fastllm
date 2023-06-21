@@ -15,7 +15,7 @@
 #include <map>
 
 #ifdef USE_CUDA
-#include "fastllm-cuda.h"
+#include "fastllm-cuda.cuh"
 #endif
 
 namespace fastllm {
