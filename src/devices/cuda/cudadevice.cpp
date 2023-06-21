@@ -22,7 +22,7 @@ namespace fastllm {
         this->ops["GeluNew"] = (BaseOperator*)(new CudaGeluNewOp());
         this->ops["Mul"] = (BaseOperator*)(new CudaMulOp());
         this->ops["AddTo"] = (BaseOperator*)(new CudaAddToOp());
-        this->ops["AttentionMaskOp"] = (BaseOperator*)(new CudaAttentionMaskOp());
+        this->ops["AttentionMask"] = (BaseOperator*)(new CudaAttentionMaskOp());
         this->ops["TopK"] = (BaseOperator*)(new CudaTopKOp());
         this->ops["PermuteSelf"] = (BaseOperator*)(new CudaPermuteSelfOp());
         this->ops["RotatePosition2D"] = (BaseOperator*)(new CudaRotatePosition2DOp());
