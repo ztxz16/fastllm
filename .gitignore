@@ -5,6 +5,8 @@ token
 /build-android/
 /build-py/
 /build/
+/pyfastllm/build/
+/pyfastllm/dist/
 /.idea/
 /.vscode/
 /example/Win32Demo/bin/*.*
