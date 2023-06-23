@@ -1372,7 +1372,9 @@ namespace fastllm {
                 for (; j < channels; j++) {
                     sum += outputData[j];
                 }
-
+                if (fabs(sum) < 1e-9) {
+                    sum = 0.1;
+                }
                 j = 0;
 #ifdef __aarch64__
                 float32x4_t fsum = vdupq_n_f32(sum);
@@ -1827,7 +1829,7 @@ namespace fastllm {
                 int index = (int) ((float *) positionIds.cpuData)[b * positionIds.dims.back() + l];
                 float *sin = ((float *) sinData.cpuData) + stride * index;
                 float *cos = ((float *) cosData.cpuData) + stride * index;
-                float *d = (float *) data.cpuData + (l * bs + b) * spatial;
+                float *d = (float *) data.cpuData + (b * len + l) * spatial;
                 for (int i = 0; i < n; i++) {
                     for (int j = 0; j < rotaryDim && j < m / 2; j++) {
                         float a = d[j], b = d[j + m / 2];

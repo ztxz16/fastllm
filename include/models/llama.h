@@ -23,7 +23,19 @@ namespace fastllm {
                 const Data &penaltyFactor,
                 std::vector <std::pair <Data, Data> > &pastKeyValues);
 
+        std::vector <int> ForwardBatch(
+                int batch,
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                const Data &penaltyFactor,
+                std::vector <std::pair <Data, Data> > &pastKeyValues);
+
         virtual std::string Response(const std::string& input, RuntimeResult retCb); // 根据给出的内容回复
+
+        virtual void ResponseBatch(const std::vector <std::string> &inputs,
+                                   std::vector <std::string> &outputs,
+                                   RuntimeResultBatch retCb);
 
         virtual void WarmUp(); // 预热
 
