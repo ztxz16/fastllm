@@ -105,7 +105,7 @@ __global__ void FastllmPermuteKernel(float *dst, float *ori, int *temp, int axis
 }
 
 __global__ void FastllmLlamaRotatePosition2DKernel(float *data, float *positionIds, float *sin, float *cos,
-                                              int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int rotateDim) {
+                                                   int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int rotateDim) {
     int o = (blockIdx.x / n);
     int l = o % len;
     int b = o / len;
@@ -192,6 +192,12 @@ __global__ void FastllmSoftmaxKernelInner1(float* input, float *output, int oute
         }
         __syncthreads();
     }
+    if (tid == 0) {
+        if (fabs(sdata[0]) < 1e-6) {
+            sdata[0] = 0.1;
+        }
+    }
+    __syncthreads();
 
     for (int i = 0; i < len; i++) {
         output[id + i] /= sdata[0];
@@ -316,8 +322,8 @@ __global__ void FastllmLayerNormKernelTop1(float *input, float *output, int chan
 
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmGemvInt8Kernel0(float *A, uint8_t *B, float *C,
-                      float *bias, float *scales, uint8_t *zeros,
-                      int m, int k) {
+                                       float *bias, float *scales, uint8_t *zeros,
+                                       int m, int k) {
     __shared__ float sdata[THREAD_PER_BLOCK];
 
     // 1. 每个线程计算一部分
@@ -351,8 +357,8 @@ __global__ void FastllmGemvInt8Kernel0(float *A, uint8_t *B, float *C,
 
 template <int NBlock, int MBlock, int KBlock>
 __global__ void FastllmCudaBaseGemmKernelInt8(float *A, uint8_t *B, float *C,
-                         float *bias, float *scales, uint8_t *zeros,
-                         int n, int m, int k) {
+                                              float *bias, float *scales, uint8_t *zeros,
+                                              int n, int m, int k) {
     int nStart = blockIdx.x * NBlock, nEnd = nStart + NBlock;
     int kStart = blockIdx.y * KBlock, kEnd = kStart + KBlock;
 
@@ -452,8 +458,8 @@ __global__ void FastllmGemvFp32Fp16Kernel2(float *A, half *B, float *C, float *b
 
 template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvInt8Kernel2(float *A, uint8_t *B, float *C,
-                      float *bias, float *scales, uint8_t *zeros,
-                      int m, int k) {
+                                       float *bias, float *scales, uint8_t *zeros,
+                                       int m, int k) {
     __shared__ float sdata[THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
 
@@ -489,8 +495,8 @@ __global__ void FastllmGemvInt8Kernel2(float *A, uint8_t *B, float *C,
 
 template <int THREAD_PER_BLOCK, int SINGLE_COMPUTE, int REDUCE_NUMBER>
 __global__ void FastllmGemvInt8Kernel1(float *A, uint8_t *B, float *C,
-                      float *bias, float *scales, uint8_t *zeros,
-                      int m, int k) {
+                                       float *bias, float *scales, uint8_t *zeros,
+                                       int m, int k) {
     __shared__ float sdata[REDUCE_NUMBER];
     unsigned int tid = threadIdx.x;
 
@@ -578,8 +584,8 @@ __global__ void FastllmGemvInt4Kernel2(float *A, uint8_t *B, float *C,
 
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmGemvInt4Kernel0(float *A, uint8_t *B, float *C,
-                      float *bias, float *scales, uint8_t *zeros,
-                      int m, int k) {
+                                       float *bias, float *scales, uint8_t *zeros,
+                                       int m, int k) {
     __shared__ float sdata[THREAD_PER_BLOCK];
 
     // 1. 每个线程计算一部分
@@ -689,7 +695,7 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
         const int nb = 32, mb = 32, kb = 32;
         dim3 grid((n - 1) / nb + 1, (k - 1) / kb + 1);
         FastllmCudaBaseGemmKernelInt8<nb, mb, kb>  <<< grid, 32 >>>
-            (cudaInput, (uint8_t *) weight.cudaData, cudaOutput, cudaBiasData, cudaScales, cudaZeropoints, n, m, k);
+                (cudaInput, (uint8_t *) weight.cudaData, cudaOutput, cudaBiasData, cudaScales, cudaZeropoints, n, m, k);
     } else {
         if (m % 256 == 0) {
             for (int i = 0; i < n; i++) {
@@ -841,7 +847,7 @@ struct CudaMemoryBuffer {
     CudaMemoryBuffer () {}
 
     CudaMemoryBuffer (void *data, size_t size, bool busy) :
-        data(data), size(size), busy(busy) {}
+            data(data), size(size), busy(busy) {}
 };
 std::vector <CudaMemoryBuffer> cudaBuffers;
 std::vector <CudaMemoryBuffer> bigBuffers;
@@ -1068,12 +1074,12 @@ bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fast
                                                              outer, channels);
         } else if (channels < 512) {
             FastllmLayerNormKernelInner1<64> <<< outer, 64 >>>(cudaInput, (float *) gamma.cudaData,
-                                                             (float *) beta.cudaData, cudaOutput,
-                                                             outer, channels);
+                                                               (float *) beta.cudaData, cudaOutput,
+                                                               outer, channels);
         } else {
             FastllmLayerNormKernelInner1<512> <<< outer, 512 >>>(cudaInput, (float *) gamma.cudaData,
-                                                             (float *) beta.cudaData, cudaOutput,
-                                                             outer, channels);
+                                                                 (float *) beta.cudaData, cudaOutput,
+                                                                 outer, channels);
         }
     } else {
         printf("layernorm error.\n");
@@ -1144,9 +1150,9 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
 }
 
 bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &input1, fastllm::Data &output,
-                                  int input0Spatial, int input1Spatial, int outputSpatial,
-                                  int input0Stride, int input1Stride,
-                                  int batch, int n, int m, int k, float alpha) {
+                            int input0Spatial, int input1Spatial, int outputSpatial,
+                            int input0Stride, int input1Stride,
+                            int batch, int n, int m, int k, float alpha) {
     float *cudaInput0 = (float *) FastllmCudaPrepareInput(input0);
     float *cudaInput1 = (float *) FastllmCudaPrepareInput(input1);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
@@ -1178,9 +1184,9 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
 }
 
 bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Data &input1, fastllm::Data &output,
-                              int input0Spatial, int input1Spatial, int outputSpatial,
-                              int input0Stride, int input1Stride,
-                              int batch, int n, int m, int k, float alpha) {
+                                  int input0Spatial, int input1Spatial, int outputSpatial,
+                                  int input0Stride, int input1Stride,
+                                  int batch, int n, int m, int k, float alpha) {
     float *cudaInput0 = (float *) FastllmCudaPrepareInput(input0);
     float *cudaInput1 = (float *) FastllmCudaPrepareInput(input1);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
@@ -1223,8 +1229,8 @@ bool FastllmCudaRotatePosition2D(fastllm::Data &data, const fastllm::Data &posit
     int len = data.dims[0], bs = data.dims[1];
     int n = data.dims[2], m = data.dims[3];
     FastllmRotatePosition2DKernel <<< outer * 2 * n, min(rotaryDim, m / 4) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
-                                             len, bs, spatial, n, m,
-                                             (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
+                                                                                len, bs, spatial, n, m,
+                                                                                (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
 
     FastllmCudaFinishInput(positionIds, cudaPositionIds);
     FastllmCudaFinishInput(sinData, cudaSin);
@@ -1235,7 +1241,7 @@ bool FastllmCudaRotatePosition2D(fastllm::Data &data, const fastllm::Data &posit
 }
 
 bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds,
-                                 const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim) {
+                                      const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim) {
     float *cudaData = (float *) FastllmCudaPrepareInput(data);
     float *cudaPositionIds = (float *) FastllmCudaPrepareInput(positionIds);
     float *cudaSin = (float *) FastllmCudaPrepareInput(sinData);
@@ -1246,8 +1252,8 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
     int bs = data.dims[0], len = data.dims[1];
     int n = data.dims[2], m = data.dims[3];
     FastllmLlamaRotatePosition2DKernel <<< outer * n, min(rotaryDim, m / 2) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
-                                                                                len, bs, spatial, n, m,
-                                                                                (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
+                                                                                 len, bs, spatial, n, m,
+                                                                                 (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
 
     FastllmCudaFinishInput(positionIds, cudaPositionIds);
     FastllmCudaFinishInput(sinData, cudaSin);
