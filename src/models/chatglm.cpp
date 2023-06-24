@@ -419,9 +419,17 @@ TimeRecord batchRecord;
                 pids[i * 2] = maskIds[i];
                 pids[i * 2 + 1] = len;
             }
+            maxLen++;
+            std::vector <float> vmasks = std::vector <float> (batch * maxLen, 0.0f);
+            for (int i = 0; i < batch; i++) {
+                seqLens[i]++;
+                for (int j = 0; j < maxLen - seqLens[i] - 2; j++) {
+                    vmasks[i * maxLen + j] = 1.0f;
+                }
+            }
             positionIds.ToDevice(DataDevice::CPU);
             attentionMask.ToDevice(DataDevice::CPU);
-            attentionMask = Data();
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, 1, maxLen}, vmasks));
             inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, fret));
             positionIds.CopyFrom(Data(DataType::FLOAT32, {batch * 2, 1}, pids));
 
