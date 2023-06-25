@@ -93,7 +93,7 @@ int main(int argc, char **argv) {
     static int tokens = 0;
     auto st = std::chrono::system_clock::now();
 
-    if (inputs.size() > 1) {
+    if (inputs.size() > 0) {
         model->ResponseBatch(inputs, outputs, [](int index, std::vector<std::string> &contents) {
             if (index != -1) {
                 for (int i = 0; i < contents.size(); i++) {
