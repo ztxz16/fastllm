@@ -545,4 +545,67 @@ namespace fastllm {
         Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
         printf("finish.\n");
     }
+
+    int LlamaModel::LaunchResponseTokens(const std::vector<int> &inputTokens) {
+        int handleId = responseContextDict.CreateHandle();
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        context->Init(this->block_cnt);
+        context->currentTokens = inputTokens;
+        return handleId;
+    }
+
+    std::pair<bool, std::vector<int>> LlamaModel::FetchResponseTokens(int handleId) {
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        if (context == nullptr) {
+            return std::make_pair(false, std::vector <int> ());
+        }
+
+        Data inputIds;
+        Data attentionMask;
+        Data positionIds;
+
+        std::vector <float> ids;
+        for (int i = 0; i < context->currentTokens.size(); i++) {
+            ids.push_back(context->currentTokens[i]);
+        }
+        if (context->preTokens == 0) {
+            int vocabSize = this->weight.tokenizer.tokenToStringDict.size();
+            if (this->do_sample) {
+                context->tokenPenaltyManager.Init(vocabSize, this->last_n, this->repeat_penalty);
+            }
+
+            ids.insert(ids.begin(), bos_token_id);
+            int seqLen = ids.size();
+            std::vector <float> vmask = std::vector <float> (seqLen * seqLen, 0);
+            std::vector <float> vpids = std::vector <float> (seqLen, 0);
+            for (int i = 0; i < seqLen; i++) {
+                vpids[i] = i;
+                for (int j = i + 1; j < seqLen; j++) {
+                    vmask[i * seqLen + j] = 1;
+                }
+            }
+
+            context->intParams["len"] = seqLen;
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, ids));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, seqLen}, vmask));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vpids));
+        } else {
+            int ret = context->currentTokens[0];
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)ret}));
+            attentionMask = Data();
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)(context->intParams["len"])}));
+            if (do_sample) {
+                context->tokenPenaltyManager.InsertToken(ret);
+            }
+            context->intParams["len"]++;
+        }
+        context->preTokens += ids.size();
+        int ret = Forward(inputIds, attentionMask, positionIds, Data(), context->pastKeyValues);
+        if (ret == eos_token_id) {
+            responseContextDict.RemoveHandle(handleId);
+            return std::make_pair(false, std::vector <int> ());
+        }
+        context->currentTokens = std::vector <int> {ret};
+        return std::make_pair(true, context->currentTokens);
+    }
 }
