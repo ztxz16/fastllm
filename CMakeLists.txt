@@ -24,7 +24,7 @@ endif()
 message(STATUS "CMAKE_CXX_FLAGS" ${CMAKE_CXX_FLAGS})
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executor.cpp
         src/devices/cpu/cpudevice.cpp
-        src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp)
+        src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/basellm.cpp)
 
 include_directories(include)
 include_directories(include/utils)

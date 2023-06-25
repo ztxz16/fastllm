@@ -244,4 +244,14 @@ namespace fastllm {
     std::string MOSSModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
         return (round == 0 ? pre_prompt : history) + user_role + input + bot_role + output + history_sep;
     }
+
+    int MOSSModel::LaunchResponseTokens(const std::vector<int> &inputTokens) {
+        ErrorInFastLLM("Unsupport.\n");
+        return 0;
+    }
+
+    std::pair<bool, std::vector<int>> MOSSModel::FetchResponseTokens(int handleId) {
+        ErrorInFastLLM("Unsupport.\n");
+        return std::make_pair(false, std::vector <int> {});
+    }
 }
