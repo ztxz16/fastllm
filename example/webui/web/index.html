@@ -802,6 +802,7 @@
         const API_URL = "chat";
         let data = [];
         let input_str;
+        let uuid = "";
         let loading = false;
         const scrollToBottom = () => {
             if (messagsEle.scrollHeight - messagsEle.scrollTop - messagsEle.clientHeight < 128) {
@@ -1004,7 +1005,15 @@
         let progressData = "";
         let resStr = "";
         const reqWord = async (refresh) => {
-            let headers = {"Content-Type": "application/json"};
+            if (uuid == "") {
+                uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+                    var r = Math.random() * 16 | 0,
+                        v = c == 'x' ? r : (r & 0x3 | 0x8);
+                    return v.toString(16);
+                });
+            }
+
+            let headers = {"Content-Type": "application/json", "uuid" : uuid};
             let idx = refresh ? refreshIdx : data.length;
             let dataSlice = [data[idx - 1]];
             const res = await fetch(API_URL, {

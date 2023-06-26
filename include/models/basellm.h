@@ -1,10 +1,40 @@
 #pragma once
 #include "fastllm.h"
 
+#include <mutex>
+
+#ifdef PY_API
+#include "Python.h"
+#include <pybind11/pytypes.h>
+using RuntimeResult = std::function<void(int index, pybind11::bytes content)>;
+#else
 using RuntimeResult = std::function<void(int index, const char* content)>;
+#endif
 using RuntimeResultBatch = std::function<void(int index, std::vector <std::string> &contents)>;
 
 namespace fastllm {
+    struct ResponseContext {
+        std::vector <std::pair <Data, Data> > pastKeyValues;
+        std::vector <int> currentTokens;
+        TokenPenaltyManager tokenPenaltyManager;
+
+        int preTokens = 0;
+        std::map <std::string, int> intParams;
+
+        void Init(int blocks);
+    };
+
+    struct ResponseContextDict {
+        std::mutex locker;
+        std::map <int, ResponseContext*> dicts;
+
+        int CreateHandle();
+
+        ResponseContext* GetHandle(int handleId);
+
+        void RemoveHandle(int handleId);
+    };
+
     class basellm {
     public:
         basellm() {};
@@ -26,6 +56,10 @@ namespace fastllm {
         virtual void ResponseBatch(const std::vector<std::string> &inputs,
                                    std::vector<std::string> &outputs,
                                    RuntimeResultBatch retCb = nullptr) {} // 批量根据给出的内容回复
+
+        virtual int LaunchResponseTokens(const std::vector <int> &inputTokens) {return -1; }; // 启动一个response任务，返回分配的handleId
+
+        virtual std::pair <bool, std::vector <int> > FetchResponseTokens(int handelId) {return std::make_pair(false, std::vector <int> ());}; // 获取指定handle的输出, bool代表这个handle是否已经结束（或者不存在）
 
         virtual void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
 
@@ -63,5 +97,7 @@ namespace fastllm {
         WeightMap weight; // 权重
 
         Data sinData, cosData;
+
+        ResponseContextDict responseContextDict;
     };
 }

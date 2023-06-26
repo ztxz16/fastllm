@@ -23,7 +23,7 @@
 #endif
 
 #ifdef USE_CUDA
-#include "fastllm-cuda.h"
+#include "fastllm-cuda.cuh"
 #endif
 
 namespace fastllm {
@@ -1077,6 +1077,12 @@ namespace fastllm {
 
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
         curExecutor->Run("RotatePosition2D", {
+                {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
+        }, {}, {{"rotaryDim", rotaryDim}});
+    }
+
+    void LlamaRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
+        curExecutor->Run("LlamaRotatePosition2D", {
                 {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
         }, {}, {{"rotaryDim", rotaryDim}});
     }

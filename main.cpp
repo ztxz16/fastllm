@@ -38,21 +38,17 @@ void ParseArgs(int argc, char **argv, RunConfig &config) {
 	}
 }
 
-int InitLLMConf(RunConfig &config, fastllm::basellm **model) {
-	fastllm::SetThreads(config.threads);
-	fastllm::SetLowMemMode(config.lowMemMode);
-    *model = fastllm::CreateLLMModelFromFile(config.path);
-	return 0;
-}
-
 int main(int argc, char **argv) {
-    fastllm::basellm *model;
     int round = 0;
     std::string history = "";
 
     RunConfig config;
 	ParseArgs(argc, argv, config);
-	InitLLMConf(config, &model);
+
+    fastllm::SetThreads(config.threads);
+    fastllm::SetLowMemMode(config.lowMemMode);
+    auto model = fastllm::CreateLLMModelFromFile(config.path);
+
     static std::string modelType = model->model_type;
     printf("欢迎使用 %s 模型. 输入内容对话，reset清空历史记录，stop退出程序.\n", model->model_type.c_str());
     while (true) {
