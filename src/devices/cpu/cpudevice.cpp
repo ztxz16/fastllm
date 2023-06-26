@@ -40,6 +40,7 @@ namespace fastllm {
         this->ops["Permute"] = (BaseOperator*)(new CpuPermuteOp());
         this->ops["PermuteSelf"] = (BaseOperator*)(new CpuPermuteSelfOp());
         this->ops["RotatePosition2D"] = (BaseOperator*)(new CpuRotatePosition2DOp());
+        this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CpuLlamaRotatePosition2DOp());
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CpuRepeatPenaltyOp());
     }
 
@@ -1371,7 +1372,9 @@ namespace fastllm {
                 for (; j < channels; j++) {
                     sum += outputData[j];
                 }
-
+                if (fabs(sum) < 1e-9) {
+                    sum = 0.1;
+                }
                 j = 0;
 #ifdef __aarch64__
                 float32x4_t fsum = vdupq_n_f32(sum);
@@ -1804,6 +1807,37 @@ namespace fastllm {
 
                         d += m;
                     }
+                }
+            }
+        }
+    }
+
+    void CpuLlamaRotatePosition2DOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &sinData = *(datas.find("sin")->second);
+        Data &cosData = *(datas.find("cos")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+
+        int bs = data.dims[0], len = data.dims[1];
+        int spatial = data.Count(2);
+        int n = data.dims[2], m = data.dims[3];
+        int stride = (int)sinData.dims[1];
+        for (int b = 0; b < bs; b++) {
+            for (int l = 0; l < len; l++) {
+                int index = (int) ((float *) positionIds.cpuData)[b * positionIds.dims.back() + l];
+                float *sin = ((float *) sinData.cpuData) + stride * index;
+                float *cos = ((float *) cosData.cpuData) + stride * index;
+                float *d = (float *) data.cpuData + (b * len + l) * spatial;
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j < rotaryDim && j < m / 2; j++) {
+                        float a = d[j], b = d[j + m / 2];
+                        d[j] = a * cos[j] - b * sin[j];
+                        d[j + m / 2] = a * sin[j] + b * cos[j];
+                    }
+
+                    d += m;
                 }
             }
         }

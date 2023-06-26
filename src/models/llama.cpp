@@ -33,28 +33,16 @@ namespace fastllm {
                 cos[i][j] = ::cos((float)i * invFreq[j]);
             }
         }
-        weight.embeddingNames.insert("model.embed_tokens.weight");
-    }
-
-    void LlamaModel::RotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds) {
-        int outer = data.dims[0] * data.dims[1];
-        int spatial = data.Count(2);
-        int n = data.dims[2], m = data.dims[3];
-        for (int o = 0; o < outer; o++) {
-            int index = (int)((float*)positionIds.cpuData)[o];
-            std::vector <float> &sin = this->sin[index];
-            std::vector <float> &cos = this->cos[index];
-            float *d = (float*)data.cpuData + o * spatial;
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j < rotary_dim && j < m / 2; j++) {
-                    float a = d[j], b = d[j + m / 2];
-                    d[j] = a * cos[j] - b * sin[j];
-                    d[j + m / 2] = a * sin[j] + b * cos[j];
-                }
-
-                d += m;
+        std::vector <float> fsin, fcos;
+        for (int i = 0; i < sin.size(); i++) {
+            for (int j = 0; j < sin[0].size(); j++) {
+                fsin.push_back(sin[i][j]);
+                fcos.push_back(cos[i][j]);
             }
         }
+        sinData.CopyFrom(Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, fsin));
+        cosData.CopyFrom(Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, fcos));
+        weight.embeddingNames.insert("model.embed_tokens.weight");
     }
 
     int LlamaModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
@@ -69,27 +57,32 @@ namespace fastllm {
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
             std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string qkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.W_pack.weight";
             std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
 
             // 1.1 Get q, k, v
-            Data q, k, v;
+            Data q, k, v, qkv;
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
 
-            Linear(attenInput, weight[qWeightName], Data(), q);
-            Linear(attenInput, weight[kWeightName], Data(), k);
-            Linear(attenInput, weight[vWeightName], Data(), v);
+            if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
+                Linear(attenInput, weight[qkvWeightName], Data(), qkv);
+                int per = qkv.dims.back() / 3;
+                Split(qkv, -1, 0, per, q);
+                Split(qkv, -1, per, per * 2, k);
+                Split(qkv, -1, per * 2, per * 3, v);
+            } else {
+                Linear(attenInput, weight[qWeightName], Data(), q);
+                Linear(attenInput, weight[kWeightName], Data(), k);
+                Linear(attenInput, weight[vWeightName], Data(), v);
+            }
 
             std::vector <int> qkvSize = {bsz, seqlen, num_attention_heads, -1};
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
 
-            q.ToDevice(DataDevice::CPU);
-            k.ToDevice(DataDevice::CPU);
-            RotatePosition2D(q, positionIds);
-            RotatePosition2D(k, positionIds);
-            q.ToDevice(DataDevice::CUDA);
-            k.ToDevice(DataDevice::CUDA);
+            fastllm::LlamaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
+            fastllm::LlamaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
 
             qkvSize = {bsz * seqlen, num_attention_heads, -1};
             q.Reshape(qkvSize);
@@ -98,7 +91,7 @@ namespace fastllm {
 
             PermuteSelf(q, {1, 0, 2});
             PermuteSelf(k, {1, 0, 2});
-            PermuteSelf(v, {1, 2, 0});
+            PermuteSelf(v, {1, 0, 2});
 
             Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
             int unitLen = 64;
@@ -116,20 +109,20 @@ namespace fastllm {
                 }
                 pastKey.Expansion(newDims);
             }
-            while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[2] > pastValue.expansionDims[2]))
-                   || (pastValue.dims.size() > 0 && pastValue.dims[2] + v.dims[2] > pastValue.expansionDims[2])) {
+            while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[1] > pastValue.expansionDims[1]))
+                   || (pastValue.dims.size() > 0 && pastValue.dims[1] + v.dims[1] > pastValue.expansionDims[1])) {
                 std::vector <int> newDims;
                 if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
-                    newDims = std::vector <int> {v.dims[0], v.dims[1], ((v.dims[2] - 1) / unitLen + 1) * unitLen};
+                    newDims = std::vector <int> {v.dims[0], ((v.dims[1] - 1) / unitLen + 1) * unitLen, v.dims[2]};
                 } else {
                     newDims = pastValue.dims;
-                    newDims[2] += ((v.dims[2] - 1) / unitLen + 1) * unitLen;
+                    newDims[1] += ((v.dims[1] - 1) / unitLen + 1) * unitLen;
                 }
                 pastValue.Expansion(newDims);
             }
 
             CatDirect(pastKey, k, 1);
-            CatDirect(pastValue, v, 2);
+            CatDirect(pastValue, v, 1);
 
             // 1.2 Attention
             // 1.2.0 q * k^T
@@ -137,10 +130,10 @@ namespace fastllm {
             MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
             attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
             if (attentionMask.dims.size() != 0) {
-                AttentionMask(attenWeights, attentionMask, -1e100);
+                AttentionMask(attenWeights, attentionMask, -10000);
             }
             Softmax(attenWeights, attenWeights, -1);
-            MatMulTransB(attenWeights, pastValue, attenOutput);
+            MatMul(attenWeights, pastValue, attenOutput);
 
             attenOutput.Reshape({attenOutput.dims[1], attenOutput.dims[2], attenOutput.dims[3]});
             PermuteSelf(attenOutput, {1, 0, 2});
@@ -164,6 +157,11 @@ namespace fastllm {
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         logits.ToDevice(DataDevice::CPU);
+
+        if (this->do_sample && penaltyFactor.dims == logits.dims) {
+            RepeatPenalty(logits, penaltyFactor);
+        }
+
         std::pair <float, int> ret = std::make_pair(-1e9, -1);
         int base = logits.dims[1] - 1;
         for (int i = 0; i < logits.dims.back(); i++) {
@@ -172,17 +170,147 @@ namespace fastllm {
         return ret.second;
     }
 
-    std::string LlamaModel::Response(const std::string& input, RuntimeResult retCb) {
-        int bos = atoi(this->weight.dicts["bos_token_id"].c_str());
-        int eos = atoi(this->weight.dicts["eos_token_id"].c_str());
+    std::vector <int> LlamaModel::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+                            const fastllm::Data &positionIds, const Data &penaltyFactor,
+                            std::vector<std::pair<Data, Data>> &pastKeyValues) {
+        Data hiddenStates;
+        Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
 
+        int seqlen = hiddenStates.dims[1];
+
+        for (int i = 0; i < block_cnt; i++) {
+            Data attenInput;
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
+                    1e-6, attenInput);
+            float *ff = (float*)attenInput.cpuData;
+            //if (seqlen > 14) std::fill(ff, ff + (seqlen - 14) * 4096, 0.0);
+
+            std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+            std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
+            std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string qkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.W_pack.weight";
+            std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
+
+            // 1.1 Get q, k, v
+            Data q, k, v, qkv;
+            int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
+            if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
+                Linear(attenInput, weight[qkvWeightName], Data(), qkv);
+                int per = qkv.dims.back() / 3;
+                Split(qkv, -1, 0, per, q);
+                Split(qkv, -1, per, per * 2, k);
+                Split(qkv, -1, per * 2, per * 3, v);
+            } else {
+                Linear(attenInput, weight[qWeightName], Data(), q);
+                Linear(attenInput, weight[kWeightName], Data(), k);
+                Linear(attenInput, weight[vWeightName], Data(), v);
+            }
+
+            std::vector <int> qkvSize = {bsz, seqlen, num_attention_heads, -1};
+            q.Reshape(qkvSize);
+            k.Reshape(qkvSize);
+            v.Reshape(qkvSize);
+
+            fastllm::LlamaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
+            fastllm::LlamaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
+            PermuteSelf(q, {0, 2, 1, 3});
+            PermuteSelf(k, {0, 2, 1, 3});
+            PermuteSelf(v, {0, 2, 1, 3});
+
+            qkvSize = {bsz * num_attention_heads, seqlen, -1};
+            q.Reshape(qkvSize);
+            k.Reshape(qkvSize);
+            v.Reshape(qkvSize);
+
+            Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
+            int unitLen = 64;
+#ifdef USE_CUDA
+            unitLen = 128;
+#endif
+            while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
+                   || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
+                std::vector <int> newDims;
+                if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                    newDims = std::vector <int> {k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
+                } else {
+                    newDims = pastKey.dims;
+                    newDims[1] += ((k.dims[1] - 1) / unitLen + 1) * unitLen;
+                }
+                pastKey.Expansion(newDims);
+            }
+            while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[1] > pastValue.expansionDims[1]))
+                   || (pastValue.dims.size() > 0 && pastValue.dims[1] + v.dims[1] > pastValue.expansionDims[1])) {
+                std::vector <int> newDims;
+                if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                    newDims = std::vector <int> {v.dims[0], ((v.dims[1] - 1) / unitLen + 1) * unitLen, v.dims[2]};
+                } else {
+                    newDims = pastValue.dims;
+                    newDims[1] += ((v.dims[1] - 1) / unitLen + 1) * unitLen;
+                }
+                pastValue.Expansion(newDims);
+            }
+
+            CatDirect(pastKey, k, 1);
+            CatDirect(pastValue, v, 1);
+
+            // 1.2 Attention
+            // 1.2.0 q * k^T
+            Data attenWeights, attenOutput;
+            MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
+            attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
+            if (attentionMask.dims.size() != 0) {
+                AttentionMask(attenWeights, attentionMask, -10000);
+            }
+            Softmax(attenWeights, attenWeights, -1);
+            MatMul(attenWeights, pastValue, attenOutput);
+
+            attenOutput.Reshape({attenOutput.dims[1], attenOutput.dims[2], attenOutput.dims[3]});
+            PermuteSelf(attenOutput, {1, 0, 2});
+            attenOutput.Reshape({seqlen, bsz, -1});
+            PermuteSelf(attenOutput, {1, 0, 2});
+
+            Data attenLastOutput;
+            Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
+            AddTo(hiddenStates, attenLastOutput);
+            // 2. mlp
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
+            Data w1, w2, w3;
+            Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
+            Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
+            Silu(w1, w1);
+            MulTo(w1, w3);
+            Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
+            AddTo(hiddenStates, w2);
+        }
+
+        RMSNorm(hiddenStates, weight["model.norm.weight"], 1e-6, hiddenStates);
+        Data logits;
+        Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
+        logits.ToDevice(DataDevice::CPU);
+        if (this->do_sample && penaltyFactor.dims == logits.dims) {
+            // RepeatPenalty(logits, penaltyFactor);
+        }
+
+        std::vector <int> lastRet;
+        for (int b = 0; b < batch; b++) {
+            int base = b * logits.dims[1] + logits.dims[1] - 1;
+            std::pair <float, int> ret = std::make_pair(-1e9, -1);
+            for (int i = 0; i < logits.dims.back(); i++) {
+                ret = max(ret, std::make_pair(((float *) logits.cpuData)[base * logits.dims.back() + i], i));
+            }
+            lastRet.push_back(ret.second);
+        }
+        return lastRet;
+    }
+
+    std::string LlamaModel::Response(const std::string& input, RuntimeResult retCb) {
+//auto st = std::chrono::system_clock::now();
         Data inputIds = this->weight.tokenizer.Encode(input);
         std::vector <float> ids;
-        ids.push_back(bos);
+        ids.push_back(bos_token_id);
         for (int i = 0; i < inputIds.Count(0); i++) {
             ids.push_back(((float*)inputIds.cpuData)[i]);
         }
-
         int seqLen = ids.size();
         inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, ids));
 
@@ -208,11 +336,21 @@ namespace fastllm {
         int len = seqLen;
         std::vector <float> results;
         int index = 0;
+
+        int vocabSize = this->weight.tokenizer.tokenToStringDict.size();
+        TokenPenaltyManager tokenPenaltyManager;
+        if (this->do_sample) {
+            tokenPenaltyManager.Init(vocabSize, this->last_n, this->repeat_penalty);
+            /*for (int i = std::max(0, (int)ids.size() - this->last_n); i < ids.size(); i++) {
+                tokenPenaltyManager.InsertToken((int)(ids[i] + 1e-6));
+            }*/
+        }
+
         while (true) {
             auto st = std::chrono::system_clock::now();
 
-            int ret = Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
-            if (ret == eos) {
+            int ret = Forward(inputIds, attentionMask, positionIds, tokenPenaltyManager.penalty, pastKeyValues);
+            if (ret == eos_token_id) {
                 break;
             }
 
@@ -220,8 +358,15 @@ namespace fastllm {
             std::string curString = weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str();
             retString += curString;
             if (retCb)
+#ifdef PY_API
+				retCb(index++, pybind11::bytes(retString));
+#else
                 retCb(index++, curString.c_str());
-            fflush(stdout);
+#endif
+
+            if (index == this->output_token_limit) {
+                break;
+            }
             results.clear();
 
             attentionMask.ToDevice(DataDevice::CPU);
@@ -229,14 +374,153 @@ namespace fastllm {
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)ret}));
             attentionMask = Data();
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)len}));
+            if (do_sample) {
+                tokenPenaltyManager.InsertToken(ret);
+            }
             len++;
 
-            // printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            //printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         }
         if (retCb)
+#ifdef PY_API
+			retCb(-1, pybind11::bytes(retString));
+#else
             retCb(-1, retString.c_str());
+#endif
 
         return retString;
+    }
+
+    void LlamaModel::ResponseBatch(const std::vector<std::string> &inputs, std::vector<std::string> &outputs,
+                                   RuntimeResultBatch retCb) {
+        int batch = inputs.size();
+        outputs.clear();
+        outputs.resize(batch, "");
+
+        std::vector <Data> inputTokens;
+        std::vector <int> seqLens;
+        inputTokens.resize(batch);
+        seqLens.resize(batch);
+        int maxLen = 0;
+        for (int i = 0; i < batch; i++) {
+            inputTokens[i].CopyFrom(this->weight.tokenizer.Encode(inputs[i]));
+            maxLen = std::max(maxLen, (int)inputTokens[i].Count(0) + 1);
+            seqLens[i] = (int)inputTokens[i].Count(0) + 1;
+        }
+
+        std::vector <float> ids = std::vector <float> (batch * maxLen, 0);
+        std::vector <float> vpids = std::vector <float> (batch * maxLen, 0);
+        std::vector <float> vmask = std::vector <float> (batch * maxLen * maxLen, 0);
+        for (int i = 0; i < batch; i++) {
+            Data &tokens = inputTokens[i];
+            int len = tokens.Count(0), base = maxLen - 1 - len;
+            ids[i * maxLen + base] = bos_token_id;
+            for (int j = 0; j < len; j++) {
+                ids[i * maxLen + base + 1 + j] = ((float*)tokens.cpuData)[j];
+            }
+            len += 1;
+
+            for (int j = 0; j < len; j++) {
+                vpids[i * maxLen + base + j] = j;
+            }
+
+            std::fill(vmask.data() + i * maxLen * maxLen,
+                      vmask.data() + i * maxLen * maxLen + (maxLen - len) * maxLen, 1.0);
+            for (int j = maxLen - len; j < maxLen; j++) {
+                std::fill(vmask.data() + i * maxLen * maxLen + j * maxLen,
+                          vmask.data() + i * maxLen * maxLen + j * maxLen + maxLen - len, 1.0);
+            }
+            for (int j = 0; j < len; j++) {
+                for (int k = j + 1; k < len; k++) {
+                    vmask[i * maxLen * maxLen + (base + j) * maxLen + base + k] = 1;
+                }
+            }
+        }
+
+        Data inputIds = Data(DataType::FLOAT32, {batch, maxLen}, ids);
+        Data attentionMask = Data(DataType::FLOAT32, {batch, maxLen, maxLen}, vmask);
+        Data positionIds = Data(DataType::FLOAT32, {batch, maxLen}, vpids);
+
+        std::vector <std::pair <Data, Data> > pastKeyValues;
+        for (int i = 0; i < block_cnt; i++) {
+            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
+                                                   Data(DataType::FLOAT32)));
+        }
+
+        std::string retString = "";
+        std::vector <int> lens = seqLens;
+        std::vector <bool> isEnding = std::vector <bool> (batch, false);
+        std::vector <float> results;
+        int index = 0;
+
+        int vocabSize = this->weight.tokenizer.tokenToStringDict.size();
+        TokenPenaltyManager tokenPenaltyManager;
+        this->do_sample = false;
+        if (this->do_sample) {
+            tokenPenaltyManager.Init(vocabSize, this->last_n, this->repeat_penalty);
+            /*for (int i = std::max(0, (int)ids.size() - this->last_n); i < ids.size(); i++) {
+                tokenPenaltyManager.InsertToken((int)(ids[i] + 1e-6));
+            }*/
+        }
+
+        while (true) {
+            auto st = std::chrono::system_clock::now();
+            std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, Data(), pastKeyValues);
+            std::vector <float> fret;
+            std::vector <float> results;
+            int endingCount = 0;
+            std::vector <std::string> curStrings;
+            for (int i = 0; i < batch; i++) {
+                fret.push_back(ret[i]);
+                if (ret[i] == eos_token_id) {
+                    isEnding[i] = true;
+                }
+                if (isEnding[i]) {
+                    curStrings.push_back("");
+                    endingCount++;
+                    continue;
+                }
+                results.push_back(ret[i]);
+                std::string curString = weight.tokenizer.Decode(
+                        Data(DataType::FLOAT32, {(int) results.size()}, results)).c_str();
+                outputs[i] += curString;
+                curStrings.push_back(curString);
+                results.clear();
+            }
+
+            if (endingCount == batch) {
+                break;
+            }
+            if (retCb) {
+                retCb(index++, curStrings);
+            }
+
+            maxLen++;
+            std::vector <float> pids = std::vector <float> (batch);
+            std::vector <float> vmasks = std::vector <float> (batch * maxLen, 0.0f);
+            for (int i = 0; i < batch; i++) {
+                pids[i] = lens[i];
+                lens[i]++;
+                for (int j = 0; j < maxLen - lens[i]; j++) {
+                    vmasks[i * maxLen + j] = 1.0f;
+                }
+            }
+            positionIds.ToDevice(DataDevice::CPU);
+            attentionMask.ToDevice(DataDevice::CPU);
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, 1, maxLen}, vmasks));
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, fret));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, pids));
+            if (index == this->output_token_limit) {
+                break;
+            }
+            if (do_sample) {
+                //tokenPenaltyManager.InsertToken(ret);
+            }
+
+            //printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+        }
+        if (retCb)
+            retCb(-1, outputs);
     }
 
     std::string LlamaModel::MakeInput(const std::string &history, int round, const std::string &input) {
@@ -260,5 +544,68 @@ namespace fastllm {
         }
         Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
         printf("finish.\n");
+    }
+
+    int LlamaModel::LaunchResponseTokens(const std::vector<int> &inputTokens) {
+        int handleId = responseContextDict.CreateHandle();
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        context->Init(this->block_cnt);
+        context->currentTokens = inputTokens;
+        return handleId;
+    }
+
+    std::pair<bool, std::vector<int>> LlamaModel::FetchResponseTokens(int handleId) {
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        if (context == nullptr) {
+            return std::make_pair(false, std::vector <int> ());
+        }
+
+        Data inputIds;
+        Data attentionMask;
+        Data positionIds;
+
+        std::vector <float> ids;
+        for (int i = 0; i < context->currentTokens.size(); i++) {
+            ids.push_back(context->currentTokens[i]);
+        }
+        if (context->preTokens == 0) {
+            int vocabSize = this->weight.tokenizer.tokenToStringDict.size();
+            if (this->do_sample) {
+                context->tokenPenaltyManager.Init(vocabSize, this->last_n, this->repeat_penalty);
+            }
+
+            ids.insert(ids.begin(), bos_token_id);
+            int seqLen = ids.size();
+            std::vector <float> vmask = std::vector <float> (seqLen * seqLen, 0);
+            std::vector <float> vpids = std::vector <float> (seqLen, 0);
+            for (int i = 0; i < seqLen; i++) {
+                vpids[i] = i;
+                for (int j = i + 1; j < seqLen; j++) {
+                    vmask[i * seqLen + j] = 1;
+                }
+            }
+
+            context->intParams["len"] = seqLen;
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, ids));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, seqLen}, vmask));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vpids));
+        } else {
+            int ret = context->currentTokens[0];
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)ret}));
+            attentionMask = Data();
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)(context->intParams["len"])}));
+            if (do_sample) {
+                context->tokenPenaltyManager.InsertToken(ret);
+            }
+            context->intParams["len"]++;
+        }
+        context->preTokens += ids.size();
+        int ret = Forward(inputIds, attentionMask, positionIds, Data(), context->pastKeyValues);
+        if (ret == eos_token_id) {
+            responseContextDict.RemoveHandle(handleId);
+            return std::make_pair(false, std::vector <int> ());
+        }
+        context->currentTokens = std::vector <int> {ret};
+        return std::make_pair(true, context->currentTokens);
     }
 }

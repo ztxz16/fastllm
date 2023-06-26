@@ -213,7 +213,11 @@ namespace fastllm {
                     Data(DataType::FLOAT32, {(int) results.size()}, results)).c_str();
             retString += current;
 			if (retCb)
+#ifdef PY_API
+				retCb(index++, pybind11::bytes(retString));
+#else
 				retCb(index++, current.c_str());
+#endif
             fflush(stdout);
             results.clear();
 
@@ -224,7 +228,11 @@ namespace fastllm {
         }
 
 		if (retCb)
+#ifdef PY_API
+			retCb(-1, pybind11::bytes(retString));
+#else
 			retCb(-1, retString.c_str());
+#endif
         // printf("%s\n", weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str());
         return retString;
     }
@@ -235,5 +243,15 @@ namespace fastllm {
 
     std::string MOSSModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
         return (round == 0 ? pre_prompt : history) + user_role + input + bot_role + output + history_sep;
+    }
+
+    int MOSSModel::LaunchResponseTokens(const std::vector<int> &inputTokens) {
+        ErrorInFastLLM("Unsupport.\n");
+        return 0;
+    }
+
+    std::pair<bool, std::vector<int>> MOSSModel::FetchResponseTokens(int handleId) {
+        ErrorInFastLLM("Unsupport.\n");
+        return std::make_pair(false, std::vector <int> {});
     }
 }

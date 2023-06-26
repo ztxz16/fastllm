@@ -166,28 +166,7 @@ PYBIND11_MODULE(pyfastllm, m) {
           return std::make_tuple(retV, pastKeyValues);
     })
     .def("save_lowbit_model", &fastllm::LlamaModel::SaveLowBitModel);
-  
-  py::class_<fastllm::BaichuanModel, fastllm::basellm>(m, "BaichuanModel")
-    .def(py::init<>())
-    .def_readonly("weight", &fastllm::BaichuanModel::weight)
-    .def_readonly("block_cnt", &fastllm::BaichuanModel::block_cnt)
-    .def("load_weights", &fastllm::BaichuanModel::LoadFromFile)
-    .def("response", &fastllm::BaichuanModel::Response)
-    .def("batch_response", &fastllm::BaichuanModel::ResponseBatch)
-    .def("warmup", &fastllm::BaichuanModel::WarmUp)
-    .def("__call__",
-        [](fastllm::BaichuanModel &model, 
-           const fastllm::Data &inputIds, 
-           const fastllm::Data &attentionMask,
-           const fastllm::Data &positionIds, 
-           const fastllm::Data &penaltyFactor,
-           std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues) {
-          int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
-          return std::make_tuple(retV, pastKeyValues);
-    })
-    .def("save_lowbit_model", &fastllm::BaichuanModel::SaveLowBitModel);
-
-
+    
 #ifdef VERSION_INFO
     m.attr("__version__") = VERSION_INFO;
 #else

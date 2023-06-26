@@ -15,7 +15,7 @@
 #include <map>
 
 #ifdef USE_CUDA
-#include "fastllm-cuda.h"
+#include "fastllm-cuda.cuh"
 #endif
 
 namespace fastllm {
@@ -280,7 +280,11 @@ TimeRecord batchRecord;
             std::string curString = weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str();
             retString += curString;
 			if (retCb)
+#ifdef PY_API
+				retCb(index++, pybind11::bytes(retString));
+#else
 				retCb(index++, curString.c_str());
+#endif
             fflush(stdout);
             results.clear();
 
@@ -298,7 +302,11 @@ TimeRecord batchRecord;
             // printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
         }
 		if (retCb)
+#ifdef PY_API
+			retCb(-1, pybind11::bytes(retString));
+#else
 			retCb(-1, retString.c_str());
+#endif
         return retString;
     }
 
@@ -411,9 +419,17 @@ TimeRecord batchRecord;
                 pids[i * 2] = maskIds[i];
                 pids[i * 2 + 1] = len;
             }
+            maxLen++;
+            std::vector <float> vmasks = std::vector <float> (batch * maxLen, 0.0f);
+            for (int i = 0; i < batch; i++) {
+                seqLens[i]++;
+                for (int j = 0; j < maxLen - seqLens[i] - 2; j++) {
+                    vmasks[i * maxLen + j] = 1.0f;
+                }
+            }
             positionIds.ToDevice(DataDevice::CPU);
             attentionMask.ToDevice(DataDevice::CPU);
-            attentionMask = Data();
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, 1, maxLen}, vmasks));
             inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, fret));
             positionIds.CopyFrom(Data(DataType::FLOAT32, {batch * 2, 1}, pids));
 
@@ -453,5 +469,65 @@ TimeRecord batchRecord;
 
     std::string ChatGLMModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
         return (history + ("[Round " + std::to_string(round) + "]\n问：" + input + "\n答：" + output + "\n"));
+    }
+
+    int ChatGLMModel::LaunchResponseTokens(const std::vector<int> &inputTokens) {
+        int handleId = responseContextDict.CreateHandle();
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        context->Init(this->block_cnt);
+        context->currentTokens = inputTokens;
+        return handleId;
+    }
+
+    std::pair<bool, std::vector<int>> ChatGLMModel::FetchResponseTokens(int handleId) {
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        if (context == nullptr) {
+            return std::make_pair(false, std::vector <int> ());
+        }
+
+        Data inputIds;
+        Data attentionMask;
+        Data positionIds;
+
+        std::vector <float> ids;
+        for (int i = 0; i < context->currentTokens.size(); i++) {
+            ids.push_back(context->currentTokens[i]);
+        }
+        if (context->preTokens == 0) {
+            int gmask_token_id = this->weight.dicts.find("gmask_token_id") != this->weight.dicts.end() ?
+                                 atoi(this->weight.dicts["gmask_token_id"].c_str()) : 130001;
+            ids.push_back(gmask_token_id);
+            ids.push_back(bos_token_id);
+
+            int seqLen = ids.size();
+            std::vector <float> vmask = std::vector <float> (seqLen * seqLen, 0);
+            std::vector <float> vpids = std::vector <float> (seqLen * 2, 0);
+            for (int i = 0; i < seqLen - 1; i++) {
+                vmask[i * seqLen + seqLen - 1] = 1;
+                vpids[i] = i;
+            }
+            vpids[seqLen - 1] = seqLen - 2;
+            vpids[seqLen * 2 - 1] = 1;
+
+            context->intParams["maskIds"] = seqLen - 2;
+            context->intParams["len"] = 1;
+
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, ids));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, seqLen}, vmask));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {2, seqLen}, vpids));
+        } else {
+            context->intParams["len"]++;
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)context->currentTokens[0]}));
+            attentionMask = Data();
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {2, 1}, {(float)context->intParams["maskIds"], (float)(context->intParams["len"])}));
+        }
+        context->preTokens += ids.size();
+        int ret = Forward(inputIds, attentionMask, positionIds, Data(), context->pastKeyValues);
+        if (ret == eos_token_id) {
+            responseContextDict.RemoveHandle(handleId);
+            return std::make_pair(false, std::vector <int> ());
+        }
+        context->currentTokens = std::vector <int> {ret};
+        return std::make_pair(true, context->currentTokens);
     }
 }
