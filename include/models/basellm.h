@@ -1,6 +1,8 @@
 #pragma once
 #include "fastllm.h"
 
+#include <thread>
+
 #include <mutex>
 
 #ifdef PY_API
@@ -14,8 +16,10 @@ using RuntimeResultBatch = std::function<void(int index, std::vector <std::strin
 
 namespace fastllm {
     struct ResponseContext {
+        bool isEnding = false;
         std::vector <std::pair <Data, Data> > pastKeyValues;
         std::vector <int> currentTokens;
+        std::queue <int> resultTokenQueue;
         TokenPenaltyManager tokenPenaltyManager;
 
         int preTokens = 0;
@@ -99,5 +103,8 @@ namespace fastllm {
         Data sinData, cosData;
 
         ResponseContextDict responseContextDict;
+
+        std::thread *mainLoop = nullptr;
+        std::mutex mainLoopLocker, dictLocker;
     };
 }
