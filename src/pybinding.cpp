@@ -51,6 +51,13 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def(py::init<fastllm::Data>())
     .def("copy_from", &fastllm::Data::CopyFrom)
     .def("count", &fastllm::Data::Count)
+    .def("to_list", [](fastllm::Data& data){
+      std::vector <float> vecData;
+      for (int i = 0; i < data.Count(0); i++) {
+            vecData.push_back(((float*)data.cpuData)[i]);
+        }
+        return vecData;
+    })
     .def("print", &fastllm::Data::Print)
     .def("to", static_cast<void (fastllm::Data::*)(void *device)>(&fastllm::Data::ToDevice));
 
@@ -100,7 +107,11 @@ PYBIND11_MODULE(pyfastllm, m) {
 
   py::class_<fastllm::Tokenizer>(m, "Tokenizer")
     .def("encode", &fastllm::Tokenizer::Encode)
-    .def("decode", &fastllm::Tokenizer::Decode);
+    .def("decode", &fastllm::Tokenizer::Decode)
+    .def("decode_byte", [](fastllm::Tokenizer &tokenizer, const fastllm::Data &data){
+      std::string ret = tokenizer.Decode(data);
+      return py::bytes(ret);
+    });
     // .def("clear", &fastllm::Tokenizer::Clear)
     // .def("insert", &fastllm::Tokenizer::Insert);
 
@@ -110,8 +121,11 @@ PYBIND11_MODULE(pyfastllm, m) {
 
   py::class_<fastllm::ChatGLMModel, fastllm::basellm>(m, "ChatGLMModel")
     .def(py::init<>())
+    .def_readonly("model_type", &fastllm::ChatGLMModel::model_type)
     .def_readonly("weight", &fastllm::ChatGLMModel::weight)
     .def_readonly("block_cnt", &fastllm::ChatGLMModel::block_cnt)
+    .def_readonly("bos_token_id", &fastllm::ChatGLMModel::bos_token_id)
+    .def_readonly("eos_token_id", &fastllm::ChatGLMModel::eos_token_id)
     .def("load_weights", &fastllm::ChatGLMModel::LoadFromFile)
     .def("response", &fastllm::ChatGLMModel::Response)
     .def("batch_response", &fastllm::ChatGLMModel::ResponseBatch)
@@ -126,12 +140,17 @@ PYBIND11_MODULE(pyfastllm, m) {
           int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
           return std::make_tuple(retV, pastKeyValues);
     })
+    .def("launch_response", &fastllm::ChatGLMModel::LaunchResponseTokens)
+    .def("fetch_response", &fastllm::ChatGLMModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::ChatGLMModel::SaveLowBitModel);
 
   py::class_<fastllm::MOSSModel, fastllm::basellm>(m, "MOSSModel")
     .def(py::init<>())
+    .def_readonly("model_type", &fastllm::MOSSModel::model_type)
     .def_readonly("weight", &fastllm::MOSSModel::weight)
     .def_readonly("block_cnt", &fastllm::MOSSModel::block_cnt)
+    .def_readonly("bos_token_id", &fastllm::MOSSModel::bos_token_id)
+    .def_readonly("eos_token_id", &fastllm::MOSSModel::eos_token_id)
     .def("load_weights", &fastllm::MOSSModel::LoadFromFile)
     .def("response", &fastllm::MOSSModel::Response)
     .def("batch_response", &fastllm::MOSSModel::ResponseBatch)
@@ -145,12 +164,17 @@ PYBIND11_MODULE(pyfastllm, m) {
           int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
           return std::make_tuple(retV, pastKeyValues);
     })
+    .def("launch_response", &fastllm::MOSSModel::LaunchResponseTokens)
+    .def("fetch_response", &fastllm::MOSSModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::MOSSModel::SaveLowBitModel);
 
   py::class_<fastllm::LlamaModel, fastllm::basellm>(m, "LlamaModel")
     .def(py::init<>())
+    .def_readonly("model_type", &fastllm::LlamaModel::model_type)
     .def_readonly("weight", &fastllm::LlamaModel::weight)
     .def_readonly("block_cnt", &fastllm::LlamaModel::block_cnt)
+    .def_readonly("bos_token_id", &fastllm::LlamaModel::bos_token_id)
+    .def_readonly("eos_token_id", &fastllm::LlamaModel::eos_token_id)
     .def("load_weights", &fastllm::LlamaModel::LoadFromFile)
     .def("response", &fastllm::LlamaModel::Response)
     .def("batch_response", &fastllm::LlamaModel::ResponseBatch)
@@ -165,6 +189,8 @@ PYBIND11_MODULE(pyfastllm, m) {
           int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
           return std::make_tuple(retV, pastKeyValues);
     })
+    .def("launch_response", &fastllm::LlamaModel::LaunchResponseTokens)
+    .def("fetch_response", &fastllm::LlamaModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::LlamaModel::SaveLowBitModel);
     
 #ifdef VERSION_INFO
