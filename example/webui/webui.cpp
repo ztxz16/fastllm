@@ -52,7 +52,9 @@ int main(int argc, char** argv) {
                     break;
                 } else {
                     results.clear();
-                    results.push_back(result.second[0]);
+                    for (int i = 0; i < result.second.size(); i++) {
+                        results.push_back(result.second[i]);
+                    }
                     session->output += model.weight.tokenizer.Decode(fastllm::Data (fastllm::DataType::FLOAT32, {(int)results.size()}, results));
                 }
                 if (session->status == 2) {
