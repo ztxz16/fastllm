@@ -40,6 +40,10 @@ namespace fastllm {
         }
         intParams.clear();
         currentTokens.clear();
+        while (resultTokenQueue.size() > 0){
+            resultTokenQueue.pop();
+        }
+        isEnding = false;
         preTokens = 0;
     }
 }
