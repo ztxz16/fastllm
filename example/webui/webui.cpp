@@ -85,10 +85,12 @@ int main(int argc, char** argv) {
         } else {
             auto prompt = model->MakeInput(session->history, session->round, input);
             auto inputs = model->weight.tokenizer.Encode(prompt);
+
             std::vector<int> tokens;
             for (int i = 0; i < inputs.Count(0); i++) {
                 tokens.push_back(((float *) inputs.cpuData)[i]);
             }
+
             int handleId = model->LaunchResponseTokens(tokens);
             std::vector<float> results;
             while (true) {
