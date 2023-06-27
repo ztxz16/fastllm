@@ -11,7 +11,7 @@ void Usage() {
 	std::cout << "[-h|--help]:                  显示帮助" << std::endl;
 	std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
 	std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
-	std::cout << "<-l|--low> <args>:            使用低内存模式" << std::endl;
+	std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
 }
 
 void ParseArgs(int argc, char **argv, RunConfig &config) {
