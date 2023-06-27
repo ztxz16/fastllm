@@ -661,11 +661,25 @@ namespace fastllm {
     std::string Tokenizer::Decode(const Data &data) {
         std::string ret = "";
         for (int i = 0; i < data.Count(0); i++) {
-            std::string &s = tokenToStringDict[(int) ((float *) data.cpuData)[i]];
+            std::string s = tokenToStringDict[(int) ((float *) data.cpuData)[i]];
+            if (s.size() == 6 && s.substr(0, 3) == "<0x" && s.back() == '>') {
+                int c = 0;
+                for (int i = 3; i < 5; i++) {
+                    c *= 16;
+                    if (s[i] >= '0' && s[i] <= '9') {
+                        c += (s[i] - '0');
+                    } else {
+                        c += (s[i] - 'A' + 10);
+                    }
+                }
+
+                s = " ";
+                s[0] = c;
+            }
             if (s == "<n>") {
                 ret += "\n";
             } else if (s == "<|tab|>") {
-                s = "\t";
+                ret += "\t";
             } else {
                 ret += s;
             }
@@ -684,20 +698,7 @@ namespace fastllm {
 		    int space_num = atoi(ret.substr(8, ret.size() - 10).c_str());
 		    return std::string(space_num, ' ');
 	    }
-        if (ret.size() == 6 && ret.substr(0, 3) == "<0x" && ret.back() == '>') {
-            int c = 0;
-            for (int i = 3; i < 5; i++) {
-                c *= 16;
-                if (ret[i] >= '0' && ret[i] <= '9') {
-                    c += (ret[i] - '0');
-                } else {
-                    c += (ret[i] - 'A' + 10);
-                }
-            }
 
-            ret = " ";
-            ret[0] = c;
-        }
         return ret;
     }
 
