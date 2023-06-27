@@ -83,7 +83,8 @@ namespace fastllm {
         NONE = 0, LINEAR = 1, EMBEDDING = 2
     };
 
-    struct Data {
+    class Data {
+    public:
         bool lockInCPU = false; // 如果lock在CPU上，那么不允许移动到其余设备
         WeightType weightType = WeightType::NONE; // 权重类型，NONE代表非权重（或未知权重）
 

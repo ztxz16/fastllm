@@ -2,7 +2,6 @@
 #include "fastllm.h"
 
 #include <thread>
-
 #include <mutex>
 
 #ifdef PY_API
@@ -16,6 +15,7 @@ using RuntimeResultBatch = std::function<void(int index, std::vector <std::strin
 
 namespace fastllm {
     struct ResponseContext {
+
         bool isEnding = false;
         std::vector <std::pair <Data, Data> > pastKeyValues;
         std::vector <int> currentTokens;
