@@ -56,6 +56,19 @@ cmake .. -DUSE_CUDA=ON
 make -j4
 ```
 
+### PC 使用python api
+
+```
+mkdir build-py
+cd build-py
+cmake .. -DPY_API=ON -DUSE_CUDA=ON （只使用CPU则使用 cmake .. -DPY_API=ON 即可）
+make -j
+cd -
+python cli.py  -m chatglm -p chatglm-6b-int8.bin 或  
+python web_api.py  -m chatglm -p chatglm-6b-int8.bin  
+```
+上述web api可使用python web_api_client.py进行测试
+
 ### Android
 
 ```
