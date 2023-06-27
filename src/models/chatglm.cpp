@@ -126,7 +126,7 @@ TimeRecord batchRecord;
             unitLen = 128;
 #endif
             while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
-                   || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
+                   || (pastKey.dims.size() > 0 && (pastKey.expansionDims.size() == 0 ||  pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1]))) {
                 std::vector <int> newDims;
                 if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
                     newDims = std::vector <int> {k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
@@ -141,7 +141,7 @@ TimeRecord batchRecord;
             }
 
             while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[1] > pastValue.expansionDims[1]))
-                   || (pastValue.dims.size() > 0 && pastValue.dims[1] + v.dims[1] > pastValue.expansionDims[1])) {
+                   || (pastValue.dims.size() > 0 && (pastValue.expansionDims.size() == 0 || pastValue.dims[1] + v.dims[1] > pastValue.expansionDims[1]) )) {
                 std::vector <int> newDims;
                 if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
                     newDims = std::vector <int> {v.dims[0], ((v.dims[1] - 1) / unitLen + 1) * unitLen, v.dims[2]};
