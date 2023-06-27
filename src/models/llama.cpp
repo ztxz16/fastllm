@@ -421,10 +421,9 @@ namespace fastllm {
                 PermuteSelf(curAttenOutput, {1, 0, 2});
                 if (attenOutput.dims.size() == 0) {
                     std::vector <int> dims = curAttenOutput.dims;
-                    dims[0] = total;
+                    dims[1] = total;
                     attenOutput.Expansion(dims);
                 }
-                attenOutput.ToDevice(DataDevice::CUDA);
                 CatDirect(attenOutput, curAttenOutput, 1);
             }
 
