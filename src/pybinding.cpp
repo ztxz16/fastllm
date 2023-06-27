@@ -192,7 +192,6 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("launch_response", &fastllm::LlamaModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::LlamaModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::LlamaModel::SaveLowBitModel);
-    
 #ifdef VERSION_INFO
     m.attr("__version__") = VERSION_INFO;
 #else
