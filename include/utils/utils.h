@@ -11,12 +11,17 @@
 #include <string>
 #include <cstdio>
 #include <cstdint>
+#include <unistd.h>
 
 #ifdef __AVX__
 #include "immintrin.h"
 #endif
 
 namespace fastllm {
+    static void MySleep(int t) {
+        sleep(t);
+    }
+
     static void ErrorInFastLLM(const std::string &error) {
         printf("FastLLM Error: %s\n", error.c_str());
         throw error;

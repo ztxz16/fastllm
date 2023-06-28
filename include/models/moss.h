@@ -29,7 +29,7 @@ namespace fastllm {
 
         virtual int LaunchResponseTokens(const std::vector <int> &inputTokens); // 启动一个response任务，返回分配的handleId
 
-        virtual std::pair <bool, std::vector <int> > FetchResponseTokens(int handelId); // 获取指定handle的输出, bool代表这个handle是否已经结束（或者不存在）
+        virtual int FetchResponseTokens(int handelId); // 获取指定handle的输出, -1代表输出结束了
     private:
 		virtual void RotatePosition2D(Data &data, const Data &positionIds); // 二维位置编码
 

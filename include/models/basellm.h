@@ -63,7 +63,7 @@ namespace fastllm {
 
         virtual int LaunchResponseTokens(const std::vector <int> &inputTokens) {return -1; }; // 启动一个response任务，返回分配的handleId
 
-        virtual std::pair <bool, std::vector <int> > FetchResponseTokens(int handelId) {return std::make_pair(false, std::vector <int> ());}; // 获取指定handle的输出, bool代表这个handle是否已经结束（或者不存在）
+        virtual int FetchResponseTokens(int handelId) {return -1; };// 获取指定handle的输出, -1代表输出结束了
 
         virtual void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
 
