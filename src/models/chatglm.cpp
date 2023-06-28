@@ -777,6 +777,7 @@ TimeRecord batchRecord;
                 }
                 dictLocker.unlock();
                 MySleep(0);
+                dictLocker.lock();
             }
         }
     }
