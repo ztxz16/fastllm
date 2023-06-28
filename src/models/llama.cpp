@@ -832,6 +832,7 @@ namespace fastllm {
                 }
                 dictLocker.unlock();
                 MySleep(0);
+                dictLocker.lock();
             }
         }
     }
