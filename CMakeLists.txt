@@ -65,7 +65,7 @@ target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS})
 add_executable(main main.cpp)
 target_link_libraries(main fastllm)
 
-add_executable(quant tools/quant.cpp)
+add_executable(quant tools/src/quant.cpp)
 target_link_libraries(quant fastllm)
 
 add_executable(webui example/webui/webui.cpp)

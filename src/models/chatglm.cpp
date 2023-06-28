@@ -14,8 +14,6 @@
 
 #include <map>
 
-#include <unistd.h>
-
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #endif
@@ -658,24 +656,30 @@ TimeRecord batchRecord;
                         std::vector <Data*> attentionMasks;
                         std::vector <Data*> positionIds;
                         std::vector <std::pair <Data*, Data*> > pastKeyValues;
-                        std::vector<float> ids;
-                        std::vector<int> seqLens;
+                        std::vector <float> ids;
+                        std::vector <int> seqLens;
+                        std::vector <int> handles;
                         model->dictLocker.lock();
                         for (auto &it: model->responseContextDict.dicts) {
                             if (it.second->isEnding) {
                                 continue;
                             }
+                            handles.push_back(it.first);
                             for (int i = 0; i < it.second->currentTokens.size(); i++) {
                                 ids.push_back(it.second->currentTokens[i]);
                             }
                             if (it.second->preTokens == 0) {
+                                int seqLen = it.second->currentTokens.size();
                                 int gmask_token_id =
                                         model->weight.dicts.find("gmask_token_id") != model->weight.dicts.end() ?
                                         atoi(model->weight.dicts["gmask_token_id"].c_str()) : 130001;
-                                ids.push_back(gmask_token_id);
-                                ids.push_back(model->bos_token_id);
+                                if (it.second->currentTokens.size() < 2 ||
+                                    it.second->currentTokens.back() != model->bos_token_id) {
+                                    ids.push_back(gmask_token_id);
+                                    ids.push_back(model->bos_token_id);
+                                    seqLen += 2;
+                                }
 
-                                int seqLen = it.second->currentTokens.size() + 2;
                                 seqLens.push_back(seqLen);
                                 std::vector<float> vmask = std::vector<float>(seqLen * seqLen, 0);
                                 std::vector<float> vpids = std::vector<float>(seqLen * 2, 0);
@@ -706,6 +710,7 @@ TimeRecord batchRecord;
                         }
 
                         if (seqLens.size() > 0) {
+                            model->dictLocker.unlock();
 #ifdef USE_CUDA
                             FastllmCudaClearBigBuffer();
 #endif
@@ -713,12 +718,10 @@ TimeRecord batchRecord;
                             std::vector<int> ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
                                                                        positionIds,
                                                                        seqLens, pastKeyValues);
-                            int idx = 0;
-                            for (auto &it: model->responseContextDict.dicts) {
-                                if (it.second->isEnding) {
-                                    continue;
-                                }
-                                int curRet = ret[idx++];
+                            model->dictLocker.lock();
+                            for (int i = 0; i < handles.size(); i++) {
+                                auto &it = *model->responseContextDict.dicts.find(handles[i]);
+                                int curRet = ret[i];
                                 if (curRet == model->eos_token_id) {
                                     it.second->isEnding = true;
                                 } else {
@@ -736,7 +739,7 @@ TimeRecord batchRecord;
                         }
 
                         model->dictLocker.unlock();
-                        pthread_yield();
+                        MySleep(0);
                     }
                 }, this);
             }
@@ -752,24 +755,29 @@ TimeRecord batchRecord;
         return handleId;
     }
 
-    std::pair<bool, std::vector<int>> ChatGLMModel::FetchResponseTokens(int handleId) {
+    int ChatGLMModel::FetchResponseTokens(int handleId) {
         dictLocker.lock();
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         if (context == nullptr) {
             dictLocker.unlock();
-            return std::make_pair(false, std::vector <int> ());
+            return -1;
         } else {
-            std::vector <int> ret;
-            while (context->resultTokenQueue.size() > 0) {
-                ret.push_back(context->resultTokenQueue.front());
-                context->resultTokenQueue.pop();
+            while (true) {
+                if (context->resultTokenQueue.size() > 0) {
+                    int ret = context->resultTokenQueue.front();
+                    context->resultTokenQueue.pop();
+                    dictLocker.unlock();
+                    return ret;
+                } else {
+                    if (context->isEnding) {
+                        responseContextDict.RemoveHandle(handleId);
+                        dictLocker.unlock();
+                        return -1;
+                    }
+                }
+                dictLocker.unlock();
+                MySleep(0);
             }
-            bool remain = (!context->isEnding || ret.size() > 0);
-            if (!remain) {
-                responseContextDict.RemoveHandle(handleId);
-            }
-            dictLocker.unlock();
-            return std::make_pair(remain, ret);
         }
     }
 }

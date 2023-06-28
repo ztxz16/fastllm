@@ -94,14 +94,12 @@ int main(int argc, char** argv) {
             int handleId = model->LaunchResponseTokens(tokens);
             std::vector<float> results;
             while (true) {
-                auto result = model->FetchResponseTokens(handleId);
-                if (result.first == false) {
+                int result = model->FetchResponseTokens(handleId);
+                if (result == -1) {
                     break;
                 } else {
                     results.clear();
-                    for (int i = 0; i < result.second.size(); i++) {
-                        results.push_back(result.second[i]);
-                    }
+                    results.push_back(result);
                     session->output += model->weight.tokenizer.Decode(fastllm::Data (fastllm::DataType::FLOAT32, {(int)results.size()}, results));
                 }
                 if (session->status == 2) {
