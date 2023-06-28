@@ -721,12 +721,14 @@ namespace fastllm {
                                 continue;
                             }
                             if (it.second->preTokens == 0) {
-                                ids.push_back(model->bos_token_id);
+                                if (it.second->currentTokens.size() == 0 || it.second->currentTokens[0] != model->bos_token_id) {
+                                    it.second->currentTokens.push_back(model->bos_token_id);
+                                }
+                                int seqLen = it.second->currentTokens.size();
                                 for (int i = 0; i < it.second->currentTokens.size(); i++) {
                                     ids.push_back(it.second->currentTokens[i]);
                                 }
 
-                                int seqLen = it.second->currentTokens.size() + 1;
                                 seqLens.push_back(seqLen);
 
                                 std::vector <float> vmask = std::vector <float> (seqLen * seqLen, 0);
@@ -792,7 +794,7 @@ namespace fastllm {
                         }
 
                         model->dictLocker.unlock();
-                        pthread_yield();
+                        MySleep(0);
                     }
                 }, this);
             }
@@ -808,24 +810,29 @@ namespace fastllm {
         return handleId;
     }
 
-    std::pair<bool, std::vector<int>> LlamaModel::FetchResponseTokens(int handleId) {
+    int LlamaModel::FetchResponseTokens(int handleId) {
         dictLocker.lock();
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         if (context == nullptr) {
             dictLocker.unlock();
-            return std::make_pair(false, std::vector <int> ());
+            return -1;
         } else {
-            std::vector <int> ret;
-            while (context->resultTokenQueue.size() > 0) {
-                ret.push_back(context->resultTokenQueue.front());
-                context->resultTokenQueue.pop();
+            while (true) {
+                if (context->resultTokenQueue.size() > 0) {
+                    int ret = context->resultTokenQueue.front();
+                    context->resultTokenQueue.pop();
+                    dictLocker.unlock();
+                    return ret;
+                } else {
+                    if (context->isEnding) {
+                        responseContextDict.RemoveHandle(handleId);
+                        dictLocker.unlock();
+                        return -1;
+                    }
+                }
+                dictLocker.unlock();
+                MySleep(0);
             }
-            bool remain = (!context->isEnding || ret.size() > 0);
-            if (!remain) {
-                responseContextDict.RemoveHandle(handleId);
-            }
-            dictLocker.unlock();
-            return std::make_pair(remain, ret);
         }
     }
 }
