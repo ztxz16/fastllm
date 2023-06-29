@@ -2,59 +2,101 @@
 
 ## 介绍
 
-fastllm是纯c++实现，无第三方依赖的大模型库，目前支持国产大模型ChatGLM-6B，MOSS;
+fastllm是纯c++实现，无第三方依赖的高性能大模型推理库
 
-可以在安卓设备上流畅运行ChatGLM-6B
-
-可以在支持CUDA的设备上加速计算
+6~7B级模型在安卓端上也可以流畅运行
 
 部署交流QQ群： 831641348
 
+| [快速开始](#快速开始) | [模型获取](#模型获取) | 
+
+## 功能概述
+
+- 🚀 纯c++实现，便于跨平台移植，可以在安卓上直接编译
+- 🚀 ARM平台支持NEON指令集加速，X86平台支持AVX指令集加速，NVIDIA平台支持CUDA加速，各个平台速度都很快就是了
+- 🚀 支持浮点模型（FP32), 半精度模型(FP16), 量化模型(INT8, INT4) 加速
+- 🚀 支持Batch速度优化
+- 🚀 支持流式输出，很方便实现打字机效果
+- 🚀 支持并发计算时动态拼Batch
+- 🚀 支持python调用
+- 🚀 前后端分离设计，便于支持新的计算设备
+- 🚀 目前支持ChatGLM模型，各种LLAMA模型(ALPACA, VICUNA等)，BAICHUAN模型，MOSS模型
+
 ## 推理速度
 
-可以使用benchmark程序进行测速，根据不同配置、不同输入，推理速度也会有一些差别
+6B级int4模型单4090延迟最低约5.5ms
 
-例如:
+6B级fp16模型单4090最大吞吐量超过10000 token / s
+
+6B级int4模型在骁龙865上速度大约为4~5 token / s
+
+[详细测试数据点这里](docs/benchmark.md)
+
+## 快速开始
+
+### 编译
+
+建议使用cmake编译，需要提前安装c++编译器，make, cmake
+
+gcc版本建议9.4以上，cmake版本建议3.23以上
+
+GPU编译需要提前安装好CUDA编译环境，建议使用尽可能新的CUDA版本
+
+使用如下命令编译
 
 ``` sh
-./benchmark -p ~/chatglm-6b-int4.bin -f ../example/benchmark/prompts/beijing.txt -b 1
-./benchmark -p ~/chatglm-6b-int8.bin -f ../example/benchmark/prompts/beijing.txt -b 1
-./benchmark -p ~/chatglm-6b-fp16.bin -f ../example/benchmark/prompts/hello.txt -b 512 -l 18
-```
-
-|              模型 | Data精度 | 平台               | Batch    | 最大推理速度(token / s) |
-|-----------------:|---------|--------------------|-----------|---------------------:|
-| ChatGLM-6b-int4  | float32 |  RTX 4090          |         1 |                  176 |
-| ChatGLM-6b-int8  | float32 |  RTX 4090          |         1 |                  121 |
-| ChatGLM-6b-fp16  | float32 |  RTX 4090          |        64 |                 2919 |
-| ChatGLM-6b-fp16  | float32 |  RTX 4090          |       256 |                 7871 |
-| ChatGLM-6b-fp16  | float32 |  RTX 4090          |       512 |                10209 |
-| ChatGLM-6b-int4  | float32 |  Xiaomi 10 Pro - 4 Threads | 1 |                4 ~ 5 |
-
-
-## 编译
-
-fastllm使用c++编写，建议使用cmake编译，需要提前安装c++编译器，make, cmake
-
-如果需要使用GPU（目前仅int8模型支持GPU加速），需要提前安装好CUDA编译环境
-
-### PC (CPU)
-
-```
+cd fastllm
 mkdir build
 cd build
-cmake ..
-make -j4
+cmake .. -DUSE_CUDA=ON # 如果不使用GPU编译，那么使用 cmake .. -DUSE_CUDA=OFF
+make -j
 ```
 
-### PC (CPU + GPU)
+编译完成后，可以使用如下命令安装简易python工具包
+
+``` sh
+cd fastllm/build/tools
+python setup.py install
+```
+
+### 运行demo程序
+
+我们假设已经获取了名为`model.flm`的模型（参照 [模型获取](#模型获取)，初次使用可以先下载转换好的模型)
+
+编译完成之后在build目录下可以使用下列demo:
+``` sh
+# 命令行聊天程序, 支持打字机效果
+./main -p model.flm 
+
+# 简易webui, 使用流式输出 + 动态batch，可多路并发访问
+./webui -p model.flm --port 1234 
+
+# python版本的命令行聊天程序，使用了模型创建以及流式对话效果
+python tools/cli_demo.py -p model.flm 
+
+# python版本的简易webui，需要先安装streamlit-chat
+streamlit run tools/web_demo.py model.flm 
 
 ```
-mkdir build-cuda
-cd build-cuda
-cmake .. -DUSE_CUDA=ON
-make -j4
+
+### 简易python调用
+
+编译后如果安装了简易python工具包，那么可以使用python来调用一些基本的API （如果没有安装，也可以在直接import编译生成的tools/fastllm_pytools来使用)
+
+``` python
+# 模型创建
+from fastllm_pytools import llm
+model = llm.model("model.flm")
+
+# 生成回复
+print(model.response("你好"))
+
+# 流式生成回复
+for response in model.stream_response(query):
+    print(response, flush = True, end = "")
+
 ```
+
 
 ### PC 使用python api
 
