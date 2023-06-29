@@ -2,7 +2,7 @@ import sys
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
-import torch2flm
+from fastllm_pytools import torch2flm
 
 if __name__ == "__main__":
     exportPath = sys.argv[1] if (sys.argv[1] is not None) else "baichuan-fp32.flm";
