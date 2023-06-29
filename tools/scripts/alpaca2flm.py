@@ -1,6 +1,6 @@
 import sys
 from transformers import LlamaTokenizer, LlamaForCausalLM
-import torch2flm
+from fastllm_pytools import torch2flm
 
 if __name__ == "__main__":
     exportPath = sys.argv[1] if (sys.argv[1] is not None) else "alpaca-fp32.flm";
