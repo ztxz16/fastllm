@@ -8,7 +8,7 @@ fastllm是纯c++实现，无第三方依赖的高性能大模型推理库
 
 部署交流QQ群： 831641348
 
-| [快速开始](#快速开始) | [模型获取](#模型获取) | 
+| [快速开始](#快速开始) | [模型获取](#模型获取) | [开发计划](#开发计划) |
 
 ## 功能概述
 
@@ -52,10 +52,10 @@ cmake .. -DUSE_CUDA=ON # 如果不使用GPU编译，那么使用 cmake .. -DUSE_
 make -j
 ```
 
-编译完成后，可以使用如下命令安装简易python工具包
+编译完成后，可以使用如下命令安装简易python工具包 (暂时只支持Linux)
 
 ``` sh
-cd fastllm/build/tools
+cd tools # 这时在fastllm/build/tools目录下
 python setup.py install
 ```
 
@@ -65,6 +65,8 @@ python setup.py install
 
 编译完成之后在build目录下可以使用下列demo:
 ``` sh
+# 这时在fastllm/build目录下
+
 # 命令行聊天程序, 支持打字机效果
 ./main -p model.flm 
 
@@ -92,13 +94,16 @@ model = llm.model("model.flm")
 print(model.response("你好"))
 
 # 流式生成回复
-for response in model.stream_response(query):
+for response in model.stream_response("你好"):
     print(response, flush = True, end = "")
-
 ```
 
+详细API说明见 [fastllm_pytools](docs/fastllm_pytools)
 
-### PC 使用python api
+这个包不包含low level api，如果需要使用更深入的功能请参考 [Python绑定](#Python绑定)
+
+
+## Python绑定
 
 ```
 mkdir build-py
@@ -111,111 +116,106 @@ python web_api.py  -m chatglm -p chatglm-6b-int8.bin
 ```
 上述web api可使用python web_api_client.py进行测试
 
-### Android
+## Android上使用
 
-```
-# Android上需要下载NDK工具编译
+### 编译
+``` sh
+# 在PC上编译需要下载NDK工具
+# 还可以尝试使用手机端编译，在termux中可以使用cmake和gcc（不需要使用NDK）
 mkdir build-android
 cd build-android
 export NDK=<your_ndk_directory>
 # 如果手机不支持，那么去掉 "-DCMAKE_CXX_FLAGS=-march=armv8.2a+dotprod" （比较新的手机都是支持的）
 cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 -DCMAKE_CXX_FLAGS=-march=armv8.2a+dotprod ..
-make -j4
+make -j
 ```
 
+### 运行
 
-编译后会在build目录下生成：
-
-1. main: 示例程序
-
-2. quant: 量化程序
-
-## 运行示例程序
-
-./main -h 可以查看具体参数信息，以下是一些简单示例：
-
-### 运行ChatGLM-6B模型
-
-```
-./main -m chatglm -p chatglm-6b-int8.bin
-```
-
-### 运行baichuan模型
-
-```
-./main -m baichuan -p baichuan-int8.bin
-```
-
-### 运行MOSS模型
-
-```
-./main -m moss -p moss-int8.bin
-```
-
-### 在Android上运行
-
-可以在Android设备上安装termux软件，并在其中执行termux-setup-storage获得读取手机文件的权限。然后将NDK编译出的main文件和模型存入手机，然后在termux中运行main文件（需要把main文件拷贝到termux的根目录下，否则无权限运行）
-
-### 运行webui
-
-webui 由 [Jacques CHEN](http://whchen.net/index.php/About.html) 提供
-
-编译出webui后，需要在运行目录中放入example/webui/web文件夹以及模型文件（默认为chatglm-6b-v1.1-int4.bin文件)，然后运行既可部署网页端服务
+1. 在Android设备上安装termux软件
+2. 在termux中执行termux-setup-storage获得读取手机文件的权限。
+3. 将NDK编译出的main文件，以及模型文件存入手机，并拷贝到termux的根目录
+4. 使用命令```chmod 777 main```赋权
+5. 然后可以运行main文件，参数格式参见```./main --help```
 
 ## 模型获取
 
-### 原始模型
+### 模型库
 
-如果使用原生的ChatGLM-6B模型或者MOSS模型，可以在百度网盘中直接获得量化的模型：
+可以在以下链接中下载已经转换好的模型
 
-[原始模型](https://pan.baidu.com/s/1DyGOWqKFbpBSSi93PJe6Ug) 提取码：pk7q
+[huggingface](https://huggingface.co/huangyuyang) 
 
-如果需要导出自己的模型，可参照如下步骤
+### 模型导出
 
-### ChatGLM模型导出
+#### ChatGLM模型导出
 
-```
+``` sh
 # 需要先安装ChatGLM-6B环境
 # 如果使用自己finetune的模型需要修改chatglm_export.py文件中创建tokenizer, model的代码
 # 如果使用量化模型，需要先编译好quant文件，这里假设已经存在build/quant文件
-cd tools
-python3 chatglm_export.py ../chatglm-6b.bin # 导出浮点模型
-cd ../build
-./quant -m chatglm -p ../chatglm-6b.bin -o ../chatglm-6b-fp16.bin -b 16 #导出float16模型
-./quant -m chatglm -p ../chatglm-6b.bin -o ../chatglm-6b-int8.bin -b 8 #导出int8模型
-./quant -m chatglm -p ../chatglm-6b.bin -o ../chatglm-6b-int4.bin -b 4 #导出int4模型
+cd build
+python3 tools/chatglm_export.py chatglm-6b-fp32.flm # 导出浮点模型
+./quant -p chatglm-6b-fp32.flm -o chatglm-6b-fp16.flm -b 16 #导出float16模型
+./quant -p chatglm-6b-fp32.flm -o chatglm-6b-int8.flm -b 8 #导出int8模型
+./quant -p chatglm-6b-fp32.flm -o chatglm-6b-int4.flm -b 4 #导出int4模型
 ```
 
 ### baichuan模型导出
 
-```
+``` sh
 # 需要先安装baichuan环境
 # 默认使用的是经过sft训练的对话模型，如果使用其余模型需要修改导出文件
 # 如果使用量化模型，需要先编译好quant文件，这里假设已经存在build/quant文件
-cd tools
-python3 baichuan_peft2flm.py ../baichuan.bin # 导出浮点模型
-cd ../build
-./quant -m baichuan -p ../baichuan.bin -o ../baichuan-fp16.bin -b 16 #导出float16模型
-./quant -m baichuan -p ../baichuan.bin -o ../baichuan-int8.bin -b 8 #导出int8模型
-./quant -m baichuan -p ../baichuan.bin -o ../baichuan-int4.bin -b 4 #导出int4模型
+cd build
+python3 tools/baichuan_peft2flm.py baichuan-fp32.flm # 导出浮点模型
+./quant -p baichuan-fp32.flm -o baichuan-fp16.flm -b 16 #导出float16模型
+./quant -p baichuan-fp32.flm -o baichuan-int8.flm -b 8 #导出int8模型
+./quant -p baichuan-fp32.flm -o baichuan-int4.flm -b 4 #导出int4模型
 ```
 
 ### MOSS模型导出
 
-```
+``` sh
 # 需要先安装MOSS环境
 # 如果使用自己finetune的模型需要修改moss_export.py文件中创建tokenizer, model的代码
 # 如果使用量化模型，需要先编译好quant文件，这里假设已经存在build/quant文件
-cd tools
-python3 moss_export.py ../moss.bin # 导出浮点模型
-cd ../build
-./quant -m moss -p ../moss.bin -o ../moss-fp16.bin -b 16 #导出float16模型
-./quant -m moss -p ../moss.bin -o ../moss-int8.bin -b 8 #导出int8模型
-./quant -m moss -p ../moss.bin -o ../moss-int4.bin -b 4 #导出int4模型
+cd build
+python3 tools/moss_export.py moss-fp32.flm # 导出浮点模型
+./quant -p moss-fp32.flm -o moss-fp16.flm -b 16 #导出float16模型
+./quant -p moss-fp32.flm -o moss-int8.flm -b 8 #导出int8模型
+./quant -p moss-fp32.flm -o moss-int4.flm -b 4 #导出int4模型
 ```
 
-## TODO
+### LLAMA系列模型导出
+``` sh
+# 修改build/tools/alpaca2flm.py程序进行导出
+# 不同llama模型使用的指令相差很大，需要参照torch2flm.py中的参数进行配置
+```
 
-1、opencl支持
+## 开发计划
 
-2、完善Sample功能
+也就是俗称的画饼部分，大家如果有需要的功能可以在讨论区提出
+
+### 短期计划
+
+- 提供直接从HF模型创建fastllm模型的python接口
+``` python
+hf_model, hf_tokenizer = ...
+flm_model = llm.from_hf_model(hf_model)
+# flm_model = llm.from_hf_model(hf_model, hf_tokenizer)
+```
+
+- 支持do_sample以及采样参数
+- 支持GLM2模型
+
+### 中期计划
+
+- 支持更多后端，如opencl, vulkan, 以及一些NPU加速设备
+- 支持、验证更多模型，完善模型库
+- 优化tokenizer (由于目前在python中可以直接使用原模型的tokenizer来分词，所以这项工作暂时并不急迫)
+
+### 长期计划
+
+- 支持ONNX模型导入、推理
+- 支持模型微调
