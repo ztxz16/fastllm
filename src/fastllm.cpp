@@ -658,10 +658,10 @@ namespace fastllm {
         return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
     }
 
-    std::string Tokenizer::Decode(const Data &data) {
+    std::string Tokenizer::Decode(const std::vector<int> &tokens) {
         std::string ret = "";
-        for (int i = 0; i < data.Count(0); i++) {
-            std::string s = tokenToStringDict[(int) ((float *) data.cpuData)[i]];
+        for (int i = 0; i < tokens.size(); i++) {
+            std::string s = tokenToStringDict[tokens[i]];
             if (s.size() == 6 && s.substr(0, 3) == "<0x" && s.back() == '>') {
                 int c = 0;
                 for (int i = 3; i < 5; i++) {
@@ -693,13 +693,21 @@ namespace fastllm {
                 ret.replace(pos, blank.length(), " ");
             else break;
         }
-	    int pos = ret.find("<|blank_");
-	    if (pos != -1) {
-		    int space_num = atoi(ret.substr(8, ret.size() - 10).c_str());
-		    return std::string(space_num, ' ');
-	    }
+        int pos = ret.find("<|blank_");
+        if (pos != -1) {
+            int space_num = atoi(ret.substr(8, ret.size() - 10).c_str());
+            return std::string(space_num, ' ');
+        }
 
         return ret;
+    }
+
+    std::string Tokenizer::Decode(const Data &data) {
+        std::vector <int> tokens;
+        for (int i = 0; i < data.Count(0); i++) {
+            tokens.push_back((int) ((float *) data.cpuData)[i]);
+        }
+        return Decode(tokens);
     }
 
     void WeightMap::LoadFromFile(const std::string &fileName) {
