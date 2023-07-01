@@ -54,6 +54,8 @@ namespace fastllm {
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
 
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
+
+        int GetVersion();
     private:
 		virtual void CausalMask(Data &data, int start) {}; // 因果mask？
     };
