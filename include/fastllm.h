@@ -247,6 +247,8 @@ namespace fastllm {
 
     void GeluNew(const Data &input, Data &output);
 
+    void Swiglu(const fastllm::Data &input, fastllm::Data &output);
+
     void Mul(const Data &input, float v, Data &output);
 
     void MulTo(Data &input0, const Data &input1); // input0 *= input1
@@ -262,6 +264,8 @@ namespace fastllm {
     void TopK(const Data &input, Data &output, int topK); // 求topk
 
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position
+
+    void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position, 相邻的元素旋转
 
     void LlamaRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position for llama
 
