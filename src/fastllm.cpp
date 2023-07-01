@@ -818,9 +818,16 @@ namespace fastllm {
         }
 
         // 写入权重
-        buffer.WriteInt((int)weight.size());
+        int need = 0;
+        for (auto &it : weight) {
+            need += (it.second.dims.size() > 0);
+        }
+        buffer.WriteInt(need);
         int tot = 0;
         for (auto &it : weight) {
+            if (it.second.dims.size() == 0) {
+                continue;
+            }
             buffer.WriteString(it.first);
             Data &data = it.second;
             buffer.WriteInt((int)data.dims.size());
@@ -918,7 +925,7 @@ namespace fastllm {
                     buffer.WriteBytes(uDatas.data(), bytes);
                 }
             }
-            printf("output (%d / %d)\r", ++tot, (int)weight.size());
+            printf("output (%d / %d)\r", ++tot, need);
             fflush(stdout);
         }
         printf("\n");
@@ -1032,6 +1039,12 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void Swiglu(const fastllm::Data &input, fastllm::Data &output) {
+        curExecutor->Run("Swiglu", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
     void Mul(const fastllm::Data &input, float v, fastllm::Data &output) {
         curExecutor->Run("Mul", {
                 {"input", (Data*)&input}, {"output", &output}
@@ -1086,6 +1099,12 @@ namespace fastllm {
 
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
         curExecutor->Run("RotatePosition2D", {
+                {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
+        }, {}, {{"rotaryDim", rotaryDim}});
+    }
+
+    void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
+        curExecutor->Run("NearlyRotatePosition2D", {
                 {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
         }, {}, {{"rotaryDim", rotaryDim}});
     }
