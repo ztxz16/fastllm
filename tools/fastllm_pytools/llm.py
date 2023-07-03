@@ -28,9 +28,19 @@ fastllm_lib.make_history_llm_model.restype = ctypes.c_char_p
 fastllm_lib.make_input_llm_model.argtype = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.make_input_llm_model.restype = ctypes.c_char_p
 
+def from_hf(model,
+            tokenizer = None,
+            dtype = "float16"):
+    from fastllm_pytools import hf_model;
+    return hf_model.create(model, tokenizer, dtype = dtype);
+
 class model:
-    def __init__ (self, path):
-        self.model = fastllm_lib.create_llm_model(path.encode());
+    def __init__ (self, path : str,
+                  id : int = -99999):
+        if (id != -99999):
+            self.model = id;
+        else:
+            self.model = fastllm_lib.create_llm_model(path.encode());
         self.direct_query = False;
 
     def get_prompt(self,
