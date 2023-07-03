@@ -85,10 +85,12 @@ class model:
                 res += cur;
                 yield res;
 
-    def chat(self, tokenizer,
-             query: str,
-             history: List[Tuple[str, str]] = None) -> str:
+    def chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, max_length: int = 8192, num_beams=1,
+             do_sample = True, top_p = 0.8, temperature = 0.8, logits_processor = None, **kwargs):
+        if (not(history)):
+            history = [];
         prompt = query if self.direct_query else self.get_prompt(query, history);
+        print("prompt", prompt);
         input = tokenizer.encode(prompt);
         handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input));
 
@@ -98,12 +100,15 @@ class model:
             if (cur == -1):
                 break;
             result.append(cur);
-        return tokenizer.decode(result);
+        response = tokenizer.decode(result);
+        history = history + [(query, response)];
+        return response, history;
 
-    def stream_chat(self, tokenizer,
-                    query: str,
-                    history: List[Tuple[str, str]] = None,
-                    one_by_one = True) -> str:
+    def stream_chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, past_key_values = None,
+                    max_length: int = 8192, do_sample = True, top_p = 0.8, temperature = 0.8, logits_processor = None,
+                    return_past_key_values = False, **kwargs) -> str:
+        if (not(history)):
+            history = [];
         prompt = query if self.direct_query else self.get_prompt(query, history);
         input = tokenizer.encode(prompt);
         handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input));
@@ -113,4 +118,9 @@ class model:
             if (cur == -1):
                 break;
             tokens.append(cur);
-            yield tokenizer.decode(cur if one_by_one else tokens);
+            response = tokenizer.decode(tokens);
+            new_history = history + [(query, response)];
+            if return_past_key_values:
+                yield response, new_history, None;
+            else:
+                yield response, new_history;
