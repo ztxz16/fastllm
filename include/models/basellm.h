@@ -47,6 +47,8 @@ namespace fastllm {
 
         virtual void LoadFromFile(const std::string &fileName); // 从文件读取
 
+        virtual void InitParams(); // 初始化参数信息
+
         // 推理
         virtual int Forward(
                 const Data &inputIds,

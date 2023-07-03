@@ -24,6 +24,17 @@ def create(model,
         print("dtype should in ", list(fastllm_data_type_dict.keys()));
         exit(0);
 
+    # 0.1 model info
+    modelInfo = model.config.__dict__
+    if (pre_prompt):
+        modelInfo["pre_prompt"] = pre_prompt;
+    if (user_role):
+        modelInfo["user_role"] = user_role;
+    if (bot_role):
+        modelInfo["bot_role"] = bot_role;
+    if (history_sep):
+        modelInfo["history_sep"] = history_sep;
+
     weight_type_dict = {};
     module_dict = {};
     for key, m in model.named_modules():
@@ -73,6 +84,9 @@ def create(model,
     model_type = model.config.__dict__["model_type"];
     model = llm.fastllm_lib.create_empty_llm_model(model_type.encode());
 
+    for it in modelInfo.keys():
+        llm.fastllm_lib.add_dict_llm_model(model, str(it).encode(), str(modelInfo[it]).encode());
+
     tot = 0;
     for key in dict:
         ori_data_type = 0;
@@ -100,6 +114,8 @@ def create(model,
         print("convert (", tot, "/", len(dict), end = " )\r");
 
     print("");
+    llm.fastllm_lib.init_params_llm_model(model);
+    llm.fastllm_lib.warmup_llm_model(model);
     ret = llm.model("", id = model);
     return ret;
 
