@@ -36,6 +36,35 @@ extern "C" {
         return id;
     }
 
+    int create_empty_llm_model(char *type) {
+        models.locker.lock();
+        int id = models.models.size();
+        models.models[id] = fastllm::CreateEmptyLLMModel(type);
+        models.locker.unlock();
+        return id;
+    }
+
+    void add_dict_llm_model(int modelId, char *key, char *value) {
+        auto model = models.GetModel(modelId);
+        model->weight.AddDict(key, value);
+        return;
+    }
+
+    void add_weight_llm_model(int modelId, char *key, int dimsLen, void *dimsData,
+                              int dataType, int weightType, int oriDataType, void *oriData) {
+        auto model = models.GetModel(modelId);
+        std::vector <int> dims = std::vector <int> (dimsLen);
+        for (int i = 0; i < dims.size(); i++) {
+            dims[i] = ((int*)dimsData)[i];
+        }
+        model->weight.AddWeight(key, dims,
+                                (fastllm::DataType)dataType,
+                                (fastllm::WeightType)weightType,
+                                (fastllm::DataType)oriDataType,
+                                (uint8_t*)oriData);
+        return;
+    }
+
     char *make_input_llm_model(int modelId, char *history, int round, char *input) {
         auto model = models.GetModel(modelId);
         char *ret = string_to_chars(model->MakeInput(history, round, input));

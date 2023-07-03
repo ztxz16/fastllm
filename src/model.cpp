@@ -28,8 +28,7 @@ namespace fastllm {
         this->weight.SaveLowBitModel(fileName, bit);
     }
 
-    std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
-        std::string modelType = GetModelTypeFromFile(fileName);
+    fastllm::basellm *CreateModelWithType(const std::string &modelType) {
         basellm *model;
         if (modelType == "chatglm") {
             model = (basellm*)(new ChatGLMModel());
@@ -49,8 +48,19 @@ namespace fastllm {
         } else {
             ErrorInFastLLM("Unkown model type: " + modelType);
         }
+        return model;
+    }
+
+    std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
+        std::string modelType = GetModelTypeFromFile(fileName);
+        basellm *model = CreateModelWithType(modelType);
         model->LoadFromFile(fileName);
         model->WarmUp();
-        return std::unique_ptr<fastllm::basellm>(model);
+        return std::unique_ptr<fastllm::basellm> (model);
+    }
+
+    std::unique_ptr<basellm> CreateEmptyLLMModel(const std::string &modelType) {
+        basellm *model = CreateModelWithType(modelType);
+        return std::unique_ptr<fastllm::basellm> (model);
     }
 }

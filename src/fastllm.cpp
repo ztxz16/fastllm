@@ -793,6 +793,34 @@ namespace fastllm {
         return;
     }
 
+    void PerChannelQuantizationMultiThread(int st, int end, int m,
+                                           float *f, uint8_t *u8, LowBitConfig *configs, int bit) {
+        for (int i = st; i < end; i++) {
+            float minValue = 1e9, maxValue = -1e9;
+            for (int j = 0; j < m; j++) {
+                minValue = std::min(minValue, f[i * m + j]);
+                maxValue = std::max(maxValue, f[i * m + j]);
+            }
+            if (bit == 8) {
+                configs[i] = LowBitConfig(minValue, maxValue, 8);
+                for (int j = 0; j < m; j++) {
+                    u8[i * m + j] = configs[i].quantization(f[i * m + j]);
+                }
+            } else {
+                configs[i] = LowBitConfig(minValue, maxValue, 4);
+                for (int j = 0; j < m; j++) {
+                    int id = (i * m + j) / 2;
+                    uint8_t value = configs[i].quantization(f[i * m + j]);
+                    if ((i * m + j) % 2) {
+                        u8[id] = (u8[id] & 0xF0) | value;
+                    } else {
+                        u8[id] = (u8[id] & 0xF) | (value << 4);
+                    }
+                }
+            }
+        }
+    }
+
     void WeightMap::SaveLowBitModel(const std::string &fileName, int bit) {
         AssertInFastLLM(fileName != "", "Error: output's name shouldn't be empty.\n");
         AssertInFastLLM(bit == 4 || bit == 8 || bit == 16, "Error: only support 16 bit or 8 bit or 4 bit model.\n");
@@ -882,33 +910,8 @@ namespace fastllm {
                         if (i == threadNum - 1) {
                             end = k;
                         }
-                        threads.push_back(new std::thread([&bit](int st, int end, int m,
-                                                                 float *f, uint8_t *u8, LowBitConfig *configs) {
-                            for (int i = st; i < end; i++) {
-                                float minValue = 1e9, maxValue = -1e9;
-                                for (int j = 0; j < m; j++) {
-                                    minValue = std::min(minValue, f[i * m + j]);
-                                    maxValue = std::max(maxValue, f[i * m + j]);
-                                }
-                                if (bit == 8) {
-                                    configs[i] = LowBitConfig(minValue, maxValue, 8);
-                                    for (int j = 0; j < m; j++) {
-                                        u8[i * m + j] = configs[i].quantization(f[i * m + j]);
-                                    }
-                                } else {
-                                    configs[i] = LowBitConfig(minValue, maxValue, 4);
-                                    for (int j = 0; j < m; j++) {
-                                        int id = (i * m + j) / 2;
-                                        uint8_t value = configs[i].quantization(f[i * m + j]);
-                                        if ((i * m + j) % 2) {
-                                            u8[id] = (u8[id] & 0xF0) | value;
-                                        } else {
-                                            u8[id] = (u8[id] & 0xF) | (value << 4);
-                                        }
-                                    }
-                                }
-                            }
-                        }, cur, end, m, (float *) data.cpuData, uDatas.data(), configs.data()));
+                        threads.push_back(new std::thread(&PerChannelQuantizationMultiThread,cur, end, m,
+                                                          (float *) data.cpuData, uDatas.data(), configs.data(), bit));
                         cur = end;
                     }
                     for (int i = 0; i < threadNum; i++) {
@@ -930,6 +933,69 @@ namespace fastllm {
         }
         printf("\n");
         return;
+    }
+
+    void WeightMap::AddDict(const std::string &key, const std::string &value) {
+        this->dicts[key] = value;
+    }
+
+    void WeightMap::AddWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType,
+                              fastllm::WeightType weightType, fastllm::DataType oriDataType, uint8_t *oriData) {
+        this->weight[key] = Data(dataType, dims);
+        Data &data = this->weight[key];
+        data.weightType = weightType;
+        data.UpdateUnitSize();
+        data.Allocate();
+        if (dataType == oriDataType) {
+            memcpy(data.cpuData, oriData, data.GetBytes());
+        } else if (oriDataType == DataType::FLOAT32 &&
+                (dataType == DataType::INT8 || dataType == DataType::INT4)) {
+            int bit = (dataType == DataType::INT4 ? 4 : 8);
+            int k = data.dims[0], m = data.dims[1];
+            int threadNum = 8;
+            int per = k / threadNum;
+            int cur = 0;
+            std::vector<std::thread *> threads;
+            std::vector<LowBitConfig> configs;
+            std::vector<uint8_t> uDatas;
+            configs.resize(k);
+
+            int bytes = k * m;
+            if (bit == 4) {
+                bytes = (k * m + 1) / 2;
+            }
+            uDatas.resize(bytes);
+            for (int i = 0; i < threadNum; i++) {
+                int end = cur + per;
+                if (i == threadNum - 1) {
+                    end = k;
+                }
+                threads.push_back(new std::thread(&PerChannelQuantizationMultiThread, cur, end, m,
+                                                  (float *) oriData, uDatas.data(), configs.data(), bit));
+                cur = end;
+            }
+            for (int i = 0; i < threadNum; i++) {
+                threads[i]->join();
+                delete threads[i];
+            }
+
+            data.perChannelAxis = 0;
+            data.perChannelsConfigs.resize(k);
+            data.zeros.resize(k);
+            data.scales.resize(k);
+            for (int i = 0; i < k; i++) {
+                data.perChannelsConfigs[i] = LowBitConfig(configs[i].min, configs[i].max, bit);
+                data.zeros[i] = data.perChannelsConfigs[i].zeroPoint;
+                data.scales[i] = data.perChannelsConfigs[i].scale;
+            }
+            memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
+        } else {
+            ErrorInFastLLM("wrong data type");
+        }
+    }
+
+    void WeightMap::SaveModel(const std::string &fileName) {
+
     }
 
     Data &WeightMap::operator[](const std::string &key) {
