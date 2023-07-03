@@ -9,6 +9,10 @@
 namespace fastllm {
     void basellm::LoadFromFile(const std::string &fileName) {
         this->weight.LoadFromFile(fileName);
+        this->InitParams();
+    }
+
+    void basellm::InitParams() {
         if (this->weight.dicts.find("bos_token_id") != this->weight.dicts.end()) {
             this->bos_token_id = atoi(this->weight.dicts["bos_token_id"].c_str());
             this->eos_token_id = atoi(this->weight.dicts["eos_token_id"].c_str());

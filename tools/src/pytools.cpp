@@ -50,6 +50,18 @@ extern "C" {
         return;
     }
 
+    void init_params_llm_model(int modelId) {
+        auto model = models.GetModel(modelId);
+        model->InitParams();
+        return;
+    }
+
+    void warmup_llm_model(int modelId) {
+        auto model = models.GetModel(modelId);
+        model->WarmUp();
+        return;
+    }
+
     void add_weight_llm_model(int modelId, char *key, int dimsLen, void *dimsData,
                               int dataType, int weightType, int oriDataType, void *oriData) {
         auto model = models.GetModel(modelId);
