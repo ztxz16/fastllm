@@ -49,7 +49,11 @@ namespace fastllm {
         }
         sinData.CopyFrom(Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, fsin));
         cosData.CopyFrom(Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, fcos));
-        weight.embeddingNames.insert("transformer.word_embeddings.weight");
+        if (GetVersion() == 1) {
+            weight.embeddingNames.insert("transformer.word_embeddings.weight");
+        } else if (GetVersion() == 2) {
+            weight.embeddingNames.insert("transformer.embedding.word_embeddings.weight");
+        }
     }
 
     int ChatGLMModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
