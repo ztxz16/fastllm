@@ -320,41 +320,6 @@ __global__ void FastllmLayerNormKernelTop1(float *input, float *output, int chan
     }
 }
 
-template <int THREAD_PER_BLOCK>
-__global__ void FastllmGemvInt8Kernel0(float *A, uint8_t *B, float *C,
-                                       float *bias, float *scales, uint8_t *zeros,
-                                       int m, int k) {
-    __shared__ float sdata[THREAD_PER_BLOCK];
-
-    // 1. 每个线程计算一部分
-    unsigned int tid = threadIdx.x;
-    unsigned int per = (m / THREAD_PER_BLOCK);
-    unsigned int id = blockIdx.x * m + threadIdx.x * per;
-    unsigned int len = per;
-    if (tid == blockDim.x - 1) {
-        len += (m - per * THREAD_PER_BLOCK);
-    }
-    float sum = 0.0;
-    for (int i = 0; i < len; i++) {
-        sum += A[threadIdx.x * per + i] * (B[id + i] - zeros[blockIdx.x]);
-    }
-    sdata[tid] = sum;
-    __syncthreads();
-
-    // 2. 求和
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-
-    // 3. 写回结果
-    if (tid == 0) {
-        C[blockIdx.x] = sdata[0] * scales[blockIdx.x] + bias[blockIdx.x];
-    }
-}
-
 template <int NBlock, int MBlock, int KBlock>
 __global__ void FastllmCudaBaseGemmKernelInt8(float *A, uint8_t *B, float *C,
                                               float *bias, float *scales, uint8_t *zeros,
@@ -582,43 +547,6 @@ __global__ void FastllmGemvInt4Kernel2(float *A, uint8_t *B, float *C,
     }
 }
 
-template <int THREAD_PER_BLOCK>
-__global__ void FastllmGemvInt4Kernel0(float *A, uint8_t *B, float *C,
-                                       float *bias, float *scales, uint8_t *zeros,
-                                       int m, int k) {
-    __shared__ float sdata[THREAD_PER_BLOCK];
-
-    // 1. 每个线程计算一部分
-    unsigned int tid = threadIdx.x;
-    unsigned int per = (m / THREAD_PER_BLOCK);
-    unsigned int id = blockIdx.x * m + threadIdx.x * per;
-    unsigned int len = per;
-    if (tid == blockDim.x - 1) {
-        len += (m - per * THREAD_PER_BLOCK);
-    }
-    float sum = 0.0;
-    for (int i = 0; i + 1 < len; i += 2) {
-        uint8_t now = B[(id + i) / 2];
-        sum += A[threadIdx.x * per + i] * ((now >> 4) - zeros[blockIdx.x]);
-        sum += A[threadIdx.x * per + i + 1] * ((now & 15) - zeros[blockIdx.x]);
-    }
-    sdata[tid] = sum;
-    __syncthreads();
-
-    // 2. 求和
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-
-    // 3. 写回结果
-    if (tid == 0) {
-        C[blockIdx.x] = sdata[0] * scales[blockIdx.x] + bias[blockIdx.x];
-    }
-}
-
 void *FastllmCudaPrepareInput(const fastllm::Data &input) {
     void *ret;
     if (input.dataDevice == fastllm::DataDevice::CUDA) {
@@ -674,14 +602,14 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
         delete[] zeropoints;
         weight.extraCudaData.push_back((void*)cudaZeropoints);
 
-        float *cudaBiasData;
-        cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cpuData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            weight.extraCudaData.push_back((void *) bias.cudaData);
         } else {
+            float *cudaBiasData;
+            cudaMalloc(&cudaBiasData, k * sizeof(float));
             cudaMemset(cudaBiasData, 0, k * sizeof(float));
+            weight.extraCudaData.push_back((void *) cudaBiasData);
         }
-        weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
     float *cudaScales = (float*)weight.extraCudaData[0];
@@ -697,22 +625,14 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
         FastllmCudaBaseGemmKernelInt8<nb, mb, kb>  <<< grid, 32 >>>
                 (cudaInput, (uint8_t *) weight.cudaData, cudaOutput, cudaBiasData, cudaScales, cudaZeropoints, n, m, k);
     } else {
-        if (m % 256 == 0) {
-            for (int i = 0; i < n; i++) {
-                FastllmGemvInt8Kernel2<256, 1> <<< k, 256 >>>(cudaInput + i * m,
-                                                              (uint8_t *) weight.cudaData,
-                                                              cudaOutput + i * k,
-                                                              cudaBiasData,
-                                                              cudaScales,
-                                                              cudaZeropoints,
-                                                              m, k);
-            }
-        } else {
-            for (int i = 0; i < n; i++) {
-                FastllmGemvInt8Kernel0<256> <<< k, 256 >>>(cudaInput + i * m, (uint8_t *) weight.cudaData,
-                                                           cudaOutput + i * k, cudaBiasData, cudaScales, cudaZeropoints,
-                                                           m, k);
-            }
+        for (int i = 0; i < n; i++) {
+            FastllmGemvInt8Kernel2<256, 1> <<< k, 256 >>>(cudaInput + i * m,
+                                                          (uint8_t *) weight.cudaData,
+                                                          cudaOutput + i * k,
+                                                          cudaBiasData,
+                                                          cudaScales,
+                                                          cudaZeropoints,
+                                                          m, k);
         }
     }
     FastllmCudaFinishInput(input, cudaInput);
@@ -739,14 +659,14 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
         delete[] zeropoints;
         weight.extraCudaData.push_back((void*)cudaZeropoints);
 
-        float *cudaBiasData;
-        cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cpuData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            weight.extraCudaData.push_back((void *) bias.cudaData);
         } else {
+            float *cudaBiasData;
+            cudaMalloc(&cudaBiasData, k * sizeof(float));
             cudaMemset(cudaBiasData, 0, k * sizeof(float));
+            weight.extraCudaData.push_back((void *) cudaBiasData);
         }
-        weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
     float *cudaScales = (float*)weight.extraCudaData[0];
@@ -757,18 +677,13 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
     for (int i = 0; i < n; i++) {
-        if (m % 256 == 0) {
-            FastllmGemvInt4Kernel2<256, 1> <<< k, 256 >>>(cudaInput + i * m,
-                                                          (uint8_t *) weight.cudaData,
-                                                          cudaOutput + i * k,
-                                                          cudaBiasData,
-                                                          cudaScales,
-                                                          cudaZeropoints,
-                                                          m, k);
-        } else {
-            FastllmGemvInt4Kernel0 <256> <<< k, 256 >>> (cudaInput + i * m, (uint8_t *) weight.cudaData,
-                                                         cudaOutput + i * k, cudaBiasData, cudaScales, cudaZeropoints, m, k);
-        }
+        FastllmGemvInt4Kernel2<256, 1> <<< k, 256 >>>(cudaInput + i * m,
+                                                      (uint8_t *) weight.cudaData,
+                                                      cudaOutput + i * k,
+                                                      cudaBiasData,
+                                                      cudaScales,
+                                                      cudaZeropoints,
+                                                      m, k);
     }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
@@ -778,14 +693,14 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
 bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         weight.ToDevice(fastllm::DataDevice::CUDA);
-        float *cudaBiasData;
-        cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cpuData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            weight.extraCudaData.push_back((void *) bias.cudaData);
         } else {
+            float *cudaBiasData;
+            cudaMalloc(&cudaBiasData, k * sizeof(float));
             cudaMemset(cudaBiasData, 0, k * sizeof(float));
+            weight.extraCudaData.push_back((void *) cudaBiasData);
         }
-        weight.extraCudaData.push_back((void*)cudaBiasData);
     }
     float *cudaBiasData = (float*)weight.extraCudaData[0];
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
