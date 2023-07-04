@@ -120,7 +120,7 @@ extern "C" {
     char *fetch_response_str_llm_model(int modelId, int handleId) {
         auto model = models.GetModel(modelId);
         int ret = model->FetchResponseTokens(handleId);
-        std::string s = (ret == -1 ? "<flmeos>" : model->weight.tokenizer.Decode(std::vector <int> {ret}));
+        std::string s = (ret == -1 ? "<flmeos>" : model->weight.tokenizer.DecodeTokens(std::vector <int> {ret}));
         return string_to_chars(s);
     }
 
