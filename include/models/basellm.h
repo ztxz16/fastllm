@@ -69,6 +69,8 @@ namespace fastllm {
 
         virtual void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
 
+        virtual void SaveModel(const std::string &fileName); // 直接导出
+
         virtual void WarmUp() {}; // 预热
 
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input) = 0; // 根据历史信息和当前输入生成prompt

@@ -823,7 +823,7 @@ namespace fastllm {
 
     void WeightMap::SaveLowBitModel(const std::string &fileName, int bit) {
         AssertInFastLLM(fileName != "", "Error: output's name shouldn't be empty.\n");
-        AssertInFastLLM(bit == 4 || bit == 8 || bit == 16, "Error: only support 16 bit or 8 bit or 4 bit model.\n");
+        AssertInFastLLM(bit == 0 || bit == 4 || bit == 8 || bit == 16, "Error: only support 16 bit or 8 bit or 4 bit model.\n");
         FileWriter buffer(fileName);
         buffer.WriteInt(this->versionId);
         if (this->versionId >= 1) {
@@ -864,68 +864,88 @@ namespace fastllm {
             }
             data.ToDevice(DataDevice::CPU);
 
-            if (data.weightType == WeightType::NONE) {
-                // 普通权重，直接写入浮点数据
-                buffer.WriteInt((int)DataType::FLOAT32);
-                buffer.WriteBytes(data.cpuData, data.GetBytes());
-            } else if (data.weightType == WeightType::EMBEDDING) {
-                // Embedding权重，存储成BF16
-                buffer.WriteInt((int)DataType::BFLOAT16);
-                int len = data.Count(0);
-                std::vector <uint16_t> uDatas;
-                uDatas.resize(len);
-                for (int i = 0; i < len; i++) {
-                    uDatas[i] = ((uint16_t *)data.cpuData)[i * 2 + 1];
+            if (bit == 0) {
+                DataType dataType = data.dataType;
+                if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
+                    buffer.WriteInt((int) dataType);
+                    buffer.WriteBytes(data.cpuData, data.GetBytes());
+                } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
+                    buffer.WriteInt((int) dataType);
+                    buffer.WriteInt(data.perChannelAxis);
+                    int k = data.perChannelAxis == -1 ? 1 : data.dims[data.perChannelAxis];
+                    for (int i = 0; i < k; i++) {
+                        buffer.WriteFloat(data.perChannelsConfigs[i].min);
+                        buffer.WriteFloat(data.perChannelsConfigs[i].max);
+                    }
+                    buffer.WriteBytes(data.cpuData, data.GetBytes());
+                } else {
+                    ErrorInFastLLM("unknown datatype");
                 }
-                buffer.WriteBytes((uint8_t*)uDatas.data(), len * sizeof(uint16_t));
-            } else if (data.weightType == WeightType::LINEAR) {
-                if (bit == 16) {
-                    // fp16, 直接转换
-                    buffer.WriteInt((int)DataType::FLOAT16);
+            } else {
+                if (data.weightType == WeightType::NONE) {
+                    // 普通权重，直接写入浮点数据
+                    buffer.WriteInt((int) DataType::FLOAT32);
+                    buffer.WriteBytes(data.cpuData, data.GetBytes());
+                } else if (data.weightType == WeightType::EMBEDDING) {
+                    // Embedding权重，存储成BF16
+                    buffer.WriteInt((int) DataType::BFLOAT16);
                     int len = data.Count(0);
-                    std::vector <uint16_t> uDatas;
+                    std::vector<uint16_t> uDatas;
                     uDatas.resize(len);
                     for (int i = 0; i < len; i++) {
-                        uDatas[i] = float_to_half(((float *)data.cpuData)[i]);
+                        uDatas[i] = ((uint16_t *) data.cpuData)[i * 2 + 1];
                     }
-                    buffer.WriteBytes((uint8_t*)uDatas.data(), len * sizeof(uint16_t));
-                } else {
-                    // Linear层权重，分通道量化之
-                    int k = data.dims[0], m = data.dims[1];
-                    int threadNum = 8;
-                    int per = k / threadNum;
-                    int cur = 0;
-                    std::vector<std::thread *> threads;
-                    std::vector<LowBitConfig> configs;
-                    std::vector<uint8_t> uDatas;
-                    configs.resize(k);
-
-                    int bytes = k * m;
-                    if (bit == 4) {
-                        bytes = (k * m + 1) / 2;
-                    }
-                    uDatas.resize(bytes);
-                    for (int i = 0; i < threadNum; i++) {
-                        int end = cur + per;
-                        if (i == threadNum - 1) {
-                            end = k;
+                    buffer.WriteBytes((uint8_t *) uDatas.data(), len * sizeof(uint16_t));
+                } else if (data.weightType == WeightType::LINEAR) {
+                    if (bit == 16) {
+                        // fp16, 直接转换
+                        buffer.WriteInt((int) DataType::FLOAT16);
+                        int len = data.Count(0);
+                        std::vector<uint16_t> uDatas;
+                        uDatas.resize(len);
+                        for (int i = 0; i < len; i++) {
+                            uDatas[i] = float_to_half(((float *) data.cpuData)[i]);
                         }
-                        threads.push_back(new std::thread(&PerChannelQuantizationMultiThread,cur, end, m,
-                                                          (float *) data.cpuData, uDatas.data(), configs.data(), bit));
-                        cur = end;
-                    }
-                    for (int i = 0; i < threadNum; i++) {
-                        threads[i]->join();
-                        delete threads[i];
-                    }
+                        buffer.WriteBytes((uint8_t *) uDatas.data(), len * sizeof(uint16_t));
+                    } else {
+                        // Linear层权重，分通道量化之
+                        int k = data.dims[0], m = data.dims[1];
+                        int threadNum = 8;
+                        int per = k / threadNum;
+                        int cur = 0;
+                        std::vector<std::thread *> threads;
+                        std::vector<LowBitConfig> configs;
+                        std::vector<uint8_t> uDatas;
+                        configs.resize(k);
 
-                    buffer.WriteInt(bit == 8 ? (int) DataType::INT8 : (int) DataType::INT4);
-                    buffer.WriteInt(0); // 按通道0分通道量化
-                    for (int i = 0; i < k; i++) {
-                        buffer.WriteFloat(configs[i].min);
-                        buffer.WriteFloat(configs[i].max);
+                        int bytes = k * m;
+                        if (bit == 4) {
+                            bytes = (k * m + 1) / 2;
+                        }
+                        uDatas.resize(bytes);
+                        for (int i = 0; i < threadNum; i++) {
+                            int end = cur + per;
+                            if (i == threadNum - 1) {
+                                end = k;
+                            }
+                            threads.push_back(new std::thread(&PerChannelQuantizationMultiThread, cur, end, m,
+                                                              (float *) data.cpuData, uDatas.data(), configs.data(),
+                                                              bit));
+                            cur = end;
+                        }
+                        for (int i = 0; i < threadNum; i++) {
+                            threads[i]->join();
+                            delete threads[i];
+                        }
+
+                        buffer.WriteInt(bit == 8 ? (int) DataType::INT8 : (int) DataType::INT4);
+                        buffer.WriteInt(0); // 按通道0分通道量化
+                        for (int i = 0; i < k; i++) {
+                            buffer.WriteFloat(configs[i].min);
+                            buffer.WriteFloat(configs[i].max);
+                        }
+                        buffer.WriteBytes(uDatas.data(), bytes);
                     }
-                    buffer.WriteBytes(uDatas.data(), bytes);
                 }
             }
             printf("output (%d / %d)\r", ++tot, need);
@@ -933,6 +953,10 @@ namespace fastllm {
         }
         printf("\n");
         return;
+    }
+
+    void WeightMap::AddTokenizerWord(const std::string &key, int value) {
+        this->tokenizer.Insert(key, value);
     }
 
     void WeightMap::AddDict(const std::string &key, const std::string &value) {
@@ -992,10 +1016,6 @@ namespace fastllm {
         } else {
             ErrorInFastLLM("wrong data type");
         }
-    }
-
-    void WeightMap::SaveModel(const std::string &fileName) {
-
     }
 
     Data &WeightMap::operator[](const std::string &key) {

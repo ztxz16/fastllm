@@ -44,6 +44,12 @@ extern "C" {
         return id;
     }
 
+    void add_tokenizer_word_llm_model(int modelId, char *key, int tokenId) {
+        auto model = models.GetModel(modelId);
+        model->weight.AddTokenizerWord(key, tokenId);
+        return;
+    }
+
     void add_dict_llm_model(int modelId, char *key, char *value) {
         auto model = models.GetModel(modelId);
         model->weight.AddDict(key, value);
@@ -59,6 +65,12 @@ extern "C" {
     void warmup_llm_model(int modelId) {
         auto model = models.GetModel(modelId);
         model->WarmUp();
+        return;
+    }
+
+    void save_llm_model(int modelId, char *path) {
+        auto model = models.GetModel(modelId);
+        model->SaveModel(path);
         return;
     }
 

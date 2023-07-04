@@ -43,50 +43,24 @@ def create(model,
             module_dict[key + ".weight"] = m;
         if (isinstance(m, torch.nn.Embedding)):
             weight_type_dict[key] = "embedding";
-    if (False):
-        # 0.1 model info
-        modelInfo = model.config.__dict__
-        if (pre_prompt):
-            modelInfo["pre_prompt"] = pre_prompt;
-        if (user_role):
-            modelInfo["user_role"] = user_role;
-        if (bot_role):
-            modelInfo["bot_role"] = bot_role;
-        if (history_sep):
-            modelInfo["history_sep"] = history_sep;
-        for it in modelInfo.keys():
-            writeKeyValue(fo, str(it), str(modelInfo[it]));
 
-        # 1. vocab
-        if (tokenizer):
-            if (hasattr(tokenizer, "sp_model")):
-                piece_size = tokenizer.sp_model.piece_size();
-                fo.write(struct.pack('i', piece_size));
-                for i in range(piece_size):
-                    s = tokenizer.sp_model.id_to_piece(i).encode();
-                    fo.write(struct.pack('i', len(s)));
-                    for c in s:
-                        fo.write(struct.pack('i', c));
-                    fo.write(struct.pack('i', i));
-            else:
-                vocab = tokenizer.get_vocab();
-                fo.write(struct.pack('i', len(vocab)));
-                for v in vocab.keys():
-                    s = v.encode();
-                    fo.write(struct.pack('i', len(s)));
-                    for c in s:
-                        fo.write(struct.pack('i', c));
-                    fo.write(struct.pack('i', vocab[v]));
-        else:
-            fo.write(struct.pack('i', 0));
     model = model.cpu();
     dict = model.state_dict();
     model_type = model.config.__dict__["model_type"];
     model = llm.fastllm_lib.create_empty_llm_model(model_type.encode());
-
     for it in modelInfo.keys():
         llm.fastllm_lib.add_dict_llm_model(model, str(it).encode(), str(modelInfo[it]).encode());
 
+    # 1. vocab
+    if (tokenizer):
+        if (hasattr(tokenizer, "sp_model")):
+            piece_size = tokenizer.sp_model.piece_size();
+            for i in range(piece_size):
+                llm.fastllm_lib.add_tokenizer_word_llm_model(model, tokenizer.sp_model.id_to_piece(i).encode(), i);
+        else:
+            vocab = tokenizer.get_vocab();
+            for v in vocab.keys():
+                llm.fastllm_lib.add_tokenizer_word_llm_model(model, v.encode(), vocab[v]);
     tot = 0;
     for key in dict:
         ori_data_type = 0;

@@ -32,6 +32,10 @@ namespace fastllm {
         this->weight.SaveLowBitModel(fileName, bit);
     }
 
+    void basellm::SaveModel(const std::string &fileName) {
+        this->weight.SaveLowBitModel(fileName, 0);
+    }
+
     fastllm::basellm *CreateModelWithType(const std::string &modelType) {
         basellm *model;
         if (modelType == "chatglm") {
