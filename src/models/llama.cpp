@@ -6,6 +6,10 @@
 
 #include "llama.h"
 
+#ifdef USE_CUDA
+#include "fastllm-cuda.cuh"
+#endif
+
 namespace fastllm {
     LlamaModel::LlamaModel() {
         this->model_type = "llama";
@@ -177,14 +181,10 @@ namespace fastllm {
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
 
         int seqlen = hiddenStates.dims[1];
-
         for (int i = 0; i < block_cnt; i++) {
             Data attenInput;
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
-            float *ff = (float*)attenInput.cpuData;
-            //if (seqlen > 14) std::fill(ff, ff + (seqlen - 14) * 4096, 0.0);
-
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
             std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
@@ -294,6 +294,164 @@ namespace fastllm {
         std::vector <int> lastRet;
         for (int b = 0; b < batch; b++) {
             int base = b * logits.dims[1] + logits.dims[1] - 1;
+            std::pair <float, int> ret = std::make_pair(-1e9, -1);
+            for (int i = 0; i < logits.dims.back(); i++) {
+                ret = max(ret, std::make_pair(((float *) logits.cpuData)[base * logits.dims.back() + i], i));
+            }
+            lastRet.push_back(ret.second);
+        }
+        return lastRet;
+    }
+
+    std::vector <int> LlamaModel::ForwardBatch(int batch,
+                                               const Data &inputIds,
+                                               const std::vector <Data*> &attentionMask,
+                                               const std::vector <Data*> &positionIds,
+                                               const std::vector <Data*> &penaltyFactor,
+                                               const std::vector <int> &seqLens,
+                                               std::vector <std::pair <Data*, Data*> > &pastKeyValues) {
+        Data hiddenStates;
+        Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
+
+        int seqlen = hiddenStates.dims[1];
+        for (int i = 0; i < block_cnt; i++) {
+            Data attenInput;
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
+                    1e-6, attenInput);
+            std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+            std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
+            std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string qkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.W_pack.weight";
+            std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
+
+            // 1.1 Get q, k, v
+            Data q, k, v, qkv;
+            int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
+            if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
+                Linear(attenInput, weight[qkvWeightName], Data(), qkv);
+                int per = qkv.dims.back() / 3;
+                Split(qkv, -1, 0, per, q);
+                Split(qkv, -1, per, per * 2, k);
+                Split(qkv, -1, per * 2, per * 3, v);
+            } else {
+                Linear(attenInput, weight[qWeightName], Data(), q);
+                Linear(attenInput, weight[kWeightName], Data(), k);
+                Linear(attenInput, weight[vWeightName], Data(), v);
+            }
+
+            Data attenOutput = Data(DataType::FLOAT32);
+            int total = 0;
+            std::vector <Data> curKs, curVs, curQs;
+            curKs.resize(batch);
+            curVs.resize(batch);
+            curQs.resize(batch);
+            for (int b = 0; b < batch; b++) {
+                Split(k, 1, total, total + seqLens[b], curKs[b]);
+                Split(v, 1, total, total + seqLens[b], curVs[b]);
+                Split(q, 1, total, total + seqLens[b], curQs[b]);
+                total += seqLens[b];
+            }
+
+            for (int b = 0; b < batch; b++) {
+                auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
+
+                std::vector<int> qkvSize = {bsz, seqLens[b], num_attention_heads, -1};
+                q.Reshape(qkvSize);
+                k.Reshape(qkvSize);
+                v.Reshape(qkvSize);
+
+                fastllm::LlamaRotatePosition2D(q, *positionIds[b], sinData, cosData, rotary_dim);
+                fastllm::LlamaRotatePosition2D(k, *positionIds[b], sinData, cosData, rotary_dim);
+                PermuteSelf(q, {0, 2, 1, 3});
+                PermuteSelf(k, {0, 2, 1, 3});
+                PermuteSelf(v, {0, 2, 1, 3});
+
+                qkvSize = {bsz * num_attention_heads, seqLens[b], -1};
+                q.Reshape(qkvSize);
+                k.Reshape(qkvSize);
+                v.Reshape(qkvSize);
+
+                Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
+                int unitLen = 64;
+#ifdef USE_CUDA
+                unitLen = 128;
+#endif
+                while ((pastKey.dims.size() == 0 &&
+                        (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
+                       || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
+                    std::vector<int> newDims;
+                    if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                        newDims = std::vector<int>{k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
+                    } else {
+                        newDims = pastKey.dims;
+                        newDims[1] += ((k.dims[1] - 1) / unitLen + 1) * unitLen;
+                    }
+                    pastKey.Expansion(newDims);
+                }
+                while ((pastValue.dims.size() == 0 &&
+                        (pastValue.expansionDims.size() == 0 || v.dims[1] > pastValue.expansionDims[1]))
+                       || (pastValue.dims.size() > 0 && pastValue.dims[1] + v.dims[1] > pastValue.expansionDims[1])) {
+                    std::vector<int> newDims;
+                    if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                        newDims = std::vector<int>{v.dims[0], ((v.dims[1] - 1) / unitLen + 1) * unitLen, v.dims[2]};
+                    } else {
+                        newDims = pastValue.dims;
+                        newDims[1] += ((v.dims[1] - 1) / unitLen + 1) * unitLen;
+                    }
+                    pastValue.Expansion(newDims);
+                }
+
+                CatDirect(pastKey, k, 1);
+                CatDirect(pastValue, v, 1);
+
+                // 1.2 Attention
+                // 1.2.0 q * k^T
+                Data attenWeights, curAttenOutput;
+                MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
+                attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
+                if (attentionMask[b] != nullptr) {
+                    AttentionMask(attenWeights, *attentionMask[b], -10000);
+                }
+                Softmax(attenWeights, attenWeights, -1);
+                MatMul(attenWeights, pastValue, curAttenOutput);
+                curAttenOutput.Reshape({curAttenOutput.dims[1], curAttenOutput.dims[2], curAttenOutput.dims[3]});
+                PermuteSelf(curAttenOutput, {1, 0, 2});
+                curAttenOutput.Reshape({seqLens[b], bsz, -1});
+                PermuteSelf(curAttenOutput, {1, 0, 2});
+                if (attenOutput.dims.size() == 0) {
+                    std::vector <int> dims = curAttenOutput.dims;
+                    dims[1] = total;
+                    attenOutput.Expansion(dims);
+                }
+                CatDirect(attenOutput, curAttenOutput, 1);
+            }
+
+            Data attenLastOutput;
+            Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
+            AddTo(hiddenStates, attenLastOutput);
+            // 2. mlp
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
+            Data w1, w2, w3;
+            Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
+            Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
+            Silu(w1, w1);
+            MulTo(w1, w3);
+            Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
+            AddTo(hiddenStates, w2);
+        }
+
+        RMSNorm(hiddenStates, weight["model.norm.weight"], 1e-6, hiddenStates);
+        Data logits;
+        Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
+        logits.ToDevice(DataDevice::CPU);
+        //if (this->do_sample && penaltyFactor.dims == logits.dims) {
+            // RepeatPenalty(logits, penaltyFactor);
+        //}
+
+        std::vector <int> lastRet;
+        int total = 0;
+        for (int b = 0; b < batch; b++) {
+            int base = (total + seqLens[b] - 1);
             std::pair <float, int> ret = std::make_pair(-1e9, -1);
             for (int i = 0; i < logits.dims.back(); i++) {
                 ret = max(ret, std::make_pair(((float *) logits.cpuData)[base * logits.dims.back() + i], i));
@@ -547,65 +705,135 @@ namespace fastllm {
     }
 
     int LlamaModel::LaunchResponseTokens(const std::vector<int> &inputTokens) {
+        mainLoopLocker.lock();
+        if (mainLoop == nullptr) {
+            if (mainLoop == nullptr) {
+                mainLoop = new std::thread([](LlamaModel *model) {
+                    while (true) {
+                        std::vector <Data*> attentionMasks;
+                        std::vector <Data*> positionIds;
+                        std::vector <std::pair <Data*, Data*> > pastKeyValues;
+                        std::vector<float> ids;
+                        std::vector<int> seqLens;
+                        model->dictLocker.lock();
+                        for (auto &it: model->responseContextDict.dicts) {
+                            if (it.second->isEnding) {
+                                continue;
+                            }
+                            if (it.second->preTokens == 0) {
+                                if (it.second->currentTokens.size() == 0 || it.second->currentTokens[0] != model->bos_token_id) {
+                                    it.second->currentTokens.push_back(model->bos_token_id);
+                                }
+                                int seqLen = it.second->currentTokens.size();
+                                for (int i = 0; i < it.second->currentTokens.size(); i++) {
+                                    ids.push_back(it.second->currentTokens[i]);
+                                }
+
+                                seqLens.push_back(seqLen);
+
+                                std::vector <float> vmask = std::vector <float> (seqLen * seqLen, 0);
+                                std::vector <float> vpids = std::vector <float> (seqLen, 0);
+                                for (int i = 0; i < seqLen; i++) {
+                                    vpids[i] = i;
+                                    for (int j = i + 1; j < seqLen; j++) {
+                                        vmask[i * seqLen + j] = 1;
+                                    }
+                                }
+                                it.second->intParams["len"] = seqLen;
+
+                                attentionMasks.push_back(new Data(DataType::FLOAT32, {seqLen, seqLen}, vmask));
+                                positionIds.push_back(new Data(DataType::FLOAT32, {2, seqLen}, vpids));
+                            } else {
+                                int ret = it.second->currentTokens[0];
+                                if (model->do_sample) {
+                                    //it.second->tokenPenaltyManager.InsertToken(ret);
+                                }
+
+                                seqLens.push_back(1);
+                                ids.push_back(ret);
+                                attentionMasks.push_back(nullptr);
+                                positionIds.push_back(new Data(DataType::FLOAT32, {1, 1}, {(float)it.second->intParams["len"]}));
+                                it.second->intParams["len"]++;
+                            }
+
+                            it.second->preTokens += seqLens.back();
+                            for (int i = 0; i < model->block_cnt; i++) {
+                                pastKeyValues.push_back(std::make_pair(&it.second->pastKeyValues[i].first,
+                                                                       &it.second->pastKeyValues[i].second));
+                            }
+                        }
+
+                        if (seqLens.size() > 0) {
+#ifdef USE_CUDA
+                            FastllmCudaClearBigBuffer();
+#endif
+                            Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
+                            std::vector<int> ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
+                                                                       positionIds, std::vector <Data*> (),
+                                                                       seqLens, pastKeyValues);
+                            int idx = 0;
+                            for (auto &it: model->responseContextDict.dicts) {
+                                if (it.second->isEnding) {
+                                    continue;
+                                }
+                                int curRet = ret[idx++];
+                                if (curRet == model->eos_token_id) {
+                                    it.second->isEnding = true;
+                                } else {
+                                    it.second->currentTokens = std::vector<int>{curRet};
+                                    it.second->resultTokenQueue.push(curRet);
+                                }
+                            }
+                        }
+
+                        for (int i = 0; i < attentionMasks.size(); i++) {
+                            delete attentionMasks[i];
+                        }
+                        for (int i = 0; i < positionIds.size(); i++) {
+                            delete positionIds[i];
+                        }
+
+                        model->dictLocker.unlock();
+                        MySleep(0);
+                    }
+                }, this);
+            }
+        }
+        mainLoopLocker.unlock();
+
+        dictLocker.lock();
         int handleId = responseContextDict.CreateHandle();
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         context->Init(this->block_cnt);
         context->currentTokens = inputTokens;
+        dictLocker.unlock();
         return handleId;
     }
 
-    std::pair<bool, std::vector<int>> LlamaModel::FetchResponseTokens(int handleId) {
+    int LlamaModel::FetchResponseTokens(int handleId) {
+        dictLocker.lock();
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         if (context == nullptr) {
-            return std::make_pair(false, std::vector <int> ());
-        }
-
-        Data inputIds;
-        Data attentionMask;
-        Data positionIds;
-
-        std::vector <float> ids;
-        for (int i = 0; i < context->currentTokens.size(); i++) {
-            ids.push_back(context->currentTokens[i]);
-        }
-        if (context->preTokens == 0) {
-            int vocabSize = this->weight.tokenizer.tokenToStringDict.size();
-            if (this->do_sample) {
-                context->tokenPenaltyManager.Init(vocabSize, this->last_n, this->repeat_penalty);
-            }
-
-            ids.insert(ids.begin(), bos_token_id);
-            int seqLen = ids.size();
-            std::vector <float> vmask = std::vector <float> (seqLen * seqLen, 0);
-            std::vector <float> vpids = std::vector <float> (seqLen, 0);
-            for (int i = 0; i < seqLen; i++) {
-                vpids[i] = i;
-                for (int j = i + 1; j < seqLen; j++) {
-                    vmask[i * seqLen + j] = 1;
-                }
-            }
-
-            context->intParams["len"] = seqLen;
-            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, ids));
-            attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, seqLen}, vmask));
-            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vpids));
+            dictLocker.unlock();
+            return -1;
         } else {
-            int ret = context->currentTokens[0];
-            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)ret}));
-            attentionMask = Data();
-            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)(context->intParams["len"])}));
-            if (do_sample) {
-                context->tokenPenaltyManager.InsertToken(ret);
+            while (true) {
+                if (context->resultTokenQueue.size() > 0) {
+                    int ret = context->resultTokenQueue.front();
+                    context->resultTokenQueue.pop();
+                    dictLocker.unlock();
+                    return ret;
+                } else {
+                    if (context->isEnding) {
+                        responseContextDict.RemoveHandle(handleId);
+                        dictLocker.unlock();
+                        return -1;
+                    }
+                }
+                dictLocker.unlock();
+                MySleep(0);
+                dictLocker.lock();
             }
-            context->intParams["len"]++;
         }
-        context->preTokens += ids.size();
-        int ret = Forward(inputIds, attentionMask, positionIds, Data(), context->pastKeyValues);
-        if (ret == eos_token_id) {
-            responseContextDict.RemoveHandle(handleId);
-            return std::make_pair(false, std::vector <int> ());
-        }
-        context->currentTokens = std::vector <int> {ret};
-        return std::make_pair(true, context->currentTokens);
     }
 }

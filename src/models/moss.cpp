@@ -250,8 +250,8 @@ namespace fastllm {
         return 0;
     }
 
-    std::pair<bool, std::vector<int>> MOSSModel::FetchResponseTokens(int handleId) {
+    int MOSSModel::FetchResponseTokens(int handleId) {
         ErrorInFastLLM("Unsupport.\n");
-        return std::make_pair(false, std::vector <int> {});
+        return -1;
     }
 }

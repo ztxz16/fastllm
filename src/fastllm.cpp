@@ -658,14 +658,28 @@ namespace fastllm {
         return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
     }
 
-    std::string Tokenizer::Decode(const Data &data) {
+    std::string Tokenizer::DecodeTokens(const std::vector<int> &tokens) {
         std::string ret = "";
-        for (int i = 0; i < data.Count(0); i++) {
-            std::string &s = tokenToStringDict[(int) ((float *) data.cpuData)[i]];
+        for (int i = 0; i < tokens.size(); i++) {
+            std::string s = tokenToStringDict[tokens[i]];
+            if (s.size() == 6 && s.substr(0, 3) == "<0x" && s.back() == '>') {
+                int c = 0;
+                for (int i = 3; i < 5; i++) {
+                    c *= 16;
+                    if (s[i] >= '0' && s[i] <= '9') {
+                        c += (s[i] - '0');
+                    } else {
+                        c += (s[i] - 'A' + 10);
+                    }
+                }
+
+                s = " ";
+                s[0] = c;
+            }
             if (s == "<n>") {
                 ret += "\n";
             } else if (s == "<|tab|>") {
-                s = "\t";
+                ret += "\t";
             } else {
                 ret += s;
             }
@@ -679,26 +693,21 @@ namespace fastllm {
                 ret.replace(pos, blank.length(), " ");
             else break;
         }
-	    int pos = ret.find("<|blank_");
-	    if (pos != -1) {
-		    int space_num = atoi(ret.substr(8, ret.size() - 10).c_str());
-		    return std::string(space_num, ' ');
-	    }
-        if (ret.size() == 6 && ret.substr(0, 3) == "<0x" && ret.back() == '>') {
-            int c = 0;
-            for (int i = 3; i < 5; i++) {
-                c *= 16;
-                if (ret[i] >= '0' && ret[i] <= '9') {
-                    c += (ret[i] - '0');
-                } else {
-                    c += (ret[i] - 'A' + 10);
-                }
-            }
-
-            ret = " ";
-            ret[0] = c;
+        int pos = ret.find("<|blank_");
+        if (pos != -1) {
+            int space_num = atoi(ret.substr(8, ret.size() - 10).c_str());
+            return std::string(space_num, ' ');
         }
+
         return ret;
+    }
+
+    std::string Tokenizer::Decode(const Data &data) {
+        std::vector <int> tokens;
+        for (int i = 0; i < data.Count(0); i++) {
+            tokens.push_back((int) ((float *) data.cpuData)[i]);
+        }
+        return DecodeTokens(tokens);
     }
 
     void WeightMap::LoadFromFile(const std::string &fileName) {
@@ -784,9 +793,37 @@ namespace fastllm {
         return;
     }
 
+    void PerChannelQuantizationMultiThread(int st, int end, int m,
+                                           float *f, uint8_t *u8, LowBitConfig *configs, int bit) {
+        for (int i = st; i < end; i++) {
+            float minValue = 1e9, maxValue = -1e9;
+            for (int j = 0; j < m; j++) {
+                minValue = std::min(minValue, f[i * m + j]);
+                maxValue = std::max(maxValue, f[i * m + j]);
+            }
+            if (bit == 8) {
+                configs[i] = LowBitConfig(minValue, maxValue, 8);
+                for (int j = 0; j < m; j++) {
+                    u8[i * m + j] = configs[i].quantization(f[i * m + j]);
+                }
+            } else {
+                configs[i] = LowBitConfig(minValue, maxValue, 4);
+                for (int j = 0; j < m; j++) {
+                    int id = (i * m + j) / 2;
+                    uint8_t value = configs[i].quantization(f[i * m + j]);
+                    if ((i * m + j) % 2) {
+                        u8[id] = (u8[id] & 0xF0) | value;
+                    } else {
+                        u8[id] = (u8[id] & 0xF) | (value << 4);
+                    }
+                }
+            }
+        }
+    }
+
     void WeightMap::SaveLowBitModel(const std::string &fileName, int bit) {
         AssertInFastLLM(fileName != "", "Error: output's name shouldn't be empty.\n");
-        AssertInFastLLM(bit == 4 || bit == 8 || bit == 16, "Error: only support 16 bit or 8 bit or 4 bit model.\n");
+        AssertInFastLLM(bit == 0 || bit == 4 || bit == 8 || bit == 16, "Error: only support 16 bit or 8 bit or 4 bit model.\n");
         FileWriter buffer(fileName);
         buffer.WriteInt(this->versionId);
         if (this->versionId >= 1) {
@@ -809,9 +846,16 @@ namespace fastllm {
         }
 
         // 写入权重
-        buffer.WriteInt((int)weight.size());
+        int need = 0;
+        for (auto &it : weight) {
+            need += (it.second.dims.size() > 0);
+        }
+        buffer.WriteInt(need);
         int tot = 0;
         for (auto &it : weight) {
+            if (it.second.dims.size() == 0) {
+                continue;
+            }
             buffer.WriteString(it.first);
             Data &data = it.second;
             buffer.WriteInt((int)data.dims.size());
@@ -820,100 +864,158 @@ namespace fastllm {
             }
             data.ToDevice(DataDevice::CPU);
 
-            if (data.weightType == WeightType::NONE) {
-                // 普通权重，直接写入浮点数据
-                buffer.WriteInt((int)DataType::FLOAT32);
-                buffer.WriteBytes(data.cpuData, data.GetBytes());
-            } else if (data.weightType == WeightType::EMBEDDING) {
-                // Embedding权重，存储成BF16
-                buffer.WriteInt((int)DataType::BFLOAT16);
-                int len = data.Count(0);
-                std::vector <uint16_t> uDatas;
-                uDatas.resize(len);
-                for (int i = 0; i < len; i++) {
-                    uDatas[i] = ((uint16_t *)data.cpuData)[i * 2 + 1];
+            if (bit == 0) {
+                DataType dataType = data.dataType;
+                if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
+                    buffer.WriteInt((int) dataType);
+                    buffer.WriteBytes(data.cpuData, data.GetBytes());
+                } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
+                    buffer.WriteInt((int) dataType);
+                    buffer.WriteInt(data.perChannelAxis);
+                    int k = data.perChannelAxis == -1 ? 1 : data.dims[data.perChannelAxis];
+                    for (int i = 0; i < k; i++) {
+                        buffer.WriteFloat(data.perChannelsConfigs[i].min);
+                        buffer.WriteFloat(data.perChannelsConfigs[i].max);
+                    }
+                    buffer.WriteBytes(data.cpuData, data.GetBytes());
+                } else {
+                    ErrorInFastLLM("unknown datatype");
                 }
-                buffer.WriteBytes((uint8_t*)uDatas.data(), len * sizeof(uint16_t));
-            } else if (data.weightType == WeightType::LINEAR) {
-                if (bit == 16) {
-                    // fp16, 直接转换
-                    buffer.WriteInt((int)DataType::FLOAT16);
+            } else {
+                if (data.weightType == WeightType::NONE) {
+                    // 普通权重，直接写入浮点数据
+                    buffer.WriteInt((int) DataType::FLOAT32);
+                    buffer.WriteBytes(data.cpuData, data.GetBytes());
+                } else if (data.weightType == WeightType::EMBEDDING) {
+                    // Embedding权重，存储成BF16
+                    buffer.WriteInt((int) DataType::BFLOAT16);
                     int len = data.Count(0);
-                    std::vector <uint16_t> uDatas;
+                    std::vector<uint16_t> uDatas;
                     uDatas.resize(len);
                     for (int i = 0; i < len; i++) {
-                        uDatas[i] = float_to_half(((float *)data.cpuData)[i]);
+                        uDatas[i] = ((uint16_t *) data.cpuData)[i * 2 + 1];
                     }
-                    buffer.WriteBytes((uint8_t*)uDatas.data(), len * sizeof(uint16_t));
-                } else {
-                    // Linear层权重，分通道量化之
-                    int k = data.dims[0], m = data.dims[1];
-                    int threadNum = 8;
-                    int per = k / threadNum;
-                    int cur = 0;
-                    std::vector<std::thread *> threads;
-                    std::vector<LowBitConfig> configs;
-                    std::vector<uint8_t> uDatas;
-                    configs.resize(k);
-
-                    int bytes = k * m;
-                    if (bit == 4) {
-                        bytes = (k * m + 1) / 2;
-                    }
-                    uDatas.resize(bytes);
-                    for (int i = 0; i < threadNum; i++) {
-                        int end = cur + per;
-                        if (i == threadNum - 1) {
-                            end = k;
+                    buffer.WriteBytes((uint8_t *) uDatas.data(), len * sizeof(uint16_t));
+                } else if (data.weightType == WeightType::LINEAR) {
+                    if (bit == 16) {
+                        // fp16, 直接转换
+                        buffer.WriteInt((int) DataType::FLOAT16);
+                        int len = data.Count(0);
+                        std::vector<uint16_t> uDatas;
+                        uDatas.resize(len);
+                        for (int i = 0; i < len; i++) {
+                            uDatas[i] = float_to_half(((float *) data.cpuData)[i]);
                         }
-                        threads.push_back(new std::thread([&bit](int st, int end, int m,
-                                                                 float *f, uint8_t *u8, LowBitConfig *configs) {
-                            for (int i = st; i < end; i++) {
-                                float minValue = 1e9, maxValue = -1e9;
-                                for (int j = 0; j < m; j++) {
-                                    minValue = std::min(minValue, f[i * m + j]);
-                                    maxValue = std::max(maxValue, f[i * m + j]);
-                                }
-                                if (bit == 8) {
-                                    configs[i] = LowBitConfig(minValue, maxValue, 8);
-                                    for (int j = 0; j < m; j++) {
-                                        u8[i * m + j] = configs[i].quantization(f[i * m + j]);
-                                    }
-                                } else {
-                                    configs[i] = LowBitConfig(minValue, maxValue, 4);
-                                    for (int j = 0; j < m; j++) {
-                                        int id = (i * m + j) / 2;
-                                        uint8_t value = configs[i].quantization(f[i * m + j]);
-                                        if ((i * m + j) % 2) {
-                                            u8[id] = (u8[id] & 0xF0) | value;
-                                        } else {
-                                            u8[id] = (u8[id] & 0xF) | (value << 4);
-                                        }
-                                    }
-                                }
-                            }
-                        }, cur, end, m, (float *) data.cpuData, uDatas.data(), configs.data()));
-                        cur = end;
-                    }
-                    for (int i = 0; i < threadNum; i++) {
-                        threads[i]->join();
-                        delete threads[i];
-                    }
+                        buffer.WriteBytes((uint8_t *) uDatas.data(), len * sizeof(uint16_t));
+                    } else {
+                        // Linear层权重，分通道量化之
+                        int k = data.dims[0], m = data.dims[1];
+                        int threadNum = 8;
+                        int per = k / threadNum;
+                        int cur = 0;
+                        std::vector<std::thread *> threads;
+                        std::vector<LowBitConfig> configs;
+                        std::vector<uint8_t> uDatas;
+                        configs.resize(k);
 
-                    buffer.WriteInt(bit == 8 ? (int) DataType::INT8 : (int) DataType::INT4);
-                    buffer.WriteInt(0); // 按通道0分通道量化
-                    for (int i = 0; i < k; i++) {
-                        buffer.WriteFloat(configs[i].min);
-                        buffer.WriteFloat(configs[i].max);
+                        int bytes = k * m;
+                        if (bit == 4) {
+                            bytes = (k * m + 1) / 2;
+                        }
+                        uDatas.resize(bytes);
+                        for (int i = 0; i < threadNum; i++) {
+                            int end = cur + per;
+                            if (i == threadNum - 1) {
+                                end = k;
+                            }
+                            threads.push_back(new std::thread(&PerChannelQuantizationMultiThread, cur, end, m,
+                                                              (float *) data.cpuData, uDatas.data(), configs.data(),
+                                                              bit));
+                            cur = end;
+                        }
+                        for (int i = 0; i < threadNum; i++) {
+                            threads[i]->join();
+                            delete threads[i];
+                        }
+
+                        buffer.WriteInt(bit == 8 ? (int) DataType::INT8 : (int) DataType::INT4);
+                        buffer.WriteInt(0); // 按通道0分通道量化
+                        for (int i = 0; i < k; i++) {
+                            buffer.WriteFloat(configs[i].min);
+                            buffer.WriteFloat(configs[i].max);
+                        }
+                        buffer.WriteBytes(uDatas.data(), bytes);
                     }
-                    buffer.WriteBytes(uDatas.data(), bytes);
                 }
             }
-            printf("output (%d / %d)\r", ++tot, (int)weight.size());
+            printf("output (%d / %d)\r", ++tot, need);
             fflush(stdout);
         }
         printf("\n");
         return;
+    }
+
+    void WeightMap::AddTokenizerWord(const std::string &key, int value) {
+        this->tokenizer.Insert(key, value);
+    }
+
+    void WeightMap::AddDict(const std::string &key, const std::string &value) {
+        this->dicts[key] = value;
+    }
+
+    void WeightMap::AddWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType,
+                              fastllm::WeightType weightType, fastllm::DataType oriDataType, uint8_t *oriData) {
+        this->weight[key] = Data(dataType, dims);
+        Data &data = this->weight[key];
+        data.weightType = weightType;
+        data.UpdateUnitSize();
+        data.Allocate();
+        if (dataType == oriDataType) {
+            memcpy(data.cpuData, oriData, data.GetBytes());
+        } else if (oriDataType == DataType::FLOAT32 &&
+                (dataType == DataType::INT8 || dataType == DataType::INT4)) {
+            int bit = (dataType == DataType::INT4 ? 4 : 8);
+            int k = data.dims[0], m = data.dims[1];
+            int threadNum = 8;
+            int per = k / threadNum;
+            int cur = 0;
+            std::vector<std::thread *> threads;
+            std::vector<LowBitConfig> configs;
+            std::vector<uint8_t> uDatas;
+            configs.resize(k);
+
+            int bytes = k * m;
+            if (bit == 4) {
+                bytes = (k * m + 1) / 2;
+            }
+            uDatas.resize(bytes);
+            for (int i = 0; i < threadNum; i++) {
+                int end = cur + per;
+                if (i == threadNum - 1) {
+                    end = k;
+                }
+                threads.push_back(new std::thread(&PerChannelQuantizationMultiThread, cur, end, m,
+                                                  (float *) oriData, uDatas.data(), configs.data(), bit));
+                cur = end;
+            }
+            for (int i = 0; i < threadNum; i++) {
+                threads[i]->join();
+                delete threads[i];
+            }
+
+            data.perChannelAxis = 0;
+            data.perChannelsConfigs.resize(k);
+            data.zeros.resize(k);
+            data.scales.resize(k);
+            for (int i = 0; i < k; i++) {
+                data.perChannelsConfigs[i] = LowBitConfig(configs[i].min, configs[i].max, bit);
+                data.zeros[i] = data.perChannelsConfigs[i].zeroPoint;
+                data.scales[i] = data.perChannelsConfigs[i].scale;
+            }
+            memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
+        } else {
+            ErrorInFastLLM("wrong data type");
+        }
     }
 
     Data &WeightMap::operator[](const std::string &key) {
@@ -1023,6 +1125,12 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void Swiglu(const fastllm::Data &input, fastllm::Data &output) {
+        curExecutor->Run("Swiglu", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
     void Mul(const fastllm::Data &input, float v, fastllm::Data &output) {
         curExecutor->Run("Mul", {
                 {"input", (Data*)&input}, {"output", &output}
@@ -1077,6 +1185,12 @@ namespace fastllm {
 
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
         curExecutor->Run("RotatePosition2D", {
+                {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
+        }, {}, {{"rotaryDim", rotaryDim}});
+    }
+
+    void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
+        curExecutor->Run("NearlyRotatePosition2D", {
                 {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
         }, {}, {{"rotaryDim", rotaryDim}});
     }

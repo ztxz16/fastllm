@@ -185,6 +185,8 @@ namespace fastllm {
         Data Encode(const std::string &s); // 编码
 
         std::string Decode(const Data &data); // 解码
+
+        std::string DecodeTokens(const std::vector <int> &tokens); // 解码
     };
 
     std::string GetModelTypeFromFile(const std::string &fileName);
@@ -202,7 +204,14 @@ namespace fastllm {
 
         void LoadFromFile(const std::string &fileName); // 从文件读取
 
-        void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
+        void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型, bit = 0代表直接存
+
+        void AddTokenizerWord(const std::string &key, int value); // 增加一个词
+
+        void AddDict(const std::string &key, const std::string &value); // 插入一个词条
+
+        void AddWeight(const std::string &key, const std::vector <int> &dims,
+                       DataType dataType, WeightType weightType, DataType oriDataType, uint8_t *oriData); // 插入一个权重
 
         Data &operator [] (const std::string &key);
     };
@@ -245,6 +254,8 @@ namespace fastllm {
 
     void GeluNew(const Data &input, Data &output);
 
+    void Swiglu(const fastllm::Data &input, fastllm::Data &output);
+
     void Mul(const Data &input, float v, Data &output);
 
     void MulTo(Data &input0, const Data &input1); // input0 *= input1
@@ -260,6 +271,8 @@ namespace fastllm {
     void TopK(const Data &input, Data &output, int topK); // 求topk
 
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position
+
+    void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position, 相邻的元素旋转
 
     void LlamaRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position for llama
 

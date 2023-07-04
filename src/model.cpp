@@ -9,6 +9,10 @@
 namespace fastllm {
     void basellm::LoadFromFile(const std::string &fileName) {
         this->weight.LoadFromFile(fileName);
+        this->InitParams();
+    }
+
+    void basellm::InitParams() {
         if (this->weight.dicts.find("bos_token_id") != this->weight.dicts.end()) {
             this->bos_token_id = atoi(this->weight.dicts["bos_token_id"].c_str());
             this->eos_token_id = atoi(this->weight.dicts["eos_token_id"].c_str());
@@ -28,8 +32,11 @@ namespace fastllm {
         this->weight.SaveLowBitModel(fileName, bit);
     }
 
-    std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
-        std::string modelType = GetModelTypeFromFile(fileName);
+    void basellm::SaveModel(const std::string &fileName) {
+        this->weight.SaveLowBitModel(fileName, 0);
+    }
+
+    fastllm::basellm *CreateModelWithType(const std::string &modelType) {
         basellm *model;
         if (modelType == "chatglm") {
             model = (basellm*)(new ChatGLMModel());
@@ -49,8 +56,19 @@ namespace fastllm {
         } else {
             ErrorInFastLLM("Unkown model type: " + modelType);
         }
+        return model;
+    }
+
+    std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
+        std::string modelType = GetModelTypeFromFile(fileName);
+        basellm *model = CreateModelWithType(modelType);
         model->LoadFromFile(fileName);
         model->WarmUp();
-        return std::unique_ptr<fastllm::basellm>(model);
+        return std::unique_ptr<fastllm::basellm> (model);
+    }
+
+    std::unique_ptr<basellm> CreateEmptyLLMModel(const std::string &modelType) {
+        basellm *model = CreateModelWithType(modelType);
+        return std::unique_ptr<fastllm::basellm> (model);
     }
 }

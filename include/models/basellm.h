@@ -1,6 +1,7 @@
 #pragma once
 #include "fastllm.h"
 
+#include <thread>
 #include <mutex>
 
 #ifdef PY_API
@@ -14,8 +15,11 @@ using RuntimeResultBatch = std::function<void(int index, std::vector <std::strin
 
 namespace fastllm {
     struct ResponseContext {
+
+        bool isEnding = false;
         std::vector <std::pair <Data, Data> > pastKeyValues;
         std::vector <int> currentTokens;
+        std::queue <int> resultTokenQueue;
         TokenPenaltyManager tokenPenaltyManager;
 
         int preTokens = 0;
@@ -43,6 +47,8 @@ namespace fastllm {
 
         virtual void LoadFromFile(const std::string &fileName); // 从文件读取
 
+        virtual void InitParams(); // 初始化参数信息
+
         // 推理
         virtual int Forward(
                 const Data &inputIds,
@@ -59,9 +65,11 @@ namespace fastllm {
 
         virtual int LaunchResponseTokens(const std::vector <int> &inputTokens) {return -1; }; // 启动一个response任务，返回分配的handleId
 
-        virtual std::pair <bool, std::vector <int> > FetchResponseTokens(int handelId) {return std::make_pair(false, std::vector <int> ());}; // 获取指定handle的输出, bool代表这个handle是否已经结束（或者不存在）
+        virtual int FetchResponseTokens(int handelId) {return -1; };// 获取指定handle的输出, -1代表输出结束了
 
         virtual void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
+
+        virtual void SaveModel(const std::string &fileName); // 直接导出
 
         virtual void WarmUp() {}; // 预热
 
@@ -99,5 +107,8 @@ namespace fastllm {
         Data sinData, cosData;
 
         ResponseContextDict responseContextDict;
+
+        std::thread *mainLoop = nullptr;
+        std::mutex mainLoopLocker, dictLocker;
     };
 }

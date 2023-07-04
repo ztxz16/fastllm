@@ -56,6 +56,15 @@ __global__ void FastllmSiluKernel(float* a, float *b, int len) {
     }
 }
 
+__global__ void FastllmSwigluKernel(float* a, float *b, int len, int spatial, int mid) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        int id = idx / mid * spatial + idx % mid;
+        float x = a[id], y = a[id + mid];
+        b[idx] = (x / (1.0 + expf(-x))) * y;
+    }
+}
+
 __global__ void FastllmMulKernel(float* a, float *b, float v, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -119,6 +128,46 @@ __global__ void FastllmLlamaRotatePosition2DKernel(float *data, float *positionI
     float va = d[i * m], vb = d[i * m + m / 2];
     d[i * m] = va * curCos - vb * curSin;
     d[i * m + m / 2] = va * curSin + vb * curCos;
+}
+
+__global__ void FastllmNearlyRotatePosition2DKernel(float *data, float *positionIds, float *sin, float *cos,
+                                                   int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int rotateDim) {
+/*
+    int len = data.dims[0], bs = data.dims[1];
+    int spatial = data.Count(2);
+    int n = data.dims[2], m = data.dims[3];
+    int stride = (int)sinData.dims[1];
+    for (int l = 0; l < len; l++) {
+        for (int b = 0; b < bs; b++) {
+            int index = (int) ((float *) positionIds.cpuData)[(b * 2) * positionIds.dims.back() + l];
+            float *sin = ((float*)sinData.cpuData) + stride * index;
+            float *cos = ((float*)cosData.cpuData) + stride * index;
+            float *d = (float *) data.cpuData + (l * bs + b) * spatial;
+            for (int i = 0; i < n; i++) {
+                int j = 0;
+                for (; j < rotaryDim; j += 2) {
+                    float a = d[j], b = d[j + 1];
+                    d[j] = a * cos[j / 2] - b * sin[j / 2];
+                    d[j + 1] = a * sin[j / 2] + b * cos[j / 2];
+                }
+                d += m;
+            }
+        }
+    }
+*/
+    int o = (blockIdx.x / n);
+    int l = o / bs;
+    int b = o % bs;
+    int j = threadIdx.x;
+    int index = (int) (positionIds[b * 2 * partStride + l]);
+
+    float curSin = sin[index * sinCosStride + j];
+    float curCos = cos[index * sinCosStride + j];
+    float *d = (float *) data + o * spatial + j * 2;
+    int i = blockIdx.x % n;
+    float va = d[i * m], vb = d[i * m + 1];
+    d[i * m] = va * curCos - vb * curSin;
+    d[i * m + 1] = va * curSin + vb * curCos;
 }
 
 __global__ void FastllmRotatePosition2DKernel(float *data, float *positionIds, float *sin, float *cos,
@@ -317,41 +366,6 @@ __global__ void FastllmLayerNormKernelTop1(float *input, float *output, int chan
     if (tid == 0) {
         outputData[0] = idData[0];
         outputData[1] = maxData[0];
-    }
-}
-
-template <int THREAD_PER_BLOCK>
-__global__ void FastllmGemvInt8Kernel0(float *A, uint8_t *B, float *C,
-                                       float *bias, float *scales, uint8_t *zeros,
-                                       int m, int k) {
-    __shared__ float sdata[THREAD_PER_BLOCK];
-
-    // 1. 每个线程计算一部分
-    unsigned int tid = threadIdx.x;
-    unsigned int per = (m / THREAD_PER_BLOCK);
-    unsigned int id = blockIdx.x * m + threadIdx.x * per;
-    unsigned int len = per;
-    if (tid == blockDim.x - 1) {
-        len += (m - per * THREAD_PER_BLOCK);
-    }
-    float sum = 0.0;
-    for (int i = 0; i < len; i++) {
-        sum += A[threadIdx.x * per + i] * (B[id + i] - zeros[blockIdx.x]);
-    }
-    sdata[tid] = sum;
-    __syncthreads();
-
-    // 2. 求和
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-
-    // 3. 写回结果
-    if (tid == 0) {
-        C[blockIdx.x] = sdata[0] * scales[blockIdx.x] + bias[blockIdx.x];
     }
 }
 
@@ -582,43 +596,6 @@ __global__ void FastllmGemvInt4Kernel2(float *A, uint8_t *B, float *C,
     }
 }
 
-template <int THREAD_PER_BLOCK>
-__global__ void FastllmGemvInt4Kernel0(float *A, uint8_t *B, float *C,
-                                       float *bias, float *scales, uint8_t *zeros,
-                                       int m, int k) {
-    __shared__ float sdata[THREAD_PER_BLOCK];
-
-    // 1. 每个线程计算一部分
-    unsigned int tid = threadIdx.x;
-    unsigned int per = (m / THREAD_PER_BLOCK);
-    unsigned int id = blockIdx.x * m + threadIdx.x * per;
-    unsigned int len = per;
-    if (tid == blockDim.x - 1) {
-        len += (m - per * THREAD_PER_BLOCK);
-    }
-    float sum = 0.0;
-    for (int i = 0; i + 1 < len; i += 2) {
-        uint8_t now = B[(id + i) / 2];
-        sum += A[threadIdx.x * per + i] * ((now >> 4) - zeros[blockIdx.x]);
-        sum += A[threadIdx.x * per + i + 1] * ((now & 15) - zeros[blockIdx.x]);
-    }
-    sdata[tid] = sum;
-    __syncthreads();
-
-    // 2. 求和
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
-        }
-        __syncthreads();
-    }
-
-    // 3. 写回结果
-    if (tid == 0) {
-        C[blockIdx.x] = sdata[0] * scales[blockIdx.x] + bias[blockIdx.x];
-    }
-}
-
 void *FastllmCudaPrepareInput(const fastllm::Data &input) {
     void *ret;
     if (input.dataDevice == fastllm::DataDevice::CUDA) {
@@ -677,7 +654,7 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
         float *cudaBiasData;
         cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cpuData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
             cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
@@ -697,22 +674,14 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
         FastllmCudaBaseGemmKernelInt8<nb, mb, kb>  <<< grid, 32 >>>
                 (cudaInput, (uint8_t *) weight.cudaData, cudaOutput, cudaBiasData, cudaScales, cudaZeropoints, n, m, k);
     } else {
-        if (m % 256 == 0) {
-            for (int i = 0; i < n; i++) {
-                FastllmGemvInt8Kernel2<256, 1> <<< k, 256 >>>(cudaInput + i * m,
-                                                              (uint8_t *) weight.cudaData,
-                                                              cudaOutput + i * k,
-                                                              cudaBiasData,
-                                                              cudaScales,
-                                                              cudaZeropoints,
-                                                              m, k);
-            }
-        } else {
-            for (int i = 0; i < n; i++) {
-                FastllmGemvInt8Kernel0<256> <<< k, 256 >>>(cudaInput + i * m, (uint8_t *) weight.cudaData,
-                                                           cudaOutput + i * k, cudaBiasData, cudaScales, cudaZeropoints,
-                                                           m, k);
-            }
+        for (int i = 0; i < n; i++) {
+            FastllmGemvInt8Kernel2<256, 1> <<< k, 256 >>>(cudaInput + i * m,
+                                                          (uint8_t *) weight.cudaData,
+                                                          cudaOutput + i * k,
+                                                          cudaBiasData,
+                                                          cudaScales,
+                                                          cudaZeropoints,
+                                                          m, k);
         }
     }
     FastllmCudaFinishInput(input, cudaInput);
@@ -742,7 +711,7 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
         float *cudaBiasData;
         cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cpuData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
             cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
@@ -757,18 +726,13 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
     for (int i = 0; i < n; i++) {
-        if (m % 256 == 0) {
-            FastllmGemvInt4Kernel2<256, 1> <<< k, 256 >>>(cudaInput + i * m,
-                                                          (uint8_t *) weight.cudaData,
-                                                          cudaOutput + i * k,
-                                                          cudaBiasData,
-                                                          cudaScales,
-                                                          cudaZeropoints,
-                                                          m, k);
-        } else {
-            FastllmGemvInt4Kernel0 <256> <<< k, 256 >>> (cudaInput + i * m, (uint8_t *) weight.cudaData,
-                                                         cudaOutput + i * k, cudaBiasData, cudaScales, cudaZeropoints, m, k);
-        }
+        FastllmGemvInt4Kernel2<256, 1> <<< k, 256 >>>(cudaInput + i * m,
+                                                      (uint8_t *) weight.cudaData,
+                                                      cudaOutput + i * k,
+                                                      cudaBiasData,
+                                                      cudaScales,
+                                                      cudaZeropoints,
+                                                      m, k);
     }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
@@ -781,7 +745,7 @@ bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
         float *cudaBiasData;
         cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cpuData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
             cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
@@ -947,6 +911,20 @@ bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     int threadPerBlock = min(256, len);
     FastllmSiluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
+    int len = output.Count(0);
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
+    int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
+
+    int threadPerBlock = min(256, len);
+    FastllmSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len, spatial, mid);
+
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
@@ -1237,6 +1215,28 @@ bool FastllmCudaRotatePosition2D(fastllm::Data &data, const fastllm::Data &posit
     FastllmCudaFinishInput(cosData, cudaCos);
     FastllmCudaFinishOutput(data, cudaData);
 
+    return true;
+}
+
+bool FastllmCudaNearlyRotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds,
+                                 const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim) {
+    float *cudaData = (float *) FastllmCudaPrepareInput(data);
+    float *cudaPositionIds = (float *) FastllmCudaPrepareInput(positionIds);
+    float *cudaSin = (float *) FastllmCudaPrepareInput(sinData);
+    float *cudaCos = (float *) FastllmCudaPrepareInput(cosData);
+
+    int outer = data.dims[0] * data.dims[1];
+    int spatial = data.Count(2);
+    int len = data.dims[0], bs = data.dims[1];
+    int n = data.dims[2], m = data.dims[3];
+    FastllmNearlyRotatePosition2DKernel <<< outer * n, min(rotaryDim, m / 4) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
+                                                                                len, bs, spatial, n, m,
+                                                                                (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
+
+    FastllmCudaFinishInput(positionIds, cudaPositionIds);
+    FastllmCudaFinishInput(sinData, cudaSin);
+    FastllmCudaFinishInput(cosData, cudaCos);
+    FastllmCudaFinishOutput(data, cudaData);
     return true;
 }
 
