@@ -13,6 +13,9 @@ using namespace pybind11::literals;
 
 
 #ifdef PY_API
+// template <typename... Args>
+// using overload_cast_ = pybind11::detail::overload_cast_impl<Args...>;
+
 
 // PYBIND11_MAKE_OPAQUE(std::vector<std::pair<fastllm::Data,fastllm::Data>>);
 PYBIND11_MAKE_OPAQUE(fastllm::Data);
@@ -107,7 +110,9 @@ PYBIND11_MODULE(pyfastllm, m) {
 
   py::class_<fastllm::Tokenizer>(m, "Tokenizer")
     .def("encode", &fastllm::Tokenizer::Encode)
-    .def("decode", &fastllm::Tokenizer::Decode)
+    // .def("decode", &fastllm::Tokenizer::Decode)
+    .def("decode", py::overload_cast<const fastllm::Data &>(&fastllm::Tokenizer::Decode), "Decode from Tensor")
+    .def("decode", py::overload_cast<const std::vector<int> &>(&fastllm::Tokenizer::Decode), "Decode from Vector")
     .def("decode_byte", [](fastllm::Tokenizer &tokenizer, const fastllm::Data &data){
       std::string ret = tokenizer.Decode(data);
       return py::bytes(ret);
@@ -128,7 +133,13 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("eos_token_id", &fastllm::ChatGLMModel::eos_token_id)
     .def("load_weights", &fastllm::ChatGLMModel::LoadFromFile)
     .def("response", &fastllm::ChatGLMModel::Response)
-    .def("batch_response", &fastllm::ChatGLMModel::ResponseBatch)
+    .def("batch_response", [](fastllm::ChatGLMModel model, 
+                              const std::vector <std::string> &inputs,
+                               RuntimeResultBatch retCb)->std::vector<std::string>outputs {
+      std::vector <std::string> &outputs,
+      model.ResponseBatch(inputs, outputs, retCb);
+      return outputs;
+    })
     .def("warmup", &fastllm::ChatGLMModel::WarmUp)
     .def("__call__",
         [](fastllm::ChatGLMModel &model, 
@@ -153,7 +164,13 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("eos_token_id", &fastllm::MOSSModel::eos_token_id)
     .def("load_weights", &fastllm::MOSSModel::LoadFromFile)
     .def("response", &fastllm::MOSSModel::Response)
-    .def("batch_response", &fastllm::MOSSModel::ResponseBatch)
+    .def("batch_response", [](fastllm::MOSSModel model, 
+                              const std::vector <std::string> &inputs,
+                               RuntimeResultBatch retCb)->std::vector<std::string>outputs {
+      std::vector <std::string> &outputs,
+      model.ResponseBatch(inputs, outputs, retCb);
+      return outputs;
+    })
     .def("__call__",
         [](fastllm::MOSSModel &model, 
            const fastllm::Data &inputIds, 
@@ -177,7 +194,13 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("eos_token_id", &fastllm::LlamaModel::eos_token_id)
     .def("load_weights", &fastllm::LlamaModel::LoadFromFile)
     .def("response", &fastllm::LlamaModel::Response)
-    .def("batch_response", &fastllm::LlamaModel::ResponseBatch)
+    .def("batch_response", [](fastllm::LlamaModel model, 
+                              const std::vector <std::string> &inputs,
+                               RuntimeResultBatch retCb)->std::vector<std::string>outputs {
+      std::vector <std::string> &outputs,
+      model.ResponseBatch(inputs, outputs, retCb);
+      return outputs;
+    })
     .def("warmup", &fastllm::LlamaModel::WarmUp)
     .def("__call__",
         [](fastllm::LlamaModel &model, 
@@ -192,7 +215,6 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("launch_response", &fastllm::LlamaModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::LlamaModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::LlamaModel::SaveLowBitModel);
-    
 #ifdef VERSION_INFO
     m.attr("__version__") = VERSION_INFO;
 #else

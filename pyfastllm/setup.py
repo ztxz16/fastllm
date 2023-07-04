@@ -5,45 +5,29 @@ from setuptools import find_packages
 
 import sys
 import argparse
+
 parser = argparse.ArgumentParser(description='build pyfastllm wheel')
 parser.add_argument('--cuda', dest='cuda', action='store_true', default=False,
                     help='build with cuda support')
 args, unknown = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + unknown
 
-__VERSION__ = "'0.1.0'"
-
-def get_version():
-    root_dir = os.getenv('PROJECT_ROOT', os.path.dirname(os.path.dirname(os.getcwd())))
-    version_header = os.path.join(root_dir, 'include/MNN/MNNDefine.h')
-    version_major = version_minor = version_patch = 'x'
-    for line in open(version_header, 'rt').readlines():
-        if '#define FASTLLM_VERSION_MAJOR' in line:
-            version_major = int(line.strip().split(' ')[-1])
-        if '#define FASTLLM_VERSION_MINOR' in line:
-            version_minor = int(line.strip().split(' ')[-1])
-        if '#define FASTLLM_VERSION_PATCH' in line:
-            version_patch = int(line.strip().split(' ')[-1])
-    return '{}.{}.{}'.format(version_major, version_minor, version_patch)
-
-
+__VERSION__ = "'0.1.2'"
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 
 ext_modules = []
 try:
-    from pybind11.setup_helpers import Pybind11Extension, ParallelCompile, naive_recompile
-
-    # `N` is to set the bumer of threads
-    # `naive_recompile` makes it recompile only if the source file changes. It does not check header files!
-    ParallelCompile("NPY_NUM_BUILD_JOBS", needs_recompile=naive_recompile, default=4).install()
-
+    from pybind11.setup_helpers import Pybind11Extension
     # could only be relative paths, otherwise the `build` command would fail if you use a MANIFEST.in to distribute your package
     # only source files (.cpp, .c, .cc) are needed
     # 
     source_files = glob.glob(os.path.join(BASE_DIR, "src/**/*.cpp"), recursive=True)
     # source_files.append(os.path.join(BASE_DIR, "src/devices/cpu/cpudevice.cpp"))
-    source_files.remove('/public/Code/Cpp/fastllm/src/devices/cuda/cudadevice.cpp')
-    print(source_files)
+
+    # remove cuda source 
+    for file in source_files:
+        if file.endswith('cudadevice.cpp'):
+            source_files.remove(file)
 
     extra_compile_args = ["-w", "-DPY_API"]
     # If any libraries are used, e.g. libabc.so
@@ -80,16 +64,21 @@ except Exception as e:
     print(e)
     sys.exit(1)
 
-cmdclass = {}
 
+cmdclass = {}
 setup(
     name='fastllm',  # used by `pip install`
-    version='0.0.1',
+    version=eval(__VERSION__),
     description='python api for fastllm',
     long_description='',
     ext_modules=ext_modules,
     packages = find_packages(), # the directory would be installed to site-packages
     cmdclass=cmdclass,
+    entry_points = {
+        'console_scripts': [
+            'fastllm-convert = fastllm.convert:convert_main',
+        ]
+    },
     setup_requires=["pybind11"],
     install_requires=[""],
     python_requires='>=3.6',
