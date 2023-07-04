@@ -658,7 +658,7 @@ namespace fastllm {
         return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
     }
 
-    std::string Tokenizer::Decode(const std::vector<int> &tokens) {
+    std::string Tokenizer::DecodeTokens(const std::vector<int> &tokens) {
         std::string ret = "";
         for (int i = 0; i < tokens.size(); i++) {
             std::string s = tokenToStringDict[tokens[i]];
@@ -707,7 +707,7 @@ namespace fastllm {
         for (int i = 0; i < data.Count(0); i++) {
             tokens.push_back((int) ((float *) data.cpuData)[i]);
         }
-        return Decode(tokens);
+        return DecodeTokens(tokens);
     }
 
     void WeightMap::LoadFromFile(const std::string &fileName) {

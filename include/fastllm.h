@@ -186,7 +186,7 @@ namespace fastllm {
 
         std::string Decode(const Data &data); // 解码
 
-        std::string Decode(const std::vector <int> &tokens); // 解码
+        std::string DecodeTokens(const std::vector <int> &tokens); // 解码
     };
 
     std::string GetModelTypeFromFile(const std::string &fileName);
