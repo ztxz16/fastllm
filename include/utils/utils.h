@@ -11,12 +11,25 @@
 #include <string>
 #include <cstdio>
 #include <cstdint>
+#if defined(_WIN32) or defined(_WIN64)
+#include <Windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #ifdef __AVX__
 #include "immintrin.h"
 #endif
 
 namespace fastllm {
+    static void MySleep(int t) {
+#if defined(_WIN32) or defined(_WIN64)
+        Sleep(t);
+#else
+        sleep(t);
+#endif
+    }
+
     static void ErrorInFastLLM(const std::string &error) {
         printf("FastLLM Error: %s\n", error.c_str());
         throw error;

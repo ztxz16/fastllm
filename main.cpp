@@ -11,7 +11,7 @@ void Usage() {
 	std::cout << "[-h|--help]:                  显示帮助" << std::endl;
 	std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
 	std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
-	std::cout << "<-l|--low> <args>:            使用低内存模式" << std::endl;
+	std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
 }
 
 void ParseArgs(int argc, char **argv, RunConfig &config) {
@@ -66,9 +66,11 @@ int main(int argc, char **argv) {
         std::string ret = model->Response(model->MakeInput(history, round, input), [](int index, const char* content) {
             if (index == 0) {
                 printf("%s:%s", modelType.c_str(), content);
+                fflush(stdout);
             }
             if (index > 0) {
                 printf("%s", content);
+                fflush(stdout);
             }
             if (index == -1) {
                 printf("\n");
