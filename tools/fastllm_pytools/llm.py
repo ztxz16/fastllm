@@ -54,6 +54,9 @@ class model:
         prompt = fastllm_lib.make_input_llm_model(self.model, prompt.encode(), len(history), query.encode()).decode();
         return prompt;
 
+    def save(self, path : str):
+        fastllm_lib.save_llm_model(self.model, path.encode());
+
     def response(self,
                  query: str,
                  history: List[Tuple[str, str]] = None) -> str:
