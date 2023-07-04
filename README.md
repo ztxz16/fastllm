@@ -22,6 +22,35 @@ fastllm是纯c++实现，无第三方依赖的高性能大模型推理库
 - 🚀 前后端分离设计，便于支持新的计算设备
 - 🚀 目前支持ChatGLM模型，各种LLAMA模型(ALPACA, VICUNA等)，BAICHUAN模型，MOSS模型
 
+## 两行代码加速 （测试中，暂时只支持ubuntu）
+
+使用如下命令安装fastllm_pytools包
+
+``` sh
+cd fastllm
+mkdir build
+cd build
+cmake .. -DUSE_CUDA=ON # 如果不使用GPU编译，那么使用 cmake .. -DUSE_CUDA=OFF
+make -j
+cd tools && python setup.py install
+```
+
+然后只需要在原本的推理程序中加入两行即可使用fastllm加速
+
+``` python
+# 这是原来的程序，通过huggingface接口创建模型
+from transformers import AutoTokenizer, AutoModel
+tokenizer = AutoTokenizer.from_pretrained("THUDM/chatglm2-6b", trust_remote_code = True)
+model = AutoModel.from_pretrained("THUDM/chatglm2-6b", trust_remote_code = True)
+
+# 加入下面这两行，将huggingface模型转换成fastllm模型
+from fastllm_pytools import llm
+model = llm.from_hf(model, dtype = "float16") # dtype支持 "float16", "int8", "int4"
+```
+
+注: 该功能处于测试阶段，目前仅ChatGLM、ChatGLM2模型可以2行加速，其余模型(LLAMA, Baichuan等)转完后需要使用model.chat接口或model.stream_chat接口来生成回复，具体可参考tools/script/cli_demo.py中的使用示例
+
+
 ## 推理速度
 
 6B级int4模型单4090延迟最低约5.5ms
