@@ -602,14 +602,14 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
         delete[] zeropoints;
         weight.extraCudaData.push_back((void*)cudaZeropoints);
 
+        float *cudaBiasData;
+        cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            weight.extraCudaData.push_back((void *) bias.cudaData);
+            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
-            float *cudaBiasData;
-            cudaMalloc(&cudaBiasData, k * sizeof(float));
             cudaMemset(cudaBiasData, 0, k * sizeof(float));
-            weight.extraCudaData.push_back((void *) cudaBiasData);
         }
+        weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
     float *cudaScales = (float*)weight.extraCudaData[0];
@@ -659,14 +659,14 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
         delete[] zeropoints;
         weight.extraCudaData.push_back((void*)cudaZeropoints);
 
+        float *cudaBiasData;
+        cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            weight.extraCudaData.push_back((void *) bias.cudaData);
+            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
-            float *cudaBiasData;
-            cudaMalloc(&cudaBiasData, k * sizeof(float));
             cudaMemset(cudaBiasData, 0, k * sizeof(float));
-            weight.extraCudaData.push_back((void *) cudaBiasData);
         }
+        weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
     float *cudaScales = (float*)weight.extraCudaData[0];
@@ -693,14 +693,14 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
 bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         weight.ToDevice(fastllm::DataDevice::CUDA);
+        float *cudaBiasData;
+        cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            weight.extraCudaData.push_back((void *) bias.cudaData);
+            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
-            float *cudaBiasData;
-            cudaMalloc(&cudaBiasData, k * sizeof(float));
             cudaMemset(cudaBiasData, 0, k * sizeof(float));
-            weight.extraCudaData.push_back((void *) cudaBiasData);
         }
+        weight.extraCudaData.push_back((void*)cudaBiasData);
     }
     float *cudaBiasData = (float*)weight.extraCudaData[0];
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
