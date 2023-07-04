@@ -56,6 +56,15 @@ __global__ void FastllmSiluKernel(float* a, float *b, int len) {
     }
 }
 
+__global__ void FastllmSwigluKernel(float* a, float *b, int len, int spatial, int mid) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        int id = idx / mid * spatial + idx % mid;
+        float x = a[id], y = a[id + mid];
+        b[idx] = (x / (1.0 + expf(-x))) * y;
+    }
+}
+
 __global__ void FastllmMulKernel(float* a, float *b, float v, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -119,6 +128,46 @@ __global__ void FastllmLlamaRotatePosition2DKernel(float *data, float *positionI
     float va = d[i * m], vb = d[i * m + m / 2];
     d[i * m] = va * curCos - vb * curSin;
     d[i * m + m / 2] = va * curSin + vb * curCos;
+}
+
+__global__ void FastllmNearlyRotatePosition2DKernel(float *data, float *positionIds, float *sin, float *cos,
+                                                   int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int rotateDim) {
+/*
+    int len = data.dims[0], bs = data.dims[1];
+    int spatial = data.Count(2);
+    int n = data.dims[2], m = data.dims[3];
+    int stride = (int)sinData.dims[1];
+    for (int l = 0; l < len; l++) {
+        for (int b = 0; b < bs; b++) {
+            int index = (int) ((float *) positionIds.cpuData)[(b * 2) * positionIds.dims.back() + l];
+            float *sin = ((float*)sinData.cpuData) + stride * index;
+            float *cos = ((float*)cosData.cpuData) + stride * index;
+            float *d = (float *) data.cpuData + (l * bs + b) * spatial;
+            for (int i = 0; i < n; i++) {
+                int j = 0;
+                for (; j < rotaryDim; j += 2) {
+                    float a = d[j], b = d[j + 1];
+                    d[j] = a * cos[j / 2] - b * sin[j / 2];
+                    d[j + 1] = a * sin[j / 2] + b * cos[j / 2];
+                }
+                d += m;
+            }
+        }
+    }
+*/
+    int o = (blockIdx.x / n);
+    int l = o / bs;
+    int b = o % bs;
+    int j = threadIdx.x;
+    int index = (int) (positionIds[b * 2 * partStride + l]);
+
+    float curSin = sin[index * sinCosStride + j];
+    float curCos = cos[index * sinCosStride + j];
+    float *d = (float *) data + o * spatial + j * 2;
+    int i = blockIdx.x % n;
+    float va = d[i * m], vb = d[i * m + 1];
+    d[i * m] = va * curCos - vb * curSin;
+    d[i * m + 1] = va * curSin + vb * curCos;
 }
 
 __global__ void FastllmRotatePosition2DKernel(float *data, float *positionIds, float *sin, float *cos,
@@ -867,6 +916,20 @@ bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
     return true;
 }
 
+bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
+    int len = output.Count(0);
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
+    int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
+
+    int threadPerBlock = min(256, len);
+    FastllmSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len, spatial, mid);
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
 bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output) {
     int len = input.Count(0);
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
@@ -1152,6 +1215,28 @@ bool FastllmCudaRotatePosition2D(fastllm::Data &data, const fastllm::Data &posit
     FastllmCudaFinishInput(cosData, cudaCos);
     FastllmCudaFinishOutput(data, cudaData);
 
+    return true;
+}
+
+bool FastllmCudaNearlyRotatePosition2D(fastllm::Data &data, const fastllm::Data &positionIds,
+                                 const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim) {
+    float *cudaData = (float *) FastllmCudaPrepareInput(data);
+    float *cudaPositionIds = (float *) FastllmCudaPrepareInput(positionIds);
+    float *cudaSin = (float *) FastllmCudaPrepareInput(sinData);
+    float *cudaCos = (float *) FastllmCudaPrepareInput(cosData);
+
+    int outer = data.dims[0] * data.dims[1];
+    int spatial = data.Count(2);
+    int len = data.dims[0], bs = data.dims[1];
+    int n = data.dims[2], m = data.dims[3];
+    FastllmNearlyRotatePosition2DKernel <<< outer * n, min(rotaryDim, m / 4) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
+                                                                                len, bs, spatial, n, m,
+                                                                                (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
+
+    FastllmCudaFinishInput(positionIds, cudaPositionIds);
+    FastllmCudaFinishInput(sinData, cudaSin);
+    FastllmCudaFinishInput(cosData, cudaCos);
+    FastllmCudaFinishOutput(data, cudaData);
     return true;
 }
 
