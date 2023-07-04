@@ -589,7 +589,7 @@ namespace fastllm {
             if (GetVersion() == 2) {
                 maskIds++;
             }
-            printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
+            // printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
         }
 		if (retCb)
 #ifdef PY_API
