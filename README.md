@@ -45,11 +45,30 @@ model = AutoModel.from_pretrained("THUDM/chatglm2-6b", trust_remote_code = True)
 
 # 加入下面这两行，将huggingface模型转换成fastllm模型
 from fastllm_pytools import llm
-model = llm.from_hf(model, dtype = "float16") # dtype支持 "float16", "int8", "int4"
+model = llm.from_hf(model, tokenizer, dtype = "float16") # dtype支持 "float16", "int8", "int4"
 ```
 
-注: 该功能处于测试阶段，目前仅ChatGLM、ChatGLM2模型可以2行加速，其余模型(LLAMA, Baichuan等)转完后需要使用model.chat接口或model.stream_chat接口来生成回复，具体可参考tools/script/cli_demo.py中的使用示例
+转好的模型可以导出到本地文件，之后可以直接读取
 
+``` python
+model.save("model.flm"); # 导出fastllm模型
+new_model = llm.model("model.flm"); # 导入fastllm模型
+```
+
+model支持了ChatGLM的API函数chat, stream_chat，因此ChatGLM的demo程序无需改动其他代码即可运行
+
+model还支持下列API用于生成回复
+
+``` python
+# 生成回复
+print(model.response("你好"))
+
+# 流式生成回复
+for response in model.stream_response("你好"):
+    print(response, flush = True, end = "")
+```
+
+注: 该功能处于测试阶段，目前仅验证了ChatGLM、ChatGLM2模型可以通过2行代码加速
 
 ## 推理速度
 
