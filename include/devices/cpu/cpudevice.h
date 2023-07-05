@@ -6,6 +6,7 @@
 #define FASTLLM_CPUDEVICE_H
 
 #include "device.h"
+#include "cputhreadpool.h"
 
 namespace fastllm {
     class CpuDevice : BaseDevice {
@@ -17,6 +18,9 @@ namespace fastllm {
 
         bool CopyDataToCPU(void *dst, void *src, size_t size); // 不重要, cpu device不会进行这个操作
         bool CopyDataFromCPU(void *dst, void *src, size_t size); // 不重要, cpu device不会进行这个操作
+
+        int threads = 4;
+        ThreadPool *threadPool = nullptr;
     };
 
     class CpuEmbedding : BaseOperator {
