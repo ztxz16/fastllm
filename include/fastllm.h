@@ -18,6 +18,8 @@
 #include <functional>
 #include <memory>
 
+#include "devices/cpu/cputhreadpool.h"
+
 namespace fastllm {
     void SetThreads(int t);
     void SetLowMemMode(bool m);
@@ -25,6 +27,7 @@ namespace fastllm {
     bool GetLowMemMode();
     int GetThreads();
     bool GetKVCacheInCPU();
+    ThreadPool *GetPool();
 
     struct LowBitConfig {
         int bit;
