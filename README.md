@@ -48,13 +48,6 @@ from fastllm_pytools import llm
 model = llm.from_hf(model, tokenizer, dtype = "float16") # dtype支持 "float16", "int8", "int4"
 ```
 
-转好的模型可以导出到本地文件，之后可以直接读取
-
-``` python
-model.save("model.flm"); # 导出fastllm模型
-new_model = llm.model("model.flm"); # 导入fastllm模型
-```
-
 model支持了ChatGLM的API函数chat, stream_chat，因此ChatGLM的demo程序无需改动其他代码即可运行
 
 model还支持下列API用于生成回复
@@ -66,6 +59,13 @@ print(model.response("你好"))
 # 流式生成回复
 for response in model.stream_response("你好"):
     print(response, flush = True, end = "")
+```
+
+转好的模型也可以导出到本地文件，之后可以直接读取，也可以使用fastllm cpp接口读取
+
+``` python
+model.save("model.flm"); # 导出fastllm模型
+new_model = llm.model("model.flm"); # 导入fastllm模型
 ```
 
 注: 该功能处于测试阶段，目前仅验证了ChatGLM、ChatGLM2模型可以通过2行代码加速
@@ -247,15 +247,9 @@ python3 tools/moss_export.py moss-fp32.flm # 导出浮点模型
 
 ### 短期计划
 
-- 提供直接从HF模型创建fastllm模型的python接口
-``` python
-hf_model, hf_tokenizer = ...
-flm_model = llm.from_hf_model(hf_model)
-# flm_model = llm.from_hf_model(hf_model, hf_tokenizer)
-```
-
 - 支持do_sample以及采样参数
-- 支持GLM2模型
+- 支持部分显存 + 部分DDR模式
+- 优化int4, int8的batch推理
 
 ### 中期计划
 
