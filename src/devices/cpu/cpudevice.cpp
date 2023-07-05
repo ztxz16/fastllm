@@ -64,6 +64,52 @@ namespace fastllm {
         return true;
     }
 
+#ifdef __AVX2__
+    int DotU8U8(uint8_t *a, uint8_t *b, int n) {
+        __m256i accH = _mm256_setzero_si256();
+        __m256i accL = _mm256_setzero_si256();
+
+        int i = 0;
+        int ans = 0;
+        const __m256i lowMask = _mm256_set1_epi8(0xf);
+        const __m256i ones = _mm256_set1_epi16(1);
+        for (; i + 31 < n; i += 32) {
+            __m256i bx = _mm256_loadu_si256((const __m256i *) (a + i));
+            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
+            __m256i byH = _mm256_and_si256(lowMask, _mm256_srli_epi16(by, 4));
+            __m256i byL = _mm256_and_si256(lowMask, by);
+
+            accH = _mm256_add_epi32(accH, _mm256_madd_epi16(_mm256_maddubs_epi16(byH, bx), ones));
+            accL = _mm256_add_epi32(accL, _mm256_madd_epi16(_mm256_maddubs_epi16(byL, bx), ones));
+        }
+        for (; i < n; i++) {
+            ans += ((int8_t*)a)[i] * b[i];
+        }
+
+        return ans + I32sum(accH) * 16 + I32sum(accL);
+    };
+
+    int DotU4U8(uint8_t *a, uint8_t *b, int n) {
+        __m256i acc = _mm256_setzero_si256();
+
+        int i = 0;
+        int ans = 0;
+        const __m256i lowMask = _mm256_set1_epi8(0xf);
+        const __m256i ones = _mm256_set1_epi16(1);
+        for (; i + 31 < n; i += 32) {
+            __m128i orix = _mm_loadu_si128((const __m128i *) (a + i / 2));
+            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+            __m256i bx = _mm256_and_si256(lowMask, bytex);
+            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(by, bx), ones));
+        }
+        for (; i < n; i++) {
+            ans += a[i] * b[i];
+        }
+
+        return ans + I32sum(acc);
+    };
+#else
 #ifdef __AVX__
     int DotU8U8(uint8_t *a, uint8_t *b, int n) {
         __m256i acc = _mm256_setzero_si256();
@@ -91,13 +137,6 @@ namespace fastllm {
     };
 
     int DotU4U8(uint8_t *a, uint8_t *b, int n) {
-        int value = 0, j = 0;
-        for (; j + 1 < n; j += 2) {
-            value += (a[j / 2] >> 4) * b[j];
-            value += (a[j / 2] & 0xF) * b[j + 1];
-        }
-        //return value;
-
         __m256i acc = _mm256_setzero_si256();
 
         int i = 0;
@@ -123,6 +162,7 @@ namespace fastllm {
 
         return ans + I32sum(acc);
     };
+#endif
 #endif
 
     void CpuEmbedding::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -723,16 +763,22 @@ namespace fastllm {
     void MultiplyMultiThread(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int threadNum) {
         int per = k / threadNum;
         int cur = 0;
-        auto pool = GetPool();
-        std::vector <std::future <void> > futures;
-        for (int i = 0; i < threadNum - 1; i++) {
-            int end = cur + per + (cur + per * (threadNum - i) < k);
-            futures.push_back(pool->Submit(Multiply, a, b + cur * m, c + cur, n, m, end - cur, k));
-            cur = end;
-        }
-        Multiply(a, b + cur * m, c + cur, n, m, k - cur, k);
-        for (int i = 0; i < threadNum - 1; i++) {
-            futures[i].get();
+        if (threadNum == 1) {
+            Multiply(a, b + cur * m, c + cur, n, m, k - cur, k);
+        } else {
+            auto pool = GetPool();
+            std::vector<std::future<void> > futures;
+            for (int i = 0; i < threadNum; i++) {
+                int end = cur + per + (cur + per * (threadNum - i) < k);
+                if (i == threadNum - 1) {
+                    end = k;
+                }
+                futures.push_back(pool->Submit(Multiply, a, b + cur * m, c + cur, n, m, end - cur, k));
+                cur = end;
+            }
+            for (int i = 0; i < futures.size(); i++) {
+                futures[i].get();
+            }
         }
     }
 
@@ -749,20 +795,24 @@ namespace fastllm {
         }
         int per = k / threadNum;
         int cur = 0;
-        auto pool = GetPool();
-        std::vector <std::future <void> > futures;
-        for (int i = 0; i < threadNum - 1; i++) {
-            int end = cur + per + (cur + per * (threadNum - i) < k);
-            futures.push_back(pool->Submit(MultiplyInt4, a, b + cur * m / 2, c + cur, n, m, end - cur, k,
-                                              weightSums + cur, weightZeros + cur, scales + cur,
-                                              (bias == nullptr ? (float*)nullptr : bias + cur), configs.data(), inputSums.data()));
-            cur = end;
-        }
-        MultiplyInt4(a, b + cur * m / 2, c + cur, n, m, k - cur, k,
-                     weightSums + cur, weightZeros + cur, scales + cur,
-                     (bias == nullptr ? (float*)nullptr : bias + cur), configs.data(), inputSums.data());
-        for (int i = 0; i < threadNum - 1; i++) {
-            futures[i].get();
+        if (threadNum == 1) {
+            MultiplyInt4(a, b + cur * m / 2, c + cur, n, m, k - cur, k,
+                         weightSums + cur, weightZeros + cur, scales + cur,
+                         (bias == nullptr ? (float*)nullptr : bias + cur), configs.data(), inputSums.data());
+        } else {
+            auto pool = GetPool();
+            std::vector<std::future<void> > futures;
+            for (int i = 0; i < threadNum; i++) {
+                int end = (i == threadNum - 1 ? k : cur + per + (cur + per * (threadNum - i) < k));
+                futures.push_back(pool->Submit(MultiplyInt4, a, b + cur * m / 2, c + cur, n, m, end - cur, k,
+                                               weightSums + cur, weightZeros + cur, scales + cur,
+                                               (bias == nullptr ? (float *) nullptr : bias + cur), configs.data(),
+                                               inputSums.data()));
+                cur = end;
+            }
+            for (int i = 0; i < futures.size(); i++) {
+                futures[i].get();
+            }
         }
     }
 
@@ -798,7 +848,7 @@ namespace fastllm {
             }
 
             FloatLinearPart(inputData, weightData, biasData, outputData, n, m, k, cur, k);
-            for (int i = 0; i < threadNum - 1; i++) {
+            for (int i = 0; i < futures.size(); i++) {
                 futures[i].get();
             }
         } else if (weight.dataType == DataType::FLOAT16) {
@@ -820,7 +870,7 @@ namespace fastllm {
             }
 
             Float16LinearPart(inputData, weightData, biasData, outputData, n, m, k, cur, k);
-            for (int i = 0; i < threadNum - 1; i++) {
+            for (int i = 0; i < futures.size(); i++) {
                 futures[i].get();
             }
         } else if (weight.dataType == DataType::INT8) {
@@ -842,22 +892,32 @@ namespace fastllm {
             std::vector <uint8_t> uinput;
             uinput.resize(n * m);
             for (int i = 0; i < n * m; i++) {
+#ifdef __AVX2__
+                uinput[i] = inputConfigs[i / m].quantization(inputData[i]) ^ 128;
+#else
                 uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
+#endif
             }
 
             MultiplyMultiThread(uinput.data(), weightData, (int32_t*)outputData, n, m, k, GetThreads());
             for (int i = 0; i < n; i++) {
                 uint32_t inputSum = 0;
                 for (int j = 0; j < m; j++) {
+#ifdef __AVX2__
+                    inputSum += uinput[i * m + j] ^ 128;
+#else
                     inputSum += uinput[i * m + j];
+#endif
                 }
 
                 for (int j = 0; j < k; j++) {
                     int value = ((int32_t*)outputData)[i * k + j];
+#ifdef __AVX2__
+                    value += (128 * weight.weightSum[j]);
+#endif
                     value -= weight.weightSum[j] * inputConfigs[i].zeroPoint;
                     value -= inputSum * weight.perChannelsConfigs[j].zeroPoint;
                     value += (int)inputConfigs[i].zeroPoint * weight.perChannelsConfigs[j].zeroPoint * m;
-
                     outputData[i * k + j] = weight.perChannelsConfigs[j].scale * inputConfigs[i].scale * value +
                                             (biasData == nullptr ? 0.0 : biasData[j]);
                 }
@@ -1253,7 +1313,7 @@ namespace fastllm {
         MatMulSingle((float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
                      input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                      n, m, k, alpha, cur, batch0);
-        for (int i = 0; i < threadNum - 1; i++) {
+        for (int i = 0; i < futures.size(); i++) {
             futures[i].get();
         }
     }
@@ -1326,7 +1386,7 @@ namespace fastllm {
         MatMulTransBSingle((float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
                            input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                            n, m, k, alpha, cur, batch0);
-        for (int i = 0; i < threadNum - 1; i++) {
+        for (int i = 0; i < futures.size(); i++) {
             futures[i].get();
         }
     }
@@ -1750,7 +1810,7 @@ namespace fastllm {
                 cur = end;
             }
             Transpose(tmpData + cur * n, curData + cur, n, m, n, m - cur);
-            for (int i = 0; i < threadNum - 1; i++) {
+            for (int i = 0; i < futures.size(); i++) {
                 futures[i].get();
             }
         } else if (axis == std::vector <int> {1, 0, 2}) {
