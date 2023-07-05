@@ -723,16 +723,16 @@ namespace fastllm {
     void MultiplyMultiThread(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int threadNum) {
         int per = k / threadNum;
         int cur = 0;
-        std::vector <std::thread*> threads;
+        auto pool = GetPool();
+        std::vector <std::future <void> > futures;
         for (int i = 0; i < threadNum - 1; i++) {
             int end = cur + per + (cur + per * (threadNum - i) < k);
-            threads.push_back(new std::thread(&Multiply, a, b + cur * m, c + cur, n, m, end - cur, k));
+            futures.push_back(pool->Submit(Multiply, a, b + cur * m, c + cur, n, m, end - cur, k));
             cur = end;
         }
         Multiply(a, b + cur * m, c + cur, n, m, k - cur, k);
         for (int i = 0; i < threadNum - 1; i++) {
-            threads[i]->join();
-            delete threads[i];
+            futures[i].get();
         }
     }
 
@@ -749,10 +749,11 @@ namespace fastllm {
         }
         int per = k / threadNum;
         int cur = 0;
-        std::vector <std::thread*> threads;
+        auto pool = GetPool();
+        std::vector <std::future <void> > futures;
         for (int i = 0; i < threadNum - 1; i++) {
             int end = cur + per + (cur + per * (threadNum - i) < k);
-            threads.push_back(new std::thread(&MultiplyInt4, a, b + cur * m / 2, c + cur, n, m, end - cur, k,
+            futures.push_back(pool->Submit(MultiplyInt4, a, b + cur * m / 2, c + cur, n, m, end - cur, k,
                                               weightSums + cur, weightZeros + cur, scales + cur,
                                               (bias == nullptr ? (float*)nullptr : bias + cur), configs.data(), inputSums.data()));
             cur = end;
@@ -761,8 +762,7 @@ namespace fastllm {
                      weightSums + cur, weightZeros + cur, scales + cur,
                      (bias == nullptr ? (float*)nullptr : bias + cur), configs.data(), inputSums.data());
         for (int i = 0; i < threadNum - 1; i++) {
-            threads[i]->join();
-            delete threads[i];
+            futures[i].get();
         }
     }
 
@@ -788,18 +788,18 @@ namespace fastllm {
             int threadNum = GetThreads();
             int per = k / threadNum;
             int cur = 0;
-            std::vector<std::thread *> threads;
+            auto pool = GetPool();
+            std::vector <std::future <void> > futures;
             for (int i = 0; i < threadNum - 1; i++) {
                 int end = cur + per + (cur + per * (threadNum - i) < k);
-                threads.push_back(new std::thread(&FloatLinearPart, inputData, weightData, biasData, outputData,
+                futures.push_back(pool->Submit(FloatLinearPart, inputData, weightData, biasData, outputData,
                                                   n, m, k, cur, end));
                 cur = end;
             }
 
             FloatLinearPart(inputData, weightData, biasData, outputData, n, m, k, cur, k);
             for (int i = 0; i < threadNum - 1; i++) {
-                threads[i]->join();
-                delete threads[i];
+                futures[i].get();
             }
         } else if (weight.dataType == DataType::FLOAT16) {
             float *inputData = (float *) input.cpuData;
@@ -810,18 +810,18 @@ namespace fastllm {
             int threadNum = GetThreads();
             int per = k / threadNum;
             int cur = 0;
-            std::vector<std::thread *> threads;
+            auto pool = GetPool();
+            std::vector <std::future <void> > futures;
             for (int i = 0; i < threadNum - 1; i++) {
                 int end = cur + per + (cur + per * (threadNum - i) < k);
-                threads.push_back(new std::thread(&Float16LinearPart, inputData, weightData, biasData, outputData,
+                futures.push_back(pool->Submit(Float16LinearPart, inputData, weightData, biasData, outputData,
                                                   n, m, k, cur, end));
                 cur = end;
             }
 
             Float16LinearPart(inputData, weightData, biasData, outputData, n, m, k, cur, k);
             for (int i = 0; i < threadNum - 1; i++) {
-                threads[i]->join();
-                delete threads[i];
+                futures[i].get();
             }
         } else if (weight.dataType == DataType::INT8) {
             float *inputData = (float *) input.cpuData;
@@ -1240,10 +1240,11 @@ namespace fastllm {
         // TODO: 汇编优化
         int per = batch0 / threadNum;
         int cur = 0;
-        std::vector<std::thread *> threads;
+        auto pool = GetPool();
+        std::vector <std::future <void> > futures;
         for (int i = 0; i < threadNum - 1; i++) {
             int end = cur + per + (cur + per * (threadNum - i) < batch0);
-            threads.push_back(new std::thread(&MatMulSingle,
+            futures.push_back(pool->Submit(MatMulSingle,
                                               (float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
                                               input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                                               n, m, k, alpha, cur, end));
@@ -1253,8 +1254,7 @@ namespace fastllm {
                      input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                      n, m, k, alpha, cur, batch0);
         for (int i = 0; i < threadNum - 1; i++) {
-            threads[i]->join();
-            delete threads[i];
+            futures[i].get();
         }
     }
 
@@ -1313,10 +1313,11 @@ namespace fastllm {
         threadNum = std::min(threadNum, 4);
         int per = batch0 / threadNum;
         int cur = 0;
-        std::vector<std::thread *> threads;
+        auto pool = GetPool();
+        std::vector <std::future <void> > futures;
         for (int i = 0; i < threadNum - 1; i++) {
             int end = cur + per + (cur + per * (threadNum - i) < batch0);
-            threads.push_back(new std::thread(&MatMulTransBSingle,
+            futures.push_back(pool->Submit(MatMulTransBSingle,
                                               (float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
                                               input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                                               n, m, k, alpha, cur, end));
@@ -1326,8 +1327,7 @@ namespace fastllm {
                            input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                            n, m, k, alpha, cur, batch0);
         for (int i = 0; i < threadNum - 1; i++) {
-            threads[i]->join();
-            delete threads[i];
+            futures[i].get();
         }
     }
 
@@ -1742,16 +1742,16 @@ namespace fastllm {
             int threadNum = 1;
             int per = m / threadNum;
             int cur = 0;
-            std::vector <std::thread*> threads;
+            auto pool = GetPool();
+            std::vector <std::future <void> > futures;
             for (int i = 0; i < threadNum - 1; i++) {
                 int end = cur + per + (cur + per * (threadNum - i) < m);
-                threads.push_back(new std::thread(&Transpose, tmpData + cur * n, curData + cur, n, m, n, end - cur));
+                futures.push_back(pool->Submit(Transpose, tmpData + cur * n, curData + cur, n, m, n, end - cur));
                 cur = end;
             }
             Transpose(tmpData + cur * n, curData + cur, n, m, n, m - cur);
             for (int i = 0; i < threadNum - 1; i++) {
-                threads[i]->join();
-                delete threads[i];
+                futures[i].get();
             }
         } else if (axis == std::vector <int> {1, 0, 2}) {
             int n = input.dims[0];

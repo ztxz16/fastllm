@@ -30,7 +30,9 @@ namespace fastllm {
     Executor defaultExecutor;
     Executor *curExecutor = &defaultExecutor;
 
+    static std::mutex globalLocker;
     static int threads = 4;
+    static ThreadPool *fastllmThreadPool = new ThreadPool(threads);
     static bool lowMemMode = false;
     static bool kvCacheInCPU = false;
 
@@ -39,7 +41,14 @@ namespace fastllm {
     }
 
     void SetThreads(int t) {
+        globalLocker.lock();
         threads = t;
+        if (fastllmThreadPool != nullptr) {
+            fastllmThreadPool->Shutdown();
+            delete fastllmThreadPool;
+        }
+        fastllmThreadPool = new ThreadPool(t);
+        globalLocker.unlock();
     }
 
     void SetLowMemMode(bool m) {
@@ -56,6 +65,10 @@ namespace fastllm {
 
     int GetThreads() {
         return threads;
+    }
+
+    ThreadPool *GetPool() {
+        return fastllmThreadPool;
     }
 
     struct FileBuffer {
