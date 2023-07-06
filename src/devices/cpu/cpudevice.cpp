@@ -64,31 +64,60 @@ namespace fastllm {
         return true;
     }
 
+#ifdef __AVX__
 #ifdef __AVX2__
     int DotU8U8(uint8_t *a, uint8_t *b, int n) {
-        __m256i accH = _mm256_setzero_si256();
-        __m256i accL = _mm256_setzero_si256();
-
+        __m256i acc = _mm256_setzero_si256();
         int i = 0;
         int ans = 0;
         const __m256i lowMask = _mm256_set1_epi8(0xf);
         const __m256i ones = _mm256_set1_epi16(1);
+        const __m256i ones8 = _mm256_set1_epi8(1);
+        const __m256i xors = _mm256_set1_epi8(-128);
         for (; i + 31 < n; i += 32) {
             __m256i bx = _mm256_loadu_si256((const __m256i *) (a + i));
             __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
-            __m256i byH = _mm256_and_si256(lowMask, _mm256_srli_epi16(by, 4));
-            __m256i byL = _mm256_and_si256(lowMask, by);
 
-            accH = _mm256_add_epi32(accH, _mm256_madd_epi16(_mm256_maddubs_epi16(byH, bx), ones));
-            accL = _mm256_add_epi32(accL, _mm256_madd_epi16(_mm256_maddubs_epi16(byL, bx), ones));
+            by = _mm256_xor_si256(by, xors);
+            by = _mm256_add_epi8(by, _mm256_and_si256(_mm256_cmpeq_epi8(by, xors), ones8));
+
+            by = _mm256_sign_epi8(by, bx);
+            bx = _mm256_sign_epi8(bx, bx);
+
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, by), ones));
         }
         for (; i < n; i++) {
-            ans += ((int8_t*)a)[i] * b[i];
+            ans += ((int8_t*)a)[i] * ((int)b[i] - 128);
         }
 
-        return ans + I32sum(accH) * 16 + I32sum(accL);
+        return ans + I32sum(acc);
     };
+#else
+    int DotU8U8(uint8_t *a, uint8_t *b, int n) {
+        __m256i acc = _mm256_setzero_si256();
 
+        int i = 0;
+        int ans = 0;
+        for (; i + 31 < n; i += 32) {
+            __m256i bx = _mm256_loadu_si256((const __m256i *) (a + i));
+            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
+
+            __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
+            __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
+
+            __m256i my0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 0));
+            __m256i my1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 1));
+
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, my0));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, my1));
+        }
+        for (; i < n; i++) {
+            ans += a[i] * b[i];
+        }
+
+        return ans + I32sum(acc);
+    };
+#endif
     int DotU4U8(uint8_t *a, uint8_t *b, int n) {
         __m256i acc = _mm256_setzero_si256();
 
@@ -109,60 +138,6 @@ namespace fastllm {
 
         return ans + I32sum(acc);
     };
-#else
-#ifdef __AVX__
-    int DotU8U8(uint8_t *a, uint8_t *b, int n) {
-        __m256i acc = _mm256_setzero_si256();
-
-        int i = 0;
-        int ans = 0;
-        for (; i + 31 < n; i += 32) {
-            __m256i bx = _mm256_loadu_si256((const __m256i *) (a + i));
-            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
-
-            __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
-            __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
-
-            __m256i my0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 0));
-            __m256i my1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 1));
-
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, my0));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, my1));
-        }
-        for (; i < n; i++) {
-            ans += a[i] * b[i];
-        }
-
-        return ans + I32sum(acc);
-    };
-
-    int DotU4U8(uint8_t *a, uint8_t *b, int n) {
-        __m256i acc = _mm256_setzero_si256();
-
-        int i = 0;
-        int ans = 0;
-        const __m256i lowMask = _mm256_set1_epi8(0xf);
-        for (; i + 31 < n; i += 32) {
-            __m128i orix = _mm_loadu_si128((const __m128i *) (a + i / 2));
-            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
-            __m256i bx = _mm256_and_si256(lowMask, bytex);
-            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
-            __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
-            __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
-
-            __m256i my0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 0));
-            __m256i my1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 1));
-
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, my0));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, my1));
-        }
-        for (; i < n; i++) {
-            ans += a[i] * b[i];
-        }
-
-        return ans + I32sum(acc);
-    };
-#endif
 #endif
 
     void CpuEmbedding::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -893,7 +868,8 @@ namespace fastllm {
             uinput.resize(n * m);
             for (int i = 0; i < n * m; i++) {
 #ifdef __AVX2__
-                uinput[i] = inputConfigs[i / m].quantization(inputData[i]) ^ 128;
+                uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
+                uinput[i] = (uinput[i] + !uinput[i]) ^ 128;
 #else
                 uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
 #endif
@@ -914,6 +890,8 @@ namespace fastllm {
                     int value = ((int32_t*)outputData)[i * k + j];
 #ifdef __AVX2__
                     value += (128 * weight.weightSum[j]);
+                    value += (128 * inputSum);
+                    value -= m * 128 * 128;
 #endif
                     value -= weight.weightSum[j] * inputConfigs[i].zeroPoint;
                     value -= inputSum * weight.perChannelsConfigs[j].zeroPoint;
