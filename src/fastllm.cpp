@@ -926,7 +926,8 @@ namespace fastllm {
                         int threadNum = 8;
                         int per = k / threadNum;
                         int cur = 0;
-                        std::vector<std::thread *> threads;
+                        auto pool = GetPool();
+                        std::vector <std::future <void> > futures;
                         std::vector<LowBitConfig> configs;
                         std::vector<uint8_t> uDatas;
                         configs.resize(k);
@@ -941,14 +942,13 @@ namespace fastllm {
                             if (i == threadNum - 1) {
                                 end = k;
                             }
-                            threads.push_back(new std::thread(&PerChannelQuantizationMultiThread, cur, end, m,
+                            futures.push_back(pool->Submit(PerChannelQuantizationMultiThread, cur, end, m,
                                                               (float *) data.cpuData, uDatas.data(), configs.data(),
                                                               bit));
                             cur = end;
                         }
                         for (int i = 0; i < threadNum; i++) {
-                            threads[i]->join();
-                            delete threads[i];
+                            futures[i].get();
                         }
 
                         buffer.WriteInt(bit == 8 ? (int) DataType::INT8 : (int) DataType::INT4);
@@ -992,7 +992,8 @@ namespace fastllm {
             int threadNum = 8;
             int per = k / threadNum;
             int cur = 0;
-            std::vector<std::thread *> threads;
+            auto pool = GetPool();
+            std::vector <std::future <void> > futures;
             std::vector<LowBitConfig> configs;
             std::vector<uint8_t> uDatas;
             configs.resize(k);
@@ -1007,13 +1008,12 @@ namespace fastllm {
                 if (i == threadNum - 1) {
                     end = k;
                 }
-                threads.push_back(new std::thread(&PerChannelQuantizationMultiThread, cur, end, m,
+                futures.push_back(pool->Submit(PerChannelQuantizationMultiThread, cur, end, m,
                                                   (float *) oriData, uDatas.data(), configs.data(), bit));
                 cur = end;
             }
             for (int i = 0; i < threadNum; i++) {
-                threads[i]->join();
-                delete threads[i];
+                futures[i].get();
             }
 
             data.perChannelAxis = 0;
