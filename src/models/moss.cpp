@@ -81,8 +81,8 @@ namespace fastllm {
     }
 
     int MOSSModel::Forward(const Data &inputIds, const Data &attentionMask,
-                            const Data &positionIds, const Data &penaltyFactor,
-                            std::vector <std::pair <Data, Data> > &pastKeyValues) {
+                            const Data &positionIds, std::vector <std::pair <Data, Data> > &pastKeyValues,
+                           const GenerationConfig &generationConfig, const LastTokensManager &lastTokens) {
         auto st = std::chrono::system_clock::now();
 
         Data inputEmbeddings;
@@ -171,20 +171,29 @@ namespace fastllm {
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], weight["lm_head.bias"], logits);
 
-        std::vector <std::pair <float, int> > v;
-        int base = logits.dims[logits.dims.size() - 2] - 1;
-        for (int i = 0; i < logits.dims.back(); i++) {
-            v.push_back(std::make_pair(((float*)logits.cpuData)[base * logits.dims.back() + i], i));
+        logits.ToDevice(DataDevice::CPU);
+        int ret = -1;
+        if (generationConfig.IsSimpleGreedy()) {
+            std::vector<std::pair<float, int> > v;
+            int base = logits.dims[logits.dims.size() - 2] - 1;
+            for (int i = 0; i < logits.dims.back(); i++) {
+                v.push_back(std::make_pair(((float *) logits.cpuData)[base * logits.dims.back() + i], i));
+            }
+            std::sort(v.begin(), v.end());
+            std::reverse(v.begin(), v.end());
+            ret = v[0].second;
+        } else {
+            ret = LLMSampling(logits, logits.dims[logits.dims.size() - 2] - 1, generationConfig, lastTokens.units[0]);
         }
-        std::sort(v.begin(), v.end());
-        std::reverse(v.begin(), v.end());
 
         float spend = GetSpan(st, std::chrono::system_clock::now());
         //printf("forward spend %f s.\n", spend);
-        return v[0].second;
+        return ret;
     }
 
-    std::string MOSSModel::Response(const std::string &input, RuntimeResult retCb) {
+    std::string MOSSModel::Response(const std::string &input,
+                                    RuntimeResult retCb,
+                                    const GenerationConfig &generationConfig) {
         Data inputIds = this->weight.tokenizer.Encode(input);
         Data attentionMask = inputIds;
         Data positionIds = inputIds;
@@ -202,8 +211,10 @@ namespace fastllm {
         std::vector<float> results;
         std::string retString = "";
 		int index = 0;
+        LastTokensManager tokens (1, generationConfig.last_n);
         while (true) {
-            int ret = Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
+            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
+            tokens.units[0].Push(ret);
             if (ret == 106068) {
                 break;
             }
@@ -225,6 +236,10 @@ namespace fastllm {
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float) ret}));
             attentionMask.CopyFrom(Data(DataType::FLOAT32, {1, len}, std::vector<float>(len, 1.0f)));
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float) (len - 1)}));
+
+            if (index == generationConfig.output_token_limit) {
+                break;
+            }
         }
 
 		if (retCb)
@@ -233,7 +248,6 @@ namespace fastllm {
 #else
 			retCb(-1, retString.c_str());
 #endif
-        // printf("%s\n", weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str());
         return retString;
     }
 
@@ -245,7 +259,8 @@ namespace fastllm {
         return (round == 0 ? pre_prompt : history) + user_role + input + bot_role + output + history_sep;
     }
 
-    int MOSSModel::LaunchResponseTokens(const std::vector<int> &inputTokens) {
+    int MOSSModel::LaunchResponseTokens(const std::vector<int> &inputTokens,
+                                        const GenerationConfig &generationConfig) {
         ErrorInFastLLM("Unsupport.\n");
         return 0;
     }

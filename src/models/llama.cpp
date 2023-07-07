@@ -50,8 +50,8 @@ namespace fastllm {
     }
 
     int LlamaModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
-                              const fastllm::Data &positionIds, const Data &penaltyFactor,
-                              std::vector<std::pair<Data, Data>> &pastKeyValues) {
+                            const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+                            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens) {
         Data hiddenStates;
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         for (int i = 0; i < block_cnt; i++) {
@@ -162,21 +162,25 @@ namespace fastllm {
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         logits.ToDevice(DataDevice::CPU);
 
-        if (this->do_sample && penaltyFactor.dims == logits.dims) {
-            RepeatPenalty(logits, penaltyFactor);
+
+        int lastRet;
+        if (generationConfig.IsSimpleGreedy()) {
+            std::pair <float, int> ret = std::make_pair(-1e9, -1);
+            int base = logits.dims[1] - 1;
+            for (int i = 0; i < logits.dims.back(); i++) {
+                ret = max(ret, std::make_pair(((float*)logits.cpuData)[base * logits.dims.back() + i], i));
+            }
+            lastRet = ret.second;
+        } else {
+            lastRet = LLMSampling(logits, logits.dims[1] - 1, generationConfig, lastTokens.units[0]);
         }
 
-        std::pair <float, int> ret = std::make_pair(-1e9, -1);
-        int base = logits.dims[1] - 1;
-        for (int i = 0; i < logits.dims.back(); i++) {
-            ret = max(ret, std::make_pair(((float*)logits.cpuData)[base * logits.dims.back() + i], i));
-        }
-        return ret.second;
+        return lastRet;
     }
 
     std::vector <int> LlamaModel::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
-                            const fastllm::Data &positionIds, const Data &penaltyFactor,
-                            std::vector<std::pair<Data, Data>> &pastKeyValues) {
+                            const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+                            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens) {
         Data hiddenStates;
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
 
@@ -287,19 +291,24 @@ namespace fastllm {
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         logits.ToDevice(DataDevice::CPU);
-        if (this->do_sample && penaltyFactor.dims == logits.dims) {
-            // RepeatPenalty(logits, penaltyFactor);
-        }
 
         std::vector <int> lastRet;
-        for (int b = 0; b < batch; b++) {
-            int base = b * logits.dims[1] + logits.dims[1] - 1;
-            std::pair <float, int> ret = std::make_pair(-1e9, -1);
-            for (int i = 0; i < logits.dims.back(); i++) {
-                ret = max(ret, std::make_pair(((float *) logits.cpuData)[base * logits.dims.back() + i], i));
+        if (generationConfig.IsSimpleGreedy()) {
+            for (int b = 0; b < batch; b++) {
+                int base = b * logits.dims[1] + logits.dims[1] - 1;
+                std::pair <float, int> ret = std::make_pair(-1e9, -1);
+                for (int i = 0; i < logits.dims.back(); i++) {
+                    ret = max(ret, std::make_pair(((float *) logits.cpuData)[base * logits.dims.back() + i], i));
+                }
+                lastRet.push_back(ret.second);
             }
-            lastRet.push_back(ret.second);
+        } else {
+            for (int b = 0; b < batch; b++) {
+                int base = b * logits.dims[1] + logits.dims[1] - 1;
+                lastRet.push_back(LLMSampling(logits, base, generationConfig, lastTokens.units[b]));
+            }
         }
+
         return lastRet;
     }
 
@@ -307,9 +316,10 @@ namespace fastllm {
                                                const Data &inputIds,
                                                const std::vector <Data*> &attentionMask,
                                                const std::vector <Data*> &positionIds,
-                                               const std::vector <Data*> &penaltyFactor,
                                                const std::vector <int> &seqLens,
-                                               std::vector <std::pair <Data*, Data*> > &pastKeyValues) {
+                                               std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                                               const std::vector <GenerationConfig> &generationConfigs,
+                                               const LastTokensManager &lastTokens) {
         Data hiddenStates;
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
 
@@ -444,24 +454,29 @@ namespace fastllm {
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         logits.ToDevice(DataDevice::CPU);
-        //if (this->do_sample && penaltyFactor.dims == logits.dims) {
-            // RepeatPenalty(logits, penaltyFactor);
-        //}
 
         std::vector <int> lastRet;
         int total = 0;
         for (int b = 0; b < batch; b++) {
-            int base = (total + seqLens[b] - 1);
-            std::pair <float, int> ret = std::make_pair(-1e9, -1);
-            for (int i = 0; i < logits.dims.back(); i++) {
-                ret = max(ret, std::make_pair(((float *) logits.cpuData)[base * logits.dims.back() + i], i));
+            if (generationConfigs[b].IsSimpleGreedy()) {
+                std::pair<float, int> ret = std::make_pair(-1e9, -1);
+                int base = (total + seqLens[b] - 1);
+                total += seqLens[b];
+                for (int i = 0; i < logits.dims.back(); i++) {
+                    ret = max(ret, std::make_pair(((float *) logits.cpuData)[base * logits.dims.back() + i], i));
+                }
+                lastRet.push_back(ret.second);
+            } else {
+                int base = (total + seqLens[b] - 1);
+                total += seqLens[b];
+                lastRet.push_back(LLMSampling(logits, base, generationConfigs[b], lastTokens.units[b]));
             }
-            lastRet.push_back(ret.second);
         }
         return lastRet;
     }
 
-    std::string LlamaModel::Response(const std::string& input, RuntimeResult retCb) {
+    std::string LlamaModel::Response(const std::string& input, RuntimeResult retCb,
+                                     const GenerationConfig &generationConfig) {
 //auto st = std::chrono::system_clock::now();
         Data inputIds = this->weight.tokenizer.Encode(input);
         std::vector <float> ids;
@@ -495,19 +510,12 @@ namespace fastllm {
         std::vector <float> results;
         int index = 0;
 
-        int vocabSize = this->weight.tokenizer.tokenToStringDict.size();
-        TokenPenaltyManager tokenPenaltyManager;
-        if (this->do_sample) {
-            tokenPenaltyManager.Init(vocabSize, this->last_n, this->repeat_penalty);
-            /*for (int i = std::max(0, (int)ids.size() - this->last_n); i < ids.size(); i++) {
-                tokenPenaltyManager.InsertToken((int)(ids[i] + 1e-6));
-            }*/
-        }
-
+        LastTokensManager tokens (1, generationConfig.last_n);
         while (true) {
             auto st = std::chrono::system_clock::now();
 
-            int ret = Forward(inputIds, attentionMask, positionIds, tokenPenaltyManager.penalty, pastKeyValues);
+            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
+            tokens.units[0].Push(ret);
             if (ret == eos_token_id) {
                 break;
             }
@@ -522,7 +530,7 @@ namespace fastllm {
                 retCb(index++, curString.c_str());
 #endif
 
-            if (index == this->output_token_limit) {
+            if (index == generationConfig.output_token_limit) {
                 break;
             }
             results.clear();
@@ -532,10 +540,13 @@ namespace fastllm {
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)ret}));
             attentionMask = Data();
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)len}));
-            if (do_sample) {
-                tokenPenaltyManager.InsertToken(ret);
-            }
+            //if (do_sample) {
+            //    tokenPenaltyManager.InsertToken(ret);
+            //}
             len++;
+            if (index == generationConfig.output_token_limit) {
+                break;
+            }
 
             //printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         }
@@ -550,7 +561,8 @@ namespace fastllm {
     }
 
     void LlamaModel::ResponseBatch(const std::vector<std::string> &inputs, std::vector<std::string> &outputs,
-                                   RuntimeResultBatch retCb) {
+                                   RuntimeResultBatch retCb,
+                                   const GenerationConfig &generationConfig) {
         int batch = inputs.size();
         outputs.clear();
         outputs.resize(batch, "");
@@ -611,19 +623,14 @@ namespace fastllm {
         std::vector <float> results;
         int index = 0;
 
-        int vocabSize = this->weight.tokenizer.tokenToStringDict.size();
-        TokenPenaltyManager tokenPenaltyManager;
-        this->do_sample = false;
-        if (this->do_sample) {
-            tokenPenaltyManager.Init(vocabSize, this->last_n, this->repeat_penalty);
-            /*for (int i = std::max(0, (int)ids.size() - this->last_n); i < ids.size(); i++) {
-                tokenPenaltyManager.InsertToken((int)(ids[i] + 1e-6));
-            }*/
-        }
-
+        LastTokensManager tokensManager (batch, generationConfig.last_n);
         while (true) {
             auto st = std::chrono::system_clock::now();
-            std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, Data(), pastKeyValues);
+            std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, pastKeyValues,
+                                                 generationConfig, tokensManager);
+            for (int i = 0; i < batch; i++) {
+                tokensManager.units[i].Push(ret[i]);
+            }
             std::vector <float> fret;
             std::vector <float> results;
             int endingCount = 0;
@@ -668,11 +675,8 @@ namespace fastllm {
             attentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, 1, maxLen}, vmasks));
             inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, fret));
             positionIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, pids));
-            if (index == this->output_token_limit) {
+            if (index == generationConfig.output_token_limit) {
                 break;
-            }
-            if (do_sample) {
-                //tokenPenaltyManager.InsertToken(ret);
             }
 
             //printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
@@ -700,11 +704,12 @@ namespace fastllm {
             pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
                                                    Data(DataType::FLOAT32)));
         }
-        Forward(inputIds, attentionMask, positionIds, Data(), pastKeyValues);
+        Forward(inputIds, attentionMask, positionIds, pastKeyValues);
         printf("finish.\n");
     }
 
-    int LlamaModel::LaunchResponseTokens(const std::vector<int> &inputTokens) {
+    int LlamaModel::LaunchResponseTokens(const std::vector<int> &inputTokens,
+                                         const GenerationConfig &generationConfig) {
         mainLoopLocker.lock();
         if (mainLoop == nullptr) {
             if (mainLoop == nullptr) {
@@ -713,13 +718,17 @@ namespace fastllm {
                         std::vector <Data*> attentionMasks;
                         std::vector <Data*> positionIds;
                         std::vector <std::pair <Data*, Data*> > pastKeyValues;
-                        std::vector<float> ids;
-                        std::vector<int> seqLens;
+                        std::vector <float> ids;
+                        std::vector <int> seqLens;
+                        std::vector <GenerationConfig> generationConfigs;
+                        LastTokensManager tokensManager;
                         model->dictLocker.lock();
                         for (auto &it: model->responseContextDict.dicts) {
                             if (it.second->isEnding) {
                                 continue;
                             }
+                            generationConfigs.push_back(it.second->generationConfig);
+                            tokensManager.units.push_back(it.second->tokens);
                             if (it.second->preTokens == 0) {
                                 if (it.second->currentTokens.size() == 0 || it.second->currentTokens[0] != model->bos_token_id) {
                                     it.second->currentTokens.push_back(model->bos_token_id);
@@ -745,10 +754,6 @@ namespace fastllm {
                                 positionIds.push_back(new Data(DataType::FLOAT32, {2, seqLen}, vpids));
                             } else {
                                 int ret = it.second->currentTokens[0];
-                                if (model->do_sample) {
-                                    //it.second->tokenPenaltyManager.InsertToken(ret);
-                                }
-
                                 seqLens.push_back(1);
                                 ids.push_back(ret);
                                 attentionMasks.push_back(nullptr);
@@ -769,8 +774,7 @@ namespace fastllm {
 #endif
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                             std::vector<int> ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
-                                                                       positionIds, std::vector <Data*> (),
-                                                                       seqLens, pastKeyValues);
+                                                                       positionIds, seqLens, pastKeyValues, generationConfigs, tokensManager);
                             int idx = 0;
                             for (auto &it: model->responseContextDict.dicts) {
                                 if (it.second->isEnding) {
@@ -782,6 +786,7 @@ namespace fastllm {
                                 } else {
                                     it.second->currentTokens = std::vector<int>{curRet};
                                     it.second->resultTokenQueue.push(curRet);
+                                    it.second->tokens.Push(curRet);
                                 }
                             }
                         }
@@ -806,6 +811,8 @@ namespace fastllm {
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         context->Init(this->block_cnt);
         context->currentTokens = inputTokens;
+        context->generationConfig = generationConfig;
+        context->tokens = LastTokensUnit(generationConfig.last_n);
         dictLocker.unlock();
         return handleId;
     }
