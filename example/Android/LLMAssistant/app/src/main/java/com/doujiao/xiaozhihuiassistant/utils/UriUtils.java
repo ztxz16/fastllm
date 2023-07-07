@@ -2,6 +2,7 @@ package com.doujiao.xiaozhihuiassistant.utils;
 
 import android.content.ContentUris;
 import android.content.Context;
+import android.content.CursorLoader;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
@@ -9,6 +10,8 @@ import android.os.Environment;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.support.annotation.RequiresApi;
+
+import java.io.File;
 
 public class UriUtils {
     /**
@@ -19,61 +22,87 @@ public class UriUtils {
      * @param context 上下文对象
      * @param uri     Uri
      */
-
-    @RequiresApi(api = Build.VERSION_CODES.KITKAT)
     public static String getPath(Context context, Uri uri) {
-        final boolean isKitKat = Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT;
+        int SDK_INT = Build.VERSION.SDK_INT;
+        if(SDK_INT < Build.VERSION_CODES.HONEYCOMB) {
+            // No longer supported
+            throw new RuntimeException("SDK_INT=" + SDK_INT);
+        } else if(SDK_INT < Build.VERSION_CODES.KITKAT) {
+            return getPathFromUri_API11to18(context, uri);
+        } else // if(SDK_INT >= Build.VERSION_CODES.KITKAT)
+            return getPathFromUri_API19(context, uri);
+    }
 
-        // DocumentProvider
-        if (isKitKat && DocumentsContract.isDocumentUri(context, uri)) {
-            // ExternalStorageProvider
-            if (isExternalStorageDocument(uri)) {
-                final String docId = DocumentsContract.getDocumentId(uri);
-                final String[] split = docId.split(":");
+    private static String getPathFromUri_API11to18(Context context, Uri uri) {
+        String[] projection = {MediaStore.Images.Media.DATA};
+        String result = null;
+
+        CursorLoader cursorLoader = new CursorLoader(context, uri, projection, null, null, null);
+        Cursor cursor = cursorLoader.loadInBackground();
+
+        if(cursor != null) {
+            int column_index = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATA);
+            cursor.moveToFirst();
+            result = cursor.getString(column_index);
+            cursor.close();
+        }
+        return result;
+    }
+
+    @RequiresApi(Build.VERSION_CODES.KITKAT)
+    private static String getPathFromUri_API19(Context context, Uri uri) {
+        String scheme = uri.getScheme();
+        String authority = uri.getAuthority();
+        if(scheme == null)
+            return null;
+
+        // https://stackoverflow.com/questions/18263489/why-doesnt-string-switch-statement-support-a-null-case
+        // https://stackoverflow.com/questions/27251456/start-browser-via-intent-url-with-schema-http-uppercase-error
+        scheme = scheme.toLowerCase();  // For resiliency, since RFC 2396 says scheme names are lowercase.
+
+        if(DocumentsContract.isDocumentUri(context, uri)) {
+            if("com.android.externalstorage.documents".equals(authority)) {  // ExternalStorageProvider
+                final String documentId = DocumentsContract.getDocumentId(uri);
+                final String[] split = documentId.split(":");
                 final String type = split[0];
 
                 if ("primary".equalsIgnoreCase(type)) {
-                    return Environment.getExternalStorageDirectory() + "/" + split[1];
+                    return new File(Environment.getExternalStorageDirectory(), split[1]).getPath();
                 }
-            }
-            // DownloadsProvider
-            else if (isDownloadsDocument(uri)) {
 
+                // TODO handle non-primary volumes
+            } else if("com.android.providers.downloads.documents".equals(authority)) {  // DownloadsProvider
                 final String id = DocumentsContract.getDocumentId(uri);
                 final Uri contentUri = ContentUris.withAppendedId(
                         Uri.parse("content://downloads/public_downloads"), Long.valueOf(id));
-
-                return getDataColumn(context, contentUri, null, null);
-            }
-            // MediaProvider
-            else if (isMediaDocument(uri)) {
-                final String docId = DocumentsContract.getDocumentId(uri);
-                final String[] split = docId.split(":");
+                return getDataColumn(context, uri, null/* selection*/, null/* selectionArgs */);
+            } else if("com.android.providers.media.documents".equals(authority)) {  // MediaProvider
+                final String documentId = DocumentsContract.getDocumentId(uri);
+                final String[] split = documentId.split(":");
                 final String type = split[0];
 
-                Uri contentUri = null;
-                if ("image".equals(type)) {
+                final Uri contentUri;
+                if("image".equals(type)) {
                     contentUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI;
-                } else if ("video".equals(type)) {
+                } else if("video".equals(type)) {
                     contentUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI;
-                } else if ("audio".equals(type)) {
+                } else if("audio".equals(type)) {
                     contentUri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
+                } else {
+                    contentUri = null;
                 }
 
                 final String selection = "_id=?";
-                final String[] selectionArgs = new String[]{
-                        split[1]
-                };
-
+                final String[] selectionArgs = new String[] { split[1] };
                 return getDataColumn(context, contentUri, selection, selectionArgs);
             }
-        }
-        // MediaStore (and general)
-        else if ("content".equalsIgnoreCase(uri.getScheme())) {
-            return getDataColumn(context, uri, null, null);
-        }
-        // File
-        else if ("file".equalsIgnoreCase(uri.getScheme())) {
+        } else if("content".equals(scheme)) {  //  MediaStore for most cases
+            // content://com.google.android.apps.photos.contentprovider/0/1/content%3A%2F%2Fmedia%2Fexternal%2Fimages%2Fmedia%2F75209/ACTUAL
+            if ("com.google.android.apps.photos.contentprovider".equals(uri.getAuthority()))
+                return uri.getLastPathSegment();
+            else
+                return getDataColumn(context, uri, null/* selection*/, null/* selectionArgs */);
+        } else if("file".equals(scheme)) {  // file
             return uri.getPath();
         }
 
@@ -81,8 +110,8 @@ public class UriUtils {
     }
 
     /**
-     * Get the value of the data column for this Uri. This is useful for
-     * MediaStore Uris, and other file-based ContentProviders.
+     * Get the value of the data column for this Uri. This is useful for MediaStore Uris, and other
+     * file-based ContentProviders.
      *
      * @param context       The context.
      * @param uri           The Uri to query.
@@ -90,59 +119,21 @@ public class UriUtils {
      * @param selectionArgs (Optional) Selection arguments used in the query.
      * @return The value of the _data column, which is typically a file path.
      */
-
-    public static String getDataColumn(Context context, Uri uri, String selection,
-                                       String[] selectionArgs) {
-
-        Cursor cursor = null;
-        final String column = "_data";
-        final String[] projection = {
-                column
-        };
-
-        try {
-            cursor = context.getContentResolver().query(uri, projection, selection, selectionArgs,
-                    null);
-            if (cursor != null && cursor.moveToFirst()) {
-                final int column_index = cursor.getColumnIndexOrThrow(column);
-                return cursor.getString(column_index);
-            }
-        } finally {
-            if (cursor != null)
-                cursor.close();
+    private static String getDataColumn(Context context, Uri uri, String selection, String[] selectionArgs) {
+        // Though MediaStore.Video.Media.DATA is used here, actually "_data" is the key. So DATA
+        // here can be MediaStore.Images.Media.DATA or MediaStore.Audio.Media.DATA, etc.
+        final String DATA = MediaStore.Video.Media.DATA;
+        final String[] projection = { DATA };
+        Cursor cursor = context.getContentResolver().query(uri, projection, selection, selectionArgs, null/* sortOrder */);
+        if(cursor != null) {
+            cursor.moveToFirst();
+            int index = cursor.getColumnIndex(DATA);
+//			if(index >= 0)
+            String data = cursor.getString(index);
+            cursor.close();
+            return data;
         }
         return null;
-    }
-
-
-    /**
-     * @param uri The Uri to check.
-     * @return Whether the Uri authority is ExternalStorageProvider.
-     */
-
-    public static boolean isExternalStorageDocument(Uri uri) {
-        return "com.android.externalstorage.documents".equals(uri.getAuthority());
-    }
-
-    /**
-     * @param uri The Uri to check.
-     * @return Whether the Uri authority is DownloadsProvider.
-     */
-
-
-    public static boolean isDownloadsDocument(Uri uri) {
-        return "com.android.providers.downloads.documents".equals(uri.getAuthority());
-    }
-
-    /**
-     * @param uri The Uri to check.
-     * @return Whether the Uri authority is MediaProvider.
-     */
-
-
-
-    public static boolean isMediaDocument(Uri uri) {
-        return "com.android.providers.media.documents".equals(uri.getAuthority());
     }
 
 }

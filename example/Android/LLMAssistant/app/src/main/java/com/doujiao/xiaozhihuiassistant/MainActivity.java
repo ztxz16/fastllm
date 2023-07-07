@@ -16,6 +16,7 @@ import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
 import android.support.v7.widget.LinearLayoutManager;
 import android.support.v7.widget.RecyclerView;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
@@ -76,11 +77,16 @@ public class MainActivity extends AppCompatActivity {
                 }
                     break;
                 case MSG_TYPE_INITMODEL_END:
-                    sendBtn.setEnabled(true);
-                    mInputEt.setText("");
-                    mTvTips.setText(PrefUtil.getModelPath());
-                    Toast.makeText(getApplicationContext(),"模型加载完成",Toast.LENGTH_SHORT).show();
-                    mIsInit = true;
+                    String model = (String)msg.obj;
+                    if (TextUtils.isEmpty(model)) {
+                        Toast.makeText(getApplicationContext(), "模型不正确！请下载正确模型。", Toast.LENGTH_SHORT).show();
+                    } else {
+                        sendBtn.setEnabled(true);
+                        mInputEt.setText("");
+                        mTvTips.setText(PrefUtil.getModelPath());
+                        Toast.makeText(getApplicationContext(), "欢迎使用:"+model, Toast.LENGTH_SHORT).show();
+                        mIsInit = true;
+                    }
                     break;
             }
         }
@@ -114,7 +120,7 @@ public class MainActivity extends AppCompatActivity {
                 @Override
                 public void run() {
                     String path = PrefUtil.getModelPath();//Environment.getExternalStorageDirectory().getAbsolutePath() + "/chatglm-6b-int4.bin";
-                    AssistantCore.getInstance().initLLM(path, new AssistantCore.runtimeResult() {
+                    String modelType = AssistantCore.getInstance().initLLM(path, new AssistantCore.runtimeResult() {
                         @Override
                         public void callbackResult(int index, String content) {
                             Message msg = Message.obtain();
@@ -124,7 +130,11 @@ public class MainActivity extends AppCompatActivity {
                             mHandler.sendMessage(msg);
                         }
                     });
-                    mHandler.sendEmptyMessage(MSG_TYPE_INITMODEL_END);
+                    Log.d("@@@","model:"+modelType);
+                    Message msg = Message.obtain();
+                    msg.obj = modelType;
+                    msg.what = MSG_TYPE_INITMODEL_END;
+                    mHandler.sendMessage(msg);
                 }
             }).start();
         } else {
