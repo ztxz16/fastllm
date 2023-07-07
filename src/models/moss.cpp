@@ -223,13 +223,13 @@ namespace fastllm {
             std::string current = weight.tokenizer.Decode(
                     Data(DataType::FLOAT32, {(int) results.size()}, results)).c_str();
             retString += current;
-            index++;
 			if (retCb)
 #ifdef PY_API
 				retCb(index, pybind11::bytes(retString));
 #else
 				retCb(index, current.c_str());
 #endif
+            index++;
             fflush(stdout);
             results.clear();
 
