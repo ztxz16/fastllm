@@ -29,6 +29,67 @@ namespace fastllm {
     bool GetKVCacheInCPU();
     ThreadPool *GetPool();
 
+    struct GenerationConfig {
+        int output_token_limit = -1; // 最多输出多少, <= 0代表无限制
+        int last_n = 64; // 末尾last_n个token计入重复惩罚
+        float repeat_penalty = 1.0f; // 重复惩罚系数，1.0代表不惩罚
+        int top_k = 1; // top_k采样
+        float top_p = 1.0; // top_p采样
+        float temperature = 1.0; // 温度参数，一般在0.1 ~ 1.0之间，设大这个参数可以带来结果的多样性
+
+        bool IsSimpleGreedy() const {
+            if (fabs(repeat_penalty - 1) > 1e-8) {
+                return false;
+            }
+            if (top_k > 1) {
+                return false;
+            }
+            return true;
+        }
+    };
+
+    struct LastTokensUnit {
+        int tot = 0;
+        std::multiset <int> tokenSet;
+        std::queue <int> tokenQueue;
+
+        LastTokensUnit () {}
+
+        LastTokensUnit (int tot) {
+            Init(tot);
+        }
+
+        void Init(int tot) {
+            this->tot = tot;
+            tokenSet.clear();
+            while (tokenQueue.size() > 0) {
+                tokenQueue.pop();
+            }
+        }
+
+        void Push(int id) {
+            if (tokenQueue.size() == tot) {
+                tokenSet.erase(tokenSet.find(tokenQueue.front()));
+                tokenQueue.pop();
+            }
+            tokenQueue.push(id);
+            tokenSet.insert(id);
+        }
+    };
+
+    struct LastTokensManager {
+        std::vector <LastTokensUnit> units;
+
+        LastTokensManager () {}
+
+        LastTokensManager (int batch, int lastN) {
+            units.resize(batch);
+            for (int i = 0; i < batch; i++) {
+                units[i].Init(lastN);
+            }
+        }
+    };
+
     struct LowBitConfig {
         int bit;
         float min, max;
@@ -219,19 +280,8 @@ namespace fastllm {
         Data &operator [] (const std::string &key);
     };
 
-    struct TokenPenaltyManager {
-        Data penalty = Data();
-        std::map <int, int> cnt;
-        std::queue <int> q;
-        int vocabSize, lastN;
-        float value;
-
-        void Init (int vocabSize, int lastN, float value);
-
-        void Clear();
-
-        void InsertToken(int token);
-    };
+    int LLMSampling(Data &logits, int outerOffset,
+                    const GenerationConfig &config, const LastTokensUnit &tokens); // 对logits里[outerOffset * vocabSize, (outerOffset + 1) * vocabSize]做Sampling
 
     void Embedding(const Data &input, Data &weight, Data &output);
 
