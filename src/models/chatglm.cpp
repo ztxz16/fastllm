@@ -584,11 +584,12 @@ namespace fastllm {
             results.push_back(ret);
             std::string curString = weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str();
             retString += curString;
+            index++;
 			if (retCb)
 #ifdef PY_API
-				retCb(index++, pybind11::bytes(retString));
+				retCb(index, pybind11::bytes(retString));
 #else
-				retCb(index++, curString.c_str());
+				retCb(index, curString.c_str());
 #endif
             fflush(stdout);
             results.clear();
@@ -752,8 +753,9 @@ namespace fastllm {
             if (endingCount == batch) {
                 break;
             }
+            index++;
             if (retCb)
-                retCb(index++, curStrings);
+                retCb(index, curStrings);
 
             len++;
             std::vector <float> pids = std::vector <float> (batch * 2);
@@ -923,6 +925,10 @@ namespace fastllm {
                                     it.second->currentTokens = std::vector<int>{curRet};
                                     it.second->resultTokenQueue.push(curRet);
                                     it.second->tokens.Push(curRet);
+                                    it.second->curTokens++;
+                                    if (it.second->curTokens == it.second->generationConfig.output_token_limit) {
+                                        it.second->isEnding = true;
+                                    }
                                 }
                             }
                         }
