@@ -130,7 +130,7 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("response", &fastllm::ChatGLMModel::Response)
     .def("batch_response", &fastllm::ChatGLMModel::ResponseBatch)
     .def("warmup", &fastllm::ChatGLMModel::WarmUp)
-    .def("__call__",
+    /*.def("__call__",
         [](fastllm::ChatGLMModel &model, 
            const fastllm::Data &inputIds, 
            const fastllm::Data &attentionMask,
@@ -139,7 +139,7 @@ PYBIND11_MODULE(pyfastllm, m) {
            std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues) {
           int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
           return std::make_tuple(retV, pastKeyValues);
-    })
+    })*/
     .def("launch_response", &fastllm::ChatGLMModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::ChatGLMModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::ChatGLMModel::SaveLowBitModel);
@@ -154,7 +154,7 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("load_weights", &fastllm::MOSSModel::LoadFromFile)
     .def("response", &fastllm::MOSSModel::Response)
     .def("batch_response", &fastllm::MOSSModel::ResponseBatch)
-    .def("__call__",
+    /*.def("__call__",
         [](fastllm::MOSSModel &model, 
            const fastllm::Data &inputIds, 
            const fastllm::Data &attentionMask,
@@ -163,7 +163,7 @@ PYBIND11_MODULE(pyfastllm, m) {
            std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues) {
           int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
           return std::make_tuple(retV, pastKeyValues);
-    })
+    })*/
     .def("launch_response", &fastllm::MOSSModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::MOSSModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::MOSSModel::SaveLowBitModel);
@@ -179,7 +179,7 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("response", &fastllm::LlamaModel::Response)
     .def("batch_response", &fastllm::LlamaModel::ResponseBatch)
     .def("warmup", &fastllm::LlamaModel::WarmUp)
-    .def("__call__",
+    /*.def("__call__",
         [](fastllm::LlamaModel &model, 
            const fastllm::Data &inputIds, 
            const fastllm::Data &attentionMask,
@@ -188,7 +188,7 @@ PYBIND11_MODULE(pyfastllm, m) {
            std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues) {
           int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
           return std::make_tuple(retV, pastKeyValues);
-    })
+    })*/
     .def("launch_response", &fastllm::LlamaModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::LlamaModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::LlamaModel::SaveLowBitModel);
