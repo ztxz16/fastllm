@@ -1,9 +1,7 @@
 #include <jni.h>
 #include <string>
-#include <android/log.h>
-
 #include "LLMChat.h"
-#define  LOG_Debug(...)  __android_log_print(ANDROID_LOG_DEBUG, "Assistant", __VA_ARGS__)
+
 
 JavaVM *g_javaVM = NULL;
 jobject g_obj;
@@ -53,18 +51,18 @@ void chatCb(int index,const char* content) {
     env = NULL;
 }
 
-extern "C" JNIEXPORT jint JNICALL
+extern "C" JNIEXPORT jstring JNICALL
 Java_com_doujiao_core_AssistantCore_initLLMConfig(
         JNIEnv* env,
         jobject obj,
-        jint modeltype,
         jstring modelpath,
         jint threads) {
     initGvm(env,obj);
     const char *path = env->GetStringUTFChars(modelpath, NULL);
-    int ret =  initGptConf(modeltype,path,threads);
+    std::string ret =  initGptConf(path,threads);
+    LOG_Debug("@@@initLLMConfig:%s",ret.c_str());
     env->ReleaseStringUTFChars( modelpath, path);
-    return ret;
+    return env->NewStringUTF(ret.c_str());
 }
 
 extern "C" JNIEXPORT jint JNICALL
