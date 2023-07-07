@@ -49,8 +49,6 @@ namespace fastllm {
             model->user_role = "<human>:";
             model->bot_role = "\n<bot>:";
             model->history_sep = "\n";
-            model->do_sample = true;
-            model->repeat_penalty = 1.1;
         } else if (modelType == "llama") {
             model = (basellm*)(new LlamaModel());
         } else {

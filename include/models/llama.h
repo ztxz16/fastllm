@@ -20,33 +20,40 @@ namespace fastllm {
                 const Data &inputIds,
                 const Data &attentionMask,
                 const Data &positionIds,
-                const Data &penaltyFactor,
-                std::vector <std::pair <Data, Data> > &pastKeyValues);
+                std::vector <std::pair <Data, Data> > &pastKeyValues,
+                const GenerationConfig &generationConfig = GenerationConfig(),
+                const LastTokensManager &lastTokens = LastTokensManager());
 
         std::vector <int> ForwardBatch(
                 int batch,
                 const Data &inputIds,
                 const Data &attentionMask,
                 const Data &positionIds,
-                const Data &penaltyFactor,
-                std::vector <std::pair <Data, Data> > &pastKeyValues);
+                std::vector <std::pair <Data, Data> > &pastKeyValues,
+                const GenerationConfig &generationConfig = GenerationConfig(),
+                const LastTokensManager &lastTokens = LastTokensManager());
 
         std::vector <int> ForwardBatch(
                 int batch,
                 const Data &inputIds,
                 const std::vector <Data*> &attentionMask,
                 const std::vector <Data*> &positionIds,
-                const std::vector <Data*> &penaltyFactor,
                 const std::vector <int> &seqLens,
-                std::vector <std::pair <Data*, Data*> > &pastKeyValues);
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager());
 
-        virtual std::string Response(const std::string& input, RuntimeResult retCb); // 根据给出的内容回复
+        virtual std::string Response(const std::string& input,
+                                     RuntimeResult retCb,
+                                     const GenerationConfig &generationConfig = GenerationConfig()); // 根据给出的内容回复
 
         virtual void ResponseBatch(const std::vector <std::string> &inputs,
                                    std::vector <std::string> &outputs,
-                                   RuntimeResultBatch retCb);
+                                   RuntimeResultBatch retCb,
+                                   const GenerationConfig &generationConfig = GenerationConfig());
 
-        virtual int LaunchResponseTokens(const std::vector <int> &inputTokens); // 启动一个response任务，返回分配的handleId
+        virtual int LaunchResponseTokens(const std::vector <int> &inputTokens,
+                                         const GenerationConfig &generationConfig = GenerationConfig()); // 启动一个response任务，返回分配的handleId
 
         virtual int FetchResponseTokens(int handelId); // 获取指定handle的输出, -1代表输出结束了
 

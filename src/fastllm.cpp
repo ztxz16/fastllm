@@ -723,6 +723,62 @@ namespace fastllm {
         return DecodeTokens(tokens);
     }
 
+    struct Random {
+        Random () {
+            srand(time(NULL));
+        }
+
+        float randP() {
+            return (float)(rand() % 10001) * 0.0001;
+        }
+    };
+
+    Random fastllmRandom;
+
+    int LLMSampling(Data &logits, int outerOffset,
+                    const GenerationConfig &config, const LastTokensUnit &tokens) {
+        logits.ToDevice(DataDevice::CPU);
+        int vocabSize = logits.dims.back();
+        float *base = ((float*)logits.cpuData) + outerOffset * vocabSize;
+
+        if (fabs(config.repeat_penalty - 1.0) > 1e-6) {
+            for (int id : tokens.tokenSet) {
+                base[id] = (base[id] < 0 ? base[id] * config.repeat_penalty : base[id] / config.repeat_penalty);
+            }
+        }
+        float invTemp = 1.0f / config.temperature;
+        std::vector <std::pair <float, int> > v;
+        for (int i = 0; i < vocabSize; i++) {
+            v.push_back(std::make_pair(-base[i] * invTemp, i));
+        }
+        int topk = std::min(vocabSize, config.top_k);
+        std::partial_sort(v.begin(), v.begin() + topk, v.end());
+        float psum = 0.0, maxValue = -v.begin()->first;
+        std::vector <float> ps;
+        for (int i = 0; i < topk; i++) {
+            ps.push_back(expf(-v[i].first - maxValue));
+            psum += ps.back();
+        }
+        float curSum = 0.0;
+        for (int i = 0; i < topk; i++) {
+            ps[i] /= psum;
+            curSum += ps[i];
+            if (curSum > config.top_p) {
+                topk = i + 1;
+                break;
+            }
+        }
+        float rnd = fastllmRandom.randP();
+        curSum = 0.0;
+        for (int i = 0; i < topk; i++) {
+            curSum += ps[i];
+            if (curSum > rnd || i == topk - 1) {
+                return v[i].second;
+            }
+        }
+        return -1;
+    }
+
     void WeightMap::LoadFromFile(const std::string &fileName) {
         FileBuffer buffer(fileName);
         this->versionId = buffer.ReadInt();
@@ -1033,37 +1089,6 @@ namespace fastllm {
 
     Data &WeightMap::operator[](const std::string &key) {
         return weight[key];
-    }
-
-    void TokenPenaltyManager::Init(int vocabSize, int lastN, float value) {
-        this->vocabSize = vocabSize;
-        this->lastN = lastN;
-        this->value = value;
-        this->Clear();
-    }
-
-    void TokenPenaltyManager::Clear() {
-        cnt.clear();
-        while (!q.empty()) {
-            q.pop();
-        }
-        penalty.CopyFrom(Data(DataType::FLOAT32, {1, 1, vocabSize}, std::vector <float> (vocabSize, 1.0f)));
-    }
-
-    void TokenPenaltyManager::InsertToken(int token) {
-        if (q.size() >= this->lastN) {
-            int now = q.front();
-            if ((--cnt[now]) == 0) {
-                cnt.erase(now);
-                ((float*)penalty.cpuData)[now] = 1.0f;
-            }
-            q.pop();
-        }
-
-        q.push(token);
-        if ((++cnt[token]) == 1) {
-            ((float *) penalty.cpuData)[token] = this->value;
-        }
     }
 
     void Embedding(const Data &input, Data &weight, Data &output) {
