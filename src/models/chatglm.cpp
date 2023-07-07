@@ -584,13 +584,13 @@ namespace fastllm {
             results.push_back(ret);
             std::string curString = weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str();
             retString += curString;
-            index++;
 			if (retCb)
 #ifdef PY_API
 				retCb(index, pybind11::bytes(retString));
 #else
 				retCb(index, curString.c_str());
 #endif
+            index++;
             fflush(stdout);
             results.clear();
 
@@ -753,10 +753,9 @@ namespace fastllm {
             if (endingCount == batch) {
                 break;
             }
-            index++;
             if (retCb)
                 retCb(index, curStrings);
-
+            index++;
             len++;
             std::vector <float> pids = std::vector <float> (batch * 2);
             for (int i = 0; i < batch; i++) {
