@@ -10,18 +10,39 @@ cmake_minimum_required(VERSION 3.10.2)
 project("assistant")
 set(CMAKE_BUILD_TYPE "Release")
 
+option(USE_CUDA "use cuda" OFF)
+
+option(PY_API "python api" OFF)
+
 #可以注释掉下面优化选项
 add_definitions(${CMAKE_CXX_FLAGS} "${CMAKE_CXX_FLAGS} -march=armv8.2a+dotprod")
 
-file(GLOB_RECURSE NANODET_SOURCE ../../../../../../../src/*.cpp)
+#file(GLOB_RECURSE NANODET_SOURCE ../../../../../../../src/*.cpp
+#                                 ../../../../../../../src/devices/cpu/*.cpp
+#                                 ../../../../../../../src/models/*.cpp)
+#
+#set(PROJECT_SOURCE
+#        ${NANODET_SOURCE}
+#        )
 
 set(PROJECT_SOURCE
-        ${NANODET_SOURCE}
+        ../../../../../../../src/fastllm.cpp
+        ../../../../../../../src/device.cpp
+        ../../../../../../../src/model.cpp
+        ../../../../../../../src/executor.cpp
+        ../../../../../../../src/devices/cpu/cpudevice.cpp
+        ../../../../../../../src/models/chatglm.cpp
+        ../../../../../../../src/models/moss.cpp
+        ../../../../../../../src/models/llama.cpp
+        ../../../../../../../src/models/basellm.cpp
         )
 
 include_directories(
         ./
-        ../../../../../../../include)
+        ../../../../../../../include
+        ../../../../../../../include/models
+        ../../../../../../../include/utils
+        ../../../../../../../include/devices/cpu)
 
 add_library( # Sets the name of the library.
         assistant
@@ -52,6 +73,6 @@ target_link_libraries( # Specifies the target library.
         # included in the NDK.
         ${log-lib})
 
-add_executable(main main.cpp ../../../../../../../src/fastllm.cpp
-        ../../../../../../../src/chatglm.cpp
-        ../../../../../../../src/moss.cpp)
+#add_executable(main main.cpp ../../../../../../../src/fastllm.cpp
+#        ../../../../../../../src/chatglm.cpp
+#        ../../../../../../../src/moss.cpp)
