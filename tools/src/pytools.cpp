@@ -28,6 +28,19 @@ extern "C" {
         return svalue;
     }
 
+    fastllm::GenerationConfig make_config(int max_length, bool do_sample, float top_p, int top_k,
+                                          float temperature, float repeat_penalty) {
+        fastllm::GenerationConfig config;
+        config.output_token_limit = max_length;
+        config.temperature = temperature;
+        config.repeat_penalty = repeat_penalty;
+        if (do_sample) {
+            config.top_p = top_p;
+            config.top_k = top_k;
+        }
+        return config;
+    }
+
     int create_llm_model(char *path) {
         models.locker.lock();
         int id = models.models.size();
@@ -100,21 +113,26 @@ extern "C" {
         return string_to_chars(model->MakeHistory(history, round, input, output));
     }
 
-    char *response_str_llm_model(int modelId, char *content) {
+    char *response_str_llm_model(int modelId, char *content,
+                                 int max_length, bool do_sample, float top_p, int top_k,
+                                 float temperature, float repeat_penalty) {
         auto model = models.GetModel(modelId);
-        std::string s = model->Response(content, nullptr);
+        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty);
+        std::string s = model->Response(content, nullptr, config);
         return string_to_chars(s);
     }
 
-    int launch_response_str_llm_model(int modelId, char *content) {
+    int launch_response_str_llm_model(int modelId, char *content,
+                                      int max_length, bool do_sample, float top_p, int top_k,
+                                      float temperature, float repeat_penalty) {
         auto model = models.GetModel(modelId);
         std::vector <int> tokens;
         auto v = model->weight.tokenizer.Encode(content);
         for (int i = 0; i < v.Count(0); i++) {
             tokens.push_back((int)((float*)v.cpuData)[i]);
         }
-
-        return model->LaunchResponseTokens(tokens);
+        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty);
+        return model->LaunchResponseTokens(tokens, config);
     }
 
     char *fetch_response_str_llm_model(int modelId, int handleId) {
@@ -124,13 +142,16 @@ extern "C" {
         return string_to_chars(s);
     }
 
-    int launch_response_llm_model(int modelId, int len, int *values) {
+    int launch_response_llm_model(int modelId, int len, int *values,
+                                  int max_length, bool do_sample, float top_p, int top_k,
+                                  float temperature, float repeat_penalty) {
         std::vector <int> input;
         for (int i = 0; i < len; i++) {
             input.push_back(values[i]);
         }
+        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty);
         auto model = models.GetModel(modelId);
-        return model->LaunchResponseTokens(input);
+        return model->LaunchResponseTokens(input, config);
     }
 
     int fetch_response_llm_model(int modelId, int handleId) {
