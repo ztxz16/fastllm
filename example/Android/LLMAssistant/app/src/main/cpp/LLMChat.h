@@ -8,10 +8,14 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-typedef void(* RuntimeResult)(int index,const char* content);
 
-int initGptConf(int model,const char* modelPath,int threads);
-int chat(const char* prompt, RuntimeResult chatCallback);
+#include <android/log.h>
+#define  LOG_Debug(...)  __android_log_print(ANDROID_LOG_DEBUG, "Assistant", __VA_ARGS__)
+
+typedef void(* RuntimeResultMobile)(int index,const char* content);
+
+std::string initGptConf(const char* modelPath,int threads);
+int chat(const char* prompt, RuntimeResultMobile chatCallback);
 void uninitLLM();
 
 #ifdef __cplusplus

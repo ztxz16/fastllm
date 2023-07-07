@@ -21,9 +21,9 @@ public class AssistantCore {
         return instance;
     }
 
-    public int initLLM(String path,runtimeResult callback) {
+    public String initLLM(String path,runtimeResult callback) {
         mRuntimeRes = callback;
-        return initLLMConfig(0,path,8);
+        return initLLMConfig(path,8);
     }
 
     @Keep
@@ -38,7 +38,7 @@ public class AssistantCore {
         void callbackResult(int index,String content);
     }
 
-    private native int initLLMConfig(int type,String path,int threads);
+    private native String initLLMConfig(String path,int threads);
     public native int chat(String prompt);
     public native int uninitLLM();
 }
