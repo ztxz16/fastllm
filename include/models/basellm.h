@@ -23,6 +23,7 @@ namespace fastllm {
         LastTokensUnit tokens;
 
         int preTokens = 0;
+        int curTokens = 0;
         std::map <std::string, int> intParams;
 
         void Init(int blocks);
