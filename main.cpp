@@ -12,9 +12,13 @@ void Usage() {
 	std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
 	std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
 	std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
+    std::cout << "<--top_p> <args>:             采样参数top_p" << std::endl;
+    std::cout << "<--top_k> <args>:             采样参数top_k" << std::endl;
+    std::cout << "<--temperature> <args>:       采样参数温度，越高结果越不固定" << std::endl;
+    std::cout << "<--repeat_penalty> <args>:    采样参数重复惩罚" << std::endl;
 }
 
-void ParseArgs(int argc, char **argv, RunConfig &config) {
+void ParseArgs(int argc, char **argv, RunConfig &config, fastllm::GenerationConfig &generationConfig) {
 	std::vector <std::string> sargv;
 	for (int i = 0; i < argc; i++) {
 		sargv.push_back(std::string(argv[i]));
@@ -31,6 +35,14 @@ void ParseArgs(int argc, char **argv, RunConfig &config) {
 			config.lowMemMode = true;
 		} else if (sargv[i] == "-m" || sargv[i] == "--model") {
             i++;
+        } else if (sargv[i] == "--top_p") {
+            generationConfig.top_p = atof(sargv[++i].c_str());
+        } else if (sargv[i] == "--top_k") {
+            generationConfig.top_k = atof(sargv[++i].c_str());
+        } else if (sargv[i] == "--temperature") {
+            generationConfig.temperature = atof(sargv[++i].c_str());
+        } else if (sargv[i] == "--repeat_penalty") {
+            generationConfig.repeat_penalty = atof(sargv[++i].c_str());
         } else {
 			Usage();
 			exit(-1);
@@ -43,7 +55,8 @@ int main(int argc, char **argv) {
     std::string history = "";
 
     RunConfig config;
-	ParseArgs(argc, argv, config);
+    fastllm::GenerationConfig generationConfig;
+	ParseArgs(argc, argv, config, generationConfig);
 
     fastllm::SetThreads(config.threads);
     fastllm::SetLowMemMode(config.lowMemMode);
@@ -75,7 +88,7 @@ int main(int argc, char **argv) {
             if (index == -1) {
                 printf("\n");
             }
-        });
+        }, generationConfig);
         history = model->MakeHistory(history, round, input, ret);
         round++;
     }
