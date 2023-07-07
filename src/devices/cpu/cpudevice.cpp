@@ -636,11 +636,9 @@ namespace fastllm {
             uint8_t *inputStart = a + block * m;
 
             for (int i = 0; i < k; i++) {
-                int value = 0;
                 uint8_t *inputWalk = inputStart;
 
                 c[block * kstride + i] = DotU8U8(inputWalk, weightWalk, m);
-                inputWalk += m;
                 weightWalk += m;
             }
         }
