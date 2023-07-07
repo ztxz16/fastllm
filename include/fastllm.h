@@ -256,7 +256,7 @@ namespace fastllm {
     std::string GetModelTypeFromFile(const std::string &fileName);
 
     struct WeightMap {
-        int versionId;
+        int versionId = 2;
 
         Tokenizer tokenizer;
 
