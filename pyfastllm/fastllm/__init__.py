@@ -1,2 +1,2 @@
 from pyfastllm import *
-from . import convert 
+from . import utils

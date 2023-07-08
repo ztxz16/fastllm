@@ -50,7 +50,7 @@ def response(model, prompt_input:str, stream_output:bool=False):
     penalty_factor = fastllm.Tensor()
 
     while True:
-        ret, pastKeyValues = model(input_ids, attention_mask, position_ids, penalty_factor, pastKeyValues)
+        ret, pastKeyValues = model.forward(input_ids, attention_mask, position_ids, penalty_factor, pastKeyValues)
         if ret == eos_token_id:
             break
 
@@ -79,14 +79,10 @@ def response(model, prompt_input:str, stream_output:bool=False):
 
 LLM_TYPE = ""
 def print_back(idx:int, content: str):
-    if idx == 0:
-        print(f"{LLM_TYPE}:{content}", end='')
-    elif idx > 0:
-        print(f"{content}", end='')
+    if idx >= 0:
+        print(f"\r{LLM_TYPE}:{content}", end='', flush=True)
     elif idx == -1:
         print()
-
-    sys.stdout.flush()
 
 def main(args):
     model_path = args.path
