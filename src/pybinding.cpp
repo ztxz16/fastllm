@@ -9,11 +9,12 @@
 
 namespace py = pybind11;
 using namespace pybind11::literals;  
-#endif
+
+// template <typename... Args>
+// using overload_cast_ = pybind11::detail::overload_cast_impl<Args...>;
 
 
-#ifdef PY_API
-
+using pastKV = std::vector<std::pair<fastllm::Data,fastllm::Data>>;
 // PYBIND11_MAKE_OPAQUE(std::vector<std::pair<fastllm::Data,fastllm::Data>>);
 PYBIND11_MAKE_OPAQUE(fastllm::Data);
 
@@ -61,7 +62,6 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("print", &fastllm::Data::Print)
     .def("to", static_cast<void (fastllm::Data::*)(void *device)>(&fastllm::Data::ToDevice));
 
-
   m.def("zeros", [](const std::vector<int> &dims, fastllm::DataType dtype)->fastllm::Data {
     int nums = 1;
     for (auto dim:dims){nums *= dim; } 
@@ -101,19 +101,31 @@ PYBIND11_MODULE(pyfastllm, m) {
      int seqLen = vecData.size();
      return fastllm::Data(fastllm::DataType::FLOAT32, {1, seqLen}, vecData);
   });
-  
-  py::class_<fastllm::WeightMap>(m, "WeightMap")
-    .def_readonly("tokenizer", &fastllm::WeightMap::tokenizer);
+
 
   py::class_<fastllm::Tokenizer>(m, "Tokenizer")
     .def("encode", &fastllm::Tokenizer::Encode)
-    .def("decode", &fastllm::Tokenizer::Decode)
+    // .def("decode", &fastllm::Tokenizer::Decode)
+    .def("decode", &fastllm::Tokenizer::Decode, "Decode from Tensor")
+    .def("decode", &fastllm::Tokenizer::DecodeTokens, "Decode from Vector")
     .def("decode_byte", [](fastllm::Tokenizer &tokenizer, const fastllm::Data &data){
       std::string ret = tokenizer.Decode(data);
       return py::bytes(ret);
-    });
-    // .def("clear", &fastllm::Tokenizer::Clear)
-    // .def("insert", &fastllm::Tokenizer::Insert);
+    })
+    .def("decode_byte", [](fastllm::Tokenizer &tokenizer, const std::vector<int>& data){
+      std::string ret = tokenizer.DecodeTokens(data);
+      return py::bytes(ret);
+    })
+    .def("clear", &fastllm::Tokenizer::Clear)
+    .def("insert", &fastllm::Tokenizer::Insert);
+  
+  py::class_<fastllm::WeightMap>(m, "WeightMap")
+    .def_readonly("tokenizer", &fastllm::WeightMap::tokenizer)
+    .def("save_lowbit", &fastllm::WeightMap::SaveLowBitModel)
+    .def("set_kv", &fastllm::WeightMap::AddDict)
+    .def("set_weight", &fastllm::WeightMap::AddWeight)
+    .def("__getitem__", [](fastllm::WeightMap &weight, std::string key){
+        return weight[key]; });
 
 
   // model classes
@@ -128,18 +140,25 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("eos_token_id", &fastllm::ChatGLMModel::eos_token_id)
     .def("load_weights", &fastllm::ChatGLMModel::LoadFromFile)
     .def("response", &fastllm::ChatGLMModel::Response)
-    .def("batch_response", &fastllm::ChatGLMModel::ResponseBatch)
+    .def("batch_response", [](fastllm::ChatGLMModel &model, 
+                              const std::vector <std::string> &inputs,
+                               RuntimeResultBatch retCb)->std::vector<std::string> {
+      std::vector <std::string> outputs;
+      model.ResponseBatch(inputs, outputs, retCb);
+      return outputs;
+    })
     .def("warmup", &fastllm::ChatGLMModel::WarmUp)
-    /*.def("__call__",
+    .def("forward",
         [](fastllm::ChatGLMModel &model, 
            const fastllm::Data &inputIds, 
            const fastllm::Data &attentionMask,
            const fastllm::Data &positionIds, 
            const fastllm::Data &penaltyFactor,
-           std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues) {
+           std::vector<std::pair<fastllm::Data, fastllm::Data>>& pastKeyValues) {
+
           int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
           return std::make_tuple(retV, pastKeyValues);
-    })*/
+    })
     .def("launch_response", &fastllm::ChatGLMModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::ChatGLMModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::ChatGLMModel::SaveLowBitModel);
@@ -153,8 +172,14 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("eos_token_id", &fastllm::MOSSModel::eos_token_id)
     .def("load_weights", &fastllm::MOSSModel::LoadFromFile)
     .def("response", &fastllm::MOSSModel::Response)
-    .def("batch_response", &fastllm::MOSSModel::ResponseBatch)
-    /*.def("__call__",
+    .def("batch_response", [](fastllm::MOSSModel &model, 
+                              const std::vector <std::string> &inputs,
+                               RuntimeResultBatch retCb)->std::vector<std::string> {
+      std::vector <std::string> outputs;
+      model.ResponseBatch(inputs, outputs, retCb);
+      return outputs;
+    })
+    .def("forward",
         [](fastllm::MOSSModel &model, 
            const fastllm::Data &inputIds, 
            const fastllm::Data &attentionMask,
@@ -163,7 +188,7 @@ PYBIND11_MODULE(pyfastllm, m) {
            std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues) {
           int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
           return std::make_tuple(retV, pastKeyValues);
-    })*/
+    })
     .def("launch_response", &fastllm::MOSSModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::MOSSModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::MOSSModel::SaveLowBitModel);
@@ -177,9 +202,15 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("eos_token_id", &fastllm::LlamaModel::eos_token_id)
     .def("load_weights", &fastllm::LlamaModel::LoadFromFile)
     .def("response", &fastllm::LlamaModel::Response)
-    .def("batch_response", &fastllm::LlamaModel::ResponseBatch)
+    .def("batch_response", [](fastllm::LlamaModel &model, 
+                              const std::vector <std::string> &inputs,
+                               RuntimeResultBatch retCb)->std::vector<std::string> {
+      std::vector <std::string> outputs;
+      model.ResponseBatch(inputs, outputs, retCb);
+      return outputs;
+    })
     .def("warmup", &fastllm::LlamaModel::WarmUp)
-    /*.def("__call__",
+    .def("forward",
         [](fastllm::LlamaModel &model, 
            const fastllm::Data &inputIds, 
            const fastllm::Data &attentionMask,
@@ -188,7 +219,7 @@ PYBIND11_MODULE(pyfastllm, m) {
            std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues) {
           int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
           return std::make_tuple(retV, pastKeyValues);
-    })*/
+    })
     .def("launch_response", &fastllm::LlamaModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::LlamaModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::LlamaModel::SaveLowBitModel);

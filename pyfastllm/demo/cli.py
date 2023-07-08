@@ -21,13 +21,10 @@ def args_parser():
 LLM_TYPE = ""
 def print_back(idx:int, content: bytearray):
     content = content.decode(encoding="utf-8", errors="replace")
-    if idx == 0:
-        print(f"{LLM_TYPE}:{content}", end='')
-    elif idx > 0:
-        print(f"{content}", end='\n')
+    if idx >= 0:
+        print(f"\r{LLM_TYPE}:{content}", end='', flush=True)
     elif idx == -1:
         print()
-
     sys.stdout.flush()
 
 def main(args):
@@ -45,7 +42,7 @@ def main(args):
         
 
     prompt = ""
-    while prompt != "exit":
+    while prompt != "stop":
         prompt = input("User: ")
         model.response(prompt, print_back)
         print()
