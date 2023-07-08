@@ -31,19 +31,19 @@ def response(model, prompt_input:str, stream_output:bool=False):
     handle = model.launch_response(input_ids)
     continue_token = True
 
+    ret_byte = b""
     ret_str = ""
-    results = []
     
     while continue_token:
-        continue_token, results = model.fetch_response(handle)
+        resp_token = model.fetch_response(handle)
+        continue_token = (resp_token != -1)
 
-        content = model.weight.tokenizer.decode_byte(fastllm.Tensor(fastllm.float32, [len(results)], results))
-        # print(content.decode(errors='ignore'))
-        content = content.decode(errors='ignore')
-        ret_str += content
+        content = model.weight.tokenizer.decode_byte([resp_token])
+        ret_byte += content
+        ret_str = ret_byte.decode(errors='ignore')
 
         if stream_output:
-            yield content
+            yield ret_str
 
     return ret_str
 
@@ -59,19 +59,15 @@ def main(args):
         model = fastllm.create_llm(model_path)
         print(f"llm model: {model.model_type}")
     
-   
     prompt = ""
-    while prompt != "exit":
+    while prompt != "stop":
         prompt = input("User: ")
 
         outputs = response(model, prompt_input=prompt, stream_output=True)
 
-        print(f"{model.model_type}:", end=" ")
+        print(f"{model.model_type}:", end=' ')
         for output in outputs:
-            # print("\033c", end="")
-            print(output, end="")
-            sys.stdout.flush()
-
+            print(f"\r{model.model_type}: {output}", end='', flush=True)
         print()
 
 if __name__ == "__main__":
