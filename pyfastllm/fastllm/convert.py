@@ -4,7 +4,7 @@ import sys
 import struct
 import numpy as np
 import argparse
-from .utils import torch2flm 
+from .utils import convert 
 
 HF_INSTALLED = False
 try:
@@ -15,8 +15,8 @@ try:
     from peft import PeftModel
     HF_INSTALLED = True
 except Exception as e:
-    logging.info("You have not installed transformers and peft before convert!!!")
-
+    logging.error("Make sure that you installed transformers and peft!!!")
+    sys.exit(1)
 
 MODEL_DICT = {
     "alpaca":{
@@ -39,24 +39,22 @@ MODEL_DICT = {
 }
 
 def parse_args():
+    # -p 模型路径或hf路径
+    # -o --out_path 导出路径
+    # -q 量化位数
     parser = argparse.ArgumentParser(description='build fastllm libs')
-    parser.add_argument('-m', dest='model', default='', required=True,
-                    help='model name with(alpaca, baichuan7B, chatglm6B, moss)')
-    parser.add_argument('-p', dest='model_path', type=list,
-                    help='a list with "tokenizer", "model", "peft model", such as: -p THUDM/chatglm-6b THUDM/chatglm-6b')
-    parser.add_argument('-q', dest='qbit', type=int, choices=[16, 8, 4, 2], 
-                    help='a list with "tokenizer", "model", "peft model", such as: -p THUDM/chatglm-6b THUDM/chatglm-6b')
     parser.add_argument('-o', dest='export_path', default=None,
                     help='output export path')
-   
-   
+    parser.add_argument('-p', dest='model_path', type=str, default='',
+                    help='the model path or huggingface path, such as: -p THUDM/chatglm-6b')
+    parser.add_argument('--lora', dest='lora_path', default='',
+                    help='lora model path')
+    parser.add_argument('-m', dest='model', default='chatglm6B',
+                    help='model name with(alpaca, baichuan7B, chatglm6B, moss)')
+    parser.add_argument('-q', dest='qbit', type=int,
+                    help='model quantization bit')
     args = parser.parse_args()
     return args
-
-
-def convert(model, tokenizer, export_path):
-    assert HF_INSTALLED, "Make sure that you installed transformers and peft before convert!!!"
-    torch2flm.tofile(model, tokenizer, export_path)
 
 
 def alpaca(model_path):
@@ -86,8 +84,11 @@ def moss(model_path, ):
     model = model.eval()
     return model, tokenizer
 
-def export_model(args):
+def main(args=None):
     assert HF_INSTALLED, "Make sure that you installed transformers and peft before convert!!!"
+    if not args:
+        args = parse_args()
+        
     if args.model not in MODEL_DICT:
         assert f"Not Support {args.model} Yet!!!"
     
@@ -103,7 +104,7 @@ def export_model(args):
     
     model, tokenizer = globals().get(args.model)(**model_args)
     export_path = args.export_path or f"{args.model}-fp32.bin"
-    torch2flm.tofile(export_path, model.model, tokenizer)
+    convert(export_path, model.model, tokenizer)
 
     if args.qbit:
         import pyfastllm as fastllm
@@ -112,10 +113,6 @@ def export_model(args):
         flm_model = fastllm.create_llm(export_path)
         flm_model.save_lowbit_model(q_export_path, args.qbit) 
 
-def convert_main():
-    assert HF_INSTALLED, "Make sure that you installed transformers and peft before convert!!!"
-    args = parse_args()
-    export_model(args)
-
 if __name__ == "__main__":
-    convert_main()
+    args = parse_args()
+    main(args)
