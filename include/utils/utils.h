@@ -115,6 +115,11 @@ namespace fastllm {
         const __m128i hi32  = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
         return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
     }
+
+    static inline int I16Sum(const __m256i a) {
+        int sum = I32sum(_mm256_madd_epi16(a, _mm256_set1_epi16(1)));
+        return sum;
+    }
 #endif
 }
 
