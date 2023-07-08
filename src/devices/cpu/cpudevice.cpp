@@ -425,6 +425,16 @@ namespace fastllm {
         }
     }
 
+    struct FP16ToFP32Manager {
+        float dict[65536];
+
+        FP16ToFP32Manager() {
+            for (uint16_t i = 0; i < 65535; i++) {
+                dict[i] = half_to_float(i);
+            }
+        }
+    } fp16tofp32;
+
     // float的input, float16的weight, 直接计算得到float的output
     void Float16LinearPart(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
                            int n, int m, int k, int st, int end) {
@@ -432,8 +442,36 @@ namespace fastllm {
             for (int j = st; j < end; j++) {
                 float now = biasData ? biasData[j] : 0.0f;
                 int l = 0;
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+                float16x8_t sum = {0, 0, 0, 0, 0, 0, 0, 0};
+                for (; l + 7 < m; l += 8) {
+                    sum = vfmaq_f16(sum, vld1q_f16((float16_t*)inputData + i * m + l),
+                                        vld1q_f16((float16_t*)weightData + j * m + l));
+                }
+                now += sum[0] + sum[1] + sum[2] + sum[3] + sum[4] + sum[5] + sum[6] + sum[7];
+#else
+#ifdef __aarch64__
+                float32x4_t sum = {0, 0, 0, 0};
+                for (; l + 3 < m; l += 4) {
+                    float32x4_t vcur = {fp16tofp32.dict[weightData[j * m + l]], fp16tofp32.dict[weightData[j * m + l + 1]],
+                                        fp16tofp32.dict[weightData[j * m + l + 2]], fp16tofp32.dict[weightData[j * m + l + 3]]};
+                    sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(inputData + i * m + l), vcur));
+                }
+                now += sum[0] + sum[1] + sum[2] + sum[3];
+#else
+#ifdef __AVX2__
+                __m256 vsum = _mm256_setzero_ps();
+                for (; l + 7 < m; l += 8) {
+                    __m256 vi = _mm256_loadu_ps(inputData + i * m + l);
+                    __m256 vw = _mm256_cvtph_ps(_mm_loadu_si128((__m128i *) (weightData + j * m + l)));
+                    vsum = _mm256_fmadd_ps(vi, vw, vsum);
+                }
+                now += Floatsum(vsum);
+#endif
+#endif
+#endif
                 for (; l < m; l++) {
-                    now += inputData[i * m + l] * half_to_float(weightData[j * m + l]);
+                    now += inputData[i * m + l] * fp16tofp32.dict[weightData[j * m + l]];
                 }
                 outputData[i * k + j] = now;
             }
@@ -791,7 +829,7 @@ namespace fastllm {
 
     void CpuLinearOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-//auto st = std::chrono::system_clock::now();
+auto st = std::chrono::system_clock::now();
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
@@ -829,7 +867,13 @@ namespace fastllm {
             uint16_t *weightData = (uint16_t *) weight.cpuData;
             float *outputData = (float *) output.cpuData;
             float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
-
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+            uint16_t *temp = new uint16_t[n * m];
+            for (int i = 0; i < n * m; i++) {
+                temp[i] = float_to_half(inputData[i]);
+            }
+            inputData = (float*)temp;
+#endif
             int threadNum = GetThreads();
             int per = k / threadNum;
             int cur = 0;
@@ -846,6 +890,9 @@ namespace fastllm {
             for (int i = 0; i < futures.size(); i++) {
                 futures[i].get();
             }
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+            delete[] temp;
+#endif
         } else if (weight.dataType == DataType::INT8) {
             float *inputData = (float *) input.cpuData;
             uint8_t *weightData = (uint8_t *) weight.cpuData;
@@ -974,8 +1021,8 @@ namespace fastllm {
         } else {
             ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
         }
-//float spend = GetSpan(st, std::chrono::system_clock::now());
-//float gops = (float)n * m * k / spend / 1e9;
+float spend = GetSpan(st, std::chrono::system_clock::now());
+float gops = (float)n * m * k / spend / 1e9;
 //printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
     }
 
