@@ -34,6 +34,27 @@ fastllm_lib.make_history_llm_model.restype = ctypes.c_char_p
 fastllm_lib.make_input_llm_model.argtype = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.make_input_llm_model.restype = ctypes.c_char_p
 
+def set_cpu_threads(threads: int):
+    fastllm_lib.set_cpu_threads(threads);
+
+def get_cpu_threads() -> int:
+    return fastllm_lib.get_cpu_threads();
+
+def print_ins_info():
+    fastllm_lib.print_cpu_ins();
+
+def set_cpu_kvcache(cpu_kvcache):
+    fastllm_lib.set_kvcache_in_cpu(ctypes.c_bool(cpu_kvcache));
+
+def get_cpu_kvcache():
+    return fastllm_lib.get_kvcache_in_cpu();
+
+def set_cpu_low_mem(low_mem):
+    fastllm_lib.set_cpu_low_mem(ctypes.c_bool(low_mem));
+
+def get_cpu_low_mem():
+    return fastllm_lib.get_cpu_low_mem();
+
 def from_hf(model,
             tokenizer = None,
             dtype = "float16"):

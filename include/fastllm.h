@@ -21,6 +21,7 @@
 #include "devices/cpu/cputhreadpool.h"
 
 namespace fastllm {
+    void PrintInstructionInfo();
     void SetThreads(int t);
     void SetLowMemMode(bool m);
     void SetKVCacheInCPU(bool kvCacheInCPU);
