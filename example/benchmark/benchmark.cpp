@@ -62,6 +62,7 @@ int main(int argc, char **argv) {
     fastllm::GenerationConfig generationConfig;
     generationConfig.output_token_limit = config.limit;
 
+    fastllm::PrintInstructionInfo();
     std::vector <std::string> inputs;
     if (config.file != "") {
         std::ifstream finputs(config.file, std::ios::in);

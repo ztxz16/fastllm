@@ -7,6 +7,34 @@
 #include <cstring>
 
 extern "C" {
+    void print_cpu_ins() {
+        fastllm::PrintInstructionInfo();
+    }
+
+    void set_cpu_threads(int threads) {
+        fastllm::SetThreads(threads);
+    }
+
+    int get_cpu_threads() {
+        return fastllm::GetThreads();
+    }
+
+    void set_cpu_low_mem(bool low) {
+        fastllm::SetLowMemMode(low);
+    }
+
+    bool get_cpu_low_mem(bool low) {
+        return fastllm::GetLowMemMode();
+    }
+
+    void set_kvcache_in_cpu(bool in) {
+        fastllm::SetKVCacheInCPU(in);
+    }
+
+    bool get_kvcache_in_cpu() {
+        return fastllm::GetKVCacheInCPU();
+    }
+
     struct ModelManager {
         std::mutex locker;
         std::map <int, std::unique_ptr<fastllm::basellm> > models;

@@ -58,6 +58,7 @@ int main(int argc, char **argv) {
     fastllm::GenerationConfig generationConfig;
 	ParseArgs(argc, argv, config, generationConfig);
 
+    fastllm::PrintInstructionInfo();
     fastllm::SetThreads(config.threads);
     fastllm::SetLowMemMode(config.lowMemMode);
     auto model = fastllm::CreateLLMModelFromFile(config.path);
