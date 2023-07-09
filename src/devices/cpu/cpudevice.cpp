@@ -416,6 +416,16 @@ namespace fastllm {
                     sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(inputData + i * m + l), vld1q_f32(weightData + j * m + l)));
                 }
                 now += sum[0] + sum[1] + sum[2] + sum[3];
+#else
+#ifdef __AVX2__
+                __m256 vsum = _mm256_setzero_ps();
+                for (; l + 7 < m; l += 8) {
+                    __m256 vi = _mm256_loadu_ps(inputData + i * m + l);
+                    __m256 vw = _mm256_loadu_ps(weightData + j * m + l);
+                    vsum = _mm256_fmadd_ps(vi, vw, vsum);
+                }
+                now += Floatsum(vsum);
+#endif
 #endif
                 for (; l < m; l++) {
                     now += inputData[i * m + l] * weightData[j * m + l];
@@ -1023,7 +1033,7 @@ auto st = std::chrono::system_clock::now();
         }
 float spend = GetSpan(st, std::chrono::system_clock::now());
 float gops = (float)n * m * k / spend / 1e9;
-//printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
+// printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
     }
 
     void CpuSplitOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
