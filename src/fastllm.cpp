@@ -36,6 +36,30 @@ namespace fastllm {
     static bool lowMemMode = false;
     static bool kvCacheInCPU = false;
 
+    void PrintInstructionInfo() {
+        std::string avx = "OFF", avx2 = "OFF", aarch64 = "OFF", neonFp16 = "OFF", neonDot = "OFF";
+#ifdef __AVX__
+        avx = "ON";
+#endif
+#ifdef __AVX2__
+        avx2 = "ON";
+#endif
+#ifdef __aarch64__
+        aarch64 = "ON";
+#endif
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+        neonFp16 = "ON";
+#endif
+#ifdef __ARM_FEATURE_DOTPROD
+        neonDot = "ON";
+#endif
+        printf("AVX: %s\n", avx.c_str());
+        printf("AVX2: %s\n", avx2.c_str());
+        printf("AARCH64: %s\n", aarch64.c_str());
+        printf("Neon FP16: %s\n", neonFp16.c_str());
+        printf("Neon DOT: %s\n", neonDot.c_str());
+    }
+
     void SetKVCacheInCPU(bool v) {
         kvCacheInCPU = v;
     }
