@@ -56,14 +56,42 @@ async def api_chat_stream(request: Request):
     history = data.get("history")
     config = pyfastllm.GenerationConfig()
     if data.get("max_length") is not None:
-        config.max_length = max_length
+        config.max_length = data.get("max_length") 
     if data.get("top_k") is not None:
-        config.top_k = top_k
+        config.top_k = data.get("top_k")
     if data.get("top_p") is not None:
-        config.top_p = top_p
+        config.top_p = data.get("top_p")
     return StreamingResponse(chat_stream(history + prompt, config), media_type='text/event-stream')
 
 
+def batch_stream(prompts: str, config: pyfastllm.GenerationConfig):
+    idx = 0
+    for response in model.batch_response(prompts, None, config): 
+        yield  f"({batch_idx}/{len(prompts)}\n prompt: {prompts[batch_idx]} \n response: {response}\n"
+        idx += 1
+
+
+@app.post("/api/batch_chat")
+async def api_batch_chat(request: Request):
+    data = await request.json()
+    prompts = data.get("prompts")
+    print(f"{prompts}  type:{type(prompts)}")
+    if prompts is None:
+        return "prompts should be list[str]"
+    history = data.get("history")
+    config = pyfastllm.GenerationConfig()
+    if data.get("max_length") is not None:
+        config.max_length = data.get("max_length") 
+    if data.get("top_k") is not None:
+        config.top_k = data.get("top_k")
+    if data.get("top_p") is not None:
+        config.top_p = data.get("top_p")
+    retV = ""
+    batch_idx = 0
+    for response in model.batch_response(prompts, None, config): 
+        retV +=  f"({batch_idx + 1}/{len(prompts)}\n prompt: {prompts[batch_idx]} \n response: {response}\n"
+        batch_idx += 1
+    return retV
 
 def main(args):
     model_path = args.path
