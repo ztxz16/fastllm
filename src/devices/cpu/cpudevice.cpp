@@ -264,13 +264,36 @@ namespace fastllm {
                     mean = sums[0] + sums[1] + sums[2] + sums[3];
                     s2 = sums2[0] + sums2[1] + sums2[2] + sums2[3];
 #endif
+#ifdef __AVX2__
+                __m256 sum_vec = _mm256_setzero_ps();
+                __m256 squared_sum_vec = _mm256_setzero_ps();
+
+                for (; j < channels - 7; j += 8) {
+                    __m256 data_vec = _mm256_loadu_ps(inputData + j);
+                    sum_vec = _mm256_add_ps(sum_vec, data_vec);
+
+                    __m256 squared_data_vec = _mm256_mul_ps(data_vec, data_vec);
+                    squared_sum_vec = _mm256_add_ps(squared_sum_vec, squared_data_vec);
+                }
+
+                float sum_array[8];
+                _mm256_storeu_ps(sum_array, sum_vec);
+                mean = sum_array[0] + sum_array[1] + sum_array[2] + sum_array[3] +
+                            sum_array[4] + sum_array[5] + sum_array[6] + sum_array[7];
+
+                float squared_sum_array[8];
+                _mm256_storeu_ps(squared_sum_array, squared_sum_vec);
+                s2 = squared_sum_array[0] + squared_sum_array[1] +
+                                    squared_sum_array[2] + squared_sum_array[3] +
+                                    squared_sum_array[4] + squared_sum_array[5] +
+                                    squared_sum_array[6] + squared_sum_array[7];
+#endif
                 for (; j < channels; j++) {
                     mean += inputData[j];
                     s2 += inputData[j] * inputData[j];
                 }
                 mean /= channels;
-                var = s2 + mean * mean * channels - 2 * mean * channels * mean;
-                var = sqrt(var / channels + 1e-10);
+                var = sqrt(s2 / channels - mean*mean + 1e-10);
                 j = 0;
 #ifdef __aarch64__
                 float32x4_t means = vdupq_n_f32(mean);
@@ -1033,7 +1056,7 @@ auto st = std::chrono::system_clock::now();
         }
 float spend = GetSpan(st, std::chrono::system_clock::now());
 float gops = (float)n * m * k / spend / 1e9;
-//printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
+// printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
     }
 
     void CpuSplitOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -1561,6 +1584,55 @@ float gops = (float)n * m * k / spend / 1e9;
             float32x4_t vtan = vdivq_f32(vsubq_f32(vex, venegx), vaddq_f32(vex, venegx));
             float32x4_t vout = vmulq_f32(vmulq_f32(c3, vx), vaddq_f32(c1, vtan));
             vst1q_f32(outputData + i, vout);
+        }
+#endif
+#ifdef __AVX2__
+        auto var1 = _mm256_set1_ps(0.044715f);
+        auto var2 = _mm256_set1_ps(0.7978845608028654f);
+        auto var3 = _mm256_set1_ps(378.f);
+        auto var4 = _mm256_set1_ps(17325.f);
+        auto var5 = _mm256_set1_ps(135135.f);
+        auto var6 = _mm256_set1_ps(28.f);
+        auto var7 = _mm256_set1_ps(3150.f);
+        auto var8 = _mm256_set1_ps(62370.f);
+        auto var9 = _mm256_set1_ps(135135.f);
+        auto var10 = _mm256_set1_ps(0.5);
+        auto varOne = _mm256_set1_ps(1.f);
+        auto varNegOne = _mm256_set1_ps(-1.f);
+
+        for (; i < len - 7; i+=8) {
+            auto x = _mm256_loadu_ps(inputData + i);  
+            // sqrt(2 / PI) * (0.044715 * x^3 + x)
+            auto y = _mm256_mul_ps(x, x);
+            y = _mm256_mul_ps(y, x);
+            y = _mm256_mul_ps(y, var1);
+            y = _mm256_add_ps(y, x);
+            y = _mm256_mul_ps(y, var2);
+
+            // y = tanh(y)
+            {
+            auto y2 = _mm256_mul_ps(y, y);
+            auto w = _mm256_add_ps(y2, var3);
+            w = _mm256_mul_ps(w, y2);
+            w = _mm256_add_ps(w, var4);
+            w = _mm256_mul_ps(w, y2);
+            w = _mm256_add_ps(w, var5);
+            w = _mm256_mul_ps(w, y);
+            auto z = _mm256_mul_ps(y2, var6);
+            z = _mm256_add_ps(z, var7);
+            z = _mm256_mul_ps(z, y2);
+            z = _mm256_add_ps(z, var8);
+            z = _mm256_mul_ps(z, y2);
+            z = _mm256_add_ps(z, var9);
+            z = _mm256_div_ps(w, z);
+            z = _mm256_max_ps(z, varNegOne);
+            y = _mm256_min_ps(z, varOne);
+            }
+
+            y = _mm256_add_ps(y, varOne);
+            y = _mm256_mul_ps(y, x);
+            y = _mm256_mul_ps(y, var10);
+            _mm256_storeu_ps(outputData + i, y);
         }
 #endif
         for (; i < len; i++) {
