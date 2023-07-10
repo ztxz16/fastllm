@@ -264,13 +264,36 @@ namespace fastllm {
                     mean = sums[0] + sums[1] + sums[2] + sums[3];
                     s2 = sums2[0] + sums2[1] + sums2[2] + sums2[3];
 #endif
+#ifdef __AVX2__
+                __m256 sum_vec = _mm256_setzero_ps();
+                __m256 squared_sum_vec = _mm256_setzero_ps();
+
+                for (; j < channels - 7; j += 8) {
+                    __m256 data_vec = _mm256_loadu_ps(inputData + j);
+                    sum_vec = _mm256_add_ps(sum_vec, data_vec);
+
+                    __m256 squared_data_vec = _mm256_mul_ps(data_vec, data_vec);
+                    squared_sum_vec = _mm256_add_ps(squared_sum_vec, squared_data_vec);
+                }
+
+                float sum_array[8];
+                _mm256_storeu_ps(sum_array, sum_vec);
+                mean = sum_array[0] + sum_array[1] + sum_array[2] + sum_array[3] +
+                            sum_array[4] + sum_array[5] + sum_array[6] + sum_array[7];
+
+                float squared_sum_array[8];
+                _mm256_storeu_ps(squared_sum_array, squared_sum_vec);
+                s2 = squared_sum_array[0] + squared_sum_array[1] +
+                                    squared_sum_array[2] + squared_sum_array[3] +
+                                    squared_sum_array[4] + squared_sum_array[5] +
+                                    squared_sum_array[6] + squared_sum_array[7];
+#endif
                 for (; j < channels; j++) {
                     mean += inputData[j];
                     s2 += inputData[j] * inputData[j];
                 }
                 mean /= channels;
-                var = s2 + mean * mean * channels - 2 * mean * channels * mean;
-                var = sqrt(var / channels + 1e-10);
+                var = sqrt(s2 / channels - mean*mean + 1e-10);
                 j = 0;
 #ifdef __aarch64__
                 float32x4_t means = vdupq_n_f32(mean);
