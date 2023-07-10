@@ -44,8 +44,7 @@ def main(args):
     prompt = ""
     while prompt != "stop":
         prompt = input("User: ")
-        config = pyfastllm.GenerationConfig()
-        model.response(prompt, print_back, config)
+        model.response(prompt, print_back)
         print()
         sys.stdout.flush()
 

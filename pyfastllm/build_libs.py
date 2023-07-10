@@ -29,7 +29,7 @@ def build_libs():
         os.system('cmake -G "Ninja" -DPY_API=ON .. && ninja pyfastllm')
     elif IS_LINUX:
         extra_opts = ' -DPY_API=ON '
-        extra_opts += ' -DUSE_CUDA=ON ' if args.cuda else ' '
+        extra_opts += ' -DMNN_CUDA=ON ' if args.cuda else ' '
         build_cmd = 'cmake ' + extra_opts + ' .. && make pyfastllm -j4'
         print(build_cmd)
         os.system('cmake ' + extra_opts + ' .. && make pyfastllm -j4')
