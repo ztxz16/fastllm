@@ -146,7 +146,7 @@ for response in model.stream_response("你好"):
     print(response, flush = True, end = "")
 ```
 
-详细API说明见 [fastllm_pytools](docs/fastllm_pytools)
+另外还可以设置cpu线程数等内容，详细API说明见 [fastllm_pytools](docs/fastllm_pytools)
 
 这个包不包含low level api，如果需要使用更深入的功能请参考 [Python绑定](#Python绑定)
 
@@ -247,7 +247,6 @@ python3 tools/moss_export.py moss-fp32.flm # 导出浮点模型
 
 ### 短期计划
 
-- 支持do_sample以及采样参数
 - 支持部分显存 + 部分DDR模式
 - 优化int4, int8的batch推理
 
