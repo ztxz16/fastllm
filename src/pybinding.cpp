@@ -21,23 +21,11 @@ PYBIND11_MAKE_OPAQUE(fastllm::Data);
 PYBIND11_MODULE(pyfastllm, m) {
   m.doc() = "fastllm python bindings";
   
-  py::class_<fastllm::GenerationConfig>(m, "GenerationConfig")
-	  .def(py::init<>())
-	  .def_readwrite("max_length", &fastllm::GenerationConfig::output_token_limit) 
-	  .def_readwrite("last_n", &fastllm::GenerationConfig::last_n) 
-	  .def_readwrite("repeat_penalty", &fastllm::GenerationConfig::repeat_penalty) 
-	  .def_readwrite("top_k", &fastllm::GenerationConfig::top_k) 
-	  .def_readwrite("top_p", &fastllm::GenerationConfig::top_p) 
-	  .def_readwrite("temperature", &fastllm::GenerationConfig::temperature)
-	  .def("is_simple_greedy", &fastllm::GenerationConfig::IsSimpleGreedy); 
-
   // high level
   m.def("set_threads", &fastllm::SetThreads)
     .def("get_threads", &fastllm::GetThreads)
     .def("set_low_memory", &fastllm::SetLowMemMode)
     .def("get_low_memory", &fastllm::GetLowMemMode)
-    .def("set_kv_cache", &fastllm::SetKVCacheInCPU)
-    .def("get_kv_cache", &fastllm::GetKVCacheInCPU)
     .def("create_llm", &fastllm::CreateLLMModelFromFile);
   
   // low level
@@ -154,10 +142,9 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("response", &fastllm::ChatGLMModel::Response)
     .def("batch_response", [](fastllm::ChatGLMModel &model, 
                               const std::vector <std::string> &inputs,
-                               RuntimeResultBatch retCb,
-							   fastllm::GenerationConfig config)->std::vector<std::string> {
+                               RuntimeResultBatch retCb)->std::vector<std::string> {
       std::vector <std::string> outputs;
-      model.ResponseBatch(inputs, outputs, retCb, config);
+      model.ResponseBatch(inputs, outputs, retCb);
       return outputs;
     })
     .def("warmup", &fastllm::ChatGLMModel::WarmUp)
@@ -165,10 +152,11 @@ PYBIND11_MODULE(pyfastllm, m) {
         [](fastllm::ChatGLMModel &model, 
            const fastllm::Data &inputIds, 
            const fastllm::Data &attentionMask,
-           const fastllm::Data &positionIds, std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues,
-           const fastllm::GenerationConfig &generationConfig, const fastllm::LastTokensManager &tokens) {
+           const fastllm::Data &positionIds, 
+           const fastllm::Data &penaltyFactor,
+           std::vector<std::pair<fastllm::Data, fastllm::Data>>& pastKeyValues) {
 
-          int retV = model.Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
+          int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
           return std::make_tuple(retV, pastKeyValues);
     })
     .def("launch_response", &fastllm::ChatGLMModel::LaunchResponseTokens)
@@ -186,19 +174,19 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("response", &fastllm::MOSSModel::Response)
     .def("batch_response", [](fastllm::MOSSModel &model, 
                               const std::vector <std::string> &inputs,
-                               RuntimeResultBatch retCb,
-							   fastllm::GenerationConfig config)->std::vector<std::string> {
+                               RuntimeResultBatch retCb)->std::vector<std::string> {
       std::vector <std::string> outputs;
-      model.ResponseBatch(inputs, outputs, retCb, config);
+      model.ResponseBatch(inputs, outputs, retCb);
       return outputs;
     })
     .def("forward",
         [](fastllm::MOSSModel &model, 
            const fastllm::Data &inputIds, 
            const fastllm::Data &attentionMask,
-           const fastllm::Data &positionIds, std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues,
-           const fastllm::GenerationConfig &generationConfig, const fastllm::LastTokensManager &tokens) {
-          int retV = model.Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
+           const fastllm::Data &positionIds, 
+           const fastllm::Data &penaltyFactor,
+           std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues) {
+          int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
           return std::make_tuple(retV, pastKeyValues);
     })
     .def("launch_response", &fastllm::MOSSModel::LaunchResponseTokens)
@@ -216,10 +204,9 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("response", &fastllm::LlamaModel::Response)
     .def("batch_response", [](fastllm::LlamaModel &model, 
                               const std::vector <std::string> &inputs,
-                               RuntimeResultBatch retCb,
-							   fastllm::GenerationConfig config)->std::vector<std::string> {
+                               RuntimeResultBatch retCb)->std::vector<std::string> {
       std::vector <std::string> outputs;
-      model.ResponseBatch(inputs, outputs, retCb, config);
+      model.ResponseBatch(inputs, outputs, retCb);
       return outputs;
     })
     .def("warmup", &fastllm::LlamaModel::WarmUp)
@@ -227,9 +214,10 @@ PYBIND11_MODULE(pyfastllm, m) {
         [](fastllm::LlamaModel &model, 
            const fastllm::Data &inputIds, 
            const fastllm::Data &attentionMask,
-           const fastllm::Data &positionIds, std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues,
-           const fastllm::GenerationConfig &generationConfig, const fastllm::LastTokensManager &tokens) {
-          int retV = model.Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
+           const fastllm::Data &positionIds, 
+           const fastllm::Data &penaltyFactor,
+           std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues) {
+          int retV = model.Forward(inputIds, attentionMask, positionIds, penaltyFactor, pastKeyValues);
           return std::make_tuple(retV, pastKeyValues);
     })
     .def("launch_response", &fastllm::LlamaModel::LaunchResponseTokens)
