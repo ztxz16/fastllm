@@ -37,6 +37,7 @@ namespace fastllm {
         this->ops["MulTo"] = (BaseOperator*)(new CpuMulToOp());
         this->ops["AddTo"] = (BaseOperator*)(new CpuAddToOp());
         this->ops["AttentionMask"] = (BaseOperator*)(new CpuAttentionMaskOp());
+        this->ops["AlibiMask"] = (BaseOperator*)(new CpuAlibiMaskOp());
         this->ops["TopK"] = (BaseOperator*)(new CpuTopKOp());
         this->ops["Permute"] = (BaseOperator*)(new CpuPermuteOp());
         this->ops["PermuteSelf"] = (BaseOperator*)(new CpuPermuteSelfOp());
@@ -1752,6 +1753,34 @@ float gops = (float)n * m * k / spend / 1e9;
                 for (int i = 0; i < spatial; i++) {
                     if (maskData[on * spatial + i] > 0.99) {
                         attnData[o * spatial + i] = maskValue;
+                    }
+                }
+            }
+        }
+    }
+
+    void CpuAlibiMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &mask = *(datas.find("mask")->second);
+        float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -10000.0;
+        float *maskData = (float *) mask.cpuData;
+        float *attnData = (float *) input.cpuData;
+        int n = input.dims[0], m = input.dims[1];
+        int spn = input.dims[2], spm = input.dims[3];
+        int spatial = input.Count(2);
+        for (int on = 0; on < n; on++) {
+            for (int om = 0; om < m; om++) {
+                float now = maskData[om];
+                int o = on * m + om;
+                float *inputNow = attnData + o * spatial;
+                for (int i = 0; i < spn; i++) {
+                    int mid = (spm - spn + i);
+                    for (int j = 0; j <= mid; j++) {
+                        inputNow[i * spm + j] += now * j;
+                    }
+                    for (int j = mid + 1; j < spm; j++) {
+                        inputNow[i * spm + j] = maskValue;
                     }
                 }
             }
