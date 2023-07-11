@@ -28,13 +28,13 @@ def save_msg(idx: int, content: bytes):
     content = content.decode(encoding="utf-8", errors="replace")
     msg_queue.put((idx, content))
 
-def response_stream(prompt: str):
+def response_stream(prompt: str, config: pyfastllm.GenerationConfig):
     global model
-    model.response(prompt, save_msg)
+    model.response(prompt, save_msg, config)
 
-def chat_stream(prompt: str):
+def chat_stream(prompt: str, config: pyfastllm.GenerationConfig):
     global model
-    thread = threading.Thread(target = response_stream, args = (prompt,))
+    thread = threading.Thread(target = response_stream, args = (prompt, config))
     thread.start()
     idx = 0
     while idx != -1:
@@ -54,9 +54,44 @@ async def api_chat_stream(request: Request):
     data = await request.json()
     prompt = data.get("prompt")
     history = data.get("history")
-    return StreamingResponse(chat_stream(history + prompt), media_type='text/event-stream')
+    config = pyfastllm.GenerationConfig()
+    if data.get("max_length") is not None:
+        config.max_length = data.get("max_length") 
+    if data.get("top_k") is not None:
+        config.top_k = data.get("top_k")
+    if data.get("top_p") is not None:
+        config.top_p = data.get("top_p")
+    return StreamingResponse(chat_stream(history + prompt, config), media_type='text/event-stream')
 
 
+def batch_stream(prompts: str, config: pyfastllm.GenerationConfig):
+    idx = 0
+    for response in model.batch_response(prompts, None, config): 
+        yield  f"({batch_idx}/{len(prompts)}\n prompt: {prompts[batch_idx]} \n response: {response}\n"
+        idx += 1
+
+
+@app.post("/api/batch_chat")
+async def api_batch_chat(request: Request):
+    data = await request.json()
+    prompts = data.get("prompts")
+    print(f"{prompts}  type:{type(prompts)}")
+    if prompts is None:
+        return "prompts should be list[str]"
+    history = data.get("history")
+    config = pyfastllm.GenerationConfig()
+    if data.get("max_length") is not None:
+        config.max_length = data.get("max_length") 
+    if data.get("top_k") is not None:
+        config.top_k = data.get("top_k")
+    if data.get("top_p") is not None:
+        config.top_p = data.get("top_p")
+    retV = ""
+    batch_idx = 0
+    for response in model.batch_response(prompts, None, config): 
+        retV +=  f"({batch_idx + 1}/{len(prompts)}\n prompt: {prompts[batch_idx]} \n response: {response}\n"
+        batch_idx += 1
+    return retV
 
 def main(args):
     model_path = args.path
