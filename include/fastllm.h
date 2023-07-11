@@ -318,6 +318,8 @@ namespace fastllm {
 
     void AttentionMask(Data &input, const Data &mask, float maskValue); // 把input里对应位置mask中为1的部分变成maskValue
 
+    void AlibiMask(Data &input, const Data &mask, float maskValue); // alibi mask
+
     void Permute(const Data &input, const std::vector<int> &axis, Data &output); // 转置
 
     void PermuteSelf(const Data &input, const std::vector<int> &axis); // 转置

@@ -1217,6 +1217,12 @@ namespace fastllm {
         }, {{"maskValue", maskValue}}, {});
     }
 
+    void AlibiMask(Data &input, const Data &mask, float maskValue) {
+        curExecutor->Run("AlibiMask", {
+                {"input", &input}, {"mask", (Data*)&mask}
+        }, {{"maskValue", maskValue}}, {});
+    }
+
     void Permute(const Data &input, const std::vector<int> &axis, Data &output) {
         Data axisData = Data(DataType::INT32PARAM, {(int)axis.size()});
         axisData.Allocate();
