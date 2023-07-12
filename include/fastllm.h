@@ -96,11 +96,13 @@ namespace fastllm {
         float min, max;
         uint8_t zeroPoint;
         float scale;
+        int type; // 0: 有zero点 1: 不需要zero点
 
-        LowBitConfig(float min, float max, int bit) {
+        LowBitConfig(float min, float max, int bit, int type) {
             this->min = min;
             this->max = max;
             this->bit = bit;
+            this->type = type;
             Reset();
         }
 
@@ -109,6 +111,10 @@ namespace fastllm {
         }
 
         void Reset() {
+            if (type == 1) {
+                this->scale = (max - min) / 15.0;
+                return;
+            }
             min = std::min(min, 0.f);
             max = std::max(max, 0.f);
 
@@ -127,16 +133,26 @@ namespace fastllm {
         }
 
         uint8_t quantization(const float &realNumber) const {
-            return (uint8_t) (std::min((double)((1 << bit) - 1), std::max(realNumber / scale + zeroPoint + 0.5, 0.0)));
+            if (type == 0) {
+                return (uint8_t) (std::min((double) ((1 << bit) - 1),
+                                           std::max(realNumber / scale + zeroPoint + 0.5, 0.0)));
+            } else {
+                return (uint8_t) (std::max(0.f, std::min(15.f, (realNumber - min) / scale + 0.5f)));
+            }
         }
 
         float invQuantization(const uint8_t &qNumber) const {
-            return (scale * ((float) qNumber - (float) zeroPoint));
+            if (type == 0) {
+                return (scale * ((float) qNumber - (float) zeroPoint));
+            } else {
+                return min + scale * qNumber;
+            }
         }
     };
 
     enum DataType {
         FLOAT32 = 0, BFLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6, FLOAT16 = 7,
+        INT4_NOZERO = 8, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale
         INT32PARAM = 100 // int32的参数，这种类型的数据永远存在CPU上
     };
 
@@ -175,7 +191,7 @@ namespace fastllm {
         // 这两个参数用于量化，对FLOAT数据不适用
         int perChannelAxis = -1; // 沿哪个轴分通道量化，-1代表没有分通道
         std::vector <LowBitConfig> perChannelsConfigs; // perChannelsConfigs[i]代表第i个通道的min, max; 如果没有分通道，perChannelsConfigs[0]代表全局min, max
-        std::vector <float> scales;
+        std::vector <float> scales, mins;
         std::vector <int> zeros;
         std::vector <int> weightSum; // 作为权重时，有时候需要存一些和加速计算
 

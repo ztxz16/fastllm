@@ -558,7 +558,7 @@ namespace fastllm {
             for (int j = st; j < end; j++) {
                 float now = biasData ? biasData[j] : 0.0f;
                 int l = 0;
-#ifdef __aarch64__
+#ifdef __aarch64__X
                 float32x4_t scales = vdupq_n_f32(configs[j].scale);
                 uint8x8_t zeros = vdup_n_u8(configs[j].zeroPoint);
                 uint8x8_t maskHigh = vdup_n_u8(0xF0);
@@ -805,6 +805,67 @@ namespace fastllm {
     }
 
     //a = [n, m], b = [k, m], c = aT(b') = [n, k]
+    void MultiplyInt4NoZero(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride,
+                      int *weightSums, float *weightMins, float *scales, float *bias, LowBitConfig *config,
+                      int *inputSums) {
+        int block = 0;
+        for (; block < n; block++) {
+            uint32_t inputSum = inputSums[block];
+            uint8_t *weightWalk = b;
+            uint8_t *inputStart = a + block * m;
+
+            for (int i = 0; i < k; i++) {
+                int value = 0;
+                uint8_t *inputWalk = inputStart;
+                int j = 0;
+#ifdef __ARM_FEATURE_DOTPROD
+                uint8x8_t maskHigh = vdup_n_u8(0xF0);
+                uint8x8_t maskLow = vdup_n_u8(0xF);
+                uint32x2_t sum0 = {0, 0};
+
+                for (; j + 15 < m; j += 16) {
+                    uint8x8_t ori = vld1_u8(weightWalk + (i * m + j) / 2);
+                    uint8x8x2_t in = vld2_u8(inputWalk + j);
+                    uint8x8_t va = vand_u8(ori, maskLow);
+                    uint8x8_t vb = vshr_n_u8(vand_u8(ori, maskHigh), 4);
+                    sum0 = vdot_u32(sum0, va, in.val[1]);
+                    sum0 = vdot_u32(sum0, vb, in.val[0]);
+                }
+                value += sum0[0] + sum0[1];
+#elif defined(__aarch64__)
+                uint8x8_t maskHigh = vdup_n_u8(0xF0);
+                uint8x8_t maskLow = vdup_n_u8(0xF);
+                uint32x4_t sum0 = {0, 0, 0, 0};
+
+                for (; j + 15 < m; j += 16) {
+                    uint8x8_t ori = vld1_u8(weightWalk + (i * m + j) / 2);
+                    uint8x8x2_t in = vld2_u8(inputWalk + j);
+                    uint8x8_t va = vand_u8(ori, maskLow);
+                    uint8x8_t vb = vshr_n_u8(vand_u8(ori, maskHigh), 4);
+                    sum0 = vpadalq_u16(sum0, vmull_u8(va, in.val[1]));
+                    sum0 = vpadalq_u16(sum0, vmull_u8(vb, in.val[0]));
+                }
+                value += sum0[0] + sum0[1] + sum0[2] + sum0[3];
+#elif defined(__AVX__)
+                value += DotU4U8(weightWalk + i * m / 2, inputWalk, m);
+                j += m;
+#endif
+
+                for (; j + 1 < m; j += 2) {
+                    int id = (i * m + j) / 2;
+                    value += (weightWalk[id] >> 4) * inputWalk[j];
+                    value += (weightWalk[id] & 0xF) * inputWalk[j + 1];
+                }
+
+                value -= weightSums[i] * config[block].zeroPoint;
+                ((float*)c)[block * kstride + i] = scales[i] * config[block].scale * value +
+                        weightMins[i] * ((float)inputSum - (int)config[block].zeroPoint * m) * config[block].scale +
+                        (bias == nullptr ? 0.0 : bias[i]);
+            }
+        }
+    }
+
+    //a = [n, m], b = [k, m], c = aT(b') = [n, k]
     void MultiplyMultiThread(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int threadNum) {
         int per = k / threadNum;
         int cur = 0;
@@ -851,6 +912,41 @@ namespace fastllm {
                 int end = (i == threadNum - 1 ? k : cur + per + (cur + per * (threadNum - i) < k));
                 futures.push_back(pool->Submit(MultiplyInt4, a, b + cur * m / 2, c + cur, n, m, end - cur, k,
                                                weightSums + cur, weightZeros + cur, scales + cur,
+                                               (bias == nullptr ? (float *) nullptr : bias + cur), configs.data(),
+                                               inputSums.data()));
+                cur = end;
+            }
+            for (int i = 0; i < futures.size(); i++) {
+                futures[i].get();
+            }
+        }
+    }
+
+    //a = [n, m], b = [k, m], c = aT(b') = [n, k]
+    void MultiplyInt4NoZeroMultiThread(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k,
+                                 int *weightSums, float *weightMins, float *scales, float *bias,
+                                 std::vector <LowBitConfig> &configs, int threadNum) {
+        std::vector <int> inputSums;
+        for (int i = 0; i < n; i++) {
+            int sum = 0;
+            for (int j = 0; j < m; j++) {
+                sum += a[i * m + j];
+            }
+            inputSums.push_back(sum);
+        }
+        int per = k / threadNum;
+        int cur = 0;
+        if (threadNum == 1) {
+            MultiplyInt4NoZero(a, b + cur * m / 2, c + cur, n, m, k - cur, k,
+                         weightSums + cur, weightMins + cur, scales + cur,
+                         (bias == nullptr ? (float*)nullptr : bias + cur), configs.data(), inputSums.data());
+        } else {
+            auto pool = GetPool();
+            std::vector<std::future<void> > futures;
+            for (int i = 0; i < threadNum; i++) {
+                int end = (i == threadNum - 1 ? k : cur + per + (cur + per * (threadNum - i) < k));
+                futures.push_back(pool->Submit(MultiplyInt4NoZero, a, b + cur * m / 2, c + cur, n, m, end - cur, k,
+                                               weightSums + cur, weightMins + cur, scales + cur,
                                                (bias == nullptr ? (float *) nullptr : bias + cur), configs.data(),
                                                inputSums.data()));
                 cur = end;
@@ -941,7 +1037,7 @@ auto st = std::chrono::system_clock::now();
                     minValue = std::min(minValue, inputData[i * m + j]);
                     maxValue = std::max(maxValue, inputData[i * m + j]);
                 }
-                inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8));
+                inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
             }
             std::vector <uint8_t> uinput;
             uinput.resize(n * m);
@@ -998,12 +1094,13 @@ auto st = std::chrono::system_clock::now();
                 delete threads[i];
             }
             */
-        } else if (weight.dataType == DataType::INT4) {
+        } else if (weight.dataType == DataType::INT4 || weight.dataType == DataType::INT4_NOZERO) {
             float *inputData = (float *) input.cpuData;
             uint8_t *weightData = (uint8_t *) weight.cpuData;
             float *outputData = (float *) output.cpuData;
             float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
             weight.CalcWeightSum();
+
             std::vector <LowBitConfig> inputConfigs;
             for (int i = 0; i < n; i++) {
                 float minValue = 1e9, maxValue = -1e9;
@@ -1011,7 +1108,7 @@ auto st = std::chrono::system_clock::now();
                     minValue = std::min(minValue, inputData[i * m + j]);
                     maxValue = std::max(maxValue, inputData[i * m + j]);
                 }
-                inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8));
+                inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
             }
             std::vector <uint8_t> uinput;
             uinput.resize(n * m);
@@ -1031,12 +1128,19 @@ auto st = std::chrono::system_clock::now();
             }
             delete[] temp;
 #endif
-            MultiplyInt4MultiThread(uinput.data(), weightData, (int32_t*)outputData, n, m, k,
-                                    weight.weightSum.data(), weight.zeros.data(), weight.scales.data(), biasData,
-                                    inputConfigs, GetThreads());
-            /*
-            这部分是float输入，float输出
-            int threadNum = threads;
+            if (weight.dataType == DataType::INT4) {
+                MultiplyInt4MultiThread(uinput.data(), weightData, (int32_t *) outputData, n, m, k,
+                                        weight.weightSum.data(), weight.zeros.data(), weight.scales.data(), biasData,
+                                        inputConfigs, GetThreads());
+            } else {
+                MultiplyInt4NoZeroMultiThread(uinput.data(), weightData, (int32_t *) outputData, n, m, k,
+                                        weight.weightSum.data(), weight.mins.data(), weight.scales.data(), biasData,
+                                        inputConfigs, GetThreads());
+            }
+
+/*
+            //这部分是float输入，float输出
+            int threadNum = GetThreads();
             int per = k / threadNum;
             int cur = 0;
             std::vector<std::thread *> threads;
@@ -1051,7 +1155,7 @@ auto st = std::chrono::system_clock::now();
                 threads[i]->join();
                 delete threads[i];
             }
-             */
+*/
         } else {
             ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
         }
