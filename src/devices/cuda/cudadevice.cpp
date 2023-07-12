@@ -139,6 +139,8 @@ namespace fastllm {
             FastllmCudaMatMulFloatInt8(input, weight, bias, output, n, m, k);
         } else if (weight.dataType == DataType::INT4) {
             FastllmCudaMatMulFloatInt4(input, weight, bias, output, n, m, k);
+        } else if (weight.dataType == DataType::INT4_NOZERO) {
+            FastllmCudaMatMulFloatInt4NoZero(input, weight, bias, output, n, m, k);
         } else {
             ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
         }

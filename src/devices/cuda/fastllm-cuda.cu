@@ -613,6 +613,38 @@ __global__ void FastllmGemvInt4Kernel2(float *A, uint8_t *B, float *C,
     }
 }
 
+template <int THREAD_PER_BLOCK, int PART>
+__global__ void FastllmGemvInt4NoZeroKernel2(float *A, uint8_t *B, float *C,
+                                       float *bias, float *scales, float *mins,
+                                       int m, int k) {
+    __shared__ float sdata[THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+
+    // 1. 计算
+    int st = blockIdx.x * PART;
+    int end = st + PART;
+    for (int p = st; p < end; p++) {
+        sdata[tid] = 0;
+        float minv = mins[p] / scales[p];
+        for (int i = tid; i < m / 2; i += THREAD_PER_BLOCK) {
+            uint8_t now = B[p * m / 2 + i];
+            sdata[tid] += (A[i * 2] * (minv + (now >> 4)) + A[i * 2 + 1] * (minv + (now & 15)));
+        }
+        __syncthreads();
+        for (unsigned int s = 1; s < THREAD_PER_BLOCK; s *= 2) {
+            if ((tid & (2 * s - 1)) == 0) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            C[p] = sdata[0] * scales[p] + bias[p];
+        }
+        __syncthreads();
+    }
+}
+
 void *FastllmCudaPrepareInput(const fastllm::Data &input) {
     void *ret;
     if (input.dataDevice == fastllm::DataDevice::CUDA) {
@@ -749,6 +781,56 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
                                                       cudaBiasData,
                                                       cudaScales,
                                                       cudaZeropoints,
+                                                      m, k);
+    }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
+        weight.ToDevice(fastllm::DataDevice::CUDA);
+
+        float *cudaScales;
+        cudaMalloc(&cudaScales, k * sizeof(float));
+        cudaMemcpy(cudaScales, weight.scales.data(), k * sizeof(float), cudaMemcpyHostToDevice);
+        weight.extraCudaData.push_back((void*)cudaScales);
+
+        float *cudaMins;
+        cudaMalloc(&cudaMins, k * sizeof(float));
+        float *mins = new float[k];
+        for (int i = 0; i < k; i++) {
+            mins[i] = weight.perChannelsConfigs[i].min;
+        }
+        cudaMemcpy(cudaMins, mins, k * sizeof(float), cudaMemcpyHostToDevice);
+        delete[] mins;
+        weight.extraCudaData.push_back((void*)cudaMins);
+
+        float *cudaBiasData;
+        cudaMalloc(&cudaBiasData, k * sizeof(float));
+        if (bias.dims.size() > 0) {
+            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+        } else {
+            cudaMemset(cudaBiasData, 0, k * sizeof(float));
+        }
+        weight.extraCudaData.push_back((void*)cudaBiasData);
+    }
+
+    float *cudaScales = (float*)weight.extraCudaData[0];
+    float *cudaMins = (float*)weight.extraCudaData[1];
+    float *cudaBiasData = (float*)weight.extraCudaData[2];
+
+    float *cudaInput = (float*)FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
+
+    for (int i = 0; i < n; i++) {
+        FastllmGemvInt4NoZeroKernel2<256, 1> <<< k, 256 >>>(cudaInput + i * m,
+                                                      (uint8_t *) weight.cudaData,
+                                                      cudaOutput + i * k,
+                                                      cudaBiasData,
+                                                      cudaScales,
+                                                      cudaMins,
                                                       m, k);
     }
     FastllmCudaFinishInput(input, cudaInput);
