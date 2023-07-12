@@ -11,6 +11,32 @@
 #endif
 
 namespace fastllm {
+    std::vector <float> GetInterLeavePowerOf2(int n) {
+        float start = powf(2, -powf(2, -(log2f(n) - 3)));
+        float ratio = start;
+        std::vector <float> ret;
+        for (int i = 0; i < n; i++) {
+            ret.push_back(start * powf(ratio, i));
+        }
+        return ret;
+    }
+    std::vector <float> GetInterleave(int n) {
+        int base = 1;
+        while (base < n) {
+            base <<= 1;
+        }
+        if (base == n) {
+            return GetInterLeavePowerOf2(n);
+        } else {
+            std::vector <float> ret = GetInterLeavePowerOf2(base / 2);
+            std::vector <float> part2 = GetInterLeavePowerOf2(base);
+            for (int i = 0; i < n - base / 2; i++) {
+                ret.push_back(part2[i * 2]);
+            }
+            return ret;
+        }
+    }
+
     LlamaModel::LlamaModel() {
         this->model_type = "llama";
 
@@ -52,6 +78,12 @@ namespace fastllm {
     int LlamaModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens) {
+        Data alibiData;
+        if (this->weight.dicts["use_alibi"] == "1") {
+            std::vector<float> alibi = GetInterleave(num_attention_heads);
+            alibiData.CopyFrom(Data(DataType::FLOAT32, {(int) alibi.size()}, alibi));
+        }
+
         Data hiddenStates;
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         for (int i = 0; i < block_cnt; i++) {
@@ -85,8 +117,10 @@ namespace fastllm {
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
 
-            fastllm::LlamaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
-            fastllm::LlamaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
+            if (alibiData.dims.size() == 0) {
+                fastllm::LlamaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
+                fastllm::LlamaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
+            }
 
             qkvSize = {bsz * seqlen, num_attention_heads, -1};
             q.Reshape(qkvSize);
@@ -133,9 +167,12 @@ namespace fastllm {
             Data attenWeights, attenOutput;
             MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
             attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
-            if (attentionMask.dims.size() != 0) {
+            if (alibiData.dims.size() != 0) {
+                AlibiMask(attenWeights, alibiData, -10000);
+            } else if (attentionMask.dims.size() != 0) {
                 AttentionMask(attenWeights, attentionMask, -10000);
             }
+
             Softmax(attenWeights, attenWeights, -1);
             MatMul(attenWeights, pastValue, attenOutput);
 
@@ -181,6 +218,12 @@ namespace fastllm {
     std::vector <int> LlamaModel::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens) {
+        Data alibiData;
+        if (this->weight.dicts["use_alibi"] == "1") {
+            std::vector<float> alibi = GetInterleave(num_attention_heads);
+            alibiData.CopyFrom(Data(DataType::FLOAT32, {(int) alibi.size()}, alibi));
+        }
+
         Data hiddenStates;
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
 
@@ -215,8 +258,11 @@ namespace fastllm {
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
 
-            fastllm::LlamaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
-            fastllm::LlamaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
+            if (alibiData.dims.size() == 0) {
+                fastllm::LlamaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
+                fastllm::LlamaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
+            }
+
             PermuteSelf(q, {0, 2, 1, 3});
             PermuteSelf(k, {0, 2, 1, 3});
             PermuteSelf(v, {0, 2, 1, 3});
@@ -262,7 +308,11 @@ namespace fastllm {
             Data attenWeights, attenOutput;
             MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
             attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
-            if (attentionMask.dims.size() != 0) {
+            if (alibiData.dims.size() != 0) {
+                attenWeights.Reshape({-1, num_attention_heads, attenWeights.dims[2], attenWeights.dims[3]});
+                AlibiMask(attenWeights, alibiData, -10000);
+                attenWeights.Reshape({1, -1, attenWeights.dims[2], attenWeights.dims[3]});
+            } else if (attentionMask.dims.size() != 0) {
                 AttentionMask(attenWeights, attentionMask, -10000);
             }
             Softmax(attenWeights, attenWeights, -1);
@@ -320,6 +370,12 @@ namespace fastllm {
                                                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
                                                const std::vector <GenerationConfig> &generationConfigs,
                                                const LastTokensManager &lastTokens) {
+        Data alibiData;
+        if (this->weight.dicts["use_alibi"] == "1") {
+            std::vector<float> alibi = GetInterleave(num_attention_heads);
+            alibiData.CopyFrom(Data(DataType::FLOAT32, {(int) alibi.size()}, alibi));
+        }
+
         Data hiddenStates;
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
 
@@ -370,8 +426,11 @@ namespace fastllm {
                 k.Reshape(qkvSize);
                 v.Reshape(qkvSize);
 
-                fastllm::LlamaRotatePosition2D(q, *positionIds[b], sinData, cosData, rotary_dim);
-                fastllm::LlamaRotatePosition2D(k, *positionIds[b], sinData, cosData, rotary_dim);
+                if (alibiData.dims.size() == 0) {
+                    fastllm::LlamaRotatePosition2D(q, *positionIds[b], sinData, cosData, rotary_dim);
+                    fastllm::LlamaRotatePosition2D(k, *positionIds[b], sinData, cosData, rotary_dim);
+                }
+
                 PermuteSelf(q, {0, 2, 1, 3});
                 PermuteSelf(k, {0, 2, 1, 3});
                 PermuteSelf(v, {0, 2, 1, 3});
@@ -419,9 +478,12 @@ namespace fastllm {
                 Data attenWeights, curAttenOutput;
                 MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
                 attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
-                if (attentionMask[b] != nullptr) {
+                if (alibiData.dims.size() != 0) {
+                    AlibiMask(attenWeights, alibiData, -10000);
+                } else if (attentionMask[b] != nullptr) {
                     AttentionMask(attenWeights, *attentionMask[b], -10000);
                 }
+
                 Softmax(attenWeights, attenWeights, -1);
                 MatMul(attenWeights, pastValue, curAttenOutput);
                 curAttenOutput.Reshape({curAttenOutput.dims[1], curAttenOutput.dims[2], curAttenOutput.dims[3]});
