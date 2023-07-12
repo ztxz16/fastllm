@@ -237,7 +237,7 @@ namespace fastllm {
         } else if (this->dataType == DataType::INT8) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
-        } else if (this->dataType == DataType::INT4) {
+        } else if (this->dataType == DataType::INT4 || this->dataType == DataType::INT4_NOZERO) {
             this->unitSize = 1;
             this->unitSizeDiv = 2;
         } else if (this->dataType == DataType::INT2) {
@@ -502,7 +502,7 @@ namespace fastllm {
                     weightSum[i] += cpuData[i * m + j];
                 }
             }
-        } else if (this->dataType == DataType::INT4) {
+        } else if (this->dataType == DataType::INT4 || this->dataType == DataType::INT4_NOZERO) {
             weightSum.resize(n);
             for (int i = 0; i < n; i++) {
                 int j = 0;
@@ -870,12 +870,27 @@ namespace fastllm {
 		            for (int i = 0; i < k; i++) {
 			            float minValue = buffer.ReadFloat();
 			            float maxValue = buffer.ReadFloat();
-			            weight[name].perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit);
+			            weight[name].perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit, 0);
 			            weight[name].zeros[i] = weight[name].perChannelsConfigs[i].zeroPoint;
 			            weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
 		            }
 		            buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
-	            }
+	            } else if (dataType == DataType::INT4_NOZERO) {
+                    int bit = 4;
+                    weight[name].perChannelAxis = buffer.ReadInt();
+                    int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
+                    weight[name].perChannelsConfigs.resize(k);
+                    weight[name].mins.resize(k);
+                    weight[name].scales.resize(k);
+                    for (int i = 0; i < k; i++) {
+                        float minValue = buffer.ReadFloat();
+                        float maxValue = buffer.ReadFloat();
+                        weight[name].perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit, 1);
+                        weight[name].mins[i] = weight[name].perChannelsConfigs[i].min;
+                        weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
+                    }
+                    buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+                }
             }
 
             printf("Load (%d / %d) \r", (i + 1), len);
@@ -888,6 +903,7 @@ namespace fastllm {
 
     void PerChannelQuantizationMultiThread(int st, int end, int m,
                                            float *f, uint8_t *u8, LowBitConfig *configs, int bit) {
+        int type = (bit == 4) ? 1 : 0;
         for (int i = st; i < end; i++) {
             float minValue = 1e9, maxValue = -1e9;
             for (int j = 0; j < m; j++) {
@@ -895,12 +911,12 @@ namespace fastllm {
                 maxValue = std::max(maxValue, f[i * m + j]);
             }
             if (bit == 8) {
-                configs[i] = LowBitConfig(minValue, maxValue, 8);
+                configs[i] = LowBitConfig(minValue, maxValue, 8, type);
                 for (int j = 0; j < m; j++) {
                     u8[i * m + j] = configs[i].quantization(f[i * m + j]);
                 }
             } else {
-                configs[i] = LowBitConfig(minValue, maxValue, 4);
+                configs[i] = LowBitConfig(minValue, maxValue, 4, type);
                 for (int j = 0; j < m; j++) {
                     int id = (i * m + j) / 2;
                     uint8_t value = configs[i].quantization(f[i * m + j]);
@@ -962,7 +978,7 @@ namespace fastllm {
                 if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
                     buffer.WriteInt((int) dataType);
                     buffer.WriteBytes(data.cpuData, data.GetBytes());
-                } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
+                } else if (dataType == DataType::INT8 || dataType == DataType::INT4 || dataType == DataType::INT4_NOZERO) {
                     buffer.WriteInt((int) dataType);
                     buffer.WriteInt(data.perChannelAxis);
                     int k = data.perChannelAxis == -1 ? 1 : data.dims[data.perChannelAxis];
@@ -1031,7 +1047,7 @@ namespace fastllm {
                             futures[i].get();
                         }
 
-                        buffer.WriteInt(bit == 8 ? (int) DataType::INT8 : (int) DataType::INT4);
+                        buffer.WriteInt(bit == 8 ? (int) DataType::INT8 : (int) DataType::INT4_NOZERO);
                         buffer.WriteInt(0); // 按通道0分通道量化
                         for (int i = 0; i < k; i++) {
                             buffer.WriteFloat(configs[i].min);
@@ -1066,8 +1082,9 @@ namespace fastllm {
         if (dataType == oriDataType) {
             memcpy(data.cpuData, oriData, data.GetBytes());
         } else if (oriDataType == DataType::FLOAT32 &&
-                (dataType == DataType::INT8 || dataType == DataType::INT4)) {
-            int bit = (dataType == DataType::INT4 ? 4 : 8);
+                (dataType == DataType::INT8 || dataType == DataType::INT4_NOZERO)) {
+            int bit = (dataType == DataType::INT4_NOZERO) ? 4 : 8;
+            int type = (bit == 4) ? 1 : 0;
             int k = data.dims[0], m = data.dims[1];
             int threadNum = 8;
             int per = k / threadNum;
@@ -1101,7 +1118,8 @@ namespace fastllm {
             data.zeros.resize(k);
             data.scales.resize(k);
             for (int i = 0; i < k; i++) {
-                data.perChannelsConfigs[i] = LowBitConfig(configs[i].min, configs[i].max, bit);
+                data.perChannelsConfigs[i] = LowBitConfig(configs[i].min, configs[i].max, bit, type);
+                data.mins[i] = data.perChannelsConfigs[i].min;
                 data.zeros[i] = data.perChannelsConfigs[i].zeroPoint;
                 data.scales[i] = data.perChannelsConfigs[i].scale;
             }
