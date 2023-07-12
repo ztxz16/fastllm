@@ -26,6 +26,18 @@ namespace fastllm {
         if (this->weight.dicts.find("num_attention_heads") != this->weight.dicts.end()) {
             num_attention_heads = atoi(this->weight.dicts["num_attention_heads"].c_str());
         }
+        if (this->weight.dicts.find("pre_prompt") != this->weight.dicts.end()) {
+            pre_prompt = this->weight.dicts["pre_prompt"];
+        }
+        if (this->weight.dicts.find("user_role") != this->weight.dicts.end()) {
+            user_role = this->weight.dicts["user_role"];
+        }
+        if (this->weight.dicts.find("bot_role") != this->weight.dicts.end()) {
+            bot_role = this->weight.dicts["bot_role"];
+        }
+        if (this->weight.dicts.find("history_sep") != this->weight.dicts.end()) {
+            history_sep = this->weight.dicts["history_sep"];
+        }
     }
 
     void basellm::SaveLowBitModel(const std::string &fileName, int bit) {
