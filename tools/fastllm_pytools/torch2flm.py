@@ -24,6 +24,10 @@ def tofile(exportPath,
 
     # 0.1 model info
     modelInfo = model.config.__dict__
+    if ("model_type" not in modelInfo):
+        print("unknown model_type.");
+        exit(0);
+
     if (pre_prompt):
         modelInfo["pre_prompt"] = pre_prompt;
     if (user_role):
@@ -32,6 +36,14 @@ def tofile(exportPath,
         modelInfo["bot_role"] = bot_role;
     if (history_sep):
         modelInfo["history_sep"] = history_sep;
+    if (modelInfo["model_type"] == "baichuan" and hasattr(model, "model") and hasattr(model.model, "get_alibi_mask")):
+        # Baichuan 2代
+        modelInfo["use_alibi"] = "1";
+        modelInfo["pre_prompt"] = "";
+        modelInfo["user_role"] = tokenizer.decode([model.generation_config.user_token_id]);
+        modelInfo["bot_role"] = tokenizer.decode([model.generation_config.assistant_token_id]);
+        modelInfo["history_sep"] = "";
+
     fo.write(struct.pack('i', len(modelInfo)));
     for it in modelInfo.keys():
         writeKeyValue(fo, str(it), str(modelInfo[it]));
