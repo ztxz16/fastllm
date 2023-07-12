@@ -4,7 +4,7 @@ import ctypes;
 import numpy as np;
 
 fastllm_data_type_dict = {
-    "int4": 4,
+    "int4": 8,
     "int8": 3,
     "float16": 7
 }

@@ -1117,6 +1117,7 @@ namespace fastllm {
             data.perChannelsConfigs.resize(k);
             data.zeros.resize(k);
             data.scales.resize(k);
+            data.mins.resize(k);
             for (int i = 0; i < k; i++) {
                 data.perChannelsConfigs[i] = LowBitConfig(configs[i].min, configs[i].max, bit, type);
                 data.mins[i] = data.perChannelsConfigs[i].min;
