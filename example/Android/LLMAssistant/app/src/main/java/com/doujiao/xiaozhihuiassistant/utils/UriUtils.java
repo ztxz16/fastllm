@@ -72,9 +72,6 @@ public class UriUtils {
 
                 // TODO handle non-primary volumes
             } else if("com.android.providers.downloads.documents".equals(authority)) {  // DownloadsProvider
-                final String id = DocumentsContract.getDocumentId(uri);
-                final Uri contentUri = ContentUris.withAppendedId(
-                        Uri.parse("content://downloads/public_downloads"), Long.valueOf(id));
                 return getDataColumn(context, uri, null/* selection*/, null/* selectionArgs */);
             } else if("com.android.providers.media.documents".equals(authority)) {  // MediaProvider
                 final String documentId = DocumentsContract.getDocumentId(uri);
