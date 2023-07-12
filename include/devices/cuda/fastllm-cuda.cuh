@@ -25,6 +25,7 @@ bool FastllmCudaSoftmax(const fastllm::Data &input, fastllm::Data &output, int a
 bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float alpha);
 bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float alpha);
 bool FastllmCudaAttentionMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue);
+bool FastllmCudaAlibiMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue);
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps);
 bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fastllm::Data &beta, fastllm::Data &output, int axis);
 bool FastllmCudaTopK(const fastllm::Data &input, fastllm::Data &output, int topk);
