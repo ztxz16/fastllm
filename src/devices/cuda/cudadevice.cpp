@@ -27,6 +27,7 @@ namespace fastllm {
         this->ops["AddTo"] = (BaseOperator*)(new CudaAddToOp());
         this->ops["MulTo"] = (BaseOperator*)(new CudaMulToOp());
         this->ops["AttentionMask"] = (BaseOperator*)(new CudaAttentionMaskOp());
+        this->ops["AlibiMask"] = (BaseOperator*)(new CudaAlibiMaskOp());
         this->ops["TopK"] = (BaseOperator*)(new CudaTopKOp());
         this->ops["PermuteSelf"] = (BaseOperator*)(new CudaPermuteSelfOp());
         this->ops["RotatePosition2D"] = (BaseOperator*)(new CudaRotatePosition2DOp());
@@ -447,11 +448,19 @@ namespace fastllm {
     }
 
     void CudaAttentionMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &mask = *(datas.find("mask")->second);
         float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -10000.0;
         FastllmCudaAttentionMask(input, mask, maskValue);
+    }
+
+    void CudaAlibiMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &mask = *(datas.find("mask")->second);
+        float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -10000.0;
+        FastllmCudaAlibiMask(input, mask, maskValue);
     }
 
     void CudaTopKOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,

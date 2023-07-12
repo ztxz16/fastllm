@@ -99,6 +99,23 @@ __global__ void FastllmAttentionMaskKernel(float* a, float *b, float maskValue, 
     }
 }
 
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmAlibiMaskKernel(float* a, float *b, float maskValue, int n, int m, int spn, int spm, int spatial) {
+    int on = blockIdx.x / m;
+    int om = blockIdx.x % m;
+    int o = on * m + om;
+    int idx = threadIdx.x;
+    float now = b[om];
+    for (int i = idx; i < spatial; i += THREAD_PER_BLOCK) {
+        int idi = i / spm, idj = i % spm;
+        if (idj <= spm - spn + idi) {
+            a[o * spatial + i] += now * idj;
+        } else {
+            a[o * spatial + i] = maskValue;
+        }
+    }
+}
+
 __global__ void FastllmPermuteKernel(float *dst, float *ori, int *temp, int axisLen, int len) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i < len) {
@@ -972,6 +989,20 @@ bool FastllmCudaAttentionMask(fastllm::Data &input, const fastllm::Data &mask, f
 
     FastllmAttentionMaskKernel <256> <<< n * m, 256>>>(cudaData, maskData, maskValue,
                                                        n, m, spatial);
+    FastllmCudaFinishInput(mask, maskData);
+    FastllmCudaFinishOutput(input, cudaData);
+    return true;
+}
+
+bool FastllmCudaAlibiMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue) {
+    int n = input.dims[0], m = input.dims[1];
+    int spn = input.dims[2], spm = input.dims[3];
+    int spatial = input.Count(2);
+    float *cudaData = (float *) FastllmCudaPrepareInput(input);
+    float *maskData = (float *) FastllmCudaPrepareInput(mask);
+
+    FastllmAlibiMaskKernel <256> <<< n * m, 256>>>(cudaData, maskData, maskValue,
+                                                   n, m, spn, spm, spatial);
     FastllmCudaFinishInput(mask, maskData);
     FastllmCudaFinishOutput(input, cudaData);
     return true;
