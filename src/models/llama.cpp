@@ -539,6 +539,9 @@ namespace fastllm {
 
     std::string LlamaModel::Response(const std::string& input, RuntimeResult retCb,
                                      const GenerationConfig &generationConfig) {
+#ifdef USE_CUDA
+        FastllmCudaClearBigBuffer();
+#endif
 //auto st = std::chrono::system_clock::now();
         Data inputIds = this->weight.tokenizer.Encode(input);
         std::vector <float> ids;
@@ -626,6 +629,9 @@ namespace fastllm {
     void LlamaModel::ResponseBatch(const std::vector<std::string> &inputs, std::vector<std::string> &outputs,
                                    RuntimeResultBatch retCb,
                                    const GenerationConfig &generationConfig) {
+#ifdef USE_CUDA
+        FastllmCudaClearBigBuffer();
+#endif
         int batch = inputs.size();
         outputs.clear();
         outputs.resize(batch, "");
