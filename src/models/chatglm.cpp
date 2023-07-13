@@ -861,8 +861,8 @@ namespace fastllm {
                                 } else {
                                     if (it.second->currentTokens.size() < 2 ||
                                         it.second->currentTokens[0] != 64790) {
-                                        ids.insert(ids.begin(), 64792);
-                                        ids.insert(ids.begin(), 64790);
+                                        ids.insert(ids.begin() + (ids.size() - it.second->currentTokens.size()), 64790);
+                                        ids.insert(ids.begin() + (ids.size() - it.second->currentTokens.size()), 64792);
                                         seqLen += 2;
                                     }
                                 }
