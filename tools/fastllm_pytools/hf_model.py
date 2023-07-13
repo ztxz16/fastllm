@@ -34,6 +34,13 @@ def create(model,
         modelInfo["bot_role"] = bot_role;
     if (history_sep):
         modelInfo["history_sep"] = history_sep;
+    if (modelInfo["model_type"] == "baichuan" and hasattr(model, "model") and hasattr(model.model, "get_alibi_mask")):
+        # Baichuan 2代
+        modelInfo["use_alibi"] = "1";
+        modelInfo["pre_prompt"] = "";
+        modelInfo["user_role"] = tokenizer.decode([model.generation_config.user_token_id]);
+        modelInfo["bot_role"] = tokenizer.decode([model.generation_config.assistant_token_id]);
+        modelInfo["history_sep"] = "";
 
     weight_type_dict = {};
     module_dict = {};
