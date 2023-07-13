@@ -919,7 +919,8 @@ void * FastllmCudaMalloc(size_t size) {
     if (size > 1024 * 1024) {
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
-            if (bigBuffers[i].size >= size && !bigBuffers[i].busy) {
+            if (bigBuffers[i].size >= size && !bigBuffers[i].busy
+                && bigBuffers[i].size - size < 32 * 1024 * 1024) {
                 if (selId == -1 || bigBuffers[selId].size > bigBuffers[i].size) {
                     selId = i;
                 }
