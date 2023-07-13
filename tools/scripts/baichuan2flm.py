@@ -12,7 +12,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(modelpath, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(modelpath, device_map="auto", trust_remote_code=True)
     try:
-        model.generation_config = GenerationConfig.from_pretrained(path);
+        model.generation_config = GenerationConfig.from_pretrained(modelpath);
     except:
         pass;
     torch2flm.tofile(exportPath, model, tokenizer);
