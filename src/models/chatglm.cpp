@@ -308,8 +308,15 @@ namespace fastllm {
                                                 ".word_embeddings.weight"], inputEmbeddings);
         Data &hiddenStates = inputEmbeddings;
         hiddenStates.ToDevice(DataDevice::CUDA);
+
+        Data attenInput;
+        Data attnProbs;
+        Data curContextLayer;
+        Data qkv, q, k, v;
+        Data attnOutput;
+        Data mlpInput, middle, middle2;
+
         for (int i = 0; i < block_cnt; i++) {
-            Data attenInput;
             if (version == 1) {
                 std::string inputLNWeightName = "transformer.layers." + std::to_string(i) + ".input_layernorm.weight";
                 std::string inputLNBiasName = "transformer.layers." + std::to_string(i) + ".input_layernorm.bias";
@@ -320,7 +327,6 @@ namespace fastllm {
                 RMSNorm(hiddenStates, weight[inputRMSWeightName], 1e-5, attenInput);
             }
 
-            Data qkv, q, k, v;
             std::string qkvWeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.weight";
             std::string qkvBiasName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.bias";
             Linear(attenInput, weight[qkvWeightName], weight[qkvBiasName], qkv);
@@ -418,7 +424,7 @@ namespace fastllm {
 
                 // 1.2 Attention
                 // 1.2.0 q * k^T
-                Data attnProbs;
+
                 q.Reshape({pastKey.dims[0], -1, q.dims[2]});
                 MatMulTransB(q, pastKey, attnProbs, 1.0 / (scale_attn * (i + 1)));
                 attnProbs.Reshape(outputSize);
@@ -432,7 +438,6 @@ namespace fastllm {
 
                 outputSize = {1, num_attention_heads, -1, pastValue.dims[2]};
                 // 1.2.3 prob * v
-                Data curContextLayer;
                 attnProbs.Reshape({pastValue.dims[0], -1, attnProbs.dims[3]});
                 MatMul(attnProbs, pastValue, curContextLayer);
                 curContextLayer.Reshape(outputSize);
@@ -451,10 +456,7 @@ namespace fastllm {
             // 1.2.4 dense
             std::string denseWeightName = weightPre + std::to_string(i) + weightMiddle + ".dense.weight";
             std::string denseBiasName = weightPre + std::to_string(i) + weightMiddle + ".dense.bias";
-            Data attnOutput;
             Linear(contextLayer, weight[denseWeightName], weight[denseBiasName], attnOutput);
-
-            Data mlpInput, middle, middle2;
             if (GetVersion() == 1) {
                 float alpha = sqrt(2 * block_cnt);
                 Mul(attenInput, alpha, hiddenStates);
