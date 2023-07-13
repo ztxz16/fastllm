@@ -404,6 +404,7 @@ namespace fastllm {
                 FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)this->cudaData, input0Stride * unitSize,
                                             (uint8_t*)old, input1Stride * unitSize, this->dims[axis] * inner * unitSize, outer);
                 FastllmCudaFree(old);
+                FastllmCudaClearBigBuffer();
 #else
                 ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif

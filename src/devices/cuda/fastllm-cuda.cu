@@ -917,11 +917,17 @@ std::vector <CudaMemoryBuffer> bigBuffers;
 
 void * FastllmCudaMalloc(size_t size) {
     if (size > 1024 * 1024) {
+        int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (bigBuffers[i].size >= size && !bigBuffers[i].busy) {
-                bigBuffers[i].busy = true;
-                return bigBuffers[i].data;
+                if (selId == -1 || bigBuffers[selId].size > bigBuffers[i].size) {
+                    selId = i;
+                }
             }
+        }
+        if (selId != -1) {
+            bigBuffers[selId].busy = true;
+            return bigBuffers[selId].data;
         }
 
         void * ret;
@@ -964,12 +970,16 @@ void FastllmCudaMallocBigBuffer(size_t size) {
 }
 
 void FastllmCudaClearBigBuffer() {
+    std::vector <CudaMemoryBuffer> temp;
     for (int i = 0; i < bigBuffers.size(); i++) {
         if (!bigBuffers[i].busy) {
             cudaFree(bigBuffers[i].data);
+        } else {
+            temp.push_back(bigBuffers[i]);
         }
     }
     bigBuffers.clear();
+    bigBuffers = temp;
 }
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size) {
