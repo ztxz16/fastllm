@@ -85,9 +85,14 @@ namespace fastllm {
         }
 
         Data hiddenStates;
+        Data attenInput;
+        Data q, k, v, qkv;
+        Data attenWeights, attenOutput;
+        Data attenLastOutput;
+        Data w1, w2, w3;
+
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         for (int i = 0; i < block_cnt; i++) {
-            Data attenInput;
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
@@ -97,9 +102,7 @@ namespace fastllm {
             std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
 
             // 1.1 Get q, k, v
-            Data q, k, v, qkv;
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
-
             if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
                 Linear(attenInput, weight[qkvWeightName], Data(), qkv);
                 int per = qkv.dims.back() / 3;
@@ -158,13 +161,11 @@ namespace fastllm {
                 }
                 pastValue.Expansion(newDims);
             }
-
             CatDirect(pastKey, k, 1);
             CatDirect(pastValue, v, 1);
 
             // 1.2 Attention
             // 1.2.0 q * k^T
-            Data attenWeights, attenOutput;
             MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
             attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
             if (alibiData.dims.size() != 0) {
@@ -180,12 +181,10 @@ namespace fastllm {
             PermuteSelf(attenOutput, {1, 0, 2});
             attenOutput.Reshape({bsz, seqlen, -1});
 
-            Data attenLastOutput;
             Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
-            Data w1, w2, w3;
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
             Silu(w1, w1);
@@ -198,7 +197,6 @@ namespace fastllm {
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         logits.ToDevice(DataDevice::CPU);
-
 
         int lastRet;
         if (generationConfig.IsSimpleGreedy()) {
@@ -225,11 +223,15 @@ namespace fastllm {
         }
 
         Data hiddenStates;
-        Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
+        Data attenInput;
+        Data q, k, v, qkv;
+        Data attenWeights, attenOutput;
+        Data attenLastOutput;
+        Data w1, w2, w3;
 
+        Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
-            Data attenInput;
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
@@ -239,7 +241,6 @@ namespace fastllm {
             std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
 
             // 1.1 Get q, k, v
-            Data q, k, v, qkv;
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
                 Linear(attenInput, weight[qkvWeightName], Data(), qkv);
@@ -305,7 +306,6 @@ namespace fastllm {
 
             // 1.2 Attention
             // 1.2.0 q * k^T
-            Data attenWeights, attenOutput;
             MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
             attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
             if (alibiData.dims.size() != 0) {
@@ -323,12 +323,10 @@ namespace fastllm {
             attenOutput.Reshape({seqlen, bsz, -1});
             PermuteSelf(attenOutput, {1, 0, 2});
 
-            Data attenLastOutput;
             Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
-            Data w1, w2, w3;
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
             Silu(w1, w1);
@@ -377,11 +375,15 @@ namespace fastllm {
         }
 
         Data hiddenStates;
-        Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
+        Data attenInput;
+        Data q, k, v, qkv;
+        Data attenWeights, curAttenOutput;
+        Data attenLastOutput;
+        Data w1, w2, w3;
 
+        Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
-            Data attenInput;
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
@@ -391,7 +393,6 @@ namespace fastllm {
             std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
 
             // 1.1 Get q, k, v
-            Data q, k, v, qkv;
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
                 Linear(attenInput, weight[qkvWeightName], Data(), qkv);
@@ -475,7 +476,6 @@ namespace fastllm {
 
                 // 1.2 Attention
                 // 1.2.0 q * k^T
-                Data attenWeights, curAttenOutput;
                 MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
                 attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
                 if (alibiData.dims.size() != 0) {
@@ -498,12 +498,10 @@ namespace fastllm {
                 CatDirect(attenOutput, curAttenOutput, 1);
             }
 
-            Data attenLastOutput;
             Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
-            Data w1, w2, w3;
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
             Silu(w1, w1);
@@ -516,7 +514,6 @@ namespace fastllm {
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         logits.ToDevice(DataDevice::CPU);
-
         std::vector <int> lastRet;
         int total = 0;
         for (int b = 0; b < batch; b++) {
@@ -801,7 +798,7 @@ namespace fastllm {
                             tokensManager.units.push_back(it.second->tokens);
                             if (it.second->preTokens == 0) {
                                 if (it.second->currentTokens.size() == 0 || it.second->currentTokens[0] != model->bos_token_id) {
-                                    it.second->currentTokens.push_back(model->bos_token_id);
+                                    it.second->currentTokens.insert(it.second->currentTokens.begin(), model->bos_token_id);
                                 }
                                 int seqLen = it.second->currentTokens.size();
                                 for (int i = 0; i < it.second->currentTokens.size(); i++) {
