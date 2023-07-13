@@ -53,7 +53,7 @@ extern "C" {
         }
     };
 
-    DLL_EXPORT static ModelManager models;
+    static ModelManager models;
 
     DLL_EXPORT char *string_to_chars(const std::string &s) {
         char *svalue = new char[s.size() + 1];

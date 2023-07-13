@@ -9,6 +9,7 @@ import android.os.Build;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Message;
+import android.provider.Settings;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
 import android.support.v4.app.ActivityCompat;
@@ -32,6 +33,11 @@ import com.doujiao.xiaozhihuiassistant.utils.StatusBarUtils;
 import com.doujiao.xiaozhihuiassistant.utils.UriUtils;
 
 import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -55,6 +61,7 @@ public class MainActivity extends AppCompatActivity {
     private static String[] PERMISSIONS_STORAGE = {Manifest.permission.WRITE_EXTERNAL_STORAGE};
     //请求状态码
     private final static int REQUEST_PERMISSION_CODE = 1;
+    protected static Uri modelUri = null;
 
     Handler mHandler = new Handler() {
         @Override
@@ -114,12 +121,39 @@ public class MainActivity extends AppCompatActivity {
     private void initModel() {
         //init:
         String modelPath = PrefUtil.getModelPath();
-        if (!modelPath.isEmpty() && new File(modelPath).exists()) {
+        if (!modelPath.isEmpty()) {
             mTvTips.setText("模型加载中..");
             new Thread(new Runnable() {
                 @Override
                 public void run() {
+                    if(modelUri != null) {
+                        try {
+                            Log.d(MainActivity.class.getName(), " writing model file to " + modelPath);
+                            InputStream inputStream = getContentResolver().openInputStream(modelUri);
+                            FileOutputStream fileOutputStream = new FileOutputStream(modelPath);
+                            byte[] buffer = new byte[1024];
+                            int bytesRead;
+                            while ((bytesRead = inputStream.read(buffer)) != -1) {
+                                fileOutputStream.write(buffer, 0, bytesRead);
+                            }
+                            fileOutputStream.close();
+                            inputStream.close();
+                            Log.d("@@@", "model file write in " + modelPath);
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
                     String path = PrefUtil.getModelPath();//Environment.getExternalStorageDirectory().getAbsolutePath() + "/chatglm-6b-int4.bin";
+                    File file = new File(path);
+                    if(!file.exists() || file.length() < 1024 * 1024 * 1024) {
+                        PrefUtil.setModelPath("");
+                        String modelType = "";
+                        Message msg = Message.obtain();
+                        msg.obj = modelType;
+                        msg.what = MSG_TYPE_INITMODEL_END;
+                        mHandler.sendMessage(msg);
+                        return;
+                    }
                     String modelType = AssistantCore.getInstance().initLLM(path, new AssistantCore.runtimeResult() {
                         @Override
                         public void callbackResult(int index, String content) {
@@ -165,8 +199,7 @@ public class MainActivity extends AppCompatActivity {
             public void onClick(View view) {
                 if (!mIsRunning) {
                     Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
-                    intent.setType("*/*.bin");
-                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    intent.setType("*/*");
                     startActivityForResult(Intent.createChooser(intent, "需要选择文件"), 1);
                 } else {
                     Toast.makeText(getApplicationContext(),"Is Running...",Toast.LENGTH_SHORT).show();
@@ -237,6 +270,12 @@ public class MainActivity extends AppCompatActivity {
         if (resultCode == Activity.RESULT_OK) {
             Uri uri = data.getData();
             String pathString = UriUtils.getPath(this, uri);
+            modelUri = null;
+            if(pathString == null || pathString.length()==0 || !pathString.startsWith("/")){
+                pathString = getApplicationContext().getExternalFilesDir("models") + "/model2.flm";
+                modelUri = uri;
+            }
+            Log.d(MainActivity.class.getName(), "uri: " + uri  + " pathString");
             PrefUtil.setModelPath(pathString);
             initModel();
         }
