@@ -3,7 +3,7 @@ plugins {
 }
 
 android {
-    compileSdk 28
+    compileSdk 30
 
     defaultConfig {
         applicationId "com.doujiao.xiaozhihuiassistant"
