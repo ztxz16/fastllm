@@ -114,10 +114,6 @@ namespace fastllm {
 
     bool CudaLinearOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data &weight = *(datas.find("weight")->second);
-        if (weight.dataType == DataType::FLOAT32) {
-            return false;
-        }
         return true;
     }
 
@@ -133,7 +129,9 @@ namespace fastllm {
         int m = input.dims.back();
         int k = output.dims.back();
 
-        if (weight.dataType == DataType::FLOAT16) {
+        if (weight.dataType == DataType::FLOAT32) {
+            FastllmCudaMatMulFloat32(input, weight, bias, output, n, m, k);
+        } else if (weight.dataType == DataType::FLOAT16) {
             FastllmCudaMatMulFloat16(input, weight, bias, output, n, m, k);
         } else if (weight.dataType == DataType::INT8) {
             FastllmCudaMatMulFloatInt8(input, weight, bias, output, n, m, k);
