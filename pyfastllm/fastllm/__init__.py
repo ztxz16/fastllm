@@ -1,2 +1,5 @@
 from pyfastllm import *
-from . import utils
+
+import utils
+import nn
+import functions
