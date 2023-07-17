@@ -29,7 +29,7 @@ namespace fastllm {
         virtual bool Malloc (void **ret, size_t size) = 0; // 分配尺寸为size的空间
         virtual bool Malloc (void **ret, Data &data); // 分配形状为dims的空间
         virtual bool Free(void *ret) = 0; // 释放ret
-
+        virtual bool MemoryCheck() = 0;
         virtual bool CopyDataToCPU(void *dst, void *src, size_t size) = 0; // device上的src拷贝到cpu上的dst
         virtual bool CopyDataToCPU(Data &data); // data数据从该device移动到CPU
 
