@@ -45,6 +45,10 @@ namespace fastllm {
         return true;
     }
 
+    bool CudaDevice::MemoryCheck(){
+        return FastllmCudaMemoryCheck();
+    }
+
     bool CudaDevice::CopyDataFromCPU(void *dst, void *src, size_t size) {
         FastllmCudaCopyFromHostToDevice(dst, src, size);
         return true;

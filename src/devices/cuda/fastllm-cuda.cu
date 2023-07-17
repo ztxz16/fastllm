@@ -18,6 +18,16 @@ double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_
     return double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
 };
 
+bool FastllmCudaMemoryCheck(){
+    size_t free_byte;
+    size_t total_byte;
+    cudaMemGetInfo(&free_byte, &total_byte);
+
+    double free_db = (double)free_byte;
+    double free_db_g = free_db / 1024.0 / 1024.0 / 1024.0;
+    return free_db_g > 2.0;
+}
+
 __global__ void FastllmCudaFloat2HalfKernel(float* a, half *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {

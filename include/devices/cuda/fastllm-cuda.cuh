@@ -3,6 +3,7 @@
 #ifdef  __cplusplus
 extern "C" {
 #endif
+bool FastllmCudaMemoryCheck();
 void FastllmInitCublas(void);
 
 void FastllmCudaMallocBigBuffer(size_t size);
