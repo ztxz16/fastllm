@@ -14,8 +14,7 @@ namespace fastllm {
 
         bool Malloc (void **ret, size_t size); // 分配尺寸为size的空间
         bool Free(void *ret); // 释放ret
-        bool MemoryCheck();
-        
+
         bool CopyDataToCPU(void *dst, void *src, size_t size);
         bool CopyDataFromCPU(void *dst, void *src, size_t size);
     };

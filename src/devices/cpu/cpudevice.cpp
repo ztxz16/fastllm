@@ -57,10 +57,6 @@ namespace fastllm {
         return true;
     }
 
-    bool CpuDevice::MemoryCheck() {
-        return true;
-    }
-
     bool CpuDevice::CopyDataFromCPU(void *dst, void *src, size_t size) {
         return true;
     }
