@@ -46,18 +46,7 @@ namespace fastllm {
             if (lockInCPU && device->deviceType != "cpu") {
                 continue;
             }
-            if (device->deviceType == "cuda" && device->CanRun(opType, datas, floatParams, intParams)) {
-                auto it = datas.find("weight");
-                if (device->MemoryCheck() || it->second->dataDevice == DataDevice::CUDA) {
-                    for (auto &it : datas) {
-                        it.second->ToDevice((void*)device);
-                    }
-                    device->Reshape(opType, datas, floatParams, intParams);
-                    device->Run(opType, datas, floatParams, intParams);
-                    break;
-                }
-            }
-            else if (device->deviceType == "cpu") {
+            if (device->CanRun(opType, datas, floatParams, intParams)) {
                 for (auto &it : datas) {
                     it.second->ToDevice((void*)device);
                 }
