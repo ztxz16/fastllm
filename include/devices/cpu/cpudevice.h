@@ -18,8 +18,7 @@ namespace fastllm {
 
         bool CopyDataToCPU(void *dst, void *src, size_t size); // 不重要, cpu device不会进行这个操作
         bool CopyDataFromCPU(void *dst, void *src, size_t size); // 不重要, cpu device不会进行这个操作
-        bool MemoryCheck();
-        
+
         int threads = 4;
         ThreadPool *threadPool = nullptr;
     };
