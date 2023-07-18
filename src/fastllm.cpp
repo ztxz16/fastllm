@@ -669,7 +669,24 @@ namespace fastllm {
         tokenToStringDict[tokenId] = s;
     }
 
-    Data Tokenizer::Encode(const std::string &s) {
+    Data Tokenizer::Encode(const std::string &ori) {
+        std::string blank = "";
+        blank += 226, blank += 150, blank += 129;
+        std::string s;
+        for (int i = 0; i < ori.size(); i++) {
+            if (ori[i] == ' ') {
+                if (i == 0 || ori[i - 1] != ' ') {
+                    s += blank;
+                }
+            } else if (ori[i] == '\t') {
+                s += "<|tab|>";
+            } else if (ori[i] == '\n') {
+                s += "<n>";
+            } else {
+                s += ori[i];
+            }
+        }
+
         std::vector <float> v;
         for (int i = 0; i < s.size(); i++) {
             int tokenId = -999999, pos = i - 1;
