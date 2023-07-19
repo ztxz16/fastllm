@@ -297,6 +297,10 @@ namespace fastllm {
         Data &operator [] (const std::string &key);
     };
 
+    void ClearProfiler();
+
+    void PrintProfiler();
+
     int LLMSampling(Data &logits, int outerOffset,
                     const GenerationConfig &config, const LastTokensUnit &tokens); // 对logits里[outerOffset * vocabSize, (outerOffset + 1) * vocabSize]做Sampling
 
