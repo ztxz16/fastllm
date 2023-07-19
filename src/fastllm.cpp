@@ -1311,4 +1311,12 @@ namespace fastllm {
                 {"input", &input}, {"penalty", (Data*)&penalty}
         }, {}, {});
     }
+
+    void ClearProfiler() {
+        curExecutor->ClearProfiler();
+    }
+
+    void PrintProfiler() {
+        curExecutor->PrintProfiler();
+    }
 }
