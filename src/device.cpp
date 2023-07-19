@@ -59,10 +59,20 @@ namespace fastllm {
             return;
         }
         // 默认的Reshape，把output和input变成一样的形状
-        Data &input = *(datas.find("input")->second);
-        Data &output = *(datas.find("output")->second);
+        Data *inputs = (datas.find("input")->second);
+        Data *outputs = (datas.find("output")->second);
+        if (inputs == outputs) {
+            return;
+        }
 
-        output.dataType = input.dataType;
-        output.Resize(input.dims);
+        int batch = 1;
+        if (intParams.find("input___batch") != intParams.end()) {
+            batch = intParams.find("input___batch")->second;
+        }
+
+        for (int i = 0; i < batch; i++) {
+            outputs[i].dataType = inputs[i].dataType;
+            outputs[i].Resize(inputs[i].dims);
+        }
     }
 }
