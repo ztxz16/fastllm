@@ -289,6 +289,7 @@ namespace fastllm {
             std::vector <std::pair <Data*, Data*> > &pastKeyValues,
             const std::vector <GenerationConfig> &generationConfigs,
             const LastTokensManager &lastTokens) {
+        int seqLen = inputIds.dims[1];
         sinData.ToDevice(DataDevice::CUDA);
         cosData.ToDevice(DataDevice::CUDA);
         int version = GetVersion();
@@ -310,11 +311,29 @@ namespace fastllm {
         hiddenStates.ToDevice(DataDevice::CUDA);
 
         Data attenInput;
-        Data attnProbs;
         Data curContextLayer;
         Data qkv, q, k, v;
         Data attnOutput;
         Data mlpInput, middle, middle2;
+        std::vector <Data> attnProbs;
+        std::vector <Data> curKs, curVs, curQs;
+        attnProbs.resize(batch);
+        curKs.resize(batch);
+        curVs.resize(batch);
+        curQs.resize(batch);
+
+        bool all1 = true;
+        for (int i = 0; i < batch; i++) {
+            all1 &= (seqLens[i] == 1);
+        }
+
+        if (batch > 1) {
+            positionIds[0]->Expansion({2, seqLen});
+            for (int i = 1; i < batch; i++) {
+                CatDirect(*(Data*)positionIds[0], *(Data*)positionIds[i], 1);
+            }
+        }
+
 
         for (int i = 0; i < block_cnt; i++) {
             if (version == 1) {
@@ -347,39 +366,44 @@ namespace fastllm {
                 v.Reshape({v.dims[0], v.dims[1], -1, embed_dim / num_attention_heads});
             }
 
+            if (version == 1) {
+                fastllm::RotatePosition2D(q, *positionIds[0], sinData, cosData, rotary_dim);
+                fastllm::RotatePosition2D(k, *positionIds[0], sinData, cosData, rotary_dim);
+            } else if (version == 2) {
+                fastllm::NearlyRotatePosition2D(q, *positionIds[0], sinData, cosData, rotary_dim);
+                fastllm::NearlyRotatePosition2D(k, *positionIds[0], sinData, cosData, rotary_dim);
+            }
+
+            k.Resize({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
+            v.Resize({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
+            q.Resize({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
+
             Data contextLayer = Data(DataType::FLOAT32);
             int total = 0;
-            std::vector <Data> curKs, curVs, curQs;
-            curKs.resize(batch);
-            curVs.resize(batch);
-            curQs.resize(batch);
-            for (int b = 0; b < batch; b++) {
-                Split(k, 0, total, total + seqLens[b], curKs[b]);
-                Split(v, 0, total, total + seqLens[b], curVs[b]);
-                Split(q, 0, total, total + seqLens[b], curQs[b]);
-                total += seqLens[b];
+
+            if (all1) {
+                SplitBatch(k, 0, batch, curKs);
+                SplitBatch(v, 0, batch, curVs);
+                SplitBatch(q, 0, batch, curQs);
+                total = batch;
+            } else {
+                for (int b = 0; b < batch; b++) {
+                    Split(k, 0, total, total + seqLens[b], curKs[b]);
+                    Split(v, 0, total, total + seqLens[b], curVs[b]);
+                    Split(q, 0, total, total + seqLens[b], curQs[b]);
+                    total += seqLens[b];
+                }
             }
 
             for (int b = 0; b < batch; b++) {
                 auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
-                if (version == 1) {
-                    fastllm::RotatePosition2D(q, *positionIds[b], sinData, cosData, rotary_dim);
-                    fastllm::RotatePosition2D(k, *positionIds[b], sinData, cosData, rotary_dim);
-                } else if (version == 2) {
-                    fastllm::NearlyRotatePosition2D(q, *positionIds[b], sinData, cosData, rotary_dim);
-                    fastllm::NearlyRotatePosition2D(k, *positionIds[b], sinData, cosData, rotary_dim);
-                }
-
-                k.Resize({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
-                v.Resize({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
-                q.Resize({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
 
                 PermuteSelf(k, {1, 0, 2});
                 PermuteSelf(v, {1, 0, 2});
                 PermuteSelf(q, {1, 0, 2});
 
-                Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
-
+                Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt +
+                                                                                                     i].second;
                 pastKey.ToDevice(DataDevice::CUDA);
                 pastValue.ToDevice(DataDevice::CUDA);
 
@@ -387,11 +411,12 @@ namespace fastllm {
 #ifdef USE_CUDA
                 unitLen = 128;
 #endif
-                while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
+                while ((pastKey.dims.size() == 0 &&
+                        (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
                        || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
-                    std::vector <int> newDims;
+                    std::vector<int> newDims;
                     if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
-                        newDims = std::vector <int> {k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
+                        newDims = std::vector<int>{k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
                         if (generationConfigs[b].output_token_limit > 0) {
                             newDims[1] = std::min(newDims[1], k.dims[1] + generationConfigs[b].output_token_limit);
                         }
@@ -402,11 +427,12 @@ namespace fastllm {
                     pastKey.Expansion(newDims);
                 }
 
-                while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[1] > pastValue.expansionDims[1]))
+                while ((pastValue.dims.size() == 0 &&
+                        (pastValue.expansionDims.size() == 0 || v.dims[1] > pastValue.expansionDims[1]))
                        || (pastValue.dims.size() > 0 && pastValue.dims[1] + v.dims[1] > pastValue.expansionDims[1])) {
-                    std::vector <int> newDims;
+                    std::vector<int> newDims;
                     if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
-                        newDims = std::vector <int> {v.dims[0], ((v.dims[1] - 1) / unitLen + 1) * unitLen, v.dims[2]};
+                        newDims = std::vector<int>{v.dims[0], ((v.dims[1] - 1) / unitLen + 1) * unitLen, v.dims[2]};
                         if (generationConfigs[b].output_token_limit > 0) {
                             newDims[1] = std::min(newDims[1], k.dims[1] + generationConfigs[b].output_token_limit);
                         }
@@ -426,20 +452,26 @@ namespace fastllm {
                 // 1.2.0 q * k^T
 
                 q.Reshape({pastKey.dims[0], -1, q.dims[2]});
-                MatMulTransB(q, pastKey, attnProbs, 1.0 / (scale_attn * (i + 1)));
-                attnProbs.Reshape(outputSize);
+                MatMulTransB(q, pastKey, attnProbs[b], 1.0 / (scale_attn * (i + 1)));
+                attnProbs[b].Reshape(outputSize);
                 // 1.2.1 Mask
                 if (attentionMask[b] != nullptr) {
-                    AttentionMask(attnProbs, *attentionMask[b], -10000);
+                    AttentionMask(attnProbs[b], *attentionMask[b], -10000);
                 }
-                // 1.2.2 softmax
-                Mul(attnProbs, i + 1, attnProbs);
-                Softmax(attnProbs, attnProbs, -1);
+            }
 
-                outputSize = {1, num_attention_heads, -1, pastValue.dims[2]};
+            // 1.2.2 softmax
+            MulBatch(attnProbs, i + 1, attnProbs);
+            for (int b = 0; b < batch; b++) {
+                Softmax(attnProbs[b], attnProbs[b], -1);
+            }
+
+            for (int b = 0; b < batch; b++) {
+                Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
+                std::vector <int> outputSize = {1, num_attention_heads, -1, pastValue.dims[2]};
                 // 1.2.3 prob * v
-                attnProbs.Reshape({pastValue.dims[0], -1, attnProbs.dims[3]});
-                MatMul(attnProbs, pastValue, curContextLayer);
+                attnProbs[b].Reshape({pastValue.dims[0], -1, attnProbs[b].dims[3]});
+                MatMul(attnProbs[b], pastValue, curContextLayer);
                 curContextLayer.Reshape(outputSize);
                 PermuteSelf(curContextLayer, {2, 0, 1, 3});
                 curContextLayer.Reshape({curContextLayer.dims[0], curContextLayer.dims[1], embed_dim});
@@ -721,8 +753,10 @@ namespace fastllm {
         LastTokensManager tokensManager (batch, generationConfig.last_n);
         while (true) {
             auto st = std::chrono::system_clock::now();
+            //ClearProfiler();
             std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, pastKeyValues,
                                                  generationConfig, tokensManager);
+            //PrintProfiler();
             for (int i = 0; i < batch; i++) {
                 tokensManager.units[i].Push(ret[i]);
             }
