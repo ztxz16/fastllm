@@ -25,6 +25,7 @@ namespace fastllm {
         this->ops["RMSNorm"] = (BaseOperator*)(new CpuRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CpuLinearOp());
         this->ops["Split"] = (BaseOperator*)(new CpuSplitOp());
+        this->ops["SplitBatch"] = (BaseOperator*)(new CpuSplitBatchOp());
         this->ops["Cat"] = (BaseOperator*)(new CpuCatOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CpuCatDirectOp());
         this->ops["MatMul"] = (BaseOperator*)(new CpuMatMulOp());
