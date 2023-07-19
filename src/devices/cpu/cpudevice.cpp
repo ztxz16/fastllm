@@ -35,6 +35,7 @@ namespace fastllm {
         this->ops["GeluNew"] = (BaseOperator*)(new CpuGeluNewOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CpuSwigluOp());
         this->ops["Mul"] = (BaseOperator*)(new CpuMulOp());
+        this->ops["MulBatch"] = (BaseOperator*)(new CpuMulBatchOp());
         this->ops["MulTo"] = (BaseOperator*)(new CpuMulToOp());
         this->ops["AddTo"] = (BaseOperator*)(new CpuAddToOp());
         this->ops["AttentionMask"] = (BaseOperator*)(new CpuAttentionMaskOp());
