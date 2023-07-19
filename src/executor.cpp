@@ -37,24 +37,35 @@ namespace fastllm {
 
     void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                        const fastllm::IntDict &intParams) {
-//auto st = std::chrono::system_clock::now();
+        auto st = std::chrono::system_clock::now();
         bool lockInCPU = false;
-        for (auto &it : datas) {
+        for (auto &it: datas) {
             lockInCPU |= it.second->lockInCPU;
         }
-        for (auto device : devices) {
+        for (auto device: devices) {
             if (lockInCPU && device->deviceType != "cpu") {
                 continue;
             }
             if (device->CanRun(opType, datas, floatParams, intParams)) {
-                for (auto &it : datas) {
-                    it.second->ToDevice((void*)device);
+                for (auto &it: datas) {
+                    it.second->ToDevice((void *) device);
                 }
                 device->Reshape(opType, datas, floatParams, intParams);
                 device->Run(opType, datas, floatParams, intParams);
                 break;
             }
         }
-//printf("%s spend %f s.\n", opType.c_str(), GetSpan(st, std::chrono::system_clock::now()));
+        float spend = GetSpan(st, std::chrono::system_clock::now());
+        profiler[opType] += spend;
+    }
+
+    void Executor::ClearProfiler() {
+        profiler.clear();
+    }
+
+    void Executor::PrintProfiler() {
+        for (auto &it : profiler) {
+            printf("%s spend %f\n", it.first.c_str(), it.second);
+        }
     }
 }
