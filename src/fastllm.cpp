@@ -1182,6 +1182,12 @@ namespace fastllm {
         }, {}, {{"axis", axis}, {"start", start}, {"end", end}});
     }
 
+    void SplitBatch(const Data &input, int axis, int part, std::vector <Data> &outputs) {
+        curExecutor->Run("SplitBatch", {
+                {"input", (Data*)&input}, {"output", (Data*)outputs.data()}
+        }, {}, {{"axis", axis}, {"output___batch", part}});
+    }
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output) {
         curExecutor->Run("Cat", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}, {"output", &output}

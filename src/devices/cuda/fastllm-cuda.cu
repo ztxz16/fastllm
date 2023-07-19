@@ -691,6 +691,17 @@ __global__ void FastllmGemvInt4NoZeroKernel2(float *A, uint8_t *B, float *C,
     }
 }
 
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmSplitBatchKernel(uint8_t *input, uint8_t **outputs, int outer, int channels, int inner) {
+    int bid = blockIdx.x / outer, oid = blockIdx.x % outer;
+    uint8_t *curInput = input + oid * channels * inner + bid * inner;
+    uint8_t *curOutput = outputs[blockIdx.x] + oid * inner;
+
+    for (int i = threadIdx.x; i < inner; i += THREAD_PER_BLOCK) {
+        curOutput[i] = curInput[i];
+    }
+}
+
 void *FastllmCudaPrepareInput(const fastllm::Data &input) {
     void *ret;
     if (input.dataDevice == fastllm::DataDevice::CUDA) {
@@ -1566,4 +1577,26 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
     FastllmCudaFinishInput(cosData, cudaCos);
     FastllmCudaFinishOutput(data, cudaData);
     return true;
+}
+
+void FastllmCudaSplitBatch(const fastllm::Data &input, fastllm::Data *outputs, int axis) {
+    int part = input.dims[axis];
+    int outer = input.Count(0) / input.Count(axis);
+    int inputStride = input.Count(axis);
+    int outputStride = outputs[0].Count(axis);
+    int inner = input.strides[axis];
+    int unitSize = input.unitSize;
+
+    uint8_t ** pointers = (uint8_t**)FastllmCudaMalloc(sizeof(uint8_t*) * part);
+    uint8_t ** cpuPointers = new uint8_t*[part];
+    for (int i = 0; i < part; i++) {
+        cpuPointers[i] = (uint8_t*)outputs[i].cudaData;
+    }
+    cudaMemcpy(pointers, cpuPointers, sizeof(uint8_t*) * part, cudaMemcpyHostToDevice);
+    FastllmSplitBatchKernel <256> <<< part * outer, 256 >>> ((uint8_t*)input.cudaData, pointers, outer, part, inner * unitSize);
+
+    FastllmCudaFree(pointers);
+    delete[] cpuPointers;
+
+    //cudaDeviceSynchronize();
 }
