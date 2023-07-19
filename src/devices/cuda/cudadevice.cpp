@@ -25,6 +25,7 @@ namespace fastllm {
         this->ops["Silu"] = (BaseOperator*)(new CudaSiluOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CudaSwigluOp());
         this->ops["Mul"] = (BaseOperator*)(new CudaMulOp());
+        this->ops["MulBatch"] = (BaseOperator*)(new CudaMulBatchOp());
         this->ops["AddTo"] = (BaseOperator*)(new CudaAddToOp());
         this->ops["MulTo"] = (BaseOperator*)(new CudaMulToOp());
         this->ops["AttentionMask"] = (BaseOperator*)(new CudaAttentionMaskOp());

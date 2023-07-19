@@ -334,6 +334,8 @@ namespace fastllm {
 
     void Mul(const Data &input, float v, Data &output);
 
+    void MulBatch(std::vector <Data> &input, float v, std::vector <Data> &output);
+
     void MulTo(Data &input0, const Data &input1); // input0 *= input1
 
     void AddTo(Data &input0, const Data &input1, float alpha = 1.0); // input0 += input1 * alpha

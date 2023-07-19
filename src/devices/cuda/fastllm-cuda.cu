@@ -13,6 +13,10 @@ static cublasHandle_t fastllmCublasHandle = nullptr;
 
 #include <chrono>
 
+void DeviceSync() {
+    //cudaDeviceSynchronize();
+}
+
 double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
     auto duration = std::chrono::duration_cast<std::chrono::microseconds> (time2 - time1);
     return double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
@@ -87,6 +91,16 @@ __global__ void FastllmMulKernel(float* a, float *b, float v, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
         b[idx] = a[idx] * v;
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmMulBatchKernel(float** pointer, int batch, float v) {
+    float *input = pointer[blockIdx.x];
+    float *output = pointer[blockIdx.x + batch];
+    int len = (int)((unsigned long long)pointer[blockIdx.x + batch * 2]);
+    for (int i = threadIdx.x; i < len; i += THREAD_PER_BLOCK) {
+        output[i] = input[i] * v;
     }
 }
 
@@ -735,7 +749,7 @@ void FastllmCudaFinishOutput(fastllm::Data &output, void *data) {
         FastllmCudaFree(data);
     }
 
-    // cudaDeviceSynchronize();
+    DeviceSync();
 }
 
 bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
@@ -1194,7 +1208,7 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
 void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void * 	src,
                                        size_t 	spitch, size_t 	width, size_t 	height) {
     cudaMemcpy2D(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice);
-    // cudaDeviceSynchronize();
+    //cudaDeviceSynchronize();
 }
 
 bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output) {
@@ -1241,6 +1255,24 @@ bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output) 
     FastllmMulKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, v, len);
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaMulBatch(const fastllm::Data *inputs, float v, int batch, const fastllm::Data *outputs) {
+    float ** pointers = (float**)FastllmCudaMalloc(sizeof(float*) * batch * 3);
+    float ** cpuPointers = new float*[batch * 3];
+    for (int i = 0; i < batch; i++) {
+        cpuPointers[i] = (float*)inputs[i].cudaData;
+        cpuPointers[i + batch] = (float*)outputs[i].cudaData;
+        cpuPointers[i + batch * 2] = (float*)(inputs[i].Count(0));
+    }
+    cudaMemcpy(pointers, cpuPointers, sizeof(float*) * batch * 3, cudaMemcpyHostToDevice);
+    FastllmMulBatchKernel <256> <<< batch, 256 >>> (pointers, batch, v);
+
+    FastllmCudaFree(pointers);
+    delete[] cpuPointers;
+
+    DeviceSync();
     return true;
 }
 
@@ -1579,7 +1611,7 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
     return true;
 }
 
-void FastllmCudaSplitBatch(const fastllm::Data &input, fastllm::Data *outputs, int axis) {
+bool FastllmCudaSplitBatch(const fastllm::Data &input, fastllm::Data *outputs, int axis) {
     int part = input.dims[axis];
     int outer = input.Count(0) / input.Count(axis);
     int inputStride = input.Count(axis);
@@ -1598,5 +1630,6 @@ void FastllmCudaSplitBatch(const fastllm::Data &input, fastllm::Data *outputs, i
     FastllmCudaFree(pointers);
     delete[] cpuPointers;
 
-    //cudaDeviceSynchronize();
+    DeviceSync();
+    return true;
 }
