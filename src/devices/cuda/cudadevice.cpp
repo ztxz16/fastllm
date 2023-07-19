@@ -16,6 +16,7 @@ namespace fastllm {
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
+        this->ops["SplitBatch"] = (BaseOperator*)(new CudaSplitBatchOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
         this->ops["MatMul"] = (BaseOperator*)(new CudaMatMulOp());
         this->ops["MatMulTransB"] = (BaseOperator*)(new CudaMatMulTransBOp());

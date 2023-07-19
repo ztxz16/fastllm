@@ -314,6 +314,8 @@ namespace fastllm {
 
     void Split(const Data &input, int axis, int start, int end, Data &output);
 
+    void SplitBatch(const Data &input, int axis, int part, std::vector <Data> &outputs); // 将input沿着axis轴切开，每份axis上的尺寸为1，放到outputs里
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 
 	void CatDirect(Data &input0, const Data &input1, int axis); // 直接把input1的数据拷贝到input0后面（需要input0提前扩容了足够的空间）
