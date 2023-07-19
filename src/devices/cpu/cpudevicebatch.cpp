@@ -59,4 +59,24 @@ namespace fastllm {
             }
         }
     }
+
+    void CpuMulBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *inputs = (datas.find("input")->second);
+        Data *outputs = (datas.find("output")->second);
+
+        float v = floatParams.find("v") != floatParams.end() ? floatParams.find("v")->second : 1.0;
+        int batch = intParams.find("input___batch")->second;
+        for (int i = 0; i < batch; i++) {
+            outputs[i].Allocate();
+            AssertInFastLLM(inputs[i].dataType == DataType::FLOAT32, "Mul error: Data's type should be float32.\n");
+
+            float *inputData = (float *) inputs[i].cpuData;
+            float *outputData = (float *) outputs[i].cpuData;
+            int len = inputs[i].Count(0);
+            for (int i = 0; i < len; i++) {
+                outputData[i] = inputData[i] * v;
+            }
+        }
+    }
 }

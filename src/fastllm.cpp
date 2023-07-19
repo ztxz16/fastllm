@@ -1242,6 +1242,12 @@ namespace fastllm {
         }, {{"v", v}}, {});
     }
 
+    void MulBatch(std::vector <Data> &input, float v, std::vector <Data> &output) {
+        curExecutor->Run("MulBatch", {
+                {"input", (Data*)input.data()}, {"output", output.data()}
+        }, {{"v", v}}, {{"input___batch", (int)input.size()}, {"output___batch", (int)output.size()}});
+    }
+
     void MulTo(Data &input0, const Data &input1) {
         curExecutor->Run("MulTo", {
                 {"input0", &input0}, {"input1", (Data*)&input1}

@@ -38,4 +38,19 @@ namespace fastllm {
         }
         FastllmCudaSplitBatch(input, outputs, axis);
     }
+
+    void CudaMulBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *inputs = (datas.find("input")->second);
+        Data *outputs = (datas.find("output")->second);
+
+        float v = floatParams.find("v") != floatParams.end() ? floatParams.find("v")->second : 1.0;
+        int batch = intParams.find("input___batch")->second;
+        for (int i = 0; i < batch; i++) {
+            outputs[i].Allocate();
+            AssertInFastLLM(inputs[i].dataType == DataType::FLOAT32, "Mul error: Data's type should be float32.\n");
+        }
+
+        FastllmCudaMulBatch(inputs, v, batch, outputs);
+    }
 }
