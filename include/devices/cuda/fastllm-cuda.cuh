@@ -16,6 +16,7 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size);
 
 void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void * 	src,
                                        size_t 	spitch, size_t 	width, size_t 	height);
+void FastllmCudaSplitBatch(const fastllm::Data &input, fastllm::Data *outputs, int axis);
 
 bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output);

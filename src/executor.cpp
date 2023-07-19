@@ -48,7 +48,13 @@ namespace fastllm {
             }
             if (device->CanRun(opType, datas, floatParams, intParams)) {
                 for (auto &it: datas) {
-                    it.second->ToDevice((void *) device);
+                    int batch = 1;
+                    if (intParams.find(it.first + "___batch") != intParams.end()) {
+                        batch = intParams.find(it.first + "___batch")->second;
+                    }
+                    for (int i = 0; i < batch; i++) {
+                        it.second[i].ToDevice((void *) device);
+                    }
                 }
                 device->Reshape(opType, datas, floatParams, intParams);
                 device->Run(opType, datas, floatParams, intParams);
