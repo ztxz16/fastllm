@@ -35,9 +35,12 @@ namespace fastllm {
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CudaLlamaRotatePosition2DOp());
 
         this->ops["SplitBatch"] = (BaseOperator*)(new CudaSplitBatchOp());
+        this->ops["CatBatch"] = (BaseOperator*)(new CudaCatBatchOp());
         this->ops["MulBatch"] = (BaseOperator*)(new CudaMulBatchOp());
         this->ops["MatMulBatch"] = (BaseOperator*)(new CudaMatMulBatchOp());
         this->ops["MatMulTransBBatch"] = (BaseOperator*)(new CudaMatMulTransBBatchOp());
+        this->ops["SoftMaxBatch"] = (BaseOperator*)(new CudaSoftmaxBatchOp());
+        this->ops["CatDirectBatch"] = (BaseOperator*)(new CudaCatDirectBatchOp());
     }
 
     bool CudaDevice::Malloc(void **ret, size_t size) {

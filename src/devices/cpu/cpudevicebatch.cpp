@@ -61,6 +61,46 @@ namespace fastllm {
         }
     }
 
+    void CpuCatBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data **inputs = (Data**)(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int dimsLen = inputs[0]->dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        int part = intParams.find("input___batch")->second;
+        std::vector <int> dims = inputs[0]->dims;
+        dims[axis] = part;
+        output.dataType = inputs[0]->dataType;
+        output.Resize(dims);
+    }
+
+    void CpuCatBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data **inputs = (Data**)(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int dimsLen = inputs[0]->dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        int part = intParams.find("input___batch")->second;
+
+        int outer = inputs[0]->Count(0) / inputs[0]->Count(axis);
+        int inputStride = inputs[0]->Count(axis);
+        int outputStride = output.Count(axis);
+        int inner = inputs[0]->strides[axis];
+        int unitSize = inputs[0]->unitSize;
+
+        output.Allocate();
+        for (int i = 0; i < part; i++) {
+            int start = i, end = i + 1;
+            for (int o = 0; o < outer; o++) {
+                memcpy(output.cpuData + (o * outputStride + start * inner) * unitSize,
+                       inputs[i]->cpuData + (o * inputStride) * unitSize,
+                       (end - start) * inner * unitSize);
+            }
+        }
+    }
+
     void CpuMulBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data **inputs = (Data**)(datas.find("input")->second);
@@ -133,6 +173,32 @@ namespace fastllm {
             tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
             tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
             op->Run("MatMulTransB", tempDatas, floatParams, intParams);
+        }
+        delete op;
+    }
+
+    void CpuSoftmaxBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuSoftMaxOp());
+        int batch = intParams.find("input___batch")->second;
+        DataDict tempDatas = datas;
+        for (int i = 0; i < batch; i++) {
+            tempDatas["input"] = ((Data**)datas.find("input")->second)[i];
+            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
+            op->Run("Softmax", tempDatas, floatParams, intParams);
+        }
+        delete op;
+    }
+
+    void CpuCatDirectBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuCatDirectOp());
+        int batch = intParams.find("input0___batch")->second;
+        DataDict tempDatas = datas;
+        for (int i = 0; i < batch; i++) {
+            tempDatas["input0"] = ((Data**)datas.find("input0")->second)[i];
+            tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
+            op->Run("CatDirect", tempDatas, floatParams, intParams);
         }
         delete op;
     }

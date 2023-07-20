@@ -1318,6 +1318,12 @@ namespace fastllm {
         }, {}, {{"axis", axis}, {"output___batch", part}});
     }
 
+    void CatBatch(std::vector <Data*> &input, int axis, Data &outputs) {
+        curExecutor->Run("CatBatch", {
+                {"input", (Data*)input.data()}, {"output", (Data*)&outputs}
+        }, {}, {{"axis", axis}, {"input___batch", (int)input.size()}});
+    }
+
     void MulBatch(std::vector <Data*> &input, float v, std::vector <Data*> &output) {
         curExecutor->Run("MulBatch", {
                 {"input", (Data*)input.data()}, {"output", (Data*)output.data()}
@@ -1340,6 +1346,18 @@ namespace fastllm {
         {{"input0___batch", (int)input0.size()},
          {"input1___batch", (int)input1.size()},
          {"output___batch", (int)output.size()}});
+    }
+
+    void SoftmaxBatch(std::vector <Data*> &input, std::vector <Data*> &output, int axis) {
+        curExecutor->Run("SoftMaxBatch", {
+                {"input", (Data*)input.data()}, {"output", (Data*)output.data()}
+        }, {}, {{"axis", axis}, {"input___batch", (int)input.size()}, {"output___batch", (int)output.size()}});
+    }
+
+    void CatDirectBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, int axis) {
+        curExecutor->Run("CatDirectBatch", {
+                {"input0", (Data*)input0.data()}, {"input1", (Data*)input1.data()}
+        }, {}, {{"axis", axis}, {"input0___batch", (int)input0.size()}, {"input1___batch", (int)input1.size()}});
     }
 
     void ClearProfiler() {

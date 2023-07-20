@@ -709,7 +709,18 @@ template <int THREAD_PER_BLOCK>
 __global__ void FastllmSplitBatchKernel(uint8_t *input, uint8_t **outputs, int outer, int channels, int inner) {
     int bid = blockIdx.x / outer, oid = blockIdx.x % outer;
     uint8_t *curInput = input + oid * channels * inner + bid * inner;
-    uint8_t *curOutput = outputs[blockIdx.x] + oid * inner;
+    uint8_t *curOutput = outputs[bid] + oid * inner;
+
+    for (int i = threadIdx.x; i < inner; i += THREAD_PER_BLOCK) {
+        curOutput[i] = curInput[i];
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmCatBatchKernel(uint8_t **inputs, uint8_t *output, int outer, int channels, int inner) {
+    int bid = blockIdx.x / outer, oid = blockIdx.x % outer;
+    uint8_t *curInput = inputs[bid] + oid * inner;
+    uint8_t *curOutput = output + oid * channels * inner + bid * inner;
 
     for (int i = threadIdx.x; i < inner; i += THREAD_PER_BLOCK) {
         curOutput[i] = curInput[i];
@@ -1608,6 +1619,29 @@ bool FastllmCudaSplitBatch(fastllm::Data &input, fastllm::Data **outputs, int ax
     }
     cudaMemcpy(pointers, cpuPointers, sizeof(uint8_t*) * part, cudaMemcpyHostToDevice);
     FastllmSplitBatchKernel <256> <<< part * outer, 256 >>> ((uint8_t*)input.cudaData, pointers, outer, part, inner * unitSize);
+
+    FastllmCudaFree(pointers);
+    delete[] cpuPointers;
+
+    DeviceSync();
+    return true;
+}
+
+bool FastllmCudaCatBatch(fastllm::Data **inputs, fastllm::Data &output, int axis) {
+    int part = output.dims[axis];
+    int outer = output.Count(0) / output.Count(axis);
+    int inputStride = inputs[0]->Count(axis);
+    int outputStride = output.Count(axis);
+    int inner = output.strides[axis];
+    int unitSize = output.unitSize;
+
+    uint8_t ** pointers = (uint8_t**)FastllmCudaMalloc(sizeof(uint8_t*) * part);
+    uint8_t ** cpuPointers = new uint8_t*[part];
+    for (int i = 0; i < part; i++) {
+        cpuPointers[i] = (uint8_t*)inputs[i]->cudaData;
+    }
+    cudaMemcpy(pointers, cpuPointers, sizeof(uint8_t*) * part, cudaMemcpyHostToDevice);
+    FastllmCatBatchKernel <256> <<< part * outer, 256 >>> (pointers, (uint8_t*)output.cudaData, outer, part, inner * unitSize);
 
     FastllmCudaFree(pointers);
     delete[] cpuPointers;

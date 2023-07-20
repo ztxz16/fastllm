@@ -385,10 +385,10 @@ namespace fastllm {
 
             if (all1) {
                 std::vector <Data*> pointersK, pointersV, pointersQ;
-                for (int i = 0; i < batch; i++) {
-                    pointersK.push_back(&curKs[i]);
-                    pointersV.push_back(&curVs[i]);
-                    pointersQ.push_back(&curQs[i]);
+                for (int b = 0; b < batch; b++) {
+                    pointersK.push_back(&curKs[b]);
+                    pointersV.push_back(&curVs[b]);
+                    pointersQ.push_back(&curQs[b]);
                 }
                 SplitBatch(k, 0, batch, pointersK);
                 SplitBatch(v, 0, batch, pointersV);
@@ -455,10 +455,22 @@ namespace fastllm {
                     }
                     pastValue.Expansion(newDims);
                 }
+            }
 
-                CatDirect(pastKey, k, 1);
-                CatDirect(pastValue, v, 1);
+            std::vector <Data*> keys, values;
+            std::vector <Data*> pointersK, pointersV;
+            for (int b = 0; b < batch; b++) {
+                keys.push_back(pastKeyValues[b * block_cnt + i].first);
+                values.push_back(pastKeyValues[b * block_cnt + i].second);
+                pointersK.push_back(&curKs[b]);
+                pointersV.push_back(&curVs[b]);
+            }
+            CatDirectBatch(keys, pointersK, 1);
+            CatDirectBatch(values, pointersV, 1);
 
+            for (int b = 0; b < batch; b++) {
+                auto &q = curQs[b];
+                Data &pastKey = *pastKeyValues[b * block_cnt + i].first;
                 outputSizes[b] = {1, q.dims[0], q.dims[1], pastKey.dims[1]};
                 q.Reshape({pastKey.dims[0], -1, q.dims[2]});
             }
@@ -490,14 +502,12 @@ namespace fastllm {
             }
 
             // 1.2.2 softmax
-            std::vector <Data*> pointerAP;
+            std::vector <Data*> attns;
             for (int i = 0; i < attnProbs.size(); i++) {
-                pointerAP.push_back(&attnProbs[i]);
+                attns.push_back(&attnProbs[i]);
             }
-            MulBatch(pointerAP, i + 1, pointerAP);
-            for (int b = 0; b < batch; b++) {
-                Softmax(attnProbs[b], attnProbs[b], -1);
-            }
+            MulBatch(attns, i + 1, attns);
+            SoftmaxBatch(attns, attns, -1);
 
             for (int b = 0; b < batch; b++) {
                 Data &pastValue = *pastKeyValues[b * block_cnt + i].second;
@@ -525,14 +535,24 @@ namespace fastllm {
                 curContextLayer[b].Reshape(outputSizes[b]);
                 PermuteSelf(curContextLayer[b], {2, 0, 1, 3});
                 curContextLayer[b].Reshape({curContextLayer[b].dims[0], curContextLayer[b].dims[1], embed_dim});
+            }
 
-                if (contextLayer.dims.size() == 0) {
-                    std::vector <int> dims = curContextLayer[b].dims;
-                    dims[0] = total;
-                    contextLayer.Expansion(dims);
+            if (all1 && batch > 1) {
+                std::vector <Data*> contexts;
+                for (int b = 0; b < batch; b++) {
+                    contexts.push_back(&curContextLayer[b]);
                 }
-                contextLayer.ToDevice(DataDevice::CUDA);
-                CatDirect(contextLayer, curContextLayer[b], 0);
+                CatBatch(contexts, 0, contextLayer);
+            } else {
+                for (int b = 0; b < batch; b++) {
+                    if (contextLayer.dims.size() == 0) {
+                        std::vector<int> dims = curContextLayer[b].dims;
+                        dims[0] = total;
+                        contextLayer.Expansion(dims);
+                    }
+                    contextLayer.ToDevice(DataDevice::CUDA);
+                    CatDirect(contextLayer, curContextLayer[b], 0);
+                }
             }
 
             // 1.2.4 dense
