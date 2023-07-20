@@ -51,6 +51,7 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
                                  const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim);
 
 bool FastllmCudaSplitBatch(fastllm::Data &input, fastllm::Data **outputs, int axis);
+bool FastllmCudaCatBatch(fastllm::Data **inputs, fastllm::Data &output, int axis);
 bool FastllmCudaMulBatch(fastllm::Data **inputs, float v, int batch, fastllm::Data **outputs);
 #ifdef  __cplusplus
 }

@@ -358,9 +358,15 @@ namespace fastllm {
 
     void SplitBatch(const Data &input, int axis, int part, std::vector <Data*> &outputs); // 将input沿着axis轴切开，每份axis上的尺寸为1，放到outputs里
 
+    void CatBatch(std::vector <Data*> &input, int axis, Data &outputs); // 将input沿着axis轴合起来，每份axis上的尺寸为1，放到output里
+
     void MatMulBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, std::vector <Data*> &output, float alpha = 1.0);
 
     void MatMulTransBBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, std::vector <Data*> &output, float alpha = 1.0);
+
+    void SoftmaxBatch(std::vector <Data*> &input, std::vector <Data*> &output, int axis);
+
+    void CatDirectBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, int axis);
 }
 
 #endif //TEST_FASTLLM_H
