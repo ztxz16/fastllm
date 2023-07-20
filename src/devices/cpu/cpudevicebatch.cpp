@@ -16,6 +16,7 @@
 #endif
 
 #include "utils.h"
+#include "device.h"
 
 namespace fastllm {
     void CpuSplitBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -78,5 +79,61 @@ namespace fastllm {
                 outputData[i] = inputData[i] * v;
             }
         }
+    }
+
+    void CpuMatMulTransBBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuMatMulTransBOp());
+        int batch = intParams.find("input0___batch")->second;
+        DataDict tempDatas = datas;
+        for (int i = 0; i < batch; i++) {
+            tempDatas["input0"] = ((Data**)datas.find("input0")->second)[i];
+            tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
+            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
+            op->Reshape("MatMulTransB", tempDatas, floatParams, intParams);
+        }
+        delete op;
+    }
+
+    void CpuMatMulTransBBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuMatMulTransBOp());
+        int batch = intParams.find("input0___batch")->second;
+        DataDict tempDatas = datas;
+        for (int i = 0; i < batch; i++) {
+            tempDatas["input0"] = ((Data**)datas.find("input0")->second)[i];
+            tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
+            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
+            op->Run("MatMulTransB", tempDatas, floatParams, intParams);
+        }
+        delete op;
+    }
+
+    void CpuMatMulBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                   const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuMatMulOp());
+        int batch = intParams.find("input0___batch")->second;
+        DataDict tempDatas = datas;
+        for (int i = 0; i < batch; i++) {
+            tempDatas["input0"] = ((Data**)datas.find("input0")->second)[i];
+            tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
+            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
+            op->Reshape("MatMulTransB", tempDatas, floatParams, intParams);
+        }
+        delete op;
+    }
+
+    void CpuMatMulBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuMatMulOp());
+        int batch = intParams.find("input0___batch")->second;
+        DataDict tempDatas = datas;
+        for (int i = 0; i < batch; i++) {
+            tempDatas["input0"] = ((Data**)datas.find("input0")->second)[i];
+            tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
+            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
+            op->Run("MatMulTransB", tempDatas, floatParams, intParams);
+        }
+        delete op;
     }
 }
