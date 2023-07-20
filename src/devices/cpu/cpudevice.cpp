@@ -47,9 +47,12 @@ namespace fastllm {
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CpuRepeatPenaltyOp());
 
         this->ops["SplitBatch"] = (BaseOperator*)(new CpuSplitBatchOp());
+        this->ops["CatBatch"] = (BaseOperator*)(new CpuCatBatchOp());
         this->ops["MulBatch"] = (BaseOperator*)(new CpuMulBatchOp());
         this->ops["MatMulBatch"] = (BaseOperator*)(new CpuMatMulBatchOp());
         this->ops["MatMulTransBBatch"] = (BaseOperator*)(new CpuMatMulTransBBatchOp());
+        this->ops["SoftMaxBatch"] = (BaseOperator*)(new CpuSoftmaxBatchOp());
+        this->ops["CatDirectBatch"] = (BaseOperator*)(new CpuCatDirectBatchOp());
     }
 
     bool CpuDevice::Malloc(void **ret, size_t size) {
