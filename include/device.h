@@ -24,6 +24,13 @@ namespace fastllm {
         virtual void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) = 0;
     };
 
+    class BaseBatchOperator : BaseOperator {
+    public:
+        // 对某一个算子进行形状推理
+        virtual void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams,
+                             const IntDict &intParams);
+    };
+
     class BaseDevice {
     public:
         virtual bool Malloc (void **ret, size_t size) = 0; // 分配尺寸为size的空间
