@@ -12,6 +12,11 @@
 #include <cmath>
 #include <cfloat>
 #include <thread>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -93,6 +98,56 @@ namespace fastllm {
 
     ThreadPool *GetPool() {
         return fastllmThreadPool;
+    }
+
+    FileMmap::FileMmap(const std::string &path) {
+        int fd = open(path.c_str(), O_RDONLY);
+        AssertInFastLLM(fd > 0, "cannot open file ");
+
+        struct stat sb;
+        AssertInFastLLM(fstat(fd, &sb) == 0, "fstat error");
+        size = sb.st_size;
+
+        data = (char *)mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+        AssertInFastLLM(data != MAP_FAILED, "mmap failed");
+
+        AssertInFastLLM(close(fd) == 0, "close file error");
+    }
+
+    FileMmap::~FileMmap() { AssertInFastLLM(munmap(data, size) == 0, "munmap failed");}
+
+    void ModelLoader::seek(int64_t offset, int whence) {
+        if (whence == SEEK_SET) {
+            ptr = data + offset;
+        } else if (whence == SEEK_CUR) {
+            ptr += offset;
+        } else if (whence == SEEK_END) {
+            ptr = data + size + offset;
+        } else {
+            printf("invalid seek mode: %d", whence);
+        }
+    }
+
+    std::string ModelLoader::ReadString() {
+        int length = ReadInt();
+        std::string s(ptr, ptr + length);
+        ptr += length;
+        return s;
+    }
+
+    int ModelLoader::ReadInt(){
+        return read_basic<int>();
+    }
+
+    float ModelLoader::ReadFloat(){
+        return read_basic<float>();
+    }
+
+    uint8_t* ModelLoader::ReadBytes(uint64_t bytes){
+        // memcpy(buffer, ptr, bytes);
+        uint8_t* buffer = (uint8_t *) ptr;
+        ptr += bytes;
+        return buffer;
     }
 
     struct FileBuffer {
@@ -415,7 +470,9 @@ namespace fastllm {
     }
 
     Data::~Data() {
+#ifndef USE_MMAP
         delete[] this->cpuData;
+#endif
 #ifdef USE_CUDA
         if (this->cudaData != nullptr) {
             FastllmCudaFree(this->cudaData);
@@ -602,7 +659,12 @@ namespace fastllm {
 
     std::string GetModelTypeFromFile(const std::string &fileName) {
         std::string ret = "unknown";
+    #ifdef USE_MMAP
+        std::unique_ptr<FileMmap> mapped_file = std::make_unique<FileMmap>(fileName);
+        ModelLoader buffer(std::string_view((char *)mapped_file->data, mapped_file->size));
+    #else
         FileBuffer buffer(fileName);
+    #endif
         int versionId = buffer.ReadInt();
         std::map <std::string, std::string> dicts;
         if (versionId >= 1) {
@@ -822,7 +884,12 @@ namespace fastllm {
     }
 
     void WeightMap::LoadFromFile(const std::string &fileName) {
+    #ifdef USE_MMAP
+        std::shared_ptr<FileMmap> mapped_file = std::make_shared<FileMmap>(fileName);
+        ModelLoader buffer(std::string_view((char *)mapped_file->data, mapped_file->size));
+    #else
         FileBuffer buffer(fileName);
+    #endif
         this->versionId = buffer.ReadInt();
 
         if (this->versionId >= 1) {
@@ -868,16 +935,32 @@ namespace fastllm {
 #if defined(_WIN32) or defined(_WIN64)
 	            	weight[name].filePos = _ftelli64(buffer.f);
 #else
+#ifdef USE_MMAP
+                    weight[name].filePos =  buffer.tell();
+#else
                     weight[name].filePos = ftell(buffer.f);
 #endif
+#endif
+#ifdef USE_MMAP
+                    buffer.seek(weight[name].GetBytes(), SEEK_CUR);
+#else
 	            	fseek(buffer.f, weight[name].GetBytes(), SEEK_CUR);
+#endif
 	            } else {
 	            	ErrorInFastLLM("Error: embedding's type should be float32 or bfloat16.\n");
 	            }
             } else {
+#ifdef USE_MMAP
+                weight[name].set_file(mapped_file);
+#else
 	            weight[name].Allocate();
+#endif
 	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
-		            buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+#ifdef USE_MMAP
+                    weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
+#else
+                    buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+#endif
 	            } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
 		            int bit = (dataType == DataType::INT4 ? 4 : 8);
 		            weight[name].perChannelAxis = buffer.ReadInt();
@@ -892,7 +975,11 @@ namespace fastllm {
 			            weight[name].zeros[i] = weight[name].perChannelsConfigs[i].zeroPoint;
 			            weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
 		            }
-		            buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+#ifdef USE_MMAP
+                    weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
+#else
+                    buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+#endif
 	            } else if (dataType == DataType::INT4_NOZERO) {
                     int bit = 4;
                     weight[name].perChannelAxis = buffer.ReadInt();
@@ -907,7 +994,11 @@ namespace fastllm {
                         weight[name].mins[i] = weight[name].perChannelsConfigs[i].min;
                         weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
                     }
+#ifdef USE_MMAP
+                    weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
+#else
                     buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+#endif
                 }
             }
 
