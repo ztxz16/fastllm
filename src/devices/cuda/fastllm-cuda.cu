@@ -1258,24 +1258,6 @@ bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output) 
     return true;
 }
 
-bool FastllmCudaMulBatch(const fastllm::Data *inputs, float v, int batch, const fastllm::Data *outputs) {
-    float ** pointers = (float**)FastllmCudaMalloc(sizeof(float*) * batch * 3);
-    float ** cpuPointers = new float*[batch * 3];
-    for (int i = 0; i < batch; i++) {
-        cpuPointers[i] = (float*)inputs[i].cudaData;
-        cpuPointers[i + batch] = (float*)outputs[i].cudaData;
-        cpuPointers[i + batch * 2] = (float*)(inputs[i].Count(0));
-    }
-    cudaMemcpy(pointers, cpuPointers, sizeof(float*) * batch * 3, cudaMemcpyHostToDevice);
-    FastllmMulBatchKernel <256> <<< batch, 256 >>> (pointers, batch, v);
-
-    FastllmCudaFree(pointers);
-    delete[] cpuPointers;
-
-    DeviceSync();
-    return true;
-}
-
 bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float alpha) {
     int len = input0.Count(0);
     float *cudaData = (float *) FastllmCudaPrepareInput(input0);
@@ -1611,21 +1593,39 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
     return true;
 }
 
-bool FastllmCudaSplitBatch(const fastllm::Data &input, fastllm::Data *outputs, int axis) {
+bool FastllmCudaSplitBatch(fastllm::Data &input, fastllm::Data **outputs, int axis) {
     int part = input.dims[axis];
     int outer = input.Count(0) / input.Count(axis);
     int inputStride = input.Count(axis);
-    int outputStride = outputs[0].Count(axis);
+    int outputStride = outputs[0]->Count(axis);
     int inner = input.strides[axis];
     int unitSize = input.unitSize;
 
     uint8_t ** pointers = (uint8_t**)FastllmCudaMalloc(sizeof(uint8_t*) * part);
     uint8_t ** cpuPointers = new uint8_t*[part];
     for (int i = 0; i < part; i++) {
-        cpuPointers[i] = (uint8_t*)outputs[i].cudaData;
+        cpuPointers[i] = (uint8_t*)outputs[i]->cudaData;
     }
     cudaMemcpy(pointers, cpuPointers, sizeof(uint8_t*) * part, cudaMemcpyHostToDevice);
     FastllmSplitBatchKernel <256> <<< part * outer, 256 >>> ((uint8_t*)input.cudaData, pointers, outer, part, inner * unitSize);
+
+    FastllmCudaFree(pointers);
+    delete[] cpuPointers;
+
+    DeviceSync();
+    return true;
+}
+
+bool FastllmCudaMulBatch(fastllm::Data **inputs, float v, int batch, fastllm::Data **outputs) {
+    float ** pointers = (float**)FastllmCudaMalloc(sizeof(float*) * batch * 3);
+    float ** cpuPointers = new float*[batch * 3];
+    for (int i = 0; i < batch; i++) {
+        cpuPointers[i] = (float*)inputs[i]->cudaData;
+        cpuPointers[i + batch] = (float*)outputs[i]->cudaData;
+        cpuPointers[i + batch * 2] = (float*)(inputs[i]->Count(0));
+    }
+    cudaMemcpy(pointers, cpuPointers, sizeof(float*) * batch * 3, cudaMemcpyHostToDevice);
+    FastllmMulBatchKernel <256> <<< batch, 256 >>> (pointers, batch, v);
 
     FastllmCudaFree(pointers);
     delete[] cpuPointers;
