@@ -16,7 +16,6 @@ namespace fastllm {
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
-        this->ops["SplitBatch"] = (BaseOperator*)(new CudaSplitBatchOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
         this->ops["MatMul"] = (BaseOperator*)(new CudaMatMulOp());
         this->ops["MatMulTransB"] = (BaseOperator*)(new CudaMatMulTransBOp());
@@ -25,7 +24,6 @@ namespace fastllm {
         this->ops["Silu"] = (BaseOperator*)(new CudaSiluOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CudaSwigluOp());
         this->ops["Mul"] = (BaseOperator*)(new CudaMulOp());
-        this->ops["MulBatch"] = (BaseOperator*)(new CudaMulBatchOp());
         this->ops["AddTo"] = (BaseOperator*)(new CudaAddToOp());
         this->ops["MulTo"] = (BaseOperator*)(new CudaMulToOp());
         this->ops["AttentionMask"] = (BaseOperator*)(new CudaAttentionMaskOp());
@@ -35,6 +33,11 @@ namespace fastllm {
         this->ops["RotatePosition2D"] = (BaseOperator*)(new CudaRotatePosition2DOp());
         this->ops["NearlyRotatePosition2D"] = (BaseOperator*)(new CudaNearlyRotatePosition2DOp());
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CudaLlamaRotatePosition2DOp());
+
+        this->ops["SplitBatch"] = (BaseOperator*)(new CudaSplitBatchOp());
+        this->ops["MulBatch"] = (BaseOperator*)(new CudaMulBatchOp());
+        this->ops["MatMulBatch"] = (BaseOperator*)(new CudaMatMulBatchOp());
+        this->ops["MatMulTransBBatch"] = (BaseOperator*)(new CudaMatMulTransBBatchOp());
     }
 
     bool CudaDevice::Malloc(void **ret, size_t size) {
