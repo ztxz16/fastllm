@@ -25,7 +25,6 @@ namespace fastllm {
         this->ops["RMSNorm"] = (BaseOperator*)(new CpuRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CpuLinearOp());
         this->ops["Split"] = (BaseOperator*)(new CpuSplitOp());
-        this->ops["SplitBatch"] = (BaseOperator*)(new CpuSplitBatchOp());
         this->ops["Cat"] = (BaseOperator*)(new CpuCatOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CpuCatDirectOp());
         this->ops["MatMul"] = (BaseOperator*)(new CpuMatMulOp());
@@ -35,7 +34,6 @@ namespace fastllm {
         this->ops["GeluNew"] = (BaseOperator*)(new CpuGeluNewOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CpuSwigluOp());
         this->ops["Mul"] = (BaseOperator*)(new CpuMulOp());
-        this->ops["MulBatch"] = (BaseOperator*)(new CpuMulBatchOp());
         this->ops["MulTo"] = (BaseOperator*)(new CpuMulToOp());
         this->ops["AddTo"] = (BaseOperator*)(new CpuAddToOp());
         this->ops["AttentionMask"] = (BaseOperator*)(new CpuAttentionMaskOp());
@@ -47,6 +45,11 @@ namespace fastllm {
         this->ops["NearlyRotatePosition2D"] = (BaseOperator*)(new CpuNearlyRotatePosition2DOp());
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CpuLlamaRotatePosition2DOp());
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CpuRepeatPenaltyOp());
+
+        this->ops["SplitBatch"] = (BaseOperator*)(new CpuSplitBatchOp());
+        this->ops["MulBatch"] = (BaseOperator*)(new CpuMulBatchOp());
+        this->ops["MatMulBatch"] = (BaseOperator*)(new CpuMatMulBatchOp());
+        this->ops["MatMulTransBBatch"] = (BaseOperator*)(new CpuMatMulTransBBatchOp());
     }
 
     bool CpuDevice::Malloc(void **ret, size_t size) {
