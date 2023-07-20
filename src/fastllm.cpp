@@ -1182,12 +1182,6 @@ namespace fastllm {
         }, {}, {{"axis", axis}, {"start", start}, {"end", end}});
     }
 
-    void SplitBatch(const Data &input, int axis, int part, std::vector <Data> &outputs) {
-        curExecutor->Run("SplitBatch", {
-                {"input", (Data*)&input}, {"output", (Data*)outputs.data()}
-        }, {}, {{"axis", axis}, {"output___batch", part}});
-    }
-
     void Cat(const Data &input0, const Data &input1, int axis, Data &output) {
         curExecutor->Run("Cat", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}, {"output", &output}
@@ -1240,12 +1234,6 @@ namespace fastllm {
         curExecutor->Run("Mul", {
                 {"input", (Data*)&input}, {"output", &output}
         }, {{"v", v}}, {});
-    }
-
-    void MulBatch(std::vector <Data> &input, float v, std::vector <Data> &output) {
-        curExecutor->Run("MulBatch", {
-                {"input", (Data*)input.data()}, {"output", output.data()}
-        }, {{"v", v}}, {{"input___batch", (int)input.size()}, {"output___batch", (int)output.size()}});
     }
 
     void MulTo(Data &input0, const Data &input1) {
@@ -1322,6 +1310,18 @@ namespace fastllm {
         curExecutor->Run("RepeatPenalty", {
                 {"input", &input}, {"penalty", (Data*)&penalty}
         }, {}, {});
+    }
+
+    void SplitBatch(const Data &input, int axis, int part, std::vector <Data*> &outputs) {
+        curExecutor->Run("SplitBatch", {
+                {"input", (Data*)&input}, {"output", (Data*)outputs.data()}
+        }, {}, {{"axis", axis}, {"output___batch", part}});
+    }
+
+    void MulBatch(std::vector <Data*> &input, float v, std::vector <Data*> &output) {
+        curExecutor->Run("MulBatch", {
+                {"input", (Data*)input.data()}, {"output", (Data*)output.data()}
+        }, {{"v", v}}, {{"input___batch", (int)input.size()}, {"output___batch", (int)output.size()}});
     }
 
     void ClearProfiler() {

@@ -40,7 +40,14 @@ namespace fastllm {
         auto st = std::chrono::system_clock::now();
         bool lockInCPU = false;
         for (auto &it: datas) {
-            lockInCPU |= it.second->lockInCPU;
+            if (intParams.find(it.first + "___batch") != intParams.end()) {
+                int batch = intParams.find(it.first + "___batch")->second;
+                for (int i = 0; i < batch; i++) {
+                    lockInCPU |= ((Data**)it.second)[i]->lockInCPU;
+                }
+            } else {
+                lockInCPU |= it.second->lockInCPU;
+            }
         }
         for (auto device: devices) {
             if (lockInCPU && device->deviceType != "cpu") {
@@ -48,12 +55,13 @@ namespace fastllm {
             }
             if (device->CanRun(opType, datas, floatParams, intParams)) {
                 for (auto &it: datas) {
-                    int batch = 1;
                     if (intParams.find(it.first + "___batch") != intParams.end()) {
-                        batch = intParams.find(it.first + "___batch")->second;
-                    }
-                    for (int i = 0; i < batch; i++) {
-                        it.second[i].ToDevice((void *) device);
+                        int batch = intParams.find(it.first + "___batch")->second;
+                        for (int i = 0; i < batch; i++) {
+                            ((Data**)it.second)[i]->ToDevice((void *) device);
+                        }
+                    } else {
+                        it.second->ToDevice((void *) device);
                     }
                 }
                 device->Reshape(opType, datas, floatParams, intParams);
@@ -70,8 +78,11 @@ namespace fastllm {
     }
 
     void Executor::PrintProfiler() {
+        float sum = 0.0;
         for (auto &it : profiler) {
             printf("%s spend %f\n", it.first.c_str(), it.second);
+            sum += it.second;
         }
+        printf("total spend %f\n", sum);
     }
 }

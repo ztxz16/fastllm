@@ -382,9 +382,15 @@ namespace fastllm {
             int total = 0;
 
             if (all1) {
-                SplitBatch(k, 0, batch, curKs);
-                SplitBatch(v, 0, batch, curVs);
-                SplitBatch(q, 0, batch, curQs);
+                std::vector <Data*> pointersK, pointersV, pointersQ;
+                for (int i = 0; i < batch; i++) {
+                    pointersK.push_back(&curKs[i]);
+                    pointersV.push_back(&curVs[i]);
+                    pointersQ.push_back(&curQs[i]);
+                }
+                SplitBatch(k, 0, batch, pointersK);
+                SplitBatch(v, 0, batch, pointersV);
+                SplitBatch(q, 0, batch, pointersQ);
                 total = batch;
             } else {
                 for (int b = 0; b < batch; b++) {
@@ -461,7 +467,11 @@ namespace fastllm {
             }
 
             // 1.2.2 softmax
-            MulBatch(attnProbs, i + 1, attnProbs);
+            std::vector <Data*> pointerAP;
+            for (int i = 0; i < attnProbs.size(); i++) {
+                pointerAP.push_back(&attnProbs[i]);
+            }
+            MulBatch(pointerAP, i + 1, pointerAP);
             for (int b = 0; b < batch; b++) {
                 Softmax(attnProbs[b], attnProbs[b], -1);
             }
