@@ -53,4 +53,60 @@ namespace fastllm {
 
         FastllmCudaMulBatch(inputs, v, batch, outputs);
     }
+
+    void CudaMatMulBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CudaMatMulOp());
+        int batch = intParams.find("input0___batch")->second;
+        DataDict tempDatas = datas;
+        for (int i = 0; i < batch; i++) {
+            tempDatas["input0"] = ((Data**)datas.find("input0")->second)[i];
+            tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
+            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
+            op->Reshape("MatMulTransB", tempDatas, floatParams, intParams);
+        }
+        delete op;
+    }
+
+    void CudaMatMulBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CudaMatMulOp());
+        int batch = intParams.find("input0___batch")->second;
+        DataDict tempDatas = datas;
+        for (int i = 0; i < batch; i++) {
+            tempDatas["input0"] = ((Data**)datas.find("input0")->second)[i];
+            tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
+            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
+            op->Run("MatMulTransB", tempDatas, floatParams, intParams);
+        }
+        delete op;
+    }
+
+    void CudaMatMulTransBBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CudaMatMulTransBOp());
+        int batch = intParams.find("input0___batch")->second;
+        DataDict tempDatas = datas;
+        for (int i = 0; i < batch; i++) {
+            tempDatas["input0"] = ((Data**)datas.find("input0")->second)[i];
+            tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
+            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
+            op->Reshape("MatMulTransB", tempDatas, floatParams, intParams);
+        }
+        delete op;
+    }
+
+    void CudaMatMulTransBBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                      const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CudaMatMulTransBOp());
+        int batch = intParams.find("input0___batch")->second;
+        DataDict tempDatas = datas;
+        for (int i = 0; i < batch; i++) {
+            tempDatas["input0"] = ((Data**)datas.find("input0")->second)[i];
+            tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
+            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
+            op->Run("MatMulTransB", tempDatas, floatParams, intParams);
+        }
+        delete op;
+    }
 }

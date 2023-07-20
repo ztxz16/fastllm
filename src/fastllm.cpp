@@ -1324,6 +1324,24 @@ namespace fastllm {
         }, {{"v", v}}, {{"input___batch", (int)input.size()}, {"output___batch", (int)output.size()}});
     }
 
+    void MatMulBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, std::vector <Data*> &output, float alpha) {
+        curExecutor->Run("MatMulBatch", {
+                        {"input0", (Data*)input0.data()}, {"input1", (Data*)input1.data()}, {"output", (Data*)output.data()}
+                         }, {{"alpha", alpha}},
+                         {{"input0___batch", (int)input0.size()},
+                          {"input1___batch", (int)input1.size()},
+                          {"output___batch", (int)output.size()}});
+    }
+
+    void MatMulTransBBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, std::vector <Data*> &output, float alpha) {
+        curExecutor->Run("MatMulTransBBatch", {
+                {"input0", (Data*)input0.data()}, {"input1", (Data*)input1.data()}, {"output", (Data*)output.data()}
+        }, {{"alpha", alpha}},
+        {{"input0___batch", (int)input0.size()},
+         {"input1___batch", (int)input1.size()},
+         {"output___batch", (int)output.size()}});
+    }
+
     void ClearProfiler() {
         curExecutor->ClearProfiler();
     }
