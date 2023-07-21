@@ -395,16 +395,21 @@ namespace fastllm {
                 SplitBatch(q, 0, batch, pointersQ);
                 total = batch;
             } else {
-                for (int b = 0; b < batch; b++) {
-                    Split(k, 0, total, total + seqLens[b], curKs[b]);
-                    Split(v, 0, total, total + seqLens[b], curVs[b]);
-                    Split(q, 0, total, total + seqLens[b], curQs[b]);
-                    total += seqLens[b];
+                if (batch > 1) {
+                    for (int b = 0; b < batch; b++) {
+                        Split(k, 0, total, total + seqLens[b], curKs[b]);
+                        Split(v, 0, total, total + seqLens[b], curVs[b]);
+                        Split(q, 0, total, total + seqLens[b], curQs[b]);
+                        total += seqLens[b];
+                    }
                 }
             }
 
             for (int b = 0; b < batch; b++) {
-                auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
+                auto pq = &(batch == 1 ? q : curQs[b]);
+                auto pk = &(batch == 1 ? k : curKs[b]);
+                auto pv = &(batch == 1 ? v : curVs[b]);
+                auto &q = *pq, &k = *pk, &v = *pv;
                 if (all1) {
                     k.Reshape({k.dims[1], k.dims[0], k.dims[2]});
                     v.Reshape({v.dims[1], v.dims[0], v.dims[2]});
@@ -457,19 +462,25 @@ namespace fastllm {
                 }
             }
 
-            std::vector <Data*> keys, values;
-            std::vector <Data*> pointersK, pointersV;
-            for (int b = 0; b < batch; b++) {
-                keys.push_back(pastKeyValues[b * block_cnt + i].first);
-                values.push_back(pastKeyValues[b * block_cnt + i].second);
-                pointersK.push_back(&curKs[b]);
-                pointersV.push_back(&curVs[b]);
+            if (batch == 1) {
+                CatDirect(*pastKeyValues[i].first, k, 1);
+                CatDirect(*pastKeyValues[i].second, v, 1);
+            } else {
+                std::vector <Data*> keys, values;
+                std::vector<Data *> pointersK, pointersV;
+                for (int b = 0; b < batch; b++) {
+                    keys.push_back(pastKeyValues[b * block_cnt + i].first);
+                    values.push_back(pastKeyValues[b * block_cnt + i].second);
+                    pointersK.push_back(&curKs[b]);
+                    pointersV.push_back(&curVs[b]);
+                }
+                CatDirectBatch(keys, pointersK, 1);
+                CatDirectBatch(values, pointersV, 1);
             }
-            CatDirectBatch(keys, pointersK, 1);
-            CatDirectBatch(values, pointersV, 1);
 
             for (int b = 0; b < batch; b++) {
-                auto &q = curQs[b];
+                auto pq = &(batch == 1 ? q : curQs[b]);
+                auto &q = *pq;
                 Data &pastKey = *pastKeyValues[b * block_cnt + i].first;
                 outputSizes[b] = {1, q.dims[0], q.dims[1], pastKey.dims[1]};
                 q.Reshape({pastKey.dims[0], -1, q.dims[2]});
@@ -487,7 +498,8 @@ namespace fastllm {
                 MatMulTransBBatch(qs, keys, attns, 1.0 / (scale_attn * (i + 1)));
             } else {
                 for (int b = 0; b < batch; b++) {
-                    auto &q = curQs[b];
+                    auto pq = &(batch == 1 ? q : curQs[b]);
+                    auto &q = *pq;
                     Data &pastKey = *pastKeyValues[b * block_cnt + i].first;
                     MatMulTransB(q, pastKey, attnProbs[b], 1.0 / (scale_attn * (i + 1)));
                 }
@@ -544,21 +556,23 @@ namespace fastllm {
                 }
                 CatBatch(contexts, 0, contextLayer);
             } else {
-                for (int b = 0; b < batch; b++) {
-                    if (contextLayer.dims.size() == 0) {
-                        std::vector<int> dims = curContextLayer[b].dims;
-                        dims[0] = total;
-                        contextLayer.Expansion(dims);
+                if (batch > 1) {
+                    for (int b = 0; b < batch; b++) {
+                        if (contextLayer.dims.size() == 0) {
+                            std::vector<int> dims = curContextLayer[b].dims;
+                            dims[0] = total;
+                            contextLayer.Expansion(dims);
+                        }
+                        contextLayer.ToDevice(DataDevice::CUDA);
+                        CatDirect(contextLayer, curContextLayer[b], 0);
                     }
-                    contextLayer.ToDevice(DataDevice::CUDA);
-                    CatDirect(contextLayer, curContextLayer[b], 0);
                 }
             }
 
             // 1.2.4 dense
             std::string denseWeightName = weightPre + std::to_string(i) + weightMiddle + ".dense.weight";
             std::string denseBiasName = weightPre + std::to_string(i) + weightMiddle + ".dense.bias";
-            Linear(contextLayer, weight[denseWeightName], weight[denseBiasName], attnOutput);
+            Linear(batch == 1 ? curContextLayer[0] : contextLayer, weight[denseWeightName], weight[denseBiasName], attnOutput);
             if (GetVersion() == 1) {
                 float alpha = sqrt(2 * block_cnt);
                 Mul(attenInput, alpha, hiddenStates);
@@ -1008,13 +1022,30 @@ namespace fastllm {
                         }
 
                         if (seqLens.size() > 0) {
+                            std::vector <std::pair <Data, Data> > *pastKeyValue1;
+                            if (seqLens.size() == 1) {
+                                pastKeyValue1 = &model->responseContextDict.dicts[handles[0]]->pastKeyValues;
+                            }
                             model->dictLocker.unlock();
 #ifdef USE_CUDA
                             FastllmCudaClearBigBuffer();
 #endif
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
-                            std::vector<int> ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
-                                                                       positionIds, seqLens, pastKeyValues, generationConfigs, tokensManager);
+//auto st = std::chrono::system_clock::now();
+//ClearProfiler();
+                            std::vector<int> ret;
+                            if (seqLens.size() > 1) {
+                                ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
+                                                          positionIds, seqLens, pastKeyValues, generationConfigs,
+                                                          tokensManager);
+                            } else {
+                                ret = std::vector <int> {model->Forward(inputIds,
+                                                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
+                                                         *positionIds[0],
+                                                         *pastKeyValue1, generationConfigs[0], tokensManager)};
+                            }
+//PrintProfiler();
+//printf("%d spend %f\n", ids.size(), GetSpan(st, std::chrono::system_clock::now()));
                             model->dictLocker.lock();
                             for (int i = 0; i < handles.size(); i++) {
                                 auto &it = *model->responseContextDict.dicts.find(handles[i]);
