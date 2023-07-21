@@ -88,6 +88,9 @@ class model:
     def save(self, path : str):
         fastllm_lib.save_llm_model(self.model, path.encode());
 
+    def eval(self):
+        pass;
+
     def response(self,
                  query: str,
                  history: List[Tuple[str, str]] = None,
