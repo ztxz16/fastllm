@@ -383,7 +383,7 @@ namespace fastllm {
             Data contextLayer = Data(DataType::FLOAT32);
             int total = 0;
 
-            if (all1) {
+            if (all1 && batch > 1) {
                 std::vector <Data*> pointersK, pointersV, pointersQ;
                 for (int b = 0; b < batch; b++) {
                     pointersK.push_back(&curKs[b]);
@@ -591,7 +591,6 @@ namespace fastllm {
                 AddTo(hiddenStates, temp);
             }
         }
-
         Data logits;
         if (version == 1) {
             LayerNorm(hiddenStates, weight["transformer.final_layernorm.weight"],
@@ -601,24 +600,20 @@ namespace fastllm {
             RMSNorm(hiddenStates, weight["transformer.encoder.final_layernorm.weight"], 1e-5, hiddenStates);
             Linear(hiddenStates, weight["transformer.output_layer.weight"], Data(), logits);
         }
-
-        logits.ToDevice(DataDevice::CPU);
         std::vector <int> lastRet;
         int total = 0;
         for (int b = 0; b < batch; b++) {
+            Data curLogit;
+            Split(logits, 0, total + seqLens[b] - 1, total + seqLens[b], curLogit);
             if (generationConfigs[b].IsSimpleGreedy()) {
-                std::pair<float, int> ret = std::make_pair(-1e9, -1);
-                int base = (total + seqLens[b] - 1);
-                total += seqLens[b];
-                for (int i = 0; i < logits.dims.back(); i++) {
-                    ret = max(ret, std::make_pair(((float *) logits.cpuData)[base * logits.dims.back() + i], i));
-                }
-                lastRet.push_back(ret.second);
+                Data topk;
+                TopK(curLogit, topk, 1);
+                topk.ToDevice(DataDevice::CPU);
+                lastRet.push_back((int) (((float *) topk.cpuData)[0] + 1e-3));
             } else {
-                int base = (total + seqLens[b] - 1);
-                total += seqLens[b];
-                lastRet.push_back(LLMSampling(logits, base, generationConfigs[b], lastTokens.units[b]));
+                lastRet.push_back(LLMSampling(curLogit, 0, generationConfigs[b], lastTokens.units[b]));
             }
+            total += seqLens[b];
         }
         return lastRet;
     }
