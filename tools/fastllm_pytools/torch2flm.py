@@ -21,6 +21,37 @@ fastllm_weight_type_dict = {
     "embedding": 2
 }
 
+v = np.random.randint(-127, 127, [10, 20]);
+temp = v;
+c_max = np.expand_dims(np.abs(v).max(axis = -1), -1)
+c_scale = c_max / 127.0
+v = (v / c_scale + 128.5).clip(1, 255).astype(np.uint8)
+
+def write_int8(fo, v):
+    c_max = np.expand_dims(np.abs(v).max(axis = -1), -1).clip(0.1, 1e100)
+    c_scale = c_max / 127.0
+    v = (v / c_scale + 128.5).clip(1, 255).astype(np.uint8)
+    fo.write(struct.pack('i', 3))
+    fo.write(struct.pack('i', 0))
+    for i in range(c_max.shape[0]):
+        fo.write(struct.pack('f', -c_max[i][0]));
+        fo.write(struct.pack('f', c_max[i][0]));
+    fo.write(v.data)
+
+def write_int4(fo, v):
+    c_min = np.expand_dims(v.min(axis = -1), -1)
+    c_max = np.expand_dims(v.max(axis = -1), -1)
+    c_scale = (c_max - c_min) / 15.0
+    v = (v - c_min) / c_scale
+    v = (v + 0.5).astype(np.int8).clip(0, 15).astype(np.uint8)
+    v = v[:, 0::2] * 16 + v[:, 1::2]
+    fo.write(struct.pack('i', 8))
+    fo.write(struct.pack('i', 0))
+    for i in range(c_min.shape[0]):
+        fo.write(struct.pack('f', c_min[i][0]));
+        fo.write(struct.pack('f', c_max[i][0]));
+    fo.write(v.data)
+
 def tofile(exportPath,
            model,
            tokenizer = None,
@@ -30,8 +61,8 @@ def tofile(exportPath,
            history_sep = None,
            dtype = "float16"):
     if (dtype not in fastllm_data_type_dict):
-        print("dtype should in ", list(fastllm_data_type_dict.keys()));
-        exit(0);
+        print("dtype should in ", list(fastllm_data_type_dict.keys()))
+        exit(0)
 
     dict = model.state_dict()
     fo = open(exportPath, "wb")
@@ -88,30 +119,30 @@ def tofile(exportPath,
     else:
         fo.write(struct.pack('i', 0))
 
-    weight_type_dict = {};
-    module_dict = {};
+    weight_type_dict = {}
+    module_dict = {}
     for key, m in model.named_modules():
         if (isinstance(m, torch.nn.Linear)):
-            weight_type_dict[key + ".weight"] = "linear";
-            module_dict[key + ".weight"] = m;
+            weight_type_dict[key + ".weight"] = "linear"
+            module_dict[key + ".weight"] = m
         if (isinstance(m, torch.nn.Embedding)):
-            weight_type_dict[key] = "embedding";
+            weight_type_dict[key] = "embedding"
 
     # 2. weight
     fo.write(struct.pack('i', len(dict)))
-    tot = 0;
+    tot = 0
     for key in dict:
-        ori_data_type = 0;
-        ori_np_data_type = np.float32;
-        cur_weight_type = 0;
+        ori_data_type = 0
+        ori_np_data_type = np.float32
+        cur_weight_type = 0
         if (key in weight_type_dict and weight_type_dict[key] in fastllm_weight_type_dict):
-            cur_weight_type = fastllm_weight_type_dict[weight_type_dict[key]];
-        to_data_type = 0;
+            cur_weight_type = fastllm_weight_type_dict[weight_type_dict[key]]
+        to_data_type = 0
         if (cur_weight_type == 1):
-            to_data_type = fastllm_data_type_dict[dtype];
+            to_data_type = fastllm_data_type_dict[dtype]
             if (to_data_type == 7):
-                ori_data_type = 7;
-                ori_np_data_type = np.float16;
+                ori_data_type = 7
+                ori_np_data_type = np.float16
 
         cur = dict[key].numpy().astype(ori_np_data_type)
         fo.write(struct.pack('i', len(key)))
@@ -119,8 +150,13 @@ def tofile(exportPath,
         fo.write(struct.pack('i', len(cur.shape)))
         for i in cur.shape:
             fo.write(struct.pack('i', i))
-        fo.write(struct.pack('i', to_data_type))
-        fo.write(cur.data)
+        if (to_data_type == 3):
+            write_int8(fo, cur)
+        elif (to_data_type == 8):
+            write_int4(fo, cur)
+        else:
+            fo.write(struct.pack('i', to_data_type))
+            fo.write(cur.data)
         tot += 1
         print("output (", tot, "/", len(dict), end = " )\r")
     print("\nfinish.")
