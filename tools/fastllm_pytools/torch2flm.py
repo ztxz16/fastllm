@@ -1,5 +1,6 @@
 import struct
 import numpy as np
+import torch
 
 def writeString(fo, s):
     fo.write(struct.pack('i', len(s)))
@@ -9,13 +10,29 @@ def writeKeyValue(fo, key, value):
     writeString(fo, key)
     writeString(fo, value)
 
+fastllm_data_type_dict = {
+    "int4": 8,
+    "int8": 3,
+    "float16": 7,
+    "float32": 0,
+}
+fastllm_weight_type_dict = {
+    "linear": 1,
+    "embedding": 2
+}
+
 def tofile(exportPath,
            model,
            tokenizer = None,
            pre_prompt = None,
            user_role = None,
            bot_role = None,
-           history_sep = None):
+           history_sep = None,
+           dtype = "float16"):
+    if (dtype not in fastllm_data_type_dict):
+        print("dtype should in ", list(fastllm_data_type_dict.keys()));
+        exit(0);
+
     dict = model.state_dict()
     fo = open(exportPath, "wb")
 
@@ -71,17 +88,38 @@ def tofile(exportPath,
     else:
         fo.write(struct.pack('i', 0))
 
+    weight_type_dict = {};
+    module_dict = {};
+    for key, m in model.named_modules():
+        if (isinstance(m, torch.nn.Linear)):
+            weight_type_dict[key + ".weight"] = "linear";
+            module_dict[key + ".weight"] = m;
+        if (isinstance(m, torch.nn.Embedding)):
+            weight_type_dict[key] = "embedding";
+
     # 2. weight
     fo.write(struct.pack('i', len(dict)))
     tot = 0;
     for key in dict:
-        cur = dict[key].numpy().astype(np.float32)
+        ori_data_type = 0;
+        ori_np_data_type = np.float32;
+        cur_weight_type = 0;
+        if (key in weight_type_dict and weight_type_dict[key] in fastllm_weight_type_dict):
+            cur_weight_type = fastllm_weight_type_dict[weight_type_dict[key]];
+        to_data_type = 0;
+        if (cur_weight_type == 1):
+            to_data_type = fastllm_data_type_dict[dtype];
+            if (to_data_type == 7):
+                ori_data_type = 7;
+                ori_np_data_type = np.float16;
+
+        cur = dict[key].numpy().astype(ori_np_data_type)
         fo.write(struct.pack('i', len(key)))
         fo.write(key.encode())
         fo.write(struct.pack('i', len(cur.shape)))
         for i in cur.shape:
             fo.write(struct.pack('i', i))
-        fo.write(struct.pack('i', 0))
+        fo.write(struct.pack('i', to_data_type))
         fo.write(cur.data)
         tot += 1
         print("output (", tot, "/", len(dict), end = " )\r")
