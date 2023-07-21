@@ -96,16 +96,46 @@ namespace fastllm {
 
     void CudaMatMulBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                      const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CudaMatMulOp());
         int batch = intParams.find("input0___batch")->second;
-        DataDict tempDatas = datas;
+        Data **input0s = (Data**)(datas.find("input0")->second);
+        Data **input1s = (Data**)(datas.find("input1")->second);
+        Data **outputs = (Data**)(datas.find("output")->second);
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : -1;
+
+        std::vector <void*> i0s, i1s, os;
+        std::vector <int> ns, ms, ks, i0Strides, i1Strides;
         for (int i = 0; i < batch; i++) {
-            tempDatas["input0"] = ((Data**)datas.find("input0")->second)[i];
-            tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
-            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
-            op->Run("MatMulTransB", tempDatas, floatParams, intParams);
+            auto &input0 = *input0s[i];
+            auto &input1 = *input1s[i];
+            auto &output = *outputs[i];
+            output.Allocate();
+
+            int input0Spatial = input0.Count(input0.dims.size() - 2);
+            int input1Spatial = input1.Count(input1.dims.size() - 2);
+            int input0Stride = input0.strides[input0.dims.size() - 2];
+            int input1Stride = input1.strides[input1.dims.size() - 2];
+            int n = input0.dims[input0.dims.size() - 2];
+            int m = input0.dims.back();
+            int k = input1.dims[input1.dims.size() - 1];
+            int batch0 = input0.Count(0) / input0Spatial;
+            int batch1 = input1.Count(0) / input1Spatial;
+            int outputSpatial = output.Count(output.dims.size() - 2);
+
+            for (int b = 0; b < batch0; b++) {
+                i0s.push_back((float*)input0.cudaData + b * input0Spatial);
+                i1s.push_back((float*)input1.cudaData + b * input1Spatial);
+                os.push_back((float*)output.cudaData + b * outputSpatial);
+                ns.push_back(n);
+                ms.push_back(m);
+                ks.push_back(k);
+                i0Strides.push_back(input0Stride);
+                i1Strides.push_back(input1Stride);
+            }
         }
-        delete op;
+
+        FastllmCudaBatchMatMulBatch(i0s.data(), i1s.data(), os.data(),
+                                    ns.data(), ms.data(), ks.data(),
+                                    i0Strides.data(), i1Strides.data(), alpha, (int)i0s.size());
     }
 
     void CudaMatMulTransBBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -124,29 +154,57 @@ namespace fastllm {
 
     void CudaMatMulTransBBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CudaMatMulTransBOp());
         int batch = intParams.find("input0___batch")->second;
-        DataDict tempDatas = datas;
+        Data **input0s = (Data**)(datas.find("input0")->second);
+        Data **input1s = (Data**)(datas.find("input1")->second);
+        Data **outputs = (Data**)(datas.find("output")->second);
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : -1;
+
+        std::vector <void*> i0s, i1s, os;
+        std::vector <int> ns, ms, ks, i0Strides, i1Strides;
         for (int i = 0; i < batch; i++) {
-            tempDatas["input0"] = ((Data**)datas.find("input0")->second)[i];
-            tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
-            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
-            op->Run("MatMulTransB", tempDatas, floatParams, intParams);
+            auto &input0 = *input0s[i];
+            auto &input1 = *input1s[i];
+            auto &output = *outputs[i];
+            output.Allocate();
+            int input0Spatial = input0.Count(input0.dims.size() - 2);
+            int input1Spatial = input1.Count(input1.dims.size() - 2);
+            int input0Stride = input0.strides[input0.dims.size() - 2];
+            int input1Stride = input1.strides[input1.dims.size() - 2];
+            int n = input0.dims[input0.dims.size() - 2];
+            int m = input0.dims.back();
+            int k = input1.dims[input1.dims.size() - 2];
+            int batch0 = input0.Count(0) / input0Spatial;
+            int batch1 = input1.Count(0) / input1Spatial;
+
+            int outputSpatial = output.Count(output.dims.size() - 2);
+            for (int b = 0; b < batch0; b++) {
+                i0s.push_back((float*)input0.cudaData + b * input0Spatial);
+                i1s.push_back((float*)input1.cudaData + b * input1Spatial);
+                os.push_back((float*)output.cudaData + b * outputSpatial);
+                ns.push_back(n);
+                ms.push_back(m);
+                ks.push_back(k);
+                i0Strides.push_back(input0Stride);
+                i1Strides.push_back(input1Stride);
+            }
         }
-        delete op;
+
+        FastllmCudaBatchMatMulTransBBatch(i0s.data(), i1s.data(), os.data(),
+                                         ns.data(), ms.data(), ks.data(),
+                                         i0Strides.data(), i1Strides.data(), alpha, (int)i0s.size());
     }
 
     void CudaSoftmaxBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CudaSoftMaxOp());
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
         int batch = intParams.find("input___batch")->second;
-        DataDict tempDatas = datas;
+        Data **inputs = (Data**)(datas.find("input")->second);
+        Data **outputs = (Data**)(datas.find("output")->second);
         for (int i = 0; i < batch; i++) {
-            tempDatas["input"] = ((Data**)datas.find("input")->second)[i];
-            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
-            op->Run("Softmax", tempDatas, floatParams, intParams);
+            outputs[i]->Allocate();
         }
-        delete op;
+        FastllmCudaSoftmaxBatch(inputs, outputs, axis, batch);
     }
 
     void CudaCatDirectBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,

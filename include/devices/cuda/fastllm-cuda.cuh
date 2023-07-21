@@ -56,6 +56,13 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
 bool FastllmCudaSplitBatch(fastllm::Data &input, fastllm::Data **outputs, int axis);
 bool FastllmCudaCatBatch(fastllm::Data **inputs, fastllm::Data &output, int axis);
 bool FastllmCudaMulBatch(fastllm::Data **inputs, float v, int batch, fastllm::Data **outputs);
+bool FastllmCudaSoftmaxBatch(fastllm::Data **inputs, fastllm::Data **outputs, int axis, int batch);
+bool FastllmCudaBatchMatMulTransBBatch(void **i0s, void **i1s, void **os,
+                                      int *ns, int *ms, int *ks,
+                                      int *i0Strides, int *i1Strides, float alpha, int batch);
+bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
+                                       int *ns, int *ms, int *ks,
+                                       int *i0Strides, int *i1Strides, float alpha, int batch);
 #ifdef  __cplusplus
 }
 #endif
