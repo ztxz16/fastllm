@@ -335,8 +335,21 @@ namespace fastllm {
             }
         }
 
+        std::vector <Data*> keys, values, qs, attns, contexts;
+        keys.resize(batch);
+        values.resize(batch);
+        qs.resize(batch);
+        attns.resize(batch);
+        contexts.resize(batch);
+
+        std::vector <Data*> pointersK, pointersV, pointersQ;
+        pointersK.resize(batch);
+        pointersV.resize(batch);
+        pointersQ.resize(batch);
+
         std::vector <std::vector <int> > outputSizes;
         outputSizes.resize(batch);
+
         for (int i = 0; i < block_cnt; i++) {
             if (version == 1) {
                 std::string inputLNWeightName = "transformer.layers." + std::to_string(i) + ".input_layernorm.weight";
@@ -384,42 +397,35 @@ namespace fastllm {
             int total = 0;
 
             if (all1 && batch > 1) {
-                std::vector <Data*> pointersK, pointersV, pointersQ;
                 for (int b = 0; b < batch; b++) {
-                    pointersK.push_back(&curKs[b]);
-                    pointersV.push_back(&curVs[b]);
-                    pointersQ.push_back(&curQs[b]);
+                    pointersK[b] = (&curKs[b]);
+                    pointersV[b] = (&curVs[b]);
+                    pointersQ[b] = (&curQs[b]);
                 }
                 SplitBatch(k, 0, batch, pointersK);
                 SplitBatch(v, 0, batch, pointersV);
                 SplitBatch(q, 0, batch, pointersQ);
                 total = batch;
+                for (int b = 0; b < batch; b++) {
+                    auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
+                    k.Reshape({k.dims[1], k.dims[0], k.dims[2]});
+                    v.Reshape({v.dims[1], v.dims[0], v.dims[2]});
+                    q.Reshape({q.dims[1], q.dims[0], q.dims[2]});
+                }
             } else {
-                if (batch > 1) {
-                    for (int b = 0; b < batch; b++) {
-                        Split(k, 0, total, total + seqLens[b], curKs[b]);
-                        Split(v, 0, total, total + seqLens[b], curVs[b]);
-                        Split(q, 0, total, total + seqLens[b], curQs[b]);
-                        total += seqLens[b];
-                    }
+                PermuteSelf(k, {1, 0, 2});
+                PermuteSelf(v, {1, 0, 2});
+                PermuteSelf(q, {1, 0, 2});
+                for (int b = 0; b < batch; b++) {
+                    Split(k, 1, total, total + seqLens[b], curKs[b]);
+                    Split(v, 1, total, total + seqLens[b], curVs[b]);
+                    Split(q, 1, total, total + seqLens[b], curQs[b]);
+                    total += seqLens[b];
                 }
             }
 
             for (int b = 0; b < batch; b++) {
-                auto pq = &(batch == 1 ? q : curQs[b]);
-                auto pk = &(batch == 1 ? k : curKs[b]);
-                auto pv = &(batch == 1 ? v : curVs[b]);
-                auto &q = *pq, &k = *pk, &v = *pv;
-                if (all1) {
-                    k.Reshape({k.dims[1], k.dims[0], k.dims[2]});
-                    v.Reshape({v.dims[1], v.dims[0], v.dims[2]});
-                    q.Reshape({q.dims[1], q.dims[0], q.dims[2]});
-                } else {
-                    PermuteSelf(k, {1, 0, 2});
-                    PermuteSelf(v, {1, 0, 2});
-                    PermuteSelf(q, {1, 0, 2});
-                }
-
+                auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
                 Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt +
                                                                                                      i].second;
                 pastKey.ToDevice(DataDevice::CUDA);
@@ -462,25 +468,17 @@ namespace fastllm {
                 }
             }
 
-            if (batch == 1) {
-                CatDirect(*pastKeyValues[i].first, k, 1);
-                CatDirect(*pastKeyValues[i].second, v, 1);
-            } else {
-                std::vector <Data*> keys, values;
-                std::vector<Data *> pointersK, pointersV;
-                for (int b = 0; b < batch; b++) {
-                    keys.push_back(pastKeyValues[b * block_cnt + i].first);
-                    values.push_back(pastKeyValues[b * block_cnt + i].second);
-                    pointersK.push_back(&curKs[b]);
-                    pointersV.push_back(&curVs[b]);
-                }
-                CatDirectBatch(keys, pointersK, 1);
-                CatDirectBatch(values, pointersV, 1);
+            for (int b = 0; b < batch; b++) {
+                keys[b] = (pastKeyValues[b * block_cnt + i].first);
+                values[b] = (pastKeyValues[b * block_cnt + i].second);
+                pointersK[b] = (&curKs[b]);
+                pointersV[b] = (&curVs[b]);
             }
+            CatDirectBatch(keys, pointersK, 1);
+            CatDirectBatch(values, pointersV, 1);
 
             for (int b = 0; b < batch; b++) {
-                auto pq = &(batch == 1 ? q : curQs[b]);
-                auto &q = *pq;
+                auto &q = curQs[b];
                 Data &pastKey = *pastKeyValues[b * block_cnt + i].first;
                 outputSizes[b] = {1, q.dims[0], q.dims[1], pastKey.dims[1]};
                 q.Reshape({pastKey.dims[0], -1, q.dims[2]});
@@ -489,17 +487,15 @@ namespace fastllm {
             // 1.2 Attention
             // 1.2.0 q * k^T
             if (all1 && batch > 1) {
-                std::vector <Data*> qs, keys, attns;
                 for (int b = 0; b < batch; b++) {
-                    qs.push_back(&curQs[b]);
-                    keys.push_back(pastKeyValues[b * block_cnt + i].first);
-                    attns.push_back(&attnProbs[b]);
+                    qs[b] = (&curQs[b]);
+                    keys[b] = (pastKeyValues[b * block_cnt + i].first);
+                    attns[b] = (&attnProbs[b]);
                 }
                 MatMulTransBBatch(qs, keys, attns, 1.0 / (scale_attn * (i + 1)));
             } else {
                 for (int b = 0; b < batch; b++) {
-                    auto pq = &(batch == 1 ? q : curQs[b]);
-                    auto &q = *pq;
+                    auto &q = curQs[b];
                     Data &pastKey = *pastKeyValues[b * block_cnt + i].first;
                     MatMulTransB(q, pastKey, attnProbs[b], 1.0 / (scale_attn * (i + 1)));
                 }
@@ -514,9 +510,8 @@ namespace fastllm {
             }
 
             // 1.2.2 softmax
-            std::vector <Data*> attns;
             for (int i = 0; i < attnProbs.size(); i++) {
-                attns.push_back(&attnProbs[i]);
+                attns[i] = (&attnProbs[i]);
             }
             MulBatch(attns, i + 1, attns);
             SoftmaxBatch(attns, attns, -1);
@@ -529,11 +524,10 @@ namespace fastllm {
 
             // 1.2.3 prob * v
             if (all1 && batch > 1) {
-                std::vector <Data*> attns, values, contexts;
                 for (int b = 0; b < batch; b++) {
-                    attns.push_back(&attnProbs[b]);
-                    values.push_back(pastKeyValues[b * block_cnt + i].second);
-                    contexts.push_back(&curContextLayer[b]);
+                    attns[b] = (&attnProbs[b]);
+                    values[b] = (pastKeyValues[b * block_cnt + i].second);
+                    contexts[b] = (&curContextLayer[b]);
                 }
                 MatMulBatch(attns, values, contexts);
             } else {
@@ -550,29 +544,26 @@ namespace fastllm {
             }
 
             if (all1 && batch > 1) {
-                std::vector <Data*> contexts;
                 for (int b = 0; b < batch; b++) {
-                    contexts.push_back(&curContextLayer[b]);
+                    contexts[b] = (&curContextLayer[b]);
                 }
                 CatBatch(contexts, 0, contextLayer);
             } else {
-                if (batch > 1) {
-                    for (int b = 0; b < batch; b++) {
-                        if (contextLayer.dims.size() == 0) {
-                            std::vector<int> dims = curContextLayer[b].dims;
-                            dims[0] = total;
-                            contextLayer.Expansion(dims);
-                        }
-                        contextLayer.ToDevice(DataDevice::CUDA);
-                        CatDirect(contextLayer, curContextLayer[b], 0);
+                for (int b = 0; b < batch; b++) {
+                    if (contextLayer.dims.size() == 0) {
+                        std::vector<int> dims = curContextLayer[b].dims;
+                        dims[0] = total;
+                        contextLayer.Expansion(dims);
                     }
+                    contextLayer.ToDevice(DataDevice::CUDA);
+                    CatDirect(contextLayer, curContextLayer[b], 0);
                 }
             }
 
             // 1.2.4 dense
             std::string denseWeightName = weightPre + std::to_string(i) + weightMiddle + ".dense.weight";
             std::string denseBiasName = weightPre + std::to_string(i) + weightMiddle + ".dense.bias";
-            Linear(batch == 1 ? curContextLayer[0] : contextLayer, weight[denseWeightName], weight[denseBiasName], attnOutput);
+            Linear(contextLayer, weight[denseWeightName], weight[denseBiasName], attnOutput);
             if (GetVersion() == 1) {
                 float alpha = sqrt(2 * block_cnt);
                 Mul(attenInput, alpha, hiddenStates);
