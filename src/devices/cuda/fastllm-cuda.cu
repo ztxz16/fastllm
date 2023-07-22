@@ -148,6 +148,16 @@ __global__ void FastllmAlibiMaskKernel(float* a, float *b, float maskValue, int 
     }
 }
 
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmTransposeByRowKernel(uint8_t *dst, uint8_t *ori, int n, int m, int k) {
+    int row = blockIdx.x / m, col = blockIdx.x % m;
+    uint8_t *curInput = ori + (row * m + col) * k;
+    uint8_t *curOutput = dst + (col * n + row) * k;
+    for (int i = threadIdx.x; i < k; i += THREAD_PER_BLOCK) {
+        curOutput[i] = curInput[i];
+    }
+}
+
 __global__ void FastllmPermuteKernel(float *dst, float *ori, int *temp, int axisLen, int len) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i < len) {
@@ -1589,8 +1599,21 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
     for (int i = 0; i < axis.size(); i++) {
         new_dims.push_back(input.dims[axis[i]]);
     }
-
-    {
+    if (axis == std::vector <int> {1, 0, 2}) {
+        int n = input.dims[0];
+        int m = input.dims[1];
+        int k = input.dims[2];
+        FastllmTransposeByRowKernel <256> <<< n * m, 256 >>>
+            ((uint8_t*)input.cudaData, (uint8_t*)tempData, n, m, k * input.unitSize);
+        input.Resize(new_dims);
+    } else if (axis == std::vector <int> {2, 0, 1, 3}) {
+        int n = input.dims[0] * input.dims[1];
+        int m = input.dims[2];
+        int k = input.dims[3];
+        FastllmTransposeByRowKernel <256> <<< n * m, 256 >>>
+            ((uint8_t*)input.cudaData, (uint8_t*)tempData, n, m, k * input.unitSize);
+        input.Resize(new_dims);
+    } else {
         std::vector<int> temp;
         int len = input.Count(0);
         for (int i = 0; i < axis.size(); i++) {
@@ -1604,10 +1627,12 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
             temp.push_back(input.Count(i + 1));
         }
 
-        int *cudaTemp = (int*)FastllmCudaMalloc(temp.size() * sizeof(int));
+        int *cudaTemp = (int *) FastllmCudaMalloc(temp.size() * sizeof(int));
         cudaMemcpy(cudaTemp, temp.data(), temp.size() * sizeof(int), cudaMemcpyHostToDevice);
         int threadPerBlock = min(256, len);
-        FastllmPermuteKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>> ((float*)input.cudaData, tempData, cudaTemp, (int)axis.size(), len);
+        FastllmPermuteKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>((float *) input.cudaData,
+                                                                                    tempData, cudaTemp,
+                                                                                    (int) axis.size(), len);
         FastllmCudaFree(cudaTemp);
     }
 
