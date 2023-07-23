@@ -1,10 +1,12 @@
 cmake_minimum_required(VERSION 3.5)
 
 project(fastllm LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
 
 option(USE_CUDA "use cuda" OFF)
 
 option(PY_API "python api" OFF)
+option(USE_MMAP "use mmap" OFF)
 
 message(STATUS "USE_CUDA: ${USE_CUDA}")
 
@@ -29,6 +31,10 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executo
 include_directories(include)
 include_directories(include/utils)
 include_directories(include/models)
+
+if (USE_MMAP)
+    add_compile_definitions(USE_MMAP)
+endif()
 
 if (USE_CUDA)
     enable_language(CUDA)

@@ -17,6 +17,7 @@
 #include <iostream>
 #include <functional>
 #include <memory>
+#include <string_view>
 
 #include "devices/cpu/cputhreadpool.h"
 
@@ -164,6 +165,39 @@ namespace fastllm {
         NONE = 0, LINEAR = 1, EMBEDDING = 2
     };
 
+    struct FileMmap {
+    public:
+        FileMmap(const std::string &path);
+        ~FileMmap();
+
+        char *data;
+        size_t size;
+    };
+
+    struct ModelLoader {
+        ModelLoader(std::string_view buffer) : data(buffer.data()), size(buffer.size()), ptr(buffer.data()) {}
+
+        int64_t tell() const { return ptr - data; }
+
+        void seek(int64_t offset, int whence);
+
+        template <typename T>
+        T read_basic() {
+            T obj = *(T *)ptr;
+            ptr += sizeof(T);
+            return obj;
+        }
+
+        std::string ReadString();
+        int ReadInt();
+        float ReadFloat();
+        uint8_t* ReadBytes(uint64_t bytes);
+
+        const char *const data;
+        size_t size;
+        const char *ptr;
+    };
+
     class Data {
     public:
         bool lockInCPU = false; // 如果lock在CPU上，那么不允许移动到其余设备
@@ -197,6 +231,7 @@ namespace fastllm {
 
         std::string fileName;
         long long filePos;
+        std::shared_ptr<FileMmap> m_file;
 
         Data () {};
 
@@ -243,6 +278,10 @@ namespace fastllm {
         void ToDevice(DataDevice device); // 移动到指定device
 
         void ToDevice(void *device);
+
+        void set_file(std::shared_ptr<FileMmap> file) {
+            m_file = file;
+        }
     };
 
     struct Tokenizer {
