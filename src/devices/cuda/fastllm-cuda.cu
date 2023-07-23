@@ -1218,7 +1218,7 @@ void * FastllmCudaMalloc(size_t size) {
     int id = -1;
     cudaGetDevice(&id);
     if (size > 1024 * 1024) {
-        auto bigBuffers = bigBuffersMap[id];
+        auto &bigBuffers = bigBuffersMap[id];
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (bigBuffers[i].size >= size && !bigBuffers[i].busy
@@ -1238,7 +1238,7 @@ void * FastllmCudaMalloc(size_t size) {
         bigBuffers.push_back(CudaMemoryBuffer(ret, size, true));
         return ret;
     }
-    auto cudaBuffers = cudaBuffersMap[id];
+    auto &cudaBuffers = cudaBuffersMap[id];
     for (int i = 0; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy) {
             cudaBuffers[i].busy = true;
@@ -1254,14 +1254,14 @@ void * FastllmCudaMalloc(size_t size) {
 void FastllmCudaFree(void *ret) {
     int id = -1;
     cudaGetDevice(&id);
-    auto cudaBuffers = cudaBuffersMap[id];
+    auto &cudaBuffers = cudaBuffersMap[id];
     for (int i = 0; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].data == ret) {
             cudaBuffers[i].busy = false;
             return;
         }
     }
-    auto bigBuffers = bigBuffersMap[id];
+    auto &bigBuffers = bigBuffersMap[id];
     for (int i = 0; i < bigBuffers.size(); i++) {
         if (bigBuffers[i].data == ret) {
             bigBuffers[i].busy = false;
@@ -1275,14 +1275,15 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     void * ret;
     int id = -1;
     cudaGetDevice(&id);
-    auto bigBuffers = bigBuffersMap[id];
+    auto &bigBuffers = bigBuffersMap[id];
     cudaMalloc(&ret, size);
     bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
 }
 
 void FastllmCudaClearBigBuffer() {
     int id = -1;
-    auto bigBuffers = bigBuffersMap[id];
+    cudaGetDevice(&id);
+    auto &bigBuffers = bigBuffersMap[id];
     std::vector <CudaMemoryBuffer> temp;
     for (int i = 0; i < bigBuffers.size(); i++) {
         if (!bigBuffers[i].busy) {
