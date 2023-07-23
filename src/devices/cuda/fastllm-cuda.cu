@@ -5,13 +5,32 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <vector>
+#include <chrono>
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
-static cublasHandle_t fastllmCublasHandle = nullptr;
+static std::map<int, cublasHandle_t> s_fastllmCublasHandleMap;
+cublasHandle_t getFastllmCublasHandle() {
+    int id = -1;
+    cudaGetDevice(&id);
 
-#include <chrono>
+    auto it = s_fastllmCublasHandleMap.find(id);
+    if (it != s_fastllmCublasHandleMap.end()) {
+        return it->second;
+    }
+    cublasHandle_t handler = nullptr;
+    auto stat = cublasCreate(&handler);
+
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf ("CUBLAS initialization failed:%d\n", stat);
+        exit(0);
+    } else {
+        s_fastllmCublasHandleMap[id] = handler;
+    }
+
+    return handler;
+}
 
 void DeviceSync() {
     //cudaDeviceSynchronize();
@@ -870,9 +889,7 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
     if (n >= 8) {
-        if (fastllmCublasHandle == nullptr) {
-            cublasCreate(&fastllmCublasHandle);
-        }
+        auto fastllmCublasHandle = getFastllmCublasHandle();
         half *cudaFp16Input, *cudaFp16Output, *cudaFp16Weight;
         cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
         cudaFp16Output = (half *) FastllmCudaMalloc(n * k * sizeof(half));
@@ -1015,9 +1032,7 @@ bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data 
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
     if (n >= 8) {
-        if (fastllmCublasHandle == nullptr) {
-            cublasCreate(&fastllmCublasHandle);
-        }
+        auto fastllmCublasHandle = getFastllmCublasHandle();
         half *cudaFp16Input, *cudaFp16Output, *cudaFp16Weight;
         cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
         cudaFp16Output = (half *) FastllmCudaMalloc(n * k * sizeof(half));
@@ -1094,9 +1109,7 @@ bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight,
 
     if (n > 1) {
         float h_alpha = 1.0, h_beta = 0.0;
-        if (fastllmCublasHandle == nullptr) {
-            cublasCreate(&fastllmCublasHandle);
-        }
+        auto fastllmCublasHandle = getFastllmCublasHandle();
         //cudaDeviceSynchronize();
         cudaDataType_t AType = CUDA_R_32F, BType = CUDA_R_32F, CType = CUDA_R_32F, ComputeType = CUDA_R_32F;
         cublasStatus_t status;
@@ -1148,9 +1161,7 @@ bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
         cudaFp16Output = (half *) FastllmCudaMalloc(n * k * sizeof(half));
 
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
-        if (fastllmCublasHandle == nullptr) {
-            cublasCreate(&fastllmCublasHandle);
-        }
+        auto fastllmCublasHandle = getFastllmCublasHandle();
         //cudaDeviceSynchronize();
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
         cublasStatus_t status;
@@ -1200,11 +1211,14 @@ struct CudaMemoryBuffer {
     CudaMemoryBuffer (void *data, size_t size, bool busy) :
             data(data), size(size), busy(busy) {}
 };
-std::vector <CudaMemoryBuffer> cudaBuffers;
-std::vector <CudaMemoryBuffer> bigBuffers;
+std::map<int, std::vector <CudaMemoryBuffer>> cudaBuffersMap;
+std::map<int, std::vector <CudaMemoryBuffer>> bigBuffersMap;
 
 void * FastllmCudaMalloc(size_t size) {
+    int id = -1;
+    cudaGetDevice(&id);
     if (size > 1024 * 1024) {
+        auto bigBuffers = bigBuffersMap[id];
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (bigBuffers[i].size >= size && !bigBuffers[i].busy
@@ -1224,6 +1238,7 @@ void * FastllmCudaMalloc(size_t size) {
         bigBuffers.push_back(CudaMemoryBuffer(ret, size, true));
         return ret;
     }
+    auto cudaBuffers = cudaBuffersMap[id];
     for (int i = 0; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy) {
             cudaBuffers[i].busy = true;
@@ -1237,12 +1252,16 @@ void * FastllmCudaMalloc(size_t size) {
 }
 
 void FastllmCudaFree(void *ret) {
+    int id = -1;
+    cudaGetDevice(&id);
+    auto cudaBuffers = cudaBuffersMap[id];
     for (int i = 0; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].data == ret) {
             cudaBuffers[i].busy = false;
             return;
         }
     }
+    auto bigBuffers = bigBuffersMap[id];
     for (int i = 0; i < bigBuffers.size(); i++) {
         if (bigBuffers[i].data == ret) {
             bigBuffers[i].busy = false;
@@ -1254,11 +1273,16 @@ void FastllmCudaFree(void *ret) {
 
 void FastllmCudaMallocBigBuffer(size_t size) {
     void * ret;
+    int id = -1;
+    cudaGetDevice(&id);
+    auto bigBuffers = bigBuffersMap[id];
     cudaMalloc(&ret, size);
     bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
 }
 
 void FastllmCudaClearBigBuffer() {
+    int id = -1;
+    auto bigBuffers = bigBuffersMap[id];
     std::vector <CudaMemoryBuffer> temp;
     for (int i = 0; i < bigBuffers.size(); i++) {
         if (!bigBuffers[i].busy) {
@@ -1648,9 +1672,7 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
     float *cudaInput1 = (float *) FastllmCudaPrepareInput(input1);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     float beta = 0;
-    if (fastllmCublasHandle == nullptr) {
-        cublasCreate(&fastllmCublasHandle);
-    }
+    auto fastllmCublasHandle = getFastllmCublasHandle();
     cublasStatus_t status;
 
     status = cublasSgemmStridedBatched(fastllmCublasHandle,
@@ -1682,9 +1704,7 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
     float *cudaInput1 = (float *) FastllmCudaPrepareInput(input1);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     float beta = 0;
-    if (fastllmCublasHandle == nullptr) {
-        cublasCreate(&fastllmCublasHandle);
-    }
+    auto fastllmCublasHandle = getFastllmCublasHandle();
     cublasStatus_t status;
 
     status = cublasSgemmStridedBatched(fastllmCublasHandle,
@@ -1883,4 +1903,8 @@ bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
     delete[] cpuPointers;
     DeviceSync();
     return true;
+}
+
+void FastllmCudaSetDevice(int gpu_id) {
+    cudaSetDevice(gpu_id);
 }

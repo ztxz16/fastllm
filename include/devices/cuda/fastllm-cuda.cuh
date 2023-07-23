@@ -63,6 +63,7 @@ bool FastllmCudaBatchMatMulTransBBatch(void **i0s, void **i1s, void **os,
 bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
                                        int *ns, int *ms, int *ks,
                                        int *i0Strides, int *i1Strides, float alpha, int batch);
+void FastllmCudaSetDevice(int gpu_id);
 #ifdef  __cplusplus
 }
 #endif
