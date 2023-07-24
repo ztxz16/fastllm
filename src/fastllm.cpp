@@ -12,11 +12,13 @@
 #include <cmath>
 #include <cfloat>
 #include <thread>
+
+#ifdef USE_MMAP
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
-
+#endif
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -99,7 +101,7 @@ namespace fastllm {
     ThreadPool *GetPool() {
         return fastllmThreadPool;
     }
-
+#ifdef USE_MMAP
     FileMmap::FileMmap(const std::string &path) {
         int fd = open(path.c_str(), O_RDONLY);
         AssertInFastLLM(fd > 0, "cannot open file ");
@@ -115,7 +117,7 @@ namespace fastllm {
     }
 
     FileMmap::~FileMmap() { AssertInFastLLM(munmap(data, size) == 0, "munmap failed");}
-
+#endif
     void ModelLoader::seek(int64_t offset, int whence) {
         if (whence == SEEK_SET) {
             ptr = data + offset;
