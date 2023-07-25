@@ -38,6 +38,7 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("get_low_memory", &fastllm::GetLowMemMode)
     .def("set_kv_cache", &fastllm::SetKVCacheInCPU)
     .def("get_kv_cache", &fastllm::GetKVCacheInCPU)
+    .def("set_device_map", &fastllm::SetDeviceMap)
     .def("create_llm", &fastllm::CreateLLMModelFromFile);
   
   // low level
