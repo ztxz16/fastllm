@@ -108,5 +108,7 @@ namespace fastllm {
 
         std::thread *mainLoop = nullptr;
         std::mutex mainLoopLocker, dictLocker;
+
+        std::map <std::string, int> deviceMap;
     };
 }

@@ -1,6 +1,7 @@
 #include "utils.h"
 
 #include "model.h"
+#include "fastllm.h"
 
 #include "chatglm.h"
 #include "moss.h"
@@ -38,6 +39,8 @@ namespace fastllm {
         if (this->weight.dicts.find("history_sep") != this->weight.dicts.end()) {
             history_sep = this->weight.dicts["history_sep"];
         }
+
+        this->deviceMap = GetDeviceMap();
     }
 
     void basellm::SaveLowBitModel(const std::string &fileName, int bit) {

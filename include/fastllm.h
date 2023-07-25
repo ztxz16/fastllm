@@ -22,6 +22,8 @@
 #include "devices/cpu/cputhreadpool.h"
 
 namespace fastllm {
+    void SetDeviceMap(const std::map <std::string, int> &deviceMap);
+    std::map <std::string, int> GetDeviceMap();
     void PrintInstructionInfo();
     void SetThreads(int t);
     void SetLowMemMode(bool m);
@@ -221,6 +223,7 @@ namespace fastllm {
         std::vector <void*> extraDeviceData;
 
         DataDevice dataDevice = DataDevice::CPU;
+        std::vector <int> dataDeviceIds;
 
         // 这两个参数用于量化，对FLOAT数据不适用
         int perChannelAxis = -1; // 沿哪个轴分通道量化，-1代表没有分通道
@@ -276,6 +279,8 @@ namespace fastllm {
         void CalcWeightSum(); // 计算WeightSum
 
         void ToDevice(DataDevice device); // 移动到指定device
+
+        void ToDevice(DataDevice device, const std::vector <int> &deviceIds); // 移动到指定device
 
         void ToDevice(void *device);
 
@@ -339,6 +344,8 @@ namespace fastllm {
     void ClearProfiler();
 
     void PrintProfiler();
+
+    void ApplyDeviceMap(const std::map <std::string, int> &deviceMap, int current, int total); // 执行到了current, 一共total，使用deviceMap切换设备
 
     int LLMSampling(Data &logits, int outerOffset,
                     const GenerationConfig &config, const LastTokensUnit &tokens); // 对logits里[outerOffset * vocabSize, (outerOffset + 1) * vocabSize]做Sampling
