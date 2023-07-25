@@ -38,6 +38,8 @@ fastllm_lib.make_history_llm_model.restype = ctypes.c_char_p
 fastllm_lib.make_input_llm_model.argtype = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.make_input_llm_model.restype = ctypes.c_char_p
 
+fastllm_lib.set_device_map.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+
 def set_cpu_threads(threads: int):
     fastllm_lib.set_cpu_threads(threads);
 
@@ -59,6 +61,27 @@ def set_cpu_low_mem(low_mem):
 def get_cpu_low_mem():
     return fastllm_lib.get_cpu_low_mem();
 
+def set_device_map(device_map):
+    devices = [];
+    values = [];
+    if (isinstance(device_map, str)):
+        devices.append(device_map);
+        values.append(1);
+    elif (isinstance(device_map, list)):
+        devices = [str(x) for x in device_map];
+        values = [1 for x in device_map];
+    elif (isinstance(device_map, dict)):
+        devices = [str(x) for x in device_map.keys()];
+        values = [int(device_map[x]) for x in device_map.keys()];
+    else:
+        print("set_device_map error.");
+        return;
+    device_str = ''.join(devices);
+    device_len = [len(x) for x in devices];
+    fastllm_lib.set_device_map(len(device_len),
+                               (ctypes.c_int * len(device_len))(*device_len),
+                               device_str.encode(),
+                               (ctypes.c_int * len(values))(*values));
 def from_hf(model,
             tokenizer = None,
             dtype = "float16"):
