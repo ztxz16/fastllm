@@ -22,6 +22,10 @@ namespace fastllm {
 
         void AddDevice(BaseDevice *device); // 增加一个device
 
+        void SetFirstDevice(const std::string &device); // 设定优先的device
+
+        std::vector <int> GetDeviceIds(const std::string &device); // 获取指定device的deviceIds
+
         // 运行一个op
         void Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                  const fastllm::IntDict &intParams);
