@@ -34,6 +34,7 @@
 #endif
 
 namespace fastllm {
+    std::map <std::string, int> defaultDeviceMap;
     Executor defaultExecutor;
     Executor *curExecutor = &defaultExecutor;
 
@@ -619,13 +620,24 @@ namespace fastllm {
     void Data::ToDevice(void *device) {
         BaseDevice *dev = (BaseDevice*)device;
         if (dev->deviceType == "cuda") {
-            this->ToDevice(DataDevice::CUDA);
+            this->ToDevice(DataDevice::CUDA, dev->deviceIds);
         } else {
-            this->ToDevice(DataDevice::CPU);
+            this->ToDevice(DataDevice::CPU, dev->deviceIds);
         }
     }
 
     void Data::ToDevice(fastllm::DataDevice device) {
+        if (device == DataDevice::CUDA) {
+            ToDevice(device, curExecutor->GetDeviceIds("cuda"));
+        } else {
+            ToDevice(device, {0});
+        }
+    }
+
+    void Data::ToDevice(fastllm::DataDevice device, const std::vector <int> &deviceIds) {
+        // TODO: 同一个Weight切分到不同 Device 上
+        // NOTICE: 目前还不支持，暂时只切到deviceIds[0]上
+
         if (this->dataType == DataType::INT32PARAM) {
             return;
         }
@@ -633,7 +645,8 @@ namespace fastllm {
         // TODO: 这里先直接跳过了
         return;
 #endif
-        if (this->dataDevice == device) {
+        if (this->dataDevice == device &&
+            (this->dataDevice == DataDevice::CPU || deviceIds.size() == 0 || this->dataDeviceIds == deviceIds)) {
             return;
         }
 
@@ -641,6 +654,7 @@ namespace fastllm {
 #ifdef USE_CUDA
             if (this->dataDevice == DataDevice::CPU) {
                 if (device == DataDevice::CUDA) {
+                    FastllmCudaSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
                     this->cudaData = FastllmCudaMalloc(expansionBytes);
                     FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, expansionBytes);
                     delete[] this->cpuData;
@@ -652,10 +666,26 @@ namespace fastllm {
                     FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
                     FastllmCudaFree(this->cudaData);
                     this->cudaData = nullptr;
+                } else if (device == DataDevice::CUDA) {
+                    FastllmCudaSetDevice(this->dataDeviceIds.size() == 0 ? 0 : this->dataDeviceIds[0]);
+                    uint8_t *cpuData = new uint8_t[expansionBytes];
+                    FastllmCudaCopyFromDeviceToHost(cpuData, this->cudaData, expansionBytes);
+                    FastllmCudaFree(this->cudaData);
+
+                    FastllmCudaSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
+                    this->cudaData = FastllmCudaMalloc(expansionBytes);
+
+                    FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
+                    delete[] cpuData;
                 }
             }
 #endif
         }
+        if (deviceIds.size() == 0) {
+            this->dataDeviceIds = {0};
+        } else {
+            this->dataDeviceIds = deviceIds;
+        };
         this->dataDevice = device;
     }
 
@@ -1459,5 +1489,33 @@ namespace fastllm {
 
     void PrintProfiler() {
         curExecutor->PrintProfiler();
+    }
+
+    void ApplyDeviceMap(const std::map <std::string, int> &deviceMap, int current, int total) {
+        if (deviceMap.size() == 0) {
+            return;
+        }
+        int sum = 0, cur = 0;
+        for (auto &it : deviceMap) {
+            sum += it.second;
+        }
+        std::string curDevice = deviceMap.begin()->first;
+        for (auto &it : deviceMap) {
+            cur += it.second;
+            // current / total <= cur / sum
+            if (current * sum <= cur * total) {
+                curDevice = it.first;
+                break;
+            }
+        }
+        curExecutor->SetFirstDevice(curDevice);
+    }
+
+    void SetDeviceMap(const std::map <std::string, int> &deviceMap) {
+        defaultDeviceMap = deviceMap;
+    }
+
+    std::map <std::string, int> GetDeviceMap() {
+        return defaultDeviceMap;
     }
 }

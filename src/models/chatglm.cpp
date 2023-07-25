@@ -99,6 +99,7 @@ namespace fastllm {
                                                 ".word_embeddings.weight"], inputEmbeddings);
         Data &hiddenStates = inputEmbeddings;
         for (int i = 0; i < block_cnt; i++) {
+            ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             if (version == 1) {
                 std::string inputLNWeightName = "transformer.layers." + std::to_string(i) + ".input_layernorm.weight";
                 std::string inputLNBiasName = "transformer.layers." + std::to_string(i) + ".input_layernorm.bias";
@@ -351,6 +352,7 @@ namespace fastllm {
         outputSizes.resize(batch);
 
         for (int i = 0; i < block_cnt; i++) {
+            ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             if (version == 1) {
                 std::string inputLNWeightName = "transformer.layers." + std::to_string(i) + ".input_layernorm.weight";
                 std::string inputLNBiasName = "transformer.layers." + std::to_string(i) + ".input_layernorm.bias";

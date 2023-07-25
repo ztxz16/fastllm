@@ -10,6 +10,7 @@
 
 #ifdef USE_CUDA
 #include "devices/cuda/cudadevice.h"
+#include "devices/cuda/fastllm-cuda.cuh"
 #endif
 
 namespace fastllm {
@@ -35,6 +36,31 @@ namespace fastllm {
         this->devices.push_back(device);
     }
 
+    void Executor::SetFirstDevice(const std::string &device) {
+        auto temp = this->devices;
+        this->devices.clear();
+        for (int i = 0; i < temp.size(); i++) {
+            if (StartWith(device, temp[i]->deviceType)) {
+                this->devices.push_back(temp[i]);
+                this->devices.back()->deviceIds = ParseDeviceIds(device, temp[i]->deviceType);
+            }
+        }
+        for (int i = 0; i < temp.size(); i++) {
+            if (!StartWith(device, temp[i]->deviceType)) {
+                this->devices.push_back(temp[i]);
+            }
+        }
+    }
+
+    std::vector <int> Executor::GetDeviceIds(const std::string &device) {
+        for (int i = 0; i < devices.size(); i++) {
+            if (StartWith(devices[i]->deviceType, device)) {
+                return devices[i]->deviceIds;
+            }
+        }
+        return {0};
+    }
+
     void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                        const fastllm::IntDict &intParams) {
         auto st = std::chrono::system_clock::now();
@@ -54,6 +80,11 @@ namespace fastllm {
                 continue;
             }
             if (device->CanRun(opType, datas, floatParams, intParams)) {
+#ifdef USE_CUDA
+                if (device->deviceType == "cuda" && device->deviceIds.size() > 0) {
+                    FastllmCudaSetDevice(device->deviceIds[0]);
+                }
+#endif
                 for (auto &it: datas) {
                     if (intParams.find(it.first + "___batch") != intParams.end()) {
                         int batch = intParams.find(it.first + "___batch")->second;
