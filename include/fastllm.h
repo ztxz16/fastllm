@@ -17,8 +17,6 @@
 #include <iostream>
 #include <functional>
 #include <memory>
-#include <string_view>
-
 #include "devices/cpu/cputhreadpool.h"
 
 namespace fastllm {
@@ -177,7 +175,7 @@ namespace fastllm {
     };
 
     struct ModelLoader {
-        ModelLoader(std::string_view buffer) : data(buffer.data()), size(buffer.size()), ptr(buffer.data()) {}
+        ModelLoader(std::string buffer) : data(buffer.data()), size(buffer.size()), ptr(buffer.data()) {}
 
         int64_t tell() const { return ptr - data; }
 
