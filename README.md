@@ -15,9 +15,10 @@ fastllm是纯c++实现，无第三方依赖的高性能大模型推理库
 - 🚀 纯c++实现，便于跨平台移植，可以在安卓上直接编译
 - 🚀 ARM平台支持NEON指令集加速，X86平台支持AVX指令集加速，NVIDIA平台支持CUDA加速，各个平台速度都很快就是了
 - 🚀 支持浮点模型（FP32), 半精度模型(FP16), 量化模型(INT8, INT4) 加速
+- 🚀 支持多卡部署，支持GPU + CPU混合部署
 - 🚀 支持Batch速度优化
-- 🚀 支持流式输出，很方便实现打字机效果
 - 🚀 支持并发计算时动态拼Batch
+- 🚀 支持流式输出，很方便实现打字机效果
 - 🚀 支持python调用
 - 🚀 前后端分离设计，便于支持新的计算设备
 - 🚀 目前支持ChatGLM模型，各种LLAMA模型(ALPACA, VICUNA等)，BAICHUAN模型，MOSS模型
@@ -44,6 +45,7 @@ tokenizer = AutoTokenizer.from_pretrained("THUDM/chatglm2-6b", trust_remote_code
 model = AutoModel.from_pretrained("THUDM/chatglm2-6b", trust_remote_code = True)
 
 # 加入下面这两行，将huggingface模型转换成fastllm模型
+# 目前from_hf接口只能接受原始模型，不能转换已经量化好的模型
 from fastllm_pytools import llm
 model = llm.from_hf(model, tokenizer, dtype = "float16") # dtype支持 "float16", "int8", "int4"
 ```
@@ -164,6 +166,35 @@ python web_api.py  -m chatglm -p chatglm-6b-int8.bin
 ```
 上述web api可使用python web_api_client.py进行测试
 
+## 多卡部署
+
+### fastllm_pytools中使用多卡部署
+
+``` python
+
+from fastllm_pytools import llm
+# 支持下列三种方式，需要在模型创建之前调用
+llm.set_device_map("cuda:0") # 将模型部署在单一设备上
+llm.set_device_map(["cuda:0", "cuda:1"]) # 将模型平均部署在多个设备上
+llm.set_device_map({"cuda:0" : 10, "cuda:1" : 5, "cpu": 1}) # 将模型按不同比例部署在多个设备上
+
+```
+
+### pybinding中使用多卡部署
+
+``` python
+import pyfastllm as llm
+# 支持以下方式，需要在模型创建之前调用
+llm.set_device_map({"cuda:0" : 10, "cuda:1" : 5, "cpu": 1}) # 将模型按不同比例部署在多个设备上
+```
+
+### c++中使用多卡部署
+
+``` cpp
+// 支持以下方式，需要在模型创建之前调用
+fastllm::SetDeviceMap({{"cuda:0", 10}, {"cuda:1", 5}, {"cpu", 1}}); // 将模型按不同比例部署在多个设备上
+```
+
 ## Android上使用
 
 ### 编译
@@ -196,30 +227,27 @@ make -j
 
 ### 模型导出
 
-#### ChatGLM模型导出
+#### ChatGLM模型导出 (默认脚本导出ChatGLM2-6b模型)
 
 ``` sh
 # 需要先安装ChatGLM-6B环境
 # 如果使用自己finetune的模型需要修改chatglm_export.py文件中创建tokenizer, model的代码
-# 如果使用量化模型，需要先编译好quant文件，这里假设已经存在build/quant文件
 cd build
-python3 tools/chatglm_export.py chatglm-6b-fp32.flm # 导出浮点模型
-./quant -p chatglm-6b-fp32.flm -o chatglm-6b-fp16.flm -b 16 #导出float16模型
-./quant -p chatglm-6b-fp32.flm -o chatglm-6b-int8.flm -b 8 #导出int8模型
-./quant -p chatglm-6b-fp32.flm -o chatglm-6b-int4.flm -b 4 #导出int4模型
+python3 tools/chatglm_export.py chatglm2-6b-fp16.flm float16 #导出float16模型
+python3 tools/chatglm_export.py chatglm2-6b-int8.flm int8 #导出int8模型
+python3 tools/chatglm_export.py chatglm2-6b-int4.flm int4 #导出int4模型
 ```
 
-### baichuan模型导出
+### baichuan模型导出 (默认脚本导出baichuan-13b-chat模型)
 
 ``` sh
 # 需要先安装baichuan环境
-# 默认使用的是经过sft训练的对话模型，如果使用其余模型需要修改导出文件
-# 如果使用量化模型，需要先编译好quant文件，这里假设已经存在build/quant文件
+# 如果使用自己finetune的模型需要修改baichuan_export.py文件中创建tokenizer, model的代码
+# 根据所需的精度，导出相应的模型
 cd build
-python3 tools/baichuan_peft2flm.py baichuan-fp32.flm # 导出浮点模型
-./quant -p baichuan-fp32.flm -o baichuan-fp16.flm -b 16 #导出float16模型
-./quant -p baichuan-fp32.flm -o baichuan-int8.flm -b 8 #导出int8模型
-./quant -p baichuan-fp32.flm -o baichuan-int4.flm -b 4 #导出int4模型
+python3 tools/baichuan2flm.py baichuan-13b-fp16.flm float16 #导出float16模型
+python3 tools/baichuan2flm.py baichuan-13b-int8.flm int8 #导出int8模型
+python3 tools/baichuan2flm.py baichuan-13b-int4.flm int4 #导出int4模型
 ```
 
 ### MOSS模型导出
@@ -227,12 +255,11 @@ python3 tools/baichuan_peft2flm.py baichuan-fp32.flm # 导出浮点模型
 ``` sh
 # 需要先安装MOSS环境
 # 如果使用自己finetune的模型需要修改moss_export.py文件中创建tokenizer, model的代码
-# 如果使用量化模型，需要先编译好quant文件，这里假设已经存在build/quant文件
+# 根据所需的精度，导出相应的模型
 cd build
-python3 tools/moss_export.py moss-fp32.flm # 导出浮点模型
-./quant -p moss-fp32.flm -o moss-fp16.flm -b 16 #导出float16模型
-./quant -p moss-fp32.flm -o moss-int8.flm -b 8 #导出int8模型
-./quant -p moss-fp32.flm -o moss-int4.flm -b 4 #导出int4模型
+python3 tools/moss_export.py moss-fp16.flm float16 #导出float16模型
+python3 tools/moss_export.py moss-int8.flm int8 #导出int8模型
+python3 tools/moss_export.py moss-int4.flm int4 #导出int4模型
 ```
 
 ### LLAMA系列模型导出
@@ -247,8 +274,9 @@ python3 tools/moss_export.py moss-fp32.flm # 导出浮点模型
 
 ### 短期计划
 
-- 支持部分显存 + 部分DDR模式
-- 优化int4, int8的batch推理
+- 添加MMLU, CMMLU等测试程序
+- 支持直接转换已经量化好的huggingface模型
+- 实现外推到8K长度
 
 ### 中期计划
 
