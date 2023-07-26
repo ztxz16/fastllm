@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 
 project(fastllm LANGUAGES CXX)
-set(CMAKE_CXX_STANDARD 17)
 
 option(USE_CUDA "use cuda" OFF)
 
