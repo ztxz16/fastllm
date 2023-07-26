@@ -112,7 +112,6 @@ namespace fastllm {
             std::string qkvWeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.weight";
             std::string qkvBiasName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.bias";
             Linear(attenInput, weight[qkvWeightName], weight[qkvBiasName], qkv);
-
             if (version == 1) {
                 qkv.Reshape({qkv.dims[0], qkv.dims[1], num_attention_heads, -1});
                 int per = qkv.dims.back() / 3;
@@ -918,12 +917,12 @@ namespace fastllm {
         if (round == 0 && GetVersion() == 1) {
             return input;
         } else {
-            return history + ("[Round " + std::to_string(round) + "]\n问：" + input + "\n答：");
+            return history + ("[Round " + std::to_string(round) + "]\n\n问：" + input + "\n\n答：");
         }
     }
 
     std::string ChatGLMModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
-        return (history + ("[Round " + std::to_string(round) + "]\n问：" + input + "\n答：" + output + "\n"));
+        return (history + ("[Round " + std::to_string(round) + "]\n\n问：" + input + "\n\n答：" + output + "\n\n"));
     }
 
     int ChatGLMModel::LaunchResponseTokens(const std::vector<int> &inputTokens,
