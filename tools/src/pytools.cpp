@@ -149,6 +149,17 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT void add_qlinear_weight_llm_model(int modelId, char *key, int dimsLen, void *dimsData,
+                                                 int bit, void *scales, void *oriData) {
+        auto model = models.GetModel(modelId);
+        std::vector <int> dims = std::vector <int> (dimsLen);
+        for (int i = 0; i < dims.size(); i++) {
+            dims[i] = ((int*)dimsData)[i];
+        }
+        model->weight.AddQLinearWeight(key, dims, bit, (float*)scales, (uint8_t*)oriData);
+        return;
+    }
+
     DLL_EXPORT char *make_input_llm_model(int modelId, char *history, int round, char *input) {
         auto model = models.GetModel(modelId);
         char *ret = string_to_chars(model->MakeInput(history, round, input));

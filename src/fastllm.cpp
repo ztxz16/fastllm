@@ -1213,6 +1213,58 @@ namespace fastllm {
         this->dicts[key] = value;
     }
 
+    void WeightMap::AddQLinearWeight(const std::string &key, const std::vector <int> &dims,
+                          int bit, float *scales, uint8_t *oriData) {
+        AssertInFastLLM(bit == 4 || bit == 8, "Error: only support 8 bit or 4 bit QLinear.\n");
+        DataType dataType = (bit == 4 ? DataType::INT4_NOZERO : DataType::INT8);
+        std::vector <int> realDims = dims;
+        if (bit == 4) {
+            realDims[1] *= 2;
+        }
+        this->weight[key] = Data(dataType, realDims);
+        Data &data = this->weight[key];
+        data.weightType = WeightType::LINEAR;
+        data.UpdateUnitSize();
+        data.Allocate();
+
+        int k = data.dims[0], m = data.dims[1];
+        int bytes = k * m / (bit == 4 ? 2 : 1);
+        data.perChannelAxis = 0;
+        data.perChannelsConfigs.resize(k);
+        data.zeros.resize(k);
+        data.scales.resize(k);
+        data.mins.resize(k);
+
+        if (bit == 4) {
+            for (int i = 0; i < k; i++) {
+                data.perChannelsConfigs[i] = LowBitConfig(-8.0 * scales[i], 7 * scales[i], bit, 1);
+                data.mins[i] = data.perChannelsConfigs[i].min;
+                data.zeros[i] = data.perChannelsConfigs[i].zeroPoint;
+                data.scales[i] = data.perChannelsConfigs[i].scale;
+            }
+            int mask = (8 << 4) | 8;
+            for (int i = 0; i < 20; i++) {
+                uint8_t a = oriData[i] >> 4, b = oriData[i] & 15;
+                int8_t ia = *(int8_t*)(&a), ib = *(int8_t*)(&b);
+            }
+            for (int i = 0; i < bytes; i++) {
+                oriData[i] = oriData[i] ^ mask;
+            }
+            memcpy((uint8_t*)data.cpuData, oriData, bytes);
+        } else {
+            for (int i = 0; i < k; i++) {
+                data.perChannelsConfigs[i] = LowBitConfig(-128.0 * scales[i], 127 * scales[i], bit, 0);
+                data.mins[i] = data.perChannelsConfigs[i].min;
+                data.zeros[i] = data.perChannelsConfigs[i].zeroPoint;
+                data.scales[i] = data.perChannelsConfigs[i].scale;
+            }
+            for (int i = 0; i < bytes; i++) {
+                oriData[i] = oriData[i] ^ 128;
+            }
+            memcpy((uint8_t*)data.cpuData, oriData, bytes);
+        }
+    }
+
     void WeightMap::AddWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType,
                               fastllm::WeightType weightType, fastllm::DataType oriDataType, uint8_t *oriData) {
         this->weight[key] = Data(dataType, dims);
