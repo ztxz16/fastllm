@@ -10,7 +10,8 @@ fastllm_data_type_dict = {
 }
 fastllm_weight_type_dict = {
     "linear": 1,
-    "embedding": 2
+    "embedding": 2,
+    "QuantizedLinear": 111
 }
 
 def create(model,
@@ -44,7 +45,11 @@ def create(model,
 
     weight_type_dict = {};
     module_dict = {};
+    weight_bits = {};
     for key, m in model.named_modules():
+        if (str(type(m)).find("QuantizedLinear") != -1):
+            weight_type_dict[key + ".weight"] = "QuantizedLinear";
+            weight_bits[key + ".weight"] = m.weight_bit_width;
         if (isinstance(m, torch.nn.Linear)):
             weight_type_dict[key + ".weight"] = "linear";
             module_dict[key + ".weight"] = m;
@@ -86,7 +91,15 @@ def create(model,
             # TODO bfloat
             to_data_type = 0;
 
-        llm.fastllm_lib.add_weight_llm_model(model, key.encode(),
+        if (cur_weight_type == 111):
+            llm.fastllm_lib.add_qlinear_weight_llm_model(model, key.encode(),
+                                                 len(dict[key].shape),
+                                                 (ctypes.c_int * len(dict[key].shape))(*list(dict[key].shape)),
+                                                 weight_bits[key],
+                                                 dict[key + "_scale"].numpy().astype(np.float32).ctypes.data_as(ctypes.c_void_p),
+                                                 dict[key].numpy().ctypes.data_as(ctypes.c_void_p));
+        else:
+            llm.fastllm_lib.add_weight_llm_model(model, key.encode(),
                                              len(dict[key].shape),
                                              (ctypes.c_int * len(dict[key].shape))(*list(dict[key].shape)),
                                              to_data_type, cur_weight_type, ori_data_type,
