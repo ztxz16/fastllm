@@ -6,6 +6,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>
 #include <pybind11/functional.h>
+#include <unordered_map>
 
 namespace py = pybind11;
 using namespace pybind11::literals;  
@@ -29,6 +30,7 @@ PYBIND11_MODULE(pyfastllm, m) {
 	  .def_readwrite("top_k", &fastllm::GenerationConfig::top_k) 
 	  .def_readwrite("top_p", &fastllm::GenerationConfig::top_p) 
 	  .def_readwrite("temperature", &fastllm::GenerationConfig::temperature)
+	  .def_readwrite("enable_hash_id", &fastllm::GenerationConfig::enable_hash_id)
 	  .def("is_simple_greedy", &fastllm::GenerationConfig::IsSimpleGreedy); 
 
   // high level
@@ -40,7 +42,9 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("get_kv_cache", &fastllm::GetKVCacheInCPU)
     .def("set_device_map", &fastllm::SetDeviceMap)
     .def("create_llm", &fastllm::CreateLLMModelFromFile);
-  
+  m.def("std_hash", [](std::string input) -> size_t {
+		return std::hash<std::string>{}(input);
+  }); 
   // low level
   m.def("get_llm_type", &fastllm::GetModelTypeFromFile);
 
