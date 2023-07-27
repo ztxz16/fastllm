@@ -22,28 +22,50 @@ def args_parser():
     return args
 
 model = None
-msg_queue = queue.Queue()
+msg_dict = dict()
 
 def save_msg(idx: int, content: bytes):
-    content = content.decode(encoding="utf-8", errors="replace")
-    msg_queue.put((idx, content))
+    global msg_dict
+    content = content.decode(encoding="utf-8", errors="ignore")
+    hash_id_idx = content.rindex("hash_id:") 
+    hash_id = content[hash_id_idx+8:]
+    content = content[:hash_id_idx].replace("<n>", "\n")
+    if hash_id in msg_dict.keys():
+        msg_dict[hash_id].put((idx, content))
+    else:
+        msg_queue = queue.Queue()
+        msg_queue.put((idx, content))
+        msg_dict[hash_id] = msg_queue
 
 def response_stream(prompt: str, config: pyfastllm.GenerationConfig):
     global model
     model.response(prompt, save_msg, config)
 
-def chat_stream(prompt: str, config: pyfastllm.GenerationConfig):
-    global model
-    thread = threading.Thread(target = response_stream, args = (prompt, config))
+def chat_stream(prompt: str, config: pyfastllm.GenerationConfig, uid:int=0, time_out=200):
+    global model, msg_dict
+    time_stamp = round(time.time() * 1000)
+    hash_id = str(pyfastllm.std_hash(f"{prompt}time_stamp:{time_stamp}"))
+    thread = threading.Thread(target = response_stream, args = (f"{prompt}time_stamp:{time_stamp}", config))
     thread.start()
     idx = 0
+    start = time.time()
+    pre_msg = ""
     while idx != -1:
-        if msg_queue.empty():
-            time.sleep(0.1)
+        if hash_id in msg_dict.keys():
+            msg_queue = msg_dict[hash_id]
+            if msg_queue.empty():
+                time.sleep(0)
+                continue
+            msg_obj = msg_queue.get(block=False)
+            idx = msg_obj[0]
+            yield msg_obj[1]
+            pre_msg = msg_obj[1]
+        else:
+            if time.time() - start > time_out:
+                yield pre_msg + f"\ntime_out: {time.time() - start} senconds"
+                break
+            time.sleep(0)
             continue
-        msg_obj = msg_queue.get(block=False)
-        idx = msg_obj[0]
-        yield msg_obj[1]
 
     
 
@@ -54,6 +76,9 @@ async def api_chat_stream(request: Request):
     data = await request.json()
     prompt = data.get("prompt")
     history = data.get("history")
+    if history is None:
+        history = ""
+    round_cnt = data.get("round_cnt")
     config = pyfastllm.GenerationConfig()
     if data.get("max_length") is not None:
         config.max_length = data.get("max_length") 
@@ -61,14 +86,16 @@ async def api_chat_stream(request: Request):
         config.top_k = data.get("top_k")
     if data.get("top_p") is not None:
         config.top_p = data.get("top_p")
+    if data.get("temperature") is not None:
+        config.temperature = data.get("temperature")
+    if data.get("repeat_penalty") is not None:
+        config.repeat_penalty = data.get("repeat_penalty")
+    uid = None
+    if data.get("uid") is not None:
+        uid = data.get("uid")
+    config.enable_hash_id = True
+    print(f"prompt:{prompt}")
     return StreamingResponse(chat_stream(history + prompt, config), media_type='text/event-stream')
-
-
-def batch_stream(prompts: str, config: pyfastllm.GenerationConfig):
-    idx = 0
-    for response in model.batch_response(prompts, None, config): 
-        yield  f"({batch_idx}/{len(prompts)}\n prompt: {prompts[batch_idx]} \n response: {response}\n"
-        idx += 1
 
 
 @app.post("/api/batch_chat")
@@ -79,6 +106,8 @@ async def api_batch_chat(request: Request):
     if prompts is None:
         return "prompts should be list[str]"
     history = data.get("history")
+    if history is None:
+        history = ""
     config = pyfastllm.GenerationConfig()
     if data.get("max_length") is not None:
         config.max_length = data.get("max_length") 
@@ -86,10 +115,17 @@ async def api_batch_chat(request: Request):
         config.top_k = data.get("top_k")
     if data.get("top_p") is not None:
         config.top_p = data.get("top_p")
+    if data.get("temperature") is not None:
+        config.temperature = data.get("temperature")
+    if data.get("repeat_penalty") is not None:
+        config.repeat_penalty = data.get("repeat_penalty")
+    uid = None
+    if data.get("uid") is not None:
+        uid = data.get("uid")
     retV = ""
     batch_idx = 0
     for response in model.batch_response(prompts, None, config): 
-        retV +=  f"({batch_idx + 1}/{len(prompts)}\n prompt: {prompts[batch_idx]} \n response: {response}\n"
+        retV +=  f"({batch_idx + 1}/{len(prompts)})\n prompt: {prompts[batch_idx]} \n response: {response}\n"
         batch_idx += 1
     return retV
 

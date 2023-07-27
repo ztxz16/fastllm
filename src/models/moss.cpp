@@ -12,6 +12,10 @@
 
 #include <algorithm>
 
+#include <sstream>
+
+#include <unordered_map>
+
 namespace fastllm {
     extern double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2);
 
@@ -194,7 +198,14 @@ namespace fastllm {
     std::string MOSSModel::Response(const std::string &input,
                                     RuntimeResult retCb,
                                     const GenerationConfig &generationConfig) {
+#ifdef PY_API
+		size_t pos = input.find_last_of("time_stamp:");
+		std::string prompt = (generationConfig.enable_hash_id && pos != std::string::npos)?  input.substr(0, pos-10):input;
+		size_t hash_id = std::hash<std::string>{}(input);
+        Data inputIds = this->weight.tokenizer.Encode(prompt);
+#else
         Data inputIds = this->weight.tokenizer.Encode(input);
+#endif
         Data attentionMask = inputIds;
         Data positionIds = inputIds;
         std::vector<std::pair<Data, Data> > pastKeyValues;
@@ -225,7 +236,15 @@ namespace fastllm {
             retString += current;
 			if (retCb)
 #ifdef PY_API
-				retCb(index, pybind11::bytes(retString));
+			{
+				if(generationConfig.enable_hash_id){
+					std::stringstream ss;
+					ss << retString << "hash_id:"<<hash_id;
+					retCb(index, pybind11::bytes(ss.str()));
+				}else{
+					retCb(index, pybind11::bytes(retString));
+				}
+			}
 #else
 				retCb(index, current.c_str());
 #endif
@@ -245,7 +264,15 @@ namespace fastllm {
 
 		if (retCb)
 #ifdef PY_API
-			retCb(-1, pybind11::bytes(retString));
+		{
+			if(generationConfig.enable_hash_id){
+				std::stringstream ss;
+				ss << retString << "hash_id:"<<hash_id;
+				retCb(-1, pybind11::bytes(ss.str()));
+			}else{
+				retCb(-1, pybind11::bytes(retString));
+			}
+		}
 #else
 			retCb(-1, retString.c_str());
 #endif
