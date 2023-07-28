@@ -82,6 +82,16 @@ new_model = llm.model("model.flm"); # 导入fastllm模型
 
 [详细测试数据点这里](docs/benchmark.md)
 
+## CMMLU精度测试
+
+|              模型  | Data精度 |  CMMLU分数 |
+|-----------------: |-------- |------------|
+| ChatGLM2-6b-int4  | float32 |  50.16     |
+| ChatGLM2-6b-int8  | float32 |  50.14     |
+| ChatGLM2-6b-fp16  | float32 |  49.63     |
+
+目前测试了ChatGLM2模型，具体测试步骤点[这里](test/cmmlu/README.md)
+
 ## 快速开始
 
 ### 编译
