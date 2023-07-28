@@ -87,23 +87,30 @@ int main(int argc, char **argv) {
     if (inputs.size() > config.batch && config.batch != -1) {
         inputs.resize(config.batch);
     }
+
+    int promptTokenNum = 0;
     for (int i = 0; i < inputs.size(); i++) {
         inputs[i] = model->MakeInput("", 0, inputs[i]);
+        promptTokenNum += model->weight.tokenizer.Encode(inputs[i]).Count(0);
     }
 
     std::vector <std::string> outputs;
     static int tokens = 0;
     auto st = std::chrono::system_clock::now();
-
+    static auto promptTime = st;
     model->ResponseBatch(inputs, outputs, [](int index, std::vector<std::string> &contents) {
         if (index != -1) {
-            for (int i = 0; i < contents.size(); i++) {
-                tokens += (contents[i].size() > 0);
+            if (index == 0) {
+                promptTime = std::chrono::system_clock::now();
+            } else {
+                for (int i = 0; i < contents.size(); i++) {
+                    tokens += (contents[i].size() > 0);
+                }
             }
         }
     }, generationConfig);
-
-    float spend = fastllm::GetSpan(st, std::chrono::system_clock::now());
+    float promptSpend = fastllm::GetSpan(st, promptTime);
+    float spend = fastllm::GetSpan(promptTime, std::chrono::system_clock::now());
 
     if (config.output != "") {
         FILE *fo = fopen(config.output.c_str(), "w");
@@ -118,6 +125,9 @@ int main(int argc, char **argv) {
     }
 
     printf("batch: %d\n", (int)inputs.size());
+    printf("prompt token number = %d\n", promptTokenNum);
+    printf("prompt use %f s\n", promptSpend);
+    printf("prompt speed = %f tokens / s\n", (float)promptTokenNum / promptSpend);
     printf("output %d tokens\nuse %f s\nspeed = %f tokens / s\n", tokens, spend, tokens / spend);
     return 0;
 }
