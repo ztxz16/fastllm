@@ -66,6 +66,6 @@ if __name__ == "__main__":
     from fastllm_pytools import llm;
     model = llm.from_hf(model, tokenizer, dtype = args.dtype);
 
-    model.save("/root/test.flm");
+    # model.save("/root/test.flm");
     # Always use Chat-style evaluation
     run_eval(model, tokenizer, eval_chat_multithread, args)
