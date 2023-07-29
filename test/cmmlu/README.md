@@ -29,6 +29,7 @@ python3 eval.py 此处填写结果保存路径
 
 |              模型  | Data精度 |  CMMLU分数 |
 |-----------------: |-------- |------------|
-| ChatGLM2-6b-int4  | float32 |  50.16     |
+| ChatGLM2-6b-fp16  | float32 |  50.16     |
 | ChatGLM2-6b-int8  | float32 |  50.14     |
-| ChatGLM2-6b-fp16  | float32 |  49.63     |
+| ChatGLM2-6b-int4  | float32 |  49.63     |
+
