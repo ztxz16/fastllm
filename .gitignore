@@ -11,6 +11,7 @@ token
 /.idea/
 /.vscode/
 /example/Win32Demo/bin/*.*
+/example/Win32Demo/Win32
 /example/Win32Demo/x64
 /example/Win32Demo/*.filters
 /example/Win32Demo/*.user
