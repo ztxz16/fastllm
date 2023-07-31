@@ -7,7 +7,8 @@ from fastllm_pytools import torch2flm
 if __name__ == "__main__":
     modelpath = "baichuan-inc/baichuan-13B-Chat"
     tokenizer = AutoTokenizer.from_pretrained(modelpath, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(modelpath, device_map="cpu", torch_dtype=torch.float16, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(modelpath, device_map="auto", torch_dtype=torch.float16, trust_remote_code=True)
+    model.to("cpu")
     try:
         model.generation_config = GenerationConfig.from_pretrained(modelpath)
     except:
