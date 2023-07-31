@@ -1,0 +1,137 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="源文件">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cu;cxx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="头文件">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;cuh;hxx;hm;inl;inc;xsd</Extensions>
+    </Filter>
+    <Filter Include="资源文件">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
+    </Filter>
+    <Filter Include="头文件\models">
+      <UniqueIdentifier>{6e72ffa3-ad6c-4f3e-9f42-de0f3d674fc0}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\models">
+      <UniqueIdentifier>{ad23d9cc-65a3-4c41-b87f-5826ce7a6dca}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\utils">
+      <UniqueIdentifier>{1da1956b-b0ea-4a15-9b4a-11a431319b7d}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\devices">
+      <UniqueIdentifier>{fa575702-cfa0-433c-8959-c953599bd9ed}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\devices\cpu">
+      <UniqueIdentifier>{2fd7965b-96c9-47a3-8bff-8bd955ba0f3a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\devices">
+      <UniqueIdentifier>{c6d29e93-8c08-452d-ace1-5ed804174f77}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\devices\cpu">
+      <UniqueIdentifier>{c17acf48-126f-4578-aaf9-aef7cfcb9fd9}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\devices\cuda">
+      <UniqueIdentifier>{d7bfe0ea-81a6-4dc4-b526-a5a4eb114296}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\devices\cuda">
+      <UniqueIdentifier>{fa0efa1b-9d09-40d3-811d-5a2cfb37d536}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\include\device.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\executor.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\fastllm.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\model.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\basellm.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\chatglm.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\factoryllm.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\llama.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\moss.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\devices\cpu\cpudevice.h">
+      <Filter>头文件\devices\cpu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\devices\cpu\cputhreadpool.h">
+      <Filter>头文件\devices\cpu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\utils\armMath.h">
+      <Filter>头文件\utils</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\utils\utils.h">
+      <Filter>头文件\utils</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\devices\cuda\cudadevice.h">
+      <Filter>头文件\devices\cuda</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\devices\cuda\fastllm-cuda.cuh">
+      <Filter>头文件\devices\cuda</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\..\src\device.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\executor.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\fastllm.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\model.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\pybinding.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\basellm.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\chatglm.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\llama.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\moss.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\devices\cpu\cpudevice.cpp">
+      <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\devices\cpu\cpudevicebatch.cpp">
+      <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\devices\cuda\cudadevice.cpp">
+      <Filter>源文件\devices\cuda</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\devices\cuda\cudadevicebatch.cpp">
+      <Filter>源文件\devices\cuda</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CudaCompile Include="..\..\src\devices\cuda\fastllm-cuda.cu">
+      <Filter>源文件\devices\cuda</Filter>
+    </CudaCompile>
+  </ItemGroup>
+</Project>
