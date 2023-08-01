@@ -31,9 +31,12 @@ Win32Demo，是windows平台上运行FastLLM程序的一个Visual Studio工程�
 
 除此之外提供了fastllm的.vcproj文件，带GPU支持，本项目最低可在Visual Studio 2015 Update 3 下编译通过。
 （但是**编译pyfastllm至少需要 MSVC 2017**）
+
 ### 编译
 
-fastllm工程目前分为CPU版本和GPU版本，为简单上手，在没有cmake时，本项目可以使用Visual Studio直接编译，配置预处理器定义开关功能项。默认使用CPU版本。
+fastllm工程目前分为CPU版本和GPU版本，为简单上手，在没有cmake时，本项目可以使用Visual Studio工程文件并配置预处理器定义开关功能项。默认使用CPU版本。
+
+签出代码后，**修改 include/fastllm.h**，Visual Studio中点击”文件“ -> "高级保存选项"，在编码中选择”Unicode (UTF-8 **带签名**) -代码页 65001“，或在其他文本编辑器中转为”UTF-8 BOM“编码。（由于linux下gcc不识别BOM头，该修改只能手动处理。）
 
 * **GPU版本**：
   - 需要正确安装CUDA；
