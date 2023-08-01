@@ -203,7 +203,7 @@ namespace fastllm {
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         logits.ToDevice(DataDevice::CPU);
 
-        int lastRet;
+        int lastRet = -1;
         if (generationConfig.IsSimpleGreedy()) {
             std::pair <float, int> ret = std::make_pair(-1e9, -1);
             int base = logits.dims[1] - 1;
@@ -211,7 +211,7 @@ namespace fastllm {
                 ret = max(ret, std::make_pair(((float*)logits.cpuData)[base * logits.dims.back() + i], i));
             }
             lastRet = ret.second;
-        } else {
+        } else if (!lastTokens.units.empty()) {
             lastRet = LLMSampling(logits, logits.dims[1] - 1, generationConfig, lastTokens.units[0]);
         }
 
