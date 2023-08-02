@@ -60,7 +60,8 @@ namespace fastllm {
         this->bos_token_id = 130004;
         this->eos_token_id = 130005;
 
-
+        this->rope = -1.0;
+        this->UpdateSinCos(1.0f);
         weight.embeddingNames.insert("transformer.word_embeddings.weight");
         weight.embeddingNames.insert("transformer.embedding.word_embeddings.weight");
     }
