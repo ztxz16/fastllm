@@ -23,12 +23,11 @@
 #endif
 
 namespace fastllm {
-    ChatGLMModel::ChatGLMModel() {
-        this->model_type = "chatglm";
-
-        this->bos_token_id = 130004;
-        this->eos_token_id = 130005;
-
+    void ChatGLMModel::UpdateSinCos(float rope) {
+        if (rope == this->rope) {
+            return;
+        }
+        this->rope = rope;
         sin.resize(max_positions);
         cos.resize(max_positions);
         std::vector <float> invFreq;
@@ -39,8 +38,8 @@ namespace fastllm {
             sin[i].resize(rotary_dim);
             cos[i].resize(rotary_dim);
             for (int j = 0; j < invFreq.size(); j++) {
-                sin[i][j] = ::sin((float)i * invFreq[j]);
-                cos[i][j] = ::cos((float)i * invFreq[j]);
+                sin[i][j] = ::sin((float)i / rope * invFreq[j]);
+                cos[i][j] = ::cos((float)i / rope * invFreq[j]);
             }
         }
 
@@ -53,6 +52,15 @@ namespace fastllm {
         }
         sinData.CopyFrom(Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, fsin));
         cosData.CopyFrom(Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, fcos));
+    }
+
+    ChatGLMModel::ChatGLMModel() {
+        this->model_type = "chatglm";
+
+        this->bos_token_id = 130004;
+        this->eos_token_id = 130005;
+
+
         weight.embeddingNames.insert("transformer.word_embeddings.weight");
         weight.embeddingNames.insert("transformer.embedding.word_embeddings.weight");
     }
@@ -71,6 +79,9 @@ namespace fastllm {
             std::vector <std::pair <Data, Data> > &pastKeyValues,
             const GenerationConfig &generationConfig,
             const LastTokensManager &lastTokens) {
+        if (this->weight.dicts.find("rope_ratio") != this->weight.dicts.end()) {
+            UpdateSinCos(atof(this->weight.dicts["rope_ratio"].c_str()));
+        }
         int maxLen = inputIds.dims[1];
         Data inputEmbeddings;
         Data attenInput;
@@ -289,6 +300,9 @@ namespace fastllm {
             std::vector <std::pair <Data*, Data*> > &pastKeyValues,
             const std::vector <GenerationConfig> &generationConfigs,
             const LastTokensManager &lastTokens) {
+        if (this->weight.dicts.find("rope_ratio") != this->weight.dicts.end()) {
+            UpdateSinCos(atof(this->weight.dicts["rope_ratio"].c_str()));
+        }
         int seqLen = inputIds.dims[1];
         sinData.ToDevice(DataDevice::CUDA);
         cosData.ToDevice(DataDevice::CUDA);
