@@ -104,9 +104,9 @@ extern "C" {
         return id;
     }
 
-    DLL_EXPORT void add_tokenizer_word_llm_model(int modelId, char *key, int tokenId) {
+    DLL_EXPORT void add_tokenizer_word_llm_model(int modelId, char *key, int tokenId, float score) {
         auto model = models.GetModel(modelId);
-        model->weight.AddTokenizerWord(key, tokenId);
+        model->weight.AddTokenizerWord(key, tokenId, score);
         return;
     }
 
