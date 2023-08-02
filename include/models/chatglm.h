@@ -64,8 +64,12 @@ namespace fastllm {
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
 
         int GetVersion();
+
+        void UpdateSinCos(float rope);
     private:
 		virtual void CausalMask(Data &data, int start) {}; // 因果mask？
+
+        float rope = 1.0f;
     };
 }
 
