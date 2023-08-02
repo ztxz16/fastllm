@@ -143,6 +143,7 @@ class model:
                                                            ctypes.c_float(temperature), ctypes.c_float(repeat_penalty));
         res = "";
         ret = b'';
+        fail_cnt = 0;
         while True:
             ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle);
             cur = "";
@@ -150,7 +151,12 @@ class model:
                 cur = ret.decode();
                 ret = b'';
             except:
-                break;
+                fail_cnt += 1;
+                if (fail_cnt == 20):
+                    break;
+                else:
+                    continue;
+            fail_cnt = 0;
             if (cur == "<flmeos>"):
                 break;
             if one_by_one:
