@@ -65,14 +65,17 @@ def create(model,
 
     # 1. vocab
     if (tokenizer):
+        if (hasattr(tokenizer, "tokenizer")):
+            tokenizer = tokenizer.tokenizer;
         if (hasattr(tokenizer, "sp_model")):
             piece_size = tokenizer.sp_model.piece_size();
             for i in range(piece_size):
-                llm.fastllm_lib.add_tokenizer_word_llm_model(model, tokenizer.sp_model.id_to_piece(i).encode(), i);
+                llm.fastllm_lib.add_tokenizer_word_llm_model(model, tokenizer.sp_model.id_to_piece(i).encode(),
+                                                             i, ctypes.c_float(tokenizer.sp_model.get_score(i)));
         else:
             vocab = tokenizer.get_vocab();
             for v in vocab.keys():
-                llm.fastllm_lib.add_tokenizer_word_llm_model(model, v.encode(), vocab[v]);
+                llm.fastllm_lib.add_tokenizer_word_llm_model(model, v.encode(), vocab[v], ctypes.c_float(1.0));
     tot = 0;
     for key in dict:
         ori_data_type = 0;

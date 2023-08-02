@@ -301,12 +301,48 @@ namespace fastllm {
     struct Tokenizer {
         struct TrieNode {
             int tokenId;
+            float score;
             std::map <int, TrieNode*> next;
             TrieNode();
         };
+        struct Symbol {
+            TrieNode *node;
+            char *s;
+            int pos, len;
+            int prev, next;
+
+            Symbol (Tokenizer::TrieNode *node,
+                    char *s, int pos, int len,
+                    int prev, int next) {
+                this->node = node;
+                this->s = s;
+                this->pos = pos;
+                this->len = len;
+                this->prev = prev;
+                this->next = next;
+            }
+        };
+        struct SymbolPairs {
+            float score;
+            int l, r, size;
+
+            SymbolPairs(float score, int l, int r, int size) {
+                this->score = score;
+                this->l = l;
+                this->r = r;
+                this->size = size;
+            }
+        };
+
+        friend bool operator < (const SymbolPairs &a, const SymbolPairs &b) {
+            return a.score < b.score || (a.score == b.score && a.l > b.l);
+        }
+
         TrieNode *root;
 
         std::unordered_map <int, std::string> tokenToStringDict;
+        std::unordered_map <int, float> tokenToScoreDict;
+        std::unordered_map <std::string, int> stringToTokenDict;
 
         Tokenizer ();
 
@@ -314,7 +350,9 @@ namespace fastllm {
 
         void Clear(); // 清空分词器
 
-        void Insert(const std::string &s, int tokenId); // 插入一个token
+        void TryMergePairs(std::vector<Symbol> &symbols, int l, int r, std::priority_queue <SymbolPairs> &q); // 插入备选symbol
+
+        void Insert(const std::string &s, int tokenId, float score = 1.0f); // 插入一个token
 
         Data Encode(const std::string &s); // 编码
 
@@ -340,7 +378,7 @@ namespace fastllm {
 
         void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型, bit = 0代表直接存
 
-        void AddTokenizerWord(const std::string &key, int value); // 增加一个词
+        void AddTokenizerWord(const std::string &key, int value, float score); // 增加一个词
 
         void AddDict(const std::string &key, const std::string &value); // 插入一个词条
 
