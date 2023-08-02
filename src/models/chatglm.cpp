@@ -274,13 +274,12 @@ namespace fastllm {
                 int base = (maxLen - 1) * batch + b;
                 lastRet.push_back((int) (((float *) topk.cpuData)[base * 2] + 1e-3));
             }
-        } else {
+        } else if (!lastTokens.units.empty()) {
             for (int b = 0; b < batch; b++) {
                 int base = (maxLen - 1) * batch + b;
                 lastRet.push_back(LLMSampling(logits, base, generationConfig, lastTokens.units[b]));
             }
         }
-
         return lastRet;
     }
 

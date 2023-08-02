@@ -186,7 +186,7 @@ namespace fastllm {
             std::sort(v.begin(), v.end());
             std::reverse(v.begin(), v.end());
             ret = v[0].second;
-        } else {
+        } else if (!lastTokens.units.empty()) {
             ret = LLMSampling(logits, logits.dims[logits.dims.size() - 2] - 1, generationConfig, lastTokens.units[0]);
         }
 
