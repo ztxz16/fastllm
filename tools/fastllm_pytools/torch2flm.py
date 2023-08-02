@@ -93,12 +93,16 @@ def tofile(exportPath,
         modelInfo["bot_role"] = tokenizer.decode([model.generation_config.assistant_token_id])
         modelInfo["history_sep"] = ""
 
+    modelInfo["tokenizer_use_score"] = "1" # 分词带分数
+
     fo.write(struct.pack('i', len(modelInfo)))
     for it in modelInfo.keys():
         writeKeyValue(fo, str(it), str(modelInfo[it]))
 
     # 1. vocab
     if (tokenizer):
+        if (hasattr(tokenizer, "tokenizer")):
+            tokenizer = tokenizer.tokenizer;
         if (hasattr(tokenizer, "sp_model")):
             piece_size = tokenizer.sp_model.piece_size()
             fo.write(struct.pack('i', piece_size))
@@ -108,6 +112,7 @@ def tofile(exportPath,
                 for c in s:
                     fo.write(struct.pack('i', c))
                 fo.write(struct.pack('i', i))
+                fo.write(struct.pack('f', float(tokenizer.sp_model.get_score(i))))
         else:
             vocab = tokenizer.get_vocab()
             fo.write(struct.pack('i', len(vocab)))
@@ -117,6 +122,7 @@ def tofile(exportPath,
                 for c in s:
                     fo.write(struct.pack('i', c))
                 fo.write(struct.pack('i', vocab[v]))
+                fo.write(struct.pack('f', 1.0))
     else:
         fo.write(struct.pack('i', 0))
 

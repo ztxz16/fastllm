@@ -751,7 +751,7 @@ namespace fastllm {
         tokenToStringDict.clear();
     }
 
-    void Tokenizer::Insert(const std::string &s, int tokenId) {
+    void Tokenizer::Insert(const std::string &s, int tokenId, float score) {
         TrieNode *now = this->root;
         for (int i = 0; i < s.size(); i++) {
             if (now->next.find(s[i]) == now->next.end()) {
@@ -760,27 +760,114 @@ namespace fastllm {
             now = now->next[s[i]];
         }
         now->tokenId = tokenId;
+        now->score = score;
         tokenToStringDict[tokenId] = s;
+        stringToTokenDict[s] = tokenId;
+    }
+
+    void Tokenizer::TryMergePairs(std::vector<Symbol> &symbols, int l, int r, std::priority_queue <SymbolPairs> &q) {
+        if (l == -1 || r == -1 || symbols[l].len == 0 || symbols[r].len == 0) {
+            return;
+        }
+        auto now = symbols[l].node;
+        char *s = symbols[r].s;
+        int pos = symbols[r].pos, len = symbols[r].len;
+        for (int i = pos; i < pos + len; i++) {
+            if (now->next.find(s[i]) != now->next.end()) {
+                now = now->next[s[i]];
+            } else {
+                return;
+            }
+        }
+        if (now->tokenId == -999999) {
+            return;
+        }
+        q.push(SymbolPairs(now->score, l, r, symbols[l].len + symbols[r].len));
     }
 
     Data Tokenizer::Encode(const std::string &ori) {
         std::string blank = "";
         blank += 226, blank += 150, blank += 129;
-        std::string s;
+        std::string s = blank;
         for (int i = 0; i < ori.size(); i++) {
             if (ori[i] == ' ') {
-                if (i == 0 || ori[i - 1] != ' ') {
+                if (i != 0 && ori[i - 1] != ' ') {
                     s += blank;
                 }
-            } else if (ori[i] == '\t') {
-                s += "<|tab|>";
-            } else if (ori[i] == '\n') {
-                s += "<n>";
             } else {
                 s += ori[i];
             }
         }
 
+        std::vector <Symbol> symbols;
+        for (int i = 0; i < s.size(); i++) {
+            int tokenId = -999999, pos = i - 1;
+            TrieNode *now = this->root;
+            for (int j = i; j < s.size(); j++) {
+                if (now->next.find(s[j]) != now->next.end()) {
+                    now = now->next[s[j]];
+                    if (now->tokenId != -999999) {
+                        tokenId = now->tokenId;
+                        pos = j;
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if (pos >= i) {
+                symbols.push_back(Symbol(now, (char*)s.data(), i, pos - i + 1, (int)symbols.size() - 1, (int)symbols.size() + 1));
+                i = pos;
+            } else {
+                symbols.push_back(Symbol(nullptr, (char*)s.data(), i, 0, (int)symbols.size() - 1, (int)symbols.size() + 1));
+            }
+        }
+        symbols.back().next = -1;
+
+        std::priority_queue <SymbolPairs> workQueue;
+        for (int i = 1; i < symbols.size(); i++) {
+            TryMergePairs(symbols, i - 1, i, workQueue);
+        }
+
+        while (!workQueue.empty()) {
+            auto top = workQueue.top();
+            workQueue.pop();
+            if (symbols[top.l].len == 0 || symbols[top.r].len == 0 ||
+                symbols[top.l].len + symbols[top.r].len != top.size) {
+                continue;
+            }
+
+            for (int i = symbols[top.r].pos; i < symbols[top.r].pos + symbols[top.r].len; i++) {
+                symbols[top.l].node = symbols[top.l].node->next[symbols[top.r].s[i]];
+            }
+            symbols[top.l].len += symbols[top.r].len;
+            symbols[top.r].len = 0;
+            symbols[top.l].next = symbols[top.r].next;
+            if (symbols[top.r].next >= 0) {
+                symbols[symbols[top.r].next].prev = top.l;
+            }
+
+            TryMergePairs(symbols, symbols[top.l].prev, top.l, workQueue);
+            TryMergePairs(symbols, top.l, symbols[top.l].next, workQueue);
+        }
+
+        std::vector <float> v;
+        for (int i = 0; i < symbols.size(); i++) {
+            if (symbols[i].len > 0) {
+                v.push_back(symbols[i].node->tokenId);
+            } else if (symbols[i].node == nullptr) {
+                // 未识别的字符
+                uint8_t c = (uint8_t)(symbols[i].s[symbols[i].pos]);
+                std::string now = "<0x00>";
+                now[3] = (c / 16 > 9 ? ('A' + c / 16 - 10) : ('0' + c / 16));
+                now[4] = (c % 16 > 9 ? ('A' + c % 16 - 10) : ('0' + c % 16));
+                if (stringToTokenDict.find(now) != stringToTokenDict.end()) {
+                    v.push_back(stringToTokenDict[now]);
+                }
+            }
+        }
+/*
+ //老旧的实现
         std::vector <float> v;
         for (int i = 0; i < s.size(); i++) {
             int tokenId = -999999, pos = i - 1;
@@ -803,7 +890,7 @@ namespace fastllm {
             }
         }
         //printf("\n");
-
+*/
         return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
     }
 
@@ -935,6 +1022,7 @@ namespace fastllm {
             }
         }
 
+        bool useScore = this->dicts["tokenizer_use_score"] == "1";
         int vocabLen = buffer.ReadInt();
         for (int i = 0; i < vocabLen; i++) {
             int len = buffer.ReadInt();
@@ -943,7 +1031,8 @@ namespace fastllm {
                 x += buffer.ReadInt();
             }
             int id = buffer.ReadInt();
-            tokenizer.Insert(x, id);
+            float score = useScore ? buffer.ReadFloat() : -i;
+            tokenizer.Insert(x, id, score);
         }
 
         int len = buffer.ReadInt();
@@ -1086,6 +1175,7 @@ namespace fastllm {
         }
 
         // 写入词表
+        bool useScore = this->dicts["tokenizer_use_score"] == "1";
         buffer.WriteInt((int)tokenizer.tokenToStringDict.size());
         for (auto &it : tokenizer.tokenToStringDict) {
             buffer.WriteInt((int)it.second.size());
@@ -1093,6 +1183,9 @@ namespace fastllm {
                 buffer.WriteInt((int)it.second[i]);
             }
             buffer.WriteInt(it.first);
+            if (useScore) {
+                buffer.WriteFloat(tokenizer.tokenToScoreDict[it.first]);
+            }
         }
 
         // 写入权重
@@ -1205,8 +1298,8 @@ namespace fastllm {
         return;
     }
 
-    void WeightMap::AddTokenizerWord(const std::string &key, int value) {
-        this->tokenizer.Insert(key, value);
+    void WeightMap::AddTokenizerWord(const std::string &key, int value, float score) {
+        this->tokenizer.Insert(key, value, score);
     }
 
     void WeightMap::AddDict(const std::string &key, const std::string &value) {
