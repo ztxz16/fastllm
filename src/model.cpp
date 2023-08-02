@@ -52,7 +52,7 @@ namespace fastllm {
     }
 
     fastllm::basellm *CreateModelWithType(const std::string &modelType) {
-        basellm *model;
+        basellm *model = nullptr;
         if (modelType == "chatglm") {
             model = (basellm*)(new ChatGLMModel());
         } else if (modelType == "moss") {
