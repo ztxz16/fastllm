@@ -15,8 +15,8 @@ option(USE_CUDA "use cuda" OFF)
 option(PY_API "python api" OFF)
 
 #可以注释掉下面优化选项
-add_definitions(${CMAKE_CXX_FLAGS} "${CMAKE_CXX_FLAGS} -march=armv8.2a+dotprod")
-
+#add_definitions(${CMAKE_CXX_FLAGS} "${CMAKE_CXX_FLAGS} -march=armv8.2a+dotprod")
+#
 #file(GLOB_RECURSE NANODET_SOURCE ../../../../../../../src/*.cpp
 #                                 ../../../../../../../src/devices/cpu/*.cpp
 #                                 ../../../../../../../src/models/*.cpp)
@@ -31,6 +31,7 @@ set(PROJECT_SOURCE
         ../../../../../../../src/model.cpp
         ../../../../../../../src/executor.cpp
         ../../../../../../../src/devices/cpu/cpudevice.cpp
+        ../../../../../../../src/devices/cpu/cpudevicebatch.cpp
         ../../../../../../../src/models/chatglm.cpp
         ../../../../../../../src/models/moss.cpp
         ../../../../../../../src/models/llama.cpp
