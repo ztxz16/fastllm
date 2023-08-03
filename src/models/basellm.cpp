@@ -3,6 +3,8 @@
 //
 
 #include "basellm.h"
+#include "utils.h"
+
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #endif
@@ -79,7 +81,7 @@ namespace fastllm {
         std::vector<float> results;
         LastTokensManager tokens(1, generationConfig.last_n);
         int promptLen = inputTokens[0].size(), index = 0;
-        FillLMMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}}, inputIds, attentionMask, positionIds);
+        FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}}, inputIds, attentionMask, positionIds);
         while (true) {
             auto st = std::chrono::system_clock::now();
             int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
@@ -111,7 +113,7 @@ namespace fastllm {
             results.clear();
 
             inputTokens[0] = std::vector<float> {(float)ret};
-            FillLMMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}}, inputIds, attentionMask, positionIds);
+            FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}}, inputIds, attentionMask, positionIds);
             if (index == generationConfig.output_token_limit) {
                 break;
             }
@@ -172,7 +174,7 @@ namespace fastllm {
 
         LastTokensManager tokensManager (batch, generationConfig.last_n);
         std::vector <bool> isEnding = std::vector <bool> (batch, false);
-        FillLMMInputsBatch(inputTokens, params, inputIds, attentionMask, positionIds);
+        FillLLMInputsBatch(inputTokens, params, inputIds, attentionMask, positionIds);
         while (true) {
             auto st = std::chrono::system_clock::now();
             std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, pastKeyValues,
@@ -210,7 +212,7 @@ namespace fastllm {
                 retCb(index, curStrings);
             index++;
             params[0]["index"] = index;
-            FillLMMInputsBatch(inputTokens, params, inputIds, attentionMask, positionIds);
+            FillLLMInputsBatch(inputTokens, params, inputIds, attentionMask, positionIds);
             // printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
 
             if (index == generationConfig.output_token_limit) {
@@ -231,14 +233,177 @@ namespace fastllm {
         exit(0);
     }
 
+    std::vector<int> basellm::ForwardBatch(int batch, const fastllm::Data &inputIds,
+                                           const std::vector<Data *> &attentionMask,
+                          const std::vector<Data *> &positionIds, const std::vector<int> &seqLens,
+                          std::vector<std::pair<Data *, Data *>> &pastKeyValues,
+                          const std::vector<GenerationConfig> &generationConfigs,
+                          const fastllm::LastTokensManager &lastTokens) {
+        printf("Unsupport forward batch.\n");
+        exit(0);
+    }
+
+    int basellm::LaunchResponseTokens(const std::vector<int> &inputTokens,
+                                      const fastllm::GenerationConfig &generationConfig) {
+        mainLoopLocker.lock();
+        if (mainLoop == nullptr) {
+            if (mainLoop == nullptr) {
+                mainLoop = new std::thread([](basellm *model) {
+                    while (true) {
+                        std::vector <Data*> attentionMasks;
+                        std::vector <Data*> positionIds;
+                        std::vector <std::pair <Data*, Data*> > pastKeyValues;
+                        std::vector <float> ids;
+                        std::vector <int> seqLens;
+                        std::vector <int> handles;
+                        std::vector <GenerationConfig> generationConfigs;
+                        LastTokensManager tokensManager;
+                        model->dictLocker.lock();
+                        for (auto &it: model->responseContextDict.dicts) {
+                            if (it.second->isEnding) {
+                                continue;
+                            }
+                            generationConfigs.push_back(it.second->generationConfig);
+                            tokensManager.units.push_back(it.second->tokens);
+                            handles.push_back(it.first);
+
+                            if (it.second->preTokens == 0) {
+                                it.second->intParams["promptLen"] = it.second->currentTokens.size();
+                                it.second->intParams["index"] = 0;
+                            } else {
+                                it.second->intParams["index"]++;
+                            }
+                            Data inputIds, attentionMask, curPositionIds;
+                            std::vector <std::vector <float> > tokens;
+                            tokens.resize(1);
+                            for (int i : it.second->currentTokens) {
+                                tokens[0].push_back(i);
+                            }
+                            model->FillLLMInputs(tokens, it.second->intParams, inputIds, attentionMask, curPositionIds);
+                            seqLens.push_back(inputIds.Count(0));
+                            for (int i = 0; i < inputIds.Count(0); i++) {
+                                ids.push_back(((float*)inputIds.cpuData)[i]);
+                            }
+                            if (attentionMask.dims.size() == 0) {
+                                attentionMasks.push_back(nullptr);
+                            } else {
+                                attentionMasks.push_back(new Data());
+                                attentionMasks.back()->CopyFrom(attentionMask);
+                            }
+                            if (curPositionIds.dims.size() == 0) {
+                                positionIds.push_back(nullptr);
+                            } else {
+                                positionIds.push_back(new Data());
+                                positionIds.back()->CopyFrom(curPositionIds);
+                            }
+                            it.second->preTokens += seqLens.back();
+                            for (int i = 0; i < model->block_cnt; i++) {
+                                pastKeyValues.push_back(std::make_pair(&it.second->pastKeyValues[i].first,
+                                                                       &it.second->pastKeyValues[i].second));
+                            }
+                        }
+
+                        if (seqLens.size() > 0) {
+                            std::vector <std::pair <Data, Data> > *pastKeyValue1;
+                            if (seqLens.size() == 1) {
+                                pastKeyValue1 = &model->responseContextDict.dicts[handles[0]]->pastKeyValues;
+                            }
+                            model->dictLocker.unlock();
+#ifdef USE_CUDA
+                            FastllmCudaClearBigBuffer();
+#endif
+                            Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
+                            std::vector<int> ret;
+                            if (seqLens.size() > 1) {
+                                ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
+                                                          positionIds, seqLens, pastKeyValues, generationConfigs,
+                                                          tokensManager);
+                            } else {
+                                ret = std::vector <int> {model->Forward(inputIds,
+                                                                        attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
+                                                                        *positionIds[0],
+                                                                        *pastKeyValue1, generationConfigs[0], tokensManager)};
+                            }
+
+                            model->dictLocker.lock();
+                            for (int i = 0; i < handles.size(); i++) {
+                                auto &it = *model->responseContextDict.dicts.find(handles[i]);
+                                int curRet = ret[i];
+                                if (curRet == model->eos_token_id) {
+                                    it.second->isEnding = true;
+                                } else {
+                                    it.second->currentTokens = std::vector<int>{curRet};
+                                    it.second->resultTokenQueue.push(curRet);
+                                    it.second->tokens.Push(curRet);
+                                    it.second->curTokens++;
+                                    if (it.second->curTokens == it.second->generationConfig.output_token_limit) {
+                                        it.second->isEnding = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        for (int i = 0; i < attentionMasks.size(); i++) {
+                            delete attentionMasks[i];
+                        }
+                        for (int i = 0; i < positionIds.size(); i++) {
+                            delete positionIds[i];
+                        }
+
+                        model->dictLocker.unlock();
+                        MySleep(0);
+                    }
+                }, this);
+            }
+        }
+        mainLoopLocker.unlock();
+
+        dictLocker.lock();
+        int handleId = responseContextDict.CreateHandle();
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        context->Init(this->block_cnt);
+        context->currentTokens = inputTokens;
+        context->generationConfig = generationConfig;
+        context->tokens = LastTokensUnit(generationConfig.last_n);
+        dictLocker.unlock();
+        return handleId;
+    }
+
+    int basellm::FetchResponseTokens(int handleId) {
+        dictLocker.lock();
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        if (context == nullptr) {
+            dictLocker.unlock();
+            return -1;
+        } else {
+            while (true) {
+                if (context->resultTokenQueue.size() > 0) {
+                    int ret = context->resultTokenQueue.front();
+                    context->resultTokenQueue.pop();
+                    dictLocker.unlock();
+                    return ret;
+                } else {
+                    if (context->isEnding) {
+                        responseContextDict.RemoveHandle(handleId);
+                        dictLocker.unlock();
+                        return -1;
+                    }
+                }
+                dictLocker.unlock();
+                MySleep(0);
+                dictLocker.lock();
+            }
+        }
+    }
+
     // 根据输入的tokens生成LLM推理的输入
-    void basellm::FillLMMInputs(std::vector <std::vector <float> > &inputTokens,
+    void basellm::FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
                                const std::map <std::string, int> &params,
                                Data &inputIds, Data &attentionMask, Data &positionIds) {
     }
 
     // 根据输入的tokens生成LLM推理的输入
-    void basellm::FillLMMInputsBatch(std::vector<std::vector<float>> &inputTokens,
+    void basellm::FillLLMInputsBatch(std::vector<std::vector<float>> &inputTokens,
                                      const std::vector<std::map<std::string, int>> &params, fastllm::Data &inputIds,
                                      fastllm::Data &attentionMask, fastllm::Data &positionIds) {
     }

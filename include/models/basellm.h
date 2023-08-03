@@ -68,13 +68,23 @@ namespace fastllm {
                 const GenerationConfig &generationConfig = GenerationConfig(),
                 const LastTokensManager &lastTokens = LastTokensManager());
 
+        virtual std::vector <int> ForwardBatch(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager());
+
         // 根据输入的tokens生成LLM推理的输入
-        virtual void FillLMMInputs(std::vector <std::vector <float> > &inputTokens,
+        virtual void FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
                                    const std::map <std::string, int> &params,
                                    Data &inputIds, Data &attentionMask, Data &positionIds);
 
         // 根据输入的tokens生成LLM推理的输入
-        virtual void FillLMMInputsBatch(std::vector <std::vector <float> > &inputTokens,
+        virtual void FillLLMInputsBatch(std::vector <std::vector <float> > &inputTokens,
                                         const std::vector <std::map <std::string, int> > &params,
                                         Data &inputIds, Data &attentionMask, Data &positionIds);
 
@@ -88,9 +98,9 @@ namespace fastllm {
                                    const GenerationConfig &generationConfig = GenerationConfig()); // 批量根据给出的内容回复
 
         virtual int LaunchResponseTokens(const std::vector <int> &inputTokens,
-                                         const GenerationConfig &generationConfig = GenerationConfig()) {return -1; }; // 启动一个response任务，返回分配的handleId
+                                         const GenerationConfig &generationConfig = GenerationConfig()); // 启动一个response任务，返回分配的handleId
 
-        virtual int FetchResponseTokens(int handelId) {return -1; };// 获取指定handle的输出, -1代表输出结束了
+        virtual int FetchResponseTokens(int handleId); // 获取指定handle的输出, -1代表输出结束了
 
         virtual void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
 
