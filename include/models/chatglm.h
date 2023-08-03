@@ -44,19 +44,14 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager());
 
         // 根据输入的tokens生成LLM推理的输入
-        virtual void FillLMMInputs(std::vector <std::vector <float> > &inputTokens,
+        virtual void FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
                                    const std::map <std::string, int> &params,
                                    Data &inputIds, Data &attentionMask, Data &positionIds);
 
         // 根据输入的tokens生成LLM推理的输入
-        virtual void FillLMMInputsBatch(std::vector <std::vector <float> > &inputTokens,
+        virtual void FillLLMInputsBatch(std::vector <std::vector <float> > &inputTokens,
                                         const std::vector <std::map <std::string, int> > &params,
                                         Data &inputIds, Data &attentionMask, Data &positionIds);
-
-        virtual int LaunchResponseTokens(const std::vector <int> &inputTokens,
-                                         const GenerationConfig &generationConfig = GenerationConfig()); // 启动一个response任务，返回分配的handleId
-
-        virtual int FetchResponseTokens(int handelId); // 获取指定handle的输出, -1代表输出结束了
 
 		virtual void WarmUp(); // 预热
 

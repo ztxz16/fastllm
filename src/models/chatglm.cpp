@@ -638,7 +638,7 @@ namespace fastllm {
         return lastRet;
     }
 
-    void ChatGLMModel::FillLMMInputs(std::vector <std::vector <float> > &inputTokens,
+    void ChatGLMModel::FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
                                      const std::map <std::string, int> &params,
                                      Data &inputIds, Data &attentionMask, Data &positionIds) {
         inputIds.ToDevice(DataDevice::CPU);
@@ -695,7 +695,7 @@ namespace fastllm {
         }
     }
 
-    void ChatGLMModel::FillLMMInputsBatch(std::vector<std::vector<float>> &inputTokens,
+    void ChatGLMModel::FillLLMInputsBatch(std::vector<std::vector<float>> &inputTokens,
                                           const std::vector<std::map<std::string, int>> &params,
                                           fastllm::Data &inputIds, fastllm::Data &attentionMask,
                                           fastllm::Data &positionIds) {
@@ -845,190 +845,6 @@ namespace fastllm {
 #else
         return (history + ("[Round " + std::to_string(round) + "]\n\n问：" + input + "\n\n答：" + output + "\n\n"));
 #endif
-    }
-
-    int ChatGLMModel::LaunchResponseTokens(const std::vector<int> &inputTokens,
-                                           const GenerationConfig &generationConfig) {
-        mainLoopLocker.lock();
-        if (mainLoop == nullptr) {
-            if (mainLoop == nullptr) {
-                mainLoop = new std::thread([](ChatGLMModel *model) {
-                    while (true) {
-                        std::vector <Data*> attentionMasks;
-                        std::vector <Data*> positionIds;
-                        std::vector <std::pair <Data*, Data*> > pastKeyValues;
-                        std::vector <float> ids;
-                        std::vector <int> seqLens;
-                        std::vector <int> handles;
-                        std::vector <GenerationConfig> generationConfigs;
-                        LastTokensManager tokensManager;
-                        model->dictLocker.lock();
-                        for (auto &it: model->responseContextDict.dicts) {
-                            if (it.second->isEnding) {
-                                continue;
-                            }
-                            generationConfigs.push_back(it.second->generationConfig);
-                            tokensManager.units.push_back(it.second->tokens);
-                            handles.push_back(it.first);
-                            for (int i = 0; i < it.second->currentTokens.size(); i++) {
-                                ids.push_back(it.second->currentTokens[i]);
-                            }
-                            if (it.second->preTokens == 0) {
-                                int seqLen = it.second->currentTokens.size();
-                                if (model->GetVersion() == 1) {
-                                    int gmask_token_id =
-                                            model->weight.dicts.find("gmask_token_id") != model->weight.dicts.end() ?
-                                            atoi(model->weight.dicts["gmask_token_id"].c_str()) : 130001;
-                                    if (it.second->currentTokens.size() < 2 ||
-                                        it.second->currentTokens.back() != model->bos_token_id) {
-                                        ids.push_back(gmask_token_id);
-                                        ids.push_back(model->bos_token_id);
-                                        seqLen += 2;
-                                    }
-                                } else {
-                                    if (it.second->currentTokens.size() < 2 ||
-                                        it.second->currentTokens[0] != 64790) {
-                                        ids.insert(ids.begin() + (ids.size() - it.second->currentTokens.size()), 64790);
-                                        ids.insert(ids.begin() + (ids.size() - it.second->currentTokens.size()), 64792);
-                                        seqLen += 2;
-                                    }
-                                }
-
-                                seqLens.push_back(seqLen);
-                                std::vector<float> vmask = std::vector<float>(seqLen * seqLen, 0);
-                                std::vector<float> vpids = std::vector<float>(seqLen * 2, 0);
-                                for (int i = 0; i < seqLen - 1; i++) {
-                                    vmask[i * seqLen + seqLen - 1] = 1;
-                                    vpids[i] = i;
-                                }
-                                vpids[seqLen - 1] = seqLen - 2;
-                                vpids[seqLen * 2 - 1] = 1;
-
-                                if (model->GetVersion() == 2) {
-                                    for (int i = 0; i < seqLen; i++) {
-                                        vpids[i] = i;
-                                        for (int j = i + 1; j < seqLen; j++) {
-                                            vmask[i * seqLen + j] = 1;
-                                        }
-                                    }
-                                }
-
-                                it.second->intParams["maskIds"] = seqLen - (model->GetVersion() == 1 ?  2 : 0);
-                                it.second->intParams["len"] = 1;
-
-                                attentionMasks.push_back(new Data(DataType::FLOAT32, {seqLen, seqLen}, vmask));
-                                positionIds.push_back(new Data(DataType::FLOAT32, {2, seqLen}, vpids));
-                            } else {
-                                seqLens.push_back(1);
-                                it.second->intParams["len"]++;
-                                attentionMasks.push_back(nullptr);
-                                positionIds.push_back(new Data(DataType::FLOAT32, {2, 1}, {(float)it.second->intParams["maskIds"], (float)(it.second->intParams["len"])}));
-                                if (model->GetVersion() == 2) {
-                                    it.second->intParams["maskIds"]++;
-                                }
-                            }
-
-                            it.second->preTokens += seqLens.back();
-                            for (int i = 0; i < model->block_cnt; i++) {
-                                pastKeyValues.push_back(std::make_pair(&it.second->pastKeyValues[i].first,
-                                                                       &it.second->pastKeyValues[i].second));
-                            }
-                        }
-
-                        if (seqLens.size() > 0) {
-                            std::vector <std::pair <Data, Data> > *pastKeyValue1;
-                            if (seqLens.size() == 1) {
-                                pastKeyValue1 = &model->responseContextDict.dicts[handles[0]]->pastKeyValues;
-                            }
-                            model->dictLocker.unlock();
-#ifdef USE_CUDA
-                            FastllmCudaClearBigBuffer();
-#endif
-                            Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
-//auto st = std::chrono::system_clock::now();
-//ClearProfiler();
-                            std::vector<int> ret;
-                            if (seqLens.size() > 1) {
-                                ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
-                                                          positionIds, seqLens, pastKeyValues, generationConfigs,
-                                                          tokensManager);
-                            } else {
-                                ret = std::vector <int> {model->Forward(inputIds,
-                                                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
-                                                         *positionIds[0],
-                                                         *pastKeyValue1, generationConfigs[0], tokensManager)};
-                            }
-//PrintProfiler();
-//printf("%d spend %f\n", ids.size(), GetSpan(st, std::chrono::system_clock::now()));
-                            model->dictLocker.lock();
-                            for (int i = 0; i < handles.size(); i++) {
-                                auto &it = *model->responseContextDict.dicts.find(handles[i]);
-                                int curRet = ret[i];
-                                if (curRet == model->eos_token_id) {
-                                    it.second->isEnding = true;
-                                } else {
-                                    it.second->currentTokens = std::vector<int>{curRet};
-                                    it.second->resultTokenQueue.push(curRet);
-                                    it.second->tokens.Push(curRet);
-                                    it.second->curTokens++;
-                                    if (it.second->curTokens == it.second->generationConfig.output_token_limit) {
-                                        it.second->isEnding = true;
-                                    }
-                                }
-                            }
-                        }
-
-                        for (int i = 0; i < attentionMasks.size(); i++) {
-                            delete attentionMasks[i];
-                        }
-                        for (int i = 0; i < positionIds.size(); i++) {
-                            delete positionIds[i];
-                        }
-
-                        model->dictLocker.unlock();
-                        MySleep(0);
-                    }
-                }, this);
-            }
-        }
-        mainLoopLocker.unlock();
-
-        dictLocker.lock();
-        int handleId = responseContextDict.CreateHandle();
-        ResponseContext *context = responseContextDict.GetHandle(handleId);
-        context->Init(this->block_cnt);
-        context->currentTokens = inputTokens;
-        context->generationConfig = generationConfig;
-        context->tokens = LastTokensUnit(generationConfig.last_n);
-        dictLocker.unlock();
-        return handleId;
-    }
-
-    int ChatGLMModel::FetchResponseTokens(int handleId) {
-        dictLocker.lock();
-        ResponseContext *context = responseContextDict.GetHandle(handleId);
-        if (context == nullptr) {
-            dictLocker.unlock();
-            return -1;
-        } else {
-            while (true) {
-                if (context->resultTokenQueue.size() > 0) {
-                    int ret = context->resultTokenQueue.front();
-                    context->resultTokenQueue.pop();
-                    dictLocker.unlock();
-                    return ret;
-                } else {
-                    if (context->isEnding) {
-                        responseContextDict.RemoveHandle(handleId);
-                        dictLocker.unlock();
-                        return -1;
-                    }
-                }
-                dictLocker.unlock();
-                MySleep(0);
-                dictLocker.lock();
-            }
-        }
     }
 
     int ChatGLMModel::GetVersion() {
