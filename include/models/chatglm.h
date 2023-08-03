@@ -43,9 +43,10 @@ namespace fastllm {
                 const std::vector <GenerationConfig> &generationConfigs,
                 const LastTokensManager &lastTokens = LastTokensManager());
 
-		virtual std::string Response(const std::string& input,
-                                     RuntimeResult retCb,
-                                     const GenerationConfig &generationConfig = GenerationConfig()); // 根据给出的内容回复
+        // 根据输入的tokens生成LLM推理的输入
+        virtual void FillLMMInputs(std::vector <std::vector <float> > &inputTokens,
+                                   const std::map <std::string, int> &params,
+                                   Data &inputIds, Data &attentionMask, Data &positionIds);
 
         virtual void ResponseBatch(const std::vector <std::string> &inputs,
                                    std::vector <std::string> &outputs,
