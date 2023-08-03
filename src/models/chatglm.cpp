@@ -639,131 +639,61 @@ namespace fastllm {
         return lastRet;
     }
 
-    std::string ChatGLMModel::Response(const std::string& input, RuntimeResult retCb,
-                                       const GenerationConfig &generationConfig) {
+    void ChatGLMModel::FillLMMInputs(std::vector <std::vector <float> > &inputTokens,
+                                     const std::map <std::string, int> &params,
+                                     Data &inputIds, Data &attentionMask, Data &positionIds) {
+        inputIds.ToDevice(DataDevice::CPU);
+        attentionMask.ToDevice(DataDevice::CPU);
+        positionIds.ToDevice(DataDevice::CPU);
+
         int gmask_token_id = this->weight.dicts.find("gmask_token_id") != this->weight.dicts.end() ?
                              atoi(this->weight.dicts["gmask_token_id"].c_str()) : 130001;
-#ifdef USE_CUDA
-        FastllmCudaClearBigBuffer();
-#endif
-#ifdef PY_API
-		size_t pos = input.find_last_of("time_stamp:");
-		std::string prompt = (generationConfig.enable_hash_id && pos != std::string::npos)?  input.substr(0, pos-10):input;
-		size_t hash_id = std::hash<std::string>{}(input);
-        Data inputIds = this->weight.tokenizer.Encode(prompt);
-#else
-        Data inputIds = this->weight.tokenizer.Encode(input);
-#endif
-        std::vector <float> ids;
-        for (int i = 0; i < inputIds.Count(0); i++) {
-            ids.push_back(((float*)inputIds.cpuData)[i]);
-        }
-        if (GetVersion() == 1) {
-            ids.push_back(gmask_token_id);
-            ids.push_back(bos_token_id);
-        } else if (GetVersion() == 2) {
-            ids.insert(ids.begin(), 64792);
-            ids.insert(ids.begin(), 64790);
-        }
+        int index = params.find("index")->second;
+        int promptLen = params.find("promptLen")->second;
 
-        int seqLen = ids.size();
-        inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, ids));
-
-        std::vector <float> vmask = std::vector <float> (seqLen * seqLen, 0);
-        std::vector <float> vpids = std::vector <float> (seqLen * 2, 0);
-        for (int i = 0; i < seqLen - 1; i++) {
-            vmask[i * seqLen + seqLen - 1] = 1;
-            vpids[i] = i;
-        }
-        vpids[seqLen - 1] = seqLen - 2;
-        vpids[seqLen * 2 - 1] = 1;
-
-        if (GetVersion() == 2) {
-            for (int i = 0; i < seqLen; i++) {
-                vpids[i] = i;
-                for (int j = i + 1; j < seqLen; j++) {
-                    vmask[i * seqLen + j] = 1;
+        if (index == 0) {
+            for (auto &ids: inputTokens) {
+                if (GetVersion() == 1) {
+                    ids.push_back(gmask_token_id);
+                    ids.push_back(bos_token_id);
+                } else if (GetVersion() == 2) {
+                    ids.insert(ids.begin(), 64792);
+                    ids.insert(ids.begin(), 64790);
                 }
             }
-        }
-        Data attentionMask = Data(DataType::FLOAT32, {seqLen, seqLen}, vmask);
-        Data positionIds = Data(DataType::FLOAT32, {2, seqLen}, vpids);
 
-        std::vector <std::pair <Data, Data> > pastKeyValues;
-        for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
-                                                   Data(DataType::FLOAT32)));
-        }
 
-        std::string retString = "";
-        int len = 1, maskIds = -1;
-        std::vector <float> results;
-		int index = 0;
-        LastTokensManager tokens (1, generationConfig.last_n);
-        while (true) {
-            auto st = std::chrono::system_clock::now();
-            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
-            tokens.units[0].Push(ret);
-            if (ret == eos_token_id) {
-                break;
+            int seqLen = inputTokens[0].size();
+            std::vector<float> vmask = std::vector<float>(seqLen * seqLen, 0);
+            std::vector<float> vpids = std::vector<float>(seqLen * 2, 0);
+            for (int i = 0; i < seqLen - 1; i++) {
+                vmask[i * seqLen + seqLen - 1] = 1;
+                vpids[i] = i;
             }
-
-            results.push_back(ret);
-            std::string curString = weight.tokenizer.Decode(Data(DataType::FLOAT32, {(int)results.size()}, results)).c_str();
-            retString += curString;
-			if (retCb)
-#ifdef PY_API
-			{
-				if(generationConfig.enable_hash_id){
-					std::stringstream ss;
-					ss << retString << "hash_id:"<<hash_id;
-					retCb(index, pybind11::bytes(ss.str()));
-				}else{
-					retCb(index, pybind11::bytes(retString));
-				}
-			}
-#else
-				retCb(index, curString.c_str());
-#endif
-            index++;
-            fflush(stdout);
-            results.clear();
-
-            len++;
-            if (maskIds == -1) {
-                maskIds = (int)ids.size() - (GetVersion() == 1 ? 2 : 0);
-            }
-
-            attentionMask.ToDevice(DataDevice::CPU);
-            positionIds.ToDevice(DataDevice::CPU);
-            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)ret}));
-            attentionMask = Data();
-            positionIds.CopyFrom(Data(DataType::FLOAT32, {2, 1}, {(float)maskIds, (float)(len)}));
+            vpids[seqLen - 1] = seqLen - 2;
+            vpids[seqLen * 2 - 1] = 1;
 
             if (GetVersion() == 2) {
-                maskIds++;
+                for (int i = 0; i < seqLen; i++) {
+                    vpids[i] = i;
+                    for (int j = i + 1; j < seqLen; j++) {
+                        vmask[i * seqLen + j] = 1;
+                    }
+                }
             }
 
-            if (index == generationConfig.output_token_limit) {
-                break;
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, inputTokens[0]));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, seqLen}, vmask));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {2, seqLen}, vpids));
+        } else {
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, inputTokens[0]));
+            attentionMask = Data();
+            if (GetVersion() == 1) {
+                positionIds.CopyFrom(Data(DataType::FLOAT32, {2, 1}, {(float) promptLen, (float) (index + 1)}));
+            } else {
+                positionIds.CopyFrom(Data(DataType::FLOAT32, {2, 1}, {(float) promptLen + index + 1, (float) (index + 1)}));
             }
-             // printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
         }
-		if (retCb)
-#ifdef PY_API
-		{
-			if(generationConfig.enable_hash_id){
-				std::stringstream ss;
-				ss << retString << "hash_id:"<<hash_id;
-				retCb(-1, pybind11::bytes(ss.str()));
-			}else{
-				retCb(-1, pybind11::bytes(retString));
-			}
-		}
-#else
-			retCb(-1, retString.c_str());
-#endif
-        return retString;
     }
 
     void ChatGLMModel::ResponseBatch(const std::vector <std::string> &inputs,
