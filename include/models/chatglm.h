@@ -48,10 +48,10 @@ namespace fastllm {
                                    const std::map <std::string, int> &params,
                                    Data &inputIds, Data &attentionMask, Data &positionIds);
 
-        virtual void ResponseBatch(const std::vector <std::string> &inputs,
-                                   std::vector <std::string> &outputs,
-                                   RuntimeResultBatch retCb,
-                                   const GenerationConfig &generationConfig = GenerationConfig());
+        // 根据输入的tokens生成LLM推理的输入
+        virtual void FillLMMInputsBatch(std::vector <std::vector <float> > &inputTokens,
+                                        const std::vector <std::map <std::string, int> > &params,
+                                        Data &inputIds, Data &attentionMask, Data &positionIds);
 
         virtual int LaunchResponseTokens(const std::vector <int> &inputTokens,
                                          const GenerationConfig &generationConfig = GenerationConfig()); // 启动一个response任务，返回分配的handleId

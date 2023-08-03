@@ -59,10 +59,24 @@ namespace fastllm {
                 const GenerationConfig &generationConfig = GenerationConfig(),
                 const LastTokensManager &lastTokens = LastTokensManager()) = 0;
 
+        virtual std::vector <int> ForwardBatch(
+                int batch,
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector <std::pair <Data, Data> > &pastKeyValues,
+                const GenerationConfig &generationConfig = GenerationConfig(),
+                const LastTokensManager &lastTokens = LastTokensManager());
+
         // 根据输入的tokens生成LLM推理的输入
         virtual void FillLMMInputs(std::vector <std::vector <float> > &inputTokens,
                                    const std::map <std::string, int> &params,
                                    Data &inputIds, Data &attentionMask, Data &positionIds);
+
+        // 根据输入的tokens生成LLM推理的输入
+        virtual void FillLMMInputsBatch(std::vector <std::vector <float> > &inputTokens,
+                                        const std::vector <std::map <std::string, int> > &params,
+                                        Data &inputIds, Data &attentionMask, Data &positionIds);
 
         virtual std::string Response(const std::string &input,
                                      RuntimeResult retCb,
@@ -71,7 +85,7 @@ namespace fastllm {
         virtual void ResponseBatch(const std::vector<std::string> &inputs,
                                    std::vector<std::string> &outputs,
                                    RuntimeResultBatch retCb = nullptr,
-                                   const GenerationConfig &generationConfig = GenerationConfig()) {} // 批量根据给出的内容回复
+                                   const GenerationConfig &generationConfig = GenerationConfig()); // 批量根据给出的内容回复
 
         virtual int LaunchResponseTokens(const std::vector <int> &inputTokens,
                                          const GenerationConfig &generationConfig = GenerationConfig()) {return -1; }; // 启动一个response任务，返回分配的handleId
