@@ -275,7 +275,6 @@ namespace fastllm {
             RMSNorm(hiddenStates, weight["transformer.encoder.final_layernorm.weight"], 1e-5, hiddenStates);
             Linear(hiddenStates, weight["transformer.output_layer.weight"], Data(), logits);
         }
-
         if (generationConfig.IsSimpleGreedy()) {
             TopK(logits, topk, 1);
             topk.ToDevice(DataDevice::CPU);
@@ -696,174 +695,113 @@ namespace fastllm {
         }
     }
 
-    void ChatGLMModel::ResponseBatch(const std::vector <std::string> &inputs,
-                               std::vector <std::string> &outputs,
-                               RuntimeResultBatch retCb,
-                               const GenerationConfig &generationConfig) {
-#ifdef USE_CUDA
-        FastllmCudaClearBigBuffer();
-#endif
-        int gmask_token_id = this->weight.dicts.find("gmask_token_id") != this->weight.dicts.end() ?
-                             atoi(this->weight.dicts["gmask_token_id"].c_str()) : 130001;
-        // 1. first
-        int batch = inputs.size();
-        outputs.clear();
-        outputs.resize(batch, "");
+    void ChatGLMModel::FillLMMInputsBatch(std::vector<std::vector<float>> &inputTokens,
+                                          const std::vector<std::map<std::string, int>> &params,
+                                          fastllm::Data &inputIds, fastllm::Data &attentionMask,
+                                          fastllm::Data &positionIds) {
+        inputIds.ToDevice(DataDevice::CPU);
+        attentionMask.ToDevice(DataDevice::CPU);
+        positionIds.ToDevice(DataDevice::CPU);
 
-        std::vector <Data> inputTokens;
-        std::vector <int> seqLens;
-        inputTokens.resize(batch);
-        seqLens.resize(batch);
-        int maxLen = 0;
-        for (int i = 0; i < batch; i++) {
-            inputTokens[i].CopyFrom(this->weight.tokenizer.Encode(inputs[i]));
-            maxLen = std::max(maxLen, (int)inputTokens[i].Count(0) + 2);
-            seqLens[i] = (int)inputTokens[i].Count(0);
-        }
+        int batch = inputTokens.size();
+        int index = params[0].find("index")->second;
+        if (index == 0) {
+            int gmask_token_id = this->weight.dicts.find("gmask_token_id") != this->weight.dicts.end() ?
+                                 atoi(this->weight.dicts["gmask_token_id"].c_str()) : 130001;
+            std::vector<int> seqLens;
+            seqLens.resize(batch);
+            int maxLen = 0;
+            for (int i = 0; i < batch; i++) {
+                maxLen = std::max(maxLen, (int) inputTokens[i].size() + 2);
+                seqLens[i] = (int) inputTokens[i].size();
+            }
 
-        std::vector <float> ids = std::vector <float> (batch * maxLen, 0);
-        std::vector <float> vpids = std::vector <float> (batch * 2 * maxLen, 0);
-        std::vector <float> vmask = std::vector <float> (batch * maxLen * maxLen, 0);
-        for (int i = 0; i < batch; i++) {
-            if (GetVersion() == 1) {
-                Data &tokens = inputTokens[i];
-                int len = tokens.Count(0), base = maxLen - 2 - len;
-                for (int j = 0; j < len; j++) {
-                    ids[i * maxLen + base + j] = ((float *) tokens.cpuData)[j];
-                }
-                ids[i * maxLen + base + len] = gmask_token_id;
-                ids[i * maxLen + base + len + 1] = bos_token_id;
-                len += 2;
-                for (int j = 0; j < len - 1; j++) {
-                    vpids[i * 2 * maxLen + base + j] = j;
-                }
-                vpids[i * 2 * maxLen + base + len - 1] = len - 2;
-                vpids[i * 2 * maxLen + maxLen + base + len - 1] = 1;
-                std::fill(vmask.data() + i * maxLen * maxLen,
-                          vmask.data() + i * maxLen * maxLen + (maxLen - len) * maxLen, 1.0);
-                for (int j = maxLen - len; j < maxLen; j++) {
-                    std::fill(vmask.data() + i * maxLen * maxLen + j * maxLen,
-                              vmask.data() + i * maxLen * maxLen + j * maxLen + maxLen - len, 1.0);
-                }
-                for (int j = 0; j < len - 1; j++) {
-                    vmask[i * maxLen * maxLen + (base + j) * maxLen + base + len - 1] = 1;
-                }
-            } else {
-                Data &tokens = inputTokens[i];
-                int len = tokens.Count(0), base = maxLen - 2 - len;
-                ids[i * maxLen + base] = 64790;
-                ids[i * maxLen + base + 1] = 64792;
-                for (int j = 0; j < len; j++) {
-                    ids[i * maxLen + base + 2 + j] = ((float*)tokens.cpuData)[j];
-                }
-                len += 2;
-                for (int j = 0; j < len; j++) {
-                    vpids[i * 2 * maxLen + base + j] = j;
-                }
+            std::vector<float> ids = std::vector<float>(batch * maxLen, 0);
+            std::vector<float> vpids = std::vector<float>(batch * 2 * maxLen, 0);
+            std::vector<float> vmask = std::vector<float>(batch * maxLen * maxLen, 0);
+            for (int i = 0; i < batch; i++) {
+                if (GetVersion() == 1) {
+                    auto &tokens = inputTokens[i];
+                    int len = tokens.size(), base = maxLen - 2 - len;
+                    for (int j = 0; j < len; j++) {
+                        ids[i * maxLen + base + j] = tokens[j];
+                    }
+                    ids[i * maxLen + base + len] = gmask_token_id;
+                    ids[i * maxLen + base + len + 1] = bos_token_id;
+                    len += 2;
+                    for (int j = 0; j < len - 1; j++) {
+                        vpids[i * 2 * maxLen + base + j] = j;
+                    }
+                    vpids[i * 2 * maxLen + base + len - 1] = len - 2;
+                    vpids[i * 2 * maxLen + maxLen + base + len - 1] = 1;
+                    std::fill(vmask.data() + i * maxLen * maxLen,
+                              vmask.data() + i * maxLen * maxLen + (maxLen - len) * maxLen, 1.0);
+                    for (int j = maxLen - len; j < maxLen; j++) {
+                        std::fill(vmask.data() + i * maxLen * maxLen + j * maxLen,
+                                  vmask.data() + i * maxLen * maxLen + j * maxLen + maxLen - len, 1.0);
+                    }
+                    for (int j = 0; j < len - 1; j++) {
+                        vmask[i * maxLen * maxLen + (base + j) * maxLen + base + len - 1] = 1;
+                    }
+                } else {
+                    auto &tokens = inputTokens[i];
+                    int len = tokens.size(), base = maxLen - 2 - len;
+                    ids[i * maxLen + base] = 64790;
+                    ids[i * maxLen + base + 1] = 64792;
+                    for (int j = 0; j < len; j++) {
+                        ids[i * maxLen + base + 2 + j] = tokens[j];
+                    }
+                    len += 2;
+                    for (int j = 0; j < len; j++) {
+                        vpids[i * 2 * maxLen + base + j] = j;
+                    }
 
-                std::fill(vmask.data() + i * maxLen * maxLen,
-                          vmask.data() + i * maxLen * maxLen + (maxLen - len) * maxLen, 1.0);
-                for (int j = maxLen - len; j < maxLen; j++) {
-                    std::fill(vmask.data() + i * maxLen * maxLen + j * maxLen,
-                              vmask.data() + i * maxLen * maxLen + j * maxLen + maxLen - len, 1.0);
-                }
-                for (int j = 0; j < len; j++) {
-                    for (int k = j + 1; k < len; k++) {
-                        vmask[i * maxLen * maxLen + (base + j) * maxLen + base + k] = 1;
+                    std::fill(vmask.data() + i * maxLen * maxLen,
+                              vmask.data() + i * maxLen * maxLen + (maxLen - len) * maxLen, 1.0);
+                    for (int j = maxLen - len; j < maxLen; j++) {
+                        std::fill(vmask.data() + i * maxLen * maxLen + j * maxLen,
+                                  vmask.data() + i * maxLen * maxLen + j * maxLen + maxLen - len, 1.0);
+                    }
+                    for (int j = 0; j < len; j++) {
+                        for (int k = j + 1; k < len; k++) {
+                            vmask[i * maxLen * maxLen + (base + j) * maxLen + base + k] = 1;
+                        }
                     }
                 }
             }
-        }
 
-        Data inputIds = Data(DataType::FLOAT32, {batch, maxLen}, ids);
-        Data attentionMask = Data(DataType::FLOAT32, {batch, maxLen, maxLen}, vmask);
-        Data positionIds = Data(DataType::FLOAT32, {batch * 2, maxLen}, vpids);
-
-        std::vector <std::pair <Data, Data> > pastKeyValues;
-        for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
-                                                   Data(DataType::FLOAT32)));
-        }
-
-        int len = 1;
-        std::vector <int> maskIds = std::vector <int> (batch, -1);
-        std::vector <bool> isEnding = std::vector <bool> (batch, false);
-        int index = 0;
-        LastTokensManager tokensManager (batch, generationConfig.last_n);
-        while (true) {
-            auto st = std::chrono::system_clock::now();
-            //ClearProfiler();
-            std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, pastKeyValues,
-                                                 generationConfig, tokensManager);
-            //PrintProfiler();
-            for (int i = 0; i < batch; i++) {
-                tokensManager.units[i].Push(ret[i]);
-            }
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, maxLen}, ids));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, maxLen, maxLen}, vmask));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {batch * 2, maxLen}, vpids));
+        } else {
             std::vector <float> fret;
-            std::vector <float> results;
-            int endingCount = 0;
-            std::vector <std::string> curStrings;
             for (int i = 0; i < batch; i++) {
-                fret.push_back(ret[i]);
-                if (ret[i] == eos_token_id) {
-                    isEnding[i] = true;
-                }
-                if (isEnding[i]) {
-                    curStrings.push_back("");
-                    endingCount++;
-                    continue;
-                }
-                results.push_back(ret[i]);
-                std::string curString = weight.tokenizer.Decode(
-                        Data(DataType::FLOAT32, {(int) results.size()}, results)).c_str();
-                outputs[i] += curString;
-                curStrings.push_back(curString);
-                results.clear();
-
-                if (maskIds[i] == -1) {
-                    maskIds[i] = seqLens[i] + (GetVersion() == 1 ? 0 : 2);
+                fret.push_back(inputTokens[i][0]);
+            }
+            std::vector <float> pids = std::vector<float>(batch * 2);
+            int maxLen = 0;
+            for (int i = 0; i < batch; i++) {
+                int promptLen = params[i].find("promptLen")->second;
+                maxLen = std::max(promptLen + 2, maxLen);
+                pids[i * 2 + 1] = index + 1;
+                if (GetVersion() == 1) {
+                    pids[i * 2] = promptLen;
+                } else {
+                    pids[i * 2] = promptLen + index + 1;
                 }
             }
-
-            if (endingCount == batch) {
-                break;
-            }
-            if (retCb)
-                retCb(index, curStrings);
-            index++;
-            len++;
-            std::vector <float> pids = std::vector <float> (batch * 2);
+            maxLen += index;
+            std::vector<float> vmasks = std::vector<float>(batch * maxLen, 0.0f);
             for (int i = 0; i < batch; i++) {
-                pids[i * 2] = maskIds[i];
-                pids[i * 2 + 1] = len;
-
-                if (GetVersion() == 2) {
-                    maskIds[i]++;
-                }
-            }
-            maxLen++;
-            std::vector <float> vmasks = std::vector <float> (batch * maxLen, 0.0f);
-            for (int i = 0; i < batch; i++) {
-                seqLens[i]++;
-                for (int j = 0; j < maxLen - seqLens[i] - 2; j++) {
+                int promptLen = params[i].find("promptLen")->second;
+                for (int j = 0; j < maxLen - index - promptLen - 2; j++) {
                     vmasks[i * maxLen + j] = 1.0f;
                 }
             }
-            positionIds.ToDevice(DataDevice::CPU);
-            attentionMask.ToDevice(DataDevice::CPU);
             attentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, 1, maxLen}, vmasks));
             inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, fret));
             positionIds.CopyFrom(Data(DataType::FLOAT32, {batch * 2, 1}, pids));
-
-            // printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
-
-            if (index == generationConfig.output_token_limit) {
-                break;
-            }
         }
-
-        if (retCb)
-            retCb(-1, outputs);
     }
 
     void ChatGLMModel::WarmUp() {
