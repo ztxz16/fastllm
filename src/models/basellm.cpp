@@ -134,10 +134,112 @@ namespace fastllm {
         return retString;
     }
 
+    void basellm::ResponseBatch(const std::vector<std::string> &inputs, std::vector<std::string> &outputs,
+                                RuntimeResultBatch retCb, const fastllm::GenerationConfig &generationConfig) {
+#ifdef USE_CUDA
+        FastllmCudaClearBigBuffer();
+#endif
+        // 1. first
+        Data inputIds, attentionMask, positionIds;
+
+        int batch = inputs.size();
+        outputs.clear();
+        outputs.resize(batch, "");
+
+        std::vector<std::vector<float> > inputTokens;
+        inputTokens.resize(batch);
+
+        for (int i = 0; i < batch; i++) {
+            Data now = this->weight.tokenizer.Encode(inputs[i]);
+            for (int j = 0; j < now.Count(0); j++) {
+                inputTokens[i].push_back(((float *) now.cpuData)[j]);
+            }
+        }
+
+        std::vector <std::pair <Data, Data> > pastKeyValues;
+        for (int i = 0; i < block_cnt; i++) {
+            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
+                                                   Data(DataType::FLOAT32)));
+        }
+
+        std::vector <std::map <std::string, int> > params;
+        params.resize(batch);
+        for (int i = 0; i < batch; i++) {
+            params[i]["promptLen"] = (int)inputTokens[i].size();
+        }
+        params[0]["index"] = 0;
+        int index = 0;
+
+        LastTokensManager tokensManager (batch, generationConfig.last_n);
+        std::vector <bool> isEnding = std::vector <bool> (batch, false);
+        FillLMMInputsBatch(inputTokens, params, inputIds, attentionMask, positionIds);
+        while (true) {
+            auto st = std::chrono::system_clock::now();
+            std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, pastKeyValues,
+                                                 generationConfig, tokensManager);
+            for (int i = 0; i < batch; i++) {
+                tokensManager.units[i].Push(ret[i]);
+            }
+            std::vector <float> fret;
+            std::vector <float> results;
+            int endingCount = 0;
+            std::vector <std::string> curStrings;
+            for (int i = 0; i < batch; i++) {
+                fret.push_back(ret[i]);
+                inputTokens[i] = std::vector <float> {(float)ret[i]};
+                if (ret[i] == eos_token_id) {
+                    isEnding[i] = true;
+                }
+                if (isEnding[i]) {
+                    curStrings.push_back("");
+                    endingCount++;
+                    continue;
+                }
+                results.push_back(ret[i]);
+                std::string curString = weight.tokenizer.Decode(
+                        Data(DataType::FLOAT32, {(int) results.size()}, results)).c_str();
+                outputs[i] += curString;
+                curStrings.push_back(curString);
+                results.clear();
+            }
+
+            if (endingCount == batch) {
+                break;
+            }
+            if (retCb)
+                retCb(index, curStrings);
+            index++;
+            params[0]["index"] = index;
+            FillLMMInputsBatch(inputTokens, params, inputIds, attentionMask, positionIds);
+            // printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
+
+            if (index == generationConfig.output_token_limit) {
+                break;
+            }
+        }
+
+        if (retCb)
+            retCb(-1, outputs);
+    }
+
+    std::vector<int> basellm::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+                                           const fastllm::Data &positionIds,
+                                           std::vector<std::pair<Data, Data>> &pastKeyValues,
+                                           const fastllm::GenerationConfig &generationConfig,
+                                           const fastllm::LastTokensManager &lastTokens) {
+        printf("Unsupport forward batch.\n");
+        exit(0);
+    }
+
     // 根据输入的tokens生成LLM推理的输入
     void basellm::FillLMMInputs(std::vector <std::vector <float> > &inputTokens,
                                const std::map <std::string, int> &params,
                                Data &inputIds, Data &attentionMask, Data &positionIds) {
+    }
 
+    // 根据输入的tokens生成LLM推理的输入
+    void basellm::FillLMMInputsBatch(std::vector<std::vector<float>> &inputTokens,
+                                     const std::vector<std::map<std::string, int>> &params, fastllm::Data &inputIds,
+                                     fastllm::Data &attentionMask, fastllm::Data &positionIds) {
     }
 }
