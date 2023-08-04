@@ -65,6 +65,7 @@ namespace fastllm {
             model->user_role = "<human>:";
             model->bot_role = "\n<bot>:";
             model->history_sep = "\n";
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::NORMAL;
         } else if (modelType == "llama") {
             model = (basellm*)(new LlamaModel());
         } else {
