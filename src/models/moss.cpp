@@ -96,7 +96,8 @@ namespace fastllm {
         // MossBlock
         for (int i = 0; i < block_cnt; i++) {
             // 1.0 LayerNorm
-            Data residual = hiddenStates;
+            Data residual;
+            Mul(hiddenStates, 1.0, residual);
             std::string lnWeightName = "transformer.h." + std::to_string(i) + ".ln_1.weight";
             std::string lnBiasName = "transformer.h." + std::to_string(i) + ".ln_1.bias";
             LayerNorm(residual, weight[lnWeightName], weight[lnBiasName], -1, hiddenStates);
@@ -116,8 +117,12 @@ namespace fastllm {
             k.Reshape({k.dims[0], k.dims[1], -1, head_dim});
             v.Reshape({v.dims[0], v.dims[1], -1, head_dim});
 
+            q.ToDevice(DataDevice::CPU);
+            k.ToDevice(DataDevice::CPU);
             RotatePosition2D(q, positionIds);
             RotatePosition2D(k, positionIds);
+            q.ToDevice(DataDevice::CUDA);
+            k.ToDevice(DataDevice::CUDA);
 
             PermuteSelf(q, {0, 2, 1, 3});
             PermuteSelf(k, {0, 2, 1, 3});
@@ -136,7 +141,9 @@ namespace fastllm {
             MatMulTransB(q, k, attnWeights, 1.0 / scale_attn);
 
             // 1.2.1 causal_mask
+            attnWeights.ToDevice(DataDevice::CPU);
             CausalMask(attnWeights, k.dims[2] - q.dims[2]);
+            attnWeights.ToDevice(DataDevice::CUDA);
 
             // 1.2.2 attentionMask
             // TODO: attentionMask, 这里似乎都是1, 暂且跳过了
@@ -253,6 +260,10 @@ namespace fastllm {
             results.clear();
 
             len++;
+
+            inputIds.ToDevice(DataDevice::CPU);
+            attentionMask.ToDevice(DataDevice::CPU);
+            positionIds.ToDevice(DataDevice::CPU);
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float) ret}));
             attentionMask.CopyFrom(Data(DataType::FLOAT32, {1, len}, std::vector<float>(len, 1.0f)));
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float) (len - 1)}));
@@ -285,6 +296,21 @@ namespace fastllm {
 
     std::string MOSSModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
         return (round == 0 ? pre_prompt : history) + user_role + input + bot_role + output + history_sep;
+    }
+
+    void MOSSModel::WarmUp() {
+        printf("Warmup...\n");
+        Data inputIds = Data(DataType::FLOAT32, {1, 1}, {(float)bos_token_id});
+        Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});
+        Data positionIds = Data(DataType::FLOAT32, {1, 1}, {0});
+
+        std::vector <std::pair <Data, Data> > pastKeyValues;
+        for (int i = 0; i < block_cnt; i++) {
+            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
+                                                   Data(DataType::FLOAT32)));
+        }
+        Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+        printf("finish.\n");
     }
 
     int MOSSModel::LaunchResponseTokens(const std::vector<int> &inputTokens,
