@@ -57,6 +57,7 @@ namespace fastllm {
             model = (basellm*)(new ChatGLMModel());
         } else if (modelType == "moss") {
             model = (basellm*)(new MOSSModel());
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::NORMAL;
         } else if (modelType == "baichuan") {
             model = (basellm*)(new LlamaModel());
             model->model_type = "baichuan";
