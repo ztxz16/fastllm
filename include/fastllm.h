@@ -299,6 +299,11 @@ namespace fastllm {
     };
 
     struct Tokenizer {
+        enum TokenizerType {
+            BPE = 0,
+            NORMAL = 1
+        };
+
         struct TrieNode {
             int tokenId;
             float score;
@@ -339,6 +344,8 @@ namespace fastllm {
         }
 
         TrieNode *root;
+
+        TokenizerType type = TokenizerType::BPE;
 
         std::unordered_map <int, std::string> tokenToStringDict;
         std::unordered_map <int, float> tokenToScoreDict;

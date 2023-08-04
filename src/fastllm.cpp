@@ -786,112 +786,114 @@ namespace fastllm {
     }
 
     Data Tokenizer::Encode(const std::string &ori) {
-        std::string blank = "";
-        blank += 226, blank += 150, blank += 129;
-        std::string s = blank;
-        for (int i = 0; i < ori.size(); i++) {
-            if (ori[i] == ' ') {
-                if (i != 0 && ori[i - 1] != ' ') {
-                    s += blank;
+        if (this->type == TokenizerType::BPE) {
+            std::string blank = "";
+            blank += 226, blank += 150, blank += 129;
+            std::string s = blank;
+            for (int i = 0; i < ori.size(); i++) {
+                if (ori[i] == ' ') {
+                    if (i != 0 && ori[i - 1] != ' ') {
+                        s += blank;
+                    }
+                } else {
+                    s += ori[i];
                 }
-            } else {
-                s += ori[i];
             }
-        }
 
-        std::vector <Symbol> symbols;
-        for (int i = 0; i < s.size(); i++) {
-            int tokenId = -999999, pos = i - 1;
-            TrieNode *now = this->root;
-            for (int j = i; j < s.size(); j++) {
-                if (now->next.find(s[j]) != now->next.end()) {
-                    now = now->next[s[j]];
-                    if (now->tokenId != -999999) {
-                        tokenId = now->tokenId;
-                        pos = j;
+            std::vector<Symbol> symbols;
+            for (int i = 0; i < s.size(); i++) {
+                int tokenId = -999999, pos = i - 1;
+                TrieNode *now = this->root;
+                for (int j = i; j < s.size(); j++) {
+                    if (now->next.find(s[j]) != now->next.end()) {
+                        now = now->next[s[j]];
+                        if (now->tokenId != -999999) {
+                            tokenId = now->tokenId;
+                            pos = j;
+                            break;
+                        }
+                    } else {
                         break;
                     }
+                }
+                if (pos >= i) {
+                    symbols.push_back(Symbol(now, (char *) s.data(), i, pos - i + 1, (int) symbols.size() - 1,
+                                             (int) symbols.size() + 1));
+                    i = pos;
                 } else {
-                    break;
+                    symbols.push_back(Symbol(nullptr, (char *) s.data(), i, 0, (int) symbols.size() - 1,
+                                             (int) symbols.size() + 1));
                 }
             }
-            if (pos >= i) {
-                symbols.push_back(Symbol(now, (char*)s.data(), i, pos - i + 1, (int)symbols.size() - 1, (int)symbols.size() + 1));
-                i = pos;
-            } else {
-                symbols.push_back(Symbol(nullptr, (char*)s.data(), i, 0, (int)symbols.size() - 1, (int)symbols.size() + 1));
-            }
-        }
-        symbols.back().next = -1;
+            symbols.back().next = -1;
 
-        std::priority_queue <SymbolPairs> workQueue;
-        for (int i = 1; i < symbols.size(); i++) {
-            TryMergePairs(symbols, i - 1, i, workQueue);
-        }
-
-        while (!workQueue.empty()) {
-            auto top = workQueue.top();
-            workQueue.pop();
-            if (symbols[top.l].len == 0 || symbols[top.r].len == 0 ||
-                symbols[top.l].len + symbols[top.r].len != top.size) {
-                continue;
+            std::priority_queue<SymbolPairs> workQueue;
+            for (int i = 1; i < symbols.size(); i++) {
+                TryMergePairs(symbols, i - 1, i, workQueue);
             }
 
-            for (int i = symbols[top.r].pos; i < symbols[top.r].pos + symbols[top.r].len; i++) {
-                symbols[top.l].node = symbols[top.l].node->next[symbols[top.r].s[i]];
-            }
-            symbols[top.l].len += symbols[top.r].len;
-            symbols[top.r].len = 0;
-            symbols[top.l].next = symbols[top.r].next;
-            if (symbols[top.r].next >= 0) {
-                symbols[symbols[top.r].next].prev = top.l;
-            }
-
-            TryMergePairs(symbols, symbols[top.l].prev, top.l, workQueue);
-            TryMergePairs(symbols, top.l, symbols[top.l].next, workQueue);
-        }
-
-        std::vector <float> v;
-        for (int i = 0; i < symbols.size(); i++) {
-            if (symbols[i].len > 0) {
-                v.push_back(symbols[i].node->tokenId);
-            } else if (symbols[i].node == nullptr) {
-                // 未识别的字符
-                uint8_t c = (uint8_t)(symbols[i].s[symbols[i].pos]);
-                std::string now = "<0x00>";
-                now[3] = (c / 16 > 9 ? ('A' + c / 16 - 10) : ('0' + c / 16));
-                now[4] = (c % 16 > 9 ? ('A' + c % 16 - 10) : ('0' + c % 16));
-                if (stringToTokenDict.find(now) != stringToTokenDict.end()) {
-                    v.push_back(stringToTokenDict[now]);
+            while (!workQueue.empty()) {
+                auto top = workQueue.top();
+                workQueue.pop();
+                if (symbols[top.l].len == 0 || symbols[top.r].len == 0 ||
+                    symbols[top.l].len + symbols[top.r].len != top.size) {
+                    continue;
                 }
+
+                for (int i = symbols[top.r].pos; i < symbols[top.r].pos + symbols[top.r].len; i++) {
+                    symbols[top.l].node = symbols[top.l].node->next[symbols[top.r].s[i]];
+                }
+                symbols[top.l].len += symbols[top.r].len;
+                symbols[top.r].len = 0;
+                symbols[top.l].next = symbols[top.r].next;
+                if (symbols[top.r].next >= 0) {
+                    symbols[symbols[top.r].next].prev = top.l;
+                }
+
+                TryMergePairs(symbols, symbols[top.l].prev, top.l, workQueue);
+                TryMergePairs(symbols, top.l, symbols[top.l].next, workQueue);
             }
-        }
-/*
- //老旧的实现
-        std::vector <float> v;
-        for (int i = 0; i < s.size(); i++) {
-            int tokenId = -999999, pos = i - 1;
-            TrieNode *now = this->root;
-            for (int j = i; j < s.size(); j++) {
-                if (now->next.find(s[j]) != now->next.end()) {
-                    now = now->next[s[j]];
-                    if (now->tokenId != -999999) {
-                        tokenId = now->tokenId;
-                        pos = j;
+
+            std::vector<float> v;
+            for (int i = 0; i < symbols.size(); i++) {
+                if (symbols[i].len > 0) {
+                    v.push_back(symbols[i].node->tokenId);
+                } else if (symbols[i].node == nullptr) {
+                    // 未识别的字符
+                    uint8_t c = (uint8_t) (symbols[i].s[symbols[i].pos]);
+                    std::string now = "<0x00>";
+                    now[3] = (c / 16 > 9 ? ('A' + c / 16 - 10) : ('0' + c / 16));
+                    now[4] = (c % 16 > 9 ? ('A' + c % 16 - 10) : ('0' + c % 16));
+                    if (stringToTokenDict.find(now) != stringToTokenDict.end()) {
+                        v.push_back(stringToTokenDict[now]);
                     }
-                } else {
-                    break;
                 }
             }
-            if (pos >= i) {
-                i = pos;
-                v.push_back(tokenId);
-                //printf("%d ", tokenId);
+            return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
+        } else {
+            std::vector <float> v;
+            for (int i = 0; i < ori.size(); i++) {
+                int tokenId = -999999, pos = i - 1;
+                TrieNode *now = this->root;
+                for (int j = i; j < ori.size(); j++) {
+                    if (now->next.find(ori[j]) != now->next.end()) {
+                        now = now->next[ori[j]];
+                        if (now->tokenId != -999999) {
+                            tokenId = now->tokenId;
+                            pos = j;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if (pos >= i) {
+                    i = pos;
+                    v.push_back(tokenId);
+                }
             }
+
+            return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
         }
-        //printf("\n");
-*/
-        return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
     }
 
     std::string Tokenizer::DecodeTokens(const std::vector<int> &tokens) {
