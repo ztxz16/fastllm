@@ -118,6 +118,8 @@ def tofile(exportPath,
             fo.write(struct.pack('i', len(vocab)))
             for v in vocab.keys():
                 s = v.encode()
+                if (modelInfo["model_type"] == "moss"):
+                    s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
                 fo.write(struct.pack('i', len(s)))
                 for c in s:
                     fo.write(struct.pack('i', c))
