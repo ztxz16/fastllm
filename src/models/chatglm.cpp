@@ -656,8 +656,10 @@ namespace fastllm {
                     ids.push_back(gmask_token_id);
                     ids.push_back(bos_token_id);
                 } else if (GetVersion() == 2) {
-                    ids.insert(ids.begin(), 64792);
-                    ids.insert(ids.begin(), 64790);
+                    if (ids.size() < 2 || ids[0] != 64790 || ids[1] != 64792) {
+                        ids.insert(ids.begin(), 64792);
+                        ids.insert(ids.begin(), 64790);
+                    }
                 }
             }
 
