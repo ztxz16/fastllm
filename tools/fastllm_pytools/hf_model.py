@@ -75,7 +75,11 @@ def create(model,
         else:
             vocab = tokenizer.get_vocab();
             for v in vocab.keys():
-                llm.fastllm_lib.add_tokenizer_word_llm_model(model, v.encode(), vocab[v], ctypes.c_float(1.0));
+                if (modelInfo["model_type"] == "moss"):
+                    vv = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v];
+                    llm.fastllm_lib.add_tokenizer_word_llm_model(model, vv, vocab[v], ctypes.c_float(1.0));
+                else:
+                    llm.fastllm_lib.add_tokenizer_word_llm_model(model, v.encode(), vocab[v], ctypes.c_float(1.0));
     tot = 0;
     for key in dict:
         ori_data_type = 0;

@@ -33,6 +33,8 @@ namespace fastllm {
                                          const GenerationConfig &generationConfig = GenerationConfig()); // 启动一个response任务，返回分配的handleId
 
         virtual int FetchResponseTokens(int handelId); // 获取指定handle的输出, -1代表输出结束了
+
+        virtual void WarmUp();
     private:
 		virtual void RotatePosition2D(Data &data, const Data &positionIds); // 二维位置编码
 
