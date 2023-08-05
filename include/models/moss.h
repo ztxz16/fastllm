@@ -29,10 +29,9 @@ namespace fastllm {
 
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
 
-        virtual int LaunchResponseTokens(const std::vector <int> &inputTokens,
-                                         const GenerationConfig &generationConfig = GenerationConfig()); // 启动一个response任务，返回分配的handleId
-
-        virtual int FetchResponseTokens(int handelId); // 获取指定handle的输出, -1代表输出结束了
+        virtual void FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
+                                         const std::map <std::string, int> &params,
+                                         Data &inputIds, Data &attentionMask, Data &positionIds);
 
         virtual void WarmUp();
     private:
