@@ -239,8 +239,26 @@ namespace fastllm {
                           std::vector<std::pair<Data *, Data *>> &pastKeyValues,
                           const std::vector<GenerationConfig> &generationConfigs,
                           const fastllm::LastTokensManager &lastTokens) {
-        printf("Unsupport forward batch.\n");
-        exit(0);
+        std::vector <int> ret;
+        int cur = 0;
+        for (int i = 0; i < batch; i++) {
+            std::vector<std::pair<Data, Data> > curKV;
+            curKV.resize(this->block_cnt);
+            for (int j = 0; j < this->block_cnt; j++) {
+                Mul(*pastKeyValues[i * this->block_cnt + j].first, 1.0, curKV[j].first);
+                Mul(*pastKeyValues[i * this->block_cnt + j].second, 1.0, curKV[j].second);
+            }
+            Data curInput;
+            Split(inputIds, 1, cur, cur + seqLens[i], curInput);
+            LastTokensManager curTokens;
+            curTokens.units.push_back(lastTokens.units[i]);
+            ret.push_back(this->Forward(curInput, *attentionMask[i], *positionIds[i], curKV, generationConfigs[i], curTokens));
+            for (int j = 0; j < this->block_cnt; j++) {
+                Mul(curKV[j].first, 1.0, *pastKeyValues[i * this->block_cnt + j].first);
+                Mul(curKV[j].second, 1.0, *pastKeyValues[i * this->block_cnt + j].second);
+            }
+        }
+        return ret;
     }
 
     int basellm::LaunchResponseTokens(const std::vector<int> &inputTokens,
