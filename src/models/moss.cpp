@@ -313,14 +313,28 @@ namespace fastllm {
         printf("finish.\n");
     }
 
-    int MOSSModel::LaunchResponseTokens(const std::vector<int> &inputTokens,
-                                        const GenerationConfig &generationConfig) {
-        ErrorInFastLLM("Unsupport.\n");
-        return 0;
-    }
-
-    int MOSSModel::FetchResponseTokens(int handleId) {
-        ErrorInFastLLM("Unsupport.\n");
-        return -1;
+    void
+    MOSSModel::FillLLMInputs(std::vector<std::vector<float>> &inputTokens, const std::map<std::string, int> &params,
+                             fastllm::Data &inputIds, fastllm::Data &attentionMask, fastllm::Data &positionIds) {
+        int index = params.find("index")->second;
+        int promptLen = params.find("promptLen")->second;
+        inputIds.ToDevice(DataDevice::CPU);
+        attentionMask.ToDevice(DataDevice::CPU);
+        positionIds.ToDevice(DataDevice::CPU);
+        if (index == 0) {
+            int seqLen = inputTokens[0].size();
+            std::vector<float> vmask = std::vector<float>(seqLen, 1);
+            std::vector<float> vpids = std::vector<float>(seqLen, 0);
+            for (int i = 0; i < seqLen; i++) {
+                vpids[i] = i;
+            }
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, inputTokens[0]));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vmask));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vpids));
+        } else {
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, inputTokens[0]));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {1, promptLen + index}, std::vector<float>(promptLen + index, 1.0f)));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float) (promptLen + index - 1)}));
+        }
     }
 }
