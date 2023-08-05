@@ -1265,19 +1265,21 @@ void FastllmCudaFree(void *ret) {
     if (ret == nullptr) {
         return;
     }
-    for (auto &it : cudaBuffersMap) {
-        auto &cudaBuffers = it.second;
-        for (int i = 0; i < cudaBuffers.size(); i++) {
-            if (cudaBuffers[i].data == ret) {
-                cudaBuffers[i].busy = false;
-                return;
+    if (!cudaBuffersMap.empty()) {
+        for (auto &it : cudaBuffersMap) {
+            auto &cudaBuffers = it.second;
+            for (int i = 0; i < cudaBuffers.size(); i++) {
+                if (cudaBuffers[i].data == ret) {
+                    cudaBuffers[i].busy = false;
+                    return;
+                }
             }
-        }
-        auto &bigBuffers = bigBuffersMap[it.first];
-        for (int i = 0; i < bigBuffers.size(); i++) {
-            if (bigBuffers[i].data == ret) {
-                bigBuffers[i].busy = false;
-                return;
+            auto &bigBuffers = bigBuffersMap[it.first];
+            for (int i = 0; i < bigBuffers.size(); i++) {
+                if (bigBuffers[i].data == ret) {
+                    bigBuffers[i].busy = false;
+                    return;
+                }
             }
         }
     }
