@@ -4,6 +4,7 @@
 
 #include "basellm.h"
 #include "utils.h"
+#include <sstream>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -60,7 +61,7 @@ namespace fastllm {
         std::string prompt = input;
 #ifdef PY_API
         size_t pos = input.find_last_of("time_stamp:");
-        std::string prompt = (generationConfig.enable_hash_id && pos != std::string::npos) ? input.substr(0, pos - 10) : input;
+        prompt = (generationConfig.enable_hash_id && pos != std::string::npos) ? input.substr(0, pos - 10) : input;
         size_t hash_id = std::hash<std::string>{}(input);
 #endif
         Data inputIds, attentionMask, positionIds;
