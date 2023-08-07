@@ -186,7 +186,7 @@ namespace fastllm {
     };
 
     struct ModelLoader {
-        ModelLoader(std::string buffer) : data(buffer.data()), size(buffer.size()), ptr(buffer.data()) {}
+        ModelLoader(const char *buffer, size_t size) : data(buffer), size(size), ptr(buffer) {}
 
         int64_t tell() const { return ptr - data; }
 
