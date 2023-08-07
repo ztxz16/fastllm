@@ -2,9 +2,12 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <fstream>
 
 #include "StringUtils.h"
-#include "factoryllm.h"
+#include "fastllm.h"
+#include "models/basellm.h"
+#include "model.h"
 #include <shellapi.h>
 
 enum RUN_TYPE {
@@ -12,36 +15,37 @@ enum RUN_TYPE {
 	RUN_TYPE_WEBUI = 1,
 };
 
-static factoryllm fllm;
 static int modeltype = 0;
-static int runType = RUN_TYPE_CONSOLE;
-static char* modelpath = NULL;
-static fastllm::basellm* chatGlm = fllm.createllm(LLM_TYPE_CHATGLM);
-static fastllm::basellm* moss = fllm.createllm(LLM_TYPE_MOSS);
+static RUN_TYPE runType = RUN_TYPE_CONSOLE;
+static std::unique_ptr<fastllm::basellm> model;
+static fastllm::GenerationConfig* generationConfig;
 static int sRound = 0;
+static std::string modelType;
 static std::string history;
 static std::string currentContent = "";
 
 
 struct RunConfig {
-	int model = LLM_TYPE_CHATGLM; // 模型类型, 0 chatglm,1 moss,2 alpaca 参考LLM_TYPE
-	std::string path = "chatglm-6b-v1.1-int4.bin"; // 模型文件路径
+	std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
 	int threads = 4; // 使用的线程数
 	bool lowMemMode = false; // 是否使用低内存模式
-	bool webuiType = true;// false 控制台运行 true webui
+	bool webuiType = false; // false 控制台运行 true webui
 };
 
 void Usage() {
 	std::cout << "Usage:" << std::endl;
-	std::cout << "[-h|--help]:                      显示帮助" << std::endl;
-	std::cout << "<-m|--model> <args>:              模型类型，默认为0, 可以设置为0(chatglm),1(moss)" << std::endl;
-	std::cout << "<-p|--path> <args>:               模型文件的路径" << std::endl;
-	std::cout << "<-t|--threads> <args>:            使用的线程数量" << std::endl;
-	std::cout << "<-l|--low> <args>:				使用低内存模式" << std::endl;
+	std::cout << "[-h|--help]:						显示帮助" << std::endl;
+	std::cout << "<-p|--path> <args>:				模型文件的路径" << std::endl;
+	std::cout << "<-t|--threads> <args>:			使用的线程数量" << std::endl;
+	std::cout << "<-l|--low>:						使用低内存模式" << std::endl;
+	std::cout << "<--top_p> <args>:					采样参数top_p" << std::endl;
+	std::cout << "<--top_k> <args>:					采样参数top_k" << std::endl;
+	std::cout << "<--temperature> <args>:			采样参数温度，越高结果越不固定" << std::endl;
+	std::cout << "<--repeat_penalty> <args>:		采样参数重复惩罚" << std::endl;
 	std::cout << "<-w|--webui> <args>:				启用webui" << std::endl;
 }
 
-void ParseArgs(int argc, char **argv, RunConfig &config) {
+void ParseArgs(int argc, char **argv, RunConfig &config, fastllm::GenerationConfig &generationConfig) {
 	std::vector <std::string> sargv;
 	for (int i = 0; i < argc; i++) {
 		sargv.push_back(std::string(argv[i]));
@@ -50,168 +54,105 @@ void ParseArgs(int argc, char **argv, RunConfig &config) {
 		if (sargv[i] == "-h" || sargv[i] == "--help") {
 			Usage();
 			exit(0);
-		}
-		else if (sargv[i] == "-m" || sargv[i] == "--model") {
-			config.model = atoi(sargv[++i].c_str());
-		}
-		else if (sargv[i] == "-p" || sargv[i] == "--path") {
+		} else if (sargv[i] == "-p" || sargv[i] == "--path") {
 			config.path = sargv[++i];
-		}
-		else if (sargv[i] == "-t" || sargv[i] == "--threads") {
+		} else if (sargv[i] == "-t" || sargv[i] == "--threads") {
 			config.threads = atoi(sargv[++i].c_str());
-		}
-		else if (sargv[i] == "-l" || sargv[i] == "--low") {
+		} else if (sargv[i] == "-l" || sargv[i] == "--low") {
 			config.lowMemMode = true;
-		}
-		else if (sargv[i] == "-w" || sargv[i] == "--webui") {
+		} else if (sargv[i] == "-m" || sargv[i] == "--model") {
+			i++;
+		} else if (sargv[i] == "--top_p") {
+			generationConfig.top_p = atof(sargv[++i].c_str());
+		} else if (sargv[i] == "--top_k") {
+			generationConfig.top_k = atof(sargv[++i].c_str());
+		} else if (sargv[i] == "--temperature") {
+			generationConfig.temperature = atof(sargv[++i].c_str());
+		} else if (sargv[i] == "--repeat_penalty") {
+			generationConfig.repeat_penalty = atof(sargv[++i].c_str());
+		} else if (sargv[i] == "-w" || sargv[i] == "--webui") {
 			config.webuiType = true;
-		}
-		else {
+		} else {
 			Usage();
 			exit(-1);
 		}
 	}
 }
 
-int initLLMConf(int model, bool isLowMem, const char* modelPath, int threads) {
-	fastllm::SetThreads(threads);
-	fastllm::SetLowMemMode(isLowMem);
-	modeltype = model;
-	//printf("@@init llm:type:%d,path:%s\n", model, modelPath);
-	if (modeltype == 0) {
-		chatGlm->LoadFromFile(modelPath);
+int initLLMConf(RunConfig config) {
+	fastllm::PrintInstructionInfo();
+	fastllm::SetThreads(config.threads);
+	fastllm::SetLowMemMode(config.lowMemMode);
+	std::ifstream f(config.path.c_str());
+	if (!f.good()) {
+		printf("模型文件 %s 不存在！\n", config.path.c_str());
+		exit(0);
 	}
-	if (modeltype == 1) {
-		moss->LoadFromFile(modelPath);
-	}
+	model = fastllm::CreateLLMModelFromFile(config.path);
+	modelType = model->model_type;
+	runType = config.webuiType ? RUN_TYPE_WEBUI : RUN_TYPE_CONSOLE;
 	return 0;
 }
 
-int chatllm(const char* prompt,int type) {
+int chatllm(const char* prompt, int type) {
 	std::string ret = "";
-	runType = type;
 	currentContent = "";
-	//printf("@@init llm:type:%d,prompt:%s\n", modeltype, prompt);
 	std::string input(prompt);
-	if (modeltype == LLM_TYPE_CHATGLM) {
-		if (input == "reset") 
-		{
-			history = "";
-			sRound = 0;
-			currentContent = "<eop>\n";
-			return 0;
+	if (runType == RUN_TYPE_CONSOLE) {
+		input = Gb2utf(input);
+	}
+	std::string strInput = model->MakeInput(history, sRound, input);
+	ret = model->Response(strInput, [](int index, const char* content) {
+		if (runType == RUN_TYPE_WEBUI) {
+			if (index > -1) {
+				currentContent += content;
+			} else {
+				currentContent += "<eop>";
+			}
+		} else {
+			// std::string result = utf2Gb(content);
+			if (index == 0) {
+				printf("%s: ", modelType.c_str());
+				// printf("%s", result.c_str());
+			}
+			if (*content > 0 && *content < 127) {
+				std::string result = utf2Gb(currentContent.c_str());
+				currentContent = "";
+				printf("%s", result.c_str());
+			}
+			// if (index > 0) {
+				// printf("%s", result.c_str());
+			// }
+			if (index == -1) {
+				std::string result = utf2Gb(currentContent.c_str());
+				currentContent = "";
+				printf("%s", result.c_str());
+				printf("\n");
+			} else {
+				currentContent += content;
+			}
 		}
-		history += ("[Round " + std::to_string(sRound++) + "]\n问：" + input);
-		auto prompt = sRound > 1 ? history : input;
-		std::string strInput = prompt;
-		if (runType == RUN_TYPE_CONSOLE) {
-			strInput = Gb2utf(prompt);
-		}
-		ret = chatGlm->Response(strInput, [](int index, const char* content) {
-			if (runType == RUN_TYPE_WEBUI)
-			{
-				if (index > -1) {
-					currentContent += content;
-				}
-				else {
-					currentContent += "<eop>";
-				}
-			}
-			else
-			{
-				std::string result = utf2Gb(content);
-				if (index == 0) {
-					printf("ChatGLM:%s", result.c_str());
-				}
-				if (index > 0) {
-					printf("%s", result.c_str());
-				}
-				if (index == -1) {
-					printf("\n");
-				}
-			}
 
-		});
-		history += ("\n答：" + ret + "\n");
-	}
-
-	if (modeltype == LLM_TYPE_MOSS) {
-		auto prompt = "You are an AI assistant whose name is MOSS. <|Human|>: " + (input) + "<eoh>";
-		std::string strInput = prompt;
-		if (runType == RUN_TYPE_CONSOLE) {
-			strInput = Gb2utf(prompt);
-		}
-		ret = moss->Response(strInput, [](int index, const char* content) {
-			if (runType == RUN_TYPE_WEBUI)
-			{
-				if (index > -1) {
-					currentContent += content;
-				}
-				else {
-					currentContent += "<eop>";
-				}
-			}
-			else
-			{
-				std::string result = utf2Gb(content);
-				if (index == 0) {
-					printf("MOSS:%s", result.c_str());
-				}
-				if (index > 0) {
-					printf("%s", result.c_str());
-				}
-				if (index == -1) {
-					printf("\n");
-				}
-			}
-			
-		});
-	}
-	long len = ret.length();
-	return len;
-}
-
-void uninitLLM()
-{
-	if (chatGlm)
-	{
-		delete chatGlm;
-		chatGlm = NULL;
-	}
-	if (moss)
-	{
-		delete moss;
-		moss = NULL;
-	}
+	}, *generationConfig);
+	history = model->MakeHistory(history, sRound, input, ret);
+	return ret.length();
 }
 
 void runConslusion() {
-	if (modeltype == LLM_TYPE_MOSS) {
-
-		while (true) {
-			printf("用户: ");
-			std::string input;
-			std::getline(std::cin, input);
-			if (input == "stop") {
-				break;
-			}
-			chatllm(input.c_str(), RUN_TYPE_CONSOLE);
+	printf("欢迎使用 %s 模型. 输入内容对话，reset清空历史记录，stop退出程序.\n", modelType.c_str());
+	while (true) {
+		printf("用户: ");
+		std::string input;
+		std::getline(std::cin, input);
+		if (input == "reset") {
+			history = "";
+			sRound = 0;
+			continue;
 		}
-	}
-	else if (modeltype == LLM_TYPE_CHATGLM) {
-		while (true) {
-			printf("用户: ");
-			std::string input;
-			std::getline(std::cin, input);
-			if (input == "stop") {
-				break;
-			}
-			chatllm(input.c_str(), RUN_TYPE_CONSOLE);
+		if (input == "stop") {
+			break;
 		}
-	}
-	else {
-		Usage();
-		exit(-1);
+		chatllm(input.c_str(), RUN_TYPE_CONSOLE);
 	}
 }
 
@@ -261,17 +202,15 @@ void runWebUI()
 
 int main(int argc, char **argv) {
 	RunConfig config;
-	ParseArgs(argc, argv, config);
-	initLLMConf(config.model, config.lowMemMode, config.path.c_str(), config.threads);
+	generationConfig = new fastllm::GenerationConfig();
+	ParseArgs(argc, argv, config, *generationConfig);
+	initLLMConf(config);
 
-	if (!config.webuiType) 
-	{
+	if (!config.webuiType) {
 		runConslusion();
-	}
-	else
-	{
+	} else {
 		runWebUI();
 	}
-	
+	delete generationConfig;
 	return 0;
 }
