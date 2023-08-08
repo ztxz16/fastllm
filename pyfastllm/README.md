@@ -40,7 +40,7 @@ Cpp手动编译：
 ```sh
 mkdir build-py
 cd build-py
-cmake .. -DUSE_CUDA=ON -DPY_API=ON
+cmake .. -DUSE_CUDA=ON -DPY_API=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 添加编译参数, 用户可指定自己安装的nvcc
 make -j4
 python cli.py -p chatglm-6b-int8.bin -t 8  # 与cpp编译的运行结果保持一致
 ```
