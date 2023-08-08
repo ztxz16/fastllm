@@ -207,6 +207,46 @@ fastllm::SetDeviceMap({{"cuda:0", 10}, {"cuda:1", 5}, {"cpu", 1}}); // 将模型
 
 ## Android上使用
 
+### Docker 编译运行
+docker 运行需要本地安装好 NVIDIA Runtime,且修改默认 runtime 为 nvidia
+
+1. 安装 nvidia-container-runtime
+```
+sudo apt-get install nvidia-container-runtime
+```
+
+2. 修改 docker 默认 runtime 为 nvidia
+
+/etc/docker/daemon.json
+```
+{
+  "registry-mirrors": [
+    "https://hub-mirror.c.163.com",
+    "https://mirror.baidubce.com"
+  ],
+  "runtimes": {
+      "nvidia": {
+          "path": "/usr/bin/nvidia-container-runtime",
+          "runtimeArgs": []
+      }
+   },
+   "default-runtime": "nvidia" // 有这一行即可
+}
+
+```
+
+3. 下载已经转好的模型到 models 目录下
+```
+models
+  chatglm2-6b-fp16.flm
+  chatglm2-6b-int8.flm
+```
+
+4. 编译并启动 webui
+```
+DOCKER_BUILDKIT=0 docker compose up -d --build
+```
+
 ### 编译
 ``` sh
 # 在PC上编译需要下载NDK工具
