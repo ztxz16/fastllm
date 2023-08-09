@@ -13,20 +13,23 @@ fastllm_lib.create_llm_model.restype = ctypes.c_int
 
 fastllm_lib.launch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                                   ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
-                                                  ctypes.c_float, ctypes.c_float]
+                                                  ctypes.c_float, ctypes.c_float, ctypes.c_bool]
 fastllm_lib.launch_response_llm_model.restype = ctypes.c_int
 
 fastllm_lib.fetch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.fetch_response_llm_model.restype = ctypes.c_int
 
+fastllm_lib.fetch_response_logits_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
+fastllm_lib.fetch_response_logits_llm_model.restype = ctypes.c_int
+
 fastllm_lib.response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p,
                                                ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
-                                               ctypes.c_float, ctypes.c_float]
+                                               ctypes.c_float, ctypes.c_float, ctypes.c_bool]
 fastllm_lib.response_str_llm_model.restype = ctypes.c_char_p
 
 fastllm_lib.launch_response_str_llm_model.argtype = [ctypes.c_int, ctypes.c_char_p,
                                                      ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
-                                                     ctypes.c_float, ctypes.c_float]
+                                                     ctypes.c_float, ctypes.c_float, ctypes.c_bool]
 fastllm_lib.launch_response_str_llm_model.restype = ctypes.c_int
 
 fastllm_lib.fetch_response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -116,6 +119,22 @@ class model:
     def eval(self):
         pass;
 
+    def response_logits(self,
+                        query: str,
+                        history: List[Tuple[str, str]] = None) -> str:
+        prompt = query if self.direct_query else self.get_prompt(query, history);
+        handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+                                                           ctypes.c_int(1), ctypes.c_bool(False), ctypes.c_float(1), ctypes.c_int(1),
+                                                           ctypes.c_float(1), ctypes.c_float(1), ctypes.c_bool(True));
+        vocab_size = fastllm_lib.get_tokenizer_vocab_size(self.model);
+        logits = list(range(vocab_size))
+        array = (ctypes.c_float * (vocab_size * 4))(*logits);
+        ret = fastllm_lib.fetch_response_logits_llm_model(self.model, handle, array);
+        out = list(array)[:vocab_size];
+        while (ret != -1):
+            ret = fastllm_lib.fetch_response_logits_llm_model(self.model, handle, array);
+        return out;
+
     def response(self,
                  query: str,
                  history: List[Tuple[str, str]] = None,
@@ -140,7 +159,7 @@ class model:
         prompt = query if self.direct_query else self.get_prompt(query, history);
         handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
                                                            ctypes.c_int(max_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
-                                                           ctypes.c_float(temperature), ctypes.c_float(repeat_penalty));
+                                                           ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False));
         res = "";
         ret = b'';
         fail_cnt = 0;
@@ -172,7 +191,8 @@ class model:
         prompt = query if self.direct_query else self.get_prompt(query, history);
         input = tokenizer.encode(prompt);
         handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
-                                                       max_length, do_sample, top_p, top_k, temperature, repeat_penalty);
+                                                       max_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                       False);
 
         result = [];
         while True:
@@ -192,7 +212,8 @@ class model:
         prompt = query if self.direct_query else self.get_prompt(query, history);
         input = tokenizer.encode(prompt);
         handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
-                                                       max_length, do_sample, top_p, top_k, temperature, repeat_penalty);
+                                                       max_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                       False);
         tokens = [];
         while True:
             cur = fastllm_lib.fetch_response_llm_model(self.model, handle);
