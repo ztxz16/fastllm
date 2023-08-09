@@ -229,7 +229,8 @@ namespace fastllm {
                                            const fastllm::Data &positionIds,
                                            std::vector<std::pair<Data, Data>> &pastKeyValues,
                                            const fastllm::GenerationConfig &generationConfig,
-                                           const fastllm::LastTokensManager &lastTokens) {
+                                           const fastllm::LastTokensManager &lastTokens,
+                                           std::vector <std::vector <float>*> *retLogits) {
         printf("Unsupport forward batch.\n");
         exit(0);
     }
@@ -239,7 +240,8 @@ namespace fastllm {
                           const std::vector<Data *> &positionIds, const std::vector<int> &seqLens,
                           std::vector<std::pair<Data *, Data *>> &pastKeyValues,
                           const std::vector<GenerationConfig> &generationConfigs,
-                          const fastllm::LastTokensManager &lastTokens) {
+                          const fastllm::LastTokensManager &lastTokens,
+                          std::vector <std::vector <float>*> *logits) {
         std::vector <int> ret;
         int cur = 0;
         for (int i = 0; i < batch; i++) {
@@ -277,12 +279,20 @@ namespace fastllm {
                         std::vector <int> handles;
                         std::vector <GenerationConfig> generationConfigs;
                         LastTokensManager tokensManager;
+                        std::vector <std::vector <float>* > logits;
                         model->dictLocker.lock();
                         for (auto &it: model->responseContextDict.dicts) {
                             if (it.second->isEnding) {
                                 continue;
                             }
                             generationConfigs.push_back(it.second->generationConfig);
+                            if (it.second->generationConfig.output_logits) {
+                                it.second->resultLogits.push(new std::vector <float> ());
+                                logits.push_back(it.second->resultLogits.back());
+                            } else {
+                                logits.push_back(nullptr);
+                            }
+
                             tokensManager.units.push_back(it.second->tokens);
                             handles.push_back(it.first);
 
@@ -336,12 +346,12 @@ namespace fastllm {
                             if (seqLens.size() > 1) {
                                 ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
                                                           positionIds, seqLens, pastKeyValues, generationConfigs,
-                                                          tokensManager);
+                                                          tokensManager, &logits);
                             } else {
                                 ret = std::vector <int> {model->Forward(inputIds,
                                                                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
                                                                         *positionIds[0],
-                                                                        *pastKeyValue1, generationConfigs[0], tokensManager)};
+                                                                        *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
                             }
 
                             model->dictLocker.lock();
@@ -399,6 +409,38 @@ namespace fastllm {
                 if (context->resultTokenQueue.size() > 0) {
                     int ret = context->resultTokenQueue.front();
                     context->resultTokenQueue.pop();
+                    dictLocker.unlock();
+                    return ret;
+                } else {
+                    if (context->isEnding) {
+                        responseContextDict.RemoveHandle(handleId);
+                        dictLocker.unlock();
+                        return -1;
+                    }
+                }
+                dictLocker.unlock();
+                MySleep(0);
+                dictLocker.lock();
+            }
+        }
+    }
+
+    int basellm::FetchResponseLogits(int handleId, std::vector<float> &logits) {
+        dictLocker.lock();
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        if (context == nullptr) {
+            dictLocker.unlock();
+            return -1;
+        } else {
+            while (true) {
+                if (context->resultTokenQueue.size() > 0) {
+                    int ret = context->resultTokenQueue.front();
+                    context->resultTokenQueue.pop();
+                    if (!context->resultLogits.empty()) {
+                        logits = *context->resultLogits.front();
+                        delete context->resultLogits.front();
+                        context->resultLogits.pop();
+                    }
                     dictLocker.unlock();
                     return ret;
                 } else {

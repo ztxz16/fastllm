@@ -10,6 +10,8 @@
 
 #include <unordered_map>
 
+#include <cstring>
+
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #endif
@@ -81,7 +83,8 @@ namespace fastllm {
 
     int LlamaModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
-                            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens) {
+                            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                            std::vector <float> *retLogits) {
         Data alibiData;
         if (this->weight.dicts["use_alibi"] == "1") {
             std::vector<float> alibi = GetInterleave(num_attention_heads);
@@ -204,6 +207,12 @@ namespace fastllm {
         logits.ToDevice(DataDevice::CPU);
 
         int lastRet = -1;
+        if (generationConfig.output_logits && retLogits != nullptr) {
+            int size = logits.dims.back();
+            logits.ToDevice(DataDevice::CPU);
+            retLogits->resize(size);
+            memcpy((float*)retLogits->data(), ((float*)logits.cpuData) + (logits.dims[1] - 1) * size, size * logits.unitSize);
+        }
         if (generationConfig.IsSimpleGreedy()) {
             std::pair <float, int> ret = std::make_pair(-1e9, -1);
             int base = logits.dims[1] - 1;
@@ -220,7 +229,8 @@ namespace fastllm {
 
     std::vector <int> LlamaModel::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
-                            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens) {
+                            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                            std::vector <std::vector <float>*> *retLogits) {
         Data alibiData;
         if (this->weight.dicts["use_alibi"] == "1") {
             std::vector<float> alibi = GetInterleave(num_attention_heads);
@@ -373,7 +383,8 @@ namespace fastllm {
                                                const std::vector <int> &seqLens,
                                                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
                                                const std::vector <GenerationConfig> &generationConfigs,
-                                               const LastTokensManager &lastTokens) {
+                                               const LastTokensManager &lastTokens,
+                                               std::vector <std::vector <float>*> *retLogits) {
         Data alibiData;
         if (this->weight.dicts["use_alibi"] == "1") {
             std::vector<float> alibi = GetInterleave(num_attention_heads);
@@ -524,6 +535,11 @@ namespace fastllm {
         std::vector <int> lastRet;
         int total = 0;
         for (int b = 0; b < batch; b++) {
+            if (generationConfigs[b].output_logits && retLogits != nullptr && (*retLogits)[b] != nullptr) {
+                int base = (total + seqLens[b] - 1);
+                (*retLogits)[b]->resize(logits.dims.back());
+                memcpy((float*)(*retLogits)[b]->data(), (float*)(logits.cpuData + base * logits.dims.back() * logits.unitSize), logits.dims.back() * logits.unitSize);
+            }
             if (generationConfigs[b].IsSimpleGreedy()) {
                 std::pair<float, int> ret = std::make_pair(-1e9, -1);
                 int base = (total + seqLens[b] - 1);
@@ -819,12 +835,19 @@ namespace fastllm {
                         std::vector <int> seqLens;
                         std::vector <GenerationConfig> generationConfigs;
                         LastTokensManager tokensManager;
+                        std::vector <std::vector <float>* > logits;
                         model->dictLocker.lock();
                         for (auto &it: model->responseContextDict.dicts) {
                             if (it.second->isEnding) {
                                 continue;
                             }
                             generationConfigs.push_back(it.second->generationConfig);
+                            if (it.second->generationConfig.output_logits) {
+                                it.second->resultLogits.push(new std::vector <float> ());
+                                logits.push_back(it.second->resultLogits.back());
+                            } else {
+                                logits.push_back(nullptr);
+                            }
                             tokensManager.units.push_back(it.second->tokens);
                             if (it.second->preTokens == 0) {
                                 if (it.second->currentTokens.size() == 0 || it.second->currentTokens[0] != model->bos_token_id) {
@@ -871,7 +894,7 @@ namespace fastllm {
 #endif
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                             std::vector<int> ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
-                                                                       positionIds, seqLens, pastKeyValues, generationConfigs, tokensManager);
+                                                                       positionIds, seqLens, pastKeyValues, generationConfigs, tokensManager, &logits);
                             int idx = 0;
                             for (auto &it: model->responseContextDict.dicts) {
                                 if (it.second->isEnding) {

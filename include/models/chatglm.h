@@ -22,7 +22,8 @@ namespace fastllm {
                 const Data &positionIds,
                 std::vector <std::pair <Data, Data> > &pastKeyValues,
                 const GenerationConfig &generationConfig = GenerationConfig(),
-                const LastTokensManager &lastTokens = LastTokensManager());
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <float> *logits = nullptr);
 
         std::vector <int> ForwardBatch(
                 int batch,
@@ -31,7 +32,8 @@ namespace fastllm {
                 const Data &positionIds,
                 std::vector <std::pair <Data, Data> > &pastKeyValues,
                 const GenerationConfig &generationConfig = GenerationConfig(),
-                const LastTokensManager &lastTokens = LastTokensManager());
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *retLogits = nullptr);
 
         std::vector <int> ForwardBatch(
                 int batch,
@@ -41,7 +43,8 @@ namespace fastllm {
                 const std::vector <int> &seqLens,
                 std::vector <std::pair <Data*, Data*> > &pastKeyValues,
                 const std::vector <GenerationConfig> &generationConfigs,
-                const LastTokensManager &lastTokens = LastTokensManager());
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr);
 
         // 根据输入的tokens生成LLM推理的输入
         virtual void FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
