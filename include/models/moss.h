@@ -20,7 +20,8 @@ namespace fastllm {
                 const Data &positionIds,
                 std::vector <std::pair <Data, Data> > &pastKeyValues,
                 const GenerationConfig &generationConfig = GenerationConfig(),
-                const LastTokensManager &lastTokens = LastTokensManager());
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <float> *logits = nullptr);
 
 		virtual std::string Response(const std::string &input, RuntimeResult retCb,
                                      const GenerationConfig &generationConfig = GenerationConfig()); // 根据给出的内容回复

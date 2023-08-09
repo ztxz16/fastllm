@@ -19,6 +19,7 @@ namespace fastllm {
         std::vector <std::pair <Data, Data> > pastKeyValues;
         std::vector <int> currentTokens;
         std::queue <int> resultTokenQueue;
+        std::queue <std::vector <float>*> resultLogits;
         GenerationConfig generationConfig;
         LastTokensUnit tokens;
 
@@ -57,7 +58,8 @@ namespace fastllm {
                 const Data &positionIds,
                 std::vector<std::pair<Data, Data> > &pastKeyValues,
                 const GenerationConfig &generationConfig = GenerationConfig(),
-                const LastTokensManager &lastTokens = LastTokensManager()) = 0;
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <float> *logits = nullptr) = 0;
 
         virtual std::vector <int> ForwardBatch(
                 int batch,
@@ -66,7 +68,8 @@ namespace fastllm {
                 const Data &positionIds,
                 std::vector <std::pair <Data, Data> > &pastKeyValues,
                 const GenerationConfig &generationConfig = GenerationConfig(),
-                const LastTokensManager &lastTokens = LastTokensManager());
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr);
 
         virtual std::vector <int> ForwardBatch(
                 int batch,
@@ -76,7 +79,8 @@ namespace fastllm {
                 const std::vector <int> &seqLens,
                 std::vector <std::pair <Data*, Data*> > &pastKeyValues,
                 const std::vector <GenerationConfig> &generationConfigs,
-                const LastTokensManager &lastTokens = LastTokensManager());
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr);
 
         // 根据输入的tokens生成LLM推理的输入
         virtual void FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
@@ -101,6 +105,8 @@ namespace fastllm {
                                          const GenerationConfig &generationConfig = GenerationConfig()); // 启动一个response任务，返回分配的handleId
 
         virtual int FetchResponseTokens(int handleId); // 获取指定handle的输出, -1代表输出结束了
+
+        virtual int FetchResponseLogits(int handleId, std::vector <float> &logits); // 获取指定handle的输出Logits
 
         virtual void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型
 
