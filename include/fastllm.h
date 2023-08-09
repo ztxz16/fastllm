@@ -38,7 +38,9 @@ namespace fastllm {
         int top_k = 1; // top_k采样
         float top_p = 1.0; // top_p采样
         float temperature = 1.0; // 温度参数，一般在0.1 ~ 1.0之间，设大这个参数可以带来结果的多样性
-		bool enable_hash_id = false; //给会话添加hash id
+        bool output_logits = false; // 是否返回logits
+		bool enable_hash_id = false; // 给会话添加hash id
+
 
         bool IsSimpleGreedy() const {
             if (fabs(repeat_penalty - 1) > 1e-8) {

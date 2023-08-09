@@ -18,6 +18,8 @@
 
 #include <unordered_map>
 
+#include <cstring>
+
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #endif
@@ -68,8 +70,11 @@ namespace fastllm {
 
     int ChatGLMModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                               const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
-                              const GenerationConfig &generationConfig, const LastTokensManager &lastTokens) {
-        return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens)[0];
+                              const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                              std::vector <float> *logits) {
+        std::vector <std::vector <float>*> batchLogits;
+        batchLogits.push_back(logits);
+        return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, &batchLogits)[0];
     }
 
     std::vector <int> ChatGLMModel::ForwardBatch(
@@ -79,7 +84,8 @@ namespace fastllm {
             const Data &positionIds,
             std::vector <std::pair <Data, Data> > &pastKeyValues,
             const GenerationConfig &generationConfig,
-            const LastTokensManager &lastTokens) {
+            const LastTokensManager &lastTokens,
+            std::vector <std::vector <float>*> *retLogits) {
         if (this->weight.dicts.find("rope_ratio") != this->weight.dicts.end()) {
             UpdateSinCos(atof(this->weight.dicts["rope_ratio"].c_str()));
         }
@@ -275,6 +281,15 @@ namespace fastllm {
             RMSNorm(hiddenStates, weight["transformer.encoder.final_layernorm.weight"], 1e-5, hiddenStates);
             Linear(hiddenStates, weight["transformer.output_layer.weight"], Data(), logits);
         }
+        if (generationConfig.output_logits && retLogits != nullptr) {
+            int size = logits.dims.back();
+            logits.ToDevice(DataDevice::CPU);
+            for (int b = 0; b < batch; b++) {
+                int base = (maxLen - 1) * batch + b;
+                (*retLogits)[b]->resize(size);
+                memcpy((float*)(*retLogits)[b]->data(), ((float*)logits.cpuData) + base * size, size * logits.unitSize);
+            }
+        }
         if (generationConfig.IsSimpleGreedy()) {
             TopK(logits, topk, 1);
             topk.ToDevice(DataDevice::CPU);
@@ -299,7 +314,8 @@ namespace fastllm {
             const std::vector <int> &seqLens,
             std::vector <std::pair <Data*, Data*> > &pastKeyValues,
             const std::vector <GenerationConfig> &generationConfigs,
-            const LastTokensManager &lastTokens) {
+            const LastTokensManager &lastTokens,
+            std::vector <std::vector <float>*> *retLogits) {
         if (this->weight.dicts.find("rope_ratio") != this->weight.dicts.end()) {
             UpdateSinCos(atof(this->weight.dicts["rope_ratio"].c_str()));
         }
@@ -622,9 +638,14 @@ namespace fastllm {
         }
         std::vector <int> lastRet;
         int total = 0;
+        Data curLogit;
         for (int b = 0; b < batch; b++) {
-            Data curLogit;
             Split(logits, 0, total + seqLens[b] - 1, total + seqLens[b], curLogit);
+            if (generationConfigs[b].output_logits && retLogits != nullptr && (*retLogits)[b] != nullptr) {
+                curLogit.ToDevice(DataDevice::CPU);
+                (*retLogits)[b]->resize(curLogit.Count(0));
+                memcpy((float*)(*retLogits)[b]->data(), (float*)curLogit.cpuData, curLogit.GetBytes());
+            }
             if (generationConfigs[b].IsSimpleGreedy()) {
                 Data topk;
                 TopK(curLogit, topk, 1);

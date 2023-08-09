@@ -86,7 +86,8 @@ namespace fastllm {
 
     int MOSSModel::Forward(const Data &inputIds, const Data &attentionMask,
                             const Data &positionIds, std::vector <std::pair <Data, Data> > &pastKeyValues,
-                           const GenerationConfig &generationConfig, const LastTokensManager &lastTokens) {
+                           const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                           std::vector <float> *retLogits) {
         auto st = std::chrono::system_clock::now();
 
         Data inputEmbeddings;
