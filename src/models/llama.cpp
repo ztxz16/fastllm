@@ -675,7 +675,21 @@ namespace fastllm {
 #ifdef USE_CUDA
         FastllmCudaClearBigBuffer();
 #endif
-        int batch = inputs.size();
+#ifdef PY_API
+        std::vector<std::string> prompts;
+        std::vector < size_t > hash_ids;
+        for (auto _input: inputs){
+            size_t hash_id = std::hash<std::string>{}(_input);
+            hash_ids.push_back(hash_id);
+
+            size_t pos = _input.find_last_of("time_stamp:");
+            std::string prompt = (generationConfig.enable_hash_id && pos != std::string::npos) ? _input.substr(0, pos - 10) : _input;
+            prompts.push_back(prompt);
+        }
+#else
+        std::vector<std::string> prompts = inputs;
+#endif
+        int batch = prompts.size();
         outputs.clear();
         outputs.resize(batch, "");
 
@@ -685,7 +699,7 @@ namespace fastllm {
         seqLens.resize(batch);
         int maxLen = 0;
         for (int i = 0; i < batch; i++) {
-            inputTokens[i].CopyFrom(this->weight.tokenizer.Encode(inputs[i]));
+            inputTokens[i].CopyFrom(this->weight.tokenizer.Encode(prompts[i]));
             maxLen = std::max(maxLen, (int)inputTokens[i].Count(0) + 1);
             seqLens[i] = (int)inputTokens[i].Count(0) + 1;
         }
@@ -768,9 +782,30 @@ namespace fastllm {
             if (endingCount == batch) {
                 break;
             }
-            if (retCb) {
-                retCb(index, curStrings);
+            if (retCb) 
+#ifdef PY_API
+            {
+                if (generationConfig.enable_hash_id) {
+                    std::vector<pybind11::bytes> rtnStrings;
+                    for (size_t i=0; i<batch; i++){
+                        std::stringstream ss;
+                        ss << curStrings[i] << "hash_id:" << hash_ids[i];
+                        rtnStrings.push_back(pybind11::bytes(ss.str()));
+                    }
+                    retCb(index, rtnStrings);
+                } else {
+                    std::vector<pybind11::bytes> rtnStrings;
+                    for (size_t i=0; i<batch; i++){
+                        std::stringstream ss;
+                        ss << curStrings[i];
+                        rtnStrings.push_back(pybind11::bytes(ss.str()));
+                    }
+                    retCb(index, rtnStrings);
+                }
             }
+#else
+                retCb(index, curStrings);
+#endif
             index++;
 
             maxLen++;
@@ -795,7 +830,29 @@ namespace fastllm {
             //printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         }
         if (retCb)
+#ifdef PY_API
+        {
+            if (generationConfig.enable_hash_id) {
+                std::vector<pybind11::bytes> rtnStrings;
+                for (size_t i=0; i<batch; i++){
+                    std::stringstream ss;
+                    ss << outputs[i] << "hash_id:" << hash_ids[i];
+                    rtnStrings.push_back(pybind11::bytes(ss.str()));
+                }
+                retCb(-1, rtnStrings);
+            } else {
+                std::vector<pybind11::bytes> rtnStrings;
+                for (size_t i=0; i<batch; i++){
+                    std::stringstream ss;
+                    ss << outputs[i];
+                    rtnStrings.push_back(pybind11::bytes(ss.str()));
+                }
+                retCb(-1, rtnStrings);
+            }
+        }
+#else
             retCb(-1, outputs);
+#endif
     }
 
     std::string LlamaModel::MakeInput(const std::string &history, int round, const std::string &input) {

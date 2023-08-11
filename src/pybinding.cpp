@@ -156,6 +156,8 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("bos_token_id", &fastllm::ChatGLMModel::bos_token_id)
     .def_readonly("eos_token_id", &fastllm::ChatGLMModel::eos_token_id)
     .def("load_weights", &fastllm::ChatGLMModel::LoadFromFile)
+    .def("make_input", &fastllm::ChatGLMModel::MakeInput)
+    .def("make_history", &fastllm::ChatGLMModel::MakeHistory)
     .def("response", &fastllm::ChatGLMModel::Response)
     .def("batch_response", [](fastllm::ChatGLMModel &model, 
                               const std::vector <std::string> &inputs,
@@ -189,6 +191,8 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("bos_token_id", &fastllm::MOSSModel::bos_token_id)
     .def_readonly("eos_token_id", &fastllm::MOSSModel::eos_token_id)
     .def("load_weights", &fastllm::MOSSModel::LoadFromFile)
+    .def("make_input", &fastllm::MOSSModel::MakeInput)
+    .def("make_history", &fastllm::MOSSModel::MakeHistory)
     .def("response", &fastllm::MOSSModel::Response)
     .def("batch_response", [](fastllm::MOSSModel &model, 
                               const std::vector <std::string> &inputs,
@@ -220,6 +224,8 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("bos_token_id", &fastllm::LlamaModel::bos_token_id)
     .def_readonly("eos_token_id", &fastllm::LlamaModel::eos_token_id)
     .def("load_weights", &fastllm::LlamaModel::LoadFromFile)
+    .def("make_input", &fastllm::LlamaModel::MakeInput)
+    .def("make_history", &fastllm::LlamaModel::MakeHistory)
     .def("response", &fastllm::LlamaModel::Response)
     .def("batch_response", [](fastllm::LlamaModel &model, 
                               const std::vector <std::string> &inputs,
