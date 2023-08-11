@@ -52,7 +52,7 @@ namespace fastllm {
         isEnding = false;
         preTokens = 0;
     }
-
+    
     std::string basellm::Response(const std::string &input, RuntimeResult retCb,
                                   const fastllm::GenerationConfig &generationConfig) {
 #ifdef USE_CUDA
@@ -142,10 +142,25 @@ namespace fastllm {
 #ifdef USE_CUDA
         FastllmCudaClearBigBuffer();
 #endif
+        
+#ifdef PY_API
+        std::vector<std::string> prompts;
+        std::vector < size_t > hash_ids;
+        for (auto _input: inputs){
+            size_t hash_id = std::hash<std::string>{}(_input);
+            hash_ids.push_back(hash_id);
+
+            size_t pos = _input.find_last_of("time_stamp:");
+            std::string prompt = (generationConfig.enable_hash_id && pos != std::string::npos) ? _input.substr(0, pos - 10) : _input;
+            prompts.push_back(prompt);
+        }
+#else
+        std::vector<std::string> prompts = inputs;
+#endif
         // 1. first
         Data inputIds, attentionMask, positionIds;
 
-        int batch = inputs.size();
+        int batch = prompts.size();
         outputs.clear();
         outputs.resize(batch, "");
 
@@ -153,7 +168,7 @@ namespace fastllm {
         inputTokens.resize(batch);
 
         for (int i = 0; i < batch; i++) {
-            Data now = this->weight.tokenizer.Encode(inputs[i]);
+            Data now = this->weight.tokenizer.Encode(prompts[i]);
             for (int j = 0; j < now.Count(0); j++) {
                 inputTokens[i].push_back(((float *) now.cpuData)[j]);
             }
@@ -210,7 +225,29 @@ namespace fastllm {
                 break;
             }
             if (retCb)
+#ifdef PY_API
+                {
+                    if (generationConfig.enable_hash_id) {
+                        std::vector<pybind11::bytes> rtnStrings;
+                        for (size_t i=0; i<batch; i++){
+                            std::stringstream ss;
+                            ss << curStrings[i] << "hash_id:" << hash_ids[i];
+                            rtnStrings.push_back(pybind11::bytes(ss.str()));
+                        }
+                        retCb(index, rtnStrings);
+                    } else {
+                        std::vector<pybind11::bytes> rtnStrings;
+                        for (size_t i=0; i<batch; i++){
+                            std::stringstream ss;
+                            ss << curStrings[i];
+                            rtnStrings.push_back(pybind11::bytes(ss.str()));
+                        }
+                        retCb(index, rtnStrings);
+                    }
+                }
+#else
                 retCb(index, curStrings);
+#endif
             index++;
             params[0]["index"] = index;
             FillLLMInputsBatch(inputTokens, params, inputIds, attentionMask, positionIds);
@@ -220,9 +257,30 @@ namespace fastllm {
                 break;
             }
         }
-
         if (retCb)
-            retCb(-1, outputs);
+#ifdef PY_API
+                {
+                    if (generationConfig.enable_hash_id) {
+                        std::vector<pybind11::bytes> rtnStrings;
+                        for (size_t i=0; i<batch; i++){
+                            std::stringstream ss;
+                            ss << outputs[i] << "hash_id:" << hash_ids[i];
+                            rtnStrings.push_back(pybind11::bytes(ss.str()));
+                        }
+                        retCb(-1, rtnStrings);
+                    } else {
+                        std::vector<pybind11::bytes> rtnStrings;
+                        for (size_t i=0; i<batch; i++){
+                            std::stringstream ss;
+                            ss << outputs[i];
+                            rtnStrings.push_back(pybind11::bytes(ss.str()));
+                        }
+                        retCb(-1, rtnStrings);
+                    }
+                }
+#else
+                retCb(-1, outputs);
+#endif
     }
 
     std::vector<int> basellm::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
