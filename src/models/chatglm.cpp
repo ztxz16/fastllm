@@ -59,13 +59,29 @@ namespace fastllm {
     ChatGLMModel::ChatGLMModel() {
         this->model_type = "chatglm";
 
-        this->bos_token_id = 130004;
-        this->eos_token_id = 130005;
+        this->bos_token_id = 130004;    // V1 后期版本 bos token，可通过 config.json 覆盖
+        this->eos_token_id = 130005;    // V1 后期版本 eos token，可通过 config.json 覆盖
+        this->gmask_token_id= 150001;   // V1最初版本, 150528 tokens，部分 config.json 没有 gmask_token_id，因此取默认值。
 
         this->rope = -1.0;
         this->UpdateSinCos(1.0f);
         weight.embeddingNames.insert("transformer.word_embeddings.weight");
         weight.embeddingNames.insert("transformer.embedding.word_embeddings.weight");
+    }
+
+    void ChatGLMModel::InitParams() {
+        basellm::InitParams();
+        if (GetVersion() == 1) {
+            if (this->weight.dicts.find("gmask_token_id") != this->weight.dicts.end()) {
+                this->gmask_token_id = atoi(this->weight.dicts["gmask_token_id"].c_str());
+            }
+        } else if (GetVersion() == 2) {
+            this->gmask_token_id = 64790;
+            this->bos_token_id = 64792;
+        }
+        if (this->weight.dicts.find("rope_ratio") != this->weight.dicts.end()) {
+            UpdateSinCos(atof(this->weight.dicts["rope_ratio"].c_str()));
+        }
     }
 
     int ChatGLMModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
@@ -86,9 +102,6 @@ namespace fastllm {
             const GenerationConfig &generationConfig,
             const LastTokensManager &lastTokens,
             std::vector <std::vector <float>*> *retLogits) {
-        if (this->weight.dicts.find("rope_ratio") != this->weight.dicts.end()) {
-            UpdateSinCos(atof(this->weight.dicts["rope_ratio"].c_str()));
-        }
         int maxLen = inputIds.dims[1];
         Data inputEmbeddings;
         Data attenInput;
@@ -328,9 +341,6 @@ namespace fastllm {
             const std::vector <GenerationConfig> &generationConfigs,
             const LastTokensManager &lastTokens,
             std::vector <std::vector <float>*> *retLogits) {
-        if (this->weight.dicts.find("rope_ratio") != this->weight.dicts.end()) {
-            UpdateSinCos(atof(this->weight.dicts["rope_ratio"].c_str()));
-        }
         int seqLen = inputIds.dims[1];
         sinData.ToDevice(DataDevice::CUDA);
         cosData.ToDevice(DataDevice::CUDA);
@@ -690,8 +700,6 @@ namespace fastllm {
         attentionMask.ToDevice(DataDevice::CPU);
         positionIds.ToDevice(DataDevice::CPU);
 
-        int gmask_token_id = this->weight.dicts.find("gmask_token_id") != this->weight.dicts.end() ?
-                             atoi(this->weight.dicts["gmask_token_id"].c_str()) : 130001;
         int index = params.find("index")->second;
         int promptLen = params.find("promptLen")->second;
 
@@ -701,9 +709,9 @@ namespace fastllm {
                     ids.push_back(gmask_token_id);
                     ids.push_back(bos_token_id);
                 } else if (GetVersion() == 2) {
-                    if (ids.size() < 2 || ids[0] != 64790 || ids[1] != 64792) {
-                        ids.insert(ids.begin(), 64792);
-                        ids.insert(ids.begin(), 64790);
+                    if (ids.size() < 2 || ids[0] != this->gmask_token_id || ids[1] != this->bos_token_id) {
+                        ids.insert(ids.begin(), this->bos_token_id);
+                        ids.insert(ids.begin(), this->gmask_token_id);
                     }
                 }
             }
@@ -753,8 +761,6 @@ namespace fastllm {
         int batch = inputTokens.size();
         int index = params[0].find("index")->second;
         if (index == 0) {
-            int gmask_token_id = this->weight.dicts.find("gmask_token_id") != this->weight.dicts.end() ?
-                                 atoi(this->weight.dicts["gmask_token_id"].c_str()) : 130001;
             std::vector<int> seqLens;
             seqLens.resize(batch);
             int maxLen = 0;
@@ -793,8 +799,8 @@ namespace fastllm {
                 } else {
                     auto &tokens = inputTokens[i];
                     int len = tokens.size(), base = maxLen - 2 - len;
-                    ids[i * maxLen + base] = 64790;
-                    ids[i * maxLen + base + 1] = 64792;
+                    ids[i * maxLen + base] = gmask_token_id;
+                    ids[i * maxLen + base + 1] = bos_token_id;
                     for (int j = 0; j < len; j++) {
                         ids[i * maxLen + base + 2 + j] = tokens[j];
                     }
@@ -871,11 +877,7 @@ namespace fastllm {
             return input;
         } else {
 #if defined(_WIN32) or defined(_WIN64)
-            std::vector <uint8_t> vask = {233, 151, 174, 239, 188, 154, 0};
-            std::vector <uint8_t> vans = {231, 173, 148, 239, 188, 154, 0};
-            std::string sask = (char*)vask.data();
-            std::string sans = (char*)vans.data();
-            return (history + ("[Round " + std::to_string(round) + "]\n\n" + sask + input + "\n\n" + sans));
+            return history + ("[Round " + std::to_string(round) + u8"]\n\n问：" + input + u8"\n\n答：");
 #else
             return history + ("[Round " + std::to_string(round) + "]\n\n问：" + input + "\n\n答：");
 #endif
@@ -884,11 +886,7 @@ namespace fastllm {
 
     std::string ChatGLMModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
 #if defined(_WIN32) or defined(_WIN64)
-        std::vector <uint8_t> vask = {233, 151, 174, 239, 188, 154, 0};
-        std::vector <uint8_t> vans = {231, 173, 148, 239, 188, 154, 0};
-        std::string sask = (char*)vask.data();
-        std::string sans = (char*)vans.data();
-        return (history + ("[Round " + std::to_string(round) + "]\n\n" + sask + input + "\n\n" + sans + output + "\n"));
+        return (history + ("[Round " + std::to_string(round) + u8"]\n\n问：" + input + u8"\n\n答：" + output + "\n"));
 #else
         return (history + ("[Round " + std::to_string(round) + "]\n\n问：" + input + "\n\n答：" + output + "\n\n"));
 #endif
