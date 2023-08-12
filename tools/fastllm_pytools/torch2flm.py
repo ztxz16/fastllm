@@ -89,8 +89,8 @@ def tofile(exportPath,
         # Baichuan 2代
         modelInfo["use_alibi"] = "1"
         modelInfo["pre_prompt"] = ""
-        modelInfo["user_role"] = tokenizer.decode([model.generation_config.user_token_id])
-        modelInfo["bot_role"] = tokenizer.decode([model.generation_config.assistant_token_id])
+        modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.user_token_id) + "> ") if hasattr(model.generation_config, "user_token_id") else "";
+        modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.assistant_token_id) + ">") if hasattr(model.generation_config, "assistant_token_id") else "";
         modelInfo["history_sep"] = ""
 
     modelInfo["tokenizer_use_score"] = "1" # 分词带分数

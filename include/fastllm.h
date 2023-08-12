@@ -317,16 +317,18 @@ namespace fastllm {
             char *s;
             int pos, len;
             int prev, next;
+            int fixId;
 
             Symbol (Tokenizer::TrieNode *node,
                     char *s, int pos, int len,
-                    int prev, int next) {
+                    int prev, int next, int fixId) {
                 this->node = node;
                 this->s = s;
                 this->pos = pos;
                 this->len = len;
                 this->prev = prev;
                 this->next = next;
+                this->fixId = fixId;
             }
         };
         struct SymbolPairs {
