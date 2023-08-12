@@ -790,6 +790,9 @@ namespace fastllm {
             std::string blank = "";
             blank += 226, blank += 150, blank += 129;
             std::string s = blank;
+            if (15 < ori.size() && ori.substr(0, 15) == "<FLM_FIX_TOKEN_") {
+                s = "";
+            }
             for (int i = 0; i < ori.size(); i++) {
                 if (ori[i] == ' ') {
                     if (i != 0 && ori[i - 1] != ' ') {
@@ -802,6 +805,20 @@ namespace fastllm {
 
             std::vector<Symbol> symbols;
             for (int i = 0; i < s.size(); i++) {
+                if (i + 3 < s.size() && s[i] == '<' && s[i + 1] == 'F' && s[i + 2] == 'L' && s[i + 3] == 'M') {
+                    if (i + 15 < s.size() && s.substr(i, 15) == "<FLM_FIX_TOKEN_") {
+                        i += 15;
+                        int now = 0;
+                        while (s[i] >= '0' && s[i] <= '9') {
+                            now = now * 10 + s[i] - '0';
+                            i++;
+                        }
+                        symbols.push_back(Symbol(nullptr, (char *) s.data(), i, 0, (int) symbols.size() - 1,
+                                                 (int) symbols.size() + 1, now));
+                        continue;
+                    }
+                }
+
                 int tokenId = -999999, pos = i - 1;
                 TrieNode *now = this->root;
                 for (int j = i; j < s.size(); j++) {
@@ -818,11 +835,11 @@ namespace fastllm {
                 }
                 if (pos >= i) {
                     symbols.push_back(Symbol(now, (char *) s.data(), i, pos - i + 1, (int) symbols.size() - 1,
-                                             (int) symbols.size() + 1));
+                                             (int) symbols.size() + 1, -999999));
                     i = pos;
                 } else {
                     symbols.push_back(Symbol(nullptr, (char *) s.data(), i, 0, (int) symbols.size() - 1,
-                                             (int) symbols.size() + 1));
+                                             (int) symbols.size() + 1, -999999));
                 }
             }
             symbols.back().next = -1;
@@ -859,13 +876,17 @@ namespace fastllm {
                 if (symbols[i].len > 0) {
                     v.push_back(symbols[i].node->tokenId);
                 } else if (symbols[i].node == nullptr) {
-                    // 未识别的字符
-                    uint8_t c = (uint8_t) (symbols[i].s[symbols[i].pos]);
-                    std::string now = "<0x00>";
-                    now[3] = (c / 16 > 9 ? ('A' + c / 16 - 10) : ('0' + c / 16));
-                    now[4] = (c % 16 > 9 ? ('A' + c % 16 - 10) : ('0' + c % 16));
-                    if (stringToTokenDict.find(now) != stringToTokenDict.end()) {
-                        v.push_back(stringToTokenDict[now]);
+                    if (symbols[i].fixId != -999999) {
+                        v.push_back(symbols[i].fixId);
+                    } else {
+                        // 未识别的字符
+                        uint8_t c = (uint8_t) (symbols[i].s[symbols[i].pos]);
+                        std::string now = "<0x00>";
+                        now[3] = (c / 16 > 9 ? ('A' + c / 16 - 10) : ('0' + c / 16));
+                        now[4] = (c % 16 > 9 ? ('A' + c % 16 - 10) : ('0' + c % 16));
+                        if (stringToTokenDict.find(now) != stringToTokenDict.end()) {
+                            v.push_back(stringToTokenDict[now]);
+                        }
                     }
                 }
             }
