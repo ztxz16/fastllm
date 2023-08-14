@@ -42,7 +42,7 @@ def write_int4(fo, v):
     c_min = np.expand_dims(-np.abs(v).max(axis = -1), -1)
     c_max = np.expand_dims(np.abs(v).max(axis = -1), -1)
     c_scale = c_max / 7.0
-    c_min = c_scale * -8.0;
+    c_min = c_scale * -8.0
     v = (v - c_min) / c_scale
     v = (v + 0.5).astype(np.int8).clip(0, 15).astype(np.uint8)
     v = v[:, 0::2] * 16 + v[:, 1::2]
@@ -73,6 +73,8 @@ def tofile(exportPath,
 
     # 0.1 model info
     modelInfo = model.config.__dict__
+    if model.generation_config is not None:
+        modelInfo.update(model.generation_config.__dict__)
     if ("model_type" not in modelInfo):
         print("unknown model_type.")
         exit(0)
@@ -89,9 +91,12 @@ def tofile(exportPath,
         # Baichuan 2代
         modelInfo["use_alibi"] = "1"
         modelInfo["pre_prompt"] = ""
-        modelInfo["user_role"] = tokenizer.decode([model.generation_config.user_token_id])
-        modelInfo["bot_role"] = tokenizer.decode([model.generation_config.assistant_token_id])
+        modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.user_token_id) + "> ") if hasattr(model.generation_config, "user_token_id") else "";
+        modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.assistant_token_id) + ">") if hasattr(model.generation_config, "assistant_token_id") else "";
         modelInfo["history_sep"] = ""
+    if modelInfo["model_type"] == "qwen":
+        modelInfo["im_end_id"] = tokenizer.im_end_id
+        modelInfo["im_start_id"] = tokenizer.im_start_id
 
     modelInfo["tokenizer_use_score"] = "1" # 分词带分数
 
@@ -102,7 +107,10 @@ def tofile(exportPath,
     # 1. vocab
     if (tokenizer):
         if (hasattr(tokenizer, "tokenizer")):
-            tokenizer = tokenizer.tokenizer;
+            if (modelInfo['model_type'] == "qwen"):
+                pass
+            else:
+                tokenizer = tokenizer.tokenizer
         if (hasattr(tokenizer, "sp_model")):
             piece_size = tokenizer.sp_model.piece_size()
             fo.write(struct.pack('i', piece_size))
@@ -117,7 +125,10 @@ def tofile(exportPath,
             vocab = tokenizer.get_vocab()
             fo.write(struct.pack('i', len(vocab)))
             for v in vocab.keys():
-                s = v.encode()
+                if (modelInfo['model_type'] == "qwen"):
+                    s = v
+                else:
+                    s = v.decode()
                 if (modelInfo["model_type"] == "moss"):
                     s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
                 fo.write(struct.pack('i', len(s)))

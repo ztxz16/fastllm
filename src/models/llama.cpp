@@ -572,7 +572,6 @@ namespace fastllm {
         Data inputIds = this->weight.tokenizer.Encode(input);
 #endif
         std::vector <float> ids;
-        ids.push_back(bos_token_id);
         for (int i = 0; i < inputIds.Count(0); i++) {
             ids.push_back(((float*)inputIds.cpuData)[i]);
         }
@@ -709,13 +708,10 @@ namespace fastllm {
         std::vector <float> vmask = std::vector <float> (batch * maxLen * maxLen, 0);
         for (int i = 0; i < batch; i++) {
             Data &tokens = inputTokens[i];
-            int len = tokens.Count(0), base = maxLen - 1 - len;
-            ids[i * maxLen + base] = bos_token_id;
+            int len = tokens.Count(0), base = maxLen - len;
             for (int j = 0; j < len; j++) {
-                ids[i * maxLen + base + 1 + j] = ((float*)tokens.cpuData)[j];
+                ids[i * maxLen + base + j] = ((float*)tokens.cpuData)[j];
             }
-            len += 1;
-
             for (int j = 0; j < len; j++) {
                 vpids[i * maxLen + base + j] = j;
             }
@@ -907,9 +903,6 @@ namespace fastllm {
                             }
                             tokensManager.units.push_back(it.second->tokens);
                             if (it.second->preTokens == 0) {
-                                if (it.second->currentTokens.size() == 0 || it.second->currentTokens[0] != model->bos_token_id) {
-                                    it.second->currentTokens.insert(it.second->currentTokens.begin(), model->bos_token_id);
-                                }
                                 int seqLen = it.second->currentTokens.size();
                                 for (int i = 0; i < it.second->currentTokens.size(); i++) {
                                     ids.push_back(it.second->currentTokens[i]);
