@@ -1,0 +1,19 @@
+version: '3.8'
+services:
+  fastllm:
+    build:
+      context: .
+      args:
+        DOCKER_BUILDKIT: 0
+        # privileged: true
+      platforms:
+        - "linux/amd64"
+      tags:
+        - "fastllm:v0.9"
+    restart: always
+    ports:
+      - 11234:8081
+    volumes:
+      - ./models/:/models/
+    command: /fastllm/build/webui -p /models/chatglm2-6b-int8.flm -w ./example/webui/web
+
