@@ -292,7 +292,7 @@ python3 tools/chatglm_export.py chatglm2-6b-int4.flm int4 #导出int4模型
 
 ``` sh
 # 需要先安装baichuan环境
-# 如果使用自己finetune的模型需要修改baichuan_export.py文件中创建tokenizer, model的代码
+# 如果使用自己finetune的模型需要修改baichuan2flm.py文件中创建tokenizer, model的代码
 # 根据所需的精度，导出相应的模型
 cd build
 python3 tools/baichuan2flm.py baichuan-13b-fp16.flm float16 #导出float16模型
