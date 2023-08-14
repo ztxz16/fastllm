@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
         }
     });
 
-    svr.set_mount_point("/", "../example/webui/web");
+    svr.set_mount_point("/", config.webPath);
     std::cout << ">>> please open http://127.0.0.1:" + std::to_string(config.port) + "\n";
     svr.listen("0.0.0.0", config.port);
 
