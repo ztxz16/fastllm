@@ -318,6 +318,16 @@ python3 tools/moss_export.py moss-int4.flm int4 #导出int4模型
 # 不同llama模型使用的指令相差很大，需要参照torch2flm.py中的参数进行配置
 ```
 
+### QWEN模型导出
+```sh
+# 需要先安装QWen环境
+# 如果使用自己finetune的模型需要修改qwen2flm.py文件中创建tokenizer, model的代码
+# 根据所需的精度，导出相应的模型
+python3 tools/qwen2flm.py qwen-7b-fp16.flm float16 #导出float16模型
+python3 tools/qwen2flm.py qwen-7b-int8.flm int8 #导出int8模型
+python3 tools/qwen2flm.py qwen-7b-int4.flm int4 #导出int4模型
+```
+
 ## 开发计划
 
 也就是俗称的画饼部分，大家如果有需要的功能可以在讨论区提出
