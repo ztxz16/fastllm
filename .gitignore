@@ -32,3 +32,4 @@ token
 /example/Android/LLMAssistant/.cxx
 /example/Android/LLMAssistant/local.properties
 /test/cmmlu/result/
+/models/
