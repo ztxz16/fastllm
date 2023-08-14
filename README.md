@@ -207,6 +207,46 @@ fastllm::SetDeviceMap({{"cuda:0", 10}, {"cuda:1", 5}, {"cpu", 1}}); // 将模型
 
 ## Android上使用
 
+### Docker 编译运行
+docker 运行需要本地安装好 NVIDIA Runtime,且修改默认 runtime 为 nvidia
+
+1. 安装 nvidia-container-runtime
+```
+sudo apt-get install nvidia-container-runtime
+```
+
+2. 修改 docker 默认 runtime 为 nvidia
+
+/etc/docker/daemon.json
+```
+{
+  "registry-mirrors": [
+    "https://hub-mirror.c.163.com",
+    "https://mirror.baidubce.com"
+  ],
+  "runtimes": {
+      "nvidia": {
+          "path": "/usr/bin/nvidia-container-runtime",
+          "runtimeArgs": []
+      }
+   },
+   "default-runtime": "nvidia" // 有这一行即可
+}
+
+```
+
+3. 下载已经转好的模型到 models 目录下
+```
+models
+  chatglm2-6b-fp16.flm
+  chatglm2-6b-int8.flm
+```
+
+4. 编译并启动 webui
+```
+DOCKER_BUILDKIT=0 docker compose up -d --build
+```
+
 ### 编译
 ``` sh
 # 在PC上编译需要下载NDK工具
@@ -252,7 +292,7 @@ python3 tools/chatglm_export.py chatglm2-6b-int4.flm int4 #导出int4模型
 
 ``` sh
 # 需要先安装baichuan环境
-# 如果使用自己finetune的模型需要修改baichuan_export.py文件中创建tokenizer, model的代码
+# 如果使用自己finetune的模型需要修改baichuan2flm.py文件中创建tokenizer, model的代码
 # 根据所需的精度，导出相应的模型
 cd build
 python3 tools/baichuan2flm.py baichuan-13b-fp16.flm float16 #导出float16模型
@@ -276,6 +316,16 @@ python3 tools/moss_export.py moss-int4.flm int4 #导出int4模型
 ``` sh
 # 修改build/tools/alpaca2flm.py程序进行导出
 # 不同llama模型使用的指令相差很大，需要参照torch2flm.py中的参数进行配置
+```
+
+### QWEN模型导出
+```sh
+# 需要先安装QWen环境
+# 如果使用自己finetune的模型需要修改qwen2flm.py文件中创建tokenizer, model的代码
+# 根据所需的精度，导出相应的模型
+python3 tools/qwen2flm.py qwen-7b-fp16.flm float16 #导出float16模型
+python3 tools/qwen2flm.py qwen-7b-int8.flm int8 #导出int8模型
+python3 tools/qwen2flm.py qwen-7b-int4.flm int4 #导出int4模型
 ```
 
 ## 开发计划
