@@ -42,6 +42,10 @@ def create(model,
         modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.user_token_id) + "> ") if hasattr(model.generation_config, "user_token_id") else "";
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.assistant_token_id) + ">") if hasattr(model.generation_config, "assistant_token_id") else "";
         modelInfo["history_sep"] = "";
+    if (modelInfo["model_type"] == "qwen"):
+        modelInfo["im_end_id"] = tokenizer.im_end_id
+        modelInfo["im_start_id"] = tokenizer.im_start_id
+
 
     weight_type_dict = {};
     module_dict = {};
@@ -66,7 +70,10 @@ def create(model,
     # 1. vocab
     if (tokenizer):
         if (hasattr(tokenizer, "tokenizer")):
-            tokenizer = tokenizer.tokenizer;
+            if modelInfo["model_type"] == "qwen":
+                pass
+            else:
+                tokenizer = tokenizer.tokenizer;
         if (hasattr(tokenizer, "sp_model")):
             piece_size = tokenizer.sp_model.piece_size();
             for i in range(piece_size):
@@ -78,6 +85,8 @@ def create(model,
                 if (modelInfo["model_type"] == "moss"):
                     vv = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v];
                     llm.fastllm_lib.add_tokenizer_word_llm_model(model, vv, vocab[v], ctypes.c_float(1.0));
+                elif (modelInfo["model_type"] == "qwen"):
+                    llm.fastllm_lib.add_tokenizer_word_llm_model(model, v, vocab[v], ctypes.c_float(1.0));
                 else:
                     llm.fastllm_lib.add_tokenizer_word_llm_model(model, v.encode(), vocab[v], ctypes.c_float(1.0));
     tot = 0;
