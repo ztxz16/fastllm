@@ -42,7 +42,7 @@ def write_int4(fo, v):
     c_min = np.expand_dims(-np.abs(v).max(axis = -1), -1)
     c_max = np.expand_dims(np.abs(v).max(axis = -1), -1)
     c_scale = c_max / 7.0
-    c_min = c_scale * -8.0;
+    c_min = c_scale * -8.0
     v = (v - c_min) / c_scale
     v = (v + 0.5).astype(np.int8).clip(0, 15).astype(np.uint8)
     v = v[:, 0::2] * 16 + v[:, 1::2]
@@ -73,6 +73,8 @@ def tofile(exportPath,
 
     # 0.1 model info
     modelInfo = model.config.__dict__
+    if model.generation_config is not None:
+        modelInfo.update(model.generation_config.__dict__)
     if ("model_type" not in modelInfo):
         print("unknown model_type.")
         exit(0)
@@ -102,7 +104,10 @@ def tofile(exportPath,
     # 1. vocab
     if (tokenizer):
         if (hasattr(tokenizer, "tokenizer")):
-            tokenizer = tokenizer.tokenizer;
+            if (modelInfo['model_type'] == "qwen"):
+                pass
+            else:
+                tokenizer = tokenizer.tokenizer
         if (hasattr(tokenizer, "sp_model")):
             piece_size = tokenizer.sp_model.piece_size()
             fo.write(struct.pack('i', piece_size))
@@ -117,7 +122,10 @@ def tofile(exportPath,
             vocab = tokenizer.get_vocab()
             fo.write(struct.pack('i', len(vocab)))
             for v in vocab.keys():
-                s = v.encode()
+                if (modelInfo['model_type'] == "qwen"):
+                    s = v
+                else:
+                    s = v.decode()
                 if (modelInfo["model_type"] == "moss"):
                     s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
                 fo.write(struct.pack('i', len(s)))
