@@ -1014,7 +1014,7 @@ namespace fastllm {
                 break;
             }
         }
-        float rnd = fastllmRandom.randP();
+        float rnd = fastllmRandom.randP() * curSum;
         curSum = 0.0;
         for (int i = 0; i < topk; i++) {
             curSum += ps[i];
