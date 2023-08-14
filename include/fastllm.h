@@ -303,7 +303,8 @@ namespace fastllm {
     struct Tokenizer {
         enum TokenizerType {
             BPE = 0,
-            NORMAL = 1
+            NORMAL = 1,
+            QWEN = 2
         };
 
         struct TrieNode {
@@ -317,16 +318,18 @@ namespace fastllm {
             char *s;
             int pos, len;
             int prev, next;
+            int fixId;
 
             Symbol (Tokenizer::TrieNode *node,
                     char *s, int pos, int len,
-                    int prev, int next) {
+                    int prev, int next, int fixId) {
                 this->node = node;
                 this->s = s;
                 this->pos = pos;
                 this->len = len;
                 this->prev = prev;
                 this->next = next;
+                this->fixId = fixId;
             }
         };
         struct SymbolPairs {
@@ -458,6 +461,8 @@ namespace fastllm {
     void LlamaRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position for llama
 
     void RepeatPenalty(Data &input, const Data &penalty); // 惩罚，input[i] = input[i] < 0 ? input[i] * penalty[i] : input[i] / penalty[i];
+
+    void ApplyLognAttn(Data &input, const Data &lognAttn, const Data &positionIds);
 
     void MulBatch(std::vector <Data*> &input, float v, std::vector <Data*> &output);
 

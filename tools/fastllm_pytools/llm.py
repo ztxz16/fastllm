@@ -121,11 +121,17 @@ class model:
 
     def response_logits(self,
                         query: str,
-                        history: List[Tuple[str, str]] = None) -> str:
+                        history: List[Tuple[str, str]] = None,
+                        tokenizer = None) -> str:
         prompt = query if self.direct_query else self.get_prompt(query, history);
-        handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+        if (tokenizer == None):
+            handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
                                                            ctypes.c_int(1), ctypes.c_bool(False), ctypes.c_float(1), ctypes.c_int(1),
                                                            ctypes.c_float(1), ctypes.c_float(1), ctypes.c_bool(True));
+        else:
+            input = tokenizer.encode(prompt);
+            handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
+                                                           1, False, 1, 1, 1, 1, True);
         vocab_size = fastllm_lib.get_tokenizer_vocab_size(self.model);
         logits = list(range(vocab_size))
         array = (ctypes.c_float * (vocab_size * 4))(*logits);
