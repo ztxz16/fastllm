@@ -90,6 +90,20 @@ $ fastllm-convert --help
 $ fastllm-convert -m chatglm6B -p hf_model_path -o output_flm_path  
 ```
 
+### 动态batch使用示例
+```sh
+mkdir build-py
+cd build-py && cmake .. -DPY_API=ON -DUSE_CUDA=ON && make -j && cd -
+cd pyfastllm/demo
+python web_api.py -m 0 -p path_for_chatglm --max_batch_size 32
+```
+可以使用locust进行压测。A100 40G，chatglm fp16 压测部分结果如下：
+|    并发数 | 平均调用时间(s) | TP95(s) | TP99(s) |
+|----------:|------|------|------|
+| 1         | 3.07 | 4.2  | 4.8 |
+| 10        | 6.11 | 11.0 | 12.0 |
+| 16        | 6.82 | 15.0 | 16.0 |
+| 32        | 10.74 | 16.0 | 20.0 |
 ## API编程接口
 
 ### fastllm数据结构
@@ -149,6 +163,8 @@ $ fastllm-convert -m chatglm6B -p hf_model_path -o output_flm_path
 - fastllm.ChatGLMModel() # 初始化模型实例
 - __call__(input_ids:fastllm.Tensor, attention_mask:fastllm.Tensor, position_ids:fastllm.Tensor, penalty_factor:fastllm.Tensor, pastKeyValues:memory_view) # 以类call function的方式调用模型进行推理 
 - fastllm.ChatGLMModel.load_weights(model_path:str) # 从文件路径中加载模型权重
+- fastllm.ChatGLMMode.make_history(history:str, round:int, input:str, output:str) # 基于历史对话和当前输入输出构造送入模型的历史对话
+- fastllm.ChatGLMMode.make_input(history:str, round:int, input:str) # 基于历史对话和当前输入构造送入模型的对话输入
 - fastllm.ChatGLMModel.response(inputs:str, callback:function) # 发送字符串到模型中并使用callback函数接受处理返回的答案
 - fastllm.ChatGLMModel.response_batch(inputs:list[str], callback:function) -> outputs:list[str] # 发送列表字符串到模型中并使用callback函数接受处理返回的答案
 - fastllm.ChatGLMModel.warmup()  # GPU热身，填充GPU，防止冷启动 
