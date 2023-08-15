@@ -11,7 +11,7 @@ using RuntimeResult = std::function<void(int index, pybind11::bytes content)>;
 using RuntimeResultBatch = std::function<void(int index, std::vector <pybind11::bytes> &contents)>;
 #else
 using RuntimeResult = std::function<void(int index, const char* content)>;
-using RuntimeResultBatch = std::function<void(int index, std::vector <std::str> &contents)>;
+using RuntimeResultBatch = std::function<void(int index, std::vector <std::string> &contents)>;
 #endif
 
 namespace fastllm {
