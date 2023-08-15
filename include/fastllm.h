@@ -412,6 +412,8 @@ namespace fastllm {
     int LLMSampling(Data &logits, int outerOffset,
                     const GenerationConfig &config, const LastTokensUnit &tokens); // 对logits里[outerOffset * vocabSize, (outerOffset + 1) * vocabSize]做Sampling
 
+    void ToDataType(const Data &input, DataType dataType);
+
     void Embedding(const Data &input, Data &weight, Data &output);
 
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output);

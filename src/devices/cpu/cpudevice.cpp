@@ -20,6 +20,8 @@
 namespace fastllm {
     CpuDevice::CpuDevice() {
         this->deviceType = "cpu";
+        this->ops["ToFloat16"] = (BaseOperator*)(new CpuToFloat16());
+        this->ops["ToFloat32"] = (BaseOperator*)(new CpuToFloat32());
         this->ops["Embedding"] = (BaseOperator*)(new CpuEmbedding());
         this->ops["LayerNorm"] = (BaseOperator*)(new CpuLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CpuRMSNormOp());
@@ -149,6 +151,48 @@ namespace fastllm {
         return ans + I32sum(acc);
     };
 #endif
+
+    void CpuToFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        if (data.dataType == DataType::FLOAT16) {
+            return;
+        }
+        if (data.dataType == DataType::FLOAT32) {
+            float *old = (float*)data.cpuData;
+            data.dataType = DataType::FLOAT16;
+            data.cpuData = new uint8_t[data.GetBytes()];
+            uint16_t *cur = (uint16_t*)data.cpuData;
+            int len = data.Count(0);
+            for (int i = 0; i < len; i++) {
+                cur[i] = float_to_half(old[i]);
+            }
+            delete[] old;
+        } else {
+            ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
+        }
+    }
+
+    void CpuToFloat32::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        if (data.dataType == DataType::FLOAT32) {
+            return;
+        }
+        if (data.dataType == DataType::FLOAT16) {
+            uint16_t *old = (uint16_t*)data.cpuData;
+            data.dataType = DataType::FLOAT32;
+            data.cpuData = new uint8_t[data.GetBytes()];
+            float *cur = (float*)data.cpuData;
+            int len = data.Count(0);
+            for (int i = 0; i < len; i++) {
+                cur[i] = half_to_float(old[i]);
+            }
+            delete[] old;
+        } else {
+            ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
+        }
+    }
 
     void CpuEmbedding::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
