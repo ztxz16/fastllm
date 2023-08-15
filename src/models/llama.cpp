@@ -699,8 +699,8 @@ namespace fastllm {
         int maxLen = 0;
         for (int i = 0; i < batch; i++) {
             inputTokens[i].CopyFrom(this->weight.tokenizer.Encode(prompts[i]));
-            maxLen = std::max(maxLen, (int)inputTokens[i].Count(0) + 1);
-            seqLens[i] = (int)inputTokens[i].Count(0) + 1;
+            maxLen = std::max(maxLen, (int)inputTokens[i].Count(0));
+            seqLens[i] = (int)inputTokens[i].Count(0);
         }
 
         std::vector <float> ids = std::vector <float> (batch * maxLen, 0);
