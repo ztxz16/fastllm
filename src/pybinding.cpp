@@ -156,6 +156,8 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("bos_token_id", &fastllm::ChatGLMModel::bos_token_id)
     .def_readonly("eos_token_id", &fastllm::ChatGLMModel::eos_token_id)
     .def("load_weights", &fastllm::ChatGLMModel::LoadFromFile)
+    .def("make_input", &fastllm::ChatGLMModel::MakeInput)
+    .def("make_history", &fastllm::ChatGLMModel::MakeHistory)
     .def("response", &fastllm::ChatGLMModel::Response)
     .def("batch_response", [](fastllm::ChatGLMModel &model, 
                               const std::vector <std::string> &inputs,
@@ -189,6 +191,8 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("bos_token_id", &fastllm::MOSSModel::bos_token_id)
     .def_readonly("eos_token_id", &fastllm::MOSSModel::eos_token_id)
     .def("load_weights", &fastllm::MOSSModel::LoadFromFile)
+    .def("make_input", &fastllm::MOSSModel::MakeInput)
+    .def("make_history", &fastllm::MOSSModel::MakeHistory)
     .def("response", &fastllm::MOSSModel::Response)
     .def("batch_response", [](fastllm::MOSSModel &model, 
                               const std::vector <std::string> &inputs,
@@ -210,7 +214,6 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("launch_response", &fastllm::MOSSModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::MOSSModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::MOSSModel::SaveLowBitModel)
-    .def("make_input", &fastllm::MOSSModel::MakeInput);
 
   py::class_<fastllm::LlamaModel, fastllm::basellm>(m, "LlamaModel")
     .def(py::init<>())
@@ -220,6 +223,8 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("bos_token_id", &fastllm::LlamaModel::bos_token_id)
     .def_readonly("eos_token_id", &fastllm::LlamaModel::eos_token_id)
     .def("load_weights", &fastllm::LlamaModel::LoadFromFile)
+    .def("make_input", &fastllm::LlamaModel::MakeInput)
+    .def("make_history", &fastllm::LlamaModel::MakeHistory)
     .def("response", &fastllm::LlamaModel::Response)
     .def("batch_response", [](fastllm::LlamaModel &model, 
                               const std::vector <std::string> &inputs,
@@ -242,7 +247,6 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("launch_response", &fastllm::LlamaModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::LlamaModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::LlamaModel::SaveLowBitModel)
-    .def("make_input", &fastllm::LlamaModel::MakeInput);
 #ifdef VERSION_INFO
     m.attr("__version__") = VERSION_INFO;
 #else
