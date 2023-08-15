@@ -1549,6 +1549,20 @@ namespace fastllm {
         return weight[key];
     }
 
+    void ToDataType(const Data &input, DataType dataType) {
+        if (dataType == DataType::FLOAT32) {
+            curExecutor->Run("ToFloat32", {
+                    {"input", (Data*)&input}
+            }, {}, {});
+        } else if (dataType == DataType::FLOAT16) {
+            curExecutor->Run("ToFloat16", {
+                    {"input", (Data*)&input}
+            }, {}, {});
+        } else {
+            ErrorInFastLLM("ToDataDevice: Unsupport data type.\n");
+        }
+    }
+
     void Embedding(const Data &input, Data &weight, Data &output) {
         curExecutor->Run("Embedding", {
                 {"input", (Data*)&input}, {"weight", &weight}, {"output", &output}
