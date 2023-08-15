@@ -36,6 +36,7 @@ set(PROJECT_SOURCE
         ../../../../../../../src/models/moss.cpp
         ../../../../../../../src/models/llama.cpp
         ../../../../../../../src/models/basellm.cpp
+        ../../../../../../../src/models/qwen.cpp
         )
 
 include_directories(
