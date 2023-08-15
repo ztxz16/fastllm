@@ -128,7 +128,7 @@ def tofile(exportPath,
                 if (modelInfo['model_type'] == "qwen"):
                     s = v
                 else:
-                    s = v.decode()
+                    s = v.encode()
                 if (modelInfo["model_type"] == "moss"):
                     s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
                 fo.write(struct.pack('i', len(s)))
