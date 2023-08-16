@@ -526,4 +526,15 @@ namespace fastllm {
                                      const std::vector<std::map<std::string, int>> &params, fastllm::Data &inputIds,
                                      fastllm::Data &attentionMask, fastllm::Data &positionIds) {
     }
+
+    void basellm::SetAdapter(const std::string &name) {
+        if (weight.peftDict.find(name) == weight.peftDict.end()) {
+            ErrorInFastLLM("Can`t find adapter name: " + name);
+        }
+        adapterName = name;
+    }
+
+    void basellm::DisableAdapter() {
+        adapterName = "";
+    }
 }
