@@ -95,8 +95,9 @@ def tofile(exportPath,
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.assistant_token_id) + ">") if hasattr(model.generation_config, "assistant_token_id") else "";
         modelInfo["history_sep"] = ""
     if modelInfo["model_type"] == "qwen":
-        modelInfo["im_end_id"] = tokenizer.im_end_id
-        modelInfo["im_start_id"] = tokenizer.im_start_id
+        if modelInfo["chat_format"] == "chatml":
+            modelInfo["im_end_id"] = tokenizer.im_end_id
+            modelInfo["im_start_id"] = tokenizer.im_start_id
 
     modelInfo["tokenizer_use_score"] = "1" # 分词带分数
 
