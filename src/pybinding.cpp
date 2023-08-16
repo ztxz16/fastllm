@@ -214,6 +214,7 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("launch_response", &fastllm::MOSSModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::MOSSModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::MOSSModel::SaveLowBitModel)
+    .def("make_input", &fastllm::MOSSModel::MakeInput);
 
   py::class_<fastllm::LlamaModel, fastllm::basellm>(m, "LlamaModel")
     .def(py::init<>())
@@ -247,6 +248,7 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("launch_response", &fastllm::LlamaModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::LlamaModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::LlamaModel::SaveLowBitModel)
+    .def("make_input", &fastllm::LlamaModel::MakeInput);
 #ifdef VERSION_INFO
     m.attr("__version__") = VERSION_INFO;
 #else
