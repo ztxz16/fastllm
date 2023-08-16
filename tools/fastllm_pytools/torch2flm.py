@@ -105,6 +105,18 @@ def tofile(exportPath,
     for it in modelInfo.keys():
         writeKeyValue(fo, str(it), str(modelInfo[it]))
 
+    if hasattr(model, "peft_config"):
+        adapter_size = len(model.peft_config)
+
+        writeString(fo, 'PEFT')
+        fo.write(struct.pack('i', adapter_size))
+        for adapter_name in model.peft_config.keys():
+            adapter_dict = model.peft_config[adapter_name].__dict__
+            writeString(fo, adapter_name)
+            fo.write(struct.pack('i', len(adapter_dict)))
+            for it in adapter_dict.keys():
+                writeKeyValue(fo, str(it), str(adapter_dict[it]))
+
     # 1. vocab
     if (tokenizer):
         if (hasattr(tokenizer, "tokenizer")):
@@ -166,8 +178,14 @@ def tofile(exportPath,
                 ori_np_data_type = np.float16
 
         cur = dict[key].numpy().astype(ori_np_data_type)
-        fo.write(struct.pack('i', len(key)))
-        fo.write(key.encode())
+        
+        if hasattr(model, "peft_config"):
+            weight_name = key.replace('base_model.model.', '')
+            fo.write(struct.pack('i', len(weight_name)))
+            fo.write(weight_name.encode())
+        else:
+            fo.write(struct.pack('i', len(key)))
+            fo.write(key.encode())
         fo.write(struct.pack('i', len(cur.shape)))
         for i in cur.shape:
             fo.write(struct.pack('i', i))
