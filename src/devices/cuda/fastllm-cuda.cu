@@ -167,6 +167,21 @@ __global__ void FastllmAlibiMaskKernel(float* a, float *b, float maskValue, int 
 }
 
 template <int THREAD_PER_BLOCK>
+__global__ void FastllmApplyLognAttnKernel(float* input, float *logn, float *pos, int b, int s, int spatial) {
+    int ob = blockIdx.x / s;
+    int os = blockIdx.x % s;
+    int o = ob * s + os;
+    int idx = threadIdx.x;
+    int curPos = (int)(pos[0]);
+
+    float v = logn[os + curPos];
+    float *curInput = input + o * spatial;
+    for (int i = idx; i < spatial; i += THREAD_PER_BLOCK) {
+        curInput[i] = curInput[i] * v;
+    }
+}
+
+template <int THREAD_PER_BLOCK>
 __global__ void FastllmTransposeByRowKernel(uint8_t *dst, uint8_t *ori, int n, int m, int k) {
     int row = blockIdx.x / m, col = blockIdx.x % m;
     uint8_t *curInput = ori + (row * m + col) * k;
@@ -1790,6 +1805,18 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
     FastllmCudaFinishInput(sinData, cudaSin);
     FastllmCudaFinishInput(cosData, cudaCos);
     FastllmCudaFinishOutput(data, cudaData);
+    return true;
+}
+
+bool FastllmCudaApplyLognAttn (fastllm::Data &input, fastllm::Data &lognAttn, fastllm::Data &positionIds) {
+    float *inputData = (float *) input.cudaData;
+    float *lognData = (float *) lognAttn.cudaData;
+    float *posData = (float *) positionIds.cudaData;
+    int batch = input.dims[0];
+    int seqLen = input.dims[1];
+    int spatial = input.Count(2);
+
+    FastllmApplyLognAttnKernel <256> <<<batch * seqLen, 256>>> (inputData, lognData, posData, batch, seqLen, spatial);
     return true;
 }
 
