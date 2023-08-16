@@ -130,7 +130,19 @@ namespace fastllm {
             }
             std::string qkvWeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.weight";
             std::string qkvBiasName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.bias";
-            Linear(attenInput, weight[qkvWeightName], weight[qkvBiasName], qkv);
+            if (!adapterName.empty()) {
+                std::string peftType = weight.peftDict[adapterName]["peft_type"];
+                if (peftType == "LORA") {
+                    std::string loraAWeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.lora_A." + adapterName + ".weight";
+                    std::string loraBWeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.lora_B." + adapterName + ".weight";
+                    LoraLayer(attenInput, weight[qkvWeightName], weight[loraAWeightName], weight[loraBWeightName], weight[qkvBiasName], qkv, weight.peftDict[adapterName]);
+                } else if (peftType == "IA3") {
+                    std::string ia3WeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.ia3_l" + adapterName + ".weight";
+                    IA3Layer(attenInput, weight[qkvWeightName], weight[ia3WeightName], weight[qkvBiasName], qkv, weight.peftDict[adapterName]);
+                }
+            } else {
+                Linear(attenInput, weight[qkvWeightName], weight[qkvBiasName], qkv);
+            }
             if (version == 1) {
                 qkv.Reshape({qkv.dims[0], qkv.dims[1], num_attention_heads, -1});
                 int per = qkv.dims.back() / 3;
@@ -394,7 +406,19 @@ namespace fastllm {
 
             std::string qkvWeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.weight";
             std::string qkvBiasName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.bias";
-            Linear(attenInput, weight[qkvWeightName], weight[qkvBiasName], qkv);
+            if (!adapterName.empty()) {
+                std::string peftType = weight.peftDict[adapterName]["peft_type"];
+                if (peftType == "LORA") {
+                    std::string loraAWeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.lora_A." + adapterName + ".weight";
+                    std::string loraBWeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.lora_B." + adapterName + ".weight";
+                    LoraLayer(attenInput, weight[qkvWeightName], weight[loraAWeightName], weight[loraBWeightName], weight[qkvBiasName], qkv, weight.peftDict[adapterName]);
+                } else if (peftType == "IA3") {
+                    std::string ia3WeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.ia3_l" + adapterName + ".weight";
+                    IA3Layer(attenInput, weight[qkvWeightName], weight[ia3WeightName], weight[qkvBiasName], qkv, weight.peftDict[adapterName]);
+                }
+            } else {
+                Linear(attenInput, weight[qkvWeightName], weight[qkvBiasName], qkv);
+            }
 
             if (version == 1) {
                 qkv.Reshape({qkv.dims[0], qkv.dims[1], num_attention_heads, -1});

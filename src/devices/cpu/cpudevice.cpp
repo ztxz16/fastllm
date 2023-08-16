@@ -1872,8 +1872,14 @@ namespace fastllm {
         float *input1Data = (float*)input1.cpuData;
 
         int len = input0.Count(0);
-        for (int i = 0; i < len; i++) {
-            input0Data[i] *= input1Data[i];
+        int inner = input1.Count(0);
+        AssertInFastLLM(len % inner == 0, "MulTo error: Data`s shape can`t perform MulTo operation.\n");
+        int round = (len / inner);
+        for (int j = 0; j < round; j++) {
+            for (int i = 0; i < len; i++) {
+               input0Data[i] *= input1Data[i];
+            }
+            input0Data += inner;
         }
     }
 

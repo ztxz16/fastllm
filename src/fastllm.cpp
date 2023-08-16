@@ -194,6 +194,14 @@ namespace fastllm {
             }
         }
 
+        bool TryReadString(const std::string &expect) {
+            long originalPos = ftell(f);
+            std::string real = ReadString();
+            fseek(f, originalPos, SEEK_SET);
+            
+            return real == expect;
+        }
+
         ~FileBuffer() {
             fclose(f);
         }
@@ -1151,6 +1159,24 @@ namespace fastllm {
             }
         }
 
+        if (buffer.TryReadString("PEFT")) {
+            // 模型文件包含peft adapter
+            std::string lora = buffer.ReadString();
+            int loraSize = buffer.ReadInt();
+            for (int i = 0; i < loraSize; i++) {
+                std::string adapter_name = buffer.ReadString();
+                this->peftDict[adapter_name] = {};
+
+                int adapter_size = buffer.ReadInt();
+                for (int j = 0; j < adapter_size; j++) {
+                    std::string key = buffer.ReadString();
+                    std::string value = buffer.ReadString();
+                    //printf("%s %s\n", key.c_str(), value.c_str());
+                    this->peftDict[adapter_name][key] = value;
+                }
+            }
+        }
+
         bool useScore = this->dicts["tokenizer_use_score"] == "1";
         int vocabLen = buffer.ReadInt();
         for (int i = 0; i < vocabLen; i++) {
@@ -1433,6 +1459,10 @@ namespace fastllm {
 
     void WeightMap::AddDict(const std::string &key, const std::string &value) {
         this->dicts[key] = value;
+    }
+
+    void WeightMap::AddAdapterDict(const std::string &name, const std::string &key, const std::string &value) {
+        this->peftDict[name][key] = value;
     }
 
     void WeightMap::AddQLinearWeight(const std::string &key, const std::vector <int> &dims,
@@ -1775,6 +1805,72 @@ namespace fastllm {
         curExecutor->Run("CatDirectBatch", {
                 {"input0", (Data*)input0.data()}, {"input1", (Data*)input1.data()}
         }, {}, {{"axis", axis}, {"input0___batch", (int)input0.size()}, {"input1___batch", (int)input1.size()}});
+    }
+
+    void LoraLayer(Data &input, Data &weight, Data &loraA, Data &loraB, const Data &bias, Data &output, 
+                   std::map <std::string, std::string> loraConfig) {
+        float r = std::atof(loraConfig["r"].c_str());
+        float lora_alpha = std::atof(loraConfig["lora_alpha"].c_str());
+        bool fan_in_fan_out = loraConfig["fan_in_fan_out"] == "true";
+        if (r > 0) {
+            float scaling = lora_alpha / r;
+            if (fan_in_fan_out) {
+                Data weightTrans;
+                Data result, loraAOut, loraBOut;
+                Permute(weight, {1, 0}, weightTrans);
+                Linear(input, weightTrans, bias, result);
+                Linear(input, loraA, Data(), loraAOut);
+                Linear(loraAOut, loraB, Data(), loraBOut);
+                Mul(loraBOut, scaling, output);
+                AddTo(output, result);  
+            } else {
+                Data result, loraAOut, loraBOut;
+                Linear(input, weight, bias, result);
+                Linear(input, loraA, Data(), loraAOut);
+                Linear(loraAOut, loraB, Data(), loraBOut);
+                Mul(loraBOut, scaling, output);
+                AddTo(output, result);  
+            }
+        } else {
+            if (fan_in_fan_out) {
+                Data weightTrans;
+                Permute(weight, {1, 0}, weightTrans);
+                Linear(input, weightTrans, bias, output);
+            } else {
+                Linear(input, weight, bias, output);
+            }
+        }
+    }
+
+    void IA3Layer(Data &input, Data &weight, Data &ia3_l, Data &bias, Data &output,
+                  std::map <std::string, std::string> ia3Config) {
+        bool is_feedforward = ia3Config["if_feedforward"] == "true";
+        bool fan_in_fan_out = ia3Config["fan_in_fan_out"] == "true";
+        if (is_feedforward) {
+            // IA3_L shape: (1, in_features)
+            // output = linear(input * ia3_l)
+            if (fan_in_fan_out) {
+                Data weightTrans;
+                Permute(weight, {1, 0}, weightTrans);
+                MulTo(input, ia3_l);
+                Linear(input, weightTrans, bias, output);
+            } else {
+                MulTo(input, ia3_l);
+                Linear(input, weight, bias, output);
+            }
+        } else {
+            // IA3_L shape: (out_features, 1)
+            // output = linear(input) * ia3_l
+            if (fan_in_fan_out) {
+                Data weightTrans;
+                Permute(weight, {1, 0}, weightTrans);
+                Linear(input, weightTrans, bias, output);
+                MulTo(output, ia3_l);
+            } else {
+                Linear(input, weight, bias, output);
+                MulTo(output, ia3_l);
+            }
+        }
     }
 
     void ClearProfiler() {
