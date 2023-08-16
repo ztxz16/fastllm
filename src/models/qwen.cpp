@@ -414,14 +414,28 @@ namespace fastllm {
     }
 
     std::string QWenModel::MakeInput(const std::string &history, int round, const std::string &input) {
-        return (round == 0 ? im_start + "system" + "\n" + pre_prompt + im_end : history) + 
-            "\n" + im_start + user_role + "\n" + input + im_end + "\n" + im_start + bot_role + "\n";
+        if (weight.dicts["chat_format"] == "chatml") {
+            return (round == 0 ? im_start + "system" + "\n" + pre_prompt + im_end : history) + 
+                "\n" + im_start + user_role + "\n" + input + im_end + "\n" + im_start + bot_role + "\n";
+        } else if (weight.dicts["chat_format"] == "raw") {
+            return history + input;
+        } else {
+            ErrorInFastLLM("Unknown char_format for QWen: " + weight.dicts["chat_format"]);
+            return "";
+        }
     }
 
     std::string QWenModel::MakeHistory(const std::string &history, int round, 
                                        const std::string &input, const std::string &output) {
-        return (round == 0 ? im_start + "system" + "\n" + pre_prompt + im_end : history) + 
-            "\n" + im_start + user_role + "\n" + input + im_end + "\n" + im_start + bot_role + "\n" + output + im_end;
+        if (weight.dicts["chat_format"] == "chatml") {
+            return (round == 0 ? im_start + "system" + "\n" + pre_prompt + im_end : history) + 
+                "\n" + im_start + user_role + "\n" + input + im_end + "\n" + im_start + bot_role + "\n" + output + im_end;
+        } else if (weight.dicts["chat_format"] == "raw") {
+            return history + input + output;
+        } else {
+            ErrorInFastLLM("Unknown char_format for QWen: " + weight.dicts["chat_format"]);
+            return "";
+        }
     }
 
     void QWenModel::FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
