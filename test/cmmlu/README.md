@@ -37,6 +37,7 @@ python3 eval.py 此处填写结果保存路径
 | ChatGLM2-6b-fp16        | float32 |0         |  50.16    |
 | ChatGLM2-6b-int8        | float32 |0         |  50.14    |
 | ChatGLM2-6b-int4        | float32 |0         |  49.63    |
+| QWen-7b-Base-fp16       | float32 |0         |  57.43    |
+| QWen-7b-Chat-fp16       | float32 |0         |  54.82    |
 | Baichuan-13b-Base-int8  | float32 |5         |  55.12    |
 | Baichuan-13b-Base-int4  | float32 |5         |  52.22    |
-
