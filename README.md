@@ -48,6 +48,9 @@ model = AutoModel.from_pretrained("THUDM/chatglm2-6b", trust_remote_code = True)
 # 目前from_hf接口只能接受原始模型，或者ChatGLM的int4, int8量化模型，暂时不能转换其它量化模型
 from fastllm_pytools import llm
 model = llm.from_hf(model, tokenizer, dtype = "float16") # dtype支持 "float16", "int8", "int4"
+
+# 注释掉这一行model.eval()
+#model = model.eval()
 ```
 
 model支持了ChatGLM的API函数chat, stream_chat，因此ChatGLM的demo程序无需改动其他代码即可运行
