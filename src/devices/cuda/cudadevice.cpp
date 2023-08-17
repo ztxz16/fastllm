@@ -33,6 +33,7 @@ namespace fastllm {
         this->ops["RotatePosition2D"] = (BaseOperator*)(new CudaRotatePosition2DOp());
         this->ops["NearlyRotatePosition2D"] = (BaseOperator*)(new CudaNearlyRotatePosition2DOp());
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CudaLlamaRotatePosition2DOp());
+        this->ops["ApplyLognAttn"] = (BaseOperator*)(new CudaApplyLognAttnOp());
 
         this->ops["SplitBatch"] = (BaseOperator*)(new CudaSplitBatchOp());
         this->ops["CatBatch"] = (BaseOperator*)(new CudaCatBatchOp());
@@ -519,8 +520,9 @@ namespace fastllm {
         AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
 
         bool same = false;
-        same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && input.dims[0] == 1);
+        same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
         same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[2] == 1);
+        same |= ((axis == std::vector <int>{0, 2, 1, 3}) && (input.dims[1] == 1 || input.dims[2] == 1));
         if (same) {
             std::vector<int> new_dims;
             for (int i = 0; i < axis.size(); i++) {
@@ -564,5 +566,14 @@ namespace fastllm {
         int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
 
         FastllmCudaLlamaRotatePosition2D(data, positionIds, sinData, cosData, rotaryDim);
+    }
+
+    void CudaApplyLognAttnOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &lognAttn = *(datas.find("lognAttn")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+
+        FastllmCudaApplyLognAttn(input, lognAttn, positionIds);
     }
 }

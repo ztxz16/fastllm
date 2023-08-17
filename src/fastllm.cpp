@@ -402,11 +402,17 @@ namespace fastllm {
     }
 
     void Data::Allocate(float v) {
-        AssertInFastLLM(this->dataType == DataType::FLOAT32, "Allocate error: Data's type should be float32.\n");
+        AssertInFastLLM(this->dataType == DataType::FLOAT32
+                        || this->dataType == DataType::FLOAT16, "Allocate error: Data's type should be float32 or float16.\n");
         this->Allocate();
-        float *f = (float*)cpuData;
         if (this->dataDevice == DataDevice::CPU) {
-            std::fill(f, f + Count(0), v);
+            if (this->dataType == DataType::FLOAT32) {
+                float *f = (float*)cpuData;
+                std::fill(f, f + Count(0), v);
+            } else if (this->dataType == DataType::FLOAT16) {
+                uint16_t *h = (uint16_t*)cpuData;
+                std::fill(h, h + Count(0), float_to_half(v));
+            }
         } else {
             // TODO: 别的设备上的初始化
         }
