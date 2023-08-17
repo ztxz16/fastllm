@@ -90,7 +90,6 @@ namespace fastllm {
         //     printf("%d ", (int )((float *) inputIds.cpuData)[i]);
         // }
         // printf("\n");
-
         Embedding(inputIds, this->weight["transformer.wte.weight"], hiddenStates);
         for (int i = 0; i < this->block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
@@ -199,37 +198,30 @@ namespace fastllm {
         }
 
         RMSNorm(hiddenStates, weight["transformer.ln_f.weight"], 1e-6, hiddenStates);
-        Data logits;
+        Data logits, topk;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
-        logits.ToDevice(DataDevice::CPU);
-
-        if (generationConfig.output_logits && retLogits != nullptr) {
-            int size = logits.dims.back();
-            logits.ToDevice(DataDevice::CPU);
-            for (int b = 0; b < batch; b++) {
-                int base = (maxLen - 1) * batch + b;
-                (*retLogits)[b]->resize(size);
-                memcpy((float*)(*retLogits)[b]->data(), ((float*)logits.cpuData) + base * size, size * logits.unitSize);
-            }
-        }
 
         std::vector <int> lastRet;
-        if (generationConfig.IsSimpleGreedy()) {
-            for (int b = 0; b < batch; b++) {
-                int base = b * logits.dims[1] + logits.dims[1] - 1;
-                std::pair <float, int> ret = std::make_pair(-1e9, -1);
-                for (int i = 0; i < logits.dims.back(); i++) {
-                    ret = max(ret, std::make_pair(((float *) logits.cpuData)[base * logits.dims.back() + i], i));
-                }
-                lastRet.push_back(ret.second);
+        int total = 0;
+        Data curLogitTemp, curLogit;
+        for (int b = 0; b < batch; b++) {
+            Split(logits, 0, b, b + 1, curLogitTemp);
+            Split(curLogitTemp, 1, maxLen - 1, maxLen, curLogit);
+            if (generationConfig.output_logits && retLogits != nullptr && (*retLogits)[b] != nullptr) {
+                curLogit.ToDevice(DataDevice::CPU);
+                (*retLogits)[b]->resize(curLogit.Count(0));
+                memcpy((float*)(*retLogits)[b]->data(), (float*)curLogit.cpuData, curLogit.GetBytes());
             }
-        } else {
-            for (int b = 0; b < batch; b++) {
-                int base = b * logits.dims[1] + logits.dims[1] - 1;
-                lastRet.push_back(LLMSampling(logits, base, generationConfig, lastTokens.units[b]));
+            if (generationConfig.IsSimpleGreedy()) {
+                Data topk;
+                TopK(curLogit, topk, 1);
+                topk.ToDevice(DataDevice::CPU);
+                lastRet.push_back((int) (((float *) topk.cpuData)[0] + 1e-3));
+            } else {
+                lastRet.push_back(LLMSampling(curLogit, 0, generationConfig, lastTokens.units[b]));
             }
+            total += maxLen;
         }
-        
         return lastRet;
     }
     
@@ -386,29 +378,26 @@ namespace fastllm {
         RMSNorm(hiddenStates, weight["transformer.ln_f.weight"], 1e-6, hiddenStates);
         Data logits;
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
-        logits.ToDevice(DataDevice::CPU);
 
         std::vector <int> lastRet;
         int total = 0;
+        Data curLogit;
         for (int b = 0; b < batch; b++) {
+            Split(logits, 1, total + seqLens[b] - 1, total + seqLens[b], curLogit);
             if (generationConfigs[b].output_logits && retLogits != nullptr && (*retLogits)[b] != nullptr) {
-                int base = (total + seqLens[b] - 1);
-                (*retLogits)[b]->resize(logits.dims.back());
-                memcpy((float*)(*retLogits)[b]->data(), (float*)(logits.cpuData + base * logits.dims.back() * logits.unitSize), logits.dims.back() * logits.unitSize);
+                curLogit.ToDevice(DataDevice::CPU);
+                (*retLogits)[b]->resize(curLogit.Count(0));
+                memcpy((float*)(*retLogits)[b]->data(), (float*)curLogit.cpuData, curLogit.GetBytes());
             }
             if (generationConfigs[b].IsSimpleGreedy()) {
-                std::pair<float, int> ret = std::make_pair(-1e9, -1);
-                int base = (total + seqLens[b] - 1);
-                total += seqLens[b];
-                for (int i = 0; i < logits.dims.back(); i++) {
-                    ret = max(ret, std::make_pair(((float *) logits.cpuData)[base * logits.dims.back() + i], i));
-                }
-                lastRet.push_back(ret.second);
+                Data topk;
+                TopK(curLogit, topk, 1);
+                topk.ToDevice(DataDevice::CPU);
+                lastRet.push_back((int) (((float *) topk.cpuData)[0] + 1e-3));
             } else {
-                int base = (total + seqLens[b] - 1);
-                total += seqLens[b];
-                lastRet.push_back(LLMSampling(logits, base, generationConfigs[b], lastTokens.units[b]));
+                lastRet.push_back(LLMSampling(curLogit, 0, generationConfigs[b], lastTokens.units[b]));
             }
+            total += seqLens[b];
         }
         return lastRet;
     }
@@ -559,6 +548,9 @@ namespace fastllm {
                 fcos.push_back(cos[i][j]);
             }
         }
+
+        sinData.ToDevice(DataDevice::CPU);
+        cosData.ToDevice(DataDevice::CPU);
         sinData.CopyFrom(Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, fsin));
         cosData.CopyFrom(Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, fcos));
     }
