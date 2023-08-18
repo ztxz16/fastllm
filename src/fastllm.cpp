@@ -194,14 +194,6 @@ namespace fastllm {
             }
         }
 
-        bool TryReadString(const std::string &expect) {
-            long originalPos = ftell(f);
-            std::string real = ReadString();
-            fseek(f, originalPos, SEEK_SET);
-            
-            return real == expect;
-        }
-
         ~FileBuffer() {
             fclose(f);
         }
@@ -1165,11 +1157,9 @@ namespace fastllm {
             }
         }
 
-        if (buffer.TryReadString("PEFT")) {
-            // 模型文件包含peft adapter
-            std::string lora = buffer.ReadString();
-            int loraSize = buffer.ReadInt();
-            for (int i = 0; i < loraSize; i++) {
+        if (this->dicts.find("peft_siz") != this->dicts.end()) {
+            int peftSize = atoi(this->dicts["peft_size"].c_str());
+            for (int i = 0; i < peftSize; i++) {
                 std::string adapter_name = buffer.ReadString();
                 this->peftDict[adapter_name] = {};
 

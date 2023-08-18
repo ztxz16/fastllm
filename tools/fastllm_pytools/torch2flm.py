@@ -101,15 +101,15 @@ def tofile(exportPath,
 
     modelInfo["tokenizer_use_score"] = "1" # 分词带分数
 
+    if hasattr(model, "peft_config"):
+        adapter_size = len(model.peft_config)
+        modelInfo["peft_size"] = adapter_size
+
     fo.write(struct.pack('i', len(modelInfo)))
     for it in modelInfo.keys():
         writeKeyValue(fo, str(it), str(modelInfo[it]))
 
     if hasattr(model, "peft_config"):
-        adapter_size = len(model.peft_config)
-
-        writeString(fo, 'PEFT')
-        fo.write(struct.pack('i', adapter_size))
         for adapter_name in model.peft_config.keys():
             adapter_dict = model.peft_config[adapter_name].__dict__
             writeString(fo, adapter_name)
