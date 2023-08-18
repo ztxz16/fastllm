@@ -232,3 +232,9 @@ class model:
                 yield response, new_history, None;
             else:
                 yield response, new_history;
+
+    def set_adapter(self, name: str):
+        fastllm_lib.set_adapter(self.model, str(name).encode())
+    
+    def disable_adapter(self):
+        fastllm_lib.disable_adapter(self.model)
