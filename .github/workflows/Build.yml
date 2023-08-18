@@ -1,0 +1,43 @@
+name: Action Build
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Set up JDK
+      uses: actions/setup-java@v1
+      with:
+        java-version: '11'
+
+    - name: Checkout code
+      uses: actions/checkout@v2
+    
+    - name: Build with arm64-v8a
+      run: |
+        wget https://dl.google.com/android/repository/android-ndk-r21d-linux-x86_64.zip
+        unzip android-ndk-r21d-linux-x86_64.zip
+        export NDK=$GITHUB_WORKSPACE/android-ndk-r21d
+        mkdir build-android
+        cd build-android
+        #ls ${NDK}/build/cmake/android.toolchain.cmake
+        cmake -DCMAKE_MAKE_PROGRAM=/usr/bin/make -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_TOOLCHAIN_FILE=${NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 -DCMAKE_CXX_FLAGS=-march=armv8.2a+dotprod ..
+        make -j -B
+        cp main fastllm-main-android
+        
+    - name: Build with x86
+      run: |
+        mkdir build-x86
+        cd build-x86
+        cmake .. -DUSE_CUDA=OFF
+        make -j
+        cp main fastllm-main-x86_64
+        
+    - name: Export and Upload Artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: Output
+        path: |
+            build-android/fastllm-main-android
+            build-x86/fastllm-main-x86_64
