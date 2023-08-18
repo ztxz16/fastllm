@@ -384,6 +384,8 @@ namespace fastllm {
 
         std::map <std::string, Data> weight;
 
+        std::map <std::string, std::map <std::string, std::string>> peftDict;
+
         std::set <std::string> embeddingNames;
 
         void LoadFromFile(const std::string &fileName); // 从文件读取
@@ -393,6 +395,8 @@ namespace fastllm {
         void AddTokenizerWord(const std::string &key, int value, float score); // 增加一个词
 
         void AddDict(const std::string &key, const std::string &value); // 插入一个词条
+
+        void AddAdapterDict(const std::string &name, const std::string &key, const std::string &value);
 
         void AddWeight(const std::string &key, const std::vector <int> &dims,
                        DataType dataType, WeightType weightType, DataType oriDataType, uint8_t *oriData); // 插入一个权重
@@ -479,6 +483,12 @@ namespace fastllm {
     void SoftmaxBatch(std::vector <Data*> &input, std::vector <Data*> &output, int axis);
 
     void CatDirectBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, int axis);
+
+    void LoraLayer(Data &input, Data &weight, Data &loraA, Data &loraB, const Data &bias, Data &output, 
+                   std::map <std::string, std::string> loraConfig);
+
+    void IA3Layer(Data &input, Data &weight, Data &ia3_l, Data &bias, Data &output,
+                  std::map <std::string, std::string> ia3Config);
 }
 
 #endif //TEST_FASTLLM_H
