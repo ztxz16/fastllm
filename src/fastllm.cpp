@@ -1157,7 +1157,7 @@ namespace fastllm {
             }
         }
 
-        if (this->dicts.find("peft_siz") != this->dicts.end()) {
+        if (this->dicts.find("peft_size") != this->dicts.end()) {
             int peftSize = atoi(this->dicts["peft_size"].c_str());
             for (int i = 0; i < peftSize; i++) {
                 std::string adapter_name = buffer.ReadString();
