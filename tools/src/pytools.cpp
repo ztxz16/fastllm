@@ -123,6 +123,24 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT void add_adapter_dict_llm_model(int modelId, char *adapterName, char *key, char *value) {
+        auto model = models.GetModel(modelId);
+        model->weight.AddAdapterDict(adapterName, key, value);
+        return;
+    }
+
+    DLL_EXPORT void set_adapter(int modelId, char *name) {
+        auto model = models.GetModel(modelId);
+        model->SetAdapter(name);
+        return;
+    }
+
+    DLL_EXPORT void disable_adapter(int modelId, char *name) {
+        auto model = models.GetModel(modelId);
+        model->DisableAdapter();
+        return;
+    }
+
     DLL_EXPORT void init_params_llm_model(int modelId) {
         auto model = models.GetModel(modelId);
         model->InitParams();

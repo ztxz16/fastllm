@@ -63,12 +63,26 @@ def create(model,
         if (isinstance(m, torch.nn.Embedding)):
             weight_type_dict[key] = "embedding";
 
+    peft_config = {}
+    active_adapter = ""
+    if hasattr(model, "peft_config"):
+        peft_config = model.peft_config
+    if hasattr(model, "active_adapter"):
+        active_adapter = model.active_adapter
+
     model = model.cpu();
     dict = model.state_dict();
     model_type = model.config.__dict__["model_type"];
     model = llm.fastllm_lib.create_empty_llm_model(model_type.encode());
     for it in modelInfo.keys():
         llm.fastllm_lib.add_dict_llm_model(model, str(it).encode(), str(modelInfo[it]).encode());
+
+    for adapter_name in peft_config.keys():
+        adapter_dict = peft_config[adapter_name].__dict__
+        for it in adapter_dict.keys():
+            llm.fastllm_lib.add_adapter_dict_llm_model(model, str(adapter_name).encode(), str(it).encode(), str(adapter_dict[it]).encode())
+    if len(active_adapter) != 0:
+        llm.fastllm_lib.set_adapter(model, str(active_adapter).encode())
 
     # 1. vocab
     if (tokenizer):
@@ -110,15 +124,18 @@ def create(model,
             # TODO bfloat
             to_data_type = 0;
 
+        weight_name = key
+        if peft_config is not None:
+            weight_name = weight_name.replace('base_model.model.', '')
         if (cur_weight_type == 111):
-            llm.fastllm_lib.add_qlinear_weight_llm_model(model, key.encode(),
+            llm.fastllm_lib.add_qlinear_weight_llm_model(model, weight_name.encode(),
                                                  len(dict[key].shape),
                                                  (ctypes.c_int * len(dict[key].shape))(*list(dict[key].shape)),
                                                  weight_bits[key],
                                                  dict[key + "_scale"].numpy().astype(np.float32).ctypes.data_as(ctypes.c_void_p),
                                                  dict[key].numpy().ctypes.data_as(ctypes.c_void_p));
         else:
-            llm.fastllm_lib.add_weight_llm_model(model, key.encode(),
+            llm.fastllm_lib.add_weight_llm_model(model, weight_name.encode(),
                                              len(dict[key].shape),
                                              (ctypes.c_int * len(dict[key].shape))(*list(dict[key].shape)),
                                              to_data_type, cur_weight_type, ori_data_type,

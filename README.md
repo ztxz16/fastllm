@@ -75,6 +75,39 @@ new_model = llm.model("model.flm"); # 导入fastllm模型
 
 注: 该功能处于测试阶段，目前仅验证了ChatGLM、ChatGLM2模型可以通过2行代码加速
 
+## PEFT支持(测试中，目前仅支持ChatGLM + LoRA)
+
+使用[🤗PEFT](https://huggingface.co/docs/peft/index)可以方便地运行finetune过的大模型，你可以使用如下的方式让你的PEFT模型使用fastllm加速：
+
+```python
+import sys
+from peft import PeftModel
+from transformers import AutoModel, AutoTokenizer
+sys.path.append('..')
+model = AutoModel.from_pretrained("THUDM/chatglm-6b", device_map='cpu', trust_remote_code=True)
+model = PeftModel.from_pretrained(model, "path/to/your/own/adapter") # 这里使用你自己的peft adapter
+model = model.eval()
+tokenizer = AutoTokenizer.from_pretrained("THUDM/chatglm-6b", trust_remote_code=True)
+
+# 如果模型中存在active_adapter，那么在fastllm模型中，这个adapter也会被默认启用
+from fastllm_pytools import llm
+model = llm.from_hf(model, tokenizer, dtype = "float16") # dtype支持 "float16", "int8", "int4"
+```
+
+接下来，你就可以像使用普通的模型一样(例如调用chat，stream_chat函数)
+
+你也可以更换PEFT模型所使用的的adapter：
+
+```python
+model.set_adapter('your adapter name')
+```
+
+或者关闭PEFT，使用原本的预训练模型：
+
+```python
+model.disable_adapter()
+```
+
 ## 推理速度
 
 6B级int4模型单4090延迟最低约5.5ms
