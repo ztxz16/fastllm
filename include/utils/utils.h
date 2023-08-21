@@ -21,6 +21,12 @@
 
 #ifdef __AVX__
 #include "immintrin.h"
+#ifdef __GNUC__
+#if __GNUC__ < 8
+#define _mm256_set_m128i(/* __m128i */ hi, /* __m128i */ lo) \
+    _mm256_insertf128_si256(_mm256_castsi128_si256(lo), (hi), 0x1)
+#endif
+#endif
 #endif
 
 namespace fastllm {
