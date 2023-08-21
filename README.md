@@ -152,7 +152,7 @@ make -j
 
 ``` sh
 cd tools # 这时在fastllm/build/tools目录下
-python setup.py install
+python3 -m pip install .
 ```
 
 ### 运行demo程序
