@@ -249,6 +249,42 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("fetch_response", &fastllm::LlamaModel::FetchResponseTokens)
     .def("save_lowbit_model", &fastllm::LlamaModel::SaveLowBitModel)
     .def("make_input", &fastllm::LlamaModel::MakeInput);
+
+  py::class_<fastllm::QWenModel, fastllm::basellm>(m, "QWenModel")
+    .def(py::init<>())
+    .def_readonly("model_type", &fastllm::QWenModel::model_type)
+    .def_readonly("weight", &fastllm::QWenModel::weight)
+    .def_readonly("block_cnt", &fastllm::QWenModel::block_cnt)
+    .def_readonly("bos_token_id", &fastllm::QWenModel::bos_token_id)
+    .def_readonly("eos_token_id", &fastllm::QWenModel::eos_token_id)
+    .def("load_weights", &fastllm::QWenModel::LoadFromFile)
+    .def("make_input", &fastllm::QWenModel::MakeInput)
+    .def("make_history", &fastllm::QWenModel::MakeHistory)
+    .def("response", &fastllm::QWenModel::Response)
+    .def("batch_response", [](fastllm::QWenModel &model, 
+                                const std::vector <std::string> &inputs,
+                                RuntimeResultBatch retCb,
+                                fastllm::GenerationConfig config)->std::vector<std::string> {
+        std::vector <std::string> outputs;
+        model.ResponseBatch(inputs, outputs, retCb, config);
+        return outputs;
+    })
+    .def("warmup", &fastllm::QWenModel::WarmUp)
+    .def("forward",
+        [](fastllm::QWenModel &model, 
+            const fastllm::Data &inputIds, 
+            const fastllm::Data &attentionMask,
+            const fastllm::Data &positionIds, std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues,
+            const fastllm::GenerationConfig &generationConfig, const fastllm::LastTokensManager &tokens) {
+
+            int retV = model.Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
+            return std::make_tuple(retV, pastKeyValues);
+    })
+    .def("launch_response", &fastllm::QWenModel::LaunchResponseTokens)
+    .def("fetch_response", &fastllm::QWenModel::FetchResponseTokens)
+    .def("save_lowbit_model", &fastllm::QWenModel::SaveLowBitModel)
+    .def("make_input", &fastllm::QWenModel::MakeInput);
+
 #ifdef VERSION_INFO
     m.attr("__version__") = VERSION_INFO;
 #else
