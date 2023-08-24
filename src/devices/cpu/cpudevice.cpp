@@ -288,7 +288,7 @@ namespace fastllm {
         for (int o = 0; o < q0; o++) {
             futures.push_back(pool->Submit(SingleAttention,
                             qd + o * q.strides[0], kd + (o / group) * k.strides[0], vd + (o / group) * v.strides[0],
-                            maskd, od + o * output.strides[0], scale,
+                            maskd ? (maskd + o / (q0 / mask.dims[0])) : maskd, od + o * output.strides[0], scale,
                             q1, q2, k1, v2));
         }
         for (int o = 0; o < futures.size(); o++) {
