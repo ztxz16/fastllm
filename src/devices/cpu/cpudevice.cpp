@@ -22,6 +22,7 @@ namespace fastllm {
         this->deviceType = "cpu";
         this->ops["ToFloat16"] = (BaseOperator*)(new CpuToFloat16());
         this->ops["ToFloat32"] = (BaseOperator*)(new CpuToFloat32());
+        this->ops["Attention"] = (BaseOperator*)(new CpuAttention());
         this->ops["Embedding"] = (BaseOperator*)(new CpuEmbedding());
         this->ops["LayerNorm"] = (BaseOperator*)(new CpuLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CpuRMSNormOp());
@@ -202,6 +203,96 @@ namespace fastllm {
             delete[] old;
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
+        }
+    }
+
+    void CpuAttention::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+
+        AssertInFastLLM(q.dims.size() == 3 && k.dims.size() == 3 && v.dims.size() == 3, "Attention: dims of q, k, v should be 3.\n");
+        AssertInFastLLM(q.dims[2] == k.dims[2], "Attention: q.dims[2] should be equal to k.dims[2].\n");
+        AssertInFastLLM(k.dims[1] == v.dims[1], "Attention: k.dims[1] should be equal to v.dims[1].\n");
+        AssertInFastLLM(k.dims[0] == v.dims[0], "Attention: k.dims[0] should be equal to v.dims[0].\n");
+        AssertInFastLLM(q.dims[0] == k.dims[0] * group, "Attention: q.dims[0] should be equal to k.dims[0] * group.\n");
+
+        AssertInFastLLM(q.dataType == k.dataType && q.dataType == v.dataType,
+                        "Attention: q, k, v's datatype should be same.\n");
+        AssertInFastLLM(q.dataType == DataType::FLOAT32, "Attention's input's type should be float32.\n");
+
+        std::vector <int> dims = {q.dims[0], q.dims[1], v.dims[2]};
+        output.dataType = q.dataType;
+        output.Resize(dims);
+    }
+
+    void SingleAttention(float *qd, float *kd, float *vd, float *maskd, float *od,
+                         float scale, int q1, int q2, int k1, int v2) {
+        float *qk = new float[k1];
+        float *temp = new float[k1];
+        for (int i = 0; i < q1; i++) {
+            float maxValue = -10000, sum = 0.0;
+            for (int j = 0; j < k1; j++) {
+                if (maskd && maskd[i * k1 + j] > 0.99) {
+                    qk[j] = -10000;
+                    continue;
+                }
+                float sum = 0.0f;
+                for (int l = 0; l < q2; l++) {
+                    sum += qd[i * q2 + l] * kd[j * q2 + l];
+                }
+                qk[j] = sum * scale;
+                maxValue = std::max(maxValue, sum * scale);
+            }
+            for (int j = 0; j < k1; j++) {
+                temp[j] = expf(qk[j] - maxValue);
+                sum += temp[j];
+            }
+            sum = std::max(sum, 0.1f);
+            for (int j = 0; j < k1; j++) {
+                qk[j] = temp[j] / sum;
+            }
+            for (int j = 0; j < k1; j++) {
+                for (int l = 0; l < v2; l++) {
+                    od[i * v2 + l] += qk[j] * vd[j * v2 + l];
+                }
+            }
+        }
+        delete[] qk;
+        delete[] temp;
+    }
+
+    void CpuAttention::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &mask = *(datas.find("mask")->second);
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+
+        output.Allocate();
+        int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
+        float *qd = (float*)q.cpuData;
+        float *kd = (float*)k.cpuData;
+        float *vd = (float*)v.cpuData;
+        float *maskd = mask.dims.size() > 0 ? (float*)mask.cpuData : nullptr;
+        float *od = (float*)output.cpuData;
+        std::fill(od, od + output.Count(0), 0.0f);
+        auto pool = GetPool();
+        std::vector<std::future<void> > futures;
+        for (int o = 0; o < q0; o++) {
+            futures.push_back(pool->Submit(SingleAttention,
+                            qd + o * q.strides[0], kd + (o / group) * k.strides[0], vd + (o / group) * v.strides[0],
+                            maskd, od + o * output.strides[0], scale,
+                            q1, q2, k1, v2));
+        }
+        for (int o = 0; o < futures.size(); o++) {
+            futures[o].get();
         }
     }
 
