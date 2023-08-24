@@ -418,6 +418,9 @@ namespace fastllm {
 
     void ToDataType(const Data &input, DataType dataType);
 
+    void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
+                   int group, float scale, int attentionType);
+
     void Embedding(const Data &input, Data &weight, Data &output);
 
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output);
