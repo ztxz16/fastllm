@@ -150,6 +150,16 @@ __global__ void FastllmAttentionMaskKernel(float* a, float *b, float maskValue, 
 }
 
 template <int THREAD_PER_BLOCK>
+__global__ void SimpleMask(float* a, float *b, float maskValue, int spatial) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < spatial) {
+        if (b[i] > 0.99) {
+            a[i] = maskValue;
+        }
+    }
+}
+
+template <int THREAD_PER_BLOCK>
 __global__ void FastllmAlibiMaskKernel(float* a, float *b, float maskValue, int n, int m, int spn, int spm, int spatial) {
     int on = blockIdx.x / m;
     int om = blockIdx.x % m;
@@ -827,6 +837,46 @@ __global__ void FastllmMatMulKernel(uint8_t** pointer, float alpha) {
             }
             output[i * k + j] = sum * alpha;
         }
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmAttentionKernel(float *qd, float *kd, float *vd, float *maskd, float *od,
+                                       float scale, int q1, int q2, int k1, int v2,
+                                       int group, int qstride, int kstride, int vstride, int ostride,
+                                       float *qk, float *temp) {
+    int o = blockIdx.x;
+    qd += o * qstride;
+    kd += (o / group) * kstride;
+    vd += (o / group) * vstride;
+    od += o * ostride;
+    qk += o * k1;
+    temp += o * k1;
+    for (int i = 0; i < q1; i++) {
+        for (int j = threadIdx.x; j < k1; j += THREAD_PER_BLOCK) {
+            if (maskd && maskd[i * k1 + j] > 0.99) {
+                qk[j] = -10000;
+                continue;
+            }
+            float sum = 0.0f;
+            float *tempQd = qd + i * q2, *tempKd = kd + j * q2;
+            for (int l = 0; l < q2; l++) {
+                sum += tempQd[l] * tempKd[l];
+            }
+            qk[j] = sum * scale;
+        }
+        __syncthreads();
+        FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (qk, temp, k1);
+        __syncthreads();
+        for (int j = threadIdx.x; j < v2; j += THREAD_PER_BLOCK) {
+            float *curInput1 = vd + j;
+            float sum = 0.0;
+            for (int l = 0; l < k1; l++) {
+                sum += temp[l] * curInput1[l * v2];
+            }
+            od[i * v2 + j] = sum;
+        }
+        __syncthreads();
     }
 }
 
@@ -1674,6 +1724,140 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
     }
 
     FastllmCudaFree(tempData);
+    return true;
+}
+
+bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+                          const fastllm::Data &mask, const fastllm::Data &output, int group, float scale) {
+    int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
+    float *qd = (float*)q.cudaData;
+    float *kd = (float*)k.cudaData;
+    float *vd = (float*)v.cudaData;
+    float *maskd = mask.dims.size() > 0 ? (float*)mask.cudaData : nullptr;
+    float *od = (float*)output.cudaData;
+    int batch = mask.dims.size() > 0 ? mask.dims[0] : 1;
+
+    if (false) {
+        float *qk = (float *) FastllmCudaMalloc(q0 * k1 * sizeof(float));
+        float *temp = (float *) FastllmCudaMalloc(q0 * k1 * sizeof(float));
+        FastllmAttentionKernel<256> <<<q0, 256>>>(qd, kd, vd, maskd, od,
+                                                  scale, q1, q2, k1, v2,
+                                                  group, q.strides[0], k.strides[0], v.strides[0], output.strides[0],
+                                                  qk, temp);
+        FastllmCudaFree(qk);
+        FastllmCudaFree(temp);
+        return true;
+    }
+
+    if (q1 > 1024) {
+        float *qk = (float *) FastllmCudaMalloc(q1 * k1 * sizeof(float));
+        float beta = 0, one = 1;
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+        cublasStatus_t status;
+
+        for (int i = 0; i < q0; i++) {
+            status = cublasSgemmStridedBatched(fastllmCublasHandle,
+                                               CUBLAS_OP_T, CUBLAS_OP_N,
+                                               k1, q1, q2, &scale,
+                                               kd + (i / group) * k.Count(1), k.strides[1], k.Count(1),
+                                               qd + i * q.Count(1), q.strides[1], q.Count(1),
+                                               &beta,
+                                               qk, k1, k1 * q1, 1);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                printf("status = %d\n", (int) status);
+                printf("Error: cublas error.\n");
+                throw ("cublas error");
+                exit(0);
+            }
+
+            if (maskd) {
+                SimpleMask<256> <<< (q1 * k1 / 256) + 1, 256>>>(qk, maskd + (i / (q0 / batch)) * q1 * k1, -10000, q1 * k1);
+            }
+
+            int outer = q1;
+            if (k1 < 8) {
+                FastllmSoftmaxKernelInner1<1> <<< outer, 1 >>>(qk, qk, outer, k1);
+            } else if (k1 < 64) {
+                FastllmSoftmaxKernelInner1<8> <<< outer, 8 >>>(qk, qk, outer, k1);
+            } else if (k1 < 512) {
+                FastllmSoftmaxKernelInner1<64> <<< outer, 64 >>>(qk, qk, outer, k1);
+            } else {
+                FastllmSoftmaxKernelInner1<256> <<< outer, 256 >>>(qk, qk, outer, k1);
+            }
+
+            status = cublasSgemmStridedBatched(fastllmCublasHandle,
+                                               CUBLAS_OP_N, CUBLAS_OP_N,
+                                               v2, q1, k1, &one,
+                                               vd + (i / group) * v.Count(1), v.strides[1], v.Count(1),
+                                               qk, k1, k1 * q1,
+                                               &beta,
+                                               od + i * v2 * q1, v2, v2 * q1, 1);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                printf("status = %d\n", (int) status);
+                printf("Error: cublas error.\n");
+                throw ("cublas error");
+                exit(0);
+            }
+        }
+
+        FastllmCudaFree(qk);
+        return true;
+    }
+
+    if (true) {
+        float *qk = (float *) FastllmCudaMalloc(q0 * q1 * k1 * sizeof(float));
+        float *temp = (float *) FastllmCudaMalloc(q0 * q1 * k1 * sizeof(float));
+        float beta = 0, one = 1;
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+        cublasStatus_t status;
+
+        status = cublasSgemmStridedBatched(fastllmCublasHandle,
+                                           CUBLAS_OP_T, CUBLAS_OP_N,
+                                           k1, q1 * group, q2, &scale,
+                                           kd, k.strides[1], k.Count(1),
+                                           qd, q.strides[1], q.Count(1) * group,
+                                           &beta,
+                                           qk, k1, k1 * q1 * group, q0 / group);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("status = %d\n", (int) status);
+            printf("Error: cublas error.\n");
+            throw ("cublas error");
+            exit(0);
+        }
+
+        if (maskd) {
+            int spatial = q1 * k1, n = batch, m = q0 / batch;
+            FastllmAttentionMaskKernel <256> <<< n * m, 256>>>(qk, maskd, -10000, n, m, spatial);
+        }
+
+        int outer = q0 * q1;
+        if (k1 < 8) {
+            FastllmSoftmaxKernelInner1<1> <<< outer, 1 >>>(qk, temp, outer, k1);
+        } else if (k1 < 64) {
+            FastllmSoftmaxKernelInner1<8> <<< outer, 8 >>>(qk, temp, outer, k1);
+        } else if (k1 < 512) {
+            FastllmSoftmaxKernelInner1<64> <<< outer, 64 >>>(qk, temp, outer, k1);
+        } else {
+            FastllmSoftmaxKernelInner1<256> <<< outer, 256 >>>(qk, temp, outer, k1);
+        }
+
+        status = cublasSgemmStridedBatched(fastllmCublasHandle,
+                                           CUBLAS_OP_N, CUBLAS_OP_N,
+                                           v2, q1 * group, k1, &one,
+                                           vd, v.strides[1], v.Count(1),
+                                           temp, k1, k1 * q1 * group,
+                                           &beta,
+                                           od, v2, v2 * q1 * group, q0 / group);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("status = %d\n", (int) status);
+            printf("Error: cublas error.\n");
+            throw ("cublas error");
+            exit(0);
+        }
+        FastllmCudaFree(qk);
+        FastllmCudaFree(temp);
+        return true;
+    }
     return true;
 }
 
