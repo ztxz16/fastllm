@@ -1589,6 +1589,14 @@ namespace fastllm {
         }
     }
 
+    void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
+                   int group, float scale, int attentionType) {
+        curExecutor->Run("Attention", {
+                {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
+                {"mask", (Data*)&mask}, {"output", (Data*)&output}
+        }, {{"scale", scale}}, {{"group", group}});
+    }
+
     void Embedding(const Data &input, Data &weight, Data &output) {
         curExecutor->Run("Embedding", {
                 {"input", (Data*)&input}, {"weight", &weight}, {"output", &output}
