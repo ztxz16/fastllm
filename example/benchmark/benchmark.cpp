@@ -6,6 +6,21 @@
 #include "utils.h"
 #include "fstream"
 
+#if defined(_WIN32) or defined(_WIN64)
+#include <codecvt>
+
+//GBK locale name in windows
+const char* GBK_LOCALE_NAME = ".936";
+
+std::string utf8_to_gbk(const std::string& str)
+{
+    std::wstring_convert<std::codecvt_utf8<wchar_t>> conv;
+    std::wstring tmp_wstr = conv.from_bytes(str);
+    std::wstring_convert<std::codecvt_byname<wchar_t, char, mbstate_t>> convert(new std::codecvt_byname<wchar_t, char, mbstate_t>(GBK_LOCALE_NAME));
+    return convert.to_bytes(tmp_wstr);
+}
+#endif
+
 struct BenchmarkConfig {
     std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
     int threads = 4; // 使用的线程数
@@ -58,6 +73,12 @@ int main(int argc, char **argv) {
     BenchmarkConfig config;
     ParseArgs(argc, argv, config);
     fastllm::SetThreads(config.threads);
+    std::ifstream model_file(config.path, std::ios::in);
+    if (!model_file.good()) {
+        printf("模型文件 %s 不存在！\n", config.path.c_str());
+        exit(0);
+    }
+    model_file.close();
     auto model = fastllm::CreateLLMModelFromFile(config.path);
     fastllm::GenerationConfig generationConfig;
     generationConfig.output_token_limit = config.limit;
@@ -66,25 +87,29 @@ int main(int argc, char **argv) {
     std::vector <std::string> inputs;
     if (config.file != "") {
         std::ifstream finputs(config.file, std::ios::in);
-        while (true) {
-            std::string input = "";
-            std::getline(finputs, input);
-            if (input == "") {
-                break;
-            } else {
-                inputs.push_back(input);
+        if (finputs.good()) {
+            while (true) {
+                std::string input = "";
+                std::getline(finputs, input);
+                if (input == "") {
+                    break;
+                } else {
+                    inputs.push_back(input);
+                }
             }
+            finputs.close();
         }
-    } else {
+    }
+    if (inputs.empty()) {
         inputs.push_back("Hello！");
     }
-    if (config.batch < 0) {
+    if (config.batch <= 0) {
         config.batch = inputs.size();
     }
     while (inputs.size() < config.batch) {
         inputs.push_back(inputs[rand() % inputs.size()]);
     }
-    if (inputs.size() > config.batch && config.batch != -1) {
+    if (inputs.size() > config.batch && config.batch > 0) {
         inputs.resize(config.batch);
     }
 
@@ -120,7 +145,11 @@ int main(int argc, char **argv) {
         fclose(fo);
     } else {
         for (int i = 0; i < outputs.size(); i++) {
+#if defined(_WIN32) or defined(_WIN64)
+            printf("[ user: \"%s\", model: \"%s\"]\n", utf8_to_gbk(inputs[i]).c_str(), utf8_to_gbk(outputs[i]).c_str());
+#else
             printf("[ user: \"%s\", model: \"%s\"]\n", inputs[i].c_str(), outputs[i].c_str());
+#endif
         }
     }
 
