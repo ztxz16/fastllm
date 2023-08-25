@@ -325,6 +325,9 @@ namespace fastllm {
     }
 
     void Data::Reshape(const std::vector<int> &dims) {
+        if (this->dims == dims) {
+            return;
+        }
         std::vector <int> outputDims = dims;
         uint64_t old = 1;
         for (int i : this->dims) {
