@@ -221,6 +221,8 @@ namespace fastllm {
 
             q.Reshape({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
             PermuteSelf(q, {1, 0, 2});
+            //Attention(q, pastKey, pastValue, attentionMask, contextLayer, q.dims[0] / pastKey.dims[0], 1.0 / scale_attn, 1);
+
 
             // 1.2 Attention
             // 1.2.0 q * k^T
@@ -232,7 +234,6 @@ namespace fastllm {
             if (attentionMask.dims.size() != 0) {
                 AttentionMask(attnProbs, attentionMask, -10000);
             }
-
             // 1.2.2 softmax
             Mul(attnProbs, i + 1, attnProbs);
             Softmax(attnProbs, attnProbs, -1);
@@ -463,9 +464,12 @@ namespace fastllm {
                 total = batch;
                 for (int b = 0; b < batch; b++) {
                     auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
-                    k.Reshape({k.dims[1], k.dims[0], k.dims[2]});
-                    v.Reshape({v.dims[1], v.dims[0], v.dims[2]});
-                    q.Reshape({q.dims[1], q.dims[0], q.dims[2]});
+                    std::swap(k.dims[0], k.dims[1]);
+                    k.strides[0] = k.dims[1] * k.dims[2]; k.strides[1] = k.dims[2];
+                    std::swap(v.dims[0], v.dims[1]);
+                    v.strides[0] = v.dims[1] * v.dims[2]; v.strides[1] = v.dims[2];
+                    std::swap(q.dims[0], q.dims[1]);
+                    q.strides[0] = q.dims[1] * q.dims[2]; q.strides[1] = q.dims[2];
                 }
             } else {
                 PermuteSelf(k, {1, 0, 2});
@@ -478,7 +482,6 @@ namespace fastllm {
                     total += seqLens[b];
                 }
             }
-
             for (int b = 0; b < batch; b++) {
                 auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
                 Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt +
@@ -522,7 +525,6 @@ namespace fastllm {
                     pastValue.Expansion(newDims);
                 }
             }
-
             for (int b = 0; b < batch; b++) {
                 keys[b] = (pastKeyValues[b * block_cnt + i].first);
                 values[b] = (pastKeyValues[b * block_cnt + i].second);
@@ -591,11 +593,21 @@ namespace fastllm {
                     MatMul(attnProbs[b], pastValue, curContextLayer[b]);
                 }
             }
-
-            for (int b = 0; b < batch; b++) {
-                curContextLayer[b].Reshape(outputSizes[b]);
-                PermuteSelf(curContextLayer[b], {2, 0, 1, 3});
-                curContextLayer[b].Reshape({curContextLayer[b].dims[0], curContextLayer[b].dims[1], embed_dim});
+            if (all1) {
+                for (int b = 0; b < batch; b++) {
+                    curContextLayer[b].dims[0] = outputSizes[b][2];
+                    curContextLayer[b].dims[1] = outputSizes[b][0];
+                    curContextLayer[b].dims[2] = embed_dim;
+                    curContextLayer[b].strides[0] = curContextLayer[b].dims[1] * curContextLayer[b].dims[2];
+                    curContextLayer[b].strides[1] = curContextLayer[b].dims[2];
+                    curContextLayer[b].strides[2] = 1;
+                }
+            } else {
+                for (int b = 0; b < batch; b++) {
+                    curContextLayer[b].Reshape(outputSizes[b]);
+                    PermuteSelf(curContextLayer[b], {2, 0, 1, 3});
+                    curContextLayer[b].Reshape({curContextLayer[b].dims[0], curContextLayer[b].dims[1], embed_dim});
+                }
             }
 
             if (all1 && batch > 1) {
@@ -614,7 +626,6 @@ namespace fastllm {
                     CatDirect(contextLayer, curContextLayer[b], 0);
                 }
             }
-
             // 1.2.4 dense
             std::string denseWeightName = weightPre + std::to_string(i) + weightMiddle + ".dense.weight";
             std::string denseBiasName = weightPre + std::to_string(i) + weightMiddle + ".dense.bias";
