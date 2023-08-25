@@ -3,6 +3,7 @@
 #include "moss.h"
 #include "basellm.h"
 #include "llama.h"
+#include "qwen.h"
 #include "fastllm.h"
 
 enum LLM_TYPE {
@@ -10,6 +11,7 @@ enum LLM_TYPE {
 	LLM_TYPE_MOSS = 1,
 	LLM_TYPE_VICUNA = 2,
 	LLM_TYPE_BAICHUAN = 3,
+    LLM_TYPE_QWEN = 4
 };
 
 class factoryllm {
@@ -31,6 +33,7 @@ public:
                 pLLM = new fastllm::LlamaModel();
                 break;
             default:
+                pLLM = new fastllm::QWenModel();
                 break;
         }
         return pLLM;
