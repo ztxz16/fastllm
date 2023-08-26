@@ -76,7 +76,7 @@ namespace fastllm {
         return true;
     }
 
-#ifdef __AVX__
+
 #ifdef __AVX2__
     int DotU8U8(uint8_t *a, uint8_t *b, int n) {
         __m256i acc = _mm256_setzero_si256();
@@ -104,32 +104,31 @@ namespace fastllm {
 
         return ans + I32sum(acc);
     };
-#else
-    int DotU8U8(uint8_t *a, uint8_t *b, int n) {
-        __m256i acc = _mm256_setzero_si256();
+//#else
+//    int DotU8U8(uint8_t *a, uint8_t *b, int n) {
+//        __m256i acc = _mm256_setzero_si256();
 
-        int i = 0;
-        int ans = 0;
-        for (; i + 31 < n; i += 32) {
-            __m256i bx = _mm256_loadu_si256((const __m256i *) (a + i));
-            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
+//        int i = 0;
+//        int ans = 0;
+//        for (; i + 31 < n; i += 32) {
+//            __m256i bx = _mm256_loadu_si256((const __m256i *) (a + i));
+//            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
 
-            __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
-            __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
+//            __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
+//            __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
 
-            __m256i my0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 0));
-            __m256i my1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 1));
+//            __m256i my0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 0));
+//            __m256i my1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 1));
 
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, my0));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, my1));
-        }
-        for (; i < n; i++) {
-            ans += a[i] * b[i];
-        }
+//            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, my0));
+//            //acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, my1));
+//        }
+//        for (; i < n; i++) {
+//            ans += a[i] * b[i];
+//        }
 
-        return ans + I32sum(acc);
-    };
-#endif
+//        return ans + I32sum(acc);
+//    };
     int DotU4U8(uint8_t *a, uint8_t *b, int n) {
         __m256i acc = _mm256_setzero_si256();
 
@@ -803,7 +802,7 @@ namespace fastllm {
                 c[block * kstride + i] = value;
             }
         }
-#elif defined(__AVX__)
+#elif defined(__AVX2__)
         int block = 0;
         for (; block < n; block++) {
             uint8_t *weightWalk = b;
@@ -877,7 +876,7 @@ namespace fastllm {
                     sum0 = vpadalq_u16(sum0, vmull_u8(vb, in.val[0]));
                 }
                 value += sum0[0] + sum0[1] + sum0[2] + sum0[3];
-#elif defined(__AVX__)
+#elif defined(__AVX2__)
                 value += DotU4U8(weightWalk + i * m / 2, inputWalk, m);
                 j += m;
 #endif
@@ -948,7 +947,7 @@ namespace fastllm {
                     sum0 = vpadalq_u16(sum0, vmull_u8(vb, in.val[0]));
                 }
                 value += sum0[0] + sum0[1] + sum0[2] + sum0[3];
-#elif defined(__AVX__)
+#elif defined(__AVX2__)
                 value += DotU4U8(weightWalk + i * m / 2, inputWalk, m);
                 j += m;
 #endif

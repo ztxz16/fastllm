@@ -545,7 +545,7 @@ namespace fastllm {
             weightSum.resize(n);
             for (int i = 0; i < n; i++) {
                 int j = 0;
-#ifdef __AVX__
+#ifdef __AVX2__
                 __m256i acc = _mm256_setzero_si256();
                 const __m256i ones = _mm256_set1_epi16(1);
                 for (; j + 31 < m; j += 32) {
@@ -591,7 +591,7 @@ namespace fastllm {
                 }
                 weightSum[i] += sum0[0] + sum0[1] + sum0[2] + sum0[3];
 #endif
-#ifdef __AVX__
+#ifdef __AVX2__
 	            __m256i acc = _mm256_setzero_si256();
 	            const __m256i lowMask = _mm256_set1_epi8(0xf);
 	            const __m256i ones = _mm256_set1_epi16(1);
