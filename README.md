@@ -170,10 +170,10 @@ python setup.py install
 ./webui -p model.flm --port 1234 
 
 # python版本的命令行聊天程序，使用了模型创建以及流式对话效果
-python tools/cli_demo.py -p model.flm 
+python tools/scripts/cli_demo.py -p model.flm 
 
 # python版本的简易webui，需要先安装streamlit-chat
-streamlit run tools/web_demo.py model.flm 
+streamlit run tools/scripts/web_demo.py model.flm 
 
 ```
 
@@ -319,9 +319,9 @@ make -j
 # 需要先安装ChatGLM-6B环境
 # 如果使用自己finetune的模型需要修改chatglm_export.py文件中创建tokenizer, model的代码
 cd build
-python3 tools/chatglm_export.py chatglm2-6b-fp16.flm float16 #导出float16模型
-python3 tools/chatglm_export.py chatglm2-6b-int8.flm int8 #导出int8模型
-python3 tools/chatglm_export.py chatglm2-6b-int4.flm int4 #导出int4模型
+python3 tools/scripts/chatglm_export.py chatglm2-6b-fp16.flm float16 #导出float16模型
+python3 tools/scripts/chatglm_export.py chatglm2-6b-int8.flm int8 #导出int8模型
+python3 tools/scripts/chatglm_export.py chatglm2-6b-int4.flm int4 #导出int4模型
 ```
 
 ### baichuan模型导出 (默认脚本导出baichuan-13b-chat模型)
@@ -331,9 +331,9 @@ python3 tools/chatglm_export.py chatglm2-6b-int4.flm int4 #导出int4模型
 # 如果使用自己finetune的模型需要修改baichuan2flm.py文件中创建tokenizer, model的代码
 # 根据所需的精度，导出相应的模型
 cd build
-python3 tools/baichuan2flm.py baichuan-13b-fp16.flm float16 #导出float16模型
-python3 tools/baichuan2flm.py baichuan-13b-int8.flm int8 #导出int8模型
-python3 tools/baichuan2flm.py baichuan-13b-int4.flm int4 #导出int4模型
+python3 tools/scripts/baichuan2flm.py baichuan-13b-fp16.flm float16 #导出float16模型
+python3 tools/scripts/baichuan2flm.py baichuan-13b-int8.flm int8 #导出int8模型
+python3 tools/scripts/baichuan2flm.py baichuan-13b-int4.flm int4 #导出int4模型
 ```
 
 ### MOSS模型导出
@@ -343,14 +343,14 @@ python3 tools/baichuan2flm.py baichuan-13b-int4.flm int4 #导出int4模型
 # 如果使用自己finetune的模型需要修改moss_export.py文件中创建tokenizer, model的代码
 # 根据所需的精度，导出相应的模型
 cd build
-python3 tools/moss_export.py moss-fp16.flm float16 #导出float16模型
-python3 tools/moss_export.py moss-int8.flm int8 #导出int8模型
-python3 tools/moss_export.py moss-int4.flm int4 #导出int4模型
+python3 tools/scripts/moss_export.py moss-fp16.flm float16 #导出float16模型
+python3 tools/scripts/moss_export.py moss-int8.flm int8 #导出int8模型
+python3 tools/scripts/moss_export.py moss-int4.flm int4 #导出int4模型
 ```
 
 ### LLAMA系列模型导出
 ``` sh
-# 修改build/tools/alpaca2flm.py程序进行导出
+# 修改build/tools/scripts/alpaca2flm.py程序进行导出
 # 不同llama模型使用的指令相差很大，需要参照torch2flm.py中的参数进行配置
 ```
 
@@ -359,9 +359,9 @@ python3 tools/moss_export.py moss-int4.flm int4 #导出int4模型
 # 需要先安装QWen环境
 # 如果使用自己finetune的模型需要修改qwen2flm.py文件中创建tokenizer, model的代码
 # 根据所需的精度，导出相应的模型
-python3 tools/qwen2flm.py qwen-7b-fp16.flm float16 #导出float16模型
-python3 tools/qwen2flm.py qwen-7b-int8.flm int8 #导出int8模型
-python3 tools/qwen2flm.py qwen-7b-int4.flm int4 #导出int4模型
+python3 tools/scripts/qwen2flm.py qwen-7b-fp16.flm float16 #导出float16模型
+python3 tools/scripts/qwen2flm.py qwen-7b-int8.flm int8 #导出int8模型
+python3 tools/scripts/qwen2flm.py qwen-7b-int4.flm int4 #导出int4模型
 ```
 
 ## 开发计划
