@@ -1272,6 +1272,7 @@ struct CudaMemoryBuffer {
             data(data), size(size), busy(busy) {}
 };
 std::map<int, std::vector <CudaMemoryBuffer>> cudaBuffersMap;
+std::map<int, size_t> noBusyCnt;
 std::map<int, std::vector <CudaMemoryBuffer>> bigBuffersMap;
 
 void * FastllmCudaMalloc(size_t size) {
@@ -1302,6 +1303,7 @@ void * FastllmCudaMalloc(size_t size) {
     for (int i = 0; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy) {
             cudaBuffers[i].busy = true;
+            noBusyCnt[id] -= cudaBuffers[i].size;
             return cudaBuffers[i].data;
         }
     }
@@ -1315,10 +1317,29 @@ void FastllmCudaFree(void *ret) {
     if (ret == nullptr) {
         return;
     }
-    for (auto &it : cudaBuffersMap) {
+    for (auto &it: cudaBuffersMap) {
+        if (noBusyCnt[it.first] > 1024 * 1024 * 1024) {
+            auto &cudaBuffers = it.second;
+            std::vector <CudaMemoryBuffer> temp;
+            for (int i = 0; i < cudaBuffers.size(); i++) {
+                if (!cudaBuffers[i].busy) {
+                    cudaSetDevice(it.first);
+                    cudaFree(cudaBuffers[i].data);
+                } else {
+                    temp.push_back(cudaBuffers[i]);
+                }
+            }
+            cudaBuffers.clear();
+            it.second = temp;
+            noBusyCnt[it.first] = 0;
+        }
+    }
+
+    for (auto &it: cudaBuffersMap) {
         auto &cudaBuffers = it.second;
         for (int i = 0; i < cudaBuffers.size(); i++) {
             if (cudaBuffers[i].data == ret) {
+                noBusyCnt[it.first] += cudaBuffers[i].size;
                 cudaBuffers[i].busy = false;
                 return;
             }
