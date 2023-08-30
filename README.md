@@ -33,7 +33,7 @@ mkdir build
 cd build
 cmake .. -DUSE_CUDA=ON # 如果不使用GPU编译，那么使用 cmake .. -DUSE_CUDA=OFF
 make -j
-cd tools && python setup.py install
+cd tools && python3 -m pip install .
 ```
 
 然后只需要在原本的推理程序中加入两行即可使用fastllm加速
@@ -152,7 +152,7 @@ make -j
 
 ``` sh
 cd tools # 这时在fastllm/build/tools目录下
-python setup.py install
+python3 -m pip install .
 ```
 
 ### 运行demo程序
