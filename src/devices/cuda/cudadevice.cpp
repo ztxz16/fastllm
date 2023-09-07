@@ -43,6 +43,7 @@ namespace fastllm {
         this->ops["MatMulTransBBatch"] = (BaseOperator*)(new CudaMatMulTransBBatchOp());
         this->ops["SoftMaxBatch"] = (BaseOperator*)(new CudaSoftmaxBatchOp());
         this->ops["CatDirectBatch"] = (BaseOperator*)(new CudaCatDirectBatchOp());
+        this->ops["AttentionBatch"] = (BaseOperator*)(new CudaAttentionBatchOp());
     }
 
     bool CudaDevice::Malloc(void **ret, size_t size) {
@@ -90,10 +91,11 @@ namespace fastllm {
 
     void CudaAttention::Run(const std::string &opType, const fastllm::DataDict &datas,
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data emptyData;
         Data &q = *(datas.find("q")->second);
         Data &k = *(datas.find("k")->second);
         Data &v = *(datas.find("v")->second);
-        Data &mask = *(datas.find("mask")->second);
+        Data &mask = datas.find("mask")->second ? *(datas.find("mask")->second) : emptyData;
         Data &output = *(datas.find("output")->second);
         int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
