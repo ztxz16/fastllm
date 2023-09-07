@@ -69,10 +69,10 @@ namespace fastllm {
             if (intParams.find(it.first + "___batch") != intParams.end()) {
                 int batch = intParams.find(it.first + "___batch")->second;
                 for (int i = 0; i < batch; i++) {
-                    lockInCPU |= ((Data**)it.second)[i]->lockInCPU;
+                    lockInCPU |= (((Data**)it.second)[i] && ((Data**)it.second)[i]->lockInCPU);
                 }
             } else {
-                lockInCPU |= it.second->lockInCPU;
+                lockInCPU |= (it.second && it.second->lockInCPU);
             }
         }
         for (auto device: devices) {
@@ -89,10 +89,14 @@ namespace fastllm {
                     if (intParams.find(it.first + "___batch") != intParams.end()) {
                         int batch = intParams.find(it.first + "___batch")->second;
                         for (int i = 0; i < batch; i++) {
-                            ((Data**)it.second)[i]->ToDevice((void *) device);
+                            if (((Data**)it.second)[i]) {
+                                ((Data**)it.second)[i]->ToDevice((void *) device);
+                            }
                         }
                     } else {
-                        it.second->ToDevice((void *) device);
+                        if (it.second) {
+                            it.second->ToDevice((void *) device);
+                        }
                     }
                 }
                 device->Reshape(opType, datas, floatParams, intParams);
