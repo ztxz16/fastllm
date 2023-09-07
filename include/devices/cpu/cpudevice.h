@@ -180,6 +180,11 @@ namespace fastllm {
     class CpuCatDirectBatchOp : BaseBatchOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
+
+    class CpuAttentionBatchOp : BaseBatchOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
 }
 
 #endif //FASTLLM_CPUDEVICE_H
