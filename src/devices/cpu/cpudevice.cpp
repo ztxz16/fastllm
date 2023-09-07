@@ -57,6 +57,7 @@ namespace fastllm {
         this->ops["MatMulTransBBatch"] = (BaseOperator*)(new CpuMatMulTransBBatchOp());
         this->ops["SoftMaxBatch"] = (BaseOperator*)(new CpuSoftmaxBatchOp());
         this->ops["CatDirectBatch"] = (BaseOperator*)(new CpuCatDirectBatchOp());
+        this->ops["AttentionBatch"] = (BaseOperator*)(new CpuAttentionBatchOp());
     }
 
     bool CpuDevice::Malloc(void **ret, size_t size) {
@@ -280,7 +281,7 @@ namespace fastllm {
         float *qd = (float*)q.cpuData;
         float *kd = (float*)k.cpuData;
         float *vd = (float*)v.cpuData;
-        float *maskd = mask.dims.size() > 0 ? (float*)mask.cpuData : nullptr;
+        float *maskd = (datas.find("mask")->second && mask.dims.size() > 0) ? (float*)mask.cpuData : nullptr;
         float *od = (float*)output.cpuData;
         std::fill(od, od + output.Count(0), 0.0f);
         auto pool = GetPool();

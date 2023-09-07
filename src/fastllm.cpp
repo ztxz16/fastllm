@@ -1814,6 +1814,21 @@ namespace fastllm {
         }, {}, {{"axis", axis}, {"input0___batch", (int)input0.size()}, {"input1___batch", (int)input1.size()}});
     }
 
+    void AttentionBatch(std::vector <Data*> &q, std::vector <Data*> &k, std::vector <Data*> &v,
+                        std::vector <Data*> &mask, std::vector <Data*> &output,
+                        int group, float scale, int attentionType) {
+        curExecutor->Run("AttentionBatch", {
+                {"q", (Data*)q.data()}, {"k", (Data*)k.data()}, {"v", (Data*)v.data()},
+                {"mask", (Data*)mask.data()}, {"output", (Data*)output.data()}
+        },
+        {{"scale", scale}},
+        {
+            {"group", group},
+            {"q___batch", (int)q.size()}, {"k___batch", (int)k.size()}, {"v___batch", (int)v.size()},
+            {"mask___batch", (int)mask.size()}, {"output___batch", (int)output.size()}
+        });
+    }
+
     void LoraLayer(Data &input, Data &weight, Data &loraA, Data &loraB, const Data &bias, Data &output, 
                    std::map <std::string, std::string> loraConfig) {
         float r = std::atof(loraConfig["r"].c_str());
