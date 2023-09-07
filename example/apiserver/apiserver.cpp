@@ -178,13 +178,40 @@ struct HttpRequest {
         }
     }
 
+    bool IsValid (char *buffer, int size) {
+        char *old = buffer;
+        headers.clear();
+        ToNext(buffer, " ", method);
+        ToNext(buffer, " ", route);
+        ToNext(buffer, "\r\n", type);
+        while (true) {
+            if (buffer[0] == 0 || ((long long)(buffer - old)) > 1024 * 1024) {
+                break;
+            }
+            if (buffer[0] == '\r' && buffer[1] == '\n') {
+                if (headers.find("Content-Length") != headers.end()) {
+                    if (size - ((long long)(buffer - old)) - 2 >= atoi(headers["Content-Length"].c_str())) {
+                        return true;
+                    } else {
+                        return false;
+                    }
+                }
+            } else {
+                std::string key;
+                ToNext(buffer, ":", key);
+                ToNext(buffer, "\r\n", headers[key]);
+            }
+        }
+        return false;
+    }
+
     void Print() {
         for (auto &it : headers) {
             printf("%s: %s\n", it.first.c_str(), it.second.c_str());
         }
         printf("body: %s\n", body.c_str());
     }
-};
+} httpChecker;
 
 struct WorkNode {
     int client;
@@ -234,10 +261,10 @@ struct WorkQueue {
                     WorkNode *now = ts->q.front();
                     ts->q.pop();
                     ts->activateQueryNumber++;
-//ts->totalQueryNumber++;
-//printf("totalQueryNumber = %d\n", ts->totalQueryNumber);
-//printf("activate = %d, q.size() = %d\n", ts->activateQueryNumber, (int) ts->q.size());
-                    new std::thread([](WorkQueue *ts, WorkNode *now) {
+ts->totalQueryNumber++;
+printf("totalQueryNumber = %d\n", ts->totalQueryNumber);
+printf("activate = %d, q.size() = %d\n", ts->activateQueryNumber, (int) ts->q.size());
+                    std::thread *t = new std::thread([](WorkQueue *ts, WorkNode *now) {
                         ts->Deal(now);
                         printf("Response client %d finish\n", now->client);
                         ts->locker.lock();
@@ -375,7 +402,6 @@ int main(int argc, char** argv) {
     listen(local_fd, 2000);
     printf("start...\n");
     int queuePos = 0;
-
     while (true) { //循环接收客户端的请求
         //5.创建一个sockaddr_in结构体，用来存储客户机的地址
         struct sockaddr_in client_addr;
@@ -386,8 +412,19 @@ int main(int argc, char** argv) {
             exit(-1);
         }
 
-        int size = read(client, buff, sizeof(buff));
+        int size = 0;
+        while (true) {
+            int cur = read(client, buff + size, sizeof(buff) - size);
+            size += cur;
+            if (httpChecker.IsValid(buff, size)) {
+                break;
+            }
+        }
         buff[size] = 0;
+
+        while (workQueue.q.size() > workQueue.maxActivateQueryNumber) {
+            sleep(0);
+        }
         workQueue.Push(buff, client);
     }
 
