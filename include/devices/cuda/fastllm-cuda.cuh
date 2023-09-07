@@ -55,6 +55,8 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
                                  const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim);
 bool FastllmCudaApplyLognAttn (fastllm::Data &input, fastllm::Data &lognAttn, fastllm::Data &positionIds);
 
+bool FastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::Data **v,
+                          fastllm::Data **mask, fastllm::Data **output, int group, float scale, int batch);
 bool FastllmCudaSplitBatch(fastllm::Data &input, fastllm::Data **outputs, int axis);
 bool FastllmCudaCatBatch(fastllm::Data **inputs, fastllm::Data &output, int axis);
 bool FastllmCudaMulBatch(fastllm::Data **inputs, float v, int batch, fastllm::Data **outputs);
