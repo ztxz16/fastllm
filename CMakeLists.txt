@@ -42,7 +42,7 @@ if (USE_CUDA)
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/cuda/fastllm-cuda.cu)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
-    set(CMAKE_CUDA_ARCHITECTURES "native")
+    set(CMAKE_CUDA_ARCHITECTURES "all")
 endif()
 
 if (PY_API)
