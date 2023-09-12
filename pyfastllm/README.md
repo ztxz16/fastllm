@@ -12,6 +12,12 @@ pyfastllm是基于fastllm的python api接口实现，通过pyfastllm可以更加
 
 ## 版本更新
 
+### v0.1.4 2023-09-12
+
+- 修复了一些后端接口变动的bug
+- 增加了新的ops, 支持低级op操作
+
+
 ### v0.1.3 2023-07-08
 
 - 增加使用和API接口文档
@@ -80,6 +86,7 @@ demo/cli_thread.py: 多线程调用api接口示例(推荐)
 demo/cli_low_api.py: 底层API调用示例
 demo/convert_model.py: 模型转换示例
 demo/web_api.py, demo/web_api_client.py: fastapi webapi调用
+demo/test_ops: 部分op的使用样例及测试
 
 ### 命令行工具
 
@@ -187,8 +194,10 @@ python web_api.py -m 0 -p path_for_chatglm --max_batch_size 32
 
 - [x]  修改response_batch的output_str函数，以返回值的形式返回答案
 - [x]  编解码部分优化，合并不同的返回类型
+- [ ]  对接numpy等矩阵库
 - [ ]  Tensor的深复制和浅复制，以及基础运算符重载
 - [ ]  fix low_api下pastKV复制的bug
-- [ ] 模型运行参数对象类，封装模型运行时参数，包含模型路径、运行线程数、是否为低内存模型、惩罚因子、温度等
-- [ ]  暴露更多的底层api接口，按照module的方式定义模型的点，拼接model实现自定义model
+- [x]  模型运行参数对象类，封装模型运行时参数，包含模型路径、运行线程数、是否为低内存模型、惩罚因子、温度等
+- [ ]  增加更多的op
+- [ ]  增加module
 
