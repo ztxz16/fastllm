@@ -20,6 +20,9 @@
 namespace fastllm {
     CpuDevice::CpuDevice() {
         this->deviceType = "cpu";
+        this->ops["ToFloat16"] = (BaseOperator*)(new CpuToFloat16());
+        this->ops["ToFloat32"] = (BaseOperator*)(new CpuToFloat32());
+        this->ops["Attention"] = (BaseOperator*)(new CpuAttention());
         this->ops["Embedding"] = (BaseOperator*)(new CpuEmbedding());
         this->ops["LayerNorm"] = (BaseOperator*)(new CpuLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CpuRMSNormOp());
@@ -45,6 +48,16 @@ namespace fastllm {
         this->ops["NearlyRotatePosition2D"] = (BaseOperator*)(new CpuNearlyRotatePosition2DOp());
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CpuLlamaRotatePosition2DOp());
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CpuRepeatPenaltyOp());
+        this->ops["ApplyLognAttn"] = (BaseOperator*)(new CpuApplyLognAttnOp());
+
+        this->ops["SplitBatch"] = (BaseOperator*)(new CpuSplitBatchOp());
+        this->ops["CatBatch"] = (BaseOperator*)(new CpuCatBatchOp());
+        this->ops["MulBatch"] = (BaseOperator*)(new CpuMulBatchOp());
+        this->ops["MatMulBatch"] = (BaseOperator*)(new CpuMatMulBatchOp());
+        this->ops["MatMulTransBBatch"] = (BaseOperator*)(new CpuMatMulTransBBatchOp());
+        this->ops["SoftMaxBatch"] = (BaseOperator*)(new CpuSoftmaxBatchOp());
+        this->ops["CatDirectBatch"] = (BaseOperator*)(new CpuCatDirectBatchOp());
+        this->ops["AttentionBatch"] = (BaseOperator*)(new CpuAttentionBatchOp());
     }
 
     bool CpuDevice::Malloc(void **ret, size_t size) {
@@ -140,6 +153,149 @@ namespace fastllm {
         return ans + I32sum(acc);
     };
 #endif
+
+    struct FP16ToFP32Manager {
+        float dict[65536];
+
+        FP16ToFP32Manager() {
+            for (uint16_t i = 0; i < 65535; i++) {
+                dict[i] = half_to_float(i);
+            }
+        }
+    } fp16tofp32;
+
+    void CpuToFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        if (data.dataType == DataType::FLOAT16) {
+            return;
+        }
+        if (data.dataType == DataType::FLOAT32) {
+            float *old = (float*)data.cpuData;
+            data.dataType = DataType::FLOAT16;
+            data.cpuData = new uint8_t[data.GetBytes()];
+            uint16_t *cur = (uint16_t*)data.cpuData;
+            int len = data.Count(0);
+            for (int i = 0; i < len; i++) {
+                cur[i] = float_to_half(old[i]);
+            }
+            delete[] old;
+        } else {
+            ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
+        }
+    }
+
+    void CpuToFloat32::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        if (data.dataType == DataType::FLOAT32) {
+            return;
+        }
+        if (data.dataType == DataType::FLOAT16) {
+            uint16_t *old = (uint16_t*)data.cpuData;
+            data.dataType = DataType::FLOAT32;
+            data.UpdateUnitSize();
+            data.cpuData = new uint8_t[data.GetBytes()];
+            float *cur = (float*)data.cpuData;
+            int len = data.Count(0);
+            for (int i = 0; i < len; i++) {
+                cur[i] = fp16tofp32.dict[old[i]];
+            }
+            delete[] old;
+        } else {
+            ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
+        }
+    }
+
+    void CpuAttention::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+
+        AssertInFastLLM(q.dims.size() == 3 && k.dims.size() == 3 && v.dims.size() == 3, "Attention: dims of q, k, v should be 3.\n");
+        AssertInFastLLM(q.dims[2] == k.dims[2], "Attention: q.dims[2] should be equal to k.dims[2].\n");
+        AssertInFastLLM(k.dims[1] == v.dims[1], "Attention: k.dims[1] should be equal to v.dims[1].\n");
+        AssertInFastLLM(k.dims[0] == v.dims[0], "Attention: k.dims[0] should be equal to v.dims[0].\n");
+        AssertInFastLLM(q.dims[0] == k.dims[0] * group, "Attention: q.dims[0] should be equal to k.dims[0] * group.\n");
+
+        AssertInFastLLM(q.dataType == k.dataType && q.dataType == v.dataType,
+                        "Attention: q, k, v's datatype should be same.\n");
+        AssertInFastLLM(q.dataType == DataType::FLOAT32, "Attention's input's type should be float32.\n");
+
+        std::vector <int> dims = {q.dims[0], q.dims[1], v.dims[2]};
+        output.dataType = q.dataType;
+        output.Resize(dims);
+    }
+
+    void SingleAttention(float *qd, float *kd, float *vd, float *maskd, float *od,
+                         float scale, int q1, int q2, int k1, int v2) {
+        float *qk = new float[k1];
+        float *temp = new float[k1];
+        for (int i = 0; i < q1; i++) {
+            float maxValue = -10000, sum = 0.0;
+            for (int j = 0; j < k1; j++) {
+                if (maskd && maskd[i * k1 + j] > 0.99) {
+                    qk[j] = -10000;
+                    continue;
+                }
+                float sum = 0.0f;
+                for (int l = 0; l < q2; l++) {
+                    sum += qd[i * q2 + l] * kd[j * q2 + l];
+                }
+                qk[j] = sum * scale;
+                maxValue = std::max(maxValue, sum * scale);
+            }
+            for (int j = 0; j < k1; j++) {
+                temp[j] = expf(qk[j] - maxValue);
+                sum += temp[j];
+            }
+            sum = std::max(sum, 0.1f);
+            for (int j = 0; j < k1; j++) {
+                qk[j] = temp[j] / sum;
+            }
+            for (int j = 0; j < k1; j++) {
+                for (int l = 0; l < v2; l++) {
+                    od[i * v2 + l] += qk[j] * vd[j * v2 + l];
+                }
+            }
+        }
+        delete[] qk;
+        delete[] temp;
+    }
+
+    void CpuAttention::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &mask = *(datas.find("mask")->second);
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+
+        output.Allocate();
+        int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
+        float *qd = (float*)q.cpuData;
+        float *kd = (float*)k.cpuData;
+        float *vd = (float*)v.cpuData;
+        float *maskd = (datas.find("mask")->second && mask.dims.size() > 0) ? (float*)mask.cpuData : nullptr;
+        float *od = (float*)output.cpuData;
+        std::fill(od, od + output.Count(0), 0.0f);
+        auto pool = GetPool();
+        std::vector<std::future<void> > futures;
+        for (int o = 0; o < q0; o++) {
+            futures.push_back(pool->Submit(SingleAttention,
+                            qd + o * q.strides[0], kd + (o / group) * k.strides[0], vd + (o / group) * v.strides[0],
+                            maskd ? (maskd + o / (q0 / mask.dims[0])) : maskd, od + o * output.strides[0], scale,
+                            q1, q2, k1, v2));
+        }
+        for (int o = 0; o < futures.size(); o++) {
+            futures[o].get();
+        }
+    }
 
     void CpuEmbedding::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
@@ -369,45 +525,70 @@ namespace fastllm {
         int outer = input.Count(0) / input.Count(axis);
         int channels = input.dims[axis];
 
-        float *inputData = (float *) input.cpuData;
-        float *outputData = (float *) output.cpuData;
-        float *weightData = (float *) weight.cpuData;
+        if (input.dataType == DataType::FLOAT32) {
+            float *inputData = (float *) input.cpuData;
+            float *outputData = (float *) output.cpuData;
+            float *weightData = (float *) weight.cpuData;
 
-        for (int i = 0; i < outer; i++) {
-            float mean = 0.f;
-            int j = 0;
+            for (int i = 0; i < outer; i++) {
+                float mean = 0.f;
+                int j = 0;
 #ifdef __aarch64__X
-            float32x4_t sums = vdupq_n_f32(0.0);
-            float32x4_t sums2 = vdupq_n_f32(0.0);
-            for (; j + 3 < channels; j += 4) {
-                float32x4_t vi = vld1q_f32(inputData + j);
-                sums = vaddq_f32(sums, vi);
-                sums2 = vaddq_f32(sums2, vmulq_f32(vi, vi));
-            }
-            mean = sums[0] + sums[1] + sums[2] + sums[3];
-            s2 = sums2[0] + sums2[1] + sums2[2] + sums2[3];
+                float32x4_t sums = vdupq_n_f32(0.0);
+                float32x4_t sums2 = vdupq_n_f32(0.0);
+                for (; j + 3 < channels; j += 4) {
+                    float32x4_t vi = vld1q_f32(inputData + j);
+                    sums = vaddq_f32(sums, vi);
+                    sums2 = vaddq_f32(sums2, vmulq_f32(vi, vi));
+                }
+                mean = sums[0] + sums[1] + sums[2] + sums[3];
+                s2 = sums2[0] + sums2[1] + sums2[2] + sums2[3];
 #endif
-            for (; j < channels; j++) {
-                mean += inputData[j] * inputData[j];
-            }
-            float scale = 1.0 / sqrt(mean / channels + eps);
-            j = 0;
+                for (; j < channels; j++) {
+                    mean += inputData[j] * inputData[j];
+                }
+                float scale = 1.0 / sqrt(mean / channels + eps);
+                j = 0;
 #ifdef __aarch64__X
-            float32x4_t means = vdupq_n_f32(mean);
-            float32x4_t vars = vdupq_n_f32(1.0 / var);
-            for (; j + 3 < channels; j += 4) {
-                float32x4_t va = vld1q_f32(gammaData + j), vb = vld1q_f32(betaData + j);
-                float32x4_t vi = vld1q_f32(inputData + j);
-                float32x4_t vo = vaddq_f32(vmulq_f32(vmulq_f32(vsubq_f32(vi, means), vars), va), vb);
-                vst1q_f32(outputData + j, vo);
-            }
+                float32x4_t means = vdupq_n_f32(mean);
+                float32x4_t vars = vdupq_n_f32(1.0 / var);
+                for (; j + 3 < channels; j += 4) {
+                    float32x4_t va = vld1q_f32(gammaData + j), vb = vld1q_f32(betaData + j);
+                    float32x4_t vi = vld1q_f32(inputData + j);
+                    float32x4_t vo = vaddq_f32(vmulq_f32(vmulq_f32(vsubq_f32(vi, means), vars), va), vb);
+                    vst1q_f32(outputData + j, vo);
+                }
 #endif
-            for (; j < channels; j++) {
-                outputData[j] = inputData[j] * scale * weightData[j];
-            }
+                for (; j < channels; j++) {
+                    outputData[j] = inputData[j] * scale * weightData[j];
+                }
 
-            inputData += channels;
-            outputData += channels;
+                inputData += channels;
+                outputData += channels;
+            }
+        } else if (input.dataType == DataType::FLOAT16) {
+            uint16_t *inputData = (uint16_t *) input.cpuData;
+            uint16_t *outputData = (uint16_t *) output.cpuData;
+            float *weightData = (float *) weight.cpuData;
+
+            for (int i = 0; i < outer; i++) {
+                float mean = 0.f;
+                int j = 0;
+                for (; j < channels; j++) {
+                    float x = fp16tofp32.dict[inputData[j]];
+                    mean += x * x;
+                }
+                float scale = 1.0 / sqrt(mean / channels + eps);
+                j = 0;
+                for (; j < channels; j++) {
+                    outputData[j] = float_to_half(fp16tofp32.dict[inputData[j]] * scale * weightData[j]);
+                }
+
+                inputData += channels;
+                outputData += channels;
+            }
+        } else {
+            ErrorInFastLLM("RMSNorm error: unsupport dataType.\n");
         }
     }
 
@@ -424,7 +605,7 @@ namespace fastllm {
         std::vector <int> dims = input.dims;
         dims.back() = weight.dims[0];
 
-        output.dataType = DataType::FLOAT32;
+        output.dataType = input.dataType;
         output.Resize(dims);
     }
 
@@ -458,16 +639,6 @@ namespace fastllm {
             }
         }
     }
-
-    struct FP16ToFP32Manager {
-        float dict[65536];
-
-        FP16ToFP32Manager() {
-            for (uint16_t i = 0; i < 65535; i++) {
-                dict[i] = half_to_float(i);
-            }
-        }
-    } fp16tofp32;
 
     // float的input, float16的weight, 直接计算得到float的output
     void Float16LinearPart(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
@@ -508,6 +679,29 @@ namespace fastllm {
                     now += inputData[i * m + l] * fp16tofp32.dict[weightData[j * m + l]];
                 }
                 outputData[i * k + j] = now;
+            }
+        }
+    }
+
+    // float16的input, float16的weight, 直接计算得到float16的output
+    void Float16xFloat16LinearPart(uint16_t *inputData, uint16_t *weightData, float *biasData, uint16_t *outputData,
+                           int n, int m, int k, int st, int end) {
+        for (int i = 0; i < n; i++) {
+            for (int j = st; j < end; j++) {
+                float now = biasData ? biasData[j] : 0.0f;
+                int l = 0;
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+                float16x8_t sum = {0, 0, 0, 0, 0, 0, 0, 0};
+                for (; l + 7 < m; l += 8) {
+                    sum = vfmaq_f16(sum, vld1q_f16((float16_t*)inputData + i * m + l),
+                                        vld1q_f16((float16_t*)weightData + j * m + l));
+                }
+                now += sum[0] + sum[1] + sum[2] + sum[3] + sum[4] + sum[5] + sum[6] + sum[7];
+#endif
+                for (; l < m; l++) {
+                    now += inputData[i * m + l] * fp16tofp32.dict[weightData[j * m + l]];
+                }
+                outputData[i * k + j] = float_to_half(now);
             }
         }
     }
@@ -959,7 +1153,7 @@ namespace fastllm {
 
     void CpuLinearOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-auto st = std::chrono::system_clock::now();
+//auto st = std::chrono::system_clock::now();
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
@@ -970,173 +1164,176 @@ auto st = std::chrono::system_clock::now();
         int m = input.dims.back();
         int k = output.dims.back();
 
-        if (weight.dataType == DataType::FLOAT32) {
-            float *inputData = (float *) input.cpuData;
-            float *weightData = (float *) weight.cpuData;
-            float *outputData = (float *) output.cpuData;
-            float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+        if (input.dataType == DataType::FLOAT32 && output.dataType == DataType::FLOAT32) {
+            if (weight.dataType == DataType::FLOAT32) {
+                float *inputData = (float *) input.cpuData;
+                float *weightData = (float *) weight.cpuData;
+                float *outputData = (float *) output.cpuData;
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
 
-            int threadNum = GetThreads();
-            int per = k / threadNum;
-            int cur = 0;
-            auto pool = GetPool();
-            std::vector <std::future <void> > futures;
-            for (int i = 0; i < threadNum - 1; i++) {
-                int end = cur + per + (cur + per * (threadNum - i) < k);
-                futures.push_back(pool->Submit(FloatLinearPart, inputData, weightData, biasData, outputData,
-                                                  n, m, k, cur, end));
-                cur = end;
-            }
+                int threadNum = GetThreads();
+                int per = k / threadNum;
+                int cur = 0;
+                auto pool = GetPool();
+                std::vector<std::future<void> > futures;
+                for (int i = 0; i < threadNum - 1; i++) {
+                    int end = cur + per + (cur + per * (threadNum - i) < k);
+                    futures.push_back(pool->Submit(FloatLinearPart, inputData, weightData, biasData, outputData,
+                                                   n, m, k, cur, end));
+                    cur = end;
+                }
 
-            FloatLinearPart(inputData, weightData, biasData, outputData, n, m, k, cur, k);
-            for (int i = 0; i < futures.size(); i++) {
-                futures[i].get();
-            }
-        } else if (weight.dataType == DataType::FLOAT16) {
-            float *inputData = (float *) input.cpuData;
-            uint16_t *weightData = (uint16_t *) weight.cpuData;
-            float *outputData = (float *) output.cpuData;
-            float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                FloatLinearPart(inputData, weightData, biasData, outputData, n, m, k, cur, k);
+                for (int i = 0; i < futures.size(); i++) {
+                    futures[i].get();
+                }
+            } else if (weight.dataType == DataType::FLOAT16) {
+                float *inputData = (float *) input.cpuData;
+                uint16_t *weightData = (uint16_t *) weight.cpuData;
+                float *outputData = (float *) output.cpuData;
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
 #ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
-            uint16_t *temp = new uint16_t[n * m];
-            for (int i = 0; i < n * m; i++) {
-                temp[i] = float_to_half(inputData[i]);
-            }
-            inputData = (float*)temp;
+                uint16_t *temp = new uint16_t[n * m];
+                for (int i = 0; i < n * m; i++) {
+                    temp[i] = float_to_half(inputData[i]);
+                }
+                inputData = (float*)temp;
 #endif
-            int threadNum = GetThreads();
-            int per = k / threadNum;
-            int cur = 0;
-            auto pool = GetPool();
-            std::vector <std::future <void> > futures;
-            for (int i = 0; i < threadNum - 1; i++) {
-                int end = cur + per + (cur + per * (threadNum - i) < k);
-                futures.push_back(pool->Submit(Float16LinearPart, inputData, weightData, biasData, outputData,
-                                                  n, m, k, cur, end));
-                cur = end;
-            }
+                int threadNum = GetThreads();
+                int per = k / threadNum;
+                int cur = 0;
+                auto pool = GetPool();
+                std::vector<std::future<void> > futures;
+                for (int i = 0; i < threadNum - 1; i++) {
+                    int end = cur + per + (cur + per * (threadNum - i) < k);
+                    futures.push_back(pool->Submit(Float16LinearPart, inputData, weightData, biasData, outputData,
+                                                   n, m, k, cur, end));
+                    cur = end;
+                }
 
-            Float16LinearPart(inputData, weightData, biasData, outputData, n, m, k, cur, k);
-            for (int i = 0; i < futures.size(); i++) {
-                futures[i].get();
-            }
+                Float16LinearPart(inputData, weightData, biasData, outputData, n, m, k, cur, k);
+                for (int i = 0; i < futures.size(); i++) {
+                    futures[i].get();
+                }
 #ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
-            delete[] temp;
+                delete[] temp;
 #endif
-        } else if (weight.dataType == DataType::INT8) {
-            float *inputData = (float *) input.cpuData;
-            uint8_t *weightData = (uint8_t *) weight.cpuData;
-            float *outputData = (float *) output.cpuData;
-            float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
-            weight.CalcWeightSum();
+            } else if (weight.dataType == DataType::INT8) {
+                float *inputData = (float *) input.cpuData;
+                uint8_t *weightData = (uint8_t *) weight.cpuData;
+                float *outputData = (float *) output.cpuData;
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                weight.CalcWeightSum();
 
-            std::vector <LowBitConfig> inputConfigs;
-            for (int i = 0; i < n; i++) {
-                float minValue = 1e9, maxValue = -1e9;
-                for (int j = 0; j < m; j++) {
-                    minValue = std::min(minValue, inputData[i * m + j]);
-                    maxValue = std::max(maxValue, inputData[i * m + j]);
+                std::vector<LowBitConfig> inputConfigs;
+                for (int i = 0; i < n; i++) {
+                    float minValue = 1e9, maxValue = -1e9;
+                    for (int j = 0; j < m; j++) {
+                        minValue = std::min(minValue, inputData[i * m + j]);
+                        maxValue = std::max(maxValue, inputData[i * m + j]);
+                    }
+                    inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
                 }
-                inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
-            }
-            std::vector <uint8_t> uinput;
-            uinput.resize(n * m);
-            for (int i = 0; i < n * m; i++) {
+                std::vector<uint8_t> uinput;
+                uinput.resize(n * m);
+                for (int i = 0; i < n * m; i++) {
 #ifdef __AVX2__
-                uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
-                uinput[i] = (uinput[i] + !uinput[i]) ^ 128;
+                    uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
+                    uinput[i] = (uinput[i] + !uinput[i]) ^ 128;
 #else
-                uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
+                    uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
 #endif
-            }
+                }
 
-            MultiplyMultiThread(uinput.data(), weightData, (int32_t*)outputData, n, m, k, GetThreads());
-            for (int i = 0; i < n; i++) {
-                uint32_t inputSum = 0;
-                for (int j = 0; j < m; j++) {
+                MultiplyMultiThread(uinput.data(), weightData, (int32_t *) outputData, n, m, k, GetThreads());
+                for (int i = 0; i < n; i++) {
+                    uint32_t inputSum = 0;
+                    for (int j = 0; j < m; j++) {
 #ifdef __AVX2__
-                    inputSum += uinput[i * m + j] ^ 128;
+                        inputSum += uinput[i * m + j] ^ 128;
 #else
-                    inputSum += uinput[i * m + j];
+                        inputSum += uinput[i * m + j];
 #endif
-                }
+                    }
 
-                for (int j = 0; j < k; j++) {
-                    int value = ((int32_t*)outputData)[i * k + j];
+                    for (int j = 0; j < k; j++) {
+                        int value = ((int32_t *) outputData)[i * k + j];
 #ifdef __AVX2__
-                    value += (128 * weight.weightSum[j]);
-                    value += (128 * inputSum);
-                    value -= m * 128 * 128;
+                        value += (128 * weight.weightSum[j]);
+                        value += (128 * inputSum);
+                        value -= m * 128 * 128;
 #endif
-                    value -= weight.weightSum[j] * inputConfigs[i].zeroPoint;
-                    value -= inputSum * weight.perChannelsConfigs[j].zeroPoint;
-                    value += (int)inputConfigs[i].zeroPoint * weight.perChannelsConfigs[j].zeroPoint * m;
-                    outputData[i * k + j] = weight.perChannelsConfigs[j].scale * inputConfigs[i].scale * value +
-                                            (biasData == nullptr ? 0.0 : biasData[j]);
-                }
-            }
-
-            /*
-            这部分是float输入，float输出
-            int threadNum = threads;
-            int per = k / threadNum;
-            int cur = 0;
-            std::vector<std::thread *> threads;
-            for (int i = 0; i < threadNum - 1; i++) {
-                int end = cur + per + (cur + per * (threadNum - i) < k);
-                threads.push_back(new std::thread(&Int8LinearPart, inputData, weightData, biasData, outputData,
-                                                  weight.perChannelsConfigs.data(), n, m, k, cur, end));
-                cur = end;
-            }
-            Int8LinearPart(inputData, weightData, biasData, outputData, weight.perChannelsConfigs.data(), n, m, k, cur, k);
-            for (int i = 0; i < threadNum - 1; i++) {
-                threads[i]->join();
-                delete threads[i];
-            }
-            */
-        } else if (weight.dataType == DataType::INT4 || weight.dataType == DataType::INT4_NOZERO) {
-            float *inputData = (float *) input.cpuData;
-            uint8_t *weightData = (uint8_t *) weight.cpuData;
-            float *outputData = (float *) output.cpuData;
-            float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
-            weight.CalcWeightSum();
-
-            std::vector <LowBitConfig> inputConfigs;
-            for (int i = 0; i < n; i++) {
-                float minValue = 1e9, maxValue = -1e9;
-                for (int j = 0; j < m; j++) {
-                    minValue = std::min(minValue, inputData[i * m + j]);
-                    maxValue = std::max(maxValue, inputData[i * m + j]);
-                }
-                inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
-            }
-            std::vector <uint8_t> uinput;
-            uinput.resize(n * m);
-            for (int i = 0; i < n * m; i++) {
-                uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
-            }
-#ifdef __AVX__
-            uint8_t *temp = new uint8_t[32];
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j + 31 < m; j += 32) {
-                    memcpy(temp, uinput.data() + i * m + j, 32);
-                    for (int k = 0; k < 16; k++) {
-                        uinput[i * m + j + k] = temp[k * 2 + 1];
-                        uinput[i * m + j + k + 16] = temp[k * 2];
+                        value -= weight.weightSum[j] * inputConfigs[i].zeroPoint;
+                        value -= inputSum * weight.perChannelsConfigs[j].zeroPoint;
+                        value += (int) inputConfigs[i].zeroPoint * weight.perChannelsConfigs[j].zeroPoint * m;
+                        outputData[i * k + j] = weight.perChannelsConfigs[j].scale * inputConfigs[i].scale * value +
+                                                (biasData == nullptr ? 0.0 : biasData[j]);
                     }
                 }
-            }
-            delete[] temp;
+
+                /*
+                这部分是float输入，float输出
+                int threadNum = threads;
+                int per = k / threadNum;
+                int cur = 0;
+                std::vector<std::thread *> threads;
+                for (int i = 0; i < threadNum - 1; i++) {
+                    int end = cur + per + (cur + per * (threadNum - i) < k);
+                    threads.push_back(new std::thread(&Int8LinearPart, inputData, weightData, biasData, outputData,
+                                                      weight.perChannelsConfigs.data(), n, m, k, cur, end));
+                    cur = end;
+                }
+                Int8LinearPart(inputData, weightData, biasData, outputData, weight.perChannelsConfigs.data(), n, m, k, cur, k);
+                for (int i = 0; i < threadNum - 1; i++) {
+                    threads[i]->join();
+                    delete threads[i];
+                }
+                */
+            } else if (weight.dataType == DataType::INT4 || weight.dataType == DataType::INT4_NOZERO) {
+                float *inputData = (float *) input.cpuData;
+                uint8_t *weightData = (uint8_t *) weight.cpuData;
+                float *outputData = (float *) output.cpuData;
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                weight.CalcWeightSum();
+
+                std::vector<LowBitConfig> inputConfigs;
+                for (int i = 0; i < n; i++) {
+                    float minValue = 1e9, maxValue = -1e9;
+                    for (int j = 0; j < m; j++) {
+                        minValue = std::min(minValue, inputData[i * m + j]);
+                        maxValue = std::max(maxValue, inputData[i * m + j]);
+                    }
+                    inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
+                }
+                std::vector<uint8_t> uinput;
+                uinput.resize(n * m);
+                for (int i = 0; i < n * m; i++) {
+                    uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
+                }
+#ifdef __AVX__
+                uint8_t *temp = new uint8_t[32];
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j + 31 < m; j += 32) {
+                        memcpy(temp, uinput.data() + i * m + j, 32);
+                        for (int k = 0; k < 16; k++) {
+                            uinput[i * m + j + k] = temp[k * 2 + 1];
+                            uinput[i * m + j + k + 16] = temp[k * 2];
+                        }
+                    }
+                }
+                delete[] temp;
 #endif
-            if (weight.dataType == DataType::INT4) {
-                MultiplyInt4MultiThread(uinput.data(), weightData, (int32_t *) outputData, n, m, k,
-                                        weight.weightSum.data(), weight.zeros.data(), weight.scales.data(), biasData,
-                                        inputConfigs, GetThreads());
-            } else {
-                MultiplyInt4NoZeroMultiThread(uinput.data(), weightData, (int32_t *) outputData, n, m, k,
-                                        weight.weightSum.data(), weight.mins.data(), weight.scales.data(), biasData,
-                                        inputConfigs, GetThreads());
-            }
+                if (weight.dataType == DataType::INT4) {
+                    MultiplyInt4MultiThread(uinput.data(), weightData, (int32_t *) outputData, n, m, k,
+                                            weight.weightSum.data(), weight.zeros.data(), weight.scales.data(),
+                                            biasData,
+                                            inputConfigs, GetThreads());
+                } else {
+                    MultiplyInt4NoZeroMultiThread(uinput.data(), weightData, (int32_t *) outputData, n, m, k,
+                                                  weight.weightSum.data(), weight.mins.data(), weight.scales.data(),
+                                                  biasData,
+                                                  inputConfigs, GetThreads());
+                }
 
 /*
             //这部分是float输入，float输出
@@ -1156,11 +1353,39 @@ auto st = std::chrono::system_clock::now();
                 delete threads[i];
             }
 */
+            } else {
+                ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
+            }
+        } else if (input.dataType == DataType::FLOAT16 && output.dataType == DataType::FLOAT16) {
+            if (weight.dataType == DataType::FLOAT16) {
+                uint16_t *inputData = (uint16_t *) input.cpuData;
+                uint16_t *weightData = (uint16_t *) weight.cpuData;
+                uint16_t *outputData = (uint16_t *) output.cpuData;
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                int threadNum = GetThreads();
+                int per = k / threadNum;
+                int cur = 0;
+                auto pool = GetPool();
+                std::vector<std::future<void> > futures;
+                for (int i = 0; i < threadNum - 1; i++) {
+                    int end = cur + per + (cur + per * (threadNum - i) < k);
+                    futures.push_back(pool->Submit(Float16xFloat16LinearPart, inputData, weightData, biasData, outputData,
+                                                   n, m, k, cur, end));
+                    cur = end;
+                }
+
+                Float16xFloat16LinearPart(inputData, weightData, biasData, outputData, n, m, k, cur, k);
+                for (int i = 0; i < futures.size(); i++) {
+                    futures[i].get();
+                }
+            } else {
+                ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
+            }
         } else {
             ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
         }
-float spend = GetSpan(st, std::chrono::system_clock::now());
-float gops = (float)n * m * k / spend / 1e9;
+//float spend = GetSpan(st, std::chrono::system_clock::now());
+//float gops = (float)n * m * k / spend / 1e9;
 // printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
     }
 
@@ -1231,7 +1456,8 @@ float gops = (float)n * m * k / spend / 1e9;
             return;
         }
 
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
+        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
                         "Cat's input's type should be float32.\n");
         AssertInFastLLM(input0.dims.size() == input1.dims.size(), "Cat Error: input's shape's size should be same.");
 
@@ -1296,8 +1522,9 @@ float gops = (float)n * m * k / spend / 1e9;
 
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
 
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
-                        "Cat's input's type should be float32.\n");
+        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
+                        "CatDirect's input's type should be float32.\n");
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "CatDirect error: inputs should use same device.\n");
 
         if (input0.dims.size() == 0) {
@@ -1367,6 +1594,47 @@ float gops = (float)n * m * k / spend / 1e9;
         }
     }
 
+    void MatMulFloat16Single(uint16_t *input0Base, uint16_t *input1Base, uint16_t *outputBase,
+                             int input0Spatial, int input1Spatial, int outputSpatial,
+                             int input0Stride, int input1Stride,
+                             int n, int m, int k, float alpha, int st, int end) {
+        float *input0 = new float[n * m];
+        float *input1 = new float[m * k];
+        float *output = new float[n * k];
+
+        for (int b = st; b < end; b++) {
+            uint16_t *input0Data = input0Base + b * input0Spatial;
+            uint16_t *input1Data = input1Base + b * input1Spatial;
+            uint16_t *outputData = outputBase + b * outputSpatial;
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j < m; j++) {
+                    input0[i * m + j] = fp16tofp32.dict[input0Data[i * input0Stride + j]];
+                }
+            }
+            for (int j = 0; j < m; j++) {
+                for (int l = 0; l < k; l++) {
+                    input1[j * k + l] = fp16tofp32.dict[input1Data[j * k + l]];
+                }
+            }
+            std::fill(output, output + n * k, 0.0f);
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j < m; j++) {
+                    float now = input0[i * m + j] * alpha;
+                    for (int l = 0; l < k; l++) {
+                        output[i * k + l] += (now * input1[j * k + l]);
+                    }
+                }
+            }
+            for (int i = 0; i < n * k; i++) {
+                outputData[i] = float_to_half(output[i]);
+            }
+        }
+
+        delete[] input0;
+        delete[] input1;
+        delete[] output;
+    }
+
     void MatMulTransBSingle(float *input0Base, float *input1Base, float *outputBase,
                             int input0Spatial, int input1Spatial, int outputSpatial,
                             int input0Stride, int input1Stride,
@@ -1404,6 +1672,28 @@ float gops = (float)n * m * k / spend / 1e9;
         }
     }
 
+    void MatMulTransBFloat16Single(uint16_t *input0Base, uint16_t *input1Base, uint16_t *outputBase,
+                            int input0Spatial, int input1Spatial, int outputSpatial,
+                            int input0Stride, int input1Stride,
+                            int n, int m, int k, float alpha, int st, int end) {
+        for (int b = st; b < end; b++) {
+            uint16_t *input0Data = input0Base + b * input0Spatial;
+            uint16_t *input1Data = input1Base + b * input1Spatial;
+            uint16_t *outputData = outputBase + b * outputSpatial;
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j < k; j++) {
+                    float now = 0.0f;
+                    int l = 0;
+                    for (; l < m; l++) {
+                        now += fp16tofp32.dict[input0Data[i * input0Stride + l]] *
+                                fp16tofp32.dict[input1Data[j * input1Stride + l]];
+                    }
+                    outputData[i * k + j] = float_to_half(now * alpha);
+                }
+            }
+        }
+    }
+
     void CpuMatMulOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input0 = *(datas.find("input0")->second);
@@ -1411,8 +1701,9 @@ float gops = (float)n * m * k / spend / 1e9;
         Data &output = *(datas.find("output")->second);
 
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMul error: inputs should use same device.\n");
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
-                        "MatMul's input's type should be float32.\n");
+        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
+                        "MatMul's input's type should be float32 or float16.\n");
         AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
                         "MatMul's input's shape's size should be >= 2.\n");
         AssertInFastLLM(input0.dims.back() == input1.dims[input1.dims.size() - 2],
@@ -1463,17 +1754,34 @@ float gops = (float)n * m * k / spend / 1e9;
         int cur = 0;
         auto pool = GetPool();
         std::vector <std::future <void> > futures;
-        for (int i = 0; i < threadNum - 1; i++) {
-            int end = cur + per + (cur + per * (threadNum - i) < batch0);
-            futures.push_back(pool->Submit(MatMulSingle,
-                                              (float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
-                                              input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
-                                              n, m, k, alpha, cur, end));
-            cur = end;
+        if (input0.dataType == DataType::FLOAT32) {
+            for (int i = 0; i < threadNum - 1; i++) {
+                int end = cur + per + (cur + per * (threadNum - i) < batch0);
+                futures.push_back(pool->Submit(MatMulSingle,
+                                               (float *) input0.cpuData, (float *) input1.cpuData,
+                                               (float *) output.cpuData,
+                                               input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                                               n, m, k, alpha, cur, end));
+                cur = end;
+            }
+            MatMulSingle((float *) input0.cpuData, (float *) input1.cpuData, (float *) output.cpuData,
+                         input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                         n, m, k, alpha, cur, batch0);
+        } else if (input0.dataType == DataType::FLOAT16) {
+            for (int i = 0; i < threadNum - 1; i++) {
+                int end = cur + per + (cur + per * (threadNum - i) < batch0);
+                futures.push_back(pool->Submit(MatMulFloat16Single,
+                                               (uint16_t *) input0.cpuData, (uint16_t *) input1.cpuData,
+                                               (uint16_t *) output.cpuData,
+                                               input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                                               n, m, k, alpha, cur, end));
+                cur = end;
+            }
+            MatMulFloat16Single((uint16_t *) input0.cpuData, (uint16_t *) input1.cpuData, (uint16_t *) output.cpuData,
+                         input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                         n, m, k, alpha, cur, batch0);
         }
-        MatMulSingle((float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
-                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
-                     n, m, k, alpha, cur, batch0);
+
         for (int i = 0; i < futures.size(); i++) {
             futures[i].get();
         }
@@ -1486,8 +1794,9 @@ float gops = (float)n * m * k / spend / 1e9;
         Data &output = *(datas.find("output")->second);
 
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMulTransB error: inputs should use same device.\n");
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
-                        "MatMulTransB's input's type should be float32.\n");
+        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
+                        "MatMulTransB's input's type should be float32 or float16.\n");
         AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
                         "MatMulTransB's input's shape's size should be >= 2.\n");
         AssertInFastLLM(input0.dims.back() == input1.dims.back(),
@@ -1536,17 +1845,34 @@ float gops = (float)n * m * k / spend / 1e9;
         int cur = 0;
         auto pool = GetPool();
         std::vector <std::future <void> > futures;
-        for (int i = 0; i < threadNum - 1; i++) {
-            int end = cur + per + (cur + per * (threadNum - i) < batch0);
-            futures.push_back(pool->Submit(MatMulTransBSingle,
-                                              (float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
-                                              input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
-                                              n, m, k, alpha, cur, end));
-            cur = end;
+        if (input0.dataType == DataType::FLOAT32) {
+            for (int i = 0; i < threadNum - 1; i++) {
+                int end = cur + per + (cur + per * (threadNum - i) < batch0);
+                futures.push_back(pool->Submit(MatMulTransBSingle,
+                                               (float *) input0.cpuData, (float *) input1.cpuData,
+                                               (float *) output.cpuData,
+                                               input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                                               n, m, k, alpha, cur, end));
+                cur = end;
+            }
+            MatMulTransBSingle((float *) input0.cpuData, (float *) input1.cpuData, (float *) output.cpuData,
+                               input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                               n, m, k, alpha, cur, batch0);
+        } else {
+            for (int i = 0; i < threadNum - 1; i++) {
+                int end = cur + per + (cur + per * (threadNum - i) < batch0);
+                futures.push_back(pool->Submit(MatMulTransBFloat16Single,
+                                               (uint16_t *) input0.cpuData, (uint16_t *) input1.cpuData,
+                                               (uint16_t *) output.cpuData,
+                                               input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                                               n, m, k, alpha, cur, end));
+                cur = end;
+            }
+            MatMulTransBFloat16Single((uint16_t *) input0.cpuData, (uint16_t *) input1.cpuData, (uint16_t *) output.cpuData,
+                               input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                               n, m, k, alpha, cur, batch0);
         }
-        MatMulTransBSingle((float*)input0.cpuData, (float*)input1.cpuData, (float*)output.cpuData,
-                           input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
-                           n, m, k, alpha, cur, batch0);
+
         for (int i = 0; i < futures.size(); i++) {
             futures[i].get();
         }
@@ -1559,7 +1885,8 @@ float gops = (float)n * m * k / spend / 1e9;
         output.Allocate();
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
 
-        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Softmax error: Data's type should be float32.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "Softmax error: Data's type should be float32.\n");
 
         int dimsLen = input.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
@@ -1569,6 +1896,15 @@ float gops = (float)n * m * k / spend / 1e9;
 
         float *inputData = (float*)input.cpuData;
         float *outputData = (float*)output.cpuData;
+
+        if (input.dataType == DataType::FLOAT16) {
+            int len = input.Count(0);
+            inputData = new float[len];
+            outputData = new float[len];
+            for (int i = 0; i < len; i++) {
+                inputData[i] = fp16tofp32.dict[((uint16_t *) input.cpuData)[i]];
+            }
+        }
 
         if (inner == 1) {
             for (int i = 0; i < outer; i++) {
@@ -1618,32 +1954,43 @@ float gops = (float)n * m * k / spend / 1e9;
                 inputData += channels;
                 outputData += channels;
             }
-            return;
+        } else {
+            for (int i = 0; i < outer; i++) {
+                std::vector<float> maxValue(inner, -FLT_MAX);
+                for (int j = 0; j < channels; j++) {
+                    for (int k = 0; k < inner; k++) {
+                        maxValue[k] = std::max(maxValue[k], inputData[j * inner + k]);
+                    }
+                }
+                std::vector<float> sum(inner, 0.0);
+                for (int j = 0; j < channels; j++) {
+                    for (int k = 0; k < inner; k++) {
+                        outputData[j * inner + k] = std::exp(inputData[j * inner + k] - maxValue[k]);
+                        sum[k] += outputData[j * inner + k];
+                    }
+                }
+
+                for (int j = 0; j < channels; j++) {
+                    for (int k = 0; k < inner; k++) {
+                        outputData[j * inner + k] /= sum[k];
+                    }
+                }
+
+                inputData += channels * inner;
+                outputData += channels * inner;
+            }
         }
 
-        for (int i = 0; i < outer; i++) {
-            std::vector<float> maxValue(inner, -FLT_MAX);
-            for (int j = 0; j < channels; j++) {
-                for (int k = 0; k < inner; k++) {
-                    maxValue[k] = std::max(maxValue[k], inputData[j * inner + k]);
-                }
-            }
-            std::vector<float> sum(inner, 0.0);
-            for (int j = 0; j < channels; j++) {
-                for (int k = 0; k < inner; k++) {
-                    outputData[j * inner + k] = std::exp(inputData[j * inner + k] - maxValue[k]);
-                    sum[k] += outputData[j * inner + k];
-                }
+        if (input.dataType == DataType::FLOAT16) {
+            int len = input.Count(0);
+            inputData -= len;
+            outputData -= len;
+            for (int i = 0; i < len; i++) {
+                ((uint16_t *) output.cpuData)[i] = float_to_half(outputData[i]);
             }
 
-            for (int j = 0; j < channels; j++) {
-                for (int k = 0; k < inner; k++) {
-                    outputData[j * inner + k] /= sum[k];
-                }
-            }
-
-            inputData += channels * inner;
-            outputData += channels * inner;
+            delete[] inputData;
+            delete[] outputData;
         }
     }
 
@@ -1762,10 +2109,21 @@ float gops = (float)n * m * k / spend / 1e9;
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         output.Allocate();
-        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Swiglu error: Data's type should be float32.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "Swiglu error: Data's type should be float32 or float16.\n");
 
         float *inputData = (float*)input.cpuData;
         float *outputData = (float*)output.cpuData;
+
+        if (input.dataType == DataType::FLOAT16) {
+            int len = input.Count(0);
+            inputData = new float[len];
+            outputData = new float[output.Count(0)];
+            for (int i = 0; i < len; i++) {
+                inputData[i] = fp16tofp32.dict[((uint16_t *) input.cpuData)[i]];
+            }
+        }
+
         int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
         int outer = input.Count(0) / spatial;
         for (int o = 0; o < outer; o++) {
@@ -1787,6 +2145,18 @@ float gops = (float)n * m * k / spend / 1e9;
             inputData += spatial;
             outputData += spatial / 2;
         }
+
+        if (input.dataType == DataType::FLOAT16) {
+            inputData -= input.Count(0);
+            outputData -= output.Count(0);
+            int len = output.Count(0);
+            for (int i = 0; i < len; i++) {
+                ((uint16_t *) output.cpuData)[i] = float_to_half(outputData[i]);
+            }
+
+            delete[] inputData;
+            delete[] outputData;
+        }
     }
 
     void CpuMulOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -1796,14 +2166,23 @@ float gops = (float)n * m * k / spend / 1e9;
         output.Allocate();
 
         float v = floatParams.find("v") != floatParams.end() ? floatParams.find("v")->second : 1.0;
-        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Mul error: Data's type should be float32.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "Mul error: Data's type should be float32 or float16.\n");
 
-        float *inputData = (float*)input.cpuData;
-        float *outputData = (float*)output.cpuData;
         int len = input.Count(0);
 
-        for (int i = 0; i < len; i++) {
-            outputData[i] = inputData[i] * v;
+        if (input.dataType == DataType::FLOAT32) {
+            float *inputData = (float *) input.cpuData;
+            float *outputData = (float *) output.cpuData;
+            for (int i = 0; i < len; i++) {
+                outputData[i] = inputData[i] * v;
+            }
+        } else if (input.dataType == DataType::FLOAT16) {
+            uint16_t *inputData = (uint16_t *) input.cpuData;
+            uint16_t *outputData = (uint16_t *) output.cpuData;
+            for (int i = 0; i < len; i++) {
+                outputData[i] = float_to_half(fp16tofp32.dict[inputData[i]] * v);
+            }
         }
     }
 
@@ -1811,16 +2190,20 @@ float gops = (float)n * m * k / spend / 1e9;
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input0 = *(datas.find("input0")->second);
         Data &input1 = *(datas.find("input1")->second);
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
-                        "MulTo error: Data's type should be float32.\n");
-        AssertInFastLLM(input0.dims == input1.dims, "AddTo error: input's shape should be same.\n");
+        AssertInFastLLM(input0.dims == input1.dims, "MulTo error: input's shape should be same.\n");
 
         float *input0Data = (float*)input0.cpuData;
         float *input1Data = (float*)input1.cpuData;
 
         int len = input0.Count(0);
-        for (int i = 0; i < len; i++) {
-            input0Data[i] *= input1Data[i];
+        int inner = input1.Count(0);
+        AssertInFastLLM(len % inner == 0, "MulTo error: Data`s shape can`t perform MulTo operation.\n");
+        int round = (len / inner);
+        for (int j = 0; j < round; j++) {
+            for (int i = 0; i < len; i++) {
+               input0Data[i] *= input1Data[i];
+            }
+            input0Data += inner;
         }
     }
 
@@ -1830,16 +2213,24 @@ float gops = (float)n * m * k / spend / 1e9;
         Data &input1 = *(datas.find("input1")->second);
         float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0;
 
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
-                        "AddTo error: Data's type should be float32.\n");
+        AssertInFastLLM(input0.dataType == DataType::FLOAT32 || input1.dataType == DataType::FLOAT16,
+                        "AddTo error: Data's type should be float32 or float16.\n");
         AssertInFastLLM(input0.dims == input1.dims, "AddTo error: input's shape should be same.\n");
 
-        float *input0Data = (float*)input0.cpuData;
-        float *input1Data = (float*)input1.cpuData;
-
         int len = input0.Count(0);
-        for (int i = 0; i < len; i++) {
-            input0Data[i] += input1Data[i] * alpha;
+
+        if (input0.dataType == DataType::FLOAT32) {
+            float *input0Data = (float *) input0.cpuData;
+            float *input1Data = (float *) input1.cpuData;
+            for (int i = 0; i < len; i++) {
+                input0Data[i] += input1Data[i] * alpha;
+            }
+        } else if (input0.dataType == DataType::FLOAT16) {
+            uint16_t *input0Data = (uint16_t *) input0.cpuData;
+            uint16_t *input1Data = (uint16_t *) input1.cpuData;
+            for (int i = 0; i < len; i++) {
+                input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] + fp16tofp32.dict[input1Data[i]] * alpha);
+            }
         }
     }
 
@@ -1848,18 +2239,38 @@ float gops = (float)n * m * k / spend / 1e9;
         Data &input = *(datas.find("input")->second);
         Data &mask = *(datas.find("mask")->second);
         float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -10000.0;
-        float *maskData = (float *) mask.cpuData;
-        float *attnData = (float *) input.cpuData;
         int spatial = input.Count(2), n = input.dims[0], m = input.dims[1];
-        for (int on = 0; on < n; on++) {
-            for (int om = 0; om < m; om++) {
-                int o = on * m + om;
-                for (int i = 0; i < spatial; i++) {
-                    if (maskData[on * spatial + i] > 0.99) {
-                        attnData[o * spatial + i] = maskValue;
+
+        AssertInFastLLM(mask.dataType == DataType::FLOAT32, "AttentionMask: mask's datatype should be float32.");
+        if (input.dataType == DataType::FLOAT32) {
+            float *maskData = (float *) mask.cpuData;
+            float *attnData = (float *) input.cpuData;
+            for (int on = 0; on < n; on++) {
+                for (int om = 0; om < m; om++) {
+                    int o = on * m + om;
+                    for (int i = 0; i < spatial; i++) {
+                        if (maskData[on * spatial + i] > 0.99) {
+                            attnData[o * spatial + i] = maskValue;
+                        }
                     }
                 }
             }
+        } else if (input.dataType == DataType::FLOAT16) {
+            float *maskData = (float *) mask.cpuData;
+            uint16_t *attnData = (uint16_t *) input.cpuData;
+            uint16_t hMaskValue = float_to_half(maskValue);
+            for (int on = 0; on < n; on++) {
+                for (int om = 0; om < m; om++) {
+                    int o = on * m + om;
+                    for (int i = 0; i < spatial; i++) {
+                        if (maskData[on * spatial + i] > 0.99) {
+                            attnData[o * spatial + i] = hMaskValue;
+                        }
+                    }
+                }
+            }
+        } else {
+            ErrorInFastLLM("AttentionMask error: unsupport input's dataType.\n");
         }
     }
 
@@ -1951,7 +2362,8 @@ float gops = (float)n * m * k / spend / 1e9;
             axis.push_back(((int32_t *) axisData.cpuData)[i]);
         }
 
-        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Permute error: datatype should be float32.");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16, "Permute error: datatype should be float32 or float16.");
         AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
         std::vector<int> new_dims;
         for (int i = 0; i < axis.size(); i++) {
@@ -2030,10 +2442,10 @@ float gops = (float)n * m * k / spend / 1e9;
         }
 
         output.Allocate();
-        float *tmpData = (float *) output.cpuData;
-        float *curData = (float *) input.cpuData;
+        uint8_t *tmpData = (uint8_t *) output.cpuData;
+        uint8_t *curData = (uint8_t *) input.cpuData;
 
-        if (axis == std::vector <int> {1, 2, 0}) {
+        if (axis == std::vector <int> {1, 2, 0} && input.dataType == DataType::FLOAT32) {
             int n = input.dims[0];
             int m = input.Count(1);
 
@@ -2044,10 +2456,10 @@ float gops = (float)n * m * k / spend / 1e9;
             std::vector <std::future <void> > futures;
             for (int i = 0; i < threadNum - 1; i++) {
                 int end = cur + per + (cur + per * (threadNum - i) < m);
-                futures.push_back(pool->Submit(Transpose, tmpData + cur * n, curData + cur, n, m, n, end - cur));
+                futures.push_back(pool->Submit(Transpose, ((float*)tmpData) + cur * n, ((float*)curData) + cur, n, m, n, end - cur));
                 cur = end;
             }
-            Transpose(tmpData + cur * n, curData + cur, n, m, n, m - cur);
+            Transpose(((float*)tmpData) + cur * n, ((float*)curData) + cur, n, m, n, m - cur);
             for (int i = 0; i < futures.size(); i++) {
                 futures[i].get();
             }
@@ -2055,19 +2467,36 @@ float gops = (float)n * m * k / spend / 1e9;
             int n = input.dims[0];
             int m = input.dims[1];
             int k = input.dims[2];
+            int unitSize = input.unitSize;
             for (int i = 0; i < n; i++) {
                 for (int j = 0; j < m; j++) {
-                    memcpy(tmpData + (j * n + i) * k, curData + (i * m + j) * k, k * sizeof(float));
+                    memcpy(tmpData + (j * n + i) * k * unitSize, curData + (i * m + j) * k * unitSize, k * unitSize);
                 }
             }
         } else if (axis == std::vector <int> {2, 0, 1, 3}) {
             int n = input.dims[0] * input.dims[1];
             int m = input.dims[2];
             int k = input.dims[3];
+            int unitSize = input.unitSize;
             for (int i = 0; i < n; i++) {
                 for (int j = 0; j < m; j++) {
-                    memcpy(tmpData + (j * n + i) * k, curData + (i * m + j) * k, k * sizeof(float));
+                    memcpy(tmpData + (j * n + i) * k * unitSize, curData + (i * m + j) * k * unitSize, k * unitSize);
                 }
+            }
+        } else if (axis == std::vector<int> {0, 2, 1, 3}) {
+            int b = input.dims[0];
+            int n = input.dims[1];
+            int m = input.dims[2];
+            int k = input.dims[3];
+            int unitSize = input.unitSize;
+            for (int o = 0; o < b; o++) {
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j < m; j++) {
+                        memcpy(tmpData + (j * n + i) * k * unitSize, curData + (i * m + j) * k * unitSize, k * unitSize);
+                    }
+                }
+                tmpData += output.Count(1) * unitSize;
+                curData += input.Count(1) * unitSize;
             }
         } else {
             std::vector<int> oldSteps;
@@ -2089,8 +2518,19 @@ float gops = (float)n * m * k / spend / 1e9;
                 }
                 oldPos[i] = old;
             }
-            for (int i = 0; i < count; ++i) {
-                tmpData[i] = curData[oldPos[i]];
+
+            if (input.unitSize == 4) {
+                for (int i = 0; i < count; ++i) {
+                    ((float*)tmpData)[i] = ((float*)curData)[oldPos[i]];
+                }
+            } else if (input.unitSize == 2) {
+                for (int i = 0; i < count; ++i) {
+                    ((uint16_t*)tmpData)[i] = ((uint16_t*)curData)[oldPos[i]];
+                }
+            } else if (input.unitSize == 1) {
+                for (int i = 0; i < count; ++i) {
+                    ((uint8_t*)tmpData)[i] = ((uint8_t*)curData)[oldPos[i]];
+                }
             }
 
             delete[] oldPos;
@@ -2106,12 +2546,14 @@ float gops = (float)n * m * k / spend / 1e9;
             axis.push_back(((int32_t *) axisData.cpuData)[i]);
         }
 
-        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Permute error: datatype should be float32.");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16, "Permute error: datatype should be float32 or float16.");
         AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
 
         bool same = false;
-        same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && input.dims[0] == 1);
+        same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
         same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[2] == 1);
+        same |= ((axis == std::vector <int>{0, 2, 1, 3}) && (input.dims[1] == 1 || input.dims[2] == 1));
         if (same) {
             std::vector<int> new_dims;
             for (int i = 0; i < axis.size(); i++) {
@@ -2179,15 +2621,29 @@ float gops = (float)n * m * k / spend / 1e9;
                 int index = (int) ((float *) positionIds.cpuData)[(b * 2) * positionIds.dims.back() + l];
                 float *sin = ((float*)sinData.cpuData) + stride * index;
                 float *cos = ((float*)cosData.cpuData) + stride * index;
-                float *d = (float *) data.cpuData + (l * bs + b) * spatial;
-                for (int i = 0; i < n; i++) {
-                    int j = 0;
-                    for (; j < rotaryDim; j += 2) {
-                        float a = d[j], b = d[j + 1];
-                        d[j] = a * cos[j / 2] - b * sin[j / 2];
-                        d[j + 1] = a * sin[j / 2] + b * cos[j / 2];
+
+                if (data.dataType == DataType::FLOAT32) {
+                    float *d = (float *) data.cpuData + (l * bs + b) * spatial;
+                    for (int i = 0; i < n; i++) {
+                        int j = 0;
+                        for (; j < rotaryDim; j += 2) {
+                            float a = d[j], b = d[j + 1];
+                            d[j] = a * cos[j / 2] - b * sin[j / 2];
+                            d[j + 1] = a * sin[j / 2] + b * cos[j / 2];
+                        }
+                        d += m;
                     }
-                    d += m;
+                } else if (data.dataType == DataType::FLOAT16) {
+                    uint16_t *d = (uint16_t *) data.cpuData + (l * bs + b) * spatial;
+                    for (int i = 0; i < n; i++) {
+                        int j = 0;
+                        for (; j < rotaryDim; j += 2) {
+                            float a = fp16tofp32.dict[d[j]], b = fp16tofp32.dict[d[j + 1]];
+                            d[j] = float_to_half(a * cos[j / 2] - b * sin[j / 2]);
+                            d[j + 1] = float_to_half(a * sin[j / 2] + b * cos[j / 2]);
+                        }
+                        d += m;
+                    }
                 }
             }
         }
@@ -2236,6 +2692,31 @@ float gops = (float)n * m * k / spend / 1e9;
         int len = input.Count(0);
         for (int i = 0; i < len; i++) {
             inputData[i] = inputData[i] < 0 ? inputData[i] * penaltyData[i] : inputData[i] / penaltyData[i];
+        }
+    }
+
+    void CpuApplyLognAttnOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &lognAttn = *(datas.find("lognAttn")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+
+        float *inputData = (float *) input.cpuData;
+        float *lognData = (float *) lognAttn.cpuData;
+
+        int batch = input.dims[0];
+        int seqLen = input.dims[1];
+        int spatial = input.Count(2);
+        int curPos = (int) ((float *) positionIds.cpuData) [0];
+        for (int b = 0; b < batch; b++) {
+            float *curInput = inputData + b * seqLen * spatial;
+            for (int i = 0; i < seqLen; i++) {
+                float logn = lognData[i + curPos];
+                for (int s = 0; s < spatial; s++) {
+                    curInput[s] *= logn;
+                }
+                curInput += spatial;
+            }
         }
     }
 }

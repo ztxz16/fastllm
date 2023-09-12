@@ -11,6 +11,8 @@
 #include <string>
 #include <cstdio>
 #include <cstdint>
+#include <vector>
+
 #if defined(_WIN32) or defined(_WIN64)
 #include <Windows.h>
 #else
@@ -70,6 +72,34 @@ namespace fastllm {
         auto duration = std::chrono::duration_cast<std::chrono::microseconds> (time2 - time1);
         return double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
     };
+
+    static bool StartWith(const std::string &a, const std::string &b) {
+        return a.size() >= b.size() && a.substr(0, b.size()) == b;
+    }
+
+    static std::vector <int> ParseDeviceIds(const std::string &s, const std::string &type) {
+        int i = type.size();
+        std::vector <int> ret;
+        std::string cur = "";
+        if (s.size() > i && s[i] == ':') {
+            i++;
+            while (i < s.size()) {
+                if (s[i] >= '0' && s[i] <= '9') {
+                    cur += s[i];
+                } else {
+                    if (cur != "") {
+                        ret.push_back(atoi(cur.c_str()));
+                        cur = "";
+                    }
+                }
+                i++;
+            }
+        }
+        if (cur != "") {
+            ret.push_back(atoi(cur.c_str()));
+        }
+        return ret;
+    }
 
     struct TimeRecord {
         std::map<std::string, float> v;

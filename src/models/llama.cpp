@@ -6,6 +6,12 @@
 
 #include "llama.h"
 
+#include <sstream>
+
+#include <unordered_map>
+
+#include <cstring>
+
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #endif
@@ -77,7 +83,8 @@ namespace fastllm {
 
     int LlamaModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
-                            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens) {
+                            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                            std::vector <float> *retLogits) {
         Data alibiData;
         if (this->weight.dicts["use_alibi"] == "1") {
             std::vector<float> alibi = GetInterleave(num_attention_heads);
@@ -93,6 +100,7 @@ namespace fastllm {
 
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         for (int i = 0; i < block_cnt; i++) {
+            ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
@@ -198,7 +206,13 @@ namespace fastllm {
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         logits.ToDevice(DataDevice::CPU);
 
-        int lastRet;
+        int lastRet = -1;
+        if (generationConfig.output_logits && retLogits != nullptr) {
+            int size = logits.dims.back();
+            logits.ToDevice(DataDevice::CPU);
+            retLogits->resize(size);
+            memcpy((float*)retLogits->data(), ((float*)logits.cpuData) + (logits.dims[1] - 1) * size, size * logits.unitSize);
+        }
         if (generationConfig.IsSimpleGreedy()) {
             std::pair <float, int> ret = std::make_pair(-1e9, -1);
             int base = logits.dims[1] - 1;
@@ -206,7 +220,7 @@ namespace fastllm {
                 ret = max(ret, std::make_pair(((float*)logits.cpuData)[base * logits.dims.back() + i], i));
             }
             lastRet = ret.second;
-        } else {
+        } else if (!lastTokens.units.empty()) {
             lastRet = LLMSampling(logits, logits.dims[1] - 1, generationConfig, lastTokens.units[0]);
         }
 
@@ -215,7 +229,8 @@ namespace fastllm {
 
     std::vector <int> LlamaModel::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
-                            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens) {
+                            const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                            std::vector <std::vector <float>*> *retLogits) {
         Data alibiData;
         if (this->weight.dicts["use_alibi"] == "1") {
             std::vector<float> alibi = GetInterleave(num_attention_heads);
@@ -232,6 +247,7 @@ namespace fastllm {
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
+            ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
@@ -367,7 +383,8 @@ namespace fastllm {
                                                const std::vector <int> &seqLens,
                                                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
                                                const std::vector <GenerationConfig> &generationConfigs,
-                                               const LastTokensManager &lastTokens) {
+                                               const LastTokensManager &lastTokens,
+                                               std::vector <std::vector <float>*> *retLogits) {
         Data alibiData;
         if (this->weight.dicts["use_alibi"] == "1") {
             std::vector<float> alibi = GetInterleave(num_attention_heads);
@@ -384,6 +401,7 @@ namespace fastllm {
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
+            ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
@@ -517,6 +535,11 @@ namespace fastllm {
         std::vector <int> lastRet;
         int total = 0;
         for (int b = 0; b < batch; b++) {
+            if (generationConfigs[b].output_logits && retLogits != nullptr && (*retLogits)[b] != nullptr) {
+                int base = (total + seqLens[b] - 1);
+                (*retLogits)[b]->resize(logits.dims.back());
+                memcpy((float*)(*retLogits)[b]->data(), (float*)(logits.cpuData + base * logits.dims.back() * logits.unitSize), logits.dims.back() * logits.unitSize);
+            }
             if (generationConfigs[b].IsSimpleGreedy()) {
                 std::pair<float, int> ret = std::make_pair(-1e9, -1);
                 int base = (total + seqLens[b] - 1);
@@ -540,9 +563,15 @@ namespace fastllm {
         FastllmCudaClearBigBuffer();
 #endif
 //auto st = std::chrono::system_clock::now();
+#ifdef PY_API
+		size_t pos = input.find_last_of("time_stamp:");
+		std::string prompt = (generationConfig.enable_hash_id && pos != std::string::npos)?  input.substr(0, pos-10):input;
+		size_t hash_id = std::hash<std::string>{}(input);
+        Data inputIds = this->weight.tokenizer.Encode(prompt);
+#else
         Data inputIds = this->weight.tokenizer.Encode(input);
+#endif
         std::vector <float> ids;
-        ids.push_back(bos_token_id);
         for (int i = 0; i < inputIds.Count(0); i++) {
             ids.push_back(((float*)inputIds.cpuData)[i]);
         }
@@ -587,7 +616,15 @@ namespace fastllm {
             retString += curString;
             if (retCb)
 #ifdef PY_API
-				retCb(index, pybind11::bytes(retString));
+			{
+				if(generationConfig.enable_hash_id){
+					std::stringstream ss;
+					ss << retString << "hash_id:"<<hash_id;
+					retCb(index, pybind11::bytes(ss.str()));
+				}else{
+					retCb(index, pybind11::bytes(retString));
+				}
+			}
 #else
                 retCb(index, curString.c_str());
 #endif
@@ -615,7 +652,15 @@ namespace fastllm {
         }
         if (retCb)
 #ifdef PY_API
-			retCb(-1, pybind11::bytes(retString));
+		{
+			if(generationConfig.enable_hash_id){
+				std::stringstream ss;
+				ss << retString << "hash_id:"<<hash_id;
+				retCb(-1, pybind11::bytes(ss.str()));
+			}else{
+				retCb(-1, pybind11::bytes(retString));
+			}
+		}
 #else
             retCb(-1, retString.c_str());
 #endif
@@ -629,7 +674,21 @@ namespace fastllm {
 #ifdef USE_CUDA
         FastllmCudaClearBigBuffer();
 #endif
-        int batch = inputs.size();
+#ifdef PY_API
+        std::vector<std::string> prompts;
+        std::vector < size_t > hash_ids;
+        for (auto _input: inputs){
+            size_t hash_id = std::hash<std::string>{}(_input);
+            hash_ids.push_back(hash_id);
+
+            size_t pos = _input.find_last_of("time_stamp:");
+            std::string prompt = (generationConfig.enable_hash_id && pos != std::string::npos) ? _input.substr(0, pos - 10) : _input;
+            prompts.push_back(prompt);
+        }
+#else
+        std::vector<std::string> prompts = inputs;
+#endif
+        int batch = prompts.size();
         outputs.clear();
         outputs.resize(batch, "");
 
@@ -639,9 +698,9 @@ namespace fastllm {
         seqLens.resize(batch);
         int maxLen = 0;
         for (int i = 0; i < batch; i++) {
-            inputTokens[i].CopyFrom(this->weight.tokenizer.Encode(inputs[i]));
-            maxLen = std::max(maxLen, (int)inputTokens[i].Count(0) + 1);
-            seqLens[i] = (int)inputTokens[i].Count(0) + 1;
+            inputTokens[i].CopyFrom(this->weight.tokenizer.Encode(prompts[i]));
+            maxLen = std::max(maxLen, (int)inputTokens[i].Count(0));
+            seqLens[i] = (int)inputTokens[i].Count(0);
         }
 
         std::vector <float> ids = std::vector <float> (batch * maxLen, 0);
@@ -649,13 +708,10 @@ namespace fastllm {
         std::vector <float> vmask = std::vector <float> (batch * maxLen * maxLen, 0);
         for (int i = 0; i < batch; i++) {
             Data &tokens = inputTokens[i];
-            int len = tokens.Count(0), base = maxLen - 1 - len;
-            ids[i * maxLen + base] = bos_token_id;
+            int len = tokens.Count(0), base = maxLen - len;
             for (int j = 0; j < len; j++) {
-                ids[i * maxLen + base + 1 + j] = ((float*)tokens.cpuData)[j];
+                ids[i * maxLen + base + j] = ((float*)tokens.cpuData)[j];
             }
-            len += 1;
-
             for (int j = 0; j < len; j++) {
                 vpids[i * maxLen + base + j] = j;
             }
@@ -722,9 +778,30 @@ namespace fastllm {
             if (endingCount == batch) {
                 break;
             }
-            if (retCb) {
-                retCb(index, curStrings);
+            if (retCb) 
+#ifdef PY_API
+            {
+                if (generationConfig.enable_hash_id) {
+                    std::vector<pybind11::bytes> rtnStrings;
+                    for (size_t i=0; i<batch; i++){
+                        std::stringstream ss;
+                        ss << curStrings[i] << "hash_id:" << hash_ids[i];
+                        rtnStrings.push_back(pybind11::bytes(ss.str()));
+                    }
+                    retCb(index, rtnStrings);
+                } else {
+                    std::vector<pybind11::bytes> rtnStrings;
+                    for (size_t i=0; i<batch; i++){
+                        std::stringstream ss;
+                        ss << curStrings[i];
+                        rtnStrings.push_back(pybind11::bytes(ss.str()));
+                    }
+                    retCb(index, rtnStrings);
+                }
             }
+#else
+                retCb(index, curStrings);
+#endif
             index++;
 
             maxLen++;
@@ -749,7 +826,29 @@ namespace fastllm {
             //printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         }
         if (retCb)
+#ifdef PY_API
+        {
+            if (generationConfig.enable_hash_id) {
+                std::vector<pybind11::bytes> rtnStrings;
+                for (size_t i=0; i<batch; i++){
+                    std::stringstream ss;
+                    ss << outputs[i] << "hash_id:" << hash_ids[i];
+                    rtnStrings.push_back(pybind11::bytes(ss.str()));
+                }
+                retCb(-1, rtnStrings);
+            } else {
+                std::vector<pybind11::bytes> rtnStrings;
+                for (size_t i=0; i<batch; i++){
+                    std::stringstream ss;
+                    ss << outputs[i];
+                    rtnStrings.push_back(pybind11::bytes(ss.str()));
+                }
+                retCb(-1, rtnStrings);
+            }
+        }
+#else
             retCb(-1, outputs);
+#endif
     }
 
     std::string LlamaModel::MakeInput(const std::string &history, int round, const std::string &input) {
@@ -789,17 +888,21 @@ namespace fastllm {
                         std::vector <int> seqLens;
                         std::vector <GenerationConfig> generationConfigs;
                         LastTokensManager tokensManager;
+                        std::vector <std::vector <float>* > logits;
                         model->dictLocker.lock();
                         for (auto &it: model->responseContextDict.dicts) {
                             if (it.second->isEnding) {
                                 continue;
                             }
                             generationConfigs.push_back(it.second->generationConfig);
+                            if (it.second->generationConfig.output_logits) {
+                                it.second->resultLogits.push(new std::vector <float> ());
+                                logits.push_back(it.second->resultLogits.back());
+                            } else {
+                                logits.push_back(nullptr);
+                            }
                             tokensManager.units.push_back(it.second->tokens);
                             if (it.second->preTokens == 0) {
-                                if (it.second->currentTokens.size() == 0 || it.second->currentTokens[0] != model->bos_token_id) {
-                                    it.second->currentTokens.insert(it.second->currentTokens.begin(), model->bos_token_id);
-                                }
                                 int seqLen = it.second->currentTokens.size();
                                 for (int i = 0; i < it.second->currentTokens.size(); i++) {
                                     ids.push_back(it.second->currentTokens[i]);
@@ -841,7 +944,7 @@ namespace fastllm {
 #endif
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                             std::vector<int> ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
-                                                                       positionIds, seqLens, pastKeyValues, generationConfigs, tokensManager);
+                                                                       positionIds, seqLens, pastKeyValues, generationConfigs, tokensManager, &logits);
                             int idx = 0;
                             for (auto &it: model->responseContextDict.dicts) {
                                 if (it.second->isEnding) {

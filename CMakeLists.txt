@@ -5,6 +5,7 @@ project(fastllm LANGUAGES CXX)
 option(USE_CUDA "use cuda" OFF)
 
 option(PY_API "python api" OFF)
+option(USE_MMAP "use mmap" OFF)
 
 message(STATUS "USE_CUDA: ${USE_CUDA}")
 
@@ -23,19 +24,23 @@ endif()
 
 message(STATUS "CMAKE_CXX_FLAGS" ${CMAKE_CXX_FLAGS})
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executor.cpp
-        src/devices/cpu/cpudevice.cpp
-        src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/basellm.cpp)
+        src/devices/cpu/cpudevice.cpp src/devices/cpu/cpudevicebatch.cpp
+        src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp)
 
 include_directories(include)
 include_directories(include/utils)
 include_directories(include/models)
+
+if (USE_MMAP)
+    add_compile_definitions(USE_MMAP)
+endif()
 
 if (USE_CUDA)
     enable_language(CUDA)
     add_compile_definitions(USE_CUDA)
     include_directories(include/devices/cuda)
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
-    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/fastllm-cuda.cu)
+    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/cuda/fastllm-cuda.cu)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
     set(CMAKE_CUDA_ARCHITECTURES "native")
 endif()
@@ -77,6 +82,9 @@ add_custom_command(
 
 add_executable(benchmark example/benchmark/benchmark.cpp)
 target_link_libraries(benchmark fastllm)
+
+add_executable(apiserver example/apiserver/apiserver.cpp example/apiserver/json11.cpp)
+target_link_libraries(apiserver fastllm)
 
 add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})

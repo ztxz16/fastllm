@@ -22,7 +22,7 @@ std::string initGptConf(const char* modelPath,int threads) {
     {
         std::string modelName = chatGlm->model_type;
         LOG_Debug("@@model name:%s\n",modelName.c_str());
-        return modelName.c_str();
+        return modelName;
     }
     LOG_Debug("@@CreateLLMModelFromFile failed.");
     return "";

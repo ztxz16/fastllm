@@ -10,6 +10,7 @@
 
 #ifdef USE_CUDA
 #include "devices/cuda/cudadevice.h"
+#include "devices/cuda/fastllm-cuda.cuh"
 #endif
 
 namespace fastllm {
@@ -35,26 +36,88 @@ namespace fastllm {
         this->devices.push_back(device);
     }
 
+    void Executor::SetFirstDevice(const std::string &device) {
+        auto temp = this->devices;
+        this->devices.clear();
+        for (int i = 0; i < temp.size(); i++) {
+            if (StartWith(device, temp[i]->deviceType)) {
+                this->devices.push_back(temp[i]);
+                this->devices.back()->deviceIds = ParseDeviceIds(device, temp[i]->deviceType);
+            }
+        }
+        for (int i = 0; i < temp.size(); i++) {
+            if (!StartWith(device, temp[i]->deviceType)) {
+                this->devices.push_back(temp[i]);
+            }
+        }
+    }
+
+    std::vector <int> Executor::GetDeviceIds(const std::string &device) {
+        for (int i = 0; i < devices.size(); i++) {
+            if (StartWith(devices[i]->deviceType, device)) {
+                return devices[i]->deviceIds;
+            }
+        }
+        return {0};
+    }
+
     void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                        const fastllm::IntDict &intParams) {
-//auto st = std::chrono::system_clock::now();
+        auto st = std::chrono::system_clock::now();
         bool lockInCPU = false;
-        for (auto &it : datas) {
-            lockInCPU |= it.second->lockInCPU;
+        for (auto &it: datas) {
+            if (intParams.find(it.first + "___batch") != intParams.end()) {
+                int batch = intParams.find(it.first + "___batch")->second;
+                for (int i = 0; i < batch; i++) {
+                    lockInCPU |= (((Data**)it.second)[i] && ((Data**)it.second)[i]->lockInCPU);
+                }
+            } else {
+                lockInCPU |= (it.second && it.second->lockInCPU);
+            }
         }
-        for (auto device : devices) {
+        for (auto device: devices) {
             if (lockInCPU && device->deviceType != "cpu") {
                 continue;
             }
             if (device->CanRun(opType, datas, floatParams, intParams)) {
-                for (auto &it : datas) {
-                    it.second->ToDevice((void*)device);
+#ifdef USE_CUDA
+                if (device->deviceType == "cuda" && device->deviceIds.size() > 0) {
+                    FastllmCudaSetDevice(device->deviceIds[0]);
+                }
+#endif
+                for (auto &it: datas) {
+                    if (intParams.find(it.first + "___batch") != intParams.end()) {
+                        int batch = intParams.find(it.first + "___batch")->second;
+                        for (int i = 0; i < batch; i++) {
+                            if (((Data**)it.second)[i]) {
+                                ((Data**)it.second)[i]->ToDevice((void *) device);
+                            }
+                        }
+                    } else {
+                        if (it.second) {
+                            it.second->ToDevice((void *) device);
+                        }
+                    }
                 }
                 device->Reshape(opType, datas, floatParams, intParams);
                 device->Run(opType, datas, floatParams, intParams);
                 break;
             }
         }
-//printf("%s spend %f s.\n", opType.c_str(), GetSpan(st, std::chrono::system_clock::now()));
+        float spend = GetSpan(st, std::chrono::system_clock::now());
+        profiler[opType] += spend;
+    }
+
+    void Executor::ClearProfiler() {
+        profiler.clear();
+    }
+
+    void Executor::PrintProfiler() {
+        float sum = 0.0;
+        for (auto &it : profiler) {
+            printf("%s spend %f\n", it.first.c_str(), it.second);
+            sum += it.second;
+        }
+        printf("total spend %f\n", sum);
     }
 }

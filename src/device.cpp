@@ -59,10 +59,35 @@ namespace fastllm {
             return;
         }
         // 默认的Reshape，把output和input变成一样的形状
-        Data &input = *(datas.find("input")->second);
-        Data &output = *(datas.find("output")->second);
+        Data *inputs = (datas.find("input")->second);
+        Data *outputs = (datas.find("output")->second);
+        if (inputs == outputs) {
+            return;
+        }
+        outputs[0].dataType = inputs[0].dataType;
+        outputs[0].Resize(inputs[0].dims);
+    }
 
-        output.dataType = input.dataType;
-        output.Resize(input.dims);
+    void BaseBatchOperator::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (datas.find("output") == datas.end()) {
+            return;
+        }
+        // 默认的Reshape，把output和input变成一样的形状
+        Data **inputs = (Data**)(datas.find("input")->second);
+        Data **outputs = (Data**)(datas.find("output")->second);
+        if (inputs == outputs) {
+            return;
+        }
+
+        int batch = 1;
+        if (intParams.find("input___batch") != intParams.end()) {
+            batch = intParams.find("input___batch")->second;
+        }
+
+        for (int i = 0; i < batch; i++) {
+            outputs[i]->dataType = inputs[i]->dataType;
+            outputs[i]->Resize(inputs[i]->dims);
+        }
     }
 }
