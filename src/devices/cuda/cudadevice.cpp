@@ -12,6 +12,7 @@
 namespace fastllm {
     CudaDevice::CudaDevice() {
         this->deviceType = "cuda";
+        this->ops["Attention"] = (BaseOperator*)(new CudaAttention());
         this->ops["LayerNorm"] = (BaseOperator*)(new CudaLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
@@ -33,6 +34,16 @@ namespace fastllm {
         this->ops["RotatePosition2D"] = (BaseOperator*)(new CudaRotatePosition2DOp());
         this->ops["NearlyRotatePosition2D"] = (BaseOperator*)(new CudaNearlyRotatePosition2DOp());
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CudaLlamaRotatePosition2DOp());
+        this->ops["ApplyLognAttn"] = (BaseOperator*)(new CudaApplyLognAttnOp());
+
+        this->ops["SplitBatch"] = (BaseOperator*)(new CudaSplitBatchOp());
+        this->ops["CatBatch"] = (BaseOperator*)(new CudaCatBatchOp());
+        this->ops["MulBatch"] = (BaseOperator*)(new CudaMulBatchOp());
+        this->ops["MatMulBatch"] = (BaseOperator*)(new CudaMatMulBatchOp());
+        this->ops["MatMulTransBBatch"] = (BaseOperator*)(new CudaMatMulTransBBatchOp());
+        this->ops["SoftMaxBatch"] = (BaseOperator*)(new CudaSoftmaxBatchOp());
+        this->ops["CatDirectBatch"] = (BaseOperator*)(new CudaCatDirectBatchOp());
+        this->ops["AttentionBatch"] = (BaseOperator*)(new CudaAttentionBatchOp());
     }
 
     bool CudaDevice::Malloc(void **ret, size_t size) {
@@ -53,6 +64,43 @@ namespace fastllm {
     bool CudaDevice::CopyDataToCPU(void *dst, void *src, size_t size) {
         FastllmCudaCopyFromDeviceToHost(dst, src, size);
         return true;
+    }
+
+    void CudaAttention::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+
+        AssertInFastLLM(q.dims.size() == 3 && k.dims.size() == 3 && v.dims.size() == 3, "Attention: dims of q, k, v should be 3.\n");
+        AssertInFastLLM(q.dims[2] == k.dims[2], "Attention: q.dims[2] should be equal to k.dims[2].\n");
+        AssertInFastLLM(k.dims[1] == v.dims[1], "Attention: k.dims[1] should be equal to v.dims[1].\n");
+        AssertInFastLLM(k.dims[0] == v.dims[0], "Attention: k.dims[0] should be equal to v.dims[0].\n");
+        AssertInFastLLM(q.dims[0] == k.dims[0] * group, "Attention: q.dims[0] should be equal to k.dims[0] * group.\n");
+
+        AssertInFastLLM(q.dataType == k.dataType && q.dataType == v.dataType,
+                        "Attention: q, k, v's datatype should be same.\n");
+        AssertInFastLLM(q.dataType == DataType::FLOAT32, "Attention's input's type should be float32.\n");
+
+        std::vector <int> dims = {q.dims[0], q.dims[1], v.dims[2]};
+        output.dataType = q.dataType;
+        output.Resize(dims);
+    }
+
+    void CudaAttention::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data emptyData;
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &mask = datas.find("mask")->second ? *(datas.find("mask")->second) : emptyData;
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+        output.Allocate();
+        FastllmCudaAttention(q, k, v, mask, output, group, scale);
     }
 
     bool CudaRMSNormOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
@@ -114,10 +162,6 @@ namespace fastllm {
 
     bool CudaLinearOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data &weight = *(datas.find("weight")->second);
-        if (weight.dataType == DataType::FLOAT32) {
-            return false;
-        }
         return true;
     }
 
@@ -133,7 +177,9 @@ namespace fastllm {
         int m = input.dims.back();
         int k = output.dims.back();
 
-        if (weight.dataType == DataType::FLOAT16) {
+        if (weight.dataType == DataType::FLOAT32) {
+            FastllmCudaMatMulFloat32(input, weight, bias, output, n, m, k);
+        } else if (weight.dataType == DataType::FLOAT16) {
             FastllmCudaMatMulFloat16(input, weight, bias, output, n, m, k);
         } else if (weight.dataType == DataType::INT8) {
             FastllmCudaMatMulFloatInt8(input, weight, bias, output, n, m, k);
@@ -513,8 +559,9 @@ namespace fastllm {
         AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
 
         bool same = false;
-        same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && input.dims[0] == 1);
+        same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
         same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[2] == 1);
+        same |= ((axis == std::vector <int>{0, 2, 1, 3}) && (input.dims[1] == 1 || input.dims[2] == 1));
         if (same) {
             std::vector<int> new_dims;
             for (int i = 0; i < axis.size(); i++) {
@@ -558,5 +605,14 @@ namespace fastllm {
         int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
 
         FastllmCudaLlamaRotatePosition2D(data, positionIds, sinData, cosData, rotaryDim);
+    }
+
+    void CudaApplyLognAttnOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &lognAttn = *(datas.find("lognAttn")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+
+        FastllmCudaApplyLognAttn(input, lognAttn, positionIds);
     }
 }

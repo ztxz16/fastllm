@@ -1,10 +1,12 @@
 #include "utils.h"
 
 #include "model.h"
+#include "fastllm.h"
 
 #include "chatglm.h"
 #include "moss.h"
 #include "llama.h"
+#include "qwen.h"
 
 namespace fastllm {
     void basellm::LoadFromFile(const std::string &fileName) {
@@ -16,6 +18,10 @@ namespace fastllm {
         if (this->weight.dicts.find("bos_token_id") != this->weight.dicts.end()) {
             this->bos_token_id = atoi(this->weight.dicts["bos_token_id"].c_str());
             this->eos_token_id = atoi(this->weight.dicts["eos_token_id"].c_str());
+        }
+        if (this->weight.dicts.find("im_start_id") != this->weight.dicts.end()) {
+            this->bos_token_id = atoi(this->weight.dicts["im_start_id"].c_str());
+            this->eos_token_id = atoi(this->weight.dicts["im_end_id"].c_str());
         }
         if (this->weight.dicts.find("num_hidden_layers") != this->weight.dicts.end()) {
             block_cnt = atoi(this->weight.dicts["num_hidden_layers"].c_str());
@@ -38,6 +44,8 @@ namespace fastllm {
         if (this->weight.dicts.find("history_sep") != this->weight.dicts.end()) {
             history_sep = this->weight.dicts["history_sep"];
         }
+
+        this->deviceMap = GetDeviceMap();
     }
 
     void basellm::SaveLowBitModel(const std::string &fileName, int bit) {
@@ -49,11 +57,13 @@ namespace fastllm {
     }
 
     fastllm::basellm *CreateModelWithType(const std::string &modelType) {
-        basellm *model;
+        basellm *model = nullptr;
         if (modelType == "chatglm") {
             model = (basellm*)(new ChatGLMModel());
         } else if (modelType == "moss") {
             model = (basellm*)(new MOSSModel());
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::NORMAL;
+            model->eos_token_id = 106068;
         } else if (modelType == "baichuan") {
             model = (basellm*)(new LlamaModel());
             model->model_type = "baichuan";
@@ -61,8 +71,12 @@ namespace fastllm {
             model->user_role = "<human>:";
             model->bot_role = "\n<bot>:";
             model->history_sep = "\n";
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::BPE;
         } else if (modelType == "llama") {
             model = (basellm*)(new LlamaModel());
+        } else if (modelType == "qwen") {
+            model = (basellm *) (new QWenModel());
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
         } else {
             ErrorInFastLLM("Unkown model type: " + modelType);
         }

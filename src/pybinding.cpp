@@ -6,6 +6,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>
 #include <pybind11/functional.h>
+#include <unordered_map>
 
 namespace py = pybind11;
 using namespace pybind11::literals;  
@@ -29,6 +30,7 @@ PYBIND11_MODULE(pyfastllm, m) {
 	  .def_readwrite("top_k", &fastllm::GenerationConfig::top_k) 
 	  .def_readwrite("top_p", &fastllm::GenerationConfig::top_p) 
 	  .def_readwrite("temperature", &fastllm::GenerationConfig::temperature)
+	  .def_readwrite("enable_hash_id", &fastllm::GenerationConfig::enable_hash_id)
 	  .def("is_simple_greedy", &fastllm::GenerationConfig::IsSimpleGreedy); 
 
   // high level
@@ -38,8 +40,11 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("get_low_memory", &fastllm::GetLowMemMode)
     .def("set_kv_cache", &fastllm::SetKVCacheInCPU)
     .def("get_kv_cache", &fastllm::GetKVCacheInCPU)
+    .def("set_device_map", &fastllm::SetDeviceMap)
     .def("create_llm", &fastllm::CreateLLMModelFromFile);
-  
+  m.def("std_hash", [](std::string input) -> size_t {
+		return std::hash<std::string>{}(input);
+  }); 
   // low level
   m.def("get_llm_type", &fastllm::GetModelTypeFromFile);
 
@@ -151,6 +156,8 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("bos_token_id", &fastllm::ChatGLMModel::bos_token_id)
     .def_readonly("eos_token_id", &fastllm::ChatGLMModel::eos_token_id)
     .def("load_weights", &fastllm::ChatGLMModel::LoadFromFile)
+    .def("make_input", &fastllm::ChatGLMModel::MakeInput)
+    .def("make_history", &fastllm::ChatGLMModel::MakeHistory)
     .def("response", &fastllm::ChatGLMModel::Response)
     .def("batch_response", [](fastllm::ChatGLMModel &model, 
                               const std::vector <std::string> &inputs,
@@ -173,7 +180,8 @@ PYBIND11_MODULE(pyfastllm, m) {
     })
     .def("launch_response", &fastllm::ChatGLMModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::ChatGLMModel::FetchResponseTokens)
-    .def("save_lowbit_model", &fastllm::ChatGLMModel::SaveLowBitModel);
+    .def("save_lowbit_model", &fastllm::ChatGLMModel::SaveLowBitModel)
+    .def("make_input", &fastllm::ChatGLMModel::MakeInput);
 
   py::class_<fastllm::MOSSModel, fastllm::basellm>(m, "MOSSModel")
     .def(py::init<>())
@@ -183,6 +191,8 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("bos_token_id", &fastllm::MOSSModel::bos_token_id)
     .def_readonly("eos_token_id", &fastllm::MOSSModel::eos_token_id)
     .def("load_weights", &fastllm::MOSSModel::LoadFromFile)
+    .def("make_input", &fastllm::MOSSModel::MakeInput)
+    .def("make_history", &fastllm::MOSSModel::MakeHistory)
     .def("response", &fastllm::MOSSModel::Response)
     .def("batch_response", [](fastllm::MOSSModel &model, 
                               const std::vector <std::string> &inputs,
@@ -203,7 +213,8 @@ PYBIND11_MODULE(pyfastllm, m) {
     })
     .def("launch_response", &fastllm::MOSSModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::MOSSModel::FetchResponseTokens)
-    .def("save_lowbit_model", &fastllm::MOSSModel::SaveLowBitModel);
+    .def("save_lowbit_model", &fastllm::MOSSModel::SaveLowBitModel)
+    .def("make_input", &fastllm::MOSSModel::MakeInput);
 
   py::class_<fastllm::LlamaModel, fastllm::basellm>(m, "LlamaModel")
     .def(py::init<>())
@@ -213,6 +224,8 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("bos_token_id", &fastllm::LlamaModel::bos_token_id)
     .def_readonly("eos_token_id", &fastllm::LlamaModel::eos_token_id)
     .def("load_weights", &fastllm::LlamaModel::LoadFromFile)
+    .def("make_input", &fastllm::LlamaModel::MakeInput)
+    .def("make_history", &fastllm::LlamaModel::MakeHistory)
     .def("response", &fastllm::LlamaModel::Response)
     .def("batch_response", [](fastllm::LlamaModel &model, 
                               const std::vector <std::string> &inputs,
@@ -234,7 +247,44 @@ PYBIND11_MODULE(pyfastllm, m) {
     })
     .def("launch_response", &fastllm::LlamaModel::LaunchResponseTokens)
     .def("fetch_response", &fastllm::LlamaModel::FetchResponseTokens)
-    .def("save_lowbit_model", &fastllm::LlamaModel::SaveLowBitModel);
+    .def("save_lowbit_model", &fastllm::LlamaModel::SaveLowBitModel)
+    .def("make_input", &fastllm::LlamaModel::MakeInput);
+
+  py::class_<fastllm::QWenModel, fastllm::basellm>(m, "QWenModel")
+    .def(py::init<>())
+    .def_readonly("model_type", &fastllm::QWenModel::model_type)
+    .def_readonly("weight", &fastllm::QWenModel::weight)
+    .def_readonly("block_cnt", &fastllm::QWenModel::block_cnt)
+    .def_readonly("bos_token_id", &fastllm::QWenModel::bos_token_id)
+    .def_readonly("eos_token_id", &fastllm::QWenModel::eos_token_id)
+    .def("load_weights", &fastllm::QWenModel::LoadFromFile)
+    .def("make_input", &fastllm::QWenModel::MakeInput)
+    .def("make_history", &fastllm::QWenModel::MakeHistory)
+    .def("response", &fastllm::QWenModel::Response)
+    .def("batch_response", [](fastllm::QWenModel &model, 
+                                const std::vector <std::string> &inputs,
+                                RuntimeResultBatch retCb,
+                                fastllm::GenerationConfig config)->std::vector<std::string> {
+        std::vector <std::string> outputs;
+        model.ResponseBatch(inputs, outputs, retCb, config);
+        return outputs;
+    })
+    .def("warmup", &fastllm::QWenModel::WarmUp)
+    .def("forward",
+        [](fastllm::QWenModel &model, 
+            const fastllm::Data &inputIds, 
+            const fastllm::Data &attentionMask,
+            const fastllm::Data &positionIds, std::vector<std::pair<fastllm::Data, fastllm::Data>> &pastKeyValues,
+            const fastllm::GenerationConfig &generationConfig, const fastllm::LastTokensManager &tokens) {
+
+            int retV = model.Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
+            return std::make_tuple(retV, pastKeyValues);
+    })
+    .def("launch_response", &fastllm::QWenModel::LaunchResponseTokens)
+    .def("fetch_response", &fastllm::QWenModel::FetchResponseTokens)
+    .def("save_lowbit_model", &fastllm::QWenModel::SaveLowBitModel)
+    .def("make_input", &fastllm::QWenModel::MakeInput);
+
 #ifdef VERSION_INFO
     m.attr("__version__") = VERSION_INFO;
 #else

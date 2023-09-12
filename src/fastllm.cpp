@@ -12,6 +12,14 @@
 #include <cmath>
 #include <cfloat>
 #include <thread>
+#include <algorithm>
+
+#ifdef USE_MMAP
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#endif
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -27,6 +35,7 @@
 #endif
 
 namespace fastllm {
+    std::map <std::string, int> defaultDeviceMap;
     Executor defaultExecutor;
     Executor *curExecutor = &defaultExecutor;
 
@@ -93,6 +102,56 @@ namespace fastllm {
 
     ThreadPool *GetPool() {
         return fastllmThreadPool;
+    }
+#ifdef USE_MMAP
+    FileMmap::FileMmap(const std::string &path) {
+        int fd = open(path.c_str(), O_RDONLY);
+        AssertInFastLLM(fd > 0, "cannot open file ");
+
+        struct stat sb;
+        AssertInFastLLM(fstat(fd, &sb) == 0, "fstat error");
+        size = sb.st_size;
+
+        data = (char *)mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+        AssertInFastLLM(data != MAP_FAILED, "mmap failed");
+
+        AssertInFastLLM(close(fd) == 0, "close file error");
+    }
+
+    FileMmap::~FileMmap() { AssertInFastLLM(munmap(data, size) == 0, "munmap failed");}
+#endif
+    void ModelLoader::seek(int64_t offset, int whence) {
+        if (whence == SEEK_SET) {
+            ptr = data + offset;
+        } else if (whence == SEEK_CUR) {
+            ptr += offset;
+        } else if (whence == SEEK_END) {
+            ptr = data + size + offset;
+        } else {
+            printf("invalid seek mode: %d", whence);
+        }
+    }
+
+    std::string ModelLoader::ReadString() {
+        int length = ReadInt();
+        std::string s(ptr, ptr + length);
+        ptr += length;
+        return s;
+    }
+
+    int ModelLoader::ReadInt(){
+        return read_basic<int>();
+    }
+
+    float ModelLoader::ReadFloat(){
+        return read_basic<float>();
+    }
+
+    uint8_t* ModelLoader::ReadBytes(uint64_t bytes){
+        // memcpy(buffer, ptr, bytes);
+        uint8_t* buffer = (uint8_t *) ptr;
+        ptr += bytes;
+        return buffer;
     }
 
     struct FileBuffer {
@@ -266,6 +325,9 @@ namespace fastllm {
     }
 
     void Data::Reshape(const std::vector<int> &dims) {
+        if (this->dims == dims) {
+            return;
+        }
         std::vector <int> outputDims = dims;
         uint64_t old = 1;
         for (int i : this->dims) {
@@ -335,11 +397,17 @@ namespace fastllm {
     }
 
     void Data::Allocate(float v) {
-        AssertInFastLLM(this->dataType == DataType::FLOAT32, "Allocate error: Data's type should be float32.\n");
+        AssertInFastLLM(this->dataType == DataType::FLOAT32
+                        || this->dataType == DataType::FLOAT16, "Allocate error: Data's type should be float32 or float16.\n");
         this->Allocate();
-        float *f = (float*)cpuData;
         if (this->dataDevice == DataDevice::CPU) {
-            std::fill(f, f + Count(0), v);
+            if (this->dataType == DataType::FLOAT32) {
+                float *f = (float*)cpuData;
+                std::fill(f, f + Count(0), v);
+            } else if (this->dataType == DataType::FLOAT16) {
+                uint16_t *h = (uint16_t*)cpuData;
+                std::fill(h, h + Count(0), float_to_half(v));
+            }
         } else {
             // TODO: 别的设备上的初始化
         }
@@ -415,7 +483,9 @@ namespace fastllm {
     }
 
     Data::~Data() {
+#ifndef USE_MMAP
         delete[] this->cpuData;
+#endif
 #ifdef USE_CUDA
         if (this->cudaData != nullptr) {
             FastllmCudaFree(this->cudaData);
@@ -560,13 +630,24 @@ namespace fastllm {
     void Data::ToDevice(void *device) {
         BaseDevice *dev = (BaseDevice*)device;
         if (dev->deviceType == "cuda") {
-            this->ToDevice(DataDevice::CUDA);
+            this->ToDevice(DataDevice::CUDA, dev->deviceIds);
         } else {
-            this->ToDevice(DataDevice::CPU);
+            this->ToDevice(DataDevice::CPU, dev->deviceIds);
         }
     }
 
     void Data::ToDevice(fastllm::DataDevice device) {
+        if (device == DataDevice::CUDA) {
+            ToDevice(device, curExecutor->GetDeviceIds("cuda"));
+        } else {
+            ToDevice(device, {0});
+        }
+    }
+
+    void Data::ToDevice(fastllm::DataDevice device, const std::vector <int> &deviceIds) {
+        // TODO: 同一个Weight切分到不同 Device 上
+        // NOTICE: 目前还不支持，暂时只切到deviceIds[0]上
+
         if (this->dataType == DataType::INT32PARAM) {
             return;
         }
@@ -574,7 +655,8 @@ namespace fastllm {
         // TODO: 这里先直接跳过了
         return;
 #endif
-        if (this->dataDevice == device) {
+        if (this->dataDevice == device &&
+            (this->dataDevice == DataDevice::CPU || deviceIds.size() == 0 || this->dataDeviceIds == deviceIds)) {
             return;
         }
 
@@ -582,6 +664,7 @@ namespace fastllm {
 #ifdef USE_CUDA
             if (this->dataDevice == DataDevice::CPU) {
                 if (device == DataDevice::CUDA) {
+                    FastllmCudaSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
                     this->cudaData = FastllmCudaMalloc(expansionBytes);
                     FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, expansionBytes);
                     delete[] this->cpuData;
@@ -593,16 +676,37 @@ namespace fastllm {
                     FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
                     FastllmCudaFree(this->cudaData);
                     this->cudaData = nullptr;
+                } else if (device == DataDevice::CUDA) {
+                    FastllmCudaSetDevice(this->dataDeviceIds.size() == 0 ? 0 : this->dataDeviceIds[0]);
+                    uint8_t *cpuData = new uint8_t[expansionBytes];
+                    FastllmCudaCopyFromDeviceToHost(cpuData, this->cudaData, expansionBytes);
+                    FastllmCudaFree(this->cudaData);
+
+                    FastllmCudaSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
+                    this->cudaData = FastllmCudaMalloc(expansionBytes);
+
+                    FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
+                    delete[] cpuData;
                 }
             }
 #endif
         }
+        if (deviceIds.size() == 0) {
+            this->dataDeviceIds = {0};
+        } else {
+            this->dataDeviceIds = deviceIds;
+        };
         this->dataDevice = device;
     }
 
     std::string GetModelTypeFromFile(const std::string &fileName) {
         std::string ret = "unknown";
+    #ifdef USE_MMAP
+        std::unique_ptr<FileMmap> mapped_file = std::make_unique<FileMmap>(fileName);
+        ModelLoader buffer((char *)mapped_file->data, mapped_file->size);
+    #else
         FileBuffer buffer(fileName);
+    #endif
         int versionId = buffer.ReadInt();
         std::map <std::string, std::string> dicts;
         if (versionId >= 1) {
@@ -657,7 +761,7 @@ namespace fastllm {
         tokenToStringDict.clear();
     }
 
-    void Tokenizer::Insert(const std::string &s, int tokenId) {
+    void Tokenizer::Insert(const std::string &s, int tokenId, float score) {
         TrieNode *now = this->root;
         for (int i = 0; i < s.size(); i++) {
             if (now->next.find(s[i]) == now->next.end()) {
@@ -666,34 +770,266 @@ namespace fastllm {
             now = now->next[s[i]];
         }
         now->tokenId = tokenId;
+        now->score = score;
         tokenToStringDict[tokenId] = s;
+        stringToTokenDict[s] = tokenId;
     }
 
-    Data Tokenizer::Encode(const std::string &s) {
-        std::vector <float> v;
-        for (int i = 0; i < s.size(); i++) {
-            int tokenId = -999999, pos = i - 1;
-            TrieNode *now = this->root;
-            for (int j = i; j < s.size(); j++) {
-                if (now->next.find(s[j]) != now->next.end()) {
-                    now = now->next[s[j]];
-                    if (now->tokenId != -999999) {
-                        tokenId = now->tokenId;
-                        pos = j;
-                    }
-                } else {
-                    break;
-                }
-            }
-            if (pos >= i) {
-                i = pos;
-                v.push_back(tokenId);
-                //printf("%d ", tokenId);
+    void Tokenizer::TryMergePairs(std::vector<Symbol> &symbols, int l, int r, std::priority_queue <SymbolPairs> &q) {
+        if (l == -1 || r == -1 || symbols[l].len == 0 || symbols[r].len == 0) {
+            return;
+        }
+        auto now = symbols[l].node;
+        char *s = symbols[r].s;
+        int pos = symbols[r].pos, len = symbols[r].len;
+        for (int i = pos; i < pos + len; i++) {
+            if (now->next.find(s[i]) != now->next.end()) {
+                now = now->next[s[i]];
+            } else {
+                return;
             }
         }
-        //printf("\n");
+        if (now->tokenId == -999999) {
+            return;
+        }
+        q.push(SymbolPairs(now->score, l, r, symbols[l].len + symbols[r].len));
+    }
 
-        return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
+    Data Tokenizer::Encode(const std::string &ori) {
+        if (this->type == TokenizerType::BPE) {
+            std::string blank = "";
+            blank += 226, blank += 150, blank += 129;
+            std::string s = blank;
+            if (15 < ori.size() && ori.substr(0, 15) == "<FLM_FIX_TOKEN_") {
+                s = "";
+            }
+            for (int i = 0; i < ori.size(); i++) {
+                if (ori[i] == ' ') {
+                    if (i != 0 && ori[i - 1] != ' ') {
+                        s += blank;
+                    }
+                } else {
+                    s += ori[i];
+                }
+            }
+
+            std::vector<Symbol> symbols;
+            for (int i = 0; i < s.size(); i++) {
+                if (i + 3 < s.size() && s[i] == '<' && s[i + 1] == 'F' && s[i + 2] == 'L' && s[i + 3] == 'M') {
+                    if (i + 15 < s.size() && s.substr(i, 15) == "<FLM_FIX_TOKEN_") {
+                        i += 15;
+                        int now = 0;
+                        while (s[i] >= '0' && s[i] <= '9') {
+                            now = now * 10 + s[i] - '0';
+                            i++;
+                        }
+                        symbols.push_back(Symbol(nullptr, (char *) s.data(), i, 0, (int) symbols.size() - 1,
+                                                 (int) symbols.size() + 1, now));
+                        continue;
+                    }
+                }
+
+                int tokenId = -999999, pos = i - 1;
+                TrieNode *now = this->root;
+                for (int j = i; j < s.size(); j++) {
+                    if (now->next.find(s[j]) != now->next.end()) {
+                        now = now->next[s[j]];
+                        if (now->tokenId != -999999) {
+                            tokenId = now->tokenId;
+                            pos = j;
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if (pos >= i) {
+                    symbols.push_back(Symbol(now, (char *) s.data(), i, pos - i + 1, (int) symbols.size() - 1,
+                                             (int) symbols.size() + 1, -999999));
+                    i = pos;
+                } else {
+                    symbols.push_back(Symbol(nullptr, (char *) s.data(), i, 0, (int) symbols.size() - 1,
+                                             (int) symbols.size() + 1, -999999));
+                }
+            }
+            symbols.back().next = -1;
+
+            std::priority_queue<SymbolPairs> workQueue;
+            for (int i = 1; i < symbols.size(); i++) {
+                TryMergePairs(symbols, i - 1, i, workQueue);
+            }
+
+            while (!workQueue.empty()) {
+                auto top = workQueue.top();
+                workQueue.pop();
+                if (symbols[top.l].len == 0 || symbols[top.r].len == 0 ||
+                    symbols[top.l].len + symbols[top.r].len != top.size) {
+                    continue;
+                }
+
+                for (int i = symbols[top.r].pos; i < symbols[top.r].pos + symbols[top.r].len; i++) {
+                    symbols[top.l].node = symbols[top.l].node->next[symbols[top.r].s[i]];
+                }
+                symbols[top.l].len += symbols[top.r].len;
+                symbols[top.r].len = 0;
+                symbols[top.l].next = symbols[top.r].next;
+                if (symbols[top.r].next >= 0) {
+                    symbols[symbols[top.r].next].prev = top.l;
+                }
+
+                TryMergePairs(symbols, symbols[top.l].prev, top.l, workQueue);
+                TryMergePairs(symbols, top.l, symbols[top.l].next, workQueue);
+            }
+
+            std::vector<float> v;
+            for (int i = 0; i < symbols.size(); i++) {
+                if (symbols[i].len > 0) {
+                    v.push_back(symbols[i].node->tokenId);
+                } else if (symbols[i].node == nullptr) {
+                    if (symbols[i].fixId != -999999) {
+                        v.push_back(symbols[i].fixId);
+                    } else {
+                        // 未识别的字符
+                        uint8_t c = (uint8_t) (symbols[i].s[symbols[i].pos]);
+                        std::string now = "<0x00>";
+                        now[3] = (c / 16 > 9 ? ('A' + c / 16 - 10) : ('0' + c / 16));
+                        now[4] = (c % 16 > 9 ? ('A' + c % 16 - 10) : ('0' + c % 16));
+                        if (stringToTokenDict.find(now) != stringToTokenDict.end()) {
+                            v.push_back(stringToTokenDict[now]);
+                        }
+                    }
+                }
+            }
+            return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
+        } else if (this->type == TokenizerType::QWEN) {
+            std::map<std::string, int> specialTokens = {{"<|im_start|>", 151644}, {"<|im_end|>", 151645}, {"<|endoftext|>", 151643}};
+
+            // comment these special tokens for now
+            // for (int i = 0; i < 205; i++) {
+            //     specialTokens.insert("<|extra_" + std::to_string(i) + "|>");
+            // }
+
+            std::vector<std::pair<int, int>> sep;
+            for (auto &token : specialTokens) {
+                int pos = 0;
+                while ((pos = ori.find(token.first, pos)) != std::string::npos) {
+                    sep.push_back({pos, token.first.size()});
+                    pos += token.first.size();
+                }
+            }
+            sep.push_back({ori.size(), 1}); // use this to tokenize the last few words
+            std::sort(sep.begin(), sep.end(), std::greater<std::pair<int, int>>());
+
+            std::vector<Symbol> symbols;
+            std::vector<float> v;
+            for (int i = 0; i <= ori.size(); i++) {
+                if (i == sep.back().first) {
+                    if (!symbols.empty()) {
+                        symbols.back().next = -1;
+                        std::priority_queue<SymbolPairs> workQueue;
+                        for (int i = 1; i < symbols.size(); i++) {
+                            TryMergePairs(symbols, i - 1, i, workQueue);
+                        }
+
+                        while (!workQueue.empty()) {
+                            auto top = workQueue.top();
+                            workQueue.pop();
+                            if (symbols[top.l].len == 0 || symbols[top.r].len == 0 ||
+                                symbols[top.l].len + symbols[top.r].len != top.size) {
+                                continue;
+                            }
+
+                            for (int i = symbols[top.r].pos; i < symbols[top.r].pos + symbols[top.r].len; i++) {
+                                symbols[top.l].node = symbols[top.l].node->next[symbols[top.r].s[i]];
+                            }
+                            symbols[top.l].len += symbols[top.r].len;
+                            symbols[top.r].len = 0;
+                            symbols[top.l].next = symbols[top.r].next;
+                            if (symbols[top.r].next >= 0) {
+                                symbols[symbols[top.r].next].prev = top.l;
+                            }
+
+                            TryMergePairs(symbols, symbols[top.l].prev, top.l, workQueue);
+                            TryMergePairs(symbols, top.l, symbols[top.l].next, workQueue);
+                        }
+
+                        for (int i = 0; i < symbols.size(); i++) {
+                            if (symbols[i].len > 0) {
+                                v.push_back(symbols[i].node->tokenId);
+                            } else if (symbols[i].node == nullptr) {
+                                // 未识别的字符
+                                uint8_t c = (uint8_t) (symbols[i].s[symbols[i].pos]);
+                                std::string now = "<0x00>";
+                                now[3] = (c / 16 > 9 ? ('A' + c / 16 - 10) : ('0' + c / 16));
+                                now[4] = (c % 16 > 9 ? ('A' + c % 16 - 10) : ('0' + c % 16));
+                                if (stringToTokenDict.find(now) != stringToTokenDict.end()) {
+                                    v.push_back(stringToTokenDict[now]);
+                                }
+                            }
+                        }
+                        symbols.clear();
+                    }
+
+                    std::string special = ori.substr(sep.back().first, sep.back().second);
+                    if (specialTokens.find(special) != specialTokens.end()) {
+                        v.push_back(specialTokens[special]);
+                    }
+
+                    i += sep.back().second - 1;
+                    sep.pop_back();
+
+                    continue;
+                }
+
+                int tokenId = -999999, pos = i - 1;
+                TrieNode *now = this->root;
+                for (int j = i; j < ori.size(); j++) {
+                    if (now->next.find(ori[j]) != now->next.end()) {
+                        now = now->next[ori[j]];
+                        if (now->tokenId != -999999) {
+                            tokenId = now->tokenId;
+                            pos = j;
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if (pos >= i) {
+                    symbols.push_back(Symbol(now, (char *) ori.data(), i, pos - i + 1, (int) symbols.size() - 1,
+                                             (int) symbols.size() + 1, -999999));
+                    i = pos;
+                } else {
+                    symbols.push_back(Symbol(nullptr, (char *) ori.data(), i, 0, (int) symbols.size() - 1,
+                                             (int) symbols.size() + 1, -999999));
+                }
+            }
+
+            return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
+        } else {
+            std::vector <float> v;
+            for (int i = 0; i < ori.size(); i++) {
+                int tokenId = -999999, pos = i - 1;
+                TrieNode *now = this->root;
+                for (int j = i; j < ori.size(); j++) {
+                    if (now->next.find(ori[j]) != now->next.end()) {
+                        now = now->next[ori[j]];
+                        if (now->tokenId != -999999) {
+                            tokenId = now->tokenId;
+                            pos = j;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if (pos >= i) {
+                    i = pos;
+                    v.push_back(tokenId);
+                }
+            }
+
+            return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
+        }
     }
 
     std::string Tokenizer::DecodeTokens(const std::vector<int> &tokens) {
@@ -793,7 +1129,7 @@ namespace fastllm {
                 break;
             }
         }
-        float rnd = fastllmRandom.randP();
+        float rnd = fastllmRandom.randP() * curSum;
         curSum = 0.0;
         for (int i = 0; i < topk; i++) {
             curSum += ps[i];
@@ -805,7 +1141,12 @@ namespace fastllm {
     }
 
     void WeightMap::LoadFromFile(const std::string &fileName) {
+    #ifdef USE_MMAP
+        std::shared_ptr<FileMmap> mapped_file = std::make_shared<FileMmap>(fileName);
+        ModelLoader buffer((char *)mapped_file->data, mapped_file->size);
+    #else
         FileBuffer buffer(fileName);
+    #endif
         this->versionId = buffer.ReadInt();
 
         if (this->versionId >= 1) {
@@ -819,6 +1160,23 @@ namespace fastllm {
             }
         }
 
+        if (this->dicts.find("peft_size") != this->dicts.end()) {
+            int peftSize = atoi(this->dicts["peft_size"].c_str());
+            for (int i = 0; i < peftSize; i++) {
+                std::string adapter_name = buffer.ReadString();
+                this->peftDict[adapter_name] = {};
+
+                int adapter_size = buffer.ReadInt();
+                for (int j = 0; j < adapter_size; j++) {
+                    std::string key = buffer.ReadString();
+                    std::string value = buffer.ReadString();
+                    //printf("%s %s\n", key.c_str(), value.c_str());
+                    this->peftDict[adapter_name][key] = value;
+                }
+            }
+        }
+
+        bool useScore = this->dicts["tokenizer_use_score"] == "1";
         int vocabLen = buffer.ReadInt();
         for (int i = 0; i < vocabLen; i++) {
             int len = buffer.ReadInt();
@@ -827,7 +1185,8 @@ namespace fastllm {
                 x += buffer.ReadInt();
             }
             int id = buffer.ReadInt();
-            tokenizer.Insert(x, id);
+            float score = useScore ? buffer.ReadFloat() : -i;
+            tokenizer.Insert(x, id, score);
         }
 
         int len = buffer.ReadInt();
@@ -851,16 +1210,32 @@ namespace fastllm {
 #if defined(_WIN32) or defined(_WIN64)
 	            	weight[name].filePos = _ftelli64(buffer.f);
 #else
+#ifdef USE_MMAP
+                    weight[name].filePos =  buffer.tell();
+#else
                     weight[name].filePos = ftell(buffer.f);
 #endif
+#endif
+#ifdef USE_MMAP
+                    buffer.seek(weight[name].GetBytes(), SEEK_CUR);
+#else
 	            	fseek(buffer.f, weight[name].GetBytes(), SEEK_CUR);
+#endif
 	            } else {
 	            	ErrorInFastLLM("Error: embedding's type should be float32 or bfloat16.\n");
 	            }
             } else {
+#ifdef USE_MMAP
+                weight[name].set_file(mapped_file);
+#else
 	            weight[name].Allocate();
+#endif
 	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
-		            buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+#ifdef USE_MMAP
+                    weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
+#else
+                    buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+#endif
 	            } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
 		            int bit = (dataType == DataType::INT4 ? 4 : 8);
 		            weight[name].perChannelAxis = buffer.ReadInt();
@@ -875,7 +1250,11 @@ namespace fastllm {
 			            weight[name].zeros[i] = weight[name].perChannelsConfigs[i].zeroPoint;
 			            weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
 		            }
-		            buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+#ifdef USE_MMAP
+                    weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
+#else
+                    buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+#endif
 	            } else if (dataType == DataType::INT4_NOZERO) {
                     int bit = 4;
                     weight[name].perChannelAxis = buffer.ReadInt();
@@ -890,7 +1269,11 @@ namespace fastllm {
                         weight[name].mins[i] = weight[name].perChannelsConfigs[i].min;
                         weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
                     }
+#ifdef USE_MMAP
+                    weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
+#else
                     buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+#endif
                 }
             }
 
@@ -946,6 +1329,7 @@ namespace fastllm {
         }
 
         // 写入词表
+        bool useScore = this->dicts["tokenizer_use_score"] == "1";
         buffer.WriteInt((int)tokenizer.tokenToStringDict.size());
         for (auto &it : tokenizer.tokenToStringDict) {
             buffer.WriteInt((int)it.second.size());
@@ -953,6 +1337,9 @@ namespace fastllm {
                 buffer.WriteInt((int)it.second[i]);
             }
             buffer.WriteInt(it.first);
+            if (useScore) {
+                buffer.WriteFloat(tokenizer.tokenToScoreDict[it.first]);
+            }
         }
 
         // 写入权重
@@ -1065,12 +1452,68 @@ namespace fastllm {
         return;
     }
 
-    void WeightMap::AddTokenizerWord(const std::string &key, int value) {
-        this->tokenizer.Insert(key, value);
+    void WeightMap::AddTokenizerWord(const std::string &key, int value, float score) {
+        this->tokenizer.Insert(key, value, score);
     }
 
     void WeightMap::AddDict(const std::string &key, const std::string &value) {
         this->dicts[key] = value;
+    }
+
+    void WeightMap::AddAdapterDict(const std::string &name, const std::string &key, const std::string &value) {
+        this->peftDict[name][key] = value;
+    }
+
+    void WeightMap::AddQLinearWeight(const std::string &key, const std::vector <int> &dims,
+                          int bit, float *scales, uint8_t *oriData) {
+        AssertInFastLLM(bit == 4 || bit == 8, "Error: only support 8 bit or 4 bit QLinear.\n");
+        DataType dataType = (bit == 4 ? DataType::INT4_NOZERO : DataType::INT8);
+        std::vector <int> realDims = dims;
+        if (bit == 4) {
+            realDims[1] *= 2;
+        }
+        this->weight[key] = Data(dataType, realDims);
+        Data &data = this->weight[key];
+        data.weightType = WeightType::LINEAR;
+        data.UpdateUnitSize();
+        data.Allocate();
+
+        int k = data.dims[0], m = data.dims[1];
+        int bytes = k * m / (bit == 4 ? 2 : 1);
+        data.perChannelAxis = 0;
+        data.perChannelsConfigs.resize(k);
+        data.zeros.resize(k);
+        data.scales.resize(k);
+        data.mins.resize(k);
+
+        if (bit == 4) {
+            for (int i = 0; i < k; i++) {
+                data.perChannelsConfigs[i] = LowBitConfig(-8.0 * scales[i], 7 * scales[i], bit, 1);
+                data.mins[i] = data.perChannelsConfigs[i].min;
+                data.zeros[i] = data.perChannelsConfigs[i].zeroPoint;
+                data.scales[i] = data.perChannelsConfigs[i].scale;
+            }
+            int mask = (8 << 4) | 8;
+            for (int i = 0; i < 20; i++) {
+                uint8_t a = oriData[i] >> 4, b = oriData[i] & 15;
+                int8_t ia = *(int8_t*)(&a), ib = *(int8_t*)(&b);
+            }
+            for (int i = 0; i < bytes; i++) {
+                oriData[i] = oriData[i] ^ mask;
+            }
+            memcpy((uint8_t*)data.cpuData, oriData, bytes);
+        } else {
+            for (int i = 0; i < k; i++) {
+                data.perChannelsConfigs[i] = LowBitConfig(-128.0 * scales[i], 127 * scales[i], bit, 0);
+                data.mins[i] = data.perChannelsConfigs[i].min;
+                data.zeros[i] = data.perChannelsConfigs[i].zeroPoint;
+                data.scales[i] = data.perChannelsConfigs[i].scale;
+            }
+            for (int i = 0; i < bytes; i++) {
+                oriData[i] = oriData[i] ^ 128;
+            }
+            memcpy((uint8_t*)data.cpuData, oriData, bytes);
+        }
     }
 
     void WeightMap::AddWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType,
@@ -1133,6 +1576,28 @@ namespace fastllm {
 
     Data &WeightMap::operator[](const std::string &key) {
         return weight[key];
+    }
+
+    void ToDataType(const Data &input, DataType dataType) {
+        if (dataType == DataType::FLOAT32) {
+            curExecutor->Run("ToFloat32", {
+                    {"input", (Data*)&input}
+            }, {}, {});
+        } else if (dataType == DataType::FLOAT16) {
+            curExecutor->Run("ToFloat16", {
+                    {"input", (Data*)&input}
+            }, {}, {});
+        } else {
+            ErrorInFastLLM("ToDataDevice: Unsupport data type.\n");
+        }
+    }
+
+    void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
+                   int group, float scale, int attentionType) {
+        curExecutor->Run("Attention", {
+                {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
+                {"mask", (Data*)&mask}, {"output", (Data*)&output}
+        }, {{"scale", scale}}, {{"group", group}});
     }
 
     void Embedding(const Data &input, Data &weight, Data &output) {
@@ -1293,5 +1758,176 @@ namespace fastllm {
         curExecutor->Run("RepeatPenalty", {
                 {"input", &input}, {"penalty", (Data*)&penalty}
         }, {}, {});
+    }
+
+    void ApplyLognAttn(Data &input, const Data &lognAttn, const Data &positionIds) {
+        curExecutor->Run("ApplyLognAttn", {
+            {"input", &input}, {"lognAttn", (Data *) &lognAttn}, {"positionIds", (Data *) &positionIds}
+        }, {}, {});
+    }
+
+    void SplitBatch(const Data &input, int axis, int part, std::vector <Data*> &outputs) {
+        curExecutor->Run("SplitBatch", {
+                {"input", (Data*)&input}, {"output", (Data*)outputs.data()}
+        }, {}, {{"axis", axis}, {"output___batch", part}});
+    }
+
+    void CatBatch(std::vector <Data*> &input, int axis, Data &outputs) {
+        curExecutor->Run("CatBatch", {
+                {"input", (Data*)input.data()}, {"output", (Data*)&outputs}
+        }, {}, {{"axis", axis}, {"input___batch", (int)input.size()}});
+    }
+
+    void MulBatch(std::vector <Data*> &input, float v, std::vector <Data*> &output) {
+        curExecutor->Run("MulBatch", {
+                {"input", (Data*)input.data()}, {"output", (Data*)output.data()}
+        }, {{"v", v}}, {{"input___batch", (int)input.size()}, {"output___batch", (int)output.size()}});
+    }
+
+    void MatMulBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, std::vector <Data*> &output, float alpha) {
+        curExecutor->Run("MatMulBatch", {
+                        {"input0", (Data*)input0.data()}, {"input1", (Data*)input1.data()}, {"output", (Data*)output.data()}
+                         }, {{"alpha", alpha}},
+                         {{"input0___batch", (int)input0.size()},
+                          {"input1___batch", (int)input1.size()},
+                          {"output___batch", (int)output.size()}});
+    }
+
+    void MatMulTransBBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, std::vector <Data*> &output, float alpha) {
+        curExecutor->Run("MatMulTransBBatch", {
+                {"input0", (Data*)input0.data()}, {"input1", (Data*)input1.data()}, {"output", (Data*)output.data()}
+        }, {{"alpha", alpha}},
+        {{"input0___batch", (int)input0.size()},
+         {"input1___batch", (int)input1.size()},
+         {"output___batch", (int)output.size()}});
+    }
+
+    void SoftmaxBatch(std::vector <Data*> &input, std::vector <Data*> &output, int axis) {
+        curExecutor->Run("SoftMaxBatch", {
+                {"input", (Data*)input.data()}, {"output", (Data*)output.data()}
+        }, {}, {{"axis", axis}, {"input___batch", (int)input.size()}, {"output___batch", (int)output.size()}});
+    }
+
+    void CatDirectBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, int axis) {
+        curExecutor->Run("CatDirectBatch", {
+                {"input0", (Data*)input0.data()}, {"input1", (Data*)input1.data()}
+        }, {}, {{"axis", axis}, {"input0___batch", (int)input0.size()}, {"input1___batch", (int)input1.size()}});
+    }
+
+    void AttentionBatch(std::vector <Data*> &q, std::vector <Data*> &k, std::vector <Data*> &v,
+                        std::vector <Data*> &mask, std::vector <Data*> &output,
+                        int group, float scale, int attentionType) {
+        curExecutor->Run("AttentionBatch", {
+                {"q", (Data*)q.data()}, {"k", (Data*)k.data()}, {"v", (Data*)v.data()},
+                {"mask", (Data*)mask.data()}, {"output", (Data*)output.data()}
+        },
+        {{"scale", scale}},
+        {
+            {"group", group},
+            {"q___batch", (int)q.size()}, {"k___batch", (int)k.size()}, {"v___batch", (int)v.size()},
+            {"mask___batch", (int)mask.size()}, {"output___batch", (int)output.size()}
+        });
+    }
+
+    void LoraLayer(Data &input, Data &weight, Data &loraA, Data &loraB, const Data &bias, Data &output, 
+                   std::map <std::string, std::string> loraConfig) {
+        float r = std::atof(loraConfig["r"].c_str());
+        float lora_alpha = std::atof(loraConfig["lora_alpha"].c_str());
+        bool fan_in_fan_out = loraConfig["fan_in_fan_out"] == "true";
+        if (r > 0) {
+            float scaling = lora_alpha / r;
+            if (fan_in_fan_out) {
+                Data weightTrans;
+                Data result, loraAOut, loraBOut;
+                Permute(weight, {1, 0}, weightTrans);
+                Linear(input, weightTrans, bias, result);
+                Linear(input, loraA, Data(), loraAOut);
+                Linear(loraAOut, loraB, Data(), loraBOut);
+                Mul(loraBOut, scaling, output);
+                AddTo(output, result);  
+            } else {
+                Data result, loraAOut, loraBOut;
+                Linear(input, weight, bias, result);
+                Linear(input, loraA, Data(), loraAOut);
+                Linear(loraAOut, loraB, Data(), loraBOut);
+                Mul(loraBOut, scaling, output);
+                AddTo(output, result);  
+            }
+        } else {
+            if (fan_in_fan_out) {
+                Data weightTrans;
+                Permute(weight, {1, 0}, weightTrans);
+                Linear(input, weightTrans, bias, output);
+            } else {
+                Linear(input, weight, bias, output);
+            }
+        }
+    }
+
+    void IA3Layer(Data &input, Data &weight, Data &ia3_l, Data &bias, Data &output,
+                  std::map <std::string, std::string> ia3Config) {
+        bool is_feedforward = ia3Config["if_feedforward"] == "true";
+        bool fan_in_fan_out = ia3Config["fan_in_fan_out"] == "true";
+        if (is_feedforward) {
+            // IA3_L shape: (1, in_features)
+            // output = linear(input * ia3_l)
+            if (fan_in_fan_out) {
+                Data weightTrans;
+                Permute(weight, {1, 0}, weightTrans);
+                MulTo(input, ia3_l);
+                Linear(input, weightTrans, bias, output);
+            } else {
+                MulTo(input, ia3_l);
+                Linear(input, weight, bias, output);
+            }
+        } else {
+            // IA3_L shape: (out_features, 1)
+            // output = linear(input) * ia3_l
+            if (fan_in_fan_out) {
+                Data weightTrans;
+                Permute(weight, {1, 0}, weightTrans);
+                Linear(input, weightTrans, bias, output);
+                MulTo(output, ia3_l);
+            } else {
+                Linear(input, weight, bias, output);
+                MulTo(output, ia3_l);
+            }
+        }
+    }
+
+    void ClearProfiler() {
+        curExecutor->ClearProfiler();
+    }
+
+    void PrintProfiler() {
+        curExecutor->PrintProfiler();
+    }
+
+    void ApplyDeviceMap(const std::map <std::string, int> &deviceMap, int current, int total) {
+        if (deviceMap.size() == 0) {
+            return;
+        }
+        int sum = 0, cur = 0;
+        for (auto &it : deviceMap) {
+            sum += it.second;
+        }
+        std::string curDevice = deviceMap.begin()->first;
+        for (auto &it : deviceMap) {
+            cur += it.second;
+            // current / total <= cur / sum
+            if (current * sum <= cur * total) {
+                curDevice = it.first;
+                break;
+            }
+        }
+        curExecutor->SetFirstDevice(curDevice);
+    }
+
+    void SetDeviceMap(const std::map <std::string, int> &deviceMap) {
+        defaultDeviceMap = deviceMap;
+    }
+
+    std::map <std::string, int> GetDeviceMap() {
+        return defaultDeviceMap;
     }
 }
