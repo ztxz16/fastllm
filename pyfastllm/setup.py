@@ -11,7 +11,7 @@ parser.add_argument('--cuda', dest='cuda', action='store_true', default=False,
 args, unknown = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + unknown
 
-__VERSION__ = "'0.1.3'"
+__VERSION__ = "'0.1.4'"
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 
@@ -70,9 +70,9 @@ def config_ext():
     return ext_modules
 
 cmdclass = {}
-dyn_libs = glob.glob("*.so")
-dyn_libs += glob.glob("*.dll")
-
+dyn_libs = glob.glob("*.so", root_dir="./fastllm")
+dyn_libs += glob.glob("*.dll", root_dir="./fastllm")
+# print(dyn_libs)
 setup(
     name='fastllm',  
     version=eval(__VERSION__),
@@ -84,16 +84,17 @@ setup(
     url='',
     long_description='',
     # ext_modules=ext_modules,
-    packages = ['fastllm'],
+    # packages = ['fastllm', 'fastllm.utils'],
+    packages = find_packages(), 
     package_data={
-        'fastllm': dyn_libs
+        'fastllm': dyn_libs,
     }, 
     cmdclass=cmdclass,
     setup_requires=[""],
     install_requires=[""],
     python_requires='>=3.6',
-    data_files = [('', dyn_libs)],
-    include_package_data=False,
+    # data_files = [('', dyn_libs)],
+    include_package_data=True,
     entry_points={
         'console_scripts':[
             'fastllm-convert = fastllm.convert:main'
