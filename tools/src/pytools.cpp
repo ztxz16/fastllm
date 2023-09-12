@@ -41,6 +41,19 @@ extern "C" {
         return fastllm::GetKVCacheInCPU();
     }
 
+    DLL_EXPORT void set_device_map(int device_cnt, int *lens, char *devices, int *values) {
+        std::map <std::string, int> deviceMap;
+        int cur = 0;
+        for (int i = 0; i < device_cnt; i++) {
+            std::string key = "";
+            for (int j = 0; j < lens[i]; j++) {
+                key += devices[cur++];
+            }
+            deviceMap[key] = values[i];
+        }
+        fastllm::SetDeviceMap(deviceMap);
+    }
+
     DLL_EXPORT struct ModelManager {
         std::mutex locker;
         std::map <int, std::unique_ptr<fastllm::basellm> > models;
@@ -63,7 +76,7 @@ extern "C" {
     }
 
     DLL_EXPORT fastllm::GenerationConfig make_config(int max_length, bool do_sample, float top_p, int top_k,
-                                          float temperature, float repeat_penalty) {
+                                          float temperature, float repeat_penalty, bool output_logits) {
         fastllm::GenerationConfig config;
         config.output_token_limit = max_length;
         config.temperature = temperature;
@@ -72,6 +85,7 @@ extern "C" {
             config.top_p = top_p;
             config.top_k = top_k;
         }
+        config.output_logits = output_logits;
         return config;
     }
 
@@ -91,15 +105,39 @@ extern "C" {
         return id;
     }
 
-    DLL_EXPORT void add_tokenizer_word_llm_model(int modelId, char *key, int tokenId) {
+    DLL_EXPORT int get_tokenizer_vocab_size(int modelId) {
         auto model = models.GetModel(modelId);
-        model->weight.AddTokenizerWord(key, tokenId);
+        int ret = model->weight.tokenizer.tokenToStringDict.size();
+        return ret;
+    }
+
+    DLL_EXPORT void add_tokenizer_word_llm_model(int modelId, char *key, int tokenId, float score) {
+        auto model = models.GetModel(modelId);
+        model->weight.AddTokenizerWord(key, tokenId, score);
         return;
     }
 
     DLL_EXPORT void add_dict_llm_model(int modelId, char *key, char *value) {
         auto model = models.GetModel(modelId);
         model->weight.AddDict(key, value);
+        return;
+    }
+
+    DLL_EXPORT void add_adapter_dict_llm_model(int modelId, char *adapterName, char *key, char *value) {
+        auto model = models.GetModel(modelId);
+        model->weight.AddAdapterDict(adapterName, key, value);
+        return;
+    }
+
+    DLL_EXPORT void set_adapter(int modelId, char *name) {
+        auto model = models.GetModel(modelId);
+        model->SetAdapter(name);
+        return;
+    }
+
+    DLL_EXPORT void disable_adapter(int modelId, char *name) {
+        auto model = models.GetModel(modelId);
+        model->DisableAdapter();
         return;
     }
 
@@ -136,6 +174,17 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT void add_qlinear_weight_llm_model(int modelId, char *key, int dimsLen, void *dimsData,
+                                                 int bit, void *scales, void *oriData) {
+        auto model = models.GetModel(modelId);
+        std::vector <int> dims = std::vector <int> (dimsLen);
+        for (int i = 0; i < dims.size(); i++) {
+            dims[i] = ((int*)dimsData)[i];
+        }
+        model->weight.AddQLinearWeight(key, dims, bit, (float*)scales, (uint8_t*)oriData);
+        return;
+    }
+
     DLL_EXPORT char *make_input_llm_model(int modelId, char *history, int round, char *input) {
         auto model = models.GetModel(modelId);
         char *ret = string_to_chars(model->MakeInput(history, round, input));
@@ -149,23 +198,23 @@ extern "C" {
 
     DLL_EXPORT char *response_str_llm_model(int modelId, char *content,
                                  int max_length, bool do_sample, float top_p, int top_k,
-                                 float temperature, float repeat_penalty) {
+                                 float temperature, float repeat_penalty, bool output_logits) {
         auto model = models.GetModel(modelId);
-        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty);
+        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits);
         std::string s = model->Response(content, nullptr, config);
         return string_to_chars(s);
     }
 
     DLL_EXPORT int launch_response_str_llm_model(int modelId, char *content,
                                       int max_length, bool do_sample, float top_p, int top_k,
-                                      float temperature, float repeat_penalty) {
+                                      float temperature, float repeat_penalty, bool output_logits) {
         auto model = models.GetModel(modelId);
         std::vector <int> tokens;
         auto v = model->weight.tokenizer.Encode(content);
         for (int i = 0; i < v.Count(0); i++) {
             tokens.push_back((int)((float*)v.cpuData)[i]);
         }
-        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty);
+        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits);
         return model->LaunchResponseTokens(tokens, config);
     }
 
@@ -178,12 +227,12 @@ extern "C" {
 
     DLL_EXPORT int launch_response_llm_model(int modelId, int len, int *values,
                                   int max_length, bool do_sample, float top_p, int top_k,
-                                  float temperature, float repeat_penalty) {
+                                  float temperature, float repeat_penalty, bool output_logits) {
         std::vector <int> input;
         for (int i = 0; i < len; i++) {
             input.push_back(values[i]);
         }
-        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty);
+        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits);
         auto model = models.GetModel(modelId);
         return model->LaunchResponseTokens(input, config);
     }
@@ -191,5 +240,15 @@ extern "C" {
     DLL_EXPORT int fetch_response_llm_model(int modelId, int handleId) {
         auto model = models.GetModel(modelId);
         return model->FetchResponseTokens(handleId);
+    }
+
+    DLL_EXPORT int fetch_response_logits_llm_model(int modelId, int handleId, float *logits) {
+        auto model = models.GetModel(modelId);
+        std::vector <float> retLogits;
+        int ret = model->FetchResponseLogits(handleId, retLogits);
+        if (ret != -1) {
+            memcpy(logits, retLogits.data(), retLogits.size() * sizeof(float));
+        }
+        return ret;
     }
 };

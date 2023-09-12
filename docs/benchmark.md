@@ -5,9 +5,9 @@
 例如:
 
 ``` sh
-./benchmark -p ~/chatglm-6b-int4.bin -f ../example/benchmark/prompts/beijing.txt -b 1
-./benchmark -p ~/chatglm-6b-int8.bin -f ../example/benchmark/prompts/beijing.txt -b 1
-./benchmark -p ~/chatglm-6b-fp16.bin -f ../example/benchmark/prompts/hello.txt -b 512 -l 18
+./benchmark -p ~/chatglm-6b-int4.flm -f ../example/benchmark/prompts/beijing.txt -b 1
+./benchmark -p ~/chatglm-6b-int8.flm -f ../example/benchmark/prompts/beijing.txt -b 1
+./benchmark -p ~/chatglm-6b-fp16.flm -f ../example/benchmark/prompts/hello.txt -b 512 -l 18
 ```
 
 |              模型 | Data精度 | 平台               | Batch    | 最大推理速度(token / s) |

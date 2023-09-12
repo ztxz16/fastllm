@@ -20,7 +20,8 @@ namespace fastllm {
                 const Data &positionIds,
                 std::vector <std::pair <Data, Data> > &pastKeyValues,
                 const GenerationConfig &generationConfig = GenerationConfig(),
-                const LastTokensManager &lastTokens = LastTokensManager());
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <float> *logits = nullptr);
 
 		virtual std::string Response(const std::string &input, RuntimeResult retCb,
                                      const GenerationConfig &generationConfig = GenerationConfig()); // 根据给出的内容回复
@@ -29,10 +30,11 @@ namespace fastllm {
 
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
 
-        virtual int LaunchResponseTokens(const std::vector <int> &inputTokens,
-                                         const GenerationConfig &generationConfig = GenerationConfig()); // 启动一个response任务，返回分配的handleId
+        virtual void FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
+                                         const std::map <std::string, int> &params,
+                                         Data &inputIds, Data &attentionMask, Data &positionIds);
 
-        virtual int FetchResponseTokens(int handelId); // 获取指定handle的输出, -1代表输出结束了
+        virtual void WarmUp();
     private:
 		virtual void RotatePosition2D(Data &data, const Data &positionIds); // 二维位置编码
 

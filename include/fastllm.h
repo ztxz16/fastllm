@@ -17,10 +17,11 @@
 #include <iostream>
 #include <functional>
 #include <memory>
-
 #include "devices/cpu/cputhreadpool.h"
 
 namespace fastllm {
+    void SetDeviceMap(const std::map <std::string, int> &deviceMap);
+    std::map <std::string, int> GetDeviceMap();
     void PrintInstructionInfo();
     void SetThreads(int t);
     void SetLowMemMode(bool m);
@@ -37,6 +38,9 @@ namespace fastllm {
         int top_k = 1; // top_k采样
         float top_p = 1.0; // top_p采样
         float temperature = 1.0; // 温度参数，一般在0.1 ~ 1.0之间，设大这个参数可以带来结果的多样性
+        bool output_logits = false; // 是否返回logits
+		bool enable_hash_id = false; // 给会话添加hash id
+
 
         bool IsSimpleGreedy() const {
             if (fabs(repeat_penalty - 1) > 1e-8) {
@@ -111,10 +115,15 @@ namespace fastllm {
         }
 
         void Reset() {
-            if (type == 1) {
+            /*if (type == 1) {
                 this->scale = (max - min) / 15.0;
                 return;
-            }
+            }*/
+            /*if (type == 1) {
+                this->scale = std::max(fabs(max), fabs(min)) / 7.0;
+                this->min = this->scale * (-7.0);
+                return;
+            }*/
             min = std::min(min, 0.f);
             max = std::max(max, 0.f);
 
@@ -129,6 +138,11 @@ namespace fastllm {
                 zeroPoint = qmax;
             } else {
                 zeroPoint = static_cast<uint8_t>(std::round(initial_zero_point));
+            }
+
+            if (type == 1) {
+                this->min = -this->scale * zeroPoint;
+                return;
             }
         }
 
@@ -164,6 +178,39 @@ namespace fastllm {
         NONE = 0, LINEAR = 1, EMBEDDING = 2
     };
 
+    struct FileMmap {
+    public:
+        FileMmap(const std::string &path);
+        ~FileMmap();
+
+        char *data;
+        size_t size;
+    };
+
+    struct ModelLoader {
+        ModelLoader(const char *buffer, size_t size) : data(buffer), size(size), ptr(buffer) {}
+
+        int64_t tell() const { return ptr - data; }
+
+        void seek(int64_t offset, int whence);
+
+        template <typename T>
+        T read_basic() {
+            T obj = *(T *)ptr;
+            ptr += sizeof(T);
+            return obj;
+        }
+
+        std::string ReadString();
+        int ReadInt();
+        float ReadFloat();
+        uint8_t* ReadBytes(uint64_t bytes);
+
+        const char *const data;
+        size_t size;
+        const char *ptr;
+    };
+
     class Data {
     public:
         bool lockInCPU = false; // 如果lock在CPU上，那么不允许移动到其余设备
@@ -187,6 +234,7 @@ namespace fastllm {
         std::vector <void*> extraDeviceData;
 
         DataDevice dataDevice = DataDevice::CPU;
+        std::vector <int> dataDeviceIds;
 
         // 这两个参数用于量化，对FLOAT数据不适用
         int perChannelAxis = -1; // 沿哪个轴分通道量化，-1代表没有分通道
@@ -197,6 +245,7 @@ namespace fastllm {
 
         std::string fileName;
         long long filePos;
+        std::shared_ptr<FileMmap> m_file;
 
         Data () {};
 
@@ -242,18 +291,70 @@ namespace fastllm {
 
         void ToDevice(DataDevice device); // 移动到指定device
 
+        void ToDevice(DataDevice device, const std::vector <int> &deviceIds); // 移动到指定device
+
         void ToDevice(void *device);
+
+        void set_file(std::shared_ptr<FileMmap> file) {
+            m_file = file;
+        }
     };
 
     struct Tokenizer {
+        enum TokenizerType {
+            BPE = 0,
+            NORMAL = 1,
+            QWEN = 2
+        };
+
         struct TrieNode {
             int tokenId;
+            float score;
             std::map <int, TrieNode*> next;
             TrieNode();
         };
+        struct Symbol {
+            TrieNode *node;
+            char *s;
+            int pos, len;
+            int prev, next;
+            int fixId;
+
+            Symbol (Tokenizer::TrieNode *node,
+                    char *s, int pos, int len,
+                    int prev, int next, int fixId) {
+                this->node = node;
+                this->s = s;
+                this->pos = pos;
+                this->len = len;
+                this->prev = prev;
+                this->next = next;
+                this->fixId = fixId;
+            }
+        };
+        struct SymbolPairs {
+            float score;
+            int l, r, size;
+
+            SymbolPairs(float score, int l, int r, int size) {
+                this->score = score;
+                this->l = l;
+                this->r = r;
+                this->size = size;
+            }
+        };
+
+        friend bool operator < (const SymbolPairs &a, const SymbolPairs &b) {
+            return a.score < b.score || (a.score == b.score && a.l > b.l);
+        }
+
         TrieNode *root;
 
+        TokenizerType type = TokenizerType::BPE;
+
         std::unordered_map <int, std::string> tokenToStringDict;
+        std::unordered_map <int, float> tokenToScoreDict;
+        std::unordered_map <std::string, int> stringToTokenDict;
 
         Tokenizer ();
 
@@ -261,7 +362,9 @@ namespace fastllm {
 
         void Clear(); // 清空分词器
 
-        void Insert(const std::string &s, int tokenId); // 插入一个token
+        void TryMergePairs(std::vector<Symbol> &symbols, int l, int r, std::priority_queue <SymbolPairs> &q); // 插入备选symbol
+
+        void Insert(const std::string &s, int tokenId, float score = 1.0f); // 插入一个token
 
         Data Encode(const std::string &s); // 编码
 
@@ -281,24 +384,46 @@ namespace fastllm {
 
         std::map <std::string, Data> weight;
 
+        std::map <std::string, std::map <std::string, std::string>> peftDict;
+
         std::set <std::string> embeddingNames;
 
         void LoadFromFile(const std::string &fileName); // 从文件读取
 
         void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型, bit = 0代表直接存
 
-        void AddTokenizerWord(const std::string &key, int value); // 增加一个词
+        void AddTokenizerWord(const std::string &key, int value, float score); // 增加一个词
 
         void AddDict(const std::string &key, const std::string &value); // 插入一个词条
+
+        void AddAdapterDict(const std::string &name, const std::string &key, const std::string &value);
 
         void AddWeight(const std::string &key, const std::vector <int> &dims,
                        DataType dataType, WeightType weightType, DataType oriDataType, uint8_t *oriData); // 插入一个权重
 
+        void AddQLinearWeight(const std::string &key, const std::vector <int> &dims,
+                              int bit, float *scales, uint8_t *oriData); // 插入一个Qlinear层的权重，量化规则为float value = scales * oriData
+
         Data &operator [] (const std::string &key);
     };
 
+    void ClearProfiler();
+
+    void PrintProfiler();
+
+    void ApplyDeviceMap(const std::map <std::string, int> &deviceMap, int current, int total); // 执行到了current, 一共total，使用deviceMap切换设备
+
     int LLMSampling(Data &logits, int outerOffset,
                     const GenerationConfig &config, const LastTokensUnit &tokens); // 对logits里[outerOffset * vocabSize, (outerOffset + 1) * vocabSize]做Sampling
+
+    void ToDataType(const Data &input, DataType dataType);
+
+    void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
+                   int group, float scale, int attentionType);
+
+    void AttentionBatch(std::vector <Data*> &q, std::vector <Data*> &k, std::vector <Data*> &v,
+                        std::vector <Data*> &mask, std::vector <Data*> &output,
+                        int group, float scale, int attentionType);
 
     void Embedding(const Data &input, Data &weight, Data &output);
 
@@ -349,6 +474,28 @@ namespace fastllm {
     void LlamaRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position for llama
 
     void RepeatPenalty(Data &input, const Data &penalty); // 惩罚，input[i] = input[i] < 0 ? input[i] * penalty[i] : input[i] / penalty[i];
+
+    void ApplyLognAttn(Data &input, const Data &lognAttn, const Data &positionIds);
+
+    void MulBatch(std::vector <Data*> &input, float v, std::vector <Data*> &output);
+
+    void SplitBatch(const Data &input, int axis, int part, std::vector <Data*> &outputs); // 将input沿着axis轴切开，每份axis上的尺寸为1，放到outputs里
+
+    void CatBatch(std::vector <Data*> &input, int axis, Data &outputs); // 将input沿着axis轴合起来，每份axis上的尺寸为1，放到output里
+
+    void MatMulBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, std::vector <Data*> &output, float alpha = 1.0);
+
+    void MatMulTransBBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, std::vector <Data*> &output, float alpha = 1.0);
+
+    void SoftmaxBatch(std::vector <Data*> &input, std::vector <Data*> &output, int axis);
+
+    void CatDirectBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, int axis);
+
+    void LoraLayer(Data &input, Data &weight, Data &loraA, Data &loraB, const Data &bias, Data &output, 
+                   std::map <std::string, std::string> loraConfig);
+
+    void IA3Layer(Data &input, Data &weight, Data &ia3_l, Data &bias, Data &output,
+                  std::map <std::string, std::string> ia3Config);
 }
 
 #endif //TEST_FASTLLM_H
