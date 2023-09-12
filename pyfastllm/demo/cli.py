@@ -3,7 +3,7 @@ import sys
 import platform
 import logging
 import argparse
-sys.path.append('./build-py')
+sys.path.append('../../build-py')
 import pyfastllm # 或fastllm
 
 logging.info(f"python gcc version:{platform.python_compiler()}")
