@@ -367,6 +367,7 @@ python3 tools/moss_export.py moss-int4.flm int4 #导出int4模型
 # 修改build/tools/alpaca2flm.py程序进行导出
 # 不同llama模型使用的指令相差很大，需要参照torch2flm.py中的参数进行配置
 ```
+一些模型的转换可以[参考这里的例子](docs/llama_cookbook.md)
 
 #### QWEN模型导出
 ```sh
