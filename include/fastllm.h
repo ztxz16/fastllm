@@ -418,6 +418,8 @@ namespace fastllm {
 
     void ToDataType(const Data &input, DataType dataType);
 
+    void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset);
+
     void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
                    int group, float scale, int attentionType);
 
