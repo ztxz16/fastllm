@@ -1592,6 +1592,14 @@ namespace fastllm {
         }
     }
 
+    void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset) {
+        curExecutor->Run("CopyKVCache", {
+                {"oldCache", (Data*)&oldCache}, {"newCache", (Data*)&newCache}
+        }, {}, {
+            {"oldBsStart", oldBsStart}, {"newBsStart", newBsStart}, {"bs", bs}, {"offset", offset}
+        });
+    }
+
     void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
                    int group, float scale, int attentionType) {
         curExecutor->Run("Attention", {
