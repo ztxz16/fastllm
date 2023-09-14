@@ -13,6 +13,7 @@ namespace fastllm {
     CudaDevice::CudaDevice() {
         this->deviceType = "cuda";
         this->ops["Attention"] = (BaseOperator*)(new CudaAttention());
+        this->ops["CopyKVCache"] = (BaseOperator*)(new CudaCopyKVCacheOp());
         this->ops["LayerNorm"] = (BaseOperator*)(new CudaLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
@@ -101,6 +102,31 @@ namespace fastllm {
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
         output.Allocate();
         FastllmCudaAttention(q, k, v, mask, output, group, scale);
+    }
+
+    void CudaCopyKVCacheOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                   const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        return;
+    }
+
+    void CudaCopyKVCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &oldCache = *(datas.find("oldCache")->second);
+        Data &newCache = *(datas.find("newCache")->second);
+
+        int oldBsStart = intParams.find("oldBsStart") != intParams.end() ? intParams.find("oldBsStart")->second : -1;
+        int newBsStart = intParams.find("newBsStart") != intParams.end() ? intParams.find("newBsStart")->second : -1;
+        int bs = intParams.find("bs") != intParams.end() ? intParams.find("bs")->second : -1;
+        int offset = intParams.find("offset") != intParams.end() ? intParams.find("offset")->second : -1;
+
+        int unitSize = oldCache.unitSize;
+
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t *) newCache.cudaData + newBsStart * newCache.strides[0] * unitSize
+                                                                          + offset * newCache.strides[1] * unitSize,
+                                          newCache.strides[0] * unitSize,
+                                          (uint8_t *) oldCache.cudaData + oldBsStart * oldCache.strides[0] * unitSize,
+                                          oldCache.strides[0] * unitSize,
+                                          oldCache.dims[1] * oldCache.dims[2] * unitSize, bs);
     }
 
     bool CudaRMSNormOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
