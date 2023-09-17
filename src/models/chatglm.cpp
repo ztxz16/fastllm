@@ -895,15 +895,13 @@ namespace fastllm {
     }
 
     std::string ChatGLMModel::MakeInput(const std::string &history, int round, const std::string &input) {
+		if (GetVersion() == 2)
+			round++;
         if (round == 0 && GetVersion() == 1) {
             return input;
         } else {
 #if defined(_WIN32) or defined(_WIN64)
-            std::vector <uint8_t> vask = {233, 151, 174, 239, 188, 154, 0};
-            std::vector <uint8_t> vans = {231, 173, 148, 239, 188, 154, 0};
-            std::string sask = (char*)vask.data();
-            std::string sans = (char*)vans.data();
-            return (history + ("[Round " + std::to_string(round) + "]\n\n" + sask + input + "\n\n" + sans));
+            return history + ("[Round " + std::to_string(round) + u8"]\n\n问：" + input + u8"\n\n答：");
 #else
             return history + ("[Round " + std::to_string(round) + "]\n\n问：" + input + "\n\n答：");
 #endif
@@ -911,12 +909,10 @@ namespace fastllm {
     }
 
     std::string ChatGLMModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
+		if (GetVersion() == 2)
+			round++;
 #if defined(_WIN32) or defined(_WIN64)
-        std::vector <uint8_t> vask = {233, 151, 174, 239, 188, 154, 0};
-        std::vector <uint8_t> vans = {231, 173, 148, 239, 188, 154, 0};
-        std::string sask = (char*)vask.data();
-        std::string sans = (char*)vans.data();
-        return (history + ("[Round " + std::to_string(round) + "]\n\n" + sask + input + "\n\n" + sans + output + "\n"));
+        return (history + ("[Round " + std::to_string(round) + u8"]\n\n问：" + input + u8"\n\n答：" + output + "\n"));
 #else
         return (history + ("[Round " + std::to_string(round) + "]\n\n问：" + input + "\n\n答：" + output + "\n\n"));
 #endif
