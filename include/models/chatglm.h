@@ -15,8 +15,10 @@ namespace fastllm {
 	public:
         ChatGLMModel (); // 构造函数
 
+        virtual void InitParams(); // 初始化参数信息
+
         // 推理
-		virtual int Forward(
+        virtual int Forward(
                 const Data &inputIds,
                 const Data &attentionMask,
                 const Data &positionIds,
@@ -56,7 +58,7 @@ namespace fastllm {
                                         const std::vector <std::map <std::string, int> > &params,
                                         Data &inputIds, Data &attentionMask, Data &positionIds);
 
-		virtual void WarmUp(); // 预热
+        virtual void WarmUp(); // 预热
 
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
 
@@ -66,7 +68,9 @@ namespace fastllm {
 
         void UpdateSinCos(float rope);
     private:
-		virtual void CausalMask(Data &data, int start) {}; // 因果mask？
+        virtual void CausalMask(Data &data, int start) {}; // 因果mask？
+
+        int gmask_token_id;
 
         float rope = 1.0f;
     };
