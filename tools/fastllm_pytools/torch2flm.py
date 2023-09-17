@@ -140,10 +140,10 @@ def tofile(exportPath,
             for v in vocab.keys():
                 if (modelInfo['model_type'] == "qwen"):
                     s = v
+                elif (modelInfo["model_type"] == "moss"):
+                    s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
                 else:
                     s = v.encode()
-                if (modelInfo["model_type"] == "moss"):
-                    s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
                 fo.write(struct.pack('i', len(s)))
                 for c in s:
                     fo.write(struct.pack('i', c))
