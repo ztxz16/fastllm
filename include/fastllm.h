@@ -247,6 +247,8 @@ namespace fastllm {
         long long filePos;
         std::shared_ptr<FileMmap> m_file;
 
+        bool directMemory = false; // 直接分配/释放Memory，不经过缓存
+
         Data () {};
 
         Data (DataType type);
