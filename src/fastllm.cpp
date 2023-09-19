@@ -368,7 +368,11 @@ namespace fastllm {
             this->cpuData = new uint8_t[this->expansionBytes];
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
-            this->cudaData = FastllmCudaMalloc(this->expansionBytes);
+            if (this->directMemory) {
+                this->cudaData = FastllmCudaDirectMalloc(this->expansionBytes);
+            } else {
+                this->cudaData = FastllmCudaMalloc(this->expansionBytes);
+            }
 #else
             ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif
@@ -382,7 +386,11 @@ namespace fastllm {
             delete[] this->cpuData;
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
-            FastllmCudaFree(this->cudaData);
+            if (this->directMemory) {
+                FastllmCudaDirectFree(this->cudaData);
+            } else {
+                FastllmCudaFree(this->cudaData);
+            }
 #else
             ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif
@@ -415,6 +423,7 @@ namespace fastllm {
 
     void Data::Expansion(const std::vector<int> &dims) {
         if (this->dims.size() == 0) {
+            this->directMemory = true;
             this->strides.resize(dims.size(), 1);
             this->strides.back() = 1;
             for (int i = dims.size() - 2; i >= 0; i--) {
@@ -488,7 +497,11 @@ namespace fastllm {
 #endif
 #ifdef USE_CUDA
         if (this->cudaData != nullptr) {
-            FastllmCudaFree(this->cudaData);
+            if (this->directMemory) {
+                FastllmCudaDirectFree(this->cudaData);
+            } else {
+                FastllmCudaFree(this->cudaData);
+            }
         }
 #endif
     }
