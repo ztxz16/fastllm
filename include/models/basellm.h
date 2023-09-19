@@ -152,5 +152,7 @@ namespace fastllm {
         std::map <std::string, int> deviceMap;
 
         std::string adapterName;
+
+        int tokensLimit = -1;
     };
 }
