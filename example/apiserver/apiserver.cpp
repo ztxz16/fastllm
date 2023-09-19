@@ -128,6 +128,8 @@ struct APIConfig {
     int threads = 4; // 使用的线程数
     bool lowMemMode = false; // 是否使用低内存模式
     int port = 8080; // 端口号
+    int tokens = -1; // token容量限制
+    int batch = 256; // batch数限制
 };
 
 void ToNext(char * &cur, const std::string &target, std::string &v) {
@@ -228,7 +230,7 @@ struct WorkNode {
 
 struct WorkQueue {
     std::unique_ptr<fastllm::basellm> model;
-    int maxActivateQueryNumber = 128;
+    int maxActivateQueryNumber = 256;
     int activateQueryNumber = 0;
     int totalQueryNumber = 0;
     std::mutex locker;
@@ -261,9 +263,11 @@ struct WorkQueue {
                     WorkNode *now = ts->q.front();
                     ts->q.pop();
                     ts->activateQueryNumber++;
-ts->totalQueryNumber++;
-printf("totalQueryNumber = %d\n", ts->totalQueryNumber);
-printf("activate = %d, q.size() = %d\n", ts->activateQueryNumber, (int) ts->q.size());
+
+                    ts->totalQueryNumber++;
+                    printf("totalQueryNumber = %d\n", ts->totalQueryNumber);
+//printf("activate = %d, q.size() = %d\n", ts->activateQueryNumber, (int) ts->q.size());
+
                     std::thread *t = new std::thread([](WorkQueue *ts, WorkNode *now) {
                         ts->Deal(now);
                         printf("Response client %d finish\n", now->client);
@@ -337,11 +341,13 @@ void Usage() {
     std::cout << "<-w|--web> <args>:            网页文件的路径" << std::endl;
     std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
     std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
+    std::cout << "<--batch>:                    最大batch数" << std::endl;
+    std::cout << "<--tokens>:                   最大tokens容量" << std::endl;
     std::cout << "<--port> <args>:              网页端口号" << std::endl;
 }
 
 void ParseArgs(int argc, char **argv, APIConfig &config) {
-    std::vector <std::string> sargv;
+    std::vector<std::string> sargv;
     for (int i = 0; i < argc; i++) {
         sargv.push_back(std::string(argv[i]));
     }
@@ -359,6 +365,10 @@ void ParseArgs(int argc, char **argv, APIConfig &config) {
             config.webPath = sargv[++i];
         } else if (sargv[i] == "--port") {
             config.port = atoi(sargv[++i].c_str());
+        } else if (sargv[i] == "--tokens") {
+            config.tokens = atoi(sargv[++i].c_str());
+        } else if (sargv[i] == "--batch") {
+            config.batch = atoi(sargv[++i].c_str());
         } else {
             Usage();
             exit(-1);
@@ -377,6 +387,8 @@ int main(int argc, char** argv) {
     fastllm::SetThreads(config.threads);
     fastllm::SetLowMemMode(config.lowMemMode);
     workQueue.model = fastllm::CreateLLMModelFromFile(config.path);
+    workQueue.model->tokensLimit = config.tokens;
+    workQueue.maxActivateQueryNumber = std::max(1, std::min(256, config.batch));
     workQueue.Start();
 
     int local_fd = socket(AF_INET, SOCK_STREAM, 0);
