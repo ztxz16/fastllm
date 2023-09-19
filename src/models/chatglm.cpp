@@ -190,7 +190,7 @@ namespace fastllm {
                 if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
                     newDims = std::vector<int>{k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
                     if (generationConfig.output_token_limit > 0) {
-                        newDims[1] = std::min(newDims[1], k.dims[1] + generationConfig.output_token_limit);
+                        newDims[1] = k.dims[1] + generationConfig.output_token_limit;
                     }
                 } else {
                     newDims = pastKey.dims;
@@ -207,7 +207,7 @@ namespace fastllm {
                 if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
                     newDims = std::vector<int>{v.dims[0], ((v.dims[1] - 1) / unitLen + 1) * unitLen, v.dims[2]};
                     if (generationConfig.output_token_limit > 0) {
-                        newDims[1] = std::min(newDims[1], k.dims[1] + generationConfig.output_token_limit);
+                        newDims[1] = k.dims[1] + generationConfig.output_token_limit;
                     }
                 } else {
                     newDims = pastValue.dims;
@@ -218,7 +218,6 @@ namespace fastllm {
             CatDirect(pastKey, k, 1);
             CatDirect(pastValue, v, 1);
             std::vector<int> outputSize = {q.dims[1], q.dims[2], q.dims[0], pastKey.dims[1]};
-
             q.Reshape({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
             PermuteSelf(q, {1, 0, 2});
             //Attention(q, pastKey, pastValue, attentionMask, contextLayer, q.dims[0] / pastKey.dims[0], 1.0 / scale_attn, 1);
@@ -344,7 +343,6 @@ namespace fastllm {
             weightPre = "transformer.encoder.layers.";
             weightMiddle = ".self_attention";
         }
-
         Data inputEmbeddings;
         Data inputIdsPermute;
         Permute(inputIds, {1, 0}, inputIdsPermute);
@@ -352,7 +350,6 @@ namespace fastllm {
                                                 ".word_embeddings.weight"], inputEmbeddings);
         Data &hiddenStates = inputEmbeddings;
         hiddenStates.ToDevice(DataDevice::CUDA);
-
         Data attenInput;
         Data qkv, q, k, v;
         Data attnOutput;
@@ -365,7 +362,6 @@ namespace fastllm {
         curKs.resize(batch);
         curVs.resize(batch);
         curQs.resize(batch);
-
         bool all1 = true;
         for (int i = 0; i < batch; i++) {
             all1 &= (seqLens[i] == 1);
@@ -377,12 +373,12 @@ namespace fastllm {
                 CatDirect(*(Data*)positionIds[0], *(Data*)positionIds[i], 1);
             }
         }
-
-        std::vector <Data*> keys, values, qs, attns, contexts;
+        std::vector <Data*> keys, values, qs, attns, masks, contexts;
         keys.resize(batch);
         values.resize(batch);
         qs.resize(batch);
         attns.resize(batch);
+        masks.resize(batch);
         contexts.resize(batch);
 
         std::vector <Data*> pointersK, pointersV, pointersQ;
@@ -392,7 +388,6 @@ namespace fastllm {
 
         std::vector <std::vector <int> > outputSizes;
         outputSizes.resize(batch);
-
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             if (version == 1) {
@@ -451,7 +446,6 @@ namespace fastllm {
 
             Data contextLayer = Data(DataType::FLOAT32);
             int total = 0;
-
             if (all1 && batch > 1) {
                 for (int b = 0; b < batch; b++) {
                     pointersK[b] = (&curKs[b]);
@@ -482,10 +476,15 @@ namespace fastllm {
                     total += seqLens[b];
                 }
             }
+
             for (int b = 0; b < batch; b++) {
                 auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
                 Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt +
                                                                                                      i].second;
+                if (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] <= pastKey.expansionDims[1]) {
+                    continue;
+                }
+
                 pastKey.ToDevice(DataDevice::CUDA);
                 pastValue.ToDevice(DataDevice::CUDA);
 
@@ -533,64 +532,76 @@ namespace fastllm {
             }
             CatDirectBatch(keys, pointersK, 1);
             CatDirectBatch(values, pointersV, 1);
-
-            for (int b = 0; b < batch; b++) {
-                auto &q = curQs[b];
-                Data &pastKey = *pastKeyValues[b * block_cnt + i].first;
-                outputSizes[b] = {1, q.dims[0], q.dims[1], pastKey.dims[1]};
-                q.Reshape({pastKey.dims[0], -1, q.dims[2]});
-            }
-
-            // 1.2 Attention
-            // 1.2.0 q * k^T
             if (all1 && batch > 1) {
                 for (int b = 0; b < batch; b++) {
                     qs[b] = (&curQs[b]);
                     keys[b] = (pastKeyValues[b * block_cnt + i].first);
-                    attns[b] = (&attnProbs[b]);
+                    values[b] = (pastKeyValues[b * block_cnt + i].second);
+                    masks[b] = attentionMask[b];
+                    contexts[b] = (&curContextLayer[b]);
+
+                    outputSizes[b] = {1, qs[b]->dims[0], qs[b]->dims[1], keys[b]->dims[1]};
                 }
-                MatMulTransBBatch(qs, keys, attns, 1.0 / (scale_attn * (i + 1)));
+                AttentionBatch(qs, keys, values, masks, contexts, qs[0]->dims[0] / values[0]->dims[0], 1.0 / scale_attn, 1);
             } else {
                 for (int b = 0; b < batch; b++) {
                     auto &q = curQs[b];
                     Data &pastKey = *pastKeyValues[b * block_cnt + i].first;
-                    MatMulTransB(q, pastKey, attnProbs[b], 1.0 / (scale_attn * (i + 1)));
+                    outputSizes[b] = {1, q.dims[0], q.dims[1], pastKey.dims[1]};
+                    q.Reshape({pastKey.dims[0], -1, q.dims[2]});
                 }
-            }
 
-            for (int b = 0; b < batch; b++) {
-                attnProbs[b].Reshape(outputSizes[b]);
-                // 1.2.1 Mask
-                if (attentionMask[b] != nullptr) {
-                    AttentionMask(attnProbs[b], *attentionMask[b], -10000);
+                // 1.2 Attention
+                // 1.2.0 q * k^T
+                if (all1 && batch > 1) {
+                    for (int b = 0; b < batch; b++) {
+                        qs[b] = (&curQs[b]);
+                        keys[b] = (pastKeyValues[b * block_cnt + i].first);
+                        attns[b] = (&attnProbs[b]);
+                    }
+                    MatMulTransBBatch(qs, keys, attns, 1.0 / (scale_attn * (i + 1)));
+                } else {
+                    for (int b = 0; b < batch; b++) {
+                        auto &q = curQs[b];
+                        Data &pastKey = *pastKeyValues[b * block_cnt + i].first;
+                        MatMulTransB(q, pastKey, attnProbs[b], 1.0 / (scale_attn * (i + 1)));
+                    }
                 }
-            }
 
-            // 1.2.2 softmax
-            for (int i = 0; i < attnProbs.size(); i++) {
-                attns[i] = (&attnProbs[i]);
-            }
-            MulBatch(attns, i + 1, attns);
-            SoftmaxBatch(attns, attns, -1);
-
-            for (int b = 0; b < batch; b++) {
-                Data &pastValue = *pastKeyValues[b * block_cnt + i].second;
-                outputSizes[b] = {1, num_attention_heads, -1, pastValue.dims[2]};
-                attnProbs[b].Reshape({pastValue.dims[0], -1, attnProbs[b].dims[3]});
-            }
-
-            // 1.2.3 prob * v
-            if (all1 && batch > 1) {
                 for (int b = 0; b < batch; b++) {
-                    attns[b] = (&attnProbs[b]);
-                    values[b] = (pastKeyValues[b * block_cnt + i].second);
-                    contexts[b] = (&curContextLayer[b]);
+                    attnProbs[b].Reshape(outputSizes[b]);
+                    // 1.2.1 Mask
+                    if (attentionMask[b] != nullptr) {
+                        AttentionMask(attnProbs[b], *attentionMask[b], -10000);
+                    }
                 }
-                MatMulBatch(attns, values, contexts);
-            } else {
+
+                // 1.2.2 softmax
+                for (int i = 0; i < attnProbs.size(); i++) {
+                    attns[i] = (&attnProbs[i]);
+                }
+                MulBatch(attns, i + 1, attns);
+                SoftmaxBatch(attns, attns, -1);
+
                 for (int b = 0; b < batch; b++) {
                     Data &pastValue = *pastKeyValues[b * block_cnt + i].second;
-                    MatMul(attnProbs[b], pastValue, curContextLayer[b]);
+                    outputSizes[b] = {1, num_attention_heads, -1, pastValue.dims[2]};
+                    attnProbs[b].Reshape({pastValue.dims[0], -1, attnProbs[b].dims[3]});
+                }
+
+                // 1.2.3 prob * v
+                if (all1 && batch > 1) {
+                    for (int b = 0; b < batch; b++) {
+                        attns[b] = (&attnProbs[b]);
+                        values[b] = (pastKeyValues[b * block_cnt + i].second);
+                        contexts[b] = (&curContextLayer[b]);
+                    }
+                    MatMulBatch(attns, values, contexts);
+                } else {
+                    for (int b = 0; b < batch; b++) {
+                        Data &pastValue = *pastKeyValues[b * block_cnt + i].second;
+                        MatMul(attnProbs[b], pastValue, curContextLayer[b]);
+                    }
                 }
             }
             if (all1) {
