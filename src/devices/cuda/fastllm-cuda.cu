@@ -1457,6 +1457,16 @@ std::map<int, std::vector <CudaMemoryBuffer>> cudaBuffersMap;
 std::map<int, size_t> noBusyCnt;
 std::map<int, std::vector <CudaMemoryBuffer>> bigBuffersMap;
 
+void * FastllmCudaDirectMalloc(size_t size) {
+    void * ret;
+    cudaMalloc(&ret, size);
+    return ret;
+}
+
+void FastllmCudaDirectFree(void *ret) {
+    cudaFree(ret);
+}
+
 void * FastllmCudaMalloc(size_t size) {
     int id = -1;
     cudaGetDevice(&id);
@@ -1465,7 +1475,7 @@ void * FastllmCudaMalloc(size_t size) {
         int selId = -1;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (bigBuffers[i].size >= size && !bigBuffers[i].busy
-                && bigBuffers[i].size - size < 32 * 1024 * 1024) {
+                && bigBuffers[i].size - size < 1 * 1024 * 1024) {
                 if (selId == -1 || bigBuffers[selId].size > bigBuffers[i].size) {
                     selId = i;
                 }
