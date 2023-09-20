@@ -7,6 +7,7 @@
 #include "moss.h"
 #include "llama.h"
 #include "qwen.h"
+#include "glm.h"
 
 namespace fastllm {
     void basellm::LoadFromFile(const std::string &fileName) {
@@ -16,8 +17,12 @@ namespace fastllm {
 
     void basellm::InitParams() {
         if (this->weight.dicts.find("bos_token_id") != this->weight.dicts.end()) {
-            this->bos_token_id = atoi(this->weight.dicts["bos_token_id"].c_str());
-            this->eos_token_id = atoi(this->weight.dicts["eos_token_id"].c_str());
+            if(this->weight.dicts["bos_token_id"]!="None"){
+                this->bos_token_id = atoi(this->weight.dicts["bos_token_id"].c_str());
+            }
+            if(this->weight.dicts["eos_token_id"]!="None"){
+                this->eos_token_id = atoi(this->weight.dicts["eos_token_id"].c_str());
+            }
         }
         if (this->weight.dicts.find("im_start_id") != this->weight.dicts.end()) {
             this->bos_token_id = atoi(this->weight.dicts["im_start_id"].c_str());
@@ -25,6 +30,8 @@ namespace fastllm {
         }
         if (this->weight.dicts.find("num_hidden_layers") != this->weight.dicts.end()) {
             block_cnt = atoi(this->weight.dicts["num_hidden_layers"].c_str());
+        }else if (this->weight.dicts.find("num_layers") != this->weight.dicts.end()) {
+            block_cnt = atoi(this->weight.dicts["num_layers"].c_str());
         }
         if (this->weight.dicts.find("hidden_size") != this->weight.dicts.end()) {
             embed_dim = atoi(this->weight.dicts["hidden_size"].c_str());
@@ -77,6 +84,8 @@ namespace fastllm {
         } else if (modelType == "qwen") {
             model = (basellm *) (new QWenModel());
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
+        } else if (modelType == "glm") {
+            model = (basellm*)(new GLMModel());
         } else {
             ErrorInFastLLM("Unkown model type: " + modelType);
         }
