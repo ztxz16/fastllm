@@ -11,6 +11,12 @@ else:
 fastllm_lib.create_llm_model.argtypes = [ctypes.c_char_p]
 fastllm_lib.create_llm_model.restype = ctypes.c_int
 
+fastllm_lib.token_decode.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+fastllm_lib.token_decode.restype = ctypes.c_int
+
+fastllm_lib.token_encode_string.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+fastllm_lib.token_encode_string.restype = ctypes.c_int
+
 fastllm_lib.launch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                                   ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
                                                   ctypes.c_float, ctypes.c_float, ctypes.c_bool]
@@ -119,6 +125,21 @@ class model:
     def eval(self):
         pass;
 
+    def tokenizer_encode_string(self, content):
+        buffer_len = len(content.encode())
+        buffer = (ctypes.c_int * buffer_len)()
+        result_len = fastllm_lib.token_encode_string(self.model, content.encode(), buffer_len, buffer)
+        assert 0 < result_len < buffer_len
+        return [i for i in buffer][:result_len]
+
+    def tokenizer_decode_token(self, token_id):
+        assert isinstance(token_id, int)
+        buffer_len = 256
+        buffer = ctypes.create_string_buffer(buffer_len)
+        ret = fastllm_lib.token_decode(self.model, token_id, buffer_len, buffer)
+        assert ret == 0
+        return buffer.raw
+
     def response_logits(self,
                         query: str,
                         history: List[Tuple[str, str]] = None,
@@ -189,6 +210,33 @@ class model:
             else:
                 res += cur;
                 yield res;
+
+    def stream_response_raw(self,
+                            input_tokens: List[int],
+                            max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
+                            one_by_one = True
+                            ):
+        handle = fastllm_lib.launch_response_llm_model(self.model, len(input_tokens),
+                                                       (ctypes.c_int * len(input_tokens))(*input_tokens),
+                                                       ctypes.c_int(max_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
+                                                       ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False))
+
+        # 可能遇到长尾char需要多个token才能够生成，所以只返回bytes，string.decode交给外部
+        # 方便统计输出token数量，和控制不完整utf8时候解码的逻辑
+
+        total_bytes = b''
+        while True:
+            cur_token = fastllm_lib.fetch_response_llm_model(self.model, handle)
+            if cur_token == -1:
+                break
+
+            cur_bytes = self.tokenizer_decode_token(cur_token)
+
+            if one_by_one:
+                yield cur_bytes
+            else:
+                total_bytes += cur_bytes
+                yield total_bytes
 
     def chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, max_length: int = 8192,
              do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0, **kwargs):
