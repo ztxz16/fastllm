@@ -118,29 +118,31 @@ extern "C" {
     }
 
     DLL_EXPORT int token_decode(int modelId, int tokenId, int output_buffer_len, char *output_buffer) {
-        if(tokenId == -1)
-            return -1;
+        // 正常时候返回0，输出buffer长度不足时返回输出的bytes数量，包含末尾的\0
+        if(tokenId == -1) {
+            output_buffer[0] = '\0';
+            return 0;
+        }
         auto model = models.GetModel(modelId);
         std::string s = model->weight.tokenizer.DecodeTokens(std::vector <int> {tokenId});
         if(s.length() + 1 > output_buffer_len) {
-            return 1;
+            return (int)s.length() + 1;
         }
         memcpy(output_buffer, s.c_str(), s.length() + 1);
         return 0;
     }
 
     DLL_EXPORT int token_encode_string(int modelId, char *content, int output_buffer_len, int *output_buffer) {
-        // 返回写入到output_buffer中的数量
+        // 返回写入到output_buffer中的数量。当output不足时候，只输出对应的部分
         auto model = models.GetModel(modelId);
         auto v = model->weight.tokenizer.Encode(content);
-        int i = 0;
-        for (; i < v.Count(0); i++) {
+        for (int i = 0; i < v.Count(0); i++) {
             if(i >= output_buffer_len) {
                 break;
             }
             output_buffer[i] = (int)((float*)v.cpuData)[i];
         }
-        return i;
+        return (int)v.Count(0);
     }
 
     DLL_EXPORT void add_dict_llm_model(int modelId, char *key, char *value) {
