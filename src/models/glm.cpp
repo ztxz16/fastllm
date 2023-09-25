@@ -66,7 +66,7 @@ namespace fastllm {
         Data positionEmbeddings;
         Data blockPositionEmbeddings;
         Data attenInput;
-        Data qkv, q, k, v;
+        Data qkv, q, k, v,q0;
         Data attnScores;
         //Data attnScores2;
         Data attnProbs;
@@ -76,7 +76,8 @@ namespace fastllm {
         Data mlpInput;
         Data mlpOutput;
         Data middle, middle2;
-        Data temp;
+        Data toSave;
+        Data mem2;
         std::vector<int> lastRet;
         // GLMBlock
         std::string weightPre, weightMiddle;
@@ -95,7 +96,6 @@ namespace fastllm {
             std::vector<float> one(attentionMask4D.Count(0),-65504.0);
             attnScoreAdds.CopyFrom(Data(DataType::FLOAT32,attentionMask4D.dims,one));
             AddTo(attnScoreAdds,attentionMask4D,65504.0);
-            attnScoreAdds.ToDevice(DataDevice::CPU);
         }
         Embedding(inputIds, this->weight["word_embeddings.weight"], inputEmbeddings);
         Data &hiddenStates = inputEmbeddings;
@@ -105,23 +105,45 @@ namespace fastllm {
         AddTo(hiddenStates,positionEmbeddings);
         Embedding(block_position_ids_1D, this->weight["transformer.block_position_embeddings.weight"], blockPositionEmbeddings);
         AddTo(hiddenStates,blockPositionEmbeddings);
+        int memory_length=(pastKeyValues[0].first.dims.size()==0?0:pastKeyValues[0].first.dims.at(1));
+        int query_length=hiddenStates.dims.at(1);
+        int new_memory_length=memory_length+query_length;
+        if(new_memory_length<=query_length){
+            Split(hiddenStates,1,hiddenStates.dims.at(1)-new_memory_length,hiddenStates.dims.at(1),toSave);
+        }else{
+            Split(hiddenStates,1,0,hiddenStates.dims.at(1),toSave);//Copy
+        }
         for (int i = 0; i < block_cnt; i++) {
+            Data &mem=pastKeyValues[i].first;
+            bool hasMem=(mem.dims.size()!=0);
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             std::string inputLNWeightName = "transformer.layers." + std::to_string(i) + ".input_layernorm.weight";
             std::string inputLNBiasName = "transformer.layers." + std::to_string(i) + ".input_layernorm.bias";
             LayerNorm(hiddenStates, weight[inputLNWeightName], weight[inputLNBiasName], -1, attenInput);
             std::string qkvWeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.weight";
             std::string qkvBiasName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.bias";
-            Linear(attenInput, weight[qkvWeightName], weight[qkvBiasName], qkv);
-            int per = qkv.dims.back() / 3;
-            Split(qkv, -1, 0, per, q);
-            Split(qkv, -1, per, per * 2, k);
-            Split(qkv, -1, per * 2, per * 3, v);
-            q.Reshape({qkv.dims[0], qkv.dims[1], num_attention_heads, -1});
+            if(!hasMem){
+                Linear(attenInput, weight[qkvWeightName], weight[qkvBiasName], qkv);
+                int per = qkv.dims.back() / 3;
+                Split(qkv, -1, 0, per, q);
+                Split(qkv, -1, per, per * 2, k);
+                Split(qkv, -1, per * 2, per * 3, v);
+            }else{
+                LayerNorm(mem, weight[inputLNWeightName], weight[inputLNBiasName], -1, mem2);
+                CatDirect(mem2,attenInput,1);
+                Linear(mem2, weight[qkvWeightName], weight[qkvBiasName], qkv);
+                int per = qkv.dims.back() / 3;
+                Split(qkv, -1, 0, per, q0);
+                Split(qkv, -1, per, per * 2, k);
+                Split(qkv, -1, per * 2, per * 3, v);
+                int tLen=q0.dims.at(1);
+                Split(q0,1,tLen-attenInput.dims.at(1),tLen,q);
+            }
+            q.Reshape({q.dims[0], q.dims[1], num_attention_heads, -1});
             PermuteSelf(q,{0,2,1,3});
-            k.Reshape({qkv.dims[0], qkv.dims[1], num_attention_heads, -1});
+            k.Reshape({k.dims[0], k.dims[1], num_attention_heads, -1});
             //PermuteSelf(k,{0,2,1,3});// (1)
-            v.Reshape({qkv.dims[0], qkv.dims[1], num_attention_heads, -1});
+            v.Reshape({v.dims[0], v.dims[1], num_attention_heads, -1});
             PermuteSelf(v,{0,2,1,3});
             //PermuteSelf(k,{0,1,2,3});// (2)
             PermuteSelf(k,{0,2,3,1});// Merged (1) + (2)
@@ -147,6 +169,14 @@ namespace fastllm {
             GeluNew(middle, middle);
             Linear(middle, weight[fcOutKeyName + ".weight"], weight[fcOutKeyName + ".bias"], mlpOutput);
             AddTo(hiddenStates,mlpOutput);
+            if(new_memory_length<=query_length){
+                Split(toSave,1,0,toSave.dims.at(1),mem);//Copy
+                Split(hiddenStates,1,hiddenStates.dims.at(1)-new_memory_length,hiddenStates.dims.at(1),toSave);
+            }else{
+                Split(mem,1,mem.dims.at(1)-new_memory_length+query_length,mem.dims.at(1),mem2);
+                Cat(mem2,toSave,1,mem);
+                Split(hiddenStates,1,0,hiddenStates.dims.at(1),toSave);//Copy
+            }
         }
         Data logits, topk;
         LayerNorm(hiddenStates, weight["transformer.final_layernorm.weight"],
@@ -185,7 +215,6 @@ namespace fastllm {
         positionIds.ToDevice(DataDevice::CPU);
 
         int index = params.find("index")->second;
-        int promptLen = params.find("promptLen")->second;
 
         if (index == 0) {
             int mask_pos=-1;
@@ -235,41 +264,19 @@ namespace fastllm {
         } else {
             const auto &inputToken=inputTokens[0];
             unsigned long tokenLen=inputToken.size();
-            unsigned long inputCnt=inputIds.Count(0);
-            int totalLen=inputCnt+tokenLen;
-            float *inputDat=reinterpret_cast<float*>(inputIds.cpuData);
-            std::vector<float> newInput(totalLen);
-            for(unsigned int i=0;i<inputCnt;i++){
-                newInput[i]=inputDat[i];
-            }
-            for(unsigned int i=0;i<tokenLen;i++){
-                newInput[inputCnt+i]=inputToken.at(i);
-            }
-            float *attentionDat=reinterpret_cast<float*>(attentionMask.cpuData);
-            std::vector<float> newAttention(totalLen*totalLen,1);
-            for(unsigned int i=0;i<inputCnt;i++){
-                for(unsigned int j=0;j<inputCnt;j++){
-                    newAttention[i*totalLen+j]=attentionDat[i*inputCnt+j];
-                }
-            }
-            for(int i=0;i<totalLen-1;i++){
-                for(int j=std::max(i+1,static_cast<int>(inputCnt));j<totalLen;j++){
-                    newAttention[totalLen*i+j]=0;
-                }
-            }
+            int oldLen=attentionMask.dims.at(1);
+            int totalLen=oldLen+tokenLen;
             float *positionDat=reinterpret_cast<float*>(positionIds.cpuData);
-            std::vector<float> newPosition(totalLen*2);
-            for(unsigned int i=0;i<inputCnt;i++){
-                newPosition[i]=positionDat[i];
-                newPosition[totalLen+i]=positionDat[inputCnt+i];
-            }
+            int posLen=positionIds.dims.at(1);
+            std::vector<float> newAttention(totalLen,1);
+            std::vector<float> newPosition(tokenLen*2);
             for(unsigned int i=0;i<tokenLen;i++){
-                newPosition[inputCnt+i]=positionDat[inputCnt-1];
-                newPosition[totalLen+inputCnt+i]=newPosition[totalLen+inputCnt+i-1]+1;
+                newPosition[i]=positionDat[posLen-1];
+                newPosition[tokenLen+i]=positionDat[posLen+posLen-1]+1;
             }
-            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, totalLen}, newInput));
-            attentionMask.CopyFrom(Data(DataType::FLOAT32, {totalLen, totalLen}, newAttention));
-            positionIds.CopyFrom(Data(DataType::FLOAT32, {2, totalLen}, newPosition));
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, static_cast<int>(tokenLen)}, inputTokens[0]));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {1, totalLen}, newAttention));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {2, static_cast<int>(tokenLen)}, newPosition));
         }
     }
 
