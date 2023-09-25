@@ -366,6 +366,8 @@ namespace fastllm {
 
         void TryMergePairs(std::vector<Symbol> &symbols, int l, int r, std::priority_queue <SymbolPairs> &q); // 插入备选symbol
 
+        int GetRank(std::vector<Symbol> &symbols,  std::vector<std::pair<int, int>> &partitions, int idx, int skip);
+
         void Insert(const std::string &s, int tokenId, float score = 1.0f); // 插入一个token
 
         Data Encode(const std::string &s); // 编码
