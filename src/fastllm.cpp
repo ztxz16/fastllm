@@ -497,11 +497,12 @@ namespace fastllm {
 #endif
 #ifdef USE_CUDA
         if (this->cudaData != nullptr) {
-            if (this->directMemory) {
+            FastllmCudaFree(this->cudaData);
+            /*if (this->directMemory) {
                 FastllmCudaDirectFree(this->cudaData);
             } else {
                 FastllmCudaFree(this->cudaData);
-            }
+            }*/
         }
 #endif
     }
