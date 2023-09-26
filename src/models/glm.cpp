@@ -33,6 +33,8 @@ namespace fastllm {
         this->eos_token_id = 50007;//<|endofpiece|>
 
         weight.embeddingNames.insert("word_embeddings.weight");
+        weight.embeddingNames.insert("transformer.position_embeddings.weight");
+        weight.embeddingNames.insert("transformer.block_position_embeddings.weight");
         weight.tokenizer.type=Tokenizer::GLM;
         weight.tokenizer.Insert("[MASK]",mask_token_id);
         weight.tokenizer.Insert("[sMASK]",smask_token_id);
@@ -68,7 +70,6 @@ namespace fastllm {
         Data attenInput;
         Data qkv, q, k, v,q0;
         Data attnScores;
-        //Data attnScores2;
         Data attnProbs;
         Data attnOutput;
         Data contextLayer;
@@ -285,6 +286,23 @@ namespace fastllm {
         basellm::InitParams();
         head_dim = embed_dim / num_attention_heads;
         scale_attn_1 = 1.0f/sqrt(head_dim);
+#ifdef USE_SENTENCEPIECE
+        if (this->weight.dicts.find("tokenizer_serialized") != this->weight.dicts.end()) {
+            const std::string &hexString=this->weight.dicts["tokenizer_serialized"];
+            if(hexString.length()%2!=0){
+                std::cerr << "Invalid hex string\n";
+            }else{
+                std::string decoded;
+                for(unsigned int i=0;i<hexString.length();i+=2){
+                    decoded.push_back(std::stoi(hexString.substr(i,2),nullptr,16));
+                }
+                printf("%lu\n",decoded.length());
+                weight.tokenizer.spProcessor=std::make_unique<sentencepiece::SentencePieceProcessor>();
+                weight.tokenizer.spProcessor->LoadFromSerializedProto(decoded);
+                printf("GetPieceSize=%d\n",weight.tokenizer.spProcessor->GetPieceSize());
+            }
+        }
+#endif
     }
 
     void GLMModel::WarmUp() {

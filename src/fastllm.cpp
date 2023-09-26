@@ -952,6 +952,15 @@ namespace fastllm {
                     findPos=nextSpecialTokenPos+nextSpecialTokenLen;
                 }
                 if(subStr.length()>0){
+#ifdef USE_SENTENCEPIECE
+                    if(spProcessor!=nullptr){
+                        std::vector<int> ids;
+                        spProcessor->Encode(subStr,&ids);
+                        for(int id:ids){
+                            v.push_back(id);
+                        }
+                    }else{
+#endif
                     std::vector<Symbol> symbols;
                     for (int i = 0; i < subStr.size(); i++) {
                         int tokenId = -999999, pos = i - 1;
@@ -1023,6 +1032,9 @@ namespace fastllm {
                             }
                         }
                     }
+#ifdef USE_SENTENCEPIECE
+                    }
+#endif
                 }
                 if(nextSpecialTokenPos>=0){
                     v.push_back(nextSpecialToken);

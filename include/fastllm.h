@@ -19,6 +19,10 @@
 #include <memory>
 #include "devices/cpu/cputhreadpool.h"
 
+#ifdef USE_SENTENCEPIECE
+#include <sentencepiece_processor.h>
+#endif
+
 namespace fastllm {
     void SetDeviceMap(const std::map <std::string, int> &deviceMap);
     std::map <std::string, int> GetDeviceMap();
@@ -358,6 +362,9 @@ namespace fastllm {
         std::unordered_map <int, std::string> tokenToStringDict;
         std::unordered_map <int, float> tokenToScoreDict;
         std::unordered_map <std::string, int> stringToTokenDict;
+#ifdef USE_SENTENCEPIECE
+        std::unique_ptr<sentencepiece::SentencePieceProcessor> spProcessor;
+#endif
 
         Tokenizer ();
 
