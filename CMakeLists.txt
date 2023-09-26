@@ -7,9 +7,13 @@ option(USE_CUDA "use cuda" OFF)
 option(PY_API "python api" OFF)
 option(USE_MMAP "use mmap" OFF)
 
+option(USE_SENTENCEPIECE "use sentencepiece" OFF)
+
 message(STATUS "USE_CUDA: ${USE_CUDA}")
 
 message(STATUS "PYTHON_API: ${PY_API}")
+
+message(STATUS "USE_SENTENCEPIECE: ${USE_SENTENCEPIECE}")
 
 set(CMAKE_BUILD_TYPE "Release")
 
@@ -33,6 +37,12 @@ include_directories(include/models)
 
 if (USE_MMAP)
     add_compile_definitions(USE_MMAP)
+endif()
+
+if (USE_SENTENCEPIECE)
+    set(CMAKE_CXX_STANDARD 17)
+    add_compile_definitions(USE_SENTENCEPIECE)
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} sentencepiece)
 endif()
 
 if (USE_CUDA)
