@@ -207,8 +207,8 @@ namespace fastllm {
                                     RuntimeResult retCb,
                                     const GenerationConfig &generationConfig) {
 #ifdef PY_API
-		size_t pos = input.find_last_of("time_stamp:");
-		std::string prompt = (generationConfig.enable_hash_id && pos != std::string::npos)?  input.substr(0, pos-10):input;
+		size_t pos = input.rfind("time_stamp:");
+		std::string prompt = (generationConfig.enable_hash_id && pos != -1)?  input.substr(0, pos):input;
 		size_t hash_id = std::hash<std::string>{}(input);
         Data inputIds = this->weight.tokenizer.Encode(prompt);
 #else
