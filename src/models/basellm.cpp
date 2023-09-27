@@ -61,8 +61,8 @@ namespace fastllm {
 #endif
         std::string prompt = input;
 #ifdef PY_API
-        size_t pos = input.find_last_of("time_stamp:");
-        prompt = (generationConfig.enable_hash_id && pos != std::string::npos) ? input.substr(0, pos - 10) : input;
+        size_t pos = input.rfind("time_stamp:");
+        prompt = (generationConfig.enable_hash_id && pos != -1) ? input.substr(0, pos) : input;
         size_t hash_id = std::hash<std::string>{}(input);
 #endif
         Data inputIds, attentionMask, positionIds;
@@ -151,8 +151,8 @@ namespace fastllm {
             size_t hash_id = std::hash<std::string>{}(_input);
             hash_ids.push_back(hash_id);
 
-            size_t pos = _input.find_last_of("time_stamp:");
-            std::string prompt = (generationConfig.enable_hash_id && pos != std::string::npos) ? _input.substr(0, pos - 10) : _input;
+            size_t pos = _input.rfind("time_stamp:");
+            std::string prompt = (generationConfig.enable_hash_id && pos != -1) ? _input.substr(0, pos) : _input;
             prompts.push_back(prompt);
         }
 #else
