@@ -7,7 +7,8 @@ from copy import deepcopy
 import traceback
 from typing import List
 sys.path.append('../../build-py')
-import pyfastllm # 或fastllm
+import pyfastllm
+import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 import threading, queue, uvicorn, json, time
@@ -106,8 +107,8 @@ def dynamic_batch_stream_func():
             
 
 def chat_stream(prompt: str, config: pyfastllm.GenerationConfig, uid:int=0, time_out=200):
-    global g_model, g_msg_dict
-    time_stamp = round(time.time() * 1000)
+    global  g_msg_dict
+    time_stamp = str(uuid.uuid1())
     hash_id = str(pyfastllm.std_hash(f"{prompt}time_stamp:{time_stamp}"))
     thread = threading.Thread(target = batch_response_stream, args = (f"{prompt}time_stamp:{time_stamp}", config))
     thread.start()
