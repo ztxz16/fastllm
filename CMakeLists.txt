@@ -71,6 +71,9 @@ target_link_libraries(main fastllm)
 add_executable(quant tools/src/quant.cpp)
 target_link_libraries(quant fastllm)
 
+add_executable(testOps test/ops/cppOps.cpp)
+target_link_libraries(testOps fastllm)
+
 add_executable(webui example/webui/webui.cpp)
 target_link_libraries(webui fastllm)
 add_custom_command(

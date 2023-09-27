@@ -247,6 +247,7 @@ namespace fastllm {
     }
 
     Data::Data(fastllm::DataType type, const std::vector<int> &dims, const std::vector<float> &data) : Data::Data(type, dims) {
+        // std::cout<<"调用数值构造"<<std::endl;
         this->Allocate();
         if (type == DataType::FLOAT32) {
             std::memcpy(this->cpuData, data.data(), this->GetBytes());
@@ -258,6 +259,7 @@ namespace fastllm {
     }
 
     void Data::CopyFrom(const Data &ori) {
+        // std::cout<<"调用拷贝构造"<<std::endl;
         if (ori.dims != this->dims || this->cpuData == nullptr) {
             if (ori.dims.size() == 0) {
                 delete[] this->cpuData;
@@ -513,6 +515,10 @@ namespace fastllm {
             printf("%d ", i);
         }
         printf("\n");
+    }
+
+    std::vector<int> Data::Shape() const{
+        return this->dims;
     }
 
     void Data::Print() const {
