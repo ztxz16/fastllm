@@ -91,7 +91,7 @@ def tofile(exportPath,
         # Baichuan 2代
         modelInfo["use_alibi"] = "1"
         modelInfo["pre_prompt"] = ""
-        modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.user_token_id) + "> ") if hasattr(model.generation_config, "user_token_id") else "";
+        modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.user_token_id) + ">") if hasattr(model.generation_config, "user_token_id") else "";
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.assistant_token_id) + ">") if hasattr(model.generation_config, "assistant_token_id") else "";
         modelInfo["history_sep"] = ""
     if modelInfo["model_type"] == "qwen":
