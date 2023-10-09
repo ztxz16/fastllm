@@ -1948,8 +1948,8 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
     float *vd = (float*)v.cudaData;
     float *maskd = mask.dims.size() > 0 ? (float*)mask.cudaData : nullptr;
     float *od = (float*)output.cudaData;
-    int batch = mask.dims.size() > 0 ? mask.dims[0] : 1;
-
+    int batch = (mask.dims.size() == 3) ? mask.dims[0] : 1;
+    int maskStride = (mask.dims.size() == 3 ? mask.strides[0] : mask.Count(0));
     if (false) {
         float *qk = (float *) FastllmCudaMalloc(q0 * k1 * sizeof(float));
         float *temp = (float *) FastllmCudaMalloc(q0 * k1 * sizeof(float));
@@ -1968,6 +1968,7 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
         auto fastllmCublasHandle = getFastllmCublasHandle();
         cublasStatus_t status;
 
+
         for (int i = 0; i < q0; i++) {
             status = cublasSgemmStridedBatched(fastllmCublasHandle,
                                                CUBLAS_OP_T, CUBLAS_OP_N,
@@ -1984,7 +1985,7 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
             }
 
             if (maskd) {
-                SimpleMask<256> <<< (q1 * k1 / 256) + 1, 256>>>(qk, maskd + (i / (q0 / batch)) * q1 * k1, -10000, q1 * k1);
+                SimpleMask<256> <<< (q1 * k1 / 256) + 1, 256>>>(qk, maskd + (i / (q0 / batch)) * maskStride, -10000, q1 * k1);
             }
 
             int outer = q1;
