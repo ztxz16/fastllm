@@ -233,15 +233,14 @@ namespace fastllm {
             std::vector<int> outputSize = {q.dims[1], q.dims[2], q.dims[0], pastKey.dims[1]};
             q.Reshape({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
             PermuteSelf(q, {1, 0, 2});
-            //Attention(q, pastKey, pastValue, attentionMask, contextLayer, q.dims[0] / pastKey.dims[0], 1.0 / scale_attn, 1);
+            Attention(q, pastKey, pastValue, attentionMask, contextLayer, q.dims[0] / pastKey.dims[0], 1.0 / scale_attn, 1);
 
-
+/*
             // 1.2 Attention
             // 1.2.0 q * k^T
             q.Reshape({pastKey.dims[0], -1, q.dims[2]});
             MatMulTransB(q, pastKey, attnProbs, 1.0 / (scale_attn * (i + 1)));
             attnProbs.Reshape(outputSize);
-
             // 1.2.1 Mask
             if (attentionMask.dims.size() != 0) {
                 AttentionMask(attnProbs, attentionMask, -10000);
@@ -255,6 +254,8 @@ namespace fastllm {
 
             attnProbs.Reshape({pastValue.dims[0], -1, attnProbs.dims[2]});
             MatMul(attnProbs, pastValue, contextLayer);
+*/
+
             contextLayer.Reshape({batch, num_attention_heads, maxLen, -1});
             PermuteSelf(contextLayer, {2, 0, 1, 3});
             contextLayer.Reshape({contextLayer.dims[0], contextLayer.dims[1], embed_dim});

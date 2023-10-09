@@ -275,7 +275,6 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
-
         output.Allocate();
         int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
         float *qd = (float*)q.cpuData;
@@ -283,13 +282,15 @@ namespace fastllm {
         float *vd = (float*)v.cpuData;
         float *maskd = (datas.find("mask")->second && mask.dims.size() > 0) ? (float*)mask.cpuData : nullptr;
         float *od = (float*)output.cpuData;
+        int batch = (mask.dims.size() == 3 ? mask.dims[0] : 1);
+        int maskStride = (mask.dims.size() == 3 ? mask.strides[0] : mask.Count(0));
         std::fill(od, od + output.Count(0), 0.0f);
         auto pool = GetPool();
         std::vector<std::future<void> > futures;
         for (int o = 0; o < q0; o++) {
             futures.push_back(pool->Submit(SingleAttention,
                             qd + o * q.strides[0], kd + (o / group) * k.strides[0], vd + (o / group) * v.strides[0],
-                            maskd ? (maskd + o / (q0 / mask.dims[0])) : maskd, od + o * output.strides[0], scale,
+                            maskd + (o / (q0 / batch)) * maskStride, od + o * output.strides[0], scale,
                             q1, q2, k1, v2));
         }
         for (int o = 0; o < futures.size(); o++) {
