@@ -67,7 +67,8 @@ def create(model,
     active_adapter = ""
     if hasattr(model, "peft_config"):
         peft_config = model.peft_config
-    if hasattr(model, "active_adapter"):
+    if hasattr(model, "active_adapter") and isinstance(model.active_adapter, str):
+        # in transformers >= 4.33.0, active_adapter is a funtion in model, ignore it now
         active_adapter = model.active_adapter
 
     model = model.cpu();
