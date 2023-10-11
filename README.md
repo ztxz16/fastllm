@@ -336,6 +336,18 @@ python3 tools/baichuan2flm.py baichuan-13b-int8.flm int8 #导出int8模型
 python3 tools/baichuan2flm.py baichuan-13b-int4.flm int4 #导出int4模型
 ```
 
+### baichuan2模型导出 (默认脚本导出baichuan2-7b-chat模型)
+
+``` sh
+# 需要先安装baichuan2环境
+# 如果使用自己finetune的模型需要修改baichuan2_2flm.py文件中创建tokenizer, model的代码
+# 根据所需的精度，导出相应的模型
+cd build
+python3 tools/baichuan2_2flm.py baichuan2-7b-fp16.flm float16 #导出float16模型
+python3 tools/baichuan2_2flm.py baichuan2-7b-int8.flm int8 #导出int8模型
+python3 tools/baichuan2_2flm.py baichuan2-7b-int4.flm int4 #导出int4模型
+```
+
 ### MOSS模型导出
 
 ``` sh
