@@ -1,5 +1,6 @@
-import fastllm
+import pytest
 import numpy as np
+import fastllm
 
 def np_rms_norm(inputs, weights, eps):
     channel = inputs.shape[-1]
@@ -87,7 +88,8 @@ def test_attention():
     output = fastllm.ops.attention(q, k, v, mask, group=1, scale=scale, attentionType=0)
     print(output)
 
-test_attention()
-test_silu()
-test_linear()
-test_rms_norm()
+if __name__ == "__main__":
+    test_attention()
+    test_silu()
+    test_linear()
+    test_rms_norm()

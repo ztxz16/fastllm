@@ -3,14 +3,12 @@ import sys
 import platform
 import logging
 import argparse
-
-sys.path.append('./build-py')
-import pyfastllm as fastllm # 或fastllm
+import fastllm 
 
 logging.info(f"python gcc version:{platform.python_compiler()}")
 
 def args_parser():
-    parser = argparse.ArgumentParser(description='pyfastllm')
+    parser = argparse.ArgumentParser(description='fastllm')
     parser.add_argument('-m', '--model', type=int, required=False, default=0, help='模型类型，默认为0, 可以设置为0(chatglm),1(moss),2(vicuna),3(baichuan)')
     parser.add_argument('-p', '--path', type=str, required=True, default='', help='模型文件的路径')
     parser.add_argument('-t', '--threads', type=int, default=4,  help='使用的线程数量')
@@ -46,16 +44,16 @@ def response(model, prompt_input:str, stream_output:bool=False):
     ret_str = ""
     ret_len = 1
     mask_ids = -1
-    results = []
+    output_tokens = []
     penalty_factor = fastllm.Tensor()
 
-    while True:
+    while len(output_tokens) < 2048: # config.max_seq_len
         ret, pastKeyValues = model.forward(input_ids, attention_mask, position_ids, penalty_factor, pastKeyValues)
         if ret == eos_token_id:
             break
 
-        results.append(ret)
-        cur_str = model.weight.tokenizer.decode(fastllm.Tensor(fastllm.float32, [len(results)], results))
+        output_tokens.append(ret)
+        cur_str = model.weight.tokenizer.decode(fastllm.Tensor(fastllm.float32, [len(output_tokens)], output_tokens))
         ret_str += cur_str
 
         print(cur_str, end="")
@@ -64,7 +62,7 @@ def response(model, prompt_input:str, stream_output:bool=False):
             yield cur_str
 
         ret_len += 1
-        results = []
+        output_tokens = []
 
         if mask_ids == -1:
             mask_ids = seq_len - 2
@@ -77,37 +75,20 @@ def response(model, prompt_input:str, stream_output:bool=False):
     return ret_str
 
 
-LLM_TYPE = ""
-def print_back(idx:int, content: str):
-    if idx >= 0:
-        print(f"\r{LLM_TYPE}:{content}", end='', flush=True)
-    elif idx == -1:
-        print()
-
-def main(args):
-    model_path = args.path
-    OLD_API = True
-    if OLD_API:
-        model = fastllm.ChatGLMModel()
-        model.load_weights(model_path)
-        model.warmup()
-    else:
-        global LLM_TYPE 
-        LLM_TYPE = fastllm.get_llm_type(model_path)
-        print(f"llm model: {LLM_TYPE}")
-        model = fastllm.create_llm(model_path)
+def run_with_low_level(args):
+    model_path = args.path 
+    llm_type = fastllm.get_llm_type(model_path)
+    print(f"llm model: {llm_type}")
+    model = fastllm.create_llm(model_path)
         
     prompt = ""
-    while prompt != "exit":
+    while prompt != "stop":
         prompt = input("User: ")
-        # model.response(prompt, print_back)
         outputs = response(model, prompt_input=prompt)
-
         for output in outputs:
-        # print()
             print(output)
             sys.stdout.flush()
 
 if __name__ == "__main__":
     args = args_parser()
-    main(args)
+    run_with_low_level(args)
