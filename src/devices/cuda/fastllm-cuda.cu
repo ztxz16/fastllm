@@ -22,7 +22,7 @@ cublasHandle_t getFastllmCublasHandle() {
     auto stat = cublasCreate(&handler);
 
     if (stat != CUBLAS_STATUS_SUCCESS) {
-        printf ("CUBLAS initialization failed:%d\n", stat);
+        printf ("Error: CUBLAS initialization failed. state %d.\n", stat);
         exit(0);
     } else {
         s_fastllmCublasHandleMap[id] = handler;
@@ -1068,7 +1068,11 @@ void *FastllmCudaPrepareInput(const fastllm::Data &input) {
         ret = (void*)input.cudaData;
     } else {
         ret = (void*)(input.expansionBytes);
-        cudaMemcpy(ret, input.cpuData, input.expansionBytes, cudaMemcpyHostToDevice);
+        auto state = cudaMemcpy(ret, input.cpuData, input.expansionBytes, cudaMemcpyHostToDevice);
+        if (cudaSuccess != state) {
+            printf("Error: CUDA error when copy from memory to GPU! state %d", state);
+            return nullptr;
+        }
     }
     return ret;
 }
@@ -1091,7 +1095,9 @@ void *FastllmCudaPrepareOutput(fastllm::Data &output) {
 
 void FastllmCudaFinishOutput(fastllm::Data &output, void *data) {
     if (output.dataDevice != fastllm::DataDevice::CUDA) {
-        cudaMemcpy(output.cpuData, data, output.expansionBytes, cudaMemcpyDeviceToHost);
+        auto state = cudaMemcpy(output.cpuData, data, output.expansionBytes, cudaMemcpyDeviceToHost);
+        if (cudaSuccess != state)
+            printf("Error: CUDA error when copy from GPU to memory! state %d", state);
         FastllmCudaFree(data);
     }
 
@@ -1101,27 +1107,30 @@ void FastllmCudaFinishOutput(fastllm::Data &output, void *data) {
 bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         float *cudaScales;
-        cudaMalloc(&cudaScales, k * sizeof(float));
-        cudaMemcpy(cudaScales, weight.scales.data(), k * sizeof(float), cudaMemcpyHostToDevice);
+        cudaError_t state = cudaSuccess;
+        state = cudaMalloc(&cudaScales, k * sizeof(float));
+        state = cudaMemcpy(cudaScales, weight.scales.data(), k * sizeof(float), cudaMemcpyHostToDevice);
         weight.extraCudaData.push_back((void*)cudaScales);
 
         uint8_t *cudaZeropoints;
-        cudaMalloc(&cudaZeropoints, k);
+        state = cudaMalloc(&cudaZeropoints, k);
         uint8_t *zeropoints = new uint8_t[k];
         for (int i = 0; i < k; i++) {
             zeropoints[i] = weight.perChannelsConfigs[i].zeroPoint;
         }
-        cudaMemcpy(cudaZeropoints, zeropoints, k, cudaMemcpyHostToDevice);
+        state = cudaMemcpy(cudaZeropoints, zeropoints, k, cudaMemcpyHostToDevice);
         delete[] zeropoints;
         weight.extraCudaData.push_back((void*)cudaZeropoints);
 
         float *cudaBiasData;
-        cudaMalloc(&cudaBiasData, k * sizeof(float));
+        state = cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
-            cudaMemset(cudaBiasData, 0, k * sizeof(float));
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
+        if (cudaSuccess != state)
+            printf("Error: CUDA error when moving bias to device! state %d\n", state);
         weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
@@ -1193,27 +1202,30 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
 bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         float *cudaScales;
-        cudaMalloc(&cudaScales, k * sizeof(float));
-        cudaMemcpy(cudaScales, weight.scales.data(), k * sizeof(float), cudaMemcpyHostToDevice);
+        cudaError_t state = cudaSuccess;
+        state = cudaMalloc(&cudaScales, k * sizeof(float));
+        state = cudaMemcpy(cudaScales, weight.scales.data(), k * sizeof(float), cudaMemcpyHostToDevice);
         weight.extraCudaData.push_back((void*)cudaScales);
 
         uint8_t *cudaZeropoints;
-        cudaMalloc(&cudaZeropoints, k);
+        state = cudaMalloc(&cudaZeropoints, k);
         uint8_t *zeropoints = new uint8_t[k];
         for (int i = 0; i < k; i++) {
             zeropoints[i] = weight.perChannelsConfigs[i].zeroPoint;
         }
-        cudaMemcpy(cudaZeropoints, zeropoints, k, cudaMemcpyHostToDevice);
+        state = cudaMemcpy(cudaZeropoints, zeropoints, k, cudaMemcpyHostToDevice);
         delete[] zeropoints;
         weight.extraCudaData.push_back((void*)cudaZeropoints);
 
         float *cudaBiasData;
-        cudaMalloc(&cudaBiasData, k * sizeof(float));
+        state = cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
-            cudaMemset(cudaBiasData, 0, k * sizeof(float));
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
+        if (cudaSuccess != state)
+            printf("Error: CUDA error when moving bias to device! state %d\n", state);
         weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
@@ -1241,27 +1253,30 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
 bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         float *cudaScales;
-        cudaMalloc(&cudaScales, k * sizeof(float));
-        cudaMemcpy(cudaScales, weight.scales.data(), k * sizeof(float), cudaMemcpyHostToDevice);
+        cudaError_t state = cudaSuccess;
+        state = cudaMalloc(&cudaScales, k * sizeof(float));
+        state = cudaMemcpy(cudaScales, weight.scales.data(), k * sizeof(float), cudaMemcpyHostToDevice);
         weight.extraCudaData.push_back((void*)cudaScales);
 
         float *cudaMins;
-        cudaMalloc(&cudaMins, k * sizeof(float));
+        state = cudaMalloc(&cudaMins, k * sizeof(float));
         float *mins = new float[k];
         for (int i = 0; i < k; i++) {
             mins[i] = weight.perChannelsConfigs[i].min;
         }
-        cudaMemcpy(cudaMins, mins, k * sizeof(float), cudaMemcpyHostToDevice);
+        state = cudaMemcpy(cudaMins, mins, k * sizeof(float), cudaMemcpyHostToDevice);
         delete[] mins;
         weight.extraCudaData.push_back((void*)cudaMins);
 
         float *cudaBiasData;
-        cudaMalloc(&cudaBiasData, k * sizeof(float));
+        state = cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
-            cudaMemset(cudaBiasData, 0, k * sizeof(float));
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
+        if (cudaSuccess != state)
+            printf("Error: CUDA error when moving bias to device! state %d\n", state);
         weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
@@ -1335,12 +1350,15 @@ bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data 
 bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         float *cudaBiasData;
-        cudaMalloc(&cudaBiasData, k * sizeof(float));
+        cudaError_t state = cudaSuccess;
+        state = cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
-            cudaMemset(cudaBiasData, 0, k * sizeof(float));
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
+        if (cudaSuccess != state)
+            printf("Error: CUDA error when moving bias to device! state %d\n", state);
         weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
@@ -1384,12 +1402,15 @@ bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight,
 bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         float *cudaBiasData;
-        cudaMalloc(&cudaBiasData, k * sizeof(float));
+        cudaError_t state = cudaSuccess;
+        state = cudaMalloc(&cudaBiasData, k * sizeof(float));
         if (bias.dims.size() > 0) {
-            cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
-            cudaMemset(cudaBiasData, 0, k * sizeof(float));
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
+        if (cudaSuccess != state)
+            printf("Error: CUDA error when moving bias to device! state %d\n", state);
         weight.extraCudaData.push_back((void*)cudaBiasData);
     }
     float *cudaBiasData = (float*)weight.extraCudaData[0];
@@ -1459,17 +1480,29 @@ std::map<int, std::vector <CudaMemoryBuffer>> bigBuffersMap;
 
 void * FastllmCudaDirectMalloc(size_t size) {
     void * ret;
-    cudaMalloc(&ret, size);
+    cudaError_t state = cudaMalloc(&ret, size);
+    if (cudaSuccess != state) {
+        printf("Error: CUDA error when allocating %d kB memory! state %d, maybe there's no enough memory left on device.\n", size >> 10, state);
+        return nullptr;
+    }
     return ret;
 }
 
 void FastllmCudaDirectFree(void *ret) {
-    cudaFree(ret);
+    cudaError_t state = cudaFree(ret);
+    if (cudaSuccess != state) {
+        printf("Error: CUDA error when release memory! state %d.\n", state);
+    }
 }
 
 void * FastllmCudaMalloc(size_t size) {
     int id = -1;
-    cudaGetDevice(&id);
+    cudaError_t state = cudaSuccess;
+    state = cudaGetDevice(&id);
+    if (cudaSuccess != state) {
+        printf("Error: CUDA error when find device! state %d", state);
+        return nullptr;
+    }
     if (size > 1024 * 1024) {
         auto &bigBuffers = bigBuffersMap[id];
         int selId = -1;
@@ -1487,7 +1520,11 @@ void * FastllmCudaMalloc(size_t size) {
         }
 
         void * ret;
-        cudaMalloc(&ret, size);
+        state = cudaMalloc(&ret, size);
+        if (cudaSuccess != state) {
+            printf("Error: CUDA error when allocating %d MB memory! state %d, maybe there's no enough memory left on device.\n", size >> 20, state);
+            return nullptr;
+        }
         bigBuffers.push_back(CudaMemoryBuffer(ret, size, true));
         return ret;
     }
@@ -1500,7 +1537,11 @@ void * FastllmCudaMalloc(size_t size) {
         }
     }
     void * ret;
-    cudaMalloc(&ret, size);
+    state = cudaMalloc(&ret, size);
+    if (cudaSuccess != state) {
+        printf("Error: CUDA error when allocating %d KB memory! state %d, maybe there's no enough memory left on device.\n", size >> 10, state);
+        return nullptr;
+    }
     cudaBuffers.push_back(CudaMemoryBuffer(ret, size, true));
     return ret;
 }
@@ -1509,14 +1550,19 @@ void FastllmCudaFree(void *ret) {
     if (ret == nullptr) {
         return;
     }
+    if (cudaBuffersMap.empty())
+        return;
+    cudaError_t state = cudaSuccess;
     for (auto &it: cudaBuffersMap) {
         if (noBusyCnt[it.first] > 1024 * 1024 * 1024) {
             auto &cudaBuffers = it.second;
             std::vector <CudaMemoryBuffer> temp;
             for (int i = 0; i < cudaBuffers.size(); i++) {
                 if (!cudaBuffers[i].busy) {
-                    cudaSetDevice(it.first);
-                    cudaFree(cudaBuffers[i].data);
+                    state = cudaSetDevice(it.first);
+                    state = cudaFree(cudaBuffers[i].data);
+                    if (cudaSuccess != state)
+                        printf("Error: CUDA error when release memory on device %d! state %d.\n", it.first, state);
                 } else {
                     temp.push_back(cudaBuffers[i]);
                 }
@@ -1544,7 +1590,11 @@ void FastllmCudaFree(void *ret) {
             }
         }
     }
-    cudaFree(ret);
+    state = cudaFree(ret);
+    if (cudaSuccess != state) {
+        printf("CUDA error when release memory! state %d.\n", state);
+        return;
+    }
 }
 
 void FastllmCudaMallocBigBuffer(size_t size) {
@@ -1553,19 +1603,28 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     cudaGetDevice(&id);
     auto &bigBuffers = bigBuffersMap[id];
     cudaMalloc(&ret, size);
+    auto state = cudaMalloc(&ret, size);
+    if (cudaSuccess != state) {
+        printf("Error: CUDA error when allocating %d MB memory! state %d. maybe there's no enough memory left on device.\n", size >> 20, state);
+    }
     bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
 }
 
 void FastllmCudaClearBigBuffer() {
     int id = -1;
     cudaGetDevice(&id);
+    if (bigBuffersMap.empty())
+        return;
+    cudaError_t state = cudaSuccess;
     for (auto &it : bigBuffersMap) {
         auto &bigBuffers = it.second;
         std::vector <CudaMemoryBuffer> temp;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy) {
-                cudaSetDevice(it.first);
-                cudaFree(bigBuffers[i].data);
+                state = cudaSetDevice(it.first);
+                state = cudaFree(bigBuffers[i].data);
+                if (cudaSuccess != state)
+                    printf("Error: CUDA error when release memory on device %d! state %d.\n", it.first, state);
             } else {
                 temp.push_back(bigBuffers[i]);
             }
@@ -1577,17 +1636,23 @@ void FastllmCudaClearBigBuffer() {
 }
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size) {
-    cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice);
+    auto state = cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice);
+    if (cudaSuccess != state)
+        printf("Error: CUDA error when copy from memory to GPU! state %d.\n", state);
     //cudaDeviceSynchronize();
 }
 
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size) {
-    cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
+    auto state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
+    if (cudaSuccess != state)
+        printf("Error: CUDA error when copy from GPU to memory! state %d.\n", state);
     //cudaDeviceSynchronize();
 }
 
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
-    cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
+    auto state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
+    if (cudaSuccess != state)
+        printf("Error: CUDA error when copy on GPU! state %d.\n", state);
     //cudaDeviceSynchronize();
 }
 
@@ -1979,7 +2044,7 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
                                                qk, k1, k1 * q1, 1);
             if (status != CUBLAS_STATUS_SUCCESS) {
                 printf("status = %d\n", (int) status);
-                printf("Error: cublas error.\n");
+                printf("Error: cublas error during MatMulTransB in Attention operator.\n");
                 throw ("cublas error");
                 exit(0);
             }
@@ -2008,7 +2073,7 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
                                                od + i * v2 * q1, v2, v2 * q1, 1);
             if (status != CUBLAS_STATUS_SUCCESS) {
                 printf("status = %d\n", (int) status);
-                printf("Error: cublas error.\n");
+                printf("Error: cublas error during MatMul in Attention operator.\n");
                 throw ("cublas error");
                 exit(0);
             }
@@ -2035,7 +2100,7 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
                                            qk, k1, k1 * q1 * group, q0 / group);
         if (status != CUBLAS_STATUS_SUCCESS) {
             printf("status = %d\n", (int) status);
-            printf("Error: cublas error.\n");
+            printf("Error: cublas error during MatMulTransB in Attention operator.\n");
             throw ("cublas error");
             exit(0);
         }
@@ -2065,7 +2130,7 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
                                            od, v2, v2 * q1 * group, q0 / group);
         if (status != CUBLAS_STATUS_SUCCESS) {
             printf("status = %d\n", (int) status);
-            printf("Error: cublas error.\n");
+            printf("Error: cublas error during MatMul in Attention operator.\n");
             throw ("cublas error");
             exit(0);
         }
@@ -2098,7 +2163,7 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
     if (status != CUBLAS_STATUS_SUCCESS) {
         printf("status = %d\n", (int)status);
         printf("%d %d %d\n", k, n, m);
-        printf("Error: cublas error.\n");
+        printf("Error: cublas error in batch MatMul.\n");
         throw("cublas error");
         exit(0);
     }
@@ -2130,7 +2195,7 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
     if (status != CUBLAS_STATUS_SUCCESS) {
         printf("status = %d\n", (int)status);
         printf("%d %d %d\n", k, n, m);
-        printf("Error: cublas error.\n");
+        printf("Error: cublas error in batch MatMulTransB.\n");
         throw("cublas error");
         exit(0);
     }
