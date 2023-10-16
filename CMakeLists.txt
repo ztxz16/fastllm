@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.5)
 
 project(fastllm LANGUAGES CXX)
 
-option(USE_CUDA "use cuda" OFF)
+option(USE_CUDA "use CUDA" OFF)
+option(CUDA_NO_TENSOR_CORE "Optimize for legacy CUDA GPUs which has Tensor Core." OFF)
 
 option(PY_API "python api" OFF)
 
@@ -13,6 +14,8 @@ option(USE_SENTENCEPIECE "use sentencepiece" OFF)
 option(USE_IVCOREX "use iluvatar corex gpu" OFF)
 
 message(STATUS "USE_CUDA: ${USE_CUDA}")
+
+message(STATUS "For legacy CUDA GPUs: ${CUDA_NO_TENSOR_CORE}")
 
 message(STATUS "PYTHON_API: ${PY_API}")
 
@@ -56,6 +59,9 @@ endif()
 if (USE_CUDA)
     enable_language(CUDA)
     add_compile_definitions(USE_CUDA)
+    if (CUDA_NO_TENSOR_CORE)
+        add_compile_definitions(CUDA_NO_TENSOR_CORE)
+    endif()
     include_directories(include/devices/cuda)
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/cuda/fastllm-cuda.cu)
