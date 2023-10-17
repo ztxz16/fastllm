@@ -415,6 +415,8 @@ namespace fastllm {
         void AddWeight(const std::string &key, const std::vector <int> &dims,
                        DataType dataType, WeightType weightType, DataType oriDataType, uint8_t *oriData); // 插入一个权重
 
+        void ReleaseWeight(); // 释放所有权重占用的空间
+
         void AddQLinearWeight(const std::string &key, const std::vector <int> &dims,
                               int bit, float *scales, uint8_t *oriData); // 插入一个Qlinear层的权重，量化规则为float value = scales * oriData
 
