@@ -107,7 +107,7 @@ def main(args=None):
     convert(export_path, model.model, tokenizer)
 
     if args.qbit:
-        import pyfastllm as fastllm
+        import fastllm
         export_name, export_ext = export_path.split('.')
         q_export_path = export_name + f"-q{args.qbit}." + export_ext 
         flm_model = fastllm.create_llm(export_path)
