@@ -21,6 +21,28 @@ void showError(cudaError_t result, char const* const message, const char* const 
     }  
 }
 
+
+#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
+
+typedef union __align__(16) {
+    uint2 in;
+    uint8_t out[8];
+} union_char8;
+
+typedef union __align__(16) {
+    uint32_t in;
+    uint8_t out[4];
+} union_char4;
+
+typedef union __align__(16) _union_half_4 {
+    uint2 in;
+    half out[4];
+    half2 out2[2];
+    __device__ _union_half_4() {
+      // Do nothing
+    }
+} union_half4;
+
 static std::map<int, cublasHandle_t> s_fastllmCublasHandleMap;
 cublasHandle_t getFastllmCublasHandle() {
     int id = -1;
@@ -806,25 +828,51 @@ template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvFp32Fp16Kernel2(float *A, half *B, float *C, float *bias, int m, int k) {
     __shared__ float sdata[THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
+    const half zero = __float2half_rn(0.0);
+    float4 regA;
+    union_half4 regB;
 
     // 1. 计算
     int st = blockIdx.x * PART;
     int end = st + PART;
     for (int p = st; p < end; p++) {
         sdata[tid] = 0;
+        const half *baseB = B + p * m;
+#ifdef CUDA_NO_TENSOR_CORE
+#pragma unroll
+        for (int i = tid*4; i < m; i += THREAD_PER_BLOCK*4) {
+            regA = FETCH_FLOAT4(A[i]);
+            regB.in = *reinterpret_cast<const uint2 *>(baseB + i);
+            float sum = 0.0f;
+            if (i < m)
+                sum += regA.x * __low2float(regB.out2[0]);
+            if (i + 1 < m)
+                sum += regA.y * __high2float(regB.out2[0]);
+            if (i + 2 < m)
+                sum += regA.z * __low2float(regB.out2[1]);
+            if (i + 3 < m)
+                sum += regA.w * __high2float(regB.out2[1]);
+            sdata[tid] += sum;
+        }
+#else
         for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
             sdata[tid] += A[i] * (float)B[p * m + i];
         }
+#endif
         __syncthreads();
-        for (unsigned int s = 1; s < THREAD_PER_BLOCK; s *= 2) {
-            if ((tid & (2 * s - 1)) == 0) {
-                sdata[tid] += sdata[tid + s];
+        float diff = 0.0f;
+        for (unsigned int s = THREAD_PER_BLOCK/2; s > 0; s >>= 1) {
+            if (tid < s) {
+                float other = sdata[tid + s] - diff;
+                float sumTmp = sdata[tid] + other;
+                diff = (sumTmp - sdata[tid]) - other;
+                sdata[tid] = sumTmp;
             }
             __syncthreads();
         }
 
         if (tid == 0) {
-            C[p] = sdata[0] + bias[p];
+            C[p] = sdata[0] + __ldg(bias + p);
         }
         __syncthreads();
     }
@@ -843,25 +891,51 @@ __global__ void FastllmGemvInt8Kernel2(float *A, uint8_t *B, float *C,
     }
     __syncthreads();*/
 
+    float4 regA;
+    union_char4 regB;
+    
     // 2. 计算
     int st = blockIdx.x * PART;
     int end = st + PART;
     for (int p = st; p < end; p++) {
         sdata[tid] = 0;
         uint8_t zero = zeros[p];
+        const uint8_t *baseB = B + p * m;
+#ifdef CUDA_NO_TENSOR_CORE
+#pragma unroll
+        for (int i = tid*4; i < m; i += THREAD_PER_BLOCK*4) {
+            regA = FETCH_FLOAT4(A[i]);
+            regB.in = *reinterpret_cast<const uint32_t *>(baseB + i);
+            float sum = 0.0f;
+            if (i < m)
+                sum += regA.x * (float)(regB.out[0] - zero);
+            if (i + 1 < m)
+                sum += regA.y * (float)(regB.out[1] - zero);
+            if (i + 2 < m)
+                sum += regA.z * (float)(regB.out[2] - zero);
+            if (i + 3 < m)
+                sum += regA.w * (float)(regB.out[3] - zero);
+            sdata[tid] += sum;
+        }
+#else
         for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
             sdata[tid] += A[i] * (B[p * m + i] - zero);
         }
+#endif
         __syncthreads();
-        for (unsigned int s = 1; s < THREAD_PER_BLOCK; s *= 2) {
-            if ((tid & (2 * s - 1)) == 0) {
-                sdata[tid] += sdata[tid + s];
+        float diff = 0.0f;
+        for (unsigned int s = THREAD_PER_BLOCK/2; s > 0; s >>= 1) {
+            if (tid < s) {
+                float other = sdata[tid + s] - diff;
+                float sumTmp = sdata[tid] + other;
+                diff = (sumTmp - sdata[tid]) - other;
+                sdata[tid] = sumTmp;
             }
             __syncthreads();
         }
 
         if (tid == 0) {
-            C[p] = sdata[0] * scales[p] + bias[p];
+            C[p] = sdata[0] * __ldg(scales + p) + __ldg(bias + p);
         }
         __syncthreads();
     }
