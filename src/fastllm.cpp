@@ -1722,6 +1722,21 @@ namespace fastllm {
         }
     }
 
+    void WeightMap::ReleaseWeight() {
+        for (auto &w : this->weight) {
+#ifndef USE_MMAP
+            delete[] w.second.cpuData;
+            w.second.cpuData = nullptr;
+#endif
+#ifdef USE_CUDA
+            if (w.second.cudaData != nullptr) {
+                FastllmCudaDirectFree(w.second.cudaData);
+                w.second.cudaData = nullptr;
+            }
+#endif
+        }
+    }
+
     Data &WeightMap::operator[](const std::string &key) {
         return weight[key];
     }
