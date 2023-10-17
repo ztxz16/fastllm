@@ -26,63 +26,66 @@ def write_tensor(fp, key, value):
     fp.write(struct.pack('i', 0))
     fp.write(value.data)
 
-def tofile(export_path,
+
+def convert_configs(f, model_config):
+    modelInfo = model_config.__dict__
+    # modelInfo["pre_prompt"] = pre_prompt or None
+    # modelInfo["user_role"] = user_role or None
+    # modelInfo["bot_role"] = bot_role or None
+    # modelInfo["history_sep"] = history_sep or None
+    write_dict(f, modelInfo)
+
+
+def convert_tokenizer(fp, tokenizer):
+    if (hasattr(tokenizer, "sp_model")):
+        piece_size = tokenizer.sp_model.piece_size()
+        fp.write(struct.pack('i', piece_size))
+        for i in range(piece_size):
+            s = tokenizer.sp_model.id_to_piece(i).encode()
+            fp.write(struct.pack('i', len(s)))
+            for c in s:
+                fp.write(struct.pack('i', c))
+            fp.write(struct.pack('i', i))
+    else:
+        vocab = tokenizer.get_vocab()
+        fp.write(struct.pack('i', len(vocab)))
+        for v in vocab.keys():
+            s = v.encode()
+            fp.write(struct.pack('i', len(s)))
+            for c in s:
+                fp.write(struct.pack('i', c))
+            fp.write(struct.pack('i', vocab[v]))
+
+
+def convert_weights(fp, state_dict):
+    fp.write(struct.pack('i', len(dict)))
+    tot = 0
+    for key in state_dict:
+        cur = dict[key].numpy().astype(np.float32)
+        write_tensor(fp, key, cur)
+        tot += 1
+
+
+def convert(file_path,
            model,
            tokenizer = None,
-           pre_prompt = None,
-           user_role = None,
-           bot_role = None,
-           history_sep = None,
            verbose=False):
-    print(verbose)
-    logger.info('start to convert torch model to fastllm model...') if verbose else None
-    dict = model.cpu().state_dict()
-        
-    with open(export_path, "wb") as fp:
+    with open(file_path, encoding='utf-8') as f:
         # 0. version id
-        fp.write(struct.pack('i', 2))
+        f.write(struct.pack('i', 2))
 
-        logger.info('start to convert model info...') if verbose else None
         # 0.1 model info
-        modelInfo = model.config.__dict__
-        modelInfo["pre_prompt"] = pre_prompt or None
-        modelInfo["user_role"] = user_role or None
-        modelInfo["bot_role"] = bot_role or None
-        modelInfo["history_sep"] = history_sep or None
-        write_dict(fp, modelInfo)
-        
+        convert_configs(f, model.config)
+
         # 1. vocab
         if tokenizer:
-            logger.info('start to convert model tokenizer...') if verbose else None
-            if (hasattr(tokenizer, "sp_model")):
-                piece_size = tokenizer.sp_model.piece_size()
-                fp.write(struct.pack('i', piece_size))
-                for i in range(piece_size):
-                    s = tokenizer.sp_model.id_to_piece(i).encode()
-                    fp.write(struct.pack('i', len(s)))
-                    for c in s:
-                        fp.write(struct.pack('i', c))
-                    fp.write(struct.pack('i', i))
-            else:
-                vocab = tokenizer.get_vocab()
-                fp.write(struct.pack('i', len(vocab)))
-                for v in vocab.keys():
-                    s = v.encode()
-                    fp.write(struct.pack('i', len(s)))
-                    for c in s:
-                        fp.write(struct.pack('i', c))
-                    fp.write(struct.pack('i', vocab[v]))
+            convert_tokenizer(f, tokenizer)
         else:
-            fp.write(struct.pack('i', 0))
+            f.write(struct.pack('i', 0))
 
         # 2. weight
-        logger.info('start to convert model weights...') if verbose else None
-        fp.write(struct.pack('i', len(dict)))
-        tot = 0
-        for key in dict:
-            cur = dict[key].numpy().astype(np.float32)
-            write_tensor(fp, key, cur)
-            tot += 1
-            logger.info(f"output ( {tot} / {len(dict)} ) \r")
-        logger.info("\nfinish.")
-        fp.close()
+        state_dict = model.cpu().state_dict()
+        convert_weights(f, state_dict )
+   
+        
+    
