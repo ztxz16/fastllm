@@ -345,3 +345,6 @@ class model:
     
     def disable_adapter(self):
         fastllm_lib.disable_adapter(self.model)
+    
+    def release_memory(self):
+        fastllm_lib.release_memory(self.model)
