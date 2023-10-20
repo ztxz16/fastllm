@@ -1,168 +1,199 @@
 #!encoding=utf8
-import fastllm
-import logging
+import os
+import tempfile
 from typing import List, Tuple
+import re
 
-try:
-    import torch
-except Exception as e:
-    logging.warn("You must install torch before using this module!")
+import pyfastllm
+from . import utils
+from .utils.quantizer import QuantType
 
 
-class ModelConfig():
-    def __init__(self, **argv) -> None:
-        self._dict = dict(argv)
-        self._c_config = None
 
-        for attr, value in argv.items():
-            setattr(self, attr, value)
-    
-    def _to_dict(self, ):
-        return self._dict
-    
-    def to_c_config(self, ):
-        attr_map = {
-            'max_length': 'output_token_limit',
+class InferConfig():
+    def __init__(self,
+                 max_length:int=2048,
+                 top_p:float=0.7,
+                 temperature:float=0.95,
+                 **kwargs) -> None:
+
+        configs = {
+            "max_length": max_length,
+            "top_p": top_p,
+            "temperature": temperature
         }
+        configs.update(kwargs)
 
-        if not self._c_config:
-            self._c_config = fastllm.GenerationConfig()
+        self.from_dict(configs)
 
-            for attr, value in self._dict:
-                setattr(self._c_config, attr_map.get(attr) or attr, value)
+    def from_dict(self, configs):
+        self.configs = configs
+        for key, val in configs.items():
+            setattr(self, key, val)
 
-        return self._c_config
-
-    def __str__(self, ):
-        print("ModelConfig: ")
-        for key, value in self._dict.items():
-            print(f"{key} : {value}")
-
-
-class baseModel:
-    def __init__ (self, config:ModelConfig):
-        pass
-
-    def chat(self, ):
-        pass
-
-    def get_input_embeddings(self, ):
-        pass
-
-    def set_input_embeddings(self, ):
-        pass
-
-    def get_prompt(self, ):
-        pass
-
-    def forward(self, ):
-        pass
+    def to_dict(self, ):
+        return self.configs
+    
+    @property
+    def flm_config(self, ):
+        flm_config = pyfastllm.GenerationConfig()
+        for attr, val in self.configs.items():
+            setattr(flm_config, attr, val)
+        return flm_config
 
 
-def chatBaseModel():
-    def get_output_embeddings():
-        pass
+class BaseModel():
+    def __init__(self, model_path:str) -> None:
+        if model_path.endswith('flm'):
+            print("loading model:", pyfastllm.get_llm_type(model_path))
+            self.model = pyfastllm.create_llm(model_path)
+        elif os.path.isdir(model_path):
+            save_path = tempfile.mkstemp()
+            utils.convert(model_path, save_path, q_type=QuantType.INT4)
+            self.model = pyfastllm.create_llm(save_path)
+        else:
+            raise NotImplementedError(f"unsupport model type!")
+    
+    def build_input(self, query, history):
+        raise NotImplementedError
+    
+    def build_history(self, query, history):
+        raise NotImplementedError
+    
+    def is_stop(self, token_id):
+        raise NotImplementedError
+    
+    def process_response(self, response):
+        raise NotImplementedError
 
-    def set_output_embeddings():
-        pass
+    def stream_chat(self,
+                    tokenizer=None,
+                    query:str='',
+                    history=None,
+                    max_length:int=2048,
+                    top_p:float=0.7,
+                    temperature:float=0.95,
+                    *args, **kwargs):
+        model = self.model
+        infer_config = InferConfig(max_length=max_length, top_p=top_p, temperature=temperature, **kwargs)
 
-    def prepare_inputs_for_generation():
-        pass
+        if not tokenizer: tokenizer = model.weight.tokenizer
+        
+        prompt = self.build_input(query)
+        input_ids = tokenizer.encode(prompt)
+        handle = model.launch_response(input_ids, infer_config.flm_config)
+        outputs = []
+        ret_str = ""
+        while len(outputs) < max_length:
+            resp_token = model.fetch_response(handle)
+            if self.is_stop(resp_token):
+                break
+            outputs.append(resp_token)
+            content = tokenizer.decode(outputs)
+            ret_str = self.process_response(content)
+            print(ret_str)
+            yield ret_str, []
 
-    def forward():
-        pass
+    def chat(self,
+                tokenizer=None,
+                query:str='',
+                history=None,
+                max_length:int=2048,
+                top_p:float=0.7,
+                temperature:float=0.95,
+                *args, **kwargs):
+        model = self.model
+        infer_config = InferConfig(max_length=max_length, top_p=top_p, temperature=temperature, **kwargs)
 
-    def stream_chat():
-        pass
+        if not tokenizer: tokenizer = model.weight.tokenizer
+        prompt = self.build_input(query, history=history)
+        input_ids = tokenizer.encode(prompt)
+        handle = model.launch_response(input_ids, infer_config.flm_config)
+        outputs = []
+        ret_str = ""
+        while len(outputs) < max_length:
+            resp_token = model.fetch_response(handle)
+            if self.is_stop(resp_token):
+                break
+            outputs.append(resp_token)
+            content = tokenizer.decode(outputs)
+            ret_str = self.process_response(content)
 
-    def stream_generate():
-        pass
+        return ret_str, []
 
 
+class ChatglmModel(BaseModel):
+    def process_response(self, response):
+        response = response.strip()
+        response = response.replace("[[训练时间]]", "2023年")
 
-    def get_prompt(self,
-                   query: str,
-                   history: List[Tuple[str, str]] = None) -> str:
-        if (not(history)):
-            history = []
-        prompt = ""
-        for i, (old_query, response) in enumerate(history):
-            prompt = fastllm.make_history_llm_model(self.model, prompt.encode(), i, old_query.encode(), response.encode()).decode()
-        prompt = fastllm.make_input_llm_model(self.model, prompt.encode(), len(history), query.encode()).decode()
+        punkts = [
+            [",", "，"],
+            ["!", "！"],
+            [":", "："],
+            [";", "；"],
+            ["\?", "？"],
+        ]
+        for item in punkts:
+            response = re.sub(r"([\u4e00-\u9fff])%s" % item[0], r"\1%s" % item[1], response)
+            response = re.sub(r"%s([\u4e00-\u9fff])" % item[0], r"%s\1" % item[1], response)
+        return response
+    
+    def is_stop(self, token_id):
+        return token_id < 0
+    
+    def build_input(self, query, history=None):
+        return query
+
+    def build_history(self, query, history=None):
+        if not history:
+            prompt = query
+        else:
+            prompt = ""
+            for i, (old_query, response) in enumerate(history):
+                prompt += "[Round {}]\n问：{}\n答：{}\n".format(i, old_query, response)
+            prompt += "[Round {}]\n问：{}\n答：".format(len(history), query)
+
         return prompt
 
-    def save(self, path : str):
-        fastllm.save_llm_model(self.model, path.encode())
+class QwenModel(BaseModel):
+    def process_response(self):
+        pass
+    
+class BaichuanModel(BaseModel):
+    def process_response(self):
+        pass
 
-    def response(self,
-                 query: str,
-                 history: List[Tuple[str, str]] = None) -> str:
-        prompt = query if self.direct_query else self.get_prompt(query, history)
-        ret = fastllm.response_str_llm_model(self.model, prompt.encode()).decode()
-        return ret
+class MossModel(BaseModel):
+    def process_response(self):
+        pass
 
-    def stream_response(self,
-                        query: str,
-                        history: List[Tuple[str, str]] = None,
-                        one_by_one = True):
-        prompt = query if self.direct_query else self.get_prompt(query, history)
-        handle = fastllm.launch_response_str_llm_model(self.model, prompt.encode())
-        res = ""
-        ret = b''
-        while True:
-            ret += fastllm.fetch_response_str_llm_model(self.model, handle)
-            cur = ""
-            try:
-                cur = ret.decode()
-                ret = b''
-            except:
-                pass
-            if (cur == "<flmeos>"):
-                break
-            if one_by_one:
-                yield cur
-            else:
-                res += cur
-                yield res
+class AutoFlmModel:
+    def __init__(self) -> None:
+        raise NotImplementedError
+    
+    @classmethod
+    def from_pretrained(cls, model_path:str):
+        # hf_model
+        if os.path.isdir(model_path):
+            save_path = tempfile.mkstemp(suffix='flm') 
+            utils.convert(model_path, save_path, q_type=QuantType.INT4)
+            model_path = save_path
+            
+        if model_path.endswith('flm'):
+            model_type = pyfastllm.get_llm_type(model_path)
+        else:
+            raise NotImplementedError(f"unsupport model type!")
+        
+        if model_type == "chatglm":
+            model = ChatglmModel(model_path)
+        elif model_type == "qwen":
+            model = QwenModel(model_path)
+        elif model_type == "baichuan":
+            model = BaichuanModel(model_path)
+        elif model_type == "moss":
+            model = MossModel(model_path)
+        else:
+            raise NotImplementedError(f"unsupport model: {model_type}!")
 
-    def chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, max_length: int = 8192, num_beams=1,
-             do_sample = True, top_p = 0.8, temperature = 0.8, logits_processor = None, **kwargs):
-        if (not(history)):
-            history = []
-        prompt = query if self.direct_query else self.get_prompt(query, history)
-        print("prompt", prompt)
-        input = tokenizer.encode(prompt)
-        handle = fastllm.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input))
-
-        result = []
-        while True:
-            cur = fastllm.fetch_response_llm_model(self.model, handle)
-            if (cur == -1):
-                break
-            result.append(cur)
-        response = tokenizer.decode(result)
-        history = history + [(query, response)]
-        return response, history
-
-    def stream_chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, past_key_values = None,
-                    max_length: int = 8192, do_sample = True, top_p = 0.8, temperature = 0.8, logits_processor = None,
-                    return_past_key_values = False, **kwargs) -> str:
-        if (not(history)):
-            history = []
-        prompt = query if self.direct_query else self.get_prompt(query, history)
-        input = tokenizer.encode(prompt)
-        handle = fastllm.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input))
-        tokens = []
-        while True:
-            cur = fastllm.fetch_response_llm_model(self.model, handle)
-            if (cur == -1):
-                break
-            tokens.append(cur)
-            response = tokenizer.decode(tokens)
-            new_history = history + [(query, response)]
-            if return_past_key_values:
-                yield response, new_history, None
-            else:
-                yield response, new_history
-
-
+        return model
