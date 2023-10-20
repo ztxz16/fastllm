@@ -12,7 +12,7 @@ pyfastllm是基于fastllm的python api接口实现，通过pyfastllm可以更加
 
 ## 版本更新
 
-### v0.1.5 2023-09-12
+### v0.1.5 2023-10-13
 
 - 修复wheel编译安装部分
 - 文件合并，修复导入
