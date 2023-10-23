@@ -9,7 +9,6 @@ from . import utils
 from .utils.quantizer import QuantType
 
 
-
 class InferConfig():
     def __init__(self,
                  max_length:int=2048,
@@ -57,9 +56,6 @@ class BaseModel():
     def build_input(self, query, history):
         raise NotImplementedError
     
-    def build_history(self, query, history):
-        raise NotImplementedError
-    
     def is_stop(self, token_id):
         raise NotImplementedError
     
@@ -78,8 +74,9 @@ class BaseModel():
         infer_config = InferConfig(max_length=max_length, top_p=top_p, temperature=temperature, **kwargs)
 
         if not tokenizer: tokenizer = model.weight.tokenizer
+        if not history: history = []
         
-        prompt = self.build_input(query)
+        prompt = self.build_input(query,history)
         input_ids = tokenizer.encode(prompt)
         handle = model.launch_response(input_ids, infer_config.flm_config)
         outputs = []
@@ -91,8 +88,7 @@ class BaseModel():
             outputs.append(resp_token)
             content = tokenizer.decode(outputs)
             ret_str = self.process_response(content)
-            print(ret_str)
-            yield ret_str, []
+            yield ret_str, history + [(query, ret_str)]
 
     def chat(self,
                 tokenizer=None,
@@ -103,12 +99,15 @@ class BaseModel():
                 temperature:float=0.95,
                 *args, **kwargs):
         model = self.model
+
         infer_config = InferConfig(max_length=max_length, top_p=top_p, temperature=temperature, **kwargs)
 
         if not tokenizer: tokenizer = model.weight.tokenizer
+        if not history: history = []
+
         prompt = self.build_input(query, history=history)
         input_ids = tokenizer.encode(prompt)
-        handle = model.launch_response(input_ids, infer_config.flm_config)
+        handle = model.launch_response(input_ids, infer_config)
         outputs = []
         ret_str = ""
         while len(outputs) < max_length:
@@ -118,55 +117,97 @@ class BaseModel():
             outputs.append(resp_token)
             content = tokenizer.decode(outputs)
             ret_str = self.process_response(content)
-
-        return ret_str, []
+        history.append((query, ret_str))
+        return ret_str, history
 
 
 class ChatglmModel(BaseModel):
     def process_response(self, response):
         response = response.strip()
         response = response.replace("[[训练时间]]", "2023年")
-
-        punkts = [
-            [",", "，"],
-            ["!", "！"],
-            [":", "："],
-            [";", "；"],
-            ["\?", "？"],
-        ]
-        for item in punkts:
-            response = re.sub(r"([\u4e00-\u9fff])%s" % item[0], r"\1%s" % item[1], response)
-            response = re.sub(r"%s([\u4e00-\u9fff])" % item[0], r"%s\1" % item[1], response)
         return response
     
     def is_stop(self, token_id):
-        return token_id < 0
+        return token_id <= 2
     
     def build_input(self, query, history=None):
-        return query
+        if not history: history = []
+        prompt = ""
 
-    def build_history(self, query, history=None):
-        if not history:
-            prompt = query
-        else:
-            prompt = ""
-            for i, (old_query, response) in enumerate(history):
-                prompt += "[Round {}]\n问：{}\n答：{}\n".format(i, old_query, response)
-            prompt += "[Round {}]\n问：{}\n答：".format(len(history), query)
-
+        for i, (old_query, response) in enumerate(history):
+            prompt += "[Round {}]\n问：{}\n答：{}\n".format(i, old_query, response)
+        prompt += "[Round {}]\n问：{}\n答：".format(len(history), query)
         return prompt
 
 class QwenModel(BaseModel):
-    def process_response(self):
-        pass
+    def process_response(self, response):
+        return response
     
+    def is_stop(self, token_id):
+        chat_format = self.model.get("chat_format", "chatml")
+        if chat_format == "raw":
+            stop_words_ids = [151643]
+        elif chat_format == "chatml":
+            stop_words_ids = [151645, 151644]
+        return token_id in stop_words_ids
+
+    def build_inputs(self, query, history=None):
+        prompt = ""
+        chat_format = self.model.get("chat_format", "chatml")
+        if chat_format == "chatml":
+            if history is None: history = []
+            prompt = f"{self.model.im_start} system \n {self.model.pre_prompt} + {self.model.im_end}"
+            for i, (old_query, response) in enumerate(history):
+                prompt += old_query + response
+            prompt += f"\n {self.model.im_start + self.model.user_role} \n {query + self.model.im_end} \n  {self.model.im_start + self.model.bot_role} \n"
+        elif chat_format == "raw":
+            prompt = query
+        else:
+            raise NotImplementedError(f"Unknown char_format for QWen: {chat_format}")
+        return prompt
+
+
 class BaichuanModel(BaseModel):
-    def process_response(self):
-        pass
+    def process_response(self, response):
+        return response
+    
+    def is_stop(self, token_id):
+        return token_id == 2
+    
+    def build_input(self, query, history=None):
+        prompt = ""
+        round = 0
+        # TODO 增加最长截断
+        for i, (role, content) in enumerate(history):
+            if role == "system" and i == 0:
+                prompt += content
+            elif role == "user":
+                round += 1
+                prompt += f"<reserved_102>{content}"
+            elif role == "assistant":
+                prompt += f"<reserved_103>{content}"
+        
+        return prompt
+
+
 
 class MossModel(BaseModel):
-    def process_response(self):
-        pass
+    def process_response(self, response):
+        return response
+    
+    def is_stop(self, token_id):
+        return token_id == 106068
+
+    def build_input(self, query, history=None):
+        prompt = self.model.pre_prompt
+        if not history: history = []
+
+        for i, (old_query, response) in enumerate(history):
+            prompt += old_query + response
+        
+        return prompt + f"{self.model.user_role} {query} {self.model.bot_role}"
+
+
 
 class AutoFlmModel:
     def __init__(self) -> None:
