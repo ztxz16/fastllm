@@ -169,6 +169,12 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT void release_memory(int modelId) {
+        auto model = models.GetModel(modelId);
+        model->weight.ReleaseWeight();
+        return;
+    }
+
     DLL_EXPORT void init_params_llm_model(int modelId) {
         auto model = models.GetModel(modelId);
         model->InitParams();
