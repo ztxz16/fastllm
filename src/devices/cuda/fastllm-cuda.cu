@@ -10,6 +10,17 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+
+#define checkCudaErrors(message, val) showError(val, message, __FILE__, __LINE__)
+
+void showError(cudaError_t result, char const* const message, const char* const file,
+           int const line) {
+    if (cudaSuccess != result) {
+        printf("%s\n  CUDA error = %d, %s at %s:%d\n  '%s'\n",
+            message, result, cudaGetErrorName(result), file, line, cudaGetErrorString(result));
+    }  
+}
+
 static std::map<int, cublasHandle_t> s_fastllmCublasHandleMap;
 cublasHandle_t getFastllmCublasHandle() {
     int id = -1;
@@ -1070,7 +1081,7 @@ void *FastllmCudaPrepareInput(const fastllm::Data &input) {
         ret = (void*)(input.expansionBytes);
         auto state = cudaMemcpy(ret, input.cpuData, input.expansionBytes, cudaMemcpyHostToDevice);
         if (cudaSuccess != state) {
-            printf("Error: CUDA error when copy from memory to GPU! state %d", state);
+            checkCudaErrors("Error: CUDA error when copy from memory to GPU!", state);
             return nullptr;
         }
     }
@@ -1096,8 +1107,7 @@ void *FastllmCudaPrepareOutput(fastllm::Data &output) {
 void FastllmCudaFinishOutput(fastllm::Data &output, void *data) {
     if (output.dataDevice != fastllm::DataDevice::CUDA) {
         auto state = cudaMemcpy(output.cpuData, data, output.expansionBytes, cudaMemcpyDeviceToHost);
-        if (cudaSuccess != state)
-            printf("Error: CUDA error when copy from GPU to memory! state %d", state);
+        checkCudaErrors("Error: CUDA error when copy from GPU to memory!", state);
         FastllmCudaFree(data);
     }
 
@@ -1129,8 +1139,7 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
         } else {
             state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
-        if (cudaSuccess != state)
-            printf("Error: CUDA error when moving bias to device! state %d\n", state);
+        checkCudaErrors("Error: CUDA error when moving bias to device!", state);
         weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
@@ -1224,8 +1233,7 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
         } else {
             state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
-        if (cudaSuccess != state)
-            printf("Error: CUDA error when moving bias to device! state %d\n", state);
+        checkCudaErrors("Error: CUDA error when moving bias to device!", state);
         weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
@@ -1275,8 +1283,7 @@ bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data 
         } else {
             state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
-        if (cudaSuccess != state)
-            printf("Error: CUDA error when moving bias to device! state %d\n", state);
+        checkCudaErrors("Error: CUDA error when moving bias to device!", state);
         weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
@@ -1357,8 +1364,7 @@ bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight,
         } else {
             state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
-        if (cudaSuccess != state)
-            printf("Error: CUDA error when moving bias to device! state %d\n", state);
+        checkCudaErrors("Error: CUDA error when moving bias to device!", state);
         weight.extraCudaData.push_back((void*)cudaBiasData);
     }
 
@@ -1409,8 +1415,7 @@ bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
         } else {
             state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
         }
-        if (cudaSuccess != state)
-            printf("Error: CUDA error when moving bias to device! state %d\n", state);
+        checkCudaErrors("Error: CUDA error when moving bias to device!", state);
         weight.extraCudaData.push_back((void*)cudaBiasData);
     }
     float *cudaBiasData = (float*)weight.extraCudaData[0];
@@ -1482,7 +1487,8 @@ void * FastllmCudaDirectMalloc(size_t size) {
     void * ret;
     cudaError_t state = cudaMalloc(&ret, size);
     if (cudaSuccess != state) {
-        printf("Error: CUDA error when allocating %d kB memory! state %d, maybe there's no enough memory left on device.\n", size >> 10, state);
+        printf("Error: CUDA error when allocating %d kB memory! maybe there's no enough memory left on device.", size >> 10);
+        checkCudaErrors("", state);
         return nullptr;
     }
     return ret;
@@ -1490,19 +1496,14 @@ void * FastllmCudaDirectMalloc(size_t size) {
 
 void FastllmCudaDirectFree(void *ret) {
     cudaError_t state = cudaFree(ret);
-    if (cudaSuccess != state) {
-        printf("Error: CUDA error when release memory! state %d.\n", state);
-    }
+    checkCudaErrors("Error: CUDA error when release memory!", state);
 }
 
 void * FastllmCudaMalloc(size_t size) {
     int id = -1;
     cudaError_t state = cudaSuccess;
     state = cudaGetDevice(&id);
-    if (cudaSuccess != state) {
-        printf("Error: CUDA error when find device! state %d", state);
-        return nullptr;
-    }
+    checkCudaErrors("Error: CUDA error when find device!", state);
     if (size > 1024 * 1024) {
         auto &bigBuffers = bigBuffersMap[id];
         int selId = -1;
@@ -1522,7 +1523,8 @@ void * FastllmCudaMalloc(size_t size) {
         void * ret;
         state = cudaMalloc(&ret, size);
         if (cudaSuccess != state) {
-            printf("Error: CUDA error when allocating %d MB memory! state %d, maybe there's no enough memory left on device.\n", size >> 20, state);
+            printf("Error: CUDA error when allocating %d MB memory! maybe there's no enough memory left on device.", size >> 20);
+            checkCudaErrors("", state);
             return nullptr;
         }
         bigBuffers.push_back(CudaMemoryBuffer(ret, size, true));
@@ -1539,7 +1541,8 @@ void * FastllmCudaMalloc(size_t size) {
     void * ret;
     state = cudaMalloc(&ret, size);
     if (cudaSuccess != state) {
-        printf("Error: CUDA error when allocating %d KB memory! state %d, maybe there's no enough memory left on device.\n", size >> 10, state);
+        printf("Error: CUDA error when allocating %d KB memory! maybe there's no enough memory left on device.", size >> 10);
+        checkCudaErrors("", state);
         return nullptr;
     }
     cudaBuffers.push_back(CudaMemoryBuffer(ret, size, true));
@@ -1562,7 +1565,8 @@ void FastllmCudaFree(void *ret) {
                     state = cudaSetDevice(it.first);
                     state = cudaFree(cudaBuffers[i].data);
                     if (cudaSuccess != state)
-                        printf("Error: CUDA error when release memory on device %d! state %d.\n", it.first, state);
+                        printf("Error: CUDA error when release memory on device %d!", it.first);
+                    checkCudaErrors("", state);
                 } else {
                     temp.push_back(cudaBuffers[i]);
                 }
@@ -1591,10 +1595,7 @@ void FastllmCudaFree(void *ret) {
         }
     }
     state = cudaFree(ret);
-    if (cudaSuccess != state) {
-        printf("CUDA error when release memory! state %d.\n", state);
-        return;
-    }
+    checkCudaErrors("CUDA error when release memory!", state);
 }
 
 void FastllmCudaMallocBigBuffer(size_t size) {
@@ -1604,9 +1605,9 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     auto &bigBuffers = bigBuffersMap[id];
     cudaMalloc(&ret, size);
     auto state = cudaMalloc(&ret, size);
-    if (cudaSuccess != state) {
-        printf("Error: CUDA error when allocating %d MB memory! state %d. maybe there's no enough memory left on device.\n", size >> 20, state);
-    }
+    if (cudaSuccess != state)
+        printf("Error: CUDA error when allocating %d MB memory! maybe there's no enough memory left on device.", size >> 20);
+    checkCudaErrors("", state);
     bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
 }
 
@@ -1624,7 +1625,8 @@ void FastllmCudaClearBigBuffer() {
                 state = cudaSetDevice(it.first);
                 state = cudaFree(bigBuffers[i].data);
                 if (cudaSuccess != state)
-                    printf("Error: CUDA error when release memory on device %d! state %d.\n", it.first, state);
+                    printf("Error: CUDA error when release memory on device %d!", it.first);
+                checkCudaErrors("", state);
             } else {
                 temp.push_back(bigBuffers[i]);
             }
@@ -1636,23 +1638,20 @@ void FastllmCudaClearBigBuffer() {
 }
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size) {
-    auto state = cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice);
-    if (cudaSuccess != state)
-        printf("Error: CUDA error when copy from memory to GPU! state %d.\n", state);
+    cudaError_t state = cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice);
+    checkCudaErrors("Error: CUDA error when copy from memory to GPU!", state);
     //cudaDeviceSynchronize();
 }
 
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size) {
-    auto state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
-    if (cudaSuccess != state)
-        printf("Error: CUDA error when copy from GPU to memory! state %d.\n", state);
+    cudaError_t state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
+    checkCudaErrors("Error: CUDA error when copy from GPU to memory!", state);
     //cudaDeviceSynchronize();
 }
 
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
-    auto state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
-    if (cudaSuccess != state)
-        printf("Error: CUDA error when copy on GPU! state %d.\n", state);
+    cudaError_t state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
+    checkCudaErrors("Error: CUDA error when copy on GPU!", state);
     //cudaDeviceSynchronize();
 }
 
