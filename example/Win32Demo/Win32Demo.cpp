@@ -135,6 +135,7 @@ int chatllm(const char* prompt, int type) {
 
 	}, *generationConfig);
 	history = model->MakeHistory(history, sRound, input, ret);
+	sRound++;
 	return ret.length();
 }
 
