@@ -297,15 +297,9 @@ __device__ void FastllmSoftmaxKernelInner1Func(float *input, float *output, int 
 
     // 1. 每个线程计算一部分
     unsigned int tid = threadIdx.x;
-    unsigned int per = (channels / THREAD_PER_BLOCK);
-    unsigned int id = threadIdx.x * per;
-    unsigned int len = per;
-    if (tid == blockDim.x - 1) {
-        len += (channels - per * THREAD_PER_BLOCK);
-    }
-    float maxValue = input[id];
-    for (int i = 0; i < len; i++) {
-        maxValue = max(maxValue, input[id + i]);
+    float maxValue = input[tid];
+    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
+        maxValue = max(maxValue, input[i]);
     }
     sdata[tid] = maxValue;
     __syncthreads();
@@ -326,9 +320,9 @@ __device__ void FastllmSoftmaxKernelInner1Func(float *input, float *output, int 
 
     // 4. 求和
     float sum = 0;
-    for (int i = 0; i < len; i++) {
-        output[id + i] = exp(input[id + i] - maxV);
-        sum += output[id + i];
+    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
+        output[i] = exp(input[i] - maxV);
+        sum += output[i];
     }
     sdata[tid] = sum;
     __syncthreads();
@@ -346,8 +340,8 @@ __device__ void FastllmSoftmaxKernelInner1Func(float *input, float *output, int 
     }
     __syncthreads();
 
-    for (int i = 0; i < len; i++) {
-        output[id + i] /= sdata[0];
+    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
+        output[i] /= sdata[0];
     }
 }
 
