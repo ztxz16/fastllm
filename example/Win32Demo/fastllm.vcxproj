@@ -72,25 +72,21 @@
     <LinkIncremental>true</LinkIncremental>
     <LibraryPath>$(CUDA_PATH)\lib\Win32;$(LibraryPath)</LibraryPath>
     <IncludePath>$(CUDA_PATH)\include;$(IncludePath)</IncludePath>
-    <TargetExt>.lib</TargetExt>
     <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
-    <TargetExt>.lib</TargetExt>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <LinkIncremental>false</LinkIncremental>
     <LibraryPath>$(CUDA_PATH)\lib\Win32;$(LibraryPath)</LibraryPath>
     <IncludePath>$(CUDA_PATH)\include;$(IncludePath)</IncludePath>
-    <TargetExt>.lib</TargetExt>
     <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <TargetExt>.lib</TargetExt>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -172,10 +168,6 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
     </Link>
-    <CudaCompile>
-      <CodeGeneration>compute_61,sm_61;%(CodeGeneration)</CodeGeneration>
-      <FastMath>true</FastMath>
-    </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="..\..\include\device.h" />
@@ -187,6 +179,7 @@
     <ClInclude Include="..\..\include\models\basellm.h" />
     <ClInclude Include="..\..\include\models\chatglm.h" />
     <ClInclude Include="..\..\include\models\factoryllm.h" />
+    <ClInclude Include="..\..\include\models\glm.h" />
     <ClInclude Include="..\..\include\models\llama.h" />
     <ClInclude Include="..\..\include\models\moss.h" />
     <ClInclude Include="..\..\include\models\qwen.h" />
@@ -202,6 +195,7 @@
     <ClCompile Include="..\..\src\model.cpp" />
     <ClCompile Include="..\..\src\models\basellm.cpp" />
     <ClCompile Include="..\..\src\models\chatglm.cpp" />
+    <ClCompile Include="..\..\src\models\glm.cpp" />
     <ClCompile Include="..\..\src\models\llama.cpp" />
     <ClCompile Include="..\..\src\models\moss.cpp" />
     <ClCompile Include="..\..\src\models\qwen.cpp" />
