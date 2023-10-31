@@ -684,11 +684,20 @@ namespace fastllm {
 #ifdef USE_CUDA
             if (this->dataDevice == DataDevice::CPU) {
                 if (device == DataDevice::CUDA) {
+                    uint8_t *cpuData = this->cpuData;
+#ifdef USE_MMAP
+                    cpuData = new uint8_t[expansionBytes];
+                    memcpy(cpuData, this->cpuData, expansionBytes);
+#endif
                     FastllmCudaSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
                     this->cudaData = FastllmCudaMalloc(expansionBytes);
-                    FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, expansionBytes);
+                    FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
+#ifdef USE_MMAP
+                    delete[] cpuData;
+#else
                     delete[] this->cpuData;
                     this->cpuData = nullptr;
+#endif
                 }
             } else if (this->dataDevice == DataDevice::CUDA) {
                 if (device == DataDevice::CPU) {
@@ -1374,7 +1383,8 @@ namespace fastllm {
 	            }
             } else {
 #ifdef USE_MMAP
-                weight[name].set_file(mapped_file);
+                weight[name].SetMapFile(mapped_file);
+                weight[name].expansionBytes = (weight[name].Count(0) * weight[name].unitSize - 1) / weight[name].unitSizeDiv + 1;
 #else
 	            weight[name].Allocate();
 #endif
