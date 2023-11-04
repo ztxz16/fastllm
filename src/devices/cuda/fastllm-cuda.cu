@@ -1655,6 +1655,24 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
     //cudaDeviceSynchronize();
 }
 
+void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src, size_t size) {
+    int canPeerAccess = 0;
+    cudaError_t state = cudaDeviceCanAccessPeer(&canPeerAccess, srcId, dstId);
+    if (canPeerAccess) {
+        state = cudaMemcpyPeer(dst, dstId, src, srcId, size);
+    } else {
+        uint8_t *cpuData = new uint8_t[size];
+        state = cudaSetDevice(srcId);
+        state = cudaMemcpy(cpuData, src, size, cudaMemcpyDeviceToHost);
+
+        state = cudaSetDevice(dstId);
+        state = cudaMemcpy(dst, cpuData, size, cudaMemcpyHostToDevice);
+        delete[] cpuData;
+    }
+    checkCudaErrors("Error: CUDA error when copy Between GPUs!", state);
+    //cudaDeviceSynchronize();
+}
+
 void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void * 	src,
                                        size_t 	spitch, size_t 	width, size_t 	height) {
     cudaMemcpy2D(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice);
