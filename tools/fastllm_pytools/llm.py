@@ -273,7 +273,8 @@ class model:
     def stream_response_raw(self,
                             input_tokens: List[int],
                             max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
-                            one_by_one = True
+                            one_by_one = True,
+                            stop_token_ids: List[int] = None
                             ):
         handle = fastllm_lib.launch_response_llm_model(self.model, len(input_tokens),
                                                        (ctypes.c_int * len(input_tokens))(*input_tokens),
@@ -286,7 +287,7 @@ class model:
         total_bytes = b''
         while True:
             cur_token = fastllm_lib.fetch_response_llm_model(self.model, handle)
-            if cur_token == -1:
+            if cur_token == -1 or stop_token_ids and cur_token in stop_token_ids:
                 break
 
             cur_bytes = self.tokenizer_decode_token(cur_token)
@@ -298,7 +299,8 @@ class model:
                 yield total_bytes
 
     def chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, max_length: int = 8192,
-             do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0, **kwargs):
+             do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0, 
+             stop_token_ids: List[int] = None, **kwargs):
         if (not(history)):
             history = [];
         prompt = query if self.direct_query else self.get_prompt(query, history);
@@ -310,7 +312,7 @@ class model:
         result = [];
         while True:
             cur = fastllm_lib.fetch_response_llm_model(self.model, handle);
-            if (cur == -1):
+            if cur == -1 or stop_token_ids and cur in stop_token_ids:
                 break;
             result.append(cur);
         response = tokenizer.decode(result);
@@ -319,7 +321,7 @@ class model:
 
     def stream_chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, past_key_values = None,
                     max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
-                    return_past_key_values = False, **kwargs) -> str:
+                    return_past_key_values = False, stop_token_ids: List[int] = None, **kwargs) -> str:
         if (not(history)):
             history = [];
         prompt = query if self.direct_query else self.get_prompt(query, history);
@@ -330,7 +332,7 @@ class model:
         tokens = [];
         while True:
             cur = fastllm_lib.fetch_response_llm_model(self.model, handle);
-            if (cur == -1):
+            if cur == -1 or stop_token_ids and cur in stop_token_ids:
                 break;
             tokens.append(cur);
             response = tokenizer.decode(tokens);
