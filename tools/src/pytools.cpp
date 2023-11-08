@@ -241,7 +241,8 @@ extern "C" {
 
     DLL_EXPORT int launch_response_str_llm_model(int modelId, char *content,
                                       int max_length, bool do_sample, float top_p, int top_k,
-                                      float temperature, float repeat_penalty, bool output_logits) {
+                                      float temperature, float repeat_penalty, bool output_logits,
+                                      int stop_token_len, int * stop_token_ids) {
         auto model = models.GetModel(modelId);
         std::vector <int> tokens;
         auto v = model->weight.tokenizer.Encode(content);
@@ -249,6 +250,10 @@ extern "C" {
             tokens.push_back((int)((float*)v.cpuData)[i]);
         }
         auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits);
+        for(int i = 0; i < stop_token_len; i++ )
+        {
+            config.stop_token_ids.insert(stop_token_ids[i]);
+        }
         return model->LaunchResponseTokens(tokens, config);
     }
 
@@ -261,12 +266,17 @@ extern "C" {
 
     DLL_EXPORT int launch_response_llm_model(int modelId, int len, int *values,
                                   int max_length, bool do_sample, float top_p, int top_k,
-                                  float temperature, float repeat_penalty, bool output_logits) {
+                                  float temperature, float repeat_penalty, bool output_logits,
+                                  int stop_token_len, int * stop_token_ids) {
         std::vector <int> input;
         for (int i = 0; i < len; i++) {
             input.push_back(values[i]);
         }
         auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits);
+        for(int i = 0; i < stop_token_len; i++ )
+        {
+            config.stop_token_ids.insert(stop_token_ids[i]);
+        }
         auto model = models.GetModel(modelId);
         return model->LaunchResponseTokens(input, config);
     }
