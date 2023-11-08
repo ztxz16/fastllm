@@ -78,7 +78,7 @@ namespace fastllm {
         Data mlpOutput;
         Data middle, middle2;
         Data toSave;
-        Data mem2;
+        Data mem2,mem3;
         std::vector<int> lastRet;
         // GLMBlock
         std::string weightPre, weightMiddle;
@@ -131,8 +131,8 @@ namespace fastllm {
                 Split(qkv, -1, per * 2, per * 3, v);
             }else{
                 LayerNorm(mem, weight[inputLNWeightName], weight[inputLNBiasName], -1, mem2);
-                CatDirect(mem2,attenInput,1);
-                Linear(mem2, weight[qkvWeightName], weight[qkvBiasName], qkv);
+                Cat(mem2,attenInput,1,mem3);
+                Linear(mem3, weight[qkvWeightName], weight[qkvBiasName], qkv);
                 int per = qkv.dims.back() / 3;
                 Split(qkv, -1, 0, per, q0);
                 Split(qkv, -1, per, per * 2, k);
@@ -296,10 +296,8 @@ namespace fastllm {
                 for(unsigned int i=0;i<hexString.length();i+=2){
                     decoded.push_back(std::stoi(hexString.substr(i,2),nullptr,16));
                 }
-                printf("%lu\n",decoded.length());
                 weight.tokenizer.spProcessor=std::make_unique<sentencepiece::SentencePieceProcessor>();
                 weight.tokenizer.spProcessor->LoadFromSerializedProto(decoded);
-                printf("GetPieceSize=%d\n",weight.tokenizer.spProcessor->GetPieceSize());
             }
         }
 #endif

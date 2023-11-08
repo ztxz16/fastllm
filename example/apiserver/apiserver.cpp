@@ -252,7 +252,11 @@ struct WorkQueue {
             while (true) {
                 std::unique_lock <std::mutex> lock(ts->locker);
                 if (ts->activateQueryNumber >= ts->maxActivateQueryNumber) {
+#ifdef WIN32
+                    Sleep(0);
+#else
                     sleep(0);
+#endif
                     continue;
                 }
                 if (ts->q.empty()) {
@@ -435,7 +439,11 @@ int main(int argc, char** argv) {
         buff[size] = 0;
 
         while (workQueue.q.size() > workQueue.maxActivateQueryNumber) {
-            sleep(0);
+#ifdef WIN32
+                    Sleep(0);
+#else
+                    sleep(0);
+#endif
         }
         workQueue.Push(buff, client);
     }
