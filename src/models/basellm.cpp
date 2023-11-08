@@ -208,6 +208,11 @@ namespace fastllm {
                 inputTokens[i] = std::vector <float> {(float)ret[i]};
                 if (ret[i] == eos_token_id) {
                     isEnding[i] = true;
+                } else {
+                    auto itStopTk = generationConfig.stop_token_ids.find(ret[i]);
+                    if (itStopTk != generationConfig.stop_token_ids.end()) {
+                        isEnding[i] = true;
+                    }
                 }
                 if (isEnding[i]) {
                     curStrings.push_back("");
@@ -659,6 +664,12 @@ printf("tot = %d\n", tot);
                                 if (curRet == model->eos_token_id) {
                                     it.second->isEnding = true;
                                 } else {
+                                    auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
+                                    if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
+                                            it.second->isEnding = true;
+                                    }
+                                }
+                                if (it.second->isEnding == false) {
                                     it.second->currentTokens = std::vector<int>{curRet};
                                     it.second->resultTokenQueue.push(curRet);
                                     it.second->tokens.Push(curRet);
