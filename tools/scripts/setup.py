@@ -10,6 +10,6 @@ setup (
     packages = ['fastllm_pytools'],
 
     package_data = {
-        '': ['*.dll', '*.so']
+        '': ['*.dll', '*.so', '*.dylib']
     }
 )
