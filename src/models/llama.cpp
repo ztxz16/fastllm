@@ -990,6 +990,12 @@ namespace fastllm {
                                 if (curRet == model->eos_token_id) {
                                     it.second->isEnding = true;
                                 } else {
+                                    auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
+                                    if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
+                                            it.second->isEnding = true;
+                                    }
+                                }
+                                if (it.second->isEnding == false) {
                                     it.second->currentTokens = std::vector<int>{curRet};
                                     it.second->resultTokenQueue.push(curRet);
                                     it.second->tokens.Push(curRet);
