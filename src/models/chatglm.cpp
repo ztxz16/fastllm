@@ -909,20 +909,28 @@ namespace fastllm {
     }
 
     std::string ChatGLMModel::MakeInput(const std::string &history, int round, const std::string &input) {
-		if (GetVersion() == 2)
-			round++;
-        if (round == 0 && GetVersion() == 1) {
-            return input;
+        if (this->bot_role != "") {
+            return (round == 0 ? pre_prompt : history) + user_role + input + bot_role;
         } else {
+            if (GetVersion() == 2)
+                round++;
+            if (round == 0 && GetVersion() == 1) {
+                return input;
+            } else {
 #if defined(_WIN32) or defined(_WIN64)
-            return history + ("[Round " + std::to_string(round) + u8"]\n\n问：" + input + u8"\n\n答：");
+                return history + ("[Round " + std::to_string(round) + u8"]\n\n问：" + input + u8"\n\n答：");
 #else
-            return history + ("[Round " + std::to_string(round) + "]\n\n问：" + input + "\n\n答：");
+                return history + ("[Round " + std::to_string(round) + "]\n\n问：" + input + "\n\n答：");
 #endif
+            }
         }
     }
 
     std::string ChatGLMModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
+        if (this->bot_role != "") {
+            return (round == 0 ? pre_prompt : history) + user_role + input + bot_role + output + history_sep;
+        }
+
 		if (GetVersion() == 2)
 			round++;
 #if defined(_WIN32) or defined(_WIN64)
