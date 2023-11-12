@@ -20,11 +20,14 @@ def args_parser():
 def response(model, prompt_input:str, stream_output:bool=False):
     gmask_token_id = 130001
     bos_token_id = 130004
-    eos_token_id = 130005
+    eos_token_id = model.eos_token_id
     
     input_ids = model.weight.tokenizer.encode(prompt_input)
-    gmask_bos = fastllm.Tensor(fastllm.float32, [1, 2], [gmask_token_id, bos_token_id])
-    input_ids = fastllm.cat([input_ids, gmask_bos], 0)
+    if model.model_type == "chatglm":
+        gmask_token_id = model.gmask_token_id
+        bos_token_id = model.bos_token_id
+        gmask_bos = fastllm.Tensor(fastllm.float32, [1, 2], [gmask_token_id, bos_token_id])
+        input_ids = fastllm.cat([gmask_bos, input_ids], 0)
 
     seq_len = input_ids.count(0)
     vmask = [0] * (seq_len * seq_len)
@@ -84,7 +87,7 @@ def run_with_low_level(args):
     prompt = ""
     while prompt != "stop":
         prompt = input("User: ")
-        outputs = response(model, prompt_input=prompt)
+        outputs = response(model, prompt_input=model.make_input("", 0, prompt))
         for output in outputs:
             print(output)
             sys.stdout.flush()
