@@ -67,10 +67,10 @@ namespace fastllm {
         int GetVersion();
 
         void UpdateSinCos(float rope);
-    private:
-        virtual void CausalMask(Data &data, int start) {}; // 因果mask？
 
         int gmask_token_id;
+    private:
+        virtual void CausalMask(Data &data, int start) {}; // 因果mask？
 
         float rope = 1.0f;
     };
