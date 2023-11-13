@@ -57,16 +57,10 @@ Cpp手动编译：
 mkdir build-py
 cd build-py
 cmake .. -DUSE_CUDA=ON -DPY_API=ON
-make -j4
-python cli.py -p chatglm-6b-int8.bin -t 8  # 与cpp编译的运行结果保持一致
-```
-
-Python脚本编译：
-
-```sh
-cd pyfastllm
-python build_libs --cuda
-python cli.py -p chatglm-6b-int8.bin -t 8 
+make -j
+cp pyfastllm*.so pyfastllm/examples/
+cd ../pyfastllm/examples/
+python3 cli_simple.py -p chatglm-6b-int8.flm  # 与cpp编译的运行结果保持一致
 ```
 
 ### wheel包方式
@@ -79,24 +73,35 @@ python cli.py -p chatglm-6b-int8.bin -t 8
 pip install pybind11
 ```
 
+- GPU
 ```sh
-cd pyfastllm
-python setup.py build
-python setup.py install 
-python cli.py -p chatglm-6b-int8.bin -t 8 
+cd pyfastllm/
+python3 setup.py build
+python3 setup.py install 
+cd examples/
+python3 cli_simple.py -p chatglm-6b-int8.flm
 ```
 
+- CPU
+```sh
+cd pyfastllm/
+export USE_CUDA=OFF
+python3 setup.py build
+python3 setup.py install 
+cd examples/
+python3 cli_simple.py -p chatglm-6b-int8.flm -t 8
+
+```
 ## 使用
 
 ### python 调用
-在demo文件夹中存放了几种常见的代码示例：
+在examples文件夹中存放了几种常见的代码示例：
 
-demo/cli.py: 以回调函数方式输出回答示例
-demo/cli_thread.py: 多线程调用api接口示例(推荐)
-demo/cli_low_api.py: 底层API调用示例
-demo/convert_model.py: 模型转换示例
-demo/web_api.py, demo/web_api_client.py: fastapi webapi调用
-demo/test_ops: 部分op的使用样例及测试
+examples/cli_simple.py: 调用api接口示例(推荐)
+examples/cli_low_api.py: 底层API调用示例
+examples/convert_model.py: 模型转换示例
+examples/web_api.py, demo/web_api_client.py: fastapi webapi调用
+examples/test_ops: 部分op的使用样例及测试
 
 ### 命令行工具
 
@@ -111,22 +116,22 @@ $ fastllm-convert -m chatglm6B -p hf_model_path -o output_flm_path
 ```sh
 mkdir build-py
 cd build-py && cmake .. -DPY_API=ON -DUSE_CUDA=ON && make -j && cd -
-cd pyfastllm/demo
+cd pyfastllm/examples
 python web_api.py -m 0 -p path_for_chatglm --max_batch_size 32
 ```
 可以使用locust进行压测。A100 40G，chatglm fp16 压测部分结果如下：
 |    并发数 | 平均调用时间(s) | TP95(s) | TP99(s) |
-|----------:|------|------|------|
-| 1         | 3.07 | 4.2  | 4.8 |
-| 10        | 6.11 | 11.0 | 12.0 |
-| 16        | 6.82 | 15.0 | 16.0 |
+|----------:|-------|------|------|
+| 1         |  3.07 |  4.2 |  4.8 |
+| 10        |  6.11 | 11.0 | 12.0 |
+| 16        |  6.82 | 15.0 | 16.0 |
 | 32        | 10.74 | 16.0 | 20.0 |
 ## API编程接口
 
 ### fastllm数据结构
 
 > fattllm.Tensor数据类型
-- fastllm.float32  
+- fastllm.float32
 - fastllm.bfloat16
 - fastllm.int16
 - fastllm.int8
@@ -192,12 +197,13 @@ python web_api.py -m 0 -p path_for_chatglm --max_batch_size 32
 
 支持的模型列表：
 
-| 模型名称 | 对应类 | 备注 
-| -- | -- | -- 
-| ChatGLM-6B | fastllm.ChatGLMModel |
-| ChatGLM2-6B | fastllm.ChatGLMModel | 在权重中标注版本
-| Moss | fastllm.MossModel |
-| Alpaca | fastllm.llamaModel | 
+| 模型名称 | 对应类 | 备注 |
+| ---- | ---- | ---- |
+| ChatGLM-6B | fastllm.ChatGLMModel |  |
+| ChatGLM2-6B | fastllm.ChatGLMModel | 在权重中标注版本 |
+| Moss | fastllm.MossModel |  |
+| Alpaca | fastllm.LlamaModel |  |
+| QWen | fastllm.QWenModel |  |
 
 
 ## 开发计划(TODO)
