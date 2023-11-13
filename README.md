@@ -196,21 +196,21 @@ for response in model.stream_response("你好"):
 
 另外还可以设置cpu线程数等内容，详细API说明见 [fastllm_pytools](docs/fastllm_pytools)
 
-这个包不包含low level api，如果需要使用更深入的功能请参考 [Python绑定](#Python绑定)
+这个包不包含low level api，如果需要使用更深入的功能请参考 [Python绑定API](#Python绑定API)
 
 
-## Python绑定
+## Python绑定API
 
 ```
-mkdir build-py
-cd build-py
-cmake .. -DPY_API=ON -DUSE_CUDA=ON （只使用CPU则使用 cmake .. -DPY_API=ON 即可）
-make -j
-cd -
-python cli.py  -m chatglm -p chatglm-6b-int8.bin 或  
-python web_api.py  -m chatglm -p chatglm-6b-int8.bin  
+cd pyfastllm
+export USE_CUDA=OFF    # 只使用CPU，如需使用GPU则去除本行
+python3 setup.py build
+python3 setup.py install 
+cd examples/
+python cli_simple.py  -m chatglm -p chatglm-6b-int8.flm 或  
+python web_api.py  -m chatglm -p chatglm-6b-int8.flm  
 ```
-上述web api可使用python web_api_client.py进行测试
+上述web api可使用`web_api_client.py`进行测试。更多用法，详见[API文档](pyfastllm/README.md)。
 
 ## 多卡部署
 
@@ -226,7 +226,7 @@ llm.set_device_map({"cuda:0" : 10, "cuda:1" : 5, "cpu": 1}) # 将模型按不同
 
 ```
 
-### pybinding中使用多卡部署
+### Python绑定API中使用多卡部署
 
 ``` python
 import pyfastllm as llm
@@ -241,9 +241,7 @@ llm.set_device_map({"cuda:0" : 10, "cuda:1" : 5, "cpu": 1}) # 将模型按不同
 fastllm::SetDeviceMap({{"cuda:0", 10}, {"cuda:1", 5}, {"cpu", 1}}); // 将模型按不同比例部署在多个设备上
 ```
 
-## Android上使用
-
-### Docker 编译运行
+## Docker 编译运行
 docker 运行需要本地安装好 NVIDIA Runtime,且修改默认 runtime 为 nvidia
 
 1. 安装 nvidia-container-runtime
@@ -282,6 +280,8 @@ models
 ```
 DOCKER_BUILDKIT=0 docker compose up -d --build
 ```
+
+## Android上使用
 
 ### 编译
 ``` sh
@@ -324,7 +324,7 @@ python3 tools/chatglm_export.py chatglm2-6b-int8.flm int8 #导出int8模型
 python3 tools/chatglm_export.py chatglm2-6b-int4.flm int4 #导出int4模型
 ```
 
-### baichuan模型导出 (默认脚本导出baichuan-13b-chat模型)
+#### baichuan模型导出 (默认脚本导出baichuan-13b-chat模型)
 
 ``` sh
 # 需要先安装baichuan环境
@@ -336,7 +336,7 @@ python3 tools/baichuan2flm.py baichuan-13b-int8.flm int8 #导出int8模型
 python3 tools/baichuan2flm.py baichuan-13b-int4.flm int4 #导出int4模型
 ```
 
-### baichuan2模型导出 (默认脚本导出baichuan2-7b-chat模型)
+#### baichuan2模型导出 (默认脚本导出baichuan2-7b-chat模型)
 
 ``` sh
 # 需要先安装baichuan2环境
@@ -348,7 +348,7 @@ python3 tools/baichuan2_2flm.py baichuan2-7b-int8.flm int8 #导出int8模型
 python3 tools/baichuan2_2flm.py baichuan2-7b-int4.flm int4 #导出int4模型
 ```
 
-### MOSS模型导出
+#### MOSS模型导出
 
 ``` sh
 # 需要先安装MOSS环境
@@ -360,13 +360,13 @@ python3 tools/moss_export.py moss-int8.flm int8 #导出int8模型
 python3 tools/moss_export.py moss-int4.flm int4 #导出int4模型
 ```
 
-### LLAMA系列模型导出
+#### LLAMA系列模型导出
 ``` sh
 # 修改build/tools/alpaca2flm.py程序进行导出
 # 不同llama模型使用的指令相差很大，需要参照torch2flm.py中的参数进行配置
 ```
 
-### QWEN模型导出
+#### QWEN模型导出
 ```sh
 # 需要先安装QWen环境
 # 如果使用自己finetune的模型需要修改qwen2flm.py文件中创建tokenizer, model的代码
