@@ -7,5 +7,5 @@ from pyfastllm import *
 from . import utils
 from . import functions as ops
 
-__version__ = "0.1.5"
+__version__ = "0.2.0"
 

@@ -45,6 +45,8 @@ class CMakeBuild(build_ext):
         # CMake lets you override the generator - we need to check this.
         # Can be set with Conda-Build, for example.
         cmake_generator = os.environ.get("CMAKE_GENERATOR", "")
+        
+        use_cuda = os.environ.get("USE_CUDA", "ON")
 
         # Set Python_EXECUTABLE instead if you use PYBIND11_FINDPYTHON
         # EXAMPLE_VERSION_INFO shows you how to pass a value into the C++ code
@@ -54,7 +56,7 @@ class CMakeBuild(build_ext):
             f"-DPYTHON_EXECUTABLE={sys.executable}",
             f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
             f"-DPY_API=ON",
-            f"-DUSE_CUDA=ON",
+            f"-DUSE_CUDA={use_cuda}",
         ]
         build_args = []
         # Adding CMake arguments set as environment variable
