@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import sys
+import sys, os
 import platform
 import logging
 import argparse
@@ -18,16 +18,15 @@ def args_parser():
 
 
 def response(model, prompt_input:str, stream_output:bool=False):
-    gmask_token_id = 130001
-    bos_token_id = 130004
 
     input_ids = model.weight.tokenizer.encode(prompt_input)
     input_ids = input_ids.to_list()
-    input_ids.extend([gmask_token_id, bos_token_id])
     input_ids = [int(v) for v in input_ids]
+    if model.model_type == "chatglm":
+        input_ids = [model.gmask_token_id, model.bos_token_id] + input_ids
     # print(input_ids)
 
-    handle = model.launch_response(input_ids)
+    handle = model.launch_response(input_ids, fastllm.GenerationConfig())
     continue_token = True
 
     ret_byte = b""
@@ -54,19 +53,37 @@ def run_with_response(args):
         model.load_weights(model_path)
         model.warmup()
     else:
+        fastllm.set_threads(args.threads)
+        fastllm.set_low_memory(args.low)
+        if not os.path.exists(model_path):
+            print(f"模型文件{args.path}不存在！")
+            exit(-1)
         model = fastllm.create_llm(model_path)
         print(f"llm model: {model.model_type}")
+    print(f"欢迎使用 {model.model_type} 模型. 输入内容对话，reset清空历史记录，stop退出程序");
     
-    prompt = ""
-    while prompt != "stop":
-        prompt = input("User: ")
+    input_text = ""
+    history = ""
+    dialog_round = 0
+    while input_text != "stop":
+        input_text = input("User: ")
+        if 'stop' == input_text:
+            break
+        if 'reset' == input_text:
+            history = ''
+            continue
+        prompt = model.make_input(history, dialog_round, input_text)
 
         outputs = response(model, prompt_input=prompt, stream_output=True)
 
         print(f"{model.model_type}:", end=' ')
+        past_len = 0
         for output in outputs:
-            print(f"\r{model.model_type}: {output}", end='', flush=True)
+            print(output[past_len:].strip(), end='', flush=True)
+            past_len = len(output)
         print()
+        model.make_history(history, dialog_round, input_text, output)
+        dialog_round += 1
 
 
 def run_with_callback(args):
@@ -78,6 +95,11 @@ def run_with_callback(args):
         model.load_weights(model_path)
         model.warmup()
     else:
+        fastllm.set_threads(args.threads)
+        fastllm.set_low_memory(args.low)
+        if not os.path.exists(model_path):
+            print(f"模型文件{args.path}不存在！")
+            exit(-1)
         LLM_TYPE = fastllm.get_llm_type(model_path)
         model = fastllm.create_llm(model_path)
     
@@ -89,6 +111,7 @@ def run_with_callback(args):
             print()
         sys.stdout.flush()
         
+    print(f"欢迎使用 {LLM_TYPE} 模型. 输入内容对话，reset清空历史记录，stop退出程序");
     prompt = ""
     while prompt != "stop":
         prompt = input("User: ")

@@ -294,6 +294,7 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def_readonly("block_cnt", &fastllm::ChatGLMModel::block_cnt)
     .def_readonly("bos_token_id", &fastllm::ChatGLMModel::bos_token_id)
     .def_readonly("eos_token_id", &fastllm::ChatGLMModel::eos_token_id)
+    .def_readonly("gmask_token_id", &fastllm::ChatGLMModel::gmask_token_id)
     .def("load_weights", &fastllm::ChatGLMModel::LoadFromFile)
     .def("make_input", &fastllm::ChatGLMModel::MakeInput)
     .def("make_history", &fastllm::ChatGLMModel::MakeHistory)
