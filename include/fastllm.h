@@ -249,7 +249,7 @@ namespace fastllm {
 
         std::string fileName;
         long long filePos;
-        std::shared_ptr<FileMmap> m_file;
+        std::shared_ptr<FileMmap> mapFile;
 
         bool directMemory = false; // 直接分配/释放Memory，不经过缓存
 
@@ -303,8 +303,8 @@ namespace fastllm {
 
         void ToDevice(void *device);
 
-        void set_file(std::shared_ptr<FileMmap> file) {
-            m_file = file;
+        void SetMapFile(std::shared_ptr<FileMmap> file) {
+        	mapFile = file;
         }
     };
 
