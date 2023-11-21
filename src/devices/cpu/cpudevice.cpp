@@ -282,8 +282,8 @@ namespace fastllm {
         float *vd = (float*)v.cpuData;
         float *maskd = (datas.find("mask")->second && mask.dims.size() > 0) ? (float*)mask.cpuData : nullptr;
         float *od = (float*)output.cpuData;
-        int batch = (mask.dims.size() == 3 ? mask.dims[0] : 1);
-        int maskStride = (mask.dims.size() == 3 ? mask.strides[0] : mask.Count(0));
+        int batch = intParams.find("q___batch")->second;
+        int maskStride = (datas.find("mask")->second) ? (mask.dims.size() == 3 ? mask.strides[0] : mask.Count(0)) : 0;
         std::fill(od, od + output.Count(0), 0.0f);
         auto pool = GetPool();
         std::vector<std::future<void> > futures;
