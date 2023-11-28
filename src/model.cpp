@@ -92,6 +92,9 @@ namespace fastllm {
             model->bot_role = "\n<bot>:";
             model->history_sep = "\n";
             model->weight.tokenizer.type = Tokenizer::TokenizerType::BPE;
+        } else if (modelType == "internlm") {
+            model = new LlamaModel();
+            model->model_type = "internlm";
         } else if (modelType == "llama") {
             model = (basellm*)(new LlamaModel());
         } else if (modelType == "qwen") {
