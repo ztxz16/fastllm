@@ -153,7 +153,7 @@ namespace fastllm {
         uint8_t quantization(const float &realNumber) const {
             if (type == 0) {
                 return (uint8_t) (std::min((double) ((1 << bit) - 1),
-                                           std::max(realNumber / scale + zeroPoint + 0.5, 0.0)));
+                                           (double) std::max(realNumber / scale + zeroPoint + 0.5, 0.0)));
             } else {
                 return (uint8_t) (std::max(0.f, std::min(15.f, (realNumber - min) / scale + 0.5f)));
             }

@@ -1156,7 +1156,7 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
         cublasStatus_t status;
 
         int len = n * m;
-        int threadPerBlock = min(256, len);
+        int threadPerBlock = std::min(256, len);
         FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaFp16Input, len);
 
         len = k * m;
@@ -1300,7 +1300,7 @@ bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data 
         cublasStatus_t status;
 
         int len = n * m;
-        int threadPerBlock = min(256, len);
+        int threadPerBlock = std::min(256, len);
         FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaFp16Input,
                                                                                           len);
 
@@ -1428,7 +1428,7 @@ bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
         cublasStatus_t status;
 
         int len = n * m;
-        int threadPerBlock = min(256, len);
+        int threadPerBlock = std::min(256, len);
         FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaFp16Input,
                                                                                           len);
 
@@ -1716,7 +1716,7 @@ bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output) {
     int len = input.Count(0);
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
-    int threadPerBlock = min(256, len);
+    int threadPerBlock = std::min(256, len);
     FastllmGeluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
@@ -1727,7 +1727,7 @@ bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
     int len = input.Count(0);
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
-    int threadPerBlock = min(256, len);
+    int threadPerBlock = std::min(256, len);
     FastllmSiluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
@@ -1740,7 +1740,7 @@ bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
 
-    int threadPerBlock = min(256, len);
+    int threadPerBlock = std::min(256, len);
     FastllmSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len, spatial, mid);
 
     FastllmCudaFinishInput(input, cudaInput);
@@ -1752,7 +1752,7 @@ bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output) 
     int len = input.Count(0);
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
-    int threadPerBlock = min(256, len);
+    int threadPerBlock = std::min(256, len);
     FastllmMulKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, v, len);
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
@@ -1764,7 +1764,7 @@ bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float 
     float *cudaData = (float *) FastllmCudaPrepareInput(input0);
     float *input1Data = (float *) FastllmCudaPrepareInput(input1);
 
-    int threadPerBlock = min(256, len);
+    int threadPerBlock = std::min(256, len);
     FastllmAddToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
     FastllmCudaFinishInput(input1, input1Data);
     FastllmCudaFinishOutput(input0, cudaData);
@@ -1776,7 +1776,7 @@ bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float 
     float *cudaData = (float *) FastllmCudaPrepareInput(input0);
     float *input1Data = (float *) FastllmCudaPrepareInput(input1);
 
-    int threadPerBlock = min(256, len);
+    int threadPerBlock = std::min(256, len);
     FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
     FastllmCudaFinishInput(input1, input1Data);
     FastllmCudaFinishOutput(input0, cudaData);
@@ -2005,7 +2005,7 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
 
         int *cudaTemp = (int *) FastllmCudaMalloc(temp.size() * sizeof(int));
         cudaMemcpy(cudaTemp, temp.data(), temp.size() * sizeof(int), cudaMemcpyHostToDevice);
-        int threadPerBlock = min(256, len);
+        int threadPerBlock = std::min(256, len);
         FastllmPermuteKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>((float *) input.cudaData,
                                                                                     tempData, cudaTemp,
                                                                                     (int) axis.size(), len);
@@ -2228,7 +2228,7 @@ bool FastllmCudaRotatePosition2D(fastllm::Data &data, const fastllm::Data &posit
     int spatial = data.Count(2);
     int len = data.dims[0], bs = data.dims[1];
     int n = data.dims[2], m = data.dims[3];
-    FastllmRotatePosition2DKernel <<< outer * 2 * n, min(rotaryDim, m / 4) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
+    FastllmRotatePosition2DKernel <<< outer * 2 * n, std::min(rotaryDim, m / 4) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
                                                                                 len, bs, spatial, n, m,
                                                                                 (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
 
@@ -2251,7 +2251,7 @@ bool FastllmCudaNearlyRotatePosition2D(fastllm::Data &data, const fastllm::Data 
     int spatial = data.Count(2);
     int len = data.dims[0], bs = data.dims[1];
     int n = data.dims[2], m = data.dims[3];
-    FastllmNearlyRotatePosition2DKernel <<< outer * n, min(rotaryDim, m / 4) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
+    FastllmNearlyRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 4) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
                                                                                   len, bs, spatial, n, m,
                                                                                   (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
 
@@ -2273,7 +2273,7 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
     int spatial = data.Count(2);
     int bs = data.dims[0], len = data.dims[1];
     int n = data.dims[2], m = data.dims[3];
-    FastllmLlamaRotatePosition2DKernel <<< outer * n, min(rotaryDim, m / 2) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
+    FastllmLlamaRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
                                                                                  len, bs, spatial, n, m,
                                                                                  (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
 
