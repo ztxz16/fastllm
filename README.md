@@ -23,7 +23,7 @@ fastllm是纯c++实现，无第三方依赖的高性能大模型推理库
 - 🚀 前后端分离设计，便于支持新的计算设备
 - 🚀 目前支持ChatGLM模型，各种LLAMA模型(ALPACA, VICUNA等)，BAICHUAN模型，MOSS模型
 
-## 两行代码加速 （测试中，暂时只支持ubuntu）
+## 两行代码加速 （测试中，暂时只支持chatglm系列）
 
 使用如下命令安装fastllm_pytools包
 
@@ -148,7 +148,7 @@ cmake .. -DUSE_CUDA=ON # 如果不使用GPU编译，那么使用 cmake .. -DUSE_
 make -j
 ```
 
-编译完成后，可以使用如下命令安装简易python工具包 (暂时只支持Linux)
+编译完成后，可以使用如下命令安装简易python工具包。
 
 ``` sh
 cd tools # 这时在fastllm/build/tools目录下
@@ -163,7 +163,7 @@ python setup.py install
 ``` sh
 # 这时在fastllm/build目录下
 
-# 命令行聊天程序, 支持打字机效果
+# 命令行聊天程序, 支持打字机效果 (只支持Linux）
 ./main -p model.flm 
 
 # 简易webui, 使用流式输出 + 动态batch，可多路并发访问
@@ -176,6 +176,8 @@ python tools/cli_demo.py -p model.flm
 streamlit run tools/web_demo.py model.flm 
 
 ```
+
+如编译中存在问题，尤其是Windows下的编译，可参考[FAQ](docs/faq.md)
 
 ### 简易python调用
 
@@ -194,7 +196,7 @@ for response in model.stream_response("你好"):
     print(response, flush = True, end = "")
 ```
 
-另外还可以设置cpu线程数等内容，详细API说明见 [fastllm_pytools](docs/fastllm_pytools)
+另外还可以设置cpu线程数等内容，详细API说明见 [fastllm_pytools](docs/fastllm_pytools.md)
 
 这个包不包含low level api，如果需要使用更深入的功能请参考 [Python绑定API](#Python绑定API)
 
