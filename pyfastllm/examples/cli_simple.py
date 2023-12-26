@@ -79,7 +79,7 @@ def run_with_response(args):
         print(f"{model.model_type}:", end=' ')
         past_len = 0
         for output in outputs:
-            print(output[past_len:].strip(), end='', flush=True)
+            print(output[past_len:], end='', flush=True)
             past_len = len(output)
         print()
         model.make_history(history, dialog_round, input_text, output)

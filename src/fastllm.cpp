@@ -34,6 +34,11 @@
 #include "fastllm-cuda.cuh"
 #endif
 
+#ifdef PY_API
+#include <pybind11/embed.h>
+namespace py = pybind11;
+#endif
+
 namespace fastllm {
     std::map <std::string, int> defaultDeviceMap;
     Executor defaultExecutor;
@@ -41,7 +46,7 @@ namespace fastllm {
 
     static std::mutex globalLocker;
     static int threads = 4;
-    static ThreadPool *fastllmThreadPool = new ThreadPool(threads);
+    static ThreadPool *fastllmThreadPool = nullptr;
     static bool lowMemMode = false;
     static bool kvCacheInCPU = false;
 
@@ -74,6 +79,9 @@ namespace fastllm {
     }
 
     void SetThreads(int t) {
+#ifdef PY_API
+        py::gil_scoped_release release;
+#endif
         globalLocker.lock();
         threads = t;
         if (fastllmThreadPool != nullptr) {
@@ -82,6 +90,9 @@ namespace fastllm {
         }
         fastllmThreadPool = new ThreadPool(t);
         globalLocker.unlock();
+#ifdef PY_API
+        py::gil_scoped_acquire acquire;
+#endif
     }
 
     void SetLowMemMode(bool m) {
@@ -101,6 +112,8 @@ namespace fastllm {
     }
 
     ThreadPool *GetPool() {
+        if (fastllmThreadPool == nullptr)
+            SetThreads(threads);
         return fastllmThreadPool;
     }
 #ifdef USE_MMAP

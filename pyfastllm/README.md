@@ -47,18 +47,19 @@ pyfastllm是基于fastllm的python api接口实现，通过pyfastllm可以更加
 
 首先下载pybind11 c++依赖:
 
-```sh
+```shell
 git submodule init 
 git submodule update  # 下载pybind11依赖
 ```
 
 Cpp手动编译：
-```sh
+
+```shell
 mkdir build-py
 cd build-py
 cmake .. -DUSE_CUDA=ON -DPY_API=ON
 make -j
-cp pyfastllm*.so pyfastllm/examples/
+cp fastllm*.so pyfastllm/examples/  # 或放置在$PYTHONPATH环境变量包含的的目录中
 cd ../pyfastllm/examples/
 python3 cli_simple.py -p chatglm-6b-int8.flm  # 与cpp编译的运行结果保持一致
 ```
@@ -69,12 +70,12 @@ python3 cli_simple.py -p chatglm-6b-int8.flm  # 与cpp编译的运行结果保�
 
 首先下载pybind11：
 
-```bash
+```shell
 pip install pybind11
 ```
 
 - GPU
-```sh
+```shell
 cd pyfastllm/
 python3 setup.py build
 python3 setup.py install 
@@ -83,25 +84,25 @@ python3 cli_simple.py -p chatglm-6b-int8.flm
 ```
 
 - CPU
-```sh
+```shell
 cd pyfastllm/
 export USE_CUDA=OFF
 python3 setup.py build
 python3 setup.py install 
 cd examples/
 python3 cli_simple.py -p chatglm-6b-int8.flm -t 8
-
 ```
+
 ## 使用
 
 ### python 调用
 在examples文件夹中存放了几种常见的代码示例：
 
-examples/cli_simple.py: 调用api接口示例(推荐)
-examples/cli_low_api.py: 底层API调用示例
-examples/convert_model.py: 模型转换示例
-examples/web_api.py, demo/web_api_client.py: fastapi webapi调用
-examples/test_ops: 部分op的使用样例及测试
+- `examples/cli_simple.py`: 调用api接口示例(推荐)
+- `examples/cli_low_api.py`: 底层API调用示例
+- `examples/convert_model.py`: 模型转换示例
+- `examples/web_api.py`, `examples/web_api_client.py`: fastapi webapi调用
+- `examples/test_ops.py`: 部分op的使用样例及测试
 
 ### 命令行工具
 
