@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
 import platform
 if platform.system() == 'Windows':
-    fastllm_lib = ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], "fastllm_tools.dll"))
+    fastllm_lib = ctypes.CDLL(os.path.join(os.path.split(os.path.realpath(__file__))[0], "fastllm_tools.dll"), winmode=0)
 elif platform.system() == 'Darwin':
     fastllm_lib = ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], "libfastllm_tools.dylib"))
 else:
