@@ -5,15 +5,20 @@ project(fastllm LANGUAGES CXX)
 option(USE_CUDA "use cuda" OFF)
 
 option(PY_API "python api" OFF)
+
 option(USE_MMAP "use mmap" OFF)
 
 option(USE_SENTENCEPIECE "use sentencepiece" OFF)
+
+option(USE_IVCOREX "use iluvatar corex gpu" OFF)
 
 message(STATUS "USE_CUDA: ${USE_CUDA}")
 
 message(STATUS "PYTHON_API: ${PY_API}")
 
 message(STATUS "USE_SENTENCEPIECE: ${USE_SENTENCEPIECE}")
+
+message(STATUS "USE_IVCOREX: ${USE_IVCOREX}")
 
 set(CMAKE_BUILD_TYPE "Release")
 
@@ -53,6 +58,11 @@ if (USE_CUDA)
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/cuda/fastllm-cuda.cu)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
     set(CMAKE_CUDA_ARCHITECTURES "native")
+endif()
+
+if (USE_IVCOREX)
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cudart)
+    set(CMAKE_CUDA_ARCHITECTURES ${IVCOREX_ARCH})
 endif()
 
 if (PY_API)
