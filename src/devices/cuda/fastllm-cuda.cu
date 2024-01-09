@@ -1481,7 +1481,7 @@ void * FastllmCudaDirectMalloc(size_t size) {
     void * ret;
     cudaError_t state = cudaMalloc(&ret, size);
     if (cudaSuccess != state) {
-        printf("Error: CUDA error when allocating %d kB memory! maybe there's no enough memory left on device.", size >> 10);
+        printf("Error: CUDA error when allocating %lu kB memory! maybe there's no enough memory left on device.", size >> 10);
         checkCudaErrors("", state);
         return nullptr;
     }
@@ -1517,7 +1517,7 @@ void * FastllmCudaMalloc(size_t size) {
         void * ret;
         state = cudaMalloc(&ret, size);
         if (cudaSuccess != state) {
-            printf("Error: CUDA error when allocating %d MB memory! maybe there's no enough memory left on device.", size >> 20);
+            printf("Error: CUDA error when allocating %lu MB memory! maybe there's no enough memory left on device.", size >> 20);
             checkCudaErrors("", state);
             return nullptr;
         }
@@ -1535,7 +1535,7 @@ void * FastllmCudaMalloc(size_t size) {
     void * ret;
     state = cudaMalloc(&ret, size);
     if (cudaSuccess != state) {
-        printf("Error: CUDA error when allocating %d KB memory! maybe there's no enough memory left on device.", size >> 10);
+        printf("Error: CUDA error when allocating %lu KB memory! maybe there's no enough memory left on device.", size >> 10);
         checkCudaErrors("", state);
         return nullptr;
     }
@@ -1600,7 +1600,7 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     cudaMalloc(&ret, size);
     auto state = cudaMalloc(&ret, size);
     if (cudaSuccess != state)
-        printf("Error: CUDA error when allocating %d MB memory! maybe there's no enough memory left on device.", size >> 20);
+        printf("Error: CUDA error when allocating %lu MB memory! maybe there's no enough memory left on device.", size >> 20);
     checkCudaErrors("", state);
     bigBuffers.push_back(CudaMemoryBuffer(ret, size, false));
 }
