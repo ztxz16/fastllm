@@ -113,10 +113,9 @@ def tofile(exportPath,
             modelInfo["im_end_id"] = tokenizer.im_end_id
             modelInfo["im_start_id"] = tokenizer.im_start_id
     if (modelInfo["model_type"] == "chatglm" and hasattr(tokenizer, "build_chat_input")):
-        print("into here")
         # chatglm3
         modelInfo["pre_prompt"] = "";
-        modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|user|>")) + ">\n");
+        modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|user|>")) + "> \n");
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|assistant|>")) + ">");
         modelInfo["history_sep"] = "";
 
