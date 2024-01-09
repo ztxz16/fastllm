@@ -51,7 +51,7 @@ def create(model,
     if (modelInfo["model_type"] == "chatglm" and hasattr(tokenizer, "build_chat_input")):
         # chatglm3
         modelInfo["pre_prompt"] = "";
-        modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|user|>")) + ">\n");
+        modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|user|>")) + "> \n");
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|assistant|>")) + ">");
         modelInfo["history_sep"] = "";
 

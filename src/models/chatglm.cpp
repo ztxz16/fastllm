@@ -34,14 +34,16 @@ namespace fastllm {
         cos.resize(max_positions);
         std::vector <float> invFreq;
         for (int i = 0; i < rotary_dim; i += 2) {
-            invFreq.push_back(1.0 / pow(10000, (float)i / rotary_dim));
+            int base = this->bot_role.empty() ? 10000 : 10000 * rope;
+            invFreq.push_back(1.0 / pow(base, (float)i / rotary_dim));
         }
         for (int i = 0; i < max_positions; i++) {
             sin[i].resize(rotary_dim);
             cos[i].resize(rotary_dim);
             for (int j = 0; j < invFreq.size(); j++) {
-                sin[i][j] = ::sin((float)i / rope * invFreq[j]);
-                cos[i][j] = ::cos((float)i / rope * invFreq[j]);
+                float scale = this->bot_role.empty() ? rope : 1.0f;
+                sin[i][j] = ::sin((float)i / scale * invFreq[j]);
+                cos[i][j] = ::cos((float)i / scale * invFreq[j]);
             }
         }
 
