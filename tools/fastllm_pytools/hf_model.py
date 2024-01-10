@@ -55,6 +55,7 @@ def create(model,
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|assistant|>")) + ">");
         modelInfo["history_sep"] = "";
 
+    modelInfo["tokenizer_use_score"] = "1" # 分词带分数
 
     weight_type_dict = {};
     module_dict = {};
