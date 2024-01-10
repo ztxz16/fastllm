@@ -801,6 +801,7 @@ namespace fastllm {
         now->tokenId = tokenId;
         now->score = score;
         tokenToStringDict[tokenId] = s;
+        tokenToScoreDict[tokenId] = score;
         stringToTokenDict[s] = tokenId;
     }
 
@@ -846,9 +847,10 @@ namespace fastllm {
             }
             for (int i = 0; i < ori.size(); i++) {
                 if (ori[i] == ' ') {
-                    if (i != 0 && ori[i - 1] != ' ') {
-                        s += blank;
-                    }
+                    // if (i != 0 && ori[i - 1] != ' ') {
+                        // s += blank;
+                    // }
+                    s += blank;
                 } else {
                     s += ori[i];
                 }
