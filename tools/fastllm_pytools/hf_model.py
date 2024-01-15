@@ -51,10 +51,11 @@ def create(model,
     if (modelInfo["model_type"] == "chatglm" and hasattr(tokenizer, "build_chat_input")):
         # chatglm3
         modelInfo["pre_prompt"] = "";
-        modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|user|>")) + ">\n");
+        modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|user|>")) + "> \n");
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|assistant|>")) + ">");
         modelInfo["history_sep"] = "";
 
+    modelInfo["tokenizer_use_score"] = "1" # 分词带分数
 
     weight_type_dict = {};
     module_dict = {};
