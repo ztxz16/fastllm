@@ -40,6 +40,14 @@ LLaMA类模型有着基本相同的结构，但权重和prompt构造有差异。
 
 如需添加Token ID而非字符串（类似baichuan-chat模型），可以使用“<FLM_FIX_TOKEN_{ID}>”的格式添加。
 
+### 两行加速
+
+```python
+    llm.from_hf(model, tokenizer, pre_prompt = "", 
+                user_role = "", bot_role = "", history_sep = "", 
+                dtype = dtype)
+```
+
 ## Base Model
 
 见上方“[修改方案](#修改方案)”。

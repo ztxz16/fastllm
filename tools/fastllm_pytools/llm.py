@@ -99,11 +99,17 @@ def set_device_map(device_map):
                                (ctypes.c_int * len(device_len))(*device_len),
                                device_str.encode(),
                                (ctypes.c_int * len(values))(*values));
+
 def from_hf(model,
             tokenizer = None,
+            pre_prompt = None,
+            user_role = None,
+            bot_role = None,
+            history_sep = None,
             dtype = "float16"):
     from fastllm_pytools import hf_model;
-    return hf_model.create(model, tokenizer, dtype = dtype);
+    return hf_model.create(model, tokenizer, pre_prompt = pre_prompt, user_role = user_role,
+                           bot_role = bot_role, history_sep = history_sep, dtype = dtype);
 
 class model:
     def __init__ (self, path : str,
