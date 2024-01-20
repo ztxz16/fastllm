@@ -87,11 +87,11 @@ def tofile(exportPath,
         print("unknown model_type.")
         exit(0)
 
-    if (pre_prompt):
+    if (pre_prompt is not None):
         modelInfo["pre_prompt"] = pre_prompt
-    if (user_role):
+    if (user_role is not None):
         modelInfo["user_role"] = user_role
-    if (bot_role):
+    if (bot_role is not None):
         modelInfo["bot_role"] = bot_role
     if (history_sep):
         modelInfo["history_sep"] = history_sep
