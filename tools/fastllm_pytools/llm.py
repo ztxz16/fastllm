@@ -182,7 +182,7 @@ class model:
                 return cache_result
 
         output_buffer_init_len = 256
-        if self.thread_local_obj.tokenizer_decode_token__output_buffer is None:
+        if "tokenizer_decode_token__output_buffer" not in dir(self.thread_local_obj) or self.thread_local_obj.tokenizer_decode_token__output_buffer is None:
             self.thread_local_obj.tokenizer_decode_token__output_buffer = ctypes.create_string_buffer(output_buffer_init_len)
 
         buffer = self.thread_local_obj.tokenizer_decode_token__output_buffer
