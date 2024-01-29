@@ -154,7 +154,7 @@ class model:
 
     def tokenizer_encode_string(self, content: str) -> List[int]:
         output_buffer_init_len = 1024
-        if "tokenizer_encode_string__output_buffer" not in self.thread_local_obj or self.thread_local_obj.tokenizer_encode_string__output_buffer is None:
+        if "tokenizer_encode_string__output_buffer" not in dir(self.thread_local_obj) or self.thread_local_obj.tokenizer_encode_string__output_buffer is None:
             self.thread_local_obj.tokenizer_encode_string__output_buffer = (ctypes.c_int * output_buffer_init_len)()
 
         buffer = self.thread_local_obj.tokenizer_encode_string__output_buffer
