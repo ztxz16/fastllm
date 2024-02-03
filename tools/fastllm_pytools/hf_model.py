@@ -86,7 +86,14 @@ def create(model,
 
     model = model.cpu();
     dict = model.state_dict();
-    model_type = model.config.__dict__["model_type"];
+
+    if (modelInfo["model_type"] == "baichuan" and modelInfo["vocab_size"] == 125696):
+        # normalize lm_head for Baichuan 2
+        lm_head = dict['lm_head.weight'].to(torch.float32)
+        dict['lm_head.weight'] = torch.nn.functional.normalize(lm_head).to(torch.float16)
+        model.load_state_dict(dict)
+
+    model_type = modelInfo["model_type"];
     model = llm.fastllm_lib.create_empty_llm_model(model_type.encode());
     for it in modelInfo.keys():
         llm.fastllm_lib.add_dict_llm_model(model, str(it).encode(), str(modelInfo[it]).encode());
