@@ -98,15 +98,15 @@ namespace fastllm {
             retString += curString;
             if (retCb)
 #ifdef PY_API
-                {
-                    if (generationConfig.enable_hash_id) {
-                        std::stringstream ss;
-                        ss << retString << "hash_id:" << hash_id;
-                        retCb(index, pybind11::bytes(ss.str()));
-                    } else {
-                        retCb(index, pybind11::bytes(retString));
-                    }
+            {
+                if (generationConfig.enable_hash_id) {
+                    std::stringstream ss;
+                    ss << retString << "hash_id:"<<hash_id;
+                    retCb(index, pybind11::bytes(ss.str()));
+                } else {
+                    retCb(index, pybind11::bytes(retString));
                 }
+            }
 #else
                 retCb(index, curString.c_str());
 #endif
@@ -123,15 +123,15 @@ namespace fastllm {
         }
         if (retCb)
 #ifdef PY_API
-            {
-                if (generationConfig.enable_hash_id) {
-                    std::stringstream ss;
-                    ss << retString << "hash_id:" << hash_id;
-                    retCb(-1, pybind11::bytes(ss.str()));
-                } else {
-                    retCb(-1, pybind11::bytes(retString));
-                }
+        {
+            if(generationConfig.enable_hash_id){
+                std::stringstream ss;
+                ss << retString << "hash_id:"<<hash_id;
+                retCb(-1, pybind11::bytes(ss.str()));
+            }else{
+                retCb(-1, pybind11::bytes(retString));
             }
+        }
 #else
             retCb(-1, retString.c_str());
 #endif
@@ -143,7 +143,6 @@ namespace fastllm {
 #ifdef USE_CUDA
         FastllmCudaClearBigBuffer();
 #endif
-        
 #ifdef PY_API
         std::vector<std::string> prompts;
         std::vector < size_t > hash_ids;
@@ -232,25 +231,25 @@ namespace fastllm {
             }
             if (retCb)
 #ifdef PY_API
-                {
-                    if (generationConfig.enable_hash_id) {
-                        std::vector<pybind11::bytes> rtnStrings;
-                        for (size_t i=0; i<batch; i++){
-                            std::stringstream ss;
-                            ss << curStrings[i] << "hash_id:" << hash_ids[i];
-                            rtnStrings.push_back(pybind11::bytes(ss.str()));
-                        }
-                        retCb(index, rtnStrings);
-                    } else {
-                        std::vector<pybind11::bytes> rtnStrings;
-                        for (size_t i=0; i<batch; i++){
-                            std::stringstream ss;
-                            ss << curStrings[i];
-                            rtnStrings.push_back(pybind11::bytes(ss.str()));
-                        }
-                        retCb(index, rtnStrings);
+            {
+                if (generationConfig.enable_hash_id) {
+                    std::vector<pybind11::bytes> rtnStrings;
+                    for (size_t i=0; i<batch; i++){
+                        std::stringstream ss;
+                        ss << curStrings[i] << "hash_id:" << hash_ids[i];
+                        rtnStrings.push_back(pybind11::bytes(ss.str()));
                     }
+                    retCb(index, rtnStrings);
+                } else {
+                    std::vector<pybind11::bytes> rtnStrings;
+                    for (size_t i=0; i<batch; i++){
+                        std::stringstream ss;
+                        ss << curStrings[i];
+                        rtnStrings.push_back(pybind11::bytes(ss.str()));
+                    }
+                    retCb(index, rtnStrings);
                 }
+            }
 #else
                 retCb(index, curStrings);
 #endif
@@ -265,27 +264,27 @@ namespace fastllm {
         }
         if (retCb)
 #ifdef PY_API
-                {
-                    if (generationConfig.enable_hash_id) {
-                        std::vector<pybind11::bytes> rtnStrings;
-                        for (size_t i=0; i<batch; i++){
-                            std::stringstream ss;
-                            ss << outputs[i] << "hash_id:" << hash_ids[i];
-                            rtnStrings.push_back(pybind11::bytes(ss.str()));
-                        }
-                        retCb(-1, rtnStrings);
-                    } else {
-                        std::vector<pybind11::bytes> rtnStrings;
-                        for (size_t i=0; i<batch; i++){
-                            std::stringstream ss;
-                            ss << outputs[i];
-                            rtnStrings.push_back(pybind11::bytes(ss.str()));
-                        }
-                        retCb(-1, rtnStrings);
-                    }
+        {
+            if (generationConfig.enable_hash_id) {
+                std::vector<pybind11::bytes> rtnStrings;
+                for (size_t i=0; i<batch; i++){
+                    std::stringstream ss;
+                    ss << outputs[i] << "hash_id:" << hash_ids[i];
+                    rtnStrings.push_back(pybind11::bytes(ss.str()));
                 }
+                retCb(-1, rtnStrings);
+            } else {
+                std::vector<pybind11::bytes> rtnStrings;
+                for (size_t i=0; i<batch; i++){
+                    std::stringstream ss;
+                    ss << outputs[i];
+                    rtnStrings.push_back(pybind11::bytes(ss.str()));
+                }
+                retCb(-1, rtnStrings);
+            }
+        }
 #else
-                retCb(-1, outputs);
+            retCb(-1, outputs);
 #endif
     }
 
