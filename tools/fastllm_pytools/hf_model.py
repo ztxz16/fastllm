@@ -22,26 +22,32 @@ def create(model,
            history_sep = None,
            dtype = "float16"):
     if (dtype not in fastllm_data_type_dict):
-        print("dtype should in ", list(fastllm_data_type_dict.keys()));
-        exit(0);
+        print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
+        exit(0)
 
     # 0.1 model info
     modelInfo = model.config.__dict__
     if model.generation_config is not None:
         modelInfo.update(model.generation_config.__dict__)
-    if (pre_prompt):
-        modelInfo["pre_prompt"] = pre_prompt;
-    if (user_role):
-        modelInfo["user_role"] = user_role;
-    if (bot_role):
-        modelInfo["bot_role"] = bot_role;
+    if (pre_prompt is not None):
+        modelInfo["pre_prompt"] = pre_prompt
+    if (user_role is not None):
+        modelInfo["user_role"] = user_role
+    if (bot_role is not None):
+        modelInfo["bot_role"] = bot_role
     if (history_sep):
-        modelInfo["history_sep"] = history_sep;
-    if (modelInfo["model_type"] == "baichuan" and hasattr(model, "model") and hasattr(model.model, "get_alibi_mask")):
-        # Baichuan 2代
-        modelInfo["use_alibi"] = "1";
-        modelInfo["pre_prompt"] = "";
-        modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.user_token_id) + "> ") if hasattr(model.generation_config, "user_token_id") else "";
+        modelInfo["history_sep"] = history_sep
+    if (modelInfo["model_type"] == "baichuan"):
+        if (hasattr(model, "model") and hasattr(model.model, "get_alibi_mask")):
+            # Baichuan / Baichuan2 13B
+            modelInfo["use_alibi"] = "1"
+        modelInfo["pre_prompt"] = ""
+        if (modelInfo["vocab_size"] == 125696):
+            # Baichuan 2代
+            modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.user_token_id) + ">") if hasattr(model.generation_config, "user_token_id") else "";
+        else:
+            # Baichuan-13B-chat
+            modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.user_token_id) + "> ") if hasattr(model.generation_config, "user_token_id") else "";
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.assistant_token_id) + ">") if hasattr(model.generation_config, "assistant_token_id") else "";
         modelInfo["history_sep"] = "";
     if (modelInfo["model_type"] == "qwen"):
@@ -80,7 +86,14 @@ def create(model,
 
     model = model.cpu();
     dict = model.state_dict();
-    model_type = model.config.__dict__["model_type"];
+
+    if (modelInfo["model_type"] == "baichuan" and modelInfo["vocab_size"] == 125696):
+        # normalize lm_head for Baichuan 2
+        lm_head = dict['lm_head.weight'].to(torch.float32)
+        dict['lm_head.weight'] = torch.nn.functional.normalize(lm_head).to(torch.float16)
+        model.load_state_dict(dict)
+
+    model_type = modelInfo["model_type"];
     model = llm.fastllm_lib.create_empty_llm_model(model_type.encode());
     for it in modelInfo.keys():
         llm.fastllm_lib.add_dict_llm_model(model, str(it).encode(), str(modelInfo[it]).encode());

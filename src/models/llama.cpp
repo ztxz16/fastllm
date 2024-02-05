@@ -653,11 +653,11 @@ namespace fastllm {
             if (retCb)
 #ifdef PY_API
 			{
-				if(generationConfig.enable_hash_id){
+				if (generationConfig.enable_hash_id) {
 					std::stringstream ss;
-					ss << retString << "hash_id:"<<hash_id;
+					ss << retString << "hash_id:" << hash_id;
 					retCb(index, pybind11::bytes(ss.str()));
-				}else{
+				} else {
 					retCb(index, pybind11::bytes(retString));
 				}
 			}
@@ -689,11 +689,11 @@ namespace fastllm {
         if (retCb)
 #ifdef PY_API
 		{
-			if(generationConfig.enable_hash_id){
+			if (generationConfig.enable_hash_id) {
 				std::stringstream ss;
-				ss << retString << "hash_id:"<<hash_id;
+				ss << retString << "hash_id:" << hash_id;
 				retCb(-1, pybind11::bytes(ss.str()));
-			}else{
+			} else {
 				retCb(-1, pybind11::bytes(retString));
 			}
 		}
@@ -814,7 +814,7 @@ namespace fastllm {
             if (endingCount == batch) {
                 break;
             }
-            if (retCb) 
+            if (retCb)
 #ifdef PY_API
             {
                 if (generationConfig.enable_hash_id) {
@@ -975,12 +975,16 @@ namespace fastllm {
                         }
 
                         if (seqLens.size() > 0) {
+                            model->dictLocker.unlock();
 #ifdef USE_CUDA
                             FastllmCudaClearBigBuffer();
 #endif
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
-                            std::vector<int> ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
-                                                                       positionIds, seqLens, pastKeyValues, generationConfigs, tokensManager, &logits);
+                            std::vector<int> ret;
+                            ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
+                                                      positionIds, seqLens, pastKeyValues, generationConfigs,
+                                                      tokensManager, &logits);
+                            model->dictLocker.lock();
                             int idx = 0;
                             for (auto &it: model->responseContextDict.dicts) {
                                 if (it.second->isEnding) {
