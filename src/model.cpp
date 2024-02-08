@@ -2,6 +2,7 @@
 
 #include "model.h"
 #include "fastllm.h"
+#include <sstream>
 
 #include "chatglm.h"
 #include "moss.h"
@@ -50,6 +51,18 @@ namespace fastllm {
         }
         if (this->weight.dicts.find("history_sep") != this->weight.dicts.end()) {
             history_sep = this->weight.dicts["history_sep"];
+        }
+        if (this->weight.dicts.find("tokenizer_add_dummy_prefix") != this->weight.dicts.end()) {
+            std::string value = this->weight.dicts["tokenizer_add_dummy_prefix"];
+            transform(value.begin(), value.end(), value.begin(), ::tolower);
+            std::istringstream iss(value);
+            iss >> std::boolalpha >> this->weight.tokenizer.add_dummy_prefix;
+        }
+        if (this->weight.dicts.find("tokenizer_remove_extra_whitespaces") != this->weight.dicts.end()) {
+            std::string value = this->weight.dicts["tokenizer_remove_extra_whitespaces"];
+            transform(value.begin(), value.end(), value.begin(), ::tolower);
+            std::istringstream iss(value);
+            iss >> std::boolalpha >> this->weight.tokenizer.remove_extra_whitespaces;
         }
 
         this->deviceMap = GetDeviceMap();
