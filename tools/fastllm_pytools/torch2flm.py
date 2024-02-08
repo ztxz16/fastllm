@@ -18,7 +18,8 @@ fastllm_data_type_dict = {
 }
 fastllm_weight_type_dict = {
     "linear": 1,
-    "embedding": 2
+    "embedding": 2,
+    "QuantizedLinear": 111
 }
 
 v = np.random.randint(-127, 127, [10, 20]);
@@ -73,12 +74,6 @@ def tofile(exportPath,
         print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
         exit(0)
 
-    dict = model.state_dict()
-    fo = open(exportPath, "wb")
-
-    # 0. version id
-    fo.write(struct.pack('i', 2))
-
     # 0.1 model info
     modelInfo = model.config.__dict__
     if model.generation_config is not None:
@@ -86,6 +81,11 @@ def tofile(exportPath,
     if ("model_type" not in modelInfo):
         print("unknown model_type.")
         exit(0)
+
+    fo = open(exportPath, "wb")
+
+    # 0. version id
+    fo.write(struct.pack('i', 2))
 
     if (pre_prompt is not None):
         modelInfo["pre_prompt"] = pre_prompt
@@ -108,7 +108,7 @@ def tofile(exportPath,
             modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.user_token_id) + "> ") if hasattr(model.generation_config, "user_token_id") else "";
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.assistant_token_id) + ">") if hasattr(model.generation_config, "assistant_token_id") else "";
         modelInfo["history_sep"] = ""
-    if modelInfo["model_type"] == "qwen":
+    if (modelInfo["model_type"] == "qwen"):
         if modelInfo["chat_format"] == "chatml":
             modelInfo["im_end_id"] = tokenizer.im_end_id
             modelInfo["im_start_id"] = tokenizer.im_start_id
@@ -119,7 +119,18 @@ def tofile(exportPath,
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|assistant|>")) + ">");
         modelInfo["history_sep"] = "";
 
-    modelInfo["tokenizer_use_score"] = "1" # 分词带分数
+    if tokenizer:
+        modelInfo["tokenizer_use_score"] = "1" # 分词带分数
+        if hasattr(tokenizer, "sp_model") or (hasattr(tokenizer, "tokenizer") and hasattr(tokenizer.tokenizer, "sp_model")):
+            try:
+                import sentencepiece.sentencepiece_model_pb2 as model_pb2
+                with open(tokenizer.vocab_file, "rb") as f:
+                    sp_model_data = f.read()
+                    sp_model_proto = model_pb2.ModelProto.FromString(sp_model_data)
+                    modelInfo["tokenizer_add_dummy_prefix"] = sp_model_proto.normalizer_spec.add_dummy_prefix
+                    modelInfo["tokenizer_remove_extra_whitespaces"] = sp_model_proto.normalizer_spec.remove_extra_whitespaces
+            except:
+                pass
 
     if hasattr(model, "peft_config"):
         adapter_size = len(model.peft_config)
@@ -137,10 +148,12 @@ def tofile(exportPath,
             for it in adapter_dict.keys():
                 writeKeyValue(fo, str(it), str(adapter_dict[it]))
 
+    dict = model.state_dict()
+
     # 1. vocab
     if (tokenizer):
         if (hasattr(tokenizer, "tokenizer")):
-            if (modelInfo['model_type'] == "qwen"):
+            if modelInfo["model_type"] == "qwen":
                 pass
             else:
                 tokenizer = tokenizer.tokenizer
@@ -158,10 +171,10 @@ def tofile(exportPath,
             vocab = tokenizer.get_vocab()
             fo.write(struct.pack('i', len(vocab)))
             for v in vocab.keys():
-                if (modelInfo['model_type'] == "qwen"):
-                    s = v
-                elif (modelInfo["model_type"] == "moss"):
+                if (modelInfo["model_type"] == "moss"):
                     s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
+                elif (modelInfo["model_type"] == "qwen"):
+                    s = v
                 else:
                     s = v.encode()
                 fo.write(struct.pack('i', len(s)))
@@ -191,6 +204,7 @@ def tofile(exportPath,
         if (key in weight_type_dict and weight_type_dict[key] in fastllm_weight_type_dict):
             cur_weight_type = fastllm_weight_type_dict[weight_type_dict[key]]
         to_data_type = 0
+
         if (cur_weight_type == 1):
             to_data_type = fastllm_data_type_dict[dtype]
             if (to_data_type == 7):
@@ -199,13 +213,11 @@ def tofile(exportPath,
 
         cur = dict[key].numpy().astype(ori_np_data_type)
         
+        weight_name = key
         if hasattr(model, "peft_config"):
-            weight_name = key.replace('base_model.model.', '')
-            fo.write(struct.pack('i', len(weight_name)))
-            fo.write(weight_name.encode())
-        else:
-            fo.write(struct.pack('i', len(key)))
-            fo.write(key.encode())
+            weight_name = weight_name.replace('base_model.model.', '')
+        fo.write(struct.pack('i', len(weight_name)))
+        fo.write(weight_name.encode())
         fo.write(struct.pack('i', len(cur.shape)))
         for i in cur.shape:
             fo.write(struct.pack('i', i))
