@@ -145,7 +145,7 @@ class model:
         fastllm_lib.save_llm_model(self.model, path.encode());
 
     def eval(self):
-        pass;
+        return self;
 
     def build_tokenizer_decode_token_cache(self):
         if self.tokenizer_decode_token_cache is not None:

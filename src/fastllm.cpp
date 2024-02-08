@@ -850,24 +850,28 @@ namespace fastllm {
         return std::numeric_limits<int>::max();
     }
 
+    std::string Tokenizer::Normalize(const std::string &ori) {
+        std::string blank = "";
+        blank += 226, blank += 150, blank += 129;
+        std::string s = this->add_dummy_prefix ? blank : "";
+        if (15 < ori.size() && ori.substr(0, 15) == "<FLM_FIX_TOKEN_") {
+            s = "";
+        }
+        for (int i = 0; i < ori.size(); i++) {
+            if (ori[i] == ' ') {
+                if (!(this->remove_extra_whitespaces && i > 0 && ori[i - 1] == ' ')) {
+                    s += blank;
+                }
+            } else {
+                s += ori[i];
+            }
+        }
+        return s;
+    }
+
     Data Tokenizer::Encode(const std::string &ori) {
         if (this->type == TokenizerType::BPE) {
-            std::string blank = "";
-            blank += 226, blank += 150, blank += 129;
-            std::string s = blank;
-            if (15 < ori.size() && ori.substr(0, 15) == "<FLM_FIX_TOKEN_") {
-                s = "";
-            }
-            for (int i = 0; i < ori.size(); i++) {
-                if (ori[i] == ' ') {
-                    // if (i != 0 && ori[i - 1] != ' ') {
-                        // s += blank;
-                    // }
-                    s += blank;
-                } else {
-                    s += ori[i];
-                }
-            }
+            std::string s = Normalize(ori);
 
             std::vector<Symbol> symbols;
             for (int i = 0; i < s.size(); i++) {
@@ -956,52 +960,41 @@ namespace fastllm {
                     }
                 }
             }
-            return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
+            return Data(DataType::FLOAT32, {1, (int)v.size()}, v);
         } else if (this->type == TokenizerType::GLM) {
             const std::map<std::string, int> specialTokens = {{"[MASK]", 50003}, {"[sMASK]", 50008}, {"[gMASK]", 50009}};
-            std::string blank = "";
-            blank += 226, blank += 150, blank += 129;
-            std::string s = blank;
-            for (int i = 0; i < ori.size(); i++) {
-                if (ori[i] == ' ') {
-                    if (i != 0 && ori[i - 1] != ' ') {
-                        s += blank;
-                    }
-                } else {
-                    s += ori[i];
-                }
-            }
+            std::string s = Normalize(ori);
             std::vector<float> v;
-            int findPos=0;
-            while(findPos<s.length()){
-                int nextSpecialToken=-1;
-                int nextSpecialTokenPos=-1;
-                int nextSpecialTokenLen=-1;
-                for(auto p:specialTokens){
-                    int ind=s.find(p.first,findPos);
-                    if(ind>=0&&(nextSpecialTokenPos<0||ind<nextSpecialTokenPos)){
-                        nextSpecialTokenPos=ind;
-                        nextSpecialToken=p.second;
-                        nextSpecialTokenLen=p.first.length();
+            int findPos = 0;
+            while (findPos < s.length()) {
+                int nextSpecialToken = -1;
+                int nextSpecialTokenPos = -1;
+                int nextSpecialTokenLen = -1;
+                for (auto p : specialTokens) {
+                    int ind = s.find(p.first, findPos);
+                    if (ind >= 0 && (nextSpecialTokenPos < 0 || ind < nextSpecialTokenPos)) {
+                        nextSpecialTokenPos = ind;
+                        nextSpecialToken = p.second;
+                        nextSpecialTokenLen = p.first.length();
                     }
                 }
                 std::string subStr;
-                if(nextSpecialTokenPos<0){
-                    subStr=s.substr(findPos);
-                    findPos=s.length();
-                }else{
-                    subStr=s.substr(findPos,nextSpecialTokenPos-findPos);
-                    findPos=nextSpecialTokenPos+nextSpecialTokenLen;
+                if (nextSpecialTokenPos < 0) {
+                    subStr = s.substr(findPos);
+                    findPos = s.length();
+                } else {
+                    subStr = s.substr(findPos, nextSpecialTokenPos - findPos);
+                    findPos = nextSpecialTokenPos + nextSpecialTokenLen;
                 }
-                if(subStr.length()>0){
+                if (subStr.length() > 0) {
 #ifdef USE_SENTENCEPIECE
-                    if(spProcessor!=nullptr){
+                    if (spProcessor!=nullptr) {
                         std::vector<int> ids;
-                        spProcessor->Encode(subStr,&ids);
-                        for(int id:ids){
+                        spProcessor->Encode(subStr, &ids);
+                        fo r(int id : ids) {
                             v.push_back(id);
                         }
-                    }else{
+                    } else {
 #endif
                     std::vector<Symbol> symbols;
                     for (int i = 0; i < subStr.size(); i++) {
@@ -1078,7 +1071,7 @@ namespace fastllm {
                     }
 #endif
                 }
-                if(nextSpecialTokenPos>=0){
+                if (nextSpecialTokenPos >= 0) {
                     v.push_back(nextSpecialToken);
                 }
             }
