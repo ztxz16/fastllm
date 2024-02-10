@@ -17,6 +17,8 @@
 #include <iostream>
 #include <functional>
 #include <memory>
+#include <locale>
+#include <codecvt>
 #include "devices/cpu/cputhreadpool.h"
 
 #ifdef USE_SENTENCEPIECE
@@ -363,10 +365,15 @@ namespace fastllm {
 
         bool add_dummy_prefix = true;   // 是否在首位添加空格
         bool remove_extra_whitespaces = true;   // 是否将多个空格合并为一个
+        bool byte_as_char = false;  // 是否将byte变为展示字符
 
         std::unordered_map <int, std::string> tokenToStringDict;
         std::unordered_map <int, float> tokenToScoreDict;
         std::unordered_map <std::string, int> stringToTokenDict;
+
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+        std::unordered_map <wchar_t, wchar_t> byteCharDict;
+        std::unordered_map <wchar_t, wchar_t> charByteDict;
 #ifdef USE_SENTENCEPIECE
         std::unique_ptr<sentencepiece::SentencePieceProcessor> spProcessor;
 #endif

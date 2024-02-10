@@ -64,6 +64,12 @@ namespace fastllm {
             std::istringstream iss(value);
             iss >> std::boolalpha >> this->weight.tokenizer.remove_extra_whitespaces;
         }
+        if (this->weight.dicts.find("tokenizer_byte_as_char") != this->weight.dicts.end()) {
+            std::string value = this->weight.dicts["tokenizer_byte_as_char"];
+            transform(value.begin(), value.end(), value.begin(), ::tolower);
+            std::istringstream iss(value);
+            iss >> std::boolalpha >> this->weight.tokenizer.byte_as_char;
+        }
 
         this->deviceMap = GetDeviceMap();
     }

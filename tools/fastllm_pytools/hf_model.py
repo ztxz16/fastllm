@@ -2,6 +2,8 @@ from fastllm_pytools import llm;
 import ctypes;
 import numpy as np
 import torch
+from transformers import PreTrainedTokenizerFast
+from tokenizers.decoders import ByteLevel
 
 fastllm_data_type_dict = {
     "int4": 8,
@@ -74,6 +76,10 @@ def create(model,
                     modelInfo["tokenizer_remove_extra_whitespaces"] = sp_model_proto.normalizer_spec.remove_extra_whitespaces
             except:
                 pass
+        elif isinstance(tokenizer, PreTrainedTokenizerFast):
+            if hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer._tokenizer, "decoder") \
+                    and isinstance(tokenizer._tokenizer.decoder, ByteLevel):
+                modelInfo["tokenizer_byte_as_char"] = True
 
     peft_config = {}
     active_adapter = ""
