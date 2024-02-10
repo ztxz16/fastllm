@@ -1,6 +1,8 @@
 import struct
 import numpy as np
 import torch
+from transformers import PreTrainedTokenizerFast
+from tokenizers.decoders import ByteLevel
 
 def writeString(fo, s):
     fo.write(struct.pack('i', len(s)))
@@ -131,6 +133,10 @@ def tofile(exportPath,
                     modelInfo["tokenizer_remove_extra_whitespaces"] = sp_model_proto.normalizer_spec.remove_extra_whitespaces
             except:
                 pass
+        elif isinstance(tokenizer, PreTrainedTokenizerFast):
+            if hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer._tokenizer, "decoder") \
+                    and isinstance(tokenizer._tokenizer.decoder, ByteLevel):
+                modelInfo["tokenizer_byte_as_char"] = True
 
     if hasattr(model, "peft_config"):
         adapter_size = len(model.peft_config)

@@ -783,6 +783,18 @@ namespace fastllm {
 
     Tokenizer::Tokenizer() {
         root = new TrieNode();
+        int n = 0;
+        wchar_t special_token = L'\x0';
+        for (; special_token < L'!'; special_token++, n++) {
+            byteCharDict[L'\x100' + n] = special_token;
+            charByteDict[special_token] = L'\x100' + n;
+        }
+        for (special_token = L'\x7F'; special_token < L'\xA1'; special_token++, n++) {
+            byteCharDict[L'\x100' + n] = special_token;
+            charByteDict[special_token] = L'\x100' + n;
+        }
+        byteCharDict[L'\x100' + n++] = L'\xAD';
+        charByteDict[L'\xAD'] = L'\x100' + n++;
     }
 
     Tokenizer::~Tokenizer() {
@@ -799,8 +811,13 @@ namespace fastllm {
                 q.push_back(it.second);
             }
         }
+        for (TrieNode * node : q)
+            delete node;
+        q.clear();
         root = new TrieNode();
         tokenToStringDict.clear();
+        tokenToScoreDict.clear();
+        stringToTokenDict.clear();
     }
 
     void Tokenizer::Insert(const std::string &s, int tokenId, float score) {
@@ -851,6 +868,15 @@ namespace fastllm {
     }
 
     std::string Tokenizer::Normalize(const std::string &ori) {
+        if (this->byte_as_char) {
+            std::wstring ws = converter.from_bytes(ori);
+            for (int i=0; i < ws.length(); i++) {
+                if (charByteDict.find(ws[i]) != charByteDict.end()) {
+                    ws[i] = charByteDict[ws[i]];
+                }
+            }
+            return converter.to_bytes(ws);
+        }
         std::string blank = "";
         blank += 226, blank += 150, blank += 129;
         std::string s = this->add_dummy_prefix ? blank : "";
@@ -1231,6 +1257,15 @@ namespace fastllm {
             if ((pos = ret.find(blank)) != std::string::npos)
                 ret.replace(pos, blank.length(), " ");
             else break;
+        }
+        if (this->byte_as_char) {
+            std::wstring wret = converter.from_bytes(ret);
+            for (int i=0; i < wret.length(); i++) {
+                if (byteCharDict.find(wret[i]) != byteCharDict.end()) {
+                    wret[i] = byteCharDict[wret[i]];
+                }
+            }
+            ret = converter.to_bytes(wret);
         }
         int pos = ret.find("<|blank_");
         if (pos != -1) {
