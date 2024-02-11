@@ -88,7 +88,7 @@ namespace fastllm {
             model = (basellm*)(new ChatGLMModel());
         } else if (modelType == "moss") {
             model = (basellm*)(new MOSSModel());
-            model->weight.tokenizer.type = Tokenizer::TokenizerType::NORMAL;
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::BPE;
             model->eos_token_id = 106068;
         } else if (modelType == "baichuan") {
             model = (basellm*)(new LlamaModel());

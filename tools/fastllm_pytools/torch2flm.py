@@ -1,4 +1,5 @@
 import struct
+import builtins, os, json
 import numpy as np
 import torch
 from transformers import PreTrainedTokenizerFast
@@ -174,9 +175,20 @@ def tofile(exportPath,
                 fo.write(struct.pack('i', i))
                 fo.write(struct.pack('f', float(tokenizer.sp_model.get_score(i))))
         else:
+            merges = {}
+            if (modelInfo["model_type"] == "moss"):
+                merges = {("".join(bpe_tokens), token_index) for bpe_tokens, token_index in sorted(tokenizer.bpe_ranks.items(), key=lambda kv: kv[1])}
+            elif isinstance(tokenizer, PreTrainedTokenizerFast):
+                tokenizer_file = tokenizer.name_or_path + tokenizer.vocab_files_names['tokenizer_file']
+                if os.path.exists(tokenizer_file):
+                    with open(tokenizer_file, "r", encoding='utf-8') as f:
+                        bpe_merges = json.load(f)["model"]["merges"]
+                        bpe_merges = [pair.replace(" ", "") for pair in bpe_merges]
+                        merges = builtins.dict(zip(bpe_merges, range(0, -len(bpe_merges), -1)))
             vocab = tokenizer.get_vocab()
             fo.write(struct.pack('i', len(vocab)))
             for v in vocab.keys():
+                score = merges[v] if v in merges else 1.0
                 if (modelInfo["model_type"] == "moss"):
                     s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
                 elif (modelInfo["model_type"] == "qwen"):
@@ -187,7 +199,7 @@ def tofile(exportPath,
                 for c in s:
                     fo.write(struct.pack('i', c))
                 fo.write(struct.pack('i', vocab[v]))
-                fo.write(struct.pack('f', 1.0))
+                fo.write(struct.pack('f', score))
     else:
         fo.write(struct.pack('i', 0))
 
