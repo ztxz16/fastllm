@@ -1,5 +1,6 @@
 from fastllm_pytools import llm;
 import ctypes;
+import builtins, os, json
 import numpy as np
 import torch
 from transformers import PreTrainedTokenizerFast
@@ -118,20 +119,31 @@ def create(model,
             else:
                 tokenizer = tokenizer.tokenizer
         if (hasattr(tokenizer, "sp_model")):
-            piece_size = tokenizer.sp_model.piece_size();
+            piece_size = tokenizer.sp_model.piece_size()
             for i in range(piece_size):
                 llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, tokenizer.sp_model.id_to_piece(i).encode(),
                                                              i, ctypes.c_float(tokenizer.sp_model.get_score(i)));
         else:
-            vocab = tokenizer.get_vocab();
+            merges = {}
+            if (modelInfo["model_type"] == "moss"):
+                merges = {("".join(bpe_tokens), token_index) for bpe_tokens, token_index in sorted(tokenizer.bpe_ranks.items(), key=lambda kv: kv[1])}
+            elif isinstance(tokenizer, PreTrainedTokenizerFast):
+                tokenizer_file = tokenizer.name_or_path + tokenizer.vocab_files_names['tokenizer_file']
+                if os.path.exists(tokenizer_file):
+                    with open(tokenizer_file, "r", encoding='utf-8') as f:
+                        bpe_merges = json.load(f)["model"]["merges"]
+                        bpe_merges = [pair.replace(" ", "") for pair in bpe_merges]
+                        merges = builtins.dict(zip(bpe_merges, range(0, -len(bpe_merges), -1)))
+            vocab = tokenizer.get_vocab()
             for v in vocab.keys():
+                score = merges[v] if v in merges else 1.0
                 if (modelInfo["model_type"] == "moss"):
-                    vv = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v];
-                    llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, vv, vocab[v], ctypes.c_float(1.0));
+                    s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
+                    llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, s, vocab[v], ctypes.c_float(score));
                 elif (modelInfo["model_type"] == "qwen"):
                     llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, v, vocab[v], ctypes.c_float(1.0));
                 else:
-                    llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, v.encode(), vocab[v], ctypes.c_float(1.0));
+                    llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, v.encode(), vocab[v], ctypes.c_float(score));
 
     weight_type_dict = {}
     module_dict = {}
@@ -157,13 +169,13 @@ def create(model,
         to_data_type = 0
 
         if (cur_weight_type == 1):
-            to_data_type = fastllm_data_type_dict[dtype];
+            to_data_type = fastllm_data_type_dict[dtype]
             if (to_data_type == 7):
-                ori_data_type = 7;
-                ori_np_data_type = np.float16;
+                ori_data_type = 7
+                ori_np_data_type = np.float16
         elif (cur_weight_type == 2):
             # TODO bfloat
-            to_data_type = 0;
+            to_data_type = 0
 
         weight_name = key
         if hasattr(model, "peft_config"):
