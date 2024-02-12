@@ -135,7 +135,7 @@ namespace fastllm {
         int embed_dim = 4096;
         int num_attention_heads = 32;
         int head_dim = embed_dim / num_attention_heads;
-        const int max_positions = 32768;
+        int max_positions = 32768;
         int rotary_dim = 64;
         const float scale_attn = sqrt(head_dim);
         int block_cnt = 28;
