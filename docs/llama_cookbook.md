@@ -128,6 +128,21 @@ python3 tools/internlm2flm.py internlm-7b-int4.flm float16 internlm/internlm-cha
 ```
 XVERSE-13B-Chat V1 版本需要对输入做NFKC规范化，fastllm暂不支持，因此需要使用原始tokenizer. 
 
+* xverse/[XVERSE-13B-256K](https://huggingface.co/xverse/XVERSE-13B-256K)
+
+该模型没有将RoPE外推参数放到config中，因此需要手工指定：
+```python
+    conf = model.config.__dict__
+    conf["model_type"] = "llama"
+    conf["rope_theta"] = 500000
+    conf["rope_scaling.type"] = "dynamic"
+    conf["rope_scaling.factor"] = 2.0
+    conf["tokenizer_add_dummy_prefix"] = False
+    torch2flm.tofile(exportPath, model, tokenizer, pre_prompt = "", 
+                     user_role = "Human: ", bot_role = "\n\nAssistant: ", 
+                     history_sep = "<FLM_FIX_TOKEN_3>", dtype = dtype)
+```
+
 ### 其他 llama1 系列
 
 * Vicuna v1.1 v1.3
@@ -215,4 +230,18 @@ XVERSE-13B-Chat V1 版本需要对输入做NFKC规范化，fastllm暂不支持�
                      pre_prompt="Below is an instruction that describes a task. " \
                                 "Write a response that appropriately completes the request.\n\n",
                      user_role="### Instruction:\n", bot_role="\n\n### Response:", history_sep="\n", dtype=dtype)
+```
+
+### Deepseek Coder
+
+  * [Deepseek-Coder-1.3B-Instruct](https://huggingface.co/deepseek-ai/deepseek-coder-1.3b-instruct)
+  * [Deepseek-Coder-6.7B-Instruct](https://huggingface.co/deepseek-ai/deepseek-coder-6.7b-instruct)
+  * [Deepseek-Coder-7B-Instruct v1.5](https://huggingface.co/deepseek-ai/deepseek-coder-7b-instruct-v1.5)
+
+```python
+    torch2flm.tofile(exportPath, model, tokenizer, 
+                     pre_prompt="<FLM_FIX_TOKEN_32013>	You are an AI programming assistant, utilizing the Deepseek Coder model, developed by Deepseek Company, " \
+                                "and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, " \
+                                "and other non-computer science questions, you will refuse to answer.\n",
+                     user_role="### Instruction:\n", bot_role="\n### Response:\n", history_sep="\n<|EOT|>\n", dtype=dtype)
 ```
