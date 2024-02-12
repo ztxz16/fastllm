@@ -64,6 +64,10 @@ def create(model,
         modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|user|>")) + "> \n");
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|assistant|>")) + ">");
         modelInfo["history_sep"] = "";
+    if "rope_scaling" in modelInfo and isinstance(modelInfo["rope_scaling"], builtins.dict):
+        rope_scaling = modelInfo.pop("rope_scaling")
+        modelInfo["rope_scaling.type"] = rope_scaling["type"]
+        modelInfo["rope_scaling.factor"] = rope_scaling["factor"]
 
     if tokenizer:
         modelInfo["tokenizer_use_score"] = "1" # 分词带分数
