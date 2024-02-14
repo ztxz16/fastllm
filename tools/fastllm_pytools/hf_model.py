@@ -144,6 +144,14 @@ def create(model,
                     llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, v, vocab[v], ctypes.c_float(1.0));
                 else:
                     llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, v.encode(), vocab[v], ctypes.c_float(score));
+        if (len(tokenizer.all_special_tokens) > 0):
+            special_tokens_str = ''.join(tokenizer.all_special_tokens)
+            special_tokens_len = [len(x) for x in tokenizer.all_special_tokens]
+            special_tokens_ids = tokenizer.all_special_ids
+            llm.fastllm_lib.set_special_tokens_llm_model(model_handle, len(special_tokens_len),
+                                                         (ctypes.c_int * len(special_tokens_len))(*special_tokens_len),
+                                                         special_tokens_str.encode(),
+                                                         (ctypes.c_int * len(special_tokens_ids))(*special_tokens_ids));
 
     weight_type_dict = {}
     module_dict = {}
@@ -195,6 +203,7 @@ def create(model,
                                              dict[key].numpy().astype(ori_np_data_type).ctypes.data_as(ctypes.c_void_p));
         tot += 1;
         print("convert (", tot, "/", len(dict), end = " )\r");
+        dict[key].to(torch.device("meta"))
 
     print("");
     llm.fastllm_lib.init_params_llm_model(model_handle);

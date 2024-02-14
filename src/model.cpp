@@ -56,19 +56,19 @@ namespace fastllm {
             std::string value = this->weight.dicts["tokenizer_add_dummy_prefix"];
             transform(value.begin(), value.end(), value.begin(), ::tolower);
             std::istringstream iss(value);
-            iss >> std::boolalpha >> this->weight.tokenizer.add_dummy_prefix;
+            iss >> std::boolalpha >> this->weight.tokenizer.addDummyPrefix;
         }
         if (this->weight.dicts.find("tokenizer_remove_extra_whitespaces") != this->weight.dicts.end()) {
             std::string value = this->weight.dicts["tokenizer_remove_extra_whitespaces"];
             transform(value.begin(), value.end(), value.begin(), ::tolower);
             std::istringstream iss(value);
-            iss >> std::boolalpha >> this->weight.tokenizer.remove_extra_whitespaces;
+            iss >> std::boolalpha >> this->weight.tokenizer.removeExtraWhitespaces;
         }
         if (this->weight.dicts.find("tokenizer_byte_as_char") != this->weight.dicts.end()) {
             std::string value = this->weight.dicts["tokenizer_byte_as_char"];
             transform(value.begin(), value.end(), value.begin(), ::tolower);
             std::istringstream iss(value);
-            iss >> std::boolalpha >> this->weight.tokenizer.byte_as_char;
+            iss >> std::boolalpha >> this->weight.tokenizer.byteAsChar;
         }
 
         this->deviceMap = GetDeviceMap();
