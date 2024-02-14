@@ -55,6 +55,8 @@ fastllm_lib.make_input_llm_model.restype = ctypes.c_char_p
 
 fastllm_lib.add_tokenizer_word_llm_model.argtype = [ctypes.c_int, ctypes.c_char_p, ctypes.c_float, ctypes.c_int]
 
+fastllm_lib.set_special_tokens_llm_model.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+
 fastllm_lib.set_device_map.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 
 def set_cpu_threads(threads: int):

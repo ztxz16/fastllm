@@ -361,11 +361,13 @@ namespace fastllm {
 
         TrieNode *root;
 
+        TrieNode *specialRoot = nullptr;
+
         TokenizerType type = TokenizerType::BPE;
 
-        bool add_dummy_prefix = true;   // 是否在首位添加空格
-        bool remove_extra_whitespaces = true;   // 是否将多个空格合并为一个
-        bool byte_as_char = false;  // 是否将byte变为展示字符
+        bool addDummyPrefix = true;   // 是否在首位添加空格
+        bool removeExtraWhitespaces = true;   // 是否将多个空格合并为一个
+        bool byteAsChar = false;  // 是否将byte变为展示字符
 
         std::unordered_map <int, std::string> tokenToStringDict;
         std::unordered_map <int, float> tokenToScoreDict;
@@ -389,6 +391,8 @@ namespace fastllm {
         int GetRank(std::vector<Symbol> &symbols,  std::vector<std::pair<int, int>> &partitions, int idx, int skip);
 
         void Insert(const std::string &s, int tokenId, float score = 1.0f); // 插入一个token
+
+        void SetSpecialTokens(const std::map <std::string, int> &specialTokens); // 设置需要优先处理的特殊token
 
         std::string Normalize(const std::string &ori); // 字符规范化
 

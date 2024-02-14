@@ -811,10 +811,20 @@ namespace fastllm {
                 q.push_back(it.second);
             }
         }
+        if (specialRoot != nullptr) {
+            q.push_back(specialRoot);
+            for (int i = q.size() - 1; i < q.size(); i++) {
+                TrieNode *now = q[i];
+                for (auto it : now->next) {
+                    q.push_back(it.second);
+                }
+            }
+        }
         for (TrieNode * node : q)
             delete node;
         q.clear();
         root = new TrieNode();
+        specialRoot = nullptr;
         tokenToStringDict.clear();
         tokenToScoreDict.clear();
         stringToTokenDict.clear();
@@ -833,6 +843,23 @@ namespace fastllm {
         tokenToStringDict[tokenId] = s;
         tokenToScoreDict[tokenId] = score;
         stringToTokenDict[s] = tokenId;
+    }
+
+    void Tokenizer::SetSpecialTokens(const std::map<std::string, int>& specialTokens) {
+        if (specialRoot == nullptr)
+            specialRoot = new TrieNode();
+        for (auto &it : specialTokens) {
+            TrieNode *now = this->specialRoot;
+            for (int i = 0; i < it.first.size(); i++) {
+                if (now->next.find(it.first[i]) == now->next.end()) {
+                    now->next[it.first[i]] = new TrieNode();
+                }
+                now = now->next[it.first[i]];
+            }
+            now->tokenId = it.second;
+            now->score = 1.0;
+            tokenToStringDict[it.second] = it.first;
+        }
     }
 
     void Tokenizer::TryMergePairs(std::vector<Symbol> &symbols, int l, int r, std::priority_queue <SymbolPairs> &q) {
@@ -868,7 +895,7 @@ namespace fastllm {
     }
 
     std::string Tokenizer::Normalize(const std::string &ori) {
-        if (this->byte_as_char) {
+        if (this->byteAsChar) {
             std::wstring ws = converter.from_bytes(ori);
             for (int i=0; i < ws.length(); i++) {
                 if (charByteDict.find(ws[i]) != charByteDict.end()) {
@@ -879,13 +906,13 @@ namespace fastllm {
         }
         std::string blank = "";
         blank += 226, blank += 150, blank += 129;
-        std::string s = this->add_dummy_prefix ? blank : "";
+        std::string s = this->addDummyPrefix ? blank : "";
         if (15 < ori.size() && ori.substr(0, 15) == "<FLM_FIX_TOKEN_") {
             s = "";
         }
         for (int i = 0; i < ori.size(); i++) {
             if (ori[i] == ' ') {
-                if (!(this->remove_extra_whitespaces && i > 0 && ori[i - 1] == ' ')) {
+                if (!(this->removeExtraWhitespaces && i > 0 && ori[i - 1] == ' ')) {
                     s += blank;
                 }
             } else {
@@ -911,6 +938,22 @@ namespace fastllm {
                         }
                         symbols.push_back(Symbol(nullptr, (char *) s.data(), i, 0, (int) symbols.size() - 1,
                                                  (int) symbols.size() + 1, now));
+                        continue;
+                    }
+                }
+
+                if (this->specialRoot != nullptr) {
+                    TrieNode *now = this->specialRoot;
+                    int next = i;
+                    for (; next < s.size(); next++) {
+                        if (now->next.find(s[next]) == now->next.end())
+                            break;
+                        now = now->next[s[next]];
+                    }
+                    if (now->tokenId != -999999 && next > i) {
+                        symbols.push_back(Symbol(nullptr, (char *)s.data(), i, 0, (int) symbols.size() - 1,
+                                          (int) symbols.size() + 1, now->tokenId));
+                        i = next - 1;
                         continue;
                     }
                 }
@@ -1258,7 +1301,7 @@ namespace fastllm {
                 ret.replace(pos, blank.length(), " ");
             else break;
         }
-        if (this->byte_as_char) {
+        if (this->byteAsChar) {
             std::wstring wret = converter.from_bytes(ret);
             for (int i=0; i < wret.length(); i++) {
                 if (byteCharDict.find(wret[i]) != byteCharDict.end()) {
