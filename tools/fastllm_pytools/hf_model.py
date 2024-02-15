@@ -67,6 +67,15 @@ def create(model,
 
     if tokenizer:
         modelInfo["tokenizer_use_score"] = "1" # 分词带分数
+        if len(tokenizer.all_special_tokens) > 0:
+            token_set = set()
+            for token in [tokenizer.bos_token, tokenizer.eos_token, tokenizer.unk_token, tokenizer.pad_token]:
+                for prompt in [pre_prompt, user_role, bot_role, history_sep]:
+                    if prompt and str(token) in prompt:
+                        modelInfo["tokenizer_has_special_tokens"] = "1"
+                token_set.add(str(token))
+            if len(tokenizer.all_special_tokens) > len(token_set):
+                modelInfo["tokenizer_has_special_tokens"] = "1"
         if hasattr(tokenizer, "sp_model") or (hasattr(tokenizer, "tokenizer") and hasattr(tokenizer.tokenizer, "sp_model")):
             try:
                 import sentencepiece.sentencepiece_model_pb2 as model_pb2
@@ -144,7 +153,7 @@ def create(model,
                     llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, v, vocab[v], ctypes.c_float(1.0));
                 else:
                     llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, v.encode(), vocab[v], ctypes.c_float(score));
-        if (len(tokenizer.all_special_tokens) > 0):
+        if ("tokenizer_has_special_tokens" in modelInfo):
             special_tokens_str = ''.join(tokenizer.all_special_tokens)
             special_tokens_len = [len(x) for x in tokenizer.all_special_tokens]
             special_tokens_ids = tokenizer.all_special_ids

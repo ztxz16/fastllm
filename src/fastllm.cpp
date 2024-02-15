@@ -845,10 +845,10 @@ namespace fastllm {
         stringToTokenDict[s] = tokenId;
     }
 
-    void Tokenizer::SetSpecialTokens(const std::map<std::string, int>& specialTokens) {
+    void Tokenizer::SetSpecialTokens(const std::map<std::string, int>& specialTokenMap) {
         if (specialRoot == nullptr)
             specialRoot = new TrieNode();
-        for (auto &it : specialTokens) {
+        for (auto &it : specialTokenMap) {
             TrieNode *now = this->specialRoot;
             for (int i = 0; i < it.first.size(); i++) {
                 if (now->next.find(it.first[i]) == now->next.end()) {
@@ -857,8 +857,10 @@ namespace fastllm {
                 now = now->next[it.first[i]];
             }
             now->tokenId = it.second;
-            now->score = 1.0;
+            now->score = 0.0f;
             tokenToStringDict[it.second] = it.first;
+            stringToTokenDict[it.first] = it.second;
+            specialTokens.push_back(it.first);
         }
     }
 
@@ -1384,12 +1386,12 @@ namespace fastllm {
     }
 
     void WeightMap::LoadFromFile(const std::string &fileName) {
-    #ifdef USE_MMAP
+#ifdef USE_MMAP
         std::shared_ptr<FileMmap> mapped_file = std::make_shared<FileMmap>(fileName);
         ModelLoader buffer((char *)mapped_file->data, mapped_file->size);
-    #else
+#else
         FileBuffer buffer(fileName);
-    #endif
+#endif
         this->versionId = buffer.ReadInt();
 
         if (this->versionId >= 1) {
@@ -1419,7 +1421,8 @@ namespace fastllm {
             }
         }
 
-        bool useScore = this->dicts["tokenizer_use_score"] == "1";
+        bool useScore = this->dicts.find("tokenizer_use_score") != this->dicts.end()
+                && this->dicts["tokenizer_use_score"] == "1";
         int vocabLen = buffer.ReadInt();
         for (int i = 0; i < vocabLen; i++) {
             int len = buffer.ReadInt();
@@ -1430,6 +1433,18 @@ namespace fastllm {
             int id = buffer.ReadInt();
             float score = useScore ? buffer.ReadFloat() : -i;
             tokenizer.Insert(x, id, score);
+        }
+        bool hasSpecialTokens = this->dicts.find("tokenizer_has_special_tokens") != this->dicts.end()
+                && this->dicts["tokenizer_has_special_tokens"] == "1";
+        if (hasSpecialTokens) {
+            std::map <std::string, int> specialTokens;
+            int specialTokenLen = buffer.ReadInt();
+            for (int i = 0; i < specialTokenLen; i++) {
+                std::string token = buffer.ReadString();
+                int id = tokenizer.stringToTokenDict[token];
+                specialTokens[token] = id;
+            }
+            tokenizer.SetSpecialTokens(specialTokens);
         }
 
         int len = buffer.ReadInt();
@@ -1448,10 +1463,10 @@ namespace fastllm {
             weight[name] = Data(dataType, dims);
 
             if (lowMemMode && this->embeddingNames.find(name) != this->embeddingNames.end()) {
-	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
-	            	weight[name].fileName = fileName;
+                if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
+                    weight[name].fileName = fileName;
 #if defined(_WIN32) or defined(_WIN64)
-	            	weight[name].filePos = _ftelli64(buffer.f);
+                    weight[name].filePos = _ftelli64(buffer.f);
 #else
 #ifdef USE_MMAP
                     weight[name].filePos =  buffer.tell();
@@ -1462,44 +1477,44 @@ namespace fastllm {
 #ifdef USE_MMAP
                     buffer.seek(weight[name].GetBytes(), SEEK_CUR);
 #else
-	            	fseek(buffer.f, weight[name].GetBytes(), SEEK_CUR);
+                    fseek(buffer.f, weight[name].GetBytes(), SEEK_CUR);
 #endif
-	            } else {
-	            	ErrorInFastLLM("Error: embedding's type should be float32 or bfloat16.\n");
-	            }
+                } else {
+                    ErrorInFastLLM("Error: embedding's type should be float32 or bfloat16.\n");
+                }
             } else {
 #ifdef USE_MMAP
                 weight[name].SetMapFile(mapped_file);
                 weight[name].expansionBytes = (weight[name].Count(0) * weight[name].unitSize - 1) / weight[name].unitSizeDiv + 1;
 #else
-	            weight[name].Allocate();
+                weight[name].Allocate();
 #endif
-	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
+                if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
 #ifdef USE_MMAP
                     weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
 #else
                     buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
 #endif
-	            } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
-		            int bit = (dataType == DataType::INT4 ? 4 : 8);
-		            weight[name].perChannelAxis = buffer.ReadInt();
-		            int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
-		            weight[name].perChannelsConfigs.resize(k);
-		            weight[name].zeros.resize(k);
-		            weight[name].scales.resize(k);
-		            for (int i = 0; i < k; i++) {
-			            float minValue = buffer.ReadFloat();
-			            float maxValue = buffer.ReadFloat();
-			            weight[name].perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit, 0);
-			            weight[name].zeros[i] = weight[name].perChannelsConfigs[i].zeroPoint;
-			            weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
-		            }
+                } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
+                    int bit = (dataType == DataType::INT4 ? 4 : 8);
+                    weight[name].perChannelAxis = buffer.ReadInt();
+                    int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
+                    weight[name].perChannelsConfigs.resize(k);
+                    weight[name].zeros.resize(k);
+                    weight[name].scales.resize(k);
+                    for (int i = 0; i < k; i++) {
+                        float minValue = buffer.ReadFloat();
+                        float maxValue = buffer.ReadFloat();
+                        weight[name].perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit, 0);
+                        weight[name].zeros[i] = weight[name].perChannelsConfigs[i].zeroPoint;
+                        weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
+                    }
 #ifdef USE_MMAP
                     weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
 #else
                     buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
 #endif
-	            } else if (dataType == DataType::INT4_NOZERO) {
+                } else if (dataType == DataType::INT4_NOZERO) {
                     int bit = 4;
                     weight[name].perChannelAxis = buffer.ReadInt();
                     int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
@@ -1513,11 +1528,11 @@ namespace fastllm {
                         weight[name].mins[i] = weight[name].perChannelsConfigs[i].min;
                         weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
                     }
-#ifdef USE_MMAP
+    #ifdef USE_MMAP
                     weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
-#else
+    #else
                     buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
-#endif
+    #endif
                 }
             }
 
@@ -1573,7 +1588,8 @@ namespace fastllm {
         }
 
         // 写入词表
-        bool useScore = this->dicts["tokenizer_use_score"] == "1";
+        bool useScore = this->dicts.find("tokenizer_use_score") != this->dicts.end()
+                && this->dicts["tokenizer_use_score"] == "1";
         buffer.WriteInt((int)tokenizer.tokenToStringDict.size());
         for (auto &it : tokenizer.tokenToStringDict) {
             buffer.WriteInt((int)it.second.size());
@@ -1583,6 +1599,15 @@ namespace fastllm {
             buffer.WriteInt(it.first);
             if (useScore) {
                 buffer.WriteFloat(tokenizer.tokenToScoreDict[it.first]);
+            }
+        }
+        bool hasSpecialTokens = this->dicts.find("tokenizer_has_special_tokens") != this->dicts.end()
+                && this->dicts["tokenizer_has_special_tokens"] == "1";
+        if (hasSpecialTokens) {
+            int specialTokenLen = tokenizer.specialTokens.size();
+            buffer.WriteInt(specialTokenLen);
+            for (int i = 0; i < specialTokenLen; i++) {
+                buffer.WriteString(tokenizer.specialTokens[i]);
             }
         }
 
