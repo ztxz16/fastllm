@@ -372,6 +372,7 @@ namespace fastllm {
         std::unordered_map <int, std::string> tokenToStringDict;
         std::unordered_map <int, float> tokenToScoreDict;
         std::unordered_map <std::string, int> stringToTokenDict;
+        std::vector <std::string> specialTokens;
 
         std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
         std::unordered_map <wchar_t, wchar_t> byteCharDict;
