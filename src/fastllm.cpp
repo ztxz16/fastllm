@@ -898,11 +898,13 @@ namespace fastllm {
 
     std::string Tokenizer::Normalize(const std::string &ori) {
         if (this->byteAsChar) {
-            std::wstring ws = converter.from_bytes(ori);
-            for (int i=0; i < ws.length(); i++) {
-                if (charByteDict.find(ws[i]) != charByteDict.end()) {
-                    ws[i] = charByteDict[ws[i]];
+            std::wstring ws(ori.size(), L' ');
+            for (int i=0; i < ori.length(); i++) {
+                wchar_t wi = static_cast<wchar_t>(static_cast<unsigned char>(ori[i]));
+                if (charByteDict.find(wi) != charByteDict.end()) {
+                    wi = charByteDict[wi];
                 }
+                ws[i] = wi;
             }
             return converter.to_bytes(ws);
         }
@@ -1305,12 +1307,14 @@ namespace fastllm {
         }
         if (this->byteAsChar) {
             std::wstring wret = converter.from_bytes(ret);
+            std::string decoded(wret.size(), ' ');
             for (int i=0; i < wret.length(); i++) {
                 if (byteCharDict.find(wret[i]) != byteCharDict.end()) {
                     wret[i] = byteCharDict[wret[i]];
                 }
+                decoded[i] = static_cast<char>(wret[i]);
             }
-            ret = converter.to_bytes(wret);
+            ret = decoded;
         }
         int pos = ret.find("<|blank_");
         if (pos != -1) {
