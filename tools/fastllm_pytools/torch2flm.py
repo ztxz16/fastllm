@@ -116,6 +116,8 @@ def tofile(exportPath,
         if modelInfo["chat_format"] == "chatml":
             modelInfo["im_end_id"] = tokenizer.im_end_id
             modelInfo["im_start_id"] = tokenizer.im_start_id
+    elif (modelInfo["model_type"] == "qwen2"):
+        modelInfo["eos_token_id"] = "151645"
     if (modelInfo["model_type"] == "chatglm" and hasattr(tokenizer, "build_chat_input")):
         # chatglm3
         modelInfo["pre_prompt"] = "";
