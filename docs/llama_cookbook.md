@@ -169,6 +169,11 @@ XVERSE-13B-Chat V1 版本需要对输入做NFKC规范化，fastllm暂不支持�
 |  7B | [meta-llama/Llama-2-7b-chat](https://huggingface.co/meta-llama/Llama-2-7b-chat) | [meta-llama/Llama-2-7b-chat-hf](https://huggingface.co/meta-llama/Llama-2-7b-chat-hf) |
 | 13B | [meta-llama/Llama-2-13b-chat](https://huggingface.co/meta-llama/Llama-2-13b-chat) | [meta-llama/Llama-2-13b-chat-hf](https://huggingface.co/meta-llama/Llama-2-13b-chat-hf) |
 
+|Model|  CodeLlama-Instruct                                                                               |
+|-----| ------------------------------------------------------------------------------------------------- |
+|  7B |  [codellama/CodeLlama-7b-Instruct-hf](https://huggingface.co/codellama/CodeLlama-7b-Instruct-hf)  |
+| 13B | [codellama/CodeLlama-13b-Instruct-hf](https://huggingface.co/codellama/CodeLlama-13b-Instruct-hf) |
+
 官方示例代码中，可以不用系统提示语：
 
 ```python
