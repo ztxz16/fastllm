@@ -10,7 +10,7 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(modelNameOrPath, trust_remote_code=True, torch_dtype=torch.float16)
     model = model.eval()
     dtype = sys.argv[2] if len(sys.argv) >= 3 else "float16"
-    exportPath = sys.argv[1] if len(sys.argv) >= 2 else "internlm-7b-' + dtype + '.flm"
+    exportPath = sys.argv[1] if len(sys.argv) >= 2 else "internlm-7b-" + dtype + ".flm"
     torch2flm.tofile(exportPath, model, tokenizer, pre_prompt = "<s><s>", 
                      user_role = "<|User|>:", bot_role = "<eoh>\n<|Bot|>:", 
                      history_sep = "<eoa>\n<s>", dtype = dtype)
