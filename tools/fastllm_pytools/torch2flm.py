@@ -1,6 +1,9 @@
 import struct
+import builtins, os, json
 import numpy as np
 import torch
+from transformers import PreTrainedTokenizerFast
+from tokenizers.decoders import ByteLevel
 
 def writeString(fo, s):
     fo.write(struct.pack('i', len(s)))
@@ -18,7 +21,8 @@ fastllm_data_type_dict = {
 }
 fastllm_weight_type_dict = {
     "linear": 1,
-    "embedding": 2
+    "embedding": 2,
+    "QuantizedLinear": 111
 }
 
 v = np.random.randint(-127, 127, [10, 20]);
@@ -73,12 +77,6 @@ def tofile(exportPath,
         print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
         exit(0)
 
-    dict = model.state_dict()
-    fo = open(exportPath, "wb")
-
-    # 0. version id
-    fo.write(struct.pack('i', 2))
-
     # 0.1 model info
     modelInfo = model.config.__dict__
     if model.generation_config is not None:
@@ -86,6 +84,11 @@ def tofile(exportPath,
     if ("model_type" not in modelInfo):
         print("unknown model_type.")
         exit(0)
+
+    fo = open(exportPath, "wb")
+
+    # 0. version id
+    fo.write(struct.pack('i', 2))
 
     if (pre_prompt is not None):
         modelInfo["pre_prompt"] = pre_prompt
@@ -108,7 +111,7 @@ def tofile(exportPath,
             modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.user_token_id) + "> ") if hasattr(model.generation_config, "user_token_id") else "";
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(model.generation_config.assistant_token_id) + ">") if hasattr(model.generation_config, "assistant_token_id") else "";
         modelInfo["history_sep"] = ""
-    if modelInfo["model_type"] == "qwen":
+    if (modelInfo["model_type"] == "qwen"):
         if modelInfo["chat_format"] == "chatml":
             modelInfo["im_end_id"] = tokenizer.im_end_id
             modelInfo["im_start_id"] = tokenizer.im_start_id
@@ -119,7 +122,31 @@ def tofile(exportPath,
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|assistant|>")) + ">");
         modelInfo["history_sep"] = "";
 
-    modelInfo["tokenizer_use_score"] = "1" # 分词带分数
+    if tokenizer:
+        modelInfo["tokenizer_use_score"] = "1" # 分词带分数
+        if len(tokenizer.all_special_tokens) > 0:
+            token_set = set()
+            for token in [tokenizer.bos_token, tokenizer.eos_token, tokenizer.unk_token, tokenizer.pad_token]:
+                for prompt in [pre_prompt, user_role, bot_role, history_sep]:
+                    if prompt and str(token) in prompt:
+                        modelInfo["tokenizer_has_special_tokens"] = "1"
+                token_set.add(str(token))
+            if len(tokenizer.all_special_tokens) > len(token_set):
+                modelInfo["tokenizer_has_special_tokens"] = "1"
+        if hasattr(tokenizer, "sp_model") or (hasattr(tokenizer, "tokenizer") and hasattr(tokenizer.tokenizer, "sp_model")):
+            try:
+                import sentencepiece.sentencepiece_model_pb2 as model_pb2
+                with open(tokenizer.vocab_file, "rb") as f:
+                    sp_model_data = f.read()
+                    sp_model_proto = model_pb2.ModelProto.FromString(sp_model_data)
+                    modelInfo["tokenizer_add_dummy_prefix"] = sp_model_proto.normalizer_spec.add_dummy_prefix
+                    modelInfo["tokenizer_remove_extra_whitespaces"] = sp_model_proto.normalizer_spec.remove_extra_whitespaces
+            except:
+                pass
+        elif isinstance(tokenizer, PreTrainedTokenizerFast):
+            if hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer._tokenizer, "decoder") \
+                    and isinstance(tokenizer._tokenizer.decoder, ByteLevel):
+                modelInfo["tokenizer_byte_as_char"] = True
 
     if hasattr(model, "peft_config"):
         adapter_size = len(model.peft_config)
@@ -137,10 +164,12 @@ def tofile(exportPath,
             for it in adapter_dict.keys():
                 writeKeyValue(fo, str(it), str(adapter_dict[it]))
 
+    dict = model.state_dict()
+
     # 1. vocab
     if (tokenizer):
         if (hasattr(tokenizer, "tokenizer")):
-            if (modelInfo['model_type'] == "qwen"):
+            if modelInfo["model_type"] == "qwen":
                 pass
             else:
                 tokenizer = tokenizer.tokenizer
@@ -155,20 +184,36 @@ def tofile(exportPath,
                 fo.write(struct.pack('i', i))
                 fo.write(struct.pack('f', float(tokenizer.sp_model.get_score(i))))
         else:
+            merges = {}
+            if (modelInfo["model_type"] == "moss"):
+                merges = {("".join(bpe_tokens), token_index) for bpe_tokens, token_index in sorted(tokenizer.bpe_ranks.items(), key=lambda kv: kv[1])}
+            elif isinstance(tokenizer, PreTrainedTokenizerFast):
+                tokenizer_file = tokenizer.name_or_path + tokenizer.vocab_files_names['tokenizer_file']
+                if os.path.exists(tokenizer_file):
+                    with open(tokenizer_file, "r", encoding='utf-8') as f:
+                        bpe_merges = json.load(f)["model"]["merges"]
+                        bpe_merges = [pair.replace(" ", "") for pair in bpe_merges]
+                        merges = builtins.dict(zip(bpe_merges, range(0, -len(bpe_merges), -1)))
             vocab = tokenizer.get_vocab()
             fo.write(struct.pack('i', len(vocab)))
             for v in vocab.keys():
-                if (modelInfo['model_type'] == "qwen"):
-                    s = v
-                elif (modelInfo["model_type"] == "moss"):
+                score = merges[v] if v in merges else 1.0
+                if (modelInfo["model_type"] == "moss"):
                     s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
+                elif (modelInfo["model_type"] == "qwen"):
+                    s = v
                 else:
                     s = v.encode()
                 fo.write(struct.pack('i', len(s)))
                 for c in s:
                     fo.write(struct.pack('i', c))
                 fo.write(struct.pack('i', vocab[v]))
-                fo.write(struct.pack('f', 1.0))
+                fo.write(struct.pack('f', score))
+        if ("tokenizer_has_special_tokens" in modelInfo):
+            fo.write(struct.pack('i', len(tokenizer.all_special_tokens)))
+            for special_token in tokenizer.all_special_tokens:
+                fo.write(struct.pack('i', len(special_token)))
+                fo.write(special_token.encode())
     else:
         fo.write(struct.pack('i', 0))
 
@@ -191,6 +236,7 @@ def tofile(exportPath,
         if (key in weight_type_dict and weight_type_dict[key] in fastllm_weight_type_dict):
             cur_weight_type = fastllm_weight_type_dict[weight_type_dict[key]]
         to_data_type = 0
+
         if (cur_weight_type == 1):
             to_data_type = fastllm_data_type_dict[dtype]
             if (to_data_type == 7):
@@ -199,13 +245,11 @@ def tofile(exportPath,
 
         cur = dict[key].numpy().astype(ori_np_data_type)
         
+        weight_name = key
         if hasattr(model, "peft_config"):
-            weight_name = key.replace('base_model.model.', '')
-            fo.write(struct.pack('i', len(weight_name)))
-            fo.write(weight_name.encode())
-        else:
-            fo.write(struct.pack('i', len(key)))
-            fo.write(key.encode())
+            weight_name = weight_name.replace('base_model.model.', '')
+        fo.write(struct.pack('i', len(weight_name)))
+        fo.write(weight_name.encode())
         fo.write(struct.pack('i', len(cur.shape)))
         for i in cur.shape:
             fo.write(struct.pack('i', i))

@@ -117,6 +117,21 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT void set_special_tokens_llm_model(int modelId, int token_cnt, int *lens, char *tokens, int *ids) {
+        std::map <std::string, int> tokenMap;
+        int cur = 0;
+        for (int i = 0; i < token_cnt; i++) {
+            std::string key = "";
+            for (int j = 0; j < lens[i]; j++) {
+                key += tokens[cur++];
+            }
+            tokenMap[key] = ids[i];
+        }
+        auto model = models.GetModel(modelId);
+        model->weight.tokenizer.SetSpecialTokens(tokenMap);
+        return;
+    }
+
     DLL_EXPORT int token_decode(int modelId, int tokenId, int output_buffer_len, char *output_buffer) {
         // 正常时候返回0，输出buffer长度不足时返回输出的bytes数量，包含末尾的\0
         if(tokenId == -1) {
