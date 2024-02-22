@@ -783,6 +783,18 @@ namespace fastllm {
 
     Tokenizer::Tokenizer() {
         root = new TrieNode();
+        int n = 0;
+        wchar_t special_token = L'\x0';
+        for (; special_token < L'!'; special_token++, n++) {
+            byteCharDict[L'\x100' + n] = special_token;
+            charByteDict[special_token] = L'\x100' + n;
+        }
+        for (special_token = L'\x7F'; special_token < L'\xA1'; special_token++, n++) {
+            byteCharDict[L'\x100' + n] = special_token;
+            charByteDict[special_token] = L'\x100' + n;
+        }
+        byteCharDict[L'\x100' + n++] = L'\xAD';
+        charByteDict[L'\xAD'] = L'\x100' + n++;
     }
 
     Tokenizer::~Tokenizer() {
@@ -799,8 +811,23 @@ namespace fastllm {
                 q.push_back(it.second);
             }
         }
+        if (specialRoot != nullptr) {
+            q.push_back(specialRoot);
+            for (int i = q.size() - 1; i < q.size(); i++) {
+                TrieNode *now = q[i];
+                for (auto it : now->next) {
+                    q.push_back(it.second);
+                }
+            }
+        }
+        for (TrieNode * node : q)
+            delete node;
+        q.clear();
         root = new TrieNode();
+        specialRoot = nullptr;
         tokenToStringDict.clear();
+        tokenToScoreDict.clear();
+        stringToTokenDict.clear();
     }
 
     void Tokenizer::Insert(const std::string &s, int tokenId, float score) {
@@ -816,6 +843,25 @@ namespace fastllm {
         tokenToStringDict[tokenId] = s;
         tokenToScoreDict[tokenId] = score;
         stringToTokenDict[s] = tokenId;
+    }
+
+    void Tokenizer::SetSpecialTokens(const std::map<std::string, int>& specialTokenMap) {
+        if (specialRoot == nullptr)
+            specialRoot = new TrieNode();
+        for (auto &it : specialTokenMap) {
+            TrieNode *now = this->specialRoot;
+            for (int i = 0; i < it.first.size(); i++) {
+                if (now->next.find(it.first[i]) == now->next.end()) {
+                    now->next[it.first[i]] = new TrieNode();
+                }
+                now = now->next[it.first[i]];
+            }
+            now->tokenId = it.second;
+            now->score = 0.0f;
+            tokenToStringDict[it.second] = it.first;
+            stringToTokenDict[it.first] = it.second;
+            specialTokens.push_back(it.first);
+        }
     }
 
     void Tokenizer::TryMergePairs(std::vector<Symbol> &symbols, int l, int r, std::priority_queue <SymbolPairs> &q) {
@@ -850,24 +896,39 @@ namespace fastllm {
         return std::numeric_limits<int>::max();
     }
 
+    std::string Tokenizer::Normalize(const std::string &ori) {
+        if (this->byteAsChar) {
+            std::wstring ws(ori.size(), L' ');
+            for (int i=0; i < ori.length(); i++) {
+                wchar_t wi = static_cast<wchar_t>(static_cast<unsigned char>(ori[i]));
+                if (charByteDict.find(wi) != charByteDict.end()) {
+                    wi = charByteDict[wi];
+                }
+                ws[i] = wi;
+            }
+            return converter.to_bytes(ws);
+        }
+        std::string blank = "";
+        blank += 226, blank += 150, blank += 129;
+        std::string s = this->addDummyPrefix ? blank : "";
+        if (15 < ori.size() && ori.substr(0, 15) == "<FLM_FIX_TOKEN_") {
+            s = "";
+        }
+        for (int i = 0; i < ori.size(); i++) {
+            if (ori[i] == ' ') {
+                if (!(this->removeExtraWhitespaces && i > 0 && ori[i - 1] == ' ')) {
+                    s += blank;
+                }
+            } else {
+                s += ori[i];
+            }
+        }
+        return s;
+    }
+
     Data Tokenizer::Encode(const std::string &ori) {
         if (this->type == TokenizerType::BPE) {
-            std::string blank = "";
-            blank += 226, blank += 150, blank += 129;
-            std::string s = blank;
-            if (15 < ori.size() && ori.substr(0, 15) == "<FLM_FIX_TOKEN_") {
-                s = "";
-            }
-            for (int i = 0; i < ori.size(); i++) {
-                if (ori[i] == ' ') {
-                    // if (i != 0 && ori[i - 1] != ' ') {
-                        // s += blank;
-                    // }
-                    s += blank;
-                } else {
-                    s += ori[i];
-                }
-            }
+            std::string s = Normalize(ori);
 
             std::vector<Symbol> symbols;
             for (int i = 0; i < s.size(); i++) {
@@ -881,6 +942,22 @@ namespace fastllm {
                         }
                         symbols.push_back(Symbol(nullptr, (char *) s.data(), i, 0, (int) symbols.size() - 1,
                                                  (int) symbols.size() + 1, now));
+                        continue;
+                    }
+                }
+
+                if (this->specialRoot != nullptr) {
+                    TrieNode *now = this->specialRoot;
+                    int next = i;
+                    for (; next < s.size(); next++) {
+                        if (now->next.find(s[next]) == now->next.end())
+                            break;
+                        now = now->next[s[next]];
+                    }
+                    if (now->tokenId != -999999 && next > i) {
+                        symbols.push_back(Symbol(nullptr, (char *)s.data(), i, 0, (int) symbols.size() - 1,
+                                          (int) symbols.size() + 1, now->tokenId));
+                        i = next - 1;
                         continue;
                     }
                 }
@@ -956,52 +1033,41 @@ namespace fastllm {
                     }
                 }
             }
-            return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
+            return Data(DataType::FLOAT32, {1, (int)v.size()}, v);
         } else if (this->type == TokenizerType::GLM) {
             const std::map<std::string, int> specialTokens = {{"[MASK]", 50003}, {"[sMASK]", 50008}, {"[gMASK]", 50009}};
-            std::string blank = "";
-            blank += 226, blank += 150, blank += 129;
-            std::string s = blank;
-            for (int i = 0; i < ori.size(); i++) {
-                if (ori[i] == ' ') {
-                    if (i != 0 && ori[i - 1] != ' ') {
-                        s += blank;
-                    }
-                } else {
-                    s += ori[i];
-                }
-            }
+            std::string s = Normalize(ori);
             std::vector<float> v;
-            int findPos=0;
-            while(findPos<s.length()){
-                int nextSpecialToken=-1;
-                int nextSpecialTokenPos=-1;
-                int nextSpecialTokenLen=-1;
-                for(auto p:specialTokens){
-                    int ind=s.find(p.first,findPos);
-                    if(ind>=0&&(nextSpecialTokenPos<0||ind<nextSpecialTokenPos)){
-                        nextSpecialTokenPos=ind;
-                        nextSpecialToken=p.second;
-                        nextSpecialTokenLen=p.first.length();
+            int findPos = 0;
+            while (findPos < s.length()) {
+                int nextSpecialToken = -1;
+                int nextSpecialTokenPos = -1;
+                int nextSpecialTokenLen = -1;
+                for (auto p : specialTokens) {
+                    int ind = s.find(p.first, findPos);
+                    if (ind >= 0 && (nextSpecialTokenPos < 0 || ind < nextSpecialTokenPos)) {
+                        nextSpecialTokenPos = ind;
+                        nextSpecialToken = p.second;
+                        nextSpecialTokenLen = p.first.length();
                     }
                 }
                 std::string subStr;
-                if(nextSpecialTokenPos<0){
-                    subStr=s.substr(findPos);
-                    findPos=s.length();
-                }else{
-                    subStr=s.substr(findPos,nextSpecialTokenPos-findPos);
-                    findPos=nextSpecialTokenPos+nextSpecialTokenLen;
+                if (nextSpecialTokenPos < 0) {
+                    subStr = s.substr(findPos);
+                    findPos = s.length();
+                } else {
+                    subStr = s.substr(findPos, nextSpecialTokenPos - findPos);
+                    findPos = nextSpecialTokenPos + nextSpecialTokenLen;
                 }
-                if(subStr.length()>0){
+                if (subStr.length() > 0) {
 #ifdef USE_SENTENCEPIECE
-                    if(spProcessor!=nullptr){
+                    if (spProcessor!=nullptr) {
                         std::vector<int> ids;
-                        spProcessor->Encode(subStr,&ids);
-                        for(int id:ids){
+                        spProcessor->Encode(subStr, &ids);
+                        fo r(int id : ids) {
                             v.push_back(id);
                         }
-                    }else{
+                    } else {
 #endif
                     std::vector<Symbol> symbols;
                     for (int i = 0; i < subStr.size(); i++) {
@@ -1078,7 +1144,7 @@ namespace fastllm {
                     }
 #endif
                 }
-                if(nextSpecialTokenPos>=0){
+                if (nextSpecialTokenPos >= 0) {
                     v.push_back(nextSpecialToken);
                 }
             }
@@ -1239,6 +1305,17 @@ namespace fastllm {
                 ret.replace(pos, blank.length(), " ");
             else break;
         }
+        if (this->byteAsChar) {
+            std::wstring wret = converter.from_bytes(ret);
+            std::string decoded(wret.size(), ' ');
+            for (int i=0; i < wret.length(); i++) {
+                if (byteCharDict.find(wret[i]) != byteCharDict.end()) {
+                    wret[i] = byteCharDict[wret[i]];
+                }
+                decoded[i] = static_cast<char>(wret[i]);
+            }
+            ret = decoded;
+        }
         int pos = ret.find("<|blank_");
         if (pos != -1) {
             int space_num = atoi(ret.substr(8, ret.size() - 10).c_str());
@@ -1313,12 +1390,12 @@ namespace fastllm {
     }
 
     void WeightMap::LoadFromFile(const std::string &fileName) {
-    #ifdef USE_MMAP
+#ifdef USE_MMAP
         std::shared_ptr<FileMmap> mapped_file = std::make_shared<FileMmap>(fileName);
         ModelLoader buffer((char *)mapped_file->data, mapped_file->size);
-    #else
+#else
         FileBuffer buffer(fileName);
-    #endif
+#endif
         this->versionId = buffer.ReadInt();
 
         if (this->versionId >= 1) {
@@ -1348,7 +1425,8 @@ namespace fastllm {
             }
         }
 
-        bool useScore = this->dicts["tokenizer_use_score"] == "1";
+        bool useScore = this->dicts.find("tokenizer_use_score") != this->dicts.end()
+                && this->dicts["tokenizer_use_score"] == "1";
         int vocabLen = buffer.ReadInt();
         for (int i = 0; i < vocabLen; i++) {
             int len = buffer.ReadInt();
@@ -1359,6 +1437,18 @@ namespace fastllm {
             int id = buffer.ReadInt();
             float score = useScore ? buffer.ReadFloat() : -i;
             tokenizer.Insert(x, id, score);
+        }
+        bool hasSpecialTokens = this->dicts.find("tokenizer_has_special_tokens") != this->dicts.end()
+                && this->dicts["tokenizer_has_special_tokens"] == "1";
+        if (hasSpecialTokens) {
+            std::map <std::string, int> specialTokens;
+            int specialTokenLen = buffer.ReadInt();
+            for (int i = 0; i < specialTokenLen; i++) {
+                std::string token = buffer.ReadString();
+                int id = tokenizer.stringToTokenDict[token];
+                specialTokens[token] = id;
+            }
+            tokenizer.SetSpecialTokens(specialTokens);
         }
 
         int len = buffer.ReadInt();
@@ -1377,10 +1467,10 @@ namespace fastllm {
             weight[name] = Data(dataType, dims);
 
             if (lowMemMode && this->embeddingNames.find(name) != this->embeddingNames.end()) {
-	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
-	            	weight[name].fileName = fileName;
+                if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
+                    weight[name].fileName = fileName;
 #if defined(_WIN32) or defined(_WIN64)
-	            	weight[name].filePos = _ftelli64(buffer.f);
+                    weight[name].filePos = _ftelli64(buffer.f);
 #else
 #ifdef USE_MMAP
                     weight[name].filePos =  buffer.tell();
@@ -1391,44 +1481,44 @@ namespace fastllm {
 #ifdef USE_MMAP
                     buffer.seek(weight[name].GetBytes(), SEEK_CUR);
 #else
-	            	fseek(buffer.f, weight[name].GetBytes(), SEEK_CUR);
+                    fseek(buffer.f, weight[name].GetBytes(), SEEK_CUR);
 #endif
-	            } else {
-	            	ErrorInFastLLM("Error: embedding's type should be float32 or bfloat16.\n");
-	            }
+                } else {
+                    ErrorInFastLLM("Error: embedding's type should be float32 or bfloat16.\n");
+                }
             } else {
 #ifdef USE_MMAP
                 weight[name].SetMapFile(mapped_file);
                 weight[name].expansionBytes = (weight[name].Count(0) * weight[name].unitSize - 1) / weight[name].unitSizeDiv + 1;
 #else
-	            weight[name].Allocate();
+                weight[name].Allocate();
 #endif
-	            if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
+                if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
 #ifdef USE_MMAP
                     weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
 #else
                     buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
 #endif
-	            } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
-		            int bit = (dataType == DataType::INT4 ? 4 : 8);
-		            weight[name].perChannelAxis = buffer.ReadInt();
-		            int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
-		            weight[name].perChannelsConfigs.resize(k);
-		            weight[name].zeros.resize(k);
-		            weight[name].scales.resize(k);
-		            for (int i = 0; i < k; i++) {
-			            float minValue = buffer.ReadFloat();
-			            float maxValue = buffer.ReadFloat();
-			            weight[name].perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit, 0);
-			            weight[name].zeros[i] = weight[name].perChannelsConfigs[i].zeroPoint;
-			            weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
-		            }
+                } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
+                    int bit = (dataType == DataType::INT4 ? 4 : 8);
+                    weight[name].perChannelAxis = buffer.ReadInt();
+                    int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
+                    weight[name].perChannelsConfigs.resize(k);
+                    weight[name].zeros.resize(k);
+                    weight[name].scales.resize(k);
+                    for (int i = 0; i < k; i++) {
+                        float minValue = buffer.ReadFloat();
+                        float maxValue = buffer.ReadFloat();
+                        weight[name].perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit, 0);
+                        weight[name].zeros[i] = weight[name].perChannelsConfigs[i].zeroPoint;
+                        weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
+                    }
 #ifdef USE_MMAP
                     weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
 #else
                     buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
 #endif
-	            } else if (dataType == DataType::INT4_NOZERO) {
+                } else if (dataType == DataType::INT4_NOZERO) {
                     int bit = 4;
                     weight[name].perChannelAxis = buffer.ReadInt();
                     int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
@@ -1442,11 +1532,11 @@ namespace fastllm {
                         weight[name].mins[i] = weight[name].perChannelsConfigs[i].min;
                         weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
                     }
-#ifdef USE_MMAP
+    #ifdef USE_MMAP
                     weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
-#else
+    #else
                     buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
-#endif
+    #endif
                 }
             }
 
@@ -1502,7 +1592,8 @@ namespace fastllm {
         }
 
         // 写入词表
-        bool useScore = this->dicts["tokenizer_use_score"] == "1";
+        bool useScore = this->dicts.find("tokenizer_use_score") != this->dicts.end()
+                && this->dicts["tokenizer_use_score"] == "1";
         buffer.WriteInt((int)tokenizer.tokenToStringDict.size());
         for (auto &it : tokenizer.tokenToStringDict) {
             buffer.WriteInt((int)it.second.size());
@@ -1512,6 +1603,15 @@ namespace fastllm {
             buffer.WriteInt(it.first);
             if (useScore) {
                 buffer.WriteFloat(tokenizer.tokenToScoreDict[it.first]);
+            }
+        }
+        bool hasSpecialTokens = this->dicts.find("tokenizer_has_special_tokens") != this->dicts.end()
+                && this->dicts["tokenizer_has_special_tokens"] == "1";
+        if (hasSpecialTokens) {
+            int specialTokenLen = tokenizer.specialTokens.size();
+            buffer.WriteInt(specialTokenLen);
+            for (int i = 0; i < specialTokenLen; i++) {
+                buffer.WriteString(tokenizer.specialTokens[i]);
             }
         }
 

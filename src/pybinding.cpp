@@ -260,6 +260,9 @@ PYBIND11_MODULE(pyfastllm, m) {
 
 
   py::class_<fastllm::Tokenizer>(m, "Tokenizer")
+    .def_readonly("add_dummy_prefix", &fastllm::Tokenizer::addDummyPrefix)
+    .def_readonly("remove_extra_whitespaces", &fastllm::Tokenizer::removeExtraWhitespaces)
+    .def_readonly("byte_as_char", &fastllm::Tokenizer::byteAsChar)
     .def("encode", &fastllm::Tokenizer::Encode)
     // .def("decode", &fastllm::Tokenizer::Decode)
     .def("decode", &fastllm::Tokenizer::Decode, "Decode from Tensor")
@@ -273,7 +276,8 @@ PYBIND11_MODULE(pyfastllm, m) {
       return py::bytes(ret);
     })
     .def("clear", &fastllm::Tokenizer::Clear)
-    .def("insert", &fastllm::Tokenizer::Insert);
+    .def("insert", &fastllm::Tokenizer::Insert)
+    .def("set_special_tokens", &fastllm::Tokenizer::SetSpecialTokens);
   
   py::class_<fastllm::WeightMap>(m, "WeightMap")
     .def_readonly("tokenizer", &fastllm::WeightMap::tokenizer)
