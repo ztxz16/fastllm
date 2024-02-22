@@ -105,10 +105,14 @@ namespace fastllm {
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+            std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
+            std::string kBiasName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.bias";
             std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string vBiasName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.bias";
             std::string qkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.W_pack.weight";
             std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
+            std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
 
             // 1.1 Get q, k, v
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
@@ -119,9 +123,12 @@ namespace fastllm {
                 Split(qkv, -1, per, per * 2, k);
                 Split(qkv, -1, per * 2, per * 3, v);
             } else {
-                Linear(attenInput, weight[qWeightName], Data(), q);
-                Linear(attenInput, weight[kWeightName], Data(), k);
-                Linear(attenInput, weight[vWeightName], Data(), v);
+                Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
+                Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
+                Data vBias = (weight.weight.find(vBiasName) != weight.weight.end()) ? weight[vBiasName] : Data();
+                Linear(attenInput, weight[qWeightName], qBias, q);
+                Linear(attenInput, weight[kWeightName], kBias, k);
+                Linear(attenInput, weight[vWeightName], vBias, v);
             }
 
             std::vector <int> qkvSize = {bsz, seqlen, num_attention_heads, -1};
@@ -198,7 +205,8 @@ namespace fastllm {
             PermuteSelf(attenOutput, {1, 0, 2});
             attenOutput.Reshape({bsz, seqlen, -1});
 
-            Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
+            Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
+            Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
@@ -267,10 +275,14 @@ namespace fastllm {
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+            std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
+            std::string kBiasName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.bias";
             std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string vBiasName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.bias";
             std::string qkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.W_pack.weight";
             std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
+            std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
 
             // 1.1 Get q, k, v
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
@@ -281,9 +293,12 @@ namespace fastllm {
                 Split(qkv, -1, per, per * 2, k);
                 Split(qkv, -1, per * 2, per * 3, v);
             } else {
-                Linear(attenInput, weight[qWeightName], Data(), q);
-                Linear(attenInput, weight[kWeightName], Data(), k);
-                Linear(attenInput, weight[vWeightName], Data(), v);
+                Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
+                Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
+                Data vBias = (weight.weight.find(vBiasName) != weight.weight.end()) ? weight[vBiasName] : Data();
+                Linear(attenInput, weight[qWeightName], qBias, q);
+                Linear(attenInput, weight[kWeightName], kBias, k);
+                Linear(attenInput, weight[vWeightName], vBias, v);
             }
 
             std::vector <int> qkvSize = {bsz, seqlen, num_attention_heads, -1};
@@ -363,7 +378,8 @@ namespace fastllm {
             attenOutput.Reshape({seqlen, bsz, -1});
             PermuteSelf(attenOutput, {1, 0, 2});
 
-            Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
+            Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
+            Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
@@ -437,10 +453,14 @@ namespace fastllm {
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     1e-6, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+            std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
+            std::string kBiasName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.bias";
             std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string vBiasName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.bias";
             std::string qkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.W_pack.weight";
             std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
+            std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
 
             // 1.1 Get q, k, v
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
@@ -451,9 +471,12 @@ namespace fastllm {
                 Split(qkv, -1, per, per * 2, k);
                 Split(qkv, -1, per * 2, per * 3, v);
             } else {
-                Linear(attenInput, weight[qWeightName], Data(), q);
-                Linear(attenInput, weight[kWeightName], Data(), k);
-                Linear(attenInput, weight[vWeightName], Data(), v);
+                Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
+                Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
+                Data vBias = (weight.weight.find(vBiasName) != weight.weight.end()) ? weight[vBiasName] : Data();
+                Linear(attenInput, weight[qWeightName], qBias, q);
+                Linear(attenInput, weight[kWeightName], kBias, k);
+                Linear(attenInput, weight[vWeightName], vBias, v);
             }
 
             Data attenOutput = Data(DataType::FLOAT32);
@@ -556,7 +579,8 @@ namespace fastllm {
                 CatDirect(attenOutput, curAttenOutput, 1);
             }
 
-            Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
+            Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
+            Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
@@ -600,9 +624,9 @@ namespace fastllm {
 #endif
 //auto st = std::chrono::system_clock::now();
 #ifdef PY_API
-		size_t pos = input.rfind("time_stamp:");
-		std::string prompt = (generationConfig.enable_hash_id && pos != -1)?  input.substr(0, pos):input;
-		size_t hash_id = std::hash<std::string>{}(input);
+        size_t pos = input.rfind("time_stamp:");
+        std::string prompt = (generationConfig.enable_hash_id && pos != -1)?  input.substr(0, pos):input;
+        size_t hash_id = std::hash<std::string>{}(input);
         Data inputIds = this->weight.tokenizer.Encode(prompt);
 #else
         Data inputIds = this->weight.tokenizer.Encode(input);

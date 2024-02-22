@@ -2,6 +2,7 @@
 
 #include "model.h"
 #include "fastllm.h"
+#include <sstream>
 
 #include "chatglm.h"
 #include "moss.h"
@@ -51,6 +52,24 @@ namespace fastllm {
         if (this->weight.dicts.find("history_sep") != this->weight.dicts.end()) {
             history_sep = this->weight.dicts["history_sep"];
         }
+        if (this->weight.dicts.find("tokenizer_add_dummy_prefix") != this->weight.dicts.end()) {
+            std::string value = this->weight.dicts["tokenizer_add_dummy_prefix"];
+            transform(value.begin(), value.end(), value.begin(), ::tolower);
+            std::istringstream iss(value);
+            iss >> std::boolalpha >> this->weight.tokenizer.addDummyPrefix;
+        }
+        if (this->weight.dicts.find("tokenizer_remove_extra_whitespaces") != this->weight.dicts.end()) {
+            std::string value = this->weight.dicts["tokenizer_remove_extra_whitespaces"];
+            transform(value.begin(), value.end(), value.begin(), ::tolower);
+            std::istringstream iss(value);
+            iss >> std::boolalpha >> this->weight.tokenizer.removeExtraWhitespaces;
+        }
+        if (this->weight.dicts.find("tokenizer_byte_as_char") != this->weight.dicts.end()) {
+            std::string value = this->weight.dicts["tokenizer_byte_as_char"];
+            transform(value.begin(), value.end(), value.begin(), ::tolower);
+            std::istringstream iss(value);
+            iss >> std::boolalpha >> this->weight.tokenizer.byteAsChar;
+        }
 
         this->deviceMap = GetDeviceMap();
     }
@@ -69,7 +88,7 @@ namespace fastllm {
             model = (basellm*)(new ChatGLMModel());
         } else if (modelType == "moss") {
             model = (basellm*)(new MOSSModel());
-            model->weight.tokenizer.type = Tokenizer::TokenizerType::NORMAL;
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::BPE;
             model->eos_token_id = 106068;
         } else if (modelType == "baichuan") {
             model = (basellm*)(new LlamaModel());
@@ -79,6 +98,9 @@ namespace fastllm {
             model->bot_role = "\n<bot>:";
             model->history_sep = "\n";
             model->weight.tokenizer.type = Tokenizer::TokenizerType::BPE;
+        } else if (modelType == "internlm") {
+            model = new LlamaModel();
+            model->model_type = "internlm";
         } else if (modelType == "llama") {
             model = (basellm*)(new LlamaModel());
         } else if (modelType == "qwen") {

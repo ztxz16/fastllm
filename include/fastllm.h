@@ -17,6 +17,8 @@
 #include <iostream>
 #include <functional>
 #include <memory>
+#include <locale>
+#include <codecvt>
 #include "devices/cpu/cputhreadpool.h"
 
 #ifdef USE_SENTENCEPIECE
@@ -43,7 +45,7 @@ namespace fastllm {
         float top_p = 1.0; // top_p采样
         float temperature = 1.0; // 温度参数，一般在0.1 ~ 1.0之间，设大这个参数可以带来结果的多样性
         bool output_logits = false; // 是否返回logits
-		bool enable_hash_id = false; // 给会话添加hash id
+        bool enable_hash_id = false; // 给会话添加hash id
         std::multiset <int> stop_token_ids;
 
         bool IsSimpleGreedy() const {
@@ -359,11 +361,22 @@ namespace fastllm {
 
         TrieNode *root;
 
+        TrieNode *specialRoot = nullptr;
+
         TokenizerType type = TokenizerType::BPE;
+
+        bool addDummyPrefix = true;   // 是否在首位添加空格
+        bool removeExtraWhitespaces = true;   // 是否将多个空格合并为一个
+        bool byteAsChar = false;  // 是否将byte变为展示字符
 
         std::unordered_map <int, std::string> tokenToStringDict;
         std::unordered_map <int, float> tokenToScoreDict;
         std::unordered_map <std::string, int> stringToTokenDict;
+        std::vector <std::string> specialTokens;
+
+        std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+        std::unordered_map <wchar_t, wchar_t> byteCharDict;
+        std::unordered_map <wchar_t, wchar_t> charByteDict;
 #ifdef USE_SENTENCEPIECE
         std::unique_ptr<sentencepiece::SentencePieceProcessor> spProcessor;
 #endif
@@ -379,6 +392,10 @@ namespace fastllm {
         int GetRank(std::vector<Symbol> &symbols,  std::vector<std::pair<int, int>> &partitions, int idx, int skip);
 
         void Insert(const std::string &s, int tokenId, float score = 1.0f); // 插入一个token
+
+        void SetSpecialTokens(const std::map <std::string, int> &specialTokens); // 设置需要优先处理的特殊token
+
+        std::string Normalize(const std::string &ori); // 字符规范化
 
         Data Encode(const std::string &s); // 编码
 

@@ -8,7 +8,13 @@ LLaMA类模型有着基本相同的结构，但权重和prompt构造有差异。
 
 以下配置方案根据模型的源代码整理，不保证模型推理结果与原版完全一致。
 
-## 修改脚本并转换
+## 修改方式
+
+目前，转换脚本和两行加速方式均可用于llama类模型。但无论采用哪一种方式，都需要预留足够的内存（可以用swap空间）。
+
+在float16模式下，转换时约需要4×参数量+1GB的空闲内存。
+
+### 转换脚本
 
 这里以支持推理各类Llama结构的基座模型为例，介绍如何应用本文档。
 
@@ -40,17 +46,36 @@ LLaMA类模型有着基本相同的结构，但权重和prompt构造有差异。
 
 如需添加Token ID而非字符串（类似baichuan-chat模型），可以使用“<FLM_FIX_TOKEN_{ID}>”的格式添加。
 
+* 执行脚本
+
+```shell
+python3 tools/alpaca2flm.py [输出文件名] [精度] [原始模型名称或路径]
+```
+
 ### 两行加速
 
 ```python
+    conf = model.config.__dict__
+    conf["model_type"] = "llama"
     llm.from_hf(model, tokenizer, pre_prompt = "", 
                 user_role = "", bot_role = "", history_sep = "", 
                 dtype = dtype)
 ```
 
+## 对齐
+
+如果想使fastllm模型和原版transformers模型基本一致，最主要的操作是对齐tokenizer。
+如果模型使用了huggingface 加速版本的Tokenizers（即模型目录中包含`tokenizer.json`并优先使用），目前的转换脚本**仅在从本地文件转换时，能够对齐tokenizer**。
+
+注意检查原始tokenizer的`encode()`方法返回的结果前面是否会加空格。如果原始tokenizer没有加空格，则需要设置：
+
+```python
+    conf["tokenizer_add_dummy_prefix"] = False
+```
+
 ## Base Model
 
-见上方“[修改方案](#修改方案)”。
+见上方“[修改方案](#修改方式)”。
 
 一部分模型需要制定bos_token_id，假设bos_token_id为1则可以配置如下：
 
@@ -66,6 +91,8 @@ LLaMA类模型有着基本相同的结构，但权重和prompt构造有差异。
 
 ### InternLM（书生）
 
+* internlm/[internlm-chat-7b](https://huggingface.co/internlm/internlm-chat-7b)
+* internlm/[internlm-chat-7b v1.1](https://huggingface.co/internlm/internlm-chat-7b-v1_1)
 * internlm/[internlm-chat-20b](https://huggingface.co/internlm/internlm-chat-20b)
 
 ```python
@@ -76,6 +103,15 @@ LLaMA类模型有着基本相同的结构，但权重和prompt构造有差异。
                      history_sep = "<eoa>\n<s>", dtype = dtype)
 ```
 
+可以直接使用`internlm2flm.py`脚本转换：
+
+``` sh
+cd build
+python3 tools/internlm2flm.py internlm-7b-fp16.flm float16 #导出float16模型
+python3 tools/internlm2flm.py internlm-7b-int8.flm int8 #导出int8模型
+python3 tools/internlm2flm.py internlm-7b-int4.flm int4 #导出int4模型
+python3 tools/internlm2flm.py internlm-7b-int4.flm float16 internlm/internlm-chat-7b #导出internlm-chat-7b float16模型
+```
 
 ### XVERSE
 
@@ -85,10 +121,12 @@ LLaMA类模型有着基本相同的结构，但权重和prompt构造有差异。
 ```python
     conf = model.config.__dict__
     conf["model_type"] = "llama"
+    conf["tokenizer_add_dummy_prefix"] = False
     torch2flm.tofile(exportPath, model, tokenizer, pre_prompt = "", 
                      user_role = "Human: ", bot_role = "\n\nAssistant: ", 
                      history_sep = "<FLM_FIX_TOKEN_3>", dtype = dtype)
 ```
+XVERSE-13B-Chat V1 版本需要对输入做NFKC规范化，fastllm暂不支持，因此需要使用原始tokenizer. 
 
 ### 其他 llama1 系列
 
@@ -163,7 +201,7 @@ LLaMA类模型有着基本相同的结构，但权重和prompt构造有差异。
 ```python
     torch2flm.tofile(exportPath, model, tokenizer, 
                      pre_prompt="The following is a conversation between a human and an AI assistant namely YuLan, developed by GSAI, Renmin University of China. " \
-                                "The AI assistant gives helpful, detailed, and polite answers to the user's questions.\n"
+                                "The AI assistant gives helpful, detailed, and polite answers to the user's questions.\n",
                      user_role="[|Human|]:", bot_role="\n[|AI|]:", history_sep="\n", dtype=dtype)
 ```
 
@@ -174,7 +212,7 @@ LLaMA类模型有着基本相同的结构，但权重和prompt构造有差异。
 
 ```python
     torch2flm.tofile(exportPath, model, tokenizer, 
-                     pre_prompt="Below is an instruction that describes a task. "
-                                "Write a response that appropriately completes the request.\n\n"
+                     pre_prompt="Below is an instruction that describes a task. " \
+                                "Write a response that appropriately completes the request.\n\n",
                      user_role="### Instruction:\n", bot_role="\n\n### Response:", history_sep="\n", dtype=dtype)
 ```
