@@ -6,8 +6,9 @@ from transformers import PreTrainedTokenizerFast
 from tokenizers.decoders import ByteLevel
 
 def writeString(fo, s):
-    fo.write(struct.pack('i', len(s)))
-    fo.write(s.encode())
+    bytes = s.encode()
+    fo.write(struct.pack('i', len(bytes)))
+    fo.write(bytes)
 
 def writeKeyValue(fo, key, value):
     writeString(fo, key)
@@ -212,8 +213,7 @@ def tofile(exportPath,
         if ("tokenizer_has_special_tokens" in modelInfo):
             fo.write(struct.pack('i', len(tokenizer.all_special_tokens)))
             for special_token in tokenizer.all_special_tokens:
-                fo.write(struct.pack('i', len(special_token)))
-                fo.write(special_token.encode())
+                writeString(fo, special_token)
     else:
         fo.write(struct.pack('i', 0))
 
@@ -248,8 +248,7 @@ def tofile(exportPath,
         weight_name = key
         if hasattr(model, "peft_config"):
             weight_name = weight_name.replace('base_model.model.', '')
-        fo.write(struct.pack('i', len(weight_name)))
-        fo.write(weight_name.encode())
+        writeString(fo, weight_name)
         fo.write(struct.pack('i', len(cur.shape)))
         for i in cur.shape:
             fo.write(struct.pack('i', i))
