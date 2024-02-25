@@ -153,6 +153,21 @@ namespace fastllm {
             iss >> std::boolalpha >> this->weight.tokenizer.byteAsChar;
         }
 
+#ifdef USE_SENTENCEPIECE
+        if (this->weight.dicts.find("tokenizer_serialized") != this->weight.dicts.end()) {
+            const std::string &hexString = this->weight.dicts["tokenizer_serialized"];
+            if (hexString.length() % 2 != 0) {
+                std::cerr << "warning: Invalid SentencePiece hex string.\n";
+            } else {
+                std::string decoded;
+                for (unsigned int i = 0; i < hexString.length(); i += 2) {
+                    decoded.push_back(std::stoi(hexString.substr(i, 2), nullptr, 16));
+                }
+                weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+                weight.tokenizer.spProcessor->LoadFromSerializedProto(decoded);
+            }
+        }
+#endif
         this->deviceMap = GetDeviceMap();
         this->moeDeviceMap = GetMoeDeviceMap();
     }
@@ -678,6 +693,15 @@ namespace fastllm {
             // PreTrainedTokenizerFast
             std::string tokenizerFile = path + "tokenizer.json";
             if (!fastllm::FileExists(tokenizerFile)) {
+#ifdef USE_SENTENCEPIECE
+                tokenizerFile = path + "tokenizer.model";
+                if (fastllm::FileExists(tokenizerFile)) {
+                    std::string& tokenizerProto = ReadAllFile(tokenizerFile);
+                    weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+                    weight.tokenizer.spProcessor->LoadFromSerializedProto(tokenizerProto);
+                    return;
+                }
+#endif
                 ErrorInFastLLM("Model with a supported tokenizer_class: " + tokenizerClass + "，but has no \"tokenizer.json\"!");
             }
             auto tokenizer = json11::Json::parse(ReadAllFile(tokenizerFile), error);
@@ -697,6 +721,14 @@ namespace fastllm {
                 model->weight.AddDict("tokenizer_byte_as_char", "True");
             }
             model->weight.tokenizer.SetSpecialTokens(spTokens);
+#ifdef USE_SENTENCEPIECE
+        } else if (tokenizerClass == "PreTrainedTokenizer"
+            || tokenizerClass == "InternLM2Tokenizer" || tokenizerClass == "InternLM3Tokenizer") {
+            std::string tokenizerFile = path + "tokenizer.model";
+            std::string& tokenizerProto = ReadAllFile(tokenizerFile);
+            weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+            weight.tokenizer.spProcessor->LoadFromSerializedProto(tokenizerProto);
+#endif
         } else if (tokenizerClass == "ChatGLM4Tokenizer") {
             // GLM4御用的分词
             std::vector <std::string> lines, line;
