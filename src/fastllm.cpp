@@ -1834,10 +1834,7 @@ namespace fastllm {
         return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
     }
 
-    Data Tokenizer::Encode(const std::string &ori) {
-        if (this->type == TokenizerType::BPE) {
-            std::string s = Normalize(ori);
-
+    std::vector<float> Tokenizer::BytePairEncode(const std::string &s) {
             std::vector<Symbol> symbols;
             for (int i = 0; i < s.size(); i++) {
                 if (i + 3 < s.size() && s[i] == '<' && s[i + 1] == 'F' && s[i + 2] == 'L' && s[i + 3] == 'M') {
@@ -1941,22 +1938,30 @@ namespace fastllm {
                     }
                 }
             }
-            return Data(DataType::FLOAT32, {1, (int)v.size()}, v);
-        } else if (this->type == TokenizerType::GLM) {
-            const std::map<std::string, int> specialTokens = {{"[MASK]", 50003}, {"[sMASK]", 50008}, {"[gMASK]", 50009}};
-            std::string s = Normalize(ori);
+            return v;
+    }
+
+    Data Tokenizer::Encode(const std::string &ori) {
+        if (this->type == TokenizerType::GLM) {
+            const std::map<std::string, int> glmSpecialTokens = {{"[MASK]", 50003}, {"<|startofpiece|>", 50006}, {"<|endofpiece|>", 50007}, {"[sMASK]", 50008}, {"[gMASK]", 50009}};
+            if (this->specialTokens.empty())
+                SetSpecialTokens(glmSpecialTokens);
+        }
+        if (this->type == TokenizerType::BPE || this->type == TokenizerType::GLM) {
+#ifdef USE_SENTENCEPIECE
+            std::string &s = const_cast<std::string &>(ori);
             std::vector<float> v;
             int findPos = 0;
             while (findPos < s.length()) {
                 int nextSpecialToken = -1;
                 int nextSpecialTokenPos = -1;
                 int nextSpecialTokenLen = -1;
-                for (auto p : specialTokens) {
-                    int ind = s.find(p.first, findPos);
+                for (auto token : this->specialTokens) {
+                    int ind = s.find(token, findPos);
                     if (ind >= 0 && (nextSpecialTokenPos < 0 || ind < nextSpecialTokenPos)) {
                         nextSpecialTokenPos = ind;
-                        nextSpecialToken = p.second;
-                        nextSpecialTokenLen = p.first.length();
+                        nextSpecialToken = stringToTokenDict[token];
+                        nextSpecialTokenLen = token.length();
                     }
                 }
                 std::string subStr;
@@ -1968,94 +1973,25 @@ namespace fastllm {
                     findPos = nextSpecialTokenPos + nextSpecialTokenLen;
                 }
                 if (subStr.length() > 0) {
-#ifdef USE_SENTENCEPIECE
-                    if (spProcessor!=nullptr) {
+                    if (spProcessor != nullptr) {
                         std::vector<int> ids;
                         spProcessor->Encode(subStr, &ids);
-                        fo r(int id : ids) {
+                        for (int id : ids) {
                             v.push_back(id);
                         }
                     } else {
-#endif
-                    std::vector<Symbol> symbols;
-                    for (int i = 0; i < subStr.size(); i++) {
-                        int tokenId = -999999, pos = i - 1;
-                        TrieNode *now = this->root;
-                        for (int j = i; j < subStr.size(); j++) {
-                            if (now->next.find(subStr[j]) != now->next.end()) {
-                                now = now->next[subStr[j]];
-                                if (now->tokenId != -999999) {
-                                    tokenId = now->tokenId;
-                                    pos = j;
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                        if (pos >= i) {
-                            symbols.push_back(Symbol(now, (char *) subStr.data(), i, pos - i + 1, (int) symbols.size() - 1,
-                                                     (int) symbols.size() + 1, -999999));
-                            i = pos;
-                        } else {
-                            symbols.push_back(Symbol(nullptr, (char *) subStr.data(), i, 0, (int) symbols.size() - 1,
-                                                     (int) symbols.size() + 1, -999999));
-                        }
+                        std::vector<float> &&subTokenIds = BytePairEncode(subStr);
+                        v.insert(v.end(), subTokenIds.begin(), subTokenIds.end());
                     }
-                    symbols.back().next = -1;
-
-                    std::priority_queue<SymbolPairs> workQueue;
-                    for (int i = 1; i < symbols.size(); i++) {
-                        TryMergePairs(symbols, i - 1, i, workQueue);
-                    }
-
-                    while (!workQueue.empty()) {
-                        auto top = workQueue.top();
-                        workQueue.pop();
-                        if (symbols[top.l].len == 0 || symbols[top.r].len == 0 ||
-                                symbols[top.l].len + symbols[top.r].len != top.size) {
-                            continue;
-                        }
-
-                        for (int i = symbols[top.r].pos; i < symbols[top.r].pos + symbols[top.r].len; i++) {
-                            symbols[top.l].node = symbols[top.l].node->next[symbols[top.r].s[i]];
-                        }
-                        symbols[top.l].len += symbols[top.r].len;
-                        symbols[top.r].len = 0;
-                        symbols[top.l].next = symbols[top.r].next;
-                        if (symbols[top.r].next >= 0) {
-                            symbols[symbols[top.r].next].prev = top.l;
-                        }
-
-                        TryMergePairs(symbols, symbols[top.l].prev, top.l, workQueue);
-                        TryMergePairs(symbols, top.l, symbols[top.l].next, workQueue);
-                    }
-                    for (int i = 0; i < symbols.size(); i++) {
-                        if (symbols[i].len > 0) {
-                            v.push_back(symbols[i].node->tokenId);
-                        } else if (symbols[i].node == nullptr) {
-                            if (symbols[i].fixId != -999999) {
-                                v.push_back(symbols[i].fixId);
-                            } else {
-                                // 未识别的字符
-                                uint8_t c = (uint8_t) (symbols[i].s[symbols[i].pos]);
-                                std::string now = "<0x00>";
-                                now[3] = (c / 16 > 9 ? ('A' + c / 16 - 10) : ('0' + c / 16));
-                                now[4] = (c % 16 > 9 ? ('A' + c % 16 - 10) : ('0' + c % 16));
-                                if (stringToTokenDict.find(now) != stringToTokenDict.end()) {
-                                    v.push_back(stringToTokenDict[now]);
-                                }
-                            }
-                        }
-                    }
-#ifdef USE_SENTENCEPIECE
-                    }
-#endif
                 }
                 if (nextSpecialTokenPos >= 0) {
                     v.push_back(nextSpecialToken);
                 }
             }
+#else
+            std::string s = Normalize(ori);
+            std::vector<float> &&v = BytePairEncode(s);
+#endif
             return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
         } else if (this->type == TokenizerType::QWEN) {
             std::map<std::string, int> specialTokens = {{"<|im_start|>", 151644}, {"<|im_end|>", 151645}, {"<|endoftext|>", 151643}};
