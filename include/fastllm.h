@@ -514,6 +514,8 @@ namespace fastllm {
         int GetTokenId(const std::string &s); // 获取s对应的tokenid
 
         std::string GetToken(int id); // 获取id对应的token
+    private:
+        std::vector<float> BytePairEncode(const std::string &s);
     };
 
     std::string GetModelTypeFromFile(const std::string &fileName);
