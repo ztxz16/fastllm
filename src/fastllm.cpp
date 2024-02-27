@@ -1662,6 +1662,7 @@ namespace fastllm {
 
     Tokenizer::TrieNode::TrieNode() {
         this->tokenId = -999999;
+        this->score = 0.0f;
     }
 
     Tokenizer::Tokenizer() {
@@ -1832,6 +1833,107 @@ namespace fastllm {
 
     bool isDigitOrChar(char c) {
         return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    }
+
+	std::vector<float> Tokenizer::UnigramEncode(const std::string &s) {
+        // SymbolPairs.l 表示上一个位置
+        // SymbolPairs.r 表示选择上一个位置的第几个TrieNode
+        std::vector<TrieNode *> specialIds;
+        std::vector<std::vector<TrieNode *>> lattice(s.size() + 1, std::vector<TrieNode *>());
+        std::vector<std::vector<SymbolPairs>> latticeScores(s.size() + 1, std::vector<SymbolPairs>());
+        for (int i = 0; i < s.size(); i++) {
+            if (i + 3 < s.size() && s[i] == '<' && s[i + 1] == 'F' && s[i + 2] == 'L' && s[i + 3] == 'M') {
+                if (i + 15 < s.size() && s.substr(i, 15) == "<FLM_FIX_TOKEN_") {
+                    int start = i;
+                    i += 15;
+                    TrieNode *fixNode = new TrieNode();
+                    fixNode->tokenId = 0;
+                    fixNode->score = -0.1;
+                    while (s[i] >= '0' && s[i] <= '9') {
+                        fixNode->tokenId = fixNode->tokenId * 10 + s[i] - '0';
+                        i++;
+                    }
+                    specialIds.push_back(fixNode);
+                    lattice[start].push_back(fixNode);
+                    latticeScores[start].push_back(SymbolPairs(0.F, i + 1, 0, i - start));
+                    continue;
+                }
+            }
+            if (this->specialRoot != nullptr) {
+                TrieNode *now = this->specialRoot;
+                int next = i;
+                for (; next < s.size(); next++) {
+                    if (now->next.find(s[next]) == now->next.end())
+                        break;
+                    now = now->next[s[next]];
+                }
+                if (now->tokenId != -999999 && next > i) {
+                    lattice[i].push_back(now);
+                    latticeScores[i].push_back(SymbolPairs(now->score, next, -1, next - i));
+                    i = next - 1;
+                    continue;
+                }
+            }
+
+            TrieNode *now = this->root;
+            for (int j = i; j < s.size(); j++) {
+                if (now->next.find(s[j]) != now->next.end()) {
+                    now = now->next[s[j]];
+                    if (now->tokenId != -999999) {
+                        lattice[i].push_back(now);
+                        latticeScores[i].push_back(SymbolPairs(now->score, j + 1, -1, j - i + 1));
+                    }
+                } else {
+                    break;
+                }
+            }
+            if (latticeScores[i].empty()) {
+                // 未识别的字符
+                uint8_t c = (uint8_t) (s[i]);
+                std::string now = "<0x00>";
+                now[3] = (c / 16 > 9 ? ('A' + c / 16 - 10) : ('0' + c / 16));
+                now[4] = (c % 16 > 9 ? ('A' + c % 16 - 10) : ('0' + c % 16));
+                if (stringToTokenDict.find(now) != stringToTokenDict.end()) {
+                    TrieNode *byte = new TrieNode();
+                    byte->tokenId = stringToTokenDict[now];
+                    byte->score = FLT_MAX - 10.0f;
+                    specialIds.push_back(byte);
+                    lattice[i].push_back(byte);
+                    latticeScores[i].push_back(SymbolPairs(0.F, i + 1, -1, 1));
+                }
+            }
+        }
+        TrieNode *empty = new TrieNode();
+        specialIds.push_back(empty);
+        lattice[s.size()].push_back(empty);
+        latticeScores[s.size()].push_back(SymbolPairs(0.F, s.size(), -1, 0));
+        // viterbi 求解
+        for (int i = 0; i < s.size(); i++) {
+            for (int j = 0; j < latticeScores[i].size(); j++) {
+                int jNext = i + latticeScores[i][j].size;
+                for (int k = 0; k < latticeScores[jNext].size(); k++) {
+                    float newScore = latticeScores[i][j].score + lattice[jNext][k]->score;
+                    if (latticeScores[jNext][k].r == -1 || latticeScores[jNext][k].score < newScore) {
+                        latticeScores[jNext][k].l = i;
+                        latticeScores[jNext][k].r = j;
+                        latticeScores[jNext][k].score = newScore;
+                    }
+                }
+            }
+        }
+        std::vector<float> v;
+        int pos = s.size();
+        int row = latticeScores[s.size()][0].l, column = latticeScores[s.size()][0].r;
+        while (column != -1) {
+            SymbolPairs& node = latticeScores[row][column];
+            v.push_back(lattice[row][column]->tokenId);
+            row = node.l;
+            column = node.r;
+        }
+        std::reverse(v.begin(), v.end());
+        for (TrieNode * node : specialIds)
+            delete node;
+        return v;
     }
 
     std::vector<float> Tokenizer::BytePairEncode(const std::string &s) {
