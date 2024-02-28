@@ -103,14 +103,14 @@ python3 tools/alpaca2flm.py [输出文件名] [精度] [原始模型名称或路
                      history_sep = "<eoa>\n<s>", dtype = dtype)
 ```
 
-可以直接使用`internlm2flm.py`脚本转换：
+可以直接使用`llamalike2flm.py`脚本转换：
 
 ``` sh
 cd build
-python3 tools/internlm2flm.py internlm-7b-fp16.flm float16 #导出float16模型
-python3 tools/internlm2flm.py internlm-7b-int8.flm int8 #导出int8模型
-python3 tools/internlm2flm.py internlm-7b-int4.flm int4 #导出int4模型
-python3 tools/internlm2flm.py internlm-7b-int4.flm float16 internlm/internlm-chat-7b #导出internlm-chat-7b float16模型
+python3 tools/llamalike2flm.py internlm-7b-fp16.flm float16 internlm/internlm-chat-20b #导出float16模型
+python3 tools/llamalike2flm.py internlm-7b-int8.flm int8 internlm/internlm-chat-20b #导出int8模型
+python3 tools/llamalike2flm.py internlm-7b-int4.flm int4 internlm/internlm-chat-20b #导出int4模型
+python3 tools/llamalike2flm.py internlm-7b-int4.flm float16 internlm/internlm-chat-7b #导出internlm-chat-7b float16模型
 ```
 
 ### XVERSE
