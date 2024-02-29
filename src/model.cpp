@@ -9,6 +9,7 @@
 #include "llama.h"
 #include "qwen.h"
 #include "glm.h"
+#include "minicpm.h"
 
 namespace fastllm {
     void basellm::LoadFromFile(const std::string &fileName) {
@@ -106,6 +107,8 @@ namespace fastllm {
         } else if (modelType == "qwen2") {
             model = new LlamaModel();
             model->model_type = "qwen";
+        } else if (modelType=="minicpm") {
+	          model = (basellm*)(new MiniCpmModel());
         } else if (modelType == "qwen") {
             model = (basellm *) (new QWenModel());
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
