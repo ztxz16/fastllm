@@ -124,8 +124,8 @@ class model:
 
         # 为了减少重复申请释放buffer对象而使用的线程局部存储区对象池
         self.thread_local_obj = threading.local()
-        self.thread_local_obj.tokenizer_encode_string__output_buffer = None
-        self.thread_local_obj.tokenizer_decode_token__output_buffer = None
+        #self.thread_local_obj.tokenizer_encode_string__output_buffer = None
+        #self.thread_local_obj.tokenizer_decode_token__output_buffer = None
 
         # tokenizer_decode_token 输出结果的静态缓存，手工触发构建
         # 由于token数量有限且不太多，所以缓存该结果来减少调用较为适合。
@@ -162,7 +162,7 @@ class model:
 
     def tokenizer_encode_string(self, content: str) -> List[int]:
         output_buffer_init_len = 1024
-        if self.thread_local_obj.tokenizer_encode_string__output_buffer is None:
+        if "tokenizer_encode_string__output_buffer" not in dir(self.thread_local_obj) or self.thread_local_obj.tokenizer_encode_string__output_buffer is None:
             self.thread_local_obj.tokenizer_encode_string__output_buffer = (ctypes.c_int * output_buffer_init_len)()
 
         buffer = self.thread_local_obj.tokenizer_encode_string__output_buffer
@@ -190,7 +190,7 @@ class model:
                 return cache_result
 
         output_buffer_init_len = 256
-        if self.thread_local_obj.tokenizer_decode_token__output_buffer is None:
+        if "tokenizer_decode_token__output_buffer" not in dir(self.thread_local_obj) or self.thread_local_obj.tokenizer_decode_token__output_buffer is None:
             self.thread_local_obj.tokenizer_decode_token__output_buffer = ctypes.create_string_buffer(output_buffer_init_len)
 
         buffer = self.thread_local_obj.tokenizer_decode_token__output_buffer

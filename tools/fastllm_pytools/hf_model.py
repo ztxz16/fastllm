@@ -41,6 +41,8 @@ def create(model,
         modelInfo["bot_role"] = bot_role
     if (history_sep):
         modelInfo["history_sep"] = history_sep
+    if modelInfo["architectures"] == ["MiniCPMForCausalLM"]:
+        modelInfo["model_type"] = "minicpm"
     if (modelInfo["model_type"] == "baichuan"):
         if (hasattr(model, "model") and hasattr(model.model, "get_alibi_mask")):
             # Baichuan / Baichuan2 13B
