@@ -21,7 +21,7 @@ fastllm是纯c++实现，无第三方依赖的高性能大模型推理库
 - 🚀 支持流式输出，很方便实现打字机效果
 - 🚀 支持python调用
 - 🚀 前后端分离设计，便于支持新的计算设备
-- 🚀 目前支持ChatGLM系列模型，各种LLAMA模型(ALPACA, VICUNA等)，BAICHUAN模型，QWEN模型，MOSS模型等
+- 🚀 目前支持ChatGLM系列模型，各种LLAMA模型(ALPACA, VICUNA等)，BAICHUAN模型，QWEN模型，MOSS模型，MINICPM模型等
 
 ## 两行代码加速 （测试中，暂时只支持chatglm系列）
 
@@ -377,6 +377,13 @@ python3 tools/moss_export.py moss-int4.flm int4 #导出int4模型
 python3 tools/qwen2flm.py qwen-7b-fp16.flm float16 #导出float16模型
 python3 tools/qwen2flm.py qwen-7b-int8.flm int8 #导出int8模型
 python3 tools/qwen2flm.py qwen-7b-int4.flm int4 #导出int4模型
+```
+
+#### MINICPM模型导出
+```sh
+cd build 
+python tools/minicpm2flm.py #导出float16模型
+./main -p minicpm-2b-float16.flm # 执行模型
 ```
 
 * **Qwen1.5**
