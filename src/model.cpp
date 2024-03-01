@@ -104,8 +104,11 @@ namespace fastllm {
             model->model_type = "internlm";
         } else if (modelType == "llama") {
             model = (basellm*)(new LlamaModel());
-	} else if (modelType=="minicpm") {
-	    model = (basellm*)(new MiniCpmModel());
+        } else if (modelType == "qwen2") {
+            model = new LlamaModel();
+            model->model_type = "qwen";
+        } else if (modelType=="minicpm") {
+	          model = (basellm*)(new MiniCpmModel());
         } else if (modelType == "qwen") {
             model = (basellm *) (new QWenModel());
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
