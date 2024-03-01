@@ -55,18 +55,49 @@ namespace fastllm {
         block_cnt = 32;
         rotary_dim = 128;
 
+        weight.embeddingNames.insert("model.embed_tokens.weight");
+    }
+
+    void LlamaModel::InitParams() {
+        basellm::InitParams();
+        if (this->weight.dicts.find("max_position_embeddings") != this->weight.dicts.end()) {
+            max_positions = atoi(this->weight.dicts["max_position_embeddings"].c_str());
+        }
+        if (this->weight.dicts.find("rope_scaling.type") != this->weight.dicts.end()) {
+            std::string type = this->weight.dicts["rope_scaling.type"];
+            if (type == "linear")
+               rope_type = RoPEType::LINEAR_SCALE;
+            else if (type == "dynamic")
+               rope_type = RoPEType::DYMAMIC_NTK;
+        }
+        if (this->weight.dicts.find("rope_theta") != this->weight.dicts.end()) {
+            rope_base = atof(this->weight.dicts["rope_theta"].c_str());
+        }
+        float factor = 1.0f;
+        if (this->weight.dicts.find("rope_scaling.factor") != this->weight.dicts.end()) {
+            rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
+        }
+        std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
+        sinData.ToDevice(DataDevice::CPU);
+        cosData.ToDevice(DataDevice::CPU);
+        sinData.CopyFrom(Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first));
+        cosData.CopyFrom(Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second));
+    }
+
+    std::pair<std::vector<float>, std::vector<float>> LlamaModel::UpdateRotaryPosEmb(float base, float factor) {
         sin.resize(max_positions);
         cos.resize(max_positions);
         std::vector <float> invFreq;
         for (int i = 0; i < rotary_dim; i += 2) {
-            invFreq.push_back(1.0 / pow(10000, (float)i / rotary_dim));
+            invFreq.push_back(1.0 / pow(base, (float)i / rotary_dim));
         }
+        float scale = rope_type == RoPEType::LINEAR_SCALE ? factor : 1.0;
         for (int i = 0; i < max_positions; i++) {
             sin[i].resize(rotary_dim);
             cos[i].resize(rotary_dim);
             for (int j = 0; j < invFreq.size(); j++) {
-                sin[i][j] = ::sin((float)i * invFreq[j]);
-                cos[i][j] = ::cos((float)i * invFreq[j]);
+                sin[i][j] = ::sin((float)i / scale * invFreq[j]);
+                cos[i][j] = ::cos((float)i / scale * invFreq[j]);
             }
         }
         std::vector <float> fsin, fcos;
@@ -76,9 +107,7 @@ namespace fastllm {
                 fcos.push_back(cos[i][j]);
             }
         }
-        sinData.CopyFrom(Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, fsin));
-        cosData.CopyFrom(Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, fcos));
-        weight.embeddingNames.insert("model.embed_tokens.weight");
+        return std::make_pair(fsin, fcos);
     }
 
     int LlamaModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
@@ -98,6 +127,8 @@ namespace fastllm {
         Data attenWeights, attenOutput;
         Data attenLastOutput;
         Data w1, w2, w3;
+        Data* sinDataPtr = &sinData;
+        Data* cosDataPtr = &cosData;
 
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         for (int i = 0; i < block_cnt; i++) {
@@ -136,9 +167,25 @@ namespace fastllm {
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
 
+            Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
+            if (GetKVCacheInCPU()) {
+                pastKey.lockInCPU = true;
+                pastValue.lockInCPU = true;
+            } else {
+                pastKey.ToDevice(DataDevice::CUDA);
+                pastValue.ToDevice(DataDevice::CUDA);
+            }
+            if (i == 0 && pastKey.dims.empty() && maxLen > max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
+                float scale = pow((rope_factor * maxLen / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+                float newbase = rope_base * scale;
+                std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
+                sinDataPtr = new Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first);
+                cosDataPtr = new Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second);
+            }
+
             if (alibiData.dims.size() == 0) {
-                fastllm::LlamaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
-                fastllm::LlamaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
+                fastllm::LlamaRotatePosition2D(q, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+                fastllm::LlamaRotatePosition2D(k, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
             }
 
             qkvSize = {bsz * seqlen, num_attention_heads, -1};
@@ -149,15 +196,6 @@ namespace fastllm {
             PermuteSelf(q, {1, 0, 2});
             PermuteSelf(k, {1, 0, 2});
             PermuteSelf(v, {1, 0, 2});
-
-            Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
-            if (GetKVCacheInCPU()) {
-                pastKey.lockInCPU = true;
-                pastValue.lockInCPU = true;
-            } else {
-                pastKey.ToDevice(DataDevice::CUDA);
-                pastValue.ToDevice(DataDevice::CUDA);
-            }
 
             int unitLen = 64;
 #ifdef USE_CUDA
@@ -246,6 +284,10 @@ namespace fastllm {
                 lastRet = LLMSampling(logits, logits.dims[1] - 1, generationConfig, lastTokens.units[0]);
             }
         }
+        if (sinDataPtr != &sinData)
+            delete sinDataPtr;
+        if (cosDataPtr != &cosData)
+            delete cosDataPtr;
 
         return lastRet;
     }
@@ -267,6 +309,8 @@ namespace fastllm {
         Data attenWeights, attenOutput;
         Data attenLastOutput;
         Data w1, w2, w3;
+        Data* sinDataPtr = &sinData;
+        Data* cosDataPtr = &cosData;
 
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         int seqlen = hiddenStates.dims[1];
@@ -306,9 +350,25 @@ namespace fastllm {
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
 
+            Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
+            if (GetKVCacheInCPU()) {
+                pastKey.lockInCPU = true;
+                pastValue.lockInCPU = true;
+            } else {
+                pastKey.ToDevice(DataDevice::CUDA);
+                pastValue.ToDevice(DataDevice::CUDA);
+            }
+            if (i == 0 && pastKey.dims.empty() && seqlen > max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
+                float scale = pow((rope_factor * seqlen / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+                float newbase = rope_base * scale;
+                std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
+                sinDataPtr = new Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first);
+                cosDataPtr = new Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second);
+            }
+
             if (alibiData.dims.size() == 0) {
-                fastllm::LlamaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
-                fastllm::LlamaRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
+                fastllm::LlamaRotatePosition2D(q, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+                fastllm::LlamaRotatePosition2D(k, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
             }
 
             PermuteSelf(q, {0, 2, 1, 3});
@@ -319,15 +379,6 @@ namespace fastllm {
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
-
-            Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
-            if (GetKVCacheInCPU()) {
-                pastKey.lockInCPU = true;
-                pastValue.lockInCPU = true;
-            } else {
-                pastKey.ToDevice(DataDevice::CUDA);
-                pastValue.ToDevice(DataDevice::CUDA);
-            }
 
             int unitLen = 64;
 #ifdef USE_CUDA
@@ -420,6 +471,10 @@ namespace fastllm {
                 }
             }
         }
+        if (sinDataPtr != &sinData)
+            delete sinDataPtr;
+        if (cosDataPtr != &cosData)
+            delete cosDataPtr;
 
         return lastRet;
     }
@@ -445,6 +500,8 @@ namespace fastllm {
         Data attenWeights, curAttenOutput;
         Data attenLastOutput;
         Data w1, w2, w3;
+        std::vector <Data*> sinDataPtrList(batch, &sinData);
+        std::vector <Data*> cosDataPtrList(batch, &cosData);
 
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
         int seqlen = hiddenStates.dims[1];
@@ -500,9 +557,25 @@ namespace fastllm {
                 k.Reshape(qkvSize);
                 v.Reshape(qkvSize);
 
+                Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
+                if (GetKVCacheInCPU()) {
+                    pastKey.lockInCPU = true;
+                    pastValue.lockInCPU = true;
+                } else {
+                    pastKey.ToDevice(DataDevice::CUDA);
+                    pastValue.ToDevice(DataDevice::CUDA);
+                }
+                if (i == 0 && pastKey.dims.empty() && seqLens[b] > max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
+                    float scale = pow((rope_factor * seqLens[b] / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+                    float newbase = rope_base * scale;
+                    std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
+                    sinDataPtrList[b] = new Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first);
+                    cosDataPtrList[b] = new Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second);
+                }
+
                 if (alibiData.dims.size() == 0) {
-                    fastllm::LlamaRotatePosition2D(q, *positionIds[b], sinData, cosData, rotary_dim);
-                    fastllm::LlamaRotatePosition2D(k, *positionIds[b], sinData, cosData, rotary_dim);
+                    fastllm::LlamaRotatePosition2D(q, *positionIds[b], *sinDataPtrList[b], *cosDataPtrList[b], rotary_dim);
+                    fastllm::LlamaRotatePosition2D(k, *positionIds[b], *sinDataPtrList[b], *cosDataPtrList[b], rotary_dim);
                 }
 
                 PermuteSelf(q, {0, 2, 1, 3});
@@ -513,15 +586,6 @@ namespace fastllm {
                 q.Reshape(qkvSize);
                 k.Reshape(qkvSize);
                 v.Reshape(qkvSize);
-
-                Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
-                if (GetKVCacheInCPU()) {
-                    pastKey.lockInCPU = true;
-                    pastValue.lockInCPU = true;
-                } else {
-                    pastKey.ToDevice(DataDevice::CUDA);
-                    pastValue.ToDevice(DataDevice::CUDA);
-                }
                 
                 int unitLen = 64;
 #ifdef USE_CUDA
@@ -614,6 +678,12 @@ namespace fastllm {
             }
             total += seqLens[b];
         }
+        for (Data* sinPtr : sinDataPtrList)
+            if (sinPtr != &sinData)
+                delete sinPtr;
+        for (Data* cosPtr : cosDataPtrList)
+            if (cosPtr != &cosData)
+                delete cosPtr;
         return lastRet;
     }
 

@@ -66,13 +66,13 @@ namespace fastllm {
 
         int GetVersion();
 
-        void UpdateSinCos(float rope);
+        void UpdateRotaryPosEmb(float rope_factor);
 
         int gmask_token_id;
     private:
         virtual void CausalMask(Data &data, int start) {}; // 因果mask？
 
-        float rope = 1.0f;
+        float rope_factor = 1.0f;
     };
 }
 
