@@ -60,12 +60,25 @@ def create(model,
         if modelInfo["chat_format"] == "chatml":
             modelInfo["im_end_id"] = tokenizer.im_end_id
             modelInfo["im_start_id"] = tokenizer.im_start_id
+    elif (modelInfo["model_type"] == "qwen2"):
+        modelInfo["eos_token_id"] = "151645"
+    elif (modelInfo["model_type"] == "internlm"):
+        modelInfo["eos_token_id"] = "103028"
+        if "rotary" in modelInfo:
+            rope_scaling = modelInfo.pop("rotary")
+            if isinstance(rope_scaling, builtins.dict):
+                modelInfo["rope_scaling.type"] = rope_scaling["type"]
+                modelInfo["rope_theta"] = rope_scaling["base"]
     if (modelInfo["model_type"] == "chatglm" and hasattr(tokenizer, "build_chat_input")):
         # chatglm3
         modelInfo["pre_prompt"] = "";
         modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|user|>")) + "> \n");
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.get_command("<|assistant|>")) + ">");
         modelInfo["history_sep"] = "";
+    if "rope_scaling" in modelInfo and isinstance(modelInfo["rope_scaling"], builtins.dict):
+        rope_scaling = modelInfo.pop("rope_scaling")
+        modelInfo["rope_scaling.type"] = rope_scaling["type"]
+        modelInfo["rope_scaling.factor"] = rope_scaling["factor"]
 
     if tokenizer:
         modelInfo["tokenizer_use_score"] = "1" # 分词带分数

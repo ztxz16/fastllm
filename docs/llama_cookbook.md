@@ -103,14 +103,14 @@ python3 tools/alpaca2flm.py [输出文件名] [精度] [原始模型名称或路
                      history_sep = "<eoa>\n<s>", dtype = dtype)
 ```
 
-可以直接使用`internlm2flm.py`脚本转换：
+可以直接使用`llamalike2flm.py`脚本转换：
 
 ``` sh
 cd build
-python3 tools/internlm2flm.py internlm-7b-fp16.flm float16 #导出float16模型
-python3 tools/internlm2flm.py internlm-7b-int8.flm int8 #导出int8模型
-python3 tools/internlm2flm.py internlm-7b-int4.flm int4 #导出int4模型
-python3 tools/internlm2flm.py internlm-7b-int4.flm float16 internlm/internlm-chat-7b #导出internlm-chat-7b float16模型
+python3 tools/llamalike2flm.py internlm-7b-fp16.flm float16 internlm/internlm-chat-20b #导出float16模型
+python3 tools/llamalike2flm.py internlm-7b-int8.flm int8 internlm/internlm-chat-20b #导出int8模型
+python3 tools/llamalike2flm.py internlm-7b-int4.flm int4 internlm/internlm-chat-20b #导出int4模型
+python3 tools/llamalike2flm.py internlm-7b-int4.flm float16 internlm/internlm-chat-7b #导出internlm-chat-7b float16模型
 ```
 
 ### XVERSE
@@ -127,6 +127,21 @@ python3 tools/internlm2flm.py internlm-7b-int4.flm float16 internlm/internlm-cha
                      history_sep = "<FLM_FIX_TOKEN_3>", dtype = dtype)
 ```
 XVERSE-13B-Chat V1 版本需要对输入做NFKC规范化，fastllm暂不支持，因此需要使用原始tokenizer. 
+
+* xverse/[XVERSE-13B-256K](https://huggingface.co/xverse/XVERSE-13B-256K)
+
+该模型没有将RoPE外推参数放到config中，因此需要手工指定：
+```python
+    conf = model.config.__dict__
+    conf["model_type"] = "llama"
+    conf["rope_theta"] = 500000
+    conf["rope_scaling.type"] = "dynamic"
+    conf["rope_scaling.factor"] = 2.0
+    conf["tokenizer_add_dummy_prefix"] = False
+    torch2flm.tofile(exportPath, model, tokenizer, pre_prompt = "", 
+                     user_role = "Human: ", bot_role = "\n\nAssistant: ", 
+                     history_sep = "<FLM_FIX_TOKEN_3>", dtype = dtype)
+```
 
 ### 其他 llama1 系列
 
@@ -153,6 +168,11 @@ XVERSE-13B-Chat V1 版本需要对输入做NFKC规范化，fastllm暂不支持�
 |-----|-----|-----|
 |  7B | [meta-llama/Llama-2-7b-chat](https://huggingface.co/meta-llama/Llama-2-7b-chat) | [meta-llama/Llama-2-7b-chat-hf](https://huggingface.co/meta-llama/Llama-2-7b-chat-hf) |
 | 13B | [meta-llama/Llama-2-13b-chat](https://huggingface.co/meta-llama/Llama-2-13b-chat) | [meta-llama/Llama-2-13b-chat-hf](https://huggingface.co/meta-llama/Llama-2-13b-chat-hf) |
+
+|Model|  CodeLlama-Instruct                                                                               |
+|-----| ------------------------------------------------------------------------------------------------- |
+|  7B |  [codellama/CodeLlama-7b-Instruct-hf](https://huggingface.co/codellama/CodeLlama-7b-Instruct-hf)  |
+| 13B | [codellama/CodeLlama-13b-Instruct-hf](https://huggingface.co/codellama/CodeLlama-13b-Instruct-hf) |
 
 官方示例代码中，可以不用系统提示语：
 
@@ -215,4 +235,18 @@ XVERSE-13B-Chat V1 版本需要对输入做NFKC规范化，fastllm暂不支持�
                      pre_prompt="Below is an instruction that describes a task. " \
                                 "Write a response that appropriately completes the request.\n\n",
                      user_role="### Instruction:\n", bot_role="\n\n### Response:", history_sep="\n", dtype=dtype)
+```
+
+### Deepseek Coder
+
+  * [Deepseek-Coder-1.3B-Instruct](https://huggingface.co/deepseek-ai/deepseek-coder-1.3b-instruct)
+  * [Deepseek-Coder-6.7B-Instruct](https://huggingface.co/deepseek-ai/deepseek-coder-6.7b-instruct)
+  * [Deepseek-Coder-7B-Instruct v1.5](https://huggingface.co/deepseek-ai/deepseek-coder-7b-instruct-v1.5)
+
+```python
+    torch2flm.tofile(exportPath, model, tokenizer, 
+                     pre_prompt="<FLM_FIX_TOKEN_32013>	You are an AI programming assistant, utilizing the Deepseek Coder model, developed by Deepseek Company, " \
+                                "and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, " \
+                                "and other non-computer science questions, you will refuse to answer.\n",
+                     user_role="### Instruction:\n", bot_role="\n### Response:\n", history_sep="\n<|EOT|>\n", dtype=dtype)
 ```
