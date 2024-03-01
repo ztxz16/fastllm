@@ -25,23 +25,23 @@
 #endif
 
 namespace fastllm {
-    void ChatGLMModel::UpdateSinCos(float rope) {
-        if (rope == this->rope) {
+    void ChatGLMModel::UpdateRotaryPosEmb(float rope_factor) {
+        if (rope_factor == this->rope_factor) {
             return;
         }
-        this->rope = rope;
+        this->rope_factor = rope_factor;
         sin.resize(max_positions);
         cos.resize(max_positions);
         std::vector <float> invFreq;
         for (int i = 0; i < rotary_dim; i += 2) {
-            int base = this->bot_role.empty() ? 10000 : 10000 * rope;
+            int base = this->bot_role.empty() ? 10000 : 10000 * this->rope_factor;
             invFreq.push_back(1.0 / pow(base, (float)i / rotary_dim));
         }
         for (int i = 0; i < max_positions; i++) {
             sin[i].resize(rotary_dim);
             cos[i].resize(rotary_dim);
             for (int j = 0; j < invFreq.size(); j++) {
-                float scale = this->bot_role.empty() ? rope : 1.0f;
+                float scale = this->bot_role.empty() ? rope_factor : 1.0f;
                 sin[i][j] = ::sin((float)i / scale * invFreq[j]);
                 cos[i][j] = ::cos((float)i / scale * invFreq[j]);
             }
@@ -65,8 +65,8 @@ namespace fastllm {
         this->eos_token_id = 130005;    // V1 后期版本 eos token，可通过 config.json 覆盖
         this->gmask_token_id= 150001;   // V1最初版本, 150528 tokens，部分 config.json 没有 gmask_token_id，因此取默认值。
 
-        this->rope = -1.0;
-        this->UpdateSinCos(1.0f);
+        this->rope_factor = -1.0;
+        this->UpdateRotaryPosEmb(1.0f);
         weight.embeddingNames.insert("transformer.word_embeddings.weight");
         weight.embeddingNames.insert("transformer.embedding.word_embeddings.weight");
     }
@@ -82,7 +82,7 @@ namespace fastllm {
             this->bos_token_id = 64792;
         }
         if (this->weight.dicts.find("rope_ratio") != this->weight.dicts.end()) {
-            UpdateSinCos(atof(this->weight.dicts["rope_ratio"].c_str()));
+            UpdateRotaryPosEmb(atof(this->weight.dicts["rope_ratio"].c_str()));
         }
     }
 

@@ -8,5 +8,5 @@ model = model.eval();
 
 if __name__ == "__main__":
     dtype = sys.argv[2] if len(sys.argv) >= 3 else "float16"
-    exportPath = sys.argv[1] if len(sys.argv) >= 2 else "moss-' + dtype + '.flm"
+    exportPath = sys.argv[1] if len(sys.argv) >= 2 else "moss-" + dtype + ".flm"
     torch2flm.tofile(exportPath, model, tokenizer, dtype = dtype)
