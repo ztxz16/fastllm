@@ -53,13 +53,13 @@ namespace fastllm {
         this->user_role = "### Instruction:\n";
         this->bot_role = "\n\n### Response:";
         */
-        this->history_sep = "</s>";
+        this->history_sep = "";
         this->pre_prompt = "";
         this->user_role = "";
         this->bot_role = "";
 
-        block_cnt = 32;
-        rotary_dim = 128;
+        block_cnt = 40;
+        rotary_dim = 64;
 
         sin.resize(max_positions);
         cos.resize(max_positions);
@@ -1074,7 +1074,7 @@ namespace fastllm {
         context->Init(this->block_cnt);
 
         context->currentTokens = inputTokens;
-        //context->currentTokens.insert(context->currentTokens.begin(), this->bos_token_id);
+        context->currentTokens.insert(context->currentTokens.begin(), this->bos_token_id);
         context->generationConfig = generationConfig;
         context->tokens = LastTokensUnit(generationConfig.last_n);
         dictLocker.unlock();
