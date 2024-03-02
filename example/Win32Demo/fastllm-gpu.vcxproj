@@ -108,6 +108,7 @@
     </Link>
     <CudaCompile>
       <CodeGeneration>compute_61,sm_61;compute_75,sm_75;compute_86,sm_86;%(CodeGeneration)</CodeGeneration>
+      <GenerateLineInfo>true</GenerateLineInfo>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -127,6 +128,8 @@
     </Link>
     <CudaCompile>
       <CodeGeneration>compute_61,sm_61;compute_75,sm_75;compute_86,sm_86;%(CodeGeneration)</CodeGeneration>
+      <TargetMachinePlatform>64</TargetMachinePlatform>
+      <GenerateLineInfo>true</GenerateLineInfo>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -150,6 +153,7 @@
     </Link>
     <CudaCompile>
       <CodeGeneration>compute_61,sm_61;compute_75,sm_75;compute_86,sm_86;%(CodeGeneration)</CodeGeneration>
+      <FastMath>true</FastMath>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -174,6 +178,7 @@
     <CudaCompile>
       <CodeGeneration>compute_61,sm_61;compute_75,sm_75;compute_86,sm_86;%(CodeGeneration)</CodeGeneration>
       <FastMath>true</FastMath>
+      <TargetMachinePlatform>64</TargetMachinePlatform>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -189,6 +194,7 @@
     <ClInclude Include="..\..\include\models\factoryllm.h" />
     <ClInclude Include="..\..\include\models\glm.h" />
     <ClInclude Include="..\..\include\models\llama.h" />
+    <ClInclude Include="..\..\include\models\minicpm.h" />
     <ClInclude Include="..\..\include\models\moss.h" />
     <ClInclude Include="..\..\include\models\qwen.h" />
     <ClInclude Include="..\..\include\utils\armMath.h" />
@@ -207,6 +213,7 @@
     <ClCompile Include="..\..\src\models\chatglm.cpp" />
     <ClCompile Include="..\..\src\models\glm.cpp" />
     <ClCompile Include="..\..\src\models\llama.cpp" />
+    <ClCompile Include="..\..\src\models\minicpm.cpp" />
     <ClCompile Include="..\..\src\models\moss.cpp" />
     <ClCompile Include="..\..\src\models\qwen.cpp" />
     <ClCompile Include="..\..\src\pybinding.cpp" />
