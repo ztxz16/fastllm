@@ -181,6 +181,7 @@
     <ClInclude Include="..\..\include\models\factoryllm.h" />
     <ClInclude Include="..\..\include\models\glm.h" />
     <ClInclude Include="..\..\include\models\llama.h" />
+    <ClCompile Include="..\..\include\models\minicpm.h" />
     <ClInclude Include="..\..\include\models\moss.h" />
     <ClInclude Include="..\..\include\models\qwen.h" />
     <ClInclude Include="..\..\include\utils\armMath.h" />
@@ -197,6 +198,7 @@
     <ClCompile Include="..\..\src\models\chatglm.cpp" />
     <ClCompile Include="..\..\src\models\glm.cpp" />
     <ClCompile Include="..\..\src\models\llama.cpp" />
+    <ClCompile Include="..\..\src\models\minicpm.cpp" />
     <ClCompile Include="..\..\src\models\moss.cpp" />
     <ClCompile Include="..\..\src\models\qwen.cpp" />
     <ClCompile Include="..\..\src\pybinding.cpp" />
