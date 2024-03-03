@@ -84,6 +84,8 @@ namespace fastllm {
         float rope_base = 10000.f;
 
         float rope_factor = 1.f;
+
+        int num_key_value_heads = num_attention_heads;
     };
 }
 
