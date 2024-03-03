@@ -60,6 +60,12 @@ namespace fastllm {
 
     void LlamaModel::InitParams() {
         basellm::InitParams();
+        num_key_value_heads = num_attention_heads;
+        if (this->weight.dicts.find("num_key_value_heads") != this->weight.dicts.end()) {
+            num_key_value_heads = atoi(this->weight.dicts["num_key_value_heads"].c_str());
+        }
+        head_dim = embed_dim / num_attention_heads;
+        rotary_dim = head_dim;
         if (this->weight.dicts.find("max_position_embeddings") != this->weight.dicts.end()) {
             max_positions = atoi(this->weight.dicts["max_position_embeddings"].c_str());
         }
@@ -162,7 +168,7 @@ namespace fastllm {
                 Linear(attenInput, weight[vWeightName], vBias, v);
             }
 
-            std::vector <int> qkvSize = {bsz, seqlen, num_attention_heads, -1};
+            std::vector <int> qkvSize = {bsz, seqlen, -1, head_dim};
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
@@ -188,7 +194,7 @@ namespace fastllm {
                 fastllm::LlamaRotatePosition2D(k, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
             }
 
-            qkvSize = {bsz * seqlen, num_attention_heads, -1};
+            qkvSize = {bsz * seqlen, -1, head_dim};
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
@@ -228,7 +234,7 @@ namespace fastllm {
 
             // 1.2 Attention
             // 1.2.0 q * k^T
-            MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
+            MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim), q.dims[0] / pastKey.dims[0]);
             attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
             if (alibiData.dims.size() != 0) {
                 AlibiMask(attenWeights, alibiData, -10000);
@@ -237,7 +243,7 @@ namespace fastllm {
             }
 
             Softmax(attenWeights, attenWeights, -1);
-            MatMul(attenWeights, pastValue, attenOutput);
+            MatMul(attenWeights, pastValue, attenOutput, 1.f, attenWeights.dims[1] / pastValue.dims[0]);
 
             attenOutput.Reshape({attenOutput.dims[1], attenOutput.dims[2], attenOutput.dims[3]});
             PermuteSelf(attenOutput, {1, 0, 2});
@@ -345,7 +351,7 @@ namespace fastllm {
                 Linear(attenInput, weight[vWeightName], vBias, v);
             }
 
-            std::vector <int> qkvSize = {bsz, seqlen, num_attention_heads, -1};
+            std::vector <int> qkvSize = {bsz, seqlen, -1, head_dim};
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
@@ -375,7 +381,7 @@ namespace fastllm {
             PermuteSelf(k, {0, 2, 1, 3});
             PermuteSelf(v, {0, 2, 1, 3});
 
-            qkvSize = {bsz * num_attention_heads, seqlen, -1};
+            qkvSize = {-1, seqlen, head_dim};
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
@@ -412,7 +418,7 @@ namespace fastllm {
 
             // 1.2 Attention
             // 1.2.0 q * k^T
-            MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
+            MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim), q.dims[0] / pastKey.dims[0]);
             attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
             if (alibiData.dims.size() != 0) {
                 attenWeights.Reshape({-1, num_attention_heads, attenWeights.dims[2], attenWeights.dims[3]});
@@ -422,7 +428,7 @@ namespace fastllm {
                 AttentionMask(attenWeights, attentionMask, -10000);
             }
             Softmax(attenWeights, attenWeights, -1);
-            MatMul(attenWeights, pastValue, attenOutput);
+            MatMul(attenWeights, pastValue, attenOutput, 1.f, attenWeights.dims[1] / pastValue.dims[0]);
 
             attenOutput.Reshape({attenOutput.dims[1], attenOutput.dims[2], attenOutput.dims[3]});
             PermuteSelf(attenOutput, {1, 0, 2});
@@ -552,7 +558,7 @@ namespace fastllm {
             for (int b = 0; b < batch; b++) {
                 auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
 
-                std::vector<int> qkvSize = {bsz, seqLens[b], num_attention_heads, -1};
+                std::vector<int> qkvSize = {bsz, seqLens[b], -1, head_dim};
                 q.Reshape(qkvSize);
                 k.Reshape(qkvSize);
                 v.Reshape(qkvSize);
@@ -582,7 +588,7 @@ namespace fastllm {
                 PermuteSelf(k, {0, 2, 1, 3});
                 PermuteSelf(v, {0, 2, 1, 3});
 
-                qkvSize = {bsz * num_attention_heads, seqLens[b], -1};
+                qkvSize = {-1, seqLens[b], head_dim};
                 q.Reshape(qkvSize);
                 k.Reshape(qkvSize);
                 v.Reshape(qkvSize);
@@ -621,7 +627,7 @@ namespace fastllm {
 
                 // 1.2 Attention
                 // 1.2.0 q * k^T
-                MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
+                MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim), q.dims[0] / pastKey.dims[0]);
                 attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
                 if (alibiData.dims.size() != 0) {
                     AlibiMask(attenWeights, alibiData, -10000);
@@ -630,7 +636,7 @@ namespace fastllm {
                 }
 
                 Softmax(attenWeights, attenWeights, -1);
-                MatMul(attenWeights, pastValue, curAttenOutput);
+                MatMul(attenWeights, pastValue, curAttenOutput, 1.f, attenWeights.dims[1] / pastValue.dims[0]);
                 curAttenOutput.Reshape({curAttenOutput.dims[1], curAttenOutput.dims[2], curAttenOutput.dims[3]});
                 PermuteSelf(curAttenOutput, {1, 0, 2});
                 curAttenOutput.Reshape({seqLens[b], bsz, -1});

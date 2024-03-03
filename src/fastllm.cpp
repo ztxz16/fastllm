@@ -1938,16 +1938,16 @@ namespace fastllm {
         }, {}, {{"axis", axis}});
     }
 
-    void MatMul(const Data &input0, const Data &input1, Data &output, float alpha) {
+    void MatMul(const Data &input0, const Data &input1, Data &output, float alpha, int group) {
         curExecutor->Run("MatMul", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}, {"output", &output}
-        }, {{"alpha", alpha}}, {});
+        }, {{"alpha", alpha}}, {{"group", group}});
     }
 
-    void MatMulTransB(const Data &input0, const Data &input1, Data &output, float alpha) {
+    void MatMulTransB(const Data &input0, const Data &input1, Data &output, float alpha, int group) {
         curExecutor->Run("MatMulTransB", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}, {"output", &output}
-        }, {{"alpha", alpha}}, {});
+        }, {{"alpha", alpha}}, {{"group", group}});
     }
 
     void Softmax(const Data &input, Data &output, int axis) {
