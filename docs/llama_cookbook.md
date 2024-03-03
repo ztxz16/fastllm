@@ -225,6 +225,17 @@ XVERSE-13B-Chat V1 版本需要对输入做NFKC规范化，fastllm暂不支持�
                      user_role="[|Human|]:", bot_role="\n[|AI|]:", history_sep="\n", dtype=dtype)
 ```
 
+## Yi
+
+* 01-ai/[Yi-6B-Chat](https://huggingface.co/01-ai/Yi-6B-Chat)
+
+* 01-ai/[Yi-34B-Chat](https://huggingface.co/01-ai/Yi-34B-Chat)
+
+```python
+    torch2flm.tofile(exportPath, model, tokenizer, pre_prompt="",
+                     user_role="<|im_start|>user\n", bot_role="<|im_end|><|im_start|>assistant\n", history_sep="<|im_end|>\n", dtype=dtype)
+```
+
 ### WizardCoder
 
   * [WizardCoder-Python-7B-V1.0](https://huggingface.co/WizardLM/WizardCoder-Python-7B-V1.0)
