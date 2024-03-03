@@ -69,6 +69,9 @@ namespace fastllm {
         if (this->weight.dicts.find("max_position_embeddings") != this->weight.dicts.end()) {
             max_positions = atoi(this->weight.dicts["max_position_embeddings"].c_str());
         }
+        if (this->weight.dicts.find("rms_norm_eps") != this->weight.dicts.end()) {
+            rms_norm_eps = atof(this->weight.dicts["rms_norm_eps"].c_str());
+        }
         if (this->weight.dicts.find("rope_scaling.type") != this->weight.dicts.end()) {
             std::string type = this->weight.dicts["rope_scaling.type"];
             if (type == "linear")
@@ -79,7 +82,6 @@ namespace fastllm {
         if (this->weight.dicts.find("rope_theta") != this->weight.dicts.end()) {
             rope_base = atof(this->weight.dicts["rope_theta"].c_str());
         }
-        float factor = 1.0f;
         if (this->weight.dicts.find("rope_scaling.factor") != this->weight.dicts.end()) {
             rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
         }
@@ -140,7 +142,7 @@ namespace fastllm {
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
-                    1e-6, attenInput);
+                    rms_norm_eps, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
@@ -253,7 +255,7 @@ namespace fastllm {
             Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
-            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
             Silu(w1, w1);
@@ -274,7 +276,7 @@ namespace fastllm {
         int lastRet = -1;
         {
             auto &hiddenStates = *lastHiddenStates;
-            RMSNorm(hiddenStates, weight["model.norm.weight"], 1e-6, hiddenStates);
+            RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
             Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
             if (generationConfig.output_logits && retLogits != nullptr) {
                 int size = logits.dims.back();
@@ -323,7 +325,7 @@ namespace fastllm {
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
-                    1e-6, attenInput);
+                    rms_norm_eps, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
@@ -439,7 +441,7 @@ namespace fastllm {
             Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
-            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
             Silu(w1, w1);
@@ -461,7 +463,7 @@ namespace fastllm {
         std::vector <int> lastRet;
         {
             auto &hiddenStates = *lastHiddenStates;
-            RMSNorm(hiddenStates, weight["model.norm.weight"], 1e-6, hiddenStates);
+            RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
             Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
             if (generationConfig.IsSimpleGreedy()) {
                 TopK(logits, topk, 1);
@@ -514,7 +516,7 @@ namespace fastllm {
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
-                    1e-6, attenInput);
+                    rms_norm_eps, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
@@ -653,7 +655,7 @@ namespace fastllm {
             Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
-            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
             Silu(w1, w1);
@@ -663,7 +665,7 @@ namespace fastllm {
         }
 
         Data logits, curLogit;
-        RMSNorm(hiddenStates, weight["model.norm.weight"], 1e-6, hiddenStates);
+        RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         std::vector <int> lastRet;
         int total = 0;
