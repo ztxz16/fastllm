@@ -15,6 +15,8 @@ namespace fastllm {
     public:
         MiniCpmModel(); // 构造函数
 
+        virtual void InitParams(); // 初始化参数信息
+
         // 推理
         virtual int Forward(
                 const Data &inputIds,
@@ -65,6 +67,13 @@ namespace fastllm {
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
 
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
+
+    private:
+        float embed_scale = 1.f;
+
+        float attention_scale = 1.f / std::sqrt(block_cnt);
+
+        float rms_scale = 1.f / 4096.f;
     };
 }
 

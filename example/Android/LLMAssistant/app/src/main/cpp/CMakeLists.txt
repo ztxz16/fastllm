@@ -32,11 +32,13 @@ set(PROJECT_SOURCE
         ../../../../../../../src/executor.cpp
         ../../../../../../../src/devices/cpu/cpudevice.cpp
         ../../../../../../../src/devices/cpu/cpudevicebatch.cpp
+        ../../../../../../../src/models/basellm.cpp
         ../../../../../../../src/models/chatglm.cpp
         ../../../../../../../src/models/moss.cpp
         ../../../../../../../src/models/llama.cpp
-        ../../../../../../../src/models/basellm.cpp
         ../../../../../../../src/models/qwen.cpp
+        ../../../../../../../src/models/glm.cpp
+        ../../../../../../../src/models/minicpm.cpp
         )
 
 include_directories(
