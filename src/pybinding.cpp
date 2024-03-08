@@ -1,13 +1,24 @@
 #include "model.h"
 #include "factoryllm.h"
 
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+
+
 namespace pyfastllm{
   // 对接不断更新的后端接口
   // 需优化，减少内存拷贝
-  fastllm::Data RMSNorm(const fastllm::Data &input, const fastllm::Data &weight, float eps){
-    fastllm::Data output;
+  
+  fastllm::Data Embedding(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output){
+    fastllm::Embedding(input, weight, output);
+    // output.ToDevice(fastllm::DataDevice::CPU);
+    return output;
+  }
+  fastllm::Data &RMSNorm(const fastllm::Data &input, const fastllm::Data &weight, float eps, fastllm::Data &output){
+    // fastllm::Data output;
     // std::cout<<"run rms norm"<<std::endl;
     fastllm::RMSNorm(input, weight, eps, output);
+    // output.ToDevice(fastllm::DataDevice::CPU);
     // output.Print();
     // std::cout<<"return val"<<std::endl;
     return output;
@@ -16,24 +27,26 @@ namespace pyfastllm{
   fastllm::Data LayerNorm(fastllm::Data &input, fastllm::Data &gamma, fastllm::Data &beta, int axis){
     fastllm::Data output;
     fastllm::LayerNorm(input, gamma, beta, axis, output);
+    // output.ToDevice(fastllm::DataDevice::CPU);
     return output;
   }
 
-  fastllm::Data Linear(fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias){
-    fastllm::Data output;
+  fastllm::Data Linear(fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output){
+    // fastllm::Data output;
     fastllm::Linear(input, weight, bias, output);
+    // output.ToDevice(fastllm::DataDevice::CPU);
     return output;
   }
 
   fastllm::Data MatMul(const fastllm::Data &input0, const fastllm::Data &input1, float alpha){
     fastllm::Data output;
     fastllm::MatMul(input0, input1, output, alpha);
+    // output.ToDevice(fastllm::DataDevice::CPU);
     return output;
   }
 
   fastllm::Data Attention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v, const fastllm::Data &mask,
-                   int group, float scale, int attentionType) {
-    fastllm::Data output;
+                   int group, float scale, int attentionType, fastllm::Data &output) {
     fastllm::Attention(q, k, v, mask, output, group, scale, attentionType);
     return output;
   }
@@ -41,65 +54,179 @@ namespace pyfastllm{
   fastllm::Data Softmax(const fastllm::Data &input,int axis) {
     fastllm::Data output;
     fastllm::Softmax(input, output, axis);
+    // output.ToDevice(fastllm::DataDevice::CPU);
     return output;
   }
 
   fastllm::Data Silu(const fastllm::Data &input) {
     fastllm::Data output;
     fastllm::Silu(input, output);
+    // output.ToDevice(fastllm::DataDevice::CPU);
     return output;
   }
 
   fastllm::Data Gelu(const fastllm::Data &input) {
     fastllm::Data output;
     fastllm::GeluNew(input, output);
+    // output.ToDevice(fastllm::DataDevice::CPU);
     return output;
   }
 
-  fastllm::Data Swiglu(const fastllm::Data &input) {
-    fastllm::Data output;
+  fastllm::Data Swiglu(const fastllm::Data &input, fastllm::Data &output) {
     fastllm::Swiglu(input, output);
     return output;
   }
 
-  fastllm::Data Mul(const fastllm::Data &input, float v){
-    fastllm::Data output;
+  fastllm::Data Mul(const fastllm::Data &input, float v, fastllm::Data &output){
     fastllm::Mul(input, v, output);
+    // output.ToDevice(fastllm::DataDevice::CPU);
     return output;
   }
 
   fastllm::Data Add(fastllm::Data &input0, const fastllm::Data &input1, float alpha) {
     // fastllm::Data output;
-    fastllm::AddTo(input0, input1);
+    fastllm::AddTo(input0, input1, alpha);
+    // input0.ToDevice(fastllm::DataDevice::CPU);
     return input0;
+  }
+
+  fastllm::Data Split(const fastllm::Data &input, int axis, int start, int end, fastllm::Data &output){
+    fastllm::Split(input, axis, start, end, output);
+    // output.ToDevice(fastllm::DataDevice::CPU);
+    return output;
+  }
+
+  fastllm::Data Permute(const fastllm::Data &input, const std::vector<int> &axis, fastllm::Data &output){
+    fastllm::Permute(input, axis, output);
+    // output.ToDevice(fastllm::DataDevice::CPU);
+    return output;
+  }
+
+  fastllm::Data Cat(const fastllm::Data &input0, const fastllm::Data &input1, int axis) {
+    fastllm::Data output;
+    fastllm::Cat(input0, input1, axis, output);
+    // output.ToDevice(fastllm::DataDevice::CPU);
+    return output;
+  }
+
+  fastllm::Data CatDirect(fastllm::Data &input0, const fastllm::Data &input1, int axis) {
+    fastllm::CatDirect(input0, input1, axis);
+    // input0.ToDevice(fastllm::DataDevice::CPU);
+    return input0;
+  }
+
+  fastllm::Data TopK(const fastllm::Data &input, int topk, fastllm::Data &output) {
+    fastllm::TopK(input, output, topk);
+    // output.ToDevice(fastllm::DataDevice::CPU);
+    return output;
+  }
+
+  fastllm::Data RotatePosition2D(fastllm::Data &input, const fastllm::Data &positionIds, fastllm::Data &sinData, fastllm::Data &cosData, int rotaryDim){
+    fastllm::RotatePosition2D(input, positionIds, sinData, cosData, rotaryDim);
+    return input;
+  }
+
+  fastllm::Data NearlyRotatePosition2D(fastllm::Data &input, 
+                          const fastllm::Data &positionIds, 
+                          fastllm::Data &sinData, 
+                          fastllm::Data &cosData, 
+                          int rotaryDim){
+    fastllm::NearlyRotatePosition2D(input, positionIds, sinData, cosData, rotaryDim);
+    return input;
   }
 
   std::string String(const fastllm::Data &data){
     std::string ss;
-    ss += "[";
+    ss += "tensor([";
     int last_dim = data.dims.back();
     int n = data.Count(0) / last_dim, m = last_dim;
     for (int i = 0; i < n; i++) {
       if (i > 0) ss += "\n";
-      for (int j = 0; j < 10 && j < m; j++) {
-          if (j>0) ss += " ";
+      for (int j = 0; j < 3 && j < m; j++) {
+          if (j>0) ss += ", ";
           ss += std::to_string(reinterpret_cast<float*>(data.cpuData)[i*m+j]);
       }
-      if (m > 10) {
-          ss += "... ";
-          for (int j = 0; j < 10 && j < m; j++) {
-            if (j>0) ss += " ";
-            ss += std::to_string(reinterpret_cast<float*>(data.cpuData)[i*m + (m-10+j)]);
+      if (m > 3) {
+          ss += "..., ";
+          for (int j = 0; j < 3 && j < m; j++) {
+            if (j>0) ss += ", ";
+            ss += std::to_string(reinterpret_cast<float*>(data.cpuData)[i*m + (m-3+j)]);
           }
       }
       
     }
-    ss += "]";
+    ss += "])";
     return ss;
+  }
+
+  std::string Size(const fastllm::Data &data){
+    std::string ss = "Size([";
+    for (int i : data.dims) {
+      ss += std::to_string(i) + ", ";
+    }
+    ss += "])";
+    return ss;
+  }
+
+  fastllm::Data ToDevice(fastllm::Data &data, const std::string &devices){
+    size_t pos = devices.find(":");
+    int len = devices.length();
+
+    std::vector<int>deviceIds;
+    std::string deviceStr = devices; 
+    int device = fastllm::DataDevice::CPU;
+    int deviceNum = 0;
+
+    if (pos != -1){
+      int deviceNum = atoi(devices.substr(pos, len-pos-1).c_str());
+      deviceStr = devices.substr(0, pos);
+    }
+
+    deviceIds = {deviceNum};
+    std::cout<<deviceStr<<std::endl;
+
+    if (deviceStr == "cuda"){
+       data.ToDevice(fastllm::DataDevice::CUDA, deviceIds);
+    }else{
+       data.ToDevice(fastllm::DataDevice::CPU, deviceIds);
+    }
+    return data;
+  }
+
+  fastllm::WeightMap LoadWeights(const std::string &fileName){
+    fastllm::WeightMap wm;
+    wm.LoadFromFile(fileName);
+    return wm;
+  }
+
+  // 浅拷贝
+  // template<class T>
+  fastllm::Data fromNumpy(pybind11::array_t<float> NpData){
+    pybind11::buffer_info buf = NpData.request();
+    // printf("%u \n", buf.ptr);
+    float *ptr = (float*) buf.ptr;
+
+    std::vector<int> dataSize;
+    int dataNum = 1;
+    for (auto sz:buf.shape){
+      dataSize.emplace_back((int)sz);
+      dataNum *= sz;
+    }
+
+    std::vector<float> Vdata;
+    for (int i=0;i<dataNum;i++){
+      Vdata.emplace_back(*(ptr+i));
+    }
+
+    fastllm::Data data = fastllm::Data(fastllm::DataType::FLOAT32, dataSize, Vdata);
+    // printf("build end!!!\n");
+    // std::memcpy(data.cpuData, ptr, data.GetBytes());
+    return data;
   }
 }
 
 #ifdef PY_API
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>
@@ -145,15 +272,14 @@ PYBIND11_MODULE(pyfastllm, m) {
   }); 
   // low level
   m.def("get_llm_type", &fastllm::GetModelTypeFromFile);
-
   m.def("llm_sampling", &fastllm::LLMSampling)
-    // .def("embedding", &fastllm::Embedding)
+    .def("embedding", &pyfastllm::Embedding)
     .def("rms_norm", &pyfastllm::RMSNorm)
     .def("layer_norm", &pyfastllm::LayerNorm)
     .def("linear", &pyfastllm::Linear)
-    // .def("split", &fastllm::Split)
-    // .def("cat", &fastllm::Cat)
-    // .def("cat_direct", &fastllm::CatDirect)
+    .def("split", &pyfastllm::Split)
+    .def("cat", &pyfastllm::Cat)
+    .def("cat_direct", &pyfastllm::CatDirect)
     .def("matmul", &pyfastllm::MatMul)
     // .def("matmul_transB", &fastllm::MatMulTransB)
     .def("softmax", &pyfastllm::Softmax)
@@ -161,18 +287,21 @@ PYBIND11_MODULE(pyfastllm, m) {
     .def("gelu", &pyfastllm::Gelu)
     .def("swiglu", &pyfastllm::Swiglu)
     .def("mul", &pyfastllm::Mul)
-    .def("attention", &pyfastllm::Attention);
-    // .def("mul_to", &fastllm::MulTo)
-    // .def("add_to", &fastllm::AddTo)
+    .def("attention", &pyfastllm::Attention)
+    .def("mul_to", &fastllm::MulTo)
+    .def("add_to", &fastllm::AddTo)
+    .def("add", &pyfastllm::Add)
     // .def("attention_mask", &fastllm::AttentionMask)
     // .def("alibi_mask", &fastllm::AlibiMask)
-    // .def("permute", &fastllm::Permute)
+    .def("permute", &pyfastllm::Permute)
     // .def("permute_self", &fastllm::PermuteSelf)
-    // .def("topk", &fastllm::TopK)
-    // .def("rotateposition2D", &fastllm::RotatePosition2D)
-    // .def("nearlyrotateposition2D", &fastllm::NearlyRotatePosition2D)
-    // .def("llama_rotateposition2D", &fastllm::LlamaRotatePosition2D)
+    .def("topk", &pyfastllm::TopK)
+    .def("rotateposition2D", &pyfastllm::RotatePosition2D)
+    .def("nearlyrotateposition2D", &pyfastllm::NearlyRotatePosition2D)
+    .def("llama_rotateposition2D", &fastllm::LlamaRotatePosition2D)
     // .def("repeat_penalty", &fastllm::RepeatPenalty);
+    .def("load", &pyfastllm::LoadWeights)
+    .def("from_numpy", &pyfastllm::fromNumpy);
 
   py::enum_<fastllm::DataType>(m, "Dtype")
     .value("float32", fastllm::DataType::FLOAT32)
@@ -194,19 +323,24 @@ PYBIND11_MODULE(pyfastllm, m) {
             py::format_descriptor<float>::format(), /* Python struct-style format descriptor */
             m.dims.size(),                                      /* Number of dimensions */
             m.dims,                 /* Buffer dimensions */
-            { sizeof(float) * m.dims[1],             /* Strides (in bytes) for each index */
-              sizeof(float) }
+            m.strides
+            // { sizeof(float) * m.dims[1],             /* Strides (in bytes) for each index */
+            //   sizeof(float) }
         );
      })
     .def_readonly("dims", &fastllm::Data::dims)
+    .def_readonly("expansionDims", &fastllm::Data::expansionDims)
     .def(py::init<>())
     .def(py::init<fastllm::DataType>())
     .def(py::init<fastllm::DataType, const std::vector<int>&>())
     .def(py::init<fastllm::DataType, const std::vector<int>&, const std::vector<float>&>())
     .def(py::init<fastllm::Data>())
-    .def_readonly("shape", &fastllm::Data::dims) 
     .def("copy_from", &fastllm::Data::CopyFrom)
     .def("count", &fastllm::Data::Count)
+
+    .def_readonly("shape", &fastllm::Data::dims)
+    .def("reshape", &fastllm::Data::Reshape)
+    .def("expansion", &fastllm::Data::Expansion)
     .def("to_list", [](fastllm::Data& data){
       std::vector <float> vecData;
       for (int i = 0; i < data.Count(0); i++) {
@@ -215,8 +349,8 @@ PYBIND11_MODULE(pyfastllm, m) {
         return vecData;
     })
     .def("__str__", &pyfastllm::String)
-    .def("print", &fastllm::Data::Print)
-    .def("to", static_cast<void (fastllm::Data::*)(void *device)>(&fastllm::Data::ToDevice));
+    .def("size", &pyfastllm::Size)
+    .def("to", &pyfastllm::ToDevice);
 
   m.def("zeros", [](const std::vector<int> &dims, fastllm::DataType dtype)->fastllm::Data {
     int nums = 1;
@@ -281,11 +415,20 @@ PYBIND11_MODULE(pyfastllm, m) {
   
   py::class_<fastllm::WeightMap>(m, "WeightMap")
     .def_readonly("tokenizer", &fastllm::WeightMap::tokenizer)
+    .def("load", &fastllm::WeightMap::LoadFromFile)
     .def("save_lowbit", &fastllm::WeightMap::SaveLowBitModel)
     .def("set_kv", &fastllm::WeightMap::AddDict)
     .def("set_weight", &fastllm::WeightMap::AddWeight)
     .def("__getitem__", [](fastllm::WeightMap &weight, std::string key){
-        return weight[key]; });
+        return weight[key]; 
+    })
+    .def("keys", [](fastllm::WeightMap &weight){
+      std::vector<std::string> keys;
+      for (auto iter:weight.weight){
+        keys.push_back(iter.first);
+      }
+      return keys;
+    });
 
 
   // model classes

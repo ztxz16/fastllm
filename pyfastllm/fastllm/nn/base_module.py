@@ -1,5 +1,6 @@
+import pyfastllm
 from typing import Any
-
+from abc import abstractmethod
 
 class Module():
     def __init__(self) -> None:
@@ -8,11 +9,9 @@ class Module():
     def __call__(self, *args: Any, **kwds: Any) -> Any:
         return self.forward(*args, **args)
     
-    @classmethod
+    @abstractmethod
     def forward(self, ):
         pass
 
     def _init_weight(self, ):
         pass
-
-    
