@@ -92,15 +92,16 @@ namespace fastllm {
         cosData.CopyFrom(Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second));
     }
 
-    std::pair<std::vector<float>, std::vector<float>> LlamaModel::UpdateRotaryPosEmb(float base, float factor) {
-        sin.resize(max_positions);
-        cos.resize(max_positions);
+    std::pair<std::vector<float>, std::vector<float>> LlamaModel::UpdateRotaryPosEmb(float base, float factor, int seqLen) {
+        int positions = std::max(max_positions, seqLen);
+        sin.resize(positions);
+        cos.resize(positions);
         std::vector <float> invFreq;
         for (int i = 0; i < rotary_dim; i += 2) {
             invFreq.push_back(1.0 / pow(base, (float)i / rotary_dim));
         }
         float scale = rope_type == RoPEType::LINEAR_SCALE ? factor : 1.0;
-        for (int i = 0; i < max_positions; i++) {
+        for (int i = 0; i < positions; i++) {
             sin[i].resize(rotary_dim);
             cos[i].resize(rotary_dim);
             for (int j = 0; j < invFreq.size(); j++) {
@@ -110,10 +111,8 @@ namespace fastllm {
         }
         std::vector <float> fsin, fcos;
         for (int i = 0; i < sin.size(); i++) {
-            for (int j = 0; j < sin[0].size(); j++) {
-                fsin.push_back(sin[i][j]);
-                fcos.push_back(cos[i][j]);
-            }
+            fsin.insert(fsin.end(), sin[i].begin(), sin[i].end());
+            fcos.insert(fcos.end(), cos[i].begin(), cos[i].end());
         }
         return std::make_pair(fsin, fcos);
     }
@@ -157,10 +156,11 @@ namespace fastllm {
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
                 Linear(attenInput, weight[qkvWeightName], Data(), qkv);
-                int per = qkv.dims.back() / 3;
-                Split(qkv, -1, 0, per, q);
-                Split(qkv, -1, per, per * 2, k);
-                Split(qkv, -1, per * 2, per * 3, v);
+                int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
+                int qdim = per * (num_attention_heads / num_key_value_heads);
+                Split(qkv, -1, 0, qdim, q);
+                Split(qkv, -1, qdim, qdim + per, k);
+                Split(qkv, -1, qdim + per, qdim + per * 2, v);
             } else {
                 Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
                 Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
@@ -183,12 +183,13 @@ namespace fastllm {
                 pastKey.ToDevice(DataDevice::CUDA);
                 pastValue.ToDevice(DataDevice::CUDA);
             }
-            if (i == 0 && pastKey.dims.empty() && maxLen > max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
-                float scale = pow((rope_factor * maxLen / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+            int targetSeqLength = (pastKey.dims.size() > 2) ? pastKey.dims[1] + maxLen : maxLen;
+            if (i == 0 && targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
+                float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
                 float newbase = rope_base * scale;
-                std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
-                sinDataPtr = new Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first);
-                cosDataPtr = new Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second);
+                std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(newbase, rope_factor, targetSeqLength);
+                sinDataPtr = new Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, pair.first);
+                cosDataPtr = new Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, pair.second);
             }
 
             if (alibiData.dims.size() == 0) {
@@ -340,10 +341,11 @@ namespace fastllm {
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
                 Linear(attenInput, weight[qkvWeightName], Data(), qkv);
-                int per = qkv.dims.back() / 3;
-                Split(qkv, -1, 0, per, q);
-                Split(qkv, -1, per, per * 2, k);
-                Split(qkv, -1, per * 2, per * 3, v);
+                int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
+                int qdim = per * (num_attention_heads / num_key_value_heads);
+                Split(qkv, -1, 0, qdim, q);
+                Split(qkv, -1, qdim, qdim + per, k);
+                Split(qkv, -1, qdim + per, qdim + per * 2, v);
             } else {
                 Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
                 Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
@@ -366,12 +368,13 @@ namespace fastllm {
                 pastKey.ToDevice(DataDevice::CUDA);
                 pastValue.ToDevice(DataDevice::CUDA);
             }
-            if (i == 0 && pastKey.dims.empty() && seqlen > max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
-                float scale = pow((rope_factor * seqlen / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+            int targetSeqLength = (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqlen : seqlen;
+            if (i == 0 && targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
+                float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
                 float newbase = rope_base * scale;
-                std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
-                sinDataPtr = new Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first);
-                cosDataPtr = new Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second);
+                std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(newbase, rope_factor, targetSeqLength);
+                sinDataPtr = new Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, pair.first);
+                cosDataPtr = new Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, pair.second);
             }
 
             if (alibiData.dims.size() == 0) {
@@ -531,10 +534,11 @@ namespace fastllm {
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
                 Linear(attenInput, weight[qkvWeightName], Data(), qkv);
-                int per = qkv.dims.back() / 3;
-                Split(qkv, -1, 0, per, q);
-                Split(qkv, -1, per, per * 2, k);
-                Split(qkv, -1, per * 2, per * 3, v);
+                int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
+                int qdim = per * (num_attention_heads / num_key_value_heads);
+                Split(qkv, -1, 0, qdim, q);
+                Split(qkv, -1, qdim, qdim + per, k);
+                Split(qkv, -1, qdim + per, qdim + per * 2, v);
             } else {
                 Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
                 Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
@@ -573,12 +577,13 @@ namespace fastllm {
                     pastKey.ToDevice(DataDevice::CUDA);
                     pastValue.ToDevice(DataDevice::CUDA);
                 }
-                if (i == 0 && pastKey.dims.empty() && seqLens[b] > max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
-                    float scale = pow((rope_factor * seqLens[b] / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+                int targetSeqLength = (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqLens[b] : seqLens[b];
+                if (i == 0 && targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
+                    float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
                     float newbase = rope_base * scale;
-                    std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
-                    sinDataPtrList[b] = new Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first);
-                    cosDataPtrList[b] = new Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second);
+                    std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(newbase, rope_factor, targetSeqLength);
+                    sinDataPtrList[b] = new Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, pair.first);
+                    cosDataPtrList[b] = new Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, pair.second);
                 }
 
                 if (alibiData.dims.size() == 0) {

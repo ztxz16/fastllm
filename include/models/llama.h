@@ -76,7 +76,7 @@ namespace fastllm {
 
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
 
-        std::pair<std::vector<float>, std::vector<float>> UpdateRotaryPosEmb(float base, float factor); // 更新位置编码
+        std::pair<std::vector<float>, std::vector<float>> UpdateRotaryPosEmb(float base, float factor, int seqLen = 0); // 更新位置编码
 
     protected:
         RoPEType rope_type = RoPEType::BASE;
