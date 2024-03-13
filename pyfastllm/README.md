@@ -13,6 +13,20 @@ pyfastllm是基于fastllm的python api接口实现，通过pyfastllm可以更加
 
 ## 版本更新
 
+
+### 已知BUG
+1. 从cpp到python存在内存拷贝
+2. 由于1的问题，fastllm后端采用的深拷贝策略，cuda data将被忽略
+3. 每个op都将转化为Host端返回，GPU内存释放存在问题
+
+
+### v0.2.1.1 2024-03-13
+- 解决了numpy转换的一些bug
+- 增加了一些Module
+- 增加了op测试
+- 完整测试并支持chatglm2
+
+
 ### v0.2.1 2024-03-08
 - 增加了低级python接口
 - 测试低级接口，实现了纯python版本的chatglm2

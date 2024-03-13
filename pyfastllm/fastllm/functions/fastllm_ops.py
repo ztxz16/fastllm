@@ -58,12 +58,15 @@ def activation(inputs: pyfastllm.Tensor, axis=-1, activate_type="silu"):
         func(inputs, output)
     return output
 
+def cat_(inputs, cur_data, axis=1):
+    pyfastllm.cat_direct(inputs, cur_data, axis)
+
 def mul(inputs: pyfastllm.Tensor, v: int):
     output = pyfastllm.Tensor()
     pyfastllm.mul(inputs, v, output)
     return output
 
-def add(input0: pyfastllm.Tensor, input1: pyfastllm.Tensor, v: int):
+def add(input0: pyfastllm.Tensor, input1: pyfastllm.Tensor, v:int=1.0):
     output = pyfastllm.Tensor()
     output = pyfastllm.add(input0, input1, v)
     return output
@@ -71,6 +74,7 @@ def add(input0: pyfastllm.Tensor, input1: pyfastllm.Tensor, v: int):
 def permute(inputs: pyfastllm.Tensor, dims=None):
     output = pyfastllm.Tensor()
     pyfastllm.permute(inputs, dims, output)
+    # pyfastllm.permute_(inputs, dims)
     return output
 
 def split(inputs: pyfastllm.Tensor, axis:int, start:int, end:int):
@@ -83,20 +87,22 @@ def topk(logits:pyfastllm.Tensor, axis:int = 1):
     pyfastllm.topk(logits, axis, output)
     return output
 
+def load(filepath):
+    state_dict = pyfastllm.WeightMap()
+    state_dict.load(filepath)
+    return state_dict
+
 def AttentionMask():
     pass
 
 def AlibiMask():
     pass
 
-def topk():
-    pass
+def RotatePosition2D(data, pos_id, sin_data, cos_data, rotary_dim):
+    return pyfastllm.rotateposition2D(data, pos_id, sin_data, cos_data, rotary_dim)
 
-def RotatePosition2D():
-    pass
-
-def NearlyRotatePosition2D():
-    pass
+def NearlyRotatePosition2D(data, pos_id, sin_data, cos_data, rotary_dim):
+    return pyfastllm.nearlyrotateposition2D(data, pos_id, sin_data, cos_data, rotary_dim)
 
 def LlamaRotatePosition2D():
     pass
