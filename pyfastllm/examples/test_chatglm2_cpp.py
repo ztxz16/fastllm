@@ -20,7 +20,7 @@ def to_numpy(data):
 ## 模型测试
 def load_weights():
     file = "/home/pan/Public/Models/models-flm/chatglm2-6b.flm"
-    state_dict = fastllm.load(file)
+    state_dict = ops.load(file)
     # print(state_dict.keys())
     return state_dict
 

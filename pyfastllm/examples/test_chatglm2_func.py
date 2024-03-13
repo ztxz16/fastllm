@@ -36,7 +36,7 @@ def to_numpy(data):
 
 def load_weights():
     file = "/home/pan/Public/Models/models-flm/chatglm2-6b.flm"
-    state_dict = fastllm.load(file)
+    state_dict = ops.load(file)
     # print(state_dict.keys())
     return state_dict
 
@@ -80,8 +80,8 @@ def core_attention(q, k, v, attn_mask, pastkv):
     seq_len, batch, num_attention_heads, attn_dim = q.shape
     embed_dim = num_attention_heads * attn_dim
     
-    k.reshape([k.shape[0], k.shape[1] * k.shape[2], k.shape[3]])
-    v.reshape([v.shape[0], v.shape[1] * v.shape[2], v.shape[3]])
+    k.reshape([k.size(0), k.size(1) * k.size(2), k.size(3)])
+    v.reshape([v.size(0), v.size(1) * v.size(2), v.size(3)])
 
     k = ops.permute(k, [1, 0, 2])
     v = ops.permute(v, [1, 0, 2])
@@ -91,40 +91,40 @@ def core_attention(q, k, v, attn_mask, pastkv):
 
     unitLen = 64
     while (
-        (len(pastKey.shape) == 0 and (len(pastKey.expansionDims) == 0 or k.shape[1] > pastKey.expansionDims[1])) 
-        or (len(pastKey.shape) > 0 and (len(pastKey.expansionDims) == 0 or pastKey.shape[1] + k.shape[1] > pastKey.expansionDims[1]))
+        (len(pastKey.shape) == 0 and (len(pastKey.expansionDims) == 0 or k.size(1) > pastKey.expansionDims[1])) 
+        or (len(pastKey.shape) > 0 and (len(pastKey.expansionDims) == 0 or pastKey.size(1) + k.size(1) > pastKey.expansionDims[1]))
         ):
         if pastKey.count(0) == 0 or len(pastKey.shape) == 0:
-            newDims =[k.shape[0], int(((k.shape[1] - 1) / unitLen + 1) * unitLen), k.shape[2]]
+            newDims =[k.size(0), int(((k.size(1) - 1) / unitLen + 1) * unitLen), k.size(2)]
         else:
             newDims = pastKey.shape 
-            newDims[1] += int(((k.shape[1] - 1) / unitLen + 1) * unitLen)
+            newDims[1] += int(((k.size(1) - 1) / unitLen + 1) * unitLen)
         
         # print(newDims)
         pastKey.expansion(newDims)
     
     while (
-        (len(pastValue.shape) == 0 and (len(pastValue.expansionDims) == 0 or v.shape[1] > pastValue.expansionDims[1])) 
-        or (len(pastValue.shape) > 0 and (len(pastValue.expansionDims) == 0 or pastValue.shape[1] + v.shape[1] > pastValue.expansionDims[1]))
+        (len(pastValue.shape) == 0 and (len(pastValue.expansionDims) == 0 or v.size(1) > pastValue.expansionDims[1])) 
+        or (len(pastValue.shape) > 0 and (len(pastValue.expansionDims) == 0 or pastValue.size(1) + v.size(1) > pastValue.expansionDims[1]))
         ):
         if pastValue.count(0) == 0 or len(pastValue.shape) == 0:
-            newDims =[v.shape[0], int(((v.shape[1] - 1) / unitLen + 1) * unitLen), v.shape[2]]
+            newDims =[v.size(0), int(((v.size(1) - 1) / unitLen + 1) * unitLen), v.size(2)]
         else:
             newDims = pastValue.shape
-            newDims[1] += int(((v.shape[1] - 1) / unitLen + 1) * unitLen)
+            newDims[1] += int(((v.size(1) - 1) / unitLen + 1) * unitLen)
 
         pastValue.expansion(newDims)
 
     pyfastllm.cat_direct(pastKey, k, 1)
     pyfastllm.cat_direct(pastValue, v, 1)
 
-    q.reshape([q.shape[0], q.shape[1] * q.shape[2], q.shape[3]])
+    q.reshape([q.size(0), q.size(1) * q.size(2), q.size(3)])
     q = ops.permute(q, [1, 0, 2])
 
-    context = ops.attention(q, pastKey, pastValue, attn_mask, q.shape[0]//pastKey.shape[0], 1.0/math.sqrt(attn_dim))
+    context = ops.attention(q, pastKey, pastValue, attn_mask, q.size(0)//pastKey.size(0), 1.0/math.sqrt(attn_dim))
     context.reshape([batch, num_attention_heads, seq_len, -1])
     context = ops.permute(context, [2, 0, 1, 3])
-    context.reshape([context.dims[0], context.dims[1], embed_dim])
+    context.reshape([context.size(0), context.size(1), embed_dim])
     return context
 
 
@@ -139,14 +139,14 @@ def transformer(hidden_states, i, attn_mask, num_attention_heads, rotary_dim, po
     # print("transformer qkv ok")
 
     qLen = embed_dim
-    kvLen = (qkv.shape[-1] - embed_dim) // 2
+    kvLen = (qkv.size(-1) - embed_dim) // 2
     q = ops.split(qkv, -1, 0, qLen)
     k = ops.split(qkv, -1, qLen, qLen + kvLen)
     v = ops.split(qkv, -1, qLen + kvLen, qLen + kvLen + kvLen)
 
-    q.reshape([q.shape[0], q.shape[1], -1, embed_dim // num_attention_heads])
-    k.reshape([k.shape[0], k.shape[1], -1, embed_dim // num_attention_heads])
-    v.reshape([v.shape[0], v.shape[1], -1, embed_dim // num_attention_heads])
+    q.reshape([q.size(0), q.size(1), -1, embed_dim // num_attention_heads])
+    k.reshape([k.size(0), k.size(1), -1, embed_dim // num_attention_heads])
+    v.reshape([v.size(0), v.size(1), -1, embed_dim // num_attention_heads])
 
     q = pyfastllm.nearlyrotateposition2D(q, pos_id, sin_data, cos_data, rotary_dim)
     k = pyfastllm.nearlyrotateposition2D(k, pos_id, sin_data, cos_data, rotary_dim)
@@ -181,14 +181,15 @@ def forward(
         pos_id,
         pastkvs
     ):
-    batch = input_ids.shape[0]
-    seq_len = input_ids.shape[1]
+    batch = input_ids.size(0)
+    seq_len = input_ids.size(1)
 
     input_ids = ops.permute(input_ids, [1, 0])
     input_embedding = ops.embedding(inputs=input_ids, embedding_weights=state_dict['transformer.embedding.word_embeddings.weight'])
     hidden_states = input_embedding
 
-    # print("embedding ok")
+    print("embedding ok")
+    print(hidden_states)
 
     rotary_dim = 64
     layer_num = 28
@@ -217,6 +218,7 @@ def forward(
     # print("topk ok")
 
     topk.to("cpu")
+    print(topk)
     topk_np = np.array(topk, copy=False)
     token = int(topk_np[0, 0, 0] + 1e-3)
     return token, pastkvs
