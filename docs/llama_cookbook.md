@@ -113,6 +113,19 @@ python3 tools/llamalike2flm.py internlm-7b-int4.flm int4 internlm/internlm-chat-
 python3 tools/llamalike2flm.py internlm-7b-int4.flm float16 internlm/internlm-chat-7b #导出internlm-chat-7b float16模型
 ```
 
+* internlm/[internlm2-chat-1_8b](https://huggingface.co/internlm/internlm2-chat-1_8b)
+* internlm/[internlm2-chat-7b](https://huggingface.co/internlm/internlm2-chat-7b)
+* internlm/[internlm2-chat-20b](https://huggingface.co/internlm/internlm2-chat-20b)
+
+使用`llamalike2flm.py`脚本转换：
+
+``` sh
+cd build
+python3 tools/llamalike2flm.py internlm2-1.8b-fp16.flm float16 iinternlm/internlm2-chat-1_8b #导出1.8B float16模型
+python3 tools/llamalike2flm.py internlm2-7b-fp16.flm float16 internlm/internlm2-chat-7b #导出chat-7b float16模型
+python3 tools/llamalike2flm.py internlm2-7b-int8.flm int8 internlm/internlm2-chat-7b #导出chat-7b int8模型
+```
+
 ### XVERSE
 
 * xverse/[XVERSE-13B-Chat](https://huggingface.co/xverse/XVERSE-13B-Chat)
