@@ -7,6 +7,7 @@ from transformers import PreTrainedTokenizerFast
 from tokenizers.decoders import ByteLevel
 
 fastllm_data_type_dict = {
+    "int4g": 9,
     "int4": 8,
     "int8": 3,
     "float16": 7,
@@ -24,10 +25,11 @@ def create(model,
            user_role = None,
            bot_role = None,
            history_sep = None,
-           dtype = "float16"):
+           dtype = "float16",
+           group = -1):
     if (dtype not in fastllm_data_type_dict):
         print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
-        exit(0)
+        exit(0)    
 
     # 0.1 model info
     modelInfo = model.config.__dict__
@@ -208,7 +210,6 @@ def create(model,
         elif (cur_weight_type == 2):
             # TODO bfloat
             to_data_type = 0
-
         weight_name = key
         if hasattr(model, "peft_config"):
             weight_name = weight_name.replace('base_model.model.', '')
