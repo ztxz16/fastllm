@@ -173,6 +173,7 @@ namespace fastllm {
     enum DataType {
         FLOAT32 = 0, BFLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6, FLOAT16 = 7,
         INT4_NOZERO = 8, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale
+        INT4_GROUP = 9, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale, 且使用分组量化
         INT32PARAM = 100 // int32的参数，这种类型的数据永远存在CPU上
     };
 
@@ -242,8 +243,14 @@ namespace fastllm {
         DataDevice dataDevice = DataDevice::CPU;
         std::vector <int> dataDeviceIds;
 
-        // 这两个参数用于量化，对FLOAT数据不适用
+        // 以下参数用于量化，对FLOAT数据不适用
         int perChannelAxis = -1; // 沿哪个轴分通道量化，-1代表没有分通道
+        int group = -1, groupCnt = -1; // 分组量化，group代表组数，groupCnt代表每组有多少个元素，-1代表不使用分组量化
+
+        // 以下为每个通道/分组的量化参数
+        // 1. 若不使用分通道量化，那么总组数 = 1
+        // 2. 若使用分通道量化，那么总组数 = 通道数
+        // 3. 若使用分组量化，那么总组数 = 通道数 * 组数(group)
         std::vector <LowBitConfig> perChannelsConfigs; // perChannelsConfigs[i]代表第i个通道的min, max; 如果没有分通道，perChannelsConfigs[0]代表全局min, max
         std::vector <float> scales, mins;
         std::vector <int> zeros;
@@ -430,7 +437,8 @@ namespace fastllm {
         void AddAdapterDict(const std::string &name, const std::string &key, const std::string &value);
 
         void AddWeight(const std::string &key, const std::vector <int> &dims,
-                       DataType dataType, WeightType weightType, DataType oriDataType, uint8_t *oriData); // 插入一个权重
+                       DataType dataType, WeightType weightType, DataType oriDataType, uint8_t *oriData,
+                       int groupCnt = -1); // 插入一个权重
 
         void ReleaseWeight(); // 释放所有权重占用的空间
 
