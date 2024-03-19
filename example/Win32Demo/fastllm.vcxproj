@@ -163,7 +163,6 @@
       <AdditionalOptions>/arch:AVX /source-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>cudart.lib;cublas.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
@@ -181,7 +180,7 @@
     <ClInclude Include="..\..\include\models\factoryllm.h" />
     <ClInclude Include="..\..\include\models\glm.h" />
     <ClInclude Include="..\..\include\models\llama.h" />
-    <ClCompile Include="..\..\include\models\minicpm.h" />
+    <ClInclude Include="..\..\include\models\minicpm.h" />
     <ClInclude Include="..\..\include\models\moss.h" />
     <ClInclude Include="..\..\include\models\qwen.h" />
     <ClInclude Include="..\..\include\utils\armMath.h" />
