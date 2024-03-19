@@ -180,8 +180,8 @@ namespace fastllm {
             attenOutput.Reshape({bsz, seqlen, -1});
 
             Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
-            Mul(attenLastOutput, this->attention_scale, attenLastOutput);
-            AddTo(hiddenStates, attenLastOutput);
+            // Mul(attenLastOutput, this->attention_scale, attenLastOutput);
+            AddTo(hiddenStates, attenLastOutput, this->attention_scale);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-5, attenInput);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
@@ -189,8 +189,8 @@ namespace fastllm {
             Silu(w1, w1);
             MulTo(w1, w3);
             Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
-            Mul(w2, this->attention_scale, w2);
-            AddTo(hiddenStates, w2);
+            // Mul(w2, this->attention_scale, w2);
+            AddTo(hiddenStates, w2, this->attention_scale);
         }
         Data logits, topk;
         Data tempHiddenStates;
@@ -338,8 +338,8 @@ namespace fastllm {
             PermuteSelf(attenOutput, {1, 0, 2});
 
             Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
-            Mul(attenLastOutput, this->attention_scale, attenLastOutput);
-            AddTo(hiddenStates, attenLastOutput);
+            // Mul(attenLastOutput, this->attention_scale, attenLastOutput);
+            AddTo(hiddenStates, attenLastOutput, this->attention_scale);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-5, attenInput);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
@@ -347,8 +347,8 @@ namespace fastllm {
             Silu(w1, w1);
             MulTo(w1, w3);
             Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
-            Mul(w2, this->attention_scale, w2);
-            AddTo(hiddenStates, w2);
+            // Mul(w2, this->attention_scale, w2);
+            AddTo(hiddenStates, w2, this->attention_scale);
         }
 
         Data logits, topk;
@@ -525,8 +525,8 @@ namespace fastllm {
             }
 
             Linear(attenOutput, weight[oWeightName], Data(), attenLastOutput);
-            Mul(attenLastOutput, this->attention_scale, attenLastOutput);
-            AddTo(hiddenStates, attenLastOutput);
+            // Mul(attenLastOutput, this->attention_scale, attenLastOutput);
+            AddTo(hiddenStates, attenLastOutput, this->attention_scale);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-5, attenInput);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
@@ -534,8 +534,8 @@ namespace fastllm {
             Silu(w1, w1);
             MulTo(w1, w3);
             Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
-            Mul(w2, this->attention_scale, w2);
-            AddTo(hiddenStates, w2);
+            // Mul(w2, this->attention_scale, w2);
+            AddTo(hiddenStates, w2, this->attention_scale);
         }
 
         Data logits, curLogit;
