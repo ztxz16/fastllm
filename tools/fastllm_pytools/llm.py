@@ -351,7 +351,9 @@ class model:
                     max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                     return_past_key_values = False, stop_token_ids: List[int] = None, **kwargs) -> str:
         type = None
-        if (tokenizer.name == "GLMTokenizer" and hasattr(tokenizer, "build_chat_input")):
+        if (hasattr(tokenizer, "name") 
+            and tokenizer.name == "GLMTokenizer" 
+            and hasattr(tokenizer, "build_chat_input")):
             type = "ChatGLM3"
 
         if (not(history)):
