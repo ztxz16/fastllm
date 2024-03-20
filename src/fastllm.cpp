@@ -383,6 +383,7 @@ namespace fastllm {
         this->expansionBytes = (size * this->unitSize - 1) / this->unitSizeDiv + 1;
         if (this->dataDevice == DataDevice::CPU) {
             this->cpuData = new uint8_t[this->expansionBytes];
+            memset(this->cpuData, 0, this->expansionBytes*sizeof(uint8_t));
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             if (this->directMemory) {
@@ -561,13 +562,13 @@ namespace fastllm {
          */
         int n = Count(0) / dims.back(), m = dims.back();
         for (int i = 0; i < n; i++) {
-            for (int j = 0; j < 10 && j < m; j++) {
+            for (int j = 0; j < 3 && j < m; j++) {
                 printf("%f ", ((float*)cpuData)[i * m + j]);
             }
-            if (m > 10) {
+            if (m > 3) {
                 printf("... ");
-                for (int j = 0; j < 10 && j < m; j++) {
-                    printf("%f ", ((float *) cpuData)[i * m + (m - 10 + j)]);
+                for (int j = 0; j < 3 && j < m; j++) {
+                    printf("%f ", ((float *) cpuData)[i * m + (m - 3 + j)]);
                 }
             }
             printf("\n");

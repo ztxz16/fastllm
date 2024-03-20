@@ -1,1 +1,2 @@
-from BaseModule import Module
+from .base_module import Module
+from .modules import *

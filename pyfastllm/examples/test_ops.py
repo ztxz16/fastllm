@@ -1,95 +1,95 @@
+import sys
 import pytest
 import numpy as np
 import fastllm
 
-def np_rms_norm(inputs, weights, eps):
-    channel = inputs.shape[-1]
-    sqrt_mean = np.sqrt(np.sum(inputs**2)/channel + eps)
-    return inputs / sqrt_mean *weights
+import pyfastllm
+import gc
 
+import np_ops
+import ops as flm_ops
 
-def np_layer_norm(inputs, gamma, beta, axis=-1):
-    assert axis < len(inputs.shapes), "axis should less than inputs dims"
-    channel = inputs.shape[axis]
-    mean = np.mean(inputs, axis=axis)
-    var = np.var(inputs, axis=axis)
+# from fastllm import ops as flm_ops
+# from fastllm import np_ops
 
-    output = (inputs - mean) / var * gamma + beta
-    return output
+np.random.seed(42)
 
-def np_linear(inputs, weights, bias):
-    output = np.matmul(inputs, weights.T) + bias
-    return output
+def diff(dataA, dataB):
+    # print(dataA)
+    # print(dataB)
+    mae = np.max(np.abs(dataA - dataB))
+    print('max abs err is ', mae)
+    return mae
 
-def np_softmax(inputs, axis=None):
-    maxv = inputs.max(axis, keepdims=True)
-    exp_v = np.exp(inputs - maxv)
-    exp_sum = np.sum(exp_v, axis=axis)
-    return exp_v / exp_sum
+def to_tensor(data):
+    return pyfastllm.from_numpy(data)
 
-def np_silu(inputs, ):
-    return inputs / (1 + np.exp(-inputs))
+def to_numpy(data):
+    # return data.numpy()
+    return np.array(data, copy=False, order='C')
+
+def test_rms_norm(inputs=None, weights=None, eps=1e-6):
+    if not inputs:
+        inputs =  np.random.random(size=[1, 256])
+        weights = np.random.random(size=[1, 256])
+
+    np_out = np_ops.rms_norm(inputs, weights, eps)
+    flm_out = flm_ops.rms_norm(to_tensor(inputs), to_tensor(weights), eps)
+    mae = diff(np_out, to_numpy(flm_out))
+    assert mae <= 1e-6
+    return flm_out
+
+def test_swiglu(inputs=None):
+    if not inputs:
+        inputs = np.random.random(size=[1, 256])
     
-def np_attention(q, k, v, mask=None, group=None, scale=None):
-    qk = np_softmax(q @ k.T * scale, axis=-1)
-    attn = qk @ v
-    return attn
+    np_out = np_ops.swiglu(inputs)
+    out = flm_ops.activation(inputs=to_tensor(inputs), activate_type="swiglu")
+    mae = diff(np_out, to_numpy(out))
+    assert mae <= 1e-6
+    return out
+    
+def test_attention(q=None, k=None, v=None, mask=None, group=1, scale=1.0):
+    if q is None:
+        q = np.random.random(size=[12, 1, 4096])
+        k = np.random.random(size=[12, 1, 4096])
+        v = np.random.random(size=[12, 1, 4096])
+        scale = 1 / np.sqrt(q.shape[-1])
 
-def test_linear():
-    inputs = np.array([[1, 2]])
-    weight = np.array([[3, 4, 5, 5, 6, 7]]).reshape([3, 2])
-    bias = np.array([0, 1, 1])
-    np_output = np_linear(inputs, weight, bias)
-    print(np_output)
+    np_out = np_ops.attention(q, k, v, scale=scale)
 
-    input = fastllm.Tensor(fastllm.float32, [1, 2], [1, 2])
-    weights = fastllm.Tensor(fastllm.float32, [3, 2], [3, 4, 5, 5, 6, 7])
-    bias = fastllm.Tensor(fastllm.float32, [3], [0, 1, 1])
-    out = fastllm.ops.linear(input, weights, bias)
-    print(out)
-
-def test_rms_norm():
-    inputs = np.array([1, 5]).reshape([1, 2])
-    weights = np.array([1, 3]).reshape([1, 2])
-    eps = 1e-6
-
-    np_out = np_rms_norm(inputs, weights, eps)
-    print(np_out)
-
-    input = fastllm.Tensor(fastllm.float32, [1, 2], [1, 5])
-    weights = fastllm.Tensor(fastllm.float32, [1, 2], [1, 3])
-    out = fastllm.Tensor()
-    out = fastllm.ops.rms_norm(input, weights, eps=1e-6)
-    print(out)
-
-def test_silu():
-    inputs = np.array([1, 5]).reshape([1, 2])
-    output = np_softmax(inputs)
-    # output = np_silu(inputs)
-    print(output)
-
-    inputs = fastllm.Tensor(fastllm.float32, [1, 2], [1, 5])
-    out = fastllm.ops.activation(input=inputs, activate_type="softmax")
-    # out = fastllm.ops.activation(input=inputs, activate_type="silu")
-    print(out)
-
-def test_attention():
-    q = np.array([1, 2, 3, 4, 5, 6]).reshape([2, 3])
-    k = np.array([5, 6, 7, 8, 9, 10]).reshape([2, 3])
-    v = np.array([1, 1, 1, 2, 1, 3]).reshape([2, 3])
-    scale = 1 / np.sqrt(q.shape[-1])
-    output = np_attention(q, k, v, scale=scale)
-    print(output)
-
-    q = fastllm.Tensor(fastllm.float32, [1, 2, 3], [1, 2, 3, 4, 5, 6])
-    k = fastllm.Tensor(fastllm.float32, [1, 2, 3], [5, 6, 7, 8, 9, 10])
-    v = fastllm.Tensor(fastllm.float32, [1, 2, 3], [1, 1, 1, 2, 1, 3])
     mask = fastllm.Tensor()
-    output = fastllm.ops.attention(q, k, v, mask, group=1, scale=scale, attentionType=0)
-    print(output)
+    flm_out = flm_ops.attention(to_tensor(q), to_tensor(k), to_tensor(v), mask, group=group, scale=scale, attentionType=0)
 
-if __name__ == "__main__":
-    test_attention()
-    test_silu()
-    test_linear()
+    mae = diff(np_out, to_numpy(flm_out))
+    assert mae <= 1e-6
+    return flm_out
+
+
+def test_linear(inputs=None, 
+           weights=None,
+           bias=None):
+    
+    if not inputs:
+        inputs = np.random.random(size=[1, 12, 4096])
+        weights = np.random.random(size=[256, 4096])
+        
+    np_out = np_ops.linear(inputs=inputs, weights=weights, bias=None)
+
+    if not bias:
+        bias = fastllm.Tensor()
+
+    output = flm_ops.linear(to_tensor(inputs), to_tensor(weights), bias)
+    mae = diff(np_out, to_numpy(output))
+
+    assert mae <= 1e-3
+    return output
+
+
+if __name__ == "__main__":    
     test_rms_norm()
+    test_attention()
+    test_linear()
+    test_swiglu()
+
+
