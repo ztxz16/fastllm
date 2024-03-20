@@ -64,6 +64,10 @@ def create(model,
             modelInfo["im_start_id"] = tokenizer.im_start_id
     elif (modelInfo["model_type"] == "qwen2"):
         modelInfo["eos_token_id"] = "151645"
+        pre_prompt = modelInfo["pre_prompt"] = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>"
+        user_role = modelInfo["user_role"] = "<|im_start|>user\n"
+        bot_role = modelInfo["bot_role"] = "<|im_end|><|im_start|>assistant\n"
+        history_sep = modelInfo["history_sep"] = "<|im_end|>\n"
     elif (modelInfo["model_type"] == "internlm"):
         modelInfo["eos_token_id"] = "103028"
         if "rotary" in modelInfo:
@@ -81,7 +85,6 @@ def create(model,
         rope_scaling = modelInfo.pop("rope_scaling")
         modelInfo["rope_scaling.type"] = rope_scaling["type"]
         modelInfo["rope_scaling.factor"] = rope_scaling["factor"]
-
     if tokenizer:
         modelInfo["tokenizer_use_score"] = "1" # 分词带分数
         if len(tokenizer.all_special_tokens) > 0:
