@@ -28,6 +28,7 @@ void callBaseOp(int optype=0){
     default:
         break;
     } 
+    outputs.ToDevice(fastllm::DataDevice::CPU);
     outputs.Print();
 }
 
@@ -49,6 +50,7 @@ void callNormOp(int normType=0){
     default:
         break;
     }
+    outputs.ToDevice(fastllm::DataDevice::CPU);
     outputs.Print();
 }
     
@@ -59,6 +61,7 @@ void callLinearOp(){
     fastllm::Data bias = fastllm::Data(fastllm::DataType::FLOAT32, {1, 3}, {0, 1, 1});
     fastllm::Data outputs;
     fastllm::Linear(inputs, weights, bias, outputs);
+    outputs.ToDevice(fastllm::DataDevice::CPU);
     outputs.Print();
 }
 
@@ -82,6 +85,7 @@ void callActivationOp(int activateType=0){
     default:
         break;
     }
+    outputs.ToDevice(fastllm::DataDevice::CPU);
     outputs.Print();
 }
 
