@@ -216,7 +216,6 @@
     <ClCompile Include="..\..\src\models\minicpm.cpp" />
     <ClCompile Include="..\..\src\models\moss.cpp" />
     <ClCompile Include="..\..\src\models\qwen.cpp" />
-    <ClCompile Include="..\..\src\pybinding.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\include\devices\cuda\fastllm-cuda.cuh">

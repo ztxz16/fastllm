@@ -98,9 +98,6 @@
     <ClCompile Include="..\..\src\model.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\src\pybinding.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
     <ClCompile Include="..\..\src\models\basellm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
