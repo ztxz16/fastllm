@@ -660,7 +660,63 @@ namespace fastllm {
                     }
                 }
             }
-        }
+        } else if (this->dataType == DataType::INT4_GROUP) {
+            weightSum.resize(n * this->group);
+            for (int i = 0; i < n; i++) {
+                for (int g = 0; g < this->group; g++) {
+                    int gid = i * this->group + g;
+                    int st = g * this->groupCnt;
+                    int end = std::min(m, (g + 1) * this->groupCnt);
+                    int j = st;
+#ifdef __aarch64__X
+                    uint8x8_t maskHigh = vdup_n_u8(0xF0);
+                    uint8x8_t maskLow = vdup_n_u8(0xF);
+                    uint32x4_t sum0 = {0, 0, 0, 0};
+
+                    for (; j + 15 < end; j += 16) {
+                        uint8x8_t ori = vld1_u8(cpuData + (i * m + j) / 2);
+                        uint8x8_t va = vand_u8(ori, maskLow);
+                        uint8x8_t vb = vshr_n_u8(vand_u8(ori, maskHigh), 4);
+
+                        uint16x4_t sa = vpaddl_u8 (va);
+                        uint16x4_t sb = vpaddl_u8 (vb);
+
+                        sum0 = vaddw_u16(sum0, vadd_u16(sa, sb));
+                    }
+                    weightSum[i] += sum0[0] + sum0[1] + sum0[2] + sum0[3];
+#endif
+#ifdef __AVX2__X
+                    __m256i acc = _mm256_setzero_si256();
+                    const __m256i lowMask = _mm256_set1_epi8(0xf);
+                    const __m256i ones = _mm256_set1_epi16(1);
+                    for (; j + 31 < m; j += 32) {
+                        __m128i orix = _mm_loadu_si128((const __m128i *) (cpuData + (i * m + j) / 2));
+                        __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+                        __m256i bx = _mm256_and_si256(lowMask, bytex);
+
+                        __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
+                        __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
+
+                        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, ones));
+                        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, ones));
+                    }
+                    weightSum[i] += I32sum(acc);
+#endif
+                    for (; j + 1 < end; j += 2) {
+                        int id = (i * m + j) / 2;
+                        weightSum[gid] += (cpuData[id] & 0xF) + (cpuData[id] >> 4);
+                    }
+                    for (; j < end; j++) {
+                        int id = (i * m + j) / 2;
+                        if ((i * m + j) % 2) {
+                            weightSum[gid] += (cpuData[id] & 0xF);
+                        } else {
+                            weightSum[gid] += (cpuData[id] >> 4);
+                        }
+                    }
+                }
+            }
+        } 
     }
 
     void Data::ToDevice(void *device) {
@@ -1541,26 +1597,28 @@ namespace fastllm {
                     buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
 #endif
                 } else if (dataType == DataType::INT4_GROUP) {
+                    auto &curWeight = weight[name];
                     int bit = 4;
-                    weight[name].perChannelAxis = buffer.ReadInt();
-                    weight[name].group = buffer.ReadInt();
-                    weight[name].groupCnt = buffer.ReadInt();
-                    int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
-                    k *= weight[name].group;
-                    weight[name].perChannelsConfigs.resize(k);
-                    weight[name].mins.resize(k);
-                    weight[name].scales.resize(k);
+                    curWeight.perChannelAxis = buffer.ReadInt();
+                    curWeight.group = buffer.ReadInt();
+                    curWeight.groupCnt = buffer.ReadInt();
+                    int k = curWeight.perChannelAxis == -1 ? 1 : dims[curWeight.perChannelAxis];
+                    k *= curWeight.group;
+                    curWeight.perChannelsConfigs.resize(k);
+                    curWeight.mins.resize(k);
+                    curWeight.scales.resize(k);
                     for (int i = 0; i < k; i++) {
                         float minValue = buffer.ReadFloat();
                         float maxValue = buffer.ReadFloat();
-                        weight[name].perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit, 1);
-                        weight[name].mins[i] = weight[name].perChannelsConfigs[i].min;
-                        weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
+                        auto config = LowBitConfig(minValue, maxValue, bit, 1);
+                        curWeight.perChannelsConfigs[i] = config;
+                        curWeight.mins[i] = config.min;
+                        curWeight.scales[i] = config.scale;
                     }
 #ifdef USE_MMAP
-                    weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
+                    curWeight.cpuData = buffer.ReadBytes(curWeight.GetBytes());
 #else
-                    buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
+                    buffer.ReadBytes(curWeight.cpuData, curWeight.GetBytes());
 #endif
                 }
             }
