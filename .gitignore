@@ -31,5 +31,5 @@ token
 /example/Android/LLMAssistant/.externalNativeBuild
 /example/Android/LLMAssistant/.cxx
 /example/Android/LLMAssistant/local.properties
-/test/cmmlu/result/
+/test/cmmlu/results/
 /models/
