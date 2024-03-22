@@ -771,6 +771,74 @@ namespace fastllm {
         }
     }
 
+    // float的input, int4g的weight, 直接计算得到float的output
+    void Int4GroupLinearPart(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                            LowBitConfig *configs, int n, int m, int k, int st, int end, int group, int groupCnt) {
+        for (int i = 0; i < n; i++) {
+            for (int j = st; j < end; j++) {
+                float now = biasData ? biasData[j] : 0.0f;
+                
+                for (int g = 0; g < group; g++) {
+                    int gst = g * groupCnt;
+                    int gend = std::min((g + 1) * groupCnt, m);
+                    int l = gst;
+#ifdef __aarch64__
+                    float32x4_t scales = vdupq_n_f32(configs[j * group + g].scale);
+                    uint8x8_t zeros = vdup_n_u8(configs[j * group + g].zeroPoint);
+                    uint8x8_t maskHigh = vdup_n_u8(0xF0);
+                    uint8x8_t maskLow = vdup_n_u8(0xF);
+                    float32x4_t sum0 = {0, 0, 0, 0};
+                    float32x4_t sum1 = {0, 0, 0, 0};
+
+                    for (; l + 15 < gend; l += 16) {
+                        uint8x8_t ori = vld1_u8(weightData + (j * m + l) / 2);
+                        float32x4x2_t in0 = vld2q_f32(inputData + i * m + l + 0);
+                        float32x4x2_t in1 = vld2q_f32(inputData + i * m + l + 8);
+                        uint8x8_t a = vand_u8(ori, maskLow);
+                        uint16x8_t result = vsubl_u8(a, zeros);
+                        int16x8_t sresult = vreinterpretq_s16_u16(result);
+                        int16x4_t result1 = vget_low_s16(sresult);
+                        int16x4_t result2 = vget_high_s16(sresult);
+                        int32x4_t result3 = vmovl_s16(result1);
+                        int32x4_t result4 = vmovl_s16(result2);
+                        float32x4_t f1 = vmulq_f32(scales, vcvtq_f32_s32(result3));
+                        float32x4_t f2 = vmulq_f32(scales, vcvtq_f32_s32(result4));
+                        sum0 = vaddq_f32(sum0, vmulq_f32(in0.val[1], f1));
+                        sum1 = vaddq_f32(sum1, vmulq_f32(in1.val[1], f2));
+
+                        a = vshr_n_u8(vand_u8(ori, maskHigh), 4);
+                        result = vsubl_u8(a, zeros);
+                        sresult = vreinterpretq_s16_u16(result);
+                        result1 = vget_low_s16(sresult);
+                        result2 = vget_high_s16(sresult);
+                        result3 = vmovl_s16(result1);
+                        result4 = vmovl_s16(result2);
+                        f1 = vmulq_f32(scales, vcvtq_f32_s32(result3));
+                        f2 = vmulq_f32(scales, vcvtq_f32_s32(result4));
+
+                        sum0 = vaddq_f32(sum0, vmulq_f32(in0.val[0], f1));
+                        sum1 = vaddq_f32(sum1, vmulq_f32(in1.val[0], f2));
+                    }
+                    now += sum0[0] + sum0[1] + sum0[2] + sum0[3];
+                    now += sum1[0] + sum1[1] + sum1[2] + sum1[3];
+#endif
+                    for (; l < gend; l++) {
+                        int id = (j * m + l) / 2;
+                        float weight = 0.0f;
+                        if ((j * m + l) % 2) {
+                            weight = configs[j * group + g].invQuantization(weightData[id] & 0xF);
+                        } else {
+                            weight = configs[j * group + g].invQuantization(weightData[id] >> 4);
+                        }
+                        now += inputData[i * m + l] * weight;
+                    }
+                }
+
+                outputData[i * k + j] = now;
+            }
+        }
+    }
+
     // float的input, int4的weight, 直接计算得到float的output
     void Int4LinearPart(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         LowBitConfig *configs, int n, int m, int k, int st, int end) {
@@ -1025,6 +1093,101 @@ namespace fastllm {
     }
 
     //a = [n, m], b = [k, m], c = aT(b') = [n, k]
+    void MultiplyInt4Group(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride,
+                         int *weightSums, float *weightMins, float *scales, float *bias, 
+                         float *iscales, float *izeros, float *inputSums, int group, int groupCnt) {
+        std::vector <float> values;
+        values.resize(group);
+
+        int block = 0;
+        for (; block < n; block++) {
+            uint8_t *weightWalk = b;
+            uint8_t *inputStart = a + block * m;
+
+            for (int i = 0; i < k; i++) {
+                std::fill(values.begin(), values.end(), 0.0f);
+                uint8_t *inputWalk = inputStart;
+                float sum = 0.0;
+
+                for (int g = 0; g < group; g++) {
+                    int st = g * groupCnt, end = std::min(m, (g + 1) * groupCnt);
+                    float &value = values[g];
+                    int j = st;
+#ifdef __ARM_FEATURE_DOTPROD
+                    uint8x8_t maskHigh = vdup_n_u8(0xF0);
+                    uint8x8_t maskLow = vdup_n_u8(0xF);
+                    uint32x2_t sum0 = {0, 0};
+
+                    for (; j + 15 < end; j += 16) {
+                        uint8x8_t ori = vld1_u8(weightWalk + (i * m + j) / 2);
+                        uint8x8x2_t in = vld2_u8(inputWalk + j);
+                        uint8x8_t va = vand_u8(ori, maskLow);
+                        uint8x8_t vb = vshr_n_u8(vand_u8(ori, maskHigh), 4);
+                        sum0 = vdot_u32(sum0, va, in.val[1]);
+                        sum0 = vdot_u32(sum0, vb, in.val[0]);
+                    }
+                    value += sum0[0] + sum0[1];
+#elif defined(__aarch64__)
+                    uint8x8_t maskHigh = vdup_n_u8(0xF0);
+                    uint8x8_t maskLow = vdup_n_u8(0xF);
+                    uint32x4_t sum0 = {0, 0, 0, 0};
+
+                    for (; j + 15 < end; j += 16) {
+                        uint8x8_t ori = vld1_u8(weightWalk + (i * m + j) / 2);
+                        uint8x8x2_t in = vld2_u8(inputWalk + j);
+                        uint8x8_t va = vand_u8(ori, maskLow);
+                        uint8x8_t vb = vshr_n_u8(vand_u8(ori, maskHigh), 4);
+                        sum0 = vpadalq_u16(sum0, vmull_u8(va, in.val[1]));
+                        sum0 = vpadalq_u16(sum0, vmull_u8(vb, in.val[0]));
+                    }
+                    value += sum0[0] + sum0[1] + sum0[2] + sum0[3];
+#elif defined(__AVX2__)
+                    value += DotU4U8(weightWalk + (i * m + st) / 2, inputWalk + st, end - st);
+                    j += (end - st);
+#endif
+                    for (; j + 1 < end; j += 2) {
+                        int id = (i * m + j) / 2;
+                        value += (weightWalk[id] >> 4) * inputWalk[j];
+                        value += (weightWalk[id] & 0xF) * inputWalk[j + 1];
+                    }
+                }
+
+                int g = 0;
+#ifdef __aarch64__
+                float32x4_t vSum = vdupq_n_f32(0.0f);
+                float32x4_t vGroupCnt = vdupq_n_f32(groupCnt);
+                for (; g + 3 < group; g += 4) {
+                    int iid = block * group + g;
+                    int gid = i * group + g;
+                    float32x4_t vValue = vld1q_f32(values.data() + g);
+                    float32x4_t vWeightSum = vcvtq_f32_s32(vld1q_s32(weightSums + gid));
+                    float32x4_t vWeightMin = vld1q_f32(weightMins + gid);
+                    float32x4_t vScale = vld1q_f32(scales + gid);
+                    float32x4_t vIzero = vld1q_f32(izeros + iid);
+                    float32x4_t vIscale = vld1q_f32(iscales + iid);
+                    float32x4_t vInputSum = vld1q_f32(inputSums + iid);
+                    float32x4_t vMiddle = vsubq_f32(vInputSum, vmulq_f32(vIzero, vGroupCnt));
+                    vValue = vsubq_f32(vValue, vmulq_f32(vWeightSum, vIzero));
+                    vSum = vaddq_f32(vSum, vmulq_f32(vScale, vmulq_f32(vIscale, vValue)));
+                    vSum = vaddq_f32(vSum, vmulq_f32(vWeightMin, vmulq_f32(vMiddle, vIscale)));
+                }
+                sum += vSum[0] + vSum[1] + vSum[2] + vSum[3];
+#endif
+                for (; g < group; g++) {
+                    int iid = block * group + g;
+                    int gid = i * group + g;
+                    int value = values[g];
+                    value -= weightSums[gid] * izeros[iid];
+                    sum += scales[gid] * iscales[iid] * value +
+                        weightMins[gid] * (inputSums[iid] - izeros[iid] * groupCnt) * iscales[iid];
+                }
+
+                ((float*)c)[block * kstride + i] = sum + (bias == nullptr ? 0.0 : bias[i]);
+            }
+        }
+    }
+
+    //a = [n, m], b = [k, m], c = aT(b') = [n, k]
     void MultiplyInt4NoZero(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride,
                       int *weightSums, float *weightMins, float *scales, float *bias, LowBitConfig *config,
                       int *inputSums) {
@@ -1169,6 +1332,50 @@ namespace fastllm {
                                                weightSums + cur, weightMins + cur, scales + cur,
                                                (bias == nullptr ? (float *) nullptr : bias + cur), configs.data(),
                                                inputSums.data()));
+                cur = end;
+            }
+            for (int i = 0; i < futures.size(); i++) {
+                futures[i].get();
+            }
+        }
+    }
+
+    //a = [n, m], b = [k, m], c = aT(b') = [n, k]
+    void MultiplyInt4GroupMultiThread(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k,
+                                 int *weightSums, float *weightMins, float *scales, float *bias,
+                                 std::vector <LowBitConfig> &configs, int threadNum, int group, int groupCnt) {
+        std::vector <float> inputSums;
+        for (int i = 0; i < n; i++) {
+            for (int g = 0; g < group; g++) {
+                int sum = 0;
+                for (int j = g * groupCnt; j < (g + 1) * groupCnt && j < m; j++) {
+                    sum += a[i * m + j];
+                }
+                inputSums.push_back(sum);
+            }
+        }
+        std::vector <float> iscales, izeros;
+        for (int i = 0; i < configs.size(); i++) {
+            iscales.push_back(configs[i].scale);
+            izeros.push_back(configs[i].zeroPoint);
+        }
+
+        int per = k / threadNum;
+        int cur = 0;
+        if (threadNum == 1) {
+            MultiplyInt4Group(a, b, c, n, m, k, k,
+                         weightSums, weightMins, scales,
+                         (bias == nullptr ? (float*)nullptr : bias), iscales.data(), izeros.data(), inputSums.data(),
+                         group, groupCnt);
+        } else {
+            auto pool = GetPool();
+            std::vector<std::future<void> > futures;
+            for (int i = 0; i < threadNum; i++) {
+                int end = (i == threadNum - 1 ? k : cur + per + (cur + per * (threadNum - i) < k));
+                futures.push_back(pool->Submit(MultiplyInt4Group, a, b + cur * m / 2, c + cur, n, m, end - cur, k,
+                                               weightSums + cur * group, weightMins + cur * group, scales + cur * group,
+                                               (bias == nullptr ? (float *) nullptr : bias + cur), iscales.data(), izeros.data(),
+                                               inputSums.data(), group, groupCnt));
                 cur = end;
             }
             for (int i = 0; i < futures.size(); i++) {
@@ -1378,6 +1585,76 @@ namespace fastllm {
                 threads[i]->join();
                 delete threads[i];
             }
+*/
+            } else if (weight.dataType == DataType::INT4_GROUP) {
+                float *inputData = (float *) input.cpuData;
+                uint8_t *weightData = (uint8_t *) weight.cpuData;
+                float *outputData = (float *) output.cpuData;
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                int group = weight.group, groupCnt = weight.groupCnt;
+                weight.CalcWeightSum();
+
+                std::vector<LowBitConfig> inputConfigs;
+                for (int i = 0; i < n; i++) {
+                    for (int g = 0; g < group; g++) {
+                        int st = g * groupCnt;
+                        int end = std::min(m, (g + 1) * groupCnt);
+                        float minValue = 1e9, maxValue = -1e9;
+                        for (int j = st; j < end; j++) {
+                            minValue = std::min(minValue, inputData[i * m + j]);
+                            maxValue = std::max(maxValue, inputData[i * m + j]);
+                        }
+                        inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
+                    }
+                }
+                std::vector<uint8_t> uinput;
+                uinput.resize(n * m);
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j < m; j++) {
+                        uinput[i * m + j] = inputConfigs[i * group + j / groupCnt].quantization(inputData[i * m + j]);    
+                    }
+                }
+
+#ifdef __AVX__
+                uint8_t *temp = new uint8_t[32];
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j + 31 < m; j += 32) {
+                        memcpy(temp, uinput.data() + i * m + j, 32);
+                        for (int k = 0; k < 16; k++) {
+                            uinput[i * m + j + k] = temp[k * 2 + 1];
+                            uinput[i * m + j + k + 16] = temp[k * 2];
+                        }
+                    }
+                }
+                delete[] temp;
+#endif
+
+                MultiplyInt4GroupMultiThread(uinput.data(), weightData, (int32_t *) outputData, n, m, k,
+                                            weight.weightSum.data(), weight.mins.data(), weight.scales.data(),
+                                            biasData, inputConfigs, GetThreads(), group, groupCnt);
+/*
+                //这部分是float输入，float输出
+                float *inputData = (float *) input.cpuData;
+                uint8_t *weightData = (uint8_t *) weight.cpuData;
+                float *outputData = (float *) output.cpuData;
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                int group = weight.group, groupCnt = weight.groupCnt;
+
+                int threadNum = GetThreads();
+                int per = k / threadNum;
+                int cur = 0;
+                std::vector<std::thread *> threads;
+                for (int i = 0; i < threadNum - 1; i++) {
+                    int end = cur + per + (cur + per * (threadNum - i) < k);
+                    threads.push_back(new std::thread(&Int4GroupLinearPart, inputData, weightData, biasData, outputData,
+                                                    weight.perChannelsConfigs.data(), n, m, k, cur, end, group, groupCnt));
+                    cur = end;
+                }
+                Int4GroupLinearPart(inputData, weightData, biasData, outputData, weight.perChannelsConfigs.data(), n, m, k, cur, k, group, groupCnt);
+                for (int i = 0; i < threadNum - 1; i++) {
+                    threads[i]->join();
+                    delete threads[i];
+                }
 */
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
