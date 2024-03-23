@@ -160,6 +160,7 @@ python setup.py install
 我们假设已经获取了名为`model.flm`的模型（参照 [模型获取](#模型获取)，初次使用可以先下载转换好的模型)
 
 编译完成之后在build目录下可以使用下列demo:
+
 ``` sh
 # 这时在fastllm/build目录下
 
@@ -176,6 +177,8 @@ python tools/cli_demo.py -p model.flm
 streamlit run tools/web_demo.py model.flm 
 
 ```
+
+Windows下的编译推荐使用Cmake GUI + Visual Studio，在图形化界面中完成。
 
 如编译中存在问题，尤其是Windows下的编译，可参考[FAQ](docs/faq.md)
 
