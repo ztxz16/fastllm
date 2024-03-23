@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1-labs
-FROM nvidia/cuda:11.7.1-devel-ubuntu22.04
+FROM nvidia/cuda:12.1.0-devel-ubuntu22.04
 
 # Update Apt repositories
 RUN apt-get update 
@@ -12,7 +12,7 @@ RUN pip install setuptools streamlit-chat
 ENV WORKDIR /fastllm
 
 # Install cmake
-RUN wget -c https://cmake.org/files/LatestRelease/cmake-3.27.0-linux-x86_64.sh && bash ./cmake-3.27.0-linux-x86_64.sh  --skip-license --prefix=/usr/
+RUN wget -c https://cmake.org/files/LatestRelease/cmake-3.28.3-linux-x86_64.sh && bash ./cmake-3.28.3-linux-x86_64.sh  --skip-license --prefix=/usr/
 
 WORKDIR $WORKDIR
 ADD . $WORKDIR/
