@@ -237,18 +237,23 @@ namespace fastllm {
 
             // 1.2 Attention
             // 1.2.0 q * k^T
-            MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim), q.dims[0] / pastKey.dims[0]);
-            attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
-            if (alibiData.dims.size() != 0) {
-                AlibiMask(attenWeights, alibiData, -10000);
-            } else if (attentionMask.dims.size() != 0) {
-                AttentionMask(attenWeights, attentionMask, -10000);
+
+            if (alibiData.dims.size() == 0) {
+                Attention(q, pastKey, pastValue, attentionMask, attenOutput, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
+            } else {
+                MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
+                attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
+                if (alibiData.dims.size() != 0) {
+                    AlibiMask(attenWeights, alibiData, -10000);
+                } else if (attentionMask.dims.size() != 0) {
+                    AttentionMask(attenWeights, attentionMask, -10000);
+                }
+
+                Softmax(attenWeights, attenWeights, -1);
+                MatMul(attenWeights, pastValue, attenOutput);
+                attenOutput.Reshape({attenOutput.dims[1], attenOutput.dims[2], attenOutput.dims[3]});
             }
 
-            Softmax(attenWeights, attenWeights, -1);
-            MatMul(attenWeights, pastValue, attenOutput, 1.f, attenWeights.dims[1] / pastValue.dims[0]);
-
-            attenOutput.Reshape({attenOutput.dims[1], attenOutput.dims[2], attenOutput.dims[3]});
             PermuteSelf(attenOutput, {1, 0, 2});
             attenOutput.Reshape({bsz, seqlen, -1});
 
@@ -791,7 +796,7 @@ namespace fastllm {
                 break;
             }
 
-            //printf("spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            // printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
         }
         if (retCb)
 #ifdef PY_API
@@ -1029,6 +1034,7 @@ namespace fastllm {
                         std::vector <std::pair <Data*, Data*> > pastKeyValues;
                         std::vector <float> ids;
                         std::vector <int> seqLens;
+                        std::vector <int> handles;
                         std::vector <GenerationConfig> generationConfigs;
                         LastTokensManager tokensManager;
                         std::vector <std::vector <float>* > logits;
@@ -1074,6 +1080,7 @@ namespace fastllm {
                                 it.second->intParams["len"]++;
                             }
 
+                            handles.push_back(it.first);
                             it.second->preTokens += seqLens.back();
                             for (int i = 0; i < model->block_cnt; i++) {
                                 pastKeyValues.push_back(std::make_pair(&it.second->pastKeyValues[i].first,
@@ -1082,15 +1089,29 @@ namespace fastllm {
                         }
 
                         if (seqLens.size() > 0) {
+                            std::vector <std::pair <Data, Data> > *pastKeyValue1;
+                            if (seqLens.size() == 1) {
+                                pastKeyValue1 = &model->responseContextDict.dicts[handles[0]]->pastKeyValues;
+                            }
+
                             model->dictLocker.unlock();
 #ifdef USE_CUDA
                             FastllmCudaClearBigBuffer();
 #endif
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                             std::vector<int> ret;
-                            ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
-                                                      positionIds, seqLens, pastKeyValues, generationConfigs,
-                                                      tokensManager, &logits);
+
+                            if (seqLens.size() > 1) {
+                                ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
+                                                          positionIds, seqLens, pastKeyValues, generationConfigs,
+                                                          tokensManager, &logits);
+                            } else {
+                                ret = std::vector <int> {model->Forward(inputIds,
+                                                                        attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
+                                                                        *positionIds[0],
+                                                                        *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
+                            }
+
                             model->dictLocker.lock();
                             int idx = 0;
                             for (auto &it: model->responseContextDict.dicts) {

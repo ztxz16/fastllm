@@ -65,6 +65,19 @@ __global__ void FastllmCudaInt82HalfKernel(uint8_t* a, float *scales, uint8_t *z
     }
 }
 
+__global__ void FastllmCudaInt4Group2HalfKernel(uint8_t* a, float *scales, float *mins, half *b, int len, int per,
+                                                int group, int groupCnt) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int gid = idx / per * group + (idx % per / groupCnt);
+    if (idx < len) {
+        if (idx % 2 == 1) {
+            b[idx] = __float2half(scales[gid] * (a[idx / 2] & 0xF) + mins[gid]);
+        } else {
+            b[idx] = __float2half(scales[gid] * (a[idx / 2] >> 4) + mins[gid]);
+        }
+    }
+}
+
 __global__ void FastllmCudaInt42HalfKernel(uint8_t* a, float *scales, float *mins, half *b, int len, int per) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -740,6 +753,38 @@ __global__ void FastllmGemvInt4Kernel2(float *A, uint8_t *B, float *C,
 }
 
 template <int THREAD_PER_BLOCK, int PART>
+__global__ void FastllmGemvInt4GroupKernel2(float *A, uint8_t *B, float *C,
+                                             float *bias, float *scales, float *mins,
+                                             int m, int k, int group, int groupCnt) {
+    __shared__ float sdata[THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    // 1. 计算
+    int st = blockIdx.x * PART;
+    int end = st + PART;
+    for (int p = st; p < end; p++) {
+        sdata[tid] = 0;
+        for (int i = tid; i < m / 2; i += THREAD_PER_BLOCK) {
+            uint8_t now = B[p * m / 2 + i];
+            int g = p * group + (i * 2 / groupCnt);
+            sdata[tid] += (A[i * 2] * (mins[g] + scales[g] * (now >> 4)) 
+                         + A[i * 2 + 1] * (mins[g] + scales[g] * (now & 15)));
+        }
+        __syncthreads();
+        for (unsigned int s = 1; s < THREAD_PER_BLOCK; s *= 2) {
+            if ((tid & (2 * s - 1)) == 0) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            C[p] = sdata[0] + bias[p];
+        }
+        __syncthreads();
+    }
+}
+
+template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvInt4NoZeroKernel2(float *A, uint8_t *B, float *C,
                                              float *bias, float *scales, float *mins,
                                              int m, int k) {
@@ -1252,6 +1297,104 @@ bool FastllmCudaMatMulFloatInt4(const fastllm::Data &input, fastllm::Data &weigh
     return true;
 }
 
+bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, 
+                                    int n, int m, int k) {
+    int group = weight.group, groupCnt = weight.groupCnt;
+    if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
+        float *cudaScales;
+        cudaError_t state = cudaSuccess;
+        state = cudaMalloc(&cudaScales, k * group * sizeof(float));
+        state = cudaMemcpy(cudaScales, weight.scales.data(), k * group * sizeof(float), cudaMemcpyHostToDevice);
+        weight.extraCudaData.push_back((void*)cudaScales);
+
+        float *cudaMins;
+        state = cudaMalloc(&cudaMins, k * group * sizeof(float));
+        float *mins = new float[k * group];
+        for (int i = 0; i < k * group; i++) {
+            mins[i] = weight.perChannelsConfigs[i].min;
+        }
+        state = cudaMemcpy(cudaMins, mins, k * group * sizeof(float), cudaMemcpyHostToDevice);
+        delete[] mins;
+        weight.extraCudaData.push_back((void*)cudaMins);
+
+        float *cudaBiasData;
+        state = cudaMalloc(&cudaBiasData, k * sizeof(float));
+        if (bias.dims.size() > 0) {
+            state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+        } else {
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
+        }
+        checkCudaErrors("Error: CUDA error when moving bias to device!", state);
+        weight.extraCudaData.push_back((void*)cudaBiasData);
+    }
+
+    float *cudaScales = (float*)weight.extraCudaData[0];
+    float *cudaMins = (float*)weight.extraCudaData[1];
+    float *cudaBiasData = (float*)weight.extraCudaData[2];
+
+    float *cudaInput = (float*)FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
+
+    if (n >= 8) {
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+        half *cudaFp16Input, *cudaFp16Output, *cudaFp16Weight;
+        cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
+        cudaFp16Output = (half *) FastllmCudaMalloc(n * k * sizeof(half));
+        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+
+        __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
+        cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+        cublasStatus_t status;
+
+        int len = n * m;
+        int threadPerBlock = std::min(256, len);
+        FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaFp16Input,
+                                                                                          len);
+
+        len = k * m;
+        FastllmCudaInt4Group2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t *) weight.cudaData,
+                                                                                         cudaScales,
+                                                                                         cudaMins,
+                                                                                         cudaFp16Weight, len, m, group, groupCnt);
+
+        status = cublasGemmEx(fastllmCublasHandle,
+                              CUBLAS_OP_T, CUBLAS_OP_N,
+                              k, n, m,
+                              &h_alpha, cudaFp16Weight, AType,
+                              m, cudaFp16Input, BType,
+                              m, &h_beta,
+                              cudaFp16Output, CType,
+                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: cublas error.\n");
+            throw("cublas error");
+            exit(0);
+        }
+
+        len = n * k;
+        FastllmCudaHalf2FlotaKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
+                                                                                           len);
+        FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
+
+        FastllmCudaFree(cudaFp16Input);
+        FastllmCudaFree(cudaFp16Output);
+        FastllmCudaFree(cudaFp16Weight);
+    } else {
+        for (int i = 0; i < n; i++) {
+            FastllmGemvInt4GroupKernel2<256, 1> <<< k, 256 >>>(cudaInput + i * m,
+                                                                (uint8_t *) weight.cudaData,
+                                                                cudaOutput + i * k,
+                                                                cudaBiasData,
+                                                                cudaScales,
+                                                                cudaMins,
+                                                                m, k, group, groupCnt);
+        }
+    }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
 bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         float *cudaScales;
@@ -1490,7 +1633,7 @@ void * FastllmCudaDirectMalloc(size_t size) {
 
 void FastllmCudaDirectFree(void *ret) {
     cudaError_t state = cudaFree(ret);
-    checkCudaErrors("Error: CUDA error when release memory!", state);
+    //checkCudaErrors("Error: CUDA error when release memory!", state);
 }
 
 void * FastllmCudaMalloc(size_t size) {

@@ -6,11 +6,32 @@ pyfastllm是基于fastllm的python api接口实现，通过pyfastllm可以更加
 
 - 对接fastapi、flask等web框架，向外提供数据接口
 - 利用python yield生成器语言特性，流式问答响应
+- 类似于torch的python低级接口，目前支持到cpu版本
 - 对接Lora、Ptuning等微调方法，下游任务可微调(开发中...)
 - 无缝对接加速HugingFace模型库，无痛加速迁移原有业务代码(开发中...)
 - 其他更多...
 
 ## 版本更新
+
+
+### 已知BUG
+1. 从cpp到python存在内存拷贝
+2. 由于1的问题，fastllm后端采用的深拷贝策略，cuda data将被忽略
+3. 每个op都将转化为Host端返回，GPU内存释放存在问题
+
+
+### v0.2.1.1 2024-03-13
+- 解决了numpy转换的一些bug
+- 增加了一些Module
+- 增加了op测试
+- 完整测试并支持chatglm2
+
+
+### v0.2.1 2024-03-08
+- 增加了低级python接口
+- 测试低级接口，实现了纯python版本的chatglm2
+- 增加了一些新的op
+
 
 ### v0.2.0 2023-10-23
 
@@ -103,6 +124,7 @@ python3 cli_simple.py -p chatglm-6b-int8.flm -t 8
 - `examples/convert_model.py`: 模型转换示例
 - `examples/web_api.py`, `examples/web_api_client.py`: fastapi webapi调用
 - `examples/test_ops.py`: 部分op的使用样例及测试
+- `examples/chatglm2.py`: 低级python接口下的chatglm2模型(目前仅支持cpu)
 
 ### 命令行工具
 
@@ -211,10 +233,10 @@ python web_api.py -m 0 -p path_for_chatglm --max_batch_size 32
 
 - [x]  修改response_batch的output_str函数，以返回值的形式返回答案
 - [x]  编解码部分优化，合并不同的返回类型
-- [ ]  对接numpy等矩阵库
-- [ ]  Tensor的深复制和浅复制，以及基础运算符重载
-- [ ]  fix low_api下pastKV复制的bug
+- [x]  对接numpy等矩阵库
+- [ ]  Tensor的深复制和浅复制，以及基础运算符重载，在python端编写
+- [x]  fix low_api下pastKV复制的bug
 - [x]  模型运行参数对象类，封装模型运行时参数，包含模型路径、运行线程数、是否为低内存模型、惩罚因子、温度等
-- [ ]  增加更多的op
-- [ ]  增加module
-
+- [x]  增加更多的op以及module，后续可增加更多
+- [ ]  增加其他后端
+- [ ]  更新文档接口说明

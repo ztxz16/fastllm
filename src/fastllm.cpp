@@ -311,7 +311,9 @@ namespace fastllm {
         } else if (this->dataType == DataType::INT8) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
-        } else if (this->dataType == DataType::INT4 || this->dataType == DataType::INT4_NOZERO) {
+        } else if (this->dataType == DataType::INT4 
+                || this->dataType == DataType::INT4_NOZERO
+                || this->dataType == DataType::INT4_GROUP) {
             this->unitSize = 1;
             this->unitSizeDiv = 2;
         } else if (this->dataType == DataType::INT2) {
@@ -381,6 +383,7 @@ namespace fastllm {
         this->expansionBytes = (size * this->unitSize - 1) / this->unitSizeDiv + 1;
         if (this->dataDevice == DataDevice::CPU) {
             this->cpuData = new uint8_t[this->expansionBytes];
+            memset(this->cpuData, 0, this->expansionBytes*sizeof(uint8_t));
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             if (this->directMemory) {
@@ -559,13 +562,13 @@ namespace fastllm {
          */
         int n = Count(0) / dims.back(), m = dims.back();
         for (int i = 0; i < n; i++) {
-            for (int j = 0; j < 10 && j < m; j++) {
+            for (int j = 0; j < 3 && j < m; j++) {
                 printf("%f ", ((float*)cpuData)[i * m + j]);
             }
-            if (m > 10) {
+            if (m > 3) {
                 printf("... ");
-                for (int j = 0; j < 10 && j < m; j++) {
-                    printf("%f ", ((float *) cpuData)[i * m + (m - 10 + j)]);
+                for (int j = 0; j < 3 && j < m; j++) {
+                    printf("%f ", ((float *) cpuData)[i * m + (m - 3 + j)]);
                 }
             }
             printf("\n");
@@ -657,7 +660,63 @@ namespace fastllm {
                     }
                 }
             }
-        }
+        } else if (this->dataType == DataType::INT4_GROUP) {
+            weightSum.resize(n * this->group);
+            for (int i = 0; i < n; i++) {
+                for (int g = 0; g < this->group; g++) {
+                    int gid = i * this->group + g;
+                    int st = g * this->groupCnt;
+                    int end = std::min(m, (g + 1) * this->groupCnt);
+                    int j = st;
+#ifdef __aarch64__X
+                    uint8x8_t maskHigh = vdup_n_u8(0xF0);
+                    uint8x8_t maskLow = vdup_n_u8(0xF);
+                    uint32x4_t sum0 = {0, 0, 0, 0};
+
+                    for (; j + 15 < end; j += 16) {
+                        uint8x8_t ori = vld1_u8(cpuData + (i * m + j) / 2);
+                        uint8x8_t va = vand_u8(ori, maskLow);
+                        uint8x8_t vb = vshr_n_u8(vand_u8(ori, maskHigh), 4);
+
+                        uint16x4_t sa = vpaddl_u8 (va);
+                        uint16x4_t sb = vpaddl_u8 (vb);
+
+                        sum0 = vaddw_u16(sum0, vadd_u16(sa, sb));
+                    }
+                    weightSum[i] += sum0[0] + sum0[1] + sum0[2] + sum0[3];
+#endif
+#ifdef __AVX2__X
+                    __m256i acc = _mm256_setzero_si256();
+                    const __m256i lowMask = _mm256_set1_epi8(0xf);
+                    const __m256i ones = _mm256_set1_epi16(1);
+                    for (; j + 31 < m; j += 32) {
+                        __m128i orix = _mm_loadu_si128((const __m128i *) (cpuData + (i * m + j) / 2));
+                        __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+                        __m256i bx = _mm256_and_si256(lowMask, bytex);
+
+                        __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
+                        __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
+
+                        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, ones));
+                        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, ones));
+                    }
+                    weightSum[i] += I32sum(acc);
+#endif
+                    for (; j + 1 < end; j += 2) {
+                        int id = (i * m + j) / 2;
+                        weightSum[gid] += (cpuData[id] & 0xF) + (cpuData[id] >> 4);
+                    }
+                    for (; j < end; j++) {
+                        int id = (i * m + j) / 2;
+                        if ((i * m + j) % 2) {
+                            weightSum[gid] += (cpuData[id] & 0xF);
+                        } else {
+                            weightSum[gid] += (cpuData[id] >> 4);
+                        }
+                    }
+                }
+            }
+        } 
     }
 
     void Data::ToDevice(void *device) {
@@ -1532,11 +1591,35 @@ namespace fastllm {
                         weight[name].mins[i] = weight[name].perChannelsConfigs[i].min;
                         weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
                     }
-    #ifdef USE_MMAP
+#ifdef USE_MMAP
                     weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
-    #else
+#else
                     buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
-    #endif
+#endif
+                } else if (dataType == DataType::INT4_GROUP) {
+                    auto &curWeight = weight[name];
+                    int bit = 4;
+                    curWeight.perChannelAxis = buffer.ReadInt();
+                    curWeight.group = buffer.ReadInt();
+                    curWeight.groupCnt = buffer.ReadInt();
+                    int k = curWeight.perChannelAxis == -1 ? 1 : dims[curWeight.perChannelAxis];
+                    k *= curWeight.group;
+                    curWeight.perChannelsConfigs.resize(k);
+                    curWeight.mins.resize(k);
+                    curWeight.scales.resize(k);
+                    for (int i = 0; i < k; i++) {
+                        float minValue = buffer.ReadFloat();
+                        float maxValue = buffer.ReadFloat();
+                        auto config = LowBitConfig(minValue, maxValue, bit, 1);
+                        curWeight.perChannelsConfigs[i] = config;
+                        curWeight.mins[i] = config.min;
+                        curWeight.scales[i] = config.scale;
+                    }
+#ifdef USE_MMAP
+                    curWeight.cpuData = buffer.ReadBytes(curWeight.GetBytes());
+#else
+                    buffer.ReadBytes(curWeight.cpuData, curWeight.GetBytes());
+#endif
                 }
             }
 
@@ -1546,6 +1629,41 @@ namespace fastllm {
         printf("\n");
         fflush(stdout);
         return;
+    }
+
+    void GroupQuantizationMultiThread(int st, int end, int m,
+                                    float *f, uint8_t *u8, LowBitConfig *configs, int bit, int group, int groupCnt) {
+        int type = (bit == 4) ? 1 : 0;
+        for (int i = st; i < end; i++) {
+            for (int g = 0; g < group; g++) {
+                int cid = i * group + g;
+                int groupStart = g * groupCnt;
+                int groupEnd = std::min((g + 1) * groupCnt, m);
+
+                float minValue = 1e9, maxValue = -1e9;
+                for (int j = groupStart; j < groupEnd; j++) {
+                    minValue = std::min(minValue, f[i * m + j]);
+                    maxValue = std::max(maxValue, f[i * m + j]);
+                }
+                if (bit == 8) {
+                    configs[cid] = LowBitConfig(minValue, maxValue, 8, type);
+                    for (int j = groupStart; j < groupEnd; j++) {
+                        u8[i * m + j] = configs[cid].quantization(f[i * m + j]);
+                    }
+                } else {
+                    configs[cid] = LowBitConfig(minValue, maxValue, 4, type);
+                    for (int j = groupStart; j < groupEnd; j++) {
+                        int id = (i * m + j) / 2;
+                        uint8_t value = configs[cid].quantization(f[i * m + j]);
+                        if ((i * m + j) % 2) {
+                            u8[id] = (u8[id] & 0xF0) | value;
+                        } else {
+                            u8[id] = (u8[id] & 0xF) | (value << 4);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     void PerChannelQuantizationMultiThread(int st, int end, int m,
@@ -1644,6 +1762,17 @@ namespace fastllm {
                     buffer.WriteInt(data.perChannelAxis);
                     int k = data.perChannelAxis == -1 ? 1 : data.dims[data.perChannelAxis];
                     for (int i = 0; i < k; i++) {
+                        buffer.WriteFloat(data.perChannelsConfigs[i].min);
+                        buffer.WriteFloat(data.perChannelsConfigs[i].max);
+                    }
+                    buffer.WriteBytes(data.cpuData, data.GetBytes());
+                } else if (dataType == DataType::INT4_GROUP) {
+                    buffer.WriteInt((int) dataType);
+                    buffer.WriteInt(data.perChannelAxis);
+                    buffer.WriteInt(data.group);
+                    buffer.WriteInt(data.groupCnt);
+                    int k = data.perChannelAxis == -1 ? 1 : data.dims[data.perChannelAxis];
+                    for (int i = 0; i < k * data.group; i++) {
                         buffer.WriteFloat(data.perChannelsConfigs[i].min);
                         buffer.WriteFloat(data.perChannelsConfigs[i].max);
                     }
@@ -1790,7 +1919,7 @@ namespace fastllm {
     }
 
     void WeightMap::AddWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType,
-                              fastllm::WeightType weightType, fastllm::DataType oriDataType, uint8_t *oriData) {
+                              fastllm::WeightType weightType, fastllm::DataType oriDataType, uint8_t *oriData, int groupCnt) {
         this->weight[key] = Data(dataType, dims);
         Data &data = this->weight[key];
         data.weightType = weightType;
@@ -1798,6 +1927,56 @@ namespace fastllm {
         data.Allocate();
         if (dataType == oriDataType) {
             memcpy(data.cpuData, oriData, data.GetBytes());
+        } else if (oriDataType == DataType::FLOAT32 
+                && dataType == DataType::INT4_GROUP) {
+            int bit = (dataType == DataType::INT4_GROUP) ? 4 : 8;
+            int type = (bit == 4) ? 1 : 0;
+            int k = data.dims[0], m = data.dims[1];
+            int threadNum = 8;
+            int per = k / threadNum;
+            int cur = 0;
+            auto pool = GetPool();
+            if (groupCnt == -1) {
+                groupCnt = 128;
+            }
+            int group = (m - 1) / groupCnt + 1;
+            std::vector <std::future <void> > futures;
+            std::vector<LowBitConfig> configs;
+            std::vector<uint8_t> uDatas;
+            configs.resize(k * group);
+
+            int bytes = k * m;
+            if (bit == 4) {
+                bytes = (k * m + 1) / 2;
+            }
+            uDatas.resize(bytes);
+            for (int i = 0; i < threadNum; i++) {
+                int end = cur + per;
+                if (i == threadNum - 1) {
+                    end = k;
+                }
+                futures.push_back(pool->Submit(GroupQuantizationMultiThread, cur, end, m,
+                                                (float *) oriData, uDatas.data(), configs.data(), bit, group, groupCnt));
+                cur = end;
+            }
+            for (int i = 0; i < threadNum; i++) {
+                futures[i].get();
+            }
+
+            data.perChannelAxis = 0;
+            data.perChannelsConfigs.resize(k * group);
+            data.group = group;
+            data.groupCnt = groupCnt;
+            data.zeros.resize(k * group);
+            data.scales.resize(k * group);
+            data.mins.resize(k * group);
+            for (int i = 0; i < k * group; i++) {
+                data.perChannelsConfigs[i] = LowBitConfig(configs[i].min, configs[i].max, bit, type);
+                data.mins[i] = data.perChannelsConfigs[i].min;
+                data.zeros[i] = data.perChannelsConfigs[i].zeroPoint;
+                data.scales[i] = data.perChannelsConfigs[i].scale;
+            }
+            memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
         } else if (oriDataType == DataType::FLOAT32 &&
                 (dataType == DataType::INT8 || dataType == DataType::INT4_NOZERO)) {
             int bit = (dataType == DataType::INT4_NOZERO) ? 4 : 8;
