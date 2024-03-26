@@ -273,7 +273,7 @@ namespace fastllm {
 
     void Data::CopyFrom(const Data &ori) {
         // std::cout<<"调用拷贝构造"<<std::endl;
-        if (ori.dims != this->dims || this->cpuData == nullptr) {
+        if (ori.dims != this->dims || this->cpuData == nullptr || ori.dataType != this->dataType) {
             if (ori.dims.size() == 0) {
                 delete[] this->cpuData;
                 this->dataType = ori.dataType;
@@ -561,14 +561,30 @@ namespace fastllm {
         printf("\n");
          */
         int n = Count(0) / dims.back(), m = dims.back();
+        std::vector <float> floatData;
+        floatData.resize(this->Count(0));
+        if (this->dataType == DataType::FLOAT32) {
+            memcpy(floatData.data(), cpuData, this->Count(0) * sizeof(float));
+        } else if (this->dataType == DataType::FLOAT16) {
+            for (int i = 0; i < floatData.size(); i++) {
+                floatData[i] = half_to_float(((uint16_t*)cpuData)[i]);
+            }
+        }
+
         for (int i = 0; i < n; i++) {
+            if (i == 10) {
+                printf("...\n");
+            }
+            if (i >= 10 && i <= n - 10) {
+                continue;
+            }
             for (int j = 0; j < 3 && j < m; j++) {
-                printf("%f ", ((float*)cpuData)[i * m + j]);
+                printf("%f ", floatData[i * m + j]);
             }
             if (m > 3) {
                 printf("... ");
                 for (int j = 0; j < 3 && j < m; j++) {
-                    printf("%f ", ((float *) cpuData)[i * m + (m - 3 + j)]);
+                    printf("%f ", floatData[i * m + (m - 3 + j)]);
                 }
             }
             printf("\n");
