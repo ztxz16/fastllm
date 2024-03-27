@@ -1894,7 +1894,7 @@ namespace fastllm {
 
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
                         (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
-                        "Cat's input's type should be float32.\n");
+                        "Cat's input's type should be float32 or float16.\n");
         AssertInFastLLM(input0.dims.size() == input1.dims.size(), "Cat Error: input's shape's size should be same.");
 
         int dimsLen = input0.dims.size();
@@ -3070,7 +3070,7 @@ namespace fastllm {
                         d += m;
                     }
                 } else if (data.dataType == DataType::FLOAT16) {
-                    int index = (int) half_to_float(((uint16_t *) positionIds.cpuData)[(b * 2) * positionIds.dims.back() + l]);
+                    int index = (int) ((float *) positionIds.cpuData)[(b * 2) * positionIds.dims.back() + l];
                     float *sin = ((float*)sinData.cpuData) + stride * index;
                     float *cos = ((float*)cosData.cpuData) + stride * index;
 

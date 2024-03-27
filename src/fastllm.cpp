@@ -326,6 +326,8 @@ namespace fastllm {
             this->unitSize = 4;
             this->unitSizeDiv = 1;
         }
+
+        this->expansionBytes = (this->expansionSize * this->unitSize - 1) / this->unitSizeDiv + 1;
     }
 
     void Data::Resize(const std::vector<int> &dims) {
