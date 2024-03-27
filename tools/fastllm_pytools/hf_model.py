@@ -75,6 +75,8 @@ def create(model,
             if isinstance(rope_scaling, builtins.dict):
                 modelInfo["rope_scaling.type"] = rope_scaling["type"]
                 modelInfo["rope_theta"] = rope_scaling["base"]
+    elif (modelInfo["model_type"] == "internlm2"):
+        modelInfo["eos_token_id"] = "92542"
     if (modelInfo["model_type"] == "chatglm" and hasattr(tokenizer, "build_chat_input")):
         # chatglm3
         modelInfo["pre_prompt"] = "";
@@ -109,6 +111,9 @@ def create(model,
         elif isinstance(tokenizer, PreTrainedTokenizerFast):
             if hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer._tokenizer, "decoder") \
                     and isinstance(tokenizer._tokenizer.decoder, ByteLevel):
+                modelInfo["tokenizer_byte_as_char"] = True
+        else:
+            if hasattr(tokenizer, "byte_encoder") and hasattr(tokenizer, "byte_decoder"):
                 modelInfo["tokenizer_byte_as_char"] = True
 
     peft_config = {}
@@ -154,10 +159,11 @@ def create(model,
                                                              i, ctypes.c_float(tokenizer.sp_model.get_score(i)));
         else:
             merges = {}
-            if (modelInfo["model_type"] == "moss"):
+            if hasattr(tokenizer, "bpe_ranks"):
                 merges = {("".join(bpe_tokens), token_index) for bpe_tokens, token_index in sorted(tokenizer.bpe_ranks.items(), key=lambda kv: kv[1])}
             elif isinstance(tokenizer, PreTrainedTokenizerFast):
-                tokenizer_file = tokenizer.name_or_path + tokenizer.vocab_files_names['tokenizer_file']
+                tokenizer_file_name = tokenizer.vocab_file if hasattr(tokenizer, "vocab_file") else tokenizer.vocab_files_names['tokenizer_file']
+                tokenizer_file = tokenizer.name_or_path + tokenizer_file_name
                 if os.path.exists(tokenizer_file):
                     with open(tokenizer_file, "r", encoding='utf-8') as f:
                         bpe_merges = json.load(f)["model"]["merges"]
@@ -166,10 +172,10 @@ def create(model,
             vocab = tokenizer.get_vocab()
             for v in vocab.keys():
                 score = merges[v] if v in merges else 1.0
-                if (modelInfo["model_type"] == "moss"):
-                    s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
-                    llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, s, vocab[v], ctypes.c_float(score));
-                elif (modelInfo["model_type"] == "qwen"):
+                # if (modelInfo["model_type"] == "moss"):
+                #     s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
+                #     llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, s, vocab[v], ctypes.c_float(score));
+                if (modelInfo["model_type"] == "qwen"):
                     llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, v, vocab[v], ctypes.c_float(1.0));
                 else:
                     llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, v.encode(), vocab[v], ctypes.c_float(score));

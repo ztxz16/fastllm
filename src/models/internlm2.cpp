@@ -260,6 +260,9 @@ namespace fastllm {
                 Split(qkv, -2, 0, qdim, q);
                 Split(qkv, -2, qdim, qdim + 1, k);
                 Split(qkv, -2, qdim + 1, qdim + 2, v);
+                q.Reshape({bsz, -1, embed_dim});
+                k.Reshape({bsz, -1, head_dim * num_key_value_heads});
+                v.Reshape({bsz, -1, head_dim * num_key_value_heads});
             } else {
                 Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
                 Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
