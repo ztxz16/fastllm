@@ -236,6 +236,7 @@ namespace fastllm {
 
 	    void *cudaData = nullptr;
         std::vector <void*> extraCudaData;
+        std::vector <void*> extraCudaHalfData;
 
         void *deviceData = nullptr;
         std::vector <void*> extraDeviceData;
