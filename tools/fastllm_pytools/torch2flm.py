@@ -169,6 +169,7 @@ def tofile(exportPath,
         modelInfo["rope_scaling.type"] = rope_scaling["type"]
         modelInfo["rope_scaling.factor"] = rope_scaling["factor"]
 
+    merges = {}
     if tokenizer:
         modelInfo["tokenizer_use_score"] = "1" # 分词带分数
         if len(tokenizer.all_special_tokens) > 0:
@@ -187,23 +188,41 @@ def tofile(exportPath,
                     sp_model_data = f.read()
                     sp_model_proto = model_pb2.ModelProto.FromString(sp_model_data)
                     modelInfo["tokenizer_add_dummy_prefix"] = sp_model_proto.normalizer_spec.add_dummy_prefix
-                    modelInfo["tokenizer_remove_extra_whitespaces"] = sp_model_proto.normalizer_spec.remove_extra_whitespaces
+                    if sp_model_proto.normalizer_spec.remove_extra_whitespaces:
+                        modelInfo["tokenizer_remove_extra_whitespaces"] = True
             except:
                 pass
         elif isinstance(tokenizer, PreTrainedTokenizerFast):
+            modelInfo["tokenizer_add_dummy_prefix"] = False
+            tokenizer_file_name = tokenizer.vocab_file if hasattr(tokenizer, "vocab_file") else tokenizer.vocab_files_names['tokenizer_file']
+            tokenizer_file = tokenizer.name_or_path + tokenizer_file_name
+            if os.path.exists(tokenizer_file):
+                with open(tokenizer_file, "r", encoding='utf-8') as f:
+                    tokenizer_data = json.load(f)
+                    if "normalizers" in tokenizer_data["normalizer"]:
+                        for normalizer in tokenizer_data["normalizer"]["normalizers"]:
+                            if normalizer["type"] == "Prepend" and \
+                                    (normalizer["prepend"] == '▁' or normalizer["prepend"] == ' '):
+                                modelInfo["tokenizer_add_dummy_prefix"] = True
+                    if "merges" in tokenizer_data["model"]:
+                        bpe_merges = tokenizer_data["model"]["merges"]
+                        bpe_merges = [pair.replace(" ", "") for pair in bpe_merges]
+                        merges = builtins.dict(zip(bpe_merges, range(0, -len(bpe_merges), -1)))
             if hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer._tokenizer, "decoder") \
                     and isinstance(tokenizer._tokenizer.decoder, ByteLevel):
                 modelInfo["tokenizer_byte_as_char"] = True
         else:
             if hasattr(tokenizer, "byte_encoder") and hasattr(tokenizer, "byte_decoder"):
                 modelInfo["tokenizer_byte_as_char"] = True
+            if not hasattr(tokenizer, "add_prefix_space") or not getattr(tokenizer, "add_prefix_space", True):
+                modelInfo["tokenizer_add_dummy_prefix"] = False
 
     if hasattr(model, "peft_config"):
         adapter_size = len(model.peft_config)
         modelInfo["peft_size"] = adapter_size
 
     fo.write(struct.pack('i', len(modelInfo)))
-    for it in modelInfo.keys():
+    for it in sorted(modelInfo.keys()):
         writeKeyValue(fo, str(it), str(modelInfo[it]))
 
     if hasattr(model, "peft_config"):
@@ -214,6 +233,8 @@ def tofile(exportPath,
             for it in adapter_dict.keys():
                 writeKeyValue(fo, str(it), str(adapter_dict[it]))
 
+    weight_type_dict = {}
+    model = model.cpu();
     dict = model.state_dict()
 
     # 1. vocab
@@ -234,17 +255,8 @@ def tofile(exportPath,
                 fo.write(struct.pack('i', i))
                 fo.write(struct.pack('f', float(tokenizer.sp_model.get_score(i))))
         else:
-            merges = {}
             if hasattr(tokenizer, "bpe_ranks"):
                 merges = {("".join(bpe_tokens), token_index) for bpe_tokens, token_index in sorted(tokenizer.bpe_ranks.items(), key=lambda kv: kv[1])}
-            elif isinstance(tokenizer, PreTrainedTokenizerFast):
-                tokenizer_file_name = tokenizer.vocab_file if hasattr(tokenizer, "vocab_file") else tokenizer.vocab_files_names['tokenizer_file']
-                tokenizer_file = tokenizer.name_or_path + tokenizer_file_name
-                if os.path.exists(tokenizer_file):
-                    with open(tokenizer_file, "r", encoding='utf-8') as f:
-                        bpe_merges = json.load(f)["model"]["merges"]
-                        bpe_merges = [pair.replace(" ", "") for pair in bpe_merges]
-                        merges = builtins.dict(zip(bpe_merges, range(0, -len(bpe_merges), -1)))
             vocab = tokenizer.get_vocab()
             fo.write(struct.pack('i', len(vocab)))
             for v in vocab.keys():
@@ -267,14 +279,13 @@ def tofile(exportPath,
     else:
         fo.write(struct.pack('i', 0))
 
-    weight_type_dict = {}
     module_dict = {}
     for key, m in model.named_modules():
         if (isinstance(m, torch.nn.Linear)):
             weight_type_dict[key + ".weight"] = "linear"
             module_dict[key + ".weight"] = m
         if (isinstance(m, torch.nn.Embedding)):
-            weight_type_dict[key] = "embedding"
+            weight_type_dict[key + ".weight"] = "embedding"
 
     # 2. weight
     fo.write(struct.pack('i', len(dict)))
