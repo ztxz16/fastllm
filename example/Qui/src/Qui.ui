@@ -1,0 +1,1168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>QuiClass</class>
+ <widget class="QWidget" name="QuiClass">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>940</width>
+    <height>542</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Qui</string>
+  </property>
+  <property name="styleSheet">
+   <string notr="true">QTextEdit
+{
+    background-color: #F5F5F5;
+    color: #333333;
+    border: 1px solid #CCCCCC;
+    border-radius: 4px;
+    padding: 4px;
+}
+
+QTextEdit:hover 
+{
+    background-color: #EDEDED;
+}
+
+QTextEdit:focus
+{
+    border: 1px solid #3399FF;
+    outline: none;
+}
+
+
+
+QToolButton 
+{
+	font: 10pt &quot;Microsoft YaHei UI&quot;;
+    background-color: #f2f2f2;
+    border: 1px solid #cccccc;
+    border-radius: 4px;
+    padding: 5px;
+}
+
+QToolButton:hover 
+{
+    background-color: #e6e6e6;
+}
+
+QToolButton:pressed 
+{
+    background-color: #d9d9d9;
+}
+
+QGroupBox 
+{
+    border: 1px solid #cccccc;
+    border-radius: 4px;
+    margin-top: 10px;
+}
+QGroupBox:title 
+{
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 5px;
+    font-weight: bold;
+}
+
+QComboBox:drop-down
+{
+    border-style:none
+}
+
+QComboBox
+{
+    background-color: #f2f2f2;
+    border: 1px solid #cccccc;
+	font: 10pt &quot;Microsoft YaHei UI&quot;;
+}
+
+QComboBox 
+{
+    background-color: #f2f2f2;
+    border: 1px solid #cccccc;
+    border-radius: 4px;
+    padding: 5px;
+	font: 10pt &quot;Microsoft YaHei UI&quot;;
+}
+
+QGroupBox 
+{
+    background-color: #f2f2f2;
+    border: 1px solid #cccccc;
+    border-radius: 4px;
+    padding: 10px;
+	font: 10pt &quot;Microsoft YaHei UI&quot;;
+}
+
+QCheckBox 
+{
+    background-color: #f2f2f2;
+    border: 1px solid #cccccc;
+    border-radius: 4px;
+    padding: 5px;
+	font: 10pt &quot;Microsoft YaHei UI&quot;;
+}
+
+QSpinBox 
+{
+    background-color: #f2f2f2;
+    border: 1px solid #cccccc;
+    border-radius: 4px;
+    padding: 5px;
+	font: 10pt &quot;Microsoft YaHei UI&quot;;
+}
+
+QLabel
+{
+    padding: 5px;
+	font: 10pt &quot;Microsoft YaHei UI&quot;;
+}
+
+QDoubleSpinBox
+{
+    background-color: #f2f2f2;
+    border: 1px solid #cccccc;
+    border-radius: 4px;
+    padding: 5px;
+	font: 10pt &quot;Microsoft YaHei UI&quot;;
+}
+
+QLineEdit
+{
+    background-color: #f2f2f2;
+    border: 1px solid #cccccc;
+    border-radius: 4px;
+    padding: 5px;
+	font: 10pt &quot;Microsoft YaHei UI&quot;;
+}</string>
+  </property>
+  <layout class="QHBoxLayout" name="horizontalLayout_3">
+   <property name="spacing">
+    <number>5</number>
+   </property>
+   <property name="leftMargin">
+    <number>5</number>
+   </property>
+   <property name="topMargin">
+    <number>5</number>
+   </property>
+   <property name="rightMargin">
+    <number>5</number>
+   </property>
+   <property name="bottomMargin">
+    <number>5</number>
+   </property>
+   <item>
+    <layout class="QVBoxLayout" name="verticalLayout_3">
+     <property name="leftMargin">
+      <number>5</number>
+     </property>
+     <property name="topMargin">
+      <number>5</number>
+     </property>
+     <property name="rightMargin">
+      <number>5</number>
+     </property>
+     <property name="bottomMargin">
+      <number>5</number>
+     </property>
+     <item>
+      <widget class="QTextEdit" name="textEditAI">
+       <property name="minimumSize">
+        <size>
+         <width>600</width>
+         <height>300</height>
+        </size>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">font: 700 11pt &quot;Microsoft YaHei UI&quot;;</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <layout class="QGridLayout" name="gridLayout">
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <property name="spacing">
+        <number>0</number>
+       </property>
+       <item row="0" column="3">
+        <widget class="QLabel" name="label_5">
+         <property name="text">
+          <string>top_k</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="10">
+        <widget class="QDoubleSpinBox" name="sbRepeatPenalty">
+         <property name="value">
+          <double>1.000000000000000</double>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="0">
+        <widget class="QLabel" name="label_4">
+         <property name="text">
+          <string>top_p</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="2">
+        <spacer name="horizontalSpacer">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>40</width>
+           <height>20</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+       <item row="0" column="9">
+        <widget class="QLabel" name="label_7">
+         <property name="text">
+          <string>repeat_penalty</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="7">
+        <widget class="QDoubleSpinBox" name="sbTemperature">
+         <property name="value">
+          <double>1.000000000000000</double>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="5">
+        <spacer name="horizontalSpacer_3">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>40</width>
+           <height>20</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+       <item row="0" column="6">
+        <widget class="QLabel" name="label_6">
+         <property name="text">
+          <string>temperature</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="1">
+        <widget class="QDoubleSpinBox" name="sbTopP">
+         <property name="value">
+          <double>1.000000000000000</double>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="8">
+        <spacer name="horizontalSpacer_4">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>40</width>
+           <height>20</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+       <item row="0" column="4">
+        <widget class="QSpinBox" name="sbTopK">
+         <property name="value">
+          <number>1</number>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <layout class="QVBoxLayout" name="verticalLayout_2">
+       <property name="spacing">
+        <number>0</number>
+       </property>
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <widget class="QTextEdit" name="textEditUser">
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>0</height>
+          </size>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>200</height>
+          </size>
+         </property>
+         <property name="styleSheet">
+          <string notr="true">	font: 700 11pt &quot;Microsoft YaHei UI&quot;;</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_2">
+         <property name="leftMargin">
+          <number>5</number>
+         </property>
+         <property name="topMargin">
+          <number>5</number>
+         </property>
+         <property name="rightMargin">
+          <number>5</number>
+         </property>
+         <property name="bottomMargin">
+          <number>5</number>
+         </property>
+         <item>
+          <widget class="QToolButton" name="btnWriteFile">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>0</width>
+             <height>0</height>
+            </size>
+           </property>
+           <property name="text">
+            <string>Save</string>
+           </property>
+           <property name="iconSize">
+            <size>
+             <width>32</width>
+             <height>32</height>
+            </size>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QToolButton" name="btnClear">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="text">
+            <string>Clear</string>
+           </property>
+           <property name="iconSize">
+            <size>
+             <width>32</width>
+             <height>32</height>
+            </size>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="horizontalSpacer_2">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+         <item>
+          <widget class="QToolButton" name="btnReset">
+           <property name="text">
+            <string>Reset</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QToolButton" name="btnSend">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Preferred" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="text">
+            <string>Send</string>
+           </property>
+           <property name="iconSize">
+            <size>
+             <width>32</width>
+             <height>32</height>
+            </size>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QVBoxLayout" name="verticalLayout_4">
+     <property name="spacing">
+      <number>0</number>
+     </property>
+     <property name="leftMargin">
+      <number>0</number>
+     </property>
+     <property name="topMargin">
+      <number>0</number>
+     </property>
+     <property name="rightMargin">
+      <number>0</number>
+     </property>
+     <property name="bottomMargin">
+      <number>0</number>
+     </property>
+     <item>
+      <widget class="QGroupBox" name="gbSetting">
+       <property name="title">
+        <string>Setting</string>
+       </property>
+       <layout class="QVBoxLayout" name="verticalLayout">
+        <property name="spacing">
+         <number>5</number>
+        </property>
+        <property name="leftMargin">
+         <number>0</number>
+        </property>
+        <property name="topMargin">
+         <number>5</number>
+        </property>
+        <property name="rightMargin">
+         <number>0</number>
+        </property>
+        <property name="bottomMargin">
+         <number>0</number>
+        </property>
+        <item>
+         <layout class="QGridLayout" name="gridLayout_5">
+          <property name="leftMargin">
+           <number>5</number>
+          </property>
+          <property name="topMargin">
+           <number>5</number>
+          </property>
+          <property name="rightMargin">
+           <number>5</number>
+          </property>
+          <property name="bottomMargin">
+           <number>5</number>
+          </property>
+          <property name="spacing">
+           <number>5</number>
+          </property>
+          <item row="0" column="0">
+           <widget class="QLabel" name="label_8">
+            <property name="text">
+             <string>Model Directory</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QLineEdit" name="edPathModel"/>
+          </item>
+          <item row="0" column="2">
+           <widget class="QToolButton" name="btnPathModel">
+            <property name="text">
+             <string>...</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
+         <layout class="QGridLayout" name="gridLayout_3">
+          <property name="leftMargin">
+           <number>5</number>
+          </property>
+          <property name="topMargin">
+           <number>5</number>
+          </property>
+          <property name="rightMargin">
+           <number>5</number>
+          </property>
+          <property name="bottomMargin">
+           <number>5</number>
+          </property>
+          <property name="spacing">
+           <number>5</number>
+          </property>
+          <item row="0" column="0">
+           <widget class="QLabel" name="label">
+            <property name="text">
+             <string>Model</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QComboBox" name="cbModelList">
+            <property name="minimumSize">
+             <size>
+              <width>220</width>
+              <height>0</height>
+             </size>
+            </property>
+            <property name="mouseTracking">
+             <bool>false</bool>
+            </property>
+            <property name="iconSize">
+             <size>
+              <width>16</width>
+              <height>16</height>
+             </size>
+            </property>
+            <property name="frame">
+             <bool>true</bool>
+            </property>
+            <item>
+             <property name="text">
+              <string>Qwen-1.5-7b-int8.flm</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>Qwen-1.5-4b-int8.flm</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>deepseek_coder-6.7b-ins-int8.flm</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>chatglm2-6b-int8.flm</string>
+             </property>
+            </item>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
+         <layout class="QGridLayout" name="gridLayout_2">
+          <property name="leftMargin">
+           <number>5</number>
+          </property>
+          <property name="topMargin">
+           <number>5</number>
+          </property>
+          <property name="rightMargin">
+           <number>5</number>
+          </property>
+          <property name="bottomMargin">
+           <number>5</number>
+          </property>
+          <property name="spacing">
+           <number>5</number>
+          </property>
+          <item row="0" column="0">
+           <widget class="QLabel" name="label_9">
+            <property name="text">
+             <string>fastllm.exe</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="2">
+           <widget class="QToolButton" name="toolButton">
+            <property name="text">
+             <string>...</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QLineEdit" name="edPathFlm"/>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="label_2">
+            <property name="text">
+             <string>Threads</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QSpinBox" name="sbThreads">
+            <property name="minimum">
+             <number>1</number>
+            </property>
+            <property name="maximum">
+             <number>128</number>
+            </property>
+            <property name="value">
+             <number>4</number>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
+         <widget class="QCheckBox" name="cbLow">
+          <property name="text">
+           <string>LowMemMode</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <layout class="QHBoxLayout" name="horizontalLayout_9">
+          <property name="leftMargin">
+           <number>5</number>
+          </property>
+          <property name="topMargin">
+           <number>5</number>
+          </property>
+          <property name="rightMargin">
+           <number>5</number>
+          </property>
+          <property name="bottomMargin">
+           <number>5</number>
+          </property>
+          <item>
+           <widget class="QGroupBox" name="gbDeviceMap">
+            <property name="title">
+             <string>DeviceMap</string>
+            </property>
+            <property name="alignment">
+             <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+            </property>
+            <property name="checkable">
+             <bool>true</bool>
+            </property>
+            <property name="checked">
+             <bool>false</bool>
+            </property>
+            <layout class="QFormLayout" name="formLayout">
+             <property name="formAlignment">
+              <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
+             </property>
+             <property name="horizontalSpacing">
+              <number>5</number>
+             </property>
+             <property name="verticalSpacing">
+              <number>5</number>
+             </property>
+             <property name="leftMargin">
+              <number>0</number>
+             </property>
+             <property name="topMargin">
+              <number>10</number>
+             </property>
+             <property name="rightMargin">
+              <number>0</number>
+             </property>
+             <property name="bottomMargin">
+              <number>0</number>
+             </property>
+             <item row="5" column="0">
+              <widget class="QCheckBox" name="ckDev2">
+               <property name="text">
+                <string/>
+               </property>
+              </widget>
+             </item>
+             <item row="6" column="0">
+              <widget class="QCheckBox" name="ckDev3">
+               <property name="text">
+                <string/>
+               </property>
+              </widget>
+             </item>
+             <item row="7" column="0">
+              <widget class="QCheckBox" name="ckDev4">
+               <property name="text">
+                <string/>
+               </property>
+              </widget>
+             </item>
+             <item row="3" column="1">
+              <layout class="QHBoxLayout" name="horizontalLayout_4">
+               <item>
+                <widget class="QComboBox" name="cbDev0">
+                 <item>
+                  <property name="text">
+                   <string>cpu</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:0</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:1</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:2</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:3</string>
+                  </property>
+                 </item>
+                </widget>
+               </item>
+               <item>
+                <widget class="QSpinBox" name="sbDev0"/>
+               </item>
+              </layout>
+             </item>
+             <item row="4" column="1">
+              <layout class="QHBoxLayout" name="horizontalLayout_5">
+               <item>
+                <widget class="QComboBox" name="cbDev1">
+                 <item>
+                  <property name="text">
+                   <string>cpu</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:0</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:1</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:2</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:3</string>
+                  </property>
+                 </item>
+                </widget>
+               </item>
+               <item>
+                <widget class="QSpinBox" name="sbDev1"/>
+               </item>
+              </layout>
+             </item>
+             <item row="5" column="1">
+              <layout class="QHBoxLayout" name="horizontalLayout_6">
+               <item>
+                <widget class="QComboBox" name="cbDev2">
+                 <item>
+                  <property name="text">
+                   <string>cpu</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:0</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:1</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:2</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:3</string>
+                  </property>
+                 </item>
+                </widget>
+               </item>
+               <item>
+                <widget class="QSpinBox" name="sbDev2"/>
+               </item>
+              </layout>
+             </item>
+             <item row="6" column="1">
+              <layout class="QHBoxLayout" name="horizontalLayout_7">
+               <item>
+                <widget class="QComboBox" name="cbDev3">
+                 <item>
+                  <property name="text">
+                   <string>cpu</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:0</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:1</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:2</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:3</string>
+                  </property>
+                 </item>
+                </widget>
+               </item>
+               <item>
+                <widget class="QSpinBox" name="sbDev3"/>
+               </item>
+              </layout>
+             </item>
+             <item row="7" column="1">
+              <layout class="QHBoxLayout" name="horizontalLayout_8">
+               <item>
+                <widget class="QComboBox" name="cbDev4">
+                 <item>
+                  <property name="text">
+                   <string>cpu</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:0</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:1</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:2</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>cuda:3</string>
+                  </property>
+                 </item>
+                </widget>
+               </item>
+               <item>
+                <widget class="QSpinBox" name="sbDev4"/>
+               </item>
+              </layout>
+             </item>
+            </layout>
+           </widget>
+          </item>
+         </layout>
+        </item>
+       </layout>
+      </widget>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="horizontalLayout">
+       <property name="sizeConstraint">
+        <enum>QLayout::SetDefaultConstraint</enum>
+       </property>
+       <property name="leftMargin">
+        <number>5</number>
+       </property>
+       <property name="topMargin">
+        <number>5</number>
+       </property>
+       <property name="rightMargin">
+        <number>5</number>
+       </property>
+       <property name="bottomMargin">
+        <number>5</number>
+       </property>
+       <item>
+        <widget class="QLabel" name="label_3">
+         <property name="text">
+          <string/>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QToolButton" name="btnApplyModel">
+         <property name="text">
+          <string>Apply</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QToolButton" name="btnStopModel">
+         <property name="text">
+          <string>Stop</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </item>
+     <item>
+      <spacer name="verticalSpacer">
+       <property name="orientation">
+        <enum>Qt::Vertical</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>20</width>
+         <height>40</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <layoutdefault spacing="6" margin="11"/>
+ <resources/>
+ <connections>
+  <connection>
+   <sender>btnClear</sender>
+   <signal>clicked()</signal>
+   <receiver>QuiClass</receiver>
+   <slot>clearChat()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>127</x>
+     <y>560</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>837</x>
+     <y>274</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>btnWriteFile</sender>
+   <signal>clicked()</signal>
+   <receiver>QuiClass</receiver>
+   <slot>wirteToFile()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>67</x>
+     <y>560</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>939</x>
+     <y>411</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>btnSend</sender>
+   <signal>clicked()</signal>
+   <receiver>QuiClass</receiver>
+   <slot>sendAI()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>603</x>
+     <y>527</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>939</x>
+     <y>438</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>btnApplyModel</sender>
+   <signal>clicked()</signal>
+   <receiver>QuiClass</receiver>
+   <slot>runModelWithSetting()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>870</x>
+     <y>565</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>474</x>
+     <y>259</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>btnPathModel</sender>
+   <signal>clicked()</signal>
+   <receiver>QuiClass</receiver>
+   <slot>onPathSelectModel()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>917</x>
+     <y>70</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>939</x>
+     <y>168</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>toolButton</sender>
+   <signal>clicked()</signal>
+   <receiver>QuiClass</receiver>
+   <slot>onPathSelectFlm()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>917</x>
+     <y>167</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>939</x>
+     <y>138</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>btnStopModel</sender>
+   <signal>clicked()</signal>
+   <receiver>QuiClass</receiver>
+   <slot>stopModelRuning()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>928</x>
+     <y>565</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>939</x>
+     <y>369</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>ckDev2</sender>
+   <signal>clicked()</signal>
+   <receiver>QuiClass</receiver>
+   <slot>onDeviceCheck()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>678</x>
+     <y>409</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>505</x>
+     <y>271</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>ckDev3</sender>
+   <signal>clicked()</signal>
+   <receiver>QuiClass</receiver>
+   <slot>onDeviceCheck()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>678</x>
+     <y>449</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>505</x>
+     <y>271</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>ckDev4</sender>
+   <signal>clicked()</signal>
+   <receiver>QuiClass</receiver>
+   <slot>onDeviceCheck()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>678</x>
+     <y>489</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>505</x>
+     <y>271</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>gbDeviceMap</sender>
+   <signal>clicked()</signal>
+   <receiver>QuiClass</receiver>
+   <slot>onDeviceCheck()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>812</x>
+     <y>306</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>505</x>
+     <y>271</y>
+    </hint>
+   </hints>
+  </connection>
+  <connection>
+   <sender>btnReset</sender>
+   <signal>clicked()</signal>
+   <receiver>QuiClass</receiver>
+   <slot>onReset()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>505</x>
+     <y>547</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>334</x>
+     <y>657</y>
+    </hint>
+   </hints>
+  </connection>
+ </connections>
+ <slots>
+  <slot>clearChat()</slot>
+  <slot>wirteToFile()</slot>
+  <slot>sendAI()</slot>
+  <slot>runModelWithSetting()</slot>
+  <slot>onPathSelectModel()</slot>
+  <slot>onPathSelectFlm()</slot>
+  <slot>stopModelRuning()</slot>
+  <slot>onDeviceCheck()</slot>
+  <slot>onReset()</slot>
+ </slots>
+</ui>
