@@ -1,0 +1,2 @@
+C:/DEV/Prj/fastllm/fastllm-bin/Release
+C:/DEV/Prj/fastllm/fastllm/example/Qui/bin/fastllm_cuda.exe
