@@ -60,8 +60,17 @@ namespace fastllm {
 
     void LlamaModel::InitParams() {
         basellm::InitParams();
+        num_key_value_heads = num_attention_heads;
+        if (this->weight.dicts.find("num_key_value_heads") != this->weight.dicts.end()) {
+            num_key_value_heads = atoi(this->weight.dicts["num_key_value_heads"].c_str());
+        }
+        head_dim = embed_dim / num_attention_heads;
+        rotary_dim = head_dim;
         if (this->weight.dicts.find("max_position_embeddings") != this->weight.dicts.end()) {
             max_positions = atoi(this->weight.dicts["max_position_embeddings"].c_str());
+        }
+        if (this->weight.dicts.find("rms_norm_eps") != this->weight.dicts.end()) {
+            rms_norm_eps = atof(this->weight.dicts["rms_norm_eps"].c_str());
         }
         if (this->weight.dicts.find("rope_scaling.type") != this->weight.dicts.end()) {
             std::string type = this->weight.dicts["rope_scaling.type"];
@@ -73,7 +82,6 @@ namespace fastllm {
         if (this->weight.dicts.find("rope_theta") != this->weight.dicts.end()) {
             rope_base = atof(this->weight.dicts["rope_theta"].c_str());
         }
-        float factor = 1.0f;
         if (this->weight.dicts.find("rope_scaling.factor") != this->weight.dicts.end()) {
             rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
         }
@@ -84,15 +92,16 @@ namespace fastllm {
         cosData.CopyFrom(Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second));
     }
 
-    std::pair<std::vector<float>, std::vector<float>> LlamaModel::UpdateRotaryPosEmb(float base, float factor) {
-        sin.resize(max_positions);
-        cos.resize(max_positions);
+    std::pair<std::vector<float>, std::vector<float>> LlamaModel::UpdateRotaryPosEmb(float base, float factor, int seqLen) {
+        int positions = std::max(max_positions, seqLen);
+        sin.resize(positions);
+        cos.resize(positions);
         std::vector <float> invFreq;
         for (int i = 0; i < rotary_dim; i += 2) {
             invFreq.push_back(1.0 / pow(base, (float)i / rotary_dim));
         }
         float scale = rope_type == RoPEType::LINEAR_SCALE ? factor : 1.0;
-        for (int i = 0; i < max_positions; i++) {
+        for (int i = 0; i < positions; i++) {
             sin[i].resize(rotary_dim);
             cos[i].resize(rotary_dim);
             for (int j = 0; j < invFreq.size(); j++) {
@@ -102,10 +111,8 @@ namespace fastllm {
         }
         std::vector <float> fsin, fcos;
         for (int i = 0; i < sin.size(); i++) {
-            for (int j = 0; j < sin[0].size(); j++) {
-                fsin.push_back(sin[i][j]);
-                fcos.push_back(cos[i][j]);
-            }
+            fsin.insert(fsin.end(), sin[i].begin(), sin[i].end());
+            fcos.insert(fcos.end(), cos[i].begin(), cos[i].end());
         }
         return std::make_pair(fsin, fcos);
     }
@@ -134,7 +141,7 @@ namespace fastllm {
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
-                    1e-6, attenInput);
+                    rms_norm_eps, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
@@ -149,10 +156,11 @@ namespace fastllm {
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
                 Linear(attenInput, weight[qkvWeightName], Data(), qkv);
-                int per = qkv.dims.back() / 3;
-                Split(qkv, -1, 0, per, q);
-                Split(qkv, -1, per, per * 2, k);
-                Split(qkv, -1, per * 2, per * 3, v);
+                int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
+                int qdim = per * (num_attention_heads / num_key_value_heads);
+                Split(qkv, -1, 0, qdim, q);
+                Split(qkv, -1, qdim, qdim + per, k);
+                Split(qkv, -1, qdim + per, qdim + per * 2, v);
             } else {
                 Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
                 Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
@@ -162,7 +170,7 @@ namespace fastllm {
                 Linear(attenInput, weight[vWeightName], vBias, v);
             }
 
-            std::vector <int> qkvSize = {bsz, seqlen, num_attention_heads, -1};
+            std::vector <int> qkvSize = {bsz, seqlen, -1, head_dim};
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
@@ -175,12 +183,13 @@ namespace fastllm {
                 pastKey.ToDevice(DataDevice::CUDA);
                 pastValue.ToDevice(DataDevice::CUDA);
             }
-            if (i == 0 && pastKey.dims.empty() && maxLen > max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
-                float scale = pow((rope_factor * maxLen / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+            int targetSeqLength = (pastKey.dims.size() > 2) ? pastKey.dims[1] + maxLen : maxLen;
+            if (i == 0 && targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
+                float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
                 float newbase = rope_base * scale;
-                std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
-                sinDataPtr = new Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first);
-                cosDataPtr = new Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second);
+                std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(newbase, rope_factor, targetSeqLength);
+                sinDataPtr = new Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, pair.first);
+                cosDataPtr = new Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, pair.second);
             }
 
             if (alibiData.dims.size() == 0) {
@@ -188,7 +197,7 @@ namespace fastllm {
                 fastllm::LlamaRotatePosition2D(k, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
             }
 
-            qkvSize = {bsz * seqlen, num_attention_heads, -1};
+            qkvSize = {bsz * seqlen, -1, head_dim};
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
@@ -252,7 +261,7 @@ namespace fastllm {
             Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
-            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
             Silu(w1, w1);
@@ -273,7 +282,7 @@ namespace fastllm {
         int lastRet = -1;
         {
             auto &hiddenStates = *lastHiddenStates;
-            RMSNorm(hiddenStates, weight["model.norm.weight"], 1e-6, hiddenStates);
+            RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
             Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
             if (generationConfig.output_logits && retLogits != nullptr) {
                 int size = logits.dims.back();
@@ -322,7 +331,7 @@ namespace fastllm {
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
-                    1e-6, attenInput);
+                    rms_norm_eps, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
@@ -337,10 +346,11 @@ namespace fastllm {
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
                 Linear(attenInput, weight[qkvWeightName], Data(), qkv);
-                int per = qkv.dims.back() / 3;
-                Split(qkv, -1, 0, per, q);
-                Split(qkv, -1, per, per * 2, k);
-                Split(qkv, -1, per * 2, per * 3, v);
+                int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
+                int qdim = per * (num_attention_heads / num_key_value_heads);
+                Split(qkv, -1, 0, qdim, q);
+                Split(qkv, -1, qdim, qdim + per, k);
+                Split(qkv, -1, qdim + per, qdim + per * 2, v);
             } else {
                 Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
                 Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
@@ -350,7 +360,7 @@ namespace fastllm {
                 Linear(attenInput, weight[vWeightName], vBias, v);
             }
 
-            std::vector <int> qkvSize = {bsz, seqlen, num_attention_heads, -1};
+            std::vector <int> qkvSize = {bsz, seqlen, -1, head_dim};
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
@@ -363,12 +373,13 @@ namespace fastllm {
                 pastKey.ToDevice(DataDevice::CUDA);
                 pastValue.ToDevice(DataDevice::CUDA);
             }
-            if (i == 0 && pastKey.dims.empty() && seqlen > max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
-                float scale = pow((rope_factor * seqlen / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+            int targetSeqLength = (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqlen : seqlen;
+            if (i == 0 && targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
+                float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
                 float newbase = rope_base * scale;
-                std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
-                sinDataPtr = new Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first);
-                cosDataPtr = new Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second);
+                std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(newbase, rope_factor, targetSeqLength);
+                sinDataPtr = new Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, pair.first);
+                cosDataPtr = new Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, pair.second);
             }
 
             if (alibiData.dims.size() == 0) {
@@ -380,7 +391,7 @@ namespace fastllm {
             PermuteSelf(k, {0, 2, 1, 3});
             PermuteSelf(v, {0, 2, 1, 3});
 
-            qkvSize = {bsz * num_attention_heads, seqlen, -1};
+            qkvSize = {-1, seqlen, head_dim};
             q.Reshape(qkvSize);
             k.Reshape(qkvSize);
             v.Reshape(qkvSize);
@@ -417,7 +428,7 @@ namespace fastllm {
 
             // 1.2 Attention
             // 1.2.0 q * k^T
-            MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
+            MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim), q.dims[0] / pastKey.dims[0]);
             attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
             if (alibiData.dims.size() != 0) {
                 attenWeights.Reshape({-1, num_attention_heads, attenWeights.dims[2], attenWeights.dims[3]});
@@ -427,7 +438,7 @@ namespace fastllm {
                 AttentionMask(attenWeights, attentionMask, -10000);
             }
             Softmax(attenWeights, attenWeights, -1);
-            MatMul(attenWeights, pastValue, attenOutput);
+            MatMul(attenWeights, pastValue, attenOutput, 1.f, attenWeights.dims[1] / pastValue.dims[0]);
 
             attenOutput.Reshape({attenOutput.dims[1], attenOutput.dims[2], attenOutput.dims[3]});
             PermuteSelf(attenOutput, {1, 0, 2});
@@ -438,7 +449,7 @@ namespace fastllm {
             Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
-            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
             Silu(w1, w1);
@@ -460,7 +471,7 @@ namespace fastllm {
         std::vector <int> lastRet;
         {
             auto &hiddenStates = *lastHiddenStates;
-            RMSNorm(hiddenStates, weight["model.norm.weight"], 1e-6, hiddenStates);
+            RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
             Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
             if (generationConfig.IsSimpleGreedy()) {
                 TopK(logits, topk, 1);
@@ -513,7 +524,7 @@ namespace fastllm {
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
-                    1e-6, attenInput);
+                    rms_norm_eps, attenInput);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
@@ -528,10 +539,11 @@ namespace fastllm {
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
                 Linear(attenInput, weight[qkvWeightName], Data(), qkv);
-                int per = qkv.dims.back() / 3;
-                Split(qkv, -1, 0, per, q);
-                Split(qkv, -1, per, per * 2, k);
-                Split(qkv, -1, per * 2, per * 3, v);
+                int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
+                int qdim = per * (num_attention_heads / num_key_value_heads);
+                Split(qkv, -1, 0, qdim, q);
+                Split(qkv, -1, qdim, qdim + per, k);
+                Split(qkv, -1, qdim + per, qdim + per * 2, v);
             } else {
                 Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
                 Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
@@ -557,7 +569,7 @@ namespace fastllm {
             for (int b = 0; b < batch; b++) {
                 auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
 
-                std::vector<int> qkvSize = {bsz, seqLens[b], num_attention_heads, -1};
+                std::vector<int> qkvSize = {bsz, seqLens[b], -1, head_dim};
                 q.Reshape(qkvSize);
                 k.Reshape(qkvSize);
                 v.Reshape(qkvSize);
@@ -570,12 +582,13 @@ namespace fastllm {
                     pastKey.ToDevice(DataDevice::CUDA);
                     pastValue.ToDevice(DataDevice::CUDA);
                 }
-                if (i == 0 && pastKey.dims.empty() && seqLens[b] > max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
-                    float scale = pow((rope_factor * seqLens[b] / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+                int targetSeqLength = (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqLens[b] : seqLens[b];
+                if (i == 0 && targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
+                    float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
                     float newbase = rope_base * scale;
-                    std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
-                    sinDataPtrList[b] = new Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first);
-                    cosDataPtrList[b] = new Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second);
+                    std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(newbase, rope_factor, targetSeqLength);
+                    sinDataPtrList[b] = new Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, pair.first);
+                    cosDataPtrList[b] = new Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, pair.second);
                 }
 
                 if (alibiData.dims.size() == 0) {
@@ -587,7 +600,7 @@ namespace fastllm {
                 PermuteSelf(k, {0, 2, 1, 3});
                 PermuteSelf(v, {0, 2, 1, 3});
 
-                qkvSize = {bsz * num_attention_heads, seqLens[b], -1};
+                qkvSize = {-1, seqLens[b], head_dim};
                 q.Reshape(qkvSize);
                 k.Reshape(qkvSize);
                 v.Reshape(qkvSize);
@@ -626,7 +639,7 @@ namespace fastllm {
 
                 // 1.2 Attention
                 // 1.2.0 q * k^T
-                MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim));
+                MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim), q.dims[0] / pastKey.dims[0]);
                 attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
                 if (alibiData.dims.size() != 0) {
                     AlibiMask(attenWeights, alibiData, -10000);
@@ -635,7 +648,7 @@ namespace fastllm {
                 }
 
                 Softmax(attenWeights, attenWeights, -1);
-                MatMul(attenWeights, pastValue, curAttenOutput);
+                MatMul(attenWeights, pastValue, curAttenOutput, 1.f, attenWeights.dims[1] / pastValue.dims[0]);
                 curAttenOutput.Reshape({curAttenOutput.dims[1], curAttenOutput.dims[2], curAttenOutput.dims[3]});
                 PermuteSelf(curAttenOutput, {1, 0, 2});
                 curAttenOutput.Reshape({seqLens[b], bsz, -1});
@@ -652,7 +665,7 @@ namespace fastllm {
             Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
-            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], 1e-6, attenInput);
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
             Silu(w1, w1);
@@ -662,7 +675,7 @@ namespace fastllm {
         }
 
         Data logits, curLogit;
-        RMSNorm(hiddenStates, weight["model.norm.weight"], 1e-6, hiddenStates);
+        RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         std::vector <int> lastRet;
         int total = 0;

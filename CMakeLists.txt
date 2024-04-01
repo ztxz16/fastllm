@@ -25,18 +25,18 @@ set(CMAKE_BUILD_TYPE "Release")
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-    set(CMAKE_CXX_FLAGS_DEBUG "/MTd /Zi /Ob0 /Od /RTC1")
-    set(CMAKE_CXX_FLAGS_RELEASE "/MT /O2 /Ob1 /Gy /DNDEBUG")
+    string(REPLACE "/Ob2" "/Ob1 /Gy" CMAKE_CXX_FLAGS_RELEASE ${CMAKE_CXX_FLAGS_RELEASE})
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNOMINMAX /std:c++17 /arch:AVX2 /source-charset:utf-8")
 else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2 -march=native")
 endif()
 
 
-message(STATUS "CMAKE_CXX_FLAGS" ${CMAKE_CXX_FLAGS})
+message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executor.cpp
         src/devices/cpu/cpudevice.cpp src/devices/cpu/cpudevicebatch.cpp
-        src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp src/models/glm.cpp src/models/minicpm.cpp)
+        src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
+        src/models/glm.cpp src/models/minicpm.cpp src/models/internlm2.cpp)
 
 include_directories(include)
 include_directories(include/utils)
@@ -69,6 +69,9 @@ if (USE_IVCOREX)
 endif()
 
 if (PY_API)
+    if(POLICY CMP0148)
+        cmake_policy(SET CMP0148 NEW)
+    endif()
     set(PYBIND third_party/pybind11)
     add_subdirectory(${PYBIND})
     add_compile_definitions(PY_API)
