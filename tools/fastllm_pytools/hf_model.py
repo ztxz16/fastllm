@@ -29,7 +29,7 @@ def create(model,
            group = -1):
     if (dtype not in fastllm_data_type_dict):
         print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
-        exit(0)    
+        exit(0)
 
     # 0.1 model info
     modelInfo = model.config.__dict__
@@ -75,6 +75,8 @@ def create(model,
             if isinstance(rope_scaling, builtins.dict):
                 modelInfo["rope_scaling.type"] = rope_scaling["type"]
                 modelInfo["rope_theta"] = rope_scaling["base"]
+    elif (modelInfo["model_type"] == "internlm2"):
+        modelInfo["eos_token_id"] = "92542"
     if (modelInfo["model_type"] == "chatglm" and hasattr(tokenizer, "build_chat_input")):
         # chatglm3
         modelInfo["pre_prompt"] = "";
@@ -85,6 +87,8 @@ def create(model,
         rope_scaling = modelInfo.pop("rope_scaling")
         modelInfo["rope_scaling.type"] = rope_scaling["type"]
         modelInfo["rope_scaling.factor"] = rope_scaling["factor"]
+
+    merges = {}
     if tokenizer:
         modelInfo["tokenizer_use_score"] = "1" # 分词带分数
         if len(tokenizer.all_special_tokens) > 0:
@@ -103,13 +107,34 @@ def create(model,
                     sp_model_data = f.read()
                     sp_model_proto = model_pb2.ModelProto.FromString(sp_model_data)
                     modelInfo["tokenizer_add_dummy_prefix"] = sp_model_proto.normalizer_spec.add_dummy_prefix
-                    modelInfo["tokenizer_remove_extra_whitespaces"] = sp_model_proto.normalizer_spec.remove_extra_whitespaces
+                    if sp_model_proto.normalizer_spec.remove_extra_whitespaces:
+                        modelInfo["tokenizer_remove_extra_whitespaces"] = True
             except:
                 pass
         elif isinstance(tokenizer, PreTrainedTokenizerFast):
+            modelInfo["tokenizer_add_dummy_prefix"] = False
+            tokenizer_file_name = tokenizer.vocab_file if hasattr(tokenizer, "vocab_file") else tokenizer.vocab_files_names['tokenizer_file']
+            tokenizer_file = tokenizer.name_or_path + tokenizer_file_name
+            if os.path.exists(tokenizer_file):
+                with open(tokenizer_file, "r", encoding='utf-8') as f:
+                    tokenizer_data = json.load(f)
+                    if "normalizers" in tokenizer_data["normalizer"]:
+                        for normalizer in tokenizer_data["normalizer"]["normalizers"]:
+                            if normalizer["type"] == "Prepend" and \
+                                    (normalizer["prepend"] == '▁' or normalizer["prepend"] == ' '):
+                                modelInfo["tokenizer_add_dummy_prefix"] = True
+                    if "merges" in tokenizer_data["model"]:
+                        bpe_merges = tokenizer_data["model"]["merges"]
+                        bpe_merges = [pair.replace(" ", "") for pair in bpe_merges]
+                        merges = builtins.dict(zip(bpe_merges, range(0, -len(bpe_merges), -1)))
             if hasattr(tokenizer, "_tokenizer") and hasattr(tokenizer._tokenizer, "decoder") \
                     and isinstance(tokenizer._tokenizer.decoder, ByteLevel):
                 modelInfo["tokenizer_byte_as_char"] = True
+        else:
+            if hasattr(tokenizer, "byte_encoder") and hasattr(tokenizer, "byte_decoder"):
+                modelInfo["tokenizer_byte_as_char"] = True
+            if not hasattr(tokenizer, "add_prefix_space") or not getattr(tokenizer, "add_prefix_space", True):
+                modelInfo["tokenizer_add_dummy_prefix"] = False
 
     peft_config = {}
     active_adapter = ""
@@ -119,6 +144,7 @@ def create(model,
         # in transformers >= 4.33.0, active_adapter is a funtion in model, ignore it now
         active_adapter = model.active_adapter
 
+    weight_type_dict = {}
     model = model.cpu();
     dict = model.state_dict()
 
@@ -127,6 +153,7 @@ def create(model,
         lm_head = dict['lm_head.weight'].to(torch.float32)
         dict['lm_head.weight'] = torch.nn.functional.normalize(lm_head).to(torch.float16)
         model.load_state_dict(dict)
+        weight_type_dict['lm_head.weight'] = "linear"
 
     model_type = modelInfo["model_type"];
     model_handle = llm.fastllm_lib.create_empty_llm_model(model_type.encode());
@@ -153,23 +180,15 @@ def create(model,
                 llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, tokenizer.sp_model.id_to_piece(i).encode(),
                                                              i, ctypes.c_float(tokenizer.sp_model.get_score(i)));
         else:
-            merges = {}
-            if (modelInfo["model_type"] == "moss"):
+            if hasattr(tokenizer, "bpe_ranks"):
                 merges = {("".join(bpe_tokens), token_index) for bpe_tokens, token_index in sorted(tokenizer.bpe_ranks.items(), key=lambda kv: kv[1])}
-            elif isinstance(tokenizer, PreTrainedTokenizerFast):
-                tokenizer_file = tokenizer.name_or_path + tokenizer.vocab_files_names['tokenizer_file']
-                if os.path.exists(tokenizer_file):
-                    with open(tokenizer_file, "r", encoding='utf-8') as f:
-                        bpe_merges = json.load(f)["model"]["merges"]
-                        bpe_merges = [pair.replace(" ", "") for pair in bpe_merges]
-                        merges = builtins.dict(zip(bpe_merges, range(0, -len(bpe_merges), -1)))
             vocab = tokenizer.get_vocab()
             for v in vocab.keys():
                 score = merges[v] if v in merges else 1.0
-                if (modelInfo["model_type"] == "moss"):
-                    s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
-                    llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, s, vocab[v], ctypes.c_float(score));
-                elif (modelInfo["model_type"] == "qwen"):
+                # if (modelInfo["model_type"] == "moss"):
+                #     s = [(ord(c) if c not in tokenizer.byte_decoder else tokenizer.byte_decoder[c]) for c in v]
+                #     llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, s, vocab[v], ctypes.c_float(score));
+                if (modelInfo["model_type"] == "qwen"):
                     llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, v, vocab[v], ctypes.c_float(1.0));
                 else:
                     llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, v.encode(), vocab[v], ctypes.c_float(score));
@@ -182,7 +201,6 @@ def create(model,
                                                          special_tokens_str.encode(),
                                                          (ctypes.c_int * len(special_tokens_ids))(*special_tokens_ids));
 
-    weight_type_dict = {}
     module_dict = {}
     weight_bits = {}
     for key, m in model.named_modules():
@@ -193,7 +211,7 @@ def create(model,
             weight_type_dict[key + ".weight"] = "linear"
             module_dict[key + ".weight"] = m
         if (isinstance(m, torch.nn.Embedding)):
-            weight_type_dict[key] = "embedding"
+            weight_type_dict[key + ".weight"] = "embedding"
 
     # 2. weight
     tot = 0

@@ -113,6 +113,19 @@ python3 tools/llamalike2flm.py internlm-7b-int4.flm int4 internlm/internlm-chat-
 python3 tools/llamalike2flm.py internlm-7b-int4.flm float16 internlm/internlm-chat-7b #导出internlm-chat-7b float16模型
 ```
 
+* internlm/[internlm2-chat-1_8b](https://huggingface.co/internlm/internlm2-chat-1_8b)
+* internlm/[internlm2-chat-7b](https://huggingface.co/internlm/internlm2-chat-7b)
+* internlm/[internlm2-chat-20b](https://huggingface.co/internlm/internlm2-chat-20b)
+
+使用`llamalike2flm.py`脚本转换：
+
+``` sh
+cd build
+python3 tools/llamalike2flm.py internlm2-1.8b-fp16.flm float16 iinternlm/internlm2-chat-1_8b #导出1.8B float16模型
+python3 tools/llamalike2flm.py internlm2-7b-fp16.flm float16 internlm/internlm2-chat-7b #导出chat-7b float16模型
+python3 tools/llamalike2flm.py internlm2-7b-int8.flm int8 internlm/internlm2-chat-7b #导出chat-7b int8模型
+```
+
 ### XVERSE
 
 * xverse/[XVERSE-13B-Chat](https://huggingface.co/xverse/XVERSE-13B-Chat)
@@ -223,6 +236,17 @@ XVERSE-13B-Chat V1 版本需要对输入做NFKC规范化，fastllm暂不支持�
                      pre_prompt="The following is a conversation between a human and an AI assistant namely YuLan, developed by GSAI, Renmin University of China. " \
                                 "The AI assistant gives helpful, detailed, and polite answers to the user's questions.\n",
                      user_role="[|Human|]:", bot_role="\n[|AI|]:", history_sep="\n", dtype=dtype)
+```
+
+## Yi
+
+* 01-ai/[Yi-6B-Chat](https://huggingface.co/01-ai/Yi-6B-Chat)
+
+* 01-ai/[Yi-34B-Chat](https://huggingface.co/01-ai/Yi-34B-Chat)
+
+```python
+    torch2flm.tofile(exportPath, model, tokenizer, pre_prompt="",
+                     user_role="<|im_start|>user\n", bot_role="<|im_end|><|im_start|>assistant\n", history_sep="<|im_end|>\n", dtype=dtype)
 ```
 
 ### WizardCoder
