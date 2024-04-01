@@ -10,6 +10,7 @@
 #include "qwen.h"
 #include "glm.h"
 #include "minicpm.h"
+#include "internlm2.h"
 
 namespace fastllm {
     void basellm::LoadFromFile(const std::string &fileName) {
@@ -101,6 +102,9 @@ namespace fastllm {
             model->weight.tokenizer.type = Tokenizer::TokenizerType::BPE;
         } else if (modelType == "internlm") {
             model = new LlamaModel();
+            model->model_type = "internlm";
+        } else if (modelType == "internlm2") {
+            model = new Internlm2Model();
             model->model_type = "internlm";
         } else if (modelType == "llama") {
             model = (basellm*)(new LlamaModel());

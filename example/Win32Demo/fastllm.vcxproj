@@ -181,6 +181,7 @@
     <ClInclude Include="..\..\include\models\chatglm.h" />
     <ClInclude Include="..\..\include\models\factoryllm.h" />
     <ClInclude Include="..\..\include\models\glm.h" />
+    <ClInclude Include="..\..\include\models\internlm2.h" />
     <ClInclude Include="..\..\include\models\llama.h" />
     <ClInclude Include="..\..\include\models\minicpm.h" />
     <ClInclude Include="..\..\include\models\moss.h" />
@@ -198,6 +199,7 @@
     <ClCompile Include="..\..\src\models\basellm.cpp" />
     <ClCompile Include="..\..\src\models\chatglm.cpp" />
     <ClCompile Include="..\..\src\models\glm.cpp" />
+    <ClCompile Include="..\..\src\models\internlm2.cpp" />
     <ClCompile Include="..\..\src\models\llama.cpp" />
     <ClCompile Include="..\..\src\models\minicpm.cpp" />
     <ClCompile Include="..\..\src\models\moss.cpp" />

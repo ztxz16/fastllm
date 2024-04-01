@@ -362,7 +362,9 @@ namespace fastllm {
         int input1Spatial = input1.Count(input1.dims.size() - 2);
         int batch0 = input0.Count(0) / input0Spatial;
         int batch1 = input1.Count(0) / input1Spatial;
-        AssertInFastLLM(batch0 == batch1, "MatMul's shape error.\n");
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        AssertInFastLLM(batch0 == batch1 * group, "MatMul: input0.dims[1] should be equal to input1.dims[0] * group.\n");
+        // AssertInFastLLM(batch0 == batch1, "MatMul's shape error.\n");
 
         std::vector <int> dims = input0.dims;
         dims.back() = input1.dims[input1.dims.size() - 1];
@@ -379,21 +381,22 @@ namespace fastllm {
 
         output.Allocate();
 
-        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : -1;
-        int input0Spatial = input0.Count(input0.dims.size() - 2);
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0f;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        int input0Spatial = input0.Count(input0.dims.size() - 2) * group;
         int input1Spatial = input1.Count(input1.dims.size() - 2);
         int input0Stride = input0.strides[input0.dims.size() - 2];
         int input1Stride = input1.strides[input1.dims.size() - 2];
-        int n = input0.dims[input0.dims.size() - 2];
+        int n = input0.dims[input0.dims.size() - 2] * group;
         int m = input0.dims.back();
         int k = input1.dims[input1.dims.size() - 1];
         int batch0 = input0.Count(0) / input0Spatial;
         int batch1 = input1.Count(0) / input1Spatial;
 
-        int outputSpatial = output.Count(output.dims.size() - 2);
+        int outputSpatial = output.Count(output.dims.size() - 2) * group;
         FastllmCudaBatchMatMul(input0, input1, output,
-                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
-                     batch0, n, m, k, alpha);
+                               input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                               batch1, n, m, k, alpha);
     }
 
     void CudaMatMulTransBOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -413,7 +416,9 @@ namespace fastllm {
         int input1Spatial = input1.Count(input1.dims.size() - 2);
         int batch0 = input0.Count(0) / input0Spatial;
         int batch1 = input1.Count(0) / input1Spatial;
-        AssertInFastLLM(batch0 == batch1, "MatMulTransB's shape error.\n");
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        AssertInFastLLM(batch0 == batch1 * group, "MatMulTransB: input0.dims[0] should be equal to input1.dims[0] * group.\n");
+        // AssertInFastLLM(batch0 == batch1, "MatMulTransB's shape error.\n");
 
         std::vector <int> dims = input0.dims;
         dims.back() = input1.dims[input1.dims.size() - 2];
@@ -429,21 +434,22 @@ namespace fastllm {
 
         output.Allocate();
 
-        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : -1;
-        int input0Spatial = input0.Count(input0.dims.size() - 2);
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0f;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        int input0Spatial = input0.Count(input0.dims.size() - 2) * group;
         int input1Spatial = input1.Count(input1.dims.size() - 2);
         int input0Stride = input0.strides[input0.dims.size() - 2];
         int input1Stride = input1.strides[input1.dims.size() - 2];
-        int n = input0.dims[input0.dims.size() - 2];
+        int n = input0.dims[input0.dims.size() - 2] * group;
         int m = input0.dims.back();
         int k = input1.dims[input1.dims.size() - 2];
         int batch0 = input0.Count(0) / input0Spatial;
         int batch1 = input1.Count(0) / input1Spatial;
 
-        int outputSpatial = output.Count(output.dims.size() - 2);
+        int outputSpatial = output.Count(output.dims.size() - 2) * group;
         FastllmCudaBatchMatMulTransB(input0, input1, output,
-                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
-                     batch0, n, m, k, alpha);
+                                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                                     batch1, n, m, k, alpha);
     }
 
     bool CudaSoftMaxOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
