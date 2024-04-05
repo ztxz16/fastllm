@@ -418,6 +418,18 @@ __device__ void FastllmSoftmaxKernelInner1Func(float *input, float *output, int 
     }
 }
 
+__device__ half FastllmHalfMaxFunc(const __half a, const __half b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 530
+    return __half2float(a) >= __half2float(b) ? a : b;
+#else
+#if defined(CUDART_VERSION) && CUDART_VERSION > 11000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    return __hmax(a, b);
+#else
+    return __hge(a, b) ? a : b;
+#endif
+#endif
+}
+
 template <int THREAD_PER_BLOCK>
 __device__ void FastllmSoftmaxKernelInner1Func(half *input, half *output, int channels) {
     __shared__ half sdata[THREAD_PER_BLOCK];
@@ -427,7 +439,7 @@ __device__ void FastllmSoftmaxKernelInner1Func(half *input, half *output, int ch
     unsigned int tid = threadIdx.x;
     half maxValue = input[tid];
     for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
-        maxValue = __hmax(maxValue, input[i]);
+        maxValue = FastllmHalfMaxFunc(maxValue, input[i]);
     }
     sdata[tid] = maxValue;
     __syncthreads();
@@ -435,7 +447,7 @@ __device__ void FastllmSoftmaxKernelInner1Func(half *input, half *output, int ch
     // 2. 求max
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            sdata[tid] = __hmax(sdata[tid], sdata[tid + s]);
+            sdata[tid] = FastllmHalfMaxFunc(sdata[tid], sdata[tid + s]);
         }
         __syncthreads();
     }
@@ -3103,7 +3115,7 @@ bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &wei
             FastllmCudaFloat2HalfKernel <<< (k - 1) / threadPerBlock + 1, threadPerBlock>>>(tempBiasData, cudaBiasData, k);
             state = cudaFree(tempBiasData);
         } else {
-            state = cudaMemset(cudaBiasData, __float2half_rn(0.0), k * sizeof(half));
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(half));
         }
         checkCudaErrors("Error: CUDA error when moving bias to device!", state);
         weight.extraCudaHalfData.push_back((void *) cudaBiasData);
