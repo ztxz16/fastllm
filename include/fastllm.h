@@ -95,7 +95,7 @@ namespace fastllm {
         }
 
         void Push(int id) {
-            if (tokenQueue.size() == tot) {
+            if (tokenQueue.size() == tot && tot > 0) {
                 tokenSet.erase(tokenSet.find(tokenQueue.front()));
                 tokenQueue.pop();
             }

@@ -1756,7 +1756,15 @@ namespace fastllm {
         float *base = ((float*)logits.cpuData) + outerOffset * vocabSize;
 
         if (fabs(config.repeat_penalty - 1.0) > 1e-6) {
-            for (int id : tokens.tokenSet) {
+            std::multiset<int>::iterator begin = tokens.tokenSet.begin();
+            std::multiset<int>::iterator end = tokens.tokenSet.end();
+            std::set<int> unique(tokens.tokenSet.begin(), tokens.tokenSet.end());
+            if (config.last_n <= 0) {
+                begin = unique.begin();
+                end = unique.end();
+            }
+            for (std::multiset<int>::iterator iter = begin; iter != end; ++iter) {
+                int id = *iter;
                 base[id] = (base[id] < 0 ? base[id] * config.repeat_penalty : base[id] / config.repeat_penalty);
             }
         }
