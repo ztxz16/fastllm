@@ -257,6 +257,7 @@ namespace fastllm {
         std::vector <int> zeros;
         std::vector <int> weightSum; // 作为权重时，有时候需要存一些和加速计算
 
+        std::string name; // weightName
         std::string fileName;
         long long filePos;
         std::shared_ptr<FileMmap> mapFile;
