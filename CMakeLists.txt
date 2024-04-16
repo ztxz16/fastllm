@@ -4,6 +4,8 @@ project(fastllm LANGUAGES CXX)
 
 option(USE_CUDA "use cuda" OFF)
 
+option(USE_TFACC "use tfacc" OFF)
+
 option(PY_API "python api" OFF)
 
 option(USE_MMAP "use mmap" OFF)
@@ -13,6 +15,8 @@ option(USE_SENTENCEPIECE "use sentencepiece" OFF)
 option(USE_IVCOREX "use iluvatar corex gpu" OFF)
 
 message(STATUS "USE_CUDA: ${USE_CUDA}")
+
+message(STATUS "USE_TFACC: ${USE_TFACC}")
 
 message(STATUS "PYTHON_API: ${PY_API}")
 
@@ -68,6 +72,17 @@ if (USE_IVCOREX)
     set(CMAKE_CUDA_ARCHITECTURES ${IVCOREX_ARCH})
 endif()
 
+if (USE_TFACC)
+    #execute_process(
+    #    COMMAND "./insmodTFDriver.sh"
+    #    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/third_party/thinkforce"
+    #)
+
+    add_compile_definitions(USE_TFACC)
+    set(FASTLLM_TFACC_SOURCES src/devices/tfacc/tfaccdevice.cpp src/devices/tfacc/fastllm-tfacc.cpp)
+    include_directories(include/devices/tfacc)
+endif()
+
 if (PY_API)
     if(POLICY CMP0148)
         cmake_policy(SET CMP0148 NEW)
@@ -81,13 +96,14 @@ if (PY_API)
 
     include_directories(third_party/pybind11/include)
     file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
-    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES})
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
 add_library(fastllm OBJECT
             ${FASTLLM_CXX_SOURCES}
             ${FASTLLM_CUDA_SOURCES}
+            ${FASTLLM_TFACC_SOURCES}
             )
 target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS})
 
@@ -115,7 +131,7 @@ target_link_libraries(benchmark fastllm)
 add_executable(apiserver example/apiserver/apiserver.cpp example/apiserver/json11.cpp)
 target_link_libraries(apiserver fastllm)
 
-add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} tools/src/pytools.cpp)
+add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
 
 if (${CMAKE_HOST_WIN32})
