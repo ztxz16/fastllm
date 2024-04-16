@@ -514,9 +514,6 @@ namespace fastllm {
                                                    Data(DataType::FLOAT32)));
         }
         Forward(inputIds, attentionMask, positionIds, pastKeyValues);
-#ifdef USE_TFACC40T
-        FastllmTfaccReleaseTempMemory();
-#endif
         printf("finish.\n");
     }
 
