@@ -272,6 +272,7 @@ namespace fastllm {
     }
 
     void Data::CopyFrom(const Data &ori) {
+        this->name = ori.name;
         // std::cout<<"调用拷贝构造"<<std::endl;
         if (ori.dims != this->dims || this->cpuData == nullptr || ori.dataType != this->dataType) {
             if (ori.dims.size() == 0) {
@@ -1542,6 +1543,7 @@ namespace fastllm {
             }
             DataType dataType = (DataType)buffer.ReadInt();
             weight[name] = Data(dataType, dims);
+            weight[name].name = name;
 
             if (lowMemMode && this->embeddingNames.find(name) != this->embeddingNames.end()) {
                 if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
