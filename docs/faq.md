@@ -43,6 +43,21 @@ cmake .. -DUSE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native
  if (PY_API)
 ```
 
+### identifier "__hdiv" is undefined
+
+**现象：**
+
+> src/devices/cuda/fastllm-cuda.cu(247): error: identifier "hexp" is undefined  
+> src/devices/cuda/fastllm-cuda.cu(247): error: identifier "__hdiv" is undefined  
+> ...
+
+**原因：** [计算能力（Compute Capability）](https://developer.nvidia.com/cuda-gpus) <= 5.3 的GPU不支持半精度计算。
+
+**解决办法：** 如需要支持这些GPU，执行cmake时使用编译选项`CUDA_NO_TENSOR_CORE`：
+
+```shell
+cmake .. -DUSE_CUDA=ON -DCUDA_NO_TENSOR_CORE=ON
+```
 
 ## Windows
 
