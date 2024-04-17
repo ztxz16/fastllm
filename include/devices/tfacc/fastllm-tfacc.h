@@ -7,4 +7,37 @@
 
 #include "fastllm.h"
 
+namespace fastllm {
+    struct TfaccClient {
+        int fd;
+        volatile uint8_t *buf;
+        volatile uint8_t *result;
+        volatile int32_t *flag;
+
+        int serverVersion;
+        int serverNumaCnt;
+
+        std::set <std::string> registerDataNames; // 向服务器上注册过的DataName
+
+        TfaccClient ();
+
+        ~TfaccClient ();
+
+        void Launch(int opType);
+
+        void Wait();
+
+        void SendLongMessage(uint8_t *buffer, int len);
+
+        void RegisterFastllmData(fastllm::Data *data);
+
+        void UnregisterFastllmData(const std::string &dataName);
+
+        void RunTfaccLinearU(int n, int m, int k, 
+                             fastllm::Data *weight, fastllm::Data *bias,
+                             std::vector <LowBitConfig> *inputConfigs,
+                             uint8_t *uinput, float *output);
+    };
+}
+
 #endif
