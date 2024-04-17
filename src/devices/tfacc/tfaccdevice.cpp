@@ -22,6 +22,8 @@
 #include "utils.h"
 
 namespace fastllm {
+    static TfaccClient tfaccClient;
+
     TfaccDevice::TfaccDevice() {
         this->deviceType = "tfacc";
         this->ops["Linear"] = (BaseOperator *) (new TfaccLinearOp());
@@ -165,71 +167,7 @@ namespace fastllm {
                 if (weight.dataType == DataType::INT4) {
                     ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
                 } else if (weight.dataType == DataType::INT8 || weight.dataType == DataType::INT4_NOZERO) {
-                    int opType = 1;
-                    if (weight.dataType == DataType::INT8) {
-                        opType = 2;
-                    }
-
-                    static int fd = open("/dev/thinkforce0", O_RDWR);
-                    static volatile uint8_t *buf = (volatile uint8_t *)mmap(NULL, 64 * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 9997 * 0x1000);
-                    static volatile uint8_t *result = buf + 32 * 1024 * 1024;
-                    static volatile int32_t *flag = (volatile int32_t*)(buf + 63 * 1024 * 1024);
-                    static int PAGE = 16 * 1024;
-                    static int maxPartCnt = 4;
-                    static int transLimit = 28 * 1024 * 1024;
-
-                    std::string biasName = biasData == nullptr ? "" : bias.name;
-                    int maxN = n;
-                    maxN = std::min(maxN, transLimit / m);
-                    maxN = std::min(maxN, (int)(transLimit / (k * sizeof(float))));
-                    
-                    // printf("maxN = %d\n", maxN);
-                    for (int baseN = 0; baseN < n; baseN += maxN) {
-                        int curN = std::min(maxN, n - baseN);
-                        ((int32_t*)buf)[0] = curN;
-                        ((int32_t*)buf)[1] = m;
-                        ((int32_t*)buf)[2] = k;
-                        ((int32_t*)buf)[3] = 1; // group
-                        ((int32_t*)buf)[4] = weight.name.size();
-                        ((int32_t*)buf)[5] = biasName.size();
-
-                        volatile uint8_t *cur = (uint8_t*)buf + 10 * sizeof(int32_t);
-                        for (int i = 0; i < curN; i++) {
-                            ((float*)cur)[0] = inputConfigs[baseN + i].min;
-                            ((float*)cur)[1] = inputConfigs[baseN + i].max;
-                            cur += 2 * sizeof(float);
-                        }
-                        memcpy((uint8_t*)cur, weight.name.c_str(), weight.name.size());
-                        cur += weight.name.size();
-                        memcpy((uint8_t*)cur, biasName.c_str(), biasName.size());
-                        cur += biasName.size();
-                        memcpy((uint8_t*)cur, uinput.data() + baseN * m, curN * m);
-                        asm volatile("dmb ish");
-
-                        volatile int *curFlag = flag;
-                        for (int i = 0; i < maxPartCnt; i++) {
-                            *(curFlag) = opType;
-                            curFlag += PAGE;
-                            asm volatile("dmb ish");
-                        }
-
-                        while (true) {
-                            volatile int *curFlag = flag;
-                            int notFinish = 0;
-                            for (int i = 0; i < maxPartCnt; i++) {
-                                notFinish |= (*curFlag);
-                                curFlag += PAGE;
-                            }
-
-                            if (!notFinish) {
-                                memcpy(((uint8_t*) outputData) + baseN * k * sizeof(int32_t), 
-                                        (uint8_t*) result, 
-                                        curN * k * sizeof(int32_t));
-                                break;
-                            }
-                            //asm volatile("dmb ish");
-                        }
-                    }
+                    tfaccClient.RunTfaccLinearU(n, m, k, &weight, &bias, &inputConfigs, uinput.data(), outputData);
                 }
             } else if (weight.dataType == DataType::INT4_GROUP) {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
