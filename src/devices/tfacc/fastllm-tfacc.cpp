@@ -17,11 +17,39 @@ namespace fastllm {
         LinearInt4NoZero = 1,
         LinearInt8 = 2,
 
-        GetComputeServerInfo = 10000
+        GetComputeServerInfo = 10000,
+        StartLongData = 10001,
+        FinishLongData = 10002
     };
 
     const int PAGE = 16 * 1024;
     static int transLimit = 28 * 1024 * 1024;
+
+    struct U8Buffer {
+        std::vector <uint8_t> buffer;
+
+        void Clear() {
+            buffer.clear();
+        }
+
+        void WriteInt(int v) {
+            int oldLen = buffer.size();
+            buffer.resize(oldLen + 4);
+            ((int*)(buffer.data() + oldLen))[0] = v;
+        }
+
+        void WriteFloat(float v) {
+            int oldLen = buffer.size();
+            buffer.resize(oldLen + 4);
+            ((float*)(buffer.data() + oldLen))[0] = v;
+        }
+
+        void WriteBytes(uint8_t *v, int len) {
+            int oldLen = buffer.size();
+            buffer.resize(oldLen + len);
+            memcpy(buffer.data() + oldLen, v, len);
+        }
+    };
 
     TfaccClient::TfaccClient() {
         fd = open("/dev/thinkforce0", O_RDWR);
@@ -50,7 +78,8 @@ namespace fastllm {
     }
 
     TfaccClient::~TfaccClient() {
-        for (auto &dataName : this->registerDataNames) {
+        std::set <std::string> names = this->registerDataNames;
+        for (auto &dataName : names) {
             this->UnregisterFastllmData(dataName);
         }
     }
@@ -80,21 +109,92 @@ namespace fastllm {
     }
 
     void TfaccClient::SendLongMessage(uint8_t *buffer, int len) {
-
+        for (int i = 0; i < len; i += transLimit) {
+            int cur = std::min(transLimit, len - i);
+            ((int32_t*)this->buf)[0] = cur;
+            memcpy((uint8_t*)this->buf + 4, buffer + i, cur);
+            this->Launch(ComputeTaskType::StartLongData);
+            this->Wait();
+        }
+        this->Launch(ComputeTaskType::FinishLongData);
+        this->Wait();
     }
 
-    void TfaccClient::RegisterFastllmData(fastllm::Data *data) {
+    void TfaccClient::RegisterFastllmData(fastllm::Data *data, const std::string &weightType) {
+        if (data->name == "" || this->registerDataNames.find(data->name) != this->registerDataNames.end()) {
+            return;
+        }
 
+        this->registerDataNames.insert(data->name);
+        json11::Json config = json11::Json::object {
+            {"op", "registerData"},
+            {"dataName", data->name},
+            {"weightType", weightType}
+        };
+        std::string configString = config.dump();
+
+        U8Buffer buffer;
+        buffer.WriteInt(configString.size());
+        buffer.WriteBytes((uint8_t*)configString.data(), configString.size());
+
+        buffer.WriteInt((int)data->dims.size());
+        for (int i : data->dims) {
+            buffer.WriteInt(i);
+        }
+        DataType dataType = data->dataType;
+        if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
+            buffer.WriteInt((int) dataType);
+            buffer.WriteBytes(data->cpuData, data->GetBytes());
+        } else if (dataType == DataType::INT8 || dataType == DataType::INT4 || dataType == DataType::INT4_NOZERO) {
+            buffer.WriteInt((int) dataType);
+            buffer.WriteInt(data->perChannelAxis);
+            int k = data->perChannelAxis == -1 ? 1 : data->dims[data->perChannelAxis];
+            for (int i = 0; i < k; i++) {
+                buffer.WriteFloat(data->perChannelsConfigs[i].min);
+                buffer.WriteFloat(data->perChannelsConfigs[i].max);
+            }
+            buffer.WriteBytes(data->cpuData, data->GetBytes());
+        } else if (dataType == DataType::INT4_GROUP) {
+            buffer.WriteInt((int) dataType);
+            buffer.WriteInt(data->perChannelAxis);
+            buffer.WriteInt(data->group);
+            buffer.WriteInt(data->groupCnt);
+            int k = data->perChannelAxis == -1 ? 1 : data->dims[data->perChannelAxis];
+            for (int i = 0; i < k * data->group; i++) {
+                buffer.WriteFloat(data->perChannelsConfigs[i].min);
+                buffer.WriteFloat(data->perChannelsConfigs[i].max);
+            }
+            buffer.WriteBytes(data->cpuData, data->GetBytes());
+        }
+
+        SendLongMessage(buffer.buffer.data(), buffer.buffer.size());
     }
 
     void TfaccClient::UnregisterFastllmData(const std::string &dataName) {
+        if (this->registerDataNames.find(dataName) == this->registerDataNames.end()) {
+            return;
+        }
 
+        this->registerDataNames.erase(dataName);
+        json11::Json config = json11::Json::object {
+            {"op", "unregisterData"},
+            {"dataName", dataName}
+        };
+        std::string configString = config.dump();
+
+        U8Buffer buffer;
+        buffer.WriteInt(configString.size());
+        buffer.WriteBytes((uint8_t*)configString.data(), configString.size());
+        SendLongMessage(buffer.buffer.data(), buffer.buffer.size());
     }
 
     void TfaccClient::RunTfaccLinearU(int n, int m, int k, 
                                      fastllm::Data *weight, fastllm::Data *bias,
                                      std::vector <LowBitConfig> *inputConfigs,
                                      uint8_t *uinput, float *output) {
+        RegisterFastllmData(weight, "linear");
+        RegisterFastllmData(bias, "bias");
+
         int opType = ComputeTaskType::LinearInt4NoZero;
         if (weight->dataType == DataType::INT8) {
             opType = ComputeTaskType::LinearInt8;
