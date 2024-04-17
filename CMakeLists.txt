@@ -43,12 +43,14 @@ message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executor.cpp
         src/devices/cpu/cpudevice.cpp src/devices/cpu/cpudevicebatch.cpp
         src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
-        src/models/glm.cpp src/models/minicpm.cpp src/models/internlm2.cpp)
+        src/models/glm.cpp src/models/minicpm.cpp src/models/internlm2.cpp
+        third_party/json11/json11.cpp)
 
 include_directories(include)
 include_directories(include/utils)
 include_directories(include/models)
 include_directories(include/devices/cpu)
+include_directories(third_party/json11)
 
 if (USE_MMAP)
     add_compile_definitions(USE_MMAP)
@@ -134,7 +136,7 @@ add_custom_command(
 add_executable(benchmark example/benchmark/benchmark.cpp)
 target_link_libraries(benchmark fastllm)
 
-add_executable(apiserver example/apiserver/apiserver.cpp example/apiserver/json11.cpp)
+add_executable(apiserver example/apiserver/apiserver.cpp)
 target_link_libraries(apiserver fastllm)
 
 add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} tools/src/pytools.cpp)
