@@ -104,6 +104,7 @@ def tofile(exportPath,
            user_role = None,
            bot_role = None,
            history_sep = None,
+           eos_id = None,
            dtype = "float16"):
     if (dtype not in fastllm_data_type_dict):
         print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
@@ -168,6 +169,8 @@ def tofile(exportPath,
         rope_scaling = modelInfo.pop("rope_scaling")
         modelInfo["rope_scaling.type"] = rope_scaling["type"]
         modelInfo["rope_scaling.factor"] = rope_scaling["factor"]
+    if eos_id:
+        modelInfo["eos_token_id"] = str(eos_id)
 
     merges = {}
     if tokenizer:
@@ -199,7 +202,7 @@ def tofile(exportPath,
             if os.path.exists(tokenizer_file):
                 with open(tokenizer_file, "r", encoding='utf-8') as f:
                     tokenizer_data = json.load(f)
-                    if "normalizers" in tokenizer_data["normalizer"]:
+                    if "normalizer" in tokenizer_data and tokenizer_data["normalizer"] and "normalizers" in tokenizer_data["normalizer"]:
                         for normalizer in tokenizer_data["normalizer"]["normalizers"]:
                             if normalizer["type"] == "Prepend" and \
                                     (normalizer["prepend"] == '▁' or normalizer["prepend"] == ' '):
