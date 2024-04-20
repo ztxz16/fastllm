@@ -16,6 +16,12 @@ namespace fastllm {
         None = 0,
         LinearInt4NoZero = 1,
         LinearInt8 = 2,
+        LinearFloat16 = 3,
+        LinearFloat32 = 4,
+        LinearInt4Group = 5,
+
+        AppendKVCache = 6,
+        DoAttention = 7,
 
         GetComputeServerInfo = 10000,
         StartLongData = 10001,
@@ -23,13 +29,19 @@ namespace fastllm {
     };
 
     const int PAGE = 16 * 1024;
-    static int transLimit = 28 * 1024 * 1024;
+    static int transLimit = 126 * 1024 * 1024;
 
     struct U8Buffer {
         std::vector <uint8_t> buffer;
 
         void Clear() {
             buffer.clear();
+        }
+
+        void WriteLongLong(long long v) {
+            int oldLen = buffer.size();
+            buffer.resize(oldLen + 8);
+            ((long long*)(buffer.data() + oldLen))[0] = v;
         }
 
         void WriteInt(int v) {
@@ -53,9 +65,9 @@ namespace fastllm {
 
     TfaccClient::TfaccClient() {
         fd = open("/dev/thinkforce0", O_RDWR);
-        buf = (volatile uint8_t *)mmap(NULL, 64 * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 9997 * 0x1000);
-        result = buf + 32 * 1024 * 1024;
-        flag = (volatile int32_t*)(buf + 63 * 1024 * 1024);
+        buf = (volatile uint8_t *)mmap(NULL, 256 * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 9997 * 0x1000);
+        result = buf + 128 * 1024 * 1024;
+        flag = (volatile int32_t*)(buf + 255 * 1024 * 1024);
 
         serverNumaCnt = 4;
         this->Launch(ComputeTaskType::GetComputeServerInfo);
@@ -235,5 +247,56 @@ namespace fastllm {
                     (uint8_t*) result,
                     curN * k * sizeof(int32_t));
         }
+    }
+
+    void TfaccClient::AppendKVCache(long long uid, Data *data) {
+        int opType = ComputeTaskType::AppendKVCache;
+
+        U8Buffer buffer;
+        buffer.WriteLongLong(uid);
+        buffer.WriteInt((int)data->dims.size());
+        for (int i : data->dims) {
+            buffer.WriteInt(i);
+        }
+        DataType dataType = data->dataType;
+        if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
+            buffer.WriteInt((int) dataType);
+            buffer.WriteBytes(data->cpuData, data->GetBytes());
+        } else {
+            ErrorInFastLLM("KVCache: Unsupport datatype.\n");
+        }
+
+        memcpy((uint8_t*)this->buf, buffer.buffer.data(), buffer.buffer.size());
+        this->Launch(opType);
+        this->Wait();
+    }
+
+    void TfaccClient::Attention(Data *q, Data *k, Data *v, int group, float scale, int maskType, Data *output) {
+        int opType = ComputeTaskType::DoAttention;
+
+        json11::Json config = json11::Json::object {
+            {"op", "Attention"},
+            {"kid", std::to_string(k->cacheUid)},
+            {"vid", std::to_string(v->cacheUid)},
+            {"qhead", q->dims[0]},
+            {"qlen", q->dims[1]},
+            {"qdim", q->dims[2]},
+            {"qtype", q->dataType},
+            {"group", group},
+            {"scale", scale},
+            {"maskType", maskType},
+        };
+        std::string configString = config.dump();
+
+        U8Buffer buffer;
+        buffer.WriteInt(configString.size());
+        buffer.WriteBytes((uint8_t*)configString.data(), configString.size());
+        buffer.WriteBytes(q->cpuData, q->GetBytes());
+
+        memcpy((uint8_t*)this->buf, buffer.buffer.data(), buffer.buffer.size());
+        this->Launch(opType);
+        this->Wait();
+
+        memcpy(output->cpuData, (uint8_t*)result, output->GetBytes());
     }
 }
