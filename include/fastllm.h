@@ -220,6 +220,9 @@ namespace fastllm {
 
     class Data {
     public:
+        long long cacheUid = 0; // 用来标注Cache id
+        bool isKVCache = false; // 是否是KV Cache TODO: 做一些KVCache的管理
+
         bool lockInCPU = false; // 如果lock在CPU上，那么不允许移动到其余设备
         WeightType weightType = WeightType::NONE; // 权重类型，NONE代表非权重（或未知权重）
 
@@ -317,6 +320,8 @@ namespace fastllm {
         void SetMapFile(std::shared_ptr<FileMmap> file) {
         	mapFile = file;
         }
+
+        void SetKVCache();
     };
 
     struct Tokenizer {
