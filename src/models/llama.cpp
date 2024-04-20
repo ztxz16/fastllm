@@ -742,6 +742,8 @@ namespace fastllm {
         for (int i = 0; i < block_cnt; i++) {
             pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
                                                    Data(DataType::FLOAT32)));
+            pastKeyValues.back().first.SetKVCache();
+            pastKeyValues.back().second.SetKVCache();
         }
 
         std::string retString = "";
@@ -885,6 +887,8 @@ namespace fastllm {
         for (int i = 0; i < block_cnt; i++) {
             pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
                                                    Data(DataType::FLOAT32)));
+            pastKeyValues.back().first.SetKVCache();
+            pastKeyValues.back().second.SetKVCache();
         }
 
         std::string retString = "";

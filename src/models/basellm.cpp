@@ -44,6 +44,8 @@ namespace fastllm {
         for (int i = 0; i < blocks; i++) {
             pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
                                                    Data(DataType::FLOAT32)));
+            pastKeyValues.back().first.SetKVCache();
+            pastKeyValues.back().second.SetKVCache();
         }
         intParams.clear();
         currentTokens.clear();
@@ -73,10 +75,14 @@ namespace fastllm {
         for (int i = 0; i < inputTokenData.Count(0); i++) {
             inputTokens[0].push_back(((float *) inputTokenData.cpuData)[i]);
         }
+        
+        DataType testDataType = DataType::FLOAT32;
         std::vector<std::pair<Data, Data> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
-                                                   Data(DataType::FLOAT32)));
+            pastKeyValues.push_back(std::make_pair(Data(testDataType),
+                                                   Data(testDataType)));
+            pastKeyValues.back().first.SetKVCache();
+            pastKeyValues.back().second.SetKVCache();
         }
 
         std::string retString = "";

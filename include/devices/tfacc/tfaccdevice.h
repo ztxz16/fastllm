@@ -6,6 +6,7 @@
 #define FASTLLM_TFACCDEVICE_H
 
 #include "device.h"
+#include "devices/cpu/cpudevice.h"
 
 namespace fastllm {
     class TfaccDevice : BaseDevice {
@@ -25,6 +26,14 @@ namespace fastllm {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         long long int Ops(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class TfaccCatDirectOp : CpuCatDirectOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class TfaccAttention : CpuAttention {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 }
 

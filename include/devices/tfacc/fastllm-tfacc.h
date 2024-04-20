@@ -37,6 +37,10 @@ namespace fastllm {
                              fastllm::Data *weight, fastllm::Data *bias,
                              std::vector <LowBitConfig> *inputConfigs,
                              uint8_t *uinput, float *output);
+        
+        void AppendKVCache(long long uid, Data *content);
+
+        void Attention(Data *q, Data *k, Data *v, int group, float scale, int maskType, Data *output);
     };
 }
 

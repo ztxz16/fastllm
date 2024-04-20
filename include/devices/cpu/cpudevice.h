@@ -33,6 +33,7 @@ namespace fastllm {
 
     class CpuAttention : BaseOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    protected:
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
@@ -65,7 +66,8 @@ namespace fastllm {
     };
 
     class CpuCatDirectOp : BaseOperator {
-        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        protected:
+            void  Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
     class CpuMatMulOp : BaseOperator {
