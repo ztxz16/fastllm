@@ -27,6 +27,9 @@ namespace fastllm {
     TfaccDevice::TfaccDevice() {
         this->deviceType = "tfacc";
         this->ops["Linear"] = (BaseOperator *) (new TfaccLinearOp());
+        this->ops["CatDirect"] = (BaseOperator *) (new TfaccCatDirectOp());
+
+        this->ops["Attention"] = (BaseOperator *) (new TfaccAttention());
     }
 
     bool TfaccDevice::Malloc(void **ret, size_t size) {
@@ -192,5 +195,52 @@ namespace fastllm {
         int k = output.dims.back();
 
         return (long long int) n * m * k;
+    }
+
+    void TfaccCatDirectOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        CpuCatDirectOp::Run(opType, datas, floatParams, intParams);
+
+        // 如果是kvCache，那么要同步到server上
+        Data *input0 = (datas.find("input0")->second);
+        Data *input1 = (datas.find("input1")->second);
+
+        if (input0->isKVCache) {
+            tfaccClient.AppendKVCache(input0->cacheUid, input1);
+        }
+    }
+
+    void TfaccAttention::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        int maskType = intParams.find("maskType") != intParams.end() ? intParams.find("maskType")->second : 0;
+
+        if (!k.isKVCache || !v.isKVCache || maskType != 0) {
+            CpuAttention::Run(opType, datas, floatParams, intParams);
+            return;
+        }
+
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+
+        tfaccClient.Attention(&q, &k, &v, group, scale, maskType, &output);
+/*
+        std::vector <float> tempOutput;
+        for (int i = 0; i < output.Count(0); i++) {
+            tempOutput.push_back(((float*)output.cpuData)[i]);
+        }
+
+        CpuAttention::Run(opType, datas, floatParams, intParams);
+        for (int i = 0; i < output.Count(0); i++) {
+            float x = ((float*)output.cpuData)[i];
+            if (fabs(x - tempOutput[i]) > 1e-5) {
+                printf("wrong %d %f %f\n", i, x, tempOutput[i]);
+                exit(0);
+            }
+        }
+*/
     }
 }
