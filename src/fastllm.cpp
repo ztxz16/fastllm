@@ -273,6 +273,9 @@ namespace fastllm {
 
     void Data::CopyFrom(const Data &ori) {
         this->name = ori.name;
+        this->isKVCache = ori.isKVCache;
+        this->cacheUid = ori.cacheUid;
+        
         // std::cout<<"调用拷贝构造"<<std::endl;
         if (ori.dims != this->dims || this->cpuData == nullptr || ori.dataType != this->dataType) {
             if (ori.dims.size() == 0) {
@@ -817,6 +820,11 @@ namespace fastllm {
             this->dataDeviceIds = deviceIds;
         };
         this->dataDevice = device;
+    }
+
+    void Data::SetKVCache() {
+        this->isKVCache = true;
+        this->cacheUid = ((long long)this) * rand() * rand() * rand() * rand();
     }
 
     std::string GetModelTypeFromFile(const std::string &fileName) {
@@ -2089,10 +2097,12 @@ namespace fastllm {
 
     void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
                    int group, float scale, int attentionType) {
+        int maskType = 0; // 0: 因果mask
+        
         curExecutor->Run("Attention", {
                 {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v},
                 {"mask", (Data*)&mask}, {"output", (Data*)&output}
-        }, {{"scale", scale}}, {{"group", group}});
+        }, {{"scale", scale}}, {{"group", group}, {"maskType", maskType}});
     }
 
     void Embedding(const Data &input, Data &weight, Data &output) {
