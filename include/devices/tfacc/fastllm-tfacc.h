@@ -33,7 +33,7 @@ namespace fastllm {
 
         void UnregisterFastllmData(const std::string &dataName);
 
-        void RunTfaccLinearU(int n, int m, int k, 
+        void RunTfaccLinearU(int n, int m, int k, int group, int groupCnt,
                              fastllm::Data *weight, fastllm::Data *bias,
                              std::vector <LowBitConfig> *inputConfigs,
                              uint8_t *uinput, float *output);

@@ -174,7 +174,7 @@ namespace fastllm {
             int k = data->perChannelAxis == -1 ? 1 : data->dims[data->perChannelAxis];
             for (int i = 0; i < k * data->group; i++) {
                 buffer.WriteFloat(data->perChannelsConfigs[i].min);
-                buffer.WriteFloat(data->perChannelsConfigs[i].max);
+                buffer.WriteFloat(data->perChannelsConfigs[i].scale);
             }
             buffer.WriteBytes(data->cpuData, data->GetBytes());
         }
@@ -200,7 +200,7 @@ namespace fastllm {
         SendLongMessage(buffer.buffer.data(), buffer.buffer.size());
     }
 
-    void TfaccClient::RunTfaccLinearU(int n, int m, int k, 
+    void TfaccClient::RunTfaccLinearU(int n, int m, int k, int group, int groupCnt, 
                                      fastllm::Data *weight, fastllm::Data *bias,
                                      std::vector <LowBitConfig> *inputConfigs,
                                      uint8_t *uinput, float *output) {
@@ -210,6 +210,9 @@ namespace fastllm {
         int opType = ComputeTaskType::LinearInt4NoZero;
         if (weight->dataType == DataType::INT8) {
             opType = ComputeTaskType::LinearInt8;
+        }
+        if (weight->dataType == DataType::INT4_GROUP) {
+            opType = ComputeTaskType::LinearInt4Group;
         }
 
         float *biasData = bias->dims.size() > 0 ? (float *) bias->cpuData : nullptr;
@@ -225,14 +228,15 @@ namespace fastllm {
             ((int32_t*)buf)[0] = curN;
             ((int32_t*)buf)[1] = m;
             ((int32_t*)buf)[2] = k;
-            ((int32_t*)buf)[3] = 1; // group
-            ((int32_t*)buf)[4] = weight->name.size();
-            ((int32_t*)buf)[5] = biasName.size();
-
+            ((int32_t*)buf)[3] = group;
+            ((int32_t*)buf)[4] = groupCnt;
+            ((int32_t*)buf)[5] = weight->name.size();
+            ((int32_t*)buf)[6] = biasName.size();
+            
             volatile uint8_t *cur = (uint8_t*)buf + 10 * sizeof(int32_t);
-            for (int i = 0; i < curN; i++) {
-                ((float*)cur)[0] = (*inputConfigs)[baseN + i].min;
-                ((float*)cur)[1] = (*inputConfigs)[baseN + i].max;
+            for (int i = 0; i < curN * group; i++) {
+                ((float*)cur)[0] = (*inputConfigs)[baseN * group + i].min;
+                ((float*)cur)[1] = (*inputConfigs)[baseN * group + i].max;
                 cur += 2 * sizeof(float);
             }
             memcpy((uint8_t*)cur, weight->name.c_str(), weight->name.size());
