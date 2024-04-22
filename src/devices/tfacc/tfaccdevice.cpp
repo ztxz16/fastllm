@@ -54,7 +54,8 @@ namespace fastllm {
         Data &input = *(datas.find("input")->second);
         Data &weight = *(datas.find("weight")->second);
         return weight.dataType == DataType::INT4_NOZERO ||
-                weight.dataType == DataType::INT8;
+                weight.dataType == DataType::INT8 ||
+                weight.dataType == DataType::INT4_GROUP;
     }
 
     void TfaccLinearOp::Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
@@ -154,26 +155,42 @@ namespace fastllm {
                         u[j] = (uint8_t) (std::min(255., (double) std::max(cur[j] / scale + zeroPoint + 0.5, 0.0)));
                     }
                 }
-#ifdef __AVX__
-                uint8_t *temp = new uint8_t[32];
-                for (int i = 0; i < n; i++) {
-                    for (int j = 0; j + 31 < m; j += 32) {
-                        memcpy(temp, uinput.data() + i * m + j, 32);
-                        for (int k = 0; k < 16; k++) {
-                            uinput[i * m + j + k] = temp[k * 2 + 1];
-                            uinput[i * m + j + k + 16] = temp[k * 2];
-                        }
-                    }
-                }
-                delete[] temp;
-#endif
+
                 if (weight.dataType == DataType::INT4) {
                     ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
                 } else if (weight.dataType == DataType::INT8 || weight.dataType == DataType::INT4_NOZERO) {
-                    tfaccClient.RunTfaccLinearU(n, m, k, &weight, &bias, &inputConfigs, uinput.data(), outputData);
+                    tfaccClient.RunTfaccLinearU(n, m, k, 1, 1, &weight, &bias, &inputConfigs, uinput.data(), outputData);
                 }
             } else if (weight.dataType == DataType::INT4_GROUP) {
-                ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
+                float *inputData = (float *) input.cpuData;
+                uint8_t *weightData = (uint8_t *) weight.cpuData;
+                float *outputData = (float *) output.cpuData;
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                int group = weight.group, groupCnt = weight.groupCnt;
+                weight.CalcWeightSum();
+
+                std::vector<LowBitConfig> inputConfigs;
+                for (int i = 0; i < n; i++) {
+                    for (int g = 0; g < group; g++) {
+                        int st = g * groupCnt;
+                        int end = std::min(m, (g + 1) * groupCnt);
+                        float minValue = 1e9, maxValue = -1e9;
+                        for (int j = st; j < end; j++) {
+                            minValue = std::min(minValue, inputData[i * m + j]);
+                            maxValue = std::max(maxValue, inputData[i * m + j]);
+                        }
+                        inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
+                    }
+                }
+                std::vector<uint8_t> uinput;
+                uinput.resize(n * m);
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j < m; j++) {
+                        uinput[i * m + j] = inputConfigs[i * group + j / groupCnt].quantization(inputData[i * m + j]);    
+                    }
+                }
+
+                tfaccClient.RunTfaccLinearU(n, m, k, group, groupCnt, &weight, &bias, &inputConfigs, uinput.data(), outputData);
             }
         } else if (input.dataType == DataType::FLOAT16 && output.dataType == DataType::FLOAT16) {
             ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
