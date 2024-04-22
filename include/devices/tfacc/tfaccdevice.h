@@ -21,7 +21,7 @@ namespace fastllm {
         bool CopyDataFromCPU(void *dst, void *src, size_t size);
     };
 
-    class TfaccLinearOp : BaseOperator {
+    class TfaccLinearOp : CpuLinearOp {
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
