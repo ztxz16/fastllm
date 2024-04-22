@@ -34,3 +34,4 @@ token
 /test/cmmlu/results/
 /models/
 /localtest/
+/third_party/tfacc/driver/tfacc2/result
