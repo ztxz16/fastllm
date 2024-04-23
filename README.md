@@ -155,6 +155,9 @@ cd tools # 这时在fastllm/build/tools目录下
 python setup.py install
 ```
 
+其他不同平台的编译可参考文档
+[TFACC平台](docs/tfacc.md)
+
 ### 运行demo程序
 
 我们假设已经获取了名为`model.flm`的模型（参照 [模型获取](#模型获取)，初次使用可以先下载转换好的模型)
