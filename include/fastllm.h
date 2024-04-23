@@ -483,6 +483,14 @@ namespace fastllm {
 
     void Linear(Data &input, Data &weight, const Data &bias, Data &output);
 
+    enum LinearExType {
+        ExTypeNone = 0,
+        ExSwiglu = 1
+    };
+    
+    void LinearEx(Data &input, Data &weight, const Data &bias, Data &output,
+                    LinearExType exType); // 扩展Linear，可以接后续操作
+
     void Split(const Data &input, int axis, int start, int end, Data &output);
 
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
