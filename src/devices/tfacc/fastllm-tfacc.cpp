@@ -203,8 +203,13 @@ namespace fastllm {
     void TfaccClient::RunTfaccLinearU(int n, int m, int k, int group, int groupCnt, 
                                      fastllm::Data *weight, fastllm::Data *bias,
                                      std::vector <LowBitConfig> *inputConfigs,
-                                     uint8_t *uinput, float *output) {
-        RegisterFastllmData(weight, "linear");
+                                     uint8_t *uinput, float *output, 
+                                     LinearExType exType) {
+        std::string linearType = "linear";
+        if (exType == LinearExType::ExSwiglu) {
+            linearType = "linearSwiglu";
+        }
+        RegisterFastllmData(weight, linearType);
         RegisterFastllmData(bias, "bias");
 
         int opType = ComputeTaskType::LinearInt4NoZero;
@@ -232,6 +237,7 @@ namespace fastllm {
             ((int32_t*)buf)[4] = groupCnt;
             ((int32_t*)buf)[5] = weight->name.size();
             ((int32_t*)buf)[6] = biasName.size();
+            ((int32_t*)buf)[7] = exType;
             
             volatile uint8_t *cur = (uint8_t*)buf + 10 * sizeof(int32_t);
             for (int i = 0; i < curN * group; i++) {
@@ -247,6 +253,10 @@ namespace fastllm {
 
             this->Launch(opType);
             this->Wait();
+
+            if (exType == LinearExType::ExSwiglu) {
+                k /= 2;
+            }
             memcpy(((uint8_t*) output) + baseN * k * sizeof(int32_t),
                     (uint8_t*) result,
                     curN * k * sizeof(int32_t));
