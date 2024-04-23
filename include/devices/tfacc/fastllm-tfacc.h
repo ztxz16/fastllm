@@ -36,7 +36,8 @@ namespace fastllm {
         void RunTfaccLinearU(int n, int m, int k, int group, int groupCnt,
                              fastllm::Data *weight, fastllm::Data *bias,
                              std::vector <LowBitConfig> *inputConfigs,
-                             uint8_t *uinput, float *output);
+                             uint8_t *uinput, float *output, 
+                             LinearExType exType);
         
         void AppendKVCache(long long uid, Data *content);
 
