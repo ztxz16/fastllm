@@ -690,7 +690,7 @@ namespace fastllm {
                     int st = g * this->groupCnt;
                     int end = std::min(m, (g + 1) * this->groupCnt);
                     int j = st;
-#ifdef __aarch64__X
+#ifdef __aarch64__
                     uint8x8_t maskHigh = vdup_n_u8(0xF0);
                     uint8x8_t maskLow = vdup_n_u8(0xF);
                     uint32x4_t sum0 = {0, 0, 0, 0};
@@ -705,7 +705,7 @@ namespace fastllm {
 
                         sum0 = vaddw_u16(sum0, vadd_u16(sa, sb));
                     }
-                    weightSum[i] += sum0[0] + sum0[1] + sum0[2] + sum0[3];
+                    weightSum[gid] += sum0[0] + sum0[1] + sum0[2] + sum0[3];
 #endif
 #ifdef __AVX2__X
                     __m256i acc = _mm256_setzero_si256();
@@ -2127,6 +2127,12 @@ namespace fastllm {
         curExecutor->Run("Linear", {
                 {"input", &input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}
         }, {}, {});
+    }
+
+    void LinearEx(Data &input, Data &weight, const Data &bias, Data &output, LinearExType exType) {
+        curExecutor->Run("Linear", {
+                {"input", &input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}
+        }, {}, {{"exType", (int)exType}});
     }
 
     void Split(const Data &input, int axis, int start, int end, Data &output) {
