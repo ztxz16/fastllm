@@ -1310,6 +1310,12 @@ namespace fastllm {
                         weightMins[gid] * (inputSums[iid] - izeros[iid] * groupCnt) * iscales[iid];
                 }
 
+                if (group * groupCnt > m) {
+                    int iid = block * group + group - 1;
+                    int gid = i * group + group - 1;
+                    sum += weightMins[gid] * izeros[iid] * (group * groupCnt - m) * iscales[iid];
+                }
+
                 ((float*)c)[block * kstride + i] = sum + (bias == nullptr ? 0.0 : bias[i]);
             }
         }
