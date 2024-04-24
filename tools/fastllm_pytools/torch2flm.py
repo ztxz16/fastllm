@@ -54,7 +54,6 @@ def write_int4g(fo, v, groupCnt = -1):
     if (pad > 0):
         v = np.concatenate((v, np.zeros([k, pad])), axis = 1)
     v.resize(k * group, groupCnt)
-
     c_min = np.expand_dims(v.min(axis = -1), -1)
     c_max = np.expand_dims(v.max(axis = -1), -1)
     c_scale = (c_max - c_min) / 15.0
@@ -64,6 +63,11 @@ def write_int4g(fo, v, groupCnt = -1):
 
     v = (v - c_min) / c_scale
     v = (v + 0.5).astype(np.int8).clip(0, 15).astype(np.uint8)
+
+    if (pad > 0):
+        v.resize(k, group * groupCnt)
+        v = v[:, :-pad].copy(order = 'C')
+
     v = v[:, 0::2] * 16 + v[:, 1::2]
     fo.write(struct.pack('i', 9))
     fo.write(struct.pack('i', 0))
@@ -72,7 +76,7 @@ def write_int4g(fo, v, groupCnt = -1):
     for i in range(c_min.shape[0]):
         fo.write(struct.pack('f', c_min[i][0]));
         fo.write(struct.pack('f', c_max[i][0]));
-    fo.write(v.data)
+    fo.write(v)
 
 def write_int4(fo, v):
     # c_min = np.expand_dims(-np.abs(v).max(axis = -1), -1)
@@ -105,7 +109,15 @@ def tofile(exportPath,
            bot_role = None,
            history_sep = None,
            eos_id = None,
+           int4g_groupcnt = -1,
            dtype = "float16"):
+    if (dtype.startswith("int4g") and len(dtype) > 5):
+        try:
+            int4g_groupcnt = int(dtype[5:])
+            dtype = "int4g";
+        except:
+            print("dtype should be like \"int4g256\"")
+            exit(0)    
     if (dtype not in fastllm_data_type_dict):
         print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
         exit(0)
@@ -321,7 +333,7 @@ def tofile(exportPath,
         elif (to_data_type == 8):
             write_int4(fo, cur)
         elif (to_data_type == 9):
-            write_int4g(fo, cur)
+            write_int4g(fo, cur, groupCnt = int4g_groupcnt)
         else:
             fo.write(struct.pack('i', to_data_type))
             fo.write(cur.data)
