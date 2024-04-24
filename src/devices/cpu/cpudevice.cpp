@@ -692,30 +692,25 @@ namespace fastllm {
             for (int i = 0; i < outer; i++) {
                 float mean = 0.f;
                 int j = 0;
-#ifdef __aarch64__X
+#ifdef __aarch64__
                 float32x4_t sums = vdupq_n_f32(0.0);
-                float32x4_t sums2 = vdupq_n_f32(0.0);
                 for (; j + 3 < channels; j += 4) {
                     float32x4_t vi = vld1q_f32(inputData + j);
-                    sums = vaddq_f32(sums, vi);
-                    sums2 = vaddq_f32(sums2, vmulq_f32(vi, vi));
+                    sums = vaddq_f32(sums, vmulq_f32(vi, vi));
                 }
                 mean = sums[0] + sums[1] + sums[2] + sums[3];
-                s2 = sums2[0] + sums2[1] + sums2[2] + sums2[3];
 #endif
                 for (; j < channels; j++) {
                     mean += inputData[j] * inputData[j];
                 }
                 float scale = 1.0 / sqrt(mean / channels + eps);
                 j = 0;
-#ifdef __aarch64__X
-                float32x4_t means = vdupq_n_f32(mean);
-                float32x4_t vars = vdupq_n_f32(1.0 / var);
+#ifdef __aarch64__
+                float32x4_t vscale = vdupq_n_f32(scale);
                 for (; j + 3 < channels; j += 4) {
-                    float32x4_t va = vld1q_f32(gammaData + j), vb = vld1q_f32(betaData + j);
                     float32x4_t vi = vld1q_f32(inputData + j);
-                    float32x4_t vo = vaddq_f32(vmulq_f32(vmulq_f32(vsubq_f32(vi, means), vars), va), vb);
-                    vst1q_f32(outputData + j, vo);
+                    float32x4_t vw = vld1q_f32(weightData + j);
+                    vst1q_f32(outputData + j, vmulq_f32(vmulq_f32(vi, vscale), vw));
                 }
 #endif
                 for (; j < channels; j++) {
