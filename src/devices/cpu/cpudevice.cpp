@@ -35,12 +35,15 @@ namespace fastllm {
         this->ops["MatMulTransB"] = (BaseOperator*)(new CpuMatMulTransBOp());
         this->ops["SoftMax"] = (BaseOperator*)(new CpuSoftMaxOp());
         this->ops["Silu"] = (BaseOperator*)(new CpuSiluOp());
+        this->ops["TanH"] = (BaseOperator*)(new CpuTanHOp());
+        this->ops["Gelu"] = (BaseOperator*)(new CpuGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CpuGeluNewOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CpuSwigluOp());
         this->ops["Mul"] = (BaseOperator*)(new CpuMulOp());
         this->ops["MulTo"] = (BaseOperator*)(new CpuMulToOp());
         this->ops["AddTo"] = (BaseOperator*)(new CpuAddToOp());
         this->ops["AttentionMask"] = (BaseOperator*)(new CpuAttentionMaskOp());
+        this->ops["AttentionExtendedMask"] = (BaseOperator*)(new CpuAttentionExtendedMaskOp());
         this->ops["AlibiMask"] = (BaseOperator*)(new CpuAlibiMaskOp());
         this->ops["TopK"] = (BaseOperator*)(new CpuTopKOp());
         this->ops["Permute"] = (BaseOperator*)(new CpuPermuteOp());
@@ -2505,6 +2508,74 @@ namespace fastllm {
         }
     }
 
+    void CpuTanHOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);                    
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "GeluNew error: Data's type should be float32.\n");
+
+        float temp = sqrt(2.0f / M_PI), factor = 0.044715;
+        float *inputData = (float*)input.cpuData;
+        float *outputData = (float*)output.cpuData;
+        int len = input.Count(0);
+        int i = 0;
+        for (; i < len; i++) {
+            outputData[i] = tanhf(inputData[i]);
+        }
+    }
+
+    float erf(float a)
+    {
+        float r, s, t, u;
+
+        t = fabsf(a);
+        s = a * a;
+        if (t > 0.927734375f)
+        {   // 475/512
+            // maximum error 0.99527 ulp
+            r = fmaf(-1.72853470e-5f, t, 3.83197126e-4f); // -0x1.220000p-16,0x1.91cfb2p-12
+            u = fmaf(-3.88396438e-3f, t, 2.42546219e-2f); // -0x1.fd1438p-9, 0x1.8d6342p-6
+            r = fmaf(r, s, u);
+            r = fmaf(r, t, -1.06777877e-1f); // -0x1.b55cb8p-4
+            r = fmaf(r, t, -6.34846687e-1f); // -0x1.450aa0p-1
+            r = fmaf(r, t, -1.28717512e-1f); // -0x1.079d0cp-3
+            r = fmaf(r, t, -t);
+            r = 1.0f - expf(r);
+            r = copysignf(r, a);
+        }
+        else
+        {
+            // maximum error 0.98929 ulp
+            r = -5.96761703e-4f;             // -0x1.38e000p-11
+            r = fmaf(r, s, 4.99119423e-3f);  //  0x1.471a58p-8
+            r = fmaf(r, s, -2.67681349e-2f); // -0x1.b691b2p-6
+            r = fmaf(r, s, 1.12819925e-1f);  //  0x1.ce1c44p-4
+            r = fmaf(r, s, -3.76125336e-1f); // -0x1.812700p-2
+            r = fmaf(r, s, 1.28379166e-1f);  //  0x1.06eba8p-3
+            r = fmaf(r, a, a);
+        }
+        return r;
+    }
+
+    void CpuGeluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "GeluNew error: Data's type should be float32.\n");
+
+        float temp = sqrt(2.0f / M_PI), factor = 0.044715;
+        float *inputData = (float*)input.cpuData;
+        float *outputData = (float*)output.cpuData;
+        int len = input.Count(0);
+        int i = 0;
+        for (; i < len; i++) {
+            float x = inputData[i];
+            outputData[i] = x * 0.5f * (1.0f + erf(x / sqrt(2.0)));
+        }
+    }
+
     void CpuGeluNewOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -2766,6 +2837,29 @@ namespace fastllm {
             }
         } else {
             ErrorInFastLLM("AttentionMask error: unsupport input's dataType.\n");
+        }
+    }
+
+    void CpuAttentionExtendedMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &mask = *(datas.find("mask")->second);
+        int spatial = input.dims[3], n = input.dims[0], m = input.dims[1] * input.dims[2];
+
+        AssertInFastLLM(mask.dataType == DataType::FLOAT32, "AttentionExtendedMask: mask's datatype should be float32.");
+        if (input.dataType == DataType::FLOAT32) {
+            float *maskData = (float *) mask.cpuData;
+            float *attnData = (float *) input.cpuData;
+            for (int on = 0; on < n; on++) {
+                for (int om = 0; om < m; om++) {
+                    int o = on * m + om;
+                    for (int i = 0; i < spatial; i++) {
+                        attnData[o * spatial + i] += maskData[on * spatial + i];
+                    }
+                }
+            }
+        } else {
+            ErrorInFastLLM("AttentionExtendedMask error: unsupport input's dataType.\n");
         }
     }
 
