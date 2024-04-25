@@ -11,6 +11,7 @@
 #include "glm.h"
 #include "minicpm.h"
 #include "internlm2.h"
+#include "bert.h"
 
 namespace fastllm {
     void basellm::LoadFromFile(const std::string &fileName) {
@@ -118,10 +119,20 @@ namespace fastllm {
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
         } else if (modelType == "glm") {
             model = (basellm*)(new GLMModel());
+        } else if (modelType == "bert") {
+            model = (basellm*)(new BertModel());
         } else {
             ErrorInFastLLM("Unkown model type: " + modelType);
         }
         return model;
+    }
+
+    std::unique_ptr<BertModel> CreateEmbeddingModelFromFile(const std::string &fileName) {
+        BertModel *model = new BertModel();
+        model->weight.tokenizer.type = Tokenizer::BERT;
+        model->LoadFromFile(fileName);
+        model->WarmUp();
+        return std::unique_ptr<fastllm::BertModel> (model);
     }
 
     std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {

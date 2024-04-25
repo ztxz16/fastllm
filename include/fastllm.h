@@ -329,7 +329,8 @@ namespace fastllm {
             BPE = 0,
             NORMAL = 1,
             QWEN = 2,
-            GLM = 3
+            GLM = 3,
+            BERT = 4
         };
 
         struct TrieNode {
@@ -505,6 +506,10 @@ namespace fastllm {
 
     void Silu(const fastllm::Data &input, fastllm::Data &output);
 
+    void TanH(const Data &input, Data &output);
+
+    void Gelu(const Data &input, Data &output);
+    
     void GeluNew(const Data &input, Data &output);
 
     void Swiglu(const fastllm::Data &input, fastllm::Data &output);
@@ -516,6 +521,8 @@ namespace fastllm {
     void AddTo(Data &input0, const Data &input1, float alpha = 1.0); // input0 += input1 * alpha
 
     void AttentionMask(Data &input, const Data &mask, float maskValue); // 把input里对应位置mask中为1的部分变成maskValue
+
+    void AttentionExtendedMask(Data &input, const Data &mask); // bert中的extended mask
 
     void AlibiMask(Data &input, const Data &mask, float maskValue); // alibi mask
 

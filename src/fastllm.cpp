@@ -1012,6 +1012,10 @@ namespace fastllm {
         return s;
     }
 
+    bool isDigitOrChar(char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    }
+
     Data Tokenizer::Encode(const std::string &ori) {
         if (this->type == TokenizerType::BPE) {
             std::string s = Normalize(ori);
@@ -1326,6 +1330,33 @@ namespace fastllm {
                 } else {
                     symbols.push_back(Symbol(nullptr, (char *) ori.data(), i, 0, (int) symbols.size() - 1,
                                              (int) symbols.size() + 1, -999999));
+                }
+            }
+
+            return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
+        } else if (this->type == TokenizerType::BERT) {
+            std::vector <float> v;
+            for (int i = 0; i < ori.size(); i++) {
+                int tokenId = -999999, pos = i - 1;
+                TrieNode *now = this->root;
+
+                if (i > 0 && isDigitOrChar(ori[i - 1]) && isDigitOrChar(ori[i])) {
+                    now = now->next['#']->next['#'];
+                }
+                for (int j = i; j < ori.size(); j++) {
+                    if (now->next.find(ori[j]) != now->next.end()) {
+                        now = now->next[ori[j]];
+                        if (now->tokenId != -999999) {
+                            tokenId = now->tokenId;
+                            pos = j;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if (pos >= i) {
+                    i = pos;
+                    v.push_back(tokenId);
                 }
             }
 
@@ -2177,6 +2208,18 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void TanH(const Data &input, Data &output) {
+        curExecutor->Run("TanH", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
+    void Gelu(const fastllm::Data &input, fastllm::Data &output) {
+        curExecutor->Run("Gelu", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
     void GeluNew(const fastllm::Data &input, fastllm::Data &output) {
         curExecutor->Run("GeluNew", {
                 {"input", (Data*)&input}, {"output", &output}
@@ -2211,6 +2254,12 @@ namespace fastllm {
         curExecutor->Run("AttentionMask", {
                 {"input", &input}, {"mask", (Data*)&mask}
         }, {{"maskValue", maskValue}}, {});
+    }
+
+    void AttentionExtendedMask(Data &input, const Data &mask) {
+        curExecutor->Run("AttentionExtendedMask", {
+                {"input", &input}, {"mask", (Data*)&mask}
+        }, {}, {});
     }
 
     void AlibiMask(Data &input, const Data &mask, float maskValue) {
