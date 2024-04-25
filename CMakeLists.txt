@@ -43,7 +43,7 @@ message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executor.cpp
         src/devices/cpu/cpudevice.cpp src/devices/cpu/cpudevicebatch.cpp
         src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
-        src/models/glm.cpp src/models/minicpm.cpp src/models/internlm2.cpp
+        src/models/glm.cpp src/models/minicpm.cpp src/models/internlm2.cpp src/models/bert.cpp
         third_party/json11/json11.cpp)
 
 include_directories(include)
