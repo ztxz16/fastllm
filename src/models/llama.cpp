@@ -262,9 +262,13 @@ namespace fastllm {
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
-            Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
+            if (CanRunLinearEx(LinearExType::ExSilu)) {
+                LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+            } else {
+                Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
+                Silu(w1, w1);
+            }
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
-            Silu(w1, w1);
             MulTo(w1, w3);
             Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
             AddTo(hiddenStates, w2);
@@ -450,9 +454,13 @@ namespace fastllm {
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
-            Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
+            if (CanRunLinearEx(LinearExType::ExSilu)) {
+                LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+            } else {
+                Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
+                Silu(w1, w1);
+            }
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
-            Silu(w1, w1);
             MulTo(w1, w3);
             Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
             AddTo(hiddenStates, w2);
@@ -666,9 +674,14 @@ namespace fastllm {
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
-            Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
+            if (CanRunLinearEx(LinearExType::ExSilu)) {
+                LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+            } else {
+                Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
+                Silu(w1, w1);
+            }
+
             Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
-            Silu(w1, w1);
             MulTo(w1, w3);
             Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
             AddTo(hiddenStates, w2);
