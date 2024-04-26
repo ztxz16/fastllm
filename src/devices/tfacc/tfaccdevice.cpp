@@ -108,7 +108,9 @@ namespace fastllm {
         Data &weight = *(datas.find("weight")->second);
         return weight.dataType == DataType::INT4_NOZERO ||
                 weight.dataType == DataType::INT8 ||
-                weight.dataType == DataType::INT4_GROUP;
+                weight.dataType == DataType::INT4_GROUP ||
+                weight.dataType == DataType::FLOAT32 ||
+                weight.dataType == DataType::FLOAT16;
     }
 
     void TfaccLinearOp::Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
@@ -154,8 +156,21 @@ namespace fastllm {
         }
 
         if (input.dataType == DataType::FLOAT32 && output.dataType == DataType::FLOAT32) {
-            if (weight.dataType == DataType::FLOAT32) {
-                ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
+            if (weight.dataType == DataType::FLOAT32 || weight.dataType == DataType::FLOAT16) {
+                tfaccClient.RunTfaccLinearF(n, m, k, &weight, &bias, (float*)input.cpuData, (float*)output.cpuData, exType, input.dataType);
+/*
+                std::vector <float> tempOutputs;
+                for (int i = 0; i < output.Count(0); i++) {
+                    tempOutputs.push_back(((float*)output.cpuData)[i]);
+                }
+                CpuLinearOp::Run(opType, datas, floatParams, intParams);
+                for (int i = 0; i < output.Count(0); i++) {
+                    if (fabs(((float*)output.cpuData)[i] - tempOutputs[i]) > 1e-5) {
+                        printf("wrong %d %f %f.\n", i, ((float*)output.cpuData)[i], tempOutputs[i]);
+                        exit(0);
+                    }
+                }
+*/
             } else if (weight.dataType == DataType::INT4 || 
                     weight.dataType == DataType::INT4_NOZERO ||
                     weight.dataType == DataType::INT4_GROUP ||
