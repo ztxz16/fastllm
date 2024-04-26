@@ -1521,6 +1521,14 @@ namespace fastllm {
         }
     }
 
+    bool CpuLinearOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (intParams.find("exType") != intParams.end()) {
+            return false;
+        }
+        return true;
+    }
+
     void CpuLinearOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
 //auto st = std::chrono::system_clock::now();

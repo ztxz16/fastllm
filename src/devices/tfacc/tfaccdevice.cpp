@@ -104,13 +104,17 @@ namespace fastllm {
     }
 
     bool TfaccLinearOp::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-        Data &input = *(datas.find("input")->second);
-        Data &weight = *(datas.find("weight")->second);
-        return weight.dataType == DataType::INT4_NOZERO ||
-                weight.dataType == DataType::INT8 ||
-                weight.dataType == DataType::INT4_GROUP ||
-                weight.dataType == DataType::FLOAT32 ||
-                weight.dataType == DataType::FLOAT16;
+        if (datas.find("weight") == datas.end()) {
+            return true;
+        }
+        Data *input = (datas.find("input")->second);
+        Data *weight = (datas.find("weight")->second);
+        return weight == nullptr ||
+                weight->dataType == DataType::INT4_NOZERO ||
+                weight->dataType == DataType::INT8 ||
+                weight->dataType == DataType::INT4_GROUP ||
+                weight->dataType == DataType::FLOAT32 ||
+                weight->dataType == DataType::FLOAT16;
     }
 
     void TfaccLinearOp::Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {

@@ -486,9 +486,12 @@ namespace fastllm {
 
     enum LinearExType {
         ExTypeNone = 0,
-        ExSwiglu = 1
+        ExSwiglu = 1,
+        ExGelu = 2,
+        ExSilu = 3
     };
     
+    bool CanRunLinearEx(LinearExType exType);
     void LinearEx(Data &input, Data &weight, const Data &bias, Data &output,
                     LinearExType exType); // 扩展Linear，可以接后续操作
 
