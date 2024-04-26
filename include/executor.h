@@ -26,6 +26,9 @@ namespace fastllm {
 
         std::vector <int> GetDeviceIds(const std::string &device); // 获取指定device的deviceIds
 
+        bool CanRunOnFirstDevice(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
+                       const fastllm::IntDict &intParams);
+                       
         // 运行一个op
         void Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                  const fastllm::IntDict &intParams);

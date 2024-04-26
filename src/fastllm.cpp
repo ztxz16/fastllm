@@ -2160,6 +2160,10 @@ namespace fastllm {
         }, {}, {});
     }
 
+    bool CanRunLinearEx(LinearExType exType) {
+        return curExecutor->CanRunOnFirstDevice("Linear", {}, {}, {{"exType", (int)exType}});
+    }
+
     void LinearEx(Data &input, Data &weight, const Data &bias, Data &output, LinearExType exType) {
         curExecutor->Run("Linear", {
                 {"input", &input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}
