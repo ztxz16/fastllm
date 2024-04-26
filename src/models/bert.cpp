@@ -153,7 +153,13 @@ namespace fastllm {
         fastllm::Data tokenTypeIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, token_type_ids);
         fastllm::Data positionIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, position_ids);
 
-// ClearProfiler(); Forward(inputIds, attentionMask, tokenTypeIds, positionIds); PrintProfiler();
+// printf("bs = %d, len = %d\n", batch, len); ClearProfiler(); Forward(inputIds, attentionMask, tokenTypeIds, positionIds); PrintProfiler();
         return Forward(inputIds, attentionMask, tokenTypeIds, positionIds);
+    }
+
+    void BertModel::WarmUp() {
+        printf("Warmup...\n");
+        EmbeddingSentence({"1"});
+	    printf("finish.\n");
     }
 }
