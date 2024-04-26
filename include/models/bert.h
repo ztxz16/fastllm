@@ -33,7 +33,7 @@ namespace fastllm {
 
         void SaveModel(const std::string &fileName); // 直接导出
 
-        void WarmUp() {}; // 预热
+        void WarmUp(); // 预热
 
         std::string model_type;
 
