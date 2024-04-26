@@ -56,7 +56,7 @@ namespace fastllm {
             ((float*)(buffer.data() + oldLen))[0] = v;
         }
 
-        void WriteBytes(uint8_t *v, int len) {
+        void WriteBytes(uint8_t *v, uint64_t len) {
             int oldLen = buffer.size();
             buffer.resize(oldLen + len);
             memcpy(buffer.data() + oldLen, v, len);
@@ -120,9 +120,9 @@ namespace fastllm {
         }
     }
 
-    void TfaccClient::SendLongMessage(uint8_t *buffer, int len) {
-        for (int i = 0; i < len; i += transLimit) {
-            int cur = std::min(transLimit, len - i);
+    void TfaccClient::SendLongMessage(uint8_t *buffer, uint64_t len) {
+        for (uint64_t i = 0; i < len; i += transLimit) {
+            int cur = (int)std::min((uint64_t)transLimit, len - i);
             ((int32_t*)this->buf)[0] = cur;
             memcpy((uint8_t*)this->buf + 4, buffer + i, cur);
             this->Launch(ComputeTaskType::StartLongData);

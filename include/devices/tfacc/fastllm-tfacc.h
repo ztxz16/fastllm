@@ -27,7 +27,7 @@ namespace fastllm {
 
         void Wait();
 
-        void SendLongMessage(uint8_t *buffer, int len);
+        void SendLongMessage(uint8_t *buffer, uint64_t len);
 
         void RegisterFastllmData(fastllm::Data *data, const std::string &weightType);
 
