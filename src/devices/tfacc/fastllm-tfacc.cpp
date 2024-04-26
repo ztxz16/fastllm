@@ -263,6 +263,60 @@ namespace fastllm {
         }
     }
 
+    void TfaccClient::RunTfaccLinearF(int n, int m, int k, fastllm::Data *weight, fastllm::Data *bias,
+                                    float *input, float *output, LinearExType exType, DataType dataType) {
+        std::string linearType = "linear";
+        if (exType == LinearExType::ExSwiglu) {
+            linearType = "linearSwiglu";
+        }
+        RegisterFastllmData(weight, linearType);
+        RegisterFastllmData(bias, "bias");
+
+        int opType = ComputeTaskType::LinearFloat32;
+        if (weight->dataType == DataType::FLOAT16) {
+            opType = ComputeTaskType::LinearFloat16;
+        }
+        float *biasData = bias->dims.size() > 0 ? (float *) bias->cpuData : nullptr;
+        std::string biasName = biasData == nullptr ? "" : bias->name;
+
+        int maxN = n;
+        maxN = std::min(maxN, (int)(transLimit / (m * sizeof(float))));
+        maxN = std::min(maxN, (int)(transLimit / (k * sizeof(float))));
+
+        int unitSize = 4;
+        if (dataType == DataType::FLOAT16) {
+            unitSize = 2;
+        } else if (dataType == DataType::FLOAT32) {
+            unitSize = 4;
+        }
+
+        // printf("maxN = %d\n", maxN);
+        for (int baseN = 0; baseN < n; baseN += maxN) {
+            int curN = std::min(maxN, n - baseN);
+            ((int32_t*)buf)[0] = curN;
+            ((int32_t*)buf)[1] = m;
+            ((int32_t*)buf)[2] = k;
+            ((int32_t*)buf)[5] = weight->name.size();
+            ((int32_t*)buf)[6] = biasName.size();
+            ((int32_t*)buf)[7] = exType;
+            ((int32_t*)buf)[8] = dataType;
+            
+            volatile uint8_t *cur = (uint8_t*)buf + 10 * sizeof(int32_t);
+            memcpy((uint8_t*)cur, weight->name.c_str(), weight->name.size());
+            cur += weight->name.size();
+            memcpy((uint8_t*)cur, biasName.c_str(), biasName.size());
+            cur += biasName.size();
+            memcpy((uint8_t*)cur, (uint8_t*)input + baseN * m * unitSize, curN * m * unitSize);
+            this->Launch(opType);
+            this->Wait();
+
+            if (exType == LinearExType::ExSwiglu) {
+                k /= 2;
+            }
+            memcpy(((uint8_t*) output) + baseN * k * unitSize, (uint8_t*) result, curN * k * unitSize);
+        }
+    }
+
     void TfaccClient::AppendKVCache(long long uid, Data *data) {
         int opType = ComputeTaskType::AppendKVCache;
 
