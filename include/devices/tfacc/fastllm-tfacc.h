@@ -38,6 +38,9 @@ namespace fastllm {
                              std::vector <LowBitConfig> *inputConfigs,
                              uint8_t *uinput, float *output, 
                              LinearExType exType);
+
+        void RunTfaccLinearF(int n, int m, int k, fastllm::Data *weight, fastllm::Data *bias,
+                            float *input, float *output, LinearExType exType, DataType dataType);
         
         void AppendKVCache(long long uid, Data *content);
 
