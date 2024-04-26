@@ -288,8 +288,12 @@ def tofile(exportPath,
                 fo.write(struct.pack('i', vocab[v]))
                 fo.write(struct.pack('f', score))
         if ("tokenizer_has_special_tokens" in modelInfo):
-            fo.write(struct.pack('i', len(tokenizer.all_special_tokens)))
-            for special_token in tokenizer.all_special_tokens:
+            all_special_tokens = tokenizer.all_special_tokens
+            if hasattr(tokenizer, "added_tokens_decoder"):
+                for i in tokenizer.added_tokens_decoder:
+                    all_special_tokens.append(str(tokenizer.added_tokens_decoder[i]))
+            fo.write(struct.pack('i', len(all_special_tokens)))
+            for special_token in all_special_tokens:
                 writeString(fo, special_token)
     else:
         fo.write(struct.pack('i', 0))
