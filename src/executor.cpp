@@ -68,6 +68,11 @@ namespace fastllm {
         return {0};
     }
 
+    bool Executor::CanRunOnFirstDevice(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
+                       const fastllm::IntDict &intParams) {     
+        return this->devices[0]->CanRun(opType, datas, floatParams, intParams);
+    }
+
     void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                        const fastllm::IntDict &intParams) {
         auto st = std::chrono::system_clock::now();
