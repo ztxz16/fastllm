@@ -91,8 +91,12 @@ namespace fastllm {
             AddTo(hiddenStates, attnOutput);
             LayerNorm(hiddenStates, this->weight[attnLNWeightName], this->weight[attnLNbiasName], -1, hiddenStates);
             
-            Linear(hiddenStates, this->weight[interDenseWeightName], this->weight[interDenseBiasName], inter);
-            Gelu(inter, inter);
+            if (CanRunLinearEx(LinearExType::ExGelu)) {
+                LinearEx(hiddenStates, this->weight[interDenseWeightName], this->weight[interDenseBiasName], inter, LinearExType::ExGelu);
+            } else {
+                Linear(hiddenStates, this->weight[interDenseWeightName], this->weight[interDenseBiasName], inter);
+                Gelu(inter, inter);
+            }
 
             Linear(inter, this->weight[outputWeightName], this->weight[outputbiasName], attnOutput);
             AddTo(hiddenStates, attnOutput);
