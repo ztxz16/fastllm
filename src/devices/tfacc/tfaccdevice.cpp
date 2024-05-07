@@ -7,6 +7,7 @@
 
 #include "devices/tfacc/tfaccdevice.h"
 #include "devices/tfacc/fastllm-tfacc.h"
+#include "devices/tfacc/alivethreadpool.h"
 
 #include <cstring>
 #include <thread>
@@ -22,6 +23,15 @@
 #include "utils.h"
 
 namespace fastllm {
+    static AliveThreadPool *aliveThreadPool = nullptr;
+
+    AliveThreadPool *GetAlivePool() {
+        if (aliveThreadPool == nullptr) {
+            aliveThreadPool = new AliveThreadPool(16);
+        }
+        return aliveThreadPool;
+    }
+
     void GetArrayMinMax(float *a, int len, float &minValue, float &maxValue) {
         int j = 0;
         minValue = 1e100;
@@ -74,6 +84,31 @@ namespace fastllm {
             uValue[j] = (uint8_t) (std::min(255., (double) std::max(fValue[j] / scale + zeroPoint + 0.5, 0.0)));
         }
     }
+
+    struct MultiThreadOnlineQuantizationOp : MultiThreadBaseOp {
+        float *input;
+        uint8_t *output;
+        LowBitConfig *configs;
+        int n, m, group, groupCnt;
+
+        MultiThreadOnlineQuantizationOp (float *input, uint8_t *output, LowBitConfig *configs, int n, int m, int group, int groupCnt) :
+                input(input), output(output), configs(configs), n(n), m(m), group(group), groupCnt(groupCnt) {} ;
+
+        void Run() {
+            for (int i = 0; i < n; i++) {
+                float *cur = input + i * m;
+                uint8_t *u = output + i * m;
+                for (int g = 0; g < group; g++) {
+                    int st = g * groupCnt;
+                    int end = std::min(m, (g + 1) * groupCnt);
+                    float minValue = 1e9, maxValue = -1e9;
+                    GetArrayMinMax(input + i * m + st, end - st, minValue, maxValue);
+                    configs[i * group + g] = (LowBitConfig(minValue, maxValue, 8, 0));
+                    QuantizationAll(cur + st, u + st, end - st, &configs[i * group + g]);
+                }
+            }
+        }
+    };
 
     static TfaccClient tfaccClient;
 
@@ -141,13 +176,14 @@ namespace fastllm {
     }
 
     void TfaccLinearOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-//auto st = std::chrono::system_clock::now();
+// float inner = 0.0;        
+// auto st = std::chrono::system_clock::now();
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
         Data &bias = *(datas.find("bias")->second);
 
-        output.Allocate(0.0f);
+        output.Allocate();
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
@@ -192,32 +228,43 @@ namespace fastllm {
                 }
 
                 std::vector<LowBitConfig> inputConfigs;
-                for (int i = 0; i < n; i++) {
-                    for (int g = 0; g < group; g++) {
-                        int st = g * groupCnt;
-                        int end = std::min(m, (g + 1) * groupCnt);
-                        float minValue = 1e9, maxValue = -1e9;
-                        GetArrayMinMax(inputData + i * m + st, end - st, minValue, maxValue);
-                        inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
-                    }
-                }
-
+                inputConfigs.resize(n * group);
                 std::vector<uint8_t> uinput;
                 uinput.resize(n * m);
-                for (int i = 0; i < n; i++) {
-                    float *cur = inputData + i * m;
-                    uint8_t *u = uinput.data() + i * m;
-                    for (int g = 0; g < group; g++) {
-                        int st = g * groupCnt;
-                        int end = std::min(m, (g + 1) * groupCnt);
-                        QuantizationAll(cur + st, u + st, end - st, &inputConfigs[i * group + g]);
+
+                if (n > 1) {
+                    auto pool = GetAlivePool();
+                    int threadNum = pool->threads.size();
+                    int per = n / pool->threads.size();
+                    int cur = 0;
+                    std::vector<fastllm::MultiThreadOnlineQuantizationOp*> ops;
+                    for (int i = 0; i < threadNum; i++) {
+                        int end = (i == threadNum - 1 ? n : cur + per + (cur + per * (threadNum - i) < n));
+                        ops.push_back(new MultiThreadOnlineQuantizationOp(
+                                        inputData + cur * m, uinput.data() + cur * m, inputConfigs.data() + cur * group,
+                                        end - cur, m, group, groupCnt));
+                        cur = end;
                     }
+                    for (int i = 0; i < threadNum; i++) {
+                        pool->PushOp(i, ops[i]);
+                    }
+                    for (int i = 0; i < threadNum; i++) {
+                        pool->Wait(i);
+                        delete ops[i];
+                    }
+                } else {
+                    MultiThreadOnlineQuantizationOp(inputData, uinput.data(), inputConfigs.data(), n, m, group, groupCnt).Run();
                 }
 
                 if (weight.dataType == DataType::INT4) {
                     ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
                 } else if (weight.dataType == DataType::INT8 || weight.dataType == DataType::INT4_NOZERO || weight.dataType == DataType::INT4_GROUP) {
+// auto st = std::chrono::system_clock::now();
                     tfaccClient.RunTfaccLinearU(n, m, k, group, groupCnt, &weight, &bias, &inputConfigs, uinput.data(), outputData, exType);
+// float spend = GetSpan(st, std::chrono::system_clock::now());
+// float gops = (float)n * m * k / spend / 1e9;
+// inner = spend;
+// if (n > 0) printf("n = %d, m = %d, k = %d, spend %f s, gops = %f (inner)\n", n, m, k, spend, gops);
                 }
             }
         } else if (input.dataType == DataType::FLOAT16 && output.dataType == DataType::FLOAT16) {
@@ -225,9 +272,9 @@ namespace fastllm {
         } else {
             ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
         }
-//float spend = GetSpan(st, std::chrono::system_clock::now());
-//float gops = (float)n * m * k / spend / 1e9;
-// printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
+// float spend = GetSpan(st, std::chrono::system_clock::now());
+// float gops = (float)n * m * k / spend / 1e9;
+// if (n > 0) printf("n = %d, m = %d, k = %d, spend %f s, gops = %f, outer = %f\n", n, m, k, spend, gops, spend - inner);
     }
 
     long long int TfaccLinearOp::Ops(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
