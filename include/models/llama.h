@@ -88,6 +88,9 @@ namespace fastllm {
         int num_key_value_heads = num_attention_heads;
 
         float rms_norm_eps = 1e-6;
+
+        bool mergeQKV = false;
+        bool mergeSwiglu = false;
     };
 }
 

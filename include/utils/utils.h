@@ -83,6 +83,15 @@ namespace fastllm {
         return a.size() >= b.size() && a.substr(0, b.size()) == b;
     }
 
+    template <typename T>
+    static std::vector <T> AppendVector(const std::vector <T> &a, const std::vector <T> &b) {
+        std::vector <T> ret = a;
+        for (int i = 0; i < b.size(); i++) {
+            ret.push_back(b[i]);
+        }
+        return ret;
+    }
+
     static std::vector <int> ParseDeviceIds(const std::string &s, const std::string &type) {
         int i = type.size();
         std::vector <int> ret;
