@@ -368,12 +368,13 @@ namespace fastllm {
         U8Buffer buffer;
         buffer.WriteInt(configString.size());
         buffer.WriteBytes((uint8_t*)configString.data(), configString.size());
-        buffer.WriteBytes(q->cpuData, q->GetBytes());
+        //buffer.WriteBytes(q->cpuData, q->GetBytes());
 
-        memcpy((uint8_t*)this->buf, buffer.buffer.data(), buffer.buffer.size());
+        RunMultiThreadMemcpy((uint8_t*)this->buf, buffer.buffer.data(), buffer.buffer.size(), GetAlivePool());
+        RunMultiThreadMemcpy((uint8_t*)this->buf + buffer.buffer.size(), q->cpuData, q->GetBytes(), GetAlivePool());
         this->Launch(opType);
         this->Wait();
 
-        memcpy(output->cpuData, (uint8_t*)result, output->GetBytes());
+        RunMultiThreadMemcpy(output->cpuData, (uint8_t*)result, output->GetBytes(), GetAlivePool());
     }
 }
