@@ -11,6 +11,13 @@
 #include <cstring>
 
 namespace fastllm {
+    static void barrier() {
+#ifdef __aarch64__
+        asm volatile("dmb ish");
+#else
+        __asm__ __volatile__("": : :"memory");
+#endif
+    }
     struct MultiThreadBaseOp {
         virtual void Run() = 0;
     };
@@ -38,11 +45,11 @@ namespace fastllm {
         void operator()() {
             auto lastRunTime = std::chrono::system_clock::now();
             while (true) {
-                asm volatile("dmb ish");
+                barrier();
                 if (task->signal == 1) {
                     task->op->Run();
                     task->signal = 0;
-                    asm volatile("dmb ish");
+                    barrier();
                     lastRunTime = std::chrono::system_clock::now();
                 }
 
@@ -56,9 +63,9 @@ namespace fastllm {
 
         void PushOp(MultiThreadBaseOp *op) {
             this->task->op = op;
-            asm volatile("dmb ish");
+            barrier();
             this->task->signal = 1;
-            asm volatile("dmb ish");
+            barrier();
         }
 
         void Wait() {
