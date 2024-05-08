@@ -745,12 +745,12 @@ namespace fastllm {
         int len = seqLen;
         std::vector <float> results;
         int index = 0;
+
         LastTokensManager tokens (1, generationConfig.last_n);
         while (true) {
             auto st = std::chrono::system_clock::now();
-ClearProfiler();
+
             int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
-PrintProfiler();
             tokens.units[0].Push(ret);
             if (ret == eos_token_id) {
                 break;
@@ -793,7 +793,7 @@ PrintProfiler();
                 break;
             }
 
-            printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
+            // printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
         }
         if (retCb)
 #ifdef PY_API
@@ -1105,12 +1105,10 @@ PrintProfiler();
                                                           positionIds, seqLens, pastKeyValues, generationConfigs,
                                                           tokensManager, &logits);
                             } else {
-ClearProfiler();
                                 ret = std::vector <int> {model->Forward(inputIds,
                                                                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
                                                                         *positionIds[0],
                                                                         *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
-PrintProfiler();
                             }
 
                             model->dictLocker.lock();
