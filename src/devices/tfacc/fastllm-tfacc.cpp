@@ -9,7 +9,7 @@
 
 #include "utils.h"
 #include "devices/tfacc/fastllm-tfacc.h"
-#include "devices/tfacc/alivethreadpool.h"
+#include "devices/cpu/alivethreadpool.h"
 #include "json11.hpp"
 
 namespace fastllm {
@@ -203,41 +203,6 @@ namespace fastllm {
         SendLongMessage(buffer.buffer.data(), buffer.buffer.size());
     }
 
-    struct MultiThreadMemcpyOp : MultiThreadBaseOp {
-        uint8_t *input, *output;
-        int len;
-
-        MultiThreadMemcpyOp (uint8_t *output, uint8_t *input, int len) : input(input), output(output), len(len) {}
-
-        void Run() {
-            memcpy(output, input, len);
-        }
-    };
-
-    void RunMultiThreadMemcpy(uint8_t *output, uint8_t *input, int len) {
-        if (len < 256 * 1024) {
-            memcpy(output, input, len);
-            return;
-        }
-        auto pool = GetAlivePool();
-        int threadNum = pool->threads.size();
-        int per = len / pool->threads.size();
-        int cur = 0;
-        std::vector<fastllm::MultiThreadMemcpyOp*> ops;
-        for (int i = 0; i < threadNum; i++) {
-            int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
-            ops.push_back(new MultiThreadMemcpyOp(output + cur, input + cur, end - cur));
-            cur = end;
-        }
-        for (int i = 0; i < threadNum; i++) {
-            pool->PushOp(i, ops[i]);
-        }
-        for (int i = 0; i < threadNum; i++) {
-            pool->Wait(i);
-            delete ops[i];
-        }
-    }
-
     void TfaccClient::RunTfaccLinearU(int n, int m, int k, int group, int groupCnt, 
                                      fastllm::Data *weight, fastllm::Data *bias,
                                      std::vector <LowBitConfig> *inputConfigs,
@@ -288,7 +253,7 @@ namespace fastllm {
             cur += weight->name.size();
             memcpy((uint8_t*)cur, biasName.c_str(), biasName.size());
             cur += biasName.size();
-            RunMultiThreadMemcpy((uint8_t*)cur, uinput + baseN * m, curN * m);
+            RunMultiThreadMemcpy((uint8_t*)cur, uinput + baseN * m, curN * m, GetAlivePool());
 // auto st1 = std::chrono::system_clock::now();
             this->Launch(opType);
             this->Wait();
@@ -301,7 +266,7 @@ namespace fastllm {
 
             RunMultiThreadMemcpy(((uint8_t*) output) + baseN * k * sizeof(int32_t),
                     (uint8_t*) result,
-                    curN * k * sizeof(int32_t));
+                    curN * k * sizeof(int32_t), GetAlivePool());
 // auto st3 = std::chrono::system_clock::now();
 // if (n > 0) printf("n = %d, m = %d, k = %d, input = %f s, calc = %f s, output = %f. total = %f\n", n, m, k, GetSpan(st0, st1), GetSpan(st1, st2), GetSpan(st2, st3), GetSpan(st0, st3));
         }

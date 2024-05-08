@@ -47,6 +47,7 @@ namespace fastllm {
     static std::mutex globalLocker;
     static int threads = 4;
     static ThreadPool *fastllmThreadPool = nullptr;
+    static AliveThreadPool *fastllmAliveThreadPool = nullptr;
     static bool lowMemMode = false;
     static bool kvCacheInCPU = false;
 
@@ -76,6 +77,23 @@ namespace fastllm {
 
     void SetKVCacheInCPU(bool v) {
         kvCacheInCPU = v;
+    }
+
+    void SetAliveThreads(int t) {
+#ifdef PY_API
+        py::gil_scoped_release release;
+#endif
+        globalLocker.lock();
+        threads = t;
+        if (fastllmAliveThreadPool != nullptr) {
+            fastllmAliveThreadPool->Shutdown();
+            delete fastllmAliveThreadPool;
+        }
+        fastllmAliveThreadPool = new AliveThreadPool(t);
+        globalLocker.unlock();
+#ifdef PY_API
+        py::gil_scoped_acquire acquire;
+#endif
     }
 
     void SetThreads(int t) {
@@ -111,11 +129,20 @@ namespace fastllm {
         return threads;
     }
 
+    AliveThreadPool *GetAlivePool() {
+        if (fastllmAliveThreadPool == nullptr) {
+            SetAliveThreads(threads);
+        }
+        return fastllmAliveThreadPool;
+    }
+
     ThreadPool *GetPool() {
-        if (fastllmThreadPool == nullptr)
+        if (fastllmThreadPool == nullptr) {
             SetThreads(threads);
+        }
         return fastllmThreadPool;
     }
+    
 #ifdef USE_MMAP
     FileMmap::FileMmap(const std::string &path) {
         int fd = open(path.c_str(), O_RDONLY);

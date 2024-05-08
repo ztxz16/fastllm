@@ -7,7 +7,7 @@
 
 #include "devices/tfacc/tfaccdevice.h"
 #include "devices/tfacc/fastllm-tfacc.h"
-#include "devices/tfacc/alivethreadpool.h"
+#include "devices/cpu/alivethreadpool.h"
 
 #include <cstring>
 #include <thread>
@@ -23,15 +23,6 @@
 #include "utils.h"
 
 namespace fastllm {
-    static AliveThreadPool *aliveThreadPool = nullptr;
-
-    AliveThreadPool *GetAlivePool() {
-        if (aliveThreadPool == nullptr) {
-            aliveThreadPool = new AliveThreadPool(16);
-        }
-        return aliveThreadPool;
-    }
-
     void GetArrayMinMax(float *a, int len, float &minValue, float &maxValue) {
         int j = 0;
         minValue = 1e100;
@@ -290,14 +281,28 @@ namespace fastllm {
     }
 
     void TfaccCatDirectOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-        CpuCatDirectOp::Run(opType, datas, floatParams, intParams);
-
-        // 如果是kvCache，那么要同步到server上
         Data *input0 = (datas.find("input0")->second);
         Data *input1 = (datas.find("input1")->second);
 
         if (input0->isKVCache) {
+            // 如果是kvCache，那么要同步到server上
             tfaccClient.AppendKVCache(input0->cacheUid, input1);
+
+            int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+            if (input0->dims.size() == 0) {
+                input0->Resize(input1->dims);
+                return;
+            }
+
+            int dimsLen = input0->dims.size();
+            axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+            std::vector <int> dims = input0->dims;
+            std::vector <int> oldDims = dims;
+            dims[axis] += input1->dims[axis];
+            input0->Resize(dims);
+        } else {
+            CpuCatDirectOp::Run(opType, datas, floatParams, intParams);
         }
     }
 
