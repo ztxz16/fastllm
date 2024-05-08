@@ -7,6 +7,7 @@
 
 #include "device.h"
 #include "cputhreadpool.h"
+#include "alivethreadpool.h"
 
 namespace fastllm {
     class CpuDevice : BaseDevice {

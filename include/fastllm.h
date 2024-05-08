@@ -20,6 +20,7 @@
 #include <locale>
 #include <codecvt>
 #include "devices/cpu/cputhreadpool.h"
+#include "devices/cpu/alivethreadpool.h"
 
 #ifdef USE_SENTENCEPIECE
 #include <sentencepiece_processor.h>
@@ -36,6 +37,7 @@ namespace fastllm {
     int GetThreads();
     bool GetKVCacheInCPU();
     ThreadPool *GetPool();
+    AliveThreadPool *GetAlivePool();
 
     struct GenerationConfig {
         int output_token_limit = -1; // 最多输出多少, <= 0代表无限制
