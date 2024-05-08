@@ -674,6 +674,72 @@ namespace fastllm {
         }
     }
 
+    struct MultiThreadRMSNormFloatOp : MultiThreadBaseOp {
+        float *input, *output, *weight;
+        int outer, channels;
+        float eps;        
+
+        MultiThreadRMSNormFloatOp (float *output, float *input, float *weight, int outer, int channels, float eps) : 
+            input(input), output(output), weight(weight), outer(outer), channels(channels), eps(eps) {}
+
+        void Run() {
+            for (int i = 0; i < outer; i++) {
+                float mean = 0.f;
+                int j = 0;
+#ifdef __aarch64__
+                float32x4_t sums = vdupq_n_f32(0.0);
+                for (; j + 3 < channels; j += 4) {
+                    float32x4_t vi = vld1q_f32(input + j);
+                    sums = vaddq_f32(sums, vmulq_f32(vi, vi));
+                }
+                mean = sums[0] + sums[1] + sums[2] + sums[3];
+#endif
+                for (; j < channels; j++) {
+                    mean += input[j] * input[j];
+                }
+                float scale = 1.0 / sqrt(mean / channels + eps);
+                j = 0;
+#ifdef __aarch64__
+                float32x4_t vscale = vdupq_n_f32(scale);
+                for (; j + 3 < channels; j += 4) {
+                    float32x4_t vi = vld1q_f32(input + j);
+                    float32x4_t vw = vld1q_f32(weight + j);
+                    vst1q_f32(output + j, vmulq_f32(vmulq_f32(vi, vscale), vw));
+                }
+#endif
+                for (; j < channels; j++) {
+                    output[j] = input[j] * scale * weight[j];
+                }
+
+                input += channels;
+                output += channels;
+            }
+        }
+    };
+
+    static void RunMultiThreadRMSNormFloat(float *output, float *input, float *weight, int outer, int channels, float eps, AliveThreadPool *pool) {
+        if (outer == 1) {
+            (MultiThreadRMSNormFloatOp(output, input, weight, outer, channels, eps)).Run();
+            return;
+        }
+        int threadNum = pool->threads.size();
+        int per = outer / pool->threads.size();
+        int cur = 0;
+        std::vector<fastllm::MultiThreadRMSNormFloatOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? outer : cur + per + (cur + per * (threadNum - i) < outer));
+            ops.push_back(new MultiThreadRMSNormFloatOp(output + cur * channels, input + cur * channels, weight, end - cur, channels, eps));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
     void CpuRMSNormOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -691,38 +757,7 @@ namespace fastllm {
             float *inputData = (float *) input.cpuData;
             float *outputData = (float *) output.cpuData;
             float *weightData = (float *) weight.cpuData;
-
-            for (int i = 0; i < outer; i++) {
-                float mean = 0.f;
-                int j = 0;
-#ifdef __aarch64__
-                float32x4_t sums = vdupq_n_f32(0.0);
-                for (; j + 3 < channels; j += 4) {
-                    float32x4_t vi = vld1q_f32(inputData + j);
-                    sums = vaddq_f32(sums, vmulq_f32(vi, vi));
-                }
-                mean = sums[0] + sums[1] + sums[2] + sums[3];
-#endif
-                for (; j < channels; j++) {
-                    mean += inputData[j] * inputData[j];
-                }
-                float scale = 1.0 / sqrt(mean / channels + eps);
-                j = 0;
-#ifdef __aarch64__
-                float32x4_t vscale = vdupq_n_f32(scale);
-                for (; j + 3 < channels; j += 4) {
-                    float32x4_t vi = vld1q_f32(inputData + j);
-                    float32x4_t vw = vld1q_f32(weightData + j);
-                    vst1q_f32(outputData + j, vmulq_f32(vmulq_f32(vi, vscale), vw));
-                }
-#endif
-                for (; j < channels; j++) {
-                    outputData[j] = inputData[j] * scale * weightData[j];
-                }
-
-                inputData += channels;
-                outputData += channels;
-            }
+            RunMultiThreadRMSNormFloat(outputData, inputData, weightData, outer, channels, eps, GetAlivePool());
         } else if (input.dataType == DataType::FLOAT16) {
             uint16_t *inputData = (uint16_t *) input.cpuData;
             uint16_t *outputData = (uint16_t *) output.cpuData;
@@ -1900,6 +1935,43 @@ namespace fastllm {
         output.Resize(dims);
     }
 
+    struct MultiThreadSliceOp : MultiThreadBaseOp {
+        uint8_t *input, *output;
+        int outer, inputStride, outputStride, copyLen;
+
+        MultiThreadSliceOp (uint8_t *output, uint8_t *input, int outer, int outputStride, int inputStride, int copyLen) : 
+            output(output), input(input), outer(outer), inputStride(inputStride), outputStride(outputStride), copyLen(copyLen) {}
+
+        void Run() {
+            for (int o = 0; o < outer; o++) {
+                memcpy(output + o * outputStride, input + o * inputStride, copyLen);
+            }
+        }
+    };
+
+    static void RunMultiThreadSlice(uint8_t *output, uint8_t *input, int outer, int inputStride, int outputStride, int copyLen, AliveThreadPool *pool) {
+        if (outer == 1) {
+            (MultiThreadSliceOp(output, input, outer, outputStride, inputStride, copyLen)).Run();
+            return;
+        }
+        int threadNum = pool->threads.size();
+        int per = outer / pool->threads.size();
+        int cur = 0;
+        std::vector<fastllm::MultiThreadSliceOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? outer : cur + per + (cur + per * (threadNum - i) < outer));
+            ops.push_back(new MultiThreadSliceOp(output + cur * outputStride, input + cur * inputStride, end - cur, outputStride, inputStride, copyLen));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
     void CpuSplitOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -1922,12 +1994,9 @@ namespace fastllm {
         int channels = input.dims[axis];
         int inner = input.strides[axis];
         int unitSize = input.unitSize;
-
-        for (int o = 0; o < outer; o++) {
-            memcpy(output.cpuData + o * outputStride * unitSize,
-                   input.cpuData + (o * inputStride + start * inner) * unitSize,
-                   (end - start) * inner * unitSize);
-        }
+        
+        RunMultiThreadSlice(output.cpuData, input.cpuData + start * inner * unitSize, outer, 
+            inputStride * unitSize, outputStride * unitSize, (end - start) * inner * unitSize, GetAlivePool());
     }
 
     void CpuCatOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -2781,6 +2850,43 @@ namespace fastllm {
         }
     }
 
+    struct MultiThreadAddToFloatOp : MultiThreadBaseOp {
+        float *input, *output;
+        int len;
+        float alpha;
+
+        MultiThreadAddToFloatOp (float *output, float *input, float alpha, int len) : input(input), output(output), alpha(alpha), len(len) {}
+
+        void Run() {
+            for (int i = 0; i < len; i++) {
+                output[i] += input[i] * alpha;
+            }
+        }
+    };
+
+    static void RunMultiThreadAddToFloat(float *output, float *input, float alpha, int len, AliveThreadPool *pool) {
+        if (len < 256 * 1024) {
+            (MultiThreadAddToFloatOp(output, input, alpha, len)).Run();
+            return;
+        }
+        int threadNum = pool->threads.size();
+        int per = len / pool->threads.size();
+        int cur = 0;
+        std::vector<fastllm::MultiThreadAddToFloatOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
+            ops.push_back(new MultiThreadAddToFloatOp(output + cur, input + cur, alpha, end - cur));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
     void CpuAddToOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input0 = *(datas.find("input0")->second);
@@ -2796,9 +2902,7 @@ namespace fastllm {
         if (input0.dataType == DataType::FLOAT32) {
             float *input0Data = (float *) input0.cpuData;
             float *input1Data = (float *) input1.cpuData;
-            for (int i = 0; i < len; i++) {
-                input0Data[i] += input1Data[i] * alpha;
-            }
+            RunMultiThreadAddToFloat(input0Data, input1Data, alpha, len, GetAlivePool());
         } else if (input0.dataType == DataType::FLOAT16) {
             uint16_t *input0Data = (uint16_t *) input0.cpuData;
             uint16_t *input1Data = (uint16_t *) input1.cpuData;
@@ -3147,25 +3251,57 @@ namespace fastllm {
                         input.dataType == DataType::FLOAT16, "Permute error: datatype should be float32 or float16.");
         AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
 
+        std::vector<int> new_dims;
+        for (int i = 0; i < axis.size(); i++) {
+            new_dims.push_back(input.dims[axis[i]]);
+        }
+
         bool same = false;
         same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
         same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[2] == 1);
         same |= ((axis == std::vector <int>{0, 2, 1, 3}) && (input.dims[1] == 1 || input.dims[2] == 1));
         if (same) {
-            std::vector<int> new_dims;
-            for (int i = 0; i < axis.size(); i++) {
-                new_dims.push_back(input.dims[axis[i]]);
-            }
             input.Resize(new_dims);
             return;
         }
 
-        auto tmp = new Data();
-        fastllm::Permute(input, axis, *tmp);
+        if (axis == std::vector<int> {0, 2, 1, 3}) {
+            std::vector <uint8_t> vold;
+            vold.resize(input.GetBytes());
+            RunMultiThreadMemcpy(vold.data(), input.cpuData, input.GetBytes(), GetAlivePool());
+            uint8_t *oldData = vold.data();
+            uint8_t *newData = (uint8_t *) input.cpuData;
+            int b = input.dims[0];
+            int n = input.dims[1];
+            int m = input.dims[2];
+            int k = input.dims[3];
+            int unitSize = input.unitSize;
+            for (int o = 0; o < b; o++) {
+                RunMultiThreadTransposeByLine(newData, oldData, n, m, k * unitSize, GetAlivePool());
+                oldData += input.Count(1) * unitSize;
+                newData += input.Count(1) * unitSize;
+            }
+            input.Resize(new_dims);
+        } else if (axis == std::vector <int> {1, 0, 2}) {
+            std::vector <uint8_t> vold;
+            vold.resize(input.GetBytes());
+            RunMultiThreadMemcpy(vold.data(), input.cpuData, input.GetBytes(), GetAlivePool());
+            uint8_t *oldData = vold.data();
+            uint8_t *newData = (uint8_t *) input.cpuData;
+            int n = input.dims[0];
+            int m = input.dims[1];
+            int k = input.dims[2];
+            int unitSize = input.unitSize;
+            RunMultiThreadTransposeByLine(newData, oldData, n, m, k * unitSize, GetAlivePool());
+            input.Resize(new_dims);
+        } else {
+            auto tmp = new Data();
+            fastllm::Permute(input, axis, *tmp);
 
-        memcpy(input.cpuData, tmp->cpuData, input.unitSize * input.Count(0));
-        input.Resize(tmp->dims);
-        delete tmp;
+            memcpy(input.cpuData, tmp->cpuData, input.unitSize * input.Count(0));
+            input.Resize(tmp->dims);
+            delete tmp;
+        }
     }
 
     void CpuRotatePosition2DOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -3250,6 +3386,65 @@ namespace fastllm {
         }
     }
 
+    struct MultiThreadLlamaRotatePosition2DFloatOp : MultiThreadBaseOp {
+        float *data, *positionIds, *sinData, *cosData;
+        int bs, len, n, m, stride, spatial, posDim, rotaryDim;      
+        int st, end;
+
+        MultiThreadLlamaRotatePosition2DFloatOp 
+            (float *data, float *positionIds, float *sinData, float *cosData, 
+            int bs, int len, int n, int m, int stride, int spatial, int posDim, int rotaryDim, 
+            int st, int end) : 
+            data(data), positionIds(positionIds), sinData(sinData), cosData(cosData), 
+            bs(bs), len(len), n(n), m(m), stride(stride), spatial(spatial), posDim(posDim), rotaryDim(rotaryDim), 
+            st(st), end(end) {}
+
+        void Run() {
+            for (int idx = st; idx < end; idx++) {
+                int b = idx / len;
+                int l = idx % len;
+                int index = (int) ((float *) positionIds)[b * posDim + l];
+                float *sin = ((float *) sinData) + stride * index;
+                float *cos = ((float *) cosData) + stride * index;
+                float *d = (float *) data + (b * len + l) * spatial;
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j < rotaryDim && j < m / 2; j++) {
+                        float a = d[j], b = d[j + m / 2];
+                        d[j] = a * cos[j] - b * sin[j];
+                        d[j + m / 2] = a * sin[j] + b * cos[j];
+                    }
+                    d += m;
+                }
+            }
+        }
+    };
+
+    static void RunMultiThreadLlamaRotatePosition2DFloat(float *data, float *positionIds, float *sinData, float *cosData, 
+            int bs, int len, int n, int m, int stride, int spatial, int posDim, int rotaryDim, AliveThreadPool *pool) {
+        if (bs * len == 1) {
+            (MultiThreadLlamaRotatePosition2DFloatOp(data, positionIds, sinData, cosData, bs, len, n, m, stride, spatial, posDim, rotaryDim, 0, bs * len)).Run();
+            return;
+        }
+
+        int threadNum = pool->threads.size();
+        int per = (bs * len) / pool->threads.size();
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLlamaRotatePosition2DFloatOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? (bs * len) : cur + per + (cur + per * (threadNum - i) < (bs * len)));
+            ops.push_back(new MultiThreadLlamaRotatePosition2DFloatOp(
+                data, positionIds, sinData, cosData, bs, len, n, m, stride, spatial, posDim, rotaryDim, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
     void CpuLlamaRotatePosition2DOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &data = *(datas.find("input")->second);
@@ -3262,23 +3457,9 @@ namespace fastllm {
         int spatial = data.Count(2);
         int n = data.dims[2], m = data.dims[3];
         int stride = (int)sinData.dims[1];
-        for (int b = 0; b < bs; b++) {
-            for (int l = 0; l < len; l++) {
-                int index = (int) ((float *) positionIds.cpuData)[b * positionIds.dims.back() + l];
-                float *sin = ((float *) sinData.cpuData) + stride * index;
-                float *cos = ((float *) cosData.cpuData) + stride * index;
-                float *d = (float *) data.cpuData + (b * len + l) * spatial;
-                for (int i = 0; i < n; i++) {
-                    for (int j = 0; j < rotaryDim && j < m / 2; j++) {
-                        float a = d[j], b = d[j + m / 2];
-                        d[j] = a * cos[j] - b * sin[j];
-                        d[j + m / 2] = a * sin[j] + b * cos[j];
-                    }
-
-                    d += m;
-                }
-            }
-        }
+        RunMultiThreadLlamaRotatePosition2DFloat((float*)data.cpuData, (float*)positionIds.cpuData, 
+            (float*)sinData.cpuData, (float*)cosData.cpuData, bs, len, n, m, stride, spatial, 
+            positionIds.dims.back(), rotaryDim, GetAlivePool());
     }
 
     void CpuRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
