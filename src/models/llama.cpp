@@ -619,17 +619,22 @@ namespace fastllm {
 
                 // 1.2 Attention
                 // 1.2.0 q * k^T
-                MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim), q.dims[0] / pastKey.dims[0]);
-                attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
-                if (alibiData.dims.size() != 0) {
-                    AlibiMask(attenWeights, alibiData, -10000);
-                } else if (attentionMask[b] != nullptr) {
-                    AttentionMask(attenWeights, *attentionMask[b], -10000);
+                if (alibiData.dims.size() == 0) {
+                    Attention(q, pastKey, pastValue, attentionMask[b] == nullptr ? Data() : *attentionMask[b], curAttenOutput, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
+                } else {
+                    MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim), q.dims[0] / pastKey.dims[0]);
+                    attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
+                    if (alibiData.dims.size() != 0) {
+                        AlibiMask(attenWeights, alibiData, -10000);
+                    } else if (attentionMask[b] != nullptr) {
+                        AttentionMask(attenWeights, *attentionMask[b], -10000);
+                    }
+
+                    Softmax(attenWeights, attenWeights, -1);
+                    MatMul(attenWeights, pastValue, curAttenOutput, 1.f, attenWeights.dims[1] / pastValue.dims[0]);
+                    curAttenOutput.Reshape({curAttenOutput.dims[1], curAttenOutput.dims[2], curAttenOutput.dims[3]});
                 }
 
-                Softmax(attenWeights, attenWeights, -1);
-                MatMul(attenWeights, pastValue, curAttenOutput, 1.f, attenWeights.dims[1] / pastValue.dims[0]);
-                curAttenOutput.Reshape({curAttenOutput.dims[1], curAttenOutput.dims[2], curAttenOutput.dims[3]});
                 PermuteSelf(curAttenOutput, {1, 0, 2});
                 curAttenOutput.Reshape({seqLens[b], bsz, -1});
                 PermuteSelf(curAttenOutput, {1, 0, 2});
