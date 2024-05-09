@@ -1961,6 +1961,7 @@ namespace fastllm {
             realDims[1] *= 2;
         }
         this->weight[key] = Data(dataType, realDims);
+        this->weight[key].name = std::string(key);
         Data &data = this->weight[key];
         data.weightType = WeightType::LINEAR;
         data.UpdateUnitSize();
@@ -2007,6 +2008,7 @@ namespace fastllm {
     void WeightMap::AddWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType,
                               fastllm::WeightType weightType, fastllm::DataType oriDataType, uint8_t *oriData, int groupCnt) {
         this->weight[key] = Data(dataType, dims);
+        this->weight[key].name = std::string(key);
         Data &data = this->weight[key];
         data.weightType = weightType;
         data.UpdateUnitSize();
