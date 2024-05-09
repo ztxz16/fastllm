@@ -35,6 +35,14 @@ namespace fastllm {
     class TfaccAttention : CpuAttention {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
+
+    class TfaccAttentionBatchOp : CpuAttentionBatchOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class TfaccCatDirectBatchOp : CpuCatDirectBatchOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
 }
 
 #endif
