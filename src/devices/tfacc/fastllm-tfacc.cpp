@@ -258,15 +258,16 @@ namespace fastllm {
             this->Launch(opType);
             this->Wait();
 // auto st2 = std::chrono::system_clock::now();
+            int outK = k;
             if (exType == LinearExType::ExSwiglu) {
-                k /= 2;
+                outK /= 2;
             }
 
             auto pool = GetAlivePool();
 
-            RunMultiThreadMemcpy(((uint8_t*) output) + baseN * k * sizeof(int32_t),
+            RunMultiThreadMemcpy(((uint8_t*) output) + baseN * outK * sizeof(int32_t),
                     (uint8_t*) result,
-                    curN * k * sizeof(int32_t), GetAlivePool());
+                    curN * outK * sizeof(int32_t), GetAlivePool());
 // auto st3 = std::chrono::system_clock::now();
 // if (n > 0) printf("n = %d, m = %d, k = %d, input = %f s, calc = %f s, output = %f. total = %f\n", n, m, k, GetSpan(st0, st1), GetSpan(st1, st2), GetSpan(st2, st3), GetSpan(st0, st3));
         }
@@ -319,10 +320,11 @@ namespace fastllm {
             this->Launch(opType);
             this->Wait();
 
+            int outK = k;
             if (exType == LinearExType::ExSwiglu) {
-                k /= 2;
+                outK /= 2;
             }
-            memcpy(((uint8_t*) output) + baseN * k * unitSize, (uint8_t*) result, curN * k * unitSize);
+            memcpy(((uint8_t*) output) + baseN * outK * unitSize, (uint8_t*) result, curN * outK * unitSize);
         }
     }
 
