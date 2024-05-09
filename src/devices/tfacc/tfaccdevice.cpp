@@ -107,8 +107,10 @@ namespace fastllm {
         this->deviceType = "tfacc";
         this->ops["Linear"] = (BaseOperator *) (new TfaccLinearOp());
         this->ops["CatDirect"] = (BaseOperator *) (new TfaccCatDirectOp());
-
         this->ops["Attention"] = (BaseOperator *) (new TfaccAttention());
+
+        this->ops["AttentionBatch"] = (BaseOperator *) (new TfaccAttentionBatchOp());
+        this->ops["CatDirectBatch"] = (BaseOperator *) (new TfaccCatDirectBatchOp());
     }
 
     bool TfaccDevice::Malloc(void **ret, size_t size) {
@@ -205,7 +207,7 @@ namespace fastllm {
             } else if (weight.dataType == DataType::INT4 || 
                     weight.dataType == DataType::INT4_NOZERO ||
                     weight.dataType == DataType::INT4_GROUP ||
-                    weight.dataType == DataType::INT8) {
+                    weight.dataType == DataType::INT8) {                
                 float *inputData = (float *) input.cpuData;
                 uint8_t *weightData = (uint8_t *) weight.cpuData;
                 float *outputData = (float *) output.cpuData;
@@ -257,6 +259,18 @@ namespace fastllm {
 // inner = spend;
 // if (n > 0) printf("n = %d, m = %d, k = %d, spend %f s, gops = %f (inner)\n", n, m, k, spend, gops);
                 }
+
+                /*std::vector <float> tempOutputs;
+                for (int i = 0; i < output.Count(0); i++) {
+                    tempOutputs.push_back(((float*)output.cpuData)[i]);
+                }
+                CpuLinearOp::Run(opType, datas, floatParams, intParams);
+                for (int i = 0; i < output.Count(0); i++) {
+                    if (fabs(((float*)output.cpuData)[i] - tempOutputs[i]) > 1e-1) {
+                        printf("wrong %d %f %f.\n", i, ((float*)output.cpuData)[i], tempOutputs[i]);
+                        exit(0);
+                    }
+                }*/
             }
         } else if (input.dataType == DataType::FLOAT16 && output.dataType == DataType::FLOAT16) {
             ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
@@ -339,5 +353,34 @@ namespace fastllm {
             }
         }
 */
+    }
+
+    void TfaccAttentionBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new TfaccAttention());
+        int batch = intParams.find("q___batch")->second;
+        DataDict tempDatas = datas;
+        for (int i = 0; i < batch; i++) {
+            tempDatas["q"] = ((Data**)datas.find("q")->second)[i];
+            tempDatas["k"] = ((Data**)datas.find("k")->second)[i];
+            tempDatas["v"] = ((Data**)datas.find("v")->second)[i];
+            tempDatas["mask"] = ((Data**)datas.find("mask")->second)[i];
+            tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
+            op->Run("Attention", tempDatas, floatParams, intParams);
+        }
+        delete op;
+    }
+
+    void TfaccCatDirectBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new TfaccCatDirectOp());
+        int batch = intParams.find("input0___batch")->second;
+        DataDict tempDatas = datas;
+        for (int i = 0; i < batch; i++) {
+            tempDatas["input0"] = ((Data**)datas.find("input0")->second)[i];
+            tempDatas["input1"] = ((Data**)datas.find("input1")->second)[i];
+            op->Run("CatDirect", tempDatas, floatParams, intParams);
+        }
+        delete op;
     }
 }
