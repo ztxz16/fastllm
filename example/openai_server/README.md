@@ -19,14 +19,14 @@
 1. 需要先安装fastllm_pytools工具包
 2. 需要安装以下依赖
 ```bash
-cd tools/server
+cd example/openai_server
 pip install -r requirements.txt
 ```
 
 ## 使用方法 && 样例
 * server启动命令
 ```bash
-cd tools/server
+cd example/openai_server
 python openai_api_server.py --model_name "model_name" -p "path_to_your_flm_model"
 # eg : python openai_api_server.py --model_name "chat-glm2-6b-int4" -p "./chatglm2-6b-int4.flm"
 ```
