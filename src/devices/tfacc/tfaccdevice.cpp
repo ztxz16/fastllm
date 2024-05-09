@@ -259,18 +259,6 @@ namespace fastllm {
 // inner = spend;
 // if (n > 0) printf("n = %d, m = %d, k = %d, spend %f s, gops = %f (inner)\n", n, m, k, spend, gops);
                 }
-
-                /*std::vector <float> tempOutputs;
-                for (int i = 0; i < output.Count(0); i++) {
-                    tempOutputs.push_back(((float*)output.cpuData)[i]);
-                }
-                CpuLinearOp::Run(opType, datas, floatParams, intParams);
-                for (int i = 0; i < output.Count(0); i++) {
-                    if (fabs(((float*)output.cpuData)[i] - tempOutputs[i]) > 1e-1) {
-                        printf("wrong %d %f %f.\n", i, ((float*)output.cpuData)[i], tempOutputs[i]);
-                        exit(0);
-                    }
-                }*/
             }
         } else if (input.dataType == DataType::FLOAT16 && output.dataType == DataType::FLOAT16) {
             ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
