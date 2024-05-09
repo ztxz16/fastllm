@@ -699,8 +699,13 @@ namespace fastllm {
                 // 1.4 MLP
                 std::string fcInKeyName = "transformer.encoder.layers." + std::to_string(i) + ".mlp.dense_h_to_4h";
                 std::string fcOutKeyName = "transformer.encoder.layers." + std::to_string(i) + ".mlp.dense_4h_to_h";
-                Linear(mlpInput, weight[fcInKeyName + ".weight"], weight[fcInKeyName + ".bias"], middle);
-                Swiglu(middle, middle2);
+                if (CanRunLinearEx(LinearExType::ExSwiglu)) {
+                    LinearEx(mlpInput, weight[fcInKeyName + ".weight"], weight[fcInKeyName + ".bias"], middle2, LinearExType::ExSwiglu);
+                } else {
+                    Linear(mlpInput, weight[fcInKeyName + ".weight"], weight[fcInKeyName + ".bias"], middle);
+                    Swiglu(middle, middle2);
+                }
+
                 Linear(middle2, weight[fcOutKeyName + ".weight"], weight[fcOutKeyName + ".bias"], hiddenStates);
                 AddTo(hiddenStates, temp);
             }
