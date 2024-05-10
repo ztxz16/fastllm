@@ -1,10 +1,10 @@
 //
-// Created by huangyuyang on 6/1/23.
+// Created by huangyuyang on 5/9/24.
 //
 
 #include "utils.h"
 
-#include "llama.h"
+#include "moe.h"
 
 #include <sstream>
 
@@ -17,34 +17,11 @@
 #endif
 
 namespace fastllm {
-    std::vector <float> GetInterLeavePowerOf2(int n) {
-        float start = powf(2, -powf(2, -(log2f(n) - 3)));
-        float ratio = start;
-        std::vector <float> ret;
-        for (int i = 0; i < n; i++) {
-            ret.push_back(start * powf(ratio, i));
-        }
-        return ret;
-    }
-    std::vector <float> GetInterleave(int n) {
-        int base = 1;
-        while (base < n) {
-            base <<= 1;
-        }
-        if (base == n) {
-            return GetInterLeavePowerOf2(n);
-        } else {
-            std::vector <float> ret = GetInterLeavePowerOf2(base / 2);
-            std::vector <float> part2 = GetInterLeavePowerOf2(base);
-            for (int i = 0; i < n - base / 2; i++) {
-                ret.push_back(part2[i * 2]);
-            }
-            return ret;
-        }
-    }
+    extern std::vector <float> GetInterLeavePowerOf2(int n);
+    extern std::vector <float> GetInterleave(int n);
 
-    LlamaModel::LlamaModel() {
-        this->model_type = "llama";
+    MoeModel::MoeModel() {
+        this->model_type = "moe";
 
         // 默认使用alpaca的提示词和instruction
         this->pre_prompt = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n";
@@ -58,8 +35,12 @@ namespace fastllm {
         weight.embeddingNames.insert("model.embed_tokens.weight");
     }
 
-    void LlamaModel::InitParams() {
+    void MoeModel::InitParams() {
         basellm::InitParams();
+        num_experts = atoi(this->weight.dicts["num_experts"].c_str());
+        num_experts_per_tok = atoi(this->weight.dicts["num_experts_per_tok"].c_str());
+        norm_topk_prob = (this->weight.dicts["norm_topk_prob"] == "true");
+
         num_key_value_heads = num_attention_heads;
         if (this->weight.dicts.find("num_key_value_heads") != this->weight.dicts.end()) {
             num_key_value_heads = atoi(this->weight.dicts["num_key_value_heads"].c_str());
@@ -92,7 +73,7 @@ namespace fastllm {
         cosData.CopyFrom(Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second));
     }
 
-    std::pair<std::vector<float>, std::vector<float>> LlamaModel::UpdateRotaryPosEmb(float base, float factor, int seqLen) {
+    std::pair<std::vector<float>, std::vector<float>> MoeModel::UpdateRotaryPosEmb(float base, float factor, int seqLen) {
         int positions = std::max(max_positions, seqLen);
         sin.resize(positions);
         cos.resize(positions);
@@ -117,7 +98,7 @@ namespace fastllm {
         return std::make_pair(fsin, fcos);
     }
 
-    int LlamaModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+    int MoeModel::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
                             std::vector <float> *retLogits) {
@@ -126,7 +107,7 @@ namespace fastllm {
         return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, &batchLogits)[0];
     }
 
-    std::vector <int> LlamaModel::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+    std::vector <int> MoeModel::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
                             std::vector <std::vector <float>*> *retLogits) {
@@ -200,7 +181,7 @@ namespace fastllm {
             this->mergeQKV = canMerge;
         }
 
-        if (!mergeSwiglu && CanRunLinearEx(LinearExType::ExSwiglu)) {
+        if (!mergeSwiglu && CanRunLinearEx(LinearExType::ExSwiglu) && false) {
             bool canMerge = true;
             for (int i = 0; i < block_cnt; i++) {
                 std::string w1WeightName = "model.layers." + std::to_string(i) + ".mlp.gate_proj.weight";
@@ -248,7 +229,7 @@ namespace fastllm {
         Data q, k, v, qkv;
         Data attenWeights, attenOutput;
         Data attenLastOutput;
-        Data w1, w2, w3;
+        Data w1, w2, w3, routerLogits, gate, attenPart, moePart, moeFinal, sharedGate;
         Data* sinDataPtr = &sinData;
         Data* cosDataPtr = &cosData;
 
@@ -258,6 +239,7 @@ namespace fastllm {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     rms_norm_eps, attenInput);
+
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
@@ -390,10 +372,13 @@ namespace fastllm {
 
             Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
             Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
+
             AddTo(hiddenStates, attenLastOutput);
-            // 2. mlp
-            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);            
+
+            // 2. moe mlp
             if (this->mergeSwiglu) {
+                // 这里是正常mlp
                 std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
                 if (CanRunLinearEx(LinearExType::ExSwiglu)) {
                     LinearEx(attenInput, weight[swigluWeightName], Data(), w1, LinearExType::ExSwiglu);
@@ -401,18 +386,65 @@ namespace fastllm {
                     Linear(attenInput, weight[swigluWeightName], Data(), w3);
                     Swiglu(w3, w1);
                 }
+                Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
+                AddTo(hiddenStates, w2);
             } else {
-                if (CanRunLinearEx(LinearExType::ExSilu)) {
-                    LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
-                } else {
-                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
-                    Silu(w1, w1);
+                // 这里是moe mlp
+                std::string gateWeightName = "model.layers." + std::to_string(i) + ".mlp.gate.weight";
+                int batch = attenInput.dims[0], len = attenInput.dims[1];
+                attenInput.Reshape({batch * len, attenInput.dims[2]});
+                Linear(attenInput, weight[gateWeightName], Data(), routerLogits);
+                Softmax(routerLogits, routerLogits, -1);
+                TopK(routerLogits, gate, this->num_experts_per_tok);
+                moeFinal = Data();
+                moeFinal.Resize({0, attenInput.dims[1]});
+                moeFinal.Expansion(attenInput.dims);
+
+                gate.ToDevice(DataDevice::CPU);
+                float *gateData = (float*)gate.cpuData;
+                for (int b = 0; b < batch * len; b++) {
+                    Data *currentData = &attenInput;
+                    if (batch * len != 1) {
+                        Split(attenInput, 0, b, b + 1, attenPart);
+                        currentData = &attenPart;
+                    }
+                    moePart.Resize(currentData->dims);
+                    moePart.Allocate(0.0f);
+
+                    for (int j = 0; j < this->num_experts_per_tok; j++) {
+                        int idx = (int)(gateData[(b * this->num_experts_per_tok + j) * 2] + 1e-1);
+                        float value = gateData[(b * this->num_experts_per_tok + j) * 2 + 1];
+                        if (CanRunLinearEx(LinearExType::ExSilu)) {
+                            LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                        } else {
+                            Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gate_proj.weight"], Data(), w1);
+                            Silu(w1, w1);
+                        }
+                        Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".up_proj.weight"], Data(), w3);
+                        MulTo(w1, w3);
+                        Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".down_proj.weight"], Data(), w2);
+                        AddTo(moePart, w2, value);
+                    }
+
+                    if (CanRunLinearEx(LinearExType::ExSilu)) {
+                        LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                    } else {
+                        Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert.gate_proj.weight"], Data(), w1);
+                        Silu(w1, w1);
+                    }
+                    Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert.up_proj.weight"], Data(), w3);
+                    MulTo(w1, w3);
+                    Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert.down_proj.weight"], Data(), w2);
+                    Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert_gate.weight"], Data(), sharedGate);
+                    sharedGate.ToDevice(DataDevice::CPU);
+                    AddTo(moePart, w2, 1 / (1 + exp(-((float*)sharedGate.cpuData)[0])));
+
+                    CatDirect(moeFinal, moePart, 0);
                 }
-                Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
-                MulTo(w1, w3);
+
+                moeFinal.Reshape(hiddenStates.dims);
+                AddTo(hiddenStates, moeFinal);
             }
-            Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
-            AddTo(hiddenStates, w2);
         }
 
         Data logits, topk;
@@ -464,7 +496,7 @@ namespace fastllm {
         return lastRet;
     }
 
-    std::vector <int> LlamaModel::ForwardBatch(int batch,
+    std::vector <int> MoeModel::ForwardBatch(int batch,
                                                const Data &inputIds,
                                                const std::vector <Data*> &attentionMask,
                                                const std::vector <Data*> &positionIds,
@@ -706,7 +738,7 @@ namespace fastllm {
         return lastRet;
     }
 
-    void LlamaModel::FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
+    void MoeModel::FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
                                     const std::map <std::string, int> &params,
                                     Data &inputIds, Data &attentionMask, Data &positionIds) {
         inputIds.ToDevice(DataDevice::CPU);
@@ -737,7 +769,7 @@ namespace fastllm {
         }
     }
 
-    void LlamaModel::FillLLMInputsBatch(std::vector<std::vector<float>> &inputTokens,
+    void MoeModel::FillLLMInputsBatch(std::vector<std::vector<float>> &inputTokens,
                                           const std::vector<std::map<std::string, int>> &params,
                                           fastllm::Data &inputIds, fastllm::Data &attentionMask,
                                           fastllm::Data &positionIds) {
@@ -812,15 +844,15 @@ namespace fastllm {
         }
     }
 
-    std::string LlamaModel::MakeInput(const std::string &history, int round, const std::string &input) {
+    std::string MoeModel::MakeInput(const std::string &history, int round, const std::string &input) {
         return (round == 0 ? pre_prompt : history) + user_role + input + bot_role;
     }
 
-    std::string LlamaModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
+    std::string MoeModel::MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) {
         return (round == 0 ? pre_prompt : history) + user_role + input + bot_role + output + history_sep;
     }
 
-    void LlamaModel::WarmUp() {
+    void MoeModel::WarmUp() {
         printf("Warmup...\n");
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
         Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});

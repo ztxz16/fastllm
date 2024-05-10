@@ -3010,7 +3010,6 @@ namespace fastllm {
         int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
 
         AssertInFastLLM(input.dataType == DataType::FLOAT32, "TopK error: Data's type should be float32.\n");
-        AssertInFastLLM(topk == 1, "Unsupport topk > 1.");
 
         int dimsLen = input.dims.size();
         std::vector<int> dims = input.dims;
@@ -3049,7 +3048,20 @@ namespace fastllm {
                 outputData += 2;
             }
         } else {
-            ErrorInFastLLM("Unsupport topk > 1.");
+            for (int o = 0; o < outer; o++) {
+                std::vector <std::pair <float, int> > v;
+                for (int j = 0; j < channels; j++) {
+                    v.push_back(std::make_pair(-inputData[j], j));
+                }
+                sort(v.begin(), v.end());
+                for (int j = 0; j < topk; j++) {
+                    outputData[j * 2] = v[j].second;
+                    outputData[j * 2 + 1] = -v[j].first;
+                }
+
+                inputData += channels;
+                outputData += 2 * topk;
+            }
         }
     }
 

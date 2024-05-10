@@ -7,6 +7,7 @@
 #include "chatglm.h"
 #include "moss.h"
 #include "llama.h"
+#include "moe.h"
 #include "qwen.h"
 #include "glm.h"
 #include "minicpm.h"
@@ -109,6 +110,8 @@ namespace fastllm {
             model->model_type = "internlm";
         } else if (modelType == "llama") {
             model = (basellm*)(new LlamaModel());
+        } else if (modelType == "moe" || modelType == "qwen2_moe") {
+            model = (basellm*)(new MoeModel());
         } else if (modelType == "qwen2") {
             model = new LlamaModel();
             model->model_type = "qwen";
