@@ -148,10 +148,10 @@ namespace fastllm {
                         Data middle;
                         Cat(qBias, kBias, -1, middle);
                         Cat(middle, vBias, -1, weight.weight[mergeQkvBiasName]);
+                        weight.weight[mergeQkvBiasName].name = mergeQkvBiasName;
                     } else {
                         weight.weight[mergeQkvBiasName] = Data();
                     }
-                    weight.weight[mergeQkvBiasName].name = mergeQkvBiasName;
 
                     weight.weight[mergeQkvWeightName] = Data(q.dataType, {q.dims[0] + k.dims[0] + v.dims[0], q.dims[1]});
                     Data &mergeQKV = weight.weight[mergeQkvWeightName];
