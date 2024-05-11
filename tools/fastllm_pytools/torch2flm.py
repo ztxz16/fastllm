@@ -209,8 +209,8 @@ def tofile(exportPath,
                 pass
         elif isinstance(tokenizer, PreTrainedTokenizerFast):
             modelInfo["tokenizer_add_dummy_prefix"] = False
-            tokenizer_file_name = tokenizer.vocab_file if hasattr(tokenizer, "vocab_file") else tokenizer.vocab_files_names['tokenizer_file']
-            tokenizer_file = tokenizer.name_or_path + tokenizer_file_name
+            tokenizer_file_name = tokenizer.vocab_file if (hasattr(tokenizer, "vocab_file") and tokenizer.vocab_file) else tokenizer.vocab_files_names['tokenizer_file']
+            tokenizer_file = os.path.join(tokenizer.name_or_path, tokenizer_file_name)
             if os.path.exists(tokenizer_file):
                 with open(tokenizer_file, "r", encoding='utf-8') as f:
                     tokenizer_data = json.load(f)
@@ -323,7 +323,10 @@ def tofile(exportPath,
                 ori_data_type = 7
                 ori_np_data_type = np.float16
 
-        cur = dict[key].numpy().astype(ori_np_data_type)
+        if (dict[key].dtype == torch.bfloat16):
+            cur = dict[key].half().numpy().astype(ori_np_data_type)
+        else:
+            cur = dict[key].numpy().astype(ori_np_data_type)
         
         weight_name = key
         if hasattr(model, "peft_config"):
