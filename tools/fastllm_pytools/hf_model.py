@@ -113,12 +113,12 @@ def create(model,
                 pass
         elif isinstance(tokenizer, PreTrainedTokenizerFast):
             modelInfo["tokenizer_add_dummy_prefix"] = False
-            tokenizer_file_name = tokenizer.vocab_file if hasattr(tokenizer, "vocab_file") else tokenizer.vocab_files_names['tokenizer_file']
-            tokenizer_file = tokenizer.name_or_path + tokenizer_file_name
+            tokenizer_file_name = tokenizer.vocab_file if (hasattr(tokenizer, "vocab_file") and tokenizer.vocab_file) else tokenizer.vocab_files_names['tokenizer_file']
+            tokenizer_file = os.path.join(tokenizer.name_or_path, tokenizer_file_name)
             if os.path.exists(tokenizer_file):
                 with open(tokenizer_file, "r", encoding='utf-8') as f:
                     tokenizer_data = json.load(f)
-                    if "normalizers" in tokenizer_data["normalizer"]:
+                    if "normalizer" in tokenizer_data and tokenizer_data["normalizer"] and "normalizers" in tokenizer_data["normalizer"]:
                         for normalizer in tokenizer_data["normalizer"]["normalizers"]:
                             if normalizer["type"] == "Prepend" and \
                                     (normalizer["prepend"] == '▁' or normalizer["prepend"] == ' '):
