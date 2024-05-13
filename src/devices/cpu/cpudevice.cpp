@@ -29,6 +29,7 @@ namespace fastllm {
         this->ops["RMSNorm"] = (BaseOperator*)(new CpuRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CpuLinearOp());
         this->ops["Split"] = (BaseOperator*)(new CpuSplitOp());
+        this->ops["Repeat"] = (BaseOperator*)(new CpuRepeatOp());
         this->ops["Cat"] = (BaseOperator*)(new CpuCatOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CpuCatDirectOp());
         this->ops["MatMul"] = (BaseOperator*)(new CpuMatMulOp());
@@ -1999,6 +2000,50 @@ namespace fastllm {
             inputStride * unitSize, outputStride * unitSize, (end - start) * inner * unitSize, GetAlivePool());
     }
 
+    void CpuRepeatOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int repeatTimes = intParams.find("repeatTimes") != intParams.end() ? intParams.find("repeatTimes")->second : 1;
+
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        std::vector <int> dims = input.dims;
+        dims[axis] *= repeatTimes;
+
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    void CpuRepeatOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int repeatTimes = intParams.find("repeatTimes") != intParams.end() ? intParams.find("repeatTimes")->second : 1;
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        output.Allocate();
+
+        int outer = output.Count(0) / output.Count(axis);
+        int inputStride = input.Count(axis);
+        int outputStride = output.Count(axis);
+        int channels = input.dims[axis];
+        int inner = input.strides[axis];
+        int unitSize = input.unitSize;
+
+        for (int o = 0; o < outer; o++) {
+            for (int t = 0; t < repeatTimes; t++) {
+                memcpy(output.cpuData + o * outputStride * unitSize + t * channels * inner * unitSize,
+                    input.cpuData + (o * inputStride) * unitSize,
+                    channels * inner * unitSize);
+            }
+        }
+    }
+
     void CpuCatOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input0 = *(datas.find("input0")->second);
@@ -2025,7 +2070,7 @@ namespace fastllm {
         axis = (axis % dimsLen + dimsLen) % dimsLen;
 
         for (int i = 0; i < dimsLen; i++) {
-            if (i != axis) {
+            if (i != axis) {                
                 AssertInFastLLM(input0.dims[i] == input1.dims[i], "Cat Error: input's shape doesn't match.");
             }
         }
@@ -2104,16 +2149,6 @@ namespace fastllm {
             }
 
             return;
-        }
-
-        AssertInFastLLM(input0.dims.size() == input1.dims.size(), "Cat Error: input's shape's size should be same.\n");
-        int dimsLen = input0.dims.size();
-        axis = (axis % dimsLen + dimsLen) % dimsLen;
-
-        for (int i = 0; i < dimsLen; i++) {
-            if (i != axis) {
-                AssertInFastLLM(input0.dims[i] == input1.dims[i], "Cat Error: input's shape doesn't match.");
-            }
         }
 
         std::vector <int> dims = input0.dims;
