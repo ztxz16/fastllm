@@ -6,7 +6,6 @@
 #define FASTLLM_CPUDEVICE_H
 
 #include "device.h"
-#include "cputhreadpool.h"
 #include "alivethreadpool.h"
 
 namespace fastllm {
@@ -21,7 +20,6 @@ namespace fastllm {
         bool CopyDataFromCPU(void *dst, void *src, size_t size); // 不重要, cpu device不会进行这个操作
 
         int threads = 4;
-        ThreadPool *threadPool = nullptr;
     };
 
     class CpuToFloat16 : BaseOperator {
