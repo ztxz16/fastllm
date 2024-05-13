@@ -186,6 +186,7 @@ namespace fastllm {
 
         /// TODO: data->clear()
         delete[] data->cpuData;
+        data->cpuData = new uint8_t[1];
     }
 
     void TfaccClient::UnregisterFastllmData(const std::string &dataName) {
