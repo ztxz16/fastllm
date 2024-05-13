@@ -1,28 +1,21 @@
 //
-// Created by huangyuyang on 6/1/23.
+// Created by huangyuyang on 5/9/24.
 //
 
-#ifndef FASTLLM_LLAMA_H
-#define FASTLLM_LLAMA_H
+#ifndef FASTLLM_DEEPSEEKV2_H
+#define FASTLLM_DEEPSEEKV2_H
 
 #include "basellm.h"
+#include "llama.h"
+
 #include "cmath"
 
 #include <iostream>
 
 namespace fastllm {
-
-    enum RoPEType { // 位置编码外推类型
-        BASE = 0,
-        LINEAR_SCALE = 1,
-        STATIC_NTK = 2,
-        DYMAMIC_NTK = 3,
-        YARN = 4
-    };
-
-    class LlamaModel: public basellm {
+    class DeepSeekV2Model: public basellm {
     public:
-        LlamaModel (); // 构造函数
+        DeepSeekV2Model (); // 构造函数
 
         virtual void InitParams(); // 初始化参数信息
 
@@ -86,9 +79,27 @@ namespace fastllm {
 
         float rms_norm_eps = 1e-6;
 
-        bool mergeQKV = false;
-        bool mergeSwiglu = false;
+        float routed_scaling_factor;
+        int num_experts_per_tok;
+        int num_experts;
+        bool norm_topk_prob;
+
+        int max_position_embeddings;
+        int rope_theta;
+        int q_lora_rank;
+        int qk_rope_head_dim;
+        int kv_lora_rank;
+        int v_head_dim;
+        int qk_nope_head_dim;
+        int q_head_dim;
+
+        int rope_scaling_beta_fast;
+        int rope_scaling_beta_slow;
+        float rope_scaling_mscale;
+        float rope_scaling_mscale_all_dim;
+        float rope_scaling_original_max_position_embeddings;
+        std::string rope_scaling_type;
     };
 }
 
-#endif //FASTLLM_LLAMA_H
+#endif //FASTLLM_DEEPSEEKV2_H
