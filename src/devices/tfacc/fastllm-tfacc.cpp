@@ -183,6 +183,9 @@ namespace fastllm {
         }
 
         SendLongMessage(buffer.buffer.data(), buffer.buffer.size());
+
+        /// TODO: data->clear()
+        delete[] data->cpuData;
     }
 
     void TfaccClient::UnregisterFastllmData(const std::string &dataName) {

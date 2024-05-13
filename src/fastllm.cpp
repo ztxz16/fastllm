@@ -2205,6 +2205,12 @@ namespace fastllm {
         }, {}, {{"axis", axis}, {"start", start}, {"end", end}});
     }
 
+    void Repeat(const Data &input, int axis, int repeatTimes, Data &output) {
+        curExecutor->Run("Repeat", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {{"axis", axis}, {"repeatTimes", repeatTimes}});
+    }
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output) {
         curExecutor->Run("Cat", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}, {"output", &output}
