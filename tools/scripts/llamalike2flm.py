@@ -21,6 +21,9 @@ if __name__ == "__main__":
     elif model.config.model_type == "qwen2":
         torch2flm.tofile(exportPath, model, tokenizer, pre_prompt="<|im_start|>system\nYou are a helpful assistant.<|im_end|>", user_role="<|im_start|>user\n",
                          bot_role="<|im_end|><|im_start|>assistant\n", history_sep="<|im_end|>\n", dtype = dtype)
+    elif model.config.model_type == "qwen2_moe":
+        torch2flm.tofile(exportPath, model, tokenizer, pre_prompt="<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n", user_role="<|im_start|>user\n",
+                        bot_role="<|im_end|>\n<|im_start|>assistant\n", history_sep="<|im_end|>\n", eos_id = tokenizer.eos_token_id, dtype = dtype)
     # add custom code here
     else:
         torch2flm.tofile(exportPath, model, tokenizer, pre_prompt = "", user_role = "", 

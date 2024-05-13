@@ -27,6 +27,14 @@ def create(model,
            history_sep = None,
            dtype = "float16",
            group = -1):
+    int4g_groupcnt = -1
+    if (dtype.startswith("int4g") and len(dtype) > 5):
+        try:
+            int4g_groupcnt = int(dtype[5:])
+            dtype = "int4g";
+        except:
+            print("dtype should be like \"int4g256\"")
+            exit(0)
     if (dtype not in fastllm_data_type_dict):
         print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
         exit(0)
@@ -246,7 +254,7 @@ def create(model,
                                              len(dict[key].shape),
                                              (ctypes.c_int * len(dict[key].shape))(*list(dict[key].shape)),
                                              to_data_type, cur_weight_type, ori_data_type,
-                                             dict[key].numpy().astype(ori_np_data_type).ctypes.data_as(ctypes.c_void_p));
+                                             dict[key].numpy().astype(ori_np_data_type).ctypes.data_as(ctypes.c_void_p), int4g_groupcnt);
         tot += 1;
         print("convert (", tot, "/", len(dict), end = " )\r");
         dict[key].to(torch.device("meta"))
