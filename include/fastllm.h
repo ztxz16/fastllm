@@ -19,7 +19,6 @@
 #include <memory>
 #include <locale>
 #include <codecvt>
-#include "devices/cpu/cputhreadpool.h"
 #include "devices/cpu/alivethreadpool.h"
 
 #ifdef USE_SENTENCEPIECE
@@ -36,7 +35,6 @@ namespace fastllm {
     bool GetLowMemMode();
     int GetThreads();
     bool GetKVCacheInCPU();
-    ThreadPool *GetPool();
     AliveThreadPool *GetAlivePool();
 
     struct GenerationConfig {

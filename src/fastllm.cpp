@@ -39,6 +39,7 @@
 namespace py = pybind11;
 #endif
 
+#include <mutex>
 namespace fastllm {
     std::map <std::string, int> defaultDeviceMap;
     Executor defaultExecutor;
@@ -46,7 +47,6 @@ namespace fastllm {
 
     static std::mutex globalLocker;
     static int threads = 4;
-    static ThreadPool *fastllmThreadPool = nullptr;
     static AliveThreadPool *fastllmAliveThreadPool = nullptr;
     static bool lowMemMode = false;
     static bool kvCacheInCPU = false;
@@ -97,20 +97,7 @@ namespace fastllm {
     }
 
     void SetThreads(int t) {
-#ifdef PY_API
-        py::gil_scoped_release release;
-#endif
-        globalLocker.lock();
-        threads = t;
-        if (fastllmThreadPool != nullptr) {
-            fastllmThreadPool->Shutdown();
-            delete fastllmThreadPool;
-        }
-        fastllmThreadPool = new ThreadPool(t);
-        globalLocker.unlock();
-#ifdef PY_API
-        py::gil_scoped_acquire acquire;
-#endif
+        SetAliveThreads(t);
     }
 
     void SetLowMemMode(bool m) {
@@ -134,13 +121,6 @@ namespace fastllm {
             SetAliveThreads(threads);
         }
         return fastllmAliveThreadPool;
-    }
-
-    ThreadPool *GetPool() {
-        if (fastllmThreadPool == nullptr) {
-            SetThreads(threads);
-        }
-        return fastllmThreadPool;
     }
     
 #ifdef USE_MMAP
@@ -1717,30 +1697,82 @@ namespace fastllm {
         return;
     }
 
-    void GroupQuantizationMultiThread(int st, int end, int m,
-                                    float *f, uint8_t *u8, LowBitConfig *configs, int bit, int group, int groupCnt) {
-        int type = (bit == 4) ? 1 : 0;
-        for (int i = st; i < end; i++) {
-            for (int g = 0; g < group; g++) {
-                int cid = i * group + g;
-                int groupStart = g * groupCnt;
-                int groupEnd = std::min((g + 1) * groupCnt, m);
+    struct MultiThreadGroupQuantizationOp : MultiThreadBaseOp {
+        int st, end, m;
+        float *f;
+        uint8_t *u8;
+        LowBitConfig *configs;
+        int bit;
+        int group, groupCnt;
 
+        MultiThreadGroupQuantizationOp (int st, int end, int m,
+                                        float *f, uint8_t *u8, LowBitConfig *configs, int bit, int group, int groupCnt) :
+                                        st(st), end(end), m(m), f(f), u8(u8), configs(configs), bit(bit), group(group), groupCnt(groupCnt) {}
+        
+        void Run() {
+            int type = (bit == 4) ? 1 : 0;
+            for (int i = st; i < end; i++) {
+                for (int g = 0; g < group; g++) {
+                    int cid = i * group + g;
+                    int groupStart = g * groupCnt;
+                    int groupEnd = std::min((g + 1) * groupCnt, m);
+
+                    float minValue = 1e9, maxValue = -1e9;
+                    for (int j = groupStart; j < groupEnd; j++) {
+                        minValue = std::min(minValue, f[i * m + j]);
+                        maxValue = std::max(maxValue, f[i * m + j]);
+                    }
+                    if (bit == 8) {
+                        configs[cid] = LowBitConfig(minValue, maxValue, 8, type);
+                        for (int j = groupStart; j < groupEnd; j++) {
+                            u8[i * m + j] = configs[cid].quantization(f[i * m + j]);
+                        }
+                    } else {
+                        configs[cid] = LowBitConfig(minValue, maxValue, 4, type);
+                        for (int j = groupStart; j < groupEnd; j++) {
+                            int id = (i * m + j) / 2;
+                            uint8_t value = configs[cid].quantization(f[i * m + j]);
+                            if ((i * m + j) % 2) {
+                                u8[id] = (u8[id] & 0xF0) | value;
+                            } else {
+                                u8[id] = (u8[id] & 0xF) | (value << 4);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    struct MultiThreadPerChannelQuantizationOp : MultiThreadBaseOp {
+        int st, end, m;
+        float *f;
+        uint8_t *u8;
+        LowBitConfig *configs;
+        int bit;
+
+        MultiThreadPerChannelQuantizationOp (int st, int end, int m,
+                                           float *f, uint8_t *u8, LowBitConfig *configs, int bit) :
+                                           st(st), end(end), m(m), f(f), u8(u8), configs(configs), bit(bit) {}
+    
+        void Run() {
+            int type = (bit == 4) ? 1 : 0;
+            for (int i = st; i < end; i++) {
                 float minValue = 1e9, maxValue = -1e9;
-                for (int j = groupStart; j < groupEnd; j++) {
+                for (int j = 0; j < m; j++) {
                     minValue = std::min(minValue, f[i * m + j]);
                     maxValue = std::max(maxValue, f[i * m + j]);
                 }
                 if (bit == 8) {
-                    configs[cid] = LowBitConfig(minValue, maxValue, 8, type);
-                    for (int j = groupStart; j < groupEnd; j++) {
-                        u8[i * m + j] = configs[cid].quantization(f[i * m + j]);
+                    configs[i] = LowBitConfig(minValue, maxValue, 8, type);
+                    for (int j = 0; j < m; j++) {
+                        u8[i * m + j] = configs[i].quantization(f[i * m + j]);
                     }
                 } else {
-                    configs[cid] = LowBitConfig(minValue, maxValue, 4, type);
-                    for (int j = groupStart; j < groupEnd; j++) {
+                    configs[i] = LowBitConfig(minValue, maxValue, 4, type);
+                    for (int j = 0; j < m; j++) {
                         int id = (i * m + j) / 2;
-                        uint8_t value = configs[cid].quantization(f[i * m + j]);
+                        uint8_t value = configs[i].quantization(f[i * m + j]);
                         if ((i * m + j) % 2) {
                             u8[id] = (u8[id] & 0xF0) | value;
                         } else {
@@ -1750,36 +1782,7 @@ namespace fastllm {
                 }
             }
         }
-    }
-
-    void PerChannelQuantizationMultiThread(int st, int end, int m,
-                                           float *f, uint8_t *u8, LowBitConfig *configs, int bit) {
-        int type = (bit == 4) ? 1 : 0;
-        for (int i = st; i < end; i++) {
-            float minValue = 1e9, maxValue = -1e9;
-            for (int j = 0; j < m; j++) {
-                minValue = std::min(minValue, f[i * m + j]);
-                maxValue = std::max(maxValue, f[i * m + j]);
-            }
-            if (bit == 8) {
-                configs[i] = LowBitConfig(minValue, maxValue, 8, type);
-                for (int j = 0; j < m; j++) {
-                    u8[i * m + j] = configs[i].quantization(f[i * m + j]);
-                }
-            } else {
-                configs[i] = LowBitConfig(minValue, maxValue, 4, type);
-                for (int j = 0; j < m; j++) {
-                    int id = (i * m + j) / 2;
-                    uint8_t value = configs[i].quantization(f[i * m + j]);
-                    if ((i * m + j) % 2) {
-                        u8[id] = (u8[id] & 0xF0) | value;
-                    } else {
-                        u8[id] = (u8[id] & 0xF) | (value << 4);
-                    }
-                }
-            }
-        }
-    }
+    };
 
     void WeightMap::SaveLowBitModel(const std::string &fileName, int bit) {
         AssertInFastLLM(fileName != "", "Error: output's name shouldn't be empty.\n");
@@ -1895,11 +1898,10 @@ namespace fastllm {
                     } else {
                         // Linear层权重，分通道量化之
                         int k = data.dims[0], m = data.dims[1];
-                        int threadNum = 8;
+                        auto *pool = GetAlivePool();
+                        int threadNum = pool->threads.size();
                         int per = k / threadNum;
                         int cur = 0;
-                        auto pool = GetPool();
-                        std::vector <std::future <void> > futures;
                         std::vector<LowBitConfig> configs;
                         std::vector<uint8_t> uDatas;
                         configs.resize(k);
@@ -1909,18 +1911,23 @@ namespace fastllm {
                             bytes = (k * m + 1) / 2;
                         }
                         uDatas.resize(bytes);
+                        std::vector<fastllm::MultiThreadPerChannelQuantizationOp*> ops;
+                
                         for (int i = 0; i < threadNum; i++) {
                             int end = cur + per;
                             if (i == threadNum - 1) {
                                 end = k;
                             }
-                            futures.push_back(pool->Submit(PerChannelQuantizationMultiThread, cur, end, m,
-                                                              (float *) data.cpuData, uDatas.data(), configs.data(),
-                                                              bit));
+                            ops.push_back(new MultiThreadPerChannelQuantizationOp(cur, end, m,
+                                                              (float *) data.cpuData, uDatas.data(), configs.data(), bit));
                             cur = end;
                         }
-                        for (int i = 0; i < threadNum; i++) {
-                            futures[i].get();
+                        for (int i = 0; i < ops.size(); i++) {
+                            pool->PushOp(i, ops[i]);
+                        }
+                        for (int i = 0; i < ops.size(); i++) {
+                            pool->Wait(i);
+                            delete ops[i];
                         }
 
                         buffer.WriteInt(bit == 8 ? (int) DataType::INT8 : (int) DataType::INT4_NOZERO);
@@ -2020,15 +2027,14 @@ namespace fastllm {
             int bit = (dataType == DataType::INT4_GROUP) ? 4 : 8;
             int type = (bit == 4) ? 1 : 0;
             int k = data.dims[0], m = data.dims[1];
-            int threadNum = 8;
+            auto pool = GetAlivePool();
+            int threadNum = pool->threads.size();
             int per = k / threadNum;
             int cur = 0;
-            auto pool = GetPool();
             if (groupCnt == -1) {
                 groupCnt = 128;
             }
             int group = (m - 1) / groupCnt + 1;
-            std::vector <std::future <void> > futures;
             std::vector<LowBitConfig> configs;
             std::vector<uint8_t> uDatas;
             configs.resize(k * group);
@@ -2038,17 +2044,22 @@ namespace fastllm {
                 bytes = (k * m + 1) / 2;
             }
             uDatas.resize(bytes);
+            std::vector<fastllm::MultiThreadGroupQuantizationOp*> ops;
             for (int i = 0; i < threadNum; i++) {
                 int end = cur + per;
                 if (i == threadNum - 1) {
                     end = k;
                 }
-                futures.push_back(pool->Submit(GroupQuantizationMultiThread, cur, end, m,
+                ops.push_back(new MultiThreadGroupQuantizationOp(cur, end, m,
                                                 (float *) oriData, uDatas.data(), configs.data(), bit, group, groupCnt));
                 cur = end;
             }
-            for (int i = 0; i < threadNum; i++) {
-                futures[i].get();
+            for (int i = 0; i < ops.size(); i++) {
+                pool->PushOp(i, ops[i]);
+            }
+            for (int i = 0; i < ops.size(); i++) {
+                pool->Wait(i);
+                delete ops[i];
             }
 
             data.perChannelAxis = 0;
@@ -2070,11 +2081,10 @@ namespace fastllm {
             int bit = (dataType == DataType::INT4_NOZERO) ? 4 : 8;
             int type = (bit == 4) ? 1 : 0;
             int k = data.dims[0], m = data.dims[1];
-            int threadNum = 8;
+            auto pool = GetAlivePool();
+            int threadNum = pool->threads.size();
             int per = k / threadNum;
             int cur = 0;
-            auto pool = GetPool();
-            std::vector <std::future <void> > futures;
             std::vector<LowBitConfig> configs;
             std::vector<uint8_t> uDatas;
             configs.resize(k);
@@ -2084,19 +2094,24 @@ namespace fastllm {
                 bytes = (k * m + 1) / 2;
             }
             uDatas.resize(bytes);
+            std::vector<fastllm::MultiThreadPerChannelQuantizationOp*> ops;
             for (int i = 0; i < threadNum; i++) {
                 int end = cur + per;
                 if (i == threadNum - 1) {
                     end = k;
                 }
-                futures.push_back(pool->Submit(PerChannelQuantizationMultiThread, cur, end, m,
-                                                  (float *) oriData, uDatas.data(), configs.data(), bit));
+                ops.push_back(new MultiThreadPerChannelQuantizationOp(cur, end, m,
+                (float *) oriData, uDatas.data(), configs.data(), bit));
                 cur = end;
             }
-            for (int i = 0; i < threadNum; i++) {
-                futures[i].get();
+            for (int i = 0; i < ops.size(); i++) {
+                pool->PushOp(i, ops[i]);
             }
-
+            for (int i = 0; i < ops.size(); i++) {
+                pool->Wait(i);
+                delete ops[i];
+            }
+            
             data.perChannelAxis = 0;
             data.perChannelsConfigs.resize(k);
             data.zeros.resize(k);
