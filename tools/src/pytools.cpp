@@ -209,7 +209,7 @@ extern "C" {
     }
 
     DLL_EXPORT void add_weight_llm_model(int modelId, char *key, int dimsLen, void *dimsData,
-                              int dataType, int weightType, int oriDataType, void *oriData) {
+                              int dataType, int weightType, int oriDataType, void *oriData, int groupCnt) {
         auto model = models.GetModel(modelId);
         std::vector <int> dims = std::vector <int> (dimsLen);
         for (int i = 0; i < dims.size(); i++) {
@@ -219,7 +219,7 @@ extern "C" {
                                 (fastllm::DataType)dataType,
                                 (fastllm::WeightType)weightType,
                                 (fastllm::DataType)oriDataType,
-                                (uint8_t*)oriData);
+                                (uint8_t*)oriData, groupCnt);
         return;
     }
 
