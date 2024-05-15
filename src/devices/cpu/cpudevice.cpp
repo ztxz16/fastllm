@@ -3525,12 +3525,32 @@ namespace fastllm {
         same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
         same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[2] == 1);
         same |= ((axis == std::vector <int>{0, 2, 1, 3}) && (input.dims[1] == 1 || input.dims[2] == 1));
+        same |= ((axis == std::vector <int>{1, 0, 2, 3}) && (input.dims[0] == 1 || input.dims[1] == 1));
         if (same) {
             input.Resize(new_dims);
             return;
         }
 
-        if (axis == std::vector<int> {0, 2, 1, 3}) {
+        bool swapLastTwoDims = false;
+        if (input.dims.size() >= 2 && input.dims.size() == new_dims.size()) {
+            std::vector <int> dims = input.dims;
+            std::swap(dims[dims.size() - 2], dims[dims.size() - 1]);
+            swapLastTwoDims = (dims == new_dims);
+        }
+
+        if (swapLastTwoDims && input.dataType == DataType::FLOAT32) {
+            int dl = input.dims.size();
+            int outer = input.Count(0) / input.Count(dl - 2);
+            int n = input.dims[dl - 2], m = input.dims[dl - 1];
+            float *temp = new float[n * m];
+            float *finput = (float*)input.cpuData;
+            for (int i = 0; i < outer; i++) {
+                memcpy(temp, finput + i * n * m, n * m * sizeof(float));
+                Transpose(finput + i * n * m, temp, n, m, n, m);
+            }
+            delete[] temp;
+            input.Resize(new_dims);
+        } else if (axis == std::vector<int> {0, 2, 1, 3}) {
             std::vector <uint8_t> vold;
             vold.resize(input.GetBytes());
             RunMultiThreadMemcpy(vold.data(), input.cpuData, input.GetBytes(), GetAlivePool());

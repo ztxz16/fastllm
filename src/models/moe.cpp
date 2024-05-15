@@ -237,6 +237,8 @@ namespace fastllm {
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+            bool canRunExSilu = CanRunLinearEx(LinearExType::ExSilu);
+
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     rms_norm_eps, attenInput);
 
@@ -375,7 +377,6 @@ namespace fastllm {
 
             AddTo(hiddenStates, attenLastOutput);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);            
-
             // 2. moe mlp
             if (this->mergeSwiglu) {
                 // 这里是正常mlp
@@ -396,10 +397,11 @@ namespace fastllm {
                 Linear(attenInput, weight[gateWeightName], Data(), routerLogits);
                 Softmax(routerLogits, routerLogits, -1);
                 TopK(routerLogits, gate, this->num_experts_per_tok);
-                moeFinal = Data();
-                moeFinal.Resize({0, attenInput.dims[1]});
-                moeFinal.Expansion(attenInput.dims);
-
+                if (batch * len > 1) {
+                    moeFinal.Resize({0, attenInput.dims[1]});
+                    moeFinal.Expansion(attenInput.dims);
+                }
+                
                 gate.ToDevice(DataDevice::CPU);
                 float *gateData = (float*)gate.cpuData;
                 for (int b = 0; b < batch * len; b++) {
@@ -414,7 +416,7 @@ namespace fastllm {
                     for (int j = 0; j < this->num_experts_per_tok; j++) {
                         int idx = (int)(gateData[(b * this->num_experts_per_tok + j) * 2] + 1e-1);
                         float value = gateData[(b * this->num_experts_per_tok + j) * 2 + 1];
-                        if (CanRunLinearEx(LinearExType::ExSilu)) {
+                        if (canRunExSilu) {
                             LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
                         } else {
                             Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gate_proj.weight"], Data(), w1);
@@ -426,7 +428,7 @@ namespace fastllm {
                         AddTo(moePart, w2, value);
                     }
 
-                    if (CanRunLinearEx(LinearExType::ExSilu)) {
+                    if (canRunExSilu) {
                         LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
                     } else {
                         Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert.gate_proj.weight"], Data(), w1);
@@ -439,12 +441,20 @@ namespace fastllm {
                     sharedGate.ToDevice(DataDevice::CPU);
                     AddTo(moePart, w2, 1 / (1 + exp(-((float*)sharedGate.cpuData)[0])));
 
-                    CatDirect(moeFinal, moePart, 0);
+                    if (batch * len > 1) {
+                        CatDirect(moeFinal, moePart, 0);
+                    }
                 }
 
-                moeFinal.Reshape(hiddenStates.dims);
-                AddTo(hiddenStates, moeFinal);
+                if (batch * len > 1) {
+                    moeFinal.Reshape(hiddenStates.dims);
+                    AddTo(hiddenStates, moeFinal);
+                } else {
+                    moePart.Reshape(hiddenStates.dims);
+                    AddTo(hiddenStates, moePart);
+                }
             }
+
         }
 
         Data logits, topk;
@@ -854,6 +864,9 @@ namespace fastllm {
 
     void MoeModel::WarmUp() {
         printf("Warmup...\n");
+        int oldTopk = this->num_experts_per_tok;
+        this->num_experts_per_tok = this->num_experts;
+
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
         Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});
         Data positionIds = Data(DataType::FLOAT32, {1, 1}, {0, 0});
@@ -864,6 +877,7 @@ namespace fastllm {
                                                    Data(DataType::FLOAT32)));
         }
         Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+        this->num_experts_per_tok = oldTopk;
         printf("finish.\n");
     }
 }
