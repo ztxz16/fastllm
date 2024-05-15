@@ -75,7 +75,7 @@ namespace fastllm {
         qk_nope_head_dim = atoi(this->weight.dicts["qk_nope_head_dim"].c_str());
         q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
 
-        num_experts = atoi(this->weight.dicts["num_experts"].c_str());
+        num_experts = atoi(this->weight.dicts["n_routed_experts"].c_str());
         num_experts_per_tok = atoi(this->weight.dicts["num_experts_per_tok"].c_str());
         norm_topk_prob = (this->weight.dicts["norm_topk_prob"] == "true");
 
@@ -823,8 +823,10 @@ namespace fastllm {
     }
 
     void DeepSeekV2Model::WarmUp() {
-return;
         printf("Warmup...\n");
+        int oldTopk = this->num_experts_per_tok;
+        this->num_experts_per_tok = this->num_experts;
+
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
         Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});
         Data positionIds = Data(DataType::FLOAT32, {1, 1}, {0, 0});
@@ -836,5 +838,6 @@ return;
         }
         Forward(inputIds, attentionMask, positionIds, pastKeyValues);
         printf("finish.\n");
+        this->num_experts_per_tok = oldTopk;
     }
 }
