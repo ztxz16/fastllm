@@ -46,7 +46,6 @@ namespace fastllm {
         float temperature = 1.0; // 温度参数，一般在0.1 ~ 1.0之间，设大这个参数可以带来结果的多样性
         bool output_logits = false; // 是否返回logits
         bool enable_hash_id = false; // 给会话添加hash id
-        bool add_special_tokens = true; // prompt添加special tokens（chatglm模型生效）
         std::multiset <int> stop_token_ids;
 
         bool IsSimpleGreedy() const {
