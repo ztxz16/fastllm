@@ -89,9 +89,7 @@ namespace fastllm {
         std::vector<float> results;
         LastTokensManager tokens(1, generationConfig.last_n);
         int promptLen = inputTokens[0].size(), index = 0;
-        int add_special_tokens = generationConfig.add_special_tokens? 1: 0;
-        FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}, {"add_special_tokens", add_special_tokens}},
-                      inputIds, attentionMask, positionIds);
+        FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}}, inputIds, attentionMask, positionIds);
         while (true) {
             auto st = std::chrono::system_clock::now();
             int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
@@ -123,8 +121,7 @@ namespace fastllm {
             results.clear();
 
             inputTokens[0] = std::vector<float> {(float)ret};
-            FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}}, {"add_special_tokens", add_special_tokens}
-                          inputIds, attentionMask, positionIds);
+            FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}}, inputIds, attentionMask, positionIds);
             if (index == generationConfig.output_token_limit) {
                 break;
             }
@@ -198,7 +195,6 @@ namespace fastllm {
         }
         params[0]["index"] = 0;
         int index = 0;
-        params[0]["add_special_tokens"] = generationConfig.add_special_tokens? 1: 0;
 
         LastTokensManager tokensManager (batch, generationConfig.last_n);
         std::vector <bool> isEnding = std::vector <bool> (batch, false);
