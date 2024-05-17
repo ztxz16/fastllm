@@ -99,6 +99,8 @@ namespace fastllm {
         float rope_scaling_mscale_all_dim;
         float rope_scaling_original_max_position_embeddings;
         std::string rope_scaling_type;
+
+        bool mergeSwiglu = false;
     };
 }
 
