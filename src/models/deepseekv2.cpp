@@ -207,6 +207,53 @@ namespace fastllm {
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
                             std::vector <std::vector <float>*> *retLogits) {
+        if (!mergeSwiglu) {
+            bool canMerge = true;
+            for (int i = 0; i < block_cnt; i++) {
+                for (int j = -1; j < this->num_experts; j++) {
+                    std::string w1WeightName = "model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".gate_proj.weight";
+                    std::string w3WeightName = "model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".up_proj.weight";
+                    std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".gateup_proj.weight";
+                    if (j == -1) {
+                        w1WeightName = "model.layers." + std::to_string(i) + ".mlp.shared_experts.gate_proj.weight";
+                        w3WeightName = "model.layers." + std::to_string(i) + ".mlp.shared_experts.up_proj.weight";
+                        swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.shared_experts.gateup_proj.weight";
+                    }
+
+                    if (weight.weight.find(w1WeightName) == weight.weight.end()) {
+                        continue;
+                    }
+
+                    Data &w1 = weight.weight[w1WeightName], &w3 = weight.weight[w3WeightName];
+                    if ((w1.dataType == DataType::INT4_GROUP && w1.dims[1] % w1.groupCnt != 0) || 
+                        (w3.dataType == DataType::INT4_GROUP && w3.dims[1] % w3.groupCnt != 0)) {
+                        canMerge = false;
+                        break;
+                    }
+
+                    weight.weight[swigluWeightName] = Data(w1.dataType, {w1.dims[0] + w3.dims[0], w1.dims[1]});
+                    Data &swiglu = weight.weight[swigluWeightName];
+                    swiglu.name = swigluWeightName;
+                    swiglu.Allocate();
+                    memcpy(swiglu.cpuData, w1.cpuData, w1.GetBytes());
+                    memcpy(swiglu.cpuData + w1.GetBytes(), w3.cpuData, w3.GetBytes());
+                        
+                    swiglu.perChannelAxis = w1.perChannelAxis;
+                    swiglu.group = w1.group;
+                    swiglu.groupCnt = w1.groupCnt;
+                    swiglu.perChannelsConfigs = AppendVector(w1.perChannelsConfigs, w3.perChannelsConfigs);
+                    swiglu.zeros = AppendVector(w1.zeros, w3.zeros);
+                    swiglu.scales = AppendVector(w1.scales, w3.scales);
+                    swiglu.mins = AppendVector(w1.mins, w3.mins);
+
+                    weight.weight.erase(w1WeightName);
+                    weight.weight.erase(w3WeightName);
+                }
+
+                this->mergeSwiglu = canMerge;
+            }           
+        }
+
         Data alibiData;
         if (this->weight.dicts["use_alibi"] == "1") {
             std::vector<float> alibi = GetInterleave(num_attention_heads);
@@ -386,26 +433,44 @@ namespace fastllm {
                         int idx = (int)(gateData[(b * this->num_experts_per_tok + j) * 2] + 1e-1);
                         float value = gateData[(b * this->num_experts_per_tok + j) * 2 + 1];
                         value *= routed_scaling_factor;
-                        if (CanRunLinearEx(LinearExType::ExSilu)) {
-                            LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                        if (this->mergeSwiglu) {
+                            if (CanRunLinearEx(LinearExType::ExSwiglu)) {
+                                LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gateup_proj.weight"], Data(), w1, LinearExType::ExSwiglu);
+                            } else {
+                                Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gateup_proj.weight"], Data(), w3);
+                                Swiglu(w3, w1);
+                            }
                         } else {
-                            Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gate_proj.weight"], Data(), w1);
-                            Silu(w1, w1);
+                            if (CanRunLinearEx(LinearExType::ExSilu)) {
+                                LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                            } else {
+                                Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gate_proj.weight"], Data(), w1);
+                                Silu(w1, w1);
+                            }
+                            Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".up_proj.weight"], Data(), w3);
+                            MulTo(w1, w3);
                         }
-                        Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".up_proj.weight"], Data(), w3);
-                        MulTo(w1, w3);
                         Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".down_proj.weight"], Data(), w2);
                         AddTo(moePart, w2, value);
                     }
 
-                    if (CanRunLinearEx(LinearExType::ExSilu)) {
-                        LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                    if (this->mergeSwiglu) {
+                        if (CanRunLinearEx(LinearExType::ExSwiglu)) {
+                            LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gateup_proj.weight"], Data(), w1, LinearExType::ExSwiglu);
+                        } else {
+                            Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gateup_proj.weight"], Data(), w3);
+                            Swiglu(w3, w1);
+                        }
                     } else {
-                        Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gate_proj.weight"], Data(), w1);
-                        Silu(w1, w1);
+                        if (CanRunLinearEx(LinearExType::ExSilu)) {
+                            LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                        } else {
+                            Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gate_proj.weight"], Data(), w1);
+                            Silu(w1, w1);
+                        }
+                        Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.up_proj.weight"], Data(), w3);
+                        MulTo(w1, w3);
                     }
-                    Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.up_proj.weight"], Data(), w3);
-                    MulTo(w1, w3);
                     Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.down_proj.weight"], Data(), w2);
                     AddTo(moePart, w2);
 
