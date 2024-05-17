@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import json
 import traceback
@@ -88,6 +89,8 @@ class FastLLmCompletion:
       
       query:str = ""
       history:List[Tuple[str, str]] = []
+      if request.prompt:
+         request.messages.append({"role": "user", "content": request.prompt})
       try:
           conversation: List[ConversationMessage] = []
           for m in request.messages:
@@ -214,6 +217,7 @@ class FastLLmCompletion:
                 model=model_name)
             data = chunk.model_dump_json(exclude_unset=True)
             yield f"data: {data}\n\n"
+            await asyncio.sleep(0)
             first_iteration = False
         
         # 2. content部分
@@ -233,6 +237,7 @@ class FastLLmCompletion:
                 model=model_name)
             data = chunk.model_dump_json(exclude_unset=True)
             yield f"data: {data}\n\n"
+            await asyncio.sleep(0)
 
         # 3. 结束标志
         choice_data = ChatCompletionResponseStreamChoice(
@@ -249,10 +254,13 @@ class FastLLmCompletion:
         data = chunk.model_dump_json(exclude_unset=True,
                                     exclude_none=True)
         yield f"data: {data}\n\n"
+        await asyncio.sleep(0)
       except ValueError as e:
         data = self.create_streaming_error_response(str(e))
         yield f"data: {data}\n\n"
+        await asyncio.sleep(0)
       yield "data: [DONE]\n\n"
+      await asyncio.sleep(0)
       
   def create_streaming_error_response(
           self,
