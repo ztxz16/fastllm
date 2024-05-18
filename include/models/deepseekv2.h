@@ -49,11 +49,6 @@ namespace fastllm {
                 const std::vector <GenerationConfig> &generationConfigs,
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
-                
-        // 根据输入的tokens生成LLM推理的输入
-        virtual void FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
-                                   const std::map <std::string, int> &params,
-                                   Data &inputIds, Data &attentionMask, Data &positionIds);
 
         // 根据输入的tokens生成LLM推理的输入
         virtual void FillLLMInputsBatch(std::vector <std::vector <float> > &inputTokens,

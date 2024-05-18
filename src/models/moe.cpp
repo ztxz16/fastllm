@@ -768,37 +768,6 @@ namespace fastllm {
         return lastRet;
     }
 
-    void MoeModel::FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
-                                    const std::map <std::string, int> &params,
-                                    Data &inputIds, Data &attentionMask, Data &positionIds) {
-        inputIds.ToDevice(DataDevice::CPU);
-        attentionMask.ToDevice(DataDevice::CPU);
-        positionIds.ToDevice(DataDevice::CPU);
-
-        int index = params.find("index")->second;
-        int promptLen = params.find("promptLen")->second;
-
-        if (index == 0) {
-            int seqLen = inputTokens[0].size();
-
-            std::vector <float> vmask = std::vector <float> (seqLen * seqLen, 0);
-            std::vector <float> vpids = std::vector <float> (seqLen, 0);
-            for (int i = 0; i < seqLen; i++) {
-                vpids[i] = i;
-                for (int j = i + 1; j < seqLen; j++) {
-                    vmask[i * seqLen + j] = 1;
-                }
-            }
-            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, inputTokens[0]));
-            attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, seqLen}, vmask));
-            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vpids));
-        } else {
-            inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, inputTokens[0]));
-            attentionMask = Data();
-            positionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float) promptLen + index - 1}));
-        }
-    }
-
     void MoeModel::FillLLMInputsBatch(std::vector<std::vector<float>> &inputTokens,
                                           const std::vector<std::map<std::string, int>> &params,
                                           fastllm::Data &inputIds, fastllm::Data &attentionMask,
