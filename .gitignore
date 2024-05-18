@@ -4,6 +4,7 @@ token
 /cmake-build-debug/
 /build-tfacc/
 /build-android/
+/build-x86/
 /build-py/
 /build/
 /pyfastllm/build/
