@@ -1,4 +1,4 @@
-﻿#include "model.h"
+#include "model.h"
 
 struct RunConfig {
 	std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
@@ -62,6 +62,7 @@ int main(int argc, char **argv) {
     fastllm::SetThreads(config.threads);
     fastllm::SetLowMemMode(config.lowMemMode);
     auto model = fastllm::CreateLLMModelFromFile(config.path);
+    model->SetSaveHistoryChat(true);
 
     static std::string modelType = model->model_type;
     printf("欢迎使用 %s 模型. 输入内容对话，reset清空历史记录，stop退出程序.\n", model->model_type.c_str());
