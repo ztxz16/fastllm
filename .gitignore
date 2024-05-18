@@ -2,11 +2,7 @@
 *.pyc
 token
 /cmake-build-debug/
-/build-tfacc/
-/build-android/
-/build-x86/
-/build-py/
-/build/
+/build*
 /pyfastllm/build/
 /pyfastllm/dist/
 /.idea/

@@ -128,6 +128,8 @@ namespace fastllm {
 
         virtual void DisableAdapter();
 
+        virtual bool SetSaveHistoryChat(bool save);
+
         std::string model_type;
 
         std::string pre_prompt; // 最初对话的提示语
@@ -159,6 +161,11 @@ namespace fastllm {
         std::string adapterName;
 
         int tokensLimit = -1;
+
+        std::string lastPrompt = "";
+        std::vector<std::pair<Data, Data> > *lastKeyValues = nullptr;
+        int lastPromptTokens = 0;
+        bool saveHistoryChat = false;
     };
 }
 

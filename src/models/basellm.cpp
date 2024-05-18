@@ -56,8 +56,30 @@ namespace fastllm {
         preTokens = 0;
     }
     
-    std::string basellm::Response(const std::string &input, RuntimeResult retCb,
+    std::string basellm::Response(const std::string &oriInput, RuntimeResult retCb,
                                   const fastllm::GenerationConfig &generationConfig) {
+        std::string input = oriInput;
+        if (this->saveHistoryChat) {
+            if (lastKeyValues != nullptr) {
+                if (input.size() < lastPrompt.size() || (input.substr(0, lastPrompt.size()) != lastPrompt)) {
+                    lastPrompt = "";
+                    lastPromptTokens = 0;
+                    delete lastKeyValues;
+                    lastKeyValues = nullptr;
+                } else {
+                    input = input.substr(lastPrompt.size());
+                }
+            }
+        } else {
+            lastPrompt = "";
+            lastPromptTokens = 0;
+            delete lastKeyValues;
+            lastKeyValues = nullptr;
+        }
+
+        //printf("lastPrompt = %s\n", lastPrompt.c_str());
+        //printf("input = %s\n", input.c_str());
+
 #ifdef USE_CUDA
         FastllmCudaClearBigBuffer();
 #endif
@@ -77,18 +99,21 @@ namespace fastllm {
         }
         
         DataType testDataType = DataType::FLOAT32;
-        std::vector<std::pair<Data, Data> > pastKeyValues;
-        for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(testDataType),
-                                                   Data(testDataType)));
-            pastKeyValues.back().first.SetKVCache();
-            pastKeyValues.back().second.SetKVCache();
+        if (lastKeyValues == nullptr) {
+            lastKeyValues = new std::vector<std::pair<Data, Data> >();
+            for (int i = 0; i < block_cnt; i++) {
+                lastKeyValues->push_back(std::make_pair(Data(testDataType),
+                                                    Data(testDataType)));
+                lastKeyValues->back().first.SetKVCache();
+                lastKeyValues->back().second.SetKVCache();
+            }
         }
 
+        std::vector<std::pair<Data, Data> > &pastKeyValues = (*lastKeyValues);
         std::string retString = "";
         std::vector<float> results;
         LastTokensManager tokens(1, generationConfig.last_n);
-        int promptLen = inputTokens[0].size(), index = 0;
+        int promptLen = lastPromptTokens + inputTokens[0].size(), index = 0;
         FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}}, inputIds, attentionMask, positionIds);
         while (true) {
             auto st = std::chrono::system_clock::now();
@@ -141,6 +166,9 @@ namespace fastllm {
 #else
             retCb(-1, retString.c_str());
 #endif
+
+        lastPrompt += (input + retString);
+        lastPromptTokens = promptLen + index;
         return retString;
     }
 
@@ -784,19 +812,19 @@ printf("tot = %d\n", tot);
         int index = params.find("index")->second;
         int promptLen = params.find("promptLen")->second;
 
-        if (index == 0) {
+        if (inputTokens[0].size() > 1) {
             int seqLen = inputTokens[0].size();
 
-            std::vector <float> vmask = std::vector <float> (seqLen * seqLen, 0);
+            std::vector <float> vmask = std::vector <float> (seqLen * promptLen, 0);
             std::vector <float> vpids = std::vector <float> (seqLen, 0);
             for (int i = 0; i < seqLen; i++) {
-                vpids[i] = i;
+                vpids[i] = promptLen - seqLen + i;
                 for (int j = i + 1; j < seqLen; j++) {
-                    vmask[i * seqLen + j] = 1;
+                    vmask[i * promptLen + (promptLen - seqLen + j)] = 1;
                 }
             }
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, inputTokens[0]));
-            attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, seqLen}, vmask));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, promptLen}, vmask));
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vpids));
         } else {
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, inputTokens[0]));
@@ -820,5 +848,18 @@ printf("tot = %d\n", tot);
 
     void basellm::DisableAdapter() {
         adapterName = "";
+    }
+
+    bool basellm::SetSaveHistoryChat(bool save) {
+        if (this->model_type == "llama" || 
+            this->model_type == "moe" || 
+            this->model_type == "internlm" || 
+            this->model_type == "qwen2_moe" || 
+            this->model_type == "deepseek_v2" ||
+            this->model_type == "qwen") {
+            this->saveHistoryChat = save;
+            return true;
+        }
+        return false;
     }
 }
