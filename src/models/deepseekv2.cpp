@@ -277,6 +277,8 @@ namespace fastllm {
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     rms_norm_eps, attenInput);
 
+            std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+            std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string qaWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_a_proj.weight";
             std::string qaBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_a_proj.bias";
             std::string qRmsNormName = "model.layers." + std::to_string(i) + ".self_attn.q_a_layernorm.weight";
@@ -301,9 +303,14 @@ namespace fastllm {
 
             // 1.1 Get q, k, v
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
-            Linear(attenInput, this->weight[qaWeightName], this->weight[qaBiasName], qa);
-            RMSNorm(qa, this->weight[qRmsNormName], this->rms_norm_eps, qa);
-            Linear(qa, this->weight[qbWeightName], this->weight[qbBiasName], q);
+            if (this->weight.weight.find(qaWeightName) != this->weight.weight.end()) { 
+                Linear(attenInput, this->weight[qaWeightName], this->weight[qaBiasName], qa);
+                RMSNorm(qa, this->weight[qRmsNormName], this->rms_norm_eps, qa);
+                Linear(qa, this->weight[qbWeightName], this->weight[qbBiasName], q);
+            } else {
+                Linear(attenInput, this->weight[qWeightName], this->weight[qBiasName], q);
+            }
+            
             q.Reshape({bsz, seqlen, -1, q_head_dim});
             PermuteSelf(q, {0, 2, 1, 3});
             Split(q, -1, 0, qk_nope_head_dim, q_nope);
