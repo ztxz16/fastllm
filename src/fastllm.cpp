@@ -897,7 +897,7 @@ namespace fastllm {
             charByteDict[special_token] = L'\x100' + n;
         }
         byteCharDict[L'\x100' + n++] = L'\xAD';
-        charByteDict[L'\xAD'] = L'\x100' + n++;
+        charByteDict[L'\xAD'] = L'\x100' + (n - 1);
     }
 
     Tokenizer::~Tokenizer() {
