@@ -447,6 +447,16 @@ namespace fastllm {
                 uint16_t *h = (uint16_t*)cpuData;
                 std::fill(h, h + Count(0), float_to_half(v));
             }
+        } if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+            if (this->dataType == DataType::FLOAT32) {
+                std::vector <float> f = std::vector <float> (Count(0), v);
+                FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(float));
+            } else if (this->dataType == DataType::FLOAT16) {
+                std::vector <uint16_t> f = std::vector <uint16_t> (Count(0), float_to_half(v));
+                FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(uint16_t));
+            }
+#endif
         } else {
             // TODO: 别的设备上的初始化
         }
