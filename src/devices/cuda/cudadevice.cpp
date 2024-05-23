@@ -44,6 +44,7 @@ namespace fastllm {
         this->ops["MatMulTransBBatch"] = (BaseOperator*)(new CudaMatMulTransBBatchOp());
         this->ops["SoftMaxBatch"] = (BaseOperator*)(new CudaSoftmaxBatchOp());
         this->ops["CatDirectBatch"] = (BaseOperator*)(new CudaCatDirectBatchOp());
+        this->ops["AppendKVCachebatch"] = (BaseOperator*)(new CudaAppendKVCacheBatchOp());
         this->ops["AttentionBatch"] = (BaseOperator*)(new CudaAttentionBatchOp());
     }
 
