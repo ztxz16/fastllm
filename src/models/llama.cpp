@@ -604,23 +604,15 @@ namespace fastllm {
                 v.Reshape({-1, v.dims[2], v.dims[3]});
 
                 for (int b = 0; b < batch; b++) {
-                    pointersK[b] = (&curKs[b]);
-                    pointersV[b] = (&curVs[b]);
-                    pointersQ[b] = (&curQs[b]);
+                    curQs[b].Resize({q.dims[1], 1, q.dims[2]});
+                    curQs[b].FakeFrom(q, b * q.strides[0] * q.unitSize);
+                    curKs[b].Resize({k.dims[1], 1, k.dims[2]});
+                    curKs[b].FakeFrom(k, b * k.strides[0] * k.unitSize);
+                    curVs[b].Resize({v.dims[1], 1, v.dims[2]});
+                    curVs[b].FakeFrom(v, b * v.strides[0] * v.unitSize);
                 }
-                SplitBatch(k, 0, batch, pointersK);
-                SplitBatch(v, 0, batch, pointersV);
-                SplitBatch(q, 0, batch, pointersQ);
+
                 total = batch;
-                for (int b = 0; b < batch; b++) {
-                    auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
-                    std::swap(k.dims[0], k.dims[1]);
-                    k.strides[0] = k.dims[1] * k.dims[2]; k.strides[1] = k.dims[2];
-                    std::swap(v.dims[0], v.dims[1]);
-                    v.strides[0] = v.dims[1] * v.dims[2]; v.strides[1] = v.dims[2];
-                    std::swap(q.dims[0], q.dims[1]);
-                    q.strides[0] = q.dims[1] * q.dims[2]; q.strides[1] = q.dims[2];
-                }
             } else {
                 for (int b = 0; b < batch; b++) {
                     Split(k, 1, total, total + seqLens[b], curKs[b]);
@@ -686,27 +678,20 @@ namespace fastllm {
             CatDirectBatch(values, pointersV, 1);
 
             if (alibiData.dims.size() == 0 && all1 && batch > 1) {
+                attenOutput.ToDevice(q.dataDevice);
+                attenOutput.Resize({1, batch, embed_dim});
+                attenOutput.Allocate();
                 for (int b = 0; b < batch; b++) {
                     qs[b] = (&curQs[b]);
                     keys[b] = (pastKeyValues[b * block_cnt + i].first);
                     values[b] = (pastKeyValues[b * block_cnt + i].second);
                     masks[b] = attentionMask[b];
+                    curContextLayer[b].FakeFrom(attenOutput, b * embed_dim * attenOutput.unitSize);
                     contexts[b] = (&curContextLayer[b]);
 
                     outputSizes[b] = {1, qs[b]->dims[0], qs[b]->dims[1], keys[b]->dims[1]};
                 }
                 AttentionBatch(qs, keys, values, masks, contexts, qs[0]->dims[0] / values[0]->dims[0], 1.0 / scale_attn, 1);
-
-                for (int b = 0; b < batch; b++) {
-                    curContextLayer[b].dims[0] = outputSizes[b][2];
-                    curContextLayer[b].dims[1] = outputSizes[b][0];
-                    curContextLayer[b].dims[2] = embed_dim;
-                    curContextLayer[b].strides[0] = curContextLayer[b].dims[1] * curContextLayer[b].dims[2];
-                    curContextLayer[b].strides[1] = curContextLayer[b].dims[2];
-                    curContextLayer[b].strides[2] = 1;
-                    contexts[b] = (&curContextLayer[b]);
-                }
-                CatBatch(contexts, 1, attenOutput);
             } else {
                 for (int b = 0; b < batch; b++) {
                     auto &q = curQs[b], &k = curKs[b], &v = curVs[b];

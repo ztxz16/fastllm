@@ -221,6 +221,8 @@ namespace fastllm {
 
     class Data {
     public:
+        bool isFake = false; // 没有创建空间，指向别的data（无需销毁）
+
         long long cacheUid = 0; // 用来标注Cache id
         bool isKVCache = false; // 是否是KV Cache TODO: 做一些KVCache的管理
 
@@ -283,6 +285,8 @@ namespace fastllm {
         Data (const Data &ori); // 深拷贝
 
         void CopyFrom(const Data &ori); // 复制
+
+        void FakeFrom(const Data &ori, size_t offset); // 将data指针指向ori的data + offset，delete时不销毁
 
         uint64_t GetBytes() const; // 获取总字节数
 
@@ -561,6 +565,8 @@ namespace fastllm {
     void SoftmaxBatch(std::vector <Data*> &input, std::vector <Data*> &output, int axis);
 
     void CatDirectBatch(std::vector <Data*> &input0, std::vector <Data*> &input1, int axis);
+
+    void AppendKVCacheBatch(std::vector <Data*> &cache, const Data &input);
 
     void LoraLayer(Data &input, Data &weight, Data &loraA, Data &loraB, const Data &bias, Data &output, 
                    std::map <std::string, std::string> loraConfig);

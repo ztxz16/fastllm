@@ -63,6 +63,7 @@ namespace fastllm {
         this->ops["MatMulTransBBatch"] = (BaseOperator*)(new CpuMatMulTransBBatchOp());
         this->ops["SoftMaxBatch"] = (BaseOperator*)(new CpuSoftmaxBatchOp());
         this->ops["CatDirectBatch"] = (BaseOperator*)(new CpuCatDirectBatchOp());
+        this->ops["AppendKVCachebatch"] = (BaseOperator*)(new CpuAppendKVCacheBatchOp());
         this->ops["AttentionBatch"] = (BaseOperator*)(new CpuAttentionBatchOp());
     }
 
@@ -1144,36 +1145,52 @@ namespace fastllm {
         MultiThreadMultiplyOp(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride) : 
             a(a), b(b), c(c), n(n), m(m), k(k), kstride(kstride) {}
         
-        void Run() {
-#ifdef __ARM_FEATURE_DOTPROD
-            int block = 0;
-            for (; block < n; block++) {
-                uint8_t *weightWalk = b;
-                uint8_t *inputStart = a + block * m;
-
+        inline static void RunSomeBlock(uint8_t *weightWalk, uint8_t *inputStart, int32_t *c, 
+                            int curBlock, uint32x4_t *sum, uint8x16_t *vi, 
+                            int block, int k, int m, int kstride) {
                 for (int i = 0; i < k; i++) {
-                    int value = 0;
+                    std::vector <int> values = std::vector <int> (curBlock, 0);
                     uint8_t *inputWalk = inputStart;
                     int j = 0;
-                    uint32x4_t sum0 = {0, 0, 0, 0};
-                    for (; j + 31 < m; j += 32) {
-                        uint8x16_t vi = vld1q_u8(inputWalk);
-                        uint8x16_t vi0 = vld1q_u8(inputWalk + 16);
+
+                    for (int j = 0; j < curBlock; j++) {
+                        sum[j][0] = sum[j][1] = sum[j][2] = sum[j][3] = 0;
+                    }
+                    for (; j + 15 < m; j += 16) {
+                        for (int x = 0; x < curBlock; x++) {
+                            vi[x] = vld1q_u8(inputWalk + m * x);
+                        }
                         uint8x16_t vw = vld1q_u8(weightWalk);
-                        uint8x16_t vw0 = vld1q_u8(weightWalk + 16);
-                        sum0 = vdotq_u32(sum0, vi, vw);
-                        sum0 = vdotq_u32(sum0, vi0, vw0);
-                        inputWalk += 32;
-                        weightWalk += 32;
+                        for (int x = 0; x < curBlock; x++) {
+                            sum[x] = vdotq_u32(sum[x], vi[x], vw);
+                        }
+                        inputWalk += 16;
+                        weightWalk += 16;
+                    }
+                    for (int x = 0; x < curBlock; x++) {
+                        values[x] += sum[x][0] + sum[x][1] + sum[x][2] + sum[x][3];
                     }
 
-                    value += sum0[0] + sum0[1] + sum0[2] + sum0[3];
                     for (; j < m; j++) {
-                        value += (int)(*(weightWalk++)) * (*(inputWalk++));
+
                     }
-                    c[block * kstride + i] = value;
+
+                    for (int x = 0; x < curBlock; x++) {
+                        c[(block + x) * kstride + i] = values[x];
+                    }
                 }
-            }
+        }
+
+        void Run() {
+#ifdef __ARM_FEATURE_DOTPROD
+#define RUNBLOCK(x) for (; block + (x - 1) < n; block += (x)) RunSomeBlock(b, a + block * m, c, (x), sum, vi, block, k, m, kstride);
+            int block = 0;
+            uint32x4_t sum[16];
+            uint8x16_t vi[16];
+            RUNBLOCK(16);
+            RUNBLOCK(8);RUNBLOCK(7);RUNBLOCK(6);RUNBLOCK(5);
+            RUNBLOCK(4);RUNBLOCK(3);RUNBLOCK(2);RUNBLOCK(1);
+#undef RUNBLOCK
 #elif defined(__aarch64__)
             int block = 0;
             for (; block < n; block++) {
