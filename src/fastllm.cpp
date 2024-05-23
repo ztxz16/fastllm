@@ -278,6 +278,20 @@ namespace fastllm {
         CopyFrom(ori);
     }
 
+    void Data::FakeFrom(const Data &ori, size_t offset) {
+        this->isFake = true;
+        this->dataDevice = ori.dataDevice;
+        if (this->dataDevice == DataDevice::CPU) {
+            this->cpuData = ori.cpuData + offset;
+        } else if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+            this->cudaData = (void*)((uint8_t*)ori.cudaData + offset);
+#else
+            ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
+        }
+    }
+
     void Data::CopyFrom(const Data &ori) {
         this->name = ori.name;
         this->isKVCache = ori.isKVCache;
@@ -429,7 +443,7 @@ namespace fastllm {
     }
 
     void Data::Allocate() {
-        if (Count(0) > expansionSize) {
+        if (!isFake && Count(0) > expansionSize) {
             FreeSpace();
             MallocSpace(Count(0));
         }
@@ -533,6 +547,9 @@ namespace fastllm {
     }
 
     Data::~Data() {
+        if (isFake) {
+            return;
+        }
 #ifndef USE_MMAP
         delete[] this->cpuData;
 #endif
@@ -2436,6 +2453,12 @@ namespace fastllm {
         curExecutor->Run("CatDirectBatch", {
                 {"input0", (Data*)input0.data()}, {"input1", (Data*)input1.data()}
         }, {}, {{"axis", axis}, {"input0___batch", (int)input0.size()}, {"input1___batch", (int)input1.size()}});
+    }
+
+    void AppendKVCacheBatch(std::vector <Data*> &caches, const Data &input) {
+        curExecutor->Run("AppendKVCachebatch", {
+                {"caches", (Data*)caches.data()}, {"input", (Data*)&input}
+        }, {}, {{"caches___batch", (int)caches.size()}});
     }
 
     void AttentionBatch(std::vector <Data*> &q, std::vector <Data*> &k, std::vector <Data*> &v,
