@@ -1144,7 +1144,7 @@ namespace fastllm {
 
         MultiThreadMultiplyOp(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride) : 
             a(a), b(b), c(c), n(n), m(m), k(k), kstride(kstride) {}
-        
+#ifdef __ARM_FEATURE_DOTPROD
         inline static void RunSomeBlock(uint8_t *weightWalk, uint8_t *inputStart, int32_t *c, 
                             int curBlock, uint32x4_t *sum, uint8x16_t *vi, 
                             int block, int k, int m, int kstride) {
@@ -1180,6 +1180,7 @@ namespace fastllm {
                     }
                 }
         }
+#endif
 
         void Run() {
 #ifdef __ARM_FEATURE_DOTPROD
