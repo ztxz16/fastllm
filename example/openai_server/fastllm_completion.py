@@ -171,6 +171,7 @@ class FastLLmCompletion:
       result = ""
       for res in result_generator:
         result += res
+        asyncio.sleep(0)
 
       choice_data = ChatCompletionResponseChoice(
               index=0,
