@@ -304,7 +304,7 @@ namespace fastllm {
             dpitchs.push_back(input0Stride * unitSize);
             srcs.push_back(input1.cudaData);
             spitchs.push_back(input1Stride * unitSize);
-            widths.push_back(input1.dims[axis] * inner * unitSize);
+            widths.push_back(inner * unitSize);
             heights.push_back(outer);
         }
 
