@@ -131,6 +131,8 @@ namespace fastllm {
         Permute(inputIds, {1, 0}, inputIdsPermute);
         Embedding(inputIdsPermute, this->weight["transformer" + std::string((version == 2 ? ".embedding" : "")) +
                                                 ".word_embeddings.weight"], inputEmbeddings);
+        ToDataType(inputEmbeddings, this->dataType);
+
         Data &hiddenStates = inputEmbeddings;
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
@@ -326,6 +328,8 @@ namespace fastllm {
                 RMSNorm(hiddenStates, weight["transformer.encoder.final_layernorm.weight"], 1e-5, hiddenStates);
                 Linear(hiddenStates, weight["transformer.output_layer.weight"], Data(), logits);
             }
+
+            ToDataType(logits, DataType::FLOAT32);
             if (generationConfig.output_logits && retLogits != nullptr) {
                 int size = logits.dims.back();
                 logits.ToDevice(DataDevice::CPU);
@@ -380,6 +384,7 @@ namespace fastllm {
         Permute(inputIds, {1, 0}, inputIdsPermute);
         Embedding(inputIdsPermute, this->weight["transformer" + std::string((version == 2 ? ".embedding" : "")) +
                                                 ".word_embeddings.weight"], inputEmbeddings);
+        ToDataType(inputEmbeddings, this->dataType);
         Data &hiddenStates = inputEmbeddings;
         hiddenStates.ToDevice(DataDevice::CUDA);
         Data attenInput;
@@ -476,26 +481,16 @@ namespace fastllm {
             v.Resize({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
             q.Resize({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
 
-            Data contextLayer = Data(DataType::FLOAT32);
+            Data contextLayer = Data(this->dataType);
             int total = 0;
             if (all1 && batch > 1) {
                 for (int b = 0; b < batch; b++) {
-                    pointersK[b] = (&curKs[b]);
-                    pointersV[b] = (&curVs[b]);
-                    pointersQ[b] = (&curQs[b]);
-                }
-                SplitBatch(k, 0, batch, pointersK);
-                SplitBatch(v, 0, batch, pointersV);
-                SplitBatch(q, 0, batch, pointersQ);
-                total = batch;
-                for (int b = 0; b < batch; b++) {
-                    auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
-                    std::swap(k.dims[0], k.dims[1]);
-                    k.strides[0] = k.dims[1] * k.dims[2]; k.strides[1] = k.dims[2];
-                    std::swap(v.dims[0], v.dims[1]);
-                    v.strides[0] = v.dims[1] * v.dims[2]; v.strides[1] = v.dims[2];
-                    std::swap(q.dims[0], q.dims[1]);
-                    q.strides[0] = q.dims[1] * q.dims[2]; q.strides[1] = q.dims[2];
+                    curQs[b].Resize({q.dims[1], 1, q.dims[2]});
+                    curQs[b].FakeFrom(q, b * q.strides[0] * q.unitSize);
+                    curKs[b].Resize({k.dims[1], 1, k.dims[2]});
+                    curKs[b].FakeFrom(k, b * k.strides[0] * k.unitSize);
+                    curVs[b].Resize({v.dims[1], 1, v.dims[2]});
+                    curVs[b].FakeFrom(v, b * v.strides[0] * v.unitSize);
                 }
             } else {
                 PermuteSelf(k, {1, 0, 2});
@@ -719,6 +714,7 @@ namespace fastllm {
             RMSNorm(hiddenStates, weight["transformer.encoder.final_layernorm.weight"], 1e-5, hiddenStates);
             Linear(hiddenStates, weight["transformer.output_layer.weight"], Data(), logits);
         }
+        ToDataType(logits, DataType::FLOAT32);
         std::vector <int> lastRet;
         int total = 0;
         Data curLogit;
