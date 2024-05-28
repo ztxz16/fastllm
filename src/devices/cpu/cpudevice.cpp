@@ -3691,42 +3691,62 @@ namespace fastllm {
     }
 
     struct MultiThreadLlamaRotatePosition2DFloatOp : MultiThreadBaseOp {
+        DataType dataType;
         float *data, *positionIds, *sinData, *cosData;
         int bs, len, n, m, stride, spatial, posDim, rotaryDim;      
         int st, end;
 
         MultiThreadLlamaRotatePosition2DFloatOp 
-            (float *data, float *positionIds, float *sinData, float *cosData, 
+            (DataType dataType, float *data, float *positionIds, float *sinData, float *cosData, 
             int bs, int len, int n, int m, int stride, int spatial, int posDim, int rotaryDim, 
             int st, int end) : 
-            data(data), positionIds(positionIds), sinData(sinData), cosData(cosData), 
+            dataType(dataType), data(data), positionIds(positionIds), sinData(sinData), cosData(cosData), 
             bs(bs), len(len), n(n), m(m), stride(stride), spatial(spatial), posDim(posDim), rotaryDim(rotaryDim), 
             st(st), end(end) {}
 
         void Run() {
-            for (int idx = st; idx < end; idx++) {
-                int b = idx / len;
-                int l = idx % len;
-                int index = (int) ((float *) positionIds)[b * posDim + l];
-                float *sin = ((float *) sinData) + stride * index;
-                float *cos = ((float *) cosData) + stride * index;
-                float *d = (float *) data + (b * len + l) * spatial;
-                for (int i = 0; i < n; i++) {
-                    for (int j = 0; j < rotaryDim && j < m / 2; j++) {
-                        float a = d[j], b = d[j + m / 2];
-                        d[j] = a * cos[j] - b * sin[j];
-                        d[j + m / 2] = a * sin[j] + b * cos[j];
+            if (dataType == DataType::FLOAT32) {
+                for (int idx = st; idx < end; idx++) {
+                    int b = idx / len;
+                    int l = idx % len;
+                    int index = (int) ((float *) positionIds)[b * posDim + l];
+                    float *sin = ((float *) sinData) + stride * index;
+                    float *cos = ((float *) cosData) + stride * index;
+                    float *d = (float *) data + (b * len + l) * spatial;
+                    for (int i = 0; i < n; i++) {
+                        for (int j = 0; j < rotaryDim && j < m / 2; j++) {
+                            float a = d[j], b = d[j + m / 2];
+                            d[j] = a * cos[j] - b * sin[j];
+                            d[j + m / 2] = a * sin[j] + b * cos[j];
+                        }
+                        d += m;
                     }
-                    d += m;
+                }
+            } else {
+                for (int idx = st; idx < end; idx++) {
+                    int b = idx / len;
+                    int l = idx % len;
+                    int index = (int) ((float *) positionIds)[b * posDim + l];
+                    float *sin = ((float *) sinData) + stride * index;
+                    float *cos = ((float *) cosData) + stride * index;
+                    uint16_t *d = (uint16_t *) data + (b * len + l) * spatial;
+                    for (int i = 0; i < n; i++) {
+                        for (int j = 0; j < rotaryDim && j < m / 2; j++) {
+                            float a = fp16tofp32.dict[d[j]], b = fp16tofp32.dict[d[j + m / 2]];
+                            d[j] = float_to_half(a * cos[j] - b * sin[j]);
+                            d[j + m / 2] = float_to_half(a * sin[j] + b * cos[j]);
+                        }
+                        d += m;
+                    }
                 }
             }
         }
     };
 
-    static void RunMultiThreadLlamaRotatePosition2DFloat(float *data, float *positionIds, float *sinData, float *cosData, 
+    static void RunMultiThreadLlamaRotatePosition2DFloat(DataType dataType, float *data, float *positionIds, float *sinData, float *cosData, 
             int bs, int len, int n, int m, int stride, int spatial, int posDim, int rotaryDim, AliveThreadPool *pool) {
         if (bs * len == 1) {
-            (MultiThreadLlamaRotatePosition2DFloatOp(data, positionIds, sinData, cosData, bs, len, n, m, stride, spatial, posDim, rotaryDim, 0, bs * len)).Run();
+            (MultiThreadLlamaRotatePosition2DFloatOp(dataType, data, positionIds, sinData, cosData, bs, len, n, m, stride, spatial, posDim, rotaryDim, 0, bs * len)).Run();
             return;
         }
 
@@ -3737,7 +3757,7 @@ namespace fastllm {
         for (int i = 0; i < threadNum; i++) {
             int end = (i == threadNum - 1 ? (bs * len) : cur + per + (cur + per * (threadNum - i) < (bs * len)));
             ops.push_back(new MultiThreadLlamaRotatePosition2DFloatOp(
-                data, positionIds, sinData, cosData, bs, len, n, m, stride, spatial, posDim, rotaryDim, cur, end));
+                dataType, data, positionIds, sinData, cosData, bs, len, n, m, stride, spatial, posDim, rotaryDim, cur, end));
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
@@ -3761,7 +3781,7 @@ namespace fastllm {
         int spatial = data.Count(2);
         int n = data.dims[2], m = data.dims[3];
         int stride = (int)sinData.dims[1];
-        RunMultiThreadLlamaRotatePosition2DFloat((float*)data.cpuData, (float*)positionIds.cpuData, 
+        RunMultiThreadLlamaRotatePosition2DFloat(data.dataType, (float*)data.cpuData, (float*)positionIds.cpuData, 
             (float*)sinData.cpuData, (float*)cosData.cpuData, bs, len, n, m, stride, spatial, 
             positionIds.dims.back(), rotaryDim, GetAlivePool());
     }
