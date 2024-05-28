@@ -239,7 +239,9 @@ namespace fastllm {
         AssertInFastLLM(q.dims[0] == k.dims[0] * group, "Attention: q.dims[0] should be equal to k.dims[0] * group.\n");
         AssertInFastLLM(q.dataType == k.dataType && q.dataType == v.dataType,
                         "Attention: q, k, v's datatype should be same.\n");
-        AssertInFastLLM(q.dataType == DataType::FLOAT32, "Attention's input's type should be float32.\n");
+        AssertInFastLLM(q.dataType == DataType::FLOAT32 ||
+                        q.dataType == DataType::FLOAT16, 
+                        "Attention's input's type should be float32 or float16.\n");
 
         for (int i = 0; i < batch; i++) {
             outputs[i]->dataType = qs[i]->dataType;

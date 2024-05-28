@@ -31,7 +31,7 @@ namespace fastllm {
         int curTokens = 0;
         std::map <std::string, int> intParams;
 
-        void Init(int blocks);
+        void Init(int blocks, DataType dataType);
     };
 
     struct ResponseContextDict {
@@ -130,6 +130,8 @@ namespace fastllm {
 
         virtual bool SetSaveHistoryChat(bool save);
 
+        virtual void SetDataType(DataType dataType);
+
         std::string model_type;
 
         std::string pre_prompt; // 最初对话的提示语
@@ -166,6 +168,8 @@ namespace fastllm {
         std::vector<std::pair<Data, Data> > *lastKeyValues = nullptr;
         int lastPromptTokens = 0;
         bool saveHistoryChat = false;
+
+        DataType dataType = DataType::FLOAT32;
     };
 }
 
