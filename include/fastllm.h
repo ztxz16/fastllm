@@ -183,7 +183,7 @@ namespace fastllm {
     };
 
     enum WeightType {
-        NONE = 0, LINEAR = 1, EMBEDDING = 2
+        NONE = 0, LINEAR = 1, EMBEDDING = 2, AUTO = 99999
     };
 
     struct FileMmap {
@@ -439,6 +439,8 @@ namespace fastllm {
 
         std::set <std::string> embeddingNames;
 
+        std::set <std::string> linearNames;
+
         void LoadFromFile(const std::string &fileName); // 从文件读取
 
         void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型, bit = 0代表直接存
@@ -457,6 +459,8 @@ namespace fastllm {
 
         void AddQLinearWeight(const std::string &key, const std::vector <int> &dims,
                               int bit, float *scales, uint8_t *oriData); // 插入一个Qlinear层的权重，量化规则为float value = scales * oriData
+
+        WeightType GetWeightType(const std::string &key); // 获取某个权重的类型（若未判断出来，则为None)
 
         Data &operator [] (const std::string &key);
     };
