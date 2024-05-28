@@ -259,6 +259,8 @@ namespace fastllm {
         Data* cosDataPtr = &cosData;
 
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
+        ToDataType(hiddenStates, this->dataType);
+
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
@@ -436,7 +438,7 @@ namespace fastllm {
             auto &hiddenStates = *lastHiddenStates;
             RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
             Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
-
+            ToDataType(logits, DataType::FLOAT32);
             if (generationConfig.output_logits && retLogits != nullptr) {
                 int size = logits.dims.back();
                 logits.ToDevice(DataDevice::CPU);
@@ -526,6 +528,8 @@ namespace fastllm {
         CatBatch(contexts, 1, allPositionIds);
 
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
+        ToDataType(hiddenStates, this->dataType);
+
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
@@ -602,7 +606,7 @@ namespace fastllm {
                 fastllm::LlamaRotatePosition2D(k, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
             }
 
-            Data attenOutput = Data(DataType::FLOAT32);
+            Data attenOutput = Data(this->dataType);
             int total = 0;
             if (all1 && batch > 1) {
                 q.Reshape({-1, q.dims[2], q.dims[3]});
@@ -767,6 +771,7 @@ namespace fastllm {
 
         RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
+        ToDataType(logits, DataType::FLOAT32);
         std::vector <int> lastRet;
         int total = 0;
 

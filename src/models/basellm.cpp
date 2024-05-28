@@ -115,6 +115,7 @@ namespace fastllm {
         int add_special_tokens = generationConfig.add_special_tokens? 1: 0;
         FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}, {"add_special_tokens", add_special_tokens}},
                       inputIds, attentionMask, positionIds);
+        ToDataType(attentionMask, this->dataType);
         while (true) {
             auto st = std::chrono::system_clock::now();
             int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);        
@@ -149,6 +150,7 @@ namespace fastllm {
             inputTokens[0] = std::vector<float> {(float)ret};
             FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}, {"add_special_tokens", add_special_tokens}},
                           inputIds, attentionMask, positionIds);
+            ToDataType(attentionMask, this->dataType);
             if (index == generationConfig.output_token_limit) {
                 break;
             }
@@ -230,6 +232,7 @@ namespace fastllm {
         LastTokensManager tokensManager (batch, generationConfig.last_n);
         std::vector <bool> isEnding = std::vector <bool> (batch, false);
         FillLLMInputsBatch(inputTokens, params, inputIds, attentionMask, positionIds);
+        ToDataType(attentionMask, this->dataType);
         while (true) {
             auto st = std::chrono::system_clock::now();
             std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, pastKeyValues,
@@ -295,6 +298,7 @@ namespace fastllm {
             index++;
             params[0]["index"] = index;
             FillLLMInputsBatch(inputTokens, params, inputIds, attentionMask, positionIds);
+            ToDataType(attentionMask, this->dataType);
             // printf("len = %d, spend %f s.\n", len, GetSpan(st, std::chrono::system_clock::now()));
 
             if (index == generationConfig.output_token_limit) {
@@ -636,8 +640,9 @@ printf("%d / %d\n", endingCount, batch);
                                 for (int i: it.second->currentTokens) {
                                     tokens[0].push_back(i);
                                 }
-                                model->FillLLMInputs(tokens, it.second->intParams, inputIds, attentionMask,
-                                                     curPositionIds);
+                                model->FillLLMInputs(tokens, it.second->intParams, inputIds, attentionMask, curPositionIds);
+                                ToDataType(attentionMask, model->dataType);
+
                                 seqLens.push_back(inputIds.Count(0));
                                 for (int i = 0; i < inputIds.Count(0); i++) {
                                     ids.push_back(((float *) inputIds.cpuData)[i]);
@@ -870,7 +875,7 @@ printf("tot = %d\n", tot);
         if (dataType == DataType::FLOAT32) {
 
         } else if (dataType == DataType::FLOAT16) {
-            AssertInFastLLM(this->model_type == "chatglm", 
+            AssertInFastLLM(this->model_type == "chatglm" || this->model_type == "llama", 
                             this->model_type + " doesn't support float16");
         } else {
             ErrorInFastLLM("SetDataType Error: datatype should be float32 or float16");
