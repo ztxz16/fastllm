@@ -39,11 +39,11 @@ namespace fastllm {
         locker.unlock();
     }
 
-    void ResponseContext::Init(int blocks) {
+    void ResponseContext::Init(int blocks, DataType dataType) {
         pastKeyValues.clear();
         for (int i = 0; i < blocks; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
-                                                   Data(DataType::FLOAT32)));
+            pastKeyValues.push_back(std::make_pair(Data(dataType),
+                                                   Data(dataType)));
             pastKeyValues.back().first.SetKVCache();
             pastKeyValues.back().second.SetKVCache();
         }
@@ -98,12 +98,10 @@ namespace fastllm {
             inputTokens[0].push_back(((float *) inputTokenData.cpuData)[i]);
         }
         
-        DataType testDataType = DataType::FLOAT32;
         if (lastKeyValues == nullptr) {
             lastKeyValues = new std::vector<std::pair<Data, Data> >();
             for (int i = 0; i < block_cnt; i++) {
-                lastKeyValues->push_back(std::make_pair(Data(testDataType),
-                                                    Data(testDataType)));
+                lastKeyValues->push_back(std::make_pair(Data(this->dataType), Data(this->dataType)));
                 lastKeyValues->back().first.SetKVCache();
                 lastKeyValues->back().second.SetKVCache();
             }
@@ -119,9 +117,10 @@ namespace fastllm {
                       inputIds, attentionMask, positionIds);
         while (true) {
             auto st = std::chrono::system_clock::now();
-            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
+            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);        
             tokens.units[0].Push(ret);
-            if (ret == eos_token_id) {
+            if (ret == eos_token_id
+                || generationConfig.stop_token_ids.find(index) != generationConfig.stop_token_ids.end()) {
                 break;
             }
 
@@ -738,7 +737,7 @@ printf("tot = %d\n", tot);
         dictLocker.lock();
         int handleId = responseContextDict.CreateHandle();
         ResponseContext *context = responseContextDict.GetHandle(handleId);
-        context->Init(this->block_cnt);
+        context->Init(this->block_cnt, this->dataType);
         context->currentTokens = inputTokens;
         context->generationConfig = generationConfig;
         context->tokens = LastTokensUnit(generationConfig.last_n);
@@ -865,5 +864,17 @@ printf("tot = %d\n", tot);
             return true;
         }
         return false;
+    }
+
+    void basellm::SetDataType(DataType dataType) {
+        if (dataType == DataType::FLOAT32) {
+
+        } else if (dataType == DataType::FLOAT16) {
+            AssertInFastLLM(this->model_type == "chatglm", 
+                            this->model_type + " doesn't support float16");
+        } else {
+            ErrorInFastLLM("SetDataType Error: datatype should be float32 or float16");
+        }
+        this->dataType = dataType;
     }
 }
