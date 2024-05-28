@@ -91,6 +91,12 @@ namespace json11 {
         out += buf;
     }
 
+    static void dump(long long value, string &out) {
+        char buf[32];
+        snprintf(buf, sizeof buf, "%lld", value);
+        out += buf;
+    }
+
     static void dump(bool value, string &out) {
         out += value ? "true" : "false";
     }
@@ -237,6 +243,16 @@ namespace json11 {
     public:
         explicit JsonInt(int value) : Value(value) {}
     };
+    
+    class JsonLL final : public Value<Json::NUMBER, long long> {
+        double number_value() const override { return m_value; }
+        int int_value() const override { return m_value; }
+        long long ll_value() const override { return m_value; }
+        bool equals(const JsonValue * other) const override { return m_value == other->number_value(); }
+        bool less(const JsonValue * other)   const override { return m_value <  other->number_value(); }
+    public:
+        explicit JsonLL(long long value) : Value(value) {}
+    };
 
     class JsonBoolean final : public Value<Json::BOOL, bool> {
         bool bool_value() const override { return m_value; }
@@ -304,6 +320,7 @@ namespace json11 {
     Json::Json(std::nullptr_t) noexcept    : m_ptr(statics().null) {}
     Json::Json(double value)               : m_ptr(make_shared<JsonDouble>(value)) {}
     Json::Json(int value)                  : m_ptr(make_shared<JsonInt>(value)) {}
+    Json::Json(long long value)            : m_ptr(make_shared<JsonLL>(value)) {}
     Json::Json(bool value)                 : m_ptr(value ? statics().t : statics().f) {}
     Json::Json(const string &value)        : m_ptr(make_shared<JsonString>(value)) {}
     Json::Json(string &&value)             : m_ptr(make_shared<JsonString>(move(value))) {}
@@ -320,6 +337,7 @@ namespace json11 {
     Json::Type Json::type()                           const { return m_ptr->type();         }
     double Json::number_value()                       const { return m_ptr->number_value(); }
     int Json::int_value()                             const { return m_ptr->int_value();    }
+    long long Json::ll_value()                        const { return m_ptr->ll_value();     }
     bool Json::bool_value()                           const { return m_ptr->bool_value();   }
     const string & Json::string_value()               const { return m_ptr->string_value(); }
     const vector<Json> & Json::array_items()          const { return m_ptr->array_items();  }
@@ -329,6 +347,7 @@ namespace json11 {
 
     double                    JsonValue::number_value()              const { return 0; }
     int                       JsonValue::int_value()                 const { return 0; }
+    long long                 JsonValue::ll_value()                  const { return 0LL; }
     bool                      JsonValue::bool_value()                const { return false; }
     const string &            JsonValue::string_value()              const { return statics().empty_string; }
     const vector<Json> &      JsonValue::array_items()               const { return statics().empty_vector; }
@@ -640,8 +659,8 @@ namespace json11 {
                 }
 
                 if (str[i] != '.' && str[i] != 'e' && str[i] != 'E'
-                    && (i - start_pos) <= static_cast<size_t>(std::numeric_limits<int>::digits10)) {
-                    return std::atoi(str.c_str() + start_pos);
+                    && (i - start_pos) <= static_cast<size_t>(std::numeric_limits<long long>::digits10)) {
+                    return std::atoll(str.c_str() + start_pos);
                 }
 
                 // Decimal part
