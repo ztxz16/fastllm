@@ -8,7 +8,7 @@ import threading
 
 def chat(model, tokenizer, prompt, output_list, idx):
     pred, history = model.chat(tokenizer, prompt, history=[], max_length = 5);
-    if pred[0] not in choices:
+    if len(pred) < 1 or (pred[0] not in choices):
         pred, history = model.chat(tokenizer, prompt, history=[], max_length = 1000);
     output_list[idx] = pred;
 
