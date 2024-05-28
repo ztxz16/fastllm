@@ -15,6 +15,8 @@ option(USE_SENTENCEPIECE "use sentencepiece" OFF)
 
 option(USE_IVCOREX "use iluvatar corex gpu" OFF)
 
+option(BUILD_CLI "build cli" OFF)
+
 message(STATUS "USE_CUDA: ${USE_CUDA}")
 
 message(STATUS "USE_TFACC: ${USE_TFACC}")
@@ -22,6 +24,8 @@ message(STATUS "USE_TFACC: ${USE_TFACC}")
 message(STATUS "For legacy CUDA GPUs: ${CUDA_NO_TENSOR_CORE}")
 
 message(STATUS "PYTHON_API: ${PY_API}")
+
+message(STATUS "BUILD_CLI: ${BUILD_CLI}")
 
 message(STATUS "USE_SENTENCEPIECE: ${USE_SENTENCEPIECE}")
 
@@ -138,6 +142,11 @@ target_link_libraries(benchmark fastllm)
 
 add_executable(apiserver example/apiserver/apiserver.cpp)
 target_link_libraries(apiserver fastllm)
+
+if (BUILD_CLI)
+    add_executable(FastllmStudio_cli example/FastllmStudio/cli/cli.cpp example/FastllmStudio/cli/ui.cpp)
+    target_link_libraries(FastllmStudio_cli fastllm)
+endif()
 
 add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
