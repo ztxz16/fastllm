@@ -1986,6 +1986,40 @@ namespace fastllm {
         this->peftDict[name][key] = value;
     }
 
+    WeightType WeightMap::GetWeightType(const std::string &key) {
+        if (this->embeddingNames.find(key) != this->embeddingNames.end()) {
+            return WeightType::EMBEDDING;
+        }
+        for (auto &linearName : this->linearNames) {
+            int n = key.size(), m = linearName.size();
+            std::vector <std::vector <bool> > f = std::vector <std::vector <bool> > (n + 1, std::vector <bool>(m + 1, 0));
+            f[0][0] = 1;
+            for (int i = 0; i <= n; i++) {
+                for (int j = 0; j <= m; j++) {
+                    if (f[i][j]) {
+                        if (i + 1 <= n && key[i] == '*') {
+                            for (int l = j; l <= m; l++) {
+                                f[i + 1][l] = 1;
+                            }
+                        }
+                        if (j + 1 <= m && linearName[j] == '*') {
+                            for (int l = i; l <= n; l++) {
+                                f[l][j + 1] = 1;
+                            }
+                        }
+                        if (i + 1 <= n && j + 1 <= m && key[i] == linearName[j]) {
+                            f[i + 1][j + 1] = 1;
+                        }
+                    }
+                }
+            }
+            if (f[n][m]) {
+                return WeightType::LINEAR;
+            }
+        }
+        return WeightType::NONE;
+    }
+
     void WeightMap::AddQLinearWeight(const std::string &key, const std::vector <int> &dims,
                           int bit, float *scales, uint8_t *oriData) {
         AssertInFastLLM(bit == 4 || bit == 8, "Error: only support 8 bit or 4 bit QLinear.\n");
@@ -2041,6 +2075,16 @@ namespace fastllm {
 
     void WeightMap::AddWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType,
                               fastllm::WeightType weightType, fastllm::DataType oriDataType, uint8_t *oriData, int groupCnt) {
+        if (weightType == WeightType::AUTO) {
+            weightType = GetWeightType(key);
+            if (weightType == WeightType::EMBEDDING) {
+                dataType = oriDataType;
+            }
+            if (weightType == WeightType::NONE) {
+                dataType = oriDataType;
+            }
+        }
+
         this->weight[key] = Data(dataType, dims);
         this->weight[key].name = std::string(key);
         Data &data = this->weight[key];
