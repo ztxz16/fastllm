@@ -2221,6 +2221,9 @@ namespace fastllm {
     }
 
     void ToDataType(const Data &input, DataType dataType) {
+        if (input.dataType == dataType) {
+            return;
+        }
         if (dataType == DataType::FLOAT32) {
             curExecutor->Run("ToFloat32", {
                     {"input", (Data*)&input}
