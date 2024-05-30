@@ -989,7 +989,6 @@ namespace fastllm {
         this->tokenizerConfig = config;
         if (config["chat_template"].is_string()) {
             this->chatTemplate = config["chat_template"].string_value();
-            printf("%s\n", this->chatTemplate.c_str());
         }
     }
 
