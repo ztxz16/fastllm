@@ -428,6 +428,10 @@ namespace fastllm {
         std::string Decode(const Data &data); // 解码
 
         std::string DecodeTokens(const std::vector <int> &tokens); // 解码
+
+        int GetTokenId(const std::string &s); // 获取s对应的tokenid
+
+        std::string GetToken(int id); // 获取id对应的token
     };
 
     std::string GetModelTypeFromFile(const std::string &fileName);

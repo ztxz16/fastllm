@@ -1492,6 +1492,18 @@ namespace fastllm {
         return DecodeTokens(tokens);
     }
 
+    int Tokenizer::GetTokenId(const std::string &s) {
+        AssertInFastLLM(stringToTokenDict.find(s) != stringToTokenDict.end(), 
+                        "Tokenizer.GetTokenId error: can't find token \"" + s + "\"");
+        return stringToTokenDict[s];
+    }
+
+    std::string Tokenizer::GetToken(int id) {
+        AssertInFastLLM(tokenToStringDict.find(id) != tokenToStringDict.end(), 
+                        "Tokenizer.GetToken error: can't find tokenid \"" + std::to_string(id) + "\"");
+        return this->DecodeTokens(std::vector <int> {id}).c_str();
+    }
+
     struct Random {
         Random () {
             srand(time(NULL));
@@ -2101,6 +2113,14 @@ namespace fastllm {
         data.Allocate();
         if (dataType == oriDataType) {
             memcpy(data.cpuData, oriData, data.GetBytes());
+        } else if (oriDataType == DataType::FLOAT32 
+                && dataType == DataType::FLOAT16) {
+            uint16_t *a = (uint16_t*)data.cpuData;
+            float *b = (float*)oriData;
+            int len = data.Count(0);
+            for (int i = 0; i < len; i++) {
+                a[i] = float_to_half(b[i]);
+            }
         } else if (oriDataType == DataType::FLOAT32 
                 && dataType == DataType::INT4_GROUP) {
             int bit = (dataType == DataType::INT4_GROUP) ? 4 : 8;
