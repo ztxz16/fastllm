@@ -235,8 +235,10 @@ namespace fastllm {
         ToDataType(attentionMask, this->dataType);
         while (true) {
             auto st = std::chrono::system_clock::now();
+// ClearProfiler();
             std::vector <int> ret = ForwardBatch(batch, inputIds, attentionMask, positionIds, pastKeyValues,
                                                  generationConfig, tokensManager);
+// PrintProfiler();
             for (int i = 0; i < batch; i++) {
                 tokensManager.units[i].Push(ret[i]);
             }
@@ -693,12 +695,12 @@ auto st = std::chrono::system_clock::now();
                                                                         *positionIds[0],
                                                                         *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
                             }
-//PrintProfiler();
 /*
-static int tot = 0;
-printf("len = %d, spend = %f s.\n", (int)seqLens.size(), GetSpan(st, std::chrono::system_clock::now()));
-tot += (int)seqLens.size();
-printf("tot = %d\n", tot);
+PrintProfiler();
+int total = 0;
+for (int i : seqLens) total += i;
+float spend = GetSpan(st, std::chrono::system_clock::now());
+printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)total / spend);
 */
                             model->dictLocker.lock();
                             for (int i = 0; i < handles.size(); i++) {
@@ -895,11 +897,31 @@ printf("tot = %d\n", tot);
     }
 
     std::string basellm::ApplyChatTemplate(const ChatMessages &messages) {
+        if (this->weight.tokenizer.chatTemplate == "") {
+            std::string ret = "";
+            std::string user = "";
+            int round = 0;
+            for (auto &message : messages) {
+                if (message.first == "user") {
+                    user = message.second;
+                } else if (message.first == "assistant") {
+                    ret = MakeHistory(ret, round++, user, message.second);
+                }
+            }
+            ret = MakeInput(ret, round, user);
+            return ret;
+        }
         return ApplyChatTemplate(ChatMessagesToJinjaVar(messages));
     }
 
     std::vector <int> basellm::ApplyChatTemplateToTokens(const ChatMessages &messages) {
-        return ApplyChatTemplateToTokens(ChatMessagesToJinjaVar(messages));
+        auto prompt = this->ApplyChatTemplate(messages);
+        auto input = this->weight.tokenizer.Encode(prompt);
+        std::vector<int> tokens;
+        for (int i = 0; i < input.Count(0); i++) {
+            tokens.push_back(((float *) input.cpuData)[i]);
+        }
+        return tokens;
     }
 
     std::string basellm::ApplyChatTemplate(const JinjaVar &var) {

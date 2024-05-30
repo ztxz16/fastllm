@@ -1,5 +1,6 @@
 import argparse
 from fastllm_pytools import llm
+import readline
 
 def args_parser():
     parser = argparse.ArgumentParser(description = 'fastllm_chat_demo')
@@ -14,6 +15,7 @@ if __name__ == "__main__":
     llm.set_cpu_threads(args.threads)
     llm.set_cpu_low_mem(args.low)
     model = llm.model(args.path)
+    model.set_save_history(True)
 
     history = []
     print("输入内容即可进行对话，clear 清空对话历史，stop 终止程序")

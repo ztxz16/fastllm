@@ -97,6 +97,14 @@ extern "C" {
         return id;
     }
 
+    DLL_EXPORT int create_llm_model_fromhf(char *path, int dataType, int groupCnt) {
+        models.locker.lock();
+        int id = models.models.size();
+        models.models[id] = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt);
+        models.locker.unlock();
+        return id;
+    }
+
     DLL_EXPORT int create_empty_llm_model(char *type) {
         models.locker.lock();
         int id = models.models.size();
@@ -190,6 +198,12 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT void set_save_history(int modelId, bool save) {
+        auto model = models.GetModel(modelId);
+        model->SetSaveHistoryChat(save);
+        return;
+    }
+
     DLL_EXPORT void init_params_llm_model(int modelId) {
         auto model = models.GetModel(modelId);
         model->InitParams();
@@ -243,6 +257,31 @@ extern "C" {
     DLL_EXPORT char *make_history_llm_model(int modelId, char *history, int round, char *input, char *output) {
         auto model = models.GetModel(modelId);
         return string_to_chars(model->MakeHistory(history, round, input, output));
+    }
+
+    DLL_EXPORT char *apply_chat_template(int modelId, char *str, int cnt, int *pos, int *len) {
+        auto model = models.GetModel(modelId);
+        fastllm::ChatMessages messages;
+        for (int i = 0; i < cnt / 2; i++) {
+            std::string role, content;
+            for (int j = 0; j < len[i * 2]; j++) {
+                role += str[pos[i * 2] + j];
+            }
+            for (int j = 0; j < len[i * 2 + 1]; j++) {
+                content += str[pos[i * 2 + 1] + j];
+            }
+            messages.push_back(std::make_pair(role, content));
+        }
+        return string_to_chars(model->ApplyChatTemplate(messages));
+    }
+
+    DLL_EXPORT void add_eos_token(int modelId, char *str, int len) {
+        std::string eos_token = "";
+        for (int i = 0; i < len; i++) {
+            eos_token += str[i];
+        }
+        auto model = models.GetModel(modelId);
+        model->eos_token_id = model->weight.tokenizer.GetTokenId(eos_token);
     }
 
     DLL_EXPORT char *response_str_llm_model(int modelId, char *content,
