@@ -10,7 +10,6 @@
 #include <string>
 #include <mutex>
 
-#include "json11.hpp"
 /*
  * Headers
  */
