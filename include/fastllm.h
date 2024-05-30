@@ -20,6 +20,7 @@
 #include <locale>
 #include <codecvt>
 #include "devices/cpu/alivethreadpool.h"
+#include "json11.hpp"
 
 #ifdef USE_SENTENCEPIECE
 #include <sentencepiece_processor.h>
@@ -379,6 +380,9 @@ namespace fastllm {
             return a.score < b.score || (a.score == b.score && a.l > b.l);
         }
 
+        json11::Json tokenizerConfig;
+        std::string chatTemplate = "";
+
         TrieNode *root;
 
         TrieNode *specialRoot = nullptr;
@@ -414,6 +418,8 @@ namespace fastllm {
         void Insert(const std::string &s, int tokenId, float score = 1.0f); // 插入一个token
 
         void SetSpecialTokens(const std::map <std::string, int> &specialTokens); // 设置需要优先处理的特殊token
+
+        void SetTokenizerConfig(const json11::Json &config);
 
         std::string Normalize(const std::string &ori); // 字符规范化
 

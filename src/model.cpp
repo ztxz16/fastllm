@@ -334,6 +334,7 @@ namespace fastllm {
         // 3. 读取分词
         std::string tokenizerConfigFile = path + "tokenizer_config.json";
         auto tokenizerConfig = json11::Json::parse(ReadAllFile(tokenizerConfigFile), error);
+        model->weight.tokenizer.SetTokenizerConfig(tokenizerConfig);
         std::string tokenizerClass = tokenizerConfig["tokenizer_class"].string_value();
         if (tokenizerClass == "PreTrainedTokenizerFast") {
             // PreTrainedTokenizerFast
