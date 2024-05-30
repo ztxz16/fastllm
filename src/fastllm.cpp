@@ -985,6 +985,14 @@ namespace fastllm {
         }
     }
 
+    void Tokenizer::SetTokenizerConfig(const json11::Json &config) {
+        this->tokenizerConfig = config;
+        if (config["chat_template"].is_string()) {
+            this->chatTemplate = config["chat_template"].string_value();
+            printf("%s\n", this->chatTemplate.c_str());
+        }
+    }
+
     void Tokenizer::TryMergePairs(std::vector<Symbol> &symbols, int l, int r, std::priority_queue <SymbolPairs> &q) {
         if (l == -1 || r == -1 || symbols[l].len == 0 || symbols[r].len == 0) {
             return;
