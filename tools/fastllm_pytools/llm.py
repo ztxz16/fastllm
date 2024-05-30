@@ -15,6 +15,11 @@ else:
 fastllm_lib.create_llm_model.argtypes = [ctypes.c_char_p]
 fastllm_lib.create_llm_model.restype = ctypes.c_int
 
+fastllm_lib.create_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+fastllm_lib.create_llm_model_fromhf.restype = ctypes.c_int
+
+fastllm_lib.add_eos_token.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+
 fastllm_lib.token_decode.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.token_decode.restype = ctypes.c_int
 
@@ -58,6 +63,9 @@ fastllm_lib.add_tokenizer_word_llm_model.argtype = [ctypes.c_int, ctypes.c_char_
 fastllm_lib.set_special_tokens_llm_model.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 
 fastllm_lib.set_device_map.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+
+fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
 
 def set_cpu_threads(threads: int):
     fastllm_lib.set_cpu_threads(threads);
@@ -113,14 +121,47 @@ def from_hf(model,
     return hf_model.create(model, tokenizer, pre_prompt = pre_prompt, user_role = user_role,
                            bot_role = bot_role, history_sep = history_sep, dtype = dtype);
 
+fastllm_data_type_dict = {
+    "int4g": 9,
+    "int4": 8,
+    "int8": 3,
+    "float16": 7,
+    "float32": 0,
+}
+
 class model:
     def __init__ (self, path : str,
-                  id : int = -99999):
+                  id : int = -99999,
+                  dtype : str = "float16",
+                  system_prompt : str = "",
+                  eos_token: List[str] = []):
+        int4g_groupcnt = 128;
+        if (dtype.startswith("int4g") and len(dtype) > 5):
+            try:
+                int4g_groupcnt = int(dtype[5:])
+                dtype = "int4g";
+            except:
+                print("dtype should be like \"int4g256\"")
+                exit(0)    
+        if (dtype not in fastllm_data_type_dict):
+            print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
+            exit(0)
         if (id != -99999):
             self.model = id;
         else:
-            self.model = fastllm_lib.create_llm_model(path.encode());
+            if os.path.isfile(path):
+                self.model = fastllm_lib.create_llm_model(path.encode());
+            elif os.path.isdir(path):
+                self.model = fastllm_lib.create_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt);
+            else:
+                print("path error: ", path);
+                exit(0)
+
         self.direct_query = False;
+        self.system_prompt = system_prompt;
+        self.eos_token = [] + eos_token
+        for token in self.eos_token:
+            fastllm_lib.add_eos_token(self.model, token.encode(), len(token.encode()));
 
         # 为了减少重复申请释放buffer对象而使用的线程局部存储区对象池
         self.thread_local_obj = threading.local()
@@ -137,11 +178,22 @@ class model:
                    history: List[Tuple[str, str]] = None) -> str:
         if (not(history)):
             history = [];
-        prompt = "";
-        for i, (old_query, response) in enumerate(history):
-            prompt = fastllm_lib.make_history_llm_model(self.model, prompt.encode(), i, old_query.encode(), response.encode()).decode();
-        prompt = fastllm_lib.make_input_llm_model(self.model, prompt.encode(), len(history), query.encode()).decode();
-        return prompt;
+        messages = []
+        if (self.system_prompt != ""):
+            messages += ["system", self.system_prompt]
+        for his in history:
+            messages += ["user", his[0], "assistant", his[1]]
+        messages += ["user", query]
+        poss = []
+        lens = []
+        all = b''
+
+        for i in range(len(messages)):
+            messages[i] = messages[i].encode()
+            all += messages[i]
+            poss.append(0 if i == 0 else poss[-1] + lens[-1])
+            lens.append(len(messages[i]))
+        return fastllm_lib.apply_chat_template(self.model, all, len(messages), (ctypes.c_int * len(poss))(*poss), (ctypes.c_int * len(lens))(*lens)).decode()
 
     def save(self, path : str):
         fastllm_lib.save_llm_model(self.model, path.encode());
@@ -394,3 +446,6 @@ class model:
     
     def release_memory(self):
         fastllm_lib.release_memory(self.model)
+    
+    def set_save_history(self, save: bool):
+        fastllm_lib.set_save_history(self.model, save);
