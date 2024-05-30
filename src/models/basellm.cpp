@@ -882,4 +882,46 @@ printf("tot = %d\n", tot);
         }
         this->dataType = dataType;
     }
+
+    JinjaVar ChatMessagesToJinjaVar(const ChatMessages &messages) {
+        JinjaVar ret = {{"messages", fastllm::JinjaArray {}}};
+        for (auto &message : messages) {
+            ret["messages"].arrayValue.push_back({
+                {"role", message.first},
+                {"content", message.second}
+            });
+        }
+        return ret;
+    }
+
+    std::string basellm::ApplyChatTemplate(const ChatMessages &messages) {
+        return ApplyChatTemplate(ChatMessagesToJinjaVar(messages));
+    }
+
+    std::vector <int> basellm::ApplyChatTemplateToTokens(const ChatMessages &messages) {
+        return ApplyChatTemplateToTokens(ChatMessagesToJinjaVar(messages));
+    }
+
+    std::string basellm::ApplyChatTemplate(const JinjaVar &var) {
+        AssertInFastLLM(this->weight.tokenizer.chatTemplate != "", 
+                        "ApplyChatTemplate error: model doesn't has chat_template.");
+        JinjaVar local = var;
+        for (auto &it : this->weight.tokenizer.tokenizerConfig.object_items()) {
+            if (it.first != "messages" && it.second.is_string()) {
+                local[it.first] = it.second.string_value();
+            }
+        }
+        JinjaTemplate temp = JinjaTemplate(this->weight.tokenizer.chatTemplate);
+        return temp.Apply(local);
+    }
+
+    std::vector <int> basellm::ApplyChatTemplateToTokens(const JinjaVar &var) {
+        auto prompt = this->ApplyChatTemplate(var);
+        auto input = this->weight.tokenizer.Encode(prompt);
+        std::vector<int> tokens;
+        for (int i = 0; i < input.Count(0); i++) {
+            tokens.push_back(((float *) input.cpuData)[i]);
+        }
+        return tokens;    
+    }
 }

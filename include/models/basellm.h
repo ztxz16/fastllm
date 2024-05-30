@@ -3,6 +3,7 @@
 #define FASTLLM_BASELLM_H
 
 #include "fastllm.h"
+#include "template.h"
 
 #include <thread>
 #include <mutex>
@@ -18,6 +19,8 @@ using RuntimeResultBatch = std::function<void(int index, std::vector <std::strin
 #endif
 
 namespace fastllm {
+    using ChatMessages = std::vector <std::pair <std::string, std::string> >;
+
     struct ResponseContext {
         bool isEnding = false;
         std::vector <std::pair <Data, Data> > pastKeyValues;
@@ -131,6 +134,15 @@ namespace fastllm {
         virtual bool SetSaveHistoryChat(bool save);
 
         virtual void SetDataType(DataType dataType);
+
+        // messages: [ (role, content) ... ]
+        virtual std::string ApplyChatTemplate(const ChatMessages &messages);
+
+        virtual std::vector <int> ApplyChatTemplateToTokens(const ChatMessages &messages);
+
+        virtual std::string ApplyChatTemplate(const JinjaVar &var);
+
+        virtual std::vector <int> ApplyChatTemplateToTokens(const JinjaVar &var);
 
         std::string model_type;
 
