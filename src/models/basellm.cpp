@@ -55,26 +55,94 @@ namespace fastllm {
         isEnding = false;
         preTokens = 0;
     }
+
+    PastKVCacheMemory::PastKVCacheMemory(const std::string &prompt, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv) {
+        this->prompt = prompt;
+        this->tokens = tokens;
+        this->flushTime = flushTime;
+        this->recordTimes = 1;
+        auto dataType = (*kv)[0].first.dataType;
+        for (int i = 0; i < kv->size(); i++) {
+            this->kv.push_back(std::make_pair(Data(dataType), Data(dataType)));
+        }
+        for (int i = 0; i < kv->size(); i++) {
+            this->kv[i].first.CopyFrom((*kv)[i].first);
+            this->kv[i].second.CopyFrom((*kv)[i].second);
+        }
+    }
+
+    void PastKVCacheManager::SetMaxRecordNum(int maxRecordNum) {
+        std::lock_guard <std::mutex> lock(this->locker);
+        this->maxRecordNum = maxRecordNum;
+    }
+
+    void PastKVCacheManager::Record(const std::string &prompt, int tokens, std::vector<std::pair<Data, Data> > *kv) {
+        std::lock_guard <std::mutex> lock(this->locker);
+        if (this->memorys.find(prompt) != this->memorys.end()) {
+            this->memorys[prompt]->recordTimes++;
+            this->memorys[prompt]->flushTime = ++flushTime;
+            return;
+        }
+
+        if (this->memorys.size() >= this->maxRecordNum) {
+            std::string prompt = "";
+            long long minFlushTime = (1LL << 60);
+            for (auto &it : this->memorys) {
+                if (it.second->flushTime < minFlushTime) {
+                    minFlushTime = it.second->flushTime;
+                    prompt = it.first;
+                }
+            }
+            delete this->memorys[prompt];
+            this->memorys.erase(this->memorys.find(prompt));
+        }
+
+        this->memorys[prompt] = new PastKVCacheMemory(prompt, tokens, ++flushTime, kv);
+    }
+
+    void PastKVCacheManager::Remove(std::string prompt) {
+        std::lock_guard <std::mutex> lock(this->locker);
+        if (this->memorys.find(prompt) != this->memorys.end()) {
+            if ((--this->memorys[prompt]->recordTimes) <= 0) {
+                delete this->memorys[prompt];
+                this->memorys.erase(this->memorys.find(prompt));
+            }
+        }
+    }
+
+    PastKVCacheMemory *PastKVCacheManager::Get(const std::string &prompt) {
+        locker.lock();
+        std::string maxPrompt = "";
+        for (auto &it : this->memorys) {
+            const std::string &cur = it.first;
+            if (cur.size() > maxPrompt.size() && cur.size() <= prompt.size() && prompt.substr(0, cur.size()) == cur) {
+                maxPrompt = cur;
+            }
+        }
+        if (maxPrompt == "") {
+            return nullptr;
+        }
+        this->memorys[maxPrompt]->flushTime = ++this->flushTime;
+        return this->memorys[maxPrompt];
+    }
+
+    void PastKVCacheManager::Unlock() {
+        locker.unlock();
+    }
     
     std::string basellm::Response(const std::string &oriInput, RuntimeResult retCb,
                                   const fastllm::GenerationConfig &generationConfig) {
         std::string input = oriInput;
+        PastKVCacheMemory *memory;
+        std::string oldPrompt;
+        int oldTokens = 0;
         if (this->saveHistoryChat) {
-            if (lastKeyValues != nullptr) {
-                if (input.size() < lastPrompt.size() || (input.substr(0, lastPrompt.size()) != lastPrompt)) {
-                    lastPrompt = "";
-                    lastPromptTokens = 0;
-                    delete lastKeyValues;
-                    lastKeyValues = nullptr;
-                } else {
-                    input = input.substr(lastPrompt.size());
-                }
+            memory = pastKVCacheManager.Get(input);
+            if (memory != nullptr) {
+                oldPrompt = memory->prompt;
+                oldTokens = memory->tokens;
+                input = input.substr(memory->prompt.size());
             }
-        } else {
-            lastPrompt = "";
-            lastPromptTokens = 0;
-            delete lastKeyValues;
-            lastKeyValues = nullptr;
         }
 
         //printf("lastPrompt = %s\n", lastPrompt.c_str());
@@ -97,21 +165,32 @@ namespace fastllm {
         for (int i = 0; i < inputTokenData.Count(0); i++) {
             inputTokens[0].push_back(((float *) inputTokenData.cpuData)[i]);
         }
-        
-        if (lastKeyValues == nullptr) {
-            lastKeyValues = new std::vector<std::pair<Data, Data> >();
-            for (int i = 0; i < block_cnt; i++) {
-                lastKeyValues->push_back(std::make_pair(Data(this->dataType), Data(this->dataType)));
-                lastKeyValues->back().first.SetKVCache();
-                lastKeyValues->back().second.SetKVCache();
-            }
+
+        std::vector <std::pair <Data, Data> > pastKeyValues;
+        for (int i = 0; i < block_cnt; i++) {
+            pastKeyValues.push_back(std::make_pair(Data(this->dataType),
+                                                   Data(this->dataType)));
         }
 
-        std::vector<std::pair<Data, Data> > &pastKeyValues = (*lastKeyValues);
+        if (this->saveHistoryChat) {
+            if (memory != nullptr) {
+                for (int i = 0; i < block_cnt; i++) {
+                    pastKeyValues[i].first.CopyFrom(memory->kv[i].first);
+                    pastKeyValues[i].second.CopyFrom(memory->kv[i].second);
+                }
+            }
+            pastKVCacheManager.Unlock();
+        }
+
+        for (int i = 0; i < block_cnt; i++) {
+            pastKeyValues.back().first.SetKVCache();
+            pastKeyValues.back().second.SetKVCache();
+        }
+
         std::string retString = "";
         std::vector<float> results;
         LastTokensManager tokens(1, generationConfig.last_n);
-        int promptLen = lastPromptTokens + inputTokens[0].size(), index = 0;
+        int promptLen = oldTokens + inputTokens[0].size(), index = 0;
         int add_special_tokens = generationConfig.add_special_tokens? 1: 0;
         FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}, {"add_special_tokens", add_special_tokens}},
                       inputIds, attentionMask, positionIds);
@@ -121,7 +200,7 @@ namespace fastllm {
             int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);        
             tokens.units[0].Push(ret);
             if (ret == eos_token_id
-                || generationConfig.stop_token_ids.find(index) != generationConfig.stop_token_ids.end()) {
+                || generationConfig.stop_token_ids.find(ret) != generationConfig.stop_token_ids.end()) {
                 break;
             }
 
@@ -171,8 +250,15 @@ namespace fastllm {
             retCb(-1, retString.c_str());
 #endif
 
-        lastPrompt += (input + retString);
-        lastPromptTokens = promptLen + index;
+        if (this->saveHistoryChat) {
+            std::string currentPrompt;
+            int currentTokens;
+            if (oldPrompt != "") {
+                pastKVCacheManager.Remove(oldPrompt);
+            }
+            pastKVCacheManager.Record(oriInput + retString, promptLen + index, &pastKeyValues);
+        }
+
         return retString;
     }
 

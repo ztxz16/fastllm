@@ -48,6 +48,40 @@ namespace fastllm {
         void RemoveHandle(int handleId);
     };
 
+    struct PastKVCacheMemory {
+        std::string prompt;
+        int tokens;
+        int recordTimes = 0;
+        long long flushTime;
+        std::vector<std::pair<Data, Data> > kv;
+
+        PastKVCacheMemory () {}
+
+        PastKVCacheMemory (const std::string &prompt, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv);
+    };
+
+    struct PastKVCacheManager {
+        std::mutex locker;
+        int maxRecordNum = 5;
+        long long flushTime = 0;
+        std::map <std::string, PastKVCacheMemory*> memorys;
+
+        // 设置最多保存的记录条数
+        void SetMaxRecordNum(int maxRecordNum);
+
+        // 插入一条记录，若已存在则增加引用计数
+        void Record(const std::string &prompt, int tokens, std::vector<std::pair<Data, Data> > *kv);
+
+        // 尝试删除一条记录，若引用计数非0不会真的删除
+        void Remove(std::string prompt);
+
+        // 获取最长匹配的Memory，并加锁
+        PastKVCacheMemory *Get(const std::string &prompt);
+
+        // 解锁
+        void Unlock();
+    };
+
     class basellm {
     public:
         basellm() {};
@@ -176,9 +210,7 @@ namespace fastllm {
 
         int tokensLimit = -1;
 
-        std::string lastPrompt = "";
-        std::vector<std::pair<Data, Data> > *lastKeyValues = nullptr;
-        int lastPromptTokens = 0;
+        PastKVCacheManager pastKVCacheManager;
         bool saveHistoryChat = false;
 
         DataType dataType = DataType::FLOAT32;
