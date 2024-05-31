@@ -1,9 +1,24 @@
 #include "model.h"
 
+std::map <std::string, fastllm::DataType> dataTypeDict = {
+    {"float32", fastllm::DataType::FLOAT32},
+    {"half", fastllm::DataType::FLOAT16},
+    {"float16", fastllm::DataType::FLOAT16},
+    {"int8", fastllm::DataType::INT8},
+    {"int4", fastllm::DataType::INT4_NOZERO},
+    {"int4z", fastllm::DataType::INT4},
+    {"int4g", fastllm::DataType::INT4_GROUP}
+};
+
 struct RunConfig {
 	std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
+    std::string systemPrompt = "";
+    std::set <std::string> eosToken;
 	int threads = 4; // 使用的线程数
 	bool lowMemMode = false; // 是否使用低内存模式
+
+    fastllm::DataType dtype = fastllm::DataType::FLOAT16;
+    int groupCnt = -1;
 };
 
 void Usage() {
@@ -12,6 +27,9 @@ void Usage() {
 	std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
 	std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
 	std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
+    std::cout << "<--system> <args>:            设置系统提示词(system prompt)" << std::endl;
+    std::cout << "<--eos_token> <args>:         设置eos token" << std::endl;
+    std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
     std::cout << "<--top_p> <args>:             采样参数top_p" << std::endl;
     std::cout << "<--top_k> <args>:             采样参数top_k" << std::endl;
     std::cout << "<--temperature> <args>:       采样参数温度，越高结果越不固定" << std::endl;
@@ -43,6 +61,19 @@ void ParseArgs(int argc, char **argv, RunConfig &config, fastllm::GenerationConf
             generationConfig.temperature = atof(sargv[++i].c_str());
         } else if (sargv[i] == "--repeat_penalty") {
             generationConfig.repeat_penalty = atof(sargv[++i].c_str());
+        } else if (sargv[i] == "--system") {
+            config.systemPrompt = sargv[++i];
+        } else if (sargv[i] == "--eos_token") {
+            config.eosToken.insert(sargv[++i]);
+        } else if (sargv[i] == "--dtype") {
+            std::string dtypeStr = sargv[++i];
+            if (dtypeStr.size() > 5 && dtypeStr.substr(0, 5) == "int4g") {
+                config.groupCnt = atoi(dtypeStr.substr(5).c_str());
+                dtypeStr = dtypeStr.substr(0, 5);
+            }
+            fastllm::AssertInFastLLM(dataTypeDict.find(dtypeStr) != dataTypeDict.end(),
+                                    "Unsupport data type: " + dtypeStr);
+            config.dtype = dataTypeDict[dtypeStr];
         } else {
 			Usage();
 			exit(-1);
@@ -51,9 +82,6 @@ void ParseArgs(int argc, char **argv, RunConfig &config, fastllm::GenerationConf
 }
 
 int main(int argc, char **argv) {
-    int round = 0;
-    std::string history = "";
-
     RunConfig config;
     fastllm::GenerationConfig generationConfig;
 	ParseArgs(argc, argv, config, generationConfig);
@@ -61,24 +89,32 @@ int main(int argc, char **argv) {
     fastllm::PrintInstructionInfo();
     fastllm::SetThreads(config.threads);
     fastllm::SetLowMemMode(config.lowMemMode);
-    auto model = fastllm::CreateLLMModelFromFile(config.path);
+    bool isHFDir = access((config.path + "/config.json").c_str(), R_OK) == 0 || access((config.path + "config.json").c_str(), R_OK) == 0;
+    auto model = !isHFDir ? fastllm::CreateLLMModelFromFile(config.path) : fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt);
     model->SetSaveHistoryChat(true);
+    
+    for (auto &it : config.eosToken) {
+        generationConfig.stop_token_ids.insert(model->weight.tokenizer.GetTokenId(it));
+    }
+    std::string systemConfig = config.systemPrompt;
+    fastllm::ChatMessages messages = {{"system", systemConfig}};
 
     static std::string modelType = model->model_type;
     printf("欢迎使用 %s 模型. 输入内容对话，reset清空历史记录，stop退出程序.\n", model->model_type.c_str());
+
     while (true) {
         printf("用户: ");
         std::string input;
         std::getline(std::cin, input);
         if (input == "reset") {
-            history = "";
-            round = 0;
+            fastllm::ChatMessages messages = {{"system", config.systemPrompt}};
             continue;
         }
         if (input == "stop") {
             break;
         }
-        std::string ret = model->Response(model->MakeInput(history, round, input), [](int index, const char* content) {
+        messages.push_back(std::make_pair("user", input));
+        std::string ret = model->Response(model->ApplyChatTemplate(messages), [](int index, const char* content) {
             if (index == 0) {
                 printf("%s:%s", modelType.c_str(), content);
                 fflush(stdout);
@@ -91,8 +127,7 @@ int main(int argc, char **argv) {
                 printf("\n");
             }
         }, generationConfig);
-        history = model->MakeHistory(history, round, input, ret);
-        round++;
+        messages.push_back(std::make_pair("assistant", ret));
     }
 
 	return 0;
