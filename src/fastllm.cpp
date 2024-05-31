@@ -299,7 +299,7 @@ namespace fastllm {
         this->cacheUid = ori.cacheUid;
         
         // std::cout<<"调用拷贝构造"<<std::endl;
-        if (ori.dims != this->dims || this->cpuData == nullptr || ori.dataType != this->dataType) {
+        if (ori.expansionDims != this->expansionDims || ori.dims != this->dims || this->cpuData == nullptr || ori.dataType != this->dataType) {
             if (ori.dims.size() == 0) {
                 delete[] this->cpuData;
                 this->dataType = ori.dataType;
@@ -309,8 +309,14 @@ namespace fastllm {
                 return;
             }
             this->dataType = ori.dataType;
-            this->Resize(ori.dims);
-            this->Allocate();
+            if (ori.expansionDims.size() > 0 && ori.expansionDims != ori.dims) {
+                this->Expansion(ori.expansionDims);
+                this->Resize(ori.dims);
+                this->Allocate();
+            } else {
+                this->Resize(ori.dims);
+                this->Allocate();
+            }
         }
         std::memcpy(this->cpuData, ori.cpuData, this->GetBytes());
     }
