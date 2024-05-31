@@ -66,6 +66,9 @@ namespace fastllm {
             this->kv.push_back(std::make_pair(Data(dataType), Data(dataType)));
         }
         for (int i = 0; i < kv->size(); i++) {
+            (*kv)[i].first.ToDevice(DataDevice::CPU);
+            (*kv)[i].second.ToDevice(DataDevice::CPU);
+
             this->kv[i].first.CopyFrom((*kv)[i].first);
             this->kv[i].second.CopyFrom((*kv)[i].second);
         }
