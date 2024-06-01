@@ -303,8 +303,8 @@ namespace fastllm {
 
         std::vector <std::pair <Data, Data> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
-                                                   Data(DataType::FLOAT32)));
+            pastKeyValues.push_back(std::make_pair(Data(dataType),
+                                                   Data(dataType)));
             pastKeyValues.back().first.SetKVCache();
             pastKeyValues.back().second.SetKVCache();
         }
