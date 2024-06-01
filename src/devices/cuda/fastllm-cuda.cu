@@ -2717,6 +2717,13 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
         FastllmTransposeByRowKernel <256> <<< n * m, 256 >>>
                 ((uint8_t*)input.cudaData, (uint8_t*)tempData, n, m, k * input.unitSize);
         input.Resize(new_dims);
+    } else if (axis == std::vector <int> {0, 2, 1, 3} && input.dims[0] == 1) {
+        int n = input.dims[1];
+        int m = input.dims[2];
+        int k = input.dims[3];
+        FastllmTransposeByRowKernel <256> <<< n * m, 256 >>>
+                ((uint8_t*)input.cudaData, (uint8_t*)tempData, n, m, k * input.unitSize);
+        input.Resize(new_dims);
     } else {
         std::vector<int> temp;
         int len = input.Count(0);
