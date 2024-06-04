@@ -213,6 +213,10 @@ namespace fastllm {
         PastKVCacheManager pastKVCacheManager;
         bool saveHistoryChat = false;
 
+        std::string lastPrompt = "";
+        std::vector<std::pair<Data, Data> > *lastKeyValues = nullptr;
+        int lastPromptTokens = 0;
+        
         DataType dataType = DataType::FLOAT32;
     };
 }
