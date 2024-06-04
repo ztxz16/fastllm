@@ -6,6 +6,7 @@
 #include <fcntl.h>
 
 #include "devices/tfacc/tfaccdevice.h"
+#include "devices/cpu/cpudevice.h"
 #include "devices/tfacc/fastllm-tfacc.h"
 #include "devices/cpu/alivethreadpool.h"
 
@@ -23,84 +24,6 @@
 #include "utils.h"
 
 namespace fastllm {
-    void GetArrayMinMax(float *a, int len, float &minValue, float &maxValue) {
-        int j = 0;
-        minValue = 1e100;
-        maxValue = -1e100;
-#ifdef __aarch64__
-        float32x4_t mins = vdupq_n_f32(1e100);
-        float32x4_t maxs = vdupq_n_f32(-1e100);
-        for (; j + 3 < len; j += 4) {
-            float32x4_t v = vld1q_f32(a + j);
-            mins = vminq_f32(mins, v);
-            maxs = vmaxq_f32(maxs, v);
-        }
-        for (int l = 0; l < 4; l++) {
-            minValue = std::min(minValue, mins[l]);
-            maxValue = std::max(maxValue, maxs[l]);
-        }
-#endif
-        for (; j < len; j++) {
-            minValue = std::min(minValue, a[j]);
-            maxValue = std::max(maxValue, a[j]);
-        }
-    }
-
-    void QuantizationAll(float *fValue, uint8_t *uValue, int len, LowBitConfig *config) {
-        float scale = config->scale;
-        float zeroPoint = config->zeroPoint;
-        int j = 0;
-#ifdef __aarch64__
-        float32x4_t scales = vdupq_n_f32(scale);
-        float32x4_t zeros = vdupq_n_f32(zeroPoint + 0.5);
-        int32x4_t maxds = vcombine_s32(vcreate_s32(0x000000ff000000ff), vcreate_s32(0x000000ff000000ff));
-        int32x4_t minds = vcombine_s32(vcreate_s32(0x0000000000000000), vcreate_s32(0x0000000000000000));
-        for (; j + 7 < len; j += 8) {
-            float32x4_t fin1 = vld1q_f32(fValue + j);
-            float32x4_t fin2 = vld1q_f32(fValue + j + 4);
-            fin1 = vaddq_f32(vdivq_f32(fin1, scales), zeros);
-            fin2 = vaddq_f32(vdivq_f32(fin2, scales), zeros);
-            int32x4_t out1 = vcvtq_s32_f32(fin1);
-            int32x4_t out2 = vcvtq_s32_f32(fin2);
-            out1 = vmaxq_s32(out1, minds);
-            out1 = vminq_s32(out1, maxds);
-            out2 = vmaxq_s32(out2, minds);
-            out2 = vminq_s32(out2, maxds);
-            uint16x8_t out3 = vpaddq_u16(vreinterpretq_u16_s32(out1), vreinterpretq_u16_s32(out2));
-            uint8x8_t out = vmovn_u16(out3);
-            vst1_u8(uValue + j, out);
-        }
-#endif
-        for (; j < len; j++) {
-            uValue[j] = (uint8_t) (std::min(255., (double) std::max(fValue[j] / scale + zeroPoint + 0.5, 0.0)));
-        }
-    }
-
-    struct MultiThreadOnlineQuantizationOp : MultiThreadBaseOp {
-        float *input;
-        uint8_t *output;
-        LowBitConfig *configs;
-        int n, m, group, groupCnt;
-
-        MultiThreadOnlineQuantizationOp (float *input, uint8_t *output, LowBitConfig *configs, int n, int m, int group, int groupCnt) :
-                input(input), output(output), configs(configs), n(n), m(m), group(group), groupCnt(groupCnt) {} ;
-
-        void Run() {
-            for (int i = 0; i < n; i++) {
-                float *cur = input + i * m;
-                uint8_t *u = output + i * m;
-                for (int g = 0; g < group; g++) {
-                    int st = g * groupCnt;
-                    int end = std::min(m, (g + 1) * groupCnt);
-                    float minValue = 1e9, maxValue = -1e9;
-                    GetArrayMinMax(input + i * m + st, end - st, minValue, maxValue);
-                    configs[i * group + g] = (LowBitConfig(minValue, maxValue, 8, 0));
-                    QuantizationAll(cur + st, u + st, end - st, &configs[i * group + g]);
-                }
-            }
-        }
-    };
-
     static TfaccClient tfaccClient;
 
     TfaccDevice::TfaccDevice() {
@@ -235,7 +158,7 @@ namespace fastllm {
                         int end = (i == threadNum - 1 ? n : cur + per + (cur + per * (threadNum - i) < n));
                         ops.push_back(new MultiThreadOnlineQuantizationOp(
                                         inputData + cur * m, uinput.data() + cur * m, inputConfigs.data() + cur * group,
-                                        end - cur, m, group, groupCnt));
+                                        end - cur, m, group, groupCnt, nullptr, nullptr, nullptr));
                         cur = end;
                     }
                     for (int i = 0; i < threadNum; i++) {
@@ -246,7 +169,7 @@ namespace fastllm {
                         delete ops[i];
                     }
                 } else {
-                    MultiThreadOnlineQuantizationOp(inputData, uinput.data(), inputConfigs.data(), n, m, group, groupCnt).Run();
+                    MultiThreadOnlineQuantizationOp(inputData, uinput.data(), inputConfigs.data(), n, m, group, groupCnt, nullptr, nullptr, nullptr).Run();
                 }
 
                 if (weight.dataType == DataType::INT4) {
