@@ -378,7 +378,7 @@ namespace fastllm {
                 pastValue.ToDevice(DataDevice::CUDA);
             }
 
-            int unitLen = 64;
+            int unitLen = 128;
 #ifdef USE_CUDA
             unitLen = 128;
 #endif
