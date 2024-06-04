@@ -2278,6 +2278,19 @@ namespace fastllm {
         });
     }
 
+    bool CanRunMergeMOE() {
+        return curExecutor->CanRunOnFirstDevice("MergeMOE", {}, {}, {});
+    }
+
+    void MergeMOE(const Data &input, const Data &logits, std::vector <Data*> weights, std::vector <Data*> biass, 
+                float routeScale, float sharedScale, int topk, Data &output) {
+        curExecutor->Run("MergeMOE", {
+                {"input", (Data*)&input}, {"logits", (Data*)&logits},
+                {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
+                {"output", (Data*)&output}
+        }, {{"sharedScale", sharedScale}, {"routeScale", routeScale}}, {{"topk", topk}});
+    }
+
     void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
                    int group, float scale, int attentionType) {
         int maskType = 0; // 0: 因果mask
