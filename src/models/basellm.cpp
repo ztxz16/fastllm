@@ -136,16 +136,22 @@ namespace fastllm {
     std::string basellm::Response(const std::string &oriInput, RuntimeResult retCb,
                                   const fastllm::GenerationConfig &generationConfig) {
         std::string input = oriInput;
-        PastKVCacheMemory *memory;
-        std::string oldPrompt;
-        int oldTokens = 0;
         if (this->saveHistoryChat) {
-            memory = pastKVCacheManager.Get(input);
-            if (memory != nullptr) {
-                oldPrompt = memory->prompt;
-                oldTokens = memory->tokens;
-                input = input.substr(memory->prompt.size());
+            if (lastKeyValues != nullptr) {
+                if (input.size() < lastPrompt.size() || (input.substr(0, lastPrompt.size()) != lastPrompt)) {
+                    lastPrompt = "";
+                    lastPromptTokens = 0;
+                    delete lastKeyValues;
+                    lastKeyValues = nullptr;
+                } else {
+                    input = input.substr(lastPrompt.size());
+                }
             }
+        } else {
+            lastPrompt = "";
+            lastPromptTokens = 0;
+            delete lastKeyValues;
+            lastKeyValues = nullptr;
         }
 
         //printf("lastPrompt = %s\n", lastPrompt.c_str());
@@ -168,32 +174,21 @@ namespace fastllm {
         for (int i = 0; i < inputTokenData.Count(0); i++) {
             inputTokens[0].push_back(((float *) inputTokenData.cpuData)[i]);
         }
-
-        std::vector <std::pair <Data, Data> > pastKeyValues;
-        for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(this->dataType),
-                                                   Data(this->dataType)));
-        }
-
-        if (this->saveHistoryChat) {
-            if (memory != nullptr) {
-                for (int i = 0; i < block_cnt; i++) {
-                    pastKeyValues[i].first.CopyFrom(memory->kv[i].first);
-                    pastKeyValues[i].second.CopyFrom(memory->kv[i].second);
-                }
+        
+        if (lastKeyValues == nullptr) {
+            lastKeyValues = new std::vector<std::pair<Data, Data> >();
+            for (int i = 0; i < block_cnt; i++) {
+                lastKeyValues->push_back(std::make_pair(Data(this->dataType), Data(this->dataType)));
+                lastKeyValues->back().first.SetKVCache();
+                lastKeyValues->back().second.SetKVCache();
             }
-            pastKVCacheManager.Unlock();
         }
 
-        for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.back().first.SetKVCache();
-            pastKeyValues.back().second.SetKVCache();
-        }
-
+        std::vector<std::pair<Data, Data> > &pastKeyValues = (*lastKeyValues);
         std::string retString = "";
         std::vector<float> results;
         LastTokensManager tokens(1, generationConfig.last_n);
-        int promptLen = oldTokens + inputTokens[0].size(), index = 0;
+        int promptLen = lastPromptTokens + inputTokens[0].size(), index = 0;
         int add_special_tokens = generationConfig.add_special_tokens? 1: 0;
         FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}, {"add_special_tokens", add_special_tokens}},
                       inputIds, attentionMask, positionIds);
@@ -253,15 +248,8 @@ namespace fastllm {
             retCb(-1, retString.c_str());
 #endif
 
-        if (this->saveHistoryChat) {
-            std::string currentPrompt;
-            int currentTokens;
-            if (oldPrompt != "") {
-                pastKVCacheManager.Remove(oldPrompt);
-            }
-            pastKVCacheManager.Record(oriInput + retString, promptLen + index, &pastKeyValues);
-        }
-
+        lastPrompt += (input + retString);
+        lastPromptTokens = promptLen + index;
         return retString;
     }
 
