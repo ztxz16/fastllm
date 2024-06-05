@@ -107,7 +107,7 @@ int main(int argc, char **argv) {
         std::string input;
         std::getline(std::cin, input);
         if (input == "reset") {
-            fastllm::ChatMessages messages = {{"system", config.systemPrompt}};
+            messages = {{"system", config.systemPrompt}};
             continue;
         }
         if (input == "stop") {

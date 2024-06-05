@@ -96,6 +96,8 @@ namespace fastllm {
         std::string rope_scaling_type;
 
         bool mergeSwiglu = false;
+        std::vector <std::vector <Data*> > weights;
+        std::vector <std::vector <Data*> > biass;
     };
 }
 
