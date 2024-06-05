@@ -1289,7 +1289,21 @@ namespace fastllm {
             return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
         } else if (this->type == TokenizerType::QWEN) {
             std::map<std::string, int> specialTokens = {{"<|im_start|>", 151644}, {"<|im_end|>", 151645}, {"<|endoftext|>", 151643}};
-
+            for (int i = 0; i < ori.size(); i++) {
+                if (i + 3 < ori.size() && ori[i] == '<' && ori[i + 1] == 'F' && ori[i + 2] == 'L' && ori[i + 3] == 'M') {
+                    if (i + 15 < ori.size() && ori.substr(i, 15) == "<FLM_FIX_TOKEN_") {
+                        i += 15;
+                        int now = 0;
+                        while (ori[i] >= '0' && ori[i] <= '9') {
+                            now = now * 10 + ori[i] - '0';
+                            i++;
+                        }
+                        specialTokens["<FLM_FIX_TOKEN_" + std::to_string(now) + ">"] = now;
+                        continue;
+                    }
+                }
+            }
+            
             // comment these special tokens for now
             // for (int i = 0; i < 205; i++) {
             //     specialTokens.insert("<|extra_" + std::to_string(i) + "|>");
