@@ -69,6 +69,12 @@ namespace fastllm {
         this->UpdateRotaryPosEmb(1.0f);
         weight.embeddingNames.insert("transformer.word_embeddings.weight");
         weight.embeddingNames.insert("transformer.embedding.word_embeddings.weight");
+
+        weight.linearNames = {
+            "*.query_key_value.weight", "*.dense.weight",
+            "*.mlp.dense_h_to_4h.weight", "*.mlp.dense_4h_to_h.weight",
+            "lm_head.weight", "transformer.output_layer.weight"
+        };
     }
 
     void ChatGLMModel::InitParams() {
@@ -77,12 +83,18 @@ namespace fastllm {
             if (this->weight.dicts.find("gmask_token_id") != this->weight.dicts.end()) {
                 this->gmask_token_id = atoi(this->weight.dicts["gmask_token_id"].c_str());
             }
-        } else if (GetVersion() == 2) {
+        } else if (GetVersion() == 2 && this->tokenizerClass != "ChatGLM4Tokenizer") {
             this->gmask_token_id = 64790;
             this->bos_token_id = 64792;
         }
-        if (this->weight.dicts.find("rope_ratio") != this->weight.dicts.end()) {
+        if (this->weight.dicts.find("rope_ratio") != this->weight.dicts.end()) {            
             UpdateRotaryPosEmb(atof(this->weight.dicts["rope_ratio"].c_str()));
+        }
+        if (this->weight.dicts.find("layernorm_epsilon") != this->weight.dicts.end()) {
+            this->layernorm_epsilon = atof(this->weight.dicts["layernorm_epsilon"].c_str());
+        }
+        if (this->weight.dicts.find("seq_length") != this->weight.dicts.end()) {
+            max_positions = atoi(this->weight.dicts["seq_length"].c_str());
         }
     }
 
@@ -143,7 +155,7 @@ namespace fastllm {
             } else if (version == 2) {
                 std::string inputRMSWeightName =
                         "transformer.encoder.layers." + std::to_string(i) + ".input_layernorm.weight";
-                RMSNorm(hiddenStates, weight[inputRMSWeightName], 1e-5, attenInput);
+                RMSNorm(hiddenStates, weight[inputRMSWeightName], layernorm_epsilon, attenInput);
             }
             std::string qkvWeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.weight";
             std::string qkvBiasName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.bias";
@@ -291,7 +303,7 @@ namespace fastllm {
                 std::string postRMSWeightName =
                         "transformer.encoder.layers." + std::to_string(i) + ".post_attention_layernorm.weight";
                 Mul(hiddenStates, 1.0, temp);
-                RMSNorm(hiddenStates, weight[postRMSWeightName], 1e-5, mlpInput);
+                RMSNorm(hiddenStates, weight[postRMSWeightName], this->layernorm_epsilon, mlpInput);
                 // 1.4 MLP
                 std::string fcInKeyName = "transformer.encoder.layers." + std::to_string(i) + ".mlp.dense_h_to_4h";
                 std::string fcOutKeyName = "transformer.encoder.layers." + std::to_string(i) + ".mlp.dense_4h_to_h";
@@ -325,7 +337,7 @@ namespace fastllm {
                           weight["transformer.final_layernorm.bias"], -1, hiddenStates);
                 Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
             } else {
-                RMSNorm(hiddenStates, weight["transformer.encoder.final_layernorm.weight"], 1e-5, hiddenStates);
+                RMSNorm(hiddenStates, weight["transformer.encoder.final_layernorm.weight"], this->layernorm_epsilon, hiddenStates);
                 Linear(hiddenStates, weight["transformer.output_layer.weight"], Data(), logits);
             }
 
@@ -434,7 +446,7 @@ namespace fastllm {
             } else if (version == 2) {
                 std::string inputRMSWeightName =
                         "transformer.encoder.layers." + std::to_string(i) + ".input_layernorm.weight";
-                RMSNorm(hiddenStates, weight[inputRMSWeightName], 1e-5, attenInput);
+                RMSNorm(hiddenStates, weight[inputRMSWeightName], this->layernorm_epsilon, attenInput);
             }
 
             std::string qkvWeightName = weightPre + std::to_string(i) + weightMiddle + ".query_key_value.weight";
@@ -690,7 +702,7 @@ namespace fastllm {
                         "transformer.encoder.layers." + std::to_string(i) + ".post_attention_layernorm.weight";
                 Data temp;
                 Mul(hiddenStates, 1.0, temp);
-                RMSNorm(hiddenStates, weight[postRMSWeightName], 1e-5, mlpInput);
+                RMSNorm(hiddenStates, weight[postRMSWeightName], this->layernorm_epsilon, mlpInput);
                 // 1.4 MLP
                 std::string fcInKeyName = "transformer.encoder.layers." + std::to_string(i) + ".mlp.dense_h_to_4h";
                 std::string fcOutKeyName = "transformer.encoder.layers." + std::to_string(i) + ".mlp.dense_4h_to_h";
@@ -711,7 +723,7 @@ namespace fastllm {
                       weight["transformer.final_layernorm.bias"], -1, hiddenStates);
             Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         } else {
-            RMSNorm(hiddenStates, weight["transformer.encoder.final_layernorm.weight"], 1e-5, hiddenStates);
+            RMSNorm(hiddenStates, weight["transformer.encoder.final_layernorm.weight"], this->layernorm_epsilon, hiddenStates);
             Linear(hiddenStates, weight["transformer.output_layer.weight"], Data(), logits);
         }
         ToDataType(logits, DataType::FLOAT32);
