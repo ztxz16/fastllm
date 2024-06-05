@@ -282,6 +282,7 @@ extern "C" {
         }
         auto model = models.GetModel(modelId);
         model->eos_token_id = model->weight.tokenizer.GetTokenId(eos_token);
+        model->eos_token_ids.insert(model->weight.tokenizer.GetTokenId(eos_token));
     }
 
     DLL_EXPORT char *response_str_llm_model(int modelId, char *content,
