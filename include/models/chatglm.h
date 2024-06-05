@@ -69,10 +69,14 @@ namespace fastllm {
         void UpdateRotaryPosEmb(float rope_factor);
 
         int gmask_token_id;
+
+        std::string tokenizerClass = "";
     private:
         virtual void CausalMask(Data &data, int start) {}; // 因果mask？
 
         float rope_factor = 1.0f;
+
+        float layernorm_epsilon = 1e-5;
     };
 }
 
