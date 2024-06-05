@@ -198,7 +198,8 @@ namespace fastllm {
             int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);        
             tokens.units[0].Push(ret);
             if (ret == eos_token_id
-                || generationConfig.stop_token_ids.find(ret) != generationConfig.stop_token_ids.end()) {
+                || generationConfig.stop_token_ids.find(ret) != generationConfig.stop_token_ids.end()
+                || eos_token_ids.find(ret) != eos_token_ids.end()) {
                 break;
             }
 
@@ -326,7 +327,7 @@ namespace fastllm {
             for (int i = 0; i < batch; i++) {
                 fret.push_back(ret[i]);
                 inputTokens[i] = std::vector <float> {(float)ret[i]};
-                if (ret[i] == eos_token_id) {
+                if (ret[i] == eos_token_id || eos_token_ids.find(ret[i]) != eos_token_ids.end()) {
                     isEnding[i] = true;
                 } else {
                     auto itStopTk = generationConfig.stop_token_ids.find(ret[i]);
@@ -783,7 +784,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             for (int i = 0; i < handles.size(); i++) {
                                 auto &it = *model->responseContextDict.dicts.find(handles[i]);
                                 int curRet = ret[i];
-                                if (curRet == model->eos_token_id) {
+                                if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                                     it.second->isEnding = true;
                                 } else {
                                     auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
