@@ -185,6 +185,7 @@ namespace fastllm {
 
         int bos_token_id;
         int eos_token_id;
+        std::set <int> eos_token_ids;
         int embed_dim = 4096;
         int num_attention_heads = 32;
         int head_dim = embed_dim / num_attention_heads;
