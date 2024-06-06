@@ -285,6 +285,8 @@ namespace fastllm {
 
         Data (const Data &ori); // 深拷贝
 
+        void CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, int groupCnt = -1); // 从oriData中创建
+
         void CopyFrom(const Data &ori); // 复制
 
         void FakeFrom(const Data &ori, size_t offset); // 将data指针指向ori的data + offset，delete时不销毁
@@ -460,6 +462,8 @@ namespace fastllm {
         void AddDict(const std::string &key, const std::string &value); // 插入一个词条
 
         void AddAdapterDict(const std::string &name, const std::string &key, const std::string &value);
+
+        void AddEmptyWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType);
 
         void AddWeight(const std::string &key, const std::vector <int> &dims,
                        DataType dataType, WeightType weightType, DataType oriDataType, uint8_t *oriData,
