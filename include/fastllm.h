@@ -332,6 +332,23 @@ namespace fastllm {
         void SetKVCache();
     };
 
+    struct PartitionLinkNode {
+        std::pair <int, int> *cur = nullptr;
+        PartitionLinkNode *next = nullptr;
+        PartitionLinkNode *prev = nullptr;
+        int id = -1;
+
+        PartitionLinkNode *Skip(int t) {
+            PartitionLinkNode *ret = this;
+            while (t--) {
+                if (ret != nullptr) {
+                    ret = ret->next;
+                }
+            }
+            return ret;
+        }
+    };
+
     struct Tokenizer {
         enum TokenizerType {
             BPE = 0,
@@ -414,6 +431,8 @@ namespace fastllm {
         void Clear(); // 清空分词器
 
         void TryMergePairs(std::vector<Symbol> &symbols, int l, int r, std::priority_queue <SymbolPairs> &q); // 插入备选symbol
+
+        int GetRank(std::vector <Symbol> &symbols, PartitionLinkNode *cur, int skip);
 
         int GetRank(std::vector<Symbol> &symbols,  std::vector<std::pair<int, int>> &partitions, int idx, int skip);
 
