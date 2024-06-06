@@ -18,6 +18,7 @@ struct RunConfig {
 	bool lowMemMode = false; // 是否使用低内存模式
 
     fastllm::DataType dtype = fastllm::DataType::FLOAT16;
+    fastllm::DataType atype = fastllm::DataType::FLOAT32;
     int groupCnt = -1;
 };
 
@@ -74,6 +75,11 @@ void ParseArgs(int argc, char **argv, RunConfig &config, fastllm::GenerationConf
             fastllm::AssertInFastLLM(dataTypeDict.find(dtypeStr) != dataTypeDict.end(),
                                     "Unsupport data type: " + dtypeStr);
             config.dtype = dataTypeDict[dtypeStr];
+        } else if (sargv[i] == "--atype") {
+            std::string atypeStr = sargv[++i];
+            fastllm::AssertInFastLLM(dataTypeDict.find(atypeStr) != dataTypeDict.end(),
+                                    "Unsupport act type: " + atypeStr);
+            config.atype = dataTypeDict[atypeStr];
         } else {
 			Usage();
 			exit(-1);
@@ -91,7 +97,10 @@ int main(int argc, char **argv) {
     fastllm::SetLowMemMode(config.lowMemMode);
     bool isHFDir = access((config.path + "/config.json").c_str(), R_OK) == 0 || access((config.path + "config.json").c_str(), R_OK) == 0;
     auto model = !isHFDir ? fastllm::CreateLLMModelFromFile(config.path) : fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt);
-    model->SetSaveHistoryChat(true);
+    if (config.atype != fastllm::DataType::FLOAT32) {
+        model->SetDataType(config.atype);
+    }
+    model->SetSaveHistoryChat(true);    
     
     for (auto &it : config.eosToken) {
         generationConfig.stop_token_ids.insert(model->weight.tokenizer.GetTokenId(it));
