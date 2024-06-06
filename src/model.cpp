@@ -456,16 +456,77 @@ namespace fastllm {
         }
 
         // 4. 读取权重
+        auto tensors = safeTensors.GetSortedItemNames();
         int cur = 0;
-        for (auto &weightName : safeTensors.GetSortedItemNames()) {
+        long long totalBytes = 0;
+        for (auto &weightName : tensors) {
             auto &tensor = safeTensors.itmeDict[weightName];
-            tensor.CreateBuffer(DataType::FLOAT32);
-            model->weight.AddWeight(weightName, tensor.intShape, linearDataType, WeightType::AUTO, DataType::FLOAT32, tensor.buffer, groupCnt);
-            tensor.ClearBuffer();
+            auto oriDataType = DataType::FLOAT32;
+            auto weightType = model->weight.GetWeightType(weightName);
+            auto dataType = (weightType == WeightType::EMBEDDING || weightType == WeightType::NONE) ? oriDataType : linearDataType;
+            model->weight.AddEmptyWeight(weightName, tensor.intShape, dataType);
+            totalBytes += tensor.bytes;
 
-            printf("Load (%d / %d) \r", (++cur), (int)safeTensors.itmeDict.size());
+            printf("Load %d \r", (++cur) * 100 / (int)safeTensors.itmeDict.size());
             fflush(stdout);
         }
+
+        std::vector <std::thread*> threads;
+        int threadNum = std::min(16, std::max(4, (int)GetAlivePool()->threads.size()));
+        int per = tensors.size() / threadNum;
+        std::mutex locker;
+        int cnt = 0;
+
+        std::vector <std::pair <int, int> > parts;
+        int start = 0;
+        for (int i = 0; i < threadNum; i++) {
+            int cur = start;
+            long long now = 0;
+            while (true) {
+                if (now * threadNum >= totalBytes || start >= tensors.size()) {
+                    break;
+                }
+                now += safeTensors.itmeDict[tensors[start]].bytes;
+                start++;
+            }
+            parts.push_back(std::make_pair(cur, start));
+        }
+        parts.back().second = tensors.size();
+        while (parts.size() < threadNum) {
+            parts.push_back(std::make_pair(-1, -1));
+        }
+
+        for (int i = 0; i < threadNum; i++) {
+            int st = per * i, end = (i == threadNum - 1) ? tensors.size() : per * (i + 1);
+            threads.push_back(
+                new std::thread([&](int st, int end) {
+                    for (int i = st; i < end; i++) {
+                        auto &weightName = tensors[i];
+                        auto &tensor = safeTensors.itmeDict[weightName];
+                        auto oriDataType = DataType::FLOAT32;
+                        auto weightType = model->weight.GetWeightType(weightName);
+                        auto dataType = (weightType == WeightType::EMBEDDING || weightType == WeightType::NONE) ? oriDataType : linearDataType;
+
+                        if (tensor.dtype == "BF16" &&
+                            (dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)) {
+                            oriDataType = DataType::BFLOAT16;
+                        }
+                        tensor.CreateBuffer(oriDataType);
+                        model->weight[weightName].CreateFromOriData(weightType, oriDataType, tensor.buffer, groupCnt);
+                        tensor.ClearBuffer();
+                        locker.lock();
+                        printf("Convert %d \r", (++cnt) * 100 / (int)safeTensors.itmeDict.size());
+                        fflush(stdout);
+                        locker.unlock();
+                    }
+                }, parts[i].first, parts[i].second)
+            );
+        }
+        for (int i = 0; i < threads.size(); i++) {
+            threads[i]->join();
+            delete threads[i];
+        }
+
         printf("\n");
         fflush(stdout);
 
