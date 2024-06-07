@@ -87,7 +87,7 @@ double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_
 __global__ void FastllmCudaFloat2HalfKernel(float* a, half *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
-        b[idx] = __float2half(a[idx]);
+        b[idx] = __float2half_rz(a[idx]);
     }
 }
 
@@ -483,7 +483,7 @@ __device__ void FastllmSoftmaxKernelInner1Func(float *input, float *output, int 
 
     // 1. 每个线程计算一部分
     unsigned int tid = threadIdx.x;
-    float maxValue = input[tid];
+    float maxValue = -1e100;
     for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
         maxValue = max(maxValue, input[i]);
     }
@@ -550,7 +550,7 @@ __device__ void FastllmSoftmaxKernelInner1Func(half *input, half *output, int ch
 
     // 1. 每个线程计算一部分
     unsigned int tid = threadIdx.x;
-    half maxValue = input[tid];
+    half maxValue = __float2half(-1e10);
     for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
         maxValue = FastllmHalfMaxFunc(maxValue, input[i]);
     }
