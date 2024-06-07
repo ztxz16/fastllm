@@ -448,7 +448,7 @@ namespace fastllm {
             // ChatGLM采用拼接token的方法，需要强行指定分割词的TokenID
             model->pre_prompt = "";
             model->user_role = ("<FLM_FIX_TOKEN_" + std::to_string(model->weight.tokenizer.GetTokenId("<|user|>"))  + ">\n");
-            model->bot_role = ("<FLM_FIX_TOKEN_" + std::to_string(model->weight.tokenizer.GetTokenId("<|assistant|>")) + ">");
+            model->bot_role = ("<FLM_FIX_TOKEN_" + std::to_string(model->weight.tokenizer.GetTokenId("<|assistant|>")) + ">\n");
             model->history_sep = "";
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
         } else {
