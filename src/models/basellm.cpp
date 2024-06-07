@@ -709,6 +709,7 @@ printf("%d / %d\n", endingCount, batch);
                                 handles.push_back(it.first);
 
                                 if (it.second->preTokens == 0) {
+                                    it.second->intParams["add_special_tokens"] = it.second->generationConfig.add_special_tokens;
                                     it.second->intParams["promptLen"] = it.second->currentTokens.size();
                                     it.second->intParams["index"] = 0;
                                 } else {
