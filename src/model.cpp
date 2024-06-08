@@ -5,7 +5,7 @@
 #include "fastllm.h"
 #include <sstream>
 #include <fstream>
-
+#include <filesystem>
 #include "chatglm.h"
 #include "moss.h"
 #include "llama.h"
@@ -17,13 +17,19 @@
 #include "internlm2.h"
 #include "bert.h"
 
+#if defined(_MSC_VER) && _MSC_VER <= 1900 // VS 2015
+    namespace fs = std::experimental::filesystem;
+#else
+    namespace fs = std::filesystem;
+#endif
+
 namespace fastllm {
     std::string ReadAllFile(const std::string &fileName) {
-        if (access(fileName.c_str(), R_OK) != 0) {
+        std::ifstream t(fileName.c_str(), std::ios::in);
+        if (!t.good()) {
             ErrorInFastLLM("Read error: can't find \"" + fileName + "\".");
         }
 
-        std::ifstream t(fileName.c_str());
         std::string ret((std::istreambuf_iterator<char>(t)), std::istreambuf_iterator<char>());
         t.close();
         return ret;
@@ -376,7 +382,8 @@ namespace fastllm {
         std::set <std::string> stFiles;
         std::string stIndexFile = path + "model.safetensors.index.json";
         std::string error;
-        if (access(stIndexFile.c_str(), R_OK) != 0) {
+        fs::path stIndex(stIndexFile);
+        if (!fs::exists(stIndex)) {
             stFiles.insert(path + "model.safetensors");
         } else {
             auto stIndex = json11::Json::parse(ReadAllFile(stIndexFile), error)["weight_map"];
