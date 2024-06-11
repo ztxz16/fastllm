@@ -1,8 +1,8 @@
 // Provide by Jacques CHEN (http://whchen.net/index.php/About.html)
 // HTML file reference from ChatGLM-MNN （https://github.com/wangzhaode/ChatGLM-MNN)
 
-#include "model.h"
 #include "httplib.h"
+#include "model.h"
 
 #include <cstdio>
 #include <cstring>
