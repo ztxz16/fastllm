@@ -1,7 +1,6 @@
 // Provide by Jacques CHEN (http://whchen.net/index.php/About.html)
 // HTML file reference from ChatGLM-MNN （https://github.com/wangzhaode/ChatGLM-MNN)
 
-#include "model.h"
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -120,6 +119,7 @@ using socket_t = int;
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include "model.h"
 
 struct APIConfig {
     std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
