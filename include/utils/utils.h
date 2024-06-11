@@ -6,11 +6,13 @@
 #ifndef FASTLLM_UTILS_H
 #define FASTLLM_UTILS_H
 
+#include <algorithm>
 #include <map>
 #include <chrono>
 #include <string>
 #include <cstdio>
 #include <cstdint>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32) or defined(_WIN64)
@@ -31,11 +33,7 @@
 
 namespace fastllm {
     static void MySleep(int t) {
-#if defined(_WIN32) or defined(_WIN64)
-        Sleep(t);
-#else
-        sleep(t);
-#endif
+        std::this_thread::sleep_for(std::chrono::seconds(0));
     }
 
     static void ErrorInFastLLM(const std::string &error) {
