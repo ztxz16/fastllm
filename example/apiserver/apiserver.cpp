@@ -121,6 +121,16 @@ using socket_t = int;
 #include <thread>
 #include "model.h"
 
+std::map <std::string, fastllm::DataType> dataTypeDict = {
+    {"float32", fastllm::DataType::FLOAT32},
+    {"half", fastllm::DataType::FLOAT16},
+    {"float16", fastllm::DataType::FLOAT16},
+    {"int8", fastllm::DataType::INT8},
+    {"int4", fastllm::DataType::INT4_NOZERO},
+    {"int4z", fastllm::DataType::INT4},
+    {"int4g", fastllm::DataType::INT4_GROUP}
+};
+
 struct APIConfig {
     std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
     std::string webPath = "web"; // 网页文件路径
@@ -129,6 +139,8 @@ struct APIConfig {
     int port = 8080; // 端口号
     int tokens = -1; // token容量限制
     int batch = 256; // batch数限制
+    fastllm::DataType dtype = fastllm::DataType::FLOAT16;
+    int groupCnt = -1;
 };
 
 void ToNext(char * &cur, const std::string &target, std::string &v) {
@@ -251,11 +263,7 @@ struct WorkQueue {
             while (true) {
                 std::unique_lock <std::mutex> lock(ts->locker);
                 if (ts->activateQueryNumber >= ts->maxActivateQueryNumber) {
-#ifdef WIN32
-                    Sleep(0);
-#else
-                    sleep(0);
-#endif
+                    fastllm::MySleep(0);
                     continue;
                 }
                 if (ts->q.empty()) {
@@ -348,6 +356,7 @@ void Usage() {
     std::cout << "<-w|--web> <args>:            网页文件的路径" << std::endl;
     std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
     std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
+    std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
     std::cout << "<--batch>:                    最大batch数" << std::endl;
     std::cout << "<--tokens>:                   最大tokens容量" << std::endl;
     std::cout << "<--port> <args>:              网页端口号" << std::endl;
@@ -372,6 +381,15 @@ void ParseArgs(int argc, char **argv, APIConfig &config) {
             config.webPath = sargv[++i];
         } else if (sargv[i] == "--port") {
             config.port = atoi(sargv[++i].c_str());
+        } else if (sargv[i] == "--dtype") {
+            std::string dtypeStr = sargv[++i];
+            if (dtypeStr.size() > 5 && dtypeStr.substr(0, 5) == "int4g") {
+                config.groupCnt = atoi(dtypeStr.substr(5).c_str());
+                dtypeStr = dtypeStr.substr(0, 5);
+            }
+            fastllm::AssertInFastLLM(dataTypeDict.find(dtypeStr) != dataTypeDict.end(),
+                                    "Unsupport data type: " + dtypeStr);
+            config.dtype = dataTypeDict[dtypeStr];
         } else if (sargv[i] == "--tokens") {
             config.tokens = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "--batch") {
@@ -393,7 +411,13 @@ int main(int argc, char** argv) {
 
     fastllm::SetThreads(config.threads);
     fastllm::SetLowMemMode(config.lowMemMode);
-    workQueue.model = fastllm::CreateLLMModelFromFile(config.path);
+    if (!fastllm::FileExists(config.path)) {
+        printf("模型文件 %s 不存在！\n", config.path.c_str());
+        exit(0);
+    }
+    bool isHFDir = fastllm::FileExists(config.path + "/config.json") || fastllm::FileExists(config.path + "config.json");
+    workQueue.model = isHFDir ? fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt)
+        : fastllm::CreateLLMModelFromFile(config.path);
     workQueue.model->tokensLimit = config.tokens;
     workQueue.maxActivateQueryNumber = std::max(1, std::min(256, config.batch));
     workQueue.Start();
@@ -442,11 +466,7 @@ int main(int argc, char** argv) {
         buff[size] = 0;
 
         while (workQueue.q.size() > workQueue.maxActivateQueryNumber) {
-#ifdef WIN32
-                    Sleep(0);
-#else
-                    sleep(0);
-#endif
+            fastllm::MySleep(0);
         }
         workQueue.Push(buff, client);
     }

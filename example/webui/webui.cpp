@@ -12,21 +12,34 @@
 #include <string>
 #include <mutex>
 
+std::map <std::string, fastllm::DataType> dataTypeDict = {
+    {"float32", fastllm::DataType::FLOAT32},
+    {"half", fastllm::DataType::FLOAT16},
+    {"float16", fastllm::DataType::FLOAT16},
+    {"int8", fastllm::DataType::INT8},
+    {"int4", fastllm::DataType::INT4_NOZERO},
+    {"int4z", fastllm::DataType::INT4},
+    {"int4g", fastllm::DataType::INT4_GROUP}
+};
+
 struct WebConfig {
     std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
     std::string webPath = "web"; // 网页文件路径
     int threads = 4; // 使用的线程数
     bool lowMemMode = false; // 是否使用低内存模式
     int port = 8081; // 端口号
+    fastllm::DataType dtype = fastllm::DataType::FLOAT16;
+    int groupCnt = -1;
 };
 
 void Usage() {
     std::cout << "Usage:" << std::endl;
     std::cout << "[-h|--help]:                  显示帮助" << std::endl;
     std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
-    std::cout << "<-w|--web> <args>:            网页文件的路径" << std::endl;
+    std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
     std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
     std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
+    std::cout << "<-w|--web> <args>:            网页文件的路径" << std::endl;
     std::cout << "<--port> <args>:              网页端口号" << std::endl;
 }
 
@@ -45,6 +58,15 @@ void ParseArgs(int argc, char **argv, WebConfig &config) {
             config.threads = atoi(sargv[++i].c_str());
         } else if (sargv[i] == "-l" || sargv[i] == "--low") {
             config.lowMemMode = true;
+        } else if (sargv[i] == "--dtype") {
+            std::string dtypeStr = sargv[++i];
+            if (dtypeStr.size() > 5 && dtypeStr.substr(0, 5) == "int4g") {
+                config.groupCnt = atoi(dtypeStr.substr(5).c_str());
+                dtypeStr = dtypeStr.substr(0, 5);
+            }
+            fastllm::AssertInFastLLM(dataTypeDict.find(dtypeStr) != dataTypeDict.end(),
+                                    "Unsupport data type: " + dtypeStr);
+            config.dtype = dataTypeDict[dtypeStr];
         } else if (sargv[i] == "-w" || sargv[i] == "--web") {
             config.webPath = sargv[++i];
         } else if (sargv[i] == "--port") {
@@ -73,7 +95,13 @@ int main(int argc, char** argv) {
 
     fastllm::SetThreads(config.threads);
     fastllm::SetLowMemMode(config.lowMemMode);
-    auto model = fastllm::CreateLLMModelFromFile(config.path);
+    if (!fastllm::FileExists(config.path)) {
+        printf("模型文件 %s 不存在！\n", config.path.c_str());
+        exit(0);
+    }
+    bool isHFDir = fastllm::FileExists(config.path + "/config.json") || fastllm::FileExists(config.path + "config.json");
+    auto model = isHFDir ? fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt)
+        : fastllm::CreateLLMModelFromFile(config.path);
 
     httplib::Server svr;
     auto chat = [&](ChatSession *session, const std::string input) {
