@@ -7,13 +7,19 @@
 
 #include <thread>
 #include <vector>
+#if defined(_WIN32) || defined(_WIN64)
+#include <Windows.h>
+#else
 #include <unistd.h>
+#endif
 #include <cstring>
 
 namespace fastllm {
     static void barrier() {
 #ifdef __aarch64__
         asm volatile("dmb ish");
+#elif defined(_WIN32) || defined(_WIN64)
+        MemoryBarrier();
 #else
         __asm__ __volatile__("": : :"memory");
 #endif
@@ -56,7 +62,7 @@ namespace fastllm {
                 auto duration = std::chrono::duration_cast<std::chrono::microseconds> (std::chrono::system_clock::now() - lastRunTime);
                 double gap = double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
                 if (gap > 3) {
-                    sleep(0);
+                    std::this_thread::sleep_for(std::chrono::seconds(0));
                 }
             }
         }
@@ -136,7 +142,7 @@ namespace fastllm {
         }
     }
 
-    // [n, m, k] -> [m, n, k], 以k个元素为单位做转置
+    // [n, m, k] -> [m, n, k], 以k个元素为单位做转置 
     struct MultiThreadTransposeByLineOp : MultiThreadBaseOp {
         uint8_t *input, *output;
         int n, m, k, st, end;
@@ -152,7 +158,7 @@ namespace fastllm {
         }
     };
 
-    // [n, m, k] -> [m, n, k], 以k个元素为单位做转置
+    // [n, m, k] -> [m, n, k], 以k个元素为单位做转置 
     static void RunMultiThreadTransposeByLine(uint8_t *output, uint8_t *input, int n, int m, int k, AliveThreadPool *pool) {
         /*if (len < 256 * 1024) {
             memcpy(output, input, len);
