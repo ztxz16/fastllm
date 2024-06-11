@@ -5,7 +5,7 @@
 #ifndef FASTLLM_TEMPLATE_H
 #define FASTLLM_TEMPLATE_H
 
-#include "utils.h"
+#include "utils/utils.h"
 
 namespace fastllm {
     struct JinjaVar {
