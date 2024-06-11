@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <thread>
 #include <vector>
+#include <filesystem>
 
 #if defined(_WIN32) or defined(_WIN64)
 #include <Windows.h>
@@ -31,9 +32,15 @@
 #endif
 #endif
 
+#if defined(_MSC_VER) && _MSC_VER <= 1900 // VS 2015
+    namespace fs = std::experimental::filesystem;
+#else
+    namespace fs = std::filesystem;
+#endif
+
 namespace fastllm {
     static void MySleep(int t) {
-        std::this_thread::sleep_for(std::chrono::seconds(0));
+        std::this_thread::sleep_for(std::chrono::seconds(t));
     }
 
     static void ErrorInFastLLM(const std::string &error) {
@@ -112,6 +119,15 @@ namespace fastllm {
             ret.push_back(atoi(cur.c_str()));
         }
         return ret;
+    }
+
+    static bool FileExists(std::string filePath) {
+#if defined(__GNUC__) && __GNUC__ < 9
+        return access(filePath.c_str(), R_OK) == 0;
+#else
+        fs::path path(filePath);
+        return fs::exists(path);
+#endif
     }
 
     struct TimeRecord {

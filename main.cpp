@@ -95,7 +95,7 @@ int main(int argc, char **argv) {
     fastllm::PrintInstructionInfo();
     fastllm::SetThreads(config.threads);
     fastllm::SetLowMemMode(config.lowMemMode);
-    bool isHFDir = access((config.path + "/config.json").c_str(), R_OK) == 0 || access((config.path + "config.json").c_str(), R_OK) == 0;
+    bool isHFDir = fastllm::FileExists(config.path + "/config.json") || fastllm::FileExists(config.path + "config.json");
     auto model = !isHFDir ? fastllm::CreateLLMModelFromFile(config.path) : fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt);
     if (config.atype != fastllm::DataType::FLOAT32) {
         model->SetDataType(config.atype);
