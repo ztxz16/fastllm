@@ -5,6 +5,7 @@
 #ifndef TEST_FASTLLM_H
 #define TEST_FASTLLM_H
 
+#define _USE_MATH_DEFINES
 #include <vector>
 #include <cstdint>
 #include <string>

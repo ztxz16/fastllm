@@ -34,6 +34,18 @@
     <Filter Include="头文件\devices\cpu">
       <UniqueIdentifier>{c17acf48-126f-4578-aaf9-aef7cfcb9fd9}</UniqueIdentifier>
     </Filter>
+    <Filter Include="头文件\devices\cuda">
+      <UniqueIdentifier>{d7bfe0ea-81a6-4dc4-b526-a5a4eb114296}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\devices\cuda">
+      <UniqueIdentifier>{fa0efa1b-9d09-40d3-811d-5a2cfb37d536}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="头文件\third_party">
+      <UniqueIdentifier>{1aa28959-8e28-496c-9bb2-e81e86c2b998}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\third_party">
+      <UniqueIdentifier>{385ba64f-d978-469c-af0c-498ec33a1bb7}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\include\device.h">
@@ -48,10 +60,19 @@
     <ClInclude Include="..\..\include\model.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\template.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\basellm.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\bert.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\chatglm.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\deepseekv2.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\models\factoryllm.h">
@@ -69,6 +90,9 @@
     <ClInclude Include="..\..\include\models\minicpm.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\moe.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\moss.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
@@ -76,6 +100,9 @@
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\devices\cpu\cpudevice.h">
+      <Filter>头文件\devices\cpu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\devices\cpu\alivethreadpool.h">
       <Filter>头文件\devices\cpu</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\devices\cpu\cputhreadpool.h">
@@ -86,6 +113,9 @@
     </ClInclude>
     <ClInclude Include="..\..\include\utils\utils.h">
       <Filter>头文件\utils</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\third_party\json11\json11.hpp">
+      <Filter>头文件\third_party</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -101,10 +131,19 @@
     <ClCompile Include="..\..\src\model.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\template.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\basellm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\bert.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\chatglm.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\deepseekv2.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\glm.cpp">
@@ -119,6 +158,9 @@
     <ClCompile Include="..\..\src\models\minicpm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\moe.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\moss.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
@@ -130,6 +172,9 @@
     </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\cpudevicebatch.cpp">
       <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\third_party\json11\json11.cpp">
+      <Filter>源文件\third_party</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

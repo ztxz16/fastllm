@@ -99,7 +99,7 @@
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>NOMINMAX;USE_CUDA;WIN32;_DEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\devices\cuda;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\devices\cuda;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(ProjectDir)..\..\third_party\json11;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/source-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <RuntimeTypeInfo>true</RuntimeTypeInfo>
@@ -120,7 +120,7 @@
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>NOMINMAX;USE_CUDA;WIN64;__AVX__;__AVX2__;_DEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\devices\cuda;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\devices\cuda;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(ProjectDir)..\..\third_party\json11;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <AdditionalOptions>/source-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
@@ -146,7 +146,7 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>NOMINMAX;USE_CUDA;WIN32;NDEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\devices\cuda;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\devices\cuda;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(ProjectDir)..\..\third_party\json11;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/source-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
@@ -173,7 +173,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>NOMINMAX;USE_CUDA;__AVX__;__AVX2__;WIN64;NDEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\devices\cuda;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(ProjectDir)..\..\include\devices;$(ProjectDir)..\..\include\devices\cpu;$(ProjectDir)..\..\include\devices\cuda;$(ProjectDir)..\..\include\models;$(ProjectDir)..\..\include\utils;$(ProjectDir)..\..\third_party\json11;$(CUDA_PATH)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <AdditionalOptions>/source-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
@@ -195,6 +195,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="..\..\include\device.h" />
+    <ClInclude Include="..\..\include\devices\cpu\alivethreadpool.h" />
     <ClInclude Include="..\..\include\devices\cpu\cpudevice.h" />
     <ClInclude Include="..\..\include\devices\cpu\cputhreadpool.h" />
     <ClInclude Include="..\..\include\devices\cuda\cudadevice.h" />
@@ -202,16 +203,21 @@
     <ClInclude Include="..\..\include\fastllm.h" />
     <ClInclude Include="..\..\include\model.h" />
     <ClInclude Include="..\..\include\models\basellm.h" />
+    <ClInclude Include="..\..\include\models\bert.h" />
     <ClInclude Include="..\..\include\models\chatglm.h" />
+    <ClInclude Include="..\..\include\models\deepseekv2.h" />
     <ClInclude Include="..\..\include\models\factoryllm.h" />
     <ClInclude Include="..\..\include\models\glm.h" />
     <ClInclude Include="..\..\include\models\internlm2.h" />
     <ClInclude Include="..\..\include\models\llama.h" />
     <ClInclude Include="..\..\include\models\minicpm.h" />
+    <ClInclude Include="..\..\include\models\moe.h" />
     <ClInclude Include="..\..\include\models\moss.h" />
     <ClInclude Include="..\..\include\models\qwen.h" />
+    <ClInclude Include="..\..\include\template.h" />
     <ClInclude Include="..\..\include\utils\armMath.h" />
     <ClInclude Include="..\..\include\utils\utils.h" />
+    <ClInclude Include="..\..\third_party\json11\json11.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\src\device.cpp" />
@@ -223,13 +229,18 @@
     <ClCompile Include="..\..\src\fastllm.cpp" />
     <ClCompile Include="..\..\src\model.cpp" />
     <ClCompile Include="..\..\src\models\basellm.cpp" />
+    <ClCompile Include="..\..\src\models\bert.cpp" />
     <ClCompile Include="..\..\src\models\chatglm.cpp" />
+    <ClCompile Include="..\..\src\models\deepseekv2.cpp" />
     <ClCompile Include="..\..\src\models\glm.cpp" />
     <ClCompile Include="..\..\src\models\internlm2.cpp" />
     <ClCompile Include="..\..\src\models\llama.cpp" />
     <ClCompile Include="..\..\src\models\minicpm.cpp" />
+    <ClCompile Include="..\..\src\models\moe.cpp" />
     <ClCompile Include="..\..\src\models\moss.cpp" />
     <ClCompile Include="..\..\src\models\qwen.cpp" />
+    <ClCompile Include="..\..\src\template.cpp" />
+    <ClCompile Include="..\..\third_party\json11\json11.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\include\devices\cuda\fastllm-cuda.cuh">
