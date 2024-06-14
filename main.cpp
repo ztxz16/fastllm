@@ -11,11 +11,11 @@ std::map <std::string, fastllm::DataType> dataTypeDict = {
 };
 
 struct RunConfig {
-	std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
+    std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
     std::string systemPrompt = "";
     std::set <std::string> eosToken;
-	int threads = 4; // 使用的线程数
-	bool lowMemMode = false; // 是否使用低内存模式
+    int threads = 4; // 使用的线程数
+    bool lowMemMode = false; // 是否使用低内存模式
 
     fastllm::DataType dtype = fastllm::DataType::FLOAT16;
     fastllm::DataType atype = fastllm::DataType::FLOAT32;
@@ -23,11 +23,11 @@ struct RunConfig {
 };
 
 void Usage() {
-	std::cout << "Usage:" << std::endl;
-	std::cout << "[-h|--help]:                  显示帮助" << std::endl;
-	std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
-	std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
-	std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
+    std::cout << "Usage:" << std::endl;
+    std::cout << "[-h|--help]:                  显示帮助" << std::endl;
+    std::cout << "<-p|--path> <args>:           模型文件的路径" << std::endl;
+    std::cout << "<-t|--threads> <args>:        使用的线程数量" << std::endl;
+    std::cout << "<-l|--low>:                   使用低内存模式" << std::endl;
     std::cout << "<--system> <args>:            设置系统提示词(system prompt)" << std::endl;
     std::cout << "<--eos_token> <args>:         设置eos token" << std::endl;
     std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
@@ -38,21 +38,21 @@ void Usage() {
 }
 
 void ParseArgs(int argc, char **argv, RunConfig &config, fastllm::GenerationConfig &generationConfig) {
-	std::vector <std::string> sargv;
-	for (int i = 0; i < argc; i++) {
-		sargv.push_back(std::string(argv[i]));
-	}
-	for (int i = 1; i < argc; i++) {
-		if (sargv[i] == "-h" || sargv[i] == "--help") {
-			Usage();
-			exit(0);
-		} else if (sargv[i] == "-p" || sargv[i] == "--path") {
-			config.path = sargv[++i];
-		} else if (sargv[i] == "-t" || sargv[i] == "--threads") {
-			config.threads = atoi(sargv[++i].c_str());
-		} else if (sargv[i] == "-l" || sargv[i] == "--low") {
-			config.lowMemMode = true;
-		} else if (sargv[i] == "-m" || sargv[i] == "--model") {
+    std::vector <std::string> sargv;
+    for (int i = 0; i < argc; i++) {
+        sargv.push_back(std::string(argv[i]));
+    }
+    for (int i = 1; i < argc; i++) {
+        if (sargv[i] == "-h" || sargv[i] == "--help") {
+            Usage();
+            exit(0);
+        } else if (sargv[i] == "-p" || sargv[i] == "--path") {
+            config.path = sargv[++i];
+        } else if (sargv[i] == "-t" || sargv[i] == "--threads") {
+            config.threads = atoi(sargv[++i].c_str());
+        } else if (sargv[i] == "-l" || sargv[i] == "--low") {
+            config.lowMemMode = true;
+        } else if (sargv[i] == "-m" || sargv[i] == "--model") {
             i++;
         } else if (sargv[i] == "--top_p") {
             generationConfig.top_p = atof(sargv[++i].c_str());
@@ -81,21 +81,25 @@ void ParseArgs(int argc, char **argv, RunConfig &config, fastllm::GenerationConf
                                     "Unsupport act type: " + atypeStr);
             config.atype = dataTypeDict[atypeStr];
         } else {
-			Usage();
-			exit(-1);
-		}
-	}
+            Usage();
+            exit(-1);
+        }
+    }
 }
 
 int main(int argc, char **argv) {
     RunConfig config;
     fastllm::GenerationConfig generationConfig;
-	ParseArgs(argc, argv, config, generationConfig);
+    ParseArgs(argc, argv, config, generationConfig);
 
     fastllm::PrintInstructionInfo();
     fastllm::SetThreads(config.threads);
     fastllm::SetLowMemMode(config.lowMemMode);
-    bool isHFDir = access((config.path + "/config.json").c_str(), R_OK) == 0 || access((config.path + "config.json").c_str(), R_OK) == 0;
+    if (!fastllm::FileExists(config.path)) {
+        printf("模型文件 %s 不存在！\n", config.path.c_str());
+        exit(0);
+    }
+    bool isHFDir = fastllm::FileExists(config.path + "/config.json") || fastllm::FileExists(config.path + "config.json");
     auto model = !isHFDir ? fastllm::CreateLLMModelFromFile(config.path) : fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt);
     if (config.atype != fastllm::DataType::FLOAT32) {
         model->SetDataType(config.atype);
@@ -139,5 +143,5 @@ int main(int argc, char **argv) {
         messages.push_back(std::make_pair("assistant", ret));
     }
 
-	return 0;
+    return 0;
 }
