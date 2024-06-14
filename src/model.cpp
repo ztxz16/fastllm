@@ -47,6 +47,12 @@ namespace fastllm {
                 u16dst[i * 2] = 0;
                 u16dst[i * 2 + 1] = u16src[i];
             }
+        } else if (srcDtype == DataType::FLOAT16 && dstDtype == DataType::FLOAT32) {
+            float *fdst = (float*)dst;
+            uint16_t *u16src = (uint16_t*)src;
+            for (int i = 0; i < len; i++) {
+                fdst[i] = half_to_float(u16src[i]);
+            }
         } else {
             ErrorInFastLLM("ConvertDataType Failed. (" + std::to_string(srcDtype) + " -> " + std::to_string(dstDtype) + ")");
         }
@@ -227,6 +233,9 @@ namespace fastllm {
             DataType srcType;
             if (this->dtype == "BF16") {
                 srcType = DataType::BFLOAT16;
+            } else if (this->dtype == "F16") 
+            {
+                srcType = DataType::FLOAT16;
             } else {
                 ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
             }
