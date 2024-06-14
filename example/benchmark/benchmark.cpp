@@ -73,13 +73,16 @@ int main(int argc, char **argv) {
     BenchmarkConfig config;
     ParseArgs(argc, argv, config);
     fastllm::SetThreads(config.threads);
-    std::ifstream model_file(config.path, std::ios::in);
-    if (!model_file.good()) {
-        printf("模型文件 %s 不存在！\n", config.path.c_str());
-        exit(0);
+    bool isHFDir = access((config.path + "/config.json").c_str(), R_OK) == 0 || access((config.path + "config.json").c_str(), R_OK) == 0;
+    if (!isHFDir) {
+        std::ifstream model_file(config.path, std::ios::in);
+        if (!model_file.good()) {
+            printf("模型文件 %s 不存在！\n", config.path.c_str());
+            exit(0);
+        }
+        model_file.close();
     }
-    model_file.close();
-    auto model = fastllm::CreateLLMModelFromFile(config.path);
+    auto model = !isHFDir ? fastllm::CreateLLMModelFromFile(config.path) : fastllm::CreateLLMModelFromHF(config.path, fastllm::DataType::FLOAT16);
     fastllm::GenerationConfig generationConfig;
     generationConfig.output_token_limit = config.limit;
 
