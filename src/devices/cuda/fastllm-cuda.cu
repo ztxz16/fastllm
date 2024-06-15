@@ -424,6 +424,23 @@ __global__ void FastllmLlamaRotatePosition2DKernel(float *data, float *positionI
     d[i * m + m / 2] = va * curSin + vb * curCos;
 }
 
+__global__ void FastllmLlamaRotatePosition2DKernel(half *data, float *positionIds, float *sin, float *cos,
+                                                   int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int rotateDim) {
+    int o = (blockIdx.x / n);
+    int l = o % len;
+    int b = o / len;
+    int j = threadIdx.x;
+    int index = (int) (positionIds[b * partStride + l]);
+
+    float curSin = sin[index * sinCosStride + j];
+    float curCos = cos[index * sinCosStride + j];
+    half *d = (half *) data + o * spatial + j;
+    int i = blockIdx.x % n;
+    float va = __half2float(d[i * m]), vb = __half2float(d[i * m + m / 2]);
+    d[i * m] = __float2half(va * curCos - vb * curSin);
+    d[i * m + m / 2] = __float2half(va * curSin + vb * curCos);
+}
+
 __global__ void FastllmNearlyRotatePosition2DKernel(float *data, float *positionIds, float *sin, float *cos,
                                                     int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int rotateDim) {
     int o = (blockIdx.x / n);
@@ -3174,9 +3191,18 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
     int spatial = data.Count(2);
     int bs = data.dims[0], len = data.dims[1];
     int n = data.dims[2], m = data.dims[3];
-    FastllmLlamaRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
+
+    if (data.dataType == fastllm::DataType::FLOAT32) {
+        FastllmLlamaRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
                                                                                  len, bs, spatial, n, m,
                                                                                  (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
+    } else if (data.dataType == fastllm::DataType::FLOAT16) {
+        FastllmLlamaRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> ((half*)cudaData, cudaPositionIds, cudaSin, cudaCos,
+                                                                                 len, bs, spatial, n, m,
+                                                                                 (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
+    }
+
+    
 
     FastllmCudaFinishInput(positionIds, cudaPositionIds);
     FastllmCudaFinishInput(sinData, cudaSin);
