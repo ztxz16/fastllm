@@ -237,7 +237,7 @@ __global__ void FastllmSwigluKernel(float* a, float *b, int len, int spatial, in
     }
 }
 
-__global__ void FastllmSwigluKernel(half* a, half *b, int len, int spatial, int mid) {
+__global__ void FastllmSwigluKernel(half* __restrict__ a, half __restrict__ *b, int len, int spatial, int mid) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
         int id = idx / mid * spatial + idx % mid;
@@ -702,12 +702,23 @@ __global__ void FastllmRMSNormKernelInner1(half *input, float *weight, half *out
     __syncthreads();
 
     // 2. 求和
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+    for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
         if (tid < s) {
             sdata2[tid] += sdata2[tid + s];
         }
         __syncthreads();
     }
+
+    if (tid < 32) {
+        volatile float *now = sdata2;
+        now[tid] += now[tid + 32];
+        now[tid] += now[tid + 16];
+        now[tid] += now[tid + 8];
+        now[tid] += now[tid + 4];
+        now[tid] += now[tid + 2];
+        now[tid] += now[tid + 1];
+    }
+    __syncthreads();
 
     // 3. 计算参数
     if (tid == 0) {
@@ -2637,10 +2648,7 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
                                                                channels, eps);
         }
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        if (channels < 64) {
-            FastllmRMSNormKernelInner1<1> <<< outer, 1 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer,
-                                                           channels, eps);
-        } else if (channels < 512) {
+        if (channels < 512) {
             FastllmRMSNormKernelInner1<64> <<< outer, 64 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer,
                                                              channels, eps);
         } else {
