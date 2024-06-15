@@ -275,10 +275,15 @@ namespace fastllm {
         void Run() {
             float *qk = new float[k1];
             float *temp = new float[k1];
+            int base = k1 - q1;
             for (int i = 0; i < q1; i++) {
                 float maxValue = -10000, sum = 0.0;
                 for (int j = 0; j < k1; j++) {
                     if (maskd && maskd[i * k1 + j] > 0.99) {
+                        qk[j] = -10000;
+                        continue;
+                    }
+                    if (!maskd && (base + i) < j) {
                         qk[j] = -10000;
                         continue;
                     }
