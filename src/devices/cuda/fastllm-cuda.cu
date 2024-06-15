@@ -562,14 +562,13 @@ __device__ half FastllmHalfMaxFunc(const __half a, const __half b) {
 
 template <int THREAD_PER_BLOCK>
 __device__ void FastllmSoftmaxKernelInner1Func(half *input, half *output, int channels) {
-    __shared__ half sdata[THREAD_PER_BLOCK];
-    __shared__ half maxV;
+    __shared__ float sdata[THREAD_PER_BLOCK];
 
     // 1. 每个线程计算一部分
     unsigned int tid = threadIdx.x;
-    half maxValue = __float2half(-1e10);
+    float maxValue = -1e10;
     for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
-        maxValue = FastllmHalfMaxFunc(maxValue, input[i]);
+        maxValue = max(maxValue, (float)input[i]);
     }
     sdata[tid] = maxValue;
     __syncthreads();
@@ -577,69 +576,39 @@ __device__ void FastllmSoftmaxKernelInner1Func(half *input, half *output, int ch
     // 2. 求max
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            sdata[tid] = FastllmHalfMaxFunc(sdata[tid], sdata[tid + s]);
+            sdata[tid] = max(sdata[tid], sdata[tid + s]);
         }
         __syncthreads();
     }
 
     // 3. 记录max
-    if (tid == 0) {
-        maxV = sdata[0];
-    }
-    __syncthreads();
-
+    float maxV = sdata[0];
+    
     // 4. 求和
     float sum = 0;
-#ifdef CUDA_NO_TENSOR_CORE
     for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
-        float outF = exp(__half2float(input[i]) - __half2float(maxV));
-        sum = sum + outF;
-        output[i] = __float2half(outF);
+        sum = sum + exp((float)input[i] - maxV);
     }
-    sdata[tid] = __float2half(sum);
+    sdata[tid] = sum;
     __syncthreads();
 
     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (tid < s) {
-            sdata[tid] = __float2half(__half2float(sdata[tid]) + __half2float(sdata[tid + s]));
+            sdata[tid] += sdata[tid + s];
         }
         __syncthreads();
     }
     if (tid == 0) {
-        if (fabs(__half2float(sdata[0])) < 1e-6) {
-            sdata[0] = __float2half(0.1);
+        if (fabs(sdata[0]) < 1e-6) {
+            sdata[0] = 0.1;
         }
     }
     __syncthreads();
 
+    float scale = 1.0 / sdata[0];
     for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
-        output[i] = __float2half(__half2float(output[i]) / __half2float(sdata[0]));
+        output[i] = (half)(exp((float)input[i] - maxV) * scale);
     }
-#else
-    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
-        output[i] = hexp(__hsub(input[i], maxV));
-        sum = sum + __half2float(output[i]);
-    }
-    sdata[tid] = __float2half(sum);
-    __syncthreads();
-
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] = __hadd(sdata[tid], sdata[tid + s]);
-        }
-        __syncthreads();
-    }
-    if (tid == 0) {
-        if (fabs(__half2float(sdata[0])) < 1e-6) {
-            sdata[0] = __float2half(0.1);
-        }
-    }
-    __syncthreads();
-
-    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
-        output[i] = __hdiv(output[i], sdata[0]);
-    }
-#endif
 }
 
 template <int THREAD_PER_BLOCK>
@@ -652,6 +621,12 @@ template <int THREAD_PER_BLOCK>
 __global__ void FastllmSoftmaxKernelInner1(half* input, half *output, int outer, int channels) {
     int o = blockIdx.x;
     FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (input + o * channels, output + o * channels, channels);
+}
+
+template <int THREAD_PER_BLOCK, typename T>
+__global__ void FastllmSoftmaxKernelInner1WithCausalMask(T* input, T *output, int outer, int channels) {
+    int o = blockIdx.x;
+    FastllmSoftmaxKernelInner1Func <THREAD_PER_BLOCK> (input + o * channels, output + o * channels, o + 1);
 }
 
 template <int THREAD_PER_BLOCK>
