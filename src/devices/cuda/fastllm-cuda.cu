@@ -10,6 +10,10 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
+#include "mma.h"
+using namespace nvcuda;
+#endif
 
 #define checkCudaErrors(message, val) showError(val, message, __FILE__, __LINE__)
 
@@ -75,6 +79,42 @@ cublasHandle_t getFastllmCublasHandle() {
     return handler;
 }
 
+__global__ void GetCudaInfoKernel(int *infos) {
+#if defined(__CUDA_ARCH__)
+    infos[0] = __CUDA_ARCH__;
+#else
+    infos[0] = 0; // cuda arch
+#endif
+}
+
+struct CudaInfos {
+    int cudaArch;
+    bool hasTensorCore;
+
+    CudaInfos () {
+        int infoLen = 10;
+        int *infos;
+        cudaMalloc(&infos, infoLen * sizeof(int));
+        GetCudaInfoKernel <<<1, 1>>> (infos);
+        int *infosInCpu = new int[infoLen];
+        cudaMemcpy(infosInCpu, infos, infoLen * sizeof(int), cudaMemcpyDeviceToHost);
+
+        cudaArch = infosInCpu[0];
+        hasTensorCore = cudaArch >= 700;
+
+        cudaFree(infos);
+        delete[] infosInCpu;
+
+        printf("CUDA_ARCH: %d\n", cudaArch);
+        printf("USE_TENSOR_CORE: %d\n", hasTensorCore);
+    }
+};
+static CudaInfos cudaInfos;
+
+CudaInfos *getCudaInfos() {
+    return &cudaInfos;
+}
+
 void DeviceSync() {
     //cudaDeviceSynchronize();
 }
@@ -83,6 +123,101 @@ double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_
     auto duration = std::chrono::duration_cast<std::chrono::microseconds> (time2 - time1);
     return double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
 };
+
+template <int BN, int BM, int BK>
+__global__ void HalfFC(
+    half * __restrict__ a, half * __restrict__ b, half * __restrict__ c,
+    const int N, const int M, const int K,
+    half scale) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
+    int tid = threadIdx.x;
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int wid = tid >> 5;
+
+    int stN = bx * BN;
+    int stK = by * BK;
+    int wrap0 = wid >> 1;
+    int wrap1 = wid & 1;
+
+    if (stN + BN <= stK) {
+        return;
+    }
+
+    __shared__ half cur[BN][BK];
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> frag_a[4][8];
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> frag_b[4][8];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, half> frag_c[4][4];
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            wmma::fill_fragment(frag_c[i][j], 0.0);
+        }
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            wmma::load_matrix_sync(frag_a[i][j], &a[(stN + wrap0 * 64 + i * 16) * M + j * 16], M);
+        }
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            wmma::load_matrix_sync(frag_b[i][j], &b[(stK + wrap1 * 64 + i * 16) * M + j * 16], M);
+        }
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                wmma::mma_sync(frag_c[i][j], frag_a[i][k], frag_b[j][k], frag_c[i][j]);
+            }
+        }
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            wmma::store_matrix_sync(&cur[(wrap0 * 64 + i * 16)][(wrap1 * 64 + j * 16)], frag_c[i][j], BK, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+
+    for (int i = 0; i < BN; i++) {
+        if (stN + i < stK + tid) {
+            cur[i][tid] = (half)0;
+        }
+    }
+
+    for (int i = 0; i < BN; i++) {
+        c[(stN + i) * K + stK + tid] = __hmul(cur[i][tid], scale);
+    }
+#endif
+}
+
+void GpuQK(half *q, half *k, half *qk, int qlen, int klen, int dim, float scale) {    
+    const int BQ = 128, BK = 128, DIM = 128;
+    dim3 blockDim(128);
+    int BX = (qlen + BQ - 1) / BQ;
+    int BY = (klen + BK - 1) / BK;
+    dim3 gridDim(BX, BY);
+    HalfFC <BQ, DIM, BK> <<<gridDim, blockDim>>> (q, k, qk, qlen, dim, klen, (half)scale);
+}
 
 __global__ void FastllmCudaFloat2HalfKernel(float* a, half *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -347,6 +482,14 @@ __global__ void SimpleMask(half* a, half *b, half maskValue, int spatial) {
         if (__half2float(b[i]) > 0.99) {
             a[i] = maskValue;
         }
+    }
+}
+
+template <int THREAD_PER_BLOCK, typename T>
+__global__ void CausalMask(T* a, T maskValue, int q, int k) {
+    a += blockIdx.x * k;
+    for (int i = k - q + blockIdx.x + threadIdx.x + 1; i < k; i += THREAD_PER_BLOCK) {
+        a[i] = maskValue;
     }
 }
 
