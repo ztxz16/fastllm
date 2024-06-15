@@ -1698,12 +1698,16 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
 
         len = n * k;
 #ifdef CUDA_NO_TENSOR_CORE
-        FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
+        }
         FastllmCudaFree(cudaFp16Input);
         FastllmCudaFree(cudaFp16Weight);
 #else
         FastllmCudaHalf2FlotaKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput, len);
-        FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
+        }
 
         FastllmCudaFree(cudaFp16Input);
         FastllmCudaFree(cudaFp16Output);
@@ -1852,7 +1856,9 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
         len = n * k;
         FastllmCudaHalf2FlotaKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
                                                                                            len);
-        FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
+        }
 
         FastllmCudaFree(cudaFp16Input);
         FastllmCudaFree(cudaFp16Output);
@@ -1971,13 +1977,17 @@ bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data 
 
         len = n * k;
 #ifdef CUDA_NO_TENSOR_CORE
-        FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
+        }
         FastllmCudaFree(cudaFp16Input);
         FastllmCudaFree(cudaFp16Weight);
 #else
         FastllmCudaHalf2FlotaKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
                                                                                            len);
-        FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
+        }
 
         FastllmCudaFree(cudaFp16Input);
         FastllmCudaFree(cudaFp16Output);
@@ -2040,7 +2050,9 @@ bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight,
             exit(0);
         }
 
-        FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, (float*)weight.extraCudaData[0], k);
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, (float*)weight.extraCudaData[0], k);
+        }
     } else {
         FastllmGemvFp32Fp32Kernel2<256, 1> <<< k, 256 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, cudaBiasData, m, k);
     }
@@ -2131,12 +2143,17 @@ bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
 
         len = n * k;
 #ifdef CUDA_NO_TENSOR_CORE
-        FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, (float*)weight.extraCudaData[0], k);
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, (float*)weight.extraCudaData[0], k);
+        }
         FastllmCudaFree(cudaFp16Input);
 #else
         FastllmCudaHalf2FlotaKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
                                                                                            len);
-        FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, (float*)weight.extraCudaData[0], k);
+
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, (float*)weight.extraCudaData[0], k);
+        }
         //cudaDeviceSynchronize();
 
         FastllmCudaFree(cudaFp16Input);
@@ -3435,7 +3452,8 @@ bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
 }
 
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
-    if (weight.cudaData == nullptr || weight.extraCudaHalfData.size() == 0) {
+    if (weight.cudaData == nullptr || 
+        (weight.extraCudaHalfData.size() == 0 && bias.dims.size() > 0)) {
         half *cudaBiasData;
         cudaError_t state = cudaSuccess;
         state = cudaMalloc(&cudaBiasData, k * sizeof(half));
@@ -3453,7 +3471,6 @@ bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &wei
         weight.extraCudaHalfData.push_back((void *) cudaBiasData);
     }
 
-    half *cudaBiasData = (half *) weight.extraCudaHalfData[0];
     half *cudaInput = (half *) FastllmCudaPrepareInput(input);
     half *cudaOutput = (half *) FastllmCudaPrepareOutput(output);
 
@@ -3479,7 +3496,10 @@ bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &wei
         exit(0);
     }
 
-    FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, (half *) weight.extraCudaHalfData[0], k);
+    if (bias.dims.size() > 0) {
+        half *cudaBiasData = (half *) weight.extraCudaHalfData[0];
+        FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, (half *) weight.extraCudaHalfData[0], k);
+    }
 
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
