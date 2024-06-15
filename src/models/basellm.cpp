@@ -890,6 +890,10 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         }
     }
 
+    bool basellm::NeedAttentionMask(int qlen, int klen) {
+        return true;
+    }
+
     // 根据输入的tokens生成LLM推理的输入
     void basellm::FillLLMInputs(std::vector <std::vector <float> > &inputTokens,
                                const std::map <std::string, int> &params,
@@ -903,18 +907,25 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 
         if (inputTokens[0].size() > 1) {
             int seqLen = inputTokens[0].size();
-
-            std::vector <float> vmask = std::vector <float> (seqLen * promptLen, 0);
             std::vector <float> vpids = std::vector <float> (seqLen, 0);
             for (int i = 0; i < seqLen; i++) {
                 vpids[i] = promptLen - seqLen + i;
-                for (int j = i + 1; j < seqLen; j++) {
-                    vmask[i * promptLen + (promptLen - seqLen + j)] = 1;
-                }
             }
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, inputTokens[0]));
-            attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, promptLen}, vmask));
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vpids));
+            
+            if (NeedAttentionMask(seqLen, promptLen)) {
+                std::vector <float> vmask = std::vector <float> (seqLen * promptLen, 0);
+                for (int i = 0; i < seqLen; i++) {
+                    vpids[i] = promptLen - seqLen + i;
+                    for (int j = i + 1; j < seqLen; j++) {
+                        vmask[i * promptLen + (promptLen - seqLen + j)] = 1;
+                    }
+                }
+                attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, promptLen}, vmask));
+            } else {
+                attentionMask = Data();
+            }
         } else {
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, inputTokens[0]));
             attentionMask = Data();
@@ -956,7 +967,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         if (dataType == DataType::FLOAT32) {
 
         } else if (dataType == DataType::FLOAT16) {
-            AssertInFastLLM(this->model_type == "chatglm" || this->model_type == "llama", 
+            AssertInFastLLM(this->model_type == "chatglm" || this->model_type == "llama" ||
+                            this->model_type == "qwen", 
                             this->model_type + " doesn't support float16");
         } else {
             ErrorInFastLLM("SetDataType Error: datatype should be float32 or float16");

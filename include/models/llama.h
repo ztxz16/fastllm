@@ -56,6 +56,9 @@ namespace fastllm {
                 const std::vector <GenerationConfig> &generationConfigs,
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
+        
+        // 是否需要生成AttentionMask
+        virtual bool NeedAttentionMask(int qlen, int klen);
 
         // 根据输入的tokens生成LLM推理的输入
         virtual void FillLLMInputsBatch(std::vector <std::vector <float> > &inputTokens,
