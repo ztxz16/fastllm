@@ -831,7 +831,7 @@ namespace fastllm {
                 }
             }
 
-            if (seqLen <= 4096) {
+            if (seqLen <= 1024) {
                 std::vector<float> vmask = std::vector<float>(seqLen * seqLen, 0);
                 for (int i = 0; i < seqLen - 1; i++) {
                     vmask[i * seqLen + seqLen - 1] = 1;

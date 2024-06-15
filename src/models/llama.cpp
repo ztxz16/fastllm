@@ -823,6 +823,15 @@ namespace fastllm {
         return lastRet;
     }
 
+    bool LlamaModel::NeedAttentionMask(int qlen, int klen) {
+        return false;
+        if (this->weight.dicts["use_alibi"] != "1" && 
+            ((qlen == 1) || (qlen >= 1024))) {
+            return false;
+        }
+        return true;
+    }
+
     void LlamaModel::FillLLMInputsBatch(std::vector<std::vector<float>> &inputTokens,
                                           const std::vector<std::map<std::string, int>> &params,
                                           fastllm::Data &inputIds, fastllm::Data &attentionMask,
