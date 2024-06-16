@@ -21,6 +21,16 @@ std::string utf8_to_gbk(const std::string& str)
 }
 #endif
 
+std::map <std::string, fastllm::DataType> dataTypeDict = {
+    {"float32", fastllm::DataType::FLOAT32},
+    {"half", fastllm::DataType::FLOAT16},
+    {"float16", fastllm::DataType::FLOAT16},
+    {"int8", fastllm::DataType::INT8},
+    {"int4", fastllm::DataType::INT4_NOZERO},
+    {"int4z", fastllm::DataType::INT4},
+    {"int4g", fastllm::DataType::INT4_GROUP}
+};
+
 struct BenchmarkConfig {
     std::string path = "chatglm-6b-int4.bin"; // 模型文件路径
     int threads = 4; // 使用的线程数
@@ -28,6 +38,10 @@ struct BenchmarkConfig {
     int batch = -1; // batch数, -1时使用文件中的行数作为batch
     std::string file; // 输入文件
     std::string output; // 输出文件，如果不设定则输出到屏幕
+
+    fastllm::DataType dtype = fastllm::DataType::FLOAT16;
+    fastllm::DataType atype = fastllm::DataType::FLOAT32;
+    int groupCnt = -1;
 };
 
 void Usage() {
@@ -38,6 +52,7 @@ void Usage() {
     std::cout << "<-l|--limit> <args>:          输出token数限制" << std::endl;
     std::cout << "<-b|--batch> <args>:          batch数"      << std::endl;
     std::cout << "<-f|--file> <args>:           输入文件，文件中每行一个prompt，如果行数不足batch则用之前的prompt补充"      << std::endl;
+    std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
 }
 
 void ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
@@ -62,6 +77,20 @@ void ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
             config.file = sargv[++i];
         } else if (sargv[i] == "-o" || sargv[i] == "--output") {
             config.output = sargv[++i];
+        }  else if (sargv[i] == "--dtype") {
+            std::string dtypeStr = sargv[++i];
+            if (dtypeStr.size() > 5 && dtypeStr.substr(0, 5) == "int4g") {
+                config.groupCnt = atoi(dtypeStr.substr(5).c_str());
+                dtypeStr = dtypeStr.substr(0, 5);
+            }
+            fastllm::AssertInFastLLM(dataTypeDict.find(dtypeStr) != dataTypeDict.end(),
+                                    "Unsupport data type: " + dtypeStr);
+            config.dtype = dataTypeDict[dtypeStr];
+        } else if (sargv[i] == "--atype") {
+            std::string atypeStr = sargv[++i];
+            fastllm::AssertInFastLLM(dataTypeDict.find(atypeStr) != dataTypeDict.end(),
+                                    "Unsupport act type: " + atypeStr);
+            config.atype = dataTypeDict[atypeStr];
         } else {
             Usage();
             exit(-1);
@@ -73,16 +102,17 @@ int main(int argc, char **argv) {
     BenchmarkConfig config;
     ParseArgs(argc, argv, config);
     fastllm::SetThreads(config.threads);
-    bool isHFDir = access((config.path + "/config.json").c_str(), R_OK) == 0 || access((config.path + "config.json").c_str(), R_OK) == 0;
-    if (!isHFDir) {
-        std::ifstream model_file(config.path, std::ios::in);
-        if (!model_file.good()) {
-            printf("模型文件 %s 不存在！\n", config.path.c_str());
-            exit(0);
-        }
-        model_file.close();
+
+     if (!fastllm::FileExists(config.path)) {
+        printf("模型文件 %s 不存在！\n", config.path.c_str());
+        exit(0);
     }
-    auto model = !isHFDir ? fastllm::CreateLLMModelFromFile(config.path) : fastllm::CreateLLMModelFromHF(config.path, fastllm::DataType::FLOAT16);
+    bool isHFDir = fastllm::FileExists(config.path + "/config.json") || fastllm::FileExists(config.path + "config.json");
+    auto model = !isHFDir ? fastllm::CreateLLMModelFromFile(config.path) : fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt);
+    if (config.atype != fastllm::DataType::FLOAT32) {
+        model->SetDataType(config.atype);
+    }
+
     fastllm::GenerationConfig generationConfig;
     generationConfig.output_token_limit = config.limit;
 
