@@ -926,6 +926,10 @@ namespace fastllm {
             pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
                                                    Data(DataType::FLOAT32)));
         }
+        if (this->weight.weight.find("lm_head.weight") == this->weight.weight.end()) {
+            this->weight["lm_head.weight"] = Data();
+            this->weight["lm_head.weight"].CopyFrom(this->weight["model.embed_tokens.weight"]);
+        }
         Forward(inputIds, attentionMask, positionIds, pastKeyValues);
         printf("finish.\n");
     }
