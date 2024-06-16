@@ -31,6 +31,7 @@ void Usage() {
     std::cout << "<--system> <args>:            设置系统提示词(system prompt)" << std::endl;
     std::cout << "<--eos_token> <args>:         设置eos token" << std::endl;
     std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
+    std::cout << "<--atype> <args>:             设置推理使用的数据类型(float32/float16)" << std::endl;
     std::cout << "<--top_p> <args>:             采样参数top_p" << std::endl;
     std::cout << "<--top_k> <args>:             采样参数top_k" << std::endl;
     std::cout << "<--temperature> <args>:       采样参数温度，越高结果越不固定" << std::endl;
@@ -104,7 +105,7 @@ int main(int argc, char **argv) {
     if (config.atype != fastllm::DataType::FLOAT32) {
         model->SetDataType(config.atype);
     }
-    model->SetSaveHistoryChat(true);    
+    model->SetSaveHistoryChat(true);
     
     for (auto &it : config.eosToken) {
         generationConfig.stop_token_ids.insert(model->weight.tokenizer.GetTokenId(it));
