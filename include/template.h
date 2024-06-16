@@ -94,7 +94,7 @@ namespace fastllm {
             {"or", JinjaToken::JinjaToKenType::JinjaTokenOr},
     };
 
-    // 一个Jinja块
+    // 一个Jinja块 
     struct JinjaBlock {
         enum JinjaBlockType {
             JinjaBlockOriginal = 0, JinjaBlockEmpty, JinjaBlockVar, JinjaBlockFor, 
