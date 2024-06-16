@@ -984,6 +984,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 {"content", message.second}
             });
         }
+        ret["add_generation_prompt"] = fastllm::JinjaVar{1};
         return ret;
     }
 
