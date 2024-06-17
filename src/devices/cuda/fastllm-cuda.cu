@@ -391,7 +391,7 @@ __global__ void FastllmSwigluKernel(float* a, float *b, int len, int spatial, in
     }
 }
 
-__global__ void FastllmSwigluKernel(half* __restrict__ a, half __restrict__ *b, int len, int spatial, int mid) {
+__global__ void FastllmSwigluKernel(half* __restrict__ a, half* __restrict__ b, int len, int spatial, int mid) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
         int id = idx / mid * spatial + idx % mid;
