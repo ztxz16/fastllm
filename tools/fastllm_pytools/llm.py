@@ -82,6 +82,9 @@ def set_cpu_kvcache(cpu_kvcache):
 def get_cpu_kvcache():
     return fastllm_lib.get_kvcache_in_cpu();
 
+def set_cuda_embedding(cuda_embedding):
+    fastllm_lib.set_cuda_embedding(ctypes.c_bool(cuda_embedding));
+
 def set_cpu_low_mem(low_mem):
     fastllm_lib.set_cpu_low_mem(ctypes.c_bool(low_mem));
 
@@ -449,3 +452,6 @@ class model:
     
     def set_save_history(self, save: bool):
         fastllm_lib.set_save_history(self.model, save);
+
+    def set_atype(self, atype: str):
+        fastllm_lib.set_model_atype(self.model, str(atype).encode());

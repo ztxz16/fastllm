@@ -29,6 +29,10 @@ extern "C" {
         fastllm::SetLowMemMode(low);
     }
 
+    DLL_EXPORT void set_cuda_embedding(bool cuda_embedding) {
+        fastllm::SetCudaEmbedding(cuda_embedding);
+    }
+
     DLL_EXPORT bool get_cpu_low_mem(bool low) {
         return fastllm::GetLowMemMode();
     }
@@ -201,6 +205,19 @@ extern "C" {
     DLL_EXPORT void set_save_history(int modelId, bool save) {
         auto model = models.GetModel(modelId);
         model->SetSaveHistoryChat(save);
+        return;
+    }
+
+    DLL_EXPORT void set_model_atype(int modelId, char *atype) {
+        auto model = models.GetModel(modelId);
+        std::string atypeStr = atype;
+        if (atypeStr == "float16" || atypeStr == "half") {
+            model->SetDataType(fastllm::DataType::FLOAT16);
+        } else if (atypeStr == "float" || atypeStr == "float32") {
+            model->SetDataType(fastllm::DataType::FLOAT32);
+        } else {
+            fastllm::ErrorInFastLLM("set_model_atype error: atype should be float32 or float16.");
+        }
         return;
     }
 
