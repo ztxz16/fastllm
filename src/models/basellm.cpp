@@ -732,6 +732,7 @@ printf("%d / %d\n", endingCount, batch);
                                     attentionMasks.push_back(nullptr);
                                 } else {
                                     attentionMasks.push_back(new Data());
+                                    attentionMask.ToDevice(DataDevice::CPU);
                                     attentionMasks.back()->CopyFrom(attentionMask);
                                 }
                                 if (curPositionIds.dims.size() == 0) {

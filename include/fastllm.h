@@ -35,6 +35,8 @@ namespace fastllm {
     void SetLowMemMode(bool m);
     void SetKVCacheInCPU(bool kvCacheInCPU);
     bool GetLowMemMode();
+    void SetCudaEmbedding(bool v);
+    bool GetCudaEmbedding();
     int GetThreads();
     bool GetKVCacheInCPU();
     AliveThreadPool *GetAlivePool();
