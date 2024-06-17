@@ -824,7 +824,6 @@ namespace fastllm {
     }
 
     bool LlamaModel::NeedAttentionMask(int qlen, int klen) {
-        return false;
         if (this->weight.dicts["use_alibi"] != "1" && 
             ((qlen == 1) || (qlen >= 1024))) {
             return false;
