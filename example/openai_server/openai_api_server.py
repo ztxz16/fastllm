@@ -15,11 +15,14 @@ def parse_args():
     parser.add_argument("--model_name", type = str, help = "部署的模型名称, 调用api时会进行名称核验", required=True)
     parser.add_argument("--host", type = str, default="0.0.0.0", help = "API Server host")
     parser.add_argument("--port", type = int, default = 8080, help = "API Server Port")
-    parser.add_argument('-p', '--path', type = str, required = True, default = '', help = 'fastllm model path(end with .flm)')
+    parser.add_argument('-p', '--path', type = str, required = True, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
     parser.add_argument('-t', '--threads', type=int, default=4,  help='fastllm model 使用的线程数量')
     parser.add_argument('-l', '--low', action='store_true', help='fastllm 是否使用低内存模式')
+    parser.add_argument('--dtype', type = str, default = "float16", help='权重类型（仅当读取HF模型时有效）')
+    parser.add_argument('--atype', type = str, default = "float32", help='推理使用的数据类型，可使用float32或float16')
+    parser.add_argument('--cuda_embedding', action='store_true', help='在cuda上进行embedding')
+    parser.add_argument('--device', type = str, help='使用的设备')
     return parser.parse_args()
-
 
 app = fastapi.FastAPI()
 # 设置允许的请求来源, 生产环境请做对应变更
@@ -66,5 +69,9 @@ if __name__ == "__main__":
     fastllm_completion = FastLLmCompletion(model_name = args.model_name,
                                            model_path = args.path,
                                            low_mem_mode = args.low,
-                                           cpu_thds = args.threads)
+                                           cpu_thds = args.threads,
+                                           atype = args.atype,
+                                           dtype = args.dtype,
+                                           cuda_embedding = args.cuda_embedding,
+                                           device = args.device)
     uvicorn.run(app, host=args.host, port=args.port)
