@@ -25,18 +25,30 @@ class FastLLmCompletion:
   def __init__(self,
                model_name,
                model_path,
+               device = "",
+               dtype = "float16",
+               atype = "float32",
+               cuda_embedding = False,
                low_mem_mode = False,
                cpu_thds = 16):
     self.model_name = model_name
     self.model_path = model_path
     self.low_mem_mode = low_mem_mode
     self.cpu_thds = cpu_thds
+    self.device = device
+    self.dtype = dtype
+    self.atype = atype
+    self.cuda_embedding = cuda_embedding
     self.init_fast_llm_model()
     
   def init_fast_llm_model(self):
+    if (self.device and self.device != ""):
+       llm.set_device_map(self.device)
     llm.set_cpu_threads(self.cpu_thds)
     llm.set_cpu_low_mem(self.low_mem_mode)
-    self.model = llm.model(self.model_path)
+    llm.set_cuda_embedding(self.cuda_embedding)
+    self.model = llm.model(self.model_path, dtype = self.dtype)
+    self.model.set_atype(self.atype)
   
   def create_error_response(
           self,
