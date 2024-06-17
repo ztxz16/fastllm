@@ -253,8 +253,9 @@ namespace fastllm {
         for (int b = 0; b < batch; b++) {
             Data &input0 = *input0s[b];
             Data &input1 = *input1s[b];
-            AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
-                            "Cat's input's type should be float32.\n");
+            AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                            (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
+                            "Cat's input's type should be float32 or float16.\n");
             AssertInFastLLM(input0.dataDevice == input1.dataDevice,
                             "CatDirect error: inputs should use same device.\n");
 
@@ -356,7 +357,8 @@ namespace fastllm {
         AssertInFastLLM(q.dims[0] == k.dims[0] * group, "Attention: q.dims[0] should be equal to k.dims[0] * group.\n");
         AssertInFastLLM(q.dataType == k.dataType && q.dataType == v.dataType,
                         "Attention: q, k, v's datatype should be same.\n");
-        AssertInFastLLM(q.dataType == DataType::FLOAT32, "Attention's input's type should be float32.\n");
+        AssertInFastLLM(q.dataType == DataType::FLOAT32 || q.dataType == DataType::FLOAT16, 
+                    "Attention's input's type should be float32 or float16.\n");
 
         for (int i = 0; i < batch; i++) {
             outputs[i]->dataType = qs[i]->dataType;
@@ -372,12 +374,32 @@ namespace fastllm {
         Data **vs = (Data**)(datas.find("v")->second);
         Data **masks = (Data**)(datas.find("mask")->second);
         Data **outputs = (Data**)(datas.find("output")->second);
-        for (int i = 0; i < batch; i++) {
-            outputs[i]->Allocate();
+
+        if (qs[0]->dataType == DataType::FLOAT32) {
+            for (int i = 0; i < batch; i++) {
+                outputs[i]->Allocate();
+            }
+            FastllmCudaAttentionBatch(qs, ks, vs, masks, outputs,
+                                    intParams.find("group")->second,
+                                    floatParams.find("scale")->second,
+                                    intParams.find("q___batch")->second);
+        } else {
+            for (int i = 0; i < batch; i++) {
+                outputs[i]->Allocate();
+            }
+            for (int i = 0; i < batch; i++) {
+                if (qs[i]->dataType == DataType::FLOAT16) {
+                    if (masks == nullptr || masks[i] == nullptr) {
+                        FastllmCudaHalfAttention(*qs[i], *ks[i], *vs[i], Data(), *outputs[i], 
+                                            intParams.find("group")->second, floatParams.find("scale")->second);
+                    } else {
+                        FastllmCudaHalfAttention(*qs[i], *ks[i], *vs[i], *masks[i], *outputs[i], 
+                                            intParams.find("group")->second, floatParams.find("scale")->second);
+                    }
+                } else {
+                    ErrorInFastLLM("AttentionBatch: datatype should be float32 or float16.");
+                }
+            }
         }
-        FastllmCudaAttentionBatch(qs, ks, vs, masks, outputs,
-                                  intParams.find("group")->second,
-                                  floatParams.find("scale")->second,
-                                  intParams.find("q___batch")->second);
     }
 }
