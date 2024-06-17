@@ -50,6 +50,7 @@ namespace fastllm {
     static AliveThreadPool *fastllmAliveThreadPool = nullptr;
     static bool lowMemMode = false;
     static bool kvCacheInCPU = false;
+    static bool cudaEmbedding = false;
 
     void PrintInstructionInfo() {
         std::string avx = "OFF", avx2 = "OFF", aarch64 = "OFF", neonFp16 = "OFF", neonDot = "OFF";
@@ -73,6 +74,14 @@ namespace fastllm {
         printf("AARCH64: %s\n", aarch64.c_str());
         printf("Neon FP16: %s\n", neonFp16.c_str());
         printf("Neon DOT: %s\n", neonDot.c_str());
+    }
+
+    void SetCudaEmbedding(bool v) {
+        cudaEmbedding = v;
+    }
+
+    bool GetCudaEmbedding() {
+        return cudaEmbedding;
     }
 
     void SetKVCacheInCPU(bool v) {
