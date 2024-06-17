@@ -219,6 +219,17 @@ void GpuQK(half *q, half *k, half *qk, int qlen, int klen, int dim, float scale)
     HalfFC <BQ, DIM, BK> <<<gridDim, blockDim>>> (q, k, qk, qlen, dim, klen, (half)scale);
 }
 
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmCudaFloatEmbeddingKernel(float *input, float *weight, float *output, int embSize) {
+    input += blockIdx.x;
+    output += blockIdx.x * embSize;
+    int token = (int)(input[0] + 1e-5);
+    weight += token * embSize;
+    for (int i = threadIdx.x; i < embSize; i+= THREAD_PER_BLOCK) {
+        output[i] = weight[i];
+    }
+}
+
 __global__ void FastllmCudaFloat2HalfKernel(float* a, half *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -320,10 +331,18 @@ __global__ void FastllmCudaInt42HalfKernel(uint8_t* a, float *scales, float *min
 #endif
 }
 
-__global__ void FastllmCudaHalf2FlotaKernel(half* a, float *b, int len) {
+__global__ void FastllmCudaHalf2FloatKernel(half* a, float *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
         b[idx] = __half2float(a[idx]);
+    }
+}
+
+__global__ void FastllmCudaBF162FloatKernel(uint16_t* a, float *b, int len) {
+    return;
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        ((uint32_t*)b)[idx] = a[idx] << 16;
     }
 }
 
@@ -1850,7 +1869,7 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
         FastllmCudaFree(cudaFp16Input);
         FastllmCudaFree(cudaFp16Weight);
 #else
-        FastllmCudaHalf2FlotaKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput, len);
+        FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput, len);
         if (bias.dims.size() > 0) {
             FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
         }
@@ -2000,7 +2019,7 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
         }
 
         len = n * k;
-        FastllmCudaHalf2FlotaKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
+        FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
                                                                                            len);
         if (bias.dims.size() > 0) {
             FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
@@ -2129,7 +2148,7 @@ bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data 
         FastllmCudaFree(cudaFp16Input);
         FastllmCudaFree(cudaFp16Weight);
 #else
-        FastllmCudaHalf2FlotaKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
+        FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
                                                                                            len);
         if (bias.dims.size() > 0) {
             FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
@@ -2294,7 +2313,7 @@ bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
         }
         FastllmCudaFree(cudaFp16Input);
 #else
-        FastllmCudaHalf2FlotaKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
+        FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
                                                                                            len);
 
         if (bias.dims.size() > 0) {
@@ -2919,6 +2938,51 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
     return true;
 }
 
+bool FastllmFloatToHalf(void *a, void *b, int len) {
+    int threadPerBlock = std::min(256, len);
+    FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((float*)a, (half*)b, len);
+    return true;
+}
+
+bool FastllmHalfToFloat(void *a, void *b, int len) {
+    int threadPerBlock = std::min(256, len);
+    FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)a, (float*)b, len);
+    return true;
+}
+
+bool FastllmBF16ToFloat(void *a, void *b, int len) {
+    int threadPerBlock = std::min(256, len);
+    FastllmCudaBF162FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((uint16_t*)a, (float*)b, len);
+    return true;
+}
+
+bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight,fastllm::Data &output) {
+    int vocabSize = weight.dims[0], embSize = weight.dims[1];
+    uint64_t inputLen = input.Count(0);
+
+    float *inputData = (float*)input.cudaData;
+    float *dstOutputData = (float*)output.cudaData;
+
+    if (weight.dataType == fastllm::DataType::FLOAT32) {
+        float *outputData = (float *) dstOutputData;
+        float *weightData = (float *) weight.cudaData;
+        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+    } else if (weight.dataType == fastllm::DataType::BFLOAT16) {
+        std::vector <float> cpuInputData = std::vector <float> (inputLen, 0.0f);
+        FastllmCudaCopyFromDeviceToHost(cpuInputData.data(), inputData, cpuInputData.size() * sizeof(float));
+        float *outputData = (float *) dstOutputData;
+        uint16_t *weightData = (uint16_t *) weight.cudaData;
+        for (int i = 0; i < inputLen; i++) {
+            int token = (int) (cpuInputData[i] + 1e-9);
+            for (int j = 0; j < embSize; j++) {
+                FastllmBF16ToFloat(outputData + i * embSize, weightData + token * embSize, embSize);
+            }
+        }
+    }
+
+    return true;
+}
+
 bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                           const fastllm::Data &mask, const fastllm::Data &output, int group, float scale) {
     int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
@@ -3074,27 +3138,44 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
     half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
 
     if (q1 >= 1024) {
-        half *qk = (half *) FastllmCudaMalloc(q1 * k1 * sizeof(half));
-        cudaMemset(qk, 0, q1 * k1 * sizeof(half));
+        int alignQ1 = q1, alignK1 = k1;
+        bool useFastAttn = getCudaInfos()->hasTensorCore && batch == 1 && (q2 == 128 && v2 == 128);
+        if (useFastAttn) {
+            alignQ1 = ((q1 - 1) / 128 + 1) * 128;
+            alignK1 = ((k1 - 1) / 128 + 1) * 128;
+        }
+
+        half *qk = (half *) FastllmCudaMalloc(alignQ1 * alignK1 * sizeof(half));
+        cudaMemset(qk, 0, alignQ1 * alignK1 * sizeof(half));
 
         auto fastllmCublasHandle = getFastllmCublasHandle();
         cublasStatus_t status;
         for (int i = 0; i < q0; i++) {
 //DeviceSync();
 //auto st = std::chrono::system_clock::now();
-            if (getCudaInfos()->hasTensorCore && batch == 1 && (q2 == 128 && v2 == 128) && false) { 
-                GpuQK(qd + i * q.Count(1), kd + (i / group) * k.Count(1), qk, q1, k1, q2, scale);
-                FastllmSoftmaxKernelInner1WithCausalMask<128> <<< q1, 128 >>>(qk, qk, q1, k1);
-                int part = k1 / 2;
+            if (useFastAttn) { 
+                GpuQK(qd + i * q.Count(1), kd + (i / group) * k.Count(1), qk, alignQ1, alignK1, q2, scale);
+                FastllmSoftmaxKernelInner1WithCausalMask<128> <<< q1, 128 >>>(qk, qk, q1, alignK1);
+                status = cublasHgemmStridedBatched(fastllmCublasHandle,
+                                               CUBLAS_OP_N, CUBLAS_OP_N,
+                                               v2, q1, alignK1, &one,
+                                               vd + (i / group) * v.Count(1), v.strides[1], v.Count(1),
+                                               qk, alignK1, alignK1 * alignQ1,
+                                               &beta,
+                                               od + i * v2 * q1, v2, v2 * q1, 1);
+/*
+                int part = (q1 + 1) / 2;
                 for (int l = 0; l < q1; l += part) {
+                    int cur = std::min(part, q1 - l);
                     status = cublasHgemmStridedBatched(fastllmCublasHandle,
                                                 CUBLAS_OP_N, CUBLAS_OP_N,
-                                                v2, part, min(k1, (l + part)), &one,
+                                                v2, cur, min(k1, (l + cur)), &one,
                                                 vd + (i / group) * v.Count(1), v.strides[1], v.Count(1),
-                                                qk + l * k1, k1, k1 * q1,
+                                                qk + l * alignK1, alignK1, alignK1 * alignQ1,
                                                 &beta,
                                                 od + i * v2 * q1 + l * v2, v2, v2 * q1, 1);
                 }
+*/
             } else {
                 status = cublasHgemmStridedBatched(fastllmCublasHandle,
                                                 CUBLAS_OP_T, CUBLAS_OP_N,
