@@ -15,7 +15,12 @@ const char* GBK_LOCALE_NAME = ".936";
 std::string utf8_to_gbk(const std::string& str)
 {
     std::wstring_convert<std::codecvt_utf8<wchar_t>> conv;
-    std::wstring tmp_wstr = conv.from_bytes(str);
+    std::wstring tmp_wstr;
+    try {
+        tmp_wstr = conv.from_bytes(str);
+    } catch (const std::range_error& e) {
+        return str;
+    }
     std::wstring_convert<std::codecvt_byname<wchar_t, char, mbstate_t>> convert(new std::codecvt_byname<wchar_t, char, mbstate_t>(GBK_LOCALE_NAME));
     return convert.to_bytes(tmp_wstr);
 }
@@ -134,7 +139,7 @@ int main(int argc, char **argv) {
         }
     }
     if (inputs.empty()) {
-        inputs.push_back("Hello！");
+        inputs.push_back("Hello!");
     }
     if (config.batch <= 0) {
         config.batch = inputs.size();
@@ -148,7 +153,9 @@ int main(int argc, char **argv) {
 
     int promptTokenNum = 0;
     for (int i = 0; i < inputs.size(); i++) {
-        inputs[i] = model->MakeInput("", 0, inputs[i]);
+        fastllm::ChatMessages messages;
+        messages.push_back({"user", inputs[i]});
+        inputs[i] = model->ApplyChatTemplate(messages);
         promptTokenNum += model->weight.tokenizer.Encode(inputs[i]).Count(0);
     }
 
