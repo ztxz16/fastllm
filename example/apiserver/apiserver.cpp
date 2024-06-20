@@ -310,7 +310,7 @@ struct WorkQueue {
             }
         }
         if (node->error != "") {
-printf("error body = %s, prompt = %s, error = %s\n", node->request.body.c_str(), node->config["prompt"].string_value().c_str(), node->error.c_str());
+            printf("error body = %s, prompt = %s, error = %s\n", node->request.body.c_str(), node->config["prompt"].string_value().c_str(), node->error.c_str());
             message += node->error;
             int ret = write(node->client, message.c_str(), message.length()); //返回error
             close(node->client);
@@ -318,7 +318,9 @@ printf("error body = %s, prompt = %s, error = %s\n", node->request.body.c_str(),
         }
 
         std::string output = "";
-        auto prompt = model->MakeInput("", 0, node->config["prompt"].string_value());
+        fastllm::ChatMessages messages;
+        messages.push_back({"user", node->config["prompt"].string_value()});
+        auto prompt = model->ApplyChatTemplate(messages);
         auto inputs = model->weight.tokenizer.Encode(prompt);
         std::vector<int> tokens;
         for (int i = 0; i < inputs.Count(0); i++) {
