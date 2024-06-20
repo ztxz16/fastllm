@@ -783,11 +783,12 @@ auto st = std::chrono::system_clock::now();
                                             *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
                                         st += curLen;
                                     }
-                            } else {
-                                ret = std::vector <int> {model->Forward(inputIds,
+                                } else {
+                                    ret = std::vector <int> {model->Forward(inputIds,
                                                                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
                                                                         *positionIds[0],
                                                                         *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
+                                }
                             }
 /*
 PrintProfiler();
