@@ -319,14 +319,14 @@ struct WorkQueue {
     }
 
     void Deal(WorkNode *node) {
-        std::string message = "";
-        message += "HTTP/1.1 200 OK\r\n";
-        message += "Content-Type:application/json\r\n";
-        message += "server:fastllm api server\r\n";
-        message += "\r\n";
-
         auto *req = &node->request;
         if ((req->route == "/generate" || req->route == "/generate/") && req->method == "POST") {
+            std::string message = "";
+            message += "HTTP/1.1 200 OK\r\n";
+            message += "Content-Type:application/json\r\n";
+            message += "server:fastllm api server\r\n";
+            message += "\r\n";
+
             if (node->error == "") {
                 if (node->config["prompt"].is_null()) {
                     node->error = "prompt is empty!";
@@ -372,6 +372,12 @@ struct WorkQueue {
 
             close(node->client);
         } else if ((req->route == "/v1/chat/completions" || req->route == "/v1/chat/completions/") && req->method == "POST") {
+            std::string message = "";
+            message += "HTTP/1.1 200 OK\r\n";
+            message += "Content-Type:application/json\r\n";
+            message += "server:fastllm api server\r\n";
+            message += "\r\n";
+
             fastllm::ChatMessages chatMessages;
             if (node->config["messages"].is_array()) {
                 for (auto &it : node->config["messages"].array_items()) {
@@ -427,6 +433,14 @@ struct WorkQueue {
             auto createTime = GetCurrentTime();
 
             if (isStream) {
+                message = "";
+                message += "HTTP/1.1 200 OK\r\n";
+                message += "Content-Type:application/json\r\n";
+                message += "server:fastllm api server\r\n";
+                message += "Transfer-Encoding: chunked\r\n";
+                message += "\r\n";
+                int ret = write(node->client, message.c_str(), message.length()); //返回初始信息
+            
                 json11::Json startResult = json11::Json::object {
                     {"id", curId},
                     {"object", "chat.completion.chunk"},
@@ -444,8 +458,13 @@ struct WorkQueue {
                         }
                     }}
                 };
-                std::string cur = (message + "data: " + startResult.dump() + "\r\n");
-                int ret = write(node->client, cur.c_str(), cur.length()); //返回初始信息
+                std::string cur = ("data: " + startResult.dump() + "\r\n");
+
+                char chunk_header[50];
+                sprintf(chunk_header, "%zx\r\n", cur.size());
+                ret = write(node->client, chunk_header, strlen(chunk_header));
+                ret = write(node->client, cur.data(), cur.size());
+                ret = write(node->client, "\r\n", 2);
 
                 int outputTokens = 0;
                 std::vector<float> results;
@@ -476,7 +495,10 @@ struct WorkQueue {
                         };
 
                         std::string cur = ("data: " + partResult.dump() + "\r\n");
-                        int ret = write(node->client, cur.c_str(), cur.length()); //返回中间信息
+                        sprintf(chunk_header, "%zx\r\n", cur.size());
+                        ret = write(node->client, chunk_header, strlen(chunk_header));
+                        ret = write(node->client, cur.data(), cur.size());
+                        ret = write(node->client, "\r\n", 2);
                         break;
                     } else {
                         outputTokens++;
@@ -502,12 +524,20 @@ struct WorkQueue {
                         };
 
                         std::string cur = ("data: " + partResult.dump() + "\r\n");
-                        int ret = write(node->client, cur.c_str(), cur.length()); //返回中间信息
+                        sprintf(chunk_header, "%zx\r\n", cur.size());
+                        ret = write(node->client, chunk_header, strlen(chunk_header));
+                        ret = write(node->client, cur.data(), cur.size());
+                        ret = write(node->client, "\r\n", 2);
                     }
                 }
 
                 cur = ("data: [DONE]");
-                ret = write(node->client, cur.c_str(), cur.length()); //返回message
+                sprintf(chunk_header, "%zx\r\n", cur.size());
+                ret = write(node->client, chunk_header, strlen(chunk_header));
+                ret = write(node->client, cur.data(), cur.size());
+                ret = write(node->client, "\r\n", 2);
+
+                ret = write(node->client, "0\r\n\r\n", 5);
                 close(node->client);
             } else {
                 int outputTokens = 0;
@@ -658,7 +688,7 @@ int main(int argc, char** argv) {
 
     struct sockaddr_in local_addr;
     local_addr.sin_family = AF_INET;
-    local_addr.sin_port = htons(8080);  //绑定端口
+    local_addr.sin_port = htons(config.port);  //绑定端口
     local_addr.sin_addr.s_addr = INADDR_ANY; //绑定本机IP地址
 
     //3.bind()： 将一个网络地址与一个套接字绑定，此处将本地地址绑定到一个套接字上
@@ -668,8 +698,7 @@ int main(int argc, char** argv) {
         exit(-1);
     }
     std::cout << "bind ready!" << std::endl;
-
-    listen(local_fd, 2000);
+    listen(local_fd, 2000);    
     printf("start...\n");
     int queuePos = 0;
     while (true) { //循环接收客户端的请求
