@@ -770,6 +770,20 @@ auto st = std::chrono::system_clock::now();
                                                           positionIds, seqLens, pastKeyValues, generationConfigs,
                                                           tokensManager, &logits);
                             } else {
+                                if (seqLens[0] > 8192) {
+                                    int len = seqLens[0];
+                                    int first = 8192, part = 2048;
+                                    for (int st = 0; st < len; ) {
+                                        int curLen = std::min(st == 0 ? first : part, len - st);
+                                        Data curInput, curPositionIds;
+                                        Split(inputIds, 1, st, st + curLen, curInput);
+                                        Split(*positionIds[0], 1, st, st + curLen, curPositionIds);
+
+                                        ret = std::vector <int> {model->Forward(curInput, Data(), curPositionIds,
+                                            *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
+                                        st += curLen;
+                                    }
+                            } else {
                                 ret = std::vector <int> {model->Forward(inputIds,
                                                                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
                                                                         *positionIds[0],
