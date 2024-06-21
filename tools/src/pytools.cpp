@@ -109,6 +109,14 @@ extern "C" {
         return id;
     }
 
+    DLL_EXPORT int create_llm_tokenizer_fromhf(char *path) {
+        models.locker.lock();
+        int id = models.models.size();
+        models.models[id] = fastllm::CreateLLMTokenizerFromHF(path);
+        models.locker.unlock();
+        return id;
+    }
+
     DLL_EXPORT int create_empty_llm_model(char *type) {
         models.locker.lock();
         int id = models.models.size();
