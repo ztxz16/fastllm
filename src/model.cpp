@@ -373,6 +373,72 @@ namespace fastllm {
         }
     }
 
+    void LoadLLMTokenizerFromHFToModel(const std::string &path, basellm *model) {
+        std::string error;
+        std::string tokenizerConfigFile = path + "tokenizer_config.json";
+        auto tokenizerConfig = json11::Json::parse(ReadAllFile(tokenizerConfigFile), error);
+        model->weight.tokenizer.SetTokenizerConfig(tokenizerConfig);
+        std::string tokenizerClass = tokenizerConfig["tokenizer_class"].string_value();
+        if (tokenizerClass == "PreTrainedTokenizerFast" || tokenizerClass == "Qwen2Tokenizer") {
+            // PreTrainedTokenizerFast
+            std::string tokenizerFile = path + "tokenizer.json";
+            auto tokenizer = json11::Json::parse(ReadAllFile(tokenizerFile), error);
+            for (auto &it : tokenizer["model"]["vocab"].object_items()) {
+                model->weight.AddTokenizerWord(it.first, it.second.int_value(), 1.0f);
+            }
+            std::map<std::string, int> spTokens;
+            for (auto &it : tokenizer["added_tokens"].array_items()) {
+                spTokens[it["content"].string_value()] = it["id"].int_value();
+            }
+            model->weight.tokenizer.SetSpecialTokens(spTokens);
+
+            if (!tokenizer["decoder"].is_null() && !tokenizer["decoder"]["type"].is_null() && 
+                tokenizer["decoder"]["type"].string_value() == "ByteLevel") {
+                model->weight.tokenizer.byteAsChar = true;
+            }
+        } else if (tokenizerClass == "ChatGLM4Tokenizer") {
+            // GLM4御用的分词
+            model->bot_role = " ";
+            std::vector <std::string> lines, line;
+            SplitString(ReadAllFile(path + "tokenizer.model"), {'\r', '\n'}, lines);
+            for (int i = 0; i < lines.size(); i++) {
+                SplitString(lines[i], {' '}, line);
+                model->weight.AddTokenizerWord(Base64Decode(line[0]), atoi(line[1].c_str()), 1.0f);
+            }
+            std::map<std::string, int> spTokens;
+            for (auto &it : tokenizerConfig["added_tokens_decoder"].object_items()) {
+                spTokens[it.second["content"].string_value()] = atoi(it.first.c_str());
+            }
+            model->weight.tokenizer.SetSpecialTokens(spTokens);
+            ((ChatGLMModel*)model)->gmask_token_id = model->weight.tokenizer.GetTokenId("[gMASK]");
+            ((ChatGLMModel*)model)->bos_token_id = model->weight.tokenizer.GetTokenId("<sop>");
+            ((ChatGLMModel*)model)->tokenizerClass = tokenizerClass;
+
+            // ChatGLM采用拼接token的方法，需要强行指定分割词的TokenID
+            model->pre_prompt = "";
+            model->user_role = ("<FLM_FIX_TOKEN_" + std::to_string(model->weight.tokenizer.GetTokenId("<|user|>"))  + ">\n");
+            model->bot_role = ("<FLM_FIX_TOKEN_" + std::to_string(model->weight.tokenizer.GetTokenId("<|assistant|>")) + ">\n");
+            model->history_sep = "";
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
+        } else {
+            ErrorInFastLLM("Unsupport tokenizer_class: " + tokenizerClass);
+        }
+    }
+
+    // 从hf文件夹读取分词
+    std::unique_ptr<basellm> CreateLLMTokenizerFromHF(const std::string &modelPath) {
+        std::string error;
+        std::string path = modelPath;
+        if (path.back() != '/' || path.back() != '\\') {
+            path += "/";
+        }
+        std::string configFile = path + "config.json";
+        auto config = json11::Json::parse(ReadAllFile(configFile), error);
+        basellm *model = CreateModelWithType(config["model_type"].string_value());
+        LoadLLMTokenizerFromHFToModel(path, model);
+        return std::unique_ptr<fastllm::basellm> (model);
+    }
+
     // 从hf文件夹读取，仅支持safetensor格式的模型
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
                                                     DataType linearDataType, int groupCnt) {
@@ -428,56 +494,7 @@ namespace fastllm {
         }
 
         // 3. 读取分词
-        std::string tokenizerConfigFile = path + "tokenizer_config.json";
-        auto tokenizerConfig = json11::Json::parse(ReadAllFile(tokenizerConfigFile), error);
-        model->weight.tokenizer.SetTokenizerConfig(tokenizerConfig);
-        std::string tokenizerClass = tokenizerConfig["tokenizer_class"].string_value();
-        if (tokenizerClass == "PreTrainedTokenizerFast" || tokenizerClass == "Qwen2Tokenizer") {
-            // PreTrainedTokenizerFast
-            std::string tokenizerFile = path + "tokenizer.json";
-            auto tokenizer = json11::Json::parse(ReadAllFile(tokenizerFile), error);
-            auto tokenizerModel = tokenizer["model"];
-            auto vocab = tokenizerModel["vocab"];
-            for (auto &it : vocab.object_items()) {
-                model->weight.AddTokenizerWord(it.first, it.second.int_value(), 1.0f);
-            }
-            std::map<std::string, int> spTokens;
-            for (auto &it : tokenizer["added_tokens"].array_items()) {
-                spTokens[it["content"].string_value()] = it["id"].int_value();
-            }
-            model->weight.tokenizer.SetSpecialTokens(spTokens);
-
-            if (!tokenizer["decoder"].is_null() && !tokenizer["decoder"]["type"].is_null() && 
-                tokenizer["decoder"]["type"].string_value() == "ByteLevel") {
-                model->weight.tokenizer.byteAsChar = true;
-            }
-        } else if (tokenizerClass == "ChatGLM4Tokenizer") {
-            // GLM4御用的分词
-            model->bot_role = " ";
-            std::vector <std::string> lines, line;
-            SplitString(ReadAllFile(path + "tokenizer.model"), {'\r', '\n'}, lines);
-            for (int i = 0; i < lines.size(); i++) {
-                SplitString(lines[i], {' '}, line);
-                model->weight.AddTokenizerWord(Base64Decode(line[0]), atoi(line[1].c_str()), 1.0f);
-            }
-            std::map<std::string, int> spTokens;
-            for (auto &it : tokenizerConfig["added_tokens_decoder"].object_items()) {
-                spTokens[it.second["content"].string_value()] = atoi(it.first.c_str());
-            }
-            model->weight.tokenizer.SetSpecialTokens(spTokens);
-            ((ChatGLMModel*)model)->gmask_token_id = model->weight.tokenizer.GetTokenId("[gMASK]");
-            ((ChatGLMModel*)model)->bos_token_id = model->weight.tokenizer.GetTokenId("<sop>");
-            ((ChatGLMModel*)model)->tokenizerClass = tokenizerClass;
-
-            // ChatGLM采用拼接token的方法，需要强行指定分割词的TokenID
-            model->pre_prompt = "";
-            model->user_role = ("<FLM_FIX_TOKEN_" + std::to_string(model->weight.tokenizer.GetTokenId("<|user|>"))  + ">\n");
-            model->bot_role = ("<FLM_FIX_TOKEN_" + std::to_string(model->weight.tokenizer.GetTokenId("<|assistant|>")) + ">\n");
-            model->history_sep = "";
-            model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
-        } else {
-            ErrorInFastLLM("Unsupport tokenizer_class: " + tokenizerClass);
-        }
+        LoadLLMTokenizerFromHFToModel(path, model);
 
         // 4. 读取权重
         auto tensors = safeTensors.GetSortedItemNames();

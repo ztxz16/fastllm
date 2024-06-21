@@ -18,6 +18,9 @@ fastllm_lib.create_llm_model.restype = ctypes.c_int
 fastllm_lib.create_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
 fastllm_lib.create_llm_model_fromhf.restype = ctypes.c_int
 
+fastllm_lib.create_llm_tokenizer_fromhf.argtypes = [ctypes.c_char_p]
+fastllm_lib.create_llm_tokenizer_fromhf.restype = ctypes.c_int
+
 fastllm_lib.add_eos_token.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
 
 fastllm_lib.token_decode.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
@@ -132,6 +135,104 @@ fastllm_data_type_dict = {
     "float32": 0,
 }
 
+class tokenizer:
+    def __init__ (self, path : str,
+                  id : int = -99999,
+                  system_prompt : str = ""):
+        self.systemp_prompt = system_prompt
+        if (id != -99999):
+            self.model = id
+        else:
+            if os.path.isfile(path):
+                self.model = fastllm_lib.create_llm_tokenizer(path.encode());
+            elif os.path.isdir(path):
+                self.model = fastllm_lib.create_llm_tokenizer_fromhf(path.encode());
+            else:
+                print("path error: ", path);
+                exit(0)
+        self.thread_local_obj = threading.local()
+        self.tokenizer_decode_token_cache = None
+    
+    def apply_chat_template(
+        self,
+        conversation: Union[List[Dict[str, str]], List[List[Dict[str, str]]], "Conversation"],
+        chat_template: Optional[str] = None,
+        add_generation_prompt: bool = False,
+        tokenize: bool = True,
+        #padding: bool = False,
+        #truncation: bool = False,
+        #max_length: Optional[int] = None,
+        #return_tensors: Optional[Union[str, TensorType]] = None,
+        #return_dict: bool = False,
+        #tokenizer_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> Union[str, List[int], List[str], List[List[int]]]:
+        if isinstance(conversation, (list, tuple)) and (
+            isinstance(conversation[0], (list, tuple)) or hasattr(conversation[0], "messages")
+        ):
+            conversations = conversation
+            is_batched = True
+        else:
+            conversations = [conversation]
+            is_batched = False
+        strs = []        
+        for conversation in conversations:
+            messages = []
+            for it in conversation:
+                if it["role"] == "system":
+                    messages += ["system", it["content"]]
+            for it in conversation:
+                if it["role"] != "system":
+                    messages += [it["role"], it["content"]]
+            poss = []
+            lens = []
+            all = b''
+            for i in range(len(messages)):
+                messages[i] = messages[i].encode()
+                all += messages[i]
+                poss.append(0 if i == 0 else poss[-1] + lens[-1])
+                lens.append(len(messages[i]))
+            strs.append(fastllm_lib.apply_chat_template(self.model, all, len(messages), (ctypes.c_int * len(poss))(*poss), (ctypes.c_int * len(lens))(*lens)).decode())
+        if (is_batched):
+            return strs
+        else:
+            return strs[0]
+        
+    def encode(
+        self,
+        text: str,
+        #text_pair: Optional[Union[TextInput, PreTokenizedInput, EncodedInput]] = None,
+        #add_special_tokens: bool = True,
+        #padding: Union[bool, str, PaddingStrategy] = False,
+        #truncation: Union[bool, str, TruncationStrategy] = None,
+        #max_length: Optional[int] = None,
+        #stride: int = 0,
+        #return_tensors: Optional[Union[str, TensorType]] = None,
+        **kwargs,
+    ) -> List[int]:
+        content = text
+        output_buffer_init_len = 1024
+        if "tokenizer_encode_string__output_buffer" not in dir(self.thread_local_obj) or self.thread_local_obj.tokenizer_encode_string__output_buffer is None:
+            self.thread_local_obj.tokenizer_encode_string__output_buffer = (ctypes.c_int * output_buffer_init_len)()
+
+        buffer = self.thread_local_obj.tokenizer_encode_string__output_buffer
+        buffer_len = len(buffer)
+        result_len = fastllm_lib.token_encode_string(self.model, content.encode(), buffer_len, buffer)
+        if result_len > buffer_len:
+            if result_len > 10240:
+                # 要处理的数据过长，使用一次性的buffer
+                temp_buffer = (ctypes.c_int * result_len)()
+                ret = fastllm_lib.token_encode_string(self.model, content.encode(), result_len, temp_buffer)
+                return [i for i in temp_buffer]
+            else:
+                # 扩展buffer大小
+                new_buffer_len = round(math.ceil(result_len / 1024.0)) * 1024
+                buffer = (ctypes.c_int * new_buffer_len)()
+                self.thread_local_obj.tokenizer_encode_string__output_buffer = buffer
+                result_len = fastllm_lib.token_encode_string(self.model, content.encode(), new_buffer_len, buffer)
+
+        return [buffer[i] for i in range(result_len)]
+
 class model:
     def __init__ (self, path : str,
                   id : int = -99999,
@@ -214,7 +315,7 @@ class model:
             cache_dict[token_id] = self.tokenizer_decode_token(token_id)
 
         self.tokenizer_decode_token_cache = cache_dict
-
+    
     def tokenizer_encode_string(self, content: str) -> List[int]:
         output_buffer_init_len = 1024
         if "tokenizer_encode_string__output_buffer" not in dir(self.thread_local_obj) or self.thread_local_obj.tokenizer_encode_string__output_buffer is None:
@@ -237,7 +338,10 @@ class model:
                 result_len = fastllm_lib.token_encode_string(self.model, content.encode(), new_buffer_len, buffer)
 
         return [buffer[i] for i in range(result_len)]
-
+    
+    def encode(self, content: str) -> List[int]:
+        return self.tokenizer_encode_string(content)
+    
     def tokenizer_decode_token(self, token_id: int) -> bytes:
         if self.tokenizer_decode_token_cache is not None:
             cache_result = self.tokenizer_decode_token_cache.get(token_id)
