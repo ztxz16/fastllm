@@ -436,6 +436,7 @@ namespace fastllm {
             model->bot_role = ("<FLM_FIX_TOKEN_" + std::to_string(model->weight.tokenizer.GetTokenId("<|assistant|>")) + ">\n");
             model->history_sep = "";
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
+            model->weight.tokenizer.chatTemplate = "";
         } else {
             ErrorInFastLLM("Unsupport tokenizer_class: " + tokenizerClass);
         }
