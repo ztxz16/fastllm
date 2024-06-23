@@ -7,6 +7,7 @@
 
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 
 #ifdef PY_API
 #include "Python.h"
@@ -86,9 +87,7 @@ namespace fastllm {
     public:
         basellm() {};
 
-        ~basellm() {
-            this->weight.ReleaseWeight();
-        };
+        ~basellm();
 
         virtual void LoadFromFile(const std::string &fileName); // 从文件读取 
 
@@ -207,6 +206,7 @@ namespace fastllm {
 
         std::thread *mainLoop = nullptr;
         std::mutex mainLoopLocker, dictLocker;
+        std::condition_variable dictCV;
 
         std::map <std::string, int> deviceMap;
 
@@ -222,6 +222,7 @@ namespace fastllm {
         int lastPromptTokens = 0;
         
         DataType dataType = DataType::FLOAT32;
+        bool isFree = false; // 是否释放
     };
 }
 
