@@ -767,7 +767,9 @@ namespace fastllm {
                         ids.push_back(gmask_token_id);
                         ids.push_back(bos_token_id);
                     } else if (GetVersion() == 2) {
-                        if (ids.size() < 2 || ids[0] != this->gmask_token_id || ids[1] != this->bos_token_id) {
+                        if (ids.size() < 2 || 
+                            (this->weight.tokenizer.tokenToStringDict.size() > 0 && 
+                            (ids[0] != this->gmask_token_id || ids[1] != this->bos_token_id))) {
                             ids.insert(ids.begin(), this->bos_token_id);
                             ids.insert(ids.begin(), this->gmask_token_id);
                         }
