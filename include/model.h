@@ -17,7 +17,8 @@ namespace fastllm {
 
     std::unique_ptr<basellm> CreateLLMModelFromHF(const std::string &modelPath, 
                                                     DataType linearDataType, 
-                                                    int groupCnt = -1);
+                                                    int groupCnt = -1,
+                                                    bool skipTokenizer = false);
     
     std::unique_ptr<basellm> CreateLLMTokenizerFromHF(const std::string &modelPath);
 }

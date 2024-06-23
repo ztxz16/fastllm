@@ -15,7 +15,7 @@ else:
 fastllm_lib.create_llm_model.argtypes = [ctypes.c_char_p]
 fastllm_lib.create_llm_model.restype = ctypes.c_int
 
-fastllm_lib.create_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+fastllm_lib.create_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool]
 fastllm_lib.create_llm_model_fromhf.restype = ctypes.c_int
 
 fastllm_lib.create_llm_tokenizer_fromhf.argtypes = [ctypes.c_char_p]
@@ -233,12 +233,125 @@ class tokenizer:
 
         return [buffer[i] for i in range(result_len)]
 
+# copy from transformers
+class GenerationConfig:
+    def __init__(self, **kwargs):
+        # Parameters that control the length of the output
+        self.max_length = kwargs.pop("max_length", 20)
+        self.max_new_tokens = kwargs.pop("max_new_tokens", 256)
+        self.min_length = kwargs.pop("min_length", 0)
+        self.min_new_tokens = kwargs.pop("min_new_tokens", None)
+        self.early_stopping = kwargs.pop("early_stopping", False)
+        self.max_time = kwargs.pop("max_time", None)
+        self.stop_strings = kwargs.pop("stop_strings", None)
+
+        # Parameters that control the generation strategy used
+        self.do_sample = kwargs.pop("do_sample", False)
+        self.num_beams = kwargs.pop("num_beams", 1)
+        self.num_beam_groups = kwargs.pop("num_beam_groups", 1)
+        self.penalty_alpha = kwargs.pop("penalty_alpha", None)
+        self.use_cache = kwargs.pop("use_cache", True)
+
+        # Parameters for manipulation of the model output logits
+        self.temperature = kwargs.pop("temperature", 1.0)
+        self.top_k = kwargs.pop("top_k", 1)
+        self.top_p = kwargs.pop("top_p", 1.0)
+        self.min_p = kwargs.pop("min_p", None)
+        self.typical_p = kwargs.pop("typical_p", 1.0)
+        self.epsilon_cutoff = kwargs.pop("epsilon_cutoff", 0.0)
+        self.eta_cutoff = kwargs.pop("eta_cutoff", 0.0)
+        self.diversity_penalty = kwargs.pop("diversity_penalty", 0.0)
+        self.repetition_penalty = kwargs.pop("repetition_penalty", 1.0)
+        self.encoder_repetition_penalty = kwargs.pop("encoder_repetition_penalty", 1.0)
+        self.length_penalty = kwargs.pop("length_penalty", 1.0)
+        self.no_repeat_ngram_size = kwargs.pop("no_repeat_ngram_size", 0)
+        self.bad_words_ids = kwargs.pop("bad_words_ids", None)
+        self.force_words_ids = kwargs.pop("force_words_ids", None)
+        self.renormalize_logits = kwargs.pop("renormalize_logits", False)
+        self.constraints = kwargs.pop("constraints", None)
+        self.forced_bos_token_id = kwargs.pop("forced_bos_token_id", None)
+        self.forced_eos_token_id = kwargs.pop("forced_eos_token_id", None)
+        self.remove_invalid_values = kwargs.pop("remove_invalid_values", False)
+        self.exponential_decay_length_penalty = kwargs.pop("exponential_decay_length_penalty", None)
+        self.suppress_tokens = kwargs.pop("suppress_tokens", None)
+        self.begin_suppress_tokens = kwargs.pop("begin_suppress_tokens", None)
+        self.forced_decoder_ids = kwargs.pop("forced_decoder_ids", None)
+        self.sequence_bias = kwargs.pop("sequence_bias", None)
+        self.token_healing = kwargs.pop("token_healing", False)
+        self.guidance_scale = kwargs.pop("guidance_scale", None)
+        self.low_memory = kwargs.pop("low_memory", None)
+        #watermarking_config = kwargs.pop("watermarking_config", None)
+        #if watermarking_config is None:
+        #    self.watermarking_config = None
+        #elif isinstance(watermarking_config, WatermarkingConfig):
+        #    self.watermarking_config = watermarking_config
+        #else:
+        #    self.watermarking_config = WatermarkingConfig.from_dict(watermarking_config)
+
+        # Parameters that define the output variables of `generate`
+        self.num_return_sequences = kwargs.pop("num_return_sequences", 1)
+        self.output_attentions = kwargs.pop("output_attentions", False)
+        self.output_hidden_states = kwargs.pop("output_hidden_states", False)
+        self.output_scores = kwargs.pop("output_scores", False)
+        self.output_logits = kwargs.pop("output_logits", None)
+        self.return_dict_in_generate = kwargs.pop("return_dict_in_generate", False)
+
+        # Special tokens that can be used at generation time
+        self.pad_token_id = kwargs.pop("pad_token_id", None)
+        self.bos_token_id = kwargs.pop("bos_token_id", None)
+        self.eos_token_id = kwargs.pop("eos_token_id", None)
+
+        # Generation parameters exclusive to encoder-decoder models
+        self.encoder_no_repeat_ngram_size = kwargs.pop("encoder_no_repeat_ngram_size", 0)
+        self.decoder_start_token_id = kwargs.pop("decoder_start_token_id", None)
+
+        # Assistant generation
+        self.num_assistant_tokens = kwargs.pop("num_assistant_tokens", 5)
+        self.num_assistant_tokens_schedule = kwargs.pop("num_assistant_tokens_schedule", "heuristic")
+
+        # Cache implementation
+        self.cache_implementation = kwargs.pop("cache_implementation", None)
+        self.cache_config = kwargs.pop("cache_config", None)
+        #if self.cache_implementation is not None:
+        #    cache_config_class = NEEDS_CACHE_CONFIG[self.cache_implementation]
+        #    if self.cache_config is None:
+        #        self.cache_config = cache_config_class()
+        #    elif isinstance(self.cache_config, dict):
+        #        self.cache_config = cache_config_class.from_dict(self.cache_config)
+        self.return_legacy_cache = kwargs.pop("return_legacy_cache", True)
+
+        # Prompt lookup decoding
+        self.prompt_lookup_num_tokens = kwargs.pop("prompt_lookup_num_tokens", None)
+        self.max_matching_ngram_size = kwargs.pop("max_matching_ngram_size", None)
+
+        # Wild card
+        self.generation_kwargs = kwargs.pop("generation_kwargs", {})
+
+        # The remaining attributes do not parametrize `.generate()`, but are informative and/or used by the hub
+        # interface.
+        self._from_model_config = kwargs.pop("_from_model_config", False)
+        self._commit_hash = kwargs.pop("_commit_hash", None)
+        self.transformers_version = kwargs.pop("transformers_version", "fastllm")
+
+        # Additional attributes without default values
+        if not self._from_model_config:
+            # we don't want to copy values from the model config if we're initializing a `GenerationConfig` from a
+            # model's default configuration file
+            for key, value in kwargs.items():
+                try:
+                    setattr(self, key, value)
+                except AttributeError as err:                    
+                    raise err
+        # Validate the values of the attributes
+        # self.validate(is_init = True)
+
 class model:
     def __init__ (self, path : str,
                   id : int = -99999,
                   dtype : str = "float16",
                   system_prompt : str = "",
-                  eos_token: List[str] = []):
+                  eos_token: List[str] = [],
+                  tokenizer_type = "auto"):
         int4g_groupcnt = 128;
         if (dtype.startswith("int4g") and len(dtype) > 5):
             try:
@@ -250,13 +363,24 @@ class model:
         if (dtype not in fastllm_data_type_dict):
             print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
             exit(0)
+        
+        self.hf_tokenizer = None
         if (id != -99999):
             self.model = id;
         else:
             if os.path.isfile(path):
                 self.model = fastllm_lib.create_llm_model(path.encode());
             elif os.path.isdir(path):
-                self.model = fastllm_lib.create_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt);
+                if tokenizer_type != "fastllm":
+                    try:
+                        from transformers import AutoTokenizer
+                        self.hf_tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
+                    except:
+                        self.hf_tokenizer = None
+                        print("Load AutoTokenizer failed. (you can try install transformers)")
+                        print("Try load fastllm tokenizer.")
+                self.model = fastllm_lib.create_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, 
+                                                                 ctypes.c_bool(self.hf_tokenizer != None));
             else:
                 print("path error: ", path);
                 exit(0)
@@ -277,27 +401,71 @@ class model:
         # 不做成自动缓存是为了避免在多线程调用的时候对缓存dict加锁，同时也为不同场景提供选择空间
         self.tokenizer_decode_token_cache = None
 
+    def generate(
+        self,
+        inputs,
+        #generation_config = None,
+        #logits_processor: Optional[LogitsProcessorList] = None,
+        #stopping_criteria: Optional[StoppingCriteriaList] = None,
+        #prefix_allowed_tokens_fn: Optional[Callable[[int, torch.Tensor], List[int]]] = None,
+        #synced_gpus: Optional[bool] = None,
+        #assistant_model: Optional["PreTrainedModel"] = None,
+        #streamer: Optional["BaseStreamer"] = None,
+        #negative_prompt_ids: Optional[torch.Tensor] = None,
+        #negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+        **kwargs) : #-> Union[GenerateOutput, torch.LongTensor]:
+        if (str(type(inputs)).find("torch.Tensor") != -1):
+            inputs = inputs.tolist()
+        config = GenerationConfig(**kwargs)        
+        stop_token_len, stop_token_list = self.stop_token_ctypes(None)
+        handles = []
+        for i in range(len(inputs)):
+            handles.append(fastllm_lib.launch_response_llm_model(self.model, len(inputs[i]),
+                                                       (ctypes.c_int * len(inputs[i]))(*inputs[i]),
+                                                       ctypes.c_int(config.max_new_tokens), ctypes.c_bool(config.do_sample), 
+                                                       ctypes.c_float(config.top_p), ctypes.c_int(config.top_k),
+                                                       ctypes.c_float(config.temperature), ctypes.c_float(config.repetition_penalty), ctypes.c_bool(False),
+                                                       stop_token_len, stop_token_list))
+        outputs = inputs
+        for i in range(len(inputs)):
+            while True:
+                cur_token = fastllm_lib.fetch_response_llm_model(self.model, handles[i])
+                if cur_token == -1:
+                    break
+                outputs[i].append(cur_token)
+        return outputs
+        
     def get_prompt(self,
                    query: str,
                    history: List[Tuple[str, str]] = None) -> str:
         if (not(history)):
             history = [];
         messages = []
-        if (self.system_prompt != ""):
-            messages += ["system", self.system_prompt]
-        for his in history:
-            messages += ["user", his[0], "assistant", his[1]]
-        messages += ["user", query]
-        poss = []
-        lens = []
-        all = b''
 
-        for i in range(len(messages)):
-            messages[i] = messages[i].encode()
-            all += messages[i]
-            poss.append(0 if i == 0 else poss[-1] + lens[-1])
-            lens.append(len(messages[i]))
-        return fastllm_lib.apply_chat_template(self.model, all, len(messages), (ctypes.c_int * len(poss))(*poss), (ctypes.c_int * len(lens))(*lens)).decode()
+        if (self.hf_tokenizer != None):
+            if (self.system_prompt != ""):
+                messages.append({"role": "system", "content": self.system_prompt})
+            for his in history:
+                messages.append({"role": "user", "content": his[0]})
+                messages.append({"role": "assistant", "content": his[1]})
+            messages.append({"role": "user", "content": query})
+            return self.hf_tokenizer.apply_chat_template(messages, tokenize = False, add_generation_prompt = True)
+        else:
+            if (self.system_prompt != ""):
+                messages += ["system", self.system_prompt]
+            for his in history:
+                messages += ["user", his[0], "assistant", his[1]]
+            messages += ["user", query]
+            poss = []
+            lens = []
+            all = b''
+
+            for i in range(len(messages)):
+                messages[i] = messages[i].encode()
+                all += messages[i]
+                poss.append(0 if i == 0 else poss[-1] + lens[-1])
+                lens.append(len(messages[i]))
+            return fastllm_lib.apply_chat_template(self.model, all, len(messages), (ctypes.c_int * len(poss))(*poss), (ctypes.c_int * len(lens))(*lens)).decode()
 
     def save(self, path : str):
         fastllm_lib.save_llm_model(self.model, path.encode());
@@ -425,35 +593,53 @@ class model:
                         history: List[Tuple[str, str]] = None,
                         max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                         one_by_one = True, stop_token_ids: List[int] = None):
-        prompt = query if self.direct_query else self.get_prompt(query, history);
-        stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids);
-        handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
-                                                           ctypes.c_int(max_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
-                                                           ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
-                                                           stop_token_len, stop_token_list);
-        res = "";
-        ret = b'';
-        fail_cnt = 0;
-        while True:
-            ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle);
-            cur = "";
-            try:
-                cur = ret.decode();
-                ret = b'';
-            except:
-                fail_cnt += 1;
-                if (fail_cnt == 20):
-                    break;
+        if (self.hf_tokenizer != None):
+            lastlen = 0
+            for cur in self.stream_chat(tokenizer = self.hf_tokenizer,
+                                      query = query,
+                                      history = history,
+                                      max_length = max_length,
+                                      do_sample = do_sample,
+                                      top_p = top_p, top_k = top_k,
+                                      temperature = temperature,
+                                      repeat_penalty = repeat_penalty,
+                                      stop_token_ids = stop_token_ids):
+                if one_by_one:
+                    ret = cur[0][lastlen:]
+                    lastlen = len(cur[0])
+                    yield ret
                 else:
-                    continue;
+                    yield cur[0]
+        else:
+            prompt = query if self.direct_query else self.get_prompt(query, history);
+            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids);
+            handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+                                                            ctypes.c_int(max_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
+                                                            ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
+                                                            stop_token_len, stop_token_list);
+            res = "";
+            ret = b'';
             fail_cnt = 0;
-            if (cur == "<flmeos>"):
-                break;
-            if one_by_one:
-                yield cur;
-            else:
-                res += cur;
-                yield res;
+            while True:
+                ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle);
+                cur = "";
+                try:
+                    cur = ret.decode();
+                    ret = b'';
+                except:
+                    fail_cnt += 1;
+                    if (fail_cnt == 20):
+                        break;
+                    else:
+                        continue;
+                fail_cnt = 0;
+                if (cur == "<flmeos>"):
+                    break;
+                if one_by_one:
+                    yield cur;
+                else:
+                    res += cur;
+                    yield res;
 
     def stream_response_raw(self,
                             input_tokens: List[int],

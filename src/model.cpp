@@ -373,6 +373,22 @@ namespace fastllm {
         }
     }
 
+    void DealLLMTokenizerFromHFToModel(const std::string &path, basellm *model) {
+        std::string error;
+        std::string tokenizerConfigFile = path + "tokenizer_config.json";
+        if (!fastllm::FileExists(tokenizerConfigFile)) {
+            return;
+        }
+        auto tokenizerConfig = json11::Json::parse(ReadAllFile(tokenizerConfigFile), error);
+        model->weight.tokenizer.SetTokenizerConfig(tokenizerConfig);
+        std::string tokenizerClass = tokenizerConfig["tokenizer_class"].string_value();
+        if (tokenizerClass == "PreTrainedTokenizerFast" || tokenizerClass == "Qwen2Tokenizer") {
+        } else if (tokenizerClass == "ChatGLM4Tokenizer") {
+            // 历史遗留问题
+            model->bot_role = " ";
+        }
+    }
+
     void LoadLLMTokenizerFromHFToModel(const std::string &path, basellm *model) {
         std::string error;
         std::string tokenizerConfigFile = path + "tokenizer_config.json";
@@ -441,7 +457,7 @@ namespace fastllm {
 
     // 从hf文件夹读取，仅支持safetensor格式的模型
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
-                                                    DataType linearDataType, int groupCnt) {
+                                                    DataType linearDataType, int groupCnt, bool skipTokenizer) {
         std::string path = modelPath;
         if (path.back() != '/' || path.back() != '\\') {
             path += "/";
@@ -494,7 +510,11 @@ namespace fastllm {
         }
 
         // 3. 读取分词
-        LoadLLMTokenizerFromHFToModel(path, model);
+        if (!skipTokenizer) {
+            LoadLLMTokenizerFromHFToModel(path, model);
+        } else {
+            DealLLMTokenizerFromHFToModel(path, model);
+        }
 
         // 4. 读取权重
         auto tensors = safeTensors.GetSortedItemNames();
