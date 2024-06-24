@@ -2,6 +2,7 @@ import ctypes;
 import math
 import os;
 import threading
+import asyncio
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
 import platform
@@ -54,6 +55,9 @@ fastllm_lib.launch_response_str_llm_model.restype = ctypes.c_int
 
 fastllm_lib.fetch_response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.fetch_response_str_llm_model.restype = ctypes.c_char_p
+
+fastllm_lib.can_fetch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+fastllm_lib.can_fetch_response_llm_model.restype = ctypes.c_bool
 
 fastllm_lib.make_history_llm_model.argtype = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p]
 fastllm_lib.make_history_llm_model.restype = ctypes.c_char_p
@@ -543,7 +547,14 @@ class model:
             return 0, None
         else:
             return ctypes.c_int(len(stop_token_ids)), (ctypes.c_int * len(stop_token_ids))(*stop_token_ids)
-        
+    
+    def get_input_token_len(self, query: str, history: List[Tuple[str, str]] = None) -> int:
+        prompt = query if self.direct_query else self.get_prompt(query, history);
+        if (self.hf_tokenizer != None):
+            return len(self.hf_tokenizer.encode(prompt))
+        else:
+            return len(self.encode(prompt))
+
     def response_logits(self,
                         query: str,
                         history: List[Tuple[str, str]] = None,
@@ -640,6 +651,62 @@ class model:
                 else:
                     res += cur;
                     yield res;
+    
+    async def stream_response_async(self,
+                        query: str,
+                        history: List[Tuple[str, str]] = None,
+                        max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
+                        one_by_one = True, stop_token_ids: List[int] = None):
+        if (self.hf_tokenizer != None):
+            lastlen = 0
+            async for cur in self.stream_chat_async(tokenizer = self.hf_tokenizer,
+                                      query = query,
+                                      history = history,
+                                      max_length = max_length,
+                                      do_sample = do_sample,
+                                      top_p = top_p, top_k = top_k,
+                                      temperature = temperature,
+                                      repeat_penalty = repeat_penalty,
+                                      stop_token_ids = stop_token_ids):
+                if one_by_one:
+                    ret = cur[0][lastlen:]
+                    lastlen = len(cur[0])
+                    yield ret
+                else:
+                    yield cur[0]
+        else:
+            prompt = query if self.direct_query else self.get_prompt(query, history);
+            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids);
+            handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+                                                            ctypes.c_int(max_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
+                                                            ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
+                                                            stop_token_len, stop_token_list);
+            res = "";
+            ret = b'';
+            fail_cnt = 0;
+            while True:
+                if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
+                    await asyncio.sleep(0)
+                    continue
+                ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle);
+                cur = "";
+                try:
+                    cur = ret.decode();
+                    ret = b'';
+                except:
+                    fail_cnt += 1;
+                    if (fail_cnt == 20):
+                        break;
+                    else:
+                        continue;
+                fail_cnt = 0;
+                if (cur == "<flmeos>"):
+                    break;
+                if one_by_one:
+                    yield cur;
+                else:
+                    res += cur;
+                    yield res;
 
     def stream_response_raw(self,
                             input_tokens: List[int],
@@ -690,8 +757,50 @@ class model:
             result.append(cur);
         response = tokenizer.decode(result);
         history = history + [(query, response)];
-        return response, history;
+        return response, history
+    
+    async def stream_chat_async(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, past_key_values = None,
+                    max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
+                    return_past_key_values = False, stop_token_ids: List[int] = None, **kwargs):
+        type = None
+        if (hasattr(tokenizer, "name") 
+            and tokenizer.name == "GLMTokenizer" 
+            and hasattr(tokenizer, "build_chat_input")):
+            type = "ChatGLM3"
 
+        if (not(history)):
+            history = [];
+        
+        if (type == "ChatGLM3"):
+            input = tokenizer.build_chat_input(query, history=history)["input_ids"].reshape(-1).tolist()
+        else:
+            prompt = query if self.direct_query else self.get_prompt(query, history);
+            input = tokenizer.encode(prompt);
+
+        stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+        handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
+                                                       max_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                       False, stop_token_len, stop_token_list);
+        tokens = [];
+        while True:
+            if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
+                await asyncio.sleep(0)
+                continue
+            cur = fastllm_lib.fetch_response_llm_model(self.model, handle);
+            if (cur == -1):
+                break;
+            tokens.append(cur);
+            response = tokenizer.decode(tokens);
+            new_history = history + [(query, response)];
+            if (type == "ChatGLM3"):
+                new_history = history
+                new_history.append({"role": "user", "content": query})
+                new_history.append({"role": "assistant", "metadata": "", "content": response})
+            if return_past_key_values:
+                yield response, new_history, None;
+            else:
+                yield response, new_history
+    
     def stream_chat(self, tokenizer, query: str, history: List[Tuple[str, str]] = None, past_key_values = None,
                     max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                     return_past_key_values = False, stop_token_ids: List[int] = None, **kwargs) -> str:
