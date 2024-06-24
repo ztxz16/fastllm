@@ -670,6 +670,16 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         return handleId;
     }
 
+    bool basellm::CanFetchResponse(int handleId) {
+        std::unique_lock<std::mutex> dictLocker(this->dictLocker);
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        if (context == nullptr) {
+            return true;
+        } else {
+            return (context->resultTokenQueue.size() > 0 || context->isEnding);
+        }
+    }
+    
     int basellm::FetchResponseTokens(int handleId) {
         std::unique_lock<std::mutex> dictLocker(this->dictLocker);
         ResponseContext *context = responseContextDict.GetHandle(handleId);

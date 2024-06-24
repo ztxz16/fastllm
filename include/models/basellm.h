@@ -148,6 +148,8 @@ namespace fastllm {
 
         virtual int LaunchResponseTokens(const std::vector <int> &inputTokens,
                                          const GenerationConfig &generationConfig = GenerationConfig()); // 启动一个response任务，返回分配的handleId
+        
+        virtual bool CanFetchResponse(int handleId); // 判断当前是否能fetch到，用于异步操作
 
         virtual int FetchResponseTokens(int handleId); // 获取指定handle的输出, -1代表输出结束了 
 
