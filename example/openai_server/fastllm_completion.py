@@ -55,7 +55,7 @@ class FastLLmCompletion:
     llm.set_cpu_threads(self.cpu_thds)
     llm.set_cpu_low_mem(self.low_mem_mode)
     llm.set_cuda_embedding(self.cuda_embedding)
-    self.model = llm.model(self.model_path, dtype = self.dtype, tokenizer_type = "fastllm")
+    self.model = llm.model(self.model_path, dtype = self.dtype, tokenizer_type = "auto")
     self.model.set_atype(self.atype)
   
   def create_error_response(
