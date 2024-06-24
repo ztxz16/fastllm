@@ -21,6 +21,14 @@ class ConversationMessage:
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
+class ChatCompletionStreamResponseWithUsage(BaseModel):
+    id: str = Field(default_factory = lambda: f"chatcmpl-{shortuuid.random()}")
+    object: str = "chat.completion.chunk"
+    created: int = Field(default_factory = lambda: int(time.time()))
+    model: str
+    choices: List[ChatCompletionResponseStreamChoice]
+    usage: Optional[UsageInfo] = Field(default = None)
+
 class FastLLmCompletion:
   def __init__(self,
                model_name,
@@ -47,7 +55,7 @@ class FastLLmCompletion:
     llm.set_cpu_threads(self.cpu_thds)
     llm.set_cpu_low_mem(self.low_mem_mode)
     llm.set_cuda_embedding(self.cuda_embedding)
-    self.model = llm.model(self.model_path, dtype = self.dtype)
+    self.model = llm.model(self.model_path, dtype = self.dtype, tokenizer_type = "fastllm")
     self.model.set_atype(self.atype)
   
   def create_error_response(
@@ -155,35 +163,39 @@ class FastLLmCompletion:
         frequency_penalty = request.frequency_penalty
 
       max_length = request.max_tokens if request.max_tokens else 8192
-      logging.info(request)
+      input_token_len = 0; # self.model.get_input_token_len(query, history)
+      #logging.info(request)
       logging.info(f"fastllm input: {query}")
       logging.info(f"fastllm history: {history}")
+      #logging.info(f"input tokens: {input_token_len}")
       # stream_response 中的结果不包含token的统计信息
-      result_generator = self.model.stream_response(query, history, 
+      result_generator = self.model.stream_response_async(query, history, 
                         max_length = max_length, do_sample = True,
                         top_p = request.top_p, top_k = request.top_k, temperature = request.temperature,
                         repeat_penalty = frequency_penalty, one_by_one = True)
       # Streaming response
       if request.stream:
           return self.chat_completion_stream_generator(
-              request, result_generator, request_id)
+              request, result_generator, request_id, input_token_len)
       else:
           try:
               return await self.chat_completion_full_generator(
-                  request, raw_request, result_generator, request_id)
+                  request, raw_request, result_generator, request_id, input_token_len)
           except ValueError as e:
               return self.create_error_response(str(e))
             
   async def chat_completion_full_generator(
               self, request: ChatCompletionRequest, raw_request: Request,
               result_generator: AsyncIterator,
-              request_id: str) -> Union[ErrorResponse, ChatCompletionResponse]:
+              request_id: str,
+              input_token_len: int) -> Union[ErrorResponse, ChatCompletionResponse]:
       model_name = self.model_name
       created_time = int(time.time())
       result = ""
-      for res in result_generator:
+      completion_tokens = 0
+      async for res in result_generator:
         result += res
-        await asyncio.sleep(0)
+        completion_tokens += 1
 
       choice_data = ChatCompletionResponseChoice(
               index=0,
@@ -194,11 +206,13 @@ class FastLLmCompletion:
 
       # TODO: 补充usage信息, 包括prompt token数, 生成的tokens数量
       response = ChatCompletionResponse(
-          id=request_id,
-          created=created_time,
-          model=model_name,
-          choices=[choice_data],
-          usage=UsageInfo(),
+          id = request_id,
+          created = created_time,
+          model = model_name,
+          choices = [choice_data],
+          usage = UsageInfo(prompt_tokens = input_token_len,
+                            total_tokens = input_token_len + completion_tokens,
+                            completion_tokens = completion_tokens)
       )
 
       return response
@@ -207,7 +221,8 @@ class FastLLmCompletion:
   async def chat_completion_stream_generator(
           self, request: ChatCompletionRequest,
           result_generator: AsyncIterator,
-          request_id: str) -> AsyncGenerator[str, None]:
+          request_id: str,
+          input_token_len: int) -> AsyncGenerator[str, None]:
       model_name = self.model_name
       created_time = int(time.time())
       chunk_object_type = "chat.completion.chunk"
@@ -218,56 +233,59 @@ class FastLLmCompletion:
         if first_iteration:
             # 1. role部分
             choice_data = ChatCompletionResponseStreamChoice(
-                            index=0,
-                            delta=DeltaMessage(role="assistant"),
-                            logprobs=None,
-                            finish_reason=None)
-            chunk = ChatCompletionStreamResponse(
-                id=request_id,
-                object=chunk_object_type,
-                created=created_time,
-                choices=[choice_data],
-                model=model_name)
+                            index = 0,
+                            delta = DeltaMessage(role = "assistant"),
+                            logprobs = None,
+                            finish_reason = None)
+            chunk = ChatCompletionStreamResponseWithUsage(
+                id = request_id,
+                object = chunk_object_type,
+                created = created_time,
+                choices = [choice_data],
+                model = model_name)
             data = chunk.model_dump_json(exclude_unset=True)
             yield f"data: {data}\n\n"
-            await asyncio.sleep(0)
             first_iteration = False
         
         # 2. content部分
-        for res in result_generator:
-            delta_text = res
+        completion_tokens = 0
+        async for res in result_generator:
+            completion_tokens += 1
+            delta_text = res            
             # Send token-by-token response for each request.n
             choice_data = ChatCompletionResponseStreamChoice(
-                index=0,
-                delta=DeltaMessage(content=delta_text),
-                logprobs=None,
-                finish_reason=None)
-            chunk = ChatCompletionStreamResponse(
-                id=request_id,
-                object=chunk_object_type,
-                created=created_time,
-                choices=[choice_data],
-                model=model_name)
+                index = 0,
+                delta = DeltaMessage(content = delta_text),
+                logprobs = None,
+                finish_reason = None)
+            chunk = ChatCompletionStreamResponseWithUsage(
+                id = request_id,
+                object = chunk_object_type,
+                created = created_time,
+                choices = [choice_data],
+                model = model_name)
             data = chunk.model_dump_json(exclude_unset=True)
             yield f"data: {data}\n\n"
-            await asyncio.sleep(0)
+            #await asyncio.sleep(0)
 
         # 3. 结束标志
         choice_data = ChatCompletionResponseStreamChoice(
-            index=0,
-            delta=DeltaMessage(),
-            logprobs=None,
-            finish_reason='stop')
-        chunk = ChatCompletionStreamResponse(
-            id=request_id,
-            object=chunk_object_type,
-            created=created_time,
-            choices=[choice_data],
-            model=model_name)
-        data = chunk.model_dump_json(exclude_unset=True,
-                                    exclude_none=True)
+            index = 0,
+            delta = DeltaMessage(),
+            logprobs = None,
+            finish_reason = 'stop')
+        chunk = ChatCompletionStreamResponseWithUsage(
+            id = request_id,
+            object = chunk_object_type,
+            created = created_time,
+            choices = [choice_data],
+            model = model_name,
+            usage = UsageInfo(prompt_tokens = input_token_len,
+                              total_tokens = input_token_len + completion_tokens,
+                              completion_tokens = completion_tokens))
+        data = chunk.model_dump_json(exclude_unset = True,
+                                    exclude_none = True)
         yield f"data: {data}\n\n"
-        await asyncio.sleep(0)
       except ValueError as e:
         data = self.create_streaming_error_response(str(e))
         yield f"data: {data}\n\n"

@@ -337,6 +337,12 @@ extern "C" {
         return model->LaunchResponseTokens(tokens, config);
     }
 
+    // 尝试fetch，如果能fetch成功则返回true（后续需要fetch一下)，用于异步操作
+    DLL_EXPORT bool can_fetch_response_llm_model(int modelId, int handleId) {
+        auto model = models.GetModel(modelId);
+        return model->CanFetchResponse(handleId);
+    }
+
     DLL_EXPORT char *fetch_response_str_llm_model(int modelId, int handleId) {
         auto model = models.GetModel(modelId);
         int ret = model->FetchResponseTokens(handleId);
