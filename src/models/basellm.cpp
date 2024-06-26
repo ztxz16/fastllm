@@ -141,6 +141,22 @@ namespace fastllm {
         this->weight.ReleaseWeight();
     }
 
+    std::map <std::string, std::vector <std::pair <std::string, DataType> > >
+                basellm::GetTensorMap(const std::vector <std::string> &tensorNames) {
+        std::map <std::string, std::vector <std::pair <std::string, DataType> > > ret;
+        for (auto &name : tensorNames) {
+            WeightType weightType = this->weight.GetWeightType(name);
+            DataType dataType = DataType::DATA_AUTO_NONE;
+            if (weightType == WeightType::LINEAR) {
+                dataType = DataType::DATA_AUTO_LINEAR;
+            } else if (weightType == WeightType::EMBEDDING) {
+                dataType = DataType::DATA_AUTO_EMBEDDING;
+            }
+            ret[name].push_back(std::make_pair(name, dataType));
+        }
+        return ret;
+    }
+
     std::string basellm::Response(const std::string &oriInput, RuntimeResult retCb,
                                   const fastllm::GenerationConfig &generationConfig) {
         std::string input = oriInput;
