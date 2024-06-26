@@ -780,6 +780,75 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
     void basellm::FillLLMInputsBatch(std::vector<std::vector<float>> &inputTokens,
                                      const std::vector<std::map<std::string, int>> &params, fastllm::Data &inputIds,
                                      fastllm::Data &attentionMask, fastllm::Data &positionIds) {
+        inputIds.ToDevice(DataDevice::CPU);
+        attentionMask.ToDevice(DataDevice::CPU);
+        positionIds.ToDevice(DataDevice::CPU);
+
+        int batch = inputTokens.size();
+        int index = params[0].find("index")->second;
+        if (index == 0) {
+            std::vector <int> seqLens;
+            seqLens.resize(batch);
+            int maxLen = 0;
+            for (int i = 0; i < batch; i++) {
+                maxLen = std::max(maxLen, (int)inputTokens[i].size());
+                seqLens[i] = (int)inputTokens[i].size();
+            }
+
+            std::vector <float> ids = std::vector <float> (batch * maxLen, 0);
+            std::vector <float> vpids = std::vector <float> (batch * maxLen, 0);
+            std::vector <float> vmask = std::vector <float> (batch * maxLen * maxLen, 0);
+            for (int i = 0; i < batch; i++) {
+                auto &tokens = inputTokens[i];
+                int len = tokens.size(), base = maxLen - len;
+                for (int j = 0; j < len; j++) {
+                    ids[i * maxLen + base + j] = tokens[j];
+                }
+                for (int j = 0; j < len; j++) {
+                    vpids[i * maxLen + base + j] = j;
+                }
+
+                std::fill(vmask.data() + i * maxLen * maxLen,
+                        vmask.data() + i * maxLen * maxLen + (maxLen - len) * maxLen, 1.0);
+                for (int j = maxLen - len; j < maxLen; j++) {
+                    std::fill(vmask.data() + i * maxLen * maxLen + j * maxLen,
+                            vmask.data() + i * maxLen * maxLen + j * maxLen + maxLen - len, 1.0);
+                }
+                for (int j = 0; j < len; j++) {
+                    for (int k = j + 1; k < len; k++) {
+                        vmask[i * maxLen * maxLen + (base + j) * maxLen + base + k] = 1;
+                    }
+                }
+            }
+
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, maxLen}, ids));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, maxLen, maxLen}, vmask));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {batch, maxLen}, vpids));
+        } else {
+            std::vector <float> pids = std::vector <float> (batch);
+            std::vector <float> fret;
+            for (int i = 0; i < batch; i++) {
+                fret.push_back(inputTokens[i][0]);
+            }
+            int maxLen = 0;
+            for (int i = 0; i < batch; i++) {
+                int promptLen = params[i].find("promptLen")->second;
+                maxLen = std::max(promptLen, maxLen);
+                pids[i] = promptLen + index - 1;
+            }
+            maxLen += index;
+            std::vector <float> vmasks = std::vector <float> (batch * maxLen, 0.0f);
+            for (int i = 0; i < batch; i++) {
+                int curLen = params[i].find("promptLen")->second + index;
+                for (int j = 0; j < maxLen - curLen; j++) {
+                    vmasks[i * maxLen + j] = 1.0f;
+                }
+            }
+
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, fret));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, 1, maxLen}, vmasks));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, pids));
+        }
     }
 
     void basellm::SetAdapter(const std::string &name) {
