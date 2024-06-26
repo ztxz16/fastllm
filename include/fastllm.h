@@ -179,7 +179,8 @@ namespace fastllm {
         FLOAT32 = 0, BFLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6, FLOAT16 = 7,
         INT4_NOZERO = 8, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale
         INT4_GROUP = 9, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale, 且使用分组量化
-        INT32PARAM = 100 // int32的参数，这种类型的数据永远存在CPU上
+        INT32PARAM = 100, // int32的参数，这种类型的数据永远存在CPU上
+        DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING // 不确定类型
     };
 
     enum DataDevice {
