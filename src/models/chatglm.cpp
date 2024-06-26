@@ -59,6 +59,7 @@ namespace fastllm {
     }
 
     ChatGLMModel::ChatGLMModel() {
+        this->model_struct = "chatglm";
         this->model_type = "chatglm";
 
         this->bos_token_id = 130004;    // V1 后期版本 bos token，可通过 config.json 覆盖

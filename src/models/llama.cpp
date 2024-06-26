@@ -44,6 +44,7 @@ namespace fastllm {
     }
 
     LlamaModel::LlamaModel() {
+        this->model_struct = "llama";
         this->model_type = "llama";
 
         // 默认使用 llama3 的提示词和instruction
