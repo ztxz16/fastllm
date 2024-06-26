@@ -101,6 +101,10 @@ namespace fastllm {
 
         virtual void InitParams(); // 初始化参数信息 
 
+        // 根据原始的tensorNames获得映射表
+        virtual std::map <std::string, std::vector <std::pair <std::string, DataType> > >
+                GetTensorMap(const std::vector <std::string> &tensorNames);
+
         // 推理
         virtual int Forward(
                 const Data &inputIds,
