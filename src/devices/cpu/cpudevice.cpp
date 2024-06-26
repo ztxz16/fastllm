@@ -243,7 +243,7 @@ namespace fastllm {
         Data &k = *(datas.find("k")->second);
         Data &v = *(datas.find("v")->second);
         Data &output = *(datas.find("output")->second);
-        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
 
         AssertInFastLLM(q.dims.size() == 3 && k.dims.size() == 3 && v.dims.size() == 3, "Attention: dims of q, k, v should be 3.\n");
         AssertInFastLLM(q.dims[2] == k.dims[2], "Attention: q.dims[2] should be equal to k.dims[2].\n");
@@ -382,7 +382,7 @@ namespace fastllm {
         Data &v = *(datas.find("v")->second);
         Data &mask = *(datas.find("mask")->second);
         Data &output = *(datas.find("output")->second);
-        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
         output.Allocate();
         int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
