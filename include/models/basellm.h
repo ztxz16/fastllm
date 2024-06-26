@@ -83,6 +83,14 @@ namespace fastllm {
         void Unlock();
     };
 
+    enum RoPEType { // 位置编码外推类型
+        BASE = 0,
+        LINEAR_SCALE = 1,
+        STATIC_NTK = 2,
+        DYMAMIC_NTK = 3,
+        YARN = 4
+    };
+
     class basellm {
     public:
         basellm() {};
@@ -183,6 +191,7 @@ namespace fastllm {
         virtual std::vector <int> ApplyChatTemplateToTokens(const JinjaVar &var);
 
         std::string model_type;
+        std::string model_struct;
 
         std::string pre_prompt; // 最初对话的提示语
         std::string user_role, bot_role, history_sep; // 用于生成每一轮的prompt
