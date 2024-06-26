@@ -517,22 +517,37 @@ namespace fastllm {
             DealLLMTokenizerFromHFToModel(path, model);
         }
 
-        // 4. 读取权重
+        // 4.0 更新模型信息
+        model->InitParams();
+
+        // 4.1 读取权重
         auto tensors = safeTensors.GetSortedItemNames();
+        
+        // tensorMap[name]代表本名为name的tensor，创建后的名字以及类型
+        // 有些tensor被共享，可能需要创建多次
+        auto tensorMap = model->GetTensorMap(tensors);
+
         int cur = 0;
         long long totalBytes = 0;
-        for (auto &weightName : tensors) {
-            auto &tensor = safeTensors.itmeDict[weightName];
+        for (auto &tensorName : tensors) {
+            auto &tensor = safeTensors.itmeDict[tensorName];
             auto oriDataType = DataType::FLOAT32;
-            auto weightType = model->weight.GetWeightType(weightName);
-            auto dataType = (weightType == WeightType::EMBEDDING || weightType == WeightType::NONE) ? oriDataType : linearDataType;
-            model->weight.AddEmptyWeight(weightName, tensor.intShape, dataType);
-            totalBytes += tensor.bytes;
+            for (auto &it : tensorMap[tensorName]) {
+                std::string weightName = it.first;
+                auto dataType = it.second;
+                if (dataType >= DATA_AUTO_NONE) {
+                    // AUTO类型
+                    dataType = (dataType == DATA_AUTO_LINEAR) ? linearDataType : oriDataType;
+                }
+                model->weight.AddEmptyWeight(weightName, tensor.intShape, dataType);
+            }
 
+            totalBytes += tensor.bytes;
             printf("Load %d \r", (++cur) * 100 / (int)safeTensors.itmeDict.size());
             fflush(stdout);
         }
 
+        // 4.2 读取
         std::vector <std::thread*> threads;
         int threadNum = std::min(16, std::max(4, (int)GetAlivePool()->threads.size()));
         int per = tensors.size() / threadNum;
@@ -563,19 +578,30 @@ namespace fastllm {
             threads.push_back(
                 new std::thread([&](int st, int end) {
                     for (int i = st; i < end; i++) {
-                        auto &weightName = tensors[i];
-                        auto &tensor = safeTensors.itmeDict[weightName];
-                        auto oriDataType = DataType::FLOAT32;
-                        auto weightType = model->weight.GetWeightType(weightName);
-                        auto dataType = (weightType == WeightType::EMBEDDING || weightType == WeightType::NONE) ? oriDataType : linearDataType;
+                        auto &tensorName = tensors[i];
+                        auto &tensor = safeTensors.itmeDict[tensorName];
 
-                        if (tensor.dtype == "BF16" &&
-                            (dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)) {
-                            oriDataType = DataType::BFLOAT16;
+                        for (auto &it : tensorMap[tensorName]) {
+                            auto oriDataType = DataType::FLOAT32;
+                            std::string weightName = it.first;
+                            auto dataType = it.second;
+                            if (dataType >= DATA_AUTO_NONE) {
+                                // AUTO类型
+                                dataType = (dataType == DATA_AUTO_LINEAR) ? linearDataType : oriDataType;
+                            }
+                            if (tensor.dtype == "BF16" &&
+                                (dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)) {
+                                oriDataType = DataType::BFLOAT16;
+                            }
+                            if (tensor.dtype == "F16" && 
+                                dataType == DataType::FLOAT16) {
+                                oriDataType = DataType::FLOAT16;
+                            }
+                            tensor.CreateBuffer(oriDataType);
+                            model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, tensor.buffer, groupCnt);
+                            tensor.ClearBuffer();
                         }
-                        tensor.CreateBuffer(oriDataType);
-                        model->weight[weightName].CreateFromOriData(weightType, oriDataType, tensor.buffer, groupCnt);
-                        tensor.ClearBuffer();
+
                         locker.lock();
                         printf("Convert %d \r", (++cnt) * 100 / (int)safeTensors.itmeDict.size());
                         fflush(stdout);
@@ -592,7 +618,6 @@ namespace fastllm {
         printf("\n");
         fflush(stdout);
 
-        model->InitParams();
         model->WarmUp();
         return std::unique_ptr<fastllm::basellm> (model);
     }
