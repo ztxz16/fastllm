@@ -242,7 +242,7 @@ namespace fastllm {
             return;
         }
 
-        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
 
         Data &output = *(datas.find("output")->second);
