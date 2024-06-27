@@ -92,7 +92,7 @@ namespace fastllm {
         if (this->weight.dicts.find("rope_scaling.factor") != this->weight.dicts.end()) {
             rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
         }
-        std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
+        std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor, std::max(max_positions, 16384));
         sinData.ToDevice(DataDevice::CPU);
         cosData.ToDevice(DataDevice::CPU);
         sinData.CopyFrom(Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first));
