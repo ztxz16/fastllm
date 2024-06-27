@@ -36,6 +36,20 @@ namespace fastllm {
                 auto data = allDatas[op.datas.find("input")->second];
                 data->ToDevice(DataDevice::CPU);
                 data->Print();
+            } else if (op.type == "DataTypeAs") {
+                auto input = allDatas[op.datas.find("input")->second];
+                DataType dataType = allDatas[op.datas.find("input1")->second]->dataType;
+                if (input->dataType != dataType) {
+                    if (dataType == DataType::FLOAT32) {
+                        excutor.Run("ToFloat32", {
+                                {"input", input}
+                        }, {}, {});
+                    } else if (dataType == DataType::FLOAT16) {
+                        excutor.Run("ToFloat16", {
+                                {"input", input}
+                        }, {}, {});
+                    } 
+                }
             } else if (op.type == "ExpandHeads") {
                 auto data = allDatas[op.datas.find("input")->second];
                 int headDim = op.intParams.find("headDim")->second;
@@ -207,6 +221,14 @@ namespace fastllm {
         );
     }
 
+    void ComputeGraph::DataTypeAs(ComputeGraphNode &input, ComputeGraphNode &input1) {
+        this->ops.push_back (
+            ComputeGraphOp("DataTypeAs", 
+                {{"input", input.name}, {"input1", input1.name}}, 
+                {}, {})
+        );
+    }
+
     void ComputeGraph::MulTo(ComputeGraphNode &input0, ComputeGraphNode &input1) {
         this->ops.push_back (
             ComputeGraphOp("MulTo", 
@@ -218,7 +240,15 @@ namespace fastllm {
     void ComputeGraph::Silu(ComputeGraphNode &input, ComputeGraphNode &output) {
         this->ops.push_back (
             ComputeGraphOp("Silu", 
-                {{"input", "w1"}, {"output", "w1"}}, 
+                {{"input", input.name}, {"output", output.name}}, 
+                {}, {})
+        );
+    }
+
+    void ComputeGraph::Swiglu(ComputeGraphNode &input, ComputeGraphNode &output) {
+        this->ops.push_back (
+            ComputeGraphOp("Swiglu", 
+                {{"input", input.name}, {"output", output.name}}, 
                 {}, {})
         );
     }

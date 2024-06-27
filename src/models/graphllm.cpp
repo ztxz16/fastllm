@@ -114,10 +114,12 @@ namespace fastllm {
         for (auto &it : weight.weight) {
             weightDicts[it.first] = &it.second;
         }
+        Data atype = Data(this->dataType);
         std::map <std::string, Data*> inputs = {
             {"inputIds", (Data*)&inputIds},
             {"positionIds", (Data*)&positionIds},
             {"attentionMask", (Data*)&attentionMask},
+            {"atype", (Data*)&atype},
             {"sin", &sinData}, {"cos", &cosData}
         };
         for (int i = 0; i < block_cnt; i++) {
@@ -250,10 +252,11 @@ namespace fastllm {
         for (auto &it : model->weight.weight) {
             wNodes[it.first] = ComputeGraphNode(it.first);
         }
-        ComputeGraphNode inputIds("inputIds"), positionIds("positionIds"), attentionMask("attentionMask"), sin("sin"), cos("cos");
+        ComputeGraphNode inputIds("inputIds"), positionIds("positionIds"), attentionMask("attentionMask"), atype("atype"), sin("sin"), cos("cos");
         ComputeGraphNode hiddenStates("hiddenStates"), attenInput("attenInput"), attenOutput("attenOutput"), attenLastOutput("attenLastOutput");
         ComputeGraphNode q("q"), k("k"), v("v"), w1("w1"), w2("w2"), w3("w3"), lastTokensStates("lastTokensStates"), logits("logits");
         graph.Embedding(inputIds, wNodes["model.embed_tokens.weight"], hiddenStates);
+        graph.DataTypeAs(hiddenStates, atype);
         for (int i = 0; i < model->block_cnt; i++) {
             std::string pre = "model.layers." + std::to_string(i);
             ComputeGraphNode pastKey("pastKey_" + std::to_string(i)), pastValue("pastValue_" + std::to_string(i));
@@ -289,6 +292,11 @@ namespace fastllm {
         model->max_positions = atoi(model->weight.dicts["seq_length"].c_str());
         model->rope_base = 10000 * pow(3, ((float)model->rotary_dim / (model->rotary_dim - 2)));
         model->rope_factor = 1.0;
+
+        model->pre_prompt = "";
+        model->user_role = "<_user>";
+        model->bot_role = "<_bot>";
+        model->history_sep = "";
     }
 
     std::map <std::string, std::vector <std::pair <std::string, DataType> > >
@@ -331,10 +339,11 @@ namespace fastllm {
         for (auto &it : model->weight.weight) {
             wNodes[it.first] = ComputeGraphNode(it.first);
         }
-        ComputeGraphNode inputIds("inputIds"), positionIds("positionIds"), attentionMask("attentionMask"), sin("sin"), cos("cos");
+        ComputeGraphNode inputIds("inputIds"), positionIds("positionIds"), attentionMask("attentionMask"), atype("atype"), sin("sin"), cos("cos");
         ComputeGraphNode hiddenStates("hiddenStates"), attenInput("attenInput"), attenOutput("attenOutput"), attenLastOutput("attenLastOutput");
         ComputeGraphNode q("q"), kv("kv"), k("k"), v("v"), w1("w1"), w2("w2"), w3("w3"), lastTokensStates("lastTokensStates"), logits("logits");
         graph.Embedding(inputIds, wNodes["transformer.word_embeddings.weight"], hiddenStates);
+        graph.DataTypeAs(hiddenStates, atype);
         for (int i = 0; i < model->block_cnt; i++) {
             std::string pre = "transformer.h." + std::to_string(i);
             ComputeGraphNode pastKey("pastKey_" + std::to_string(i)), pastValue("pastValue_" + std::to_string(i));
