@@ -52,6 +52,7 @@ namespace fastllm {
         void Update();
 
         void AddTo(ComputeGraphNode &input0, ComputeGraphNode &input1, float alpha = 1.0); // input0 += input1 * alpha
+        void DataTypeAs(ComputeGraphNode &input, ComputeGraphNode &input1); // 将input的dataType设成和input1一样
         void Embedding(ComputeGraphNode &input, ComputeGraphNode &weight, ComputeGraphNode &output);
         void ExpandHead(ComputeGraphNode &input, int headDim);
         void FusedAttention(ComputeGraphNode &q, ComputeGraphNode &k, ComputeGraphNode &v, 
@@ -65,6 +66,7 @@ namespace fastllm {
         void Silu(ComputeGraphNode &input, ComputeGraphNode &output);
         void Split(ComputeGraphNode &input, int axis, int start, int end, ComputeGraphNode &output);
         void SplitLastTokenStates(ComputeGraphNode &input, ComputeGraphNode &output);
+        void Swiglu(ComputeGraphNode &input, ComputeGraphNode &output);
 
         // 以下op用于调试
         void Exit(); // 退出
