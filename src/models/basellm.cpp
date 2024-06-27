@@ -896,7 +896,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 
         } else if (dataType == DataType::FLOAT16) {
             AssertInFastLLM(this->model_struct == "chatglm" || 
-                            this->model_struct == "llama", 
+                            this->model_struct == "llama" ||
+                            this->model_struct == "graph", 
                             this->model_struct + " doesn't support float16");
         } else {
             ErrorInFastLLM("SetDataType Error: datatype should be float32 or float16");
