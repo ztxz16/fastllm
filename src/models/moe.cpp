@@ -33,6 +33,13 @@ namespace fastllm {
         rotary_dim = 128;
 
         weight.embeddingNames.insert("model.embed_tokens.weight");
+        weight.linearNames = {
+            "lm_head.weight", "model.layers.*.down_proj.weight", "model.layers.*.up_proj.weight",
+            "model.layers.*.gate_proj.weight",  "model.layers.*.gate_proj.weight", "model.layers.*.gateup_proj.weight",
+            "model.layers.*.self_attn.o_proj.weight", "model.layers.*.self_attn.q_proj.weight", "model.layers.*.self_attn.k_proj.weight",
+            "model.layers.*.self_attn.v_proj.weight", "model.layers.*.self_attn.mergeqkv.weight", "model.layers.*.self_attn.W_pack.weight",
+            "model.layers.*.mlp.*.weight"
+        };
     }
 
     void MoeModel::InitParams() {
