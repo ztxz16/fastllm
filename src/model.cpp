@@ -398,7 +398,9 @@ namespace fastllm {
         auto tokenizerConfig = json11::Json::parse(ReadAllFile(tokenizerConfigFile), error);
         model->weight.tokenizer.SetTokenizerConfig(tokenizerConfig);
         std::string tokenizerClass = tokenizerConfig["tokenizer_class"].string_value();
-        if (tokenizerClass == "PreTrainedTokenizerFast" || tokenizerClass == "Qwen2Tokenizer") {
+        if (tokenizerClass == "PreTrainedTokenizerFast" 
+            || tokenizerClass == "Qwen2Tokenizer"
+            || tokenizerClass == "BloomTokenizer") {
             // PreTrainedTokenizerFast
             std::string tokenizerFile = path + "tokenizer.json";
             auto tokenizer = json11::Json::parse(ReadAllFile(tokenizerFile), error);

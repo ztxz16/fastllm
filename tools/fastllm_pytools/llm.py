@@ -446,7 +446,7 @@ class model:
             history = [];
         messages = []
 
-        if (self.hf_tokenizer != None):
+        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             if (self.system_prompt != ""):
                 messages.append({"role": "system", "content": self.system_prompt})
             for his in history:
