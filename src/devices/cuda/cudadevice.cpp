@@ -294,6 +294,8 @@ namespace fastllm {
         if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaHalfMatMulFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::INT8){
+                FastllmCudaHalfMatMulFloatInt8(input, weight, bias, output, n, m, k);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
