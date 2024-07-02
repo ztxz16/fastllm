@@ -58,6 +58,7 @@ namespace fastllm {
         void FusedAttention(ComputeGraphNode &q, ComputeGraphNode &k, ComputeGraphNode &v, 
                             ComputeGraphNode &curk, ComputeGraphNode &curv, 
                             ComputeGraphNode &original, ComputeGraphNode &mask, ComputeGraphNode &output, 
+                            ComputeGraphNode &seqLens,
                             float scale, int maskType, int unitLen); // 融合的attention
         void Linear(ComputeGraphNode &input, ComputeGraphNode &weight, ComputeGraphNode &bias, ComputeGraphNode &output);
         void LlamaRotatePosition2D(ComputeGraphNode &input, ComputeGraphNode &positionIds, ComputeGraphNode &sinData, ComputeGraphNode &cosData, int rotaryDim); // 2D position for llama
@@ -65,13 +66,16 @@ namespace fastllm {
         void RMSNorm(ComputeGraphNode &input, ComputeGraphNode &weight, float eps, ComputeGraphNode &output);
         void Silu(ComputeGraphNode &input, ComputeGraphNode &output);
         void Split(ComputeGraphNode &input, int axis, int start, int end, ComputeGraphNode &output);
-        void SplitLastTokenStates(ComputeGraphNode &input, ComputeGraphNode &output);
+        void SplitLastTokenStates(ComputeGraphNode &input, ComputeGraphNode &seqLens, ComputeGraphNode &output);
         void Swiglu(ComputeGraphNode &input, ComputeGraphNode &output);
 
         // 以下op用于调试
         void Exit(); // 退出
         void Print(ComputeGraphNode &input); // 打印
     };
+
+    // 优化计算图
+    void OptimizeComputeGraph(ComputeGraph &graph, WeightMap &weight);
 
     // 执行计算图
     void RunComputeGraph (const ComputeGraph &graph, 

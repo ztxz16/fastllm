@@ -110,6 +110,11 @@ namespace fastllm {
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
                             std::vector <std::vector <float>*> *retLogits) {
         BuildGraph();
+        Data seqLensData = Data(DataType::INT32PARAM, {batch});
+        seqLensData.Allocate();
+        for (int i = 0; i < seqLensData.Count(0); i++) {
+            ((int32_t*)seqLensData.cpuData)[i] = inputIds.dims[1];
+        }
         std::map <std::string, Data*> weightDicts;
         for (auto &it : weight.weight) {
             weightDicts[it.first] = &it.second;
@@ -120,7 +125,8 @@ namespace fastllm {
             {"positionIds", (Data*)&positionIds},
             {"attentionMask", (Data*)&attentionMask},
             {"atype", (Data*)&atype},
-            {"sin", &sinData}, {"cos", &cosData}
+            {"sin", &sinData}, {"cos", &cosData},
+            {"seqLens", (Data*)&seqLensData}
         };
         for (int i = 0; i < block_cnt; i++) {
             inputs.insert({"pastKey_" + std::to_string(i), (Data*)&pastKeyValues[i].first});
@@ -168,8 +174,78 @@ namespace fastllm {
                                                const std::vector <GenerationConfig> &generationConfigs,
                                                const LastTokensManager &lastTokens,
                                                std::vector <std::vector <float>*> *retLogits) {
-        ErrorInFastLLM("Unsupport forward batch.\n");
-        return {1};
+        BuildGraph();
+        Data seqLensData = Data(DataType::INT32PARAM, {(int)seqLens.size()});
+        seqLensData.Allocate();
+        for (int i = 0; i < seqLensData.Count(0); i++) {
+            ((int32_t*)seqLensData.cpuData)[i] = seqLens[i];
+        }
+        int seqLen = inputIds.dims[1];
+        Data allPositionIds;
+        allPositionIds.CopyFrom(*(Data*)positionIds[0]);
+        allPositionIds.Expansion({1, seqLen});
+        for (int i = 1; i < batch; i++) {
+            CatDirect(allPositionIds, *(Data*)positionIds[i], 1);
+        }
+        std::map <std::string, Data*> weightDicts;
+        for (auto &it : weight.weight) {
+            weightDicts[it.first] = &it.second;
+        }
+        Data atype = Data(this->dataType);
+        std::map <std::string, Data*> inputs = {
+            {"inputIds", (Data*)&inputIds},
+            {"positionIds", (Data*)&allPositionIds},
+            {"atype", (Data*)&atype},
+            {"sin", &sinData}, {"cos", &cosData},
+            {"seqLens", &seqLensData}
+        };
+        for (int b = 0; b < batch; b++) {
+            std::string sb = std::to_string(b);
+            inputs.insert({"attentionMask_" + sb, attentionMask[b]});
+            for (int i = 0; i < block_cnt; i++) {
+                inputs.insert({"pastKey_" + std::to_string(i) + "_" + sb, pastKeyValues[b * block_cnt + i].first});
+                inputs.insert({"pastValue_" + std::to_string(i) + "_" + sb, pastKeyValues[b * block_cnt + i].second});
+            }
+        }
+        Data logits, topk;
+        RunComputeGraph(graph, this->deviceMap, inputs, weightDicts, {{"logits", (Data*)&logits}});
+        ToDataType(logits, DataType::FLOAT32);
+        std::vector <Data> curLogits;
+        curLogits.resize(batch);
+
+        std::vector <int> lastRet;
+        int total = 0;
+
+        /*if (all1 && batch > 1) {
+            for (int b = 0; b < batch; b++) {
+                pointersK[b] = (&curLogits[b]);
+            }
+            SplitBatch(logits, 1, batch, pointersK);
+        } else */{
+            for (int b = 0; b < batch; b++) {
+                Split(logits, 1, b, b + 1, curLogits[b]);
+            }
+        }
+
+        for (int b = 0; b < batch; b++) {
+            Data &curLogit = curLogits[b];
+
+            if (generationConfigs[b].output_logits && retLogits != nullptr && (*retLogits)[b] != nullptr) {
+                curLogit.ToDevice(DataDevice::CPU);
+                (*retLogits)[b]->resize(curLogit.Count(0));
+                memcpy((float*)(*retLogits)[b]->data(), (float*)curLogit.cpuData, curLogit.GetBytes());
+            }
+            if (generationConfigs[b].IsSimpleGreedy()) {
+                Data topk;
+                TopK(curLogit, topk, 1);
+                topk.ToDevice(DataDevice::CPU);
+                lastRet.push_back((int) (((float *) topk.cpuData)[0] + 1e-3));
+            } else {
+                lastRet.push_back(LLMSampling(curLogit, 0, generationConfigs[b], lastTokens.units[b]));
+            }
+            total += seqLens[b];
+        }
+        return lastRet;
     }
 
     bool GraphLLMModel::NeedAttentionMask(int qlen, int klen) {
@@ -252,7 +328,7 @@ namespace fastllm {
         for (auto &it : model->weight.weight) {
             wNodes[it.first] = ComputeGraphNode(it.first);
         }
-        ComputeGraphNode inputIds("inputIds"), positionIds("positionIds"), attentionMask("attentionMask"), atype("atype"), sin("sin"), cos("cos");
+        ComputeGraphNode inputIds("inputIds"), positionIds("positionIds"), attentionMask("attentionMask"), atype("atype"), sin("sin"), cos("cos"), seqLens("seqLens");
         ComputeGraphNode hiddenStates("hiddenStates"), attenInput("attenInput"), attenOutput("attenOutput"), attenLastOutput("attenLastOutput");
         ComputeGraphNode q("q"), k("k"), v("v"), w1("w1"), w2("w2"), w3("w3"), lastTokensStates("lastTokensStates"), logits("logits");
         graph.Embedding(inputIds, wNodes["model.embed_tokens.weight"], hiddenStates);
@@ -269,7 +345,7 @@ namespace fastllm {
             graph.ExpandHead(v, model->head_dim);
             graph.LlamaRotatePosition2D(q, positionIds, sin, cos, model->rotary_dim);
             graph.LlamaRotatePosition2D(k, positionIds, sin, cos, model->rotary_dim);
-            graph.FusedAttention(q, pastKey, pastValue, k, v, attenInput, attentionMask, attenOutput, 1.0 / sqrt(model->head_dim), 1, 128);
+            graph.FusedAttention(q, pastKey, pastValue, k, v, attenInput, attentionMask, attenOutput, seqLens, 1.0 / sqrt(model->head_dim), 0, 128);
             graph.Linear(attenOutput, wNodes[pre + ".self_attn.o_proj.weight"], wNodes[pre + ".self_attn.o_proj.bias"], attenLastOutput);
             graph.AddTo(hiddenStates, attenLastOutput);
             graph.RMSNorm(hiddenStates, wNodes[pre + ".post_attention_layernorm.weight"], model->rms_norm_eps, attenInput);
@@ -281,9 +357,11 @@ namespace fastllm {
             graph.AddTo(hiddenStates, w2);
         }
 
-        graph.SplitLastTokenStates(hiddenStates, lastTokensStates);
+        graph.SplitLastTokenStates(hiddenStates, seqLens, lastTokensStates);
         graph.RMSNorm(lastTokensStates, wNodes["model.norm.weight"], model->rms_norm_eps, lastTokensStates);
         graph.Linear(lastTokensStates, wNodes["lm_head.weight"], wNodes["lm_head.bias"], logits);
+        
+        OptimizeComputeGraph(graph, model->weight);
         graph.Update();
     }
 
@@ -339,7 +417,7 @@ namespace fastllm {
         for (auto &it : model->weight.weight) {
             wNodes[it.first] = ComputeGraphNode(it.first);
         }
-        ComputeGraphNode inputIds("inputIds"), positionIds("positionIds"), attentionMask("attentionMask"), atype("atype"), sin("sin"), cos("cos");
+        ComputeGraphNode inputIds("inputIds"), positionIds("positionIds"), attentionMask("attentionMask"), atype("atype"), sin("sin"), cos("cos"), seqLens("seqLens");
         ComputeGraphNode hiddenStates("hiddenStates"), attenInput("attenInput"), attenOutput("attenOutput"), attenLastOutput("attenLastOutput");
         ComputeGraphNode q("q"), kv("kv"), k("k"), v("v"), w1("w1"), w2("w2"), w3("w3"), lastTokensStates("lastTokensStates"), logits("logits");
         graph.Embedding(inputIds, wNodes["transformer.word_embeddings.weight"], hiddenStates);
@@ -356,7 +434,7 @@ namespace fastllm {
             graph.ExpandHead(q, model->head_dim);                
             graph.LlamaRotatePosition2D(q, positionIds, sin, cos, model->rotary_dim);
             graph.LlamaRotatePosition2D(k, positionIds, sin, cos, model->rotary_dim);
-            graph.FusedAttention(q, pastKey, pastValue, k, v, attenInput, attentionMask, attenOutput, 1.0 / sqrt(model->head_dim), 1, 128);
+            graph.FusedAttention(q, pastKey, pastValue, k, v, attenInput, attentionMask, attenOutput, seqLens, 1.0 / sqrt(model->head_dim), 0, 128);
             graph.Linear(attenOutput, wNodes[pre + ".self_attention.dense.weight"], wNodes[pre + ".self_attention.dense.bias"], attenLastOutput);
             graph.AddTo(hiddenStates, attenLastOutput);
             graph.RMSNorm(hiddenStates, wNodes[pre + ".post_attention_layernorm.weight"], model->rms_norm_eps, attenInput);
@@ -368,9 +446,11 @@ namespace fastllm {
             graph.AddTo(hiddenStates, w2);
         }
 
-        graph.SplitLastTokenStates(hiddenStates, lastTokensStates);
+        graph.SplitLastTokenStates(hiddenStates, seqLens, lastTokensStates);
         graph.RMSNorm(lastTokensStates, wNodes["transformer.ln_f.weight"], model->rms_norm_eps, lastTokensStates);
         graph.Linear(lastTokensStates, wNodes["transformer.lm_head.weight"], wNodes["transformer.lm_head.bias"], logits);
+
+        OptimizeComputeGraph(graph, model->weight);
         graph.Update();
     }
 }

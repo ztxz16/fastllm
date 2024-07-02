@@ -502,6 +502,8 @@ namespace fastllm {
         Data &operator [] (const std::string &key);
     };
 
+    void *GetExecutor();
+
     void ClearProfiler();
 
     void PrintProfiler();
