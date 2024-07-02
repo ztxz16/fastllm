@@ -550,7 +550,7 @@ class model:
     
     def get_input_token_len(self, query: str, history: List[Tuple[str, str]] = None) -> int:
         prompt = query if self.direct_query else self.get_prompt(query, history);
-        if (self.hf_tokenizer != None):
+        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             return len(self.hf_tokenizer.encode(prompt))
         else:
             return len(self.encode(prompt))
@@ -604,7 +604,7 @@ class model:
                         history: List[Tuple[str, str]] = None,
                         max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                         one_by_one = True, stop_token_ids: List[int] = None):
-        if (self.hf_tokenizer != None):
+        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             lastlen = 0
             for cur in self.stream_chat(tokenizer = self.hf_tokenizer,
                                       query = query,
@@ -657,7 +657,7 @@ class model:
                         history: List[Tuple[str, str]] = None,
                         max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                         one_by_one = True, stop_token_ids: List[int] = None):
-        if (self.hf_tokenizer != None):
+        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             lastlen = 0
             async for cur in self.stream_chat_async(tokenizer = self.hf_tokenizer,
                                       query = query,
