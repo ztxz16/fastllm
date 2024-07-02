@@ -2903,6 +2903,10 @@ namespace fastllm {
         }
     }
 
+    void *GetExecutor() {
+        return (void*)curExecutor;
+    }
+
     void ClearProfiler() {
         curExecutor->ClearProfiler();
     }
