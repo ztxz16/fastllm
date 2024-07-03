@@ -424,6 +424,8 @@ namespace fastllm {
         std::string tokenizerConfigFile = path + "tokenizer_config.json";
         auto tokenizerConfig = json11::Json::parse(ReadAllFile(tokenizerConfigFile), error);
         model->weight.tokenizer.SetTokenizerConfig(tokenizerConfig);
+        if (!model->weight.tokenizer.chatTemplate.empty() && model->weight.dicts.find("chat_template") == model->weight.dicts.end())
+            model->weight.AddDict("chat_template", model->weight.tokenizer.chatTemplate);
         std::string tokenizerClass = tokenizerConfig["tokenizer_class"].string_value();
         if (tokenizerClass == "PreTrainedTokenizerFast" 
             || tokenizerClass == "Qwen2Tokenizer"
@@ -439,10 +441,13 @@ namespace fastllm {
                 spTokens[it["content"].string_value()] = it["id"].int_value();
             }
             model->weight.tokenizer.SetSpecialTokens(spTokens);
+            if (!spTokens.empty())
+                model->weight.AddDict("tokenizer_has_special_tokens", "1");
 
             if (!tokenizer["decoder"].is_null() && !tokenizer["decoder"]["type"].is_null() && 
                 tokenizer["decoder"]["type"].string_value() == "ByteLevel") {
                 model->weight.tokenizer.byteAsChar = true;
+                model->weight.AddDict("tokenizer_byte_as_char", "True");
             }
         } else if (tokenizerClass == "ChatGLM4Tokenizer") {
             // GLM4御用的分词
@@ -515,7 +520,7 @@ namespace fastllm {
         auto config = json11::Json::parse(ReadAllFile(configFile), error);
         basellm *model = CreateModelWithType(config["model_type"].string_value());
         for (auto &it : config.object_items()) {
-            model->weight.AddDict(it.first, it.second.dump().c_str());
+            model->weight.AddDict(it.first, it.second.is_string() ? it.second.string_value() : it.second.dump());
         }
         // 设置eos_token_id
         if (config["eos_token_id"].is_array()) {
