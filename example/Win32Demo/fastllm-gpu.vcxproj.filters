@@ -57,6 +57,9 @@
     <ClInclude Include="..\..\include\fastllm.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\graph.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\model.h">
       <Filter>头文件</Filter>
     </ClInclude>
@@ -79,6 +82,9 @@
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\models\glm.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\graphllm.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\models\internlm2.h">
@@ -134,6 +140,9 @@
     <ClCompile Include="..\..\src\fastllm.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\graph.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\model.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
@@ -153,6 +162,9 @@
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\glm.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\graphllm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\internlm2.cpp">
