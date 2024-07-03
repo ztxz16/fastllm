@@ -262,9 +262,9 @@ namespace fastllm {
             ClearBuffer();
             buffer = new uint8_t[len * unitSize];
 
-            FILE *fi = fopen(this->fileName.c_str(), "r");
+            FILE *fi = fopen(this->fileName.c_str(), "rb");
             int ret;
-#if defined(_WIN32) or defined(_WIN64)
+#if defined(_WIN32) || defined(_WIN64)
             _fseeki64(fi, this->data_offsets[0], 0);
 #else
             fseek(fi, this->data_offsets[0], 0);
