@@ -170,10 +170,8 @@ namespace fastllm {
             model = (basellm*)(new GLMModel());
         } else if (modelType == "bert") {
             model = (basellm*)(new BertModel());
-        } else if (modelType == "telechat") {
-            model = new GraphLLMModel("telechat");
         } else {
-            ErrorInFastLLM("Unknown model type: " + modelType);
+            model = new GraphLLMModel(modelType);
         }
         return model;
     }
