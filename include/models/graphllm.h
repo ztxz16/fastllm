@@ -99,23 +99,25 @@ namespace fastllm {
         virtual void BuildGraph(GraphLLMModel *model) = 0;
     };
 
-    // Qwen模型
-    class QwenGraphModelConfig : GraphLLMModelConfig {
+    // 工厂类
+    using GraphLLMModelConfigCreator = std::function<GraphLLMModelConfig*()>;
+    class GraphLLMModelConfigFactory {
     public:
-        //void InitParams(GraphLLMModel *model);
-        std::map <std::string, std::vector <std::pair <std::string, DataType> > >
-                GetTensorMap(GraphLLMModel *model, const std::vector <std::string> &tensorNames);
-        void BuildGraph(GraphLLMModel *model);
+        static void RegisterGraphLLMModelConfig(const std::string& type, GraphLLMModelConfigCreator creator);
+        static GraphLLMModelConfig* CreateGraphLLMModelConfig(const std::string& type);
     };
-
-    // TeleChat模型
-    class TeleChatGraphModelConfig : GraphLLMModelConfig {
-    public:
-        void InitParams(GraphLLMModel *model);
-        std::map <std::string, std::vector <std::pair <std::string, DataType> > >
-                GetTensorMap(GraphLLMModel *model, const std::vector <std::string> &tensorNames);
-        void BuildGraph(GraphLLMModel *model);
-    };
+    
+    #define REGISTERGRAPHMODELCONFIG(className, classType) \
+    class className##GraphModelConfigHelper { \
+        public: \
+        className##GraphModelConfigHelper() { \
+                GraphLLMModelConfigFactory::RegisterGraphLLMModelConfig(#className, []() { \
+                        auto* obj = new classType(); \
+                        return (GraphLLMModelConfig*)obj; \
+                }); \
+        } \
+    }; \
+    className##GraphModelConfigHelper className##graphModelConfighelper;
 }
 
 #endif // FASTLLM_GRAPHLLM_H
