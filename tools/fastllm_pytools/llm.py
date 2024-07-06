@@ -617,8 +617,11 @@ class model:
                                       stop_token_ids = stop_token_ids):
                 if one_by_one:
                     ret = cur[0][lastlen:]
-                    lastlen = len(cur[0])
-                    yield ret
+                    if (ret.encode().find(b'\xef\xbf\xbd') == -1):
+                        lastlen = len(cur[0])
+                        yield ret
+                    else:
+                        yield ""
                 else:
                     yield cur[0]
         else:
@@ -670,8 +673,11 @@ class model:
                                       stop_token_ids = stop_token_ids):
                 if one_by_one:
                     ret = cur[0][lastlen:]
-                    lastlen = len(cur[0])
-                    yield ret
+                    if (ret.encode().find(b'\xef\xbf\xbd') == -1):
+                        lastlen = len(cur[0])
+                        yield ret
+                    else:
+                        yield ""
                 else:
                     yield cur[0]
         else:
