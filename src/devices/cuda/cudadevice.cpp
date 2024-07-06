@@ -294,11 +294,13 @@ namespace fastllm {
         if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaHalfMatMulFloat16(input, weight, bias, output, n, m, k);
-            } else if (weight.dataType == DataType::INT8){
+            } else if (weight.dataType == DataType::INT8) {
                 FastllmCudaHalfMatMulFloatInt8(input, weight, bias, output, n, m, k);
-            } else if (weight.dataType == DataType::INT4_GROUP){
+            } else if (weight.dataType == DataType::INT4_GROUP) {
                 FastllmCudaHalfMatMulFloatInt4Group(input, weight, bias, output, n, m, k);
-            }else {
+            } else if (weight.dataType == DataType::INT4_NOZERO) {
+                FastllmCudaHalfMatMulFloatInt4NoZero(input, weight, bias, output, n, m, k);
+            } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
         } else if (input.dataType == DataType::FLOAT32) {
