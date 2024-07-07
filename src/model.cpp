@@ -66,11 +66,21 @@ namespace fastllm {
 
     void basellm::InitParams() {
         if (this->weight.dicts.find("bos_token_id") != this->weight.dicts.end()) {
-            if(this->weight.dicts["bos_token_id"]!="None"){
+            if (this->weight.dicts["bos_token_id"]!="None") {
                 this->bos_token_id = atoi(this->weight.dicts["bos_token_id"].c_str());
             }
-            if(this->weight.dicts["eos_token_id"]!="None"){
-                this->eos_token_id = atoi(this->weight.dicts["eos_token_id"].c_str());
+        }
+        if (this->weight.dicts.find("eos_token_id") != this->weight.dicts.end()) {
+            if (this->weight.dicts["eos_token_id"]!="None") {
+                if (this->weight.dicts["eos_token_id"][0] == '[' && this->eos_token_ids.empty()) {
+                    std::string error;
+                    json11::Json ids = json11::Json::parse(this->weight.dicts["eos_token_id"], error);
+                    for (auto &it : ids.array_items()) {
+                        this->eos_token_ids.insert(it.int_value());
+                    }
+                } else {
+                    this->eos_token_id = atoi(this->weight.dicts["eos_token_id"].c_str());
+                }
             }
         }
         if (this->weight.dicts.find("im_start_id") != this->weight.dicts.end()) {
@@ -127,6 +137,16 @@ namespace fastllm {
     }
 
     void basellm::SaveModel(const std::string &fileName) {
+        if (this->weight.tokenizer.chatTemplate.empty()) {
+            if (this->weight.dicts.find("pre_prompt") == this->weight.dicts.end())
+                this->weight.dicts["pre_prompt"] = pre_prompt;
+            if (this->weight.dicts.find("user_role") == this->weight.dicts.end())
+                this->weight.dicts["user_role"] = user_role;
+            if (this->weight.dicts.find("bot_role") == this->weight.dicts.end())
+                this->weight.dicts["bot_role"] = bot_role;
+            if (this->weight.dicts.find("history_sep") == this->weight.dicts.end())
+                this->weight.dicts["history_sep"] = history_sep;
+        }
         this->weight.SaveLowBitModel(fileName, 0);
     }
 
@@ -451,7 +471,6 @@ namespace fastllm {
             }
         } else if (tokenizerClass == "ChatGLM4Tokenizer") {
             // GLM4御用的分词
-            model->bot_role = " ";
             std::vector <std::string> lines, line;
             SplitString(ReadAllFile(path + "tokenizer.model"), {'\r', '\n'}, lines);
             for (int i = 0; i < lines.size(); i++) {
@@ -463,8 +482,8 @@ namespace fastllm {
                 spTokens[it.second["content"].string_value()] = atoi(it.first.c_str());
             }
             model->weight.tokenizer.SetSpecialTokens(spTokens);
-            ((ChatGLMModel*)model)->gmask_token_id = model->weight.tokenizer.GetTokenId("[gMASK]");
-            ((ChatGLMModel*)model)->bos_token_id = model->weight.tokenizer.GetTokenId("<sop>");
+            model->weight.AddDict("tokenizer_has_special_tokens", "1");
+            model->weight.AddDict("tokenizer_class", tokenizerClass);
             ((ChatGLMModel*)model)->tokenizerClass = tokenizerClass;
 
             // ChatGLM采用拼接token的方法，需要强行指定分割词的TokenID
