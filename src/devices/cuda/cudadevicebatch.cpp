@@ -248,16 +248,32 @@ namespace fastllm {
         Data **input1s = (Data**)(datas.find("input1")->second);
         int batch = intParams.find("input0___batch")->second;
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        AssertInFastLLM((input0s[0]->dataType == DataType::FLOAT32 && input1s[0]->dataType == DataType::FLOAT32) ||
+                        (input0s[0]->dataType == DataType::FLOAT16 && input1s[0]->dataType == DataType::FLOAT16),
+                        "Cat's input's type should be float32 or float16.\n");
+        AssertInFastLLM(input0s[0]->dataDevice == input1s[0]->dataDevice,
+                            "CatDirect error: inputs should use same device.\n");
+        AssertInFastLLM(input0s[0]->dims.size() == 0 || input0s[0]->dims.size() == input1s[0]->dims.size(),
+                            "Cat Error: input's shape's size should be same.\n");
+        int dimsLen = input0s[0]->dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        for (int i = 0; i < dimsLen; i++) {
+            if (i != axis) {
+                AssertInFastLLM(input0s[0]->dims[i] == input1s[0]->dims[i], "Cat Error: input's shape doesn't match.");
+            }
+        }
         std::vector <void*> dsts, srcs;
         std::vector <size_t> dpitchs, spitchs, widths, heights;
+        dsts.resize(batch);
+        srcs.resize(batch);
+        dpitchs.resize(batch);
+        spitchs.resize(batch);
+        widths.resize(batch);
+        heights.resize(batch);
+
         for (int b = 0; b < batch; b++) {
             Data &input0 = *input0s[b];
             Data &input1 = *input1s[b];
-            AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
-                            (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
-                            "Cat's input's type should be float32 or float16.\n");
-            AssertInFastLLM(input0.dataDevice == input1.dataDevice,
-                            "CatDirect error: inputs should use same device.\n");
 
             if (input0.dims.size() == 0) {
                 input0.Resize(input1.dims);
@@ -270,30 +286,17 @@ namespace fastllm {
                 int inner = input0.strides[axis];
                 int unitSize = input0.unitSize;
 
-                dsts.push_back(input0.cudaData);
-                dpitchs.push_back(input0Stride * unitSize);
-                srcs.push_back(input1.cudaData);
-                spitchs.push_back(input1Stride * unitSize);
-                widths.push_back(input1.dims[axis] * inner * unitSize);
-                heights.push_back(outer);
+                dsts[b] = (input0.cudaData);
+                dpitchs[b] = (input0Stride * unitSize);
+                srcs[b] = (input1.cudaData);
+                spitchs[b] = (input1Stride * unitSize);
+                widths[b] = (input1.dims[axis] * inner * unitSize);
+                heights[b] = (outer);
                 continue;
             }
 
-            AssertInFastLLM(input0.dims.size() == input1.dims.size(),
-                            "Cat Error: input's shape's size should be same.\n");
-            int dimsLen = input0.dims.size();
-            axis = (axis % dimsLen + dimsLen) % dimsLen;
-
-            for (int i = 0; i < dimsLen; i++) {
-                if (i != axis) {
-                    AssertInFastLLM(input0.dims[i] == input1.dims[i], "Cat Error: input's shape doesn't match.");
-                }
-            }
-
-            std::vector<int> dims = input0.dims;
-            std::vector<int> oldDims = dims;
-            dims[axis] += input1.dims[axis];
-            input0.Resize(dims);
+            int oldAxisDims = input0.dims[axis];
+            input0.dims[axis] += input1.dims[axis];
             int outer = input0.Count(0) / input0.Count(axis);
             int input0Stride = input0.Count(axis);
             int input1Stride = input1.Count(axis);
@@ -301,12 +304,12 @@ namespace fastllm {
             int inner = input0.strides[axis];
             int unitSize = input0.unitSize;
 
-            dsts.push_back((uint8_t *) input0.cudaData + oldDims[axis] * inner * unitSize);
-            dpitchs.push_back(input0Stride * unitSize);
-            srcs.push_back(input1.cudaData);
-            spitchs.push_back(input1Stride * unitSize);
-            widths.push_back(inner * unitSize);
-            heights.push_back(outer);
+            dsts[b] = ((uint8_t *) input0.cudaData + oldAxisDims * inner * unitSize);
+            dpitchs[b] = (input0Stride * unitSize);
+            srcs[b] = (input1.cudaData);
+            spitchs[b] = (input1Stride * unitSize);
+            widths[b] = (inner * unitSize);
+            heights[b] = (outer);
         }
 
         FastllmCudaMemcpy2DDeviceToDeviceBatch(dsts.data(), dpitchs.data(), srcs.data(),
