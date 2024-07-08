@@ -1976,6 +1976,8 @@ namespace fastllm {
             }
             tokenizer.SetSpecialTokens(specialTokens);
         }
+        if (this->dicts.find("chat_template") != this->dicts.end())
+            tokenizer.chatTemplate = this->dicts["chat_template"];
 
         int len = buffer.ReadInt();
         for (int i = 0; i < len; i++) {
