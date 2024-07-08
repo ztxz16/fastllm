@@ -582,7 +582,7 @@ namespace fastllm {
                                 if (isPrompt) {
                                     cnt += it.second->currentTokens.size();
 
-                                    if (cnt > 300) {
+                                    if (cnt > 1024) {
                                         break;
                                     }
                                     // break;
