@@ -80,6 +80,9 @@ namespace fastllm {
 
     void ChatGLMModel::InitParams() {
         basellm::InitParams();
+        if (this->weight.dicts.find("tokenizer_class") != this->weight.dicts.end()) {
+            this->tokenizerClass = this->weight.dicts["tokenizer_class"];
+        }
         if (GetVersion() == 1) {
             if (this->weight.dicts.find("gmask_token_id") != this->weight.dicts.end()) {
                 this->gmask_token_id = atoi(this->weight.dicts["gmask_token_id"].c_str());
@@ -96,6 +99,11 @@ namespace fastllm {
         }
         if (this->weight.dicts.find("rope_ratio") != this->weight.dicts.end()) {            
             UpdateRotaryPosEmb(atof(this->weight.dicts["rope_ratio"].c_str()));
+        }
+        if (this->tokenizerClass == "ChatGLM4Tokenizer") {
+            this->gmask_token_id = this->weight.tokenizer.GetTokenId("[gMASK]");
+            this->bos_token_id = this->weight.tokenizer.GetTokenId("<sop>");
+            this->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
         }
     }
 
