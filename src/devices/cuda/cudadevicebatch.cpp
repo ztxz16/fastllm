@@ -378,7 +378,12 @@ namespace fastllm {
         Data **masks = (Data**)(datas.find("mask")->second);
         Data **outputs = (Data**)(datas.find("output")->second);
 
-        if (qs[0]->dataType == DataType::FLOAT32) {
+        long long aveLen = 0;
+        for (int i = 0; i < batch; i++) {
+            aveLen += ks[i]->dims[1];
+        }
+        aveLen /= batch;
+        if (qs[0]->dataType == DataType::FLOAT32 || aveLen < 512) {
             for (int i = 0; i < batch; i++) {
                 outputs[i]->Allocate();
             }
