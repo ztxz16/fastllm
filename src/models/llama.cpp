@@ -789,33 +789,51 @@ namespace fastllm {
         std::vector <int> lastRet;
         int total = 0;
 
-        if (all1 && batch > 1) {
-            for (int b = 0; b < batch; b++) {
-                pointersK[b] = (&curLogits[b]);
-            }
-            SplitBatch(logits, 1, batch, pointersK);
-        } else {
-            for (int b = 0; b < batch; b++) {
-                Split(logits, 1, total + seqLens[b] - 1, total + seqLens[b], curLogits[b]);
+        bool allSimple = true;
+        for (int b = 0; b < batch; b++) {
+            if (!generationConfigs[b].IsSimpleGreedy()) {
+                allSimple = false;
+                break;
             }
         }
 
-        for (int b = 0; b < batch; b++) {
-            Data &curLogit = curLogits[b];
-            if (generationConfigs[b].output_logits && retLogits != nullptr && (*retLogits)[b] != nullptr) {
-                curLogit.ToDevice(DataDevice::CPU);
-                (*retLogits)[b]->resize(curLogit.Count(0));
-                memcpy((float*)(*retLogits)[b]->data(), (float*)curLogit.cpuData, curLogit.GetBytes());
+        if (all1 && batch > 1 && allSimple) {
+            Data topk;
+            TopK(logits, topk, 1);
+            topk.ToDevice(DataDevice::CPU);
+            float *topkData = (float*)topk.cpuData;
+            for (int b = 0; b < batch; b++) {
+                lastRet.push_back((int) (topkData[0] + 1e-3));
+                topkData += topk.Count(2);
             }
-            if (generationConfigs[b].IsSimpleGreedy()) {
-                Data topk;
-                TopK(curLogit, topk, 1);
-                topk.ToDevice(DataDevice::CPU);
-                lastRet.push_back((int) (((float *) topk.cpuData)[0] + 1e-3));
+        } else {
+            if (all1 && batch > 1) {
+                for (int b = 0; b < batch; b++) {
+                    pointersK[b] = (&curLogits[b]);
+                }
+                SplitBatch(logits, 1, batch, pointersK);
             } else {
-                lastRet.push_back(LLMSampling(curLogit, 0, generationConfigs[b], lastTokens.units[b]));
+                for (int b = 0; b < batch; b++) {
+                    Split(logits, 1, total + seqLens[b] - 1, total + seqLens[b], curLogits[b]);
+                }
             }
-            total += seqLens[b];
+
+            for (int b = 0; b < batch; b++) {
+                Data &curLogit = curLogits[b];
+                if (generationConfigs[b].output_logits && retLogits != nullptr && (*retLogits)[b] != nullptr) {
+                    curLogit.ToDevice(DataDevice::CPU);
+                    (*retLogits)[b]->resize(curLogit.Count(0));
+                    memcpy((float*)(*retLogits)[b]->data(), (float*)curLogit.cpuData, curLogit.GetBytes());
+                }
+                if (generationConfigs[b].IsSimpleGreedy()) {
+                    Data topk;
+                    TopK(curLogit, topk, 1);
+                    topk.ToDevice(DataDevice::CPU);
+                    lastRet.push_back((int) (((float *) topk.cpuData)[0] + 1e-3));
+                } else {
+                    lastRet.push_back(LLMSampling(curLogit, 0, generationConfigs[b], lastTokens.units[b]));
+                }
+            }
         }
         if (sinDataPtr != &sinData)
             delete sinDataPtr;
