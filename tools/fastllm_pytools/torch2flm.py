@@ -179,11 +179,11 @@ def tofile(exportPath,
         modelInfo["history_sep"] = "";
     if (modelInfo["model_type"] == "chatglm" and hasattr(tokenizer, "name") and tokenizer.name == "GLM4Tokenizer"):
         # glm-4-chat
-        modelInfo["pre_prompt"] = "[gMASK]<sop>";
+        modelInfo["pre_prompt"] = "";
         modelInfo["user_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.convert_tokens_to_ids("<|user|>")) + ">\n");
         modelInfo["bot_role"] = ("<FLM_FIX_TOKEN_" + str(tokenizer.convert_tokens_to_ids("<|assistant|>")) + ">");
         modelInfo["history_sep"] = "";
-        modelInfo["eos_token_id"] = "151336"
+        modelInfo["tokenizer_class"] = tokenizer.name;
     if "rope_scaling" in modelInfo and isinstance(modelInfo["rope_scaling"], builtins.dict):
         rope_scaling = modelInfo.pop("rope_scaling")
         modelInfo["rope_scaling.type"] = rope_scaling["type"]
