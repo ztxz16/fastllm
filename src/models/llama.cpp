@@ -151,7 +151,7 @@ namespace fastllm {
                 std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
                 std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
 
-                if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
+                if (weight.weight.find(qkvWeightName) != weight.weight.end() || weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
                     mergeQKV = true;
                     break;
                 } else {
@@ -214,6 +214,10 @@ namespace fastllm {
                 std::string w3WeightName = "model.layers." + std::to_string(i) + ".mlp.up_proj.weight";
                 std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
 
+                if (weight.weight.find(swigluWeightName) != weight.weight.end()) {
+                    mergeQKV = true;
+                    break;
+                }
                 Data &w1 = weight.weight[w1WeightName], &w3 = weight.weight[w3WeightName];
                 if ((w1.dataType == DataType::INT4_GROUP && w1.dims[1] % w1.groupCnt != 0) || 
                     (w3.dataType == DataType::INT4_GROUP && w3.dims[1] % w3.groupCnt != 0)) {
