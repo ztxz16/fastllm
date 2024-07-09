@@ -1,7 +1,7 @@
 import sys
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from fastllm_pytools import torch2flm
+from ftllm import torch2flm
 
 if __name__ == "__main__":
     modelNameOrPath = sys.argv[3] if len(sys.argv) >= 4 else 'meta-llama/Meta-Llama-3-8B'

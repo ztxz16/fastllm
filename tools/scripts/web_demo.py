@@ -1,6 +1,6 @@
 import streamlit as st
 from streamlit_chat import message
-from fastllm_pytools import llm
+from ftllm import llm
 import sys
 
 st.set_page_config(

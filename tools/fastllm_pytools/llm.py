@@ -127,7 +127,7 @@ def from_hf(model,
             bot_role = None,
             history_sep = None,
             dtype = "float16"):
-    from fastllm_pytools import hf_model;
+    from ftllm import hf_model;
     return hf_model.create(model, tokenizer, pre_prompt = pre_prompt, user_role = user_role,
                            bot_role = bot_role, history_sep = history_sep, dtype = dtype);
 

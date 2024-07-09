@@ -4,7 +4,7 @@ import argparse
 import logging
 import os
 from transformers import AutoTokenizer
-from fastllm_pytools import llm
+from ftllm import llm
 
 def args_parser():
     parser = argparse.ArgumentParser(description = 'fastllm_test')

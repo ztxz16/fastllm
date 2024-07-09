@@ -11,7 +11,7 @@ from openai.types.chat import (ChatCompletionContentPartParam,
                                ChatCompletionRole)
 
 from protocal.openai_protocol import *
-from fastllm_pytools import llm
+from ftllm import llm
 
 class ConversationMessage:
     def __init__(self, role:str, content:str):
