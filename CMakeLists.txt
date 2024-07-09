@@ -17,7 +17,13 @@ option(USE_IVCOREX "use iluvatar corex gpu" OFF)
 
 option(BUILD_CLI "build cli" OFF)
 
+if(NOT DEFINED CUDA_ARCH)
+    set(CUDA_ARCH "native")
+endif()
+
 message(STATUS "USE_CUDA: ${USE_CUDA}")
+
+message(STATUS "CUDA_ARCH: ${CUDA_ARCH}")
 
 message(STATUS "USE_TFACC: ${USE_TFACC}")
 
@@ -78,7 +84,7 @@ if (USE_CUDA)
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/cuda/fastllm-cuda.cu)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
-    set(CMAKE_CUDA_ARCHITECTURES "native")
+    set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
 endif()
 
 if (USE_IVCOREX)
@@ -158,10 +164,10 @@ if (${CMAKE_HOST_WIN32})
             TARGET fastllm_tools
             POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory tools
-            COMMAND ${CMAKE_COMMAND} -E make_directory tools/fastllm_pytools
-            COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools ${CMAKE_BINARY_DIR}/tools/fastllm_pytools/.
+            COMMAND ${CMAKE_COMMAND} -E make_directory tools/ftllm
+            COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools ${CMAKE_BINARY_DIR}/tools/ftllm/.
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts ${CMAKE_BINARY_DIR}/tools/.
-            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/$(Configuration)/fastllm_tools.dll ${CMAKE_BINARY_DIR}/tools/fastllm_pytools/.
+            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/$(Configuration)/fastllm_tools.dll ${CMAKE_BINARY_DIR}/tools/ftllm/.
             COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_BINARY_DIR}/$(Configuration)/fastllm_tools.dll
     )
 else()
@@ -169,10 +175,10 @@ else()
             TARGET fastllm_tools
             POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory tools
-            COMMAND ${CMAKE_COMMAND} -E make_directory tools/fastllm_pytools
-            COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools ${CMAKE_BINARY_DIR}/tools/fastllm_pytools/.
+            COMMAND ${CMAKE_COMMAND} -E make_directory tools/ftllm
+            COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools ${CMAKE_BINARY_DIR}/tools/ftllm/.
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts ${CMAKE_BINARY_DIR}/tools/.
-            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/libfastllm_tools.* ${CMAKE_BINARY_DIR}/tools/fastllm_pytools/.
+            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/libfastllm_tools.* ${CMAKE_BINARY_DIR}/tools/ftllm/.
             COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_BINARY_DIR}/libfastllm_tools.*
     )
 endif()
