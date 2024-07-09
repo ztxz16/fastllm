@@ -10,6 +10,6 @@ cd $folder
 cmake .. "$@"
 make -j
 cd tools
-python setup.py sdist build
-python setup.py bdist_wheel
-python setup.py install
+python3 setup.py sdist build
+python3 setup.py bdist_wheel
+python3 setup.py install
