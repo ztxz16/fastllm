@@ -41,7 +41,7 @@ bash install.sh -DUSE_CUDA=ON # 编译GPU版本
 
 ### 运行demo程序 (python)
 
-假设我们的模型位于"/mnt/hfmodels/Qwen/Qwen2-7B-Instruct/"目录
+假设我们的模型位于"~/Qwen2-7B-Instruct/"目录
 
 编译完成后可以使用下列demo:
 
@@ -70,10 +70,10 @@ python3 -m ftllm.server -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080 --model_name q
 # 进入fastllm/build-fastllm目录
 
 # 命令行聊天程序, 支持打字机效果 (只支持Linux）
-./main -p model.flm 
+./main -p ~/Qwen2-7B-Instruct/ 
 
 # 简易webui, 使用流式输出 + 动态batch，可多路并发访问
-./webui -p model.flm --port 1234 
+./webui -p ~/Qwen2-7B-Instruct/ --port 1234 
 ```
 
 Windows下的编译推荐使用Cmake GUI + Visual Studio，在图形化界面中完成。
@@ -85,7 +85,7 @@ Windows下的编译推荐使用Cmake GUI + Visual Studio，在图形化界面中
 ``` python
 # 模型创建
 from ftllm import llm
-model = llm.model("model.flm")
+model = llm.model("~/Qwen2-7B-Instruct/")
 
 # 生成回复
 print(model.response("你好"))

@@ -39,7 +39,7 @@ For compilation on other platforms, refer to the documentation:
 
 ### Running the demo program (python)
 
-Assuming our model is located in the "/mnt/hfmodels/Qwen/Qwen2-7B-Instruct/" directory:
+Assuming our model is located in the "~/Qwen2-7B-Instruct/" directory:
 
 After compilation, you can use the following demos:
 
@@ -68,10 +68,10 @@ For architectures that cannot directly read Hugging Face models, refer to [Model
 # Enter the fastllm/build-fastllm directory
 
 # Command line chat program, supports typewriter effect (Linux only)
-./main -p model.flm 
+./main -p ~/Qwen2-7B-Instruct/
 
 # Simple webui, uses streaming output + dynamic batch, supports concurrent access
-./webui -p model.flm --port 1234 
+./webui -p ~/Qwen2-7B-Instruct/ --port 1234 
 ```
 
 Compilation on Windows is recommended using Cmake GUI + Visual Studio, completed in the graphical interface.
@@ -83,7 +83,7 @@ For compilation issues, especially on Windows, refer to [FAQ](docs/faq.md).
 ``` python
 # Model creation
 from ftllm import llm
-model = llm.model("model.flm")
+model = llm.model("~/Qwen2-7B-Instruct/")
 
 # Generate response
 print(model.response("你好"))
