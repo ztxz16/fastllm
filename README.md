@@ -56,6 +56,10 @@ python3 -m ftllm.chat -t 16 -p ~/Qwen2-7B-Instruct/ --dtype int8
 # 需要安装依赖: pip install -r requirements-server.txt
 # 这里在8080端口打开了一个模型名为qwen的server
 python3 -m ftllm.server -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080 --model_name qwen
+
+# webui
+# 需要安装依赖: pip install streamlit-chat
+python3 -m ftllm.webui -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080
 ```
 
 以上demo均可使用参数 --help 查看详细参数
