@@ -201,6 +201,7 @@
     <ClInclude Include="..\..\include\devices\cuda\cudadevice.h" />
     <ClInclude Include="..\..\include\executor.h" />
     <ClInclude Include="..\..\include\fastllm.h" />
+    <ClInclude Include="..\..\include\graph.h" />
     <ClInclude Include="..\..\include\model.h" />
     <ClInclude Include="..\..\include\models\basellm.h" />
     <ClInclude Include="..\..\include\models\bert.h" />
@@ -208,6 +209,7 @@
     <ClInclude Include="..\..\include\models\deepseekv2.h" />
     <ClInclude Include="..\..\include\models\factoryllm.h" />
     <ClInclude Include="..\..\include\models\glm.h" />
+    <ClInclude Include="..\..\include\models\graphllm.h" />
     <ClInclude Include="..\..\include\models\internlm2.h" />
     <ClInclude Include="..\..\include\models\llama.h" />
     <ClInclude Include="..\..\include\models\minicpm.h" />
@@ -227,12 +229,14 @@
     <ClCompile Include="..\..\src\devices\cuda\cudadevicebatch.cpp" />
     <ClCompile Include="..\..\src\executor.cpp" />
     <ClCompile Include="..\..\src\fastllm.cpp" />
+    <ClCompile Include="..\..\src\graph.cpp" />
     <ClCompile Include="..\..\src\model.cpp" />
     <ClCompile Include="..\..\src\models\basellm.cpp" />
     <ClCompile Include="..\..\src\models\bert.cpp" />
     <ClCompile Include="..\..\src\models\chatglm.cpp" />
     <ClCompile Include="..\..\src\models\deepseekv2.cpp" />
     <ClCompile Include="..\..\src\models\glm.cpp" />
+    <ClCompile Include="..\..\src\models\graphllm.cpp" />
     <ClCompile Include="..\..\src\models\internlm2.cpp" />
     <ClCompile Include="..\..\src\models\llama.cpp" />
     <ClCompile Include="..\..\src\models\minicpm.cpp" />

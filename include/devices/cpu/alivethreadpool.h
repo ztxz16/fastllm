@@ -62,7 +62,7 @@ namespace fastllm {
                 auto duration = std::chrono::duration_cast<std::chrono::microseconds> (std::chrono::system_clock::now() - lastRunTime);
                 double gap = double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
                 if (gap > 3) {
-                    std::this_thread::sleep_for(std::chrono::seconds(0));
+                    std::this_thread::sleep_for(std::chrono::microseconds(2));
                 }
             }
         }
