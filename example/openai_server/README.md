@@ -16,7 +16,7 @@
 
 ## 依赖
 以下依赖在python 3.12.2上没有问题
-1. 需要先安装fastllm_pytools工具包
+1. 需要先安装ftllm工具包
 2. 需要安装以下依赖
 ```bash
 cd example/openai_server

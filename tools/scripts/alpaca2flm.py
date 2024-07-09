@@ -1,7 +1,7 @@
 import sys
 import torch
 from transformers import AutoTokenizer, LlamaForCausalLM
-from fastllm_pytools import torch2flm
+from ftllm import torch2flm
 
 if __name__ == "__main__":
     model_name = sys.argv[3] if len(sys.argv) >= 4 else 'minlik/chinese-alpaca-33b-merged'

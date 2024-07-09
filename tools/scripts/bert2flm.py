@@ -1,6 +1,6 @@
 import sys
 from transformers import AutoTokenizer, AutoModel
-from fastllm_pytools import torch2flm
+from ftllm import torch2flm
 
 if __name__ == "__main__":
     modelpath = sys.argv[3] if len(sys.argv) >= 4 else 'BAAI/bge-small-zh-v1.5'

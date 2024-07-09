@@ -63,7 +63,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True,)
     model = AutoModel.from_pretrained(args.model_name_or_path, trust_remote_code=True).cpu()
 
-    from fastllm_pytools import llm;
+    from ftllm import llm;
     model = llm.from_hf(model, tokenizer, dtype = args.dtype);
 
     # model.save("/root/test.flm");

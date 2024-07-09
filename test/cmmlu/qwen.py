@@ -77,7 +77,7 @@ if __name__ == "__main__":
             torch_dtype=torch.float16,
         )
 
-    from fastllm_pytools import llm;
+    from ftllm import llm;
     model = llm.from_hf(model, tokenizer, dtype = args.dtype)
     model.direct_query = True
 
