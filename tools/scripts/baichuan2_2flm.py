@@ -2,7 +2,7 @@ import sys
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.generation.utils import GenerationConfig
-from fastllm_pytools import torch2flm
+from ftllm import torch2flm
 
 if __name__ == "__main__":
     modelpath = "baichuan-inc/Baichuan2-7B-Chat"

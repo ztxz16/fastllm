@@ -1,6 +1,6 @@
 import sys
 from transformers import AutoTokenizer, AutoModel
-from fastllm_pytools import torch2flm
+from ftllm import torch2flm
 
 if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained("THUDM/chatglm2-6b", trust_remote_code=True)

@@ -1,5 +1,5 @@
 import argparse
-from fastllm_pytools import llm
+from ftllm import llm
 import readline
 
 def args_parser():

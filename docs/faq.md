@@ -108,7 +108,7 @@ GPU编译时，根据使用的CUDA版本，将cudart cublas的相关dll文件复
   * %CUDA_PATH%\bin\cublas64_12.dll
   * %CUDA_PATH%\bin\cublasLt64_12.dll
 
-## fastllm_pytools
+## ftllm
 
 ### 释放内存报错： CUDA error when release memory
 

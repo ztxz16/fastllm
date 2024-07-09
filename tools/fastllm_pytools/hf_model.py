@@ -1,4 +1,4 @@
-from fastllm_pytools import llm;
+from ftllm import llm;
 import ctypes;
 import builtins, os, json
 import numpy as np
