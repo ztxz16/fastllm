@@ -44,14 +44,14 @@ namespace fastllm {
         } else if (srcDtype == DataType::BFLOAT16 && dstDtype == DataType::FLOAT32) {
             uint16_t *u16dst = (uint16_t*)dst;
             uint16_t *u16src = (uint16_t*)src;
-            for (int i = 0; i < len; i++) {
+            for (size_t i = 0; i < len; i++) {
                 u16dst[i * 2] = 0;
                 u16dst[i * 2 + 1] = u16src[i];
             }
         } else if (srcDtype == DataType::FLOAT16 && dstDtype == DataType::FLOAT32) {
             float *fdst = (float*)dst;
             uint16_t *u16src = (uint16_t*)src;
-            for (int i = 0; i < len; i++) {
+            for (size_t i = 0; i < len; i++) {
                 fdst[i] = half_to_float(u16src[i]);
             }
         } else {
@@ -280,7 +280,7 @@ namespace fastllm {
                 ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport dst dtype " + std::to_string(dstType) + "\n");
             }
             ClearBuffer();
-            buffer = new uint8_t[len * unitSize];
+            buffer = new uint8_t[(size_t)len * unitSize];
 
             FILE *fi = fopen(this->fileName.c_str(), "rb");
             int ret;
