@@ -1,6 +1,6 @@
 import sys
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from fastllm_pytools import torch2flm
+from ftllm import torch2flm
 
 tokenizer = AutoTokenizer.from_pretrained("fnlp/moss-moon-003-sft", trust_remote_code=True);
 model = AutoModelForCausalLM.from_pretrained("fnlp/moss-moon-003-sft", trust_remote_code=True).float();

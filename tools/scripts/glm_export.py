@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import binascii
 from transformers import AutoTokenizer, AutoModel
-from fastllm_pytools import torch2flm
+from ftllm import torch2flm
 
 def glmtofile(exportPath,
            model,

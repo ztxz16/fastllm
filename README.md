@@ -1,5 +1,7 @@
 # fastllm
 
+[English Document](README_EN.md)
+
 ## 介绍
 
 fastllm是纯c++实现，无第三方依赖的多平台高性能大模型推理库

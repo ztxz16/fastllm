@@ -1,7 +1,7 @@
 import sys
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.generation import GenerationConfig
-from fastllm_pytools import torch2flm
+from ftllm import torch2flm
 
 if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen-7B-Chat", trust_remote_code=True)
