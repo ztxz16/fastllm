@@ -28,18 +28,7 @@ gcc版本建议9.4以上，cmake版本建议3.23以上
 使用如下命令编译
 
 ``` sh
-cd fastllm
-mkdir build
-cd build
-cmake .. -DUSE_TFACC=ON
-make -j
-```
-
-编译完成后，可以使用如下命令安装简易python工具包。
-
-``` sh
-cd tools # 这时在fastllm/build/tools目录下
-python setup.py install
+bash install.sh -DUSE_TFACC=ON
 ```
 
 ### 运行demo程序
