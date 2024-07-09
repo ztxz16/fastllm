@@ -25,6 +25,36 @@ void showError(cudaError_t result, char const* const message, const char* const 
     }  
 }
 
+/*
+size_t totalMalloc = 0;
+std::map <void*, size_t> mallocMap;
+std::map <size_t, int> mallocCnt;
+
+template <typename T>
+cudaError_t CCMalloc(T **ret, size_t size) {
+printf("malloc %f m\n", (double)size / 1e6);
+totalMalloc += size;
+printf("total malloc %f m\n", (double)totalMalloc / 1e6);
+    cudaError_t sta = cudaMalloc(ret, size);
+mallocMap[ret[0]] = size;
+mallocCnt[size]++;
+    return sta;
+}
+
+template <typename T>
+cudaError_t CCFree(T *ret) {
+printf("free %f m\n", (double)mallocMap[ret] / 1e6);
+totalMalloc -= mallocMap[ret];
+mallocCnt[mallocMap[ret]]--;
+printf("total malloc %f m\n", (double)totalMalloc / 1e6);
+for (auto &it : mallocCnt) {
+    if (it.second > 0) printf("(%f: %d) ", (double)it.first / 1e6, it.second);
+}
+printf("\n");
+    cudaError_t sta = cudaFree(ret);
+    return sta;
+}
+*/
 
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 #define FETCH_FLOAT2(pointer) (reinterpret_cast<float2*>(&(pointer))[0])
@@ -4045,24 +4075,11 @@ bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &wei
 
 bool FastllmCudaHalfMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaHalfData.size() == 0) {
-        float *cudaScales;
-        cudaError_t state = cudaSuccess;
-        state = cudaMalloc(&cudaScales, k * sizeof(float));
-        state = cudaMemcpy(cudaScales, weight.scales.data(), k * sizeof(float), cudaMemcpyHostToDevice);
-        weight.extraCudaHalfData.push_back((void*)cudaScales);
-
-        uint8_t *cudaZeropoints;
-        state = cudaMalloc(&cudaZeropoints, k);
-        uint8_t *zeropoints = new uint8_t[k];
-        for (int i = 0; i < k; i++) {
-            zeropoints[i] = weight.perChannelsConfigs[i].zeroPoint;
-        }
-        state = cudaMemcpy(cudaZeropoints, zeropoints, k, cudaMemcpyHostToDevice);
-        delete[] zeropoints;
-        weight.extraCudaHalfData.push_back((void*)cudaZeropoints);
+        weight.extraCudaHalfData.push_back((void*)weight.extraCudaData[0]);
+        weight.extraCudaHalfData.push_back((void*)weight.extraCudaData[1]);
 
         half *cudaBiasData;
-        state = cudaMalloc(&cudaBiasData, k * sizeof(half));
+        cudaError_t state = cudaMalloc(&cudaBiasData, k * sizeof(half));
         if (bias.dims.size() > 0) {
             float *tempBiasData;
             state = cudaMalloc(&tempBiasData, k * sizeof(float));
@@ -4144,24 +4161,11 @@ bool FastllmCudaHalfMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &w
 bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     int group = weight.group, groupCnt = weight.groupCnt;
     if (weight.cudaData == nullptr || weight.extraCudaHalfData.size() == 0) {
-        float *cudaScales;
-        cudaError_t state = cudaSuccess;
-        state = cudaMalloc(&cudaScales, k * group * sizeof(float));
-        state = cudaMemcpy(cudaScales, weight.scales.data(), k * group * sizeof(float), cudaMemcpyHostToDevice);
-        weight.extraCudaHalfData.push_back((void*)cudaScales);
-
-        float *cudaMins;
-        state = cudaMalloc(&cudaMins, k * group * sizeof(float));
-        float *mins = new float[k * group];
-        for (int i = 0; i < k * group; i++) {
-            mins[i] = weight.perChannelsConfigs[i].min;
-        }
-        state = cudaMemcpy(cudaMins, mins, k * group * sizeof(float), cudaMemcpyHostToDevice);
-        delete[] mins;
-        weight.extraCudaHalfData.push_back((void*)cudaMins);
+        weight.extraCudaHalfData.push_back((void*)weight.extraCudaData[0]);
+        weight.extraCudaHalfData.push_back((void*)weight.extraCudaData[1]);
 
         half *cudaBiasData;
-        state = cudaMalloc(&cudaBiasData, k * sizeof(half));
+        cudaError_t state = cudaMalloc(&cudaBiasData, k * sizeof(half));
         if (bias.dims.size() > 0) {
             float *tempBiasData;
             state = cudaMalloc(&tempBiasData, k * sizeof(float));
@@ -4241,24 +4245,11 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
 
 bool FastllmCudaHalfMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaHalfData.size() == 0) {
-        float *cudaScales;
-        cudaError_t state = cudaSuccess;
-        state = cudaMalloc(&cudaScales, k * sizeof(float));
-        state = cudaMemcpy(cudaScales, weight.scales.data(), k * sizeof(float), cudaMemcpyHostToDevice);
-        weight.extraCudaHalfData.push_back((void*)cudaScales);
-
-        float *cudaMins;
-        state = cudaMalloc(&cudaMins, k * sizeof(float));
-        float *mins = new float[k];
-        for (int i = 0; i < k; i++) {
-            mins[i] = weight.perChannelsConfigs[i].min;
-        }
-        state = cudaMemcpy(cudaMins, mins, k * sizeof(float), cudaMemcpyHostToDevice);
-        delete[] mins;
-        weight.extraCudaHalfData.push_back((void*)cudaMins);
+        weight.extraCudaHalfData.push_back((void*)weight.extraCudaData[0]);
+        weight.extraCudaHalfData.push_back((void*)weight.extraCudaData[1]);
 
         half *cudaBiasData;
-        state = cudaMalloc(&cudaBiasData, k * sizeof(half));
+        cudaError_t state = cudaMalloc(&cudaBiasData, k * sizeof(half));
         if (bias.dims.size() > 0) {
             float *tempBiasData;
             state = cudaMalloc(&tempBiasData, k * sizeof(float));
