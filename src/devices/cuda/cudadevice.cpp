@@ -588,7 +588,7 @@ namespace fastllm {
         output.Allocate();
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16, 
-                        "Swiglu error: Data's type should be float32.\n");
+                        "Swiglu error: Data's type should be float32 or float16.\n");
         FastllmCudaSwiglu(input, output);
     }
 
@@ -597,7 +597,9 @@ namespace fastllm {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         output.Allocate();
-        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Silu error: Data's type should be float32.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16, 
+                        "Silu error: Data's type should be float32 or float16.\n");
         FastllmCudaSilu(input, output);
     }
 
@@ -633,8 +635,9 @@ namespace fastllm {
         Data &input1 = *(datas.find("input1")->second);
         float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0;
 
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
-                        "MulTo error: Data's type should be float32.\n");
+        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
+                        "MulTo error: Data's type should be float32 or float16.\n");
         AssertInFastLLM(input0.dims == input1.dims, "MulTo error: input's shape should be same.\n");
         FastllmCudaMulTo(input0, input1, alpha);
     }
