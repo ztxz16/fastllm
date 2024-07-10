@@ -413,6 +413,14 @@ __global__ void FastllmSiluKernel(float* a, float *b, int len) {
     }
 }
 
+__global__ void FastllmSiluKernel(half* a, half *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = (float)a[idx];
+        b[idx] = (half)(x / (1.0 + expf(-x)));
+    }
+}
+
 __global__ void FastllmSwigluKernel(float* a, float *b, int len, int spatial, int mid) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -486,6 +494,13 @@ __global__ void FastllmMulToKernel(float* a, float *b, float alpha, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
         a[idx] *= b[idx] * alpha;
+    }
+}
+
+__global__ void FastllmMulToKernel(half* a, half *b, float alpha, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        a[idx] *= (half)((float)b[idx] * alpha);
     }
 }
 
@@ -2921,7 +2936,11 @@ bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     int threadPerBlock = std::min(256, len);
-    FastllmSiluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmSiluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        FastllmSiluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, len);
+    }
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
@@ -2985,7 +3004,11 @@ bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float 
     float *input1Data = (float *) FastllmCudaPrepareInput(input1);
 
     int threadPerBlock = std::min(256, len);
-    FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
+    if (input0.dataType == fastllm::DataType::FLOAT32) {
+        FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
+    } else {
+        FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaData, (half*)input1Data, alpha, len);
+    }
     FastllmCudaFinishInput(input1, input1Data);
     FastllmCudaFinishOutput(input0, cudaData);
     return true;
