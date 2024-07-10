@@ -383,7 +383,9 @@ namespace fastllm {
             aveLen += ks[i]->dims[1];
         }
         aveLen /= batch;
-        if (qs[0]->dataType == DataType::FLOAT32 || aveLen < 512) {
+        if (qs[0]->dataType == DataType::FLOAT32 || 
+            (aveLen < 512 && batch >= 4) ||
+            (aveLen < 4096 && batch >= 32)) {
             for (int i = 0; i < batch; i++) {
                 outputs[i]->Allocate();
             }
