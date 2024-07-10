@@ -3368,28 +3368,51 @@ namespace fastllm {
         }
     }
 
+    struct FP16SiluManager {
+        uint16_t dict[65536];
+
+        FP16SiluManager() {
+            for (uint16_t i = 0; i < 65535; i++) {
+                float x = half_to_float(i);
+                float y = x / (1.0 + expf(-x));
+                dict[i] = float_to_half(y);
+            }
+        }
+    } fp16SiluManager;
+
     void CpuSiluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         output.Allocate();
-        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Silu error: Data's type should be float32.\n");
-        float *inputData = (float*)input.cpuData;
-        float *outputData = (float*)output.cpuData;
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16, 
+                        "Silu error: Data's type should be float32 or float16.\n");
         int len = input.Count(0);
-        int i = 0;
-#ifdef __aarch64__
-        float32x4_t c1 = vdupq_n_f32(1.0f);
-        for (; i + 3 < len; i += 4) {
-            float32x4_t vx = vld1q_f32(inputData + i);
-            float32x4_t vdiv = vaddq_f32(c1, exp_ps(vnegq_f32(vx)));
-            vx = vdivq_f32(vx, vdiv);
-            vst1q_f32(outputData + i, vx);
-        }
-#endif
-        for (; i < len; i++) {
-            float x = inputData[i];
-            outputData[i] = x / (1.0 + expf(-x));
+
+        if (input.dataType == DataType::FLOAT16) {
+            uint16_t *inputData = (uint16_t*)input.cpuData;
+            uint16_t *outputData = (uint16_t*)output.cpuData;
+            for (int i = 0; i < len; i++) {
+                outputData[i] = fp16SiluManager.dict[inputData[i]];
+            }
+        } else {
+            float *inputData = (float*)input.cpuData;
+            float *outputData = (float*)output.cpuData;
+            int i = 0;
+    #ifdef __aarch64__
+            float32x4_t c1 = vdupq_n_f32(1.0f);
+            for (; i + 3 < len; i += 4) {
+                float32x4_t vx = vld1q_f32(inputData + i);
+                float32x4_t vdiv = vaddq_f32(c1, exp_ps(vnegq_f32(vx)));
+                vx = vdivq_f32(vx, vdiv);
+                vst1q_f32(outputData + i, vx);
+            }
+    #endif
+            for (; i < len; i++) {
+                float x = inputData[i];
+                outputData[i] = x / (1.0 + expf(-x));
+            }
         }
     }
 
@@ -3643,18 +3666,29 @@ namespace fastllm {
         Data &input1 = *(datas.find("input1")->second);
         AssertInFastLLM(input0.dims == input1.dims, "MulTo error: input's shape should be same.\n");
 
-        float *input0Data = (float*)input0.cpuData;
-        float *input1Data = (float*)input1.cpuData;
-
         int len = input0.Count(0);
         int inner = input1.Count(0);
         AssertInFastLLM(len % inner == 0, "MulTo error: Data`s shape can`t perform MulTo operation.\n");
         int round = (len / inner);
-        for (int j = 0; j < round; j++) {
-            for (int i = 0; i < len; i++) {
-               input0Data[i] *= input1Data[i];
+
+        if (input0.dataType == DataType::FLOAT16) {
+            uint16_t *input0Data = (uint16_t*)input0.cpuData;
+            uint16_t *input1Data = (uint16_t*)input1.cpuData;
+            for (int j = 0; j < round; j++) {
+                for (int i = 0; i < len; i++) {
+                    input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] * fp16tofp32.dict[input1Data[i]]);
+                }
+                input0Data += inner;
             }
-            input0Data += inner;
+        } else {
+            float *input0Data = (float*)input0.cpuData;
+            float *input1Data = (float*)input1.cpuData;
+            for (int j = 0; j < round; j++) {
+                for (int i = 0; i < len; i++) {
+                input0Data[i] *= input1Data[i];
+                }
+                input0Data += inner;
+            }
         }
     }
 
