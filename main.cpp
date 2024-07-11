@@ -1,4 +1,4 @@
-﻿#include "model.h"
+#include "model.h"
 #ifdef _WIN32
 #include <stdlib.h>
 #endif
