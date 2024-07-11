@@ -121,7 +121,7 @@ using socket_t = int;
 #include <thread>
 #include "model.h"
 
-long long GetCurrentTime() {
+long long _GetCurrentTime() {
     auto now = std::chrono::high_resolution_clock::now();
     auto duration = now.time_since_epoch();
     return std::chrono::duration_cast<std::chrono::seconds>(duration).count();
@@ -430,7 +430,7 @@ struct WorkQueue {
             }
 
             std::string curId = "fastllm-" + GenerateRandomID();
-            auto createTime = GetCurrentTime();
+            auto createTime = _GetCurrentTime();
 
             if (isStream) {
                 message = "";
