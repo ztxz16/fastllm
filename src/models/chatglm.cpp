@@ -757,7 +757,8 @@ namespace fastllm {
             if (GetVersion() == 1) {
                 positionIds.CopyFrom(Data(DataType::FLOAT32, {2, 1}, {(float) promptLen, (float) (index + 1)}));
             } else {
-                positionIds.CopyFrom(Data(DataType::FLOAT32, {2, 1}, {(float) promptLen + index + 1, (float) (index + 1)}));
+                int gap = add_special_tokens ? 1 : -1;
+                positionIds.CopyFrom(Data(DataType::FLOAT32, {2, 1}, {(float) promptLen + index + gap, (float) (index + gap)}));
             }
         }
     }
