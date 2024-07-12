@@ -830,7 +830,8 @@ __device__ void FastllmSoftmaxKernelInner1Func(half *input, half *output, int ch
     }
     __syncthreads();
     float maxV = sdata[0];
-    
+    __syncthreads();
+
     // 4. 求和
     float sum = 0;
     for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
