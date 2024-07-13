@@ -56,8 +56,8 @@ namespace fastllm {
         preTokens = 0;
     }
 
-    PastKVCacheMemory::PastKVCacheMemory(const std::string &prompt, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv) {
-        this->prompt = prompt;
+    PastKVCacheMemory::PastKVCacheMemory(const std::vector <int> &inputToken, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv) {
+        this->inputToken = inputToken;
         this->tokens = tokens;
         this->flushTime = flushTime;
         this->recordTimes = 1;
@@ -66,9 +66,6 @@ namespace fastllm {
             this->kv.push_back(std::make_pair(Data(dataType), Data(dataType)));
         }
         for (int i = 0; i < kv->size(); i++) {
-            (*kv)[i].first.ToDevice(DataDevice::CPU);
-            (*kv)[i].second.ToDevice(DataDevice::CPU);
-
             this->kv[i].first.CopyFrom((*kv)[i].first);
             this->kv[i].second.CopyFrom((*kv)[i].second);
         }
@@ -79,54 +76,63 @@ namespace fastllm {
         this->maxRecordNum = maxRecordNum;
     }
 
-    void PastKVCacheManager::Record(const std::string &prompt, int tokens, std::vector<std::pair<Data, Data> > *kv) {
+    void PastKVCacheManager::Record(const std::vector <int> &inputToken, int tokens, std::vector<std::pair<Data, Data> > *kv) {
         std::lock_guard <std::mutex> lock(this->locker);
-        if (this->memorys.find(prompt) != this->memorys.end()) {
-            this->memorys[prompt]->recordTimes++;
-            this->memorys[prompt]->flushTime = ++flushTime;
+        if (this->memorys.find(inputToken) != this->memorys.end()) {
+            this->memorys[inputToken]->recordTimes++;
+            this->memorys[inputToken]->flushTime = ++flushTime;
             return;
         }
 
         if (this->memorys.size() >= this->maxRecordNum) {
-            std::string prompt = "";
+            std::vector <int> eraseToken;
             long long minFlushTime = (1LL << 60);
             for (auto &it : this->memorys) {
                 if (it.second->flushTime < minFlushTime) {
                     minFlushTime = it.second->flushTime;
-                    prompt = it.first;
+                    eraseToken = it.first;
                 }
             }
-            delete this->memorys[prompt];
-            this->memorys.erase(this->memorys.find(prompt));
+            delete this->memorys[eraseToken];
+            this->memorys.erase(this->memorys.find(eraseToken));
         }
 
-        this->memorys[prompt] = new PastKVCacheMemory(prompt, tokens, ++flushTime, kv);
+        this->memorys[inputToken] = new PastKVCacheMemory(inputToken, tokens, ++flushTime, kv);
     }
 
-    void PastKVCacheManager::Remove(std::string prompt) {
+    void PastKVCacheManager::Remove(const std::vector <int> &inputToken) {
         std::lock_guard <std::mutex> lock(this->locker);
-        if (this->memorys.find(prompt) != this->memorys.end()) {
-            if ((--this->memorys[prompt]->recordTimes) <= 0) {
-                delete this->memorys[prompt];
-                this->memorys.erase(this->memorys.find(prompt));
+        if (this->memorys.find(inputToken) != this->memorys.end()) {
+            if ((--this->memorys[inputToken]->recordTimes) <= 0) {
+                delete this->memorys[inputToken];
+                this->memorys.erase(this->memorys.find(inputToken));
             }
         }
     }
 
-    PastKVCacheMemory *PastKVCacheManager::Get(const std::string &prompt) {
-        locker.lock();
-        std::string maxPrompt = "";
+    PastKVCacheMemory *PastKVCacheManager::Get(const std::vector <int> &inputToken) {
+        std::lock_guard <std::mutex> lock(this->locker);
+        std::vector <int> maxToken;
         for (auto &it : this->memorys) {
-            const std::string &cur = it.first;
-            if (cur.size() > maxPrompt.size() && cur.size() <= prompt.size() && prompt.substr(0, cur.size()) == cur) {
-                maxPrompt = cur;
+            const std::vector <int> &cur = it.first;
+            if (cur.size() > maxToken.size() && cur.size() <= inputToken.size()) {
+                bool match = true;
+                for (int i = 0; i < cur.size(); i++) {
+                    if (inputToken[i] != cur[i]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    maxToken = cur;
+                }
             }
         }
-        if (maxPrompt == "") {
+        if (maxToken.size() == 0) {
             return nullptr;
         }
-        this->memorys[maxPrompt]->flushTime = ++this->flushTime;
-        return this->memorys[maxPrompt];
+        this->memorys[maxToken]->flushTime = ++this->flushTime;
+        return this->memorys[maxToken];
     }
 
     void PastKVCacheManager::Unlock() {
@@ -542,8 +548,8 @@ namespace fastllm {
                                 handles.push_back(it.first);
 
                                 if (it.second->preTokens == 0) {
-                                    it.second->intParams["add_special_tokens"] = it.second->generationConfig.add_special_tokens;
-                                    it.second->intParams["promptLen"] = it.second->currentTokens.size();
+                                    it.second->intParams["add_special_tokens"] = it.second->cacheLen > 0 ? false : it.second->generationConfig.add_special_tokens;
+                                    it.second->intParams["promptLen"] = it.second->cacheLen + it.second->currentTokens.size();
                                     it.second->intParams["index"] = 0;
                                 } else {
                                     it.second->intParams["index"]++;
@@ -579,7 +585,7 @@ namespace fastllm {
                                     pastKeyValues.push_back(std::make_pair(&it.second->pastKeyValues[i].first,
                                                                            &it.second->pastKeyValues[i].second));
                                 }
-                                if (isPrompt) {
+                                if (isPrompt) {                                    
                                     cnt += it.second->currentTokens.size();
 
                                     if (cnt > 1024) {
@@ -681,6 +687,17 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         context->currentTokens = inputTokens;
         context->generationConfig = generationConfig;
         context->tokens = LastTokensUnit(generationConfig.last_n);
+
+        auto cache = pastKVCacheManager.Get(inputTokens);
+        if (cache != nullptr) {
+            for (int i = 0; i < this->block_cnt; i++) {
+                context->pastKeyValues[i].first.CopyFrom(cache->kv[i].first);
+                context->pastKeyValues[i].second.CopyFrom(cache->kv[i].second);
+            }
+            context->currentTokens.erase(context->currentTokens.begin(), context->currentTokens.begin() + cache->inputToken.size());
+            context->cacheLen = cache->inputToken.size();
+        }
+
         dictLocker.unlock();
         dictCV.notify_one();
         return handleId;
@@ -747,6 +764,34 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 dictLocker.lock();
             }
         }
+    }
+
+    void basellm::AddPromptCache(const std::vector <int> &inputTokens) {
+        std::unique_lock<std::mutex> dictLocker(this->dictLocker);
+        auto cache = pastKVCacheManager.Get(inputTokens);
+        if (cache != nullptr && cache->inputToken.size() == inputTokens.size()) {
+            return;
+        }
+        Data inputIds, attentionMask, positionIds;
+        std::vector<std::pair<Data, Data> > pastKeyValues;
+        for (int i = 0; i < block_cnt; i++) {
+            pastKeyValues.push_back(std::make_pair(Data(this->dataType), Data(this->dataType)));
+            pastKeyValues.back().first.SetKVCache();
+            pastKeyValues.back().second.SetKVCache();
+        }
+
+        int promptLen = inputTokens.size(), index = 0;
+        int add_special_tokens = false;
+        std::vector <std::vector <float> > fInputTokens;
+        fInputTokens.resize(1);
+        for (int i = 0; i < inputTokens.size(); i++) {
+            fInputTokens[0].push_back(inputTokens[i]);
+        }
+        FillLLMInputs(fInputTokens, {{"promptLen", promptLen}, {"index", index}, {"add_special_tokens", add_special_tokens}},
+                      inputIds, attentionMask, positionIds);
+        ToDataType(attentionMask, this->dataType);
+        int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+        pastKVCacheManager.Record(inputTokens, inputTokens.size(), &pastKeyValues);
     }
 
     bool basellm::NeedAttentionMask(int qlen, int klen) {

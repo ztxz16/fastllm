@@ -712,6 +712,7 @@ namespace fastllm {
                             (ids[0] != this->gmask_token_id || ids[1] != this->bos_token_id))) {
                             ids.insert(ids.begin(), this->bos_token_id);
                             ids.insert(ids.begin(), this->gmask_token_id);
+                            promptLen += 2;
                         }
                     }
                 }
@@ -733,18 +734,22 @@ namespace fastllm {
             }
 
             if (seqLen <= 1024) {
-                std::vector<float> vmask = std::vector<float>(seqLen * seqLen, 0);
-                for (int i = 0; i < seqLen - 1; i++) {
-                    vmask[i * seqLen + seqLen - 1] = 1;
-                }
                 if (GetVersion() == 2) {
+                    std::vector <float> vmask = std::vector <float> (seqLen * promptLen, 0);
                     for (int i = 0; i < seqLen; i++) {
+                        vpids[i] = promptLen - seqLen + i;
                         for (int j = i + 1; j < seqLen; j++) {
-                            vmask[i * seqLen + j] = 1;
+                            vmask[i * promptLen + (promptLen - seqLen + j)] = 1;
                         }
                     }
+                    attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, promptLen}, vmask));
+                } else {
+                    std::vector<float> vmask = std::vector<float>(seqLen * seqLen, 0);
+                    for (int i = 0; i < seqLen - 1; i++) {
+                        vmask[i * seqLen + seqLen - 1] = 1;
+                    }
+                    attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, seqLen}, vmask));
                 }
-                attentionMask.CopyFrom(Data(DataType::FLOAT32, {seqLen, seqLen}, vmask));
             } else {
                 attentionMask = Data();
             }
