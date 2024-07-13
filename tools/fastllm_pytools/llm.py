@@ -36,6 +36,8 @@ fastllm_lib.launch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ct
                                                   ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_llm_model.restype = ctypes.c_int
 
+fastllm_lib.add_cache_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+
 fastllm_lib.fetch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.fetch_response_llm_model.restype = ctypes.c_int
 
@@ -654,6 +656,16 @@ class model:
                 else:
                     res += cur;
                     yield res;
+    
+    def add_cache(self,
+                        prompt: str):
+        if (self.hf_tokenizer != None):
+            tokenizer = self.hf_tokenizer
+            input = tokenizer.encode(prompt);
+            fastllm_lib.add_cache_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input));
+        else:
+            print("add_cache failed: need hf_tokenizer.")
+            exit(0)
     
     async def stream_response_async(self,
                         query: str,

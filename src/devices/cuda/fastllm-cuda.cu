@@ -3332,7 +3332,7 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
     int batch = (mask.dims.size() == 3) ? mask.dims[0] : 1;
     int maskStride = (mask.dims.size() == 3 ? mask.strides[0] : mask.Count(0));
 
-    if (q1 >= 1024 || (q1 > 1 && q1 != k1)) {
+    if (q1 >= 1024 || (q1 > 1 && q1 != k1 && k1 >= 1024)) {
         float *qk = (float *) FastllmCudaMalloc(q1 * k1 * sizeof(float));
         float beta = 0, one = 1;
         auto fastllmCublasHandle = getFastllmCublasHandle();
@@ -3463,7 +3463,7 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
     int maskStride = (mask.dims.size() == 3 ? mask.strides[0] : mask.Count(0));
 
     half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
-    if (q1 >= 1024 || (q1 > 1 && q1 != k1)) {
+    if (q1 >= 1024 || (q1 > 1 && q1 != k1 && k1 >= 1024)) {
         int alignQ1 = q1, alignK1 = k1;
         bool useFastAttn = getCudaInfos()->hasTensorCore && batch == 1 && (q2 == 128 && v2 == 128);
         if (useFastAttn) {
@@ -3824,10 +3824,10 @@ bool DoFastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::
         qk[b] = mem + memSum;
         memSum += s;
     }
-    
+
+    uint8_t ** pointers = (uint8_t**)FastllmCudaMalloc(sizeof(uint8_t*) * batch * k0 * 8);
+    uint8_t ** cpuPointers = new uint8_t*[batch * k0 * 8];
     if (true) {
-        uint8_t ** pointers = (uint8_t**)FastllmCudaMalloc(sizeof(uint8_t*) * batch * k0 * 8);
-        uint8_t ** cpuPointers = new uint8_t*[batch * k0 * 8];
         for (int b = 0; b < batch; b++) {
             for (int i = 0; i < k0; i++) {
                 cpuPointers[(b * k0 + i) * 8 + 0] = (uint8_t *) q[b]->cudaData + i * group * q[b]->dims[1] * q[b]->dims[2] * sizeof(T);
@@ -3846,14 +3846,10 @@ bool DoFastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::
         } else {
             FastllmMatMulTransBBatchKernel <128> <<<batch * k0, 128>>> (pointers, scale);
         }
-        FastllmCudaFree(pointers);
-        delete[] cpuPointers;
     }
 
     if (true) {
         int outer = q[0]->dims[0] * q[0]->dims[1];
-        uint8_t ** pointers = (uint8_t**)FastllmCudaMalloc(sizeof(uint8_t*) * batch * 2);
-        uint8_t ** cpuPointers = new uint8_t*[batch * 2];
         int maxChannels = 0;
         for (int b = 0; b < batch; b++) {
             int outer = q[b]->dims[0] * q[b]->dims[1];
@@ -3870,13 +3866,9 @@ bool DoFastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::
         } else {
             FastllmSoftmaxKernelBatchInner1 <T, 128> <<<batch * outer, 128>>> (pointers, outer);
         }
-        FastllmCudaFree(pointers);
-        delete[] cpuPointers;
     }
 
     if (true) {
-        uint8_t ** pointers = (uint8_t**)FastllmCudaMalloc(sizeof(uint8_t*) * batch * k0 * 8);
-        uint8_t ** cpuPointers = new uint8_t*[batch * k0 * 8];
         for (int b = 0; b < batch; b++) {
             for (int i = 0; i < k0; i++) {
                 cpuPointers[(b * k0 + i) * 8 + 0] = (uint8_t *) qk[b] + i * group * q[b]->dims[1] * k[b]->dims[1] * sizeof(T);
@@ -3896,9 +3888,10 @@ bool DoFastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::
         } else {
             FastllmMatMulKernel <128> <<<batch * k0, 128>>> (pointers, 1.0f);
         }
-        FastllmCudaFree(pointers);
-        delete[] cpuPointers;
     }
+
+    FastllmCudaFree(pointers);
+    delete[] cpuPointers;
 
     FastllmCudaFree(mem);
     delete[] qk;
