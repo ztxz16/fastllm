@@ -35,6 +35,8 @@ namespace fastllm {
         int curTokens = 0;
         std::map <std::string, int> intParams;
 
+        int cacheLen = 0;
+
         void Init(int blocks, DataType dataType);
     };
 
@@ -50,7 +52,7 @@ namespace fastllm {
     };
 
     struct PastKVCacheMemory {
-        std::string prompt;
+        std::vector <int> inputToken;
         int tokens;
         int recordTimes = 0;
         long long flushTime;
@@ -58,26 +60,26 @@ namespace fastllm {
 
         PastKVCacheMemory () {}
 
-        PastKVCacheMemory (const std::string &prompt, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv);
+        PastKVCacheMemory (const std::vector <int> &prompt, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv);
     };
 
     struct PastKVCacheManager {
         std::mutex locker;
         int maxRecordNum = 5;
         long long flushTime = 0;
-        std::map <std::string, PastKVCacheMemory*> memorys;
+        std::map <std::vector <int>, PastKVCacheMemory*> memorys;
 
         // 设置最多保存的记录条数
         void SetMaxRecordNum(int maxRecordNum);
 
         // 插入一条记录，若已存在则增加引用计数
-        void Record(const std::string &prompt, int tokens, std::vector<std::pair<Data, Data> > *kv);
+        void Record(const std::vector <int> &inputToken, int tokens, std::vector<std::pair<Data, Data> > *kv);
 
         // 尝试删除一条记录，若引用计数非0不会真的删除
-        void Remove(std::string prompt);
+        void Remove(const std::vector <int> &inputToken);
 
         // 获取最长匹配的Memory，并加锁
-        PastKVCacheMemory *Get(const std::string &prompt);
+        PastKVCacheMemory *Get(const std::vector <int> &inputToken);
 
         // 解锁
         void Unlock();
@@ -172,6 +174,8 @@ namespace fastllm {
         virtual void SaveModel(const std::string &fileName); // 直接导出
 
         virtual void WarmUp() {}; // 预热
+
+        virtual void AddPromptCache(const std::vector <int> &inputTokens);
 
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input) = 0; // 根据历史信息和当前输入生成prompt
 
