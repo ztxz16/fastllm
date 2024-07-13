@@ -382,4 +382,13 @@ extern "C" {
         }
         return ret;
     }
+
+    DLL_EXPORT void add_cache_llm_model(int modelId, int len, int *values) {
+        std::vector <int> input;
+        for (int i = 0; i < len; i++) {
+            input.push_back(values[i]);
+        }
+        auto model = models.GetModel(modelId);
+        model->AddPromptCache(input);
+    }
 };
