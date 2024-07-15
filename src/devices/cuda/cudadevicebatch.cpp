@@ -255,9 +255,9 @@ namespace fastllm {
                             "CatDirect error: inputs should use same device.\n");
         AssertInFastLLM(input0s[0]->dims.size() == 0 || input0s[0]->dims.size() == input1s[0]->dims.size(),
                             "Cat Error: input's shape's size should be same.\n");
-        int dimsLen = input0s[0]->dims.size();
+        int dimsLen = input0s[1]->dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
-        for (int i = 0; i < dimsLen; i++) {
+        for (int i = 0; i < dimsLen && i < input0s[0]->dims.size(); i++) {
             if (i != axis) {
                 AssertInFastLLM(input0s[0]->dims[i] == input1s[0]->dims[i], "Cat Error: input's shape doesn't match.");
             }
