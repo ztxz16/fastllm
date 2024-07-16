@@ -32,8 +32,8 @@ if "messages" not in st.session_state:
 
 max_new_tokens = st.sidebar.slider("max_new_tokens", 0, 8192, 512, step = 1)
 top_p = st.sidebar.slider("top_p", 0.0, 1.0, 0.8, step = 0.01)
-top_k = st.sidebar.slider("top_k", 1, 100, 1, step = 1)
-temperature = st.sidebar.slider("temperature", 0.0, 2.0, 1.0, step = 0.01)
+top_k = st.sidebar.slider("top_k", 1, 50, 1, step = 1)
+temperature = st.sidebar.slider("temperature", 0.0, 10.0, 1.0, step = 0.1)
 repeat_penalty = st.sidebar.slider("repeat_penalty", 1.0, 10.0, 1.0, step = 0.05)
 
 buttonClean = st.sidebar.button("清理会话历史", key="clean")
