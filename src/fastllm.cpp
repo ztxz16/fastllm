@@ -1931,6 +1931,38 @@ namespace fastllm {
         return -1;
     }
 
+    // 已经做过repeat_penalty和topk，仅做采样
+    int LLMSamplingOnly(Data &logits, int outerOffset, const GenerationConfig &config) {
+        int maxTopKSize = logits.dims.back() / 2;
+        float *base = ((float*)logits.cpuData) + outerOffset * maxTopKSize * 2;
+        float invTemp = 1.0f / config.temperature;
+        int topk = config.top_k;
+        float psum = 0.0, maxValue = base[1];
+        std::vector <float> ps;
+        for (int i = 0; i < topk; i++) {
+            ps.push_back(expf(base[i * 2 + 1] - maxValue));
+            psum += ps.back();
+        }
+        float curSum = 0.0;
+        for (int i = 0; i < topk; i++) {
+            ps[i] /= psum;
+            curSum += ps[i];
+            if (curSum > config.top_p) {
+                topk = i + 1;
+                break;
+            }
+        }
+        float rnd = fastllmRandom.randP() * curSum;
+        curSum = 0.0;
+        for (int i = 0; i < topk; i++) {
+            curSum += ps[i];
+            if (curSum > rnd || i == topk - 1) {
+                return base[i * 2];
+            }
+        }
+        return -1;
+    }
+
     void WeightMap::LoadFromFile(const std::string &fileName) {
 #ifdef USE_MMAP
         std::shared_ptr<FileMmap> mapped_file = std::make_shared<FileMmap>(fileName);
@@ -2774,9 +2806,9 @@ namespace fastllm {
         }, {}, {{"rotaryDim", rotaryDim}});
     }
 
-    void RepeatPenalty(Data &input, const Data &penalty) {
+    void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale) {
         curExecutor->Run("RepeatPenalty", {
-                {"input", &input}, {"penalty", (Data*)&penalty}
+                {"input", &input}, {"penalty", (Data*)&penalty}, {"penaltyScale", (Data*)&penaltyScale}
         }, {}, {});
     }
 

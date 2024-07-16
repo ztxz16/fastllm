@@ -665,26 +665,77 @@ namespace fastllm {
             RMSNorm(hiddenStates, weight["transformer.encoder.final_layernorm.weight"], this->layernorm_epsilon, hiddenStates);
             Linear(hiddenStates, weight["transformer.output_layer.weight"], Data(), logits);
         }
+        
         ToDataType(logits, DataType::FLOAT32);
         std::vector <int> lastRet;
-        int total = 0;
-        Data curLogit;
+
+        bool allSimple = true, needLogits = false;
+        int maxTopK = 1;
         for (int b = 0; b < batch; b++) {
-            Split(logits, 0, total + seqLens[b] - 1, total + seqLens[b], curLogit);
-            if (generationConfigs[b].output_logits && retLogits != nullptr && (*retLogits)[b] != nullptr) {
-                curLogit.ToDevice(DataDevice::CPU);
-                (*retLogits)[b]->resize(curLogit.Count(0));
-                memcpy((float*)(*retLogits)[b]->data(), (float*)curLogit.cpuData, curLogit.GetBytes());
+            if (!generationConfigs[b].IsSimpleGreedy()) {
+                allSimple = false;
+                break;
             }
-            if (generationConfigs[b].IsSimpleGreedy()) {
-                Data topk;
-                TopK(curLogit, topk, 1);
-                topk.ToDevice(DataDevice::CPU);
-                lastRet.push_back((int) (((float *) topk.cpuData)[0] + 1e-3));
-            } else {
-                lastRet.push_back(LLMSampling(curLogit, 0, generationConfigs[b], lastTokens.units[b]));
+        }
+        for (int b = 0; b < batch; b++) {
+            needLogits |= generationConfigs[b].output_logits;
+            maxTopK = std::max(maxTopK, generationConfigs[b].top_k);
+        }
+
+        if (all1 && batch > 1 && allSimple) {
+            Data topk;
+            TopK(logits, topk, 1);
+            topk.ToDevice(DataDevice::CPU);
+            float *topkData = (float*)topk.cpuData;
+            for (int b = 0; b < batch; b++) {
+                lastRet.push_back((int) (topkData[0] + 1e-3));
+                topkData += topk.Count(2);
             }
-            total += seqLens[b];
+        } else if (all1 && batch > 1 && maxTopK <= 50 && !needLogits) {
+            int maxTokenSetSize = 0;
+            for (int b = 0; b < batch; b++) {
+                maxTokenSetSize = std::max(maxTokenSetSize, (int)lastTokens.units[b].tokenSet.size());
+            }
+            std::vector <float> penaltyData = std::vector <float> (batch * maxTokenSetSize, -100.0f);
+            std::vector <float> penaltyScaleData = std::vector <float> (batch, 1.0f);
+            for (int b = 0; b < batch; b++) {
+                int curId = 0;
+                for (int i : lastTokens.units[b].tokenSet) {
+                    penaltyData[b * maxTokenSetSize + curId] = i;
+                    curId++;
+                }
+                penaltyScaleData[b] = generationConfigs[b].repeat_penalty;
+            }
+            Data penalty, penaltyScale;
+            penalty.CopyFrom(Data(DataType::FLOAT32, {batch, maxTokenSetSize}, penaltyData));
+            penaltyScale.CopyFrom(Data(DataType::FLOAT32, {batch}, penaltyScaleData));
+            RepeatPenalty(logits, penalty, penaltyScale);
+            Data topk;
+            TopK(logits, topk, maxTopK);
+            topk.ToDevice(DataDevice::CPU);
+            for (int b = 0; b < batch; b++) {
+                lastRet.push_back(LLMSamplingOnly(topk, b, generationConfigs[b]));
+            }
+        } else {
+            int total = 0;
+            Data curLogit;
+            for (int b = 0; b < batch; b++) {
+                Split(logits, 0, total + seqLens[b] - 1, total + seqLens[b], curLogit);
+                if (generationConfigs[b].output_logits && retLogits != nullptr && (*retLogits)[b] != nullptr) {
+                    curLogit.ToDevice(DataDevice::CPU);
+                    (*retLogits)[b]->resize(curLogit.Count(0));
+                    memcpy((float*)(*retLogits)[b]->data(), (float*)curLogit.cpuData, curLogit.GetBytes());
+                }
+                if (generationConfigs[b].IsSimpleGreedy()) {
+                    Data topk;
+                    TopK(curLogit, topk, 1);
+                    topk.ToDevice(DataDevice::CPU);
+                    lastRet.push_back((int) (((float *) topk.cpuData)[0] + 1e-3));
+                } else {
+                    lastRet.push_back(LLMSampling(curLogit, 0, generationConfigs[b], lastTokens.units[b]));
+                }
+                total += seqLens[b];
+            }
         }
         return lastRet;
     }
