@@ -591,6 +591,20 @@ __global__ void FastllmApplyLognAttnKernel(float* input, float *logn, float *pos
 }
 
 template <int THREAD_PER_BLOCK>
+__global__ void FastllmRepeatPenaltyKernel(float* input, float *penalty, float *penaltyScaleData, int tokens, int vocabs) {
+    unsigned int bid = blockIdx.x;
+    input += bid * vocabs;
+    penalty += bid * tokens;
+    float scale = penaltyScaleData[bid];
+    for (int i = threadIdx.x; i < tokens; i += THREAD_PER_BLOCK) {
+        int token = (int)(penalty[i] + 1e-6);
+        if (token >= 0) {
+            input[token] = input[token] < 0 ? input[token] * scale : input[token] / scale;
+        }
+    }
+}
+
+template <int THREAD_PER_BLOCK>
 __global__ void FastllmTransposeByRowKernel(uint8_t *dst, uint8_t *ori, int n, int m, int k) {
     int row = blockIdx.x / m, col = blockIdx.x % m;
     uint8_t *curInput = ori + (row * m + col) * k;
@@ -1071,6 +1085,69 @@ __global__ void FastllmLayerNormKernelTop1(float *input, float *output, int chan
     if (tid == 0) {
         outputData[0] = idData[0];
         outputData[1] = maxData[0];
+    }
+}
+
+template <int THREAD_PER_BLOCK, int MAXK>
+__global__ void FastllmLayerNormKernelTopK(float *input, float *output, int K, int channels) {
+    __shared__ float idData[THREAD_PER_BLOCK][MAXK];
+    __shared__ float maxData[THREAD_PER_BLOCK][MAXK];
+    float *inputData = input + blockIdx.x * channels;
+    float *outputData = output + blockIdx.x * 2 * K;
+    int tid = threadIdx.x;
+    for (int i = 0; i < K; i++) {
+        maxData[tid][i] = -1e100;
+    }
+    for (int j = tid; j < channels; j += THREAD_PER_BLOCK) {
+        float cur = inputData[j];
+        for (int l = 0; l < K; l++) {
+            if (cur > maxData[tid][l]) {
+                for (int x = K - 1; x > l; x--) {
+                    maxData[tid][x] = maxData[tid][x - 1];
+                    idData[tid][x] = idData[tid][x - 1];
+                }
+                maxData[tid][l] = cur;
+                idData[tid][l] = j;
+                break;
+            }
+        }
+    }
+    __syncthreads();
+
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            int pos0 = 0, pos1 = 0;
+            while (pos0 + pos1 < K) {
+                if (maxData[tid][pos0] > maxData[tid + s][pos1]) {
+                    pos0++;
+                } else {
+                    pos1++;
+                }
+            }
+            pos0--;
+            pos1--;
+            int pos = K - 1;
+            while (pos >= 0) {
+                if (pos1 < 0 || (pos0 >= 0 && maxData[tid][pos0] < maxData[tid + s][pos1])) {
+                    maxData[tid][pos] = maxData[tid][pos0];
+                    idData[tid][pos] = idData[tid][pos0];
+                    pos0--;
+                } else {
+                    maxData[tid][pos] = maxData[tid + s][pos1];
+                    idData[tid][pos] = idData[tid + s][pos1];
+                    pos1--;
+                }
+                pos--;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        for (int i = 0; i < K; i++) {
+            outputData[i * 2] = idData[0][i];
+            outputData[i * 2 + 1] = maxData[0][i];
+        }
     }
 }
 
@@ -3189,8 +3266,8 @@ bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fast
 }
 
 bool FastllmCudaTopK(const fastllm::Data &input, fastllm::Data &output, int topk) {
-    if (topk != 1) {
-        printf("topk: unsupport topk > 1.");
+    if (topk > 50) {
+        printf("topk: unsupport topk > 50.");
         exit(0);
     }
 
@@ -3201,7 +3278,12 @@ bool FastllmCudaTopK(const fastllm::Data &input, fastllm::Data &output, int topk
     int outer = input.Count(0) / input.Count(dimsLen - 1);
     int channels = input.dims[dimsLen - 1];
 
-    FastllmLayerNormKernelTop1 <256> <<< outer, 256 >>> (cudaInput, cudaOutput, channels);
+    if (topk == 1) {
+        FastllmLayerNormKernelTop1 <256> <<< outer, 256 >>> (cudaInput, cudaOutput, channels);
+    } else {
+        FastllmLayerNormKernelTopK <64, 50> <<< outer, 64 >>> (cudaInput, cudaOutput, topk, channels);
+    }
+
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
@@ -3805,6 +3887,17 @@ bool FastllmCudaApplyLognAttn (fastllm::Data &input, fastllm::Data &lognAttn, fa
     int spatial = input.Count(2);
 
     FastllmApplyLognAttnKernel <256> <<<batch * seqLen, 256>>> (inputData, lognData, posData, batch, seqLen, spatial);
+    return true;
+}
+
+bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fastllm::Data &penaltyScale) {
+    float *inputData = (float*)input.cudaData;
+    float *penaltyData = (float*)penalty.cudaData;
+    float *penaltyScaleData = (float*)penaltyScale.cudaData;
+    int batch = penalty.dims[0], tokens = penalty.dims[1];
+    int vocabs = input.dims.back();
+
+    FastllmRepeatPenaltyKernel <64> <<<batch, 64>>> (inputData, penaltyData, penaltyScaleData, tokens, vocabs);
     return true;
 }
 

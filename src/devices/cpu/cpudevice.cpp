@@ -4362,14 +4362,24 @@ namespace fastllm {
                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &penalty = *(datas.find("penalty")->second);
-        AssertInFastLLM(input.dataType == DataType::FLOAT32 && penalty.dataType == DataType::FLOAT32,
+        Data &penaltyScale = *(datas.find("penaltyScale")->second);
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 && penalty.dataType == DataType::FLOAT32 && penaltyScale.dataType == DataType::FLOAT32,
                         "Repeat Penalty error: Data's type should be float32.\n");
         float *inputData = (float*)input.cpuData;
         float *penaltyData = (float*)penalty.cpuData;
+        float *penaltyScaleData = (float*)penaltyScale.cpuData;
 
-        int len = input.Count(0);
-        for (int i = 0; i < len; i++) {
-            inputData[i] = inputData[i] < 0 ? inputData[i] * penaltyData[i] : inputData[i] / penaltyData[i];
+        int batch = penalty.dims[0], tokens = penalty.dims[1];
+        int vocabs = input.dims.back();
+        for (int b = 0; b < batch; b++) {
+            float scale = penaltyScaleData[b];
+            for (int i = 0; i < tokens; i++) {
+                int token = (int)(penaltyData[b * tokens + i] + 1e-6);
+                if (token >= 0) {
+                    int id = b * vocabs + token;
+                    inputData[id] = inputData[id] < 0 ? inputData[id] * scale : inputData[id] / scale;
+                }
+            }
         }
     }
 
