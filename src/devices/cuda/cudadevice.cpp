@@ -38,6 +38,7 @@ namespace fastllm {
         this->ops["RotatePosition2D"] = (BaseOperator*)(new CudaRotatePosition2DOp());
         this->ops["NearlyRotatePosition2D"] = (BaseOperator*)(new CudaNearlyRotatePosition2DOp());
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CudaLlamaRotatePosition2DOp());
+        this->ops["RepeatPenalty"] = (BaseOperator*)(new CudaRepeatPenaltyOp());
         this->ops["ApplyLognAttn"] = (BaseOperator*)(new CudaApplyLognAttnOp());
 
         this->ops["SplitBatch"] = (BaseOperator*)(new CudaSplitBatchOp());
@@ -665,8 +666,7 @@ namespace fastllm {
         int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
 
         AssertInFastLLM(input.dataType == DataType::FLOAT32, "TopK error: Data's type should be float32.\n");
-        AssertInFastLLM(topk == 1, "Unsupport topk > 1.");
-
+        
         int dimsLen = input.dims.size();
         std::vector<int> dims = input.dims;
         dims[dimsLen - 1] = topk * 2;
@@ -678,7 +678,7 @@ namespace fastllm {
     bool CudaTopKOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
-        if (topk != 1) {
+        if (topk > 50) {
             return false;
         }
         return true;
@@ -754,6 +754,16 @@ namespace fastllm {
         int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
 
         FastllmCudaLlamaRotatePosition2D(data, positionIds, sinData, cosData, rotaryDim);
+    }
+
+    void CudaRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &penalty = *(datas.find("penalty")->second);
+        Data &penaltyScale = *(datas.find("penaltyScale")->second);
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 && penalty.dataType == DataType::FLOAT32 && penaltyScale.dataType == DataType::FLOAT32,
+                        "Repeat Penalty error: Data's type should be float32.\n");
+        FastllmCudaRepeatPenalty(input, penalty, penaltyScale);
     }
 
     void CudaApplyLognAttnOp::Run(const std::string &opType, const fastllm::DataDict &datas,
