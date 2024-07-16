@@ -510,6 +510,8 @@ namespace fastllm {
 
     void ApplyDeviceMap(const std::map <std::string, int> &deviceMap, int current, int total); // 执行到了current, 一共total，使用deviceMap切换设备
 
+    int LLMSamplingOnly(Data &logits, int outerOffset, const GenerationConfig &config);
+
     int LLMSampling(Data &logits, int outerOffset,
                     const GenerationConfig &config, const LastTokensUnit &tokens); // 对logits里[outerOffset * vocabSize, (outerOffset + 1) * vocabSize]做Sampling
 
@@ -595,7 +597,7 @@ namespace fastllm {
 
     void LlamaRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position for llama
 
-    void RepeatPenalty(Data &input, const Data &penalty); // 惩罚，input[i] = input[i] < 0 ? input[i] * penalty[i] : input[i] / penalty[i];
+    void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale); // 重复惩罚
 
     void ApplyLognAttn(Data &input, const Data &lognAttn, const Data &positionIds);
 

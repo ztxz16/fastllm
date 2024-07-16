@@ -819,12 +819,17 @@ namespace fastllm {
         std::vector <int> lastRet;
         int total = 0;
 
-        bool allSimple = true;
+        bool allSimple = true, needLogits = false;
+        int maxTopK = 1;
         for (int b = 0; b < batch; b++) {
             if (!generationConfigs[b].IsSimpleGreedy()) {
                 allSimple = false;
                 break;
             }
+        }
+        for (int b = 0; b < batch; b++) {
+            needLogits |= generationConfigs[b].output_logits;
+            maxTopK = std::max(maxTopK, generationConfigs[b].top_k);
         }
 
         if (all1 && batch > 1 && allSimple) {
@@ -835,6 +840,31 @@ namespace fastllm {
             for (int b = 0; b < batch; b++) {
                 lastRet.push_back((int) (topkData[0] + 1e-3));
                 topkData += topk.Count(2);
+            }
+        } else if (all1 && batch > 1 && maxTopK <= 50 && !needLogits) {
+            int maxTokenSetSize = 0;
+            for (int b = 0; b < batch; b++) {
+                maxTokenSetSize = std::max(maxTokenSetSize, (int)lastTokens.units[b].tokenSet.size());
+            }
+            std::vector <float> penaltyData = std::vector <float> (batch * maxTokenSetSize, -100.0f);
+            std::vector <float> penaltyScaleData = std::vector <float> (batch, 1.0f);
+            for (int b = 0; b < batch; b++) {
+                int curId = 0;
+                for (int i : lastTokens.units[b].tokenSet) {
+                    penaltyData[b * maxTokenSetSize + curId] = i;
+                    curId++;
+                }
+                penaltyScaleData[b] = generationConfigs[b].repeat_penalty;
+            }
+            Data penalty, penaltyScale;
+            penalty.CopyFrom(Data(DataType::FLOAT32, {batch, maxTokenSetSize}, penaltyData));
+            penaltyScale.CopyFrom(Data(DataType::FLOAT32, {batch}, penaltyScaleData));
+            RepeatPenalty(logits, penalty, penaltyScale);
+            Data topk;
+            TopK(logits, topk, maxTopK);
+            topk.ToDevice(DataDevice::CPU);
+            for (int b = 0; b < batch; b++) {
+                lastRet.push_back(LLMSamplingOnly(topk, b, generationConfigs[b]));
             }
         } else {
             if (all1 && batch > 1) {
