@@ -9,6 +9,8 @@ def make_normal_parser(des: str) -> argparse.ArgumentParser:
     parser.add_argument('--dtype', type = str, default = "float16", help = '权重类型（读取HF模型时有效）')
     parser.add_argument('--atype', type = str, default = "float32", help = '推理类型，可使用float32或float16')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
+    parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
+    parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--device', type = str, help = '使用的设备')
     return parser
 
@@ -29,4 +31,8 @@ def make_normal_llm_model(args):
         llm.set_cuda_embedding(True)
     model = llm.model(args.path, dtype = args.dtype, tokenizer_type = "auto")
     model.set_atype(args.atype)
+    if (args.max_batch > 0):
+        model.set_max_batch(args.max_batch)
+    if (args.kv_cache_limit != "" and args.kv_cache_limit != "auto"):
+        model.set_kv_cache_limit(args.kv_cache_limit)
     return model

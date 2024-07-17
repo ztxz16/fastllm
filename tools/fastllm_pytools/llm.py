@@ -76,6 +76,15 @@ fastllm_lib.set_device_map.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_ch
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
 
+fastllm_lib.set_kv_cache_limit_llm_model.argtypes = [ctypes.c_int, ctypes.c_int64]
+
+fastllm_lib.set_max_batch_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+
+fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
+
+fastllm_lib.get_max_input_len_llm_model.argtypes = [ctypes.c_int]
+fastllm_lib.get_max_input_len_llm_model.restype = ctypes.c_int
+
 def set_cpu_threads(threads: int):
     fastllm_lib.set_cpu_threads(threads);
 
@@ -841,7 +850,32 @@ class model:
         fastllm_lib.release_memory(self.model)
     
     def set_save_history(self, save: bool):
-        fastllm_lib.set_save_history(self.model, save);
+        fastllm_lib.set_save_history(self.model, save)
 
     def set_atype(self, atype: str):
-        fastllm_lib.set_model_atype(self.model, str(atype).encode());
+        fastllm_lib.set_model_atype(self.model, str(atype).encode())
+
+    def set_kv_cache_limit(self, limit: str):
+        limit_bytes = 0
+        try:
+            if (limit.endswith('k') or limit.endswith('K')):
+                limit_bytes = int(limit[:-1]) * 1024
+            elif (limit.endswith('m') or limit.endswith('M')):
+                limit_bytes = int(limit[:-1]) * 1024 * 1024
+            elif (limit.endswith('g') or limit.endswith('G')):
+                limit_bytes = int(limit[:-1]) * 1024 * 1024 * 1024
+            else:
+                limit_bytes = int(limit[:-1])
+        except:
+            print('set_kv_cache_limit error, param should be like "10k" or "10m" or "1g"')
+            exit(0)
+        fastllm_lib.set_kv_cache_limit_llm_model(self.model, ctypes.c_int64(limit_bytes))
+    
+    def set_max_batch(self, batch: int):
+        fastllm_lib.set_max_batch_llm_model(self.model, batch)
+    
+    def set_verbose(self, verbose: int):
+        fastllm_lib.set_verbose_llm_model(self.model, verbose)
+    
+    def get_max_input_len(self):
+        return fastllm_lib.get_max_input_len_llm_model(self.model)
