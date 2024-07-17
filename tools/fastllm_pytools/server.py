@@ -62,6 +62,7 @@ if __name__ == "__main__":
     args = parse_args()
     logging.info(args)
     model = make_normal_llm_model(args)
+    model.set_verbose(True)
     fastllm_completion = FastLLmCompletion(model_name = args.model_name,
                                            model = model)
     uvicorn.run(app, host = args.host, port = args.port)
