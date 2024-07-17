@@ -110,6 +110,37 @@ cublasHandle_t getFastllmCublasHandle() {
     return handler;
 }
 
+std::vector <long long> FastllmCudaGetFreeSizes() {
+    int deviceCount;
+    auto error = cudaGetDeviceCount(&deviceCount);
+    if (error != cudaSuccess) {
+        printf("cudaGetDeviceCount returned %d\n-> %s\n", (int)error, cudaGetErrorString(error));
+        return {};
+    }
+    std::vector <long long> ret;
+    
+    // 遍历所有设备
+    for (int i = 0; i < deviceCount; ++i) {
+        cudaDeviceProp prop;
+        error = cudaGetDeviceProperties(&prop, i);
+        if (error == cudaSuccess) {
+            // printf("Device %d: \"%s\"\n", i, prop.name);
+            // printf("  Compute capability: %d.%d\n", prop.major, prop.minor);
+            // printf("  Total global memory: %zu bytes\n", prop.totalGlobalMem);
+            
+            // 获取当前设备的显存使用情况
+            size_t free = 0, total = 0;
+            cudaMemGetInfo(&free, &total);
+            ret.push_back(free);
+            // printf("  Free memory: %zu bytes\n", free);
+            // printf("  Remaining memory: %zu bytes\n", total - free);
+        } else {
+            printf("cudaGetDeviceProperties returned %d\n-> %s\n", (int)error, cudaGetErrorString(error));
+        }
+    }
+    return ret;
+}
+
 __global__ void GetCudaInfoKernel(int *infos) {
 #if defined(__CUDA_ARCH__)
     infos[0] = __CUDA_ARCH__;
