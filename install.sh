@@ -8,8 +8,11 @@ fi
 
 cd $folder
 cmake .. "$@"
-make -j
+make -j$(nproc)
+
+if [ $? == 0 ]; then
 cd tools
 python3 setup.py sdist build
 python3 setup.py bdist_wheel
 python3 setup.py install
+fi
