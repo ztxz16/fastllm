@@ -240,6 +240,11 @@ namespace fastllm {
         std::vector<std::pair<Data, Data> > *lastKeyValues = nullptr;
         int lastPromptTokens = 0;
         
+        long long elementsInKVCachePerToken = -1; // 每个token使用多少个元素的的KVCache
+        long long kvCacheLimit = -1;
+        int maxBatch = -1;
+        bool verbose = false;
+
         DataType dataType = DataType::FLOAT32;
         bool isFree = false; // 是否释放
     };
