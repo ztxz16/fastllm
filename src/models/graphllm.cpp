@@ -321,6 +321,9 @@ namespace fastllm {
                                                    Data(DataType::FLOAT32)));
         }
         Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+        elementsInKVCachePerToken = (long long)block_cnt * 
+            (pastKeyValues[0].first.dims[0] * pastKeyValues[0].first.dims[2] + 
+             pastKeyValues[0].second.dims[0] * pastKeyValues[0].second.dims[2]);
         printf("finish.\n");
     }
 

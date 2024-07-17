@@ -486,6 +486,40 @@ namespace fastllm {
         if (mainLoop == nullptr) {
             if (mainLoop == nullptr) {
                 mainLoop = new std::thread([](basellm *model) {
+                    long long kvCacheLimit = 16LL << 30;
+#ifdef USE_CUDA
+                    auto freeSizes = FastllmCudaGetFreeSizes();
+                    kvCacheLimit = 0;
+                    for (long long i : freeSizes) {
+                        kvCacheLimit += std::max(0LL, i - (2LL << 30));
+                    }
+#endif
+                    if (model->kvCacheLimit > 0) {
+                        kvCacheLimit = model->kvCacheLimit;
+                    }
+
+                    int unitSize = (model->dataType == DataType::FLOAT32 ? 4 : 2);
+                    int maxTotalLens = kvCacheLimit / (model->elementsInKVCachePerToken * unitSize);
+                    if (model->tokensLimit > 0) {
+                        maxTotalLens = model->tokensLimit;
+                    }
+
+                    int maxBatch = std::max(1, std::min(512, maxTotalLens / 128));
+                    if (model->maxBatch > 0) {
+                        maxBatch = model->maxBatch;
+                    }
+                    
+                    model->tokensLimit = maxTotalLens;
+
+                    model->verbose = true;
+                    if (model->verbose) {
+                        printf("Fastllm KV Cache Limit: %f MB.\n", (double)kvCacheLimit / 1024 / 1024);
+                        printf("Fastllm KV Cache Token limit: %d tokens.\n", maxTotalLens);
+                        printf("Fastllm Batch limit: %d.\n", maxBatch);
+                    }
+
+                    auto lastRecordTime = std::chrono::system_clock::now();
+                    long long genTokens = 0;
                     while (true) {
                         if (model->isFree) {
                             break;
@@ -502,10 +536,12 @@ namespace fastllm {
                         
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
 
-                        int limit = model->tokensLimit > 0 ? model->tokensLimit : 1e9;
+                        int limit = maxTotalLens;
+                        int promptLimit = limit * 2 / 3;
+
                         int lenSum = 0;
                         for (auto &it: model->responseContextDict.dicts) {
-                            if (it.second->pastKeyValues[0].first.expansionDims.size() > 0 && !it.second->isEnding) {
+                            if (it.second->pastKeyValues[0].first.expansionDims.size() > 0) {
                                 lenSum += it.second->pastKeyValues[0].first.expansionDims[1];
                             }
                         }
@@ -515,7 +551,7 @@ namespace fastllm {
                             if (isPrompt == 0 && seqLens.size() > 0) {
                                 continue;
                             }
-                            if (lenSum > limit && isPrompt) {
+                            if (lenSum >= promptLimit && isPrompt) {
                                 continue;
                             }
 
@@ -532,8 +568,22 @@ namespace fastllm {
 
                                 int outputLimit = it.second->generationConfig.output_token_limit;
                                 outputLimit = (outputLimit < 0 ? 128 : outputLimit);
-                                if (isPrompt && lenSum + it.second->currentTokens.size() + outputLimit > limit) {
+                                if (isPrompt && lenSum + it.second->currentTokens.size() > promptLimit) {
                                     continue;
+                                }
+
+                                if (!isPrompt) {
+                                    if (it.second->pastKeyValues[0].first.expansionDims[1] == it.second->pastKeyValues[0].first.dims[1]) {
+                                        int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;                                        
+                                        int predictLen = 256;
+                                        if (sur > 0) {
+                                            predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
+                                        }
+                                        if (lenSum + predictLen > limit) {
+                                            continue;
+                                        }
+                                        lenSum += predictLen;
+                                    }
                                 }
 
                                 generationConfigs.push_back(it.second->generationConfig);
@@ -593,6 +643,10 @@ namespace fastllm {
                                     }
                                     // break;
                                 }
+
+                                if (seqLens.size() >= maxBatch || lenSum + seqLens.size() * 128 > limit) {
+                                    break;
+                                }
                             }
                         }
                         if (seqLens.size() > 0) {
@@ -633,6 +687,7 @@ auto st = std::chrono::system_clock::now();
                                                                         *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
                                 }
                             }
+                            
 
 //PrintProfiler();
 /*int total = 0;
@@ -640,6 +695,17 @@ for (int i : seqLens) total += i;
 float spend = GetSpan(st, std::chrono::system_clock::now());
 printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)total / spend);
 */
+                            if (model->verbose) {
+                                genTokens += seqLens.size();
+                                auto nowTime = std::chrono::system_clock::now();
+                                float spend = GetSpan(lastRecordTime, nowTime);
+                                if (spend > 1) {
+                                    printf("Current batch: %d, Speed: %f tokens / s.\n", (int)seqLens.size(), (float)genTokens / spend);
+                                    lastRecordTime = nowTime;
+                                    genTokens = 0;
+                                }
+                            }
+
                             dictLocker.lock();
                             for (int i = 0; i < handles.size(); i++) {
                                 auto &it = *model->responseContextDict.dicts.find(handles[i]);
