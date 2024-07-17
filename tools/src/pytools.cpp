@@ -391,4 +391,24 @@ extern "C" {
         auto model = models.GetModel(modelId);
         model->AddPromptCache(input);
     }
+
+    DLL_EXPORT void set_kv_cache_limit_llm_model(int modelId, long long bytes) {
+        auto model = models.GetModel(modelId);
+        model->kvCacheLimit = bytes;
+    }
+
+    DLL_EXPORT void set_max_batch_llm_model(int modelId, int batch) {
+        auto model = models.GetModel(modelId);
+        model->maxBatch = batch;
+    }
+
+    DLL_EXPORT void set_verbose_llm_model(int modelId, bool verbose) {
+        auto model = models.GetModel(modelId);
+        model->verbose = verbose;
+    }
+
+    DLL_EXPORT int get_max_input_len_llm_model(int modelId) {
+        auto model = models.GetModel(modelId);
+        return model->max_positions;
+    }
 };
