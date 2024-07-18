@@ -25,11 +25,13 @@ st.set_page_config(
 def get_model():
     args = parse_args()
     model = make_normal_llm_model(args)
+    model.set_verbose(True)
     return model
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+system_prompt = st.sidebar.text_input("system_prompt", "")
 max_new_tokens = st.sidebar.slider("max_new_tokens", 0, 8192, 512, step = 1)
 top_p = st.sidebar.slider("top_p", 0.0, 1.0, 0.8, step = 0.01)
 top_k = st.sidebar.slider("top_k", 1, 50, 1, step = 1)
@@ -55,8 +57,15 @@ if prompt := st.chat_input("请开始对话"):
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         full_response = ""
-        for chunk in model.stream_response(prompt, 
-                                           st.session_state.messages, 
+        messages = []
+        if system_prompt != "":
+            messages.append({"role": "system", "content": system_prompt})
+        for his in st.session_state.messages:
+            messages.append({"role": "user", "content": his[0]})
+            messages.append({"role": "assistant", "content": his[1]})
+        messages.append({"role": "user", "content": prompt})
+
+        for chunk in model.stream_response(messages,
                                            max_length = max_new_tokens,
                                            top_k = top_k,
                                            top_p = top_p,
