@@ -10,9 +10,12 @@ cd $folder
 cmake .. "$@"
 make -j$(nproc)
 
-if [ $? == 0 ]; then
+#编译失败停止执行
+if [ $? != 0 ]; then
+    exit -1
+fi
+
 cd tools
 python3 setup.py sdist build
 python3 setup.py bdist_wheel
 python3 setup.py install
-fi
