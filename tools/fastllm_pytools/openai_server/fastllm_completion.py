@@ -104,34 +104,9 @@ class FastLLmCompletion:
           # fastllm 样例中history只能是一问一答, system promt 暂时不支持
           if len(conversation) == 0:
             raise Exception("Empty msg")
-
-          for i in range(len(conversation)):
-            msg = conversation[i]
-            if msg.role == "system":
-              # fastllm 暂时不支持system prompt
-              continue
-            elif msg.role == "user":
-              if i + 1 < len(conversation):
-                next_msg = conversation[i + 1]
-                if next_msg.role == "assistant":
-                  history.append((msg.content, next_msg.content))
-                else:
-                  # 只能是user、assistant、user、assistant的格式
-                  raise Exception("fastllm requires that the prompt words must appear alternately in the roles of user and assistant.")
-            elif msg.role == "assistant":
-              if i - 1 < 0:
-                raise Exception("fastllm Not Support assistant prompt in first message")
-              else:
-                pre_msg = conversation[i - 1]
-                if pre_msg.role != "user":
-                  raise Exception("In FastLLM, The message role before the assistant msg must be user")
-            else:
-              raise NotImplementedError(f"prompt role {msg.role } not supported yet")
-            
-          last_msg = conversation[-1]
-          if last_msg.role != "user":
-            raise Exception("last msg role must be user")
-          query = last_msg.content
+          messages = []
+          for msg in conversation:
+            messages.append({"role": msg.role, "content": msg.content})
 
       except Exception as e:
           logging.error("Error in applying chat template from request: %s", e)
@@ -147,11 +122,10 @@ class FastLLmCompletion:
       max_length = request.max_tokens if request.max_tokens else 8192
       input_token_len = 0; # self.model.get_input_token_len(query, history)
       #logging.info(request)
-      logging.info(f"fastllm input: {query}")
-      logging.info(f"fastllm history: {history}")
+      logging.info(f"fastllm input message: {messages}")
       #logging.info(f"input tokens: {input_token_len}")
       # stream_response 中的结果不包含token的统计信息
-      result_generator = self.model.stream_response_async(query, history, 
+      result_generator = self.model.stream_response_async(messages,
                         max_length = max_length, do_sample = True,
                         top_p = request.top_p, top_k = request.top_k, temperature = request.temperature,
                         repeat_penalty = frequency_penalty, one_by_one = True)
