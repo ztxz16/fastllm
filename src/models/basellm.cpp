@@ -510,8 +510,6 @@ namespace fastllm {
                     }
                     
                     model->tokensLimit = maxTotalLens;
-
-                    model->verbose = true;
                     if (model->verbose) {
                         printf("Fastllm KV Cache Limit: %f MB.\n", (double)kvCacheLimit / 1024 / 1024);
                         printf("Fastllm KV Cache Token limit: %d tokens.\n", maxTotalLens);
