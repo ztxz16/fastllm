@@ -415,6 +415,31 @@ class model:
         # 由于token数量有限且不太多，所以缓存该结果来减少调用较为适合。
         # 不做成自动缓存是为了避免在多线程调用的时候对缓存dict加锁，同时也为不同场景提供选择空间
         self.tokenizer_decode_token_cache = None
+    
+    def apply_chat_template(
+        self,
+        conversation: List[Dict[str, str]],
+        chat_template: Optional[str] = None,
+        add_generation_prompt: bool = False,
+        **kwargs,
+    ) -> str:
+        messages = []
+        for it in conversation:
+            if it["role"] == "system":
+                messages += ["system", it["content"]]
+        for it in conversation:
+            if it["role"] != "system":
+                messages += [it["role"], it["content"]]
+        poss = []
+        lens = []
+        all = b''
+        for i in range(len(messages)):
+            messages[i] = messages[i].encode()
+            all += messages[i]
+            poss.append(0 if i == 0 else poss[-1] + lens[-1])
+            lens.append(len(messages[i]))
+        str = fastllm_lib.apply_chat_template(self.model, all, len(messages), (ctypes.c_int * len(poss))(*poss), (ctypes.c_int * len(lens))(*lens)).decode()
+        return str
 
     def generate(
         self,
@@ -611,32 +636,57 @@ class model:
         return ret;
 
     def stream_response(self,
-                        query: str,
+                        query: Union[str, List[Dict[str, str]]],
                         history: List[Tuple[str, str]] = None,
                         max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
-                        one_by_one = True, stop_token_ids: List[int] = None):
+                        one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True):
+        conversation = None
+        if (isinstance(query, List)):
+            conversation = query
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
-            lastlen = 0
-            for cur in self.stream_chat(tokenizer = self.hf_tokenizer,
-                                      query = query,
-                                      history = history,
-                                      max_length = max_length,
-                                      do_sample = do_sample,
-                                      top_p = top_p, top_k = top_k,
-                                      temperature = temperature,
-                                      repeat_penalty = repeat_penalty,
-                                      stop_token_ids = stop_token_ids):
-                if one_by_one:
-                    ret = cur[0][lastlen:]
-                    if (ret.encode().find(b'\xef\xbf\xbd') == -1):
-                        lastlen = len(cur[0])
-                        yield ret
-                    else:
-                        yield ""
+            tokenizer = self.hf_tokenizer
+            type = None
+            if (hasattr(tokenizer, "name") 
+                and tokenizer.name == "GLMTokenizer" 
+                and hasattr(tokenizer, "build_chat_input")):
+                type = "ChatGLM3"
+            if (not(history)):
+                history = [];
+            if (type == "ChatGLM3"):
+                input = tokenizer.build_chat_input(query, history=history)["input_ids"].reshape(-1).tolist()
+            else:
+                prompt = ""
+                if (conversation != None and len(conversation) != 0):
+                    prompt = tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = False)
                 else:
-                    yield cur[0]
+                    prompt = query if self.direct_query else self.get_prompt(query, history)
+                input = tokenizer.encode(prompt)
+            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+            handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
+                                                        max_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                        False, stop_token_len, stop_token_list)
+            tokens = [];
+            while True:
+                if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
+                    continue
+                cur = fastllm_lib.fetch_response_llm_model(self.model, handle)
+                if (cur == -1):
+                    break
+                tokens.append(cur)
+                ret = tokenizer.decode(tokens)
+                if (ret.encode().find(b'\xef\xbf\xbd') == -1):
+                    tokens.clear()
+                    yield ret
+                else:
+                    yield ""
+            if len(tokens) > 0:
+                yield tokenizer.decode(tokens)
         else:
-            prompt = query if self.direct_query else self.get_prompt(query, history);
+            prompt = ""
+            if (conversation != None and len(conversation) != 0):
+                prompt = self.apply_chat_template(conversation)
+            else:
+                prompt = query if self.direct_query else self.get_prompt(query, history)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids);
             handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
                                                             ctypes.c_int(max_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
@@ -677,10 +727,13 @@ class model:
             exit(0)
     
     async def stream_response_async(self,
-                        query: str,
+                        query: Union[str, List[Dict[str, str]]],
                         history: List[Tuple[str, str]] = None,
                         max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
-                        one_by_one = True, stop_token_ids: List[int] = None):
+                        one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True):
+        conversation = None
+        if (isinstance(query, List)):
+            conversation = query
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             tokenizer = self.hf_tokenizer
             type = None
@@ -693,12 +746,16 @@ class model:
             if (type == "ChatGLM3"):
                 input = tokenizer.build_chat_input(query, history=history)["input_ids"].reshape(-1).tolist()
             else:
-                prompt = query if self.direct_query else self.get_prompt(query, history);
-                input = tokenizer.encode(prompt);
+                prompt = ""
+                if (conversation != None and len(conversation) != 0):
+                    prompt = tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = False)
+                else:
+                    prompt = query if self.direct_query else self.get_prompt(query, history)
+                input = tokenizer.encode(prompt)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                         max_length, do_sample, top_p, top_k, temperature, repeat_penalty,
-                                                        False, stop_token_len, stop_token_list);
+                                                        False, stop_token_len, stop_token_list)
             tokens = [];
             while True:
                 if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
@@ -717,38 +774,42 @@ class model:
             if len(tokens) > 0:
                 yield tokenizer.decode(tokens)
         else:
-            prompt = query if self.direct_query else self.get_prompt(query, history);
-            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids);
+            prompt = ""
+            if (conversation != None and len(conversation) != 0):
+                prompt = self.apply_chat_template(conversation)
+            else:
+                prompt = query if self.direct_query else self.get_prompt(query, history)
+            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
                                                             ctypes.c_int(max_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
                                                             ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
-                                                            stop_token_len, stop_token_list);
-            res = "";
-            ret = b'';
-            fail_cnt = 0;
+                                                            stop_token_len, stop_token_list)
+            res = ""
+            ret = b''
+            fail_cnt = 0
             while True:
                 if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
                     await asyncio.sleep(0)
                     continue
-                ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle);
-                cur = "";
+                ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
+                cur = ""
                 try:
-                    cur = ret.decode();
-                    ret = b'';
+                    cur = ret.decode()
+                    ret = b''
                 except:
-                    fail_cnt += 1;
+                    fail_cnt += 1
                     if (fail_cnt == 20):
-                        break;
+                        break
                     else:
-                        continue;
-                fail_cnt = 0;
+                        continue
+                fail_cnt = 0
                 if (cur == "<flmeos>"):
-                    break;
+                    break
                 if one_by_one:
-                    yield cur;
+                    yield cur
                 else:
-                    res += cur;
-                    yield res;
+                    res += cur
+                    yield res
 
     def stream_response_raw(self,
                             input_tokens: List[int],
