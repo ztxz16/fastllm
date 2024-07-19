@@ -110,6 +110,14 @@ extern "C" {
         return id;
     }
 
+    DLL_EXPORT int create_llm_model_fromhf_with_config(char *path, int dataType, int groupCnt, bool skipTokenizer, char *config) {
+        models.locker.lock();
+        int id = models.models.size();
+        models.models[id] = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt, skipTokenizer, (std::string)config);
+        models.locker.unlock();
+        return id;
+    }
+
     DLL_EXPORT int create_llm_tokenizer_fromhf(char *path) {
         models.locker.lock();
         int id = models.models.size();
