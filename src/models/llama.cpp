@@ -422,7 +422,7 @@ namespace fastllm {
                     Silu(q, q);
                 }
                 Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), v);
-                MulTo(v, q);
+                MulTo(q, v);
             }
             Linear(q, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), k);
             AddTo(hiddenStates, k);
