@@ -190,6 +190,8 @@ namespace fastllm {
             model = (basellm*)(new GLMModel());
         } else if (modelType == "bert") {
             model = (basellm*)(new BertModel());
+        } else if (modelType == "fastllmJson") {
+            model = new GraphLLMModel("fastllmJson");
         } else {
             model = new GraphLLMModel(modelType);
         }
@@ -514,7 +516,9 @@ namespace fastllm {
 
     // 从hf文件夹读取，仅支持safetensor格式的模型
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
-                                                    DataType linearDataType, int groupCnt, bool skipTokenizer) {
+                                                    DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig) {
+        bool isJsonModel = (modelConfig.size() > 0);
+
         std::string path = modelPath;
         if (path.back() != '/' || path.back() != '\\') {
             path += "/";
@@ -537,7 +541,10 @@ namespace fastllm {
         // 2. 创建网络基本信息
         std::string configFile = path + "config.json";
         auto config = json11::Json::parse(ReadAllFile(configFile), error);
-        basellm *model = CreateModelWithType(config["model_type"].string_value());
+        basellm *model = CreateModelWithType(isJsonModel ? "fastllmJson" : config["model_type"].string_value());
+        if (isJsonModel) {
+            ((GraphLLMModel*)model)->graphLLMModelConfig->Init(modelConfig);
+        }
         for (auto &it : config.object_items()) {
             model->weight.AddDict(it.first, it.second.is_string() ? it.second.string_value() : it.second.dump());
         }

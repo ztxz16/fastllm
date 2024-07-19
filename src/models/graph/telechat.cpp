@@ -107,7 +107,7 @@ namespace fastllm {
                 graph.DataTypeAs(hiddenStates, atype);
                 for (int i = 0; i < model->block_cnt; i++) {
                     std::string pre = "transformer.h." + std::to_string(i);
-                    ComputeGraphNode pastKey("pastKey_" + std::to_string(i)), pastValue("pastValue_" + std::to_string(i));
+                    ComputeGraphNode pastKey("pastKey." + std::to_string(i)), pastValue("pastValue." + std::to_string(i));
                     graph.RMSNorm(hiddenStates, wNodes[pre + ".ln_1.weight"], model->rms_norm_eps, attenInput);
                     graph.Linear(attenInput, wNodes[pre + ".attn.c_attn.weight"], wNodes[pre + ".attn.c_attn.bias"], qkv);
                     graph.ExpandHead(qkv, model->head_dim);
@@ -145,7 +145,7 @@ namespace fastllm {
                 graph.DataTypeAs(hiddenStates, atype);
                 for (int i = 0; i < model->block_cnt; i++) {
                     std::string pre = "transformer.h." + std::to_string(i);
-                    ComputeGraphNode pastKey("pastKey_" + std::to_string(i)), pastValue("pastValue_" + std::to_string(i));
+                    ComputeGraphNode pastKey("pastKey." + std::to_string(i)), pastValue("pastValue." + std::to_string(i));
                     graph.RMSNorm(hiddenStates, wNodes[pre + ".input_layernorm.weight"], model->rms_norm_eps, attenInput);
                     graph.Linear(attenInput, wNodes[pre + ".self_attention.query.weight"], wNodes[pre + ".self_attention.query.bias"], q);
                     graph.Linear(attenInput, wNodes[pre + ".self_attention.key_value.weight"], wNodes[pre + ".self_attention.key_value.bias"], kv);

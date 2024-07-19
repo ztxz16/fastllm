@@ -500,6 +500,9 @@ namespace fastllm {
 
                     int unitSize = (model->dataType == DataType::FLOAT32 ? 4 : 2);
                     int maxTotalLens = kvCacheLimit / (model->elementsInKVCachePerToken * unitSize);
+                    if (model->elementsInKVCachePerToken <= 0) {
+                        maxTotalLens = kvCacheLimit / 1024 / 1024;
+                    }
                     if (model->tokensLimit > 0) {
                         maxTotalLens = model->tokensLimit;
                     }
