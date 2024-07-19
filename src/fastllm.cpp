@@ -31,7 +31,10 @@
 #endif
 
 #ifdef USE_CUDA
-#include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
+#ifdef USE_ASCEND_NPU
+#include "devices/ascend/fastllm-acl.h"
 #endif
 
 #ifdef PY_API
@@ -455,6 +458,11 @@ namespace fastllm {
 #else
             ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif
+#ifdef USE_ASCEND_NPU
+            this->deviceData = ptr;
+#else
+            ErrorInFastLLM("Error: Ascend CL is not supported.\n");
+#endif
         }
     }
 
@@ -483,6 +491,12 @@ namespace fastllm {
 #else
             ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif
+#ifdef USE_ASCEND_NPU
+        } else if (this->dataDevice == DataDevice::NPU) {
+            this->deviceData = (void*)((uint8_t*)ori.deviceData + offset);
+#else
+            ErrorInFastLLM("Error: Ascend CL is not supported.\n");
+#endif
         }
     }
 
@@ -509,6 +523,11 @@ namespace fastllm {
                     FastllmCudaFree(this->cudaData);
                     this->cudaData = nullptr;
 #endif
+                } else if (this->dataDevice == DataDevice::NPU) {
+#ifdef USE_ASCEND_NPU
+                    npu::FastllmAclFree(this->deviceData);
+                    this->deviceData = nullptr;
+#endif
                 }
                 return;
             }
@@ -531,6 +550,10 @@ namespace fastllm {
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             FastllmCudaCopyFromDeviceToDevice(this->cudaData, ori.cudaData, this->GetBytes());
+#endif
+        } else if (this->dataDevice == DataDevice::NPU) {
+#ifdef USE_ASCEND_NPU
+            npu::FastllmAclCopyFromDeviceToDevice(this->deviceData, ori.deviceData, this->GetBytes());
 #endif
         }
     }
@@ -1162,6 +1185,17 @@ namespace fastllm {
 #else
             ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif
+        } else if (this->dataDevice == DataDevice::NPU) {
+#ifdef USE_ASCEND_NPU
+            npu::FastllmAclSetDevice(0);
+            if (this->directMemory) {
+                this->deviceData = npu::FastllmAclDirectMalloc(this->expansionBytes);
+            } else {
+                this->deviceData = npu::FastllmAclMalloc(this->expansionBytes);
+            }
+#else
+            ErrorInFastLLM("Error: Ascend CL is not supported.\n");
+#endif
         }
     }
 
@@ -1188,6 +1222,17 @@ namespace fastllm {
             this->cudaData = nullptr;
 #else
             ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
+        } else if (this->dataDevice == DataDevice::NPU) {
+#ifdef USE_ASCEND_NPU
+            if (this->directMemory) {
+                npu::FastllmAclDirectFree(this->deviceData);
+            } else {
+                npu::FastllmAclFree(this->deviceData);
+            }
+            this->deviceData = nullptr;
+#else
+            ErrorInFastLLM("Error: Ascend CL is not supported.\n");
 #endif
         }
     }
@@ -1219,6 +1264,16 @@ namespace fastllm {
             } else if (this->dataType == DataType::FLOAT16) {
                 std::vector <uint16_t> f = std::vector <uint16_t> (Count(0), float_to_half(v));
                 FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(uint16_t));
+            }
+#endif
+        } else if (this->dataDevice == DataDevice::NPU) {
+#ifdef USE_ASCEND_NPU
+            if (this->dataType == DataType::FLOAT32) {
+                std::vector <float> f = std::vector <float> (Count(0), v);
+                npu::FastllmAclCopyFromHostToDevice(deviceData, f.data(), Count(0) * sizeof(float));
+            } else if (this->dataType == DataType::FLOAT16) {
+                std::vector <uint16_t> f = std::vector <uint16_t> (Count(0), float_to_half(v));
+                npu::FastllmAclCopyFromHostToDevice(deviceData, f.data(), Count(0) * sizeof(uint16_t));
             }
 #endif
         } else {
@@ -1262,13 +1317,13 @@ namespace fastllm {
         }
         this->expansionDims = dims;
         if (this->expansionBytes != 0) {
+            int outer = this->Count(0) / this->Count(axis);
+            int input0Stride = this->Count(axis);
+            int inner = this->strides[axis];
+            int unitSize = this->unitSize;
             if (this->dataDevice == DataDevice::CPU) {
                 uint8_t *old = this->cpuData;
                 MallocSpace(this->strides[0] * std::max(this->dims[0], dims[0]));
-                int outer = this->Count(0) / this->Count(axis);
-                int input0Stride = this->Count(axis);
-                int inner = this->strides[axis];
-                int unitSize = this->unitSize;
                 for (int o = 0; o < outer; o++) {
                     memcpy(this->cpuData + o * input0Stride * unitSize,
                            old + o * input1Stride * unitSize,
@@ -1279,16 +1334,25 @@ namespace fastllm {
 #ifdef USE_CUDA
                 uint8_t *old = (uint8_t*)this->cudaData;
                 MallocSpace(this->strides[0] * std::max(this->dims[0], dims[0]));
-                int outer = this->Count(0) / this->Count(axis);
-                int input0Stride = this->Count(axis);
-                int inner = this->strides[axis];
-                int unitSize = this->unitSize;
                 FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)this->cudaData, input0Stride * unitSize,
                                             (uint8_t*)old, input1Stride * unitSize, this->dims[axis] * inner * unitSize, outer);
                 FastllmCudaFree(old);
                 FastllmCudaClearBigBuffer();
 #else
                 ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
+            } else if (this->dataDevice == DataDevice::NPU) {
+#ifdef USE_ASCEND_NPU
+                uint8_t *old = (uint8_t*)this->deviceData;
+                MallocSpace(this->strides[0] * std::max(this->dims[0], dims[0]));
+                for (int o = 0; o < outer; o++) {
+                    npu::FastllmAclCopyFromDeviceToDevice((uint8_t*)this->deviceData + o * input0Stride * unitSize,
+                                                          old + o * input1Stride * unitSize, this->dims[axis] * inner * unitSize);
+                }
+                npu::FastllmAclFree(old);
+                npu::FastllmAclClearBigBuffer();
+#else
+                ErrorInFastLLM("Error: Ascend CL is not supported.\n");
 #endif
             }
         } else {
@@ -1320,6 +1384,11 @@ namespace fastllm {
             } else {
                 FastllmCudaFree(this->cudaData);
             }*/
+        }
+#endif
+#ifdef USE_ASCEND_NPU
+        if (this->deviceData != nullptr) {
+            npu::FastllmAclFree(this->deviceData);
         }
 #endif
     }
@@ -1539,6 +1608,8 @@ namespace fastllm {
         BaseDevice *dev = (BaseDevice*)device;
         if (dev->deviceType == "cuda" || dev->deviceType == "multicuda") {
             this->ToDevice(DataDevice::CUDA, dev->deviceIds);
+        } else if (dev->deviceType == "acl") {
+            this->ToDevice(DataDevice::NPU, dev->deviceIds);
         } else {
             this->ToDevice(DataDevice::CPU, dev->deviceIds);
         }
@@ -1547,6 +1618,8 @@ namespace fastllm {
     void Data::ToDevice(fastllm::DataDevice device) {
         if (device == DataDevice::CUDA) {
             ToDevice(device, curExecutor->GetDeviceIds("cuda"));
+        } else if (device == DataDevice::NPU) {
+            ToDevice(device, curExecutor->GetDeviceIds("acl"));
         } else {
             ToDevice(device, {0});
         }
@@ -1560,8 +1633,13 @@ namespace fastllm {
             return;
         }
 #ifndef USE_CUDA
+#ifdef USE_ASCEND_NPU
+        if (device == DataDevice::CUDA)
+            device = DataDevice::NPU;
+#else
         // TODO: 这里先直接跳过了
         return;
+#endif
 #endif
         if (this->dataDevice == device &&
             (this->dataDevice == DataDevice::CPU || deviceIds.size() == 0 || this->dataDeviceIds == deviceIds)) {
@@ -1569,8 +1647,8 @@ namespace fastllm {
         }
 
         if (this->expansionBytes != 0) {
-#ifdef USE_CUDA
             if (this->dataDevice == DataDevice::CPU) {
+#ifdef USE_CUDA
                 if (device == DataDevice::CUDA) {
                     uint8_t *cpuData = this->cpuData;
 #ifdef USE_MMAP
@@ -1587,7 +1665,27 @@ namespace fastllm {
                     this->cpuData = nullptr;
 #endif
                 }
+#endif
+#ifdef USE_ASCEND_NPU
+                if (device == DataDevice::NPU) {
+                    uint8_t *cpuData = this->cpuData;
+#ifdef USE_MMAP
+                    cpuData = new uint8_t[expansionBytes];
+                    memcpy(cpuData, this->cpuData, expansionBytes);
+#endif
+                    npu::FastllmAclSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
+                    this->deviceData = npu::FastllmAclMalloc(expansionBytes);
+                    npu::FastllmAclCopyFromHostToDevice(this->deviceData, cpuData, expansionBytes);
+#ifdef USE_MMAP
+                    delete[] cpuData;
+#else
+                    delete[] this->cpuData;
+                    this->cpuData = nullptr;
+#endif
+                }
+#endif
             } else if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
                 if (device == DataDevice::CPU) {
                     this->cpuData = new uint8_t[expansionBytes];
                     FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
@@ -1597,17 +1695,61 @@ namespace fastllm {
                     int sourceDevice = this->dataDeviceIds.size() == 0 ? 0 : this->dataDeviceIds[0];
                     int destDevice = deviceIds.size() == 0 ? 0 : deviceIds[0];
                     if (sourceDevice != destDevice) {
-                                        FastllmCudaSetDevice(destDevice);
-                                        void *newCudaData = FastllmCudaMalloc(expansionBytes);
-                                        FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
-                                        FastllmCudaSetDevice(sourceDevice);
-                                        FastllmCudaFree(this->cudaData);
-                                        this->cudaData = newCudaData;
-                                        FastllmCudaSetDevice(destDevice);
+                        FastllmCudaSetDevice(destDevice);
+                        void *newCudaData = FastllmCudaMalloc(expansionBytes);
+                        FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
+                        FastllmCudaSetDevice(sourceDevice);
+                        FastllmCudaFree(this->cudaData);
+                        this->cudaData = newCudaData;
+                        FastllmCudaSetDevice(destDevice);
                     }
-                }
-            }
+#ifdef USE_ASCEND_NPU
+                } else if (device == DataDevice::NPU) {
+                    this->cpuData = new uint8_t[expansionBytes];
+                    FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
+                    FastllmCudaFree(this->cudaData);
+                    this->cudaData = nullptr;
+                    npu::FastllmAclSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
+                    this->deviceData = npu::FastllmAclMalloc(expansionBytes);
+                    npu::FastllmAclCopyFromHostToDevice(this->deviceData, this->cpuData, expansionBytes);
+                    delete[] this->cpuData;
+                    this->cpuData = nullptr;
 #endif
+                }
+#endif
+            } else if (this->dataDevice == DataDevice::NPU) {
+#ifdef USE_ASCEND_NPU
+                if (device == DataDevice::CPU) {
+                    this->cpuData = new uint8_t[expansionBytes];
+                    npu::FastllmAclCopyFromDeviceToHost(this->cpuData, this->deviceData, expansionBytes);
+                    npu::FastllmAclFree(this->deviceData);
+                    this->deviceData = nullptr;
+                } else if (device == DataDevice::NPU) {
+                    int sourceDevice = this->dataDeviceIds.size() == 0 ? 0 : this->dataDeviceIds[0];
+                    int destDevice = deviceIds.size() == 0 ? 0 : deviceIds[0];
+                    npu::FastllmAclSetDevice(destDevice);
+                    void *newDeviceData = npu::FastllmAclMalloc(expansionBytes);
+
+                    npu::FastllmAclMemcpyBetweenDevices(destDevice, newDeviceData, sourceDevice, this->deviceData, expansionBytes);
+                    npu::FastllmAclSetDevice(sourceDevice);
+                    npu::FastllmAclFree(this->deviceData);
+                    this->deviceData = newDeviceData;
+                    npu::FastllmAclSetDevice(destDevice);
+#ifdef USE_CUDA
+                } else if (device == DataDevice::CUDA) {
+                    this->cpuData = new uint8_t[expansionBytes];
+                    npu::FastllmAclCopyFromDeviceToHost(this->cpuData, this->deviceData, expansionBytes);
+                    npu::FastllmAclFree(this->deviceData);
+                    this->deviceData = nullptr;
+                    FastllmCudaSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
+                    this->cudaData = FastllmCudaMalloc(expansionBytes);
+                    FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, expansionBytes);
+                    delete[] this->cpuData;
+                    this->cpuData = nullptr;
+#endif
+                }
+#endif
+            }
         }
         if (deviceIds.size() == 0) {
             this->dataDeviceIds = {0};
@@ -2570,6 +2712,10 @@ namespace fastllm {
         }
 #ifdef USE_CUDA
         FastllmCudaClearBigBuffer();
+#endif
+#ifdef USE_ASCEND_NPU
+        npu::FastllmAclClearBigBuffer();
+        npu::FastllmAclClearBuffer();
 #endif
     }
 

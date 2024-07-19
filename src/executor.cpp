@@ -19,6 +19,10 @@
 #include "devices/tfacc/tfaccdevice.h"
 #endif
 
+#ifdef USE_ASCEND_NPU
+#include "devices/ascend/ascenddevice.h"
+#include "devices/ascend/fastllm-acl.h"
+#endif
 #ifdef USE_TOPS
 #include "devices/tops/topsdevice.h"
 #endif
@@ -55,6 +59,9 @@ namespace fastllm {
             }
         } catch (...) {
         }
+#endif
+#ifdef USE_ASCEND_NPU
+        this->devices.push_back((BaseDevice*) new AscendNpuDevice());
 #endif
 
 #ifdef USE_NUMAS
@@ -146,6 +153,11 @@ namespace fastllm {
                     if (device->deviceIdsRatio.size() > 0) {
                         FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
                     }
+                }
+#endif
+#ifdef USE_ASCEND_NPU
+                if (device->deviceType == "npu" && device->deviceIds.size() > 0) {
+                    npu::FastllmAclSetDevice(device->deviceIds[0]);
                 }
 #endif
                 bool intParamsSize = intParams.size();
