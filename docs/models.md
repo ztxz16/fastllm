@@ -4,26 +4,26 @@
 
 目前Fastllm加载模型有以下几种方式。
 
-* **加载后转换（两行加速模式）** (convert on-the-fly)
+* **加载后转换（两行加速模式）** (convert on-the-fly)  
     将原始模型加载为HuggingFace模型，再通过`from_hf()`方法，转换并加速，这种方法内存占用大且速度慢，目前不再推荐。
 
-* **离线转换** (convert offline)
+* **离线转换** (convert offline)  
     将原始模型转换为.flm格式的模型，一些[模型](#flm模型库)已经转换好。
 
-* **直接读取** (load from Huggingface .safetensors)
+* **直接读取** (load from Huggingface .safetensors)  
     直接读取HuggingFace上发布的模型，仅支持.safetensors格式的模型。
 
 
 ## 支持模型一览 Model List
 
 
-* ✔ 表示支持该方式，并测试通过；
+* ✔ 表示支持该方式，并测试通过；  
     ✔ means supports this mode and passes the test.
 
-* ❌ 表示本应该支持该方式，但实际测试后发现本功能并不受支持，可能在后续版本修复。
+* ❌ 表示本应该支持该方式，但实际测试后发现本功能并不受支持，可能在后续版本修复；  
     ❌ means this method is supposed to be supported, but failed after actual testing.
 
-* √ 表示支持，但是还没有测试过
+* √ 表示支持，但是还没有测试过。  
     √ means supported, but not tested.
 
 ### GLM系列
@@ -61,6 +61,7 @@
 | Qwen/Qwen1.5-14B-Chat  | [✔](#其它模型) | [✔](#qwen模型导出) | ✔<sup>3</sup> |
 | Qwen/Qwen1.5-72B-Chat  | [✔](#其它模型) | [✔](#qwen模型导出) | ✔<sup>3</sup> |
 | Qwen/Qwen1.5-32B-Chat  | [✔](#其它模型) | [✔](#qwen模型导出) | ✔<sup>3</sup> |
+| Qwen/Qwen1.5-110B-Chat | [√](#其它模型) | [√](#qwen模型导出) | √<sup>3</sup> |
 | Qwen/CodeQwen1.5-7B-Chat | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
 | Qwen/Qwen2-0.5B-Instruct | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
 | Qwen/Qwen2-1.5B-Instruct | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
