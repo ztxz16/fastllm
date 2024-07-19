@@ -3,6 +3,8 @@ import math
 import os;
 import threading
 import asyncio
+import copy
+import json
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
 import platform
@@ -18,6 +20,9 @@ fastllm_lib.create_llm_model.restype = ctypes.c_int
 
 fastllm_lib.create_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool]
 fastllm_lib.create_llm_model_fromhf.restype = ctypes.c_int
+
+fastllm_lib.create_llm_model_fromhf_with_config.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_char_p]
+fastllm_lib.create_llm_model_fromhf_with_config.restype = ctypes.c_int
 
 fastllm_lib.create_llm_tokenizer_fromhf.argtypes = [ctypes.c_char_p]
 fastllm_lib.create_llm_tokenizer_fromhf.restype = ctypes.c_int
@@ -366,7 +371,24 @@ class model:
                   dtype : str = "float16",
                   system_prompt : str = "",
                   eos_token: List[str] = [],
-                  tokenizer_type = "auto"):
+                  tokenizer_type = "auto", 
+                  model_json: str = "", 
+                  graph: type = None):
+        if (graph != None):
+            current_graph = graph()
+            if (os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json"))):
+                if (os.path.isfile(os.path.join(path, "config.json"))):
+                    current_graph.config = json.load(open(os.path.join(path, "config.json"), "r"))
+                if (os.path.isfile(os.path.join(path, "tokenizer_config.json"))):
+                    current_graph.tokenizer_config = json.load(open(os.path.join(path, "tokenizer_config.json"), "r"))
+                if (os.path.isfile(os.path.join(path, "generation_config.json"))):
+                    current_graph.generation_config = json.load(open(os.path.join(path, "generation_config.json"), "r"))
+                current_graph.build()
+                model_json = str(current_graph)
+            else:
+                print("When using a custom Graph, only model folders in HF format can be read.")
+                exit(0)
+        
         int4g_groupcnt = 128;
         if (dtype.startswith("int4g") and len(dtype) > 5):
             try:
@@ -394,7 +416,11 @@ class model:
                         self.hf_tokenizer = None
                         print("Load AutoTokenizer failed. (you can try install transformers)")
                         print("Try load fastllm tokenizer.")
-                self.model = fastllm_lib.create_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, 
+                if model_json != "":
+                    self.model = fastllm_lib.create_llm_model_fromhf_with_config(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, 
+                                                                 ctypes.c_bool(self.hf_tokenizer != None), model_json.encode());
+                else:
+                    self.model = fastllm_lib.create_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, 
                                                                  ctypes.c_bool(self.hf_tokenizer != None));
             else:
                 print("path error: ", path);
@@ -940,3 +966,113 @@ class model:
     
     def get_max_input_len(self):
         return fastllm_lib.get_max_input_len_llm_model(self.model)
+
+def GraphNode(name: str,
+              type: str = "data",
+              value = None):
+    dict = {"name": name, "type": type}
+    if value:
+        dict["value"] = value
+    return dict
+
+class GraphWeight:
+    def __init__ (self, pre = ""):
+        self.pre = pre
+
+    def __getitem__ (self, index):
+        return GraphWeight(self.pre + str(index))
+
+    def to_json(self):
+        return GraphNode(self.pre, type = "weight")
+    
+class GraphData:
+    def __init__ (self, pre = ""):
+        self.pre = pre
+
+    def __getitem__ (self, index):
+        return GraphData(self.pre + str(index))
+
+    def to_json(self):
+        return GraphNode(self.pre)
+
+def FloatGraphNode(v):
+    if (isinstance(v, int) or isinstance(v, str)):
+        v = float(v)
+    if (isinstance(v, float)):
+        return GraphNode("", "constant.float", v)
+    if (isinstance(v, Dict)):
+        v["type"] = "config.float"
+    return v
+    
+def IntGraphNode(v):
+    if (isinstance(v, float)):
+        v = int(v)
+    if (isinstance(v, int)):
+        return GraphNode("", "constant.int", v)
+    if (isinstance(v, Dict)):
+        v["type"] = "config.int"
+    return v
+
+class ComputeGraph:
+    def __init__ (self):
+        self.weight = GraphWeight()
+        self.data = GraphData()
+        self.graph = []
+    
+    def __str__(self):
+        return json.dumps(self.graph, indent = 4, default = lambda x: x.to_json())
+    
+    def Print(self, input):
+        self.graph.append({"type": "Print", 
+                           "nodes": {"input": input}})
+    
+    def Exit(self):
+        self.graph.append({"type": "Exit"})
+    
+    def AddTo(self, input0, input1, alpha = 1.0):
+        self.graph.append({"type": "AddTo", 
+                           "nodes": {"input0": input0, "input1": input1, "alpha": FloatGraphNode(alpha)}})
+    
+    def DataTypeAs(self, input, input1):
+        self.graph.append({"type": "DataTypeAs", 
+                           "nodes": {"input": input, "input1": input1}})
+        
+    def Embedding(self, input, weight, output):
+        self.graph.append({"type": "Embedding", 
+                           "nodes": {"input": input, "weight": weight, "output": output}})
+    
+    def ExpandHead(self, input, headDim):
+        self.graph.append({"type": "ExpandHeads", 
+                           "nodes": {"input": input, "headDim": IntGraphNode(headDim)}})
+    
+    def FusedAttention(self, q, k, v, curk, curv, original, mask, output, seqLens, 
+                       scale, maskType = 0, unitLen = 128):
+        self.graph.append({"type": "FusedAttention", 
+                           "nodes": {"q": q, "k": k, "v": v, "curk": curk, "curv": curv, 
+                                    "original": original, "mask": mask, "output": output, "seqLens": seqLens, 
+                                     "scale": FloatGraphNode(scale), 
+                                     "maskType": IntGraphNode(maskType), "unitLen": IntGraphNode(unitLen)}})
+        
+    def Linear(self, input, weight, bias, output):
+        self.graph.append({"type": "Linear", 
+                           "nodes": {"input": input, "weight": weight, "bias": bias, "output": output}})
+    
+    def LlamaRotatePosition2D(self, input, positionIds, sin, cos, rotaryDim):
+        self.graph.append({"type": "LlamaRotatePosition2D", 
+                           "nodes": {"input": input, "positionIds": positionIds, "sin": sin, "cos": cos, "rotaryDim": IntGraphNode(rotaryDim)}})
+    
+    def MulTo(self, input0, input1):
+        self.graph.append({"type": "MulTo", 
+                           "nodes": {"input0": input0, "input1": input1}})
+        
+    def RMSNorm(self, input, weight, eps, output):
+        self.graph.append({"type": "RMSNorm", 
+                           "nodes": {"input": input, "weight": weight, "eps": FloatGraphNode(eps), "output": output}})
+    
+    def Silu(self, input, output):
+        self.graph.append({"type": "Silu", 
+                           "nodes": {"input": input, "output": output}})
+    
+    def SplitLastTokenStates(self, input, seqLens, output):
+        self.graph.append({"type": "SplitLastTokenStates", 
+                           "nodes": {"input": input, "output": output, "seqLens": seqLens}})

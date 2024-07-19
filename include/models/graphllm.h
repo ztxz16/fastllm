@@ -77,17 +77,19 @@ namespace fastllm {
 
         float rms_norm_eps = 1e-6;
 
+        GraphLLMModelConfig *graphLLMModelConfig = nullptr;
     protected:
         ComputeGraph graph;
 
         bool inited = false;
-
-        GraphLLMModelConfig *graphLLMModelConfig = nullptr;
     };
 
     // 模型配置的基类，用于描述一个具体的modeltype相关的模型信息
     class GraphLLMModelConfig {
     public:
+        // 初始化
+        virtual void Init(const std::string &config);
+
         // 参数初始化
         virtual void InitParams(GraphLLMModel *model);
 

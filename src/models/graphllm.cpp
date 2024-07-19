@@ -126,8 +126,8 @@ namespace fastllm {
             {"seqLens", (Data*)&seqLensData}
         };
         for (int i = 0; i < block_cnt; i++) {
-            inputs.insert({"pastKey_" + std::to_string(i), (Data*)&pastKeyValues[i].first});
-            inputs.insert({"pastValue_" + std::to_string(i), (Data*)&pastKeyValues[i].second});
+            inputs.insert({"pastKey." + std::to_string(i), (Data*)&pastKeyValues[i].first});
+            inputs.insert({"pastValue." + std::to_string(i), (Data*)&pastKeyValues[i].second});
         }
         Data logits, topk;
         RunComputeGraph(graph, this->deviceMap, inputs, weightDicts, {{"logits", (Data*)&logits}});
@@ -198,10 +198,10 @@ namespace fastllm {
         };
         for (int b = 0; b < batch; b++) {
             std::string sb = std::to_string(b);
-            inputs.insert({"attentionMask_" + sb, attentionMask[b]});
+            inputs.insert({"attentionMask." + sb, attentionMask[b]});
             for (int i = 0; i < block_cnt; i++) {
-                inputs.insert({"pastKey_" + std::to_string(i) + "_" + sb, pastKeyValues[b * block_cnt + i].first});
-                inputs.insert({"pastValue_" + std::to_string(i) + "_" + sb, pastKeyValues[b * block_cnt + i].second});
+                inputs.insert({"pastKey." + std::to_string(i) + "." + sb, pastKeyValues[b * block_cnt + i].first});
+                inputs.insert({"pastValue." + std::to_string(i) + "." + sb, pastKeyValues[b * block_cnt + i].second});
             }
         }
         Data logits, topk;
@@ -337,6 +337,9 @@ namespace fastllm {
         }
         inited = true;
         this->graphLLMModelConfig->BuildGraph(this);
+    }
+
+    void GraphLLMModelConfig::Init(const std::string &config) {
     }
 
     void GraphLLMModelConfig::InitParams(GraphLLMModel *model) {
