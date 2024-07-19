@@ -875,6 +875,7 @@ namespace fastllm {
             } else {
                 for (int b = 0; b < batch; b++) {
                     Split(logits, 1, total + seqLens[b] - 1, total + seqLens[b], curLogits[b]);
+                    total += seqLens[b];
                 }
             }
 
