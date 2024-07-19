@@ -27,21 +27,13 @@ cmake .. -DUSE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native
 
 **解决办法：**
 
-手动修改 CMakeLists.txt，根据GPU型号手动指定GPU的[Compute Capability](https://developer.nvidia.com/cuda-gpus)。如：
+根据GPU型号手动指定GPU的[Compute Capability](https://developer.nvidia.com/cuda-gpus)。如：
 
-``` diff
---- a/CMakeLists.txt
-+++ b/CMakeLists.txt
-@@ -52,7 +52,7 @@
-     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
-     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/cuda/fastllm-cuda.cu)
-     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
--    set(CMAKE_CUDA_ARCHITECTURES "native")
-+    set(CMAKE_CUDA_ARCHITECTURES 61 75 86 89)
- endif()
- 
- if (PY_API)
+```shell
+cmake .. -DUSE_CUDA=ON -DCUDA_ARCH="61;75;86;89"
 ```
+
+若需要支持多种GPU架构，请使用“;”分隔（如上面例子）。
 
 ### identifier "__hdiv" is undefined
 
