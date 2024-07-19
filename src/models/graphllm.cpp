@@ -270,7 +270,7 @@ namespace fastllm {
                 SplitBatch(logits, 1, batch, pointersK);
             } else */{
                 for (int b = 0; b < batch; b++) {
-                    Split(logits, 1, total + seqLens[b] - 1, total + seqLens[b], curLogits[b]);
+                    Split(logits, 1, b, b + 1, curLogits[b]);
                 }
             }
 
