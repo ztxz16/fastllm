@@ -266,7 +266,7 @@ namespace fastllm {
                         for (int i = 0; i < 2; i++) {
                             std::vector <Data*> caches, curs;
                             for (int b = 0; b < batch; b++) {                    
-                                auto cache = allDatas[op.datas.find(i == 0 ? "k" : "v")->second + "_" + std::to_string(b)];
+                                auto cache = allDatas[op.datas.find(i == 0 ? "k" : "v")->second + "." + std::to_string(b)];
                                 auto cur = i == 0 ? &curKs[b] : &curVs[b];
                                 while ((cache->dims.size() == 0 && (cache->expansionDims.size() == 0 || cur->dims[1] > cache->expansionDims[1]))
                                     || (cache->dims.size() > 0 && cache->dims[1] + cur->dims[1] > cache->expansionDims[1])) {
@@ -300,7 +300,7 @@ namespace fastllm {
                         contexts.resize(batch);
 
                         for (int b = 0; b < batch; b++) {
-                            std::string sb = "_" + std::to_string(b);
+                            std::string sb = "." + std::to_string(b);
                             qs[b] = (&curQs[b]);
                             keys[b] = allDatas[op.datas.find("k")->second + sb];
                             values[b] = allDatas[op.datas.find("v")->second + sb];
@@ -353,7 +353,7 @@ namespace fastllm {
                         int unitLen = op.intParams.find("unitLen")->second;
                         for (int b = 0; b < batch; b++) {
                             for (int i = 0; i < 2; i++) {                    
-                                auto cache = allDatas[op.datas.find(i == 0 ? "k" : "v")->second + "_" + std::to_string(b)];
+                                auto cache = allDatas[op.datas.find(i == 0 ? "k" : "v")->second + "." + std::to_string(b)];
                                 auto cur = i == 0 ? &curKs[b] : &curVs[b];
                                 while ((cache->dims.size() == 0 && (cache->expansionDims.size() == 0 || cur->dims[1] > cache->expansionDims[1]))
                                     || (cache->dims.size() > 0 && cache->dims[1] + cur->dims[1] > cache->expansionDims[1])) {
@@ -373,7 +373,7 @@ namespace fastllm {
                         }
 
                         for (int b = 0; b < batch; b++) {
-                            std::string sb = "_" + std::to_string(b);
+                            std::string sb = "." + std::to_string(b);
                             Data *k = allDatas[op.datas.find("k")->second + sb];
                             Data *v = allDatas[op.datas.find("v")->second + sb];
                             Data *mask = allDatas[op.datas.find("mask")->second + sb];
