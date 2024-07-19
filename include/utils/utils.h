@@ -14,7 +14,11 @@
 #include <cstdint>
 #include <thread>
 #include <vector>
+#if defined(__GNUC__) && __GNUC__ < 8
+#include <experimental/filesystem>
+#else
 #include <filesystem>
+#endif
 
 #if defined(_WIN32) or defined(_WIN64)
 #include <Windows.h>
@@ -32,7 +36,7 @@
 #endif
 #endif
 
-#if defined(_MSC_VER) && _MSC_VER <= 1900 // VS 2015
+#if (defined(_MSC_VER) && _MSC_VER <= 1900) || (defined(__GNUC__) && __GNUC__ < 8) // VS 2015) 
     namespace fs = std::experimental::filesystem;
 #else
     namespace fs = std::filesystem;
