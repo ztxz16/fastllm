@@ -261,7 +261,7 @@ namespace fastllm {
     size_t GetDataBytes(DataType type, size_t rows, size_t columns);
 
     enum DataDevice {
-        CPU = 0, CUDA = 1
+        CPU = 0, CUDA = 1, NPU = 2
     };
 
     enum WeightType {
