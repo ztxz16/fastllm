@@ -32,6 +32,18 @@ namespace fastllm {
         this->history_sep = "</s>";
 
         weight.embeddingNames.insert("model.embed_tokens.weight");
+        weight.linearNames = {
+            "lm_head.weight", "model.layers.*.mlp*down_proj.weight", "model.layers.*.mlp*up_proj.weight",
+            "model.layers.*.mlp*gate_proj.weight",
+            "model.layers.*.self_attn.q_proj.weight",
+            "model.layers.*.self_attn.q_a_proj.weight",
+            "model.layers.*.self_attn.q_b_proj.weight",
+            "model.layers.*.self_attn.kv_a_proj_with_mqa.weight",
+            "model.layers.*.self_attn.kv_b_proj.weight",
+            "model.layers.*.self_attn.o_proj.weight", "model.layers.*.self_attn.q_proj.weight", "model.layers.*.self_attn.k_proj.weight",
+            "model.layers.*.self_attn.v_proj.weight", "model.layers.*.self_attn.mergeqkv.weight", "model.layers.*.self_attn.W_pack.weight",
+            "model.layers.*.mlp.gate.weight"
+        };
     }
 
     void DeepSeekV2Model::InitParams() {
