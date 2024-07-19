@@ -8,17 +8,18 @@ fastllm是纯c++实现，无第三方依赖的多平台高性能大模型推理�
 
 部署交流QQ群： 831641348
 
-| [快速开始](#快速开始) | [模型获取](#模型获取) |
+| [快速开始](#快速开始) | [模型获取](docs/models.md) |
 
 ## 功能概述
 
 - 🚀 纯c++实现，便于跨平台移植，可以在安卓上直接编译
+- 🚀 无论ARM平台，X86平台，NVIDIA平台，速度都较快
 - 🚀 支持读取Hugging face原始模型并直接量化
 - 🚀 支持部署Openai api server
 - 🚀 支持多卡部署，支持GPU + CPU混合部署
 - 🚀 支持动态Batch，流式输出
 - 🚀 前后端分离设计，便于支持新的计算设备
-- 🚀 目前支持ChatGLM系列模型，Qwen2系列模型，各种LLAMA模型(ALPACA, VICUNA等)，BAICHUAN模型，MOSS模型，MINICPM模型等
+- 🚀 目前支持ChatGLM系列模型，Qwen系列模型，各种LLAMA模型(ALPACA, VICUNA等)，BAICHUAN模型，MOSS模型，MINICPM模型等
 
 ## 快速开始
 
@@ -66,7 +67,7 @@ python3 -m ftllm.webui -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080
 
 目前模型的支持情况见: [模型列表](docs/models.md)
 
-有一些架构暂时无法直接读取Hugging face模型，可以参考 [模型转换文档](docs/convert_model.md) 转换fastllm格式的模型
+一些早期的HuggingFace模型无法直接读取，可以参考 [模型转换](docs/models.md#模型导出convert-offline) 转换fastllm格式的模型
 
 ### 运行demo程序 (c++)
 
