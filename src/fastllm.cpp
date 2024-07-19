@@ -902,6 +902,7 @@ namespace fastllm {
     }
 
     void Data::Print() const {
+        ((Data*)this)->ToDevice(DataDevice::CPU);
         printf("shape: ");
         for (int i : this->dims) {
             printf("%d ", i);
