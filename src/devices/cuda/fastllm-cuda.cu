@@ -119,7 +119,7 @@ std::vector <long long> FastllmCudaGetFreeSizes() {
     }
     std::vector <long long> ret;
     
-    // 遍历所有设备
+    // 遍历所有设备  
     for (int i = 0; i < deviceCount; ++i) {
         cudaDeviceProp prop;
         error = cudaGetDeviceProperties(&prop, i);
@@ -128,7 +128,7 @@ std::vector <long long> FastllmCudaGetFreeSizes() {
             // printf("  Compute capability: %d.%d\n", prop.major, prop.minor);
             // printf("  Total global memory: %zu bytes\n", prop.totalGlobalMem);
             
-            // 获取当前设备的显存使用情况
+            // 获取当前设备的显存使用情况  
             size_t free = 0, total = 0;
             cudaMemGetInfo(&free, &total);
             ret.push_back(free);
@@ -447,8 +447,8 @@ __global__ void FastllmSiluKernel(float* a, float *b, int len) {
 __global__ void FastllmSiluKernel(half* a, half *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
-        float x = (float)a[idx];
-        b[idx] = (half)(x / (1.0 + expf(-x)));
+        float x = __half2float(a[idx]);
+        b[idx] = __float2half(x / (1.0 + expf(-x)));
     }
 }
 
@@ -531,7 +531,11 @@ __global__ void FastllmMulToKernel(float* a, float *b, float alpha, int len) {
 __global__ void FastllmMulToKernel(half* a, half *b, float alpha, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
+#ifdef CUDA_NO_TENSOR_CORE
+        a[idx] = __float2half(__half2float(b[idx]) * alpha * __half2float(a[idx]));
+#else
         a[idx] *= (half)((float)b[idx] * alpha);
+#endif
     }
 }
 
@@ -2904,14 +2908,14 @@ void FastllmCudaClearBigBuffer() {
         auto &bigBuffers = it.second;
         std::vector <CudaMemoryBuffer> temp;
         long long littleMemSum = 0;        
-        long long littleMemSumLimit = 300 * 1024 * 1024; // 留一小部分复用
+        long long littleMemSumLimit = 300 * 1024 * 1024; // 留一小部分复用  
         std::vector <std::pair <std::size_t, int > > v;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy) {
                 v.push_back(std::make_pair(bigBuffers[i].size, i));
             }
         }
-        sort(v.begin(), v.end());
+        std::sort(v.begin(), v.end());
         std::set <int> littleMemIds;
         for (int i = 0; i < v.size(); i++) {
             littleMemSum += v[i].first;
