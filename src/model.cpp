@@ -449,7 +449,7 @@ namespace fastllm {
         if (!model->weight.tokenizer.chatTemplate.empty() && model->weight.dicts.find("chat_template") == model->weight.dicts.end())
             model->weight.AddDict("chat_template", model->weight.tokenizer.chatTemplate);
         std::string tokenizerClass = tokenizerConfig["tokenizer_class"].string_value();
-        if (tokenizerClass == "PreTrainedTokenizerFast" 
+        if (tokenizerClass == "PreTrainedTokenizerFast" || tokenizerClass == "LlamaTokenizerFast"
             || tokenizerClass == "Qwen2Tokenizer"
             || tokenizerClass == "BloomTokenizer") {
             // PreTrainedTokenizerFast
