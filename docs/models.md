@@ -74,8 +74,8 @@
 
 |                                       模型  | 加载后转换 |  离线转换  |  直接读取  |
 |-------------------------------------------: |------------|------------|------------|
-| deepseek-ai/Deepseek-Coder-1.3B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ❌<sup>4</sup> |
-| deepseek-ai/Deepseek-Coder-6.7B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ❌<sup>4</sup> |
+| deepseek-ai/Deepseek-Coder-1.3B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
+| deepseek-ai/Deepseek-Coder-6.7B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
 | deepseek-ai/Deepseek-Coder-7B-Instruct v1.5 | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ❌<sup>4</sup> |
 | deepseek-ai/deepseek-coder-33b-instruct     | [√](llama_cookbook.md#deepseek-coder) | [√](llama_cookbook.md#deepseek-coder) | ❌<sup>4</sup> |
 | deepseek-ai/DeepSeek-V2-Chat                | √ | ✔ | √<sup>4</sup> |

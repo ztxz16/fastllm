@@ -49,7 +49,7 @@ namespace fastllm {
     // 词法分析后的Token
     struct JinjaToken {
         enum JinjaToKenType {
-            JinjaTokenID = 0, JinjaTokenNUM, JinjaTokenSTRING, JinjaTokenDOT, 
+            JinjaTokenID = 0, JinjaTokenBOOL, JinjaTokenNUM, JinjaTokenSTRING, JinjaTokenDOT,
             JinjaTokenLMB, JinjaTokenRMB, JinjaTokenLSB, JinjaTokenRSB,
             JinjaTokenSet, JinjaTokenFor, JinjaTokenEndFor, JinjaTokenIf, JinjaTokenElse, JinjaTokenEndif,
             JinjaTokenIn,
@@ -90,8 +90,11 @@ namespace fastllm {
             {"endif", JinjaToken::JinjaToKenType::JinjaTokenEndif},
             {"set", JinjaToken::JinjaToKenType::JinjaTokenSet},
             {"in", JinjaToken::JinjaToKenType::JinjaTokenIn},
+            {"true", JinjaToken::JinjaToKenType::JinjaTokenBOOL},
+            {"false", JinjaToken::JinjaToKenType::JinjaTokenBOOL},
             {"and", JinjaToken::JinjaToKenType::JinjaTokenAnd},
             {"or", JinjaToken::JinjaToKenType::JinjaTokenOr},
+            {"not", JinjaToken::JinjaToKenType::JinjaTokenNot}
     };
 
     // 一个Jinja块 
