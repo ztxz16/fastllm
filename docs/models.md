@@ -68,20 +68,24 @@
 | Qwen/Qwen2-7B-Instruct   | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
 | Qwen/Qwen2-72B-Instruct  |  | [✔](#qwen模型导出) | ✔ |
 
-> 注3： 需要更新，检查 tokenizer_config.json 是否为最新版本
+> 注3： 需要更新，检查 `tokenizer_config.json` 是否为最新版本
 
 ### DeepSeek系列
 
 |                                       模型  | 加载后转换 |  离线转换  |  直接读取  |
 |-------------------------------------------: |------------|------------|------------|
-| deepseek-ai/Deepseek-Coder-1.3B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
-| deepseek-ai/Deepseek-Coder-6.7B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
-| deepseek-ai/Deepseek-Coder-7B-Instruct v1.5 | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ❌<sup>4</sup> |
-| deepseek-ai/deepseek-coder-33b-instruct     | [√](llama_cookbook.md#deepseek-coder) | [√](llama_cookbook.md#deepseek-coder) | ❌<sup>4</sup> |
-| deepseek-ai/DeepSeek-V2-Chat                | √ | ✔ | √<sup>4</sup> |
-| deepseek-ai/DeepSeek-V2-Lite-Chat           | √ | ✔ | √<sup>4</sup> |
-| deepseek-ai/DeepSeek-Coder-V2-Instruct      | √ | √ | √<sup>4</sup> |
-| deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct | √ | √ | √<sup>4</sup> |
+| deepseek-ai/Deepseek-Coder-1.3B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔<sup>4</sup><sup>5</sup> |
+| deepseek-ai/Deepseek-Coder-6.7B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔<sup>4</sup><sup>5</sup> |
+| deepseek-ai/Deepseek-Coder-7B-Instruct v1.5 | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔<sup>4</sup> |
+| deepseek-ai/deepseek-coder-33b-instruct     | [√](llama_cookbook.md#deepseek-coder) | [√](llama_cookbook.md#deepseek-coder) | ✔<sup>4</sup> |
+| deepseek-ai/DeepSeek-V2-Chat                | √ | ✔ | √ |
+| deepseek-ai/DeepSeek-V2-Lite-Chat           | √ | ✔ | ✔ |
+| deepseek-ai/DeepSeek-Coder-V2-Instruct      | √ | ✔ | √ |
+| deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct | √ | ✔ | ✔ |
+
+> 注4： Python ftllm用AutoTokenizer而不使用Fastllm Tokenizer可以实现加载，但是C++程序尚不支持加载该模型的Tokenizer。
+> 注5： C++端仅支持最早的几个 `tokenizer_config.json` 版本
+
 
 ### LLaMA类模型
 
@@ -106,8 +110,6 @@
 |  |  |  |  |
 | meta-llama/Meta-Llama-3-8B-Instruct |  | [✔](tools/scripts/llama3_to_flm.py) | ✔ |
 | meta-llama/Meta-Llama-3-70B-Instruct |  | [✔](tools/scripts/llama3_to_flm.py) | ✔ |
-
-> 注4： Python ftllm用AutoTokenizer而不使用Fastllm Tokenizer可以实现加载，但是C++程序尚不支持加载该模型的Tokenizer。
 
 ### 其它模型
 
