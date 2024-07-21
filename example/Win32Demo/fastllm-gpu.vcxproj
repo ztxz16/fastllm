@@ -237,6 +237,9 @@
     <ClCompile Include="..\..\src\models\deepseekv2.cpp" />
     <ClCompile Include="..\..\src\models\glm.cpp" />
     <ClCompile Include="..\..\src\models\graphllm.cpp" />
+    <ClCompile Include="..\..\src\models\graph\fastllmjson.cpp" />
+    <ClCompile Include="..\..\src\models\graph\qwen2.cpp" />
+    <ClCompile Include="..\..\src\models\graph\telechat.cpp" />
     <ClCompile Include="..\..\src\models\internlm2.cpp" />
     <ClCompile Include="..\..\src\models\llama.cpp" />
     <ClCompile Include="..\..\src\models\minicpm.cpp" />

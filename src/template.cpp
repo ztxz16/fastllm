@@ -8,6 +8,10 @@ namespace fastllm {
     bool JinjaVar::BoolValue() const {
         if (this->type == JinjaInt) {
             return (this->intValue != 0);
+        } else if (this->stringValue == "true") {
+            return true;
+        } else if (this->stringValue == "false") {
+            return false;
         }
         ErrorInFastLLM("Jinja error: " + this->Dump() + " is not bool.");
         return false;
@@ -104,6 +108,10 @@ namespace fastllm {
                 AssertInFastLLM(value[len - 1] == '}' && value[len - 2] == (value[1] == '%' ? '%' : '}'), 
                                 "Jinja block error: " + value);
                 int st = 2, end = len - 2;
+                if (value[1] == '%' && value[2] == '-')
+                    st = 3;
+                if (value[len - 2] == '%' && value[len - 3] == '-')
+                    end = len - 3;
                 while (st < end) {
                     char now = value[st];
                     if (IsWhite(now)) {
@@ -151,9 +159,9 @@ namespace fastllm {
                         int j = FindNextChar(st + 1, end, -1);
                         std::string id = value.substr(st, j - st);
                         if (keyWords.find(id) != keyWords.end()) {
-                            tokens.push_back(JinjaToken(keyWords[id]));    
+                            tokens.push_back(JinjaToken(keyWords[id], keyWords[id] == JinjaToken::JinjaTokenBOOL ? id : ""));
                         } else {
-                            tokens.push_back(JinjaToken(JinjaToken::JinjaToken::JinjaTokenID, id));
+                            tokens.push_back(JinjaToken(JinjaToken::JinjaTokenID, id));
                         }
                         st = j;
                     } else if (IsDigit(now)) {
@@ -189,6 +197,8 @@ namespace fastllm {
                         type = JinjaBlockType::JinjaBlockSet;
                     } else if (tokens[0].type == JinjaToken::JinjaTokenIf) {
                         type = JinjaBlockType::JinjaBlockIf;
+                    } else if (tokens[0].type == JinjaToken::JinjaTokenElseIf) {
+                        type = JinjaBlockType::JinjaBlockElseIf;
                     } else if (tokens[0].type == JinjaToken::JinjaTokenElse) {
                         type = JinjaBlockType::JinjaBlockElse;
                     } else if (tokens[0].type == JinjaToken::JinjaTokenEndif) {
@@ -210,6 +220,8 @@ namespace fastllm {
             if (a.type == JinjaVar::JinjaString && b.type == JinjaVar::JinjaString) {
                 return a.stringValue + b.stringValue;
             }
+        } else if (op == JinjaToken::JinjaTokenIn) {
+            return b.dictValue.find(a.stringValue) != b.dictValue.end();
         } else if (op == JinjaToken::JinjaTokenEqual) {
             if (a.type != b.type) {
                 return false;
@@ -289,6 +301,7 @@ namespace fastllm {
         // 1 中缀表达式转后缀表达式
         for (int i = st; i < end; i++) {
             if (tokens[i].type == JinjaToken::JinjaTokenID || 
+                tokens[i].type == JinjaToken::JinjaTokenBOOL ||
                 tokens[i].type == JinjaToken::JinjaTokenNUM ||
                 tokens[i].type == JinjaToken::JinjaTokenSTRING) {
                 suffixExp.push_back(tokens[i]);
@@ -316,6 +329,7 @@ namespace fastllm {
                         tokens[i].type == JinjaToken::JinjaTokenDiv ||
                         tokens[i].type == JinjaToken::JinjaTokenEqual ||
                         tokens[i].type == JinjaToken::JinjaTokenNotEqual ||
+                        tokens[i].type == JinjaToken::JinjaTokenIn ||
                         tokens[i].type == JinjaToken::JinjaTokenAnd ||
                         tokens[i].type == JinjaToken::JinjaTokenOr ||
                         tokens[i].type == JinjaToken::JinjaTokenFliter) {
@@ -335,7 +349,12 @@ namespace fastllm {
         std::vector <JinjaVar> vars;
         for (auto &it : suffixExp) {
             if (it.type == JinjaToken::JinjaTokenID) {
-                vars.push_back(JinjaVar(JinjaVar::JinjaNone, it.value));
+                if (it.value == "defined")
+                    vars.push_back(local);
+                else
+                    vars.push_back(JinjaVar(JinjaVar::JinjaNone, it.value));
+            } else if (it.type == JinjaToken::JinjaTokenBOOL) {
+                vars.push_back(JinjaVar(it.value));
             } else if (it.type == JinjaToken::JinjaTokenSTRING) {
                 vars.push_back(JinjaVar(it.value));
             } else if (it.type == JinjaToken::JinjaTokenNUM) {
@@ -381,6 +400,7 @@ namespace fastllm {
                         it.type == JinjaToken::JinjaTokenAssign ||
                         it.type == JinjaToken::JinjaTokenEqual ||
                         it.type == JinjaToken::JinjaTokenNotEqual ||
+                        it.type == JinjaToken::JinjaTokenIn ||
                         it.type == JinjaToken::JinjaTokenAnd ||
                         it.type == JinjaToken::JinjaTokenOr) {
                 AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
@@ -408,7 +428,7 @@ namespace fastllm {
         for (int i = st; i < end; i++) {
             JinjaBlock &curBlock = blocks[i];
             if (curBlock.type == JinjaBlock::JinjaBlockType::JinjaBlockOriginal) {
-                ret += curBlock.value;
+                ret += JinjaTrim(JinjaVar(curBlock.value)).stringValue;
             } else if (curBlock.type == JinjaBlock::JinjaBlockType::JinjaBlockVar) {
                 ret += ComputeExpression(var, curBlock.tokens, 0, curBlock.tokens.size()).DirectValue();
             } else if (curBlock.type == JinjaBlock::JinjaBlockFor) {
@@ -458,7 +478,7 @@ namespace fastllm {
                 }
                 var[iterId] = original;
                 i = endPos;
-            } else if (curBlock.type == JinjaBlock::JinjaBlockIf) {
+            } else if (curBlock.type == JinjaBlock::JinjaBlockIf || curBlock.type == JinjaBlock::JinjaBlockType::JinjaBlockElseIf) {
                 int cnt = 0;
                 int elsePos = -1;
                 int endPos = -1;
@@ -468,6 +488,11 @@ namespace fastllm {
                     } else if (blocks[j].type == JinjaBlock::JinjaBlockType::JinjaBlockElse) {
                         if (cnt == 0) {
                             elsePos = j;
+                        }
+                    } else if (blocks[j].type == JinjaBlock::JinjaBlockType::JinjaBlockElseIf) {
+                        if (cnt == 0) {
+                            endPos = j;
+                            break;
                         }
                     } else if (blocks[j].type == JinjaBlock::JinjaBlockType::JinjaBlockEndIf) {
                         if ((cnt--) == 0) {
@@ -495,7 +520,10 @@ namespace fastllm {
                         Parse(elsePos + 1, endPos, var, ret);
                     }
                 }
-                i = endPos;
+                if (blocks[endPos].type == JinjaBlock::JinjaBlockType::JinjaBlockElseIf)
+                    i = endPos - 1;
+                else
+                    i = endPos;
             } else if (curBlock.type == JinjaBlock::JinjaBlockSet) {
                 // 目前仅支持 "set 变量 = 表达式" 格式
                 AssertInFastLLM(
