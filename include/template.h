@@ -51,7 +51,7 @@ namespace fastllm {
         enum JinjaToKenType {
             JinjaTokenID = 0, JinjaTokenBOOL, JinjaTokenNUM, JinjaTokenSTRING, JinjaTokenDOT,
             JinjaTokenLMB, JinjaTokenRMB, JinjaTokenLSB, JinjaTokenRSB,
-            JinjaTokenSet, JinjaTokenFor, JinjaTokenEndFor, JinjaTokenIf, JinjaTokenElse, JinjaTokenEndif,
+            JinjaTokenSet, JinjaTokenFor, JinjaTokenEndFor, JinjaTokenIf, JinjaTokenElse, JinjaTokenElseIf, JinjaTokenEndif,
             JinjaTokenIn,
             JinjaTokenAssign, JinjaTokenNotEqual, JinjaTokenEqual, JinjaTokenAdd, JinjaTokenSub, JinjaTokenMul, JinjaTokenDiv,
             JinjaTokenNot, JinjaTokenAnd, JinjaTokenOr,
@@ -86,10 +86,12 @@ namespace fastllm {
             {"for", JinjaToken::JinjaToKenType::JinjaTokenFor},
             {"endfor", JinjaToken::JinjaToKenType::JinjaTokenEndFor},
             {"if", JinjaToken::JinjaToKenType::JinjaTokenIf},
+            {"elif", JinjaToken::JinjaToKenType::JinjaTokenElseIf},
             {"else", JinjaToken::JinjaToKenType::JinjaTokenElse},
             {"endif", JinjaToken::JinjaToKenType::JinjaTokenEndif},
             {"set", JinjaToken::JinjaToKenType::JinjaTokenSet},
             {"in", JinjaToken::JinjaToKenType::JinjaTokenIn},
+            {"is", JinjaToken::JinjaToKenType::JinjaTokenIn},
             {"true", JinjaToken::JinjaToKenType::JinjaTokenBOOL},
             {"false", JinjaToken::JinjaToKenType::JinjaTokenBOOL},
             {"and", JinjaToken::JinjaToKenType::JinjaTokenAnd},
@@ -101,7 +103,7 @@ namespace fastllm {
     struct JinjaBlock {
         enum JinjaBlockType {
             JinjaBlockOriginal = 0, JinjaBlockEmpty, JinjaBlockVar, JinjaBlockFor, 
-            JinjaBlockEndFor, JinjaBlockIf, JinjaBlockElse, JinjaBlockEndIf,
+            JinjaBlockEndFor, JinjaBlockIf, JinjaBlockElseIf, JinjaBlockElse, JinjaBlockEndIf,
             JinjaBlockSet
         };
 
