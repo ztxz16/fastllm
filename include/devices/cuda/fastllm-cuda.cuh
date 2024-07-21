@@ -1,11 +1,11 @@
 #include "fastllm.h"
 
+std::vector <long long> FastllmCudaGetFreeSizes();
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
 void FastllmInitCublas(void);
-
-std::vector <long long> FastllmCudaGetFreeSizes();
 
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
