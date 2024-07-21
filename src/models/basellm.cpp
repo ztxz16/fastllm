@@ -1064,6 +1064,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         for (auto &it : this->weight.tokenizer.tokenizerConfig.object_items()) {
             if (it.first != "messages" && it.second.is_string()) {
                 local[it.first] = it.second.string_value();
+            } else if (it.first.find_last_of("_token") != std::string::npos && it.second.is_object()) {
+                local[it.first] = it.second["content"].string_value();
             }
         }
         JinjaTemplate temp = JinjaTemplate(this->weight.tokenizer.chatTemplate);

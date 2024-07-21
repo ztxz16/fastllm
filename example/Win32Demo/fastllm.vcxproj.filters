@@ -19,6 +19,9 @@
     <Filter Include="源文件\models">
       <UniqueIdentifier>{ad23d9cc-65a3-4c41-b87f-5826ce7a6dca}</UniqueIdentifier>
     </Filter>
+    <Filter Include="源文件\models\graph">
+      <UniqueIdentifier>{8ea8c4cc-b75e-4c3a-a4e9-1e4900de6380}</UniqueIdentifier>
+    </Filter>
     <Filter Include="头文件\utils">
       <UniqueIdentifier>{1da1956b-b0ea-4a15-9b4a-11a431319b7d}</UniqueIdentifier>
     </Filter>
@@ -178,6 +181,15 @@
     </ClCompile>
     <ClCompile Include="..\..\src\models\qwen.cpp">
       <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\graph\fastllmjson.cpp">
+      <Filter>源文件\models\graph</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\graph\qwen2.cpp">
+      <Filter>源文件\models\graph</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\graph\telechat.cpp">
+      <Filter>源文件\models\graph</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\cpudevice.cpp">
       <Filter>源文件\devices\cpu</Filter>
