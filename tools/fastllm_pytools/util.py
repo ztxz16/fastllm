@@ -12,6 +12,7 @@ def make_normal_parser(des: str) -> argparse.ArgumentParser:
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--device', type = str, help = '使用的设备')
+    parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     return parser
 
 def make_normal_llm_model(args):
@@ -29,7 +30,17 @@ def make_normal_llm_model(args):
     llm.set_cpu_low_mem(args.low)
     if (args.cuda_embedding):
         llm.set_cuda_embedding(True)
-    model = llm.model(args.path, dtype = args.dtype, tokenizer_type = "auto")
+    graph = None
+    if (args.custom != ""):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("custom_module", args.custom)
+        if spec is None:
+            raise ImportError(f"Cannot load module at {args.custom}")
+        custom_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(custom_module)
+        if (hasattr(custom_module, "__model__")):
+            graph = getattr(custom_module, "__model__")
+    model = llm.model(args.path, dtype = args.dtype, graph = graph, tokenizer_type = "auto")
     model.set_atype(args.atype)
     if (args.max_batch > 0):
         model.set_max_batch(args.max_batch)

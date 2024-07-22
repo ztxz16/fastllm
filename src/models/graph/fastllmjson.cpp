@@ -3,21 +3,47 @@
 namespace fastllm {
     class FastllmJsonModelConfig : GraphLLMModelConfig {
     public:
-        json11::Json config;
+        json11::Json json, graphJson, configJson, tokenizerConfigJson, generationConfigJson;
 
         void Init(const std::string &configString) {
             std::string error;
-            config = json11::Json::parse(configString, error);
+            json = json11::Json::parse(configString, error);
+            graphJson = json["graph"];
+            configJson = json["config"];
+            tokenizerConfigJson = json["tokenizer_config"];
+            generationConfigJson = json["generation_config"];
         }
 
         void InitParams(GraphLLMModel *model) {
+            if (configJson["max_positions"].is_number()) {
+                model->max_positions = configJson["max_positions"].int_value();
+            }
+            if (configJson["rope_base"].is_number()) {
+                model->rope_base = configJson["rope_base"].number_value();
+            }
+            if (configJson["rope_factor"].is_number()) {
+                model->rope_factor = configJson["rope_factor"].number_value();
+            }
+
+            if (configJson["pre_prompt"].is_string()) {
+                model->pre_prompt = configJson["pre_prompt"].string_value();
+            }
+            if (configJson["user_role"].is_string()) {
+                model->user_role = configJson["user_role"].string_value();
+            }
+            if (configJson["bot_role"].is_string()) {
+                model->bot_role = configJson["bot_role"].string_value();
+            }
+            if (configJson["history_sep"].is_string()) {
+                model->history_sep = configJson["history_sep"].string_value();
+            }
         }
 
         std::map <std::string, std::vector <std::pair <std::string, DataType> > >
                 GetTensorMap(GraphLLMModel *model, const std::vector <std::string> &tensorNames) {
             std::string embeddingName = "";
             std::map <std::string, std::vector <std::pair <std::string, DataType> > > ret;
-            for (auto &op : config.array_items()) {
+            for (auto &op : graphJson.array_items()) {
                 std::string type = op["type"].string_value();
                 std::map <std::string, std::string> weights;
                 for (auto &it : op["nodes"].object_items()) {
@@ -54,7 +80,7 @@ namespace fastllm {
                 wNodes[it.first] = ComputeGraphNode(it.first);
             }
 
-            for (auto &op : config.array_items()) {
+            for (auto &op : graphJson.array_items()) {
                 std::string type = op["type"].string_value();
                 std::map <std::string, std::string> datas;
                 std::map <std::string, float> floatParams;

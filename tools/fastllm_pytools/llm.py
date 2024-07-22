@@ -1020,7 +1020,14 @@ class ComputeGraph:
         self.graph = []
     
     def __str__(self):
-        return json.dumps(self.graph, indent = 4, default = lambda x: x.to_json())
+        output = {"graph": self.graph}
+        if (hasattr(self, "config")):
+            output["config"] = self.config
+        if (hasattr(self, "tokenizer_config")):
+            output["tokenizer_config"] = self.tokenizer_config
+        if (hasattr(self, "generation_config")):
+            output["generation_config"] = self.generation_config
+        return json.dumps(output, indent = 4, default = lambda x: x.to_json())
     
     def Print(self, input):
         self.graph.append({"type": "Print", 
