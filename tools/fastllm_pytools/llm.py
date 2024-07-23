@@ -496,7 +496,7 @@ class model:
         for i in range(len(inputs)):
             while True:
                 cur_token = fastllm_lib.fetch_response_llm_model(self.model, handles[i])
-                if cur_token == -1:
+                if cur_token <= -1:
                     break
                 outputs[i].append(cur_token)
         return outputs
@@ -697,7 +697,7 @@ class model:
                 if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
                     continue
                 cur = fastllm_lib.fetch_response_llm_model(self.model, handle)
-                if (cur == -1):
+                if (cur <= -1):
                     break
                 tokens.append(cur)
                 ret = tokenizer.decode(tokens)
@@ -789,8 +789,10 @@ class model:
                     await asyncio.sleep(0)
                     continue
                 cur = fastllm_lib.fetch_response_llm_model(self.model, handle)
-                if (cur == -1):
-                    break;
+                if (cur <= -1):
+                    if (cur == -2):
+                        yield "prompt too long"
+                    break
                 tokens.append(cur)
                 ret = tokenizer.decode(tokens)
                 if (ret.encode().find(b'\xef\xbf\xbd') == -1):
@@ -857,7 +859,7 @@ class model:
         total_bytes = b''
         while True:
             cur_token = fastllm_lib.fetch_response_llm_model(self.model, handle)
-            if cur_token == -1:
+            if cur_token <= -1:
                 break
 
             cur_bytes = self.tokenizer_decode_token(cur_token)
@@ -882,7 +884,7 @@ class model:
         result = [];
         while True:
             cur = fastllm_lib.fetch_response_llm_model(self.model, handle);
-            if (cur == -1):
+            if (cur <= -1):
                 break;
             result.append(cur);
         response = tokenizer.decode(result);
@@ -914,7 +916,7 @@ class model:
         tokens = [];
         while True:
             cur = fastllm_lib.fetch_response_llm_model(self.model, handle);
-            if (cur == -1):
+            if (cur <= -1):
                 break;
             tokens.append(cur);
             response = tokenizer.decode(tokens);
