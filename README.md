@@ -20,6 +20,7 @@ fastllm是纯c++实现，无第三方依赖的多平台高性能大模型推理�
 - 🚀 支持动态Batch，流式输出
 - 🚀 前后端分离设计，便于支持新的计算设备
 - 🚀 目前支持ChatGLM系列模型，Qwen系列模型，各种LLAMA模型(ALPACA, VICUNA等)，BAICHUAN模型，MOSS模型，MINICPM模型等
+- 🚀 支持Python自定义模型结构
 
 ## 快速开始
 
@@ -69,12 +70,14 @@ python3 -m ftllm.webui -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080
 
 一些早期的HuggingFace模型无法直接读取，可以参考 [模型转换](docs/models.md#模型导出convert-offline) 转换fastllm格式的模型
 
+可以自定义模型结构，具体见 [自定义模型](docs/custom_model.md)
+
 ### 运行demo程序 (c++)
 
 ```
 # 进入fastllm/build-fastllm目录
 
-# 命令行聊天程序, 支持打字机效果 (只支持Linux）
+# 命令行聊天程序, 支持打字机效果
 ./main -p ~/Qwen2-7B-Instruct/ 
 
 # 简易webui, 使用流式输出 + 动态batch，可多路并发访问
