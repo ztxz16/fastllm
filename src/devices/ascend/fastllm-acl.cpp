@@ -27,9 +27,8 @@ void FastllmAclInit() {
 }
 
 static std::map<int32_t, aclrtContext> FastllmAclContextMap;
-aclrtContext getFastllmAclContextHandle() {
-    int32_t id = -1;
-    aclrtGetDevice(&id);
+aclrtContext getFastllmAclContextHandle(int32_t id) {
+    // aclrtGetDevice(&id);
     auto it = FastllmAclContextMap.find(id);
     if (it != FastllmAclContextMap.end()) {
         return it->second;
@@ -45,20 +44,41 @@ aclrtContext getFastllmAclContextHandle() {
     return context;
 }
 
+static int32_t curDeviceId = -1;
+
+static aclrtStream stream = nullptr;
+
 void FastllmAclFinalize() {
+    if (stream != nullptr) {
+        aclError state = aclrtSynchronizeStream(stream);
+        state = aclrtDestroyStream(stream);
+        checkAclError("Error: Ascend CL error when destroy stream!", state);
+    }
     for (auto &it : FastllmAclContextMap) {
         aclError state = aclrtDestroyContext(it.second);
         checkAclError("Error: Ascend CL error when destory context!", state);
-        state = aclrtResetDevice(it.first);
-        checkAclError("Error: Ascend CL reset device failed", state);
+        // state = aclrtResetDevice(it.first);
+        // checkAclError("Error: Ascend CL reset device failed", state);
     }
     aclError state = aclFinalize();
     checkAclError("Error: Ascend CL error when finalize!", state);
 }
 
 void FastllmAclSetDevice(int32_t device_id) {
-    aclError state = aclrtSetDevice(device_id);
+    //aclError state = aclrtSetDevice(device_id);
+    aclError state;
+    if (curDeviceId == device_id)
+        return;
+    if (curDeviceId != -1) {
+        state = aclrtDestroyStream(&stream);
+        checkAclError("Error: Ascend CL error when destroy stream!", state);
+    }
+    aclrtContext context = getFastllmAclContextHandle(device_id);
+    state = aclrtSetCurrentContext(context);
     checkAclError("Error: Ascend CL error when set device!", state);
+    state = aclrtCreateStream(&stream);
+    checkAclError("Error: Ascend CL error when create stream!", state);
+    curDeviceId = device_id;
 }
 
 void DeviceSync() {
