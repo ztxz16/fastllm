@@ -90,7 +90,6 @@ class FastLLmCompletion:
           return error_check_ret
       
       query:str = ""
-      history:List[Tuple[str, str]] = []
       if request.prompt:
          request.messages.append({"role": "user", "content": request.prompt})
       try:
@@ -101,7 +100,6 @@ class FastLLmCompletion:
 
               conversation.extend(messages)
 
-          # fastllm 样例中history只能是一问一答, system promt 暂时不支持
           if len(conversation) == 0:
             raise Exception("Empty msg")
           messages = []
@@ -120,11 +118,11 @@ class FastLLmCompletion:
         frequency_penalty = request.frequency_penalty
 
       max_length = request.max_tokens if request.max_tokens else 8192
-      input_token_len = 0; # self.model.get_input_token_len(query, history)
+      input_token_len = self.model.get_input_token_len(messages)
       #logging.info(request)
       logging.info(f"fastllm input message: {messages}")
       #logging.info(f"input tokens: {input_token_len}")
-      # stream_response 中的结果不包含token的统计信息
+
       result_generator = self.model.stream_response_async(messages,
                         max_length = max_length, do_sample = True,
                         top_p = request.top_p, top_k = request.top_k, temperature = request.temperature,
