@@ -1,3 +1,5 @@
+### 自定义模型
+
 对于Fastllm框架中没有支持的模型，可以通过自定义模型结构来支持
 
 Pyhton 自定义模型只需要一个python文件来描述模型结构，可参考 [QWEN](../example/python/qwen2.py) 中的实现
@@ -6,7 +8,7 @@ Pyhton 自定义模型只需要一个python文件来描述模型结构，可参�
 
 使用ftllm.chat, ftllm.webui, ftllm.server时，可以加入参数--custom来指定自定义模型文件
 
-假设我们的模型位于 "~/Qwen2-7B-Instruct/" 目录，自定义模型位于 "~/qwen2.py"
+假设我们的模型位于 `~/Qwen2-7B-Instruct/` 目录，自定义模型位于 `~/qwen2.py`
 
 那么可以使用命令
 
