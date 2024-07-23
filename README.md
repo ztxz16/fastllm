@@ -70,7 +70,7 @@ python3 -m ftllm.webui -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080
 
 一些早期的HuggingFace模型无法直接读取，可以参考 [模型转换](docs/models.md#模型导出convert-offline) 转换fastllm格式的模型
 
-可以自定义模型结构，具体见 [自定义模型](docs/custom_model.md)
+可以自定义模型结构，具体见 [自定义模型](docs/custom.md)
 
 ### 运行demo程序 (c++)
 
