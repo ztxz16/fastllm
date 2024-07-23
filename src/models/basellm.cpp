@@ -513,9 +513,13 @@ namespace fastllm {
                     }
                     
                     model->tokensLimit = maxTotalLens;
+                    int limit = maxTotalLens;
+                    model->promptLimit = limit * 2 / 3;
+
                     if (model->verbose) {
                         printf("Fastllm KV Cache Limit: %f MB.\n", (double)kvCacheLimit / 1024 / 1024);
                         printf("Fastllm KV Cache Token limit: %d tokens.\n", maxTotalLens);
+                        printf("Fastllm Prompt Token limit: %d tokens.\n", std::min(model->max_positions, model->promptLimit));
                         printf("Fastllm Batch limit: %d.\n", maxBatch);
                     }
 
@@ -538,7 +542,7 @@ namespace fastllm {
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
 
                         int limit = maxTotalLens;
-                        int promptLimit = limit * 2 / 3;
+                        int promptLimit = model->promptLimit;
 
                         int lenSum = 0;
                         for (auto &it: model->responseContextDict.dicts) {
@@ -564,6 +568,11 @@ namespace fastllm {
                                     continue;
                                 }
                                 if (!isPrompt && it.second->preTokens == 0) {
+                                    continue;
+                                }
+                                if (it.second->currentTokens.size() > promptLimit) {
+                                    it.second->isEnding = true;
+                                    it.second->error = ResponseContextErrorPromptTooLong;
                                     continue;
                                 }
 
@@ -794,7 +803,11 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 } else {
                     if (context->isEnding) {
                         responseContextDict.RemoveHandle(handleId);
-                        return -1;
+                        if (context->error == ResponseContextErrorNone) {
+                            return -1;
+                        } else if (context->error == ResponseContextErrorPromptTooLong) {
+                            return -2;
+                        }
                     }
                 }
                 dictLocker.unlock();

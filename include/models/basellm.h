@@ -22,6 +22,10 @@ using RuntimeResultBatch = std::function<void(int index, std::vector <std::strin
 namespace fastllm {
     using ChatMessages = std::vector <std::pair <std::string, std::string> >;
 
+    enum ResponseContextError {
+        ResponseContextErrorNone = 0, ResponseContextErrorPromptTooLong
+    };
+
     struct ResponseContext {
         bool isEnding = false;
         std::vector <std::pair <Data, Data> > pastKeyValues;
@@ -30,6 +34,7 @@ namespace fastllm {
         std::queue <std::vector <float>*> resultLogits;
         GenerationConfig generationConfig;
         LastTokensUnit tokens;
+        ResponseContextError error = ResponseContextErrorNone;
 
         int preTokens = 0;
         int curTokens = 0;
@@ -232,6 +237,7 @@ namespace fastllm {
         std::string adapterName;
 
         int tokensLimit = -1;
+        int promptLimit = -1;
 
         PastKVCacheManager pastKVCacheManager;
         bool saveHistoryChat = false;
