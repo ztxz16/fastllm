@@ -610,11 +610,12 @@ class model:
         else:
             return ctypes.c_int(len(stop_token_ids)), (ctypes.c_int * len(stop_token_ids))(*stop_token_ids)
     
-    def get_input_token_len(self, query: str, history: List[Tuple[str, str]] = None) -> int:
-        prompt = query if self.direct_query else self.get_prompt(query, history);
+    def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True) -> int:
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+            prompt = self.hf_tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = False)
             return len(self.hf_tokenizer.encode(prompt))
         else:
+            prompt = self.apply_chat_template(conversation)
             return len(self.encode(prompt))
 
     def response_logits(self,
