@@ -489,9 +489,21 @@ namespace fastllm {
                     long long kvCacheLimit = 16LL << 30;
 #ifdef USE_CUDA
                     auto freeSizes = FastllmCudaGetFreeSizes();
+                    auto dmap = GetDeviceMap();
+                    std::set <int> deviceIds;
+                    for (auto &it : dmap) {
+                        if (StartWith(it.first, "cuda")) {
+                            for (int id : ParseDeviceIds(it.first, "cuda")) {
+                                deviceIds.insert(id);
+                            }
+                        }
+                    }
+                    if (deviceIds.size() == 0) {
+                        deviceIds.insert(0);
+                    }
                     kvCacheLimit = 0;
-                    for (long long i : freeSizes) {
-                        kvCacheLimit += std::max(0LL, i - (2LL << 30));
+                    for (int id : deviceIds) {
+                        kvCacheLimit += std::max(0LL, freeSizes[id] - (2LL << 30));
                     }
 #endif
                     if (model->kvCacheLimit > 0) {
@@ -803,10 +815,14 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 } else {
                     if (context->isEnding) {
                         responseContextDict.RemoveHandle(handleId);
+                        dictLocker.unlock();
+                        dictCV.notify_one();
                         if (context->error == ResponseContextErrorNone) {
                             return -1;
                         } else if (context->error == ResponseContextErrorPromptTooLong) {
                             return -2;
+                        } else {
+                            return -1;
                         }
                     }
                 }
@@ -836,6 +852,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 } else {
                     if (context->isEnding) {
                         responseContextDict.RemoveHandle(handleId);
+                        dictLocker.unlock();
+                        dictCV.notify_one();
                         return -1;
                     }
                 }

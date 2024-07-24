@@ -120,6 +120,9 @@ std::vector <long long> FastllmCudaGetFreeSizes() {
     std::vector <long long> ret;
     
     // 遍历所有设备  
+    int id = -1;
+    cudaGetDevice(&id);
+
     for (int i = 0; i < deviceCount; ++i) {
         cudaDeviceProp prop;
         error = cudaGetDeviceProperties(&prop, i);
@@ -129,6 +132,7 @@ std::vector <long long> FastllmCudaGetFreeSizes() {
             // printf("  Total global memory: %zu bytes\n", prop.totalGlobalMem);
             
             // 获取当前设备的显存使用情况  
+            cudaSetDevice(i);
             size_t free = 0, total = 0;
             cudaMemGetInfo(&free, &total);
             ret.push_back(free);
@@ -138,6 +142,7 @@ std::vector <long long> FastllmCudaGetFreeSizes() {
             printf("cudaGetDeviceProperties returned %d\n-> %s\n", (int)error, cudaGetErrorString(error));
         }
     }
+    cudaSetDevice(id);
     return ret;
 }
 
