@@ -660,6 +660,7 @@ class model:
             for l in range(len(common_token)):
                 if (l >= len(cur_token) or cur_token[l] != common_token[l]):
                     common_token = common_token[:l]
+                    break
 
         last_ret = ""
         max_prob = -1e5
