@@ -687,6 +687,10 @@ class model:
                 softmax(out)
                 if (idx < len(real_input)):
                     cur_prob += math.log(out[real_input[idx]])
+                while True:
+                    if (ret <= -1):
+                        break
+                    ret = fastllm_lib.fetch_response_logits_llm_model(self.model, handle, array)
             max_id = -1
             for i in cur_set:
                 if max_id == -1 or out[i] > out[max_id]:
