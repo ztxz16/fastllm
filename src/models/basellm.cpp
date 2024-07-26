@@ -750,6 +750,24 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                                     }
                                 }
                             }
+                        } else {
+                            int maxLen = -1, select = -1;
+                            for (auto &it: model->responseContextDict.dicts) {
+                                if (it.second->isEnding) {
+                                    continue;
+                                }
+                                if (it.second->pastKeyValues[0].first.expansionDims.size() > 0) {
+                                    int curLen = it.second->pastKeyValues[0].first.expansionDims[1];
+                                    if (curLen > maxLen) {
+                                        maxLen = curLen;
+                                        select = it.first;
+                                    }
+                                }
+                            }
+                            if (select != -1) {
+                                model->responseContextDict.dicts[select]->isEnding = true;
+                                continue;
+                            }
                         }
 
                         for (int i = 0; i < attentionMasks.size(); i++) {
