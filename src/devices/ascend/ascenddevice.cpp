@@ -60,6 +60,8 @@ namespace fastllm {
 
     bool AscendLinearOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Executor *executor = (Executor *) GetExecutor();
+        this->warmUpMode = executor->isWarmUpMode();
 
         Data &input = *(datas.find("input")->second);
         Data &weight = *(datas.find("weight")->second);

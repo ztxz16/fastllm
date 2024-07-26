@@ -3,6 +3,9 @@
 
 #include "model.h"
 #include "fastllm.h"
+#ifdef USE_ASCEND_NPU
+#include "executor.h"
+#endif
 #include <sstream>
 #include <fstream>
 #include <regex>
@@ -1343,6 +1346,10 @@ if (false) {
     std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
         std::string modelType = GetModelTypeFromFile(fileName);
         basellm *model = CreateModelWithType(modelType);
+#ifdef USE_ASCEND_NPU
+        Executor *executor = (Executor *) GetExecutor();
+        executor->setWarmUpMode(true);
+#endif
         if(modelType == "bert"){
             BertModel *bertModel = (BertModel*)model;
             bertModel->weight.tokenizer.type = Tokenizer::BERT;
@@ -1352,6 +1359,9 @@ if (false) {
             model->LoadFromFile(fileName);
             model->WarmUp();
         }
+#ifdef USE_ASCEND_NPU
+        executor->setWarmUpMode(false);
+#endif
         return std::unique_ptr<fastllm::basellm> (model);
     }
 
@@ -1991,8 +2001,15 @@ if (false) {
 
         delete loraTensors;
 
+#ifdef USE_ASCEND_NPU
+        Executor *executor = (Executor *) GetExecutor();
+        executor->setWarmUpMode(true);
+#endif
         if (!weightOnly)
             model->WarmUp();
+#ifdef USE_ASCEND_NPU
+        executor->setWarmUpMode(false);
+#endif
         return std::unique_ptr<fastllm::basellm> (model);
     }
 

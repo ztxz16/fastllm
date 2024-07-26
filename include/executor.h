@@ -12,6 +12,10 @@ namespace fastllm {
     private:
         std::vector <BaseDevice*> devices;
         std::map <std::string, float> profiler;
+#ifdef USE_ASCEND_NPU
+        // 当前状态是否为warm up
+        bool warmUpMode;
+#endif
 
     public:
         Executor (); // 创建默认的Executor
@@ -34,6 +38,15 @@ namespace fastllm {
         // 运行一个op
         void Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                  const fastllm::IntDict &intParams);
+
+#ifdef USE_ASCEND_NPU
+        void setWarmUpMode(bool mode) {
+            this->warmUpMode = mode;
+        }
+        bool isWarmUpMode() {
+            return this->warmUpMode;
+        }
+#endif
 
         void ClearProfiler();
 
