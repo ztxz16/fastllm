@@ -29,6 +29,7 @@ namespace fastllm {
         BaseAscendOperator() {}
         BaseAscendOperator(std::string name) : name(name) {}
     protected:
+        bool warmUpMode;
         std::string name;
     };
 
