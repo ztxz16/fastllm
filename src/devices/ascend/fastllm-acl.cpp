@@ -77,10 +77,12 @@ void FastllmAclSetDevice(int32_t device_id) {
     aclError state;
     if (curDeviceId == device_id)
         return;
-    if (curDeviceId != -1) {
+    if (curDeviceId != -1 || device_id == -1) {
         state = aclrtDestroyStream(&stream);
         checkAclError("Error: Ascend CL error when destroy stream!", state);
     }
+    if (device_id == -1)
+        device_id = curDeviceId;
     aclrtContext context = getFastllmAclContextHandle(device_id);
     state = aclrtSetCurrentContext(context);
     checkAclError("Error: Ascend CL error when set device!", state);
@@ -227,7 +229,7 @@ void FastllmAclFree(void *ret) {
             std::vector <AscendMemoryBuffer> temp;
             for (int i = 0; i < buffers.size(); i++) {
                 if (!buffers[i].busy) {
-                    state = aclrtSetDevice(it.first);
+                    FastllmAclSetDevice(it.first);
                     state = aclrtFree(buffers[i].data);
                     if (ACL_SUCCESS != state)
                         printf("Error: AscendCL error when release memory on device %d!", it.first);
@@ -286,7 +288,7 @@ void FastllmAclClearBigBuffer() {
         std::vector <AscendMemoryBuffer> temp;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (!bigBuffers[i].busy) {
-                state = aclrtSetDevice(it.first);
+                FastllmAclSetDevice(it.first);
                 state = aclrtFree(bigBuffers[i].data);
                 if (ACL_SUCCESS != state)
                     printf("Error: AscendCL error when release memory on device %d!", it.first);
@@ -298,7 +300,7 @@ void FastllmAclClearBigBuffer() {
         bigBuffers.clear();
         bigBuffers = temp;
     }
-    aclrtSetDevice(id);
+    FastllmAclSetDevice(id);
 }
 
 
@@ -313,7 +315,7 @@ void FastllmAclClearBuffer() {
         std::vector <AscendMemoryBuffer> temp;
         for (int i = 0; i < buffers.size(); i++) {
             if (!buffers[i].busy) {
-                state = aclrtSetDevice(it.first);
+                FastllmAclSetDevice(it.first);
                 state = aclrtFree(buffers[i].data);
                 if (ACL_SUCCESS != state)
                     printf("Error: AscendCL error when release memory on device %d!", it.first);
@@ -325,7 +327,7 @@ void FastllmAclClearBuffer() {
         buffers.clear();
         buffers = temp;
     }
-    aclrtSetDevice(id);
+    FastllmAclSetDevice(id);
 }
 
 int FastllmAclCopyFromHostToDevice(void *dst, void *src, size_t size) {
@@ -391,6 +393,10 @@ void FastllmAclToTensor(const std::pair<std::string, Data*> &data, std::vector<a
     }
     aclTensorDesc* tensor = aclCreateTensorDesc(dataTypes[data.second->dataType], expandDims64.size(),
                                        expandDims64.data(), aclFormat::ACL_FORMAT_ND);
+    // printf("%s: type: %d dims: %zu : ", data.first.c_str(), dataTypes[data.second->dataType], expandDims64.size());
+    // for (int j = 0; j < expandDims64.size(); j++)
+    //     printf("%ld ", expandDims64[j]);
+    // printf(" %ld\n", data.second->deviceData);
     aclSetTensorDescName(tensor, data.first.c_str());
     tensors.emplace_back(tensor);
     aclDataBuffer* buffer = aclCreateDataBuffer(data.second->deviceData, data.second->expansionBytes);
@@ -415,10 +421,10 @@ void FastllmAclCreateShape(const std::pair<std::string, Data*> &data, std::vecto
             range_info[i][0] = range_info[i][1] = expandDims64[i];
         }
     }
-    printf("%s: type: %d dims: %zu : ", data.first.c_str(), dataTypes[data.second->dataType], expandDims64.size());
-	for (int j = 0; j < expandDims64.size(); j++)
-        printf("%ld ", expandDims64[j]);
-    printf("\n");
+    // printf("%s: type: %d dims: %zu : ", data.first.c_str(), dataTypes[data.second->dataType], expandDims64.size());
+    // for (int j = 0; j < expandDims64.size(); j++)
+    //     printf("%ld ", expandDims64[j]);
+    // printf("\n");
     aclTensorDesc* tensor = aclCreateTensorDesc(dataTypes[data.second->dataType], expandDims64.size(),
                                        expandDims64.data(), aclFormat::ACL_FORMAT_ND);
     aclSetTensorDescName(tensor, data.first.c_str());
