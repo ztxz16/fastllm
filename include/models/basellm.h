@@ -134,7 +134,7 @@ namespace fastllm {
     public:
         basellm() {};
 
-        ~basellm();
+        virtual ~basellm();
 
         virtual void LoadFromFile(const std::string &fileName); // 从文件读取   
 

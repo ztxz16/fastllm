@@ -3314,4 +3314,10 @@ namespace fastllm {
     std::map <std::string, int> GetMoeDeviceMap() {
         return defaultMoeDeviceMap;
     }
+
+    void Finalize() {
+#ifdef USE_ASCEND_NPU
+        npu::FastllmAclFinalize();
+#endif
+    }
 }

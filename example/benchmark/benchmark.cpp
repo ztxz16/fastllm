@@ -199,5 +199,7 @@ int main(int argc, char **argv) {
     printf("prompt use %f s\n", promptSpend);
     printf("prompt speed = %f tokens / s\n", (float)promptTokenNum / promptSpend);
     printf("output %d tokens\nuse %f s\nspeed = %f tokens / s\n", tokens, spend, tokens / spend);
+    model.reset();
+    fastllm::Finalize();
     return 0;
 }

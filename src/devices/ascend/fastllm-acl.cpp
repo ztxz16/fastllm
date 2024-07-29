@@ -7,12 +7,14 @@
 #include <acl/acl.h>
 #include <acl/acl_op_compiler.h>
 
-#define checkAclErrorFormat(message, state, args...) \
-    if (ACL_SUCCESS != state) { \
-        printf(message, ##args); \
+#define checkAclErrorFormat(message, state, args...)                                 \
+    if (ACL_SUCCESS != state) {                                                      \
+        printf(message, ##args);                                                     \
         printf("AsecndCL error = %d at %s:%d\n", state, "fastllm-acl.cpp", __LINE__);\
-        if (state >= 500000) \
-            exit(state);\
+        if (state >= 500000) {                                                       \
+            aclFinalize();                                                           \
+            exit(state);                                                             \
+        }                                                                            \
     }
 
 #define checkAclError(message, val) showError(val, message, "fastllm-acl.cpp", __LINE__)
@@ -21,8 +23,10 @@ void showError(aclError state, char const* const message, const char* const file
            int const line) {
     if (ACL_SUCCESS != state) {
         printf("%s  AsecndCL error = %d at %s:%d\n", message, state, file, line);
-        if (state >= 500000)
+        if (state >= 500000) {
+            aclFinalize();
             exit(state);
+        }
     }
 }
 
@@ -61,6 +65,7 @@ void FastllmAclFinalize() {
         aclError state = aclrtSynchronizeStream(stream);
         state = aclrtDestroyStream(stream);
         checkAclError("Error: Ascend CL error when destroy stream!", state);
+        stream = nullptr;
     }
     for (auto &it : FastllmAclContextMap) {
         aclError state = aclrtDestroyContext(it.second);
@@ -68,6 +73,7 @@ void FastllmAclFinalize() {
         // state = aclrtResetDevice(it.first);
         // checkAclError("Error: Ascend CL reset device failed", state);
     }
+    FastllmAclContextMap.clear();
     aclError state = aclFinalize();
     checkAclError("Error: Ascend CL error when finalize!", state);
 }

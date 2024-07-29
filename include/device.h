@@ -33,6 +33,7 @@ namespace fastllm {
 
     class BaseDevice {
     public:
+        virtual ~BaseDevice();
         virtual bool Malloc (void **ret, size_t size) = 0; // 分配尺寸为size的空间  
         virtual bool Malloc (void **ret, Data &data); // 分配形状为dims的空间  
         virtual bool Free(void *ret) = 0; // 释放ret

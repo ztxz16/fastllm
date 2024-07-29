@@ -14,7 +14,7 @@ namespace fastllm {
     }
 
     AscendNpuDevice::~AscendNpuDevice() {
-        npu::FastllmAclFinalize();
+        // npu::FastllmAclFinalize();
     }
 
     bool AscendNpuDevice::Malloc(void **ret, size_t size) {
