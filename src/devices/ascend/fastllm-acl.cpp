@@ -396,10 +396,11 @@ void FastllmAclToTensor(const std::pair<std::string, Data*> &data, std::vector<a
     // printf("%s: type: %d dims: %zu : ", data.first.c_str(), dataTypes[data.second->dataType], expandDims64.size());
     // for (int j = 0; j < expandDims64.size(); j++)
     //     printf("%ld ", expandDims64[j]);
-    // printf(" %ld\n", data.second->deviceData);
     aclSetTensorDescName(tensor, data.first.c_str());
     tensors.emplace_back(tensor);
-    aclDataBuffer* buffer = aclCreateDataBuffer(data.second->deviceData, data.second->expansionBytes);
+    uint64_t size = data.second->expansionBytes == 0 ? (data.second->Count(0) * data.second->unitSize - 1) / data.second->unitSizeDiv + 1 : data.second->expansionBytes;
+    // printf(" %ld\n", size);
+    aclDataBuffer* buffer = aclCreateDataBuffer(data.second->deviceData, size);
     buffers.emplace_back(buffer);
 }
 
@@ -432,7 +433,7 @@ void FastllmAclCreateShape(const std::pair<std::string, Data*> &data, std::vecto
         aclError state = aclSetTensorShapeRange(tensor, dimensions->size(), range_info);
         checkAclError("Error: AscendCL tensor dynamic shape setting error. ", state);
     } else {
-        delete range_info;
+        delete[] range_info;
     }
     tensors.emplace_back(tensor);
 }
