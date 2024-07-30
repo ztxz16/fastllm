@@ -67,6 +67,8 @@ fastllm_lib.fetch_response_str_llm_model.restype = ctypes.c_char_p
 fastllm_lib.can_fetch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.can_fetch_response_llm_model.restype = ctypes.c_bool
 
+fastllm_lib.abort_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+
 fastllm_lib.make_history_llm_model.argtype = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p]
 fastllm_lib.make_history_llm_model.restype = ctypes.c_char_p
 
@@ -844,7 +846,7 @@ class model:
             print("add_cache failed: need hf_tokenizer.")
             exit(0)
     
-    async def stream_response_async(self,
+    def launch_stream_response(self,
                         query: Union[str, List[Dict[str, str]]],
                         history: List[Tuple[str, str]] = None,
                         max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
@@ -874,7 +876,27 @@ class model:
             handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                         max_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                         False, stop_token_len, stop_token_list)
-            tokens = [];
+            return handle
+        else:
+            prompt = ""
+            if (conversation != None and len(conversation) != 0):
+                prompt = self.apply_chat_template(conversation)
+            else:
+                prompt = query if self.direct_query else self.get_prompt(query, history)
+            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+            handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+                                                            ctypes.c_int(max_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
+                                                            ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
+                                                            stop_token_len, stop_token_list)
+            return handle
+    
+    def abort_handle(self, handle):
+        fastllm_lib.abort_response_llm_model(self.model, handle)
+
+    async def stream_response_handle_async(self, handle):
+        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+            tokenizer = self.hf_tokenizer
+            tokens = []
             while True:
                 if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
                     await asyncio.sleep(0)
@@ -894,16 +916,6 @@ class model:
             if len(tokens) > 0:
                 yield tokenizer.decode(tokens)
         else:
-            prompt = ""
-            if (conversation != None and len(conversation) != 0):
-                prompt = self.apply_chat_template(conversation)
-            else:
-                prompt = query if self.direct_query else self.get_prompt(query, history)
-            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
-            handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
-                                                            ctypes.c_int(max_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
-                                                            ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
-                                                            stop_token_len, stop_token_list)
             res = ""
             ret = b''
             fail_cnt = 0
@@ -925,11 +937,17 @@ class model:
                 fail_cnt = 0
                 if (cur == "<flmeos>"):
                     break
-                if one_by_one:
-                    yield cur
-                else:
-                    res += cur
-                    yield res
+                yield cur
+                    
+    async def stream_response_async(self,
+                        query: Union[str, List[Dict[str, str]]],
+                        history: List[Tuple[str, str]] = None,
+                        max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
+                        one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True):
+        handle = self.launch_stream_response(query, history, max_length, do_sample, top_p, top_k, temperature, 
+                                             repeat_penalty, one_by_one, stop_token_ids, add_generation_prompt)
+        async for ret in self.stream_response_handle_async(handle):
+            yield ret
 
     def stream_response_raw(self,
                             input_tokens: List[int],

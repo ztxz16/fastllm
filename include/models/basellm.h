@@ -27,7 +27,9 @@ namespace fastllm {
     };
 
     struct ResponseContext {
-        bool isEnding = false;
+        bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
+        bool isAbort = false; // 代表这个请求被中断了，也就是说不会再有人来fetch它了，那么推理完之后就可以删除这个请求了
+        
         std::vector <std::pair <Data, Data> > pastKeyValues;
         std::vector <int> currentTokens;
         std::queue <int> resultTokenQueue;
@@ -173,6 +175,8 @@ namespace fastllm {
         virtual int FetchResponseTokens(int handleId); // 获取指定handle的输出, -1代表输出结束了 
 
         virtual int FetchResponseLogits(int handleId, std::vector <float> &logits); // 获取指定handle的输出Logits
+
+        virtual void AbortResponse(int handleId); // 中断handleId的请求
 
         virtual void SaveLowBitModel(const std::string &fileName, int bit); // 存储成量化模型 
 
