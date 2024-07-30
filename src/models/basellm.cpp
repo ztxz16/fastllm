@@ -552,6 +552,17 @@ namespace fastllm {
                         std::vector <std::vector <float>* > logits;
                         
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+                        
+                        // 首先把已经abort的请求删除掉
+                        std::set <int> abortHandles;
+                        for (auto &it: model->responseContextDict.dicts) {
+                            if (it.second->isAbort) {
+                                abortHandles.insert(it.first);
+                            }
+                        }
+                        for (auto &it : abortHandles) {
+                            model->responseContextDict.RemoveHandle(it);
+                        }
 
                         int limit = maxTotalLens;
                         int promptLimit = model->promptLimit;
@@ -816,6 +827,17 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             return true;
         } else {
             return (context->resultTokenQueue.size() > 0 || context->isEnding);
+        }
+    }
+
+    void basellm::AbortResponse(int handleId) {
+        std::unique_lock<std::mutex> dictLocker(this->dictLocker);
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        
+        if (context == nullptr) {
+            return;
+        } else {
+            context->isAbort = true;
         }
     }
     
