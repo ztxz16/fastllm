@@ -714,23 +714,26 @@ class model:
                         ) -> str:
         prompt = query if self.direct_query else self.get_prompt(query, history);
         stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+        if (tokenizer == None and self.hf_tokenizer != None):
+            tokenizer = self.hf_tokenizer
         if (tokenizer == None):
+            vocab_size = fastllm_lib.get_tokenizer_vocab_size(self.model)
             handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
                                                            ctypes.c_int(1), ctypes.c_bool(False), ctypes.c_float(1), ctypes.c_int(1),
                                                            ctypes.c_float(1), ctypes.c_float(1), ctypes.c_bool(True),
-                                                           stop_token_len, stop_token_list);
+                                                           stop_token_len, stop_token_list)
         else:
-            input = tokenizer.encode(prompt);
+            input = tokenizer.encode(prompt)
             handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
-                                                           1, False, 1, 1, 1, 1, True, stop_token_len, stop_token_list);
-        vocab_size = fastllm_lib.get_tokenizer_vocab_size(self.model);
+                                                           1, False, 1, 1, 1, 1, True, stop_token_len, stop_token_list)
+            vocab_size = len(tokenizer.get_vocab())
         logits = list(range(vocab_size))
-        array = (ctypes.c_float * (vocab_size * 4))(*logits);
-        ret = fastllm_lib.fetch_response_logits_llm_model(self.model, handle, array);
-        out = list(array)[:vocab_size];
+        array = (ctypes.c_float * (vocab_size * 4))(*logits)
+        ret = fastllm_lib.fetch_response_logits_llm_model(self.model, handle, array)
+        out = list(array)[:vocab_size]
         while (ret != -1):
-            ret = fastllm_lib.fetch_response_logits_llm_model(self.model, handle, array);
-        return out;
+            ret = fastllm_lib.fetch_response_logits_llm_model(self.model, handle, array)
+        return out
 
     def response(self,
                  query: str,
