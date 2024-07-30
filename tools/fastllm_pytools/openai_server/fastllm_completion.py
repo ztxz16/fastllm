@@ -9,6 +9,7 @@ from typing import (AsyncGenerator, AsyncIterator, Awaitable, Iterable, List,
 import uuid
 from openai.types.chat import (ChatCompletionContentPartParam,
                                ChatCompletionRole)
+from starlette.background import BackgroundTask
 
 from .protocal.openai_protocol import *
 from ftllm import llm
@@ -75,7 +76,8 @@ class FastLLmCompletion:
   async def create_chat_completion(
       self, request: ChatCompletionRequest, raw_request: Request
   ) -> Union[ErrorResponse, AsyncGenerator[str, None],
-              ChatCompletionResponse]:
+              ChatCompletionResponse, 
+              Tuple[AsyncGenerator[str, None], AsyncGenerator]]:
       """Completion API similar to OpenAI's API.
 
       See https://platform.openai.com/docs/api-reference/chat/create
@@ -118,28 +120,40 @@ class FastLLmCompletion:
         frequency_penalty = request.frequency_penalty
 
       max_length = request.max_tokens if request.max_tokens else 8192
-      input_token_len = self.model.get_input_token_len(messages)
       #logging.info(request)
       logging.info(f"fastllm input message: {messages}")
       #logging.info(f"input tokens: {input_token_len}")
+      
+      input_token_len = self.model.get_input_token_len(messages)
 
-      result_generator = self.model.stream_response_async(messages,
+      handle = self.model.launch_stream_response(messages,
                         max_length = max_length, do_sample = True,
                         top_p = request.top_p, top_k = request.top_k, temperature = request.temperature,
                         repeat_penalty = frequency_penalty, one_by_one = True)
+      result_generator = self.model.stream_response_handle_async(handle)
       # Streaming response
       if request.stream:
-          return self.chat_completion_stream_generator(
-              request, result_generator, request_id, input_token_len)
+          return (self.chat_completion_stream_generator(
+              request, raw_request, result_generator, request_id, input_token_len), 
+              BackgroundTask(self.check_disconnect, raw_request, request_id, handle))
       else:
           try:
               return await self.chat_completion_full_generator(
-                  request, raw_request, result_generator, request_id, input_token_len)
+                  request, raw_request, handle, result_generator, request_id, input_token_len)
           except ValueError as e:
               return self.create_error_response(str(e))
-            
+
+  async def check_disconnect(self, raw_request: Request, request_id, handle: int):
+    while True:
+      if await raw_request.is_disconnected():
+        self.model.abort_handle(handle)
+        logging.info(f"Abort request: {request_id}")
+        return
+      await asyncio.sleep(1)  # 检查间隔
+      
   async def chat_completion_full_generator(
               self, request: ChatCompletionRequest, raw_request: Request,
+              handle: int,
               result_generator: AsyncIterator,
               request_id: str,
               input_token_len: int) -> Union[ErrorResponse, ChatCompletionResponse]:
@@ -150,6 +164,10 @@ class FastLLmCompletion:
       async for res in result_generator:
         result += res
         completion_tokens += 1
+        if await raw_request.is_disconnected():
+           self.model.abort_handle(handle)
+           logging.info(f"Abort request: {request_id}")
+           return self.create_error_response("Client disconnected")
 
       choice_data = ChatCompletionResponseChoice(
               index=0,
@@ -173,7 +191,7 @@ class FastLLmCompletion:
       
             
   async def chat_completion_stream_generator(
-          self, request: ChatCompletionRequest,
+          self, request: ChatCompletionRequest, raw_request: Request,
           result_generator: AsyncIterator,
           request_id: str,
           input_token_len: int) -> AsyncGenerator[str, None]:

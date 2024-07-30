@@ -37,14 +37,15 @@ async def create_chat_completion(request: ChatCompletionRequest,
     generator = await fastllm_completion.create_chat_completion(
         request, raw_request)
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
+        return JSONResponse(content = generator.model_dump(),
+                            status_code = generator.code)
     if request.stream:
-        return StreamingResponse(content=generator,
-                                 media_type="text/event-stream")
+        return StreamingResponse(content = generator[0],
+                                 background = generator[1], 
+                                 media_type = "text/event-stream")
     else:
         assert isinstance(generator, ChatCompletionResponse)
-        return JSONResponse(content=generator.model_dump())
+        return JSONResponse(content = generator.model_dump())
 
 def init_logging(log_level = logging.INFO, log_file:str = None):
     logging_format = '%(asctime)s %(process)d %(filename)s[line:%(lineno)d] %(levelname)s: %(message)s'

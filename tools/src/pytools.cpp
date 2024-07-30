@@ -352,6 +352,12 @@ extern "C" {
         return model->CanFetchResponse(handleId);
     }
 
+    // 终止handleId的请求
+    DLL_EXPORT void abort_response_llm_model(int modelId, int handleId) {
+        auto model = models.GetModel(modelId);
+        model->AbortResponse(handleId);
+    }
+
     DLL_EXPORT char *fetch_response_str_llm_model(int modelId, int handleId) {
         auto model = models.GetModel(modelId);
         int ret = model->FetchResponseTokens(handleId);
