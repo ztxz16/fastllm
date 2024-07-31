@@ -37,6 +37,76 @@ namespace fastllm {
         return result == 0;
     }
 
+    bool BaseAscendOperator::RunSingleOp(const std::string &opType, const fastllm::OrderedData &inputData,
+                                         const fastllm::DataDict &outputData, const fastllm::FloatDict &floatParams,
+                                         const fastllm::IntDict &intParams, const std::map <std::string, bool> &boolParams) {
+        std::vector<aclTensorDesc *> inputTensors;
+        std::vector<aclDataBuffer *> inputBuffers;
+        for (auto &pair : inputData)
+            npu::FastllmAclToTensor(pair, inputTensors, inputBuffers);
+        std::vector<aclTensorDesc *> outputTensors;
+        std::vector<aclDataBuffer *> outputBuffers;
+        for (auto &pair : outputData)
+            npu::FastllmAclToTensor(pair, outputTensors, outputBuffers);
+        aclopAttr *attr;
+        npu::FastllmAclToOpAttribute(floatParams, intParams, boolParams, &attr);
+        bool result = npu::FastllmAclExecute(opType, inputTensors, inputBuffers,
+                               outputTensors, outputBuffers, attr);
+        npu::FastllmAclDestoryTensors(inputTensors, inputBuffers, outputTensors, outputBuffers, &attr);
+        return result;
+    }
+
+    bool BaseAscendOperator::CompileAndRunSingleOp(const std::string &opType, const OrderedData &inputData, const fastllm::DataDict &outputData,
+                                                   const DynamicShapeDict &dynamicShapes, const FloatDict &floatParams,
+                                                   const IntDict &intParams, const BoolDict &boolParams) {
+        std::vector<aclTensorDesc *> inputTensors;
+        std::vector<aclDataBuffer *> inputBuffers;
+        for (auto &pair : inputData)
+            npu::FastllmAclToTensor(pair, inputTensors, inputBuffers);
+        std::vector<aclTensorDesc *> outputTensors;
+        std::vector<aclDataBuffer *> outputBuffers;
+        for (auto &pair : outputData)
+            npu::FastllmAclToTensor(pair, outputTensors, outputBuffers);
+        aclopAttr *attr;
+        npu::FastllmAclToOpAttribute(floatParams, intParams, boolParams, &attr);
+        if (warmUpMode) {
+            std::vector<aclTensorDesc *> inputTensorsForCompile;
+            std::vector<aclTensorDesc *> outputTensorsForCompile;
+            for (auto &pair : inputData) {
+                auto it = dynamicShapes.find(pair.first);
+                if (it != dynamicShapes.end()) {
+                    npu::FastllmAclCreateShape(pair, inputTensorsForCompile, it->second.first, it->second.second);
+                } else {
+                    npu::FastllmAclCreateShape(pair, inputTensorsForCompile);
+                }
+            }
+            for (auto &pair : outputData) {
+                auto it = dynamicShapes.find(pair.first);
+                if (it != dynamicShapes.end()) {
+                    npu::FastllmAclCreateShape(pair, outputTensorsForCompile, it->second.first, it->second.second);
+                } else {
+                    npu::FastllmAclCreateShape(pair, outputTensorsForCompile);
+                }
+            }
+            npu::FastllmAclInitOp(opType, inputTensorsForCompile, outputTensorsForCompile, attr);
+            npu::FastllmAclDestroyShape(inputTensorsForCompile);
+            npu::FastllmAclDestroyShape(outputTensorsForCompile);
+        }
+        bool result = npu::FastllmAclExecuteAfterInit(opType, inputTensors, inputBuffers,
+                                                      outputTensors, outputBuffers, attr);
+        npu::FastllmAclDestoryTensors(inputTensors, inputBuffers, outputTensors, outputBuffers, &attr);
+        return result;
+    }
+
+    bool BaseAscendOperator::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!deviceOk)
+            return false;
+        Executor *executor = (Executor *) GetExecutor();
+        this->warmUpMode = executor->isWarmUpMode();
+        return true;
+    }
+
     AscendLinearOp::AscendLinearOp() :
         BaseAscendOperator("BatchMatMulV2") {}
 
@@ -60,6 +130,8 @@ namespace fastllm {
 
     bool AscendLinearOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!deviceOk)
+            return false;
         Executor *executor = (Executor *) GetExecutor();
         this->warmUpMode = executor->isWarmUpMode();
 
@@ -124,23 +196,23 @@ namespace fastllm {
         if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT16) {
                 if (warmUpMode)
-                    npu::FastllmAclInitOp(this->name, inputTensorsForCompile, outputTensorsForCompile, attr);
-                npu::FastllmAclExecuteAfterInit(this->name, inputTensors, inputBuffers,
-                                                outputTensors, outputBuffers, attr);
+                    deviceOk = npu::FastllmAclInitOp(this->name, inputTensorsForCompile, outputTensorsForCompile, attr);
+                deviceOk = npu::FastllmAclExecuteAfterInit(this->name, inputTensors, inputBuffers,
+                                                           outputTensors, outputBuffers, attr);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
         } else if (input.dataType == DataType::FLOAT32) {
             if (weight.dataType == DataType::FLOAT32) {
                 if (warmUpMode)
-                    npu::FastllmAclInitOp(this->name, inputTensorsForCompile, outputTensorsForCompile, attr);
-                npu::FastllmAclExecuteAfterInit(this->name, inputTensors, inputBuffers,
-                                                outputTensors, outputBuffers, attr);
+                    deviceOk = npu::FastllmAclInitOp(this->name, inputTensorsForCompile, outputTensorsForCompile, attr);
+                deviceOk = npu::FastllmAclExecuteAfterInit(this->name, inputTensors, inputBuffers,
+                                                           outputTensors, outputBuffers, attr);
             } else if (weight.dataType == DataType::FLOAT16) {
                 if (warmUpMode)
-                    npu::FastllmAclInitOp(this->name, inputTensorsForCompile, outputTensorsForCompile, attr);
-                npu::FastllmAclExecuteAfterInit(this->name, inputTensors, inputBuffers,
-                                                outputTensors, outputBuffers, attr);
+                    deviceOk = npu::FastllmAclInitOp(this->name, inputTensorsForCompile, outputTensorsForCompile, attr);
+                deviceOk = npu::FastllmAclExecuteAfterInit(this->name, inputTensors, inputBuffers,
+                                                           outputTensors, outputBuffers, attr);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
