@@ -15,8 +15,8 @@ namespace fastllm {
         };
 
         JinjaVarType type = JinjaNone;
-        long long intValue;
-        float floatValue;
+        long long intValue = 0LL;
+        float floatValue = 0.0f;
         std::string stringValue;
         std::vector <JinjaVar> arrayValue;
         std::map <std::string, JinjaVar> dictValue;
@@ -55,7 +55,7 @@ namespace fastllm {
             JinjaTokenIn,
             JinjaTokenAssign, JinjaTokenNotEqual, JinjaTokenEqual, JinjaTokenAdd, JinjaTokenSub, JinjaTokenMul, JinjaTokenDiv,
             JinjaTokenNot, JinjaTokenAnd, JinjaTokenOr,
-            JinjaTokenFliter
+            JinjaTokenFliter, JinjaTokenNamespace
         };
 
         JinjaToKenType type;
@@ -96,7 +96,8 @@ namespace fastllm {
             {"false", JinjaToken::JinjaToKenType::JinjaTokenBOOL},
             {"and", JinjaToken::JinjaToKenType::JinjaTokenAnd},
             {"or", JinjaToken::JinjaToKenType::JinjaTokenOr},
-            {"not", JinjaToken::JinjaToKenType::JinjaTokenNot}
+            {"not", JinjaToken::JinjaToKenType::JinjaTokenNot},
+            {"namespace", JinjaToken::JinjaToKenType::JinjaTokenNamespace}
     };
 
     // 一个Jinja块 
