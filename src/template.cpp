@@ -280,13 +280,20 @@ namespace fastllm {
         this->temp = temp;
         // 词法解析
         int pos = 0;
+        bool trimNext = false;
         for (int i = 0; i < temp.size(); i++) {
             if (temp[i] == '{' && i + 1 < temp.size() && (temp[i + 1] == '{' || temp[i + 1] == '%') ) {
-                blocks.push_back(JinjaBlock(temp.substr(pos, i - pos)));
                 size_t curEnd = temp[i + 1] == '%' ? temp.find("%}", i + 2) : temp.find("}}", i + 2);
                 AssertInFastLLM(curEnd != -1, 
                                 "Can't find blockend: " + temp.substr(i, std::min(10, (int)temp.size() - i)));
+                std::string part = temp.substr(pos, i - pos);
+                if (temp[i + 2] == '-')
+                    part.erase(0, part.find_first_not_of(" \n\r\t"));
+                if (trimNext)
+                    part.erase(part.find_last_not_of(" \n\r\t") + 1);
+                blocks.push_back(JinjaBlock(part));
                 blocks.push_back(temp.substr(i, curEnd + 2 - i));
+                trimNext = (temp[curEnd - 1] == '-');
                 pos = curEnd + 2;
                 i = curEnd + 1;
             }
@@ -314,6 +321,15 @@ namespace fastllm {
                 }
                 AssertInFastLLM(ops.size() > 0 && ops.back().type == JinjaToken::JinjaTokenLSB, "Error: barckets doesn't match.");
                 ops.pop_back();
+            } else if (tokens[i].type == JinjaToken::JinjaTokenNamespace) {
+                // 目前仅支持 "变量 = 表达式" 格式
+                AssertInFastLLM(
+                    tokens.size() - i >= 3 &&
+                    tokens[i + 2].type == JinjaToken::JinjaTokenID &&
+                    tokens[i + 3].type == JinjaToken::JinjaTokenAssign,
+                    "Jinja error: only support format \"(var = expression)\"."
+                );
+                ops.push_back(tokens[i]);
             } else if (tokens[i].type == JinjaToken::JinjaTokenRMB) {
                 while (ops.size() > 0 && ops.back().type != JinjaToken::JinjaTokenLMB) {
                     suffixExp.push_back(ops.back());
@@ -380,6 +396,15 @@ namespace fastllm {
                 vars.pop_back();
                 vars.pop_back();
                 vars.push_back(a[b]);
+            } else if (it.type == JinjaToken::JinjaTokenNamespace) {
+                AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
+                JinjaVar a = vars[vars.size() - 2], b = vars.back();
+                if (b.type == JinjaVar::JinjaNone) {
+                    b = local[b];
+                }
+                vars.pop_back();
+                vars.pop_back();
+                vars.push_back(JinjaVar({{a.stringValue, b}}));
             } else if (it.type == JinjaToken::JinjaTokenFliter) {
                 AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
                 JinjaVar a = vars[vars.size() - 2], b = vars.back();
@@ -428,7 +453,7 @@ namespace fastllm {
         for (int i = st; i < end; i++) {
             JinjaBlock &curBlock = blocks[i];
             if (curBlock.type == JinjaBlock::JinjaBlockType::JinjaBlockOriginal) {
-                ret += JinjaTrim(JinjaVar(curBlock.value)).stringValue;
+                ret += curBlock.value;
             } else if (curBlock.type == JinjaBlock::JinjaBlockType::JinjaBlockVar) {
                 ret += ComputeExpression(var, curBlock.tokens, 0, curBlock.tokens.size()).DirectValue();
             } else if (curBlock.type == JinjaBlock::JinjaBlockFor) {
@@ -526,15 +551,25 @@ namespace fastllm {
                     i = endPos;
             } else if (curBlock.type == JinjaBlock::JinjaBlockSet) {
                 // 目前仅支持 "set 变量 = 表达式" 格式
-                AssertInFastLLM(
-                    curBlock.tokens.size() >= 4 &&
-                    curBlock.tokens[1].type == JinjaToken::JinjaTokenID &&
-                    curBlock.tokens[2].type == JinjaToken::JinjaTokenAssign,
-                    "Jinja error: only support format \"set var = expression\"."
-                );
-
-                std::string iterId = curBlock.tokens[1].value;
-                var[iterId] = ComputeExpression(var, curBlock.tokens, 3, curBlock.tokens.size());
+                if (curBlock.tokens.size() >= 4 &&
+                        curBlock.tokens[1].type == JinjaToken::JinjaTokenID &&
+                        curBlock.tokens[2].type == JinjaToken::JinjaTokenAssign) {
+                    std::string iterId = curBlock.tokens[1].value;
+                    var[iterId] = ComputeExpression(var, curBlock.tokens, 3, curBlock.tokens.size());
+                } else if (curBlock.tokens.size() >= 4 &&
+                        curBlock.tokens[1].type == JinjaToken::JinjaTokenID &&
+                        curBlock.tokens[curBlock.tokens.size() - 2].type == JinjaToken::JinjaTokenAssign) {
+                    JinjaVar value = ComputeExpression(var, curBlock.tokens, curBlock.tokens.size() - 1, curBlock.tokens.size());
+                    JinjaVar key = ComputeExpression(var, curBlock.tokens, 1, curBlock.tokens.size() - 2);
+                    key.type = value.type;
+                    key.intValue = value.intValue;
+                    key.floatValue = value.floatValue;
+                    key.stringValue = value.stringValue;
+                    key.arrayValue = value.arrayValue;
+                    key.dictValue = value.dictValue;
+                } else {
+                    ErrorInFastLLM("Jinja error: only support format \"set var = expression\".");
+                }
             } else {
                 ErrorInFastLLM("Jinja usupport block: " + curBlock.value);
             }

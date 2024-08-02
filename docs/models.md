@@ -74,17 +74,16 @@
 
 |                                       模型  | 加载后转换 |  离线转换  |  直接读取  |
 |-------------------------------------------: |------------|------------|------------|
-| deepseek-ai/Deepseek-Coder-1.3B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔<sup>4</sup><sup>5</sup> |
-| deepseek-ai/Deepseek-Coder-6.7B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔<sup>4</sup><sup>5</sup> |
-| deepseek-ai/Deepseek-Coder-7B-Instruct v1.5 | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔<sup>4</sup> |
-| deepseek-ai/deepseek-coder-33b-instruct     | [√](llama_cookbook.md#deepseek-coder) | [√](llama_cookbook.md#deepseek-coder) | ✔<sup>4</sup> |
+| deepseek-ai/Deepseek-Coder-1.3B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
+| deepseek-ai/Deepseek-Coder-6.7B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
+| deepseek-ai/Deepseek-Coder-7B-Instruct v1.5 | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
+| deepseek-ai/deepseek-coder-33b-instruct     | [√](llama_cookbook.md#deepseek-coder) | [√](llama_cookbook.md#deepseek-coder) | ✔ |
 | deepseek-ai/DeepSeek-V2-Chat                | √ | ✔ | √ |
 | deepseek-ai/DeepSeek-V2-Lite-Chat           | √ | ✔ | ✔ |
 | deepseek-ai/DeepSeek-Coder-V2-Instruct      | √ | ✔ | √ |
 | deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct | √ | ✔ | ✔ |
 
 > 注4： Python ftllm用AutoTokenizer而不使用Fastllm Tokenizer可以实现加载，但是C++程序尚不支持加载该模型的Tokenizer。
-> 注5： C++端仅支持最早的几个 `tokenizer_config.json` 版本
 
 
 ### LLaMA类模型
