@@ -11,6 +11,8 @@ namespace fastllm {
         this->deviceType = "acl";
         npu::FastllmAclInit();
         this->ops["Linear"] = new AscendLinearOp();
+        this->ops["Silu"] = new AscendSiluOp();
+        this->ops["MulTo"] = new AscendMulToOp();
     }
 
     AscendNpuDevice::~AscendNpuDevice() {
@@ -222,6 +224,46 @@ namespace fastllm {
         npu::FastllmAclDestroyShape(inputTensorsForCompile);
         npu::FastllmAclDestroyShape(outputTensorsForCompile);
         npu::FastllmAclDestoryTensors(inputTensors, inputBuffers, outputTensors, outputBuffers, &attr);
+    }
+
+    AscendSiluOp::AscendSiluOp() : 
+        BaseAscendOperator("Swish") {}
+
+    void AscendSiluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = datas.find("input")->second;
+        Data *output = datas.find("output")->second;
+        DynamicShapeDict dynamicShapes;
+        dynamicShapes["x"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        deviceOk = CompileAndRunSingleOp(this->name, {{"x", input}}, {{"y", output}}, dynamicShapes, {{"scale", 1.0}}, {}, {});
+    }
+
+    AscendMulToOp::AscendMulToOp() : 
+        BaseAscendOperator("Mul") {}
+
+    bool AscendMulToOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!BaseAscendOperator::CanRun(opType, datas, floatParams, intParams))
+            return false;
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0f;
+        return alpha == 1.0f;
+    }
+
+    void AscendMulToOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+
+        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
+                        "MulTo error: Data's type should be float32 or float16.\n");
+        AssertInFastLLM(input0.dims == input1.dims, "MulTo error: input's shape should be same.\n");
+        DynamicShapeDict dynamicShapes;
+        dynamicShapes["x1"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        dynamicShapes["x2"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        deviceOk = CompileAndRunSingleOp(this->name, {{"x1", &input0}, {"x2", &input1}}, {{"y", &input0}}, dynamicShapes, {}, {}, {});
     }
 
 }
