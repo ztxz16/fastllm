@@ -406,7 +406,6 @@ __global__ void FastllmCudaHalf2FloatKernel(half* a, float *b, int len) {
 }
 
 __global__ void FastllmCudaBF162FloatKernel(uint16_t* a, float *b, int len) {
-    return;
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
         ((uint32_t*)b)[idx] = a[idx] << 16;
