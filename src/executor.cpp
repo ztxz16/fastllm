@@ -11,6 +11,8 @@
 #ifdef USE_CUDA
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/multicuda/multicudadevice.h"
+#include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
 #ifdef USE_TFACC
@@ -22,6 +24,7 @@ namespace fastllm {
         this->devices.clear();
 #ifdef USE_CUDA
         this->devices.push_back((BaseDevice*) new CudaDevice());
+        this->devices.push_back((BaseDevice*) new MultiCudaDevice());
 #endif
 #ifdef USE_TFACC
         this->devices.push_back((BaseDevice*) new TfaccDevice());
@@ -95,6 +98,9 @@ namespace fastllm {
 #ifdef USE_CUDA
                 if (device->deviceType == "cuda" && device->deviceIds.size() > 0) {
                     FastllmCudaSetDevice(device->deviceIds[0]);
+                }
+                if (device->deviceType == "multicuda" && device->deviceIds.size() > 0) {
+                    FastllmMultiCudaSetDevice(device->deviceIds);
                 }
 #endif
                 for (auto &it: datas) {
