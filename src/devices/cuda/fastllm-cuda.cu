@@ -1102,6 +1102,7 @@ __global__ void FastllmLayerNormKernelTop1(float *input, float *output, int chan
     float *inputData = input + blockIdx.x * channels;
     float *outputData = output + blockIdx.x * 2;
     int tid = threadIdx.x;
+    idData[tid] = tid;
     maxData[tid] = -1e100;
     for (int j = tid; j < channels; j += THREAD_PER_BLOCK) {
         if (inputData[j] > maxData[tid]) {
@@ -1134,6 +1135,7 @@ __global__ void FastllmLayerNormKernelTopK(float *input, float *output, int K, i
     float *inputData = input + blockIdx.x * channels;
     float *outputData = output + blockIdx.x * 2 * K;
     int tid = threadIdx.x;
+    idData[tid][0] = tid;
     for (int i = 0; i < K; i++) {
         maxData[tid][i] = -1e100;
     }
