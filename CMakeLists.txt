@@ -83,6 +83,10 @@ if (USE_CUDA)
     include_directories(include/devices/cuda)
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
     set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/cuda/fastllm-cuda.cu)
+
+    include_directories(include/devices/multicuda)
+    set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES} src/devices/multicuda/multicudadevice.cpp src/devices/multicuda/fastllm-multicuda.cu)
+
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
     set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
 endif()
