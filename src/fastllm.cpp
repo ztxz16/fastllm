@@ -1102,7 +1102,7 @@ namespace fastllm {
 
     void Data::ToDevice(void *device) {
         BaseDevice *dev = (BaseDevice*)device;
-        if (dev->deviceType == "cuda") {
+        if (dev->deviceType == "cuda" || dev->deviceType == "multicuda") {
             this->ToDevice(DataDevice::CUDA, dev->deviceIds);
         } else {
             this->ToDevice(DataDevice::CPU, dev->deviceIds);
