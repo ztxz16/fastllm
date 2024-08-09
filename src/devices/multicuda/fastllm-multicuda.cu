@@ -39,6 +39,16 @@ extern void *FastllmCudaPrepareOutput(fastllm::Data &output);
 extern void FastllmCudaFinishInput(const fastllm::Data &input, void *data);
 extern void FastllmCudaFinishOutput(fastllm::Data &output, void *data);
 
+extern void LaunchFastllmGemmFp16Fp16(half *input, half *weight, half *output, half *bias, int n, int m, int k);
+extern void LaunchFastllmGemmFp16Int8(half *input, uint8_t *weight, half *output, half *bias, float *scales, uint8_t *zeros, int n, int m, int k);
+extern void LaunchFastllmGemmFp16Int4NoZero(half *input, uint8_t *weight, half *output, half *bias, float *scales, float *mins, int n, int m, int k);
+extern void LaunchFastllmGemmFp16Int4Group(half *input, uint8_t *weight, half *output, half *bias, float *scales, float *mins, int n, int m, int k, int group, int groupCnt);
+
+extern void LaunchFastllmGemmFp32Fp16(float *input, half *weight, float *output, float *bias, int n, int m, int k);
+extern void LaunchFastllmGemmFp32Int8(float *input, uint8_t *weight, float *output, float *bias, float *scales, uint8_t *zeros, int n, int m, int k);
+extern void LaunchFastllmGemmFp32Int4NoZero(float *input, uint8_t *weight, float *output, float *bias, float *scales, float *mins, int n, int m, int k);
+extern void LaunchFastllmGemmFp32Int4Group(float *input, uint8_t *weight, float *output, float *bias, float *scales, float *mins, int n, int m, int k, int group, int groupCnt);
+
 std::vector <int> multiCudaCurrentDevices;
 
 void FastllmMultiCudaSetDevice(std::vector <int> ids) {
@@ -74,55 +84,65 @@ namespace fastllm {
                 cudaMemcpy(curInput, cudaInput, n * m * sizeof(half), cudaMemcpyDeviceToDevice);
             }
 
-            __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
-            auto fastllmCublasHandle = getFastllmCublasHandle();
-            cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
-            cublasStatus_t status;
+            if (weightDataType == DataType::FLOAT16 && n < 8) {
+                LaunchFastllmGemmFp16Fp16(curInput, (half*)weight, curOutput, bias, n, m, len);
+            } else if (weightDataType == DataType::INT8 && n < 8) {
+                LaunchFastllmGemmFp16Int8(curInput, (uint8_t*)weight, curOutput, bias, scales, zeros, n, m, len);
+            } else if (weightDataType == DataType::INT4_NOZERO && n < 8) {
+                LaunchFastllmGemmFp16Int4NoZero(curInput, (uint8_t*)weight, curOutput, bias, scales, mins, n, m, len);
+            } else if (weightDataType == DataType::INT4_GROUP && n < 8) {
+                LaunchFastllmGemmFp16Int4Group(curInput, (uint8_t*)weight, curOutput, bias, scales, mins, n, m, k, group, groupCnt);
+            } else {
+                __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
+                auto fastllmCublasHandle = getFastllmCublasHandle();
+                cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+                cublasStatus_t status;
 
-            half *fp16Weight = (half*)weight;
-            bool isQuant = false;
-            if (weightDataType == DataType::INT4_NOZERO) {
-                int threadPerBlock = std::min(256, len * m);
-                isQuant = true;
-                fp16Weight = (half*)FastllmCudaMalloc(len * m * sizeof(half));
-                FastllmCudaInt42HalfKernel <<< (len * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, scales, mins, fp16Weight, len * m, m);
-            } else if (weightDataType == DataType::INT4_GROUP) {
-                int threadPerBlock = std::min(256, len * m);
-                isQuant = true;
-                fp16Weight = (half*)FastllmCudaMalloc(len * m * sizeof(half));
-                FastllmCudaInt4Group2HalfKernel <<< (len * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, scales, mins, fp16Weight, len * m, m, group, groupCnt);
-            } else if (weightDataType == DataType::INT8) {
-                int threadPerBlock = std::min(256, len * m);
-                isQuant = true;
-                fp16Weight = (half*)FastllmCudaMalloc(len * m * sizeof(half));
-                FastllmCudaInt82HalfKernel <<< (len * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, scales, zeros, fp16Weight, len * m, m);
-            }
+                half *fp16Weight = (half*)weight;
+                bool isQuant = false;
+                if (weightDataType == DataType::INT4_NOZERO) {
+                    int threadPerBlock = std::min(256, len * m);
+                    isQuant = true;
+                    fp16Weight = (half*)FastllmCudaMalloc(len * m * sizeof(half));
+                    FastllmCudaInt42HalfKernel <<< (len * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, scales, mins, fp16Weight, len * m, m);
+                } else if (weightDataType == DataType::INT4_GROUP) {
+                    int threadPerBlock = std::min(256, len * m);
+                    isQuant = true;
+                    fp16Weight = (half*)FastllmCudaMalloc(len * m * sizeof(half));
+                    FastllmCudaInt4Group2HalfKernel <<< (len * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, scales, mins, fp16Weight, len * m, m, group, groupCnt);
+                } else if (weightDataType == DataType::INT8) {
+                    int threadPerBlock = std::min(256, len * m);
+                    isQuant = true;
+                    fp16Weight = (half*)FastllmCudaMalloc(len * m * sizeof(half));
+                    FastllmCudaInt82HalfKernel <<< (len * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, scales, zeros, fp16Weight, len * m, m);
+                }
 
-            status = cublasGemmEx(fastllmCublasHandle,
-                                    CUBLAS_OP_T, CUBLAS_OP_N,
-                                    len, n, m, &h_alpha, fp16Weight, AType, 
-                                    m, curInput, BType,
-                                    m, &h_beta,
-                                    curOutput, CType,
-                                    len, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                printf("Error: cublas error.\n");
-                throw ("cublas error");
-                exit(0);
-            }            
+                status = cublasGemmEx(fastllmCublasHandle,
+                                        CUBLAS_OP_T, CUBLAS_OP_N,
+                                        len, n, m, &h_alpha, fp16Weight, AType, 
+                                        m, curInput, BType,
+                                        m, &h_beta,
+                                        curOutput, CType,
+                                        len, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    printf("Error: cublas error.\n");
+                    throw ("cublas error");
+                    exit(0);
+                }            
 
-            if (hasBias) {
-                FastllmCudaBiasKernel <<< n, 256 >>>(curOutput, bias, len);
+                if (hasBias) {
+                    FastllmCudaBiasKernel <<< n, 256 >>>(curOutput, bias, len);
+                }
+
+                if (isQuant) {
+                    FastllmCudaFree(fp16Weight);
+                }
             }
 
             if (deviceId != 0 || n > 1) {
                 cudaMemcpy2D(cudaOutput + start, k * sizeof(half), curOutput, len * sizeof(half), len * sizeof(half), n, cudaMemcpyDeviceToDevice);
                 FastllmCudaFree(curInput);
                 FastllmCudaFree(curOutput);
-            }
-
-            if (isQuant) {
-                FastllmCudaFree(fp16Weight);
             }
         }
     };
@@ -154,67 +174,77 @@ namespace fastllm {
                 
                 cudaMemcpy(curInput, cudaInput, n * m * sizeof(float), cudaMemcpyDeviceToDevice);
             }
-            auto fastllmCublasHandle = getFastllmCublasHandle();
-            half *cudaFp16Input, *cudaFp16Output;
-            cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
-            cudaFp16Output = (half *) FastllmCudaMalloc(n * len * sizeof(half));
+            
+            if (weightDataType == DataType::FLOAT16 && n < 8) {
+                LaunchFastllmGemmFp32Fp16(curInput, (half*)weight, curOutput, bias, n, m, len);
+            } else if (weightDataType == DataType::INT8 && n < 8) {
+                LaunchFastllmGemmFp32Int8(curInput, (uint8_t*)weight, curOutput, bias, scales, zeros, n, m, len);
+            } else if (weightDataType == DataType::INT4_NOZERO && n < 8) {
+                LaunchFastllmGemmFp32Int4NoZero(curInput, (uint8_t*)weight, curOutput, bias, scales, mins, n, m, len);
+            } else if (weightDataType == DataType::INT4_GROUP && n < 8) {
+                LaunchFastllmGemmFp32Int4Group(curInput, (uint8_t*)weight, curOutput, bias, scales, mins, n, m, k, group, groupCnt);
+            } else {
+                auto fastllmCublasHandle = getFastllmCublasHandle();
+                half *cudaFp16Input, *cudaFp16Output;
+                cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
+                cudaFp16Output = (half *) FastllmCudaMalloc(n * len * sizeof(half));
 
-            __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
-            cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
-            cublasStatus_t status;
+                __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
+                cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+                cublasStatus_t status;
 
-            int threadPerBlock = std::min(256, n * m);
-            FastllmCudaFloat2HalfKernel <<< (n * m - 1) / threadPerBlock + 1, threadPerBlock>>>(curInput, cudaFp16Input, n * m);
+                int threadPerBlock = std::min(256, n * m);
+                FastllmCudaFloat2HalfKernel <<< (n * m - 1) / threadPerBlock + 1, threadPerBlock>>>(curInput, cudaFp16Input, n * m);
 
-            half *fp16Weight = (half*)weight;
-            bool isQuant = false;
-            if (weightDataType == DataType::INT4_NOZERO) {
-                int threadPerBlock = std::min(256, len * m);
-                isQuant = true;
-                fp16Weight = (half*)FastllmCudaMalloc(len * m * sizeof(half));
-                FastllmCudaInt42HalfKernel <<< (len * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, scales, mins, fp16Weight, len * m, m);
-            } else if (weightDataType == DataType::INT4_GROUP) {
-                int threadPerBlock = std::min(256, len * m);
-                isQuant = true;
-                fp16Weight = (half*)FastllmCudaMalloc(len * m * sizeof(half));
-                FastllmCudaInt4Group2HalfKernel <<< (len * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, scales, mins, fp16Weight, len * m, m, group, groupCnt);
-            } else if (weightDataType == DataType::INT8) {
-                int threadPerBlock = std::min(256, len * m);
-                isQuant = true;
-                fp16Weight = (half*)FastllmCudaMalloc(len * m * sizeof(half));
-                FastllmCudaInt82HalfKernel <<< (len * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, scales, zeros, fp16Weight, len * m, m);
+                half *fp16Weight = (half*)weight;
+                bool isQuant = false;
+                if (weightDataType == DataType::INT4_NOZERO) {
+                    int threadPerBlock = std::min(256, len * m);
+                    isQuant = true;
+                    fp16Weight = (half*)FastllmCudaMalloc(len * m * sizeof(half));
+                    FastllmCudaInt42HalfKernel <<< (len * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, scales, mins, fp16Weight, len * m, m);
+                } else if (weightDataType == DataType::INT4_GROUP) {
+                    int threadPerBlock = std::min(256, len * m);
+                    isQuant = true;
+                    fp16Weight = (half*)FastllmCudaMalloc(len * m * sizeof(half));
+                    FastllmCudaInt4Group2HalfKernel <<< (len * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, scales, mins, fp16Weight, len * m, m, group, groupCnt);
+                } else if (weightDataType == DataType::INT8) {
+                    int threadPerBlock = std::min(256, len * m);
+                    isQuant = true;
+                    fp16Weight = (half*)FastllmCudaMalloc(len * m * sizeof(half));
+                    FastllmCudaInt82HalfKernel <<< (len * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, scales, zeros, fp16Weight, len * m, m);
+                }
+
+                status = cublasGemmEx(fastllmCublasHandle,
+                                    CUBLAS_OP_T, CUBLAS_OP_N,
+                                    len, n, m,
+                                    &h_alpha, fp16Weight, AType,
+                                    m, cudaFp16Input, BType,
+                                    m, &h_beta,
+                                    cudaFp16Output, CType,
+                                    len, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    printf("Error: cublas error.\n");
+                    throw("cublas error");
+                    exit(0);
+                }
+
+                FastllmCudaHalf2FloatKernel <<< (n * len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, curOutput, n * len);
+                if (hasBias) {
+                    FastllmCudaBiasKernel <<< n, 256 >>> (curOutput, bias, len);
+                }
+
+                FastllmCudaFree(cudaFp16Input);
+                FastllmCudaFree(cudaFp16Output);
+
+                if (isQuant) {
+                    FastllmCudaFree(fp16Weight);
+                }
             }
-
-            status = cublasGemmEx(fastllmCublasHandle,
-                                CUBLAS_OP_T, CUBLAS_OP_N,
-                                len, n, m,
-                                &h_alpha, fp16Weight, AType,
-                                m, cudaFp16Input, BType,
-                                m, &h_beta,
-                                cudaFp16Output, CType,
-                                len, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
-            if (status != CUBLAS_STATUS_SUCCESS) {
-                printf("Error: cublas error.\n");
-                throw("cublas error");
-                exit(0);
-            }
-
-            FastllmCudaHalf2FloatKernel <<< (n * len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, curOutput, n * len);
-            if (hasBias) {
-                FastllmCudaBiasKernel <<< n, 256 >>> (curOutput, bias, len);
-            }
-
-            FastllmCudaFree(cudaFp16Input);
-            FastllmCudaFree(cudaFp16Output);
-
             if (deviceId != 0 || n > 1) {
                 cudaMemcpy2D(cudaOutput + start, k * sizeof(float), curOutput, len * sizeof(float), len * sizeof(float), n, cudaMemcpyDeviceToDevice);
                 FastllmCudaFree(curInput);
                 FastllmCudaFree(curOutput);
-            }
-
-            if (isQuant) {
-                FastllmCudaFree(fp16Weight);
             }
         }
     };
