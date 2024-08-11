@@ -64,8 +64,9 @@ bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # GPU version
 
 For compilation instructions on other platforms, please refer to the documentation:  
 
-[TFACC Platform](docs/tfacc.md)
-[ROCm Platform](docs/rocm.md)
+[TFACC Platform](docs/tfacc.md)  
+[ROCm Platform](docs/rocm.md)  
+[Huawei Ascend NPU Platform](docs/ascend_npu.md)
 
 If you meet problem during compilation, see [FAQ](docs/faq.md) doc.
 
