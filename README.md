@@ -41,10 +41,6 @@ bash install.sh -DUSE_CUDA=ON # 编译GPU版本
 其他不同平台的编译可参考文档
 [TFACC平台](docs/tfacc.md)
 
-### 运行OpenAI API Server
-
-编译安装完成后，
-
 ### 运行demo程序 (python)
 
 假设我们的模型位于"~/Qwen2-7B-Instruct/"目录
