@@ -44,16 +44,16 @@ Assuming our model is located in the "~/Qwen2-7B-Instruct/" directory:
 After compilation, you can use the following demos:
 
 ``` sh
+# OpenAI API server (currently in testing and tuning phase)
+# Requires dependencies: pip install -r requirements-server.txt
+# Opens a server named 'qwen' on port 8080
+python3 -m ftllm.server -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080 --model_name qwen
+
 # Use a model with float16 precision for conversation
 python3 -m ftllm.chat -t 16 -p ~/Qwen2-7B-Instruct/ 
 
 # Online quantization to int8 model for conversation
 python3 -m ftllm.chat -t 16 -p ~/Qwen2-7B-Instruct/ --dtype int8
-
-# OpenAI API server (currently in testing and tuning phase)
-# Requires dependencies: pip install -r requirements-server.txt
-# Opens a server named 'qwen' on port 8080
-python3 -m ftllm.server -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080 --model_name qwen
 
 # webui
 # Requires dependencies: pip install streamlit-chat
@@ -62,9 +62,13 @@ python3 -m ftllm.webui -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080
 
 Detailed parameters can be viewed using the --help argument for all demos.
 
+For detailed parameter explanations, please refer to [Parameter Documentation](docs/english_demo_arguments.md).
+
 Current model support can be found at: [Model List](docs/models.md)
 
 For architectures that cannot directly read Hugging Face models, refer to [Model Conversion Documentation](docs/convert_model.md) to convert models to fastllm format.
+
+If you need to customize the model structure, you can refer to the detailed instructions [Custom Model](docs/english_custom.md)
 
 ### Running the demo program (c++)
 
