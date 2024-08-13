@@ -17,7 +17,7 @@ def make_normal_parser(des: str) -> argparse.ArgumentParser:
 
 def parse_args():
     parser = make_normal_parser("fastllm webui")
-    parser.add_argument("--port", type = int, default = 8080, help = "API server port")
+    parser.add_argument("--port", type = int, default = 8080, help = "网页端口")
     parser.add_argument("--title", type = str, default = "fastllm webui", help = "页面标题")
     return parser.parse_args()
 

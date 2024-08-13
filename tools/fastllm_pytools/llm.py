@@ -1058,16 +1058,17 @@ class model:
         limit_bytes = 0
         try:
             if (limit.endswith('k') or limit.endswith('K')):
-                limit_bytes = int(limit[:-1]) * 1024
+                limit_bytes = float(limit[:-1]) * 1e3
             elif (limit.endswith('m') or limit.endswith('M')):
-                limit_bytes = int(limit[:-1]) * 1024 * 1024
+                limit_bytes = float(limit[:-1]) * 1e6
             elif (limit.endswith('g') or limit.endswith('G')):
-                limit_bytes = int(limit[:-1]) * 1024 * 1024 * 1024
+                limit_bytes = float(limit[:-1]) * 1e9
             else:
-                limit_bytes = int(limit[:-1])
+                limit_bytes = float(limit[:-1])
         except:
             print('set_kv_cache_limit error, param should be like "10k" or "10m" or "1g"')
             exit(0)
+        limit_bytes = int(limit_bytes)
         fastllm_lib.set_kv_cache_limit_llm_model(self.model, ctypes.c_int64(limit_bytes))
     
     def set_max_batch(self, batch: int):
