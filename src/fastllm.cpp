@@ -289,6 +289,7 @@ namespace fastllm {
 
     void Data::FakeFrom(const Data &ori, size_t offset) {
         this->dataType = ori.dataType;
+        this->UpdateUnitSize();
         this->isFake = true;
         this->dataDevice = ori.dataDevice;
         if (this->dataDevice == DataDevice::CPU) {
