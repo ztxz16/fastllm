@@ -756,7 +756,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                                             pending++;
                                         }
                                     }
-                                    printf("alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n", alive, pending, aliveLen, (int)seqLens.size(), (float)genTokens / spend);
+                                    printf("alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n", alive, pending, aliveLen, (float)genTokens / spend);
                                     lastRecordTime = nowTime;
                                     genTokens = 0;
                                 }
