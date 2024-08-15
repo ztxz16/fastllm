@@ -254,13 +254,17 @@ namespace fastllm {
         fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuAttention());
         int batch = intParams.find("q___batch")->second;
         DataDict tempDatas = datas;
+        fastllm::IntDict tempIntParams = intParams;
         for (int i = 0; i < batch; i++) {
             tempDatas["q"] = ((Data**)datas.find("q")->second)[i];
             tempDatas["k"] = ((Data**)datas.find("k")->second)[i];
             tempDatas["v"] = ((Data**)datas.find("v")->second)[i];
             tempDatas["mask"] = ((Data**)datas.find("mask")->second)[i];
             tempDatas["output"] = ((Data**)datas.find("output")->second)[i];
-            op->Run("Attention", tempDatas, floatParams, intParams);
+            if (tempIntParams.find("mask___batch") != intParams.end()) {
+                tempIntParams["mask___batch"] = 1;
+            }
+            op->Run("Attention", tempDatas, floatParams, tempIntParams);
         }
         delete op;
     }
