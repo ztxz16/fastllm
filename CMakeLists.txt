@@ -51,11 +51,13 @@ endif()
 
 message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 file(GLOB GRAPH_MODEL_FILES "src/models/graph/*.cpp")
+file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executor.cpp src/template.cpp src/graph.cpp
         src/devices/cpu/cpudevice.cpp src/devices/cpu/cpudevicebatch.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp
         third_party/json11/json11.cpp
+        ${CPU_DEVICE_FILES}
         ${GRAPH_MODEL_FILES})
 
 include_directories(include)
