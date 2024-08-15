@@ -83,6 +83,16 @@ namespace fastllm {
                (e > 143) * 0x7FFF; // sign : normalized : denormalized : saturate
     }
 
+    struct FP16ToFP32Manager {
+        float dict[65536];
+
+        FP16ToFP32Manager() {
+            for (uint16_t i = 0; i < 65535; i++) {
+                dict[i] = half_to_float(i);
+            }
+        }
+    };
+
     static double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
         auto duration = std::chrono::duration_cast<std::chrono::microseconds> (time2 - time1);
         return double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;

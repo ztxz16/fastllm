@@ -4,6 +4,7 @@
 
 #define _USE_MATH_DEFINES
 #include "devices/cpu/cpudevice.h"
+#include "devices/cpu/computeutils.h"
 
 #include <cstring>
 #include <thread>
@@ -161,15 +162,7 @@ namespace fastllm {
     };
 #endif
 
-    struct FP16ToFP32Manager {
-        float dict[65536];
-
-        FP16ToFP32Manager() {
-            for (uint16_t i = 0; i < 65535; i++) {
-                dict[i] = half_to_float(i);
-            }
-        }
-    } fp16tofp32;
+    FP16ToFP32Manager fp16tofp32;
 
     void Float16ToFloat32(uint16_t *float16, float *float32, int len) {
         for (int i = 0; i < len; i++) {
@@ -1549,24 +1542,10 @@ namespace fastllm {
             n(n), m(m), k(k), st(st), end(end) {}
 
         void Run() {
-            for (int i = 0; i < n; i++) {
-                for (int j = st; j < end; j++) {
-                    float now = biasData ? biasData[j] : 0.0f;
-                    int l = 0;
-#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
-                    float16x8_t sum = {0, 0, 0, 0, 0, 0, 0, 0};
-                    for (; l + 7 < m; l += 8) {
-                        sum = vfmaq_f16(sum, vld1q_f16((float16_t*)inputData + i * m + l),
-                                            vld1q_f16((float16_t*)weightData + j * m + l));
-                    }
-                    now += sum[0] + sum[1] + sum[2] + sum[3] + sum[4] + sum[5] + sum[6] + sum[7];
-#endif
-                    for (; l < m; l++) {
-                        now += inputData[i * m + l] * fp16tofp32.dict[weightData[j * m + l]];
-                    }
-                    outputData[i * k + j] = float_to_half(now);
-                }
-            }
+            MatMulFloat16Float16(
+                inputData, weightData, biasData, outputData, 
+                n, m, k, st, end
+            );
         }
     };
 
