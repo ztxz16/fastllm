@@ -89,57 +89,6 @@ namespace fastllm {
 
 
 #ifdef __AVX2__
-    int DotU8U8(uint8_t *a, uint8_t *b, int n) {
-        __m256i acc = _mm256_setzero_si256();
-        int i = 0;
-        int ans = 0;
-        const __m256i lowMask = _mm256_set1_epi8(0xf);
-        const __m256i ones = _mm256_set1_epi16(1);
-        const __m256i ones8 = _mm256_set1_epi8(1);
-        const __m256i xors = _mm256_set1_epi8(-128);
-        for (; i + 31 < n; i += 32) {
-            __m256i bx = _mm256_loadu_si256((const __m256i *) (a + i));
-            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
-
-            by = _mm256_xor_si256(by, xors);
-            by = _mm256_add_epi8(by, _mm256_and_si256(_mm256_cmpeq_epi8(by, xors), ones8));
-
-            by = _mm256_sign_epi8(by, bx);
-            bx = _mm256_sign_epi8(bx, bx);
-
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, by), ones));
-        }
-        for (; i < n; i++) {
-            ans += ((int8_t*)a)[i] * ((int)b[i] - 128);
-        }
-
-        return ans + I32sum(acc);
-    };
-//#else
-//    int DotU8U8(uint8_t *a, uint8_t *b, int n) {
-//        __m256i acc = _mm256_setzero_si256();
-
-//        int i = 0;
-//        int ans = 0;
-//        for (; i + 31 < n; i += 32) {
-//            __m256i bx = _mm256_loadu_si256((const __m256i *) (a + i));
-//            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
-
-//            __m256i mx0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 0));
-//            __m256i mx1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(bx, 1));
-
-//            __m256i my0 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 0));
-//            __m256i my1 = _mm256_cvtepu8_epi16(_mm256_extractf128_si256(by, 1));
-
-//            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, my0));
-//            //acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, my1));
-//        }
-//        for (; i < n; i++) {
-//            ans += a[i] * b[i];
-//        }
-
-//        return ans + I32sum(acc);
-//    };
     int DotU4U8(uint8_t *a, uint8_t *b, int n) {
         __m256i acc = _mm256_setzero_si256();
 
@@ -165,7 +114,17 @@ namespace fastllm {
     FP16ToFP32Manager fp16tofp32;
 
     void Float16ToFloat32(uint16_t *float16, float *float32, int len) {
-        for (int i = 0; i < len; i++) {
+        int i = 0;
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+        for (; i + 7 < len; i += 8) {
+            float16x8_t input_vec = vld1q_f16((float16_t*)float16 + i);
+            float32x4_t output_vec1 = vcvt_f32_f16(vget_low_f16(input_vec));
+            float32x4_t output_vec2 = vcvt_f32_f16(vget_high_f16(input_vec));
+            vst1q_f32(float32 + i, output_vec1);
+            vst1q_f32(float32 + i + 4, output_vec2);
+        }
+#endif
+        for (; i < len; i++) {
             float32[i] = fp16tofp32.dict[float16[i]];
         }
     }
@@ -1728,143 +1687,9 @@ namespace fastllm {
 
         MultiThreadMultiplyOp(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride) : 
             a(a), b(b), c(c), n(n), m(m), k(k), kstride(kstride) {}
-#ifdef __ARM_FEATURE_DOTPROD
-        inline static void RunSomeBlock(uint8_t *weightWalk, uint8_t *inputStart, int32_t *c, 
-                            int curBlock, uint32x4_t *sum, uint8x16_t *vi, 
-                            int block, int k, int m, int kstride) {
-                for (int i = 0; i < k; i++) {
-                    std::vector <int> values = std::vector <int> (curBlock, 0);
-                    uint8_t *inputWalk = inputStart;
-                    int j = 0;
-
-                    for (int j = 0; j < curBlock; j++) {
-                        sum[j][0] = sum[j][1] = sum[j][2] = sum[j][3] = 0;
-                    }
-                    for (; j + 15 < m; j += 16) {
-                        for (int x = 0; x < curBlock; x++) {
-                            vi[x] = vld1q_u8(inputWalk + m * x);
-                        }
-                        uint8x16_t vw = vld1q_u8(weightWalk);
-                        for (int x = 0; x < curBlock; x++) {
-                            sum[x] = vdotq_u32(sum[x], vi[x], vw);
-                        }
-                        inputWalk += 16;
-                        weightWalk += 16;
-                    }
-                    for (int x = 0; x < curBlock; x++) {
-                        values[x] += sum[x][0] + sum[x][1] + sum[x][2] + sum[x][3];
-                    }
-
-                    for (; j < m; j++) {
-                        int curWeight = (int)(*(weightWalk++));
-                        for (int x = 0; x < curBlock; x++) {
-                            values[x] += curWeight * (*(inputWalk + x * m));
-                        }
-                        inputWalk++;
-                    }
-
-                    for (int x = 0; x < curBlock; x++) {
-                        c[(block + x) * kstride + i] = values[x];
-                    }
-                }
-        }
-#endif
 
         void Run() {
-#ifdef __ARM_FEATURE_DOTPROD
-#define RUNBLOCK(x) for (; block + (x - 1) < n; block += (x)) RunSomeBlock(b, a + block * m, c, (x), sum, vi, block, k, m, kstride);
-            int block = 0;
-            uint32x4_t sum[16];
-            uint8x16_t vi[16];
-            RUNBLOCK(16);
-            RUNBLOCK(8);RUNBLOCK(7);RUNBLOCK(6);RUNBLOCK(5);
-            RUNBLOCK(4);RUNBLOCK(3);RUNBLOCK(2);RUNBLOCK(1);
-#undef RUNBLOCK
-#elif defined(__aarch64__)
-            int block = 0;
-            for (; block < n; block++) {
-                uint8_t *weightWalk = b;
-                uint8_t *inputStart = a + block * m;
-
-                for (int i = 0; i < k; i++) {
-                    int value = 0;
-                    uint8_t *inputWalk = inputStart;
-
-                    int per = 64;
-                    int cnt = m / per;
-                    int sur = m % per;
-
-                    uint32x4_t sum = {0};
-                    uint16x8_t temp = {0};
-                    uint16x8_t temp1 = {0};
-                    uint16x8_t temp2 = {0};
-                    uint16x8_t temp3 = {0};
-                    uint16x8_t temp4 = {0};
-                    uint16x8_t temp5 = {0};
-                    uint16x8_t temp6 = {0};
-                    uint16x8_t temp7 = {0};
-
-                    while (cnt--) {
-                        temp = vmull_u8(vld1_u8(inputWalk), vld1_u8(weightWalk));
-                        temp1 = vmull_u8(vld1_u8(inputWalk + 8), vld1_u8(weightWalk + 8));
-                        temp2 = vmull_u8(vld1_u8(inputWalk + 16), vld1_u8(weightWalk + 16));
-                        temp3 = vmull_u8(vld1_u8(inputWalk + 24), vld1_u8(weightWalk + 24));
-                        temp4 = vmull_u8(vld1_u8(inputWalk + 32), vld1_u8(weightWalk + 32));
-                        temp5 = vmull_u8(vld1_u8(inputWalk + 40), vld1_u8(weightWalk + 40));
-                        temp6 = vmull_u8(vld1_u8(inputWalk + 48), vld1_u8(weightWalk + 48));
-                        temp7 = vmull_u8(vld1_u8(inputWalk + 56), vld1_u8(weightWalk + 56));
-
-                        sum = vpadalq_u16(sum, temp);
-                        sum = vpadalq_u16(sum, temp1);
-                        sum = vpadalq_u16(sum, temp2);
-                        sum = vpadalq_u16(sum, temp3);
-                        sum = vpadalq_u16(sum, temp4);
-                        sum = vpadalq_u16(sum, temp5);
-                        sum = vpadalq_u16(sum, temp6);
-                        sum = vpadalq_u16(sum, temp7);
-
-                        inputWalk += per;
-                        weightWalk += per;
-                    }
-
-                    value += (sum[0] + sum[1] + sum[2] + sum[3]);
-                    while (sur--) {
-                        value += (int)(*(weightWalk++)) * (*(inputWalk++));
-                    }
-
-                    c[block * kstride + i] = value;
-                }
-            }
-#elif defined(__AVX2__)
-            int block = 0;
-            for (; block < n; block++) {
-                uint8_t *weightWalk = b;
-                uint8_t *inputStart = a + block * m;
-
-                for (int i = 0; i < k; i++) {
-                    uint8_t *inputWalk = inputStart;
-
-                    c[block * kstride + i] = DotU8U8(inputWalk, weightWalk, m);
-                    weightWalk += m;
-                }
-            }
-#else
-            int block = 0;
-            for (; block < n; block++) {
-                uint8_t *weightWalk = b;
-                uint8_t *inputStart = a + block * m;
-
-                for (int i = 0; i < k; i++) {
-                    int value = 0;
-                    uint8_t *inputWalk = inputStart;
-                    for (int j = 0; j < m; j++) {
-                        value += (int)(*(weightWalk++)) * (*(inputWalk++));
-                    }
-
-                    c[block * kstride + i] = value;
-                }
-            }
-#endif
+            MatMulInt8Int8(a, b, c, n, m, k, kstride);
         }
     };
 
@@ -2589,6 +2414,58 @@ namespace fastllm {
                 for (int i = 0; i < threadNum; i++) {
                     pool->Wait(i);
                     delete ops[i];
+                }
+            }  else if (weight.dataType == DataType::INT8) {
+                uint16_t *inputData = (uint16_t *) input.cpuData;
+                uint8_t *weightData = (uint8_t *) weight.cpuData;
+                uint16_t *outputData = (uint16_t *) output.cpuData;
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                weight.CalcWeightSum();
+                std::vector<uint8_t> uinput;
+                uinput.resize(n * m);
+                std::vector<LowBitConfig> inputConfigs;
+                for (int i = 0; i < n; i++) {
+                    float minValue = 1e9, maxValue = -1e9;
+                    for (int j = 0; j < m; j++) {
+                        minValue = std::min(minValue, fp16tofp32.dict[inputData[i * m + j]]);
+                        maxValue = std::max(maxValue, fp16tofp32.dict[inputData[i * m + j]]);
+                    }
+                    inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
+                }
+                for (int i = 0; i < n * m; i++) {
+#ifdef __AVX2__
+                    uinput[i] = inputConfigs[i / m].quantization(fp16tofp32.dict[inputData[i]]);
+                    uinput[i] = (uinput[i] + !uinput[i]) ^ 128;
+#else
+                    uinput[i] = inputConfigs[i / m].quantization(fp16tofp32.dict[inputData[i]]);
+#endif
+                }
+                std::vector <int> int32Output;
+                int32Output.resize(n * k, 0);
+                MultiplyMultiThread(uinput.data(), weightData, (int32_t *) int32Output.data(), n, m, k, GetThreads());
+                for (int i = 0; i < n; i++) {
+                    uint32_t inputSum = 0;
+                    for (int j = 0; j < m; j++) {
+#ifdef __AVX2__
+                        inputSum += uinput[i * m + j] ^ 128;
+#else
+                        inputSum += uinput[i * m + j];
+#endif
+                    }
+
+                    for (int j = 0; j < k; j++) {
+                        int value = int32Output[i * k + j];
+#ifdef __AVX2__
+                        value += (128 * weight.weightSum[j]);
+                        value += (128 * inputSum);
+                        value -= m * 128 * 128;
+#endif
+                        value -= weight.weightSum[j] * inputConfigs[i].zeroPoint;
+                        value -= inputSum * weight.perChannelsConfigs[j].zeroPoint;
+                        value += (int) inputConfigs[i].zeroPoint * weight.perChannelsConfigs[j].zeroPoint * m;
+                        outputData[i * k + j] = float_to_half(weight.perChannelsConfigs[j].scale * inputConfigs[i].scale * value +
+                                                (biasData == nullptr ? 0.0 : biasData[j]));
+                    }
                 }
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");

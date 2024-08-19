@@ -21,6 +21,35 @@ namespace fastllm {
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
 
+#ifdef __AVX2__
+    int DotU8U8(uint8_t *a, uint8_t *b, int n) {
+        __m256i acc = _mm256_setzero_si256();
+        int i = 0;
+        int ans = 0;
+        const __m256i lowMask = _mm256_set1_epi8(0xf);
+        const __m256i ones = _mm256_set1_epi16(1);
+        const __m256i ones8 = _mm256_set1_epi8(1);
+        const __m256i xors = _mm256_set1_epi8(-128);
+        for (; i + 31 < n; i += 32) {
+            __m256i bx = _mm256_loadu_si256((const __m256i *) (a + i));
+            __m256i by = _mm256_loadu_si256((const __m256i *) (b + i));
+
+            by = _mm256_xor_si256(by, xors);
+            by = _mm256_add_epi8(by, _mm256_and_si256(_mm256_cmpeq_epi8(by, xors), ones8));
+
+            by = _mm256_sign_epi8(by, bx);
+            bx = _mm256_sign_epi8(bx, bx);
+
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, by), ones));
+        }
+        for (; i < n; i++) {
+            ans += ((int8_t*)a)[i] * ((int)b[i] - 128);
+        }
+
+        return ans + I32sum(acc);
+    };
+#endif
+
     void MatMulFloat16Float16(uint16_t *inputData, uint16_t *weightData, float *biasData, uint16_t *outputData, 
                             int n, int m, int k, int st, int end) {
 #ifdef __aarch64__
@@ -411,6 +440,145 @@ namespace fastllm {
                 }
             }
         }
+#endif
+    }
+
+#ifdef __ARM_FEATURE_DOTPROD
+        inline static void MatMulInt8Int8RunSomeBlock(uint8_t *weightWalk, uint8_t *inputStart, int32_t *c, 
+                            int curBlock, uint32x4_t *sum, uint8x16_t *vi, 
+                            int block, int k, int m, int kstride) {
+                for (int i = 0; i < k; i++) {
+                    std::vector <int> values = std::vector <int> (curBlock, 0);
+                    uint8_t *inputWalk = inputStart;
+                    int j = 0;
+
+                    for (int j = 0; j < curBlock; j++) {
+                        sum[j][0] = sum[j][1] = sum[j][2] = sum[j][3] = 0;
+                    }
+                    for (; j + 15 < m; j += 16) {
+                        for (int x = 0; x < curBlock; x++) {
+                            vi[x] = vld1q_u8(inputWalk + m * x);
+                        }
+                        uint8x16_t vw = vld1q_u8(weightWalk);
+                        for (int x = 0; x < curBlock; x++) {
+                            sum[x] = vdotq_u32(sum[x], vi[x], vw);
+                        }
+                        inputWalk += 16;
+                        weightWalk += 16;
+                    }
+                    for (int x = 0; x < curBlock; x++) {
+                        values[x] += sum[x][0] + sum[x][1] + sum[x][2] + sum[x][3];
+                    }
+
+                    for (; j < m; j++) {
+                        int curWeight = (int)(*(weightWalk++));
+                        for (int x = 0; x < curBlock; x++) {
+                            values[x] += curWeight * (*(inputWalk + x * m));
+                        }
+                        inputWalk++;
+                    }
+
+                    for (int x = 0; x < curBlock; x++) {
+                        c[(block + x) * kstride + i] = values[x];
+                    }
+                }
+        }
+#endif
+
+    void MatMulInt8Int8(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride) {
+#ifdef __ARM_FEATURE_DOTPROD
+#define RUNBLOCK(x) for (; block + (x - 1) < n; block += (x)) MatMulInt8Int8RunSomeBlock(b, a + block * m, c, (x), sum, vi, block, k, m, kstride);
+            int block = 0;
+            uint32x4_t sum[16];
+            uint8x16_t vi[16];
+            RUNBLOCK(16);
+            RUNBLOCK(8);RUNBLOCK(7);RUNBLOCK(6);RUNBLOCK(5);
+            RUNBLOCK(4);RUNBLOCK(3);RUNBLOCK(2);RUNBLOCK(1);
+#undef RUNBLOCK
+#elif defined(__aarch64__)
+            int block = 0;
+            for (; block < n; block++) {
+                uint8_t *weightWalk = b;
+                uint8_t *inputStart = a + block * m;
+
+                for (int i = 0; i < k; i++) {
+                    int value = 0;
+                    uint8_t *inputWalk = inputStart;
+
+                    int per = 64;
+                    int cnt = m / per;
+                    int sur = m % per;
+
+                    uint32x4_t sum = {0};
+                    uint16x8_t temp = {0};
+                    uint16x8_t temp1 = {0};
+                    uint16x8_t temp2 = {0};
+                    uint16x8_t temp3 = {0};
+                    uint16x8_t temp4 = {0};
+                    uint16x8_t temp5 = {0};
+                    uint16x8_t temp6 = {0};
+                    uint16x8_t temp7 = {0};
+
+                    while (cnt--) {
+                        temp = vmull_u8(vld1_u8(inputWalk), vld1_u8(weightWalk));
+                        temp1 = vmull_u8(vld1_u8(inputWalk + 8), vld1_u8(weightWalk + 8));
+                        temp2 = vmull_u8(vld1_u8(inputWalk + 16), vld1_u8(weightWalk + 16));
+                        temp3 = vmull_u8(vld1_u8(inputWalk + 24), vld1_u8(weightWalk + 24));
+                        temp4 = vmull_u8(vld1_u8(inputWalk + 32), vld1_u8(weightWalk + 32));
+                        temp5 = vmull_u8(vld1_u8(inputWalk + 40), vld1_u8(weightWalk + 40));
+                        temp6 = vmull_u8(vld1_u8(inputWalk + 48), vld1_u8(weightWalk + 48));
+                        temp7 = vmull_u8(vld1_u8(inputWalk + 56), vld1_u8(weightWalk + 56));
+
+                        sum = vpadalq_u16(sum, temp);
+                        sum = vpadalq_u16(sum, temp1);
+                        sum = vpadalq_u16(sum, temp2);
+                        sum = vpadalq_u16(sum, temp3);
+                        sum = vpadalq_u16(sum, temp4);
+                        sum = vpadalq_u16(sum, temp5);
+                        sum = vpadalq_u16(sum, temp6);
+                        sum = vpadalq_u16(sum, temp7);
+
+                        inputWalk += per;
+                        weightWalk += per;
+                    }
+
+                    value += (sum[0] + sum[1] + sum[2] + sum[3]);
+                    while (sur--) {
+                        value += (int)(*(weightWalk++)) * (*(inputWalk++));
+                    }
+
+                    c[block * kstride + i] = value;
+                }
+            }
+#elif defined(__AVX2__)
+            int block = 0;
+            for (; block < n; block++) {
+                uint8_t *weightWalk = b;
+                uint8_t *inputStart = a + block * m;
+
+                for (int i = 0; i < k; i++) {
+                    uint8_t *inputWalk = inputStart;
+
+                    c[block * kstride + i] = DotU8U8(inputWalk, weightWalk, m);
+                    weightWalk += m;
+                }
+            }
+#else
+            int block = 0;
+            for (; block < n; block++) {
+                uint8_t *weightWalk = b;
+                uint8_t *inputStart = a + block * m;
+
+                for (int i = 0; i < k; i++) {
+                    int value = 0;
+                    uint8_t *inputWalk = inputStart;
+                    for (int j = 0; j < m; j++) {
+                        value += (int)(*(weightWalk++)) * (*(inputWalk++));
+                    }
+
+                    c[block * kstride + i] = value;
+                }
+            }
 #endif
     }
 }
