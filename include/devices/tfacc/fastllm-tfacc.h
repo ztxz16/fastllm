@@ -37,7 +37,8 @@ namespace fastllm {
                              fastllm::Data *weight, fastllm::Data *bias,
                              std::vector <LowBitConfig> *inputConfigs,
                              uint8_t *uinput, float *output, 
-                             LinearExType exType);
+                             LinearExType exType, 
+                             DataType outputType);
 
         void RunTfaccLinearF(int n, int m, int k, fastllm::Data *weight, fastllm::Data *bias,
                             float *input, float *output, LinearExType exType, DataType dataType);
