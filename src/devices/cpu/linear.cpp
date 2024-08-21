@@ -52,7 +52,7 @@ namespace fastllm {
 
     void MatMulFloat16Float16(uint16_t *inputData, uint16_t *weightData, float *biasData, uint16_t *outputData, 
                             int n, int m, int k, int st, int end) {
-#ifdef __aarch64__
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
         if (n > 1 && n < 8) {
             const int BLOCKA = 7;
             float16x8_t va[BLOCKA], vb, vc[BLOCKA];
