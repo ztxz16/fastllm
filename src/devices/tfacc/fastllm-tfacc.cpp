@@ -211,7 +211,8 @@ namespace fastllm {
                                      fastllm::Data *weight, fastllm::Data *bias,
                                      std::vector <LowBitConfig> *inputConfigs,
                                      uint8_t *uinput, float *output, 
-                                     LinearExType exType) {
+                                     LinearExType exType, 
+                                     DataType outputType) {
         std::string linearType = "linear";
         if (exType == LinearExType::ExSwiglu) {
             linearType = "linearSwiglu";
@@ -235,6 +236,7 @@ namespace fastllm {
         maxN = std::min(maxN, (int)(transLimit / (k * sizeof(float))));
 
         // printf("maxN = %d\n", maxN);
+        int outputUnitSize = (outputType == DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
         for (int baseN = 0; baseN < n; baseN += maxN) {
 // auto st0 = std::chrono::system_clock::now();
             int curN = std::min(maxN, n - baseN);
@@ -246,6 +248,7 @@ namespace fastllm {
             ((int32_t*)buf)[5] = weight->name.size();
             ((int32_t*)buf)[6] = biasName.size();
             ((int32_t*)buf)[7] = exType;
+            ((int32_t*)buf)[8] = outputType;
             
             volatile uint8_t *cur = (uint8_t*)buf + 10 * sizeof(int32_t);
             for (int i = 0; i < curN * group; i++) {
@@ -269,9 +272,9 @@ namespace fastllm {
 
             auto pool = GetAlivePool();
 
-            RunMultiThreadMemcpy(((uint8_t*) output) + baseN * outK * sizeof(int32_t),
+            RunMultiThreadMemcpy(((uint8_t*) output) + baseN * outK * outputUnitSize,
                     (uint8_t*) result,
-                    curN * outK * sizeof(int32_t), GetAlivePool());
+                    curN * outK * outputUnitSize, GetAlivePool());
 // auto st3 = std::chrono::system_clock::now();
 // if (n > 0) printf("n = %d, m = %d, k = %d, input = %f s, calc = %f s, output = %f. total = %f\n", n, m, k, GetSpan(st0, st1), GetSpan(st1, st2), GetSpan(st2, st3), GetSpan(st0, st3));
         }
