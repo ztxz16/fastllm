@@ -17,6 +17,7 @@
 #include "internlm2.h"
 #include "bert.h"
 #include "graphllm.h"
+#include "phi3.h"
 
 namespace fastllm {
     std::string ReadAllFile(const std::string &fileName) {
@@ -181,6 +182,9 @@ namespace fastllm {
         } else if (modelType == "qwen2") {
             model = new LlamaModel();
             model->model_type = "qwen";
+        } else if (modelType == "phi3") {
+            model = new Phi3Model();
+            model->model_type = "phi3";
         } else if (modelType=="minicpm") {
             model = new MiniCpmModel();
         } else if (modelType == "qwen") {
@@ -451,7 +455,8 @@ namespace fastllm {
         std::string tokenizerClass = tokenizerConfig["tokenizer_class"].string_value();
         if (tokenizerClass == "PreTrainedTokenizerFast" || tokenizerClass == "LlamaTokenizerFast"
             || tokenizerClass == "Qwen2Tokenizer"
-            || tokenizerClass == "BloomTokenizer") {
+            || tokenizerClass == "BloomTokenizer"
+            || tokenizerClass == "LlamaTokenizer") {
             // PreTrainedTokenizerFast
             std::string tokenizerFile = path + "tokenizer.json";
             auto tokenizer = json11::Json::parse(ReadAllFile(tokenizerFile), error);
