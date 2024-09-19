@@ -19,7 +19,7 @@ else:
 fastllm_lib.create_llm_model.argtypes = [ctypes.c_char_p]
 fastllm_lib.create_llm_model.restype = ctypes.c_int
 
-fastllm_lib.create_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool]
+fastllm_lib.create_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_char_p]
 fastllm_lib.create_llm_model_fromhf.restype = ctypes.c_int
 
 fastllm_lib.create_llm_model_fromhf_with_config.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_char_p]
@@ -387,7 +387,8 @@ class model:
                   eos_token: List[str] = [],
                   tokenizer_type = "auto", 
                   model_json: str = "", 
-                  graph: type = None):
+                  graph: type = None, 
+                  lora: str = ""):
         if (graph != None):
             current_graph = graph()
             if (os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json"))):
@@ -435,7 +436,7 @@ class model:
                                                                  ctypes.c_bool(self.hf_tokenizer != None), model_json.encode());
                 else:
                     self.model = fastllm_lib.create_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, 
-                                                                 ctypes.c_bool(self.hf_tokenizer != None));
+                                                                 ctypes.c_bool(self.hf_tokenizer != None), lora.encode());
             else:
                 print("path error: ", path);
                 exit(0)
