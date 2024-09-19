@@ -102,10 +102,10 @@ extern "C" {
         return id;
     }
 
-    DLL_EXPORT int create_llm_model_fromhf(char *path, int dataType, int groupCnt, bool skipTokenizer) {
+    DLL_EXPORT int create_llm_model_fromhf(char *path, int dataType, int groupCnt, bool skipTokenizer, char *lora) {
         models.locker.lock();
         int id = models.models.size();
-        models.models[id] = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt, skipTokenizer);
+        models.models[id] = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt, skipTokenizer, "", lora);
         models.locker.unlock();
         return id;
     }
