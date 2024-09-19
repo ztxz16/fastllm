@@ -270,9 +270,13 @@ namespace fastllm {
             DataType srcType;
             if (this->dtype == "BF16") {
                 srcType = DataType::BFLOAT16;
-            } else if (this->dtype == "F16") 
-            {
+            } else if (this->dtype == "F16") {
                 srcType = DataType::FLOAT16;
+            } else if (this->dtype == "F32") {
+                srcType = DataType::FLOAT32;
+                if (dstType != DataType::FLOAT32) {
+                    ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
+                }
             } else {
                 ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
             }
@@ -532,9 +536,35 @@ namespace fastllm {
 
     // 从hf文件夹读取，仅支持safetensor格式的模型
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
-                                                    DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig) {
-        bool isJsonModel = (modelConfig.size() > 0);
+                                                    DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig,
+                                                    const std::string &loraPath) {
+        std::map <std::string, std::pair <std::string, std::string> > loraDicts;
+        SafeTensors *loraTensors = nullptr;
+        float loraScaling;
+        if (loraPath != "") {
+            std::string path = loraPath;
+            if (path.back() != '/' || path.back() != '\\') {
+                path += "/";
+            }
+            loraTensors = new SafeTensors({path + "adapter_model.safetensors"});
+            for (auto &it : loraTensors->GetSortedItemNames()) {
+                if (it.size() >= 31 &&
+                    it.substr(0, 17) == "base_model.model." &&
+                    (it.substr(it.size() - 14) == ".lora_A.weight" || it.substr(it.size() - 14) == ".lora_B.weight")) {
+                    std::string originalName = it.substr(17, it.size() - 31) + ".weight";
+                    if (it.substr(it.size() - 14) == ".lora_A.weight") {
+                        loraDicts[originalName].first = it;
+                    } else {
+                        loraDicts[originalName].second = it;
+                    }
+                }
+            }
+            std::string loraConfigError;
+            auto loraConfig = json11::Json::parse(ReadAllFile(path + "adapter_config.json"), loraConfigError);
+            loraScaling = loraConfig["lora_alpha"].number_value() / loraConfig["r"].number_value();
+        }
 
+        bool isJsonModel = (modelConfig.size() > 0);
         std::string path = modelPath;
         if (path.back() != '/' || path.back() != '\\') {
             path += "/";
@@ -681,6 +711,61 @@ namespace fastllm {
                                 oriDataType = DataType::FLOAT16;
                             }
                             tensor.CreateBuffer(oriDataType);
+
+                            if (loraDicts.find(weightName) != loraDicts.end()) {
+                                std::string loraA = loraDicts[weightName].first;
+                                std::string loraB = loraDicts[weightName].second;
+
+                                int inDim = loraTensors->itmeDict[loraA].intShape[1];
+                                int outDim = loraTensors->itmeDict[loraB].intShape[0];
+                                int lora = loraTensors->itmeDict[loraA].intShape[0];
+
+                                AssertInFastLLM(loraTensors->itmeDict[loraA].dtype == "F32" && 
+                                                loraTensors->itmeDict[loraB].dtype == "F32", 
+                                                "Lora error: lora's dtype should be F32.");
+                                loraTensors->itmeDict[loraA].CreateBuffer(DataType::FLOAT32);
+                                loraTensors->itmeDict[loraB].CreateBuffer(DataType::FLOAT32);
+                                float *weightA = (float*)loraTensors->itmeDict[loraA].buffer;
+                                float *weightB = (float*)loraTensors->itmeDict[loraB].buffer;
+
+                                std::vector <float> loraFactor;
+                                loraFactor.resize(inDim * outDim, 0.0f);
+                                for (int i = 0; i < outDim; i++) {
+                                    for (int j = 0; j < lora; j++) {
+                                        for (int k = 0; k < inDim; k++) {
+                                            loraFactor[i * inDim + k] += weightB[i * lora + j] * weightA[j * inDim + k];
+                                        }
+                                    }
+                                }
+                                for (int i = 0; i < loraFactor.size(); i++) {
+                                    loraFactor[i] *= loraScaling;
+                                }
+
+                                loraTensors->itmeDict[loraA].ClearBuffer();
+                                loraTensors->itmeDict[loraB].ClearBuffer();
+
+                                if (oriDataType == DataType::BFLOAT16) {
+                                    uint16_t *fp16Weight = (uint16_t*)tensor.buffer;
+                                    for (int i = 0; i < loraFactor.size(); i++) {
+                                        uint32_t now = fp16Weight[i] << 16;
+                                        float newV = ((float*)&now)[0] + loraFactor[i];
+                                        fp16Weight[i] = ((uint32_t*)&newV)[0] >> 16;
+                                    }
+                                } else if (oriDataType == DataType::FLOAT16) {
+                                    uint16_t *fp16Weight = (uint16_t*)tensor.buffer;
+                                    for (int i = 0; i < loraFactor.size(); i++) {
+                                        fp16Weight[i] = float_to_half(half_to_float(fp16Weight[i]) + loraFactor[i]);
+                                    }
+                                } else if (oriDataType == DataType::FLOAT32) {
+                                    float *fp32Weight = (float*)tensor.buffer;
+                                    for (int i = 0; i < loraFactor.size(); i++) {
+                                        fp32Weight[i] = fp32Weight[i] + loraFactor[i];
+                                    }
+                                } else {
+                                    ErrorInFastLLM("Lora error, dtype should be float32, float16 or bfloat16.");
+                                }
+                            }
+
                             if (it.second == DATA_AUTO_CONV) {
                                 tensor.Transpose(oriDataType);
                             }
@@ -703,6 +788,8 @@ namespace fastllm {
 
         printf("\n");
         fflush(stdout);
+
+        delete loraTensors;
 
         model->WarmUp();
         return std::unique_ptr<fastllm::basellm> (model);
