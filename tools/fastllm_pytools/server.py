@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .openai_server.protocal.openai_protocol import *
 from .openai_server.fastllm_completion import FastLLmCompletion
+from .openai_server.fastllm_embed import FastLLmEmbed
 from .util import make_normal_parser
 from .util import make_normal_llm_model
 
@@ -30,6 +31,7 @@ app.add_middleware(
 )
 
 fastllm_completion:FastLLmCompletion
+fastllm_embed:FastLLmEmbed
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest,
@@ -46,6 +48,12 @@ async def create_chat_completion(request: ChatCompletionRequest,
     else:
         assert isinstance(generator, ChatCompletionResponse)
         return JSONResponse(content = generator.model_dump())
+
+@app.post("/v1/embed")
+async def create_embed(request: EmbedRequest,
+                       raw_request: Request):
+    embedding = fastllm_embed.embedding_sentence(request, raw_request)
+    return JSONResponse(embedding)
 
 def init_logging(log_level = logging.INFO, log_file:str = None):
     logging_format = '%(asctime)s %(process)d %(filename)s[line:%(lineno)d] %(levelname)s: %(message)s'
@@ -64,6 +72,6 @@ if __name__ == "__main__":
     logging.info(args)
     model = make_normal_llm_model(args)
     model.set_verbose(True)
-    fastllm_completion = FastLLmCompletion(model_name = args.model_name,
-                                           model = model)
+    fastllm_completion = FastLLmCompletion(model_name = args.model_name, model = model)
+    fastllm_embed = FastLLmEmbed(model_name = args.model_name, model = model)
     uvicorn.run(app, host = args.host, port = args.port)
