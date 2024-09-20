@@ -200,3 +200,10 @@ class CompletionStreamResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[CompletionResponseStreamChoice]
+
+class EmbedRequest(BaseModel):
+    inputs: str
+    normalize: Optional[bool]
+    prompt_name: Optional[str]
+    truncate: Optional[bool]
+    truncation_direction: Optional[str]

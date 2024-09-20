@@ -93,6 +93,9 @@ fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
 fastllm_lib.get_max_input_len_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_max_input_len_llm_model.restype = ctypes.c_int
 
+fastllm_lib.embedding_sentence.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_bool, ctypes.POINTER(ctypes.c_int)]
+fastllm_lib.embedding_sentence.restype = ctypes.POINTER(ctypes.c_float)
+
 def softmax(a):
     max_value = a[0]
     for i in a:
@@ -1080,6 +1083,15 @@ class model:
     
     def get_max_input_len(self):
         return fastllm_lib.get_max_input_len_llm_model(self.model)
+
+    def embedding_sentence(self, input: str, normalize = True):
+        embedding_len = ctypes.c_int(0)
+        embedding_c_float = fastllm_lib.embedding_sentence(self.model, input.encode(), normalize, embedding_len)
+        embedding = []
+        for i in range(embedding_len.value):
+            embedding.append(embedding_c_float[i])
+            #print("{:.7f}".format(embedding[i]), end=" ")
+        return embedding
 
 def GraphNode(name: str,
               type: str = "data",

@@ -425,4 +425,14 @@ extern "C" {
         auto model = models.GetModel(modelId);
         return model->max_positions;
     }
+
+    DLL_EXPORT float* embedding_sentence(int modelId, char *input, bool normalize, int *embeddingLen) {
+        fastllm::BertModel *model = (fastllm::BertModel*)models.GetModel(modelId);
+        std::string str(input);
+        std::vector <float> result = model->EmbeddingSentence(str, normalize);
+        float *fvalue = new float[result.size()];
+        memcpy(fvalue, result.data(), result.size() * sizeof(float));
+        *embeddingLen = result.size();
+        return fvalue;
+    }
 };
