@@ -213,8 +213,15 @@ namespace fastllm {
     std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
         std::string modelType = GetModelTypeFromFile(fileName);
         basellm *model = CreateModelWithType(modelType);
-        model->LoadFromFile(fileName);
-        model->WarmUp();
+        if(modelType == "bert"){
+            BertModel *bertModel = (BertModel*)model;
+            bertModel->weight.tokenizer.type = Tokenizer::BERT;
+            bertModel->LoadFromFile(fileName);
+            bertModel->WarmUp();
+        }else{
+            model->LoadFromFile(fileName);
+            model->WarmUp();
+        }
         return std::unique_ptr<fastllm::basellm> (model);
     }
 
