@@ -135,6 +135,40 @@ namespace fastllm {
         return ret;
     }
 
+    std::vector <float> BertModel::EmbeddingSentence(const std::vector <int> &tokens, bool normalize) {
+        std::vector <std::vector <int> > tokenss;
+        tokenss.push_back(tokens);
+        return EmbeddingSentenceBatch(tokenss, normalize)[0];
+    }
+
+    std::vector <std::vector <float> > BertModel::EmbeddingSentenceBatch(const std::vector <std::vector <int> > &tokens, bool normalize) {
+        int batch = tokens.size(), len = 0;
+        for (int i = 0; i < batch; i++) {
+            len = std::max(len, (int)tokens[i].size());
+        }
+
+        std::vector <float> ids = std::vector <float> (batch * len, 0.0f);
+        std::vector <float> seqLens = std::vector <float> (batch, 0.0f);
+        std::vector <float> token_type_ids = std::vector <float> (batch * len, 0.0f);
+        std::vector <float> attention_mask = std::vector <float> (batch * len, -1e10f);
+        std::vector <float> position_ids = std::vector <float> (batch * len, 0.0f);
+        for (int i = 0; i < batch; i++) {
+            seqLens[i] = tokens[i].size();
+            for (int j = 0; j < tokens[i].size(); j++) {
+                ids[i * len + j] = tokens[i][j];
+                attention_mask[i * len + j] = 0;
+                position_ids[i * len + j] = j;
+            }
+        }
+
+        fastllm::Data inputIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, ids);
+        fastllm::Data attentionMask = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, attention_mask);
+        fastllm::Data tokenTypeIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, token_type_ids);
+        fastllm::Data positionIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, position_ids);
+
+        return ForwardAll(inputIds, attentionMask, tokenTypeIds, positionIds, normalize);
+    }
+
     std::vector <float> BertModel::EmbeddingSentence(const std::string &context, bool normalize) {
         std::vector <std::string> contexts;
         contexts.push_back(context);
