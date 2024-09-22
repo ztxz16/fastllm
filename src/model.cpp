@@ -16,6 +16,7 @@
 #include "minicpm.h"
 #include "internlm2.h"
 #include "bert.h"
+#include "xlmroberta.h"
 #include "graphllm.h"
 #include "phi3.h"
 
@@ -194,6 +195,8 @@ namespace fastllm {
             model = (basellm*)(new GLMModel());
         } else if (modelType == "bert") {
             model = (basellm*)(new BertModel());
+        } else if (modelType == "xlm-roberta") {
+            model = (basellm*)(new XlmRobertaModel());
         } else if (modelType == "fastllmJson") {
             model = new GraphLLMModel("fastllmJson");
         } else {
