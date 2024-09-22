@@ -435,4 +435,35 @@ extern "C" {
         *embeddingLen = result.size();
         return fvalue;
     }
+
+    DLL_EXPORT float* embedding_tokens(int modelId, int inputLen, int *input, bool normalize, int *embeddingLen) {
+        fastllm::BertModel *model = (fastllm::BertModel*)models.GetModel(modelId);
+        std::vector <int> tokens;
+        for (int i = 0; i < inputLen; i++) {
+            tokens.push_back(input[i]);
+        }
+        std::vector <float> result = model->EmbeddingSentence(tokens, normalize);
+        float *fvalue = new float[result.size()];
+        memcpy(fvalue, result.data(), result.size() * sizeof(float));
+        *embeddingLen = result.size();
+        return fvalue;
+    }
+
+    DLL_EXPORT float* reranker_compute_score(int modelId, int batch, int *seqLens, int *tokens) {
+        fastllm::XlmRobertaModel *model = (fastllm::XlmRobertaModel*)models.GetModel(modelId);
+        std::vector <std::vector <int> > inputIds;
+        inputIds.resize(batch);
+        int pos = 0;
+        for (int i = 0; i < batch; i++) {
+            for (int j = 0; j < seqLens[i]; j++) {
+                inputIds[i].push_back(tokens[pos++]);
+            }
+        }
+        auto ret = model->ComputeScore(inputIds);
+        float *fvalue = new float[batch];
+        for (int i = 0; i < batch; i++) {
+            fvalue[i] = ret[i];
+        }
+        return fvalue;
+    }
 };

@@ -33,7 +33,11 @@ namespace fastllm {
                 const GenerationConfig &generationConfig = GenerationConfig(),
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <float> *logits = nullptr);
-        
+
+        std::vector <float> EmbeddingSentence(const std::vector <int> &tokens, bool normalize);
+
+        std::vector <std::vector <float> > EmbeddingSentenceBatch(const std::vector <std::vector <int> > &tokens, bool normalize);
+
         std::vector <float> EmbeddingSentence(const std::string &context, bool normalize);
 
         std::vector <std::vector <float> > EmbeddingSentenceBatch(const std::vector <std::string> &contexts, bool normalize);
@@ -56,7 +60,6 @@ namespace fastllm {
         int max_positions = 32768;
         int block_cnt = 12;
 
-        WeightMap weight; // 权重
         std::map <std::string, int> deviceMap;
     };
 }
