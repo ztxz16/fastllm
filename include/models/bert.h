@@ -6,6 +6,9 @@
 #include "fastllm.h"
 
 namespace fastllm {
+    // 类BERT类大模型基础类
+    // 支持Compute-Score，计算两个token序列的相似程度（用于reranker)
+    // 支持Embedding，生成token序列的向量
     class BertModel: public basellm {
     public:
         BertModel() {};
@@ -16,8 +19,10 @@ namespace fastllm {
 
         void InitParams(); // 初始化参数信息 
 
+        void Normalize(float *data, int dataLen);
+
         // 推理
-        std::vector <std::vector <float> > ForwardAll(
+        virtual std::vector <std::vector <float> > ForwardAll(
                 const Data &inputIds,
                 const Data &attentionMask,
                 const Data &tokenTypeIds,
@@ -33,6 +38,14 @@ namespace fastllm {
                 const GenerationConfig &generationConfig = GenerationConfig(),
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <float> *logits = nullptr);
+
+        virtual void FillBertInputsBatch(const std::vector <std::vector <int> > &tokens,
+                                Data &inputIds, Data &attentionMask, Data &tokenTypeIds, Data &positionIds);
+
+        // 计算相似分数
+        // tokens: 输入tokens， tokens[i]代表第i个输入的token序列
+        // ret: ret[i]代表第i个输入的相似度
+        std::vector <float> ComputeScore(std::vector <std::vector <int> > tokens);
 
         std::vector <float> EmbeddingSentence(const std::vector <int> &tokens, bool normalize);
 

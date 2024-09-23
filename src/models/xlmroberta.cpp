@@ -22,11 +22,6 @@ namespace fastllm {
         };
     }
 
-    void XlmRobertaModel::LoadFromFile(const std::string &fileName) {
-        this->weight.LoadFromFile(fileName);
-        InitParams();
-    }
-
     void XlmRobertaModel::InitParams() {
         if (this->weight.dicts.find("layer_norm_eps") != this->weight.dicts.end()) {
             this->layer_norm_eps = atof(this->weight.dicts["layer_norm_eps"].c_str());
@@ -45,12 +40,51 @@ namespace fastllm {
         this->head_dim = embed_dim / num_attention_heads;
     }
 
-    std::vector <float> XlmRobertaModel::Forward(
+    void XlmRobertaModel::FillBertInputsBatch(const std::vector <std::vector <int> > &tokens,
+                                Data &inputIds, Data &attentionMask, Data &tokenTypeIds, Data &positionIds) {
+        int batch = tokens.size(), len = 0;
+        for (int i = 0; i < batch; i++) {
+            len = std::max(len, (int)tokens[i].size());
+        }
+
+        std::vector <float> ids = std::vector <float> (batch * len, 0.0f);
+        std::vector <float> seqLens = std::vector <float> (batch, 0.0f);
+        std::vector <float> token_type_ids = std::vector <float> (batch * len, 0.0f);
+        std::vector <float> attention_mask = std::vector <float> (batch * len, -1e10f);
+        std::vector <float> position_ids = std::vector <float> (batch * len, 0.0f);
+        for (int i = 0; i < batch; i++) {
+            seqLens[i] = tokens[i].size();
+            for (int j = 0; j < tokens[i].size(); j++) {
+                ids[i * len + j] = tokens[i][j];
+                attention_mask[i * len + j] = 0;
+                position_ids[i * len + j] = 2 + j;
+            }
+        }
+        inputIds.CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, ids));
+        attentionMask.CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, attention_mask));
+        tokenTypeIds.CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, token_type_ids));
+        positionIds.CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, position_ids));
+    }
+
+    void Normalize__(float *data, int dataLen)
+    {
+        float sum = 0.0;
+        for(int i = 0; i < dataLen; i++)
+            sum += data[i] * data[i];
+
+        if (sum < 1e-6) sum = 1e-6;
+        else sum = sqrt(sum);
+
+        for(int i = 0; i < dataLen; i++)
+            data[i] = data[i] / sum;
+    }
+
+    std::vector <std::vector <float> > XlmRobertaModel::ForwardAll(
                 const Data &inputIds,
                 const Data &attentionMask,
                 const Data &tokenTypeIds,
-                const Data &positionIds) {
-        // embedding
+                const Data &positionIds,
+                bool normalize) {
         Data inputEmbeddings, tokenTypeEmbeddings, positionIdEmbeddings;
         Embedding(inputIds, this->weight["roberta.embeddings.word_embeddings.weight"], inputEmbeddings);
         Embedding(tokenTypeIds, this->weight["roberta.embeddings.token_type_embeddings.weight"], tokenTypeEmbeddings);
@@ -59,7 +93,6 @@ namespace fastllm {
         AddTo(inputEmbeddings, positionIdEmbeddings);
         Data hiddenStates, firstStates;
         LayerNorm(inputEmbeddings, this->weight["roberta.embeddings.LayerNorm.weight"], this->weight["roberta.embeddings.LayerNorm.bias"], -1, hiddenStates);
-
         Data q, k, v, qk, qkv, attnOutput, inter, pooler, logits;
         for (int i = 0; i < this->block_cnt; i++) {
             std::string queryWeightName = "roberta.encoder.layer." + std::to_string(i) + ".attention.self.query.weight";
@@ -117,9 +150,13 @@ namespace fastllm {
 
         Split(hiddenStates, 1, 0, 1, firstStates);
         firstStates.Reshape({firstStates.dims[0], -1});
-        Linear(firstStates, this->weight["classifier.dense.weight"], this->weight["classifier.dense.bias"], pooler);
-        TanH(pooler, pooler);
-        Linear(pooler, this->weight["classifier.out_proj.weight"], this->weight["classifier.out_proj.bias"], logits);
+        if (this->weight.weight.find("classifier.dense.weight") != this->weight.weight.end()) {
+            Linear(firstStates, this->weight["classifier.dense.weight"], this->weight["classifier.dense.bias"], pooler);
+            TanH(pooler, pooler);
+            Linear(pooler, this->weight["classifier.out_proj.weight"], this->weight["classifier.out_proj.bias"], logits);
+        } else {
+            Mul(firstStates, 1.0f, logits);
+        }
 
         logits.ToDevice(DataDevice::CPU);
         float *fret = (float*)logits.cpuData;
@@ -127,49 +164,12 @@ namespace fastllm {
         std::vector <std::vector <float> > ret;
         ret.resize(batch, std::vector <float> (outputDim, 0.0f));
         for (int i = 0; i < batch; i++) {
+            if (normalize) {
+                Normalize(fret + i * outputDim, outputDim);
+            }
             memcpy(ret[i].data(), fret + i * outputDim, outputDim * sizeof(float));
         }
-
-        std::vector <float> lastRet;
-        for (int i = 0; i < batch; i++) {
-            lastRet.push_back(ret[i][0]);
-        }
-
-        return lastRet;
-    }
-
-    std::vector <float> XlmRobertaModel::ComputeScore(std::vector <std::vector <int> > tokens) {
-        int batch = tokens.size(), maxLen = tokens[0].size();
-        for (int i = 0; i < tokens.size(); i++) {
-            maxLen = std::max(maxLen, (int)tokens[i].size());
-        }
-        std::vector <float> inputIds = std::vector <float> (batch * maxLen, 1.0f);
-        std::vector <float> attentionMasks = std::vector <float> (batch * maxLen, -10000.0f);
-        std::vector <float> positionIds = std::vector <float> (batch * maxLen, 0.0f);
-        std::vector <float> tokenTypeIds = std::vector <float> (batch * maxLen, 0.0f);
-        for (int i = 0; i < batch; i++) {
-            for (int j = 0; j < (int)tokens[i].size(); j++) {
-                inputIds[i * maxLen + j] = tokens[i][j];
-                attentionMasks[i * maxLen + j] = 0.0f;
-                positionIds[i * maxLen + j] = 2 + j;
-            }
-        }
-        
-        fastllm::Data inputIdsData = fastllm::Data (fastllm::DataType::FLOAT32, {batch, maxLen}, inputIds);
-        fastllm::Data attentionMasksData = fastllm::Data (fastllm::DataType::FLOAT32, {batch, maxLen}, attentionMasks);
-        fastllm::Data positionIdsData = fastllm::Data (fastllm::DataType::FLOAT32, {batch, maxLen}, positionIds);
-        fastllm::Data tokenTypeIdsData = fastllm::Data (fastllm::DataType::FLOAT32, {batch, maxLen}, tokenTypeIds);
-        return Forward(inputIdsData, attentionMasksData, tokenTypeIdsData, positionIdsData);
-    }
-
-    std::vector <float> XlmRobertaModel::EmbeddingSentence(const std::string &context) {
-        std::vector <std::string> contexts;
-        contexts.push_back(context);
-        return EmbeddingSentenceBatch(contexts)[0];
-    }
-
-    std::vector <std::vector <float> > XlmRobertaModel::EmbeddingSentenceBatch(const std::vector <std::string> &contexts) {
-        return {};
+        return ret;
     }
 
     void XlmRobertaModel::WarmUp() {
