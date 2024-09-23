@@ -32,7 +32,8 @@ bool FastllmBF16ToFloat(void *a, void *b, int len);
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                           const fastllm::Data &mask, const fastllm::Data &output, int group, float scale);
-bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output);
+bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output);\
+bool FastllmCudaGelu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output);
