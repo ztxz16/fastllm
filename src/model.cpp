@@ -287,6 +287,9 @@ namespace fastllm {
                 if (dstType != DataType::FLOAT32) {
                     ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
                 }
+            } else if (this->dtype == "I64") {
+                printf("skip I64 tensor %s\n", this->tensorName.c_str());
+                return;
             } else {
                 ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
             }
