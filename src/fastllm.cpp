@@ -549,7 +549,9 @@ namespace fastllm {
         data.UpdateUnitSize();
         data.Allocate();
         if (dataType == oriDataType) {
-            memcpy(data.cpuData, oriData, data.GetBytes());
+            if (oriData != nullptr) {
+                memcpy(data.cpuData, oriData, data.GetBytes());
+            } 
         } else if (oriDataType == DataType::BFLOAT16
                 && dataType == DataType::FLOAT16) {
             uint16_t *a = (uint16_t*)data.cpuData;
