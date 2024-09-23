@@ -212,7 +212,17 @@ namespace fastllm {
 
     void BertModel::WarmUp() {
         printf("Warmup...\n");
-        EmbeddingSentence({"1"}, true);
+        int batch = 1, len = 1;
+        std::vector <float> ids = std::vector <float> (batch * len, 0.0f);
+        std::vector <float> seqLens = std::vector <float> (batch, 0.0f);
+        std::vector <float> token_type_ids = std::vector <float> (batch * len, 0.0f);
+        std::vector <float> attention_mask = std::vector <float> (batch * len, -1e10f);
+        std::vector <float> position_ids = std::vector <float> (batch * len, 0.0f);
+        fastllm::Data inputIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, ids);
+        fastllm::Data attentionMask = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, attention_mask);
+        fastllm::Data tokenTypeIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, token_type_ids);
+        fastllm::Data positionIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, position_ids);
+        ForwardAll(inputIds, attentionMask, tokenTypeIds, positionIds, true);
 	    printf("finish.\n");
     }
 
