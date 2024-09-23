@@ -25,6 +25,7 @@ namespace fastllm {
         this->ops["MatMul"] = (BaseOperator*)(new CudaMatMulOp());
         this->ops["MatMulTransB"] = (BaseOperator*)(new CudaMatMulTransBOp());
         this->ops["SoftMax"] = (BaseOperator*)(new CudaSoftMaxOp());
+        this->ops["Gelu"] = (BaseOperator*)(new CudaGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CudaGeluNewOp());
         this->ops["Silu"] = (BaseOperator*)(new CudaSiluOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CudaSwigluOp());
@@ -569,6 +570,15 @@ namespace fastllm {
         output.Allocate();
         AssertInFastLLM(input.dataType == DataType::FLOAT32, "GeluNew error: Data's type should be float32.\n");
         FastllmCudaGeluNew(input, output);
+    }
+
+    void CudaGeluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "GeluNew error: Data's type should be float32.\n");
+        FastllmCudaGelu(input, output);
     }
 
     void CudaSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
