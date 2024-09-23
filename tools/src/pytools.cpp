@@ -450,7 +450,7 @@ extern "C" {
     }
 
     DLL_EXPORT float* reranker_compute_score(int modelId, int batch, int *seqLens, int *tokens) {
-        fastllm::XlmRobertaModel *model = (fastllm::XlmRobertaModel*)models.GetModel(modelId);
+        fastllm::BertModel *model = (fastllm::BertModel*)models.GetModel(modelId);
         std::vector <std::vector <int> > inputIds;
         inputIds.resize(batch);
         int pos = 0;
