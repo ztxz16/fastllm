@@ -95,7 +95,10 @@ namespace fastllm {
             PermuteSelf(k, {0, 2, 1, 3});
             PermuteSelf(v, {0, 2, 1, 3});
             MatMulTransB(q, k, qk, 1.0 / sqrt(this->head_dim), 1);
-            AttentionExtendedMask(qk, attentionMask);
+            std::vector <int> dims = qk.dims;
+            qk.Resize({dims[0], -1, dims[3]});
+            AttentionMask(qk, attentionMask, -1e9);
+            qk.Resize(dims);
 
             Softmax(qk, qk, -1);
             MatMul(qk, v, qkv, 1.0, 1);
@@ -150,7 +153,7 @@ namespace fastllm {
         std::vector <float> ids = std::vector <float> (batch * len, 0.0f);
         std::vector <float> seqLens = std::vector <float> (batch, 0.0f);
         std::vector <float> token_type_ids = std::vector <float> (batch * len, 0.0f);
-        std::vector <float> attention_mask = std::vector <float> (batch * len, -1e10f);
+        std::vector <float> attention_mask = std::vector <float> (batch * len, 1);
         std::vector <float> position_ids = std::vector <float> (batch * len, 0.0f);
         for (int i = 0; i < batch; i++) {
             seqLens[i] = tokens[i].size();
