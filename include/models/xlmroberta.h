@@ -28,8 +28,6 @@ namespace fastllm {
                 const Data &positionIds,
                 bool normalize);
 
-        void WarmUp(); // 预热
-
         std::string model_type;
 
         float layer_norm_eps = 1e-12;
