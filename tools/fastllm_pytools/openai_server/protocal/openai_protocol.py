@@ -203,7 +203,15 @@ class CompletionStreamResponse(BaseModel):
 
 class EmbedRequest(BaseModel):
     inputs: str
-    normalize: Optional[bool]
-    prompt_name: Optional[str]
-    truncate: Optional[bool]
-    truncation_direction: Optional[str]
+    normalize: Optional[bool] = False
+    prompt_name: Optional[str] = "null"
+    truncate: Optional[bool] = False
+    truncation_direction: Optional[str] = 'right'
+
+class RerankRequest(BaseModel):
+    query: str
+    texts: List[str]
+    raw_scores: Optional[bool] = True
+    return_text: Optional[bool] = False
+    truncate: Optional[bool] = False
+    truncation_direction: Optional[str] = "right"
