@@ -13,6 +13,7 @@ void *FastllmCudaMalloc(size_t size);
 void FastllmCudaFree(void *ret);
 void * FastllmCudaDirectMalloc(size_t size);
 void FastllmCudaDirectFree(void *ret);
+void FastllmCudaMemset0(void *ret, size_t size);
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size);

@@ -2888,6 +2888,10 @@ void FastllmCudaDirectFree(void *ret) {
     //checkCudaErrors("Error: CUDA error when release memory!", state);
 }
 
+void FastllmCudaMemset0(void *ret, size_t size) {
+    cudaMemset(ret, 0, size);
+}
+
 void * FastllmCudaMalloc(size_t size) {
     int id = -1;
     cudaError_t state = cudaSuccess;
