@@ -745,6 +745,7 @@ namespace fastllm {
             } else {
                 this->cudaData = FastllmCudaMalloc(this->expansionBytes);
             }
+            FastllmCudaMemset0(this->cudaData, this->expansionBytes);
 #else
             ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif
