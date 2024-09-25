@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .openai_server.protocal.openai_protocol import *
 from .openai_server.fastllm_completion import FastLLmCompletion
 from .openai_server.fastllm_embed import FastLLmEmbed
+from .openai_server.fastllm_reranker import FastLLmReranker
 from .util import make_normal_parser
 from .util import make_normal_llm_model
 
@@ -55,6 +56,13 @@ async def create_embed(request: EmbedRequest,
     embedding = fastllm_embed.embedding_sentence(request, raw_request)
     return JSONResponse(embedding)
 
+@app.post("/v1/rerank")
+async def create_rerank(request: RerankRequest,
+                       raw_request: Request):
+    print(request)
+    scores = fastllm_reranker.rerank(request, raw_request)    
+    return JSONResponse(scores)
+
 def init_logging(log_level = logging.INFO, log_file:str = None):
     logging_format = '%(asctime)s %(process)d %(filename)s[line:%(lineno)d] %(levelname)s: %(message)s'
     root = logging.getLogger()
@@ -74,4 +82,5 @@ if __name__ == "__main__":
     model.set_verbose(True)
     fastllm_completion = FastLLmCompletion(model_name = args.model_name, model = model)
     fastllm_embed = FastLLmEmbed(model_name = args.model_name, model = model)
+    fastllm_reranker = FastLLmReranker(model_name = args.model_name, model = model)
     uvicorn.run(app, host = args.host, port = args.port)
