@@ -112,6 +112,7 @@ namespace fastllm {
         for (auto &node : graph.nodes) {
             if (allDatas.find(node.name) == allDatas.end()) {
                 allDatas[node.name] = new Data();
+                tempDatas[node.name] = allDatas[node.name];
             }
         }
         Data emptyData;
