@@ -14,6 +14,7 @@
 #include "qwen.h"
 #include "glm.h"
 #include "minicpm.h"
+#include "minicpm3.h"
 #include "internlm2.h"
 #include "bert.h"
 #include "xlmroberta.h"
@@ -188,6 +189,8 @@ namespace fastllm {
             model->model_type = "phi3";
         } else if (modelType=="minicpm") {
             model = new MiniCpmModel();
+        } else if (modelType=="minicpm3") {
+            model = new MiniCpm3Model();
         } else if (modelType == "qwen") {
             model = (basellm *) (new QWenModel());
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
@@ -473,7 +476,8 @@ namespace fastllm {
         if (tokenizerClass == "PreTrainedTokenizerFast" || tokenizerClass == "LlamaTokenizerFast"
             || tokenizerClass == "Qwen2Tokenizer"
             || tokenizerClass == "BloomTokenizer"
-            || tokenizerClass == "LlamaTokenizer") {
+            || tokenizerClass == "LlamaTokenizer"
+            || tokenizerClass == "MiniCPMTokenizer") {
             // PreTrainedTokenizerFast
             std::string tokenizerFile = path + "tokenizer.json";
             auto tokenizer = json11::Json::parse(ReadAllFile(tokenizerFile), error);
