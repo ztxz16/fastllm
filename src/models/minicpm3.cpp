@@ -151,7 +151,6 @@ namespace fastllm {
             Cat(q_nope, q_rope, -1, query_states);
 
             k_rope.Reshape({bsz, seqlen * qk_rope_head_dim});
-            k_rope_expand.ToDevice(DataDevice::CUDA);
             k_rope_expand.CopyFrom(k_rope);
             k_rope_expand.Expansion({bsz, num_attention_heads * seqlen * qk_rope_head_dim});
             for (int i = 1; i < num_attention_heads; i++)
@@ -353,7 +352,6 @@ namespace fastllm {
                 Cat(q_nope, q_rope, -1, query_states);
 
                 k_rope.Reshape({bsz, seqlen * qk_rope_head_dim});
-                k_rope_expand.ToDevice(DataDevice::CUDA);
                 k_rope_expand.CopyFrom(k_rope);
                 k_rope_expand.Expansion({bsz, num_attention_heads * seqlen * qk_rope_head_dim});
                 for (int i = 1; i < num_attention_heads; i++)
