@@ -188,7 +188,7 @@ namespace fastllm {
     };
 
     enum WeightType {
-        NONE = 0, LINEAR = 1, EMBEDDING = 2, AUTO = 99999
+        NONE = 0, LINEAR = 1, EMBEDDING = 2, CONV2D = 3, AUTO = 99999
     };
 
     struct FileMmap {
@@ -529,6 +529,8 @@ namespace fastllm {
     void AttentionBatch(std::vector <Data*> &q, std::vector <Data*> &k, std::vector <Data*> &v,
                         std::vector <Data*> &mask, std::vector <Data*> &output,
                         int group, float scale, int attentionType);
+
+    void Conv2D(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, Data &output);
 
     void Embedding(const Data &input, Data &weight, Data &output);
 

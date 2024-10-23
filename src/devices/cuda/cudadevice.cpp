@@ -20,6 +20,7 @@ namespace fastllm {
         this->ops["LayerNorm"] = (BaseOperator*)(new CudaLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
+        this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
         this->ops["MatMul"] = (BaseOperator*)(new CudaMatMulOp());
@@ -156,12 +157,13 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+        int maskType = intParams.find("maskType") != intParams.end() ? intParams.find("maskType")->second : 0;
         output.Allocate();
 
         if (q.dataType == DataType::FLOAT32) {
-            FastllmCudaAttention(q, k, v, mask, output, group, scale);
+            FastllmCudaAttention(q, k, v, mask, output, group, scale, maskType);
         } else if (q.dataType == DataType::FLOAT16) {
-            FastllmCudaHalfAttention(q, k, v, mask, output, group, scale);
+            FastllmCudaHalfAttention(q, k, v, mask, output, group, scale, maskType);
         }
     }
 
@@ -256,6 +258,31 @@ namespace fastllm {
         FastllmCudaEmbedding(input, weight, output);
     }
 
+    void CudaConv2DOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &bias = *(datas.find("bias")->second);
+
+        output.Allocate();
+
+        int inputChannels = intParams.find("inputChannels")->second;
+        int outputChannels = intParams.find("outputChannels")->second;
+        int kernelH = intParams.find("kernelH")->second;
+        int kernelW = intParams.find("kernelW")->second;
+        int padH = intParams.find("padH")->second;
+        int padW = intParams.find("padW")->second;
+        int strideH = intParams.find("strideH")->second;
+        int strideW = intParams.find("strideW")->second;
+        
+        std::vector <int> dims = input.dims;
+        int inputHeight = dims[2], inputWidth = dims[3];
+        int outputHeight = (inputHeight + padH + padH - kernelH) / strideH + 1;
+        int outputWidth = (inputWidth + padW + padW - kernelW) / strideW + 1;
+
+        FastllmCudaConv2DFloat32(input, weight, bias, inputChannels, outputChannels, kernelH, kernelW, strideH, strideW, padH, padW, output);
+    }
+
     void CudaLinearOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -292,7 +319,6 @@ namespace fastllm {
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
-
         if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaHalfMatMulFloat16(input, weight, bias, output, n, m, k);
@@ -577,7 +603,8 @@ namespace fastllm {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         output.Allocate();
-        AssertInFastLLM(input.dataType == DataType::FLOAT32, "GeluNew error: Data's type should be float32.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16, "Gelu error: Data's type should be float32 or float16.\n");
         FastllmCudaGelu(input, output);
     }
 
