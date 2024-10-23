@@ -480,8 +480,22 @@ namespace fastllm {
         return ret;
     }
 
+    std::vector <int> basellm::ForwardMultimodal(
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data> > &pastKeyValues,
+                const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                const GenerationConfig &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *logits) {
+        printf("Unsupport multi modal forward.\n");
+        exit(0);
+    }
+
     int basellm::LaunchResponseTokens(const std::vector<int> &inputTokens,
-                                      const fastllm::GenerationConfig &generationConfig) {
+                                      const fastllm::GenerationConfig &generationConfig,
+                                      const std::map <std::string, std::vector <Data*> > &multimodalInput) {
         mainLoopLocker.lock();
         if (mainLoop == nullptr) {
             if (mainLoop == nullptr) {
@@ -725,10 +739,18 @@ auto st = std::chrono::system_clock::now();
                                         st += curLen;
                                     }
                                 } else {
-                                    ret = std::vector <int> {model->Forward(inputIds,
+                                    if (model->responseContextDict.dicts.begin()->second->multimodalInput.size() > 0) {
+                                        auto context = model->responseContextDict.dicts.begin()->second;
+                                        ret = model->ForwardMultimodal(inputIds, 
+                                                            attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
+                                                            *positionIds[0], *pastKeyValue1, context->multimodalInput,
+                                                           context->generationConfig, tokensManager, &logits);
+                                    } else {
+                                        ret = std::vector <int> {model->Forward(inputIds,
                                                                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
                                                                         *positionIds[0],
                                                                         *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
+                                    }
                                 }
                             }
 //PrintProfiler();
@@ -825,6 +847,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         context->Init(this->block_cnt, this->dataType);
         context->currentTokens = inputTokens;
         context->generationConfig = generationConfig;
+        context->multimodalInput = multimodalInput;
         context->tokens = LastTokensUnit(generationConfig.last_n);
 
         auto cache = pastKVCacheManager.Get(inputTokens);
