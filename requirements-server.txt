@@ -2,3 +2,4 @@ fastapi
 pydantic
 openai
 shortuuid
+unicorn
