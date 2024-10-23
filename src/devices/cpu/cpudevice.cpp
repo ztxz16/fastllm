@@ -31,6 +31,7 @@ namespace fastllm {
         this->ops["LayerNorm"] = (BaseOperator*)(new CpuLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CpuRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CpuLinearOp());
+        this->ops["Conv2D"] = (BaseOperator*)(new CpuConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CpuSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CpuRepeatOp());
         this->ops["Cat"] = (BaseOperator*)(new CpuCatOp());
@@ -1374,6 +1375,97 @@ namespace fastllm {
         } else {
             ErrorInFastLLM("RMSNorm error: unsupport dataType.\n");
         }
+    }
+
+    bool CpuConv2DOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        return true;
+    }
+
+    void CpuConv2DOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &bias = *(datas.find("bias")->second);
+
+        output.Allocate(0.0f);
+
+        int inputChannels = intParams.find("inputChannels")->second;
+        int outputChannels = intParams.find("outputChannels")->second;
+        int kernelH = intParams.find("kernelH")->second;
+        int kernelW = intParams.find("kernelW")->second;
+        int padH = intParams.find("padH")->second;
+        int padW = intParams.find("padW")->second;
+        int strideH = intParams.find("strideH")->second;
+        int strideW = intParams.find("strideW")->second;
+        
+        std::vector <int> dims = input.dims;
+        int inputHeight = dims[2], inputWidth = dims[3];
+        int outputHeight = (inputHeight + padH + padH - kernelH) / strideH + 1;
+        int outputWidth = (inputWidth + padW + padW - kernelW) / strideW + 1;
+
+        float *floatInput = (float*)input.cpuData;
+        float *floatWeight = (float*)weight.cpuData;
+        float *floatBias = (float*)bias.cpuData;
+        float *floatOutput = (float*)output.cpuData;
+        for (int oc = 0; oc < outputChannels; oc++) {
+            float *startWeight = (float*)floatWeight + oc * (inputChannels * kernelH * kernelW);
+            for (int oh = 0; oh < outputHeight; oh++) {
+                for (int ow = 0; ow < outputWidth; ow++) {
+                    int ih = oh * strideH - padH;
+                    int iw = ow * strideW - padW;
+                    float value = floatBias[oc];
+                    float *curWeight = startWeight;
+                    for (int c = 0; c < inputChannels; c++) {
+                        float *curInput = (float*)floatInput + c * inputHeight * inputWidth;
+                        for (int h = 0; h < kernelH; h++) {
+                            for (int w = 0; w < kernelW; w++) {
+                                float inputValue = 0;
+                                if (ih + h >= 0 && ih + h < inputHeight && iw + w >= 0 && iw + w < inputWidth) {
+                                    inputValue = curInput[(ih + h) * inputWidth + (iw + w)];
+                                }
+                                value += inputValue * (*(curWeight++));
+                            }
+                        }
+                    }
+
+                    *(floatOutput++) = value;
+                }
+            }
+        }
+    }
+
+    void CpuConv2DOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+
+        int inputChannels = intParams.find("inputChannels")->second;
+        int outputChannels = intParams.find("outputChannels")->second;
+        int kernelH = intParams.find("kernelH")->second;
+        int kernelW = intParams.find("kernelW")->second;
+        int padH = intParams.find("padH")->second;
+        int padW = intParams.find("padW")->second;
+        int strideH = intParams.find("strideH")->second;
+        int strideW = intParams.find("strideW")->second;
+        
+        AssertInFastLLM(weight.dims.size() == 4, "Conv2D's weight's shape's size should be 4.\n");
+        AssertInFastLLM(input.dims[1] == inputChannels, "Conv2D's input's shape error.\n");
+
+        weight.weightType = WeightType::CONV2D;
+
+        std::vector <int> dims = input.dims;
+        int inputHeight = dims[2], inputWidth = dims[3];
+        int outputHeight = (inputHeight + padH + padH - kernelH) / strideH + 1;
+        int outputWidth = (inputWidth + padW + padW - kernelW) / strideW + 1;
+        dims[1] = outputChannels;
+        dims[2] = outputHeight;
+        dims[3] = outputWidth;
+
+        output.dataType = input.dataType;
+        output.Resize(dims);
     }
 
     void CpuLinearOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
