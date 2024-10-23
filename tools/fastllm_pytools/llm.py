@@ -42,6 +42,14 @@ fastllm_lib.launch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ct
                                                   ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_llm_model.restype = ctypes.c_int
 
+fastllm_lib.launch_response_llm_model_multimodal.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                                            ctypes.c_char_p, ctypes.c_void_p, 
+                                                            ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
+                                                            ctypes.c_float, ctypes.c_float, ctypes.c_bool,
+                                                            ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+fastllm_lib.launch_response_llm_model_multimodal.restype = ctypes.c_int
+
+
 fastllm_lib.add_cache_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
 
 fastllm_lib.fetch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
@@ -446,6 +454,8 @@ class model:
                 else:
                     self.model = fastllm_lib.create_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, 
                                                                  ctypes.c_bool(self.hf_tokenizer != None), lora.encode());
+                if (os.path.isfile(os.path.join(path, "config.json"))):
+                    self.config = json.load(open(os.path.join(path, "config.json"), "r"))
             else:
                 print("path error: ", path);
                 exit(0)
@@ -860,10 +870,57 @@ class model:
                         query: Union[str, List[Dict[str, str]]],
                         history: List[Tuple[str, str]] = None,
                         max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
-                        one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True):
+                        one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True, 
+                        images: List = None):
         conversation = None
         if (isinstance(query, List)):
             conversation = query
+        if (images != None):
+            architecture = ""
+            try:
+                architecture = self.config["architectures"][0]
+            except:
+                print("Error: can't detect architectures for this model.")
+                exit(0)
+            if (architecture == "CogVLMForCausalLM"):
+                image_channels = int(self.config["vision_config"]["in_channels"])
+                image_size = int(self.config["vision_config"]["image_size"])
+                configs = {
+                    "image_channels": image_channels,  
+                    "image_height": image_size,
+                    "image_width": image_size
+                }
+                des = json.dumps(configs)
+                from torchvision import transforms
+                transform = transforms.Compose(
+                    [
+                        transforms.Resize(
+                            (image_size, image_size), interpolation=transforms.InterpolationMode.BICUBIC
+                        ),
+                        transforms.ToTensor(),
+                        transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+                    ]
+                )
+                image = transform(images[0]).reshape([-1]).tolist()
+            else:
+                print("Error: can't support architectures: " + architecture)
+                exit(0)
+
+            # 有图片输入，多模态模型
+            tokenizer = self.hf_tokenizer
+            prompt = ""
+            if (conversation != None and len(conversation) != 0):
+                prompt = tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = False)
+            else:
+                prompt = query if self.direct_query else self.get_prompt(query, history)
+            input = tokenizer.encode(prompt)
+            stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+            handle = fastllm_lib.launch_response_llm_model_multimodal(self.model, len(input), (ctypes.c_int * len(input))(*input),
+                                                        des.encode(), (ctypes.c_float * len(image))(*image),
+                                                        max_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                        False, stop_token_len, stop_token_list)
+            return handle
+
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             tokenizer = self.hf_tokenizer
             type = None
@@ -902,6 +959,50 @@ class model:
     
     def abort_handle(self, handle):
         fastllm_lib.abort_response_llm_model(self.model, handle)
+    
+    def stream_response_handle(self, handle):
+        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+            tokenizer = self.hf_tokenizer
+            tokens = []
+            while True:
+                if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
+                    continue
+                cur = fastllm_lib.fetch_response_llm_model(self.model, handle)
+                if (cur <= -1):
+                    if (cur == -2):
+                        yield "prompt too long"
+                    break
+                tokens.append(cur)
+                ret = tokenizer.decode(tokens)
+                if (ret.encode().find(b'\xef\xbf\xbd') == -1):
+                    tokens.clear()
+                    yield ret
+                else:
+                    yield ""
+            if len(tokens) > 0:
+                yield tokenizer.decode(tokens)
+        else:
+            res = ""
+            ret = b''
+            fail_cnt = 0
+            while True:
+                if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
+                    continue
+                ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
+                cur = ""
+                try:
+                    cur = ret.decode()
+                    ret = b''
+                except:
+                    fail_cnt += 1
+                    if (fail_cnt == 20):
+                        break
+                    else:
+                        continue
+                fail_cnt = 0
+                if (cur == "<flmeos>"):
+                    break
+                yield cur
 
     async def stream_response_handle_async(self, handle):
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
