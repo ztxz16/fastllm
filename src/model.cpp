@@ -19,6 +19,7 @@
 #include "xlmroberta.h"
 #include "graphllm.h"
 #include "phi3.h"
+#include "cogvlm.h"
 
 namespace fastllm {
     std::string ReadAllFile(const std::string &fileName) {
@@ -197,6 +198,8 @@ namespace fastllm {
             model = (basellm*)(new BertModel());
         } else if (modelType == "xlm-roberta") {
             model = (basellm*)(new XlmRobertaModel());
+        } else if (modelType == "cogvlm" || modelType == "CogVLMForCausalLM") {
+            model = (basellm*)(new CogvlmModel());
         } else if (modelType == "fastllmJson") {
             model = new GraphLLMModel("fastllmJson");
         } else {
@@ -600,7 +603,17 @@ namespace fastllm {
         // 2. 创建网络基本信息
         std::string configFile = path + "config.json";
         auto config = json11::Json::parse(ReadAllFile(configFile), error);
-        basellm *model = CreateModelWithType(isJsonModel ? "fastllmJson" : config["model_type"].string_value());
+        std::string modelType = "";
+        if (isJsonModel) {
+            modelType = "fastllmJson";
+        } else {
+            if (!config["model_type"].is_null()) {
+                modelType = config["model_type"].string_value();
+            } else {
+                modelType = config["architectures"].array_items()[0].string_value();
+            }
+        }
+        basellm *model = CreateModelWithType(modelType);
         if (isJsonModel) {
             ((GraphLLMModel*)model)->graphLLMModelConfig->Init(modelConfig);
         }

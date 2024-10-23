@@ -32,6 +32,7 @@ namespace fastllm {
         
         std::vector <std::pair <Data, Data> > pastKeyValues;
         std::vector <int> currentTokens;
+        std::map <std::string, std::vector <Data*> > multimodalInput;
         std::queue <int> resultTokenQueue;
         std::queue <std::vector <float>*> resultLogits;
         GenerationConfig generationConfig;
@@ -144,6 +145,16 @@ namespace fastllm {
                 const std::vector <GenerationConfig> &generationConfigs,
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
+        
+        virtual std::vector <int> ForwardMultimodal(
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data> > &pastKeyValues,
+                const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                const GenerationConfig &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr);
 
         // 是否需要生成AttentionMask
         virtual bool NeedAttentionMask(int qlen, int klen);
@@ -168,7 +179,8 @@ namespace fastllm {
                                    const GenerationConfig &generationConfig = GenerationConfig()); // 批量根据给出的内容回复 
 
         virtual int LaunchResponseTokens(const std::vector <int> &inputTokens,
-                                         const GenerationConfig &generationConfig = GenerationConfig()); // 启动一个response任务，返回分配的handleId
+                                         const GenerationConfig &generationConfig = GenerationConfig(),
+                                         const std::map <std::string, std::vector <Data*> > &multimodalInput = {}); // 启动一个response任务，返回分配的handleId
         
         virtual bool CanFetchResponse(int handleId); // 判断当前是否能fetch到，用于异步操作
 
@@ -209,6 +221,7 @@ namespace fastllm {
 
         std::string model_type;
         std::string model_struct;
+        bool is_multi_modal = false; // 是否是多模态模型
 
         std::string pre_prompt; // 最初对话的提示语
         std::string user_role, bot_role, history_sep; // 用于生成每一轮的prompt
