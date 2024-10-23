@@ -382,6 +382,40 @@ extern "C" {
         return model->LaunchResponseTokens(input, config);
     }
 
+    DLL_EXPORT int launch_response_llm_model_multimodal(int modelId, int len, int *values, 
+                                  char *multimodal_json, float *multimodal_data,
+                                  int max_length, bool do_sample, float top_p, int top_k,
+                                  float temperature, float repeat_penalty, bool output_logits,
+                                  int stop_token_len, int * stop_token_ids) {
+        std::vector <int> input;
+        for (int i = 0; i < len; i++) {
+            input.push_back(values[i]);
+        }
+        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, false);
+        for(int i = 0; i < stop_token_len; i++ ) {
+            config.stop_token_ids.insert(stop_token_ids[i]);
+        }
+        auto model = models.GetModel(modelId);
+
+        std::string error;
+        auto multimodal_config = json11::Json::parse(multimodal_json, error);
+        int image_channels = multimodal_config["image_channels"].int_value();
+        int image_height = multimodal_config["image_height"].int_value();
+        int image_width = multimodal_config["image_width"].int_value();
+
+        std::vector <float> imageInput;
+        imageInput.resize(1 * image_channels * image_height * image_width);
+        memcpy(&imageInput[0], multimodal_data, imageInput.size() * sizeof(float));
+
+        std::map <std::string, std::vector <fastllm::Data*> > *multimodalInput = new std::map <std::string, std::vector <fastllm::Data*> > ();
+        fastllm::Data *imageInputData = new fastllm::Data();
+        imageInputData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {1, image_channels, image_height, image_width}, imageInput));
+        (*multimodalInput)["images"].push_back(imageInputData);
+
+        int ret = model->LaunchResponseTokens(input, config, *multimodalInput);
+        return ret;
+    }
+
     DLL_EXPORT int fetch_response_llm_model(int modelId, int handleId) {
         auto model = models.GetModel(modelId);
         return model->FetchResponseTokens(handleId);
