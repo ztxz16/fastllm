@@ -400,10 +400,10 @@ namespace fastllm {
                 if (qs[i]->dataType == DataType::FLOAT16) {
                     if (masks == nullptr || masks[i] == nullptr) {
                         FastllmCudaHalfAttention(*qs[i], *ks[i], *vs[i], Data(), *outputs[i], 
-                                            intParams.find("group")->second, floatParams.find("scale")->second);
+                                            intParams.find("group")->second, floatParams.find("scale")->second, 0);
                     } else {
                         FastllmCudaHalfAttention(*qs[i], *ks[i], *vs[i], *masks[i], *outputs[i], 
-                                            intParams.find("group")->second, floatParams.find("scale")->second);
+                                            intParams.find("group")->second, floatParams.find("scale")->second, 0);
                     }
                 } else {
                     ErrorInFastLLM("AttentionBatch: datatype should be float32 or float16.");

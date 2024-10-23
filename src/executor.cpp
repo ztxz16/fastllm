@@ -90,6 +90,7 @@ namespace fastllm {
                 lockInCPU |= (it.second && it.second->lockInCPU);
             }
         }
+        bool run = false;
         for (auto device: devices) {
             if (lockInCPU && device->deviceType != "cpu") {
                 continue;
@@ -119,8 +120,12 @@ namespace fastllm {
                 }
                 device->Reshape(opType, datas, floatParams, intParams);
                 device->Run(opType, datas, floatParams, intParams);
+                run = true;
                 break;
             }
+        }
+        if (!run) {
+            ErrorInFastLLM("Can't run " + opType + " in any device.");
         }
         float spend = GetSpan(st, std::chrono::system_clock::now());
         profiler[opType] += spend;
