@@ -304,6 +304,7 @@ namespace fastllm {
     }
 
     void Data::CopyFrom(const Data &ori) {
+        this->ToDevice(ori.dataDevice);
         this->name = ori.name;
         this->isKVCache = ori.isKVCache;
         this->cacheUid = ori.cacheUid;
