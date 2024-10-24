@@ -179,6 +179,7 @@ namespace fastllm {
             int visionLayers = atoi(this->weight.dicts["vision_config.num_hidden_layers"].c_str());
             int visionNumHeads = atoi(this->weight.dicts["vision_config.num_heads"].c_str());
 
+            ToDataType(x, this->dataType);
             for (int i = 0; i < visionLayers; i++) {
                 std::string pre = "model.vision.transformer.layers." + std::to_string(i);
                 int B = x.dims[0], L = x.dims[1];
@@ -231,6 +232,7 @@ namespace fastllm {
                 AddTo(x, mlp);
             }
 
+            ToDataType(x, DataType::FLOAT32);
             Split(x, 1, 1, x.dims[1], y);
             int gridSize = int(sqrt(y.dims[1]) + 1e-9);
             y.Reshape({y.dims[0], gridSize, gridSize, y.dims[2]});
@@ -272,7 +274,8 @@ namespace fastllm {
             startPos = 1;
             endPos = 1;
         }
-        
+
+        ToDataType(x, this->dataType);
         Data &hiddenStates = x;
         Data attenInput, w1, w2, textW2, visionW2, w3;
         Data* sinDataPtr = &sinData;
@@ -460,7 +463,8 @@ namespace fastllm {
         Data norm, logit;
         RMSNorm(*lastHiddenStates, this->weight["model.norm.weight"], rms_norm_eps, norm);
         Linear(norm, this->weight["lm_head.weight"], Data(), logit);
-
+        
+        ToDataType(logit, DataType::FLOAT32);
         std::vector <int> lastRet;
         Data topk;
         TopK(logit, topk, 1);
