@@ -3776,14 +3776,15 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
     half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
     if (q1 >= 1024 || (q1 > 1 && q1 != k1 && k1 >= 1024)) {
         int alignQ1 = q1, alignK1 = k1;
+        int part = alignK1;
         bool useFastAttn = getCudaInfos()->hasTensorCore && batch == 1 && (q2 == 128 && v2 == 128) && maskType == 0;
         if (useFastAttn) {
             alignQ1 = ((q1 - 1) / 128 + 1) * 128;
             alignK1 = ((k1 - 1) / 128 + 1) * 128;
+            part = (alignK1 > 8192 ? 8192 : alignK1);
         }
-
-        int part = (alignK1 > 8192 ? 8192 : alignK1);
         half *qk = (half *) FastllmCudaMalloc(alignQ1 * part * sizeof(half));
+
         cudaMemset(qk, 0, alignQ1 * part * sizeof(half));
         auto fastllmCublasHandle = getFastllmCublasHandle();
         cublasStatus_t status;
