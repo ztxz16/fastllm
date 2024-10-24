@@ -22,6 +22,7 @@ namespace fastllm {
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
+        this->ops["Cat"] = (BaseOperator*)(new CudaCatOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
         this->ops["MatMul"] = (BaseOperator*)(new CudaMatMulOp());
         this->ops["MatMulTransB"] = (BaseOperator*)(new CudaMatMulTransBOp());
@@ -398,6 +399,42 @@ namespace fastllm {
         FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)output.cudaData, outputStride * unitSize,
                                           (uint8_t*)input.cudaData + start * inner * unitSize, inputStride * unitSize,
                                           (end - start) * inner * unitSize, outer);
+    }
+
+    void CudaCatOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        Data &output = *(datas.find("output")->second);
+
+        output.Allocate();
+
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        if (input0.dims.size() == 0 && input1.dims.size() > 0) {
+            output.CopyFrom(input1);
+            return;
+        }
+        if (input1.dims.size() == 0 && input0.dims.size() > 0) {
+            output.CopyFrom(input0);
+            return;
+        }
+
+        int dimsLen = input0.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        int outer = output.Count(0) / output.Count(axis);
+        int input0Stride = input0.Count(axis);
+        int input1Stride = input1.Count(axis);
+        int outputStride = output.Count(axis);
+        int inner = input0.strides[axis];
+        int unitSize = input0.unitSize;
+
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t *) output.cudaData, outputStride * unitSize,
+                                            (uint8_t *) input0.cudaData, input0Stride * unitSize,
+                                            input0.dims[axis] * inner * unitSize, outer);
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t *) output.cudaData + input0.dims[axis] * inner * unitSize, outputStride * unitSize,
+                                            (uint8_t *) input1.cudaData, input1Stride * unitSize,
+                                            input1.dims[axis] * inner * unitSize, outer);
     }
 
     void CudaCatDirectOp::Run(const std::string &opType, const fastllm::DataDict &datas,
