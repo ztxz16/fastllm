@@ -29,8 +29,8 @@ GPU compilation requires a pre-installed CUDA compilation environment, using the
 Compile using the following commands:
 
 ``` sh
-bash install.sh -DUSE_CUDA=ON # Compile GPU version
-# bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 # Specify CUDA architecture, e.g., 4090 uses architecture 89
+bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # Compile GPU version
+# bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 -D CMAKE_CUDA_COMPILER=$(which nvcc) # Specify CUDA architecture, e.g., 4090 uses architecture 89
 # bash install.sh # Compile CPU version only
 ```
 
