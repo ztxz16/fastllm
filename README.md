@@ -33,8 +33,8 @@ GPU编译需要提前安装好CUDA编译环境，建议使用尽可能新的CUDA
 使用如下命令编译
 
 ``` sh
-bash install.sh -DUSE_CUDA=ON # 编译GPU版本
-# bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 # 可以指定CUDA架构，如4090使用89架构
+bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU版本
+# bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 -D CMAKE_CUDA_COMPILER=$(which nvcc) # 可以指定CUDA架构，如4090使用89架构
 # bash install.sh # 仅编译CPU版本
 ```
 
