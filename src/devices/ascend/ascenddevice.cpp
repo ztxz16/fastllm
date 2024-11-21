@@ -13,6 +13,7 @@ namespace fastllm {
         this->ops["Linear"] = new AscendLinearOp();
         this->ops["Silu"] = new AscendSiluOp();
         this->ops["MulTo"] = new AscendMulToOp();
+        this->ops["AddTo"] = new AscendAddToOp();
     }
 
     AscendNpuDevice::~AscendNpuDevice() {
@@ -264,6 +265,27 @@ namespace fastllm {
         dynamicShapes["x2"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
         dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
         deviceOk = CompileAndRunSingleOp(this->name, {{"x1", &input0}, {"x2", &input1}}, {{"y", &input0}}, dynamicShapes, {}, {}, {});
+    }
+
+    AscendAddToOp::AscendAddToOp() :
+        BaseAscendOperator("Axpy") {}
+
+    void AscendAddToOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0f;
+
+        AssertInFastLLM(input0.dataType == DataType::FLOAT32 || input1.dataType == DataType::FLOAT16,
+                        "AddTo error: Data's type should be float32 or float16.\n");
+        AssertInFastLLM(input0.dims == input1.dims, "AddTo error: input's shape should be same.\n");
+
+        int len = input0.Count(0);
+        DynamicShapeDict dynamicShapes;
+        dynamicShapes["x1"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        dynamicShapes["x2"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+        deviceOk = CompileAndRunSingleOp(this->name, {{"x1", &input0}, {"x2", &input1}}, {{"y", &input0}}, dynamicShapes, floatParams, {}, {});
     }
 
 }

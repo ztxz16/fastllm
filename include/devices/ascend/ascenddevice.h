@@ -70,6 +70,12 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class AscendAddToOp : public BaseAscendOperator {
+    public:
+        AscendAddToOp();
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
 }
 
 #endif // FASTLLM_ASCEND_DEVICE_H
