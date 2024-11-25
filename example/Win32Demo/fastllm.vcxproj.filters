@@ -78,6 +78,9 @@
     <ClInclude Include="..\..\include\models\chatglm.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\cogvlm.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\deepseekv2.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
@@ -99,13 +102,22 @@
     <ClInclude Include="..\..\include\models\minicpm.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\minicpm3.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\moe.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\models\moss.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\phi3.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\qwen.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\xlmroberta.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\devices\cpu\cpudevice.h">
@@ -155,6 +167,9 @@
     <ClCompile Include="..\..\src\models\chatglm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\cogvlm.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\deepseekv2.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
@@ -173,16 +188,28 @@
     <ClCompile Include="..\..\src\models\minicpm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\minicpm3.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\moe.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\moss.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\phi3.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\qwen.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\xlmroberta.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\graph\fastllmjson.cpp">
+      <Filter>源文件\models\graph</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\graph\phi3.cpp">
       <Filter>源文件\models\graph</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\graph\qwen2.cpp">
