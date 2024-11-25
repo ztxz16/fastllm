@@ -33,17 +33,23 @@ set(PROJECT_SOURCE
         ../../../../../../../src/template.cpp
         ../../../../../../../src/devices/cpu/cpudevice.cpp
         ../../../../../../../src/devices/cpu/cpudevicebatch.cpp
+        ../../../../../../../src/devices/cpu/linear.cpp
         ../../../../../../../src/models/basellm.cpp
         ../../../../../../../src/models/bert.cpp
         ../../../../../../../src/models/chatglm.cpp
+        ../../../../../../../src/models/cogvlm.cpp
         ../../../../../../../src/models/deepseekv2.cpp
-        ../../../../../../../src/models/moss.cpp
-        ../../../../../../../src/models/llama.cpp
-        ../../../../../../../src/models/qwen.cpp
         ../../../../../../../src/models/glm.cpp
+        ../../../../../../../src/models/graphllm.cpp
+        ../../../../../../../src/models/llama.cpp
         ../../../../../../../src/models/internlm2.cpp
         ../../../../../../../src/models/minicpm.cpp
+        ../../../../../../../src/models/minicpm3.cpp
         ../../../../../../../src/models/moe.cpp
+        ../../../../../../../src/models/moss.cpp
+        ../../../../../../../src/models/phi3.cpp
+        ../../../../../../../src/models/qwen.cpp
+        ../../../../../../../src/models/xlmroberta.cpp
         )
 
 include_directories(
