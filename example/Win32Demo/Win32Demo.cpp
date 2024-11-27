@@ -133,7 +133,7 @@ int initLLMConf(RunConfig config) {
 		generationConfig->stop_token_ids.insert(model->weight.tokenizer.GetTokenId(it));
 	}
 	std::string systemConfig = config.systemPrompt;
-	messages = new fastllm::ChatMessages({{"system", systemConfig}});
+	messages = systemConfig.empty() ? new fastllm::ChatMessages() : new fastllm::ChatMessages({{"system", systemConfig}});
 
 	modelType = model->model_type;
 	runType = config.webuiType ? RUN_TYPE_WEBUI : RUN_TYPE_CONSOLE;

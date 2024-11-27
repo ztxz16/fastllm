@@ -67,6 +67,13 @@
 | Qwen/Qwen2-1.5B-Instruct | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
 | Qwen/Qwen2-7B-Instruct   | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
 | Qwen/Qwen2-72B-Instruct  |  | [✔](#qwen模型导出) | ✔ |
+| Qwen/Qwen2.5-0.5B-Instruct | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
+| Qwen/Qwen2.5-1.5B-Instruct | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
+| Qwen/Qwen2.5-3B-Instruct   | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
+| Qwen/Qwen2.5-7B-Instruct   | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
+| Qwen/Qwen2.5-14B-Instruct  | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
+| Qwen/Qwen2.5-32B-Instruct  | √ | √ | ✔ |
+| Qwen/Qwen2.5-72B-Instruct  |  | √ | ✔ |
 
 > 注3： 需要更新，检查 `tokenizer_config.json` 是否为最新版本
 
@@ -241,7 +248,7 @@ python3 tools/qwen2flm.py qwen-7b-int8.flm int8 #导出int8模型
 python3 tools/qwen2flm.py qwen-7b-int4.flm int4 #导出int4模型
 ```
 
-* **Qwen1.5**
+* **Qwen1.5 / Qwen2 / Qwen2.5**
 
 ```sh
 # 需要先安装QWen2环境（transformers >= 4.37.0）
