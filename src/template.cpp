@@ -12,6 +12,8 @@ namespace fastllm {
             return true;
         } else if (this->stringValue == "false") {
             return false;
+        } else if (this->type == JinjaArray) {
+            return !this->arrayValue.empty();
         }
         ErrorInFastLLM("Jinja error: " + this->Dump() + " is not bool.");
         return false;
@@ -108,9 +110,9 @@ namespace fastllm {
                 AssertInFastLLM(value[len - 1] == '}' && value[len - 2] == (value[1] == '%' ? '%' : '}'), 
                                 "Jinja block error: " + value);
                 int st = 2, end = len - 2;
-                if (value[1] == '%' && value[2] == '-')
+                if (value[2] == '-')
                     st = 3;
-                if (value[len - 2] == '%' && value[len - 3] == '-')
+                if (value[len - 3] == '-')
                     end = len - 3;
                 while (st < end) {
                     char now = value[st];
@@ -145,7 +147,7 @@ namespace fastllm {
                             }
                             if (value[j] == '\\') {
                                 AssertInFastLLM(j + 1 < end, "Jinja error: parse string failed: " + value.substr(st, std::min(10, (int)value.size() - st)));
-                                cur += escapeChars[value[j + 1]];
+                                cur += escapeChars[value[++j]];
                             } else {
                                 cur += value[j];
                             }
@@ -259,6 +261,8 @@ namespace fastllm {
         if (type == JinjaToken::JinjaTokenOr) {
             return -2;
         } else if (type == JinjaToken::JinjaTokenAnd) {
+            return -2;
+        } else if (type == JinjaToken::JinjaTokenNot) {
             return -1;
         } else if (type == JinjaToken::JinjaTokenEqual || type == JinjaToken::JinjaTokenNotEqual) {
             return 0;
@@ -270,6 +274,8 @@ namespace fastllm {
             return 3;
         } else if (type == JinjaToken::JinjaTokenDOT) {
             return 4;
+        } else if (type == JinjaToken::JinjaTokenLSB || type == JinjaToken::JinjaTokenLMB) {
+            return -5;
         } else {
             ErrorInFastLLM("Jinja error: unsupport op: " + std::to_string(type));
             return -1;
@@ -348,6 +354,7 @@ namespace fastllm {
                         tokens[i].type == JinjaToken::JinjaTokenIn ||
                         tokens[i].type == JinjaToken::JinjaTokenAnd ||
                         tokens[i].type == JinjaToken::JinjaTokenOr ||
+                        tokens[i].type == JinjaToken::JinjaTokenNot ||
                         tokens[i].type == JinjaToken::JinjaTokenFliter) {
                 while (ops.size() > 0 && GetOpLevel(ops.back().type) > GetOpLevel(tokens[i].type)) {
                     suffixExp.push_back(ops.back());
@@ -418,6 +425,14 @@ namespace fastllm {
                 } else {
                     ErrorInFastLLM("Jinja Error: unsupport filter " + b.stringValue);
                 }
+            } else if (it.type == JinjaToken::JinjaTokenNot) {
+                AssertInFastLLM(vars.size() >= 1, "Jinja Error: expression error.");
+                JinjaVar a = vars.back();
+                if (a.type == JinjaVar::JinjaNone) {
+                    a = local[a];
+                }
+                vars.pop_back();
+                vars.push_back(a.type == JinjaVar::JinjaNone ? JinjaVar(1) : JinjaVar(!a.BoolValue()));
             } else if (it.type == JinjaToken::JinjaTokenAdd ||
                         it.type == JinjaToken::JinjaTokenSub ||
                         it.type == JinjaToken::JinjaTokenMul ||
