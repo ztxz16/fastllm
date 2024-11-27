@@ -149,7 +149,8 @@ int main(int argc, char** argv) {
         locker.lock();
         if (sessions.find(uuid) == sessions.end()) {
             sessions[uuid] = new ChatSession();
-            sessions[uuid]->messages.push_back({"system", config.systemPrompt});
+            if (!config.systemPrompt.empty())
+                sessions[uuid]->messages.push_back({"system", config.systemPrompt});
         }
         auto *session = sessions[uuid];
         locker.unlock();
