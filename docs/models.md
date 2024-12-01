@@ -50,10 +50,10 @@
 
 |              模型  | 加载后转换 |  离线转换  |  直接读取  |
 |-------------------: |------------|------------|------------|
-| Qwen/Qwen-7B-Chat   | [✔](#其它模型) | [✔](#qwen模型导出) |  |
-| Qwen/Qwen-14B-Chat  | [✔](#其它模型) | [✔](#qwen模型导出) |  |
-| Qwen/Qwen-72B-Chat  | [✔](#其它模型) | [✔](#qwen模型导出) |  |
-| Qwen/Qwen-1_8B-Chat | [✔](#其它模型) | [✔](#qwen模型导出) |  |
+| Qwen/Qwen-7B-Chat   | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
+| Qwen/Qwen-14B-Chat  | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
+| Qwen/Qwen-72B-Chat  | [✔](#其它模型) | [✔](#qwen模型导出) | √ |
+| Qwen/Qwen-1_8B-Chat | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
 | Qwen/Qwen1.5-0.5B-Chat | [✔](#其它模型) | [✔](#qwen模型导出) | ✔<sup>3</sup> |
 | Qwen/Qwen1.5-1.8B-Chat | [✔](#其它模型) | [✔](#qwen模型导出) | ✔<sup>3</sup> |
 | Qwen/Qwen1.5-4B-Chat   | [✔](#其它模型) | [✔](#qwen模型导出) | ✔<sup>3</sup> |
