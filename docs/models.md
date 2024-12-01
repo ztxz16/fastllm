@@ -130,6 +130,9 @@
 |  |  |  |  |
 | openbmb/MiniCPM-2B-sft-fp16 | [✔](#其它模型) | [✔](#minicpm模型导出) |  |
 | openbmb/MiniCPM-2B-dpo-fp16 | [✔](#其它模型) | [✔](#minicpm模型导出) |  |
+| openbmb/MiniCPM3-4B | [✔](#其它模型) | [✔](#minicpm模型导出) |  |
+|  |  |  |  |
+| microsoft/Phi-3-mini-4k-instruct |  |  | ✔ |
 
 
 ### 加载后转换（两行加速模式）(convert on-the-fly)
@@ -265,6 +268,7 @@ python3 tools/llamalike2flm.py qwen1.5-7b-int4.flm int4 "qwen/Qwen1.5-14B-Chat" 
 # 需要先安装MiniCPM环境（transformers >= 4.36.0） 
 # 默认脚本导出iniCPM-2B-dpo-fp16模型
 cd build 
-python tools/minicpm2flm.py minicpm-2b-float16.flm #导出dpo-float16模型
+python tools/minicpm2flm.py minicpm-2b-fp16.flm #导出dpo-float16模型
+python tools/minicpm2flm.py minicpm3-4b-fp16.flm openbmb/MiniCPM3-4B #导出minicpm3-float16模型
 ./main -p minicpm-2b-float16.flm # 执行模型
 ```
