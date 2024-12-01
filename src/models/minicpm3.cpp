@@ -80,6 +80,8 @@ namespace fastllm {
         if (this->weight.dicts.find("kv_lora_rank") != this->weight.dicts.end()) {
             this->kv_lora_rank = std::stoi(this->weight.dicts["kv_lora_rank"]);
         }
+        weight.tokenizer.SetSpecialTokens({{"<s>", 2}, {"<s>", 1}, {"<unk>", 0}, {"<|im_start|>", 73441}, {"<|im_end|>", 73440}, {"<|tool_call|>", 73442}, 
+                                          {"<|execute_start|>", 73443}, {"<|execute_end|>", 73444}, {"<|fim_prefix|>", 73445}, {"<|fim_middle|>", 73446}, {"<|fim_suffix|>", 73447}});
     }
 
     int MiniCpm3Model::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
