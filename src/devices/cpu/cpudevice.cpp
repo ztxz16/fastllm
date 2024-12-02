@@ -1030,7 +1030,8 @@ namespace fastllm {
 
         AssertInFastLLM(weight.dims.size() == 2, "Embedding's weight's dim should be 2.\n");
         AssertInFastLLM(weight.dataType == DataType::FLOAT32 ||
-                        weight.dataType == DataType::BFLOAT16, "Embedding's weight's type should be float32 or bfloat16.\n");
+                        weight.dataType == DataType::FLOAT16 ||
+                        weight.dataType == DataType::BFLOAT16, "Embedding's weight's type should be float32 or float16 or bfloat16.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16, 
                         "Embedding's input's type should be float32 or float16.\n");
@@ -1041,6 +1042,9 @@ namespace fastllm {
         dims.push_back(embSize);
 
         output.dataType = input.dataType;
+        if (weight.dataType == DataType::FLOAT16) {
+            output.dataType = DataType::FLOAT16;
+        }
         output.Resize(dims);
     }
 

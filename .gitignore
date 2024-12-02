@@ -34,3 +34,4 @@ token
 /third_party/tfacc/driver/tfacc2/result
 /.chainlit
 /.files
+*.o
