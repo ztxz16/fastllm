@@ -79,10 +79,13 @@ namespace fastllm {
 
     // 执行计算图
     void RunComputeGraph (const ComputeGraph &graph, 
-                        const std::map <std::string, int> &deviceMap,
-                        std::map <std::string, Data*> inputs,
-                        std::map <std::string, Data*> weights,
-                        std::map <std::string, Data*> outputs);
+                            const std::map <std::string, int> &deviceMap,
+                            const std::map <std::string, Data*> &inputs,
+                            const std::map <std::string, Data*> &weights,
+                            const std::map <std::string, Data*> &outputs, 
+                            std::vector <std::vector <Data*> > &pastKeys, 
+                            std::vector <std::vector <Data*> > &pastValues,
+                            std::vector <Data*> &masks);
 }
 
 #endif //FASTLLM_GRAPH_H

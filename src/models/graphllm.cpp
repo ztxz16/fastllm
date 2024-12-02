@@ -116,6 +116,12 @@ namespace fastllm {
         for (auto &it : weight.weight) {
             weightDicts[it.first] = &it.second;
         }
+        std::vector <std::vector <Data*> > pastKeys, pastValues;
+        std::vector <Data*> masks;
+        pastKeys.resize(block_cnt);
+        pastValues.resize(block_cnt);
+        masks.push_back((Data*)&attentionMask);
+
         Data atype = Data(this->dataType);
         std::map <std::string, Data*> inputs = {
             {"inputIds", (Data*)&inputIds},
@@ -126,11 +132,11 @@ namespace fastllm {
             {"seqLens", (Data*)&seqLensData}
         };
         for (int i = 0; i < block_cnt; i++) {
-            inputs.insert({"pastKey." + std::to_string(i), (Data*)&pastKeyValues[i].first});
-            inputs.insert({"pastValue." + std::to_string(i), (Data*)&pastKeyValues[i].second});
+            pastKeys[i].push_back((Data*)&pastKeyValues[i].first);
+            pastValues[i].push_back((Data*)&pastKeyValues[i].second);
         }
         Data logits, topk;
-        RunComputeGraph(graph, this->deviceMap, inputs, weightDicts, {{"logits", (Data*)&logits}});
+        RunComputeGraph(graph, this->deviceMap, inputs, weightDicts, {{"logits", (Data*)&logits}}, pastKeys, pastValues, masks);
         std::vector <int> lastRet;
         {
             ToDataType(logits, DataType::FLOAT32);
@@ -179,10 +185,13 @@ namespace fastllm {
         }
         int seqLen = inputIds.dims[1];
         Data allPositionIds;
-        allPositionIds.CopyFrom(*(Data*)positionIds[0]);
-        allPositionIds.Expansion({1, seqLen});
-        for (int i = 1; i < batch; i++) {
-            CatDirect(allPositionIds, *(Data*)positionIds[i], 1);
+        int pos = 0;
+        allPositionIds.dataType = positionIds[0]->dataType;
+        allPositionIds.Resize({1, seqLen});
+        allPositionIds.Allocate();
+        for (int i = 0; i < batch; i++) {
+            memcpy(allPositionIds.cpuData + pos, positionIds[i]->cpuData, (size_t)positionIds[i]->GetBytes());
+            pos += positionIds[i]->GetBytes();
         }
         std::map <std::string, Data*> weightDicts;
         for (auto &it : weight.weight) {
@@ -196,16 +205,87 @@ namespace fastllm {
             {"sin", &sinData}, {"cos", &cosData},
             {"seqLens", &seqLensData}
         };
+
+        std::vector <std::vector <Data*> > pastKeys, pastValues;
+        std::vector <Data*> masks;
+        pastKeys.resize(block_cnt);
+        pastValues.resize(block_cnt);
+        for (int i = 0; i < block_cnt; i++) {
+            pastKeys[i].resize(batch);
+            pastValues[i].resize(batch);
+        }
+        masks.resize(batch);
         for (int b = 0; b < batch; b++) {
-            std::string sb = std::to_string(b);
-            inputs.insert({"attentionMask." + sb, attentionMask[b]});
+            masks[b] = attentionMask[b];
             for (int i = 0; i < block_cnt; i++) {
-                inputs.insert({"pastKey." + std::to_string(i) + "." + sb, pastKeyValues[b * block_cnt + i].first});
-                inputs.insert({"pastValue." + std::to_string(i) + "." + sb, pastKeyValues[b * block_cnt + i].second});
+                pastKeys[i][b] = pastKeyValues[b * block_cnt + i].first;
+                pastValues[i][b] = pastKeyValues[b * block_cnt + i].second;
+            }
+            for (int i = 0; i < block_cnt; i++) {
+                if (GetKVCacheInCPU()) {
+                    pastKeyValues[b * block_cnt + i].first->lockInCPU = true;
+                    pastKeyValues[b * block_cnt + i].second->lockInCPU = true;
+                } else {
+                    if (pastKeyValues[b * block_cnt + i].first->dataDevice == DataDevice::CUDA) {
+                        break;
+                    }
+                    pastKeyValues[b * block_cnt + i].first->ToDevice(DataDevice::CUDA);
+                    pastKeyValues[b * block_cnt + i].second->ToDevice(DataDevice::CUDA);
+                }
             }
         }
+
+        // 拼batch, 把短句补长
+        Data curAttentionMask;
+        Data realInputIds;
+        int maxLen = 0, totalLen = 0;
+        if (batch > 1 && seqLen != seqLens.size()) {        
+            for (int i = 0; i < batch; i++) {
+                maxLen = std::max(maxLen, seqLens[i]);
+            }
+            int totalLen = maxLen * batch;
+            Data tempInputIds;
+            Mul(inputIds, 1.0, tempInputIds);
+            ToDataType(tempInputIds, DataType::FLOAT32);
+            tempInputIds.ToDevice(DataDevice::CPU);
+            allPositionIds.ToDevice(DataDevice::CPU);
+            float *floatInputIds = (float*)tempInputIds.cpuData;
+            float *floatPositionIds = (float*)allPositionIds.cpuData;
+            
+            std::vector <float> vmask = std::vector <float> (batch * maxLen * maxLen, 0);
+            std::vector <float> vpids = std::vector <float> (batch * maxLen, 0);
+            std::vector <float> ids = std::vector <float> (batch * maxLen, 0.0);
+            for (int i = 0; i < batch; i++) {
+                int len = seqLens[i], base = maxLen - len;
+                for (int j = 0; j < len; j++) {
+                    ids[i * maxLen + base + j] = (*floatInputIds++);
+                    vpids[i * maxLen + base + j] = (*floatPositionIds++);
+                }
+                std::fill(vmask.data() + i * maxLen * maxLen,
+                    vmask.data() + i * maxLen * maxLen + (maxLen - len) * maxLen, 1.0);
+                for (int j = maxLen - len; j < maxLen; j++) {
+                    std::fill(vmask.data() + i * maxLen * maxLen + j * maxLen,
+                                vmask.data() + i * maxLen * maxLen + j * maxLen + maxLen - len, 1.0);
+                }
+                for (int j = 0; j < len; j++) {
+                    for (int k = j + 1; k < len; k++) {
+                        vmask[i * maxLen * maxLen + (base + j) * maxLen + base + k] = 1;
+                    }
+                }
+            }
+
+            realInputIds.CopyFrom(Data(DataType::FLOAT32, {1, batch * maxLen}, ids));
+            curAttentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, maxLen, maxLen}, vmask));
+            allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, batch * maxLen}, vpids));
+
+            ToDataType(curAttentionMask, this->dataType);
+            inputs.insert({"attentionMask", &curAttentionMask});
+            inputs["inputIds"] = (Data*)&realInputIds;
+            inputs["positionIds"] = (Data*)&allPositionIds;
+        }
+
         Data logits, topk;
-        RunComputeGraph(graph, this->deviceMap, inputs, weightDicts, {{"logits", (Data*)&logits}});
+        RunComputeGraph(graph, this->deviceMap, inputs, weightDicts, {{"logits", (Data*)&logits}}, pastKeys, pastValues, masks);
         ToDataType(logits, DataType::FLOAT32);
         std::vector <Data> curLogits;
         curLogits.resize(batch);

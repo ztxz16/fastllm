@@ -76,6 +76,18 @@ namespace fastllm {
                     }
                     ComputeGraphNode input(op.datas["input"]), weight(mergeWeightName), bias(mergeBiasName), mid(outputName);
                     graph.Linear(input, weight, bias, mid);
+
+                    // 如果后面接的silu + mul, 那么合并成swiglu
+                    if (j == i + 1) {
+                        if (j + 2 < ops.size() && 
+                            ops[j + 1].type == "Silu" && ops[j + 1].datas["input"] == ops[j + 1].datas["output"] && ops[j + 1].datas["input"] == ops[i].datas["output"] &&
+                            ops[j + 2].type == "MulTo" && ops[j + 2].datas["input0"] == ops[i].datas["output"] && ops[j + 2].datas["input1"] == ops[j].datas["output"]) {
+                            ComputeGraphNode swigluOutput(ops[i].datas["output"]);
+                            graph.Swiglu(mid, swigluOutput);
+                            i = j + 2;
+                            continue;
+                        }
+                    }
                     offset = 0;
                     for (int l = i; l <= j; l++) {
                         ComputeGraphNode output(ops[l].datas["output"]);
@@ -91,17 +103,43 @@ namespace fastllm {
         }
     }
 
+    void ParseIdsByDots(const std::string &s, std::vector <int> &ids) {
+        ids.clear();
+        int now = 0;
+        for (int i = 0; i < s.size(); i++) {
+            if (s[i] == '.') {
+                if (now >= 0) {
+                    ids.push_back(now);
+                }
+                now = 0;
+            } else if (now >= 0 && s[i] >= '0' && s[i] <= '9') {
+                now = now * 10 + s[i] - '0';
+            } else {
+                now = -1;
+            }
+        }
+        if (now >= 0) {
+            ids.push_back(now);
+        }
+    }
+
     void RunComputeGraph (const ComputeGraph &graph, 
                             const std::map <std::string, int> &deviceMap,
-                            std::map <std::string, Data*> inputs,
-                            std::map <std::string, Data*> weights,
-                            std::map <std::string, Data*> outputs) {
+                            const std::map <std::string, Data*> &inputs,
+                            const std::map <std::string, Data*> &weights,
+                            const std::map <std::string, Data*> &outputs, 
+                            std::vector <std::vector <Data*> > &pastKeys, 
+                            std::vector <std::vector <Data*> > &pastValues,
+                            std::vector <Data*> &masks) {                                
         Executor &excutor = *((Executor*)GetExecutor());
-        std::map <std::string, Data*> tempDatas;
-        std::map <std::string, Data*> allDatas;
+        std::unordered_map <std::string, Data*> tempDatas;
+        std::unordered_map <std::string, Data*> allDatas;
+        std::vector <int> ids;
 
+        std::vector <Data> curContextLayer;
+        std::vector <Data> curQs, curKs, curVs, curOutputs;
         for (auto &it : inputs) {
-            allDatas[it.first] = it.second;
+            allDatas[it.first] = it.second;            
         }
         for (auto &it : weights) {
             allDatas[it.first] = it.second;
@@ -116,7 +154,6 @@ namespace fastllm {
             }
         }
         Data emptyData;
-
         for (int i = 0; i < graph.ops.size(); i++) {
             auto &op = graph.ops[i];
             // 一些没实现的算子
@@ -124,8 +161,10 @@ namespace fastllm {
                 exit(0);
             } else if (op.type == "Print") {
                 auto data = allDatas[op.datas.find("input")->second];
+                auto oriDevice = data->dataDevice;
                 data->ToDevice(DataDevice::CPU);
                 data->Print();
+                data->ToDevice(oriDevice);
             } else if (op.type == "DataTypeAs") {
                 auto input = allDatas[op.datas.find("input")->second];
                 DataType dataType = allDatas[op.datas.find("input1")->second]->dataType;
@@ -149,6 +188,9 @@ namespace fastllm {
                 dims.push_back(headDim);
                 data->Reshape(dims);
             } else if (op.type == "FusedAttention") {
+                ParseIdsByDots(op.datas.find("k")->second, ids);
+                int layerId = ids[0];
+
                 std::vector <int> seqLens;
                 {
                     auto data = allDatas[op.datas.find("seqLens")->second];
@@ -156,7 +198,6 @@ namespace fastllm {
                         seqLens.push_back(((int*)data->cpuData)[i]);
                     }
                 }
-
                 if (seqLens.size() == 1) {
                     {
                         std::vector <int> axis = {0, 2, 1, 3};
@@ -177,7 +218,7 @@ namespace fastllm {
 
                     int unitLen = op.intParams.find("unitLen")->second;
                     for (int i = 0; i < 2; i++) {                    
-                        auto cache = allDatas[op.datas.find(i == 0 ? "k" : "v")->second];
+                        auto cache = i == 0 ? pastKeys[layerId][0] : pastValues[layerId][0];
                         auto cur = allDatas[op.datas.find(i == 0 ? "curk" : "curv")->second];
 
                         while ((cache->dims.size() == 0 && (cache->expansionDims.size() == 0 || cur->dims[1] > cache->expansionDims[1]))
@@ -200,6 +241,10 @@ namespace fastllm {
                     for (auto &it : op.datas) {
                         dataDict[it.first] = allDatas[it.second];
                     }
+                    dataDict["k"] = pastKeys[layerId][0];
+                    dataDict["v"] = pastValues[layerId][0];
+                    dataDict["mask"] = masks[0];
+
                     excutor.Run("Attention", dataDict, op.floatParams, op.intParams);
                     {
                         auto output = allDatas[op.datas.find("output")->second];
@@ -221,16 +266,18 @@ namespace fastllm {
                     }
                 } else {
                     int batch = seqLens.size(), total = 0;
-                    bool all1 = true;
+                    bool all1 = true, allSame = true;
                     for (int i = 0; i < seqLens.size(); i++) {
                         if (seqLens[i] != 1) {
                             all1 = false;
-                            break;
                         }
+                        if (seqLens[i] != seqLens[0]) {
+                            allSame = false;
+                        }
+                        total += seqLens[i];
                     }
-                    
+                    int paddingLen = allDatas[op.datas.find("q")->second]->dims[1];
                     if (all1) {
-                        std::vector <Data> curQs, curKs, curVs, curOutputs;
                         curQs.resize(batch);
                         curKs.resize(batch);
                         curVs.resize(batch);
@@ -262,12 +309,85 @@ namespace fastllm {
                             curVs[b].FakeFrom(v, b * v.strides[0] * v.unitSize);
                         }
                         total = batch;
-
                         int unitLen = op.intParams.find("unitLen")->second;
+                        std::vector <Data*> qs, contexts;
+                        qs.resize(batch);
+                        contexts.resize(batch);
+
                         for (int i = 0; i < 2; i++) {
                             std::vector <Data*> caches, curs;
                             for (int b = 0; b < batch; b++) {                    
-                                auto cache = allDatas[op.datas.find(i == 0 ? "k" : "v")->second + "." + std::to_string(b)];
+                                auto cache = i == 0 ? pastKeys[layerId][b] : pastValues[layerId][b];
+                                auto cur = i == 0 ? &curKs[b] : &curVs[b];
+                                bool needExpansion = false;
+                                while ((cache->dims.size() == 0 && (cache->expansionDims.size() == 0 || cur->dims[1] > cache->expansionDims[1]))
+                                    || (cache->dims.size() > 0 && cache->dims[1] + cur->dims[1] > cache->expansionDims[1])) {
+                                    std::vector <int> newDims;
+                                    if (cache->Count(0) == 0 || cache->dims.size() == 0) {
+                                        newDims = std::vector <int> {cur->dims[0], ((cur->dims[1] - 1) / unitLen + 1) * unitLen, cur->dims[2]};
+                                    } else {
+                                        newDims = cache->dims;
+                                        newDims[1] += ((cur->dims[1] - 1) / unitLen + 1) * unitLen;
+                                    }
+                                    cache->Expansion(newDims);
+                                    needExpansion = true;
+                                }
+                                caches.push_back(cache);
+                                curs.push_back(cur);                    
+                            }
+                            CatDirectBatch(caches, curs, 1);
+                        }
+                        auto &attenOutput = *allDatas[op.datas.find("output")->second];
+                        attenOutput.dataType = q.dataType;
+                        attenOutput.ToDevice(q.dataDevice);
+                        attenOutput.Resize({1, batch, embed_dim});
+                        attenOutput.Allocate();
+                        curContextLayer.resize(batch);
+                        for (int b = 0; b < batch; b++) {
+                            qs[b] = (&curQs[b]);
+                            curContextLayer[b].FakeFrom(attenOutput, b * embed_dim * attenOutput.unitSize);
+                            contexts[b] = (&curContextLayer[b]);
+                        }
+                        AttentionBatch(qs, pastKeys[layerId], pastValues[layerId], masks, contexts, qs[0]->dims[0] / pastValues[layerId][0]->dims[0], op.floatParams.find("scale")->second, 1);
+                    } else if (total != paddingLen || allSame) {
+                        int maxLen = seqLens[0];
+                        for (int i = 0; i < seqLens.size(); i++) {
+                            maxLen = std::max(maxLen, seqLens[i]);
+                        }
+                        auto &q = *allDatas[op.datas.find("q")->second];
+                        auto &k = *allDatas[op.datas.find("curk")->second];
+                        auto &v = *allDatas[op.datas.find("curv")->second];
+                        
+                        std::vector <Data> curKs, curVs;
+                        int head_dim = allDatas[op.datas.find("q")->second]->dims.back();
+                        curKs.resize(batch);
+                        curVs.resize(batch);
+                        PermuteSelf(k, {0, 2, 1, 3});
+                        PermuteSelf(v, {0, 2, 1, 3});
+                        k.Reshape({-1, k.dims[2], k.dims[3]});
+                        v.Reshape({-1, v.dims[2], v.dims[3]});
+                        for (int b = 0; b < batch; b++) {
+                            excutor.Run("Split", {
+                                    {"input", &k}, {"output", &curKs[b]}
+                            }, {}, {{"axis", 1}, {"start", maxLen * (b + 1) - seqLens[b]}, {"end", maxLen * (b + 1)}});
+                            excutor.Run("Split", {
+                                    {"input", &v}, {"output", &curVs[b]}
+                            }, {}, {{"axis", 1}, {"start", maxLen * (b + 1) - seqLens[b]}, {"end", maxLen * (b + 1)}});
+                            total += seqLens[b];
+                        }
+
+                        k.Reshape({1, k.dims[0], k.dims[1], k.dims[2]});
+                        v.Reshape({1, v.dims[0], v.dims[1], v.dims[2]});
+                        PermuteSelf(k, {0, 2, 1, 3});
+                        PermuteSelf(v, {0, 2, 1, 3});
+
+                        std::vector <Data*> pointersK, pointersV;
+                        int unitLen = op.intParams.find("unitLen")->second;
+                        for (int b = 0; b < batch; b++) {
+                            pointersK.push_back(&curKs[b]);
+                            pointersV.push_back(&curVs[b]);
+                            for (int i = 0; i < 2; i++) {        
+                                auto cache = i == 0 ? pastKeys[layerId][b] : pastValues[layerId][b];            
                                 auto cur = i == 0 ? &curKs[b] : &curVs[b];
                                 while ((cache->dims.size() == 0 && (cache->expansionDims.size() == 0 || cur->dims[1] > cache->expansionDims[1]))
                                     || (cache->dims.size() > 0 && cache->dims[1] + cur->dims[1] > cache->expansionDims[1])) {
@@ -279,38 +399,34 @@ namespace fastllm {
                                         newDims[1] += ((cur->dims[1] - 1) / unitLen + 1) * unitLen;
                                     }
                                     cache->Expansion(newDims);
-                                }
-                                caches.push_back(cache);
-                                curs.push_back(cur);                    
+                                }              
                             }
-                            CatDirectBatch(caches, curs, 1);
                         }
+
+                        CatDirectBatch(pastKeys[layerId], pointersK, 1);
+                        CatDirectBatch(pastValues[layerId], pointersV, 1);
+
+                        int q0 = q.dims[2], k0 = k.dims[2], dims = q.dims[3];
+                        q.Reshape({batch, maxLen, q0, dims});
+                        PermuteSelf(q, {0, 2, 1, 3});
+                        q.Reshape({batch * q0, maxLen, -1});
+
+                        k.Reshape({batch, maxLen, k0, dims});
+                        PermuteSelf(k, {0, 2, 1, 3});
+                        k.Reshape({batch * k0, maxLen, -1});
+
+                        v.Reshape({batch, maxLen, k0, dims});
+                        PermuteSelf(v, {0, 2, 1, 3});
+                        v.Reshape({batch * k0, maxLen, -1});
 
                         auto &attenOutput = *allDatas[op.datas.find("output")->second];
-                        attenOutput.dataType = q.dataType;
-                        attenOutput.ToDevice(q.dataDevice);
-                        attenOutput.Resize({1, batch, embed_dim});
-                        attenOutput.Allocate();
-                        std::vector <Data> curContextLayer;
-                        std::vector <Data*> qs, keys, values, masks, contexts;
-                        curContextLayer.resize(batch);
-                        qs.resize(batch);
-                        keys.resize(batch);
-                        values.resize(batch);
-                        masks.resize(batch);
-                        contexts.resize(batch);
-
-                        for (int b = 0; b < batch; b++) {
-                            std::string sb = "." + std::to_string(b);
-                            qs[b] = (&curQs[b]);
-                            keys[b] = allDatas[op.datas.find("k")->second + sb];
-                            values[b] = allDatas[op.datas.find("v")->second + sb];
-                            masks[b] = allDatas[op.datas.find("mask")->second + sb];
-                            curContextLayer[b].FakeFrom(attenOutput, b * embed_dim * attenOutput.unitSize);
-                            contexts[b] = (&curContextLayer[b]);
-                        }
-                        AttentionBatch(qs, keys, values, masks, contexts, qs[0]->dims[0] / values[0]->dims[0], op.floatParams.find("scale")->second, 1);
+                        Attention(q, k, v, *allDatas[op.datas.find("mask")->second], attenOutput, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1);
+                        PermuteSelf(attenOutput, {1, 0, 2});
+                        attenOutput.Reshape({maxLen, batch, -1});
+                        PermuteSelf(attenOutput, {1, 0, 2});
+                        attenOutput.Reshape({1, -1, attenOutput.dims[2]});
                     } else {
+                        total = 0;
                         std::vector <Data> curQs, curKs, curVs, curOutputs;
                         curQs.resize(batch);
                         curKs.resize(batch);
@@ -354,7 +470,7 @@ namespace fastllm {
                         int unitLen = op.intParams.find("unitLen")->second;
                         for (int b = 0; b < batch; b++) {
                             for (int i = 0; i < 2; i++) {                    
-                                auto cache = allDatas[op.datas.find(i == 0 ? "k" : "v")->second + "." + std::to_string(b)];
+                                auto cache = i == 0 ? pastKeys[layerId][b] : pastValues[layerId][b];            
                                 auto cur = i == 0 ? &curKs[b] : &curVs[b];
                                 while ((cache->dims.size() == 0 && (cache->expansionDims.size() == 0 || cur->dims[1] > cache->expansionDims[1]))
                                     || (cache->dims.size() > 0 && cache->dims[1] + cur->dims[1] > cache->expansionDims[1])) {
@@ -366,7 +482,7 @@ namespace fastllm {
                                         newDims[1] += ((cur->dims[1] - 1) / unitLen + 1) * unitLen;
                                     }
                                     cache->Expansion(newDims);
-                                }                    
+                                }              
                                 excutor.Run("CatDirect", {
                                         {"input0", cache}, {"input1", cur}
                                 }, {}, {{"axis", 1}});
@@ -374,10 +490,10 @@ namespace fastllm {
                         }
 
                         for (int b = 0; b < batch; b++) {
-                            std::string sb = "." + std::to_string(b);
-                            Data *k = allDatas[op.datas.find("k")->second + sb];
-                            Data *v = allDatas[op.datas.find("v")->second + sb];
-                            Data *mask = allDatas[op.datas.find("mask")->second + sb];
+                            Data *k = pastKeys[layerId][b];
+                            Data *v = pastValues[layerId][b];
+                            Data *mask = masks[b];
+                            
                             excutor.Run("Attention", {
                                     {"q", (Data*)&curQs[b]}, {"k", k}, {"v", v},
                                     {"mask", mask}, {"output", (Data*)&curOutputs[b]}
@@ -401,7 +517,6 @@ namespace fastllm {
                                     {"input", output}, {"axis", &axisData}
                             }, {}, {});
                         }
-
                         auto lastOutput = allDatas[op.datas.find("output")->second];
                         for (int b = 0; b < batch; b++) {
                             Data *output = (Data*)&curOutputs[b];
@@ -420,13 +535,16 @@ namespace fastllm {
                     }
                 }
             } else if (op.type == "SplitLastTokenStates") {
+                int total = 0, maxLen = 0;
                 std::vector <int> seqLens;
                 {
                     auto data = allDatas[op.datas.find("seqLens")->second];
                     for (int i = 0; i < data->Count(0); i++) {
                         seqLens.push_back(((int*)data->cpuData)[i]);
+                        total += seqLens.back();
+                        maxLen = std::max(maxLen, seqLens.back());
                     }
-                }
+                }                
                 auto input = allDatas[op.datas.find("input")->second];
                 auto output = allDatas[op.datas.find("output")->second];
                 int len = input->dims[1];
@@ -435,24 +553,52 @@ namespace fastllm {
                     output->FakeFrom(*input, 0);
                 } else if (input->dims[0] == 1 && seqLens.size() > 1) {
                     auto lastOutput = allDatas[op.datas.find("output")->second];
-                    int total = 0;
-                    for (int b = 0; b < seqLens.size(); b++) {
-                        Data output;
-                        excutor.Run("Split", {
-                            {"input", input}, {"output", (Data*)&output}
-                        }, {}, {{"axis", 1}, {"start", total + seqLens[b] - 1}, {"end", total + seqLens[b]}});
-                        if (b == 0) {
-                            lastOutput->dataType = output.dataType;
-                            std::vector <int> dims = output.dims;
-                            dims[1] = 0;
-                            lastOutput->Resize(dims);
-                            dims[1] = seqLens.size();
-                            lastOutput->Expansion(dims);
+                    if (total != input->dims[1]) {
+                        int total = 0;
+                        for (int b = 0; b < seqLens.size(); b++) {
+                            Data output;
+                            excutor.Run("Split", {
+                                {"input", input}, {"output", (Data*)&output}
+                            }, {}, {{"axis", 1}, {"start", maxLen * (b + 1) - 1}, {"end", maxLen * (b + 1)}});
+                            if (b == 0) {
+                                lastOutput->dataType = output.dataType;
+                                std::vector <int> dims = output.dims;
+                                dims[1] = 0;
+                                lastOutput->Resize(dims);
+                                dims[1] = seqLens.size();
+                                lastOutput->Expansion(dims);
+                            }
+                            excutor.Run("CatDirect", {
+                                    {"input0", lastOutput}, {"input1", (Data*)&output}
+                            }, {}, {{"axis", 1}});                    
+                            total += seqLens[b];    
                         }
-                        excutor.Run("CatDirect", {
-                                {"input0", lastOutput}, {"input1", (Data*)&output}
-                        }, {}, {{"axis", 1}});                    
-                        total += seqLens[b];    
+                    } else {
+                        if (total == seqLens.size()) {
+                            excutor.Run("Mul", {
+                                {"input", (Data*)input}, {"output", (Data*)lastOutput}
+                            }, {{"v", 1.0f}}, {});  
+                        } else {
+                            int total = 0;
+                            for (int b = 0; b < seqLens.size(); b++) {
+                                Data output;
+                                excutor.Run("Split", {
+                                    {"input", input}, {"output", (Data*)&output}
+                                }, {}, {{"axis", 1}, {"start", total + seqLens[b] - 1}, {"end", total + seqLens[b]}});
+                                if (b == 0) {
+                                    lastOutput->dataType = output.dataType;
+                                    std::vector <int> dims = output.dims;
+                                    dims[1] = 0;
+                                    lastOutput->Resize(dims);
+                                    dims[1] = seqLens.size();
+                                    lastOutput->Expansion(dims);
+                                }
+                                excutor.Run("CatDirect", {
+                                        {"input0", lastOutput}, {"input1", (Data*)&output}
+                                }, {}, {{"axis", 1}});                    
+                                total += seqLens[b];    
+                            }
+                        }
                     }
                 } else {
                     excutor.Run("Split", {

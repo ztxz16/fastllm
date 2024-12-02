@@ -286,8 +286,8 @@ void GpuQK(half *q, half *k, half *qk, int qlen, int klen, int dim, float scale,
     HalfFC <BQ, DIM, BK> <<<gridDim, blockDim>>> (q, k, qk, qlen, dim, klen, (half)scale, base);
 }
 
-template <int THREAD_PER_BLOCK>
-__global__ void FastllmCudaFloatEmbeddingKernel(float *input, float *weight, float *output, int embSize) {
+template <int THREAD_PER_BLOCK, typename T>
+__global__ void FastllmCudaFloatEmbeddingKernel(float *input, T *weight, T *output, int embSize) {
     input += blockIdx.x;
     output += blockIdx.x * embSize;
     int token = (int)(input[0] + 1e-5);
@@ -467,8 +467,8 @@ __global__ void FastllmSiluKernel(float* a, float *b, int len) {
 __global__ void FastllmSiluKernel(half* a, half *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
-        float x = __half2float(a[idx]);
-        b[idx] = __float2half(x / (1.0 + expf(-x)));
+        half x = a[idx];
+        b[idx] = __hdiv(x, __hadd(__float2half(1.0), hexp(-x)));
     }
 }
 
@@ -477,7 +477,7 @@ __global__ void FastllmSwigluKernel(float* a, float *b, int len, int spatial, in
     if (idx < len) {
         int id = idx / mid * spatial + idx % mid;
         float x = a[id], y = a[id + mid];
-        b[idx] = (x / (1.0 + expf(-x))) * y;
+        b[idx] = (x / (1.0f + expf(-x))) * y;
     }
 }
 
@@ -3134,13 +3134,13 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
         delete[] cpuData;
     }
     checkCudaErrors("Error: CUDA error when copy Between GPUs!", state);
-    //cudaDeviceSynchronize();
+    DeviceSync();
 }
 
 void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void * 	src,
                                        size_t 	spitch, size_t 	width, size_t 	height) {
     cudaMemcpy2D(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice);
-    //cudaDeviceSynchronize();
+    DeviceSync();
 }
 
 template <int THREAD_PER_BLOCK>
@@ -3223,7 +3223,7 @@ bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
     int len = input.Count(0);
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
-    int threadPerBlock = std::min(256, len);
+    int threadPerBlock = std::min(1024, len);
     if (input.dataType == fastllm::DataType::FLOAT32) {
         FastllmSiluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
@@ -3240,7 +3240,7 @@ bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
 
-    int threadPerBlock = std::min(256, len);
+    int threadPerBlock = std::min(1024, len);
     if (input.dataType == fastllm::DataType::FLOAT32) {
         FastllmSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len, spatial, mid);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
@@ -3274,7 +3274,7 @@ bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float 
     float *cudaData = (float *) FastllmCudaPrepareInput(input0);
     float *input1Data = (float *) FastllmCudaPrepareInput(input1);
 
-    int threadPerBlock = std::min(256, len);
+    int threadPerBlock = std::min(1024, len);
     if (input0.dataType == fastllm::DataType::FLOAT32) {
         FastllmAddToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
     } else if (input0.dataType == fastllm::DataType::FLOAT16) {
@@ -3584,24 +3584,28 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
     }
 
     FastllmCudaFree(tempData);
+    DeviceSync();
     return true;
 }
 
 bool FastllmFloatToHalf(void *a, void *b, int len) {
     int threadPerBlock = std::min(256, len);
     FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((float*)a, (half*)b, len);
+    DeviceSync();
     return true;
 }
 
 bool FastllmHalfToFloat(void *a, void *b, int len) {
     int threadPerBlock = std::min(256, len);
     FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)a, (float*)b, len);
+    DeviceSync();
     return true;
 }
 
 bool FastllmBF16ToFloat(void *a, void *b, int len) {
     int threadPerBlock = std::min(256, len);
     FastllmCudaBF162FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((uint16_t*)a, (float*)b, len);
+    DeviceSync();
     return true;
 }
 
@@ -3616,6 +3620,10 @@ bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weigh
         float *outputData = (float *) dstOutputData;
         float *weightData = (float *) weight.cudaData;
         FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+    } else if (weight.dataType == fastllm::DataType::FLOAT16) {
+        half *outputData = (half *) dstOutputData;
+        half *weightData = (half *) weight.cudaData;
+        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
     } else if (weight.dataType == fastllm::DataType::BFLOAT16) {
         std::vector <float> cpuInputData = std::vector <float> (inputLen, 0.0f);
         FastllmCudaCopyFromDeviceToHost(cpuInputData.data(), inputData, cpuInputData.size() * sizeof(float));
@@ -3627,8 +3635,11 @@ bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weigh
                 FastllmBF16ToFloat(outputData + i * embSize, weightData + token * embSize, embSize);
             }
         }
+    } else {
+        
     }
 
+    DeviceSync();
     return true;
 }
 
@@ -4137,6 +4148,105 @@ bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fas
 template <typename T>
 bool DoFastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::Data **v,
                                fastllm::Data **mask, fastllm::Data **output, int group, float scale, int batch) {
+    if (false) {
+        half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
+        int q0 = q[0]->dims[0], q1 = q[0]->dims[1], q2 = q[0]->dims[2], k0 = k[0]->dims[0], k1 = k[0]->dims[1], v2 = v[0]->dims[2];
+        for (int i = 0; i < batch; i++) {
+            q1 = std::max(q1, q[i]->dims[1]);
+            k1 = std::max(k1, k[i]->dims[1]);
+        }
+
+        half *allKeys = (half*) FastllmCudaMalloc(batch * k0 * k1 * q2 * sizeof(half));
+        half *allValues = (half*) FastllmCudaMalloc(batch * k0 * k1 * v2 * sizeof(half));
+
+        std::vector <void*> dsts, srcs;
+        std::vector <size_t> dpitchs, spitchs, widths, heights;
+        for (int i = 0; i < batch; i++) {
+            dsts.push_back((uint8_t *) (allKeys + i * k0 * k1 * q2));
+            dpitchs.push_back(k1 * q2 * sizeof(half));
+            srcs.push_back(k[i]->cudaData);
+            spitchs.push_back(k[i]->strides[0] * sizeof(half));
+            widths.push_back(k[i]->dims[1] * q2 * sizeof(half));
+            heights.push_back(k0);
+
+            dsts.push_back((uint8_t *) (allValues + i * k0 * k1 * v2));
+            dpitchs.push_back(k1 * v2 * sizeof(half));
+            srcs.push_back(v[i]->cudaData);
+            spitchs.push_back(v[i]->strides[0] * sizeof(half));
+            widths.push_back(v[i]->dims[1] * v2 * sizeof(half));
+            heights.push_back(k0);
+        }
+        FastllmCudaMemcpy2DDeviceToDeviceBatch(dsts.data(), dpitchs.data(), srcs.data(), spitchs.data(), widths.data(), heights.data(), dsts.size());
+/*
+        for (int i = 0; i < batch; i++) {
+            cudaMemcpy2D(
+                allKeys + i * k0 * k1 * q2, k1 * q2 * sizeof(half), 
+                k[i]->cudaData, k[i]->strides[0] * sizeof(half), 
+                k[i]->dims[1] * q2 * sizeof(half), k0, 
+                cudaMemcpyDeviceToDevice
+            );
+            cudaMemcpy2D(
+                allValues + i * k0 * k1 * v2, k1 * v2 * sizeof(half), 
+                v[i]->cudaData, v[i]->strides[0] * sizeof(half), 
+                v[i]->dims[1] * v2 * sizeof(half), k0, 
+                cudaMemcpyDeviceToDevice
+            );
+        }
+*/
+        half *qd = (half*)q[0]->cudaData;
+        half *od = (half*)output[0]->cudaData;
+        half *qk = (half *) FastllmCudaMalloc(batch * q0 * q1 * k1 * sizeof(half));
+        half *temp = (half *) FastllmCudaMalloc(batch * q0 * q1 * k1 * sizeof(half));
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+        cublasStatus_t status;
+
+        status = cublasHgemmStridedBatched(fastllmCublasHandle,
+                                           CUBLAS_OP_T, CUBLAS_OP_N,
+                                           k1, q1 * group, q2, &hscale,
+                                           allKeys, q2, k1 * q2,
+                                           qd, q2, group * q1 * q2,
+                                           &beta,
+                                           qk, k1, k1 * q1 * group, batch * q0 / group);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("status = %d\n", (int) status);
+            printf("Error: cublas error during MatMulTransB in Attention operator.\n");
+            throw ("cublas error");
+            exit(0);
+        }
+
+        int outer = batch * q0 * q1;
+        if (k1 < 8) {
+            FastllmSoftmaxKernelInner1<1> <<< outer, 1 >>>(qk, temp, outer, k1);
+        } else if (k1 < 64) {
+            FastllmSoftmaxKernelInner1<8> <<< outer, 8 >>>(qk, temp, outer, k1);
+        } else if (k1 < 512) {
+            FastllmSoftmaxKernelInner1<64> <<< outer, 64 >>>(qk, temp, outer, k1);
+        } else {
+            FastllmSoftmaxKernelInner1<256> <<< outer, 256 >>>(qk, temp, outer, k1);
+        }
+
+        status = cublasHgemmStridedBatched(fastllmCublasHandle,
+                                           CUBLAS_OP_N, CUBLAS_OP_N,
+                                           v2, q1 * group, k1, &one,
+                                           allValues, v2, k1 * v2,
+                                           temp, k1, k1 * q1 * group,
+                                           &beta,
+                                           od, v2, v2 * q1 * group, batch * q0 / group);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("status = %d\n", (int) status);
+            printf("Error: cublas error during MatMul in Attention operator.\n");
+            throw ("cublas error");
+            exit(0);
+        }
+
+        FastllmCudaFree(allKeys);
+        FastllmCudaFree(allValues);
+        FastllmCudaFree(qk);
+        FastllmCudaFree(temp);
+        DeviceSync();
+        return true;
+    }
+
     int k0 = k[0]->dims[0];
     size_t memSum = 0;
     for (int b = 0; b < batch; b++) {
