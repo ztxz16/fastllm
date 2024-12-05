@@ -479,10 +479,13 @@ namespace fastllm {
         if (tokenizerClass == "PreTrainedTokenizerFast" || tokenizerClass == "LlamaTokenizerFast"
             || tokenizerClass == "Qwen2Tokenizer"
             || tokenizerClass == "BloomTokenizer"
-            || tokenizerClass == "LlamaTokenizer"
+            || tokenizerClass == "LlamaTokenizer" || tokenizerClass == "CodeLlamaTokenizer"
             || tokenizerClass == "MiniCPMTokenizer") {
             // PreTrainedTokenizerFast
             std::string tokenizerFile = path + "tokenizer.json";
+            if (!fastllm::FileExists(tokenizerFile)) {
+                ErrorInFastLLM("Model with a supported tokenizer_class: " + tokenizerClass + "，but has no \"tokenizer.json\"!");
+            }
             auto tokenizer = json11::Json::parse(ReadAllFile(tokenizerFile), error);
             for (auto &it : tokenizer["model"]["vocab"].object_items()) {
                 model->weight.AddTokenizerWord(it.first, it.second.int_value(), 1.0f);
