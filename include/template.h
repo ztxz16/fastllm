@@ -53,9 +53,9 @@ namespace fastllm {
             JinjaTokenLMB, JinjaTokenRMB, JinjaTokenLSB, JinjaTokenRSB,
             JinjaTokenSet, JinjaTokenFor, JinjaTokenEndFor, JinjaTokenIf, JinjaTokenElse, JinjaTokenElseIf, JinjaTokenEndif,
             JinjaTokenIn,
-            JinjaTokenAssign, JinjaTokenNotEqual, JinjaTokenEqual, JinjaTokenAdd, JinjaTokenSub, JinjaTokenMul, JinjaTokenDiv,
+            JinjaTokenAssign, JinjaTokenNotEqual, JinjaTokenEqual, JinjaTokenAdd, JinjaTokenSub, JinjaTokenMul, JinjaTokenDiv, JinjaTokenMod,
             JinjaTokenNot, JinjaTokenAnd, JinjaTokenOr,
-            JinjaTokenFliter, JinjaTokenNamespace
+            JinjaTokenFilter, JinjaTokenNamespace, JinjaTokenSlice
         };
 
         JinjaToKenType type;
@@ -74,7 +74,9 @@ namespace fastllm {
             {'-', JinjaToken::JinjaToKenType::JinjaTokenSub},
             {'*', JinjaToken::JinjaToKenType::JinjaTokenMul},
             {'/', JinjaToken::JinjaToKenType::JinjaTokenDiv},
-            {'|', JinjaToken::JinjaToKenType::JinjaTokenFliter}
+            {'%', JinjaToken::JinjaToKenType::JinjaTokenMod},
+            {'|', JinjaToken::JinjaToKenType::JinjaTokenFilter},
+            {':', JinjaToken::JinjaToKenType::JinjaTokenSlice}
     };
 
     static std::map <char, char> escapeChars = {
