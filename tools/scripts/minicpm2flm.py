@@ -10,10 +10,13 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(modelNameOrPath, trust_remote_code=True, torch_dtype=torch.float16)
     model = model.eval()
 
-    model.config.__dict__['model_type'] = 'minicpm'
-
     dtype = sys.argv[2] if len(sys.argv) >= 3 else "float16"
     exportPath = sys.argv[1] if len(sys.argv) >= 2 else "minicpm-2b-" + dtype + ".flm"
-    torch2flm.tofile(exportPath, model, tokenizer, pre_prompt = "<s>", 
-                     user_role = "<用户>", bot_role = "<AI>", 
-                     history_sep = "", dtype = dtype)
+
+    if model.config.architectures == ["MiniCPMForCausalLM"]:
+        model.config.model_type = "minicpm"
+        torch2flm.tofile(exportPath, model, tokenizer, pre_prompt = "<s>", user_role = "<用户>",
+                         bot_role = "<AI>", history_sep = "", dtype = dtype)
+    else:
+        torch2flm.tofile(exportPath, model, tokenizer, pre_prompt="", user_role="<|im_start|>user\n",
+                         bot_role="<|im_end|>\n<|im_start|>assistant\n", history_sep="<|im_end|>\n", eos_id = tokenizer.eos_token_id, dtype = dtype)

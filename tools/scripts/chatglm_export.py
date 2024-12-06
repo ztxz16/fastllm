@@ -3,8 +3,9 @@ from transformers import AutoTokenizer, AutoModel
 from ftllm import torch2flm
 
 if __name__ == "__main__":
-    tokenizer = AutoTokenizer.from_pretrained("THUDM/chatglm2-6b", trust_remote_code=True)
-    model = AutoModel.from_pretrained("THUDM/chatglm2-6b", trust_remote_code=True)
+    modelNameOrPath = sys.argv[3] if len(sys.argv) >= 4 else 'THUDM/chatglm2-6b'
+    tokenizer = AutoTokenizer.from_pretrained(modelNameOrPath, trust_remote_code=True)
+    model = AutoModel.from_pretrained(modelNameOrPath, trust_remote_code=True)
     model = model.eval()
 
     dtype = sys.argv[2] if len(sys.argv) >= 3 else "float16"

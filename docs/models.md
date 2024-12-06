@@ -50,10 +50,10 @@
 
 |              模型  | 加载后转换 |  离线转换  |  直接读取  |
 |-------------------: |------------|------------|------------|
-| Qwen/Qwen-7B-Chat   | [✔](#其它模型) | [✔](#qwen模型导出) |  |
-| Qwen/Qwen-14B-Chat  | [✔](#其它模型) | [✔](#qwen模型导出) |  |
-| Qwen/Qwen-72B-Chat  | [✔](#其它模型) | [✔](#qwen模型导出) |  |
-| Qwen/Qwen-1_8B-Chat | [✔](#其它模型) | [✔](#qwen模型导出) |  |
+| Qwen/Qwen-7B-Chat   | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
+| Qwen/Qwen-14B-Chat  | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
+| Qwen/Qwen-72B-Chat  | [✔](#其它模型) | [✔](#qwen模型导出) | √ |
+| Qwen/Qwen-1_8B-Chat | [✔](#其它模型) | [✔](#qwen模型导出) | ✔ |
 | Qwen/Qwen1.5-0.5B-Chat | [✔](#其它模型) | [✔](#qwen模型导出) | ✔<sup>3</sup> |
 | Qwen/Qwen1.5-1.8B-Chat | [✔](#其它模型) | [✔](#qwen模型导出) | ✔<sup>3</sup> |
 | Qwen/Qwen1.5-4B-Chat   | [✔](#其它模型) | [✔](#qwen模型导出) | ✔<sup>3</sup> |
@@ -99,8 +99,8 @@
 |-----------------: |------------|------------|------------|
 | meta-llama/Llama-2-7b-chat-hf | [✔](llama_cookbook.md#llama2-chat) | [✔](llama_cookbook.md#llama2-chat) |  |
 | meta-llama/Llama-2-13b-chat-hf | [✔](llama_cookbook.md#llama2-chat) | [✔](llama_cookbook.md#llama2-chat) |  |
-| codellama/CodeLlama-7b-Instruct-hf | [✔](llama_cookbook.md#llama2-chat) | [✔](llama_cookbook.md#llama2-chat) |  |
-| codellama/CodeLlama-13b-Instruct-hf | [✔](llama_cookbook.md#llama2-chat) | [✔](llama_cookbook.md#llama2-chat) |  |
+| codellama/CodeLlama-7b-Instruct-hf | [✔](llama_cookbook.md#llama2-chat) | [✔](llama_cookbook.md#llama2-chat) | ✔ |
+| codellama/CodeLlama-13b-Instruct-hf | [✔](llama_cookbook.md#llama2-chat) | [✔](llama_cookbook.md#llama2-chat) | ✔ |
 | xverse/XVERSE-13B-Chat | [✔](llama_cookbook.md#xverse) | [✔](llama_cookbook.md#xverse) |  |
 | xverse/XVERSE-7B-Chat | [✔](llama_cookbook.md#xverse) | [✔](llama_cookbook.md#xverse) |  |
 |  |  |  |  |
@@ -130,6 +130,9 @@
 |  |  |  |  |
 | openbmb/MiniCPM-2B-sft-fp16 | [✔](#其它模型) | [✔](#minicpm模型导出) |  |
 | openbmb/MiniCPM-2B-dpo-fp16 | [✔](#其它模型) | [✔](#minicpm模型导出) |  |
+| openbmb/MiniCPM3-4B | [✔](#其它模型) | [✔](#minicpm模型导出) |  |
+|  |  |  |  |
+| microsoft/Phi-3-mini-4k-instruct |  |  | ✔ |
 
 
 ### 加载后转换（两行加速模式）(convert on-the-fly)
@@ -265,6 +268,7 @@ python3 tools/llamalike2flm.py qwen1.5-7b-int4.flm int4 "qwen/Qwen1.5-14B-Chat" 
 # 需要先安装MiniCPM环境（transformers >= 4.36.0） 
 # 默认脚本导出iniCPM-2B-dpo-fp16模型
 cd build 
-python tools/minicpm2flm.py minicpm-2b-float16.flm #导出dpo-float16模型
+python tools/minicpm2flm.py minicpm-2b-fp16.flm #导出dpo-float16模型
+python tools/minicpm2flm.py minicpm3-4b-fp16.flm openbmb/MiniCPM3-4B #导出minicpm3-float16模型
 ./main -p minicpm-2b-float16.flm # 执行模型
 ```
