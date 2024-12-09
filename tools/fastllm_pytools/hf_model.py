@@ -101,8 +101,8 @@ def create(model,
         modelInfo["tokenizer_class"] = tokenizer.name;
     if "rope_scaling" in modelInfo and isinstance(modelInfo["rope_scaling"], builtins.dict):
         rope_scaling = modelInfo.pop("rope_scaling")
-        modelInfo["rope_scaling.type"] = rope_scaling["type"]
-        modelInfo["rope_scaling.factor"] = rope_scaling["factor"]
+        for key, value in rope_scaling.items():
+            modelInfo["rope_scaling." + key] = value
     if eos_id:
         modelInfo["eos_token_id"] = str(eos_id)
 

@@ -173,6 +173,7 @@
   <ItemGroup>
     <ClInclude Include="..\..\include\device.h" />
     <ClInclude Include="..\..\include\devices\cpu\alivethreadpool.h" />
+    <ClInclude Include="..\..\include\devices\cpu\computeutils.h" />
     <ClInclude Include="..\..\include\devices\cpu\cpudevice.h" />
     <ClInclude Include="..\..\include\devices\cpu\cputhreadpool.h" />
     <ClInclude Include="..\..\include\executor.h" />
@@ -182,6 +183,7 @@
     <ClInclude Include="..\..\include\models\basellm.h" />
     <ClInclude Include="..\..\include\models\bert.h" />
     <ClInclude Include="..\..\include\models\chatglm.h" />
+    <ClInclude Include="..\..\include\models\cogvlm.h" />
     <ClInclude Include="..\..\include\models\deepseekv2.h" />
     <ClInclude Include="..\..\include\models\factoryllm.h" />
     <ClInclude Include="..\..\include\models\glm.h" />
@@ -189,9 +191,12 @@
     <ClInclude Include="..\..\include\models\internlm2.h" />
     <ClInclude Include="..\..\include\models\llama.h" />
     <ClInclude Include="..\..\include\models\minicpm.h" />
+    <ClInclude Include="..\..\include\models\minicpm3.h" />
     <ClInclude Include="..\..\include\models\moe.h" />
     <ClInclude Include="..\..\include\models\moss.h" />
+    <ClInclude Include="..\..\include\models\phi3.h" />
     <ClInclude Include="..\..\include\models\qwen.h" />
+    <ClInclude Include="..\..\include\models\xlmroberta.h" />
     <ClInclude Include="..\..\include\template.h" />
     <ClInclude Include="..\..\include\utils\armMath.h" />
     <ClInclude Include="..\..\include\utils\utils.h" />
@@ -201,6 +206,7 @@
     <ClCompile Include="..\..\src\device.cpp" />
     <ClCompile Include="..\..\src\devices\cpu\cpudevice.cpp" />
     <ClCompile Include="..\..\src\devices\cpu\cpudevicebatch.cpp" />
+    <ClCompile Include="..\..\src\devices\cpu\linear.cpp" />
     <ClCompile Include="..\..\src\executor.cpp" />
     <ClCompile Include="..\..\src\fastllm.cpp" />
     <ClCompile Include="..\..\src\graph.cpp" />
@@ -208,18 +214,23 @@
     <ClCompile Include="..\..\src\models\basellm.cpp" />
     <ClCompile Include="..\..\src\models\bert.cpp" />
     <ClCompile Include="..\..\src\models\chatglm.cpp" />
+    <ClCompile Include="..\..\src\models\cogvlm.cpp" />
     <ClCompile Include="..\..\src\models\deepseekv2.cpp" />
     <ClCompile Include="..\..\src\models\glm.cpp" />
     <ClCompile Include="..\..\src\models\graphllm.cpp" />
     <ClCompile Include="..\..\src\models\graph\fastllmjson.cpp" />
+    <ClCompile Include="..\..\src\models\graph\phi3.cpp" />
     <ClCompile Include="..\..\src\models\graph\qwen2.cpp" />
     <ClCompile Include="..\..\src\models\graph\telechat.cpp" />
     <ClCompile Include="..\..\src\models\internlm2.cpp" />
     <ClCompile Include="..\..\src\models\llama.cpp" />
     <ClCompile Include="..\..\src\models\minicpm.cpp" />
+    <ClCompile Include="..\..\src\models\minicpm3.cpp" />
     <ClCompile Include="..\..\src\models\moe.cpp" />
     <ClCompile Include="..\..\src\models\moss.cpp" />
+    <ClCompile Include="..\..\src\models\phi3.cpp" />
     <ClCompile Include="..\..\src\models\qwen.cpp" />
+    <ClCompile Include="..\..\src\models\xlmroberta.cpp" />
     <ClCompile Include="..\..\src\template.cpp" />
     <ClCompile Include="..\..\third_party\json11\json11.cpp" />
   </ItemGroup>
