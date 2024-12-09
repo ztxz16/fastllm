@@ -190,8 +190,6 @@ namespace fastllm {
             model->model_type = "phi3";
         } else if (modelType=="minicpm") {
             model = new MiniCpmModel();
-        } else if (modelType=="minicpm3") {
-            model = new MiniCpm3Model();
         } else if (modelType == "qwen") {
             model = (basellm *) (new QWenModel());
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;

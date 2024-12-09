@@ -22,6 +22,7 @@ namespace fastllm {
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
+        this->ops["Repeat"] = (BaseOperator*)(new CudaRepeatOp());
         this->ops["Cat"] = (BaseOperator*)(new CudaCatOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
         this->ops["MatMul"] = (BaseOperator*)(new CudaMatMulOp());
@@ -399,6 +400,27 @@ namespace fastllm {
         FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)output.cudaData, outputStride * unitSize,
                                           (uint8_t*)input.cudaData + start * inner * unitSize, inputStride * unitSize,
                                           (end - start) * inner * unitSize, outer);
+    }
+
+    void CudaRepeatOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int repeatTimes = intParams.find("repeatTimes") != intParams.end() ? intParams.find("repeatTimes")->second : 1;
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        output.Allocate();
+
+        int outer = output.Count(0) / output.Count(axis);
+        int inputStride = input.Count(axis);
+        int outputStride = output.Count(axis);
+        int channels = input.dims[axis];
+        int inner = input.strides[axis];
+        int unitSize = input.unitSize;
+
+        FastllmCudaRepeat(input.cudaData, output.cudaData, outer, repeatTimes, inputStride * unitSize, outputStride * unitSize, channels * inner * unitSize, channels * inner * unitSize);
     }
 
     void CudaCatOp::Run(const std::string &opType, const fastllm::DataDict &datas,

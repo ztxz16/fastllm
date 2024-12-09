@@ -52,6 +52,7 @@ namespace fastllm {
         void Update();
 
         void AddTo(ComputeGraphNode &input0, ComputeGraphNode &input1, float alpha = 1.0); // input0 += input1 * alpha
+        void Cat(ComputeGraphNode &input0, ComputeGraphNode &input1, int axis, ComputeGraphNode &output);
         void DataTypeAs(ComputeGraphNode &input, ComputeGraphNode &input1); // 将input的dataType设成和input1一样
         void Embedding(ComputeGraphNode &input, ComputeGraphNode &weight, ComputeGraphNode &output);
         void ExpandHead(ComputeGraphNode &input, int headDim);
@@ -62,7 +63,9 @@ namespace fastllm {
                             float scale, int maskType, int unitLen); // 融合的attention
         void Linear(ComputeGraphNode &input, ComputeGraphNode &weight, ComputeGraphNode &bias, ComputeGraphNode &output);
         void LlamaRotatePosition2D(ComputeGraphNode &input, ComputeGraphNode &positionIds, ComputeGraphNode &sinData, ComputeGraphNode &cosData, int rotaryDim); // 2D position for llama
+        void Mul(ComputeGraphNode &input, float v, ComputeGraphNode &output); // output = input * v
         void MulTo(ComputeGraphNode &input0, ComputeGraphNode &input1); // input0 *= input1
+        void Repeat(ComputeGraphNode &input, int axis, int repeatTimes, ComputeGraphNode &output);
         void RMSNorm(ComputeGraphNode &input, ComputeGraphNode &weight, float eps, ComputeGraphNode &output);
         void Silu(ComputeGraphNode &input, ComputeGraphNode &output);
         void Split(ComputeGraphNode &input, int axis, int start, int end, ComputeGraphNode &output);

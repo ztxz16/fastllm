@@ -3165,6 +3165,21 @@ __global__ void FastllmMemcpyBatchKernel (uint8_t** pointer) {
     }
 }
 
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmRepeatKernel (void *inputOri, void *outputOri, int outer, int repeatTimes, int inputStride, int outputStride0, int outputStride1, int copyLen) {
+    int id = blockIdx.x;
+    int i = id / repeatTimes, j = id % repeatTimes;
+    uint8_t *output = (uint8_t*)outputOri + i * outputStride0 + j * outputStride1;
+    uint8_t *input = (uint8_t*)inputOri + i * inputStride;
+    for (int x = threadIdx.x; x < copyLen; x += THREAD_PER_BLOCK) {
+        output[x] = input[x];
+    }
+}
+
+void FastllmCudaRepeat(void *input, void *output, int outer, int repeatTimes, int inputStride, int outputStride0, int outputStride1, int copyLen) {
+    FastllmRepeatKernel <256> <<< outer * repeatTimes, 256 >>> (input, output, outer, repeatTimes, inputStride, outputStride0, outputStride1, copyLen);
+}
+
 void FastllmCudaMemcpy2DDeviceToDeviceBatch(void ** 	dsts, size_t *	dpitchs, void ** 	srcs,
                                             size_t *	spitchs, size_t *widths, size_t *	heights,
                                             int batch) {
