@@ -56,6 +56,11 @@ namespace fastllm {
         }
 
         weight.embeddingNames.insert("transformer.wte.weight");
+        weight.linearNames = {
+            "lm_head.weight", "transformer.h.*.ln_1.weight", "transformer.h.*.attn.c_attn.weight",
+            "transformer.h.*.attn.c_proj.weight", "transformer.h.*.ln_2.weight",
+            "transformer.h.*.mlp.w1.weight", "transformer.h.*.mlp.w2.weight", "transformer.h.*.mlp.c_proj.weight"
+        };
     }
 
     int QWenModel::Forward(const Data &inputIds,
@@ -166,12 +171,13 @@ namespace fastllm {
 
             // Attention
             MatMulTransB(query, pastKey, attnWeights, 1.0 / sqrt(head_dim));
-            attnWeights.Reshape({1, attnWeights.dims[0], attnWeights.dims[1], attnWeights.dims[2]});
+            attnWeights.Reshape({batch, -1, attnWeights.dims[1], attnWeights.dims[2]});
             if (!attentionMask.dims.empty()) {
                 AttentionMask(attnWeights, attentionMask, -10000);
             }
 
             Softmax(attnWeights, attnWeights, -1);
+            attnWeights.Reshape({1, -1, attnWeights.dims[2], attnWeights.dims[3]});
             MatMul(attnWeights, pastValue, attnOutput);
 
             attnOutput.Reshape({attnOutput.dims[1], attnOutput.dims[2], attnOutput.dims[3]});
@@ -460,45 +466,68 @@ namespace fastllm {
                                        Data &inputIds, Data &attentionMask, Data &positionIds) {
         int batch = inputTokens.size();
         int index = params[0].find("index")->second;
-        int promptLen = params[0].find("promptLen")->second;
 
         inputIds.ToDevice(DataDevice::CPU);
         attentionMask.ToDevice(DataDevice::CPU);
         positionIds.ToDevice(DataDevice::CPU);
         
+        std::vector<int> seqLens;
+        seqLens.resize(batch);
+        int maxLen = 0;
+        for (int i = 0; i < batch; i++) {
+            int promptLen = params[i].find("promptLen")->second + index;
+            maxLen = std::max(promptLen, maxLen);
+            seqLens[i] = promptLen;
+        }
+
         if (index == 0) {
             int seqLen = inputTokens[0].size();
-            std::vector<float> ids = std::vector<float>(batch * seqLen, 0);
-            std::vector <float> vmask = std::vector <float> (batch * seqLen * seqLen, 0);
-            std::vector<float> vpids = std::vector<float>(batch * seqLen, 0);
-            for (int b = 0; b < batch; b++) {
-                for (int i = 0; i < seqLen; i++) {
-                    ids[b * seqLen + i] = inputTokens[b][i];
+            std::vector<float> ids = std::vector <float> (batch * maxLen, 0);
+            std::vector<float> vpids = std::vector <float> (batch * maxLen, 0);
+            std::vector<float> vmask = std::vector <float> (batch * maxLen * maxLen, 0);
+            for (int i = 0; i < batch; i++) {
+                auto &tokens = inputTokens[i];
+                int len = tokens.size(), base = maxLen - len;
+                for (int j = 0; j < len; j++) {
+                    ids[i * maxLen + base + j] = tokens[j];
+                }
+                for (int j = 0; j < len; j++) {
+                    vpids[i * maxLen + base + j] = j;
+                }
+
+                std::fill(vmask.data() + i * maxLen * maxLen,
+                          vmask.data() + i * maxLen * maxLen + (maxLen - len) * maxLen, 1.0);
+                for (int j = maxLen - len; j < maxLen; j++) {
+                    std::fill(vmask.data() + i * maxLen * maxLen + j * maxLen,
+                              vmask.data() + i * maxLen * maxLen + j * maxLen + maxLen - len, 1.0);
+                }
+                for (int j = 0; j < len; j++) {
+                    for (int k = j + 1; k < len; k++) {
+                        vmask[i * maxLen * maxLen + (base + j) * maxLen + base + k] = 1;
+                    }
                 }
             }
-            for (int i = 0; i < seqLen; i++) {
-                vpids[i] = i;
-                for (int j = i + 1; j < seqLen; j++) {
-                    vmask[i * seqLen + j] = 1;
-                }
-            }
-            for (int b = 1; b < batch; b++) {
-                memcpy(vmask.data() + b * seqLen * seqLen, vmask.data(), seqLen * seqLen * sizeof(float));
-                memcpy(vpids.data() + b * seqLen, vpids.data(), seqLen * sizeof(float));
-            }
-            inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, seqLen}, ids));
-            attentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, seqLen, seqLen}, vmask));
-            positionIds.CopyFrom(Data(DataType::FLOAT32, {batch, seqLen}, vpids));
+
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, maxLen}, ids));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, maxLen, maxLen}, vmask));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {batch, maxLen}, vpids));
         } else {
-            std::vector<float> ids = std::vector<float>(batch * 1, 0);
-            std::vector<float> vpids = std::vector<float>(batch * 1, 0);
-            for (int b = 0; b < batch; b++) {
-                ids[b] = inputTokens[b][0];
-                vpids[b] = (float) (promptLen + index - 1);
+            maxLen++;
+            std::vector<float> fret;
+            for (int i = 0; i < batch; i++) {
+                fret.push_back(inputTokens[i][0]);
             }
-            inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, ids));
-            attentionMask.CopyFrom(Data());
-            positionIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, vpids));
+            std::vector<float> pids = std::vector<float>(batch);
+            std::vector<float> vmasks = std::vector<float>(batch * maxLen, 0.0f);
+            for (int i = 0; i < batch; i++) {
+                pids[i] = seqLens[i] - 1;
+                for (int j = 0; j < maxLen - seqLens[i] - 1; j++) {
+                    vmasks[i * maxLen + j] = 1.0f;
+                }
+            }
+            inputIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, fret));
+            attentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, 1, maxLen}, vmasks));
+            positionIds.CopyFrom(Data(DataType::FLOAT32, {batch, 1}, pids));
         }
     }
 
