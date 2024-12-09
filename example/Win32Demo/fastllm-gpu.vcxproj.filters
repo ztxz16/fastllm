@@ -49,6 +49,12 @@
     <Filter Include="源文件\third_party">
       <UniqueIdentifier>{385ba64f-d978-469c-af0c-498ec33a1bb7}</UniqueIdentifier>
     </Filter>
+    <Filter Include="头文件\devices\multicuda">
+      <UniqueIdentifier>{917a368b-3a0e-476b-9f35-6af4433aca16}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="源文件\devices\multicuda">
+      <UniqueIdentifier>{9fbf8989-df11-4dc7-9697-d69d10b7f0bf}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\include\device.h">
@@ -78,6 +84,9 @@
     <ClInclude Include="..\..\include\models\chatglm.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\cogvlm.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\deepseekv2.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
@@ -99,19 +108,31 @@
     <ClInclude Include="..\..\include\models\minicpm.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\minicpm3.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\moe.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\models\moss.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\phi3.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\qwen.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\include\devices\cpu\cpudevice.h">
-      <Filter>头文件\devices\cpu</Filter>
+    <ClInclude Include="..\..\include\models\xlmroberta.h">
+      <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\devices\cpu\alivethreadpool.h">
+      <Filter>头文件\devices\cpu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\devices\cpu\computeutils.h">
+      <Filter>头文件\devices\cpu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\devices\cpu\cpudevice.h">
       <Filter>头文件\devices\cpu</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\devices\cpu\cputhreadpool.h">
@@ -128,6 +149,12 @@
     </ClInclude>
     <ClInclude Include="..\..\include\devices\cuda\fastllm-cuda.cuh">
       <Filter>头文件\devices\cuda</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\devices\multicuda\multicudadevice.h">
+      <Filter>头文件\devices\multicuda</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\devices\multicuda\fastllm-multicuda.cuh">
+      <Filter>头文件\devices\multicuda</Filter>
     </ClInclude>
     <ClInclude Include="..\..\third_party\json11\json11.hpp">
       <Filter>头文件\third_party</Filter>
@@ -161,6 +188,9 @@
     <ClCompile Include="..\..\src\models\chatglm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\cogvlm.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\deepseekv2.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
@@ -179,16 +209,28 @@
     <ClCompile Include="..\..\src\models\minicpm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\minicpm3.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\moe.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\moss.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\phi3.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\qwen.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\xlmroberta.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\graph\fastllmjson.cpp">
+      <Filter>源文件\models\graph</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\graph\phi3.cpp">
       <Filter>源文件\models\graph</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\graph\qwen2.cpp">
@@ -203,11 +245,17 @@
     <ClCompile Include="..\..\src\devices\cpu\cpudevicebatch.cpp">
       <Filter>源文件\devices\cpu</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\devices\cpu\linear.cpp">
+      <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\devices\cuda\cudadevice.cpp">
       <Filter>源文件\devices\cuda</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\devices\cuda\cudadevicebatch.cpp">
       <Filter>源文件\devices\cuda</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\devices\multicuda\multicudadevice.cpp">
+      <Filter>源文件\devices\multicuda</Filter>
     </ClCompile>
     <ClCompile Include="..\..\third_party\json11\json11.cpp">
       <Filter>源文件\third_party</Filter>
@@ -216,6 +264,9 @@
   <ItemGroup>
     <CudaCompile Include="..\..\src\devices\cuda\fastllm-cuda.cu">
       <Filter>源文件\devices\cuda</Filter>
+    </CudaCompile>
+    <CudaCompile Include="..\..\src\devices\multicuda\fastllm-multicuda.cu">
+      <Filter>源文件\devices\multicuda</Filter>
     </CudaCompile>
   </ItemGroup>
 </Project>

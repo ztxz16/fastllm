@@ -477,10 +477,13 @@ namespace fastllm {
         if (tokenizerClass == "PreTrainedTokenizerFast" || tokenizerClass == "LlamaTokenizerFast"
             || tokenizerClass == "Qwen2Tokenizer"
             || tokenizerClass == "BloomTokenizer"
-            || tokenizerClass == "LlamaTokenizer"
+            || tokenizerClass == "LlamaTokenizer" || tokenizerClass == "CodeLlamaTokenizer"
             || tokenizerClass == "MiniCPMTokenizer") {
             // PreTrainedTokenizerFast
             std::string tokenizerFile = path + "tokenizer.json";
+            if (!fastllm::FileExists(tokenizerFile)) {
+                ErrorInFastLLM("Model with a supported tokenizer_class: " + tokenizerClass + "，but has no \"tokenizer.json\"!");
+            }
             auto tokenizer = json11::Json::parse(ReadAllFile(tokenizerFile), error);
             for (auto &it : tokenizer["model"]["vocab"].object_items()) {
                 model->weight.AddTokenizerWord(it.first, it.second.int_value(), 1.0f);
@@ -522,6 +525,18 @@ namespace fastllm {
             model->history_sep = "";
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
             model->weight.tokenizer.chatTemplate = "";
+        } else if (tokenizerClass == "QWenTokenizer") {
+            // Qwen用的分词
+            std::vector <std::string> lines, line;
+            SplitString(ReadAllFile(path + "qwen.tiktoken"), {'\n'}, lines);
+            for (int i = 0; i < lines.size(); i++) {
+                SplitString(lines[i], {' '}, line);
+                model->weight.AddTokenizerWord(Base64Decode(line[0]), atoi(line[1].c_str()), 1.0f);
+            }
+            model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
+            model->weight.tokenizer.chatTemplate = "";
+            model->weight.dicts["im_end_id"] = std::to_string(lines.size() + 1);
+            model->weight.dicts["im_start_id"] = std::to_string(lines.size() + 2);
         } else {
             ErrorInFastLLM("Unsupport tokenizer_class: " + tokenizerClass);
         }
@@ -635,7 +650,7 @@ namespace fastllm {
             for (auto &it : generation_config.object_items()) {
                 if ("eos_token_id" == it.first && it.second.type() == json11::Json::ARRAY)
                     continue;
-                model->weight.AddDict(it.first, it.second.dump().c_str());
+                model->weight.AddDict(it.first, it.second.is_string() ? it.second.string_value() : it.second.dump());
             }
             // 更新eos_token_id
             if (generation_config["eos_token_id"].is_array()) {
