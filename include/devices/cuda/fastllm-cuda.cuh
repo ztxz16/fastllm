@@ -25,6 +25,7 @@ void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void *
 void FastllmCudaMemcpy2DDeviceToDeviceBatch(void ** 	dsts, size_t *	dpitchs, void ** 	srcs,
                                        size_t *	spitchs, size_t *widths, size_t *	heights,
                                        int batch);
+void FastllmCudaRepeat(void *input, void *output, int outer, int repeatTimes, int inputStride, int outputStride0, int outputStride1, int copyLen);
 
 bool FastllmFloatToHalf(void *a, void *b, int len);
 bool FastllmHalfToFloat(void *a, void *b, int len);

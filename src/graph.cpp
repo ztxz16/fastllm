@@ -406,7 +406,7 @@ namespace fastllm {
                         CatDirectBatch(pastKeys[layerId], pointersK, 1);
                         CatDirectBatch(pastValues[layerId], pointersV, 1);
 
-                        int q0 = q.dims[2], k0 = k.dims[2], dims = q.dims[3];
+                        int q0 = q.dims[2], k0 = k.dims[2], dims = q.dims[3], vdims = v.dims[3];
                         q.Reshape({batch, maxLen, q0, dims});
                         PermuteSelf(q, {0, 2, 1, 3});
                         q.Reshape({batch * q0, maxLen, -1});
@@ -415,7 +415,7 @@ namespace fastllm {
                         PermuteSelf(k, {0, 2, 1, 3});
                         k.Reshape({batch * k0, maxLen, -1});
 
-                        v.Reshape({batch, maxLen, k0, dims});
+                        v.Reshape({batch, maxLen, k0, vdims});
                         PermuteSelf(v, {0, 2, 1, 3});
                         v.Reshape({batch * k0, maxLen, -1});
 
@@ -693,6 +693,14 @@ namespace fastllm {
         );
     }
 
+    void ComputeGraph::Cat(ComputeGraphNode &input0, ComputeGraphNode &input1, int axis, ComputeGraphNode &output) {
+        this->ops.push_back (
+            ComputeGraphOp("Cat", 
+                {{"input0", input0.name}, {"input1", input1.name}, {"output", output.name}}, 
+                {}, {{"axis", axis}})
+        );
+    }
+
     void ComputeGraph::DataTypeAs(ComputeGraphNode &input, ComputeGraphNode &input1) {
         this->ops.push_back (
             ComputeGraphOp("DataTypeAs", 
@@ -701,11 +709,27 @@ namespace fastllm {
         );
     }
 
+    void ComputeGraph::Mul(ComputeGraphNode &input, float v, ComputeGraphNode &output) {
+        this->ops.push_back (
+            ComputeGraphOp("Mul", 
+                {{"input", input.name}, {"output", output.name}}, 
+                {{"v", v}}, {})
+        );
+    }
+
     void ComputeGraph::MulTo(ComputeGraphNode &input0, ComputeGraphNode &input1) {
         this->ops.push_back (
             ComputeGraphOp("MulTo", 
                 {{"input0", input0.name}, {"input1", input1.name}}, 
                 {}, {})
+        );
+    }
+
+    void ComputeGraph::Repeat(ComputeGraphNode &input, int axis, int repeatTimes, ComputeGraphNode &output) {
+        this->ops.push_back (
+            ComputeGraphOp("Repeat", 
+                {{"input", input.name}, {"output", output.name}}, 
+                {}, {{"axis", axis}, {"repeatTimes", repeatTimes}})
         );
     }
 
