@@ -495,6 +495,24 @@ __global__ void FastllmSwigluKernel(half* __restrict__ a, half* __restrict__ b, 
     }
 }
 
+__global__ void FastllmAddKernel(float* a, float *b, float v, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        b[idx] = a[idx] + v;
+    }
+}
+
+__global__ void FastllmAddKernel(half* a, half *b, half v, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+#ifdef CUDA_NO_TENSOR_CORE
+        b[idx] = __float2half(__half2float(a[idx]) + __half2float(v));
+#else
+        b[idx] = __hadd(a[idx], v);
+#endif
+    }
+}
+
 __global__ void FastllmMulKernel(float* a, float *b, float v, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -3260,6 +3278,23 @@ bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
         FastllmSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len, spatial, mid);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, len, spatial, mid);
+    }
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaAdd(const fastllm::Data &input, float v, fastllm::Data &output) {
+    int len = input.Count(0);
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
+    int threadPerBlock = std::min(256, len);
+
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmAddKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, v, len);
+    } else {
+        FastllmAddKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, __float2half_rn(v), len);
     }
 
     FastllmCudaFinishInput(input, cudaInput);
