@@ -709,6 +709,14 @@ namespace fastllm {
         );
     }
 
+    void ComputeGraph::Add(ComputeGraphNode &input, float v, ComputeGraphNode &output) {
+        this->ops.push_back (
+            ComputeGraphOp("Add", 
+                {{"input", input.name}, {"output", output.name}}, 
+                {{"v", v}}, {})
+        );
+    }
+
     void ComputeGraph::Mul(ComputeGraphNode &input, float v, ComputeGraphNode &output) {
         this->ops.push_back (
             ComputeGraphOp("Mul", 
@@ -730,6 +738,14 @@ namespace fastllm {
             ComputeGraphOp("Repeat", 
                 {{"input", input.name}, {"output", output.name}}, 
                 {}, {{"axis", axis}, {"repeatTimes", repeatTimes}})
+        );
+    }
+
+    void ComputeGraph::Gelu(ComputeGraphNode &input, ComputeGraphNode &output) {
+        this->ops.push_back (
+            ComputeGraphOp("Gelu", 
+                {{"input", input.name}, {"output", output.name}}, 
+                {}, {})
         );
     }
 
