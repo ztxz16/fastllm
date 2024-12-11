@@ -38,6 +38,7 @@ bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output);\
 bool FastllmCudaGelu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output);
+bool FastllmCudaAdd(const fastllm::Data &input, float v, fastllm::Data &output);
 bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output);
 bool FastllmCudaSoftmax(const fastllm::Data &input, fastllm::Data &output, int axis);
 bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float alpha);

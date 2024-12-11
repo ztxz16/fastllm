@@ -32,6 +32,7 @@ namespace fastllm {
         this->ops["GeluNew"] = (BaseOperator*)(new CudaGeluNewOp());
         this->ops["Silu"] = (BaseOperator*)(new CudaSiluOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CudaSwigluOp());
+        this->ops["Add"] = (BaseOperator*)(new CudaAddOp());
         this->ops["Mul"] = (BaseOperator*)(new CudaMulOp());
         this->ops["AddTo"] = (BaseOperator*)(new CudaAddToOp());
         this->ops["MulTo"] = (BaseOperator*)(new CudaMulToOp());
@@ -698,6 +699,19 @@ namespace fastllm {
                         input.dataType == DataType::FLOAT16, 
                         "Silu error: Data's type should be float32 or float16.\n");
         FastllmCudaSilu(input, output);
+    }
+
+    void CudaAddOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+
+        float v = floatParams.find("v") != floatParams.end() ? floatParams.find("v")->second : 1.0;
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16, 
+                        "Mul error: Data's type should be float32 or float16.\n");
+        FastllmCudaAdd(input, v, output);
     }
 
     void CudaMulOp::Run(const std::string &opType, const fastllm::DataDict &datas,

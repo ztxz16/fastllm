@@ -46,6 +46,7 @@ namespace fastllm {
         this->ops["Swiglu"] = (BaseOperator*)(new CpuSwigluOp());
         this->ops["Mul"] = (BaseOperator*)(new CpuMulOp());
         this->ops["MulTo"] = (BaseOperator*)(new CpuMulToOp());
+        this->ops["Add"] = (BaseOperator*)(new CpuAddOp());
         this->ops["AddTo"] = (BaseOperator*)(new CpuAddToOp());
         this->ops["AttentionMask"] = (BaseOperator*)(new CpuAttentionMaskOp());
         this->ops["AttentionExtendedMask"] = (BaseOperator*)(new CpuAttentionExtendedMaskOp());
@@ -3608,6 +3609,33 @@ namespace fastllm {
             uint16_t *outputData = (uint16_t *) output.cpuData;
             for (int i = 0; i < len; i++) {
                 outputData[i] = float_to_half(fp16tofp32.dict[inputData[i]] * v);
+            }
+        }
+    }
+
+    void CpuAddOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+
+        float v = floatParams.find("v") != floatParams.end() ? floatParams.find("v")->second : 1.0;
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "Add error: Data's type should be float32 or float16.\n");
+
+        int len = input.Count(0);
+
+        if (input.dataType == DataType::FLOAT32) {
+            float *inputData = (float *) input.cpuData;
+            float *outputData = (float *) output.cpuData;
+            for (int i = 0; i < len; i++) {
+                outputData[i] = inputData[i] + v;
+            }
+        } else if (input.dataType == DataType::FLOAT16) {
+            uint16_t *inputData = (uint16_t *) input.cpuData;
+            uint16_t *outputData = (uint16_t *) output.cpuData;
+            for (int i = 0; i < len; i++) {
+                outputData[i] = float_to_half(fp16tofp32.dict[inputData[i]] + v);
             }
         }
     }
