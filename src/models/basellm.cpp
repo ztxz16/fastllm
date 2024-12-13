@@ -588,6 +588,11 @@ namespace fastllm {
                                 currentActivate++;
                             }
                         }
+                        std::vector <std::pair <int, int> > orders;
+                        for (auto &it : model->responseContextDict.dicts) {
+                            orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
+                        }
+                        sort(orders.begin(), orders.end());
 
                         for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
                             int cnt = 0;
@@ -599,7 +604,12 @@ namespace fastllm {
                                 continue;
                             }
 */
-                            for (auto &it: model->responseContextDict.dicts) {
+
+                            int currentMaxLen = 0;
+
+                            // for (auto &it: model->responseContextDict.dicts) {
+                            for (auto &ii : orders) {
+                                auto &it = *model->responseContextDict.dicts.find(ii.second);
                                 if (it.second->isEnding) {
                                     continue;
                                 }
@@ -640,6 +650,10 @@ namespace fastllm {
                                         lenSum += predictLen;
                                     }
                                 } else {
+                                    if (it.second->currentTokens.size() * 2 < currentMaxLen) {
+                                        continue;
+                                    }
+                                    currentMaxLen = std::max(currentMaxLen, (int)it.second->currentTokens.size());
                                     lenSum += it.second->currentTokens.size();
                                     currentActivate++;
                                 }
