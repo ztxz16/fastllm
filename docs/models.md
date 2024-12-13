@@ -4,15 +4,14 @@
 
 目前Fastllm加载模型有以下几种方式。
 
-* **加载后转换（两行加速模式）** (convert on-the-fly)  
-    将原始模型加载为HuggingFace模型，再通过`from_hf()`方法，转换并加速，这种方法内存占用大且速度慢，目前不再推荐。
+* **直接读取** (load from Huggingface .safetensors)  
+    直接读取HuggingFace上发布的.safetensors格式的模型（其他格式的模型可以使用transformer库导出成safetensors格式，参见[导出safetensors模型](#导出safetensors模型)。
 
 * **离线转换** (convert offline)  
     将原始模型转换为.flm格式的模型，一些[模型](#flm模型库)已经转换好。
 
-* **直接读取** (load from Huggingface .safetensors)  
-    直接读取HuggingFace上发布的模型，仅支持.safetensors格式的模型。
-
+* **加载后转换（不推荐）**
+    将原始模型加载为HuggingFace模型，再通过`from_hf()`方法，转换并加速，这种方法内存占用大且速度慢，目前不再推荐。
 
 ## 支持模型一览 Model List
 
@@ -121,6 +120,11 @@
 
 |              模型  | 加载后转换 |  离线转换  |  直接读取  |
 |-----------------: |------------|------------|------------|
+| microsoft/Phi-3-mini-4k-instruct |  |  | ✔ |
+| google/gemma-2-9b |  |  | ✔ |
+| google/gemma-2-27b |  |  | ✔ |
+| TeleAI/TeleChat2-3B |  |  | ✔ |
+| TeleAI/TeleChat2-7B |  |  | ✔ |
 | fnlp/moss-moon-003-sft | [✔]() | [✔](#moss模型导出) |  |
 | fnlp/moss-moon-003-sft-plugin | [✔]() | [✔](#moss模型导出) |  |
 |  |  |  |  |
@@ -132,8 +136,32 @@
 | openbmb/MiniCPM-2B-dpo-fp16 | [✔](#其它模型) | [✔](#minicpm模型导出) |  |
 | openbmb/MiniCPM3-4B | [✔](#其它模型) | [✔](#minicpm模型导出) |  |
 |  |  |  |  |
-| microsoft/Phi-3-mini-4k-instruct |  |  | ✔ |
 
+
+### 导出safetensors模型
+
+通过transformers库可以将模型导出成.safetensors格式，代码如下：
+
+``` python
+# 保存这段代码为trans.py, 然后执行
+# python trans.py --input 原模型地址 --output 导出.safetensors模型的地址（可以和input相同）
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+import argparse
+def parse_args():
+    parser = argparse.ArgumentParser(description = "trans")
+    parser.add_argument("--input", type = str, required = True)
+    parser.add_argument("--output", type = str, required = True)
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    tokenizer = AutoTokenizer.from_pretrained(args.input, trust_remote_code = True)
+    model = AutoModelForCausalLM.from_pretrained(args.input, device_map = "cpu",torch_dtype = "auto", trust_remote_code = True).eval()
+
+    model.save_pretrained(args.output, max_shard_size = "2048MB", safe_serialization = True)
+    tokenizer.save_pretrained(args.output, max_shard_size = "2048MB", safe_serialization = True)
+```
 
 ### 加载后转换（两行加速模式）(convert on-the-fly)
 
