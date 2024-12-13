@@ -4,13 +4,20 @@ namespace fastllm {
     class TeleChatGraphModelConfig : GraphLLMModelConfig {
     public:
         enum TeleChatModelType {
-            TeleChat7B, TeleChat52B
+            TeleChat7B, TeleChat52B,
+            TeleChat2
         };
         TeleChatModelType teleChatModelType = TeleChatModelType::TeleChat7B;
 
         void InitParams(GraphLLMModel *model) {
             if (model->weight.dicts.find("n_positions") != model->weight.dicts.end()) {
                 teleChatModelType = TeleChat52B;
+            }
+
+            std::string error;
+            auto config = json11::Json::parse(model->weight.dicts["architectures"], error);
+            if (config.array_items()[0].string_value() == "Telechat2ForCausalLM") {
+                teleChatModelType = TeleChat2;
             }
             
             if (teleChatModelType == TeleChat52B) {
@@ -33,6 +40,10 @@ namespace fastllm {
                 model->user_role = "<_user>";
                 model->bot_role = "<_bot>";
                 model->history_sep = "";
+
+                if (teleChatModelType == TeleChat2) {
+                    model->rope_base = 10000;
+                }
             }
         }
 
@@ -67,6 +78,11 @@ namespace fastllm {
                 };
                 std::string embeddingName = "transformer.word_embeddings.weight";
                 std::string logitsName = "transformer.lm_head.weight";
+
+                if (teleChatModelType == TeleChat2) {
+                    logitsName = "lm_head.weight";
+                }
+
                 ret[embeddingName].push_back(std::make_pair(embeddingName, DataType::DATA_AUTO_EMBEDDING));
                 for (int i = 0; i < model->block_cnt; i++) {
                     std::string pre = "transformer.h." + std::to_string(i);
@@ -78,11 +94,6 @@ namespace fastllm {
                     if (ret[name].size() == 0) {
                         ret[name].push_back(std::make_pair(name, DataType::DATA_AUTO_NONE));
                     }
-                }
-                if (ret.find(logitsName) == ret.end()) {
-                    ret[embeddingName].push_back(std::make_pair(logitsName, DataType::DATA_AUTO_LINEAR));
-                } else {
-                    ret[logitsName][0].second = DataType::DATA_AUTO_LINEAR;
                 }
                 if (ret.find(logitsName) == ret.end()) {
                     ret[embeddingName].push_back(std::make_pair(logitsName, DataType::DATA_AUTO_LINEAR));
@@ -133,6 +144,11 @@ namespace fastllm {
                 OptimizeComputeGraph(graph, model->weight);
                 graph.Update();
             } else {
+                std::string logitsName = "transformer.lm_head.weight";
+                if (teleChatModelType == TeleChat2) {
+                    logitsName = "lm_head.weight";
+                }
+
                 auto &graph = *(model->GetGraph());
                 std::map <std::string, ComputeGraphNode> wNodes;
                 for (auto &it : model->weight.weight) {
@@ -169,8 +185,7 @@ namespace fastllm {
 
                 graph.SplitLastTokenStates(hiddenStates, seqLens, lastTokensStates);
                 graph.RMSNorm(lastTokensStates, wNodes["transformer.ln_f.weight"], model->rms_norm_eps, lastTokensStates);
-                graph.Linear(lastTokensStates, wNodes["transformer.lm_head.weight"], wNodes["transformer.lm_head.bias"], logits);
-
+                graph.Linear(lastTokensStates, wNodes[logitsName], wNodes[""], logits);
                 OptimizeComputeGraph(graph, model->weight);
                 graph.Update();
             }
