@@ -93,14 +93,18 @@ namespace fastllm {
         }
         if (this->weight.dicts.find("num_hidden_layers") != this->weight.dicts.end()) {
             block_cnt = atoi(this->weight.dicts["num_hidden_layers"].c_str());
-        }else if (this->weight.dicts.find("num_layers") != this->weight.dicts.end()) {
+        } else if (this->weight.dicts.find("num_layers") != this->weight.dicts.end()) {
             block_cnt = atoi(this->weight.dicts["num_layers"].c_str());
+        } else if (this->weight.dicts.find("n_layer") != this->weight.dicts.end()) {
+            block_cnt = atoi(this->weight.dicts["n_layer"].c_str());
         }
         if (this->weight.dicts.find("hidden_size") != this->weight.dicts.end()) {
             embed_dim = atoi(this->weight.dicts["hidden_size"].c_str());
         }
         if (this->weight.dicts.find("num_attention_heads") != this->weight.dicts.end()) {
             num_attention_heads = atoi(this->weight.dicts["num_attention_heads"].c_str());
+        } else if (this->weight.dicts.find("n_head") != this->weight.dicts.end()) {
+            num_attention_heads = atoi(this->weight.dicts["n_head"].c_str());
         }
         if (this->weight.dicts.find("pre_prompt") != this->weight.dicts.end()) {
             pre_prompt = this->weight.dicts["pre_prompt"];
