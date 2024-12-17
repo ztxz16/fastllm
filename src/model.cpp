@@ -539,8 +539,8 @@ namespace fastllm {
             }
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
             model->weight.tokenizer.chatTemplate = "";
-            model->weight.dicts["im_end_id"] = std::to_string(lines.size() + 1);
-            model->weight.dicts["im_start_id"] = std::to_string(lines.size() + 2);
+            model->weight.dicts["im_start_id"] = std::to_string(lines.size() + 1);
+            model->weight.dicts["im_end_id"] = std::to_string(lines.size() + 2);
         } else {
             ErrorInFastLLM("Unsupport tokenizer_class: " + tokenizerClass);
         }
