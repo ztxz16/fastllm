@@ -8,10 +8,10 @@ namespace fastllm {
     bool JinjaVar::BoolValue() const {
         if (this->type == JinjaInt) {
             return (this->intValue != 0);
-        } else if (this->stringValue == "true") {
-            return true;
         } else if (this->stringValue == "false") {
             return false;
+        } else if (this->type == JinjaString) {
+            return !this->stringValue.empty();
         } else if (this->type == JinjaArray) {
             return !this->arrayValue.empty();
         }
@@ -22,8 +22,11 @@ namespace fastllm {
     JinjaVar& JinjaVar::operator[] (const JinjaVar &b) {
         if (this->type == JinjaArray) {
             AssertInFastLLM(b.type == JinjaInt, "Jinja Error: subscript for array should be integer.");
-            AssertInFastLLM(b.intValue < this->arrayValue.size(), "Jinja error: subscript out of range.");
-            return this->arrayValue[b.intValue];
+            long long value = b.intValue;
+            if (value < 0)
+                value = b.intValue + this->arrayValue.size();
+            AssertInFastLLM(value < this->arrayValue.size(), "Jinja error: subscript out of range.");
+            return this->arrayValue[value];
         } else if (this->type == JinjaDict) {
             return this->dictValue[b.DirectValue()];
         } else {
@@ -452,8 +455,29 @@ namespace fastllm {
                 }
                 vars.pop_back();
                 vars.push_back(a.type == JinjaVar::JinjaNone ? JinjaVar(1) : JinjaVar(!a.BoolValue()));
+            } else if (it.type == JinjaToken::JinjaTokenSub) {
+                AssertInFastLLM(vars.size() > 0, "Jinja Error: expression '-' error.");
+                JinjaVar a = vars.back();
+                if (a.type == JinjaVar::JinjaNone)
+                    a = local[a];
+                AssertInFastLLM(a.type == JinjaVar::JinjaInt || a.type == JinjaVar::JinjaFloat, "Jinja Error: expression '-' error.");
+                if (vars.size() > 1) {
+                    JinjaVar b = vars[vars.size() - 2];
+                    if (b.type == JinjaVar::JinjaNone)
+                        b = local[b];
+                    if (b.type == JinjaVar::JinjaInt || b.type == JinjaVar::JinjaFloat) {
+                        vars.pop_back();
+                        vars.pop_back();
+                        vars.push_back(JinjaBinaryOp(a, b, it.type));
+                        continue;
+                    }
+                }
+                vars.pop_back();
+                if (a.type == JinjaVar::JinjaInt)
+                    vars.push_back(JinjaVar(-a.intValue));
+                else
+                    vars.push_back(JinjaVar(-a.floatValue));
             } else if (it.type == JinjaToken::JinjaTokenAdd ||
-                        it.type == JinjaToken::JinjaTokenSub ||
                         it.type == JinjaToken::JinjaTokenMul ||
                         it.type == JinjaToken::JinjaTokenDiv ||
                         it.type == JinjaToken::JinjaTokenMod ||
@@ -531,7 +555,7 @@ namespace fastllm {
                 std::string iterId = curBlock.tokens[1].value;
                 JinjaVar exp = ComputeExpression(var, curBlock.tokens, 3, curBlock.tokens.size());
                 JinjaVar original = var[iterId];
-                var["loop"] = {{"index", 1}, {"index0", 0}, {"first", 1}};
+                var["loop"] = {{"index", 1}, {"index0", 0}, {"first", 1}, {"last", 0}};
                 if (exp.type == JinjaVar::JinjaArray) {
                     for (auto &it : exp.arrayValue) {
                         var[iterId] = it;
@@ -539,6 +563,7 @@ namespace fastllm {
                         var["loop"]["index"].intValue++;
                         var["loop"]["index0"].intValue++;
                         var["loop"]["first"].intValue = 0;
+                        var["loop"]["last"].intValue = (var["loop"]["index"].intValue == exp.arrayValue.size());
                     }
                 } else if (exp.type == JinjaVar::JinjaDict) {
                     for (auto &it : exp.dictValue) {
@@ -547,6 +572,7 @@ namespace fastllm {
                         var["loop"]["index"].intValue++;
                         var["loop"]["index0"].intValue++;
                         var["loop"]["first"].intValue = 0;
+                        var["loop"]["last"].intValue = (var["loop"]["index"].intValue == exp.arrayValue.size());
                     }
                 } else {
                     ErrorInFastLLM(exp.Dump() + " is not iterable");
@@ -561,13 +587,12 @@ namespace fastllm {
                     if (blocks[j].type == JinjaBlock::JinjaBlockType::JinjaBlockIf) {
                         cnt++;
                     } else if (blocks[j].type == JinjaBlock::JinjaBlockType::JinjaBlockElse) {
-                        if (cnt == 0) {
+                        if (cnt == 0 && elsePos == -1) {
                             elsePos = j;
                         }
                     } else if (blocks[j].type == JinjaBlock::JinjaBlockType::JinjaBlockElseIf) {
-                        if (cnt == 0) {
-                            endPos = j;
-                            break;
+                        if (cnt == 0 && elsePos == -1) {
+                            elsePos = j;
                         }
                     } else if (blocks[j].type == JinjaBlock::JinjaBlockType::JinjaBlockEndIf) {
                         if ((cnt--) == 0) {
