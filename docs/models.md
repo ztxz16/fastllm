@@ -10,7 +10,7 @@
 * **离线转换** (convert offline)  
     将原始模型转换为.flm格式的模型，一些[模型](#flm模型库)已经转换好。
 
-* **加载后转换（不推荐）**
+* **加载后转换（不推荐）**  (convert on-the-fly (NOT RECOMMENDED)) 
     将原始模型加载为HuggingFace模型，再通过`from_hf()`方法，转换并加速，这种方法内存占用大且速度慢，目前不再推荐。
 
 ## 支持模型一览 Model List
@@ -74,7 +74,7 @@
 | Qwen/Qwen2.5-32B-Instruct  | √ | √ | ✔ |
 | Qwen/Qwen2.5-72B-Instruct  |  | √ | ✔ |
 
-> 注3： 需要更新，检查 `tokenizer_config.json` 是否为最新版本
+> 注3： ~~需要更新，检查 `tokenizer_config.json` 是否为最新版本~~
 
 ### DeepSeek系列
 

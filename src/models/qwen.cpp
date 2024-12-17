@@ -57,8 +57,7 @@ namespace fastllm {
 
         weight.embeddingNames.insert("transformer.wte.weight");
         weight.linearNames = {
-            "lm_head.weight", "transformer.h.*.ln_1.weight", "transformer.h.*.attn.c_attn.weight",
-            "transformer.h.*.attn.c_proj.weight", "transformer.h.*.ln_2.weight",
+            "lm_head.weight", "transformer.h.*.attn.c_attn.weight", "transformer.h.*.attn.c_proj.weight", 
             "transformer.h.*.mlp.w1.weight", "transformer.h.*.mlp.w2.weight", "transformer.h.*.mlp.c_proj.weight"
         };
     }
