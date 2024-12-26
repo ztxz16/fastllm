@@ -11,6 +11,7 @@ namespace fastllm {
         this->deviceType = "acl";
         npu::FastllmAclInit();
         this->ops["Linear"] = new AscendLinearOp();
+        this->ops["Split"] = new AscendSplitOp();
         this->ops["Silu"] = new AscendSiluOp();
         this->ops["MulTo"] = new AscendMulToOp();
         this->ops["AddTo"] = new AscendAddToOp();
@@ -225,6 +226,85 @@ namespace fastllm {
         npu::FastllmAclDestroyShape(inputTensorsForCompile);
         npu::FastllmAclDestroyShape(outputTensorsForCompile);
         npu::FastllmAclDestoryTensors(inputTensors, inputBuffers, outputTensors, outputBuffers, &attr);
+    }
+
+    AscendSplitOp::AscendSplitOp() : 
+        BaseAscendOperator("Slice") {}
+
+    bool AscendSplitOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!BaseAscendOperator::CanRun(opType, datas, floatParams, intParams))
+            return false;
+        Data* input = datas.find("input")->second;
+        if (input->dataDevice != DataDevice::NPU)
+            return false;
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        return (axis != 1);
+    }
+
+    void AscendSplitOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int start = intParams.find("start") != intParams.end() ? intParams.find("start")->second : 0;
+        int end = intParams.find("end") != intParams.end() ? intParams.find("end")->second : 0;
+
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        start = std::max(0, std::min(input.dims[axis] - 1, start));
+        end = std::max(0, std::min(input.dims[axis], end));
+        std::vector <int> dims = input.dims;
+        dims[axis] = end - start;
+
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    void AscendSplitOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+
+        output.Allocate();
+
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int start = intParams.find("start") != intParams.end() ? intParams.find("start")->second : 0;
+        int end = intParams.find("end") != intParams.end() ? intParams.find("end")->second : 0;
+
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        start = std::max(0, std::min(input.dims[axis] - 1, start));
+        end = std::max(0, std::min(input.dims[axis], end));
+        std::vector <int32_t> offsetDims(dimsLen);
+        offsetDims[axis] = start;
+        Data offsets(DataType::FLOAT32, {dimsLen});
+        offsets.Allocate();
+        for (int i = 0; i < dimsLen; i++) {
+            ((int32_t*)offsets.cpuData)[i] = offsetDims[i];
+        }
+        offsets.ToDevice(input.dataDevice);
+        offsets.dataType = DataType::INT32PARAM;
+        std::vector <int32_t> sizeDims(input.dims);
+        sizeDims[axis] = end - start;
+        Data sizes(DataType::FLOAT32, {dimsLen});
+        sizes.Allocate();
+        for (int i = 0; i < dimsLen; i++) {
+            ((int32_t*)sizes.cpuData)[i] = sizeDims[i];
+        }
+        sizes.ToDevice(input.dataDevice);
+        sizes.dataType = DataType::INT32PARAM;
+        OrderedData inputDict({{"x", &input}, {"offsets", &offsets}, {"size", &sizes}});
+        if (axis == 1) {
+            deviceOk = RunSingleOp(this->name, inputDict, {{"y", &output}}, {}, {}, {});
+        } else {
+            DynamicShapeDict dynamicShapes;
+            dynamicShapes["x"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+            dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
+            deviceOk = CompileAndRunSingleOp(this->name, inputDict, {{"y", &output}}, dynamicShapes, {}, {}, {});
+        }
     }
 
     AscendSiluOp::AscendSiluOp() : 
