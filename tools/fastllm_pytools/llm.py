@@ -110,6 +110,13 @@ fastllm_lib.embedding_tokens.restype = ctypes.POINTER(ctypes.c_float)
 fastllm_lib.reranker_compute_score.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.reranker_compute_score.restype = ctypes.POINTER(ctypes.c_float)
 
+fastllm_lib.t2s_decode.argtypes = [ctypes.c_char_p,
+    ctypes.c_int, ctypes.c_int, ctypes.c_void_p, 
+    ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p), 
+    ctypes.POINTER(ctypes.c_int64), 
+    ctypes.POINTER(ctypes.c_float)]
+fastllm_lib.t2s_decode.restype = ctypes.POINTER(ctypes.c_int64)
+
 def softmax(a):
     max_value = a[0]
     for i in a:
@@ -166,6 +173,43 @@ def set_device_map(device_map):
                                (ctypes.c_int * len(device_len))(*device_len),
                                device_str.encode(),
                                (ctypes.c_int * len(values))(*values));
+
+def t2s_decode(safetensors_path, xy_pos, k_cache, v_cache, y, pe):
+    bsz = xy_pos.shape[0]
+    src_len = v_cache[0].shape[1]
+    assert bsz == 1
+    assert xy_pos.shape[1] == 1 and xy_pos.shape[2] == 512
+    assert len(k_cache) == 24 and len(v_cache) == 24
+    assert k_cache[0].shape[0] == bsz and k_cache[0].shape[1] == src_len and k_cache[0].shape[2] == 512
+    assert y.shape[0] == bsz
+    assert pe.shape[0] == 1 and pe.shape[1] == 4000 and pe.shape[2] == 512 
+
+    y = y.cpu()
+    pe_list = pe.view(4000 * 512).tolist();
+    pe_p = (ctypes.c_float * len(pe_list))(*pe_list)
+    kk = []
+    k_cache_ct = []
+    vv = []
+    v_cache_ct = []
+    for i in range(len(k_cache)):
+        kk.append(k_cache[i].contiguous())
+        vv.append(v_cache[i].contiguous())
+        k_cache_ct.append(ctypes.cast(kk[-1].data_ptr(), ctypes.c_void_p))
+        v_cache_ct.append(ctypes.cast(vv[-1].data_ptr(), ctypes.c_void_p))
+
+    ret_c = fastllm_lib.t2s_decode(
+        safetensors_path.encode(),
+        src_len, y.shape[1], 
+        ctypes.cast(xy_pos.data_ptr(), ctypes.c_void_p),
+        (ctypes.c_void_p * len(k_cache_ct))(*k_cache_ct),
+        (ctypes.c_void_p * len(v_cache_ct))(*v_cache_ct),
+        ctypes.cast(y.data_ptr(), ctypes.POINTER(ctypes.c_int64)),
+        pe_p)
+    num = ret_c[0];
+    ret = []
+    for i in range(num):
+        ret.append(ret_c[i+1]);
+    return ret
 
 def from_hf(model,
             tokenizer = None,
