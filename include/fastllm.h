@@ -281,6 +281,8 @@ namespace fastllm {
 
         Data (DataType type, const std::vector <int> &dims); // 构造函数
 
+        Data (DataType type, const std::vector <int> &dims, DataDevice device, void *ptr); // 构造函数，使用已有数据地址的Fake data
+
         // 构造函数，创建好之后从data复制数据
         // data中是原始数据，如果type不是float那么需要量化
         Data (DataType type, const std::vector <int> &dims, const std::vector <float> &data);
@@ -568,6 +570,8 @@ namespace fastllm {
     void Silu(const fastllm::Data &input, fastllm::Data &output);
 
     void TanH(const Data &input, Data &output);
+
+    void Relu(const Data &input, Data &output);
 
     void Gelu(const Data &input, Data &output);
     
