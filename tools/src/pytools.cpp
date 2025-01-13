@@ -12,6 +12,8 @@
 #define DLL_EXPORT
 #endif
 
+#include "pytools_t2s.cpp"
+
 extern "C" {
     DLL_EXPORT void print_cpu_ins() {
         fastllm::PrintInstructionInfo();
