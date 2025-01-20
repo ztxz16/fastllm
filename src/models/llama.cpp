@@ -406,26 +406,34 @@ namespace fastllm {
             AddTo(hiddenStates, attenInput);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
-            if (this->mergeSwiglu) {
+
+            if (this->mergeSwiglu && CanRunMLP()) {
                 std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
-                if (CanRunLinearEx(LinearExType::ExSwiglu)) {
-                    LinearEx(attenInput, weight[swigluWeightName], Data(), q, LinearExType::ExSwiglu);
-                } else {
-                    Linear(attenInput, weight[swigluWeightName], Data(), v);
-                    Swiglu(v, q);
-                }
+                std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
+                MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), k);
+                AddTo(hiddenStates, k);
             } else {
-                if (CanRunLinearEx(LinearExType::ExSilu)) {
-                    LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), q, LinearExType::ExSilu);
+                if (this->mergeSwiglu) {
+                    std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+                    if (CanRunLinearEx(LinearExType::ExSwiglu)) {
+                        LinearEx(attenInput, weight[swigluWeightName], Data(), q, LinearExType::ExSwiglu);
+                    } else {
+                        Linear(attenInput, weight[swigluWeightName], Data(), v);
+                        Swiglu(v, q);
+                    }
                 } else {
-                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), q);
-                    Silu(q, q);
+                    if (CanRunLinearEx(LinearExType::ExSilu)) {
+                        LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), q, LinearExType::ExSilu);
+                    } else {
+                        Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), q);
+                        Silu(q, q);
+                    }
+                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), v);
+                    MulTo(q, v);
                 }
-                Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), v);
-                MulTo(q, v);
+                Linear(q, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), k);
+                AddTo(hiddenStates, k);
             }
-            Linear(q, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), k);
-            AddTo(hiddenStates, k);
         }
 
         Data logits, topk;
@@ -786,27 +794,35 @@ namespace fastllm {
             AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
-            if (this->mergeSwiglu) {
-                std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
-                if (CanRunLinearEx(LinearExType::ExSwiglu)) {
-                    LinearEx(attenInput, weight[swigluWeightName], Data(), w1, LinearExType::ExSwiglu);
-                } else {
-                    Linear(attenInput, weight[swigluWeightName], Data(), w3);
-                    Swiglu(w3, w1);
-                }
-            } else {
-                if (CanRunLinearEx(LinearExType::ExSilu)) {
-                    LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
-                } else {
-                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
-                    Silu(w1, w1);
-                }
-                Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
-                MulTo(w1, w3);
-            }
 
-            Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
-            AddTo(hiddenStates, w2);
+            if (this->mergeSwiglu && CanRunMLP()) {
+                std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+                std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
+                MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), k);
+                AddTo(hiddenStates, k);
+            } else {
+                if (this->mergeSwiglu) {
+                    std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+                    if (CanRunLinearEx(LinearExType::ExSwiglu)) {
+                        LinearEx(attenInput, weight[swigluWeightName], Data(), w1, LinearExType::ExSwiglu);
+                    } else {
+                        Linear(attenInput, weight[swigluWeightName], Data(), w3);
+                        Swiglu(w3, w1);
+                    }
+                } else {
+                    if (CanRunLinearEx(LinearExType::ExSilu)) {
+                        LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                    } else {
+                        Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
+                        Silu(w1, w1);
+                    }
+                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
+                    MulTo(w1, w3);
+                }
+
+                Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
+                AddTo(hiddenStates, w2);
+            }
         }
 
         Data logits;

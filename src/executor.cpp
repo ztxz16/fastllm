@@ -24,7 +24,7 @@ namespace fastllm {
         this->devices.clear();
 #ifdef USE_CUDA
         this->devices.push_back((BaseDevice*) new CudaDevice());
-        this->devices.push_back((BaseDevice*) new MultiCudaDevice());
+        this->devices.push_back((BaseDevice*) new MultiCudaDevice((CudaDevice*)this->devices.back()));
 #endif
 #ifdef USE_TFACC
         this->devices.push_back((BaseDevice*) new TfaccDevice());
@@ -80,16 +80,20 @@ namespace fastllm {
                        const fastllm::IntDict &intParams) {
         auto st = std::chrono::system_clock::now();
         bool lockInCPU = false;
-        for (auto &it: datas) {
-            if (intParams.find(it.first + "___batch") != intParams.end()) {
-                int batch = intParams.find(it.first + "___batch")->second;
-                for (int i = 0; i < batch; i++) {
-                    lockInCPU |= (((Data**)it.second)[i] && ((Data**)it.second)[i]->lockInCPU);
+        if (GetKVCacheInCPU()) {
+            // 暂时只有kvcache可能lock在CPU上
+            for (auto &it: datas) {
+                if (intParams.find(it.first + "___batch") != intParams.end()) {
+                    int batch = intParams.find(it.first + "___batch")->second;
+                    for (int i = 0; i < batch; i++) {
+                        lockInCPU |= (((Data**)it.second)[i] && ((Data**)it.second)[i]->lockInCPU);
+                    }
+                } else {
+                    lockInCPU |= (it.second && it.second->lockInCPU);
                 }
-            } else {
-                lockInCPU |= (it.second && it.second->lockInCPU);
             }
         }
+
         bool run = false;
         for (auto device: devices) {
             if (lockInCPU && device->deviceType != "cpu") {
@@ -104,8 +108,9 @@ namespace fastllm {
                     FastllmMultiCudaSetDevice(device->deviceIds);
                 }
 #endif
+                bool intParamsSize = intParams.size();
                 for (auto &it: datas) {
-                    if (intParams.find(it.first + "___batch") != intParams.end()) {
+                    if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
                         int batch = intParams.find(it.first + "___batch")->second;
                         for (int i = 0; i < batch; i++) {
                             if (((Data**)it.second)[i]) {
