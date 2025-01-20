@@ -1167,14 +1167,15 @@ namespace fastllm {
                 } else if (device == DataDevice::CUDA) {
                     int sourceDevice = this->dataDeviceIds.size() == 0 ? 0 : this->dataDeviceIds[0];
                     int destDevice = deviceIds.size() == 0 ? 0 : deviceIds[0];
-                    FastllmCudaSetDevice(destDevice);
-                    void *newCudaData = FastllmCudaMalloc(expansionBytes);
-
-                    FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
-                    FastllmCudaSetDevice(sourceDevice);
-                    FastllmCudaFree(this->cudaData);
-                    this->cudaData = newCudaData;
-                    FastllmCudaSetDevice(destDevice);
+                    if (sourceDevice != destDevice) {
+                                        FastllmCudaSetDevice(destDevice);
+                                        void *newCudaData = FastllmCudaMalloc(expansionBytes);
+                                        FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
+                                        FastllmCudaSetDevice(sourceDevice);
+                                        FastllmCudaFree(this->cudaData);
+                                        this->cudaData = newCudaData;
+                                        FastllmCudaSetDevice(destDevice);
+                    }
                 }
             }
 #endif
