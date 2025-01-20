@@ -2667,10 +2667,23 @@ namespace fastllm {
         return curExecutor->CanRunOnFirstDevice("Linear", {}, {}, {{"exType", (int)exType}});
     }
 
+    bool CanRunMLP() {
+        return curExecutor->CanRunOnFirstDevice("MLP", {}, {}, {});
+    }
+
     void LinearEx(Data &input, Data &weight, const Data &bias, Data &output, LinearExType exType) {
         curExecutor->Run("Linear", {
                 {"input", &input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}
         }, {}, {{"exType", (int)exType}});
+    }
+
+    void MLP(Data &input, Data &weight0, const Data &bias0, Data &weight1, const Data &bias1, Data &output) {
+        curExecutor->Run("MLP", {
+                {"input", &input}, 
+                {"weight0", &weight0}, {"bias0", (Data*)&bias0}, 
+                {"weight1", &weight1}, {"bias1", (Data*)&bias1}, 
+                {"output", &output}
+        }, {}, {});
     }
 
     void Split(const Data &input, int axis, int start, int end, Data &output) {
