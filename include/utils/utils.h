@@ -94,8 +94,8 @@ namespace fastllm {
     };
 
     static double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds> (time2 - time1);
-        return double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds> (time2 - time1);
+        return double(duration.count()) * std::chrono::nanoseconds::period::num / std::chrono::nanoseconds::period::den;
     };
 
     static bool StartWith(const std::string &a, const std::string &b) {
