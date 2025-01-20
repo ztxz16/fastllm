@@ -12,9 +12,11 @@
 #include "utils.h"
 
 namespace fastllm {
-    MultiCudaDevice::MultiCudaDevice() {
+    MultiCudaDevice::MultiCudaDevice(CudaDevice *cudaDevice) {
+        this->cudaDevice = cudaDevice;
         this->deviceType = "multicuda";
 
+        this->ops["MLP"] = (BaseOperator*)(new MultiCudaMLPOp());
         this->ops["Linear"] = (BaseOperator*)(new MultiCudaLinearOp());
     }
 
@@ -38,6 +40,76 @@ namespace fastllm {
         return true;
     }
 
+    bool MultiCudaDevice::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        if (this->ops.find(opType) == this->ops.end()) {
+            if (((BaseDevice*)this->cudaDevice)->ops.find(opType) == ((BaseDevice*)this->cudaDevice)->ops.end()) {
+                return false;
+            } else {
+                return ((BaseDevice*)this->cudaDevice)->CanRun(opType, datas, floatParams, intParams);
+            }
+        } else {
+            return this->ops[opType]->CanRun(opType, datas, floatParams, intParams);
+        }
+    }
+
+    // 对某一个算子进行形状推理
+    void MultiCudaDevice::Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        if (this->ops.find(opType) == this->ops.end()) {
+            ((BaseDevice*)this->cudaDevice)->Reshape(opType, datas, floatParams, intParams);
+        } else {
+            this->ops[opType]->Reshape(opType, datas, floatParams, intParams);
+        }
+    }
+
+    // 对某一个算子进行推理
+    void MultiCudaDevice::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        if (this->ops.find(opType) == this->ops.end()) {
+            ((BaseDevice*)this->cudaDevice)->Run(opType, datas, floatParams, intParams);
+        } else {
+            this->ops[opType]->Run(opType, datas, floatParams, intParams);
+        }
+    }
+
+    void MultiCudaMLPOp::Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight0 = *(datas.find("weight0")->second);
+        Data &weight1 = *(datas.find("weight1")->second);
+
+        AssertInFastLLM(weight0.dims.size() == 2 && weight1.dims.size() == 2, "MLP's weight's shape's size should be 2.\n");
+        AssertInFastLLM(input.dims.back() == weight0.dims[1], "MLP's weight's shape error.\n");
+        AssertInFastLLM(weight0.dims[0] / 2 == weight1.dims[1], "MLP's weight's shape error.\n");
+        AssertInFastLLM(weight0.dataType == weight1.dataType, "MLP's weight's data type error.\n");
+
+        weight0.weightType = WeightType::LINEAR;
+        weight1.weightType = WeightType::LINEAR;
+        std::vector <int> dims = input.dims;
+        dims.back() = weight1.dims[0];
+
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    void MultiCudaMLPOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight0 = *(datas.find("weight0")->second);
+        Data &bias0 = *(datas.find("bias0")->second);
+        Data &weight1 = *(datas.find("weight1")->second);
+        Data &bias1 = *(datas.find("bias1")->second);
+
+        output.Allocate();
+        FastllmMultiCudaMLP(input, weight0, weight1, output);
+    }
+
+    bool MultiCudaLinearOp::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        if (intParams.find("exType") != intParams.end()) {
+            return false;
+        }
+        Data &weight = *(datas.find("weight")->second);
+        return weight.dims[0] > 30000;
+    }
+
     void MultiCudaLinearOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
 // auto st = std::chrono::system_clock::now();
         Data &input = *(datas.find("input")->second);
@@ -55,7 +127,7 @@ namespace fastllm {
                 weight.dataType == DataType::INT8 ||
                 weight.dataType == DataType::INT4_NOZERO ||
                 weight.dataType == DataType::INT4_GROUP) {
-                FastllmMultiCudaHalfMatMul(input, weight, bias, output, n, m, k);
+                FastllmMultiCudaMatMul(input, weight, bias, output, n, m, k);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
