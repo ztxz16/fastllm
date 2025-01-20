@@ -574,7 +574,7 @@ namespace fastllm {
     // 从hf文件夹读取，仅支持safetensor格式的模型
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
                                                     DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig,
-                                                    const std::string &loraPath) {
+                                                    const std::string &loraPath, bool weightOnly) {
         std::map <std::string, std::pair <std::string, std::string> > loraDicts;
         SafeTensors *loraTensors = nullptr;
         float loraScaling;
@@ -623,9 +623,11 @@ namespace fastllm {
 
         // 2. 创建网络基本信息
         std::string configFile = path + "config.json";
-        auto config = json11::Json::parse(ReadAllFile(configFile), error);
+        auto config = weightOnly ? json11::Json() : json11::Json::parse(ReadAllFile(configFile), error);
         std::string modelType = "";
-        if (isJsonModel) {
+        if (weightOnly) {
+            modelType = "qwen";
+        } else if (isJsonModel) {
             modelType = "fastllmJson";
         } else {
             if (!config["model_type"].is_null()) {
@@ -842,7 +844,8 @@ namespace fastllm {
 
         delete loraTensors;
 
-        model->WarmUp();
+        if (!weightOnly)
+            model->WarmUp();
         return std::unique_ptr<fastllm::basellm> (model);
     }
 }
