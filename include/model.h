@@ -21,7 +21,8 @@ namespace fastllm {
                                                     int groupCnt = -1,
                                                     bool skipTokenizer = false,
                                                     const std::string &modelConfig = "",
-                                                    const std::string &loraPath = "");
+                                                    const std::string &loraPath = "",
+                                                    bool weightOnly = false);
     
     std::unique_ptr<basellm> CreateLLMTokenizerFromHF(const std::string &modelPath);
 }

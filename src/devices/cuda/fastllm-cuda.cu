@@ -434,6 +434,14 @@ __global__ void FastllmCudaBiasKernel(half *a, half *bias, int k) {
     }
 }
 
+__global__ void FastllmReluKernel(float* a, float *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = a[idx];
+        b[idx] = x > 0 ? x : 0;
+    }
+}
+
 __global__ void FastllmGeluKernel(float* a, float *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -3268,6 +3276,22 @@ void FastllmCudaMemcpy2DDeviceToDeviceBatch(void ** 	dsts, size_t *	dpitchs, voi
     DeviceSync();
 }
 
+bool FastllmCudaRelu(const fastllm::Data &input, fastllm::Data &output) {
+    int len = input.Count(0);
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
+    int threadPerBlock = std::min(256, len);
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmReluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
+    } else {
+        printf("Relu datatype error.\n");
+        exit(0);
+    }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
 bool FastllmCudaGelu(const fastllm::Data &input, fastllm::Data &output) {
     int len = input.Count(0);
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
@@ -3544,7 +3568,10 @@ bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fast
     int inner = input.strides[axis];
 
     if (inner == 1) {
-        if (input.dataType == fastllm::DataType::FLOAT32) {
+        if (gamma.dataType != fastllm::DataType::FLOAT32 || beta.dataType != fastllm::DataType::FLOAT32) {
+            printf("layernorm datatype error.\n");
+            exit(0);    
+        } else if (input.dataType == fastllm::DataType::FLOAT32) {
             if (channels < 64) {
                 FastllmLayerNormKernelInner1<1> <<< outer, 1 >>>(cudaInput, (float *) gamma.cudaData,
                                                                 (float *) beta.cudaData, cudaOutput,
