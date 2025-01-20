@@ -10,6 +10,8 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#define max(a, b) ((a) > (b) ? (a) : (b))
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
 #include "mma.h"
 using namespace nvcuda;
@@ -187,8 +189,8 @@ void DeviceSync() {
 }
 
 double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds> (time2 - time1);
-    return double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
+    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds> (time2 - time1);
+    return double(duration.count()) * std::chrono::nanoseconds::period::num / std::chrono::nanoseconds::period::den;
 };
 
 template <int BN, int BM, int BK>
@@ -538,6 +540,27 @@ __global__ void FastllmMulBatchKernel(float** pointer, int batch, float v) {
     int len = (int)((unsigned long long)pointer[blockIdx.x + batch * 2]);
     for (int i = threadIdx.x; i < len; i += THREAD_PER_BLOCK) {
         output[i] = input[i] * v;
+    }
+}
+
+
+__global__ void FastllmReduceKernel(float *output, float* input, int len, int threadNum) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        output[idx] = 0;
+        for (int i = 0; i < threadNum; i++) {
+            output[idx] += input[idx + i * len];
+        }
+    }
+}
+
+__global__ void FastllmReduceKernel(half *output, half* input, int len, int threadNum) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        output[idx] = (half)0;
+        for (int i = 0; i < threadNum; i++) {
+            output[idx] = __hadd(output[idx], input[idx + i * len]);
+        }
     }
 }
 
@@ -1536,8 +1559,12 @@ __global__ void FastllmGemvFp32Fp16Kernel2MultiRow(float *A, half *B, float *C, 
     }
 
     if (tid == 0) {
+        if (bias == nullptr) {
+            for (int x = 0; x < PART; x++) C[p + k * x] = sdata[x][0];
+        } else {
 #pragma unroll
-        for (int x = 0; x < PART; x++) C[p + k * x] = sdata[x][0] + __ldg(bias + p);
+            for (int x = 0; x < PART; x++) C[p + k * x] = sdata[x][0] + __ldg(bias + p);
+        }
     }
     __syncthreads();
 }
@@ -1793,29 +1820,40 @@ template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvFp16Int4NoZeroKernel2(half *A, uint8_t *B, half *C,
                                                 half *bias, float *scales, float *mins,
                                                 int m, int k) {
-    __shared__ float sdata[THREAD_PER_BLOCK];
+    __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
+    float minvs[PART];
 
     // 1. 计算
     int st = blockIdx.x * PART;
     int end = st + PART;
-    for (int p = st; p < end; p++) {
-        sdata[tid] = 0;
-        float minv = mins[p] / scales[p];
-        for (int i = tid; i < m / 2; i += THREAD_PER_BLOCK) {
-            uint8_t now = B[p * m / 2 + i];
-            sdata[tid] += ((float)A[i * 2] * (minv + (now >> 4)) + (float)A[i * 2 + 1] * (minv + (now & 15)));
+    for (int p = 0; p < PART; p++) {
+        sdata[p][tid] = 0;
+        minvs[p] = mins[st + p] / scales[st + p];
+    }
+
+    for (int i = tid; i < m / 2; i += THREAD_PER_BLOCK) {
+        for (int p = 0; p < PART; p++) {
+            uint8_t now = B[(st + p) * m / 2 + i];
+            sdata[p][tid] += ((float)A[i * 2] * (minvs[p] + (now >> 4)) + (float)A[i * 2 + 1] * (minvs[p] + (now & 15)));
         }
         __syncthreads();
+    }
+
+    for (int p = 0; p < PART; p++) {
         for (unsigned int s = 1; s < THREAD_PER_BLOCK; s *= 2) {
             if ((tid & (2 * s - 1)) == 0) {
-                sdata[tid] += sdata[tid + s];
+                sdata[p][tid] += sdata[p][tid + s];
             }
             __syncthreads();
         }
 
         if (tid == 0) {
-            C[p] = (half)(sdata[0] * scales[p] + (float)bias[p]);
+            if (bias == nullptr) {
+                C[st + p] = (half)(sdata[p][0] * scales[st + p]);
+            } else {
+                C[st + p] = (half)(sdata[p][0] * scales[st + p] + (float)bias[st + p]);
+            }
         }
         __syncthreads();
     }
@@ -1856,7 +1894,11 @@ __global__ void FastllmGemvInt4NoZeroKernel1(float *A, uint8_t *B, float *C,
         //if (tid <= 32)
             //warpReduce(sdata, tid);
         if (tid == 0) {
-            C[p] = sdata[0] * scales[p] + bias[p];
+            if (bias == nullptr) {
+                C[p] = sdata[0] * scales[p];
+            } else {
+                C[p] = sdata[0] * scales[p] + bias[p];
+            }
         }
         __syncthreads();
     }
@@ -4202,8 +4244,8 @@ bool DoFastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::
         half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
         int q0 = q[0]->dims[0], q1 = q[0]->dims[1], q2 = q[0]->dims[2], k0 = k[0]->dims[0], k1 = k[0]->dims[1], v2 = v[0]->dims[2];
         for (int i = 0; i < batch; i++) {
-            q1 = std::max(q1, q[i]->dims[1]);
-            k1 = std::max(k1, k[i]->dims[1]);
+            q1 = max(q1, q[i]->dims[1]);
+            k1 = max(k1, k[i]->dims[1]);
         }
 
         half *allKeys = (half*) FastllmCudaMalloc(batch * k0 * k1 * q2 * sizeof(half));
@@ -4753,7 +4795,7 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
 
 void LaunchFastllmGemmFp16Int4NoZero(half *input, uint8_t *weight, half *output, half *bias, float *scales, float *mins, int n, int m, int k) {
     for (int i = 0; i < n; i++) {
-        FastllmGemvFp16Int4NoZeroKernel2<256, 1> <<< k, 256 >>>(input + i * m, weight, output + i * k, bias, scales, mins, m, k);
+        FastllmGemvFp16Int4NoZeroKernel2<128, 4> <<< k / 4, 128 >>>(input + i * m, weight, output + i * k, bias, scales, mins, m, k);
     }
 }
 
