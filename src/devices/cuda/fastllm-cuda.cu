@@ -1870,9 +1870,9 @@ __global__ void FastllmGemvFp16Int4NoZeroKernel2(half *A, uint8_t *B, half *C,
 
         if (tid == 0) {
             if (bias == nullptr) {
-                C[st + p] = (half)(sdata[p][0] * scales[st + p]);
+                C[p] = (half)(sdata[0] * scales[p]);
             } else {
-                C[st + p] = (half)(sdata[p][0] * scales[st + p] + (float)bias[st + p]);
+                C[p] = (half)(sdata[0] * scales[p] + (float)bias[p]);
             }
         }
         __syncthreads();
