@@ -1473,6 +1473,8 @@ __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(half *A, half *B, half *C, ha
     for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
         
     const half *baseB = B + p * m;
+
+    if (m % 4 == 0) {
 #pragma unroll
         for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
 #pragma unroll
@@ -1491,6 +1493,14 @@ __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(half *A, half *B, half *C, ha
                 sdata[x][tid] += sum;
             }
         }
+    } else {
+        for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    sdata[x][tid] += (float)A[i + x * m] * (float)baseB[i];
+                }
+        }
+    }
     __syncthreads();
     float diff = 0.0f;
     for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
@@ -1533,8 +1543,9 @@ __global__ void FastllmGemvFp32Fp16Kernel2MultiRow(float *A, half *B, float *C, 
     for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
         
     const half *baseB = B + p * m;
+    if (m % 4 == 0) {
 #pragma unroll
-        for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
+        for (int i = tid * 4; i + 3 < m; i += THREAD_PER_BLOCK * 4) {
 #pragma unroll
             for (int x = 0; x < PART; x++) {
                 regA = FETCH_FLOAT4(A[i + x * m]);
@@ -1551,6 +1562,14 @@ __global__ void FastllmGemvFp32Fp16Kernel2MultiRow(float *A, half *B, float *C, 
                 sdata[x][tid] += sum;
             }
         }
+    } else {
+        for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                sdata[x][tid] += A[i + x * m] * (float)baseB[i];
+            }
+        }
+    }
     __syncthreads();
     float diff = 0.0f;
     for (unsigned int s = THREAD_PER_BLOCK/2; s > 0; s >>= 1) {
