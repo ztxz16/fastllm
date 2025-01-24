@@ -107,7 +107,7 @@ namespace fastllm {
             return false;
         }
         Data &weight = *(datas.find("weight")->second);
-        return weight.dims[0] > 30000;
+        return weight.dims[0] > 10000 || weight.dims[1] > 10000;
     }
 
     void MultiCudaLinearOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {

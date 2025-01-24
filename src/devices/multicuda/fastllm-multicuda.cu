@@ -63,34 +63,6 @@ void FastllmMultiCudaSetDevice(std::vector <int> ids) {
 }
 
 namespace fastllm {
-    struct MultiCudaPrepareInput : MultiThreadBaseOp {
-        int deviceId;
-        uint8_t *cudaInput, *cudaOutput;
-        int inputLen, outputLen;
-        uint8_t **curInput, **curOutput;
-        bool forceMalloc;
-
-        MultiCudaPrepareInput(int deviceId, uint8_t *cudaInput, uint8_t *cudaOutput, int inputLen, int outputLen, uint8_t **curInput, uint8_t **curOutput, bool forceMalloc)
-            : deviceId(deviceId), cudaInput(cudaInput), cudaOutput(cudaOutput), inputLen(inputLen), outputLen(outputLen), curInput(curInput), curOutput(curOutput), forceMalloc(forceMalloc) {}
-
-        void Run() {
-            *curInput = cudaInput; 
-            *curOutput = cudaOutput; 
-            
-            if (deviceId != 0 || forceMalloc) {
-                cudaSetDevice(deviceId);
-                *curInput = (uint8_t*)FastllmCudaMalloc(inputLen);                
-                *curOutput = (uint8_t*)FastllmCudaMalloc(outputLen);
-// cudaDeviceSynchronize();
-// auto st = std::chrono::system_clock::now();
-                cudaMemcpy(*curInput, cudaInput, inputLen, cudaMemcpyDeviceToDevice);
-// cudaDeviceSynchronize();
-// float tt = GetSpan(st, std::chrono::system_clock::now());
-// printf("memcpy %d bytes spend %f s, (%f GB / s).\n", (int)inputLen, tt, inputLen / tt / 1e9);
-            }
-        }
-    };
-
     template <typename T>
     void RunMatmul(void *weight, DataType weightDataType, T *bias, 
                         int n, int m, int k, bool hasBias, float *scales, float *mins, uint8_t *zeros, int group, int groupCnt, 
@@ -228,16 +200,16 @@ namespace fastllm {
         int deviceId;
         void *weight;
         DataType weightDataType;
-        T *cudaInput, *cudaOutput, *bias;
+        T *cpuInput, *cudaInput, *cudaOutput, *bias;
         int n, m, k, start, len;
         bool hasBias;
         float *scales, *mins;
         uint8_t *zeros;
         int group, groupCnt;
 
-        MultiCudaMatMulSingleOp(int deviceId, void *weight, DataType weightDataType, T *cudaInput, T *cudaOutput, T *bias, 
+        MultiCudaMatMulSingleOp(int deviceId, void *weight, DataType weightDataType, T *cpuInput, T *cudaInput, T *cudaOutput, T *bias, 
                                     int n, int m, int k, int start, int len, bool hasBias, float *scales, float *mins, uint8_t *zeros, int group, int groupCnt)
-            : deviceId(deviceId), weight(weight), weightDataType(weightDataType), cudaInput(cudaInput), cudaOutput(cudaOutput), bias(bias), 
+            : deviceId(deviceId), weight(weight), weightDataType(weightDataType), cpuInput(cpuInput), cudaInput(cudaInput), cudaOutput(cudaOutput), bias(bias), 
             n(n), m(m), k(k), start(start), len(len), hasBias(hasBias), scales(scales), mins(mins), zeros(zeros), group(group), groupCnt(groupCnt) {}
 
         void Run() {
@@ -245,18 +217,20 @@ namespace fastllm {
             T *curInput = cudaInput; 
             T *curOutput = cudaOutput; 
 
-            if (deviceId != 0 || n > 1) {
+            if (deviceId != 0) {
                 curInput = (T*)FastllmCudaMalloc(n * m * sizeof(T));                
+                cudaMemcpy(curInput, cpuInput, n * m * sizeof(T), cudaMemcpyHostToDevice);
+            }
+            if (deviceId != 0 || n > 1) {
                 curOutput = (T*)FastllmCudaMalloc(n * len * sizeof(T));
-                
-                cudaMemcpy(curInput, cudaInput, n * m * sizeof(T), cudaMemcpyDeviceToDevice);
             }
 
-            cudaDeviceSynchronize();
             RunMatmul(weight, weightDataType, bias, n, m, len, hasBias, scales, mins, zeros, group, groupCnt, curInput, curOutput);
+            if (deviceId != 0) {
+                FastllmCudaFree(curInput);
+            }
             if (deviceId != 0 || n > 1) {
                 cudaMemcpy2D(cudaOutput + start, k * sizeof(T), curOutput, len * sizeof(T), len * sizeof(T), n, cudaMemcpyDeviceToDevice);
-                FastllmCudaFree(curInput);
                 FastllmCudaFree(curOutput);
             }
         }
@@ -285,12 +259,15 @@ namespace fastllm {
             cudaSetDevice(deviceId);
             *curInput = cudaInput; 
             *curOutput = cudaOutput; 
-            if (deviceId != 0 || n > 1) {
+            if (deviceId != 0) {
                 *curInput = (T*)FastllmCudaMalloc(n * m * sizeof(T));                
                 *curOutput = (T*)FastllmCudaMalloc(n * k2 * sizeof(T));
                 // cudaMemcpy(*curInput, cudaInput, n * m * sizeof(T), cudaMemcpyDeviceToDevice);
                 cudaMemcpy(*curInput, cpuInput, n * m * sizeof(T), cudaMemcpyHostToDevice);
+            } else if (threadNum > 1) {
+                *curOutput = partOutput;
             }
+
             T *mid0 = (T*)FastllmCudaMalloc(n * k1 * sizeof(T));
             T *mid1 = (T*)FastllmCudaMalloc(n * k1 / 2 * sizeof(T));
             bool isQuantWeight = weight0->mins.size() > 0;
@@ -299,7 +276,7 @@ namespace fastllm {
                 datas0 = weight0->extraCudaHalfData;
                 datas1 = weight1->extraCudaHalfData;
             }
-            cudaDeviceSynchronize();
+
             RunMatmul(datas0[tid * 2], weight0->dataType,
                             (T *) datas0[tid * 2 + 1],
                             n, m, k1, false,
@@ -316,12 +293,11 @@ namespace fastllm {
                             (float*)(isQuantWeight ? datas1[threadNum * 2 + tid * 3 + 1] : nullptr),
                             (uint8_t*)(isQuantWeight ? datas1[threadNum * 2 + tid * 3 + 2] : nullptr),
                             weight1->group, weight1->groupCnt, mid1, *curOutput);
-            cudaDeviceSynchronize();
-            if (threadNum > 1) {
+
+            if (threadNum > 1 && deviceId > 0) {
                 cudaMemcpy(partOutput, *curOutput, n * k2 * sizeof(T), cudaMemcpyDeviceToDevice);
             }
 
-            cudaDeviceSynchronize();
             FastllmCudaFree(mid0);
             FastllmCudaFree(mid1);
         }
@@ -573,6 +549,11 @@ bool FastllmMultiCudaMatMulInner(const fastllm::Data &input, fastllm::Data &weig
 
     int isQuantWeight = (weight.mins.size() > 0);
     int threadNum = multiCudaCurrentDevices.size();
+
+    T *cpuInput = new T[input.Count(0)];
+    cudaMemcpy(cpuInput, cudaInput, input.GetBytes(), cudaMemcpyDeviceToHost);
+    cudaDeviceSynchronize();
+
     for (int i = 0; i < threadNum; i++) {
         int deviceId = multiCudaCurrentDevices[i];
         int start = points[i], len = points[i + 1] - points[i];
@@ -582,7 +563,7 @@ bool FastllmMultiCudaMatMulInner(const fastllm::Data &input, fastllm::Data &weig
         }
         ops.push_back(new fastllm::MultiCudaMatMulSingleOp <T> (
             deviceId, datas[i * 2], weight.dataType,
-            cudaInput, cudaOutput, 
+            cpuInput, cudaInput, cudaOutput, 
             (T*) datas[i * 2 + 1],
             n, m, k, start, len, bias.dims.size() > 0,
             (float*)(isQuantWeight ? datas[threadNum * 2 + i * 3] : nullptr),
@@ -599,6 +580,7 @@ bool FastllmMultiCudaMatMulInner(const fastllm::Data &input, fastllm::Data &weig
         delete ops[i];
     }
 
+    delete[] cpuInput;
     cudaSetDevice(0);
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
@@ -617,8 +599,32 @@ bool FastllmMultiCudaMatMul(const fastllm::Data &input, fastllm::Data &weight, c
     return false;
 }
 
+std::vector <bool> streamInits = std::vector <bool> (4, 0);
+cudaStream_t streams[4];
+
+cudaStream_t *GetFastllmStream(int id) {
+    if (!streamInits[id]) {
+        streamInits[id] = true;
+        cudaSetDevice(id);
+        cudaStreamCreate(&streams[id]);
+        cudaSetDevice(0);
+    }
+    return &streams[id];
+}
+
 template <typename T>
 bool FastllmMultiCudaMLPInner(const fastllm::Data &input, fastllm::Data &weight0, fastllm::Data &weight1, fastllm::Data &output) {
+    int deviceNum = multiCudaCurrentDevices.size();
+    for (int i = 0; i < deviceNum; i++) {
+        cudaSetDevice(multiCudaCurrentDevices[i]);
+        for (int j = 0; j < deviceNum; j++) {
+            if (i != j) {
+                cudaDeviceEnablePeerAccess(multiCudaCurrentDevices[j], 0);
+            }
+        }
+    }
+    cudaSetDevice(0);
+
     std::vector <int> points = FastllmMultiCudaGetSplitPoints(weight0.dims[0] / 2);
     if ((weight0.extraCudaData.size() == 0)) {
         int mid = weight0.dims[0] / 2;
@@ -660,7 +666,6 @@ bool FastllmMultiCudaMLPInner(const fastllm::Data &input, fastllm::Data &weight0
 
     {
         // fused MLP
-auto st = std::chrono::system_clock::now();
         T *cudaInput = (T *) FastllmCudaPrepareInput(input);
         T *cudaOutput = (T *) FastllmCudaPrepareOutput(output);
 
@@ -673,8 +678,10 @@ auto st = std::chrono::system_clock::now();
         curOutputs.resize(threadNum);
 
         T *cpuInput = new T[input.Count(0)];
-        cudaMemcpy(cpuInput, cudaInput, input.GetBytes(), cudaMemcpyDeviceToHost);
-        cudaDeviceSynchronize();
+        if (threadNum > 1) {
+            cudaMemcpy(cpuInput, cudaInput, input.GetBytes(), cudaMemcpyDeviceToHost);
+            // cudaDeviceSynchronize();
+        }
 
         T *partOutput = (T*)FastllmCudaMalloc(output.GetBytes() * threadNum);
 
@@ -689,79 +696,48 @@ auto st = std::chrono::system_clock::now();
                 cpuInput, partOutput + output.Count(0) * i, threadNum, i
             ));
         }
-        for (int i = 0; i < threadNum; i++) {
+        for (int i = 1; i < threadNum; i++) {
             pool->PushOp(i, ops[i]);
         }
+        ops[0]->Run();
         for (int i = 0; i < threadNum; i++) {
             pool->Wait(i);
             delete ops[i];
         }
 
         delete[] cpuInput;
-// printf("step 0 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-
+        cudaSetDevice(0);
         if (threadNum > 1) {
             int len = output.Count(0);
-            for (int t = 0; t < threadNum; t++) {
-                if ((long long)curOutputs[t] != (long long)cudaOutput) {
-                    FastllmCudaFree(curOutputs[t]);
-                }
-
-                if ((long long)curInputs[t] != (long long)cudaInput) {
-                    FastllmCudaFree(curInputs[t]);
-                }
-            }
-
-            cudaSetDevice(0);
-            len = output.Count(0);
             int threadPerBlock = std::min(256, len);
-            FastllmReduceKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaOutput, partOutput, len, threadNum);
-            FastllmCudaFree(partOutput);
-        }
-
-        /*
-        if (threadNum > 0) {
-            int len = output.Count(0);
-            T *cpuResult = new T[len], *now = new T[len];
+/*
             for (int i = 0; i < threadNum; i++) {
-                int deviceId = multiCudaCurrentDevices[i];    
+                int deviceId = multiCudaCurrentDevices[i];
                 cudaSetDevice(deviceId);
-                if (i == 0) {
-                    cudaMemcpy(cpuResult, curOutputs[i], len * sizeof(T), cudaMemcpyDeviceToHost);
-                } else {
-                    cudaMemcpy(now, curOutputs[i], len * sizeof(T), cudaMemcpyDeviceToHost);
-                    if (typeid(T) == typeid(half)) {
-                        for (int i = 0; i < len; i++) {
-                            cpuResult[i] = __hadd(((half*)cpuResult)[i], ((half*)now)[i]);
-                        }
-                    } else {
-                        for (int i = 0; i < len; i++) {
-                            cpuResult[i] = (T)((float)cpuResult[i] + (float)now[i]);
-                        }
-                    }
-                }
-
-                if ((long long)curOutputs[i] != (long long)cudaOutput) {
-                    FastllmCudaFree(curOutputs[i]);
-                }
-
-                if ((long long)curInputs[i] != (long long)cudaInput) {
-                    FastllmCudaFree(curInputs[i]);
+                if (deviceId > 0) {
+                    cudaMemcpyAsync(partOutput + len * i, curOutputs[i], len * sizeof(T), cudaMemcpyDeviceToDevice, *GetFastllmStream(deviceId));
                 }
             }
-
+            for (int i = 0; i < threadNum; i++) {
+                cudaStreamSynchronize(*GetFastllmStream(multiCudaCurrentDevices[i]));
+            }
             cudaSetDevice(0);
-            cudaMemcpy(cudaOutput, cpuResult, len * sizeof(T), cudaMemcpyHostToDevice);
-
-            delete[] cpuResult;
-            delete[] now;
+*/
+            FastllmReduceKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaOutput, partOutput, len, threadNum);
         }
-        */
-        
-        cudaSetDevice(0);
+
+        for (int t = 0; t < threadNum; t++) {
+            if ((long long)curOutputs[t] != (long long)cudaOutput) {
+                FastllmCudaFree(curOutputs[t]);
+            }
+            if ((long long)curInputs[t] != (long long)cudaInput) {
+                FastllmCudaFree(curInputs[t]);
+            }
+        }
+        FastllmCudaFree(partOutput);
+
         FastllmCudaFinishInput(input, cudaInput);
         FastllmCudaFinishOutput(output, cudaOutput);
-// printf("step 1 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
     }
     return true;
 }
