@@ -1,6 +1,8 @@
 #include <cstdio>
 #include <ctime>
+#ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#endif
 
 float exponential_rand() {
 	float val = ((float)rand())/RAND_MAX;
