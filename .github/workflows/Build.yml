@@ -14,17 +14,17 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v2
     
-    - name: Build with arm64-v8a
-      run: |
-        wget -q https://dl.google.com/android/repository/android-ndk-r22b-linux-x86_64.zip
-        unzip android-ndk-r22b-linux-x86_64.zip
-        export NDK=$GITHUB_WORKSPACE/android-ndk-r22b
-        mkdir build-android
-        cd build-android
+    #- name: Build with arm64-v8a
+    #  run: |
+    #    wget -q https://dl.google.com/android/repository/android-ndk-r22b-linux-x86_64.zip
+    #    unzip android-ndk-r22b-linux-x86_64.zip
+    #    export NDK=$GITHUB_WORKSPACE/android-ndk-r22b
+    #    mkdir build-android
+    #    cd build-android
         #ls ${NDK}/build/cmake/android.toolchain.cmake
-        cmake -DCMAKE_MAKE_PROGRAM=/usr/bin/make -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_TOOLCHAIN_FILE=${NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 -DCMAKE_CXX_FLAGS=-march=armv8.2a+dotprod ..
-        make -j -B
-        cp main fastllm-main-android
+    #    cmake -DCMAKE_MAKE_PROGRAM=/usr/bin/make -DCMAKE_CXX_COMPILER=/usr/bin/g++ -DCMAKE_TOOLCHAIN_FILE=${NDK}/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 -DCMAKE_CXX_FLAGS=-march=armv8.2a+dotprod ..
+    #    make -j -B
+    #    cp main fastllm-main-android
         
     - name: Build with x86
       run: |
