@@ -3010,6 +3010,7 @@ struct CudaMemoryBuffer {
             data(data), size(size), busy(busy) {}
 };
 std::map<int, std::vector <CudaMemoryBuffer>> cudaBuffersMap;
+std::map<int, int> cudaBuffersMinId; // 最小的空闲id
 std::map<int, size_t> noBusyCnt;
 std::map<int, std::vector <CudaMemoryBuffer>> bigBuffersMap;
 
@@ -3065,10 +3066,13 @@ void * FastllmCudaMalloc(size_t size) {
         return ret;
     }
     auto &cudaBuffers = cudaBuffersMap[id];
-    for (int i = 0; i < cudaBuffers.size(); i++) {
+    for (int i = cudaBuffersMinId[id]; i < cudaBuffers.size(); i++) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy) {
             cudaBuffers[i].busy = true;
             noBusyCnt[id] -= cudaBuffers[i].size;
+            while (cudaBuffers[cudaBuffersMinId[id]].busy) {
+                cudaBuffersMinId[id]++;
+            }
             return cudaBuffers[i].data;
         }
     }
@@ -3117,6 +3121,7 @@ void FastllmCudaFree(void *ret) {
             if (cudaBuffers[i].data == ret) {
                 noBusyCnt[it.first] += cudaBuffers[i].size;
                 cudaBuffers[i].busy = false;
+                cudaBuffersMinId[it.first] = std::min(cudaBuffersMinId[it.first], i);
                 return;
             }
         }
