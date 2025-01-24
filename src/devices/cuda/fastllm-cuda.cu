@@ -1847,30 +1847,23 @@ template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvFp16Int4NoZeroKernel2(half *A, uint8_t *B, half *C,
                                                 half *bias, float *scales, float *mins,
                                                 int m, int k) {
-    __shared__ float sdata[PART][THREAD_PER_BLOCK];
+    __shared__ float sdata[THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
-    float minvs[PART];
 
     // 1. 计算
     int st = blockIdx.x * PART;
     int end = st + PART;
-    for (int p = 0; p < PART; p++) {
-        sdata[p][tid] = 0;
-        minvs[p] = mins[st + p] / scales[st + p];
-    }
-
-    for (int i = tid; i < m / 2; i += THREAD_PER_BLOCK) {
-        for (int p = 0; p < PART; p++) {
-            uint8_t now = B[(st + p) * m / 2 + i];
-            sdata[p][tid] += ((float)A[i * 2] * (minvs[p] + (now >> 4)) + (float)A[i * 2 + 1] * (minvs[p] + (now & 15)));
+    for (int p = st; p < end; p++) {
+        sdata[tid] = 0;
+        float minv = mins[p] / scales[p];
+        for (int i = tid; i < m / 2; i += THREAD_PER_BLOCK) {
+            uint8_t now = B[p * m / 2 + i];
+            sdata[tid] += ((float)A[i * 2] * (minv + (now >> 4)) + (float)A[i * 2 + 1] * (minv + (now & 15)));
         }
         __syncthreads();
-    }
-
-    for (int p = 0; p < PART; p++) {
         for (unsigned int s = 1; s < THREAD_PER_BLOCK; s *= 2) {
             if ((tid & (2 * s - 1)) == 0) {
-                sdata[p][tid] += sdata[p][tid + s];
+                sdata[tid] += sdata[tid + s];
             }
             __syncthreads();
         }
@@ -4846,7 +4839,7 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
 
 void LaunchFastllmGemmFp16Int4NoZero(half *input, uint8_t *weight, half *output, half *bias, float *scales, float *mins, int n, int m, int k) {
     for (int i = 0; i < n; i++) {
-        FastllmGemvFp16Int4NoZeroKernel2<128, 4> <<< k / 4, 128 >>>(input + i * m, weight, output + i * k, bias, scales, mins, m, k);
+        FastllmGemvFp16Int4NoZeroKernel2<64, 1> <<< k / 1, 64 >>>(input + i * m, weight, output + i * k, bias, scales, mins, m, k);
     }
 }
 
