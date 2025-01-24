@@ -434,6 +434,14 @@ __global__ void FastllmCudaBiasKernel(half *a, half *bias, int k) {
     }
 }
 
+__global__ void FastllmReluKernel(float* a, float *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = a[idx];
+        b[idx] = x > 0 ? x : 0;
+    }
+}
+
 __global__ void FastllmGeluKernel(float* a, float *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -1465,6 +1473,8 @@ __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(half *A, half *B, half *C, ha
     for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
         
     const half *baseB = B + p * m;
+
+    if (m % 4 == 0) {
 #pragma unroll
         for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
 #pragma unroll
@@ -1483,6 +1493,14 @@ __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(half *A, half *B, half *C, ha
                 sdata[x][tid] += sum;
             }
         }
+    } else {
+        for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    sdata[x][tid] += (float)A[i + x * m] * (float)baseB[i];
+                }
+        }
+    }
     __syncthreads();
     float diff = 0.0f;
     for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
@@ -1525,8 +1543,9 @@ __global__ void FastllmGemvFp32Fp16Kernel2MultiRow(float *A, half *B, float *C, 
     for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
         
     const half *baseB = B + p * m;
+    if (m % 4 == 0) {
 #pragma unroll
-        for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
+        for (int i = tid * 4; i + 3 < m; i += THREAD_PER_BLOCK * 4) {
 #pragma unroll
             for (int x = 0; x < PART; x++) {
                 regA = FETCH_FLOAT4(A[i + x * m]);
@@ -1543,6 +1562,14 @@ __global__ void FastllmGemvFp32Fp16Kernel2MultiRow(float *A, half *B, float *C, 
                 sdata[x][tid] += sum;
             }
         }
+    } else {
+        for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                sdata[x][tid] += A[i + x * m] * (float)baseB[i];
+            }
+        }
+    }
     __syncthreads();
     float diff = 0.0f;
     for (unsigned int s = THREAD_PER_BLOCK/2; s > 0; s >>= 1) {
@@ -3268,6 +3295,22 @@ void FastllmCudaMemcpy2DDeviceToDeviceBatch(void ** 	dsts, size_t *	dpitchs, voi
     DeviceSync();
 }
 
+bool FastllmCudaRelu(const fastllm::Data &input, fastllm::Data &output) {
+    int len = input.Count(0);
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
+    int threadPerBlock = std::min(256, len);
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmReluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
+    } else {
+        printf("Relu datatype error.\n");
+        exit(0);
+    }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
 bool FastllmCudaGelu(const fastllm::Data &input, fastllm::Data &output) {
     int len = input.Count(0);
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
@@ -3544,7 +3587,10 @@ bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fast
     int inner = input.strides[axis];
 
     if (inner == 1) {
-        if (input.dataType == fastllm::DataType::FLOAT32) {
+        if (gamma.dataType != fastllm::DataType::FLOAT32 || beta.dataType != fastllm::DataType::FLOAT32) {
+            printf("layernorm datatype error.\n");
+            exit(0);    
+        } else if (input.dataType == fastllm::DataType::FLOAT32) {
             if (channels < 64) {
                 FastllmLayerNormKernelInner1<1> <<< outer, 1 >>>(cudaInput, (float *) gamma.cudaData,
                                                                 (float *) beta.cudaData, cudaOutput,

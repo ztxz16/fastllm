@@ -275,6 +275,23 @@ namespace fastllm {
         Resize(dims);
     }
 
+    Data::Data (DataType type, const std::vector <int> &dims, DataDevice device, void *ptr): Data::Data(type, dims) {
+        this->isFake = true;
+        this->expansionSize = this->Count(0);
+        this->UpdateUnitSize();
+        this->dataDevice = device;
+        if (device == DataDevice::CPU) {
+            this->cpuData = (uint8_t*)ptr;
+        } else if (this->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+            this->cudaData = ptr;
+            this->dataDeviceIds = {0}; // todo 支持多卡
+#else
+            ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
+        }
+    }
+
     Data::Data(fastllm::DataType type, const std::vector<int> &dims, const std::vector<float> &data) : Data::Data(type, dims) {
         // std::cout<<"调用数值构造"<<std::endl;
         this->Allocate();
@@ -2591,7 +2608,7 @@ namespace fastllm {
                     {"input", (Data*)&input}
             }, {}, {});
         } else {
-            ErrorInFastLLM("ToDataDevice: Unsupport data type.\n");
+            ErrorInFastLLM("ToDataType: Unsupport data type.\n");
         }
     }
 
@@ -2736,6 +2753,12 @@ namespace fastllm {
 
     void TanH(const Data &input, Data &output) {
         curExecutor->Run("TanH", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
+    void Relu(const fastllm::Data &input, fastllm::Data &output) {
+        curExecutor->Run("Relu", {
                 {"input", (Data*)&input}, {"output", &output}
         }, {}, {});
     }

@@ -41,6 +41,7 @@ namespace fastllm {
         this->ops["SoftMax"] = (BaseOperator*)(new CpuSoftMaxOp());
         this->ops["Silu"] = (BaseOperator*)(new CpuSiluOp());
         this->ops["TanH"] = (BaseOperator*)(new CpuTanHOp());
+        this->ops["Relu"] = (BaseOperator*)(new CpuReluOp());
         this->ops["Gelu"] = (BaseOperator*)(new CpuGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CpuGeluNewOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CpuSwigluOp());
@@ -2170,6 +2171,8 @@ namespace fastllm {
         Data &weight = *(datas.find("weight")->second);
         Data &bias = *(datas.find("bias")->second);
 
+        AssertInFastLLM(bias.dataType == DataType::FLOAT32, "Linear's bias' type should be float32.\n");
+
         output.Allocate(0.0f);
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
@@ -3419,6 +3422,23 @@ namespace fastllm {
         return r;
     }
 
+    void CpuReluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Relu error: Data's type should be float32.\n");
+
+        float *inputData = (float*)input.cpuData;
+        float *outputData = (float*)output.cpuData;
+        int len = input.Count(0);
+        int i = 0;
+        for (; i < len; i++) {
+            float x = inputData[i];
+            outputData[i] = x > 0 ? x : 0;
+        }
+    }
+
     void CpuGeluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -3715,7 +3735,7 @@ namespace fastllm {
         Data &input1 = *(datas.find("input1")->second);
         float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0;
 
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 || input1.dataType == DataType::FLOAT16,
+        AssertInFastLLM(input0.dataType == DataType::FLOAT32 || input0.dataType == DataType::FLOAT16,
                         "AddTo error: Data's type should be float32 or float16.\n");
         AssertInFastLLM(input0.dims == input1.dims, "AddTo error: input's shape should be same.\n");
 

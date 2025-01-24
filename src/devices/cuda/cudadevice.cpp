@@ -28,6 +28,7 @@ namespace fastllm {
         this->ops["MatMul"] = (BaseOperator*)(new CudaMatMulOp());
         this->ops["MatMulTransB"] = (BaseOperator*)(new CudaMatMulTransBOp());
         this->ops["SoftMax"] = (BaseOperator*)(new CudaSoftMaxOp());
+        this->ops["Relu"] = (BaseOperator*)(new CudaReluOp());
         this->ops["Gelu"] = (BaseOperator*)(new CudaGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CudaGeluNewOp());
         this->ops["Silu"] = (BaseOperator*)(new CudaSiluOp());
@@ -322,7 +323,9 @@ namespace fastllm {
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
-        if (input.dataType == DataType::FLOAT16) {
+        if (bias.dataType != DataType::FLOAT32) {
+            ErrorInFastLLM("Linear error: unsupport bias' dataType.\n");
+        } else if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaHalfMatMulFloat16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT8) {
@@ -666,6 +669,15 @@ namespace fastllm {
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16, "Gelu error: Data's type should be float32 or float16.\n");
         FastllmCudaGelu(input, output);
+    }
+
+    void CudaReluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Relu error: Data's type should be float32\n");
+        FastllmCudaRelu(input, output);
     }
 
     void CudaSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
