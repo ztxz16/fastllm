@@ -35,7 +35,7 @@ jobs:
         cp main fastllm-main-x86_64
         
     - name: Export and Upload Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: Output
         path: |
