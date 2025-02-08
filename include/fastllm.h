@@ -179,6 +179,7 @@ namespace fastllm {
         FLOAT32 = 0, BFLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6, FLOAT16 = 7,
         INT4_NOZERO = 8, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale
         INT4_GROUP = 9, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale, 且使用分组量化
+        FP8_E4M3 = 10,
         INT32PARAM = 100, // int32的参数，这种类型的数据永远存在CPU上
         DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV
     };
@@ -522,8 +523,8 @@ namespace fastllm {
     void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset);
 
     bool CanRunMergeMOE();
-    void MergeMOE(const Data &input, const Data &logits, std::vector <Data*> weights, std::vector <Data*> biass, 
-                float routeScale, float sharedScale, int topk, Data &output);
+    void MergeMOE(const Data &input, const Data &logits, Data &gateBias, std::vector <Data*> weights, std::vector <Data*> biass, 
+                float routeScale, float sharedScale, int topk, bool needNorm, Data &output);
 
     void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
                    int group, float scale, int attentionType);
@@ -577,6 +578,10 @@ namespace fastllm {
     void TanH(const Data &input, Data &output);
 
     void Relu(const Data &input, Data &output);
+
+    void Sigmoid(const Data &input, Data &output);
+
+    void Normalize(const Data &input, Data &output, int axis);
 
     void Gelu(const Data &input, Data &output);
     
