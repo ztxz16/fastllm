@@ -43,6 +43,14 @@
 #endif
 
 namespace fastllm {
+    static bool StringEndWith(const std::string &s, const std::string &end) {
+        return s.size() >= end.size() && s.substr(s.size() - end.size()) == end;
+    }
+
+    static bool StringStartWith(const std::string &s, const std::string &end) {
+        return s.size() >= end.size() && s.substr(0, end.size()) == end;
+    }
+
     static void MySleep(int t) {
         std::this_thread::sleep_for(std::chrono::seconds(t));
     }
@@ -87,7 +95,7 @@ namespace fastllm {
         float dict[65536];
 
         FP16ToFP32Manager() {
-            for (uint16_t i = 0; i < 65535; i++) {
+            for (int i = 0; i < 65536; i++) {
                 dict[i] = half_to_float(i);
             }
         }

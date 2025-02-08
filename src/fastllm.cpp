@@ -2624,13 +2624,13 @@ namespace fastllm {
         return curExecutor->CanRunOnFirstDevice("MergeMOE", {}, {}, {});
     }
 
-    void MergeMOE(const Data &input, const Data &logits, std::vector <Data*> weights, std::vector <Data*> biass, 
-                float routeScale, float sharedScale, int topk, Data &output) {
+    void MergeMOE(const Data &input, const Data &logits, Data &gateBias, std::vector <Data*> weights, std::vector <Data*> biass, 
+                float routeScale, float sharedScale, int topk, bool needNorm, Data &output) {
         curExecutor->Run("MergeMOE", {
-                {"input", (Data*)&input}, {"logits", (Data*)&logits},
+                {"input", (Data*)&input}, {"logits", (Data*)&logits}, {"gateBias", (Data*)&gateBias},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
                 {"output", (Data*)&output}
-        }, {{"sharedScale", sharedScale}, {"routeScale", routeScale}}, {{"topk", topk}});
+        }, {{"sharedScale", sharedScale}, {"routeScale", routeScale}}, {{"topk", topk}, {"needNorm", needNorm}});
     }
 
     // attentionType
@@ -2745,6 +2745,12 @@ namespace fastllm {
         }, {}, {{"axis", axis}});
     }
 
+    void Normalize(const Data &input, Data &output, int axis) {
+        curExecutor->Run("Normalize", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {{"axis", axis}});
+    }
+
     void Silu(const fastllm::Data &input, fastllm::Data &output) {
         curExecutor->Run("Silu", {
                 {"input", (Data*)&input}, {"output", &output}
@@ -2759,6 +2765,12 @@ namespace fastllm {
 
     void Relu(const fastllm::Data &input, fastllm::Data &output) {
         curExecutor->Run("Relu", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
+    void Sigmoid(const fastllm::Data &input, fastllm::Data &output) {
+        curExecutor->Run("Sigmoid", {
                 {"input", (Data*)&input}, {"output", &output}
         }, {}, {});
     }
