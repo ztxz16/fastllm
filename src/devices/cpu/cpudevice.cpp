@@ -39,9 +39,11 @@ namespace fastllm {
         this->ops["MatMul"] = (BaseOperator*)(new CpuMatMulOp());
         this->ops["MatMulTransB"] = (BaseOperator*)(new CpuMatMulTransBOp());
         this->ops["SoftMax"] = (BaseOperator*)(new CpuSoftMaxOp());
+        this->ops["Normalize"] = (BaseOperator*)(new CpuNormalizeOp());
         this->ops["Silu"] = (BaseOperator*)(new CpuSiluOp());
         this->ops["TanH"] = (BaseOperator*)(new CpuTanHOp());
         this->ops["Relu"] = (BaseOperator*)(new CpuReluOp());
+        this->ops["Sigmoid"] = (BaseOperator*)(new CpuSigmoidOp());
         this->ops["Gelu"] = (BaseOperator*)(new CpuGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CpuGeluNewOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CpuSwigluOp());
@@ -739,10 +741,12 @@ namespace fastllm {
 
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
+        Data &gateBias = *(datas.find("gateBias")->second);
         Data &logits = *(datas.find("logits")->second);
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
         int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        int needNorm = intParams.find("needNorm") != intParams.end() ? intParams.find("needNorm")->second : 0;
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
         float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
         output.Allocate();
@@ -758,11 +762,27 @@ namespace fastllm {
             for (int j = 0; j < channels; j++) {
                 oriV.push_back(std::make_pair(-((float*)logits.cpuData)[j], j));
             }
+            if (gateBias.dims.size() > 0) {
+                ToDataType(gateBias, DataType::FLOAT32);
+                gateBias.ToDevice(DataDevice::CPU);
+                float *cpuBias = (float*)gateBias.cpuData;
+                for (int i = 0; i < channels; i++) {
+                    oriV[i].first -= cpuBias[i];
+                }
+            }
+
             sort(oriV.begin(), oriV.end());
-            
+            float sum = 1.0;
+            if (needNorm) {
+                sum = 0.0;
+                for (int j = 0; j < topk; j++) {
+                    sum += ((float*)logits.cpuData)[oriV[j].second];
+                }
+            }
+
             std::vector <std::pair <int, float> > v;
             for (int j = 0; j < topk; j++) {
-                v.push_back(std::make_pair(oriV[j].second + 1, -oriV[j].first * routeScale));
+                v.push_back(std::make_pair(oriV[j].second + 1, ((float*)logits.cpuData)[oriV[j].second] / sum * routeScale));
             }
             v.push_back(std::make_pair(0, sharedScale));
             float *inputData = (float *) input.cpuData;
@@ -947,15 +967,37 @@ namespace fastllm {
         } else {
             // normal
             Data gate, attenPart, moePart, w1, w2, w3;
-            TopK(logits, gate, topk);
-            gate.ToDevice(DataDevice::CPU);
-            float *gateData = (float*)gate.cpuData;
+            ToDataType(logits, DataType::FLOAT32);
+            logits.ToDevice(DataDevice::CPU);
+            float *cpuRouterLogits = (float*)logits.cpuData;
+            int m = logits.dims.back();
 
             if (input.dims[0] == 1) {
+                std::vector <std::pair <float, int> > v; // (value, idx)
+                for (int i = 0; i < m; i++) {
+                    v.push_back(std::make_pair(-cpuRouterLogits[i], i));
+                }
+                if (gateBias.dims.size() > 0) {
+                    ToDataType(gateBias, DataType::FLOAT32);
+                    gateBias.ToDevice(DataDevice::CPU);
+                    float *cpuBias = (float*)gateBias.cpuData;
+                    for (int i = 0; i < m; i++) {
+                        v[i].first -= cpuBias[i];
+                    }
+                }
+                sort(v.begin(), v.end());
+                float sum = 1.0;
+                if (needNorm) {
+                    sum = 0.0;
+                    for (int j = 0; j < topk; j++) {
+                        sum += cpuRouterLogits[v[j].second];
+                    }
+                }
+
                 output.Allocate(0.0f);
                 for (int j = 0; j < topk; j++) {
-                    int idx = (int)(gateData[j * 2] + 1e-1);
-                    float value = gateData[j * 2 + 1] * routeScale;
+                    int idx = v[j].second;
+                    float value = cpuRouterLogits[idx] / sum * routeScale;
 
                     Linear(input, *weights[(idx + 1) * 2], Data(), w3);
                     Swiglu(w3, w1);
@@ -977,10 +1019,32 @@ namespace fastllm {
                     currentData = &attenPart;
                     moePart.Resize(currentData->dims);
                     moePart.Allocate(0.0f);
+
+                    float *cur = cpuRouterLogits + b * m;
+                    std::vector <std::pair <float, int> > v; // (value, idx)
+                    for (int i = 0; i < m; i++) {
+                        v.push_back(std::make_pair(-cur[i], i));
+                    }
+                    if (gateBias.dims.size() > 0) {
+                        ToDataType(gateBias, DataType::FLOAT32);
+                        gateBias.ToDevice(DataDevice::CPU);
+                        float *cpuBias = (float*)gateBias.cpuData;
+                        for (int i = 0; i < m; i++) {
+                            v[i].first -= cpuBias[i];
+                        }
+                    }
+                    sort(v.begin(), v.end());
+                    float sum = 1.0;
+                    if (needNorm) {
+                        sum = 0.0;
+                        for (int j = 0; j < topk; j++) {
+                            sum += cur[v[j].second];
+                        }
+                    }
                     
                     for (int j = 0; j < topk; j++) {
-                        int idx = (int)(gateData[(b * topk + j) * 2] + 1e-1);
-                        float value = gateData[(b * topk + j) * 2 + 1] * routeScale;
+                        int idx = v[j].second;
+                        float value = cur[idx] / sum * routeScale;
 
                         Linear(*currentData, *weights[(idx + 1) * 2], Data(), w3);
                         Swiglu(w3, w1);
@@ -3208,6 +3272,85 @@ namespace fastllm {
         }
     }
 
+    void CpuNormalizeOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "Normalize error: Data's type should be float32 or float16.\n");
+
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        int outer = input.Count(0) / input.Count(axis);
+        int channels = input.dims[axis];
+        int inner = input.Count(axis + 1);
+
+        float *inputData = (float*)input.cpuData;
+        float *outputData = (float*)output.cpuData;
+
+        if (input.dataType == DataType::FLOAT16) {
+            int len = input.Count(0);
+            inputData = new float[len];
+            outputData = new float[len];
+            for (int i = 0; i < len; i++) {
+                inputData[i] = fp16tofp32.dict[((uint16_t *) input.cpuData)[i]];
+            }
+        }
+        if (inner == 1) {
+            for (int i = 0; i < outer; i++) {
+                float sum = 0;
+                for (int j = 0; j < channels; j++) {
+                    sum += inputData[j];
+                }
+                for (int j = 0; j < channels; j++) {
+                    inputData[j] /= sum;
+                }
+                inputData += channels;
+                outputData += channels;
+            }
+        } else {
+            /*for (int i = 0; i < outer; i++) {
+                std::vector<float> maxValue(inner, -FLT_MAX);
+                for (int j = 0; j < channels; j++) {
+                    for (int k = 0; k < inner; k++) {
+                        maxValue[k] = std::max(maxValue[k], inputData[j * inner + k]);
+                    }
+                }
+                std::vector<float> sum(inner, 0.0);
+                for (int j = 0; j < channels; j++) {
+                    for (int k = 0; k < inner; k++) {
+                        outputData[j * inner + k] = std::exp(inputData[j * inner + k] - maxValue[k]);
+                        sum[k] += outputData[j * inner + k];
+                    }
+                }
+
+                for (int j = 0; j < channels; j++) {
+                    for (int k = 0; k < inner; k++) {
+                        outputData[j * inner + k] /= sum[k];
+                    }
+                }
+
+                inputData += channels * inner;
+                outputData += channels * inner;
+            }*/
+        }
+
+        if (input.dataType == DataType::FLOAT16) {
+            int len = input.Count(0);
+            inputData -= len;
+            outputData -= len;
+            for (int i = 0; i < len; i++) {
+                ((uint16_t *) output.cpuData)[i] = float_to_half(outputData[i]);
+            }
+
+            delete[] inputData;
+            delete[] outputData;
+        }
+    }
+
     void CpuSoftMaxOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -3436,6 +3579,23 @@ namespace fastllm {
         for (; i < len; i++) {
             float x = inputData[i];
             outputData[i] = x > 0 ? x : 0;
+        }
+    }
+
+    void CpuSigmoidOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Sigmoid error: Data's type should be float32.\n");
+
+        float *inputData = (float*)input.cpuData;
+        float *outputData = (float*)output.cpuData;
+        int len = input.Count(0);
+        int i = 0;
+        for (; i < len; i++) {
+            float x = inputData[i];
+            outputData[i] = 1.0 / (1.0 + exp(-x));
         }
     }
 
