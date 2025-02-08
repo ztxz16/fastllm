@@ -266,10 +266,9 @@ namespace fastllm {
             }           
         }
 
-        Data alibiData;
-        if (this->weight.dicts["use_alibi"] == "1") {
-            std::vector<float> alibi = GetInterleave(num_attention_heads);
-            alibiData.CopyFrom(Data(DataType::FLOAT32, {(int) alibi.size()}, alibi));
+        std::string scoring_func = "softmax";
+        if (this->weight.dicts.find("scoring_func") != this->weight.dicts.end()) {
+            scoring_func = this->weight.dicts["scoring_func"];
         }
 
         int maxLen = inputIds.dims[1];
@@ -301,6 +300,10 @@ namespace fastllm {
                 }
             }
         }
+
+        float softmax_scale = 1.0 / sqrt(q_head_dim);
+        float mscale = 0.1 * rope_scaling_mscale * log(rope_factor) + 1.0;
+        softmax_scale = softmax_scale * mscale * mscale;
                     
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
@@ -419,7 +422,8 @@ namespace fastllm {
 
             CatDirect(pastKey, k, 1);
             CatDirect(pastValue, v, 1);
-            Attention(q, pastKey, pastValue, attentionMask, attenOutput, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(q_head_dim), 1);
+            Attention(q, pastKey, pastValue, attentionMask, attenOutput, q.dims[0] / pastKey.dims[0], softmax_scale, 1);
+
             PermuteSelf(attenOutput, {1, 0, 2});
             attenOutput.Reshape({seqlen, bsz, -1});
             PermuteSelf(attenOutput, {1, 0, 2});
@@ -429,7 +433,6 @@ namespace fastllm {
 
             AddTo(hiddenStates, attenLastOutput);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);            
-
             // 2. moe mlp
             if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.gate_proj.weight") != weight.weight.end()) {
                 if (CanRunLinearEx(LinearExType::ExSilu)) {
@@ -445,30 +448,55 @@ namespace fastllm {
             } else {
                 // 这里是moe mlp
                 std::string gateWeightName = "model.layers." + std::to_string(i) + ".mlp.gate.weight";
+                std::string gateBiasName = "model.layers." + std::to_string(i) + ".mlp.gate.e_score_correction_bias";
+
                 int batch = attenInput.dims[0], len = attenInput.dims[1];
                 attenInput.Reshape({batch * len, attenInput.dims[2]});
                 Linear(attenInput, weight[gateWeightName], Data(), routerLogits);
-                Softmax(routerLogits, routerLogits, -1);
+
+                bool needNorm = false;
+                if (scoring_func == "sigmoid") {
+                    Sigmoid(routerLogits, routerLogits);
+                    needNorm = true;
+                } else {
+                    Softmax(routerLogits, routerLogits, -1);
+                }
 
                 if (this->mergeSwiglu && CanRunMergeMOE()) {
                     MergeMOE (
-                        attenInput, routerLogits,
+                        attenInput, routerLogits, weight[gateBiasName],
                         weights[i], biass[i],
                         this->routed_scaling_factor, 1.0f,
-                        this->num_experts_per_tok,
+                        this->num_experts_per_tok, needNorm,
                         moeFinal
                     );
                 } else {
-                    TopK(routerLogits, gate, this->num_experts_per_tok);
-                    gate.ToDevice(DataDevice::CPU);
-                    float *gateData = (float*)gate.cpuData;
-                    /// TODO: 这里是greedy topk， 需要实现group limited topk
+                    Data &bias = weight[gateBiasName];                  
+                    ToDataType(routerLogits, DataType::FLOAT32);
+                    routerLogits.ToDevice(DataDevice::CPU);
+                    float *cpuRouterLogits = (float*)routerLogits.cpuData;
+                    int m = routerLogits.dims.back();
 
                     moeFinal = Data();
                     moeFinal.Resize({0, attenInput.dims[1]});
                     moeFinal.Expansion(attenInput.dims);
 
                     for (int b = 0; b < batch * len; b++) {
+                        float *cur = cpuRouterLogits + b * m;
+                        std::vector <std::pair <float, int> > v; // (value, idx)
+                        for (int i = 0; i < m; i++) {
+                            v.push_back(std::make_pair(-cur[i], i));
+                        }
+                        if (bias.dims.size() > 0) {
+                            ToDataType(bias, DataType::FLOAT32);
+                            bias.ToDevice(DataDevice::CPU);
+                            float *cpuBias = (float*)bias.cpuData;
+                            for (int i = 0; i < m; i++) {
+                                v[i].first -= cpuBias[i];
+                            }
+                        }
+
+                        sort(v.begin(), v.end());
                         Data *currentData = &attenInput;
                         if (batch * len != 1) {
                             Split(attenInput, 0, b, b + 1, attenPart);
@@ -477,9 +505,20 @@ namespace fastllm {
                         moePart.Resize(currentData->dims);
                         moePart.Allocate(0.0f);
 
+                        float sum = 0.0;
                         for (int j = 0; j < this->num_experts_per_tok; j++) {
-                            int idx = (int)(gateData[(b * this->num_experts_per_tok + j) * 2] + 1e-1);
-                            float value = gateData[(b * this->num_experts_per_tok + j) * 2 + 1];
+                            float value = cur[v[j].second];
+                            sum += value;
+                        }
+                        if (!needNorm) {
+                            sum = 1.0;
+                        }
+
+                        for (int j = 0; j < this->num_experts_per_tok; j++) {
+                            int idx = v[j].second;
+                            float value = cur[idx];
+
+                            value /= sum;
                             value *= routed_scaling_factor;
                             if (this->mergeSwiglu) {
                                 if (CanRunLinearEx(LinearExType::ExSwiglu)) {
@@ -590,12 +629,6 @@ namespace fastllm {
                                                const std::vector <GenerationConfig> &generationConfigs,
                                                const LastTokensManager &lastTokens,
                                                std::vector <std::vector <float>*> *retLogits) {
-        Data alibiData;
-        if (this->weight.dicts["use_alibi"] == "1") {
-            std::vector<float> alibi = GetInterleave(num_attention_heads);
-            alibiData.CopyFrom(Data(DataType::FLOAT32, {(int) alibi.size()}, alibi));
-        }
-
         Data hiddenStates;
         Data attenInput;
         Data q, k, v, qkv;
@@ -689,10 +722,8 @@ namespace fastllm {
                     cosDataPtrList[b] = new Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, pair.second);
                 }
 
-                if (alibiData.dims.size() == 0) {
-                    fastllm::LlamaRotatePosition2D(q, *positionIds[b], *sinDataPtrList[b], *cosDataPtrList[b], rotary_dim);
-                    fastllm::LlamaRotatePosition2D(k, *positionIds[b], *sinDataPtrList[b], *cosDataPtrList[b], rotary_dim);
-                }
+                fastllm::LlamaRotatePosition2D(q, *positionIds[b], *sinDataPtrList[b], *cosDataPtrList[b], rotary_dim);
+                fastllm::LlamaRotatePosition2D(k, *positionIds[b], *sinDataPtrList[b], *cosDataPtrList[b], rotary_dim);
 
                 PermuteSelf(q, {0, 2, 1, 3});
                 PermuteSelf(k, {0, 2, 1, 3});
@@ -737,22 +768,7 @@ namespace fastllm {
 
                 // 1.2 Attention
                 // 1.2.0 q * k^T
-                if (alibiData.dims.size() == 0) {
-                    Attention(q, pastKey, pastValue, attentionMask[b] == nullptr ? Data() : *attentionMask[b], curAttenOutput, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
-                } else {
-                    MatMulTransB(q, pastKey, attenWeights, 1.0 / sqrt(head_dim), q.dims[0] / pastKey.dims[0]);
-                    attenWeights.Reshape({1, attenWeights.dims[0], attenWeights.dims[1], attenWeights.dims[2]});
-                    if (alibiData.dims.size() != 0) {
-                        AlibiMask(attenWeights, alibiData, -10000);
-                    } else if (attentionMask[b] != nullptr) {
-                        AttentionMask(attenWeights, *attentionMask[b], -10000);
-                    }
-
-                    Softmax(attenWeights, attenWeights, -1);
-                    MatMul(attenWeights, pastValue, curAttenOutput, 1.f, attenWeights.dims[1] / pastValue.dims[0]);
-                    curAttenOutput.Reshape({curAttenOutput.dims[1], curAttenOutput.dims[2], curAttenOutput.dims[3]});
-                }
-
+                Attention(q, pastKey, pastValue, attentionMask[b] == nullptr ? Data() : *attentionMask[b], curAttenOutput, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
                 PermuteSelf(curAttenOutput, {1, 0, 2});
                 curAttenOutput.Reshape({seqLens[b], bsz, -1});
                 PermuteSelf(curAttenOutput, {1, 0, 2});
