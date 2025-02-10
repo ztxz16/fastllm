@@ -482,6 +482,90 @@ namespace fastllm {
         }
     };
 
+    struct MultiThreadBase3GroupQuantizationOp : MultiThreadBaseOp {
+        int st, end, m;
+        float *f32;
+        uint8_t *u8;
+        uint16_t *halfScales;
+        int group, groupCnt;
+
+        MultiThreadBase3GroupQuantizationOp (int st, int end, int m,
+                                        float *f32, uint8_t *u8, uint16_t *halfScales, int group, int groupCnt) :
+                                        st(st), end(end), m(m), f32(f32), u8(u8), halfScales(halfScales), group(group), groupCnt(groupCnt) {}
+        
+        void Run() {
+            std::vector <uint8_t> base = {1, 3, 9, 27, 81};
+            int bytesPerGroup = ((groupCnt - 1) / 5) + 1;
+            for (int i = st; i < end; i++) {
+                for (int g = 0; g < group; g++) {
+                    uint8_t *cur = u8 + i * group * bytesPerGroup + g * bytesPerGroup;
+                    int cid = i * group + g;
+                    int groupStart = g * groupCnt;
+                    int groupEnd = std::min((g + 1) * groupCnt, m);
+
+                    float minValue = 1e9, maxValue = -1e9, mean = 0.0;
+                    for (int j = groupStart; j < groupEnd; j++) {
+                        minValue = std::min(minValue, f32[i * m + j]);
+                        maxValue = std::max(maxValue, f32[i * m + j]);
+                        mean += fabs(f32[i * m + j]);
+                    }
+                    mean = std::max(1e-5f, mean / (groupEnd - groupStart));
+                    float scale = mean;
+                    halfScales[i * group + g] = float_to_half(scale);
+
+                    memcpy(cur, cur + bytesPerGroup, 0);
+                    for (int j = groupStart; j < groupEnd; j++) {
+                        float now = f32[i * m + j];
+                        uint8_t curV = (now > -scale * 0.5) + (now > scale * 0.5);
+                        cur[(j - groupStart) / 5] += curV * base[(j - groupStart) % 5];
+                    }
+                }
+            }
+        }
+    };
+
+    struct MultiThreadBase3GroupQuantizationBF16Op : MultiThreadBaseOp {
+        int st, end, m;
+        uint16_t *bf;
+        uint8_t *u8;
+        uint16_t *halfScales;
+        int group, groupCnt;
+
+        MultiThreadBase3GroupQuantizationBF16Op (int st, int end, int m,
+                                        uint16_t *bf, uint8_t *u8, uint16_t *halfScales, int group, int groupCnt) :
+                                        st(st), end(end), m(m), bf(bf), u8(u8), halfScales(halfScales), group(group), groupCnt(groupCnt) {}
+        
+        void Run() {
+            std::vector <uint8_t> base = {1, 3, 9, 27, 81};
+            int bytesPerGroup = ((groupCnt - 1) / 5) + 1;
+            for (int i = st; i < end; i++) {
+                for (int g = 0; g < group; g++) {
+                    uint8_t *cur = u8 + i * group * bytesPerGroup + g * bytesPerGroup;
+                    int cid = i * group + g;
+                    int groupStart = g * groupCnt;
+                    int groupEnd = std::min((g + 1) * groupCnt, m);
+
+                    float minValue = 1e9, maxValue = -1e9, mean = 0.0;
+                    for (int j = groupStart; j < groupEnd; j++) {
+                        minValue = std::min(minValue, bf16tofp32.dict[bf[i * m + j]]);
+                        maxValue = std::max(maxValue, bf16tofp32.dict[bf[i * m + j]]);
+                        mean += fabs(bf16tofp32.dict[bf[i * m + j]]);
+                    }
+                    mean = std::max(1e-5f, mean / (groupEnd - groupStart));
+                    float scale = mean;
+                    halfScales[i * group + g] = float_to_half(scale);
+
+                    memcpy(cur, cur + bytesPerGroup, 0);
+                    for (int j = groupStart; j < groupEnd; j++) {
+                        float now = bf16tofp32.dict[bf[i * m + j]];
+                        uint8_t curV = (now > -scale * 0.5) + (now > scale * 0.5);
+                        cur[(j - groupStart) / 5] += curV * base[(j - groupStart) % 5];
+                    }
+                }
+            }
+        }
+    };
+
     struct MultiThreadPerChannelQuantizationBF16Op : MultiThreadBaseOp {
         int st, end, m;
         uint16_t *bf;
@@ -653,6 +737,29 @@ namespace fastllm {
                 data.mins[i] = data.perChannelsConfigs[i].min;
                 data.zeros[i] = data.perChannelsConfigs[i].zeroPoint;
                 data.scales[i] = data.perChannelsConfigs[i].scale;
+            }
+            memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
+        } else if ((oriDataType == DataType::FLOAT32 || oriDataType == DataType::BFLOAT16) &&
+                (dataType == DataType::BASE3_GROUP)) {
+            int k = data.dims[0], m = data.dims[1];
+            if (groupCnt == -1) {
+                groupCnt = 128;
+            }
+            int group = (m - 1) / groupCnt + 1;
+            int bytesPerGroup = ((groupCnt - 1) / 5) + 1;
+            std::vector<uint16_t> scales;
+            std::vector<uint8_t> uDatas;
+            scales.resize(k * group);
+            int bytes = k * group * bytesPerGroup;
+            uDatas.resize(bytes);
+            data.group = group;
+            data.groupCnt = groupCnt;
+            data.halfScales.resize(k * group);
+
+            if (oriDataType == DataType::FLOAT32) {
+               (MultiThreadBase3GroupQuantizationOp(0, k, m, (float*)oriData, uDatas.data(), data.halfScales.data(), group, groupCnt)).Run();
+            } else if (oriDataType == DataType::BFLOAT16) {
+               (MultiThreadBase3GroupQuantizationBF16Op(0, k, m, (uint16_t*)oriData, uDatas.data(), data.halfScales.data(), group, groupCnt)).Run();
             }
             memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
         } else {
