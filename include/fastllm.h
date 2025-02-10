@@ -180,8 +180,17 @@ namespace fastllm {
         INT4_NOZERO = 8, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale
         INT4_GROUP = 9, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale, 且使用分组量化
         FP8_E4M3 = 10,
+        INT2_GROUP = 11, // 不用zeroPoint的int2, floatValue = min + uint4Value * scale, 且使用分组量化
+        BASE3_GROUP = 12, // 三元量化，-1 0 1
         INT32PARAM = 100, // int32的参数，这种类型的数据永远存在CPU上
         DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV
+    };
+
+    static std::map <DataType, int> DataTypeBits = {
+        {DataType::FLOAT32, 32}, {DataType::BFLOAT16, 16}, {DataType::INT16, 16}, 
+        {DataType::INT8, 8}, {DataType::INT4, 4}, {DataType::INT2, 2}, {DataType::BIT, 1}, 
+        {DataType::FLOAT16, 16}, {DataType::INT4_NOZERO, 4}, {DataType::INT4_GROUP, 4},
+        {DataType::FP8_E4M3, 8}, {DataType::INT2_GROUP, 2}, {DataType::BASE3_GROUP, 2}
     };
 
     enum DataDevice {
@@ -268,6 +277,8 @@ namespace fastllm {
         std::vector <float> scales, mins;
         std::vector <int> zeros;
         std::vector <int> weightSum; // 作为权重时，有时候需要存一些和加速计算
+
+        std::vector <uint16_t> halfScales; // 某些量化方式使用float16的scales
 
         std::string name; // weightName
         std::string fileName;
