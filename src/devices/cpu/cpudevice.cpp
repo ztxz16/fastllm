@@ -1650,6 +1650,39 @@ namespace fastllm {
         }
     };
 
+    struct MultiThreadBase3GroupLinearOp : MultiThreadBaseOp {
+        float *inputData;
+        uint8_t *weightData;
+        float *biasData, *outputData;
+        int n, m, k, st, end, group, groupCnt;
+        uint16_t *halfScales;
+
+        MultiThreadBase3GroupLinearOp(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                           int n, int m, int k, int st, int end, int group, int groupCnt, uint16_t *halfScales) : 
+            inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData),
+            n(n), m(m), k(k), st(st), end(end), group(group), groupCnt(groupCnt), halfScales(halfScales) {}
+
+        void Run() {
+            std::vector <uint8_t> base = {1, 3, 9, 27, 81};
+            int bytesPerGroup = ((groupCnt - 1) / 5) + 1;   
+            for (int i = 0; i < n; i++) {
+                for (int j = st; j < end; j++) {
+                    float now = biasData ? biasData[j] : 0.0f;
+                    for (int g = 0; g < group; g++) {
+                        uint8_t *cur = weightData + j * group * bytesPerGroup + g * bytesPerGroup;
+                        float sum = 0.0;
+                        int l = 0;
+                        for (; l < groupCnt && g * groupCnt + l < m; l++) {
+                            sum += inputData[i * m + g * groupCnt + l] * (cur[l / 5] / base[l % 5] % 3 - 1);
+                        }
+                        now += sum * fp16tofp32.dict[halfScales[j * group + g]];
+                    }
+                    outputData[i * k + j] = now;
+                }
+            }
+        }
+    };
+
     struct MultiThreadFloat16Float16LinearOp : MultiThreadBaseOp {
         uint16_t *inputData;
         uint16_t *weightData;
@@ -2551,6 +2584,34 @@ namespace fastllm {
                     delete threads[i];
                 }
 */
+            } else if (weight.dataType == DataType::BASE3_GROUP) {
+                std::vector <uint8_t> base = {1, 3, 9, 27, 81};
+                float *inputData = (float *) input.cpuData;
+                uint8_t *weightData = (uint8_t *) weight.cpuData;
+                float *outputData = (float *) output.cpuData;
+                float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+                
+                auto pool = GetAlivePool();
+                int threadNum = pool->threads.size();
+                int per = k / threadNum;
+                int cur = 0;
+                std::vector<fastllm::MultiThreadBase3GroupLinearOp*> ops;
+                for (int i = 0; i < threadNum; i++) {
+                    int end = cur + per + (cur + per * (threadNum - i) < k);
+                    if (i == threadNum - 1) {
+                        end = k;
+                    }
+                    ops.push_back(new MultiThreadBase3GroupLinearOp(inputData, weightData, biasData, outputData,
+                                                   n, m, k, cur, end, weight.group, weight.groupCnt, weight.halfScales.data()));
+                    cur = end;
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->PushOp(i, ops[i]);
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->Wait(i);
+                    delete ops[i];
+                }
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
