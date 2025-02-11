@@ -97,6 +97,27 @@ namespace fastllm {
         cosData.ToDevice(DataDevice::CPU);
         sinData.CopyFrom(Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first));
         cosData.CopyFrom(Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second));
+        for (int i = 0; i < block_cnt; i++) {
+            std::string w1WeightName = "model.layers." + std::to_string(i) + ".mlp.gate_proj.weight";
+            std::string w3WeightName = "model.layers." + std::to_string(i) + ".mlp.up_proj.weight";
+            std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+            this->weightMergeRules.push_back(
+                WeightMergeRule({WeightMergeRuleSingle({w1WeightName, w3WeightName}, swigluWeightName, std::string("linearSwiglu"))})
+            );
+
+            std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+            std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
+            std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
+            std::string kBiasName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.bias";
+            std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string vBiasName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.bias";
+            std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+            std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
+            this->weightMergeRules.push_back(
+                WeightMergeRule({WeightMergeRuleSingle({qWeightName, kWeightName, vWeightName}, mergeQkvWeightName, std::string("linear")),
+                                 WeightMergeRuleSingle({qBiasName, kBiasName, vBiasName}, mergeQkvBiasName, std::string("bias"))})
+            );
+        }
     }
 
     std::pair<std::vector<float>, std::vector<float>> LlamaModel::UpdateRotaryPosEmb(float base, float factor, int seqLen) {
@@ -137,116 +158,6 @@ namespace fastllm {
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
                             std::vector <std::vector <float>*> *retLogits) {
-        if (!mergeQKV) {
-            bool canMerge = true;
-            for (int i = 0; i < block_cnt; i++) {
-                std::string qkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.W_pack.weight";
-                
-                std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
-                std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
-                std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
-                std::string kBiasName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.bias";
-                std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
-                std::string vBiasName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.bias";
-                std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
-                std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
-
-                if (weight.weight.find(qkvWeightName) != weight.weight.end() || weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
-                    mergeQKV = true;
-                    break;
-                } else {
-                    Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
-                    Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
-                    Data vBias = (weight.weight.find(vBiasName) != weight.weight.end()) ? weight[vBiasName] : Data();
-
-                    Data &q = weight.weight[qWeightName];
-                    Data &k = weight.weight[kWeightName];
-                    Data &v = weight.weight[vWeightName];
-
-                    if ((q.dataType == DataType::INT4_GROUP && q.dims[1] % q.groupCnt != 0) || 
-                        (k.dataType == DataType::INT4_GROUP && k.dims[1] % k.groupCnt != 0) ||
-                        (v.dataType == DataType::INT4_GROUP && v.dims[1] % v.groupCnt != 0)) {
-                        canMerge = false;
-                        break;
-                    }
-
-                    if (weight.weight.find(qBiasName) != weight.weight.end()) {
-                        Data middle;
-                        Cat(qBias, kBias, -1, middle);
-                        Cat(middle, vBias, -1, weight.weight[mergeQkvBiasName]);
-                        weight.weight[mergeQkvBiasName].name = mergeQkvBiasName;
-                    } else {
-                        weight.weight[mergeQkvBiasName] = Data();
-                    }
-
-                    weight.weight[mergeQkvWeightName] = Data(q.dataType, {q.dims[0] + k.dims[0] + v.dims[0], q.dims[1]});
-                    Data &mergeQKV = weight.weight[mergeQkvWeightName];
-
-                    mergeQKV.name = mergeQkvWeightName;
-                    mergeQKV.Allocate();
-                    memcpy(mergeQKV.cpuData, q.cpuData, q.GetBytes());
-                    memcpy(mergeQKV.cpuData + q.GetBytes(), k.cpuData, k.GetBytes());
-                    memcpy(mergeQKV.cpuData + q.GetBytes() + k.GetBytes(), v.cpuData, v.GetBytes());
-                    mergeQKV.group = q.group;
-                    mergeQKV.groupCnt = q.groupCnt;
-                    mergeQKV.perChannelAxis = q.perChannelAxis;
-                    mergeQKV.perChannelsConfigs = AppendVector(q.perChannelsConfigs, AppendVector(k.perChannelsConfigs, v.perChannelsConfigs));
-                    mergeQKV.zeros = AppendVector(q.zeros, AppendVector(k.zeros, v.zeros));
-                    mergeQKV.scales = AppendVector(q.scales, AppendVector(k.scales, v.scales));
-                    mergeQKV.mins = AppendVector(q.mins, AppendVector(k.mins, v.mins));
-
-                    weight.weight.erase(qWeightName);
-                    weight.weight.erase(kWeightName);
-                    weight.weight.erase(vWeightName);
-                    weight.weight.erase(qBiasName);
-                    weight.weight.erase(kBiasName);
-                    weight.weight.erase(vBiasName);
-                }
-            }
-
-            this->mergeQKV = canMerge;
-        }
-
-        if (!mergeSwiglu) {
-            bool canMerge = true;
-            for (int i = 0; i < block_cnt; i++) {
-                std::string w1WeightName = "model.layers." + std::to_string(i) + ".mlp.gate_proj.weight";
-                std::string w3WeightName = "model.layers." + std::to_string(i) + ".mlp.up_proj.weight";
-                std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
-
-                if (weight.weight.find(swigluWeightName) != weight.weight.end()) {
-                    mergeQKV = true;
-                    break;
-                }
-                Data &w1 = weight.weight[w1WeightName], &w3 = weight.weight[w3WeightName];
-                if ((w1.dataType == DataType::INT4_GROUP && w1.dims[1] % w1.groupCnt != 0) || 
-                    (w3.dataType == DataType::INT4_GROUP && w3.dims[1] % w3.groupCnt != 0)) {
-                    canMerge = false;
-                    break;
-                }
-
-                weight.weight[swigluWeightName] = Data(w1.dataType, {w1.dims[0] + w3.dims[0], w1.dims[1]});
-                Data &swiglu = weight.weight[swigluWeightName];
-                swiglu.name = swigluWeightName;
-                swiglu.Allocate();
-                memcpy(swiglu.cpuData, w1.cpuData, w1.GetBytes());
-                memcpy(swiglu.cpuData + w1.GetBytes(), w3.cpuData, w3.GetBytes());
-                    
-                swiglu.perChannelAxis = w1.perChannelAxis;
-                swiglu.group = w1.group;
-                swiglu.groupCnt = w1.groupCnt;
-                swiglu.perChannelsConfigs = AppendVector(w1.perChannelsConfigs, w3.perChannelsConfigs);
-                swiglu.zeros = AppendVector(w1.zeros, w3.zeros);
-                swiglu.scales = AppendVector(w1.scales, w3.scales);
-                swiglu.mins = AppendVector(w1.mins, w3.mins);
-
-                weight.weight.erase(w1WeightName);
-                weight.weight.erase(w3WeightName);
-            }
-
-            this->mergeSwiglu = canMerge;            
-        }
-        
         Data alibiData;
         if (this->weight.dicts["use_alibi"] == "1") {
             std::vector<float> alibi = GetInterleave(num_attention_heads);
@@ -407,14 +318,13 @@ namespace fastllm {
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
 
-            if (this->mergeSwiglu && CanRunMLP()) {
-                std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+            std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+            if (weight.weight.find(swigluWeightName) != weight.weight.end() && CanRunMLP()) {
                 std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
                 MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), k);
                 AddTo(hiddenStates, k);
             } else {
-                if (this->mergeSwiglu) {
-                    std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+                if (weight.weight.find(swigluWeightName) != weight.weight.end()) {
                     if (CanRunLinearEx(LinearExType::ExSwiglu)) {
                         LinearEx(attenInput, weight[swigluWeightName], Data(), q, LinearExType::ExSwiglu);
                     } else {
@@ -795,14 +705,13 @@ namespace fastllm {
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
 
-            if (this->mergeSwiglu && CanRunMLP()) {
-                std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+            std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+            if (weight.weight.find(swigluWeightName) != weight.weight.end() && CanRunMLP()) {
                 std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
                 MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), k);
                 AddTo(hiddenStates, k);
             } else {
-                if (this->mergeSwiglu) {
-                    std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+                if (weight.weight.find(swigluWeightName) != weight.weight.end()) {
                     if (CanRunLinearEx(LinearExType::ExSwiglu)) {
                         LinearEx(attenInput, weight[swigluWeightName], Data(), w1, LinearExType::ExSwiglu);
                     } else {

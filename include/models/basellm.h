@@ -101,6 +101,31 @@ namespace fastllm {
         YARN = 4
     };
 
+    struct WeightMergeRuleSingle {
+        std::vector <std::string> inputs;
+        std::string output;
+        std::string type;
+
+        WeightMergeRuleSingle (const std::vector <std::string> &inputs, std::string output, std::string type) :
+            inputs(inputs), output(output), type(type) {}
+    };
+
+    struct WeightMergeRule {
+        // 权重合并的规则
+        std::vector <WeightMergeRuleSingle> rules; 
+        // 当rules涉及到的所有权重都被读取后，依此遍历rules中的每条规则，如果都满足合并条件，那么执行合并
+
+        std::set <std::string> allInputs; // 所有涉及到的合并前的name
+
+        WeightMergeRule (const std::vector <WeightMergeRuleSingle> &rules) : rules (rules) {
+            for (auto &rule : rules) {
+                for (auto &input : rule.inputs) {
+                    allInputs.insert(input);
+                }
+            }
+        }
+    };
+
     class basellm {
     public:
         basellm() {};
@@ -236,6 +261,8 @@ namespace fastllm {
         int rotary_dim = 64;
         const float scale_attn = sqrt(head_dim);
         int block_cnt = 28;
+
+        std::vector <WeightMergeRule> weightMergeRules;
 
         std::vector<std::vector<float> > sin, cos;
 

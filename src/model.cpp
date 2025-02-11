@@ -22,6 +22,10 @@
 #include "phi3.h"
 #include "cogvlm.h"
 
+#ifdef USE_TFACC
+#include "fastllm-tfacc.h"
+#endif
+
 namespace fastllm {
     std::string ReadAllFile(const std::string &fileName) {
         std::ifstream t(fileName.c_str(), std::ios::in);
@@ -743,11 +747,15 @@ namespace fastllm {
 
         int cur = 0;
         long long totalBytes = 0;
+        std::set <std::string> allWeightNames; // 所有创建了的weight name
+        std::set <std::string> allFinishNames; // 转换好的weight name
+
         for (auto &tensorName : tensors) {
             auto &tensor = safeTensors.itmeDict[tensorName];
             auto oriDataType = DataType::FLOAT32;
             for (auto &it : tensorMap[tensorName]) {
                 std::string weightName = it.first;
+                allWeightNames.insert(weightName);
                 auto dataType = it.second;
                 if (dataType >= DATA_AUTO_NONE) {
                     // AUTO类型
@@ -902,6 +910,106 @@ namespace fastllm {
                             }
                             model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, tensor.buffer, groupCnt);
                             tensor.ClearBuffer();
+
+                            locker.lock();
+                            allFinishNames.insert(weightName);
+                            // 检查是否需要合并权重
+                            bool needMerge = false;
+                            for (auto &rule : model->weightMergeRules) {
+                                if (rule.allInputs.find(weightName) == rule.allInputs.end()) {
+                                    continue;
+                                }
+                                needMerge = true;
+                                bool canMerge = true;
+                                for (auto &name : rule.allInputs) {
+                                    if (allWeightNames.find(name) != allWeightNames.end() && 
+                                        allFinishNames.find(name) == allFinishNames.end()) {
+                                        canMerge = false;
+                                    }
+                                }
+                                if (!canMerge) {
+                                    continue;
+                                }
+                                for (auto &it : rule.rules) {
+                                    for (auto input : it.inputs) {
+                                        if (model->weight[input].dims.size() == 2) {
+                                            if (model->weight[input].groupCnt != -1 && 
+                                                model->weight[input].dims[1] % model->weight[input].groupCnt != 0) {
+                                                canMerge = false;
+                                                break;
+                                            }
+                                            if (model->weight[input].dataType != model->weight[input].dataType ||
+                                                model->weight[input].dims[1] != model->weight[input].dims[1]) {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (!canMerge) {
+                                    continue;
+                                }
+
+                                locker.unlock();
+                                for (auto &it : rule.rules) {
+                                    int dim0Len = 0;
+                                    for (auto input : it.inputs) {
+                                        dim0Len += model->weight[input].dims[0];
+                                    }
+                                    if (model->weight[it.inputs[0]].dims.size() == 1) {
+                                        std::string mergeName = it.output;
+                                        model->weight[mergeName] = Data(model->weight[it.inputs[0]].dataType, {dim0Len});
+                                        Data &mergeData = model->weight[mergeName];
+                                        mergeData.name = mergeName;
+                                        mergeData.Allocate();
+                                        uint64_t offset = 0;
+                                        for (auto input : it.inputs) {
+                                            memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
+                                            offset += model->weight[input].GetBytes();
+                                        }
+                                    } else {
+                                        std::string input0 = it.inputs[0];
+                                        std::string mergeName = it.output;
+                                        model->weight[mergeName] = Data(model->weight[input0].dataType, {dim0Len, model->weight[input0].dims[1]});
+                                        Data &mergeData = model->weight[mergeName];
+                                        mergeData.name = mergeName;
+                                        mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
+                                        mergeData.group = model->weight[input0].group;
+                                        mergeData.groupCnt = model->weight[input0].groupCnt;
+
+                                        mergeData.Allocate();
+                                        uint64_t offset = 0;
+                                        for (auto input : it.inputs) {
+                                            mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, model->weight[input].perChannelsConfigs);
+                                            mergeData.zeros = AppendVector(mergeData.zeros, model->weight[input].zeros);
+                                            mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
+                                            mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
+                                            mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
+                                            memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
+                                            offset += model->weight[input].GetBytes();
+                                        }
+#ifdef USE_TFACC
+                                        locker.lock();
+                                        mergeData.weightSum.resize(1);
+                                        RegisterFastllmData(&mergeData, it.type);
+                                        locker.unlock();
+#endif
+                                    }
+
+                                    for (auto input : it.inputs) {
+                                        model->weight.weight.erase(input);
+                                    }
+                                }
+                                locker.lock();
+                            }
+                            locker.unlock();
+#ifdef USE_TFACC
+                            if (!needMerge && it.second == DATA_AUTO_LINEAR) {
+                                locker.lock();
+                                model->weight.weight[weightName].weightSum.resize(1);
+                                RegisterFastllmData(&model->weight.weight[weightName], "linear");
+                                locker.unlock();
+                            }
+#endif
                         }
 
                         locker.lock();

@@ -187,6 +187,16 @@ namespace fastllm {
         /// TODO: data->clear()
         delete[] data->cpuData;
         data->cpuData = new uint8_t[1];
+        // data->weightSum.clear();
+        data->mins.clear();
+        data->scales.clear();
+        data->zeros.clear();
+        data->perChannelsConfigs.clear();
+
+        data->mins.shrink_to_fit();
+        data->scales.shrink_to_fit();
+        data->zeros.shrink_to_fit();
+        data->perChannelsConfigs.shrink_to_fit();
     }
 
     void TfaccClient::UnregisterFastllmData(const std::string &dataName) {
