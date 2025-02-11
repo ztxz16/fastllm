@@ -47,6 +47,8 @@ namespace fastllm {
 
         void Attention(Data *q, Data *k, Data *v, int group, float scale, int maskType, Data *output);
     };
+
+    void RegisterFastllmData(fastllm::Data *data, const std::string &weightType);
 }
 
 #endif
