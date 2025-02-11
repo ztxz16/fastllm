@@ -359,4 +359,8 @@ namespace fastllm {
         }
         delete op;
     }
+
+    void RegisterFastllmData(fastllm::Data *data, const std::string &weightType) {
+        tfaccClient.RegisterFastllmData(data, weightType);
+    }
 }
