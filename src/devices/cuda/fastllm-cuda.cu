@@ -477,8 +477,13 @@ __global__ void FastllmSiluKernel(float* a, float *b, int len) {
 __global__ void FastllmSiluKernel(half* a, half *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
+#ifdef CUDA_NO_TENSOR_CORE
+        float x = __half2float(a[idx]);
+        b[idx] = __float2half(x / (1.0 + expf(-x)));
+#else
         half x = a[idx];
         b[idx] = __hdiv(x, __hadd(__float2half(1.0), hexp(-x)));
+#endif
     }
 }
 
