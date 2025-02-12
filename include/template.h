@@ -76,6 +76,7 @@ namespace fastllm {
             {'/', JinjaToken::JinjaToKenType::JinjaTokenDiv},
             {'%', JinjaToken::JinjaToKenType::JinjaTokenMod},
             {'|', JinjaToken::JinjaToKenType::JinjaTokenFilter},
+            {',', JinjaToken::JinjaToKenType::JinjaTokenNamespace},
             {':', JinjaToken::JinjaToKenType::JinjaTokenSlice}
     };
 

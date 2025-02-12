@@ -1319,11 +1319,12 @@ namespace fastllm {
             specialRoot = new TrieNode();
         for (auto &it : specialTokenMap) {
             TrieNode *now = this->specialRoot;
-            for (int i = 0; i < it.first.size(); i++) {
-                if (now->next.find(it.first[i]) == now->next.end()) {
-                    now->next[it.first[i]] = new TrieNode();
+            std::string normalized = Normalize(it.first);
+            for (int i = 0; i < normalized.size(); i++) {
+                if (now->next.find(normalized[i]) == now->next.end()) {
+                    now->next[normalized[i]] = new TrieNode();
                 }
-                now = now->next[it.first[i]];
+                now = now->next[normalized[i]];
             }
             now->tokenId = it.second;
             now->score = 0.0f;
