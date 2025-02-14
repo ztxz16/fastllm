@@ -2727,17 +2727,18 @@ namespace fastllm {
         });
     }
 
-    bool CanRunMergeMOE() {
-        return curExecutor->CanRunOnFirstDevice("MergeMOE", {}, {}, {});
+    bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass) {
+        return curExecutor->CanRunOnFirstDevice("MergeMOE", {{"input", (Data*)&input}, {"biass", (Data*)biass.data()}}, {}, {});
     }
 
-    void MergeMOE(const Data &input, const Data &logits, Data &gateBias, std::vector <Data*> weights, std::vector <Data*> biass, 
+    void MergeMOE(const Data &input, const Data &logits, Data &gateBias, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 float routeScale, float sharedScale, int topk, bool needNorm, Data &output) {
         curExecutor->Run("MergeMOE", {
                 {"input", (Data*)&input}, {"logits", (Data*)&logits}, {"gateBias", (Data*)&gateBias},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
                 {"output", (Data*)&output}
-        }, {{"sharedScale", sharedScale}, {"routeScale", routeScale}}, {{"topk", topk}, {"needNorm", needNorm}});
+        }, {{"sharedScale", sharedScale}, {"routeScale", routeScale}}, {{"topk", topk}, {"needNorm", needNorm}, 
+                                        {"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()}});
     }
 
     // attentionType

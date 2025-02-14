@@ -963,6 +963,8 @@ namespace fastllm {
                 for (int k = 0; k < m; k++) {
                     fLastOutput[k] += curOutput[k] * value;
                 }
+                delete[] results[j];
+                delete[] middles[j];
             }
         } else {
             // normal

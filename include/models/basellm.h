@@ -263,6 +263,7 @@ namespace fastllm {
         int block_cnt = 28;
 
         std::vector <WeightMergeRule> weightMergeRules;
+        std::map <std::string, std::string> specialWeights; //一些特殊层，可以提前注册（一般用于TFACC）
 
         std::vector<std::vector<float> > sin, cos;
 

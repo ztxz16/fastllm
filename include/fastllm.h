@@ -533,8 +533,8 @@ namespace fastllm {
 
     void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset);
 
-    bool CanRunMergeMOE();
-    void MergeMOE(const Data &input, const Data &logits, Data &gateBias, std::vector <Data*> weights, std::vector <Data*> biass, 
+    bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass);
+    void MergeMOE(const Data &input, const Data &logits, Data &gateBias, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 float routeScale, float sharedScale, int topk, bool needNorm, Data &output);
 
     void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,

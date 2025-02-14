@@ -127,14 +127,19 @@ namespace fastllm {
                 std::string w1WeightName = "model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".gate_proj.weight";
                 std::string w3WeightName = "model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".up_proj.weight";
                 std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".gateup_proj.weight";
+                std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".down_proj.weight";
                 if (j == -1) {
                     w1WeightName = "model.layers." + std::to_string(i) + ".mlp.shared_experts.gate_proj.weight";
                     w3WeightName = "model.layers." + std::to_string(i) + ".mlp.shared_experts.up_proj.weight";
                     swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.shared_experts.gateup_proj.weight";
+                    downWeightName = "model.layers." + std::to_string(i) + ".mlp.shared_experts.down_proj.weight";
                 }
                 this->weightMergeRules.push_back(
                     WeightMergeRule({WeightMergeRuleSingle({w1WeightName, w3WeightName}, swigluWeightName, std::string("linearSwiglu"))})
                 );
+
+                this->specialWeights[swigluWeightName] = "linearSwiglu";
+                this->specialWeights[downWeightName] = "linearColumn";
             }
         }
     }
@@ -430,8 +435,8 @@ namespace fastllm {
                 } else {
                     Softmax(routerLogits, routerLogits, -1);
                 }
-
-                if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() && CanRunMergeMOE()) {
+                if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
+                    && CanRunMergeMOE(attenInput, biass[i])) {
                     MergeMOE (
                         attenInput, routerLogits, weight[gateBiasName],
                         weights[i], biass[i],
