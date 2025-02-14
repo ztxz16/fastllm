@@ -32,6 +32,8 @@ namespace fastllm {
     TfaccDevice::TfaccDevice() {
         this->deviceType = "tfacc";
         this->ops["Linear"] = (BaseOperator *) (new TfaccLinearOp());
+        this->ops["MergeMOE"] = (BaseOperator*)(new TfaccMergeMOE());
+
         /*this->ops["CatDirect"] = (BaseOperator *) (new TfaccCatDirectOp());
         this->ops["Attention"] = (BaseOperator *) (new TfaccAttention());
 
@@ -268,6 +270,88 @@ namespace fastllm {
         int k = output.dims.back();
 
         return (long long int) n * m * k;
+    }
+
+    bool TfaccMergeMOE::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data **biass = (Data**)(datas.find("biass")->second);
+        if (biass[0] != nullptr && biass[0]->dims.size() > 0) {
+            return false;
+        }
+        return true;
+    }
+
+    extern void OnlineQuantization(float *inputData, std::vector<uint8_t> &uinput, std::vector<LowBitConfig> &inputConfigs, 
+                            int n, int m, int group, int groupCnt,
+                            std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros);
+    
+    void TfaccMergeMOE::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &gateBias = *(datas.find("gateBias")->second);
+        Data &logits = *(datas.find("logits")->second);
+        Data **weights = (Data**)(datas.find("weights")->second);
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        int needNorm = intParams.find("needNorm") != intParams.end() ? intParams.find("needNorm")->second : 0;
+        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
+        float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
+        output.Allocate();
+
+        int dimsLen = logits.dims.size();
+        int outer = logits.Count(0) / logits.Count(dimsLen - 1);
+        int channels = logits.dims[dimsLen - 1];
+        int n = input.dims[0], m = input.dims[1], k = output.dims[1];
+
+        for (int o = 0; o < outer; o++) {
+            std::vector <std::pair <float, int> > oriV;
+            for (int j = 0; j < channels; j++) {
+                oriV.push_back(std::make_pair(-((float*)logits.cpuData)[o * channels + j], j));
+            }
+            if (gateBias.dims.size() > 0) {
+                ToDataType(gateBias, DataType::FLOAT32);
+                gateBias.ToDevice(DataDevice::CPU);
+                float *cpuBias = (float*)gateBias.cpuData;
+                for (int i = 0; i < channels; i++) {
+                    oriV[i].first -= cpuBias[i];
+                }
+            }
+
+            sort(oriV.begin(), oriV.end());
+            float sum = 1.0;
+            if (needNorm) {
+                sum = 0.0;
+                for (int j = 0; j < topk; j++) {
+                    sum += ((float*)logits.cpuData)[o * channels + oriV[j].second];
+                }
+            }
+
+            std::vector <std::pair <int, float> > v;
+            for (int j = 0; j < topk; j++) {
+                v.push_back(std::make_pair(oriV[j].second + 1, ((float*)logits.cpuData)[o * channels + oriV[j].second] / sum * routeScale));
+            }
+            v.push_back(std::make_pair(0, sharedScale));
+            float *inputData = ((float *) input.cpuData) + o * m;
+            int group = weights[0]->group, groupCnt = weights[0]->groupCnt;
+            if (weights[0]->dataType != DataType::INT4_GROUP) {
+                group = 1;
+                groupCnt = m;
+            }
+            std::vector<LowBitConfig> inputConfigs;
+            std::vector<uint8_t> uinput;
+            std::vector <float> inputSums;
+            std::vector <float> iscales, izeros;
+            OnlineQuantization(inputData, uinput, inputConfigs, 1, m, group, groupCnt, 
+                                inputSums, iscales, izeros);
+            
+            std::vector <fastllm::Data*> ws;
+            std::vector <float> factors;
+            for (int i = 0; i < v.size(); i++) {
+                ws.push_back(weights[v[i].first * 2]);
+                ws.push_back(weights[v[i].first * 2 + 1]);
+                factors.push_back(v[i].second);
+            }
+            tfaccClient.RunTfaccMOEU(1, m, k, group, groupCnt, ws, factors, &inputConfigs, uinput.data(), ((float*)output.cpuData) + o * k, output.dataType);
+        }
     }
 
     void TfaccCatDirectOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
