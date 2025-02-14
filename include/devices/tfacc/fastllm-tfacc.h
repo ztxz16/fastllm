@@ -43,6 +43,12 @@ namespace fastllm {
         void RunTfaccLinearF(int n, int m, int k, fastllm::Data *weight, fastllm::Data *bias,
                             float *input, float *output, LinearExType exType, DataType dataType);
         
+        void RunTfaccMOEU(int n, int m, int k, int group, int groupCnt,
+                        std::vector <fastllm::Data*> weights, std::vector <float> factors,
+                        std::vector <LowBitConfig> *inputConfigs,
+                        uint8_t *uinput, float *output, 
+                        DataType outputType);
+        
         void AppendKVCache(long long uid, Data *content);
 
         void Attention(Data *q, Data *k, Data *v, int group, float scale, int maskType, Data *output);

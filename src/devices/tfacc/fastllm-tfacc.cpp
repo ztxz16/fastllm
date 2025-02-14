@@ -25,6 +25,8 @@ namespace fastllm {
 
         AppendKVCache = 6,
         DoAttention = 7,
+        MOEInt4NoZero = 8,
+        MOEInt4Group = 9,
 
         GetComputeServerInfo = 10000,
         StartLongData = 10001,
@@ -166,7 +168,7 @@ namespace fastllm {
             int k = data->perChannelAxis == -1 ? 1 : data->dims[data->perChannelAxis];
             for (int i = 0; i < k; i++) {
                 buffer.WriteFloat(data->perChannelsConfigs[i].min);
-                buffer.WriteFloat(data->perChannelsConfigs[i].max);
+                buffer.WriteFloat(dataType == DataType::INT4_NOZERO ? data->perChannelsConfigs[i].scale : data->perChannelsConfigs[i].max);
             }
             buffer.WriteBytes(data->cpuData, data->GetBytes());
         } else if (dataType == DataType::INT4_GROUP) {
@@ -342,6 +344,78 @@ namespace fastllm {
                 outK /= 2;
             }
             memcpy(((uint8_t*) output) + baseN * outK * unitSize, (uint8_t*) result, curN * outK * unitSize);
+        }
+    }
+
+    void TfaccClient::RunTfaccMOEU(int n, int m, int k, int group, int groupCnt,
+                        std::vector <fastllm::Data*> weights, std::vector <float> factors,
+                        std::vector <LowBitConfig> *inputConfigs,
+                        uint8_t *uinput, float *output, 
+                        DataType outputType) {
+        for (int i = 0; i < weights.size(); i += 2) {
+            RegisterFastllmData(weights[i], "linearSwiglu");
+            RegisterFastllmData(weights[i + 1], "linearColumn");
+        }
+        int opType = ComputeTaskType::MOEInt4NoZero;
+        /*if (weights[0]->dataType == DataType::INT8) {
+            opType = ComputeTaskType::LinearInt8;
+        }
+        if (weight->dataType == DataType::INT4_GROUP) {
+            opType = ComputeTaskType::LinearInt4Group;
+        }*/
+
+
+        int maxN = n;
+        maxN = std::min(maxN, transLimit / m);
+        maxN = std::min(maxN, (int)(transLimit / (k * sizeof(float))));
+
+        // printf("maxN = %d\n", maxN);
+        std::vector <std::string> weightNames, biasNames;
+        for (int i = 0; i < weights.size(); i++) {
+            weightNames.push_back(weights[i]->name);
+        }
+        int outputUnitSize = (outputType == DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
+maxN = 1;
+        for (int baseN = 0; baseN < n; baseN += maxN) {
+// auto st0 = std::chrono::system_clock::now();
+            int curN = std::min(maxN, n - baseN);
+            json11::Json config = json11::Json::object {
+                {"op", "moe"},
+                {"weights", weightNames},
+                {"factors", factors},
+                {"n", curN}, {"m", m}, {"k", k},
+                {"group", group}, {"groupCnt", groupCnt},
+                {"outputType", outputType},
+            };
+            std::string configString = config.dump();
+
+            U8Buffer buffer;
+            buffer.WriteInt(configString.size());
+            buffer.WriteBytes((uint8_t*)configString.data(), configString.size());
+
+            std::vector <float> minmaxs;
+            for (int i = 0; i < curN * group; i++) {
+                minmaxs.push_back((*inputConfigs)[baseN * group + i].min);
+                minmaxs.push_back((*inputConfigs)[baseN * group + i].max);
+            }
+
+            RunMultiThreadMemcpy((uint8_t*)this->buf, buffer.buffer.data(), buffer.buffer.size(), GetAlivePool());
+            RunMultiThreadMemcpy((uint8_t*)this->buf + buffer.buffer.size(), (uint8_t*)minmaxs.data(), minmaxs.size() * sizeof(float), GetAlivePool());
+            RunMultiThreadMemcpy((uint8_t*)this->buf + buffer.buffer.size() + minmaxs.size() * sizeof(float), (uint8_t*)uinput + baseN * m, curN * m, GetAlivePool());
+
+            this->Launch(opType);
+            this->Wait();
+
+            auto pool = GetAlivePool();
+
+            float *floatResult = (float*)result;
+            for (int i = 1; i < serverNumaCnt; i++) {
+                for (int j = 0; j < curN * k; j++) {
+                    floatResult[j] += floatResult[i * curN * k + j];
+                }
+            }
+            RunMultiThreadMemcpy(((uint8_t*) output) + baseN * k * outputUnitSize, (uint8_t*) result,
+                    curN * k * outputUnitSize, GetAlivePool());
         }
     }
 
