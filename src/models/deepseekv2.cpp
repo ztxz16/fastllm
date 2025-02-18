@@ -435,6 +435,8 @@ namespace fastllm {
                 } else {
                     Softmax(routerLogits, routerLogits, -1);
                 }
+
+                ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
                     && CanRunMergeMOE(attenInput, biass[i])) {
                     MergeMOE (
@@ -540,6 +542,7 @@ namespace fastllm {
                 }
 
                 moeFinal.Reshape(hiddenStates.dims);
+                ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
                 AddTo(hiddenStates, moeFinal);
             }
         }

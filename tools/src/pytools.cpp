@@ -60,6 +60,19 @@ extern "C" {
         fastllm::SetDeviceMap(deviceMap);
     }
 
+    DLL_EXPORT void set_moe_device_map(int device_cnt, int *lens, char *devices, int *values) {
+        std::map <std::string, int> deviceMap;
+        int cur = 0;
+        for (int i = 0; i < device_cnt; i++) {
+            std::string key = "";
+            for (int j = 0; j < lens[i]; j++) {
+                key += devices[cur++];
+            }
+            deviceMap[key] = values[i];
+        }
+        fastllm::SetMoeDeviceMap(deviceMap);
+    }
+
     DLL_EXPORT struct ModelManager {
         std::mutex locker;
         std::map <int, std::unique_ptr<fastllm::basellm> > models;

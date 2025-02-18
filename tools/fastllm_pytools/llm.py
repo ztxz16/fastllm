@@ -88,6 +88,7 @@ fastllm_lib.add_tokenizer_word_llm_model.argtype = [ctypes.c_int, ctypes.c_char_
 fastllm_lib.set_special_tokens_llm_model.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 
 fastllm_lib.set_device_map.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+fastllm_lib.set_moe_device_map.argtype = [ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
@@ -152,7 +153,7 @@ def set_cpu_low_mem(low_mem):
 def get_cpu_low_mem():
     return fastllm_lib.get_cpu_low_mem();
 
-def set_device_map(device_map):
+def set_device_map(device_map, is_moe = False):
     devices = [];
     values = [];
     if (isinstance(device_map, str)):
@@ -169,7 +170,13 @@ def set_device_map(device_map):
         return;
     device_str = ''.join(devices);
     device_len = [len(x) for x in devices];
-    fastllm_lib.set_device_map(len(device_len),
+    if (is_moe):
+        fastllm_lib.set_moe_device_map(len(device_len),
+                               (ctypes.c_int * len(device_len))(*device_len),
+                               device_str.encode(),
+                               (ctypes.c_int * len(values))(*values));
+    else:
+        fastllm_lib.set_device_map(len(device_len),
                                (ctypes.c_int * len(device_len))(*device_len),
                                device_str.encode(),
                                (ctypes.c_int * len(values))(*values));
