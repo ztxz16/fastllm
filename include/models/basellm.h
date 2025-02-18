@@ -278,6 +278,7 @@ namespace fastllm {
         std::condition_variable dictCV;
 
         std::map <std::string, int> deviceMap;
+        std::map <std::string, int> moeDeviceMap;
 
         std::string adapterName;
 
