@@ -994,8 +994,10 @@ namespace fastllm {
                                         }
 #ifdef USE_TFACC
                                         locker.lock();
+                                        if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
                                         mergeData.weightSum.resize(1);
                                         RegisterFastllmData(&mergeData, it.type);
+                                        }
                                         locker.unlock();
 #endif
                                     }
@@ -1010,8 +1012,10 @@ namespace fastllm {
 #ifdef USE_TFACC
                             if (!needMerge && it.second == DATA_AUTO_LINEAR) {
                                 locker.lock();
+                                if (model->specialWeights.find(weightName) != model->specialWeights.end()) {
                                 model->weight.weight[weightName].weightSum.resize(1);
-                                RegisterFastllmData(&model->weight.weight[weightName], "linear");
+                                    RegisterFastllmData(&model->weight.weight[weightName], model->specialWeights[weightName]);
+                                }
                                 locker.unlock();
                             }
 #endif
