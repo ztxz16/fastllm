@@ -144,6 +144,7 @@ namespace fastllm {
         }
 
         this->deviceMap = GetDeviceMap();
+        this->moeDeviceMap = GetMoeDeviceMap();
     }
 
     void basellm::SaveLowBitModel(const std::string &fileName, int bit) {
@@ -808,6 +809,10 @@ namespace fastllm {
                     for (int i = st; i < end; i++) {
                         auto &tensorName = tensors[i];
                         if (StringEndWith(tensorName, "_scale_inv")) {
+                            locker.lock();
+                            printf("Convert %d \r", (++cnt) * 100 / (int)tensorMap.size());
+                            fflush(stdout);
+                            locker.unlock();
                             continue;
                         }
                         auto &tensor = safeTensors.itmeDict[tensorName];

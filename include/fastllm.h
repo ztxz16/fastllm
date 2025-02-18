@@ -29,7 +29,11 @@
 
 namespace fastllm {
     void SetDeviceMap(const std::map <std::string, int> &deviceMap);
+    void SetMoeDeviceMap(const std::map <std::string, int> &moeDeviceMap);
+
     std::map <std::string, int> GetDeviceMap();
+    std::map <std::string, int> GetMoeDeviceMap();
+
     void PrintInstructionInfo();
     void SetThreads(int t);
     void SetLowMemMode(bool m);

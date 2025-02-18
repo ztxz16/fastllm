@@ -41,7 +41,7 @@ namespace py = pybind11;
 
 #include <mutex>
 namespace fastllm {
-    std::map <std::string, int> defaultDeviceMap;
+    std::map <std::string, int> defaultDeviceMap, defaultMoeDeviceMap;
     Executor defaultExecutor;
     Executor *curExecutor = &defaultExecutor;
 
@@ -3168,5 +3168,13 @@ namespace fastllm {
 
     std::map <std::string, int> GetDeviceMap() {
         return defaultDeviceMap;
+    }
+
+    void SetMoeDeviceMap(const std::map <std::string, int> &deviceMap) {
+        defaultMoeDeviceMap = deviceMap;
+    }
+
+    std::map <std::string, int> GetMoeDeviceMap() {
+        return defaultMoeDeviceMap;
     }
 }
