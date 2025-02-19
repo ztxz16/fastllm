@@ -956,6 +956,9 @@ namespace fastllm {
 
                                 locker.unlock();
                                 for (auto &it : rule.rules) {
+                                    if (allWeightNames.find(it.inputs[0]) == allWeightNames.end()) {
+                                        continue;
+                                    }
                                     int dim0Len = 0;
                                     for (auto input : it.inputs) {
                                         dim0Len += model->weight[input].dims[0];
