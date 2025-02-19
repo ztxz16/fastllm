@@ -348,10 +348,11 @@ namespace fastllm {
                 ops.pop_back();
             } else if (tokens[i].type == JinjaToken::JinjaTokenNamespace) {
                 // 目前仅支持 "变量 = 表达式" 格式
+                int index = tokens[i + 1].type == JinjaToken::JinjaTokenLSB ? 1 : 0;
                 AssertInFastLLM(
                     tokens.size() - i >= 3 &&
-                    tokens[i + 2].type == JinjaToken::JinjaTokenID &&
-                    tokens[i + 3].type == JinjaToken::JinjaTokenAssign,
+                    tokens[i + index + 1].type == JinjaToken::JinjaTokenID &&
+                    tokens[i + index + 2].type == JinjaToken::JinjaTokenAssign,
                     "Jinja error: only support format \"(var = expression)\"."
                 );
                 ops.push_back(tokens[i]);
@@ -427,13 +428,21 @@ namespace fastllm {
                 vars.push_back(a[b]);
             } else if (it.type == JinjaToken::JinjaTokenNamespace) {
                 AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
-                JinjaVar a = vars[vars.size() - 2], b = vars.back();
+                JinjaVar last = vars.back();
+                int shift = (last.type == JinjaVar::JinjaDict) ? 1 : 0 ;
+                JinjaVar a = vars[vars.size() - 2 - shift], b = vars[vars.size() - 1 - shift];
                 if (b.type == JinjaVar::JinjaNone) {
                     b = local[b];
                 }
                 vars.pop_back();
                 vars.pop_back();
-                vars.push_back(JinjaVar({{a.stringValue, b}}));
+                if (last.type == JinjaVar::JinjaDict) {
+                    vars.pop_back();
+                    last.dictValue[a.stringValue] = b;
+                    vars.push_back(last);
+                } else {
+                    vars.push_back(JinjaVar({{a.stringValue, b}}));
+                }
             } else if (it.type == JinjaToken::JinjaTokenFilter) {
                 AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
                 JinjaVar a = vars[vars.size() - 2], b = vars.back();
@@ -583,7 +592,7 @@ namespace fastllm {
                 int cnt = 0;
                 int elsePos = -1;
                 int endPos = -1;
-                for (int j = i + 1; j < end; j++) {
+                for (int j = i + 1; j <= end; j++) {
                     if (blocks[j].type == JinjaBlock::JinjaBlockType::JinjaBlockIf) {
                         cnt++;
                     } else if (blocks[j].type == JinjaBlock::JinjaBlockType::JinjaBlockElse) {
