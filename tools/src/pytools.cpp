@@ -117,6 +117,13 @@ extern "C" {
         return id;
     }
 
+    DLL_EXPORT void export_llm_model_fromhf(char *path, int dataType, int groupCnt, char *lora, char *outputPath) {
+        models.locker.lock();
+        fastllm::ExportLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt, outputPath, "", lora);
+        models.locker.unlock();
+        return;
+    }
+
     DLL_EXPORT int create_llm_model_fromhf(char *path, int dataType, int groupCnt, bool skipTokenizer, char *lora) {
         models.locker.lock();
         int id = models.models.size();
