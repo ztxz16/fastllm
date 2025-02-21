@@ -183,6 +183,70 @@ namespace fastllm {
         return buffer;
     }
 
+    struct ByteReader {
+        uint8_t *cur;
+
+        ByteReader (uint8_t *data) {
+            this->cur = data;
+        }
+
+        int ReadInt() {
+            int ret = *((int*)cur);
+            cur += sizeof(int);
+            return ret;
+        }
+
+        float ReadFloat() {
+            float ret = *((float*)cur);
+            cur += sizeof(float);
+            return ret;
+        }
+
+        std::string ReadString() {
+            int len = ReadInt();
+            std::string ret = "";
+            char *v = new char[len + 5];
+            v[len] = 0;
+            memcpy(v, cur, len);
+            cur += len;
+            return v;
+        }
+
+        void ReadBytes(uint8_t *buffer, uint64_t bytes) {
+            memcpy(buffer, cur, bytes);
+            cur += bytes;
+        }
+    };
+
+    struct ByteWriter {
+        uint8_t *cur;
+
+        ByteWriter (uint8_t *data) {
+            this->cur = data;
+        }
+
+        void WriteInt(int v) {
+            *((int*)cur) = v;
+            cur += sizeof(int);
+        }
+
+        void WriteFloat(float v) {
+            *((float*)cur) = v;
+            cur += sizeof(float);
+        }
+
+        void WriteString(const std::string &s) {
+            WriteInt((int)s.size());
+            memcpy(cur, s.data(), s.size());
+            cur += s.size();
+        }
+
+        void WriteBytes(uint8_t *buffer, uint64_t bytes) {
+            memcpy(cur, buffer, bytes);
+            cur += bytes;
+        }
+    };
+
     struct FileBuffer {
         FILE *f;
 
@@ -1315,6 +1379,130 @@ namespace fastllm {
     void Data::SetKVCache() {
         this->isKVCache = true;
         this->cacheUid = ((long long)this) * rand() * rand() * rand() * rand();
+    }
+
+    // 计算形成Fastllm格式需要多少Bytes
+    uint64_t Data::GetFastllmFormateBytes() {
+        uint64_t ret = 0;
+        ret += sizeof(int) * 2;
+        if (this->dataType == FLOAT16 || this->dataType == FLOAT32 || this->dataType == BFLOAT16) {
+            ret += this->GetBytes();
+        } else if (this->dataType == INT4_NOZERO ||
+                    this->dataType == INT4 ||
+                    this->dataType == INT8) {
+            ret += sizeof(int);
+            int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
+            ret += k * 2 * sizeof(float);
+            ret += this->GetBytes();
+        } else if (this->dataType == INT4_GROUP) {
+            ret += sizeof(int) * 3;
+            int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
+            ret += k * this->group * 2 * sizeof(float);
+            ret += this->GetBytes();
+        } else {
+            ErrorInFastLLM("ExportFastllmFormat Error: data type error.");
+        }
+        return ret;
+    }
+
+    // 导出成Fastllm格式
+    void Data::ExportFastllmFormat(uint8_t *bytes) {
+        ByteWriter writer(bytes);
+        writer.WriteInt(1); // 版本号
+        writer.WriteInt((int)this->dataType);
+        if (this->dataType == FLOAT16 || this->dataType == FLOAT32 || this->dataType == BFLOAT16) {
+            writer.WriteBytes(this->cpuData, GetBytes());
+            return;
+        } else if (this->dataType == INT8 || this->dataType == INT4 || this->dataType == INT4_NOZERO) {
+            writer.WriteInt(this->perChannelAxis);
+            int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
+            for (int i = 0; i < k; i++) {
+                writer.WriteFloat(this->perChannelsConfigs[i].min);
+                if (this->dataType == INT4_NOZERO) {
+                    writer.WriteFloat(this->perChannelsConfigs[i].scale);
+                } else {
+                    writer.WriteFloat(this->perChannelsConfigs[i].max);
+                }
+            }
+            writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else if (this->dataType == INT4_GROUP) {
+            writer.WriteInt(this->perChannelAxis);
+            writer.WriteInt(this->group);
+            writer.WriteInt(this->groupCnt);
+            int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
+            for (int i = 0; i < k * this->group; i++) {
+                writer.WriteFloat(this->perChannelsConfigs[i].min);
+                writer.WriteFloat(this->perChannelsConfigs[i].scale);
+            }
+            writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else {
+            ErrorInFastLLM("ExportFastllmFormat Error: data type error.");
+        }
+    }
+
+    // 从Fastllm格式中创建
+    void Data::CreateFromFastllmFormat(uint8_t *datas, uint64_t len) {
+        this->weightType = WeightType::AUTO;
+        ByteReader reader(datas);
+        int version = reader.ReadInt();
+        if (version == 1) {
+            this->dataType = (DataType)reader.ReadInt();
+            this->Resize(this->dims);
+            this->Allocate();
+            if (this->dataType == FLOAT16 || this->dataType == FLOAT32 || this->dataType == BFLOAT16) {
+                reader.ReadBytes(this->cpuData, len);
+                return;
+            } else if (this->dataType == INT8 || this->dataType == INT4 || this->dataType == INT4_NOZERO) {
+                this->perChannelAxis = reader.ReadInt();
+                int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
+                this->perChannelsConfigs.resize(k);
+                this->mins.resize(k);
+                this->scales.resize(k);
+                this->zeros.resize(k);
+                for (int i = 0; i < k; i++) {
+                    if (this->dataType == INT4_NOZERO) {
+                        float minValue = reader.ReadFloat();
+                        float scale = reader.ReadFloat();
+                        this->perChannelsConfigs[i] = LowBitConfig(minValue, minValue + 15 * scale, 4, 1);
+                        this->perChannelsConfigs[i].min = minValue;
+                        this->perChannelsConfigs[i].scale = scale;
+                    } else {
+                        int bit = (dataType == DataType::INT4 ? 4 : 8);
+                        float minValue = reader.ReadFloat();
+                        float maxValue = reader.ReadFloat();
+                        this->perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit, 0);
+                    }
+                    this->mins[i] = this->perChannelsConfigs[i].min;
+                    this->scales[i] = this->perChannelsConfigs[i].scale;
+                    this->zeros[i] = this->perChannelsConfigs[i].zeroPoint;
+                }
+                reader.ReadBytes(this->cpuData, this->GetBytes());
+            } else if (this->dataType == INT4_GROUP) {
+                this->perChannelAxis = reader.ReadInt();
+                this->group = reader.ReadInt();
+                this->groupCnt = reader.ReadInt();
+                int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
+                this->perChannelsConfigs.resize(k * this->group);
+                this->mins.resize(k * this->group);
+                this->scales.resize(k * this->group);
+                this->zeros.resize(k * this->group);
+                for (int i = 0; i < k * this->group; i++) {
+                    float minValue = reader.ReadFloat();
+                    float scale = reader.ReadFloat();
+                    this->perChannelsConfigs[i] = LowBitConfig(minValue, minValue + 15 * scale, 4, 1);
+                    this->perChannelsConfigs[i].min = minValue;
+                    this->perChannelsConfigs[i].scale = scale;
+                    this->mins[i] = this->perChannelsConfigs[i].min;
+                    this->scales[i] = this->perChannelsConfigs[i].scale;
+                    this->zeros[i] = this->perChannelsConfigs[i].zeroPoint;
+                }
+                reader.ReadBytes(this->cpuData, this->GetBytes());
+            } else {
+                ErrorInFastLLM("CreateFromFastllmFormat Error: data type error.");
+            }
+        } else {
+            ErrorInFastLLM("CreateFromFastllmFormat error: unsupport version " + std::to_string(version));
+        }
     }
 
     std::string GetModelTypeFromFile(const std::string &fileName) {

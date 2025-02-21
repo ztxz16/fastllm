@@ -16,6 +16,8 @@ elif platform.system() == 'Darwin':
 else:
     fastllm_lib = ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], "libfastllm_tools.so"))
 
+fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p]
+
 fastllm_lib.create_llm_model.argtypes = [ctypes.c_char_p]
 fastllm_lib.create_llm_model.restype = ctypes.c_int
 
@@ -117,6 +119,31 @@ fastllm_lib.t2s_decode.argtypes = [ctypes.c_char_p,
     ctypes.POINTER(ctypes.c_int64), 
     ctypes.POINTER(ctypes.c_float)]
 fastllm_lib.t2s_decode.restype = ctypes.POINTER(ctypes.c_int64)
+
+fastllm_data_type_dict = {
+    "int4g": 9,
+    "int4": 8,
+    "int8": 3,
+    "float16": 7,
+    "float32": 0,
+}
+
+def export_llm_model_fromhf(path : str,
+                            output : str,
+                            dtype : str = "float16",
+                            lora: str = ""):
+    int4g_groupcnt = 128;
+    if (dtype.startswith("int4g") and len(dtype) > 5):
+        try:
+            int4g_groupcnt = int(dtype[5:])
+            dtype = "int4g";
+        except:
+            print("dtype should be like \"int4g256\"")
+            exit(0)    
+    if (dtype not in fastllm_data_type_dict):
+        print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
+        exit(0)
+    fastllm_lib.export_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, lora.encode(), output.encode());
 
 def softmax(a):
     max_value = a[0]
@@ -228,14 +255,6 @@ def from_hf(model,
     from ftllm import hf_model;
     return hf_model.create(model, tokenizer, pre_prompt = pre_prompt, user_role = user_role,
                            bot_role = bot_role, history_sep = history_sep, dtype = dtype);
-
-fastllm_data_type_dict = {
-    "int4g": 9,
-    "int4": 8,
-    "int8": 3,
-    "float16": 7,
-    "float32": 0,
-}
 
 class tokenizer:
     def __init__ (self, path : str,
