@@ -24,6 +24,13 @@ namespace fastllm {
                                                     const std::string &loraPath = "",
                                                     bool weightOnly = false);
     
+    void ExportLLMModelFromHF(const std::string &modelPath, 
+                            DataType linearDataType, 
+                            int groupCnt, 
+                            const std::string &exportPath, 
+                            const std::string &modelConfig = "",
+                            const std::string &loraPath = "");
+    
     std::unique_ptr<basellm> CreateLLMTokenizerFromHF(const std::string &modelPath);
 }
 

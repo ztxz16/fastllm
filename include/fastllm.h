@@ -352,6 +352,15 @@ namespace fastllm {
         }
 
         void SetKVCache();
+
+        // 计算形成Fastllm格式需要多少Bytes
+        uint64_t GetFastllmFormateBytes();
+
+        // 导出成Fastllm格式
+        void ExportFastllmFormat(uint8_t *bytes);
+
+        // 从Fastllm格式中创建
+        void CreateFromFastllmFormat(uint8_t *datas, uint64_t len);
     };
 
     struct PartitionLinkNode {
