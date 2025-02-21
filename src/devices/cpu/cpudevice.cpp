@@ -135,7 +135,15 @@ namespace fastllm {
     }
 
     void Float32ToFloat16(float *float32, uint16_t *float16, int len) {
-        for (int i = 0; i < len; i++) {
+        int i = 0;
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+        for (; i + 3 < len; i += 4) {
+            float32x4_t input_vec = vld1q_f32(float32 + i);
+            float16x4_t output_vec = vcvt_f16_f32(input_vec);
+            vst1_f16((float16_t*)float16 + i, output_vec);
+        }
+#endif
+        for (; i < len; i++) {
             float16[i] = float_to_half(float32[i]);
         }
     }
