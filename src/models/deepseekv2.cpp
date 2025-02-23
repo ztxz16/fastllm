@@ -256,6 +256,8 @@ namespace fastllm {
         Data* cosDataPtr = &cosData;
 
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
+        ToDataType(hiddenStates, this->dataType);
+
         int seqlen = hiddenStates.dims[1];
 
         if (weights.size() == 0) {
@@ -334,16 +336,14 @@ namespace fastllm {
             Split(kv, -1, qk_nope_head_dim, qk_nope_head_dim + v_head_dim, v);
 
             PermuteSelf(q_pe, {0, 2, 1, 3});
-            q_pe.Reshape({q_pe.dims[0], q_pe.dims[1], q_pe.dims[2], -1, 2});
-            PermuteSelf(q_pe, {0, 1, 2, 4, 3});
-            q_pe.Reshape({q_pe.dims[0], q_pe.dims[1], q_pe.dims[2], -1});
-            fastllm::LlamaRotatePosition2D(q_pe, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+            PermuteSelf(q_pe, {1, 0, 2, 3});
+            fastllm::NearlyRotatePosition2D(q_pe, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+            PermuteSelf(q_pe, {1, 0, 2, 3});
             PermuteSelf(q_pe, {0, 2, 1, 3});
 
-            k_pe.Reshape({bsz, seqlen, 1, qk_rope_head_dim / 2, 2});
-            PermuteSelf(k_pe, {0, 1, 2, 4, 3});
-            k_pe.Reshape({bsz, seqlen, 1, qk_rope_head_dim});
-            fastllm::LlamaRotatePosition2D(k_pe, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+            PermuteSelf(k_pe, {1, 0, 2, 3});
+            fastllm::NearlyRotatePosition2D(k_pe, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+            PermuteSelf(k_pe, {1, 0, 2, 3});
             PermuteSelf(k_pe, {0, 2, 1, 3});
 
             Cat(q_nope, q_pe, -1, q);
@@ -540,7 +540,6 @@ namespace fastllm {
                         CatDirect(moeFinal, moePart, 0);
                     }
                 }
-
                 moeFinal.Reshape(hiddenStates.dims);
                 ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
                 AddTo(hiddenStates, moeFinal);
@@ -562,6 +561,7 @@ namespace fastllm {
             auto &hiddenStates = *lastHiddenStates;
             RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
             Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
+            ToDataType(logits, DataType::FLOAT32);
             if (generationConfig.output_logits && retLogits != nullptr) {
                 int size = logits.dims.back();
                 logits.ToDevice(DataDevice::CPU);
