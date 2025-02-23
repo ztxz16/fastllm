@@ -833,6 +833,7 @@ namespace fastllm {
         same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
         same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[2] == 1);
         same |= ((axis == std::vector <int>{0, 2, 1, 3}) && (input.dims[1] == 1 || input.dims[2] == 1));
+        same |= ((axis == std::vector <int>{1, 0, 2, 3}) && (input.dims[0] == 1 || input.dims[1] == 1));
         if (same) {
             std::vector<int> new_dims;
             for (int i = 0; i < axis.size(); i++) {
