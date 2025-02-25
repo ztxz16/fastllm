@@ -24,6 +24,7 @@ namespace fastllm {
 
     DeepSeekV2Model::DeepSeekV2Model() {
         this->model_type = "deepseek_v2";
+        this->model_struct = "deepseek_v2";
 
         // 默认使用alpaca的提示词和instruction
         this->pre_prompt = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n";
@@ -363,8 +364,8 @@ namespace fastllm {
                 pastKey.lockInCPU = true;
                 pastValue.lockInCPU = true;
             } else {
-                pastKey.ToDevice(DataDevice::CUDA);
-                pastValue.ToDevice(DataDevice::CUDA);
+                pastKey.ToDevice(k.dataDevice);
+                pastValue.ToDevice(v.dataDevice);
             }
 
             int unitLen = 128;
@@ -540,9 +541,13 @@ namespace fastllm {
                         CatDirect(moeFinal, moePart, 0);
                     }
                 }
+
                 moeFinal.Reshape(hiddenStates.dims);
+
+                Data tempMoeFinal;
+                tempMoeFinal.CopyFrom(moeFinal);
                 ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
-                AddTo(hiddenStates, moeFinal);
+                AddTo(hiddenStates, tempMoeFinal);
             }
         }
 
