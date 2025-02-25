@@ -352,9 +352,11 @@ namespace fastllm {
                         std::vector <LowBitConfig> *inputConfigs,
                         uint8_t *uinput, float *output, 
                         DataType outputType) {
+        if (this->registerDataNames.find(weights[0]->name) == this->registerDataNames.end()) {
         for (int i = 0; i < weights.size(); i += 2) {
             RegisterFastllmData(weights[i], "linearSwiglu");
             RegisterFastllmData(weights[i + 1], "linearColumn");
+            }
         }
         int opType = ComputeTaskType::MOEInt4NoZero;
         /*if (weights[0]->dataType == DataType::INT8) {
@@ -370,52 +372,63 @@ namespace fastllm {
         maxN = std::min(maxN, (int)(transLimit / (k * sizeof(float))));
 
         // printf("maxN = %d\n", maxN);
-        std::vector <std::string> weightNames, biasNames;
-        for (int i = 0; i < weights.size(); i++) {
-            weightNames.push_back(weights[i]->name);
+        std::string factorString = "[", weightString = "[";
+        for (int i = 0; i < factors.size(); i++) {
+            if (i > 0) {
+                factorString += ",\n";
+            }
+            factorString += std::to_string(factors[i]);
         }
+        for (int i = 0; i < weights.size(); i++) {
+            if (i > 0) {
+                weightString += ",\n";
+            }
+            weightString += ('\"') + weights[i]->name + ('\"');
+        }
+        factorString += "]";
+        weightString += "]";
         int outputUnitSize = (outputType == DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
+        
 maxN = 1;
         for (int baseN = 0; baseN < n; baseN += maxN) {
 // auto st0 = std::chrono::system_clock::now();
             int curN = std::min(maxN, n - baseN);
-            json11::Json config = json11::Json::object {
-                {"op", "moe"},
-                {"weights", weightNames},
-                {"factors", factors},
-                {"n", curN}, {"m", m}, {"k", k},
-                {"group", group}, {"groupCnt", groupCnt},
-                {"outputType", outputType},
-            };
-            std::string configString = config.dump();
-
+            std::string configString = "{";
+            configString += "\"factors\":" +  factorString + ",";
+            configString += "\"group\":" +  std::to_string(group) + ",";
+            configString += "\"groupCnt\":" +  std::to_string(groupCnt) + ",";
+            configString += "\"n\":" +  std::to_string(n) + ",";
+            configString += "\"m\":" +  std::to_string(m) + ",";
+            configString += "\"k\":" +  std::to_string(k) + ",";
+            configString += "\"op\":\"moe\",";
+            configString += "\"outputType\":" +  std::to_string(0) + ",";
+            configString += "\"weights\":" +  weightString + "}";
             U8Buffer buffer;
             buffer.WriteInt(configString.size());
             buffer.WriteBytes((uint8_t*)configString.data(), configString.size());
-
             std::vector <float> minmaxs;
             for (int i = 0; i < curN * group; i++) {
                 minmaxs.push_back((*inputConfigs)[baseN * group + i].min);
                 minmaxs.push_back((*inputConfigs)[baseN * group + i].max);
             }
-
             RunMultiThreadMemcpy((uint8_t*)this->buf, buffer.buffer.data(), buffer.buffer.size(), GetAlivePool());
             RunMultiThreadMemcpy((uint8_t*)this->buf + buffer.buffer.size(), (uint8_t*)minmaxs.data(), minmaxs.size() * sizeof(float), GetAlivePool());
             RunMultiThreadMemcpy((uint8_t*)this->buf + buffer.buffer.size() + minmaxs.size() * sizeof(float), (uint8_t*)uinput + baseN * m, curN * m, GetAlivePool());
-
             this->Launch(opType);
             this->Wait();
-
             auto pool = GetAlivePool();
 
-            float *floatResult = (float*)result;
+            uint8_t *oriResult = new uint8_t[serverNumaCnt * curN * k * outputUnitSize];
+            RunMultiThreadMemcpy(oriResult, (uint8_t*)result, serverNumaCnt * curN * k * outputUnitSize, GetAlivePool());
+            float *floatResult = (float*)oriResult;
             for (int i = 1; i < serverNumaCnt; i++) {
                 for (int j = 0; j < curN * k; j++) {
                     floatResult[j] += floatResult[i * curN * k + j];
                 }
             }
-            RunMultiThreadMemcpy(((uint8_t*) output) + baseN * k * outputUnitSize, (uint8_t*) result,
+            RunMultiThreadMemcpy(((uint8_t*) output) + baseN * k * outputUnitSize, (uint8_t*) oriResult,
                     curN * k * outputUnitSize, GetAlivePool());
+            delete[] oriResult;
         }
     }
 
