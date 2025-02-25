@@ -315,8 +315,8 @@ namespace fastllm {
                     oriV[i].first -= cpuBias[i];
                 }
             }
-
-            sort(oriV.begin(), oriV.end());
+            // sort(oriV.begin(), oriV.end());
+            std::nth_element(oriV.begin(), oriV.begin() + topk, oriV.end());
             float sum = 1.0;
             if (needNorm) {
                 sum = 0.0;
