@@ -1140,7 +1140,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             AssertInFastLLM(this->model_struct == "chatglm" || 
                             this->model_struct == "llama" ||
                             this->model_struct == "graph" ||
-                            this->model_struct == "cogvlm", 
+                            this->model_struct == "cogvlm" ||
+                            this->model_struct == "deepseek_v2", 
                             this->model_struct + " doesn't support float16");
         } else {
             ErrorInFastLLM("SetDataType Error: datatype should be float32 or float16");
