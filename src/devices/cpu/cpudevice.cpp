@@ -2314,7 +2314,7 @@ namespace fastllm {
                 QuantizationAll(cur + st, u + st, end - st, &configs[i * group + g]);
             }
         }
-#ifdef __AVX__
+#ifdef __AVX2__
         uint8_t *temp = new uint8_t[32];
         for (int i = 0; i < n; i++) {
             for (int j = 0; j + 31 < m; j += 32) {
@@ -2561,7 +2561,7 @@ namespace fastllm {
                         u[j] = (uint8_t) (std::min(255., (double) std::max(cur[j] / scale + zeroPoint + 0.5, 0.0)));
                     }
                 }
-#ifdef __AVX__
+#ifdef __AVX2__
                 uint8_t *temp = new uint8_t[32];
                 for (int i = 0; i < n; i++) {
                     for (int j = 0; j + 31 < m; j += 32) {
@@ -2633,7 +2633,7 @@ namespace fastllm {
                     }
                 }
 
-#ifdef __AVX__
+#ifdef __AVX2__
                 uint8_t *temp = new uint8_t[32];
                 for (int i = 0; i < n; i++) {
                     for (int j = 0; j + 31 < m; j += 32) {
