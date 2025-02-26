@@ -1332,6 +1332,9 @@ namespace fastllm {
 
             for (auto it : items) {
                 std::string weightName = it->tensorName;
+                if (StringEndWith(weightName, "_scale_inv")) {
+                    continue;
+                }
                 weights[weightName].ExportFastllmFormat(bytes.data() + offsets[weightName][0]);
             }
 
