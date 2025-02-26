@@ -1133,6 +1133,10 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         return false;
     }
 
+    void basellm::SetMoeExperts(int experts) {
+        return;
+    }
+
     void basellm::SetDataType(DataType dataType) {
         if (dataType == DataType::FLOAT32) {
 

@@ -233,6 +233,8 @@ namespace fastllm {
 
         virtual bool SetSaveHistoryChat(bool save);
 
+        virtual void SetMoeExperts(int experts);
+
         virtual void SetDataType(DataType dataType);
 
         // messages: [ (role, content) ... ]

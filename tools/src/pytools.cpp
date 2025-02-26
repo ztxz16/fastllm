@@ -247,6 +247,12 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT void set_moe_experts(int modelId, int moe_experts) {
+        auto model = models.GetModel(modelId);
+        model->SetMoeExperts(moe_experts);
+        return;
+    }
+
     DLL_EXPORT void set_model_atype(int modelId, char *atype) {
         auto model = models.GetModel(modelId);
         std::string atypeStr = atype;
