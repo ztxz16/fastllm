@@ -1885,6 +1885,57 @@ __global__ void FastllmGemvFp16Int4NoZeroKernel2(half *A, uint8_t *B, half *C,
 }
 
 template <int THREAD_PER_BLOCK, int PART>
+__global__ void FastllmGemvInt4NoZeroKernel1MultiRow(float *A, uint8_t *B, float *C,
+                                                     float *bias, float *scales, float *mins,
+                                                     int m, int k) {
+    __shared__ float sdata[PART][THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+
+    // 1. 计算
+    int st = blockIdx.x;
+    int p = st;
+#pragma unroll
+    for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
+
+    const uint8_t *baseB = B + p * m / 2;
+    float minv = __ldg(mins + p) / __ldg(scales + p);
+    for (int i = tid * 2; i < m / 2; i += THREAD_PER_BLOCK * 2) {
+        uint16_t bBuffer = *reinterpret_cast<const uint16_t *>(baseB + i);
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            float4 aBuffer = FETCH_FLOAT4(A[i * 2 + x * m]);
+            sdata[x][tid] += aBuffer.x * (minv + ((bBuffer >> 4) & 15)) + aBuffer.y * (minv + (bBuffer & 15));
+            sdata[x][tid] += aBuffer.z * (minv + (bBuffer >> 12)) + aBuffer.w * (minv + ((bBuffer >> 8) & 15));
+        }
+    }
+    __syncthreads();
+
+    float diff = 0.0f;
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            #pragma unroll
+            for (int x = 0; x < PART; x++) {
+                float other = sdata[x][tid + s] - diff;
+                float sumTmp = sdata[x][tid] + other;
+                diff = (sumTmp - sdata[x][tid]) - other;
+                sdata[x][tid] = sumTmp;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        if (bias == nullptr) {
+            for (int x = 0; x < PART; x++) C[p + k * x] = sdata[x][0] * scales[p];
+        } else {
+#pragma unroll
+            for (int x = 0; x < PART; x++) C[p + k * x] = sdata[x][0] * scales[p] + bias[p];
+        }
+    }
+    __syncthreads();
+}
+
+template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvInt4NoZeroKernel1(float *A, uint8_t *B, float *C,
                                              float *bias, float *scales, float *mins,
                                              int m, int k) {
@@ -2706,6 +2757,25 @@ void LaunchFastllmGemmFp32Int4NoZero(float *input, uint8_t *weight, float *outpu
     for (int i = 0; i < n; i++) {
         FastllmGemvInt4NoZeroKernel1<64, 1> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, scales, mins, m, k);
     }
+    return;
+    if (n == 1) {
+        FastllmGemvInt4NoZeroKernel1MultiRow<64, 1> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k);
+    } else if (n == 2) {
+        FastllmGemvInt4NoZeroKernel1MultiRow<64, 2> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k);
+    } else if (n == 3) {
+        FastllmGemvInt4NoZeroKernel1MultiRow<64, 3> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k);
+    } else if (n == 4) {
+        FastllmGemvInt4NoZeroKernel1MultiRow<64, 4> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k);
+    } else if (n == 5) {
+        FastllmGemvInt4NoZeroKernel1MultiRow<64, 5> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k);
+    } else if (n == 6) {
+        FastllmGemvInt4NoZeroKernel1MultiRow<64, 6> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k);
+    } else if (n == 7) {
+        FastllmGemvInt4NoZeroKernel1MultiRow<64, 7> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k);
+    } else {
+        printf("Error: LaunchFastllmGemmFp32Int4NoZero: n > 7.\n");
+        exit(0);
+    }
 }
 
 bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
@@ -2744,7 +2814,7 @@ bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data 
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
-    if (n >= 8) {
+    if (n >= 16) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
         half *cudaFp16Input, *cudaFp16Output, *cudaFp16Weight;
 #ifdef CUDA_NO_TENSOR_CORE
