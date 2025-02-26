@@ -1236,6 +1236,9 @@ class model:
     def set_atype(self, atype: str):
         fastllm_lib.set_model_atype(self.model, str(atype).encode())
 
+    def set_moe_experts(self, experts: int):
+        fastllm_lib.set_moe_experts(self.model, experts)
+
     def set_kv_cache_limit(self, limit: str):
         limit_bytes = 0
         try:

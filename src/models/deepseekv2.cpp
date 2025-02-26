@@ -88,6 +88,7 @@ namespace fastllm {
         qk_nope_head_dim = atoi(this->weight.dicts["qk_nope_head_dim"].c_str());
         q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
 
+        n_shared_experts = atoi(this->weight.dicts["n_shared_experts"].c_str());
         num_experts = atoi(this->weight.dicts["n_routed_experts"].c_str());
         num_experts_per_tok = atoi(this->weight.dicts["num_experts_per_tok"].c_str());
         norm_topk_prob = (this->weight.dicts["norm_topk_prob"] == "true");
@@ -923,5 +924,9 @@ namespace fastllm {
              pastKeyValues[0].second.dims[0] * pastKeyValues[0].second.dims[2]);
         printf("finish.\n");
         this->num_experts_per_tok = oldTopk;
+    }
+
+    void DeepSeekV2Model::SetMoeExperts(int experts) {
+        this->num_experts_per_tok = std::max(1, experts - this->n_shared_experts);
     }
 }
