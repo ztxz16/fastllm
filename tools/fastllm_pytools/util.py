@@ -13,6 +13,7 @@ def make_normal_parser(des: str) -> argparse.ArgumentParser:
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
+    parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
     return parser
@@ -56,6 +57,8 @@ def make_normal_llm_model(args):
             graph = getattr(custom_module, "__model__")
     model = llm.model(args.path, dtype = args.dtype, graph = graph, tokenizer_type = "auto", lora = args.lora)
     model.set_atype(args.atype)
+    if (args.moe_experts > 0):
+        model.set_moe_experts(args.moe_experts)
     if (args.max_batch > 0):
         model.set_max_batch(args.max_batch)
     if (args.kv_cache_limit != "" and args.kv_cache_limit != "auto"):
