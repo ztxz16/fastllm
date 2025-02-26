@@ -63,6 +63,8 @@ namespace fastllm {
 
         std::pair<std::vector<float>, std::vector<float>> UpdateRotaryPosEmb(float base, float factor, int seqLen = 0); // 更新位置编码
 
+        void SetMoeExperts(int experts);
+
     protected:
         RoPEType rope_type = RoPEType::BASE;
 
@@ -75,6 +77,7 @@ namespace fastllm {
         float rms_norm_eps = 1e-6;
 
         float routed_scaling_factor;
+        int n_shared_experts;
         int num_experts_per_tok;
         int num_experts;
         bool norm_topk_prob;
