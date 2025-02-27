@@ -16,7 +16,8 @@ setup (
         '': ['*.dll', '*.so', '*.dylib']
     },
     install_requires=[
-        'transformers'
+        'transformers',
+        'jinja2>=3.1.0'
     ],
     extras_require={
         'all': all_require,
