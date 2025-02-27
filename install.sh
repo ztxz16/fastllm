@@ -16,6 +16,7 @@ if [ $? != 0 ]; then
 fi
 
 cd tools
-python3 setup.py sdist build
-python3 setup.py bdist_wheel
-python3 setup.py install
+pip install .[all]
+#python3 setup.py sdist build
+#python3 setup.py bdist_wheel
+#python3 setup.py install --all
