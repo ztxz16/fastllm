@@ -20,7 +20,10 @@ fastllm是纯c++实现，无第三方依赖的多平台高性能大模型推理�
 - 🚀 支持动态Batch，流式输出
 - 🚀 前后端分离设计，便于支持新的计算设备
 - 🚀 目前支持ChatGLM系列模型，Qwen系列模型，各种LLAMA模型(ALPACA, VICUNA等)，BAICHUAN模型，MOSS模型，MINICPM模型等
+- 🚀 支持Moe模型的cpu-cuda混合部署
 - 🚀 支持Python自定义模型结构
+
+## [查看DeepSeek部署指南](docs/deepseek.md)
 
 ## 快速开始
 
