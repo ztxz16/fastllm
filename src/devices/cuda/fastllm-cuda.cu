@@ -2773,8 +2773,10 @@ void LaunchFastllmGemmFp32Int4NoZero(float *input, uint8_t *weight, float *outpu
     } else if (n == 7) {
         FastllmGemvInt4NoZeroKernel1MultiRow<64, 7> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k);
     } else {
-        printf("Error: LaunchFastllmGemmFp32Int4NoZero: n > 7.\n");
-        exit(0);
+        for (int i = 0; i < n; i++) {
+            FastllmGemvInt4NoZeroKernel1<64, 1> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, scales, mins, m, k);
+        }
+        return;
     }
 }
 
