@@ -19,12 +19,19 @@
 #include "devices/tfacc/tfaccdevice.h"
 #endif
 
+#ifdef USE_TOPS
+#include "devices/tops/topsdevice.h"
+#endif
+
 namespace fastllm {
     Executor::Executor() {
         this->devices.clear();
 #ifdef USE_CUDA
         this->devices.push_back((BaseDevice*) new CudaDevice());
         this->devices.push_back((BaseDevice*) new MultiCudaDevice((CudaDevice*)this->devices.back()));
+#endif
+#ifdef USE_TOPS
+        this->devices.push_back((BaseDevice*) new TopsDevice());
 #endif
 #ifdef USE_TFACC
         this->devices.push_back((BaseDevice*) new TfaccDevice());
