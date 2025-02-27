@@ -20,7 +20,10 @@ apt-get install gcc g++ make cmake
 git clone https://www.github.com/ztxz16/fastllm
 cd fastllm
 bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU版本
+
 # bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 -D CMAKE_CUDA_COMPILER=$(which nvcc) # 可以指定CUDA架构，如4090使用89架构
+# -DCUDA_ARCH指定的数字参考[Compute Capability](https://developer.nvidia.com/cuda-gpus)
+
 # bash install.sh # 仅编译CPU版本
 ```
 
@@ -81,6 +84,10 @@ python3 -m ftllm.server -p /mnt/DeepSeek-V3/ -t 27 --moe_device cpu --device cud
   - **描述**: 指定 MOE（Mixture of Experts）层的计算设备。
   - **可选值**: `cpu` 或 `cuda`。
   - **示例**: `--moe_device cpu`
+
+- `--moe_experts`:
+  - **描述**: 指定 MOE（Mixture of Experts）层使用的专家数。不设定则根据模型配置设定。减少专家数可以提高推理速度，但可能降低推理准确度
+  - **示例**: `--moe_experts 6`
 
 - `--dtype`:
   - **描述**: 指定模型的数据类型。
