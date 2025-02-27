@@ -110,6 +110,22 @@ if (USE_TFACC)
     include_directories(include/devices/tfacc)
 endif()
 
+if (USE_TOPS) # For suiyuan
+    add_compile_definitions(USE_TOPS)
+    set(FASTLLM_TOPS_SOURCES src/devices/tops/topsdevice.cpp)
+    include_directories(include/devices/tops)
+
+    include_directories(/usr/include/gcu/)
+    include_directories(/opt/tops/include)
+    include_directories(/usr/include/gcu/topsdnn)
+    include_directories(/usr/src/topsaten_samples/common)
+
+    link_directories(/usr/lib)
+    link_directories(/opt/tops/lib)
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} topsaten /opt/tops/lib/libtopsrt.so)
+    #target_link_libraries(main rtcu)
+endif()
+
 if (PY_API)
     if(POLICY CMP0148)
         cmake_policy(SET CMP0148 NEW)
@@ -123,7 +139,7 @@ if (PY_API)
 
     include_directories(third_party/pybind11/include)
     file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
-    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES})
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
@@ -131,6 +147,7 @@ add_library(fastllm OBJECT
             ${FASTLLM_CXX_SOURCES}
             ${FASTLLM_CUDA_SOURCES}
             ${FASTLLM_TFACC_SOURCES}
+            ${FASTLLM_TOPS_SOURCES}
             )
 target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS})
 
@@ -163,7 +180,7 @@ if (BUILD_CLI)
     target_link_libraries(FastllmStudio_cli fastllm)
 endif()
 
-add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} tools/src/pytools.cpp)
+add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES} tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
 
 if (${CMAKE_HOST_WIN32})
