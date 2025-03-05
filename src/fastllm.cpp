@@ -410,6 +410,7 @@ namespace fastllm {
                 return;
             }
             this->dataType = ori.dataType;
+            this->UpdateUnitSize();
             if (ori.expansionDims.size() > 0 && ori.expansionDims != ori.dims) {
                 this->Expansion(ori.expansionDims);
                 this->Resize(ori.dims);
@@ -1383,11 +1384,12 @@ namespace fastllm {
 
     // 计算形成Fastllm格式需要多少Bytes
     uint64_t Data::GetFastllmFormateBytes() {
+        if (this->dataType == FLOAT16 || this->dataType == FLOAT32 || this->dataType == BFLOAT16) {
+            return this->GetBytes();
+        } 
         uint64_t ret = 0;
         ret += sizeof(int) * 2;
-        if (this->dataType == FLOAT16 || this->dataType == FLOAT32 || this->dataType == BFLOAT16) {
-            ret += this->GetBytes();
-        } else if (this->dataType == INT4_NOZERO ||
+        if (this->dataType == INT4_NOZERO ||
                     this->dataType == INT4 ||
                     this->dataType == INT8) {
             ret += sizeof(int);
@@ -1408,12 +1410,13 @@ namespace fastllm {
     // 导出成Fastllm格式
     void Data::ExportFastllmFormat(uint8_t *bytes) {
         ByteWriter writer(bytes);
-        writer.WriteInt(1); // 版本号
-        writer.WriteInt((int)this->dataType);
         if (this->dataType == FLOAT16 || this->dataType == FLOAT32 || this->dataType == BFLOAT16) {
             writer.WriteBytes(this->cpuData, GetBytes());
             return;
-        } else if (this->dataType == INT8 || this->dataType == INT4 || this->dataType == INT4_NOZERO) {
+        } 
+        writer.WriteInt(1); // 版本号
+        writer.WriteInt((int)this->dataType);
+        if (this->dataType == INT8 || this->dataType == INT4 || this->dataType == INT4_NOZERO) {
             writer.WriteInt(this->perChannelAxis);
             int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
             for (int i = 0; i < k; i++) {
