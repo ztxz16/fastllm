@@ -266,6 +266,8 @@ namespace fastllm {
 
         std::vector <WeightMergeRule> weightMergeRules;
         std::map <std::string, std::string> specialWeights; //一些特殊层，可以提前注册（一般用于TFACC）
+        std::set <std::string> cantQuantLinears; // 不能量化的Linear层
+        std::set <std::string> moeLinears;
 
         std::vector<std::vector<float> > sin, cos;
 

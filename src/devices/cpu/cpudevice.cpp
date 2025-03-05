@@ -1084,6 +1084,7 @@ namespace fastllm {
                 AddTo(output, w2, sharedScale);
             } else {
                 Data moeFinal = Data();
+                ToDataType(moeFinal, input.dataType);
                 moeFinal.Resize({0, input.dims[1]});
                 moeFinal.Expansion(input.dims);
                 for (int b = 0; b < input.dims[0]; b++) {
@@ -1092,6 +1093,7 @@ namespace fastllm {
                     currentData = &attenPart;
                     moePart.Resize(currentData->dims);
                     moePart.Allocate(0.0f);
+                    ToDataType(moePart, input.dataType);
 
                     float *cur = cpuRouterLogits + b * m;
                     std::vector <std::pair <float, int> > v; // (value, idx)
@@ -4448,8 +4450,10 @@ namespace fastllm {
         bool same = false;
         same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
         same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[2] == 1);
+        same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[0] == 1 && input.dims[1] == 1);
         same |= ((axis == std::vector <int>{0, 2, 1, 3}) && (input.dims[1] == 1 || input.dims[2] == 1));
         same |= ((axis == std::vector <int>{1, 0, 2, 3}) && (input.dims[0] == 1 || input.dims[1] == 1));
+        same |= ((axis == std::vector <int>{1, 2, 0, 3}) && input.dims[1] == 1 && input.dims[2] == 1);
         if (same) {
             input.Resize(new_dims);
             return;
