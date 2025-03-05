@@ -22,14 +22,20 @@ namespace fastllm {
                                                     bool skipTokenizer = false,
                                                     const std::string &modelConfig = "",
                                                     const std::string &loraPath = "",
-                                                    bool weightOnly = false);
+                                                    bool weightOnly = false, 
+                                                    bool useMoeDataType = false, 
+                                                    DataType moeDataType = DataType::FLOAT32, 
+                                                    int moeGroupCnt = -1);
     
     void ExportLLMModelFromHF(const std::string &modelPath, 
                             DataType linearDataType, 
                             int groupCnt, 
                             const std::string &exportPath, 
                             const std::string &modelConfig = "",
-                            const std::string &loraPath = "");
+                            const std::string &loraPath = "", 
+                            bool useMoeDataType = false, 
+                            DataType moeDataType = DataType::FLOAT32, 
+                            int moeGroupCnt = -1);
     
     std::unique_ptr<basellm> CreateLLMTokenizerFromHF(const std::string &modelPath);
 }

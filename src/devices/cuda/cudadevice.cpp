@@ -525,8 +525,10 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
 
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMul error: inputs should use same device.\n");
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
-                        "MatMul's input's type should be float32.\n");
+        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+                        (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT16),
+                        "MatMul's input's type should be float32 or float16.\n");
         AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
                         "MatMul's input's shape's size should be >= 2.\n");
         AssertInFastLLM(input0.dims.back() == input1.dims[input1.dims.size() - 2],
@@ -579,8 +581,10 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
 
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMulTransB error: inputs should use same device.\n");
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32,
-                        "MatMulTransB's input's type should be float32.\n");
+        AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+                        (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT16),
+                        "MatMulTransB's input's type should be float32 or float16.\n");
         AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
                         "MatMulTransB's input's shape's size should be >= 2.\n");
         AssertInFastLLM(input0.dims.back() == input1.dims.back(),
@@ -832,8 +836,10 @@ namespace fastllm {
         bool same = false;
         same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
         same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[2] == 1);
+        same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[0] == 1 && input.dims[1] == 1);
         same |= ((axis == std::vector <int>{0, 2, 1, 3}) && (input.dims[1] == 1 || input.dims[2] == 1));
         same |= ((axis == std::vector <int>{1, 0, 2, 3}) && (input.dims[0] == 1 || input.dims[1] == 1));
+        same |= ((axis == std::vector <int>{1, 2, 0, 3}) && input.dims[1] == 1 && input.dims[2] == 1);
         if (same) {
             std::vector<int> new_dims;
             for (int i = 0; i < axis.size(); i++) {

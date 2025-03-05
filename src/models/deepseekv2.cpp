@@ -142,7 +142,13 @@ namespace fastllm {
 
                 this->specialWeights[swigluWeightName] = "linearSwiglu";
                 this->specialWeights[downWeightName] = "linearColumn";
+                
+                this->moeLinears.insert(w1WeightName);
+                this->moeLinears.insert(w3WeightName);
+                this->moeLinears.insert(downWeightName);
             }
+
+            this->cantQuantLinears.insert("model.layers." + std::to_string(i) + ".self_attn.kv_b_proj.weight");
         }
     }
 
@@ -343,57 +349,106 @@ namespace fastllm {
             PermuteSelf(k_pe, {1, 0, 2, 3});
             PermuteSelf(k_pe, {0, 2, 1, 3});
 
-            if (false) {
+            if (true) {
+                auto &k = k_pe, &v = kv_ln;
+                k_pe.Reshape({k_pe.dims[0], k_pe.dims[2], k_pe.dims[3]});
+                Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
+                if (GetKVCacheInCPU()) {
+                    pastKey.lockInCPU = true;
+                    pastValue.lockInCPU = true;
+                } else {
+                    pastKey.ToDevice(k.dataDevice);
+                    pastValue.ToDevice(v.dataDevice);
+                }
+                int unitLen = 128;
+                while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
+                    || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
+                    std::vector <int> newDims;
+                    if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                        newDims = std::vector <int> {k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
+                    } else {
+                        newDims = pastKey.dims;
+                        newDims[1] += ((k.dims[1] - 1) / unitLen + 1) * unitLen;
+                    }
+                    pastKey.Expansion(newDims);
+                }
+                while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[1] > pastValue.expansionDims[1]))
+                    || (pastValue.dims.size() > 0 && pastValue.dims[1] + v.dims[1] > pastValue.expansionDims[1])) {
+                    std::vector <int> newDims;
+                    if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                        newDims = std::vector <int> {v.dims[0], ((v.dims[1] - 1) / unitLen + 1) * unitLen, v.dims[2]};
+                    } else {
+                        newDims = pastValue.dims;
+                        newDims[1] += ((v.dims[1] - 1) / unitLen + 1) * unitLen;
+                    }
+                    pastValue.Expansion(newDims);
+                }
+                CatDirect(pastKey, k, 1);
+                CatDirect(pastValue, v, 1);
+// printf("matmul catdirect spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // absorb
                 PermuteSelf(q_pe, {0, 2, 1, 3});
                 PermuteSelf(q_nope, {0, 2, 1, 3});
-
+// printf("matmul permuteself spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 int b = q_nope.dims[0], s = q_nope.dims[1], h = q_nope.dims[2], d = q_nope.dims[3];
                 PermuteSelf(q_nope, {2, 0, 1, 3});
                 q_nope.Reshape({q_nope.dims[0], -1, q_nope.dims[3]});
 
-                this->weight[kvWeightName].Reshape({128, 256, 512});
-                Data kv0, kv1, result;
-                Data score0, score1;
+                std::string kv0Name = kvWeightName + "__0", kv1Name = kvWeightName + "__1";
+                if (this->weight.weight.find(kvWeightName) != this->weight.weight.end()) {
+                    this->weight[kvWeightName].Reshape({num_attention_heads, -1, kv_lora_rank});
+                    Split(this->weight[kvWeightName], 1, 0, qk_nope_head_dim, this->weight[kv0Name]);
+                    Split(this->weight[kvWeightName], 1, qk_nope_head_dim, qk_nope_head_dim + v_head_dim, this->weight[kv1Name]);
+                    this->weight.weight.erase(kvWeightName);
+                }
 
-                Split(this->weight[kvWeightName], 1, 0, 128, kv0);
-                Split(this->weight[kvWeightName], 1, 128, 256, kv1);
+                Data &kv0 = this->weight[kv0Name];
+                Data &kv1 = this->weight[kv1Name];
 
+                Data result, score0, score1;
+// printf("matmul prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 MatMul(q_nope, kv0, result);
+// printf("matmul0 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 PermuteSelf(result, {1, 0, 2});
-                int c = result.dims.back(), t = kv_ln.dims[1];
+                int c = result.dims.back(), t = pastValue.dims[1];
                 result.Reshape({b, s * h, c});
-
-                MatMulTransB(result, kv_ln, score0);
+// printf("inner mla 0 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                MatMulTransB(result, pastValue, score0);
+// printf("inner mla 1 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 score0.Reshape({b, s, h, t});
-                k_pe.Reshape({k_pe.dims[0], k_pe.dims[2], k_pe.dims[3]});
                 q_pe.Reshape({q_pe.dims[0], -1, q_pe.dims[3]});
-                MatMulTransB(q_pe, k_pe, score1);
+// printf("inner mla 2 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                MatMulTransB(q_pe, pastKey, score1);
+// printf("inner mla 3 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 score1.Reshape({b, s, h, t});
 
                 AddTo(score1, score0);
                 Mul(score1, softmax_scale, score0);
 
-                score0.Reshape({b * s, h, t});
-                PermuteSelf(score0, {0, 2, 1});
-                ToDataType(attentionMask, DataType::FLOAT32);
-                AttentionMask(score0, attentionMask, -10000);
-                PermuteSelf(score0, {0, 2, 1});    
+                if (attentionMask.dims.size() > 0) {
+                    score0.Reshape({b * s, h, t});
+                    ToDataType(attentionMask, DataType::FLOAT32);
+                    AttentionMask(score0, attentionMask, -10000);
+                }
 
                 Softmax(score0, score0, -1);
-                Data x, y;
+                Data x;
                 score0.Reshape({b, s * h, t});
-                MatMul(score0, kv_ln, x);
+// printf("inner mla 4 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                MatMul(score0, pastValue, x);
+// printf("inner mla 5 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 x.Reshape({b, s, h, c});
-
                 PermuteSelf(x, {2, 0, 1, 3});
                 x.Reshape({h, b * s, c});
-                MatMulTransB(x, kv1, y);
-                y.Reshape({h, b, s, -1});
-                PermuteSelf(y, {1, 2, 0, 3});
-
-                y.Print();
-                exit(0);
+// printf("inner mla spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                MatMulTransB(x, kv1, attenOutput);
+// attenOutput.Print();
+// exit(0);
+// printf("matmul1 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                attenOutput.Reshape({h, b, s, -1});
+                PermuteSelf(attenOutput, {1, 2, 0, 3});
+                attenOutput.Reshape({seqlen, bsz, -1});
+                PermuteSelf(attenOutput, {1, 0, 2});
             } else {
                 Linear(kv_ln, this->weight[kvWeightName], this->weight[kvBiasName], kv);
                 kv.Reshape({bsz, seqlen, num_attention_heads, qk_nope_head_dim + v_head_dim});
@@ -780,126 +835,229 @@ namespace fastllm {
             PermuteSelf(k_pe, {1, 0, 2, 3});
             PermuteSelf(k_pe, {0, 2, 1, 3});
 
-            Linear(kv_ln, this->weight[kvWeightName], this->weight[kvBiasName], kv);
-            kv.Reshape({bsz, seqlen, num_attention_heads, qk_nope_head_dim + v_head_dim});
-            PermuteSelf(kv, {0, 2, 1, 3});
-            Split(kv, -1, 0, qk_nope_head_dim, k_nope);
-            Split(kv, -1, qk_nope_head_dim, qk_nope_head_dim + v_head_dim, v);
-            Cat(q_nope, q_pe, -1, q);
-
-            Repeat(k_pe, 1, k_nope.dims[1], k_pe_repeat);
-            Cat(k_nope, k_pe_repeat, -1, k);
-
-            PermuteSelf(q, {1, 0, 2, 3});
-            PermuteSelf(k, {1, 0, 2, 3});
-            PermuteSelf(v, {1, 0, 2, 3});
-            q.Reshape({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
-            k.Reshape({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
-            v.Reshape({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
-
-            PermuteSelf(q, {1, 0, 2});
-            q.Reshape({1, q.dims[0], q.dims[1], q.dims[2]});
-            PermuteSelf(k, {1, 0, 2});
-            k.Reshape({1, k.dims[0], k.dims[1], k.dims[2]});
-            PermuteSelf(v, {1, 0, 2});
-            v.Reshape({1, v.dims[0], v.dims[1], v.dims[2]});
-            int targetSeqLength = 0;
-            for (int b = 0; b < batch; b++) {
-                Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
-                if (GetKVCacheInCPU()) {
-                    pastKey.lockInCPU = true;
-                    pastValue.lockInCPU = true;
-                } else {
-                    pastKey.ToDevice(k.dataDevice);
-                    pastValue.ToDevice(v.dataDevice);
-                }
-            }
-
-            for (int b = 0; b < batch; b++) {
-                Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
-                int curLen = seqLens[b];
-                
-                int unitLen = 64;
-#ifdef USE_CUDA
-                unitLen = 128;
-#endif
-                int cacheOuter = k.dims[2], cacheInner = k.dims[3];
-                while ((pastKey.dims.size() == 0 &&
-                        (pastKey.expansionDims.size() == 0 || curLen > pastKey.expansionDims[1]))
-                       || (pastKey.dims.size() > 0 && pastKey.dims[1] + curLen > pastKey.expansionDims[1])) {
-                    std::vector<int> newDims;
-                    if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
-                        newDims = std::vector<int> {cacheOuter, ((curLen - 1) / unitLen + 1) * unitLen, cacheInner};
-                    } else {
-                        newDims = pastKey.dims;
-                        newDims[1] += ((curLen - 1) / unitLen + 1) * unitLen;
-                    }
-                    pastKey.Expansion(newDims);
-                }
-
-                cacheOuter = v.dims[2], cacheInner = v.dims[3];
-                while ((pastValue.dims.size() == 0 &&
-                        (pastValue.expansionDims.size() == 0 || curLen > pastValue.expansionDims[1]))
-                       || (pastValue.dims.size() > 0 && pastValue.dims[1] + curLen > pastValue.expansionDims[1])) {
-                    std::vector<int> newDims;
-                    if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
-                        newDims = std::vector<int>{cacheOuter, ((curLen - 1) / unitLen + 1) * unitLen, cacheInner};
-                    } else {
-                        newDims = pastValue.dims;
-                        newDims[1] += ((curLen - 1) / unitLen + 1) * unitLen;
-                    }
-                    pastValue.Expansion(newDims);
-                }
-            }
-
             Data attenOutput = Data(this->dataType);
-            int total = 0;
+            if (true) {
+                k_pe.Reshape({k_pe.dims[0], k_pe.dims[2], k_pe.dims[3]});
+                for (int bid = 0; bid < batch; bid++) {
+                    Data k, v;
+                    Split(k_pe, 1, bid, bid + 1, k);
+                    Split(kv_ln, 1, bid, bid + 1, v);
+                    Data &pastKey = *pastKeyValues[bid * block_cnt + i].first, &pastValue = *pastKeyValues[bid * block_cnt + i].second;
+                    if (GetKVCacheInCPU()) {
+                        pastKey.lockInCPU = true;
+                        pastValue.lockInCPU = true;
+                    } else {
+                        pastKey.ToDevice(k.dataDevice);
+                        pastValue.ToDevice(v.dataDevice);
+                    }
+                    int unitLen = 128;
+                    while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
+                        || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
+                        std::vector <int> newDims;
+                        if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                            newDims = std::vector <int> {k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
+                        } else {
+                            newDims = pastKey.dims;
+                            newDims[1] += ((k.dims[1] - 1) / unitLen + 1) * unitLen;
+                        }
+                        pastKey.Expansion(newDims);
+                    }
+                    while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[1] > pastValue.expansionDims[1]))
+                        || (pastValue.dims.size() > 0 && pastValue.dims[1] + v.dims[1] > pastValue.expansionDims[1])) {
+                        std::vector <int> newDims;
+                        if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                            newDims = std::vector <int> {v.dims[0], ((v.dims[1] - 1) / unitLen + 1) * unitLen, v.dims[2]};
+                        } else {
+                            newDims = pastValue.dims;
+                            newDims[1] += ((v.dims[1] - 1) / unitLen + 1) * unitLen;
+                        }
+                        pastValue.Expansion(newDims);
+                    }
+                    CatDirect(pastKey, k, 1);
+                    CatDirect(pastValue, v, 1);
+                    // absorb
+                    Data cur_q_pe, cur_q_nope;
+                    Split(q_pe, 2, bid, bid + 1, cur_q_pe);
+                    Split(q_nope, 2, bid, bid + 1, cur_q_nope);
 
-            q.Reshape({-1, q.dims[2], q.dims[3]});
-            k.Reshape({-1, k.dims[2], k.dims[3]});
-            v.Reshape({-1, v.dims[2], v.dims[3]});
+                    PermuteSelf(cur_q_pe, {0, 2, 1, 3});
+                    PermuteSelf(cur_q_nope, {0, 2, 1, 3});
+                    int b = cur_q_nope.dims[0], s = cur_q_nope.dims[1], h = cur_q_nope.dims[2], d = cur_q_nope.dims[3];
+                    PermuteSelf(cur_q_nope, {2, 0, 1, 3});
+                    cur_q_nope.Reshape({cur_q_nope.dims[0], -1, cur_q_nope.dims[3]});
 
-            std::vector <int> qdims = {q.dims[1], 1, q.dims[2]};
-            std::vector <uint64_t> qstrides = {(uint64_t)q.dims[2], (uint64_t)q.dims[2], 1};
-            std::vector <int> kdims = {k.dims[1], 1, k.dims[2]};
-            std::vector <uint64_t> kstrides = {(uint64_t)k.dims[2], (uint64_t)k.dims[2], 1};
-            std::vector <int> vdims = {v.dims[1], 1, v.dims[2]};
-            std::vector <uint64_t> vstrides = {(uint64_t)v.dims[2], (uint64_t)v.dims[2], 1};
-            for (int b = 0; b < batch; b++) {
-                curQs[b].dims = qdims;
-                curQs[b].strides = qstrides;
-                curQs[b].FakeFrom(q, b * q.strides[0] * q.unitSize);
-                curKs[b].dims = kdims;
-                curKs[b].strides = kstrides;
-                curKs[b].FakeFrom(k, b * k.strides[0] * k.unitSize);
-                curVs[b].dims = vdims;
-                curVs[b].strides = vstrides;
-                curVs[b].FakeFrom(v, b * v.strides[0] * v.unitSize);
+                    std::string kv0Name = kvWeightName + "__0", kv1Name = kvWeightName + "__1";
+                    if (this->weight.weight.find(kvWeightName) != this->weight.weight.end()) {
+                        this->weight[kvWeightName].Reshape({num_attention_heads, -1, kv_lora_rank});
+                        Split(this->weight[kvWeightName], 1, 0, qk_nope_head_dim, this->weight[kv0Name]);
+                        Split(this->weight[kvWeightName], 1, qk_nope_head_dim, qk_nope_head_dim + v_head_dim, this->weight[kv1Name]);
+                        this->weight.weight.erase(kvWeightName);
+                    }
+
+                    Data &kv0 = this->weight[kv0Name];
+                    Data &kv1 = this->weight[kv1Name];
+
+                    Data result, score0, score1;
+                    ToDataType(cur_q_nope, kv0.dataType);
+                    MatMul(cur_q_nope, kv0, result);
+                    ToDataType(result, this->dataType);
+                    PermuteSelf(result, {1, 0, 2});
+                    int c = result.dims.back(), t = pastValue.dims[1];
+                    result.Reshape({b, s * h, c});
+                    MatMulTransB(result, pastValue, score0);
+                    score0.Reshape({b, s, h, t});
+                    cur_q_pe.Reshape({cur_q_pe.dims[0], -1, cur_q_pe.dims[3]});
+                    MatMulTransB(cur_q_pe, pastKey, score1);
+                    score1.Reshape({b, s, h, t});
+
+                    AddTo(score1, score0);
+                    Mul(score1, softmax_scale, score0);
+
+                    Softmax(score0, score0, -1);
+                    Data x;
+                    score0.Reshape({b, s * h, t});
+                    MatMul(score0, pastValue, x);
+                    x.Reshape({b, s, h, c});
+                    PermuteSelf(x, {2, 0, 1, 3});
+                    x.Reshape({h, b * s, c});
+                    ToDataType(x, kv1.dataType);
+
+                    MatMulTransB(x, kv1, curAttenOutput);
+                    ToDataType(curAttenOutput, this->dataType);
+                    curAttenOutput.Reshape({h, b, s, -1});
+                    PermuteSelf(curAttenOutput, {1, 2, 0, 3});
+                    curAttenOutput.Reshape({s, b, -1});
+                    PermuteSelf(curAttenOutput, {1, 0, 2});
+
+                    if (bid == 0) {
+                        Mul(curAttenOutput, 1.0f, attenOutput);
+                    } else {
+                        Data temp;
+                        Mul(attenOutput, 1.0f, temp);
+                        Cat(temp, curAttenOutput, 1, attenOutput);
+                    }
+                }
+            } else {
+                Linear(kv_ln, this->weight[kvWeightName], this->weight[kvBiasName], kv);
+                kv.Reshape({bsz, seqlen, num_attention_heads, qk_nope_head_dim + v_head_dim});
+                PermuteSelf(kv, {0, 2, 1, 3});
+                Split(kv, -1, 0, qk_nope_head_dim, k_nope);
+                Split(kv, -1, qk_nope_head_dim, qk_nope_head_dim + v_head_dim, v);
+                Cat(q_nope, q_pe, -1, q);
+
+                Repeat(k_pe, 1, k_nope.dims[1], k_pe_repeat);
+                Cat(k_nope, k_pe_repeat, -1, k);
+
+                PermuteSelf(q, {1, 0, 2, 3});
+                PermuteSelf(k, {1, 0, 2, 3});
+                PermuteSelf(v, {1, 0, 2, 3});
+                q.Reshape({q.dims[0], q.dims[1] * q.dims[2], q.dims[3]});
+                k.Reshape({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
+                v.Reshape({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
+
+                PermuteSelf(q, {1, 0, 2});
+                q.Reshape({1, q.dims[0], q.dims[1], q.dims[2]});
+                PermuteSelf(k, {1, 0, 2});
+                k.Reshape({1, k.dims[0], k.dims[1], k.dims[2]});
+                PermuteSelf(v, {1, 0, 2});
+                v.Reshape({1, v.dims[0], v.dims[1], v.dims[2]});
+                int targetSeqLength = 0;
+                for (int b = 0; b < batch; b++) {
+                    Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
+                    if (GetKVCacheInCPU()) {
+                        pastKey.lockInCPU = true;
+                        pastValue.lockInCPU = true;
+                    } else {
+                        pastKey.ToDevice(k.dataDevice);
+                        pastValue.ToDevice(v.dataDevice);
+                    }
+                }
+
+                for (int b = 0; b < batch; b++) {
+                    Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
+                    int curLen = seqLens[b];
+                    
+                    int unitLen = 64;
+    #ifdef USE_CUDA
+                    unitLen = 128;
+    #endif
+                    int cacheOuter = k.dims[2], cacheInner = k.dims[3];
+                    while ((pastKey.dims.size() == 0 &&
+                            (pastKey.expansionDims.size() == 0 || curLen > pastKey.expansionDims[1]))
+                        || (pastKey.dims.size() > 0 && pastKey.dims[1] + curLen > pastKey.expansionDims[1])) {
+                        std::vector<int> newDims;
+                        if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                            newDims = std::vector<int> {cacheOuter, ((curLen - 1) / unitLen + 1) * unitLen, cacheInner};
+                        } else {
+                            newDims = pastKey.dims;
+                            newDims[1] += ((curLen - 1) / unitLen + 1) * unitLen;
+                        }
+                        pastKey.Expansion(newDims);
+                    }
+
+                    cacheOuter = v.dims[2], cacheInner = v.dims[3];
+                    while ((pastValue.dims.size() == 0 &&
+                            (pastValue.expansionDims.size() == 0 || curLen > pastValue.expansionDims[1]))
+                        || (pastValue.dims.size() > 0 && pastValue.dims[1] + curLen > pastValue.expansionDims[1])) {
+                        std::vector<int> newDims;
+                        if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                            newDims = std::vector<int>{cacheOuter, ((curLen - 1) / unitLen + 1) * unitLen, cacheInner};
+                        } else {
+                            newDims = pastValue.dims;
+                            newDims[1] += ((curLen - 1) / unitLen + 1) * unitLen;
+                        }
+                        pastValue.Expansion(newDims);
+                    }
+                }
+
+                int total = 0;
+                q.Reshape({-1, q.dims[2], q.dims[3]});
+                k.Reshape({-1, k.dims[2], k.dims[3]});
+                v.Reshape({-1, v.dims[2], v.dims[3]});
+
+                std::vector <int> qdims = {q.dims[1], 1, q.dims[2]};
+                std::vector <uint64_t> qstrides = {(uint64_t)q.dims[2], (uint64_t)q.dims[2], 1};
+                std::vector <int> kdims = {k.dims[1], 1, k.dims[2]};
+                std::vector <uint64_t> kstrides = {(uint64_t)k.dims[2], (uint64_t)k.dims[2], 1};
+                std::vector <int> vdims = {v.dims[1], 1, v.dims[2]};
+                std::vector <uint64_t> vstrides = {(uint64_t)v.dims[2], (uint64_t)v.dims[2], 1};
+                for (int b = 0; b < batch; b++) {
+                    curQs[b].dims = qdims;
+                    curQs[b].strides = qstrides;
+                    curQs[b].FakeFrom(q, b * q.strides[0] * q.unitSize);
+                    curKs[b].dims = kdims;
+                    curKs[b].strides = kstrides;
+                    curKs[b].FakeFrom(k, b * k.strides[0] * k.unitSize);
+                    curVs[b].dims = vdims;
+                    curVs[b].strides = vstrides;
+                    curVs[b].FakeFrom(v, b * v.strides[0] * v.unitSize);
+                }
+
+                total = batch;
+                for (int b = 0; b < batch; b++) {
+                    keys[b] = (pastKeyValues[b * block_cnt + i].first);
+                    values[b] = (pastKeyValues[b * block_cnt + i].second);
+                    pointersK[b] = (&curKs[b]);
+                    pointersV[b] = (&curVs[b]);
+                }
+                CatDirectBatch(keys, pointersK, 1);
+                CatDirectBatch(values, pointersV, 1);
+
+                int attnOutputDim = weight[oWeightName].dims[1];
+                attenOutput.ToDevice(q.dataDevice);
+                attenOutput.Resize({1, batch, attnOutputDim});
+                attenOutput.Allocate();
+                for (int b = 0; b < batch; b++) {
+                    qs[b] = (&curQs[b]);
+                    keys[b] = (pastKeyValues[b * block_cnt + i].first);
+                    values[b] = (pastKeyValues[b * block_cnt + i].second);
+                    masks[b] = attentionMask[b];
+                    curContextLayer[b].FakeFrom(attenOutput, b * attnOutputDim * attenOutput.unitSize);
+                    contexts[b] = (&curContextLayer[b]);
+                }
+                AttentionBatch(qs, keys, values, masks, contexts, qs[0]->dims[0] / values[0]->dims[0], 1.0 / scale_attn, 1);
             }
 
-            total = batch;
-            for (int b = 0; b < batch; b++) {
-                keys[b] = (pastKeyValues[b * block_cnt + i].first);
-                values[b] = (pastKeyValues[b * block_cnt + i].second);
-                pointersK[b] = (&curKs[b]);
-                pointersV[b] = (&curVs[b]);
-            }
-            CatDirectBatch(keys, pointersK, 1);
-            CatDirectBatch(values, pointersV, 1);
-
-            int attnOutputDim = weight[oWeightName].dims[1];
-            attenOutput.ToDevice(q.dataDevice);
-            attenOutput.Resize({1, batch, attnOutputDim});
-            attenOutput.Allocate();
-            for (int b = 0; b < batch; b++) {
-                qs[b] = (&curQs[b]);
-                keys[b] = (pastKeyValues[b * block_cnt + i].first);
-                values[b] = (pastKeyValues[b * block_cnt + i].second);
-                masks[b] = attentionMask[b];
-                curContextLayer[b].FakeFrom(attenOutput, b * attnOutputDim * attenOutput.unitSize);
-                contexts[b] = (&curContextLayer[b]);
-            }
-            AttentionBatch(qs, keys, values, masks, contexts, qs[0]->dims[0] / values[0]->dims[0], 1.0 / scale_attn, 1);
             Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
             Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
             AddTo(hiddenStates, attenLastOutput);
