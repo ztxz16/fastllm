@@ -155,6 +155,9 @@ namespace fastllm {
             DataType dataType = DataType::DATA_AUTO_NONE;
             if (weightType == WeightType::LINEAR) {
                 dataType = DataType::DATA_AUTO_LINEAR;
+                if (this->cantQuantLinears.find(name) != this->cantQuantLinears.end()) {
+                    dataType = DataType::FLOAT16;
+                }
             } else if (weightType == WeightType::EMBEDDING) {
                 dataType = DataType::DATA_AUTO_EMBEDDING;
             }

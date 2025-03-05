@@ -642,7 +642,7 @@ namespace fastllm {
     // 从hf文件夹读取，仅支持safetensor格式的模型
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
                                                     DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig,
-                                                    const std::string &loraPath, bool weightOnly) {
+                                                    const std::string &loraPath, bool weightOnly, bool useMoeDataType, DataType moeDataType, int moeGroupCnt) {
         std::map <std::string, std::pair <std::string, std::string> > loraDicts;
         SafeTensors *loraTensors = nullptr;
         float loraScaling;
@@ -751,6 +751,17 @@ namespace fastllm {
         // 有些tensor被共享，可能需要创建多次
         auto tensorMap = model->GetTensorMap(tensors);
 
+        // 如果有需要，为moe设置特定的量化参数
+        if (model->moeLinears.size() > 0 && useMoeDataType) {
+            for (auto &it : tensorMap) {
+                for (auto &weight : it.second) {
+                    if (model->moeLinears.find(weight.first) != model->moeLinears.end()) {
+                        weight.second = moeDataType;
+                    }
+                }
+            }
+        }
+
         int cur = 0;
         long long totalBytes = 0;
         std::set <std::string> allWeightNames; // 所有创建了的weight name
@@ -840,7 +851,7 @@ namespace fastllm {
                                 oriDataType = DataType::FLOAT16;
                             }
                             if (tensor.dtype == "F8_E4M3" && 
-                                (dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)){
+                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)){
                                 oriDataType = DataType::FLOAT32;
                                 scaleTensorName = tensorName + "_scale_inv";
                                 if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
@@ -921,7 +932,8 @@ namespace fastllm {
                                 if (it.second == DATA_AUTO_CONV) {
                                     tensor.Transpose(oriDataType);
                                 }
-                                model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, tensor.buffer, groupCnt);
+                                model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, tensor.buffer,
+                                        model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt);
                             }
                             tensor.ClearBuffer();
 
@@ -1022,12 +1034,10 @@ namespace fastllm {
                             }
                             locker.unlock();
 #ifdef USE_TFACC
-                            if (!needMerge && it.second == DATA_AUTO_LINEAR) {
+                            if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
                                 locker.lock();
-                                if (model->specialWeights.find(weightName) != model->specialWeights.end()) {
                                     model->weight.weight[weightName].weightSum.resize(1);
                                     RegisterFastllmData(&model->weight.weight[weightName], model->specialWeights[weightName]);
-                                }
                                 locker.unlock();
                             }
 #endif
@@ -1059,7 +1069,7 @@ namespace fastllm {
     // 从hf文件夹读取，仅支持safetensor格式的模型，然后导出成safetensor格式
     void ExportLLMModelFromHF(const std::string &modelPath, 
                             DataType linearDataType, int groupCnt, const std::string &exportPath, const std::string &modelConfig,
-                            const std::string &loraPath) {
+                            const std::string &loraPath, bool useMoeDataType, DataType moeDataType, int moeGroupCnt) {
         // 检查源目录是否存在
         if (!fs::exists(modelPath) || !fs::is_directory(modelPath)) {
             std::cerr << "源目录不存在或不是一个目录: " << modelPath << std::endl;
@@ -1160,6 +1170,17 @@ namespace fastllm {
         auto tensors = safeTensors.GetSortedItemNames();
         auto tensorMap = model->GetTensorMap(tensors);
 
+        // 如果有需要，为moe设置特定的量化参数
+        if (model->moeLinears.size() > 0) {
+            for (auto &it : tensorMap) {
+                for (auto &weight : it.second) {
+                    if (model->moeLinears.find(weight.first) != model->moeLinears.end()) {
+                        weight.second = moeDataType;
+                    }
+                }
+            }
+        }
+
         for (auto &file : safeTensors.fileNames) {
             std::map <std::string, Data> weights;
             std::string outputFileName = outputFileDict[file];
@@ -1221,7 +1242,7 @@ namespace fastllm {
                                 oriDataType = DataType::FLOAT16;
                             }
                             if (tensor.dtype == "F8_E4M3" && 
-                                (dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)) {
+                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)) {
                                 oriDataType = DataType::FLOAT32;
                                 scaleTensorName = tensor.tensorName + "_scale_inv";
                                 if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
@@ -1300,7 +1321,8 @@ namespace fastllm {
                             if (dataType == DATA_AUTO_CONV) {
                                 tensor.Transpose(oriDataType);
                             }
-                            weights[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, tensor.buffer, groupCnt);
+                            weights[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, tensor.buffer, 
+                                model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt);
                             tensor.ClearBuffer();
                         }
                     }, st, end)
@@ -1318,8 +1340,17 @@ namespace fastllm {
                 long long currentBytes = weights[weightName].GetFastllmFormateBytes();
                 offsets[weightName] = {currentOffset, currentOffset + currentBytes};
                 currentOffset += currentBytes;
+                std::string dtype = "fastllm";
+                DataType realType = weights[weightName].dataType;
+                if (realType == FLOAT16) {
+                    dtype = "F16";
+                } else if (realType == FLOAT32) {
+                    dtype = "F32";
+                } else if (realType == BFLOAT16) {
+                    dtype = "BF16";
+                }
                 config[weightName] = json11::Json::object {
-                        {"dtype", "fastllm"},
+                        {"dtype", dtype},
                         {"shape", json11::Json(weights[weightName].dims)},
                         {"data_offsets", json11::Json(offsets[weightName])}
                 };

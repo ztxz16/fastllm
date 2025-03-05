@@ -2972,6 +2972,11 @@ void LaunchFastllmGemmFp32Fp16(float *input, half *weight, float *output, float 
     } else if (n == 7) {
         FastllmGemvFp32Fp16Kernel2MultiRow<256, 7> <<< k, 256 >>>(input, weight, output, bias, m, k);
     } else {
+        for (int i = 0; i < n; i++) {
+            FastllmGemvFp32Fp16Kernel2MultiRow<256, 1> <<< k, 256 >>>(input + i * m, weight, output + i * k, bias, m, k);
+        }
+        return;
+
         printf("Error: LaunchFastllmGemmFp32Fp16: n > 7.\n");
         exit(0);
     }
@@ -4199,13 +4204,41 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
     auto fastllmCublasHandle = getFastllmCublasHandle();
     cublasStatus_t status;
 
-    status = cublasSgemmStridedBatched(fastllmCublasHandle,
-                                       CUBLAS_OP_N, CUBLAS_OP_N,
-                                       k, n, m, &alpha,
-                                       cudaInput1, input1Stride, input1Spatial,
-                                       cudaInput0, input0Stride, input0Spatial,
-                                       &beta,
-                                       cudaOutput, k, k * n, batch);
+    if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT32) {
+        status = cublasSgemmStridedBatched(fastllmCublasHandle,
+                                        CUBLAS_OP_N, CUBLAS_OP_N,
+                                        k, n, m, &alpha,
+                                        cudaInput1, input1Stride, input1Spatial,
+                                        cudaInput0, input0Stride, input0Spatial,
+                                        &beta,
+                                        cudaOutput, k, k * n, batch);
+    } else if (input0.dataType == fastllm::DataType::FLOAT16 && input1.dataType == fastllm::DataType::FLOAT16) {
+        half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
+        status = cublasHgemmStridedBatched(fastllmCublasHandle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                k, n, m, &h_alpha,
+                (half*)cudaInput1, input1Stride, input1Spatial,
+                (half*)cudaInput0, input0Stride, input0Spatial,
+                &h_beta,
+                (half*)cudaOutput, k, k * n, batch);
+    } else if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT16) {
+        half *tempInput0 = (half*)FastllmCudaMalloc(input0.Count(0) * sizeof(half));
+        half *tempOutput = (half*)FastllmCudaMalloc(output.Count(0) * sizeof(half));
+        FastllmFloatToHalf(cudaInput0, tempInput0, input0.Count(0));
+
+        half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
+        status = cublasHgemmStridedBatched(fastllmCublasHandle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                k, n, m, &h_alpha,
+                (half*)cudaInput1, input1Stride, input1Spatial,
+                (half*)tempInput0, input0Stride, input0Spatial,
+                &h_beta,
+                (half*)tempOutput, k, k * n, batch);
+        FastllmHalfToFloat(tempOutput, cudaOutput, output.Count(0));
+        FastllmCudaFree(tempInput0);
+        FastllmCudaFree(tempOutput);
+    }
+
     if (status != CUBLAS_STATUS_SUCCESS) {
         printf("status = %d\n", (int)status);
         printf("%d %d %d\n", k, n, m);
@@ -4231,13 +4264,41 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
     auto fastllmCublasHandle = getFastllmCublasHandle();
     cublasStatus_t status;
 
-    status = cublasSgemmStridedBatched(fastllmCublasHandle,
+    if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT32) {
+        status = cublasSgemmStridedBatched(fastllmCublasHandle,
                                        CUBLAS_OP_T, CUBLAS_OP_N,
                                        k, n, m, &alpha,
                                        cudaInput1, input1Stride, input1Spatial,
                                        cudaInput0, input0Stride, input0Spatial,
                                        &beta,
                                        cudaOutput, k, k * n, batch);
+    } else if (input0.dataType == fastllm::DataType::FLOAT16 && input1.dataType == fastllm::DataType::FLOAT16) {
+        half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
+        status = cublasHgemmStridedBatched(fastllmCublasHandle,
+                                        CUBLAS_OP_T, CUBLAS_OP_N,
+                                        k, n, m, &h_alpha,
+                                        (half*)cudaInput1, input1Stride, input1Spatial,
+                                        (half*)cudaInput0, input0Stride, input0Spatial,
+                                        &h_beta,
+                                        (half*)cudaOutput, k, k * n, batch);
+    } else if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT16) {
+        half *tempInput0 = (half*)FastllmCudaMalloc(input0.Count(0) * sizeof(half));
+        half *tempOutput = (half*)FastllmCudaMalloc(output.Count(0) * sizeof(half));
+        FastllmFloatToHalf(cudaInput0, tempInput0, input0.Count(0));
+
+        half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
+        status = cublasHgemmStridedBatched(fastllmCublasHandle,
+                                        CUBLAS_OP_T, CUBLAS_OP_N,
+                                        k, n, m, &h_alpha,
+                                        (half*)cudaInput1, input1Stride, input1Spatial,
+                                        (half*)tempInput0, input0Stride, input0Spatial,
+                                        &h_beta,
+                                        (half*)tempOutput, k, k * n, batch);
+        FastllmHalfToFloat(tempOutput, cudaOutput, output.Count(0));
+        FastllmCudaFree(tempInput0);
+        FastllmCudaFree(tempOutput);
+    }
+
     if (status != CUBLAS_STATUS_SUCCESS) {
         printf("status = %d\n", (int)status);
         printf("%d %d %d\n", k, n, m);
