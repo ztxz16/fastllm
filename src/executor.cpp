@@ -53,6 +53,10 @@ namespace fastllm {
         this->devices.push_back(device);
     }
 
+    std::string Executor::GetFirstDeviceType() {
+        return this->devices[0]->deviceType;
+    }
+
     void Executor::SetFirstDevice(const std::string &device) {
         auto temp = this->devices;
         this->devices.clear();

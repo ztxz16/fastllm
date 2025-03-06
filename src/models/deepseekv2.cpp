@@ -2,7 +2,10 @@
 // Created by huangyuyang on 5/11/24.
 //
 
+#include <random>
 #include "deepseekv2.h"
+
+#include "executor.h"
 
 #include "utils.h"
 
@@ -244,10 +247,41 @@ namespace fastllm {
         return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, &batchLogits)[0];
     }
 
+    std::vector <int> GumbelMaxTrick(Data &logits, int batch) {
+        std::vector <int> ret;
+        Mul(logits, 1 / 0.6, logits);
+        Softmax(logits, logits, -1);
+        ToDataType(logits, DataType::FLOAT32);
+        logits.ToDevice(DataDevice::CPU);
+        int vocabSize = logits.dims.back();
+        static std::random_device rd;  // 用于获取随机种子
+        static std::mt19937 gen(rd()); // 使用Mersenne Twister引擎
+        // 设置指数分布，lambda = 1
+        static std::exponential_distribution<> exp_dist(1.0);
+
+        for (int b = 0; b < batch; b++) {
+            float *base = ((float*)logits.cpuData) + b * vocabSize;
+            int selId = -1;
+            float maxValue = -1e10;
+            for (int i = 0; i < vocabSize; i++) {
+                float nowValue = base[i] / exp_dist(gen);
+                if (nowValue > maxValue) {
+                    maxValue = nowValue;
+                    selId = i;
+                }
+            }
+            ret.push_back(selId);
+        }
+
+        return ret;
+    }
+
     std::vector <int> DeepSeekV2Model::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
                             std::vector <std::vector <float>*> *retLogits) {
+        Executor &excutor = *((Executor*)GetExecutor());
+
         std::string scoring_func = "softmax";
         if (this->weight.dicts.find("scoring_func") != this->weight.dicts.end()) {
             scoring_func = this->weight.dicts["scoring_func"];
@@ -349,7 +383,7 @@ namespace fastllm {
             PermuteSelf(k_pe, {1, 0, 2, 3});
             PermuteSelf(k_pe, {0, 2, 1, 3});
 
-            if (true) {
+            if (excutor.GetFirstDeviceType() == "cuda") {
                 auto &k = k_pe, &v = kv_ln;
                 k_pe.Reshape({k_pe.dims[0], k_pe.dims[2], k_pe.dims[3]});
                 Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
@@ -674,6 +708,9 @@ namespace fastllm {
             RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
             Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
             ToDataType(logits, DataType::FLOAT32);
+            if (this->weight.dicts["model_type"] != "deepseek_v2") {
+                return GumbelMaxTrick(logits, batch);
+            }
             if (generationConfig.output_logits && retLogits != nullptr) {
                 int size = logits.dims.back();
                 logits.ToDevice(DataDevice::CPU);
@@ -717,6 +754,7 @@ namespace fastllm {
                                                const std::vector <GenerationConfig> &generationConfigs,
                                                const LastTokensManager &lastTokens,
                                                std::vector <std::vector <float>*> *retLogits) {
+        Executor &excutor = *((Executor*)GetExecutor());
         int seqLen = inputIds.dims[1];
         std::string scoring_func = "softmax";
         if (this->weight.dicts.find("scoring_func") != this->weight.dicts.end()) {
@@ -836,7 +874,7 @@ namespace fastllm {
             PermuteSelf(k_pe, {0, 2, 1, 3});
 
             Data attenOutput = Data(this->dataType);
-            if (true) {
+            if (excutor.GetFirstDeviceType() == "cuda") {
                 k_pe.Reshape({k_pe.dims[0], k_pe.dims[2], k_pe.dims[3]});
                 for (int bid = 0; bid < batch; bid++) {
                     Data k, v;
@@ -1226,6 +1264,11 @@ namespace fastllm {
         Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
         ToDataType(logits, DataType::FLOAT32);
         std::vector <int> lastRet;
+
+        if (this->weight.dicts["model_type"] != "deepseek_v2") {
+            return GumbelMaxTrick(logits, batch);
+        }
+
         int total = 0;
 
         bool allSimple = true, needLogits = false;
