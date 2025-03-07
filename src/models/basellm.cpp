@@ -161,7 +161,11 @@ namespace fastllm {
             } else if (weightType == WeightType::EMBEDDING) {
                 dataType = DataType::DATA_AUTO_EMBEDDING;
             }
-            ret[name].push_back(std::make_pair(name, dataType));
+            if (StringEndWith(name, ".qweight")) {
+                ret[name].push_back(std::make_pair(name.substr(0, name.size()-7) + "weight", dataType));
+            } else {
+                ret[name].push_back(std::make_pair(name, dataType));
+            }
         }
         return ret;
     }
