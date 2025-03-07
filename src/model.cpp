@@ -344,6 +344,54 @@ namespace fastllm {
             fclose(fi);
         }
 
+        void CreateBufferWithAWQ(DataType dstType, SafeTensorItem &scale, SafeTensorItem &qzero) {
+            const int groupCnt = this->shape[0] / scale.shape[0];
+            AssertInFastLLM(this->shape.size() == 2 && scale.shape.size() == 2 && qzero.shape.size() == 2,
+                            "CreateBufferWithAWQ error: shape.size() should be 2.");
+            AssertInFastLLM(groupCnt * scale.shape[0] == this->shape[0] && groupCnt * qzero.shape[0] == this->shape[0] &&
+                            8 * this->shape[1] == scale.shape[1] && this->shape[1] == qzero.shape[1],
+                            "CreateBufferWithAWQ error: shape error.");
+            AssertInFastLLM(this->dtype == "I32" && qzero.dtype == "I32",
+                            "CreateBufferWithAWQ error: dtype shoud be I32.");
+            int n = this->shape[0], m = this->shape[1];
+
+            ClearBuffer();
+            buffer = new uint8_t[this->bytes * 8];
+            float *floatBuffer = (float*)buffer;
+            FILE *fweight = fopen(this->fileName.c_str(), "rb");
+            FILE *fqzero  = fopen(qzero.fileName.c_str(), "rb");
+#if defined(_WIN32) || defined(_WIN64)
+            _fseeki64(fweight, this->data_offsets[0], 0);
+            _fseeki64(fqzero,  qzero.data_offsets[0], 0);
+#else
+            fseek(fweight, this->data_offsets[0], 0);
+            fseek(fqzero,  qzero.data_offsets[0], 0);
+#endif
+            uint8_t *ori_weight = new uint8_t[this->bytes];
+            uint8_t *ori_qzero  = new uint8_t[qzero.bytes];
+            int ret;
+            ret = fread(ori_weight, 1, this->bytes, fweight);
+            ret = fread(ori_qzero , 1, qzero.bytes, fqzero);
+            unsigned int* weight_int32 = (unsigned int*)ori_weight;
+            unsigned int* qzero_int32  = (unsigned int*)ori_qzero;
+            float* scale_f32 = (float*)scale.buffer;
+            static const int awq_shift[8] = {0,16,4,20,8,24,12,28}; // awq order = [0,2,4,8,1,3,5,7]
+            for (int x = 0; x < n; x++) {
+                for (int y = 0; y < m * 8; y++) {
+                    int gx = x / groupCnt;
+                    int gy = y >> 3;
+                    int w = (weight_int32[x * m + gy] >> awq_shift[y & 7]) & 15;
+                    int z = (qzero_int32[gx * m + gy] >> awq_shift[y & 7]) & 15;
+                    float s = scale_f32[gx * m * 8 + y];
+                    floatBuffer[x * m * 8 + y] = (w - z) * s;
+                }
+            }
+            delete[] ori_weight;
+            delete[] ori_qzero;
+            fclose(fweight);
+            fclose(fqzero);
+        }
+
         void CreateBuffer(DataType dstType) {
             //printf("read %s from %s [%llu %llu] (%f M)\n", this->tensorName.c_str(), this->fileName.c_str(), this->data_offsets[0], this->data_offsets[0] + this->bytes, (float)this->bytes / 1e6);
             FILE *fi = fopen(this->fileName.c_str(), "rb");
@@ -692,6 +740,7 @@ namespace fastllm {
         // 2. 创建网络基本信息
         std::string configFile = path + "config.json";
         auto config = weightOnly ? json11::Json() : json11::Json::parse(ReadAllFile(configFile), error);
+        bool isAwqModel = false;
         std::string modelType = "";
         if (weightOnly) {
             modelType = "qwen";
@@ -702,6 +751,18 @@ namespace fastllm {
                 modelType = config["model_type"].string_value();
             } else {
                 modelType = config["architectures"].array_items()[0].string_value();
+            }
+            if (!config["quantization_config"].is_null()) {
+                auto qconfig = config["quantization_config"];
+                AssertInFastLLM(qconfig["quant_method"] == "awq" &&
+                                qconfig["bits"] == 4 &&
+                                qconfig["version"] == "gemm" &&
+                                qconfig["zero_point"].bool_value(), 
+                                "Config error: only 4bits AWQ with zero point and gemm version is supported.");
+                isAwqModel = true;
+                if (linearDataType != DataType::INT4_GROUP || groupCnt != 128) {
+                    printf("WARNING: It is recommended to use \"--dtype int4g128\" for AWQ models.");
+                }
             }
         }
         basellm *model = CreateModelWithType(modelType);
@@ -782,6 +843,8 @@ namespace fastllm {
                     std::vector <int> realShape = tensor.intShape;
                     std::swap(realShape[0], realShape[1]);
                     model->weight.AddEmptyWeight(weightName, realShape, dataType);
+                } else if (isAwqModel && StringEndWith(tensorName, ".qweight")) {
+                    model->weight.AddEmptyWeight(weightName, {tensor.intShape[1]*8, tensor.intShape[0]}, linearDataType);
                 } else {
                     model->weight.AddEmptyWeight(weightName, tensor.intShape, dataType);
                 }
@@ -824,7 +887,8 @@ namespace fastllm {
                 new std::thread([&](int st, int end) {
                     for (int i = st; i < end; i++) {
                         auto &tensorName = tensors[i];
-                        if (StringEndWith(tensorName, "_scale_inv")) {
+                        if (StringEndWith(tensorName, "_scale_inv") ||
+                            (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
                             locker.lock();
                             printf("Convert %d \r", (++cnt) * 100 / (int)tensorMap.size());
                             fflush(stdout);
@@ -833,6 +897,7 @@ namespace fastllm {
                         }
                         auto &tensor = safeTensors.itmeDict[tensorName];
                         std::string scaleTensorName = "";
+                        std::string qzeroTensorName = "";
 
                         for (auto &it : tensorMap[tensorName]) {
                             auto oriDataType = DataType::FLOAT32;
@@ -858,14 +923,34 @@ namespace fastllm {
                                     scaleTensorName = "";
                                 }
                             }
+                            if (tensor.dtype == "I32" && isAwqModel && StringEndWith(tensorName, "qweight")) {
+                                std::string name = tensorName.substr(0, tensorName.size() - strlen("qweight"));
+                                oriDataType = DataType::FLOAT32;
+                                scaleTensorName = name + "scales";
+                                qzeroTensorName = name + "qzeros";
+                                AssertInFastLLM(safeTensors.itmeDict.find(scaleTensorName) != safeTensors.itmeDict.end() &&
+                                                safeTensors.itmeDict.find(qzeroTensorName) != safeTensors.itmeDict.end(),
+                                                "Tensor error: can't find AWQ scalse / qzeros.");
+                            }
 
                             if (scaleTensorName == "") {
                                 tensor.CreateBuffer(oriDataType);
-                            } else {
+                            } else if(!isAwqModel) {
                                 auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
                                 AssertInFastLLM(scaleTensor.dtype == "F32", "Tensor scale error: scale's dtype should be F32.");
                                 scaleTensor.CreateBuffer(DataType::FLOAT32);
                                 tensor.CreateBufferWithScale(oriDataType, scaleTensor);
+                            } else {
+                                auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
+                                auto &qzeroTensor = safeTensors.itmeDict[qzeroTensorName];
+                                scaleTensor.CreateBuffer(DataType::FLOAT32);
+                                tensor.CreateBufferWithAWQ(oriDataType, scaleTensor, qzeroTensor);
+                                int n = tensor.intShape[0], m = tensor.intShape[1]*8;
+                                int len = n * m;
+                                float *temp = new float[len];
+                                memcpy(temp, tensor.buffer, len * sizeof(float));
+                                fastllm::Transpose((float*)tensor.buffer, temp, n, m, n, m);
+                                delete[] temp;
                             }
 
                             if (loraDicts.find(weightName) != loraDicts.end()) {
@@ -964,8 +1049,9 @@ namespace fastllm {
                                                 canMerge = false;
                                                 break;
                                             }
-                                            if (model->weight[input].dataType != model->weight[input].dataType ||
-                                                model->weight[input].dims[1] != model->weight[input].dims[1]) {
+                                            if (model->weight[input].dataType != model->weight[it.inputs[0]].dataType ||
+                                                model->weight[input].dims[1] != model->weight[it.inputs[0]].dims[1]) {
+                                                canMerge = false;
                                                 break;
                                             }
                                         }
