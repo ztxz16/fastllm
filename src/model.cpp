@@ -752,7 +752,7 @@ namespace fastllm {
             } else {
                 modelType = config["architectures"].array_items()[0].string_value();
             }
-            if (!config["quantization_config"].is_null()) {
+            if (!config["quantization_config"].is_null() && config["quantization_config"]["quant_method"] == "awq") {
                 auto qconfig = config["quantization_config"];
                 AssertInFastLLM(qconfig["quant_method"] == "awq" &&
                                 qconfig["bits"] == 4 &&
