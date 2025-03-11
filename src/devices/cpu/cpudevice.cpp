@@ -454,17 +454,8 @@ namespace fastllm {
         }
     }
 
-    struct MultiThreadSwigluOp : MultiThreadBaseOp {
-        float *input, *output;
-        int mid, len, n, inputStride, outputStride;
-
-        MultiThreadSwigluOp (float *input, int mid, int len, float *output,
-                             int n, int inputStride, int outputStride) :
-            input(input), mid(mid), len(len), output(output),
-            n(n), inputStride(inputStride), outputStride(outputStride) {}
-
-        void Run() {
-            for (int o = 0; o < n; o++) {
+    void MultiThreadSwigluOp::Run() {
+        for (int o = 0; o < n; o++) {
                 float *cur = (float*)input + o * inputStride;
                 float *out = (float*)output + o * outputStride;
                 int i = 0;
@@ -482,9 +473,20 @@ namespace fastllm {
                     float x = cur[i], y = cur[i + mid];
                     out[i] = (x / (1.0 + expf(-x))) * y;
                 }
+        }
+    }
+
+    void MultiThreadSwigluFloat16Op::Run() {
+        for (int o = 0; o < n; o++) {
+            uint16_t *cur = (uint16_t*)input + o * inputStride;
+            uint16_t *out = (uint16_t*)output + o * outputStride;
+            int i = 0;
+            for (; i < len; i++) {
+                float x = fp16tofp32.dict[cur[i]], y = fp16tofp32.dict[cur[i + mid]];
+                out[i] = float_to_half((x / (1.0 + expf(-x))) * y);
             }
         }
-    };
+    }
 
     struct MultiThreadLinearInt4NoZeroOp : MultiThreadBaseOp {
         uint8_t *a, *b;
@@ -620,33 +622,13 @@ namespace fastllm {
             }
         }
     };
-    
-    struct MultiThreadLinearInt4GroupOp : MultiThreadBaseOp {
-        uint8_t *a, *b;
-        int32_t *c;
-        int n, m, k, kstride;
-        int *weightSums;
-        float *weightMins;
-        float *scales;
-        float *bias;
-        float *iscales, *izeros;
-        float *inputSums;
-        int group, groupCnt;
 
-        MultiThreadLinearInt4GroupOp(
-                uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride,
-                int *weightSums, float *weightMins, float *scales, float *bias,
-                float *iscales, float *izeros, float *inputSums, int group, int groupCnt
-        ) :
-                a(a), b(b), c(c), n(n), m(m), k(k), kstride(kstride),
-                weightSums(weightSums), weightMins(weightMins), scales(scales), bias(bias),
-                iscales(iscales), izeros(izeros), inputSums(inputSums), group(group), groupCnt(groupCnt) {}
-
-        void Run() {
+    void MultiThreadLinearInt4GroupOp::Run() {
             std::vector <float> values;
             values.resize(group);
 
             int block = 0;
+            int realGroup = (m - 1) / groupCnt + 1;
             for (; block < n; block++) {
                 uint8_t *weightWalk = b;
                 uint8_t *inputStart = a + block * m;
@@ -656,7 +638,7 @@ namespace fastllm {
                     uint8_t *inputWalk = inputStart;
                     float sum = 0.0;
 
-                    for (int g = 0; g < group; g++) {
+                    for (int g = 0; g < realGroup; g++) {
                         int st = g * groupCnt, end = std::min(m, (g + 1) * groupCnt);
                         float &value = values[g];
                         int j = st;
@@ -703,7 +685,7 @@ namespace fastllm {
 #ifdef __aarch64__
                     float32x4_t vSum = vdupq_n_f32(0.0f);
                     float32x4_t vGroupCnt = vdupq_n_f32(groupCnt);
-                    for (; g + 3 < group; g += 4) {
+                    for (; g + 3 < realGroup; g += 4) {
                         int iid = block * group + g;
                         int gid = i * group + g;
                         float32x4_t vValue = vld1q_f32(values.data() + g);
@@ -720,7 +702,7 @@ namespace fastllm {
                     }
                     sum += vSum[0] + vSum[1] + vSum[2] + vSum[3];
 #endif
-                    for (; g < group; g++) {
+                    for (; g < realGroup; g++) {
                         int iid = block * group + g;
                         int gid = i * group + g;
                         int value = values[g];
@@ -738,8 +720,7 @@ namespace fastllm {
                     ((float*)c)[block * kstride + i] = sum + (bias == nullptr ? 0.0 : bias[i]);
                 }
             }
-        }
-    };
+    }
 
     void MultiplyInt4GroupMultiThread(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k,
                                  int *weightSums, float *weightMins, float *scales, float *bias,
@@ -1672,18 +1653,7 @@ namespace fastllm {
         }
     };
 
-    struct MultiThreadFloat16LinearOp : MultiThreadBaseOp {
-        float *inputData;
-        uint16_t *weightData;
-        float *biasData, *outputData;
-        int n, m, k, st, end;
-
-        MultiThreadFloat16LinearOp(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
-                           int n, int m, int k, int st, int end) : 
-            inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData),
-            n(n), m(m), k(k), st(st), end(end) {}
-
-        void Run() {
+    void MultiThreadFloat16LinearOp::Run() {
             for (int i = 0; i < n; i++) {
                 for (int j = st; j < end; j++) {
                     float now = biasData ? biasData[j] : 0.0f;
@@ -1722,8 +1692,85 @@ namespace fastllm {
                     outputData[i * k + j] = now;
                 }
             }
+    }
+
+    void MultiThreadInt4GroupLinearOp::Run() {
+        for (int i = 0; i < n; i++) {
+            for (int j = st; j < end; j++) {
+                float now = biasData ? biasData[j] : 0.0f;
+                for (int g = 0; g < group; g++) {
+                    int gst = g * groupCnt;
+                    int gend = std::min((g + 1) * groupCnt, m);
+                    int l = gst;
+                    float curMin = fp16tofp32.dict[mins[j * group + g]];
+                    float curScale = fp16tofp32.dict[scales[j * group + g]];
+#ifdef __AVX2__
+                    __m256 now_vec = _mm256_setzero_ps();
+                    const __m256 scale_vec = _mm256_set1_ps(curScale);
+                    const __m256 min_vec = _mm256_set1_ps(curMin);
+                        
+                    for (; l + 8 <= gend; l += 8) {
+                        // 计算权重索引（每次处理4个字节）
+                        size_t weight_offset = (j * m + l) / 2;
+                        const uint8_t* weight_ptr = &weightData[weight_offset];
+                            
+                        // 加载4个权重字节
+                        __m128i v = _mm_loadl_epi64((const __m128i*)weight_ptr);
+                            
+                        // 拆分高/低4位
+                        __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0F));
+                        __m128i lo = _mm_and_si128(v, _mm_set1_epi8(0x0F));
+                            
+                        // 交错排列成 [hi0, lo0, hi1, lo1, ...]
+                        __m128i hi_lo = _mm_unpacklo_epi8(hi, lo);
+                            
+                        // 将8个字节扩展为8个int32
+                        __m128i lo_nib = _mm_cvtepu8_epi32(hi_lo);
+                        __m128i hi_nib = _mm_cvtepu8_epi32(_mm_srli_si128(hi_lo, 4));
+                        __m256i nibbles = _mm256_set_m128i(hi_nib, lo_nib);
+                        
+                        // 转换为浮点数并计算权重
+                        __m256 weights = _mm256_fmadd_ps(
+                        _mm256_cvtepi32_ps(nibbles), scale_vec, min_vec);
+                        
+                        // 加载8个输入元素
+                        const float* input_ptr = &inputData[i * m + l];
+                        __m256 input = _mm256_loadu_ps(input_ptr);
+                            
+                        // 乘积累加
+                        now_vec = _mm256_fmadd_ps(input, weights, now_vec);
+                    }
+                        
+                    // 水平求和
+                    __m128 sum128 = _mm_add_ps(_mm256_extractf128_ps(now_vec, 1),
+                                                _mm256_castps256_ps128(now_vec));
+                    sum128 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+                    sum128 = _mm_add_ss(sum128, _mm_shuffle_ps(sum128, sum128, 0x55));
+                    now += _mm_cvtss_f32(sum128);
+#endif
+                    // 处理剩余不足8个元素的情况
+                    for (; l + 1 < gend; l += 2) {
+                        uint8_t v = weightData[(j * m + l) / 2];
+                        now += inputData[i * m + l] * (curMin + (v >> 4) * curScale);
+                        now += inputData[i * m + l + 1] * (curMin + (v & 0x0F) * curScale);
+                    }
+
+                    for (; l < gend; l++) {
+                        int id = (j * m + l) / 2;
+                        float weight = 0.0f;
+                        if ((j * m + l) % 2) {
+                            weight = curMin + (weightData[id] & 0xF) * curScale;
+                        } else {
+                            weight = curMin + (weightData[id] >> 4) * curScale;
+                        }
+                        now += inputData[i * m + l] * weight;
+                    }
+                }
+
+                outputData[i * k + j] = now;
+            }
         }
-    };
+    }
 
     struct MultiThreadBase3GroupLinearOp : MultiThreadBaseOp {
         float *inputData;
@@ -1758,25 +1805,12 @@ namespace fastllm {
         }
     };
 
-    struct MultiThreadFloat16Float16LinearOp : MultiThreadBaseOp {
-        uint16_t *inputData;
-        uint16_t *weightData;
-        float *biasData;
-        uint16_t *outputData;
-        int n, m, k, st, end;
-
-        MultiThreadFloat16Float16LinearOp(uint16_t *inputData, uint16_t *weightData, float *biasData, uint16_t *outputData,
-                           int n, int m, int k, int st, int end) : 
-            inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData),
-            n(n), m(m), k(k), st(st), end(end) {}
-
-        void Run() {
-            MatMulFloat16Float16(
+    void MultiThreadFloat16Float16LinearOp::Run() {
+        MatMulFloat16Float16(
                 inputData, weightData, biasData, outputData, 
                 n, m, k, st, end
-            );
-        }
-    };
+        );
+    }
 
     // float的input, int8的weight, 直接计算得到float的output
     void Int8LinearPart(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
@@ -2304,10 +2338,11 @@ namespace fastllm {
     }
 
     void MultiThreadOnlineQuantizationOp::Run() {
+        int realGroup = (m - 1) / groupCnt + 1;
         for (int i = 0; i < n; i++) {
             float *cur = input + i * m;
             uint8_t *u = output + i * m;
-            for (int g = 0; g < group; g++) {
+            for (int g = 0; g < realGroup; g++) {
                 int st = g * groupCnt;
                 int end = std::min(m, (g + 1) * groupCnt);
                 float minValue = 1e9, maxValue = -1e9;
@@ -2331,7 +2366,7 @@ namespace fastllm {
 #endif
         if (inputSums != nullptr) {
             for (int i = 0; i < n; i++) {
-                for (int g = 0; g < group; g++) {
+                for (int g = 0; g < realGroup; g++) {
                     iscales[i * group + g] = configs[i * group + g].scale;
                     izeros[i * group + g] = configs[i * group + g].zeroPoint;
                     int sum = 0;
@@ -2713,7 +2748,6 @@ namespace fastllm {
                 uint16_t *weightData = (uint16_t *) weight.cpuData;
                 uint16_t *outputData = (uint16_t *) output.cpuData;
                 float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
-
                 auto pool = GetAlivePool();
                 int threadNum = pool->threads.size();
                 int per = k / threadNum;

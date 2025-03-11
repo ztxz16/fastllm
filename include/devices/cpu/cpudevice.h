@@ -24,6 +24,98 @@ namespace fastllm {
         void Run();
     };
 
+    struct MultiThreadSwigluOp : MultiThreadBaseOp {
+        float *input, *output;
+        int mid, len, n, inputStride, outputStride;
+
+        MultiThreadSwigluOp (float *input, int mid, int len, float *output,
+                             int n, int inputStride, int outputStride) :
+            input(input), mid(mid), len(len), output(output),
+            n(n), inputStride(inputStride), outputStride(outputStride) {}
+
+        void Run();
+    };
+
+    struct MultiThreadSwigluFloat16Op : MultiThreadBaseOp {
+        uint16_t *input, *output;
+        int mid, len, n, inputStride, outputStride;
+
+        MultiThreadSwigluFloat16Op (uint16_t *input, int mid, int len, uint16_t *output,
+                             int n, int inputStride, int outputStride) :
+            input(input), mid(mid), len(len), output(output),
+            n(n), inputStride(inputStride), outputStride(outputStride) {}
+
+        void Run();
+    };
+
+    struct MultiThreadFloat16LinearOp : MultiThreadBaseOp {
+        float *inputData;
+        uint16_t *weightData;
+        float *biasData, *outputData;
+        int n, m, k, st, end;
+
+        MultiThreadFloat16LinearOp(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
+                           int n, int m, int k, int st, int end) : 
+            inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData),
+            n(n), m(m), k(k), st(st), end(end) {}
+
+        void Run();
+    };
+
+    struct MultiThreadFloat16Float16LinearOp : MultiThreadBaseOp {
+        uint16_t *inputData;
+        uint16_t *weightData;
+        float *biasData;
+        uint16_t *outputData;
+        int n, m, k, st, end;
+
+        MultiThreadFloat16Float16LinearOp(uint16_t *inputData, uint16_t *weightData, float *biasData, uint16_t *outputData,
+                           int n, int m, int k, int st, int end) : 
+            inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData),
+            n(n), m(m), k(k), st(st), end(end) {}
+
+        void Run();
+    };
+
+    struct MultiThreadInt4GroupLinearOp : MultiThreadBaseOp {
+        float *inputData;
+        uint8_t *weightData;
+        float *biasData, *outputData;
+        uint16_t *mins, *scales;
+        int n, m, k, st, end, group, groupCnt;
+
+        MultiThreadInt4GroupLinearOp(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                                uint16_t *mins, uint16_t *scales, int n, int m, int k, int st, int end, int group, int groupCnt) : 
+            inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData), mins(mins), scales(scales),
+            n(n), m(m), k(k), st(st), end(end), group(group), groupCnt(groupCnt) {}
+
+        void Run();
+    };
+
+    struct MultiThreadLinearInt4GroupOp : MultiThreadBaseOp {
+        uint8_t *a, *b;
+        int32_t *c;
+        int n, m, k, kstride;
+        int *weightSums;
+        float *weightMins;
+        float *scales;
+        float *bias;
+        float *iscales, *izeros;
+        float *inputSums;
+        int group, groupCnt;
+
+        MultiThreadLinearInt4GroupOp(
+                uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride,
+                int *weightSums, float *weightMins, float *scales, float *bias,
+                float *iscales, float *izeros, float *inputSums, int group, int groupCnt
+        ) :
+                a(a), b(b), c(c), n(n), m(m), k(k), kstride(kstride),
+                weightSums(weightSums), weightMins(weightMins), scales(scales), bias(bias),
+                iscales(iscales), izeros(izeros), inputSums(inputSums), group(group), groupCnt(groupCnt) {}
+
+        void Run();
+    };
+
     class CpuDevice : BaseDevice {
     public:
         CpuDevice ();
