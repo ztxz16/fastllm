@@ -63,7 +63,7 @@ namespace fastllm {
         for (int i = 0; i < temp.size(); i++) {
             if (StartWith(device, temp[i]->deviceType)) {
                 this->devices.push_back(temp[i]);
-                this->devices.back()->deviceIds = ParseDeviceIds(device, temp[i]->deviceType);
+                this->devices.back()->deviceIds = ParseDeviceIds(device, temp[i]->deviceType, this->devices.back()->deviceIdsRatio);
             }
         }
         for (int i = 0; i < temp.size(); i++) {
@@ -117,6 +117,9 @@ namespace fastllm {
                 }
                 if (device->deviceType == "multicuda" && device->deviceIds.size() > 0) {
                     FastllmMultiCudaSetDevice(device->deviceIds);
+                    if (device->deviceIdsRatio.size() > 0) {
+                        FastllmMultiCudaSetDeviceRatio(device->deviceIdsRatio);
+                    }
                 }
 #endif
                 bool intParamsSize = intParams.size();

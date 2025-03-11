@@ -512,9 +512,10 @@ namespace fastllm {
                     auto freeSizes = FastllmCudaGetFreeSizes();
                     auto dmap = GetDeviceMap();
                     std::set <int> deviceIds;
+                    std::map <int, int> ratios;
                     for (auto &it : dmap) {
                         if (StartWith(it.first, "cuda")) {
-                            for (int id : ParseDeviceIds(it.first, "cuda")) {
+                            for (int id : ParseDeviceIds(it.first, "cuda", ratios)) {
                                 deviceIds.insert(id);
                             }
                         }

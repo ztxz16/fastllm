@@ -55,6 +55,7 @@ namespace fastllm {
         std::string deviceType;
         std::string deviceName;
         std::vector <int> deviceIds;
+        std::map <int, int> deviceIdsRatio;
 
         std::map <std::string, BaseOperator*> ops;
     };
