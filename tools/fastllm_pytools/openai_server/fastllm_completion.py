@@ -33,10 +33,12 @@ class ChatCompletionStreamResponseWithUsage(BaseModel):
 class FastLLmCompletion:
   def __init__(self,
                model_name,
-               model):
+               model,
+               think):
     self.model_name = model_name
     self.model = model
     self.init_fast_llm_model()
+    self.think = think
     
   def init_fast_llm_model(self):
     pass
@@ -134,7 +136,7 @@ class FastLLmCompletion:
       # Streaming response
       if request.stream:
           return (self.chat_completion_stream_generator(
-              request, raw_request, result_generator, request_id, input_token_len), 
+              request, raw_request, result_generator, request_id, input_token_len, think = self.think),
               BackgroundTask(self.check_disconnect, raw_request, request_id, handle))
       else:
           try:
@@ -194,7 +196,7 @@ class FastLLmCompletion:
           self, request: ChatCompletionRequest, raw_request: Request,
           result_generator: AsyncIterator,
           request_id: str,
-          input_token_len: int) -> AsyncGenerator[str, None]:
+          input_token_len: int, think: bool) -> AsyncGenerator[str, None]:
       model_name = self.model_name
       created_time = int(time.time())
       chunk_object_type = "chat.completion.chunk"
@@ -218,7 +220,27 @@ class FastLLmCompletion:
             data = chunk.model_dump_json(exclude_unset=True)
             yield f"data: {data}\n\n"
             first_iteration = False
-        
+
+        # 新增：发送<think>标签
+        has_sent_label = False
+        if not has_sent_label and think:
+            choice_data = ChatCompletionResponseStreamChoice(
+                index=0,
+                delta=DeltaMessage(content="<think>\n"),
+                logprobs=None,
+                finish_reason=None
+            )
+            chunk = ChatCompletionStreamResponseWithUsage(
+                id=request_id,
+                object=chunk_object_type,
+                created=created_time,
+                choices=[choice_data],
+                model=model_name
+            )
+            data = chunk.model_dump_json(exclude_unset=True)
+            yield f"data: {data}\n\n"  # 发送标签块
+            has_sent_label = True      # 标记已发送标签
+
         # 2. content部分
         completion_tokens = 0
         async for res in result_generator:
