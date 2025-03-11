@@ -119,26 +119,40 @@ namespace fastllm {
         return ret;
     }
 
-    static std::vector <int> ParseDeviceIds(const std::string &s, const std::string &type) {
+    static std::vector <int> ParseDeviceIds(const std::string &s, const std::string &type, std::map <int, int> &ratios) {
         int i = type.size();
         std::vector <int> ret;
-        std::string cur = "";
+        std::string cur[2] = {"", ""};
+        int idx = 0;
         if (s.size() > i && s[i] == ':') {
             i++;
             while (i < s.size()) {
-                if (s[i] >= '0' && s[i] <= '9') {
-                    cur += s[i];
+                if (s[i] == 'c' && i + 2 < s.size() && s[i + 1] == 'p' && s[i + 2] == 'u') {
+                    cur[0] = "99999";
+                    i += 2;
+                } else if (s[i] >= '0' && s[i] <= '9') {
+                    cur[idx] += s[i];
+                } else if (s[i] == ':' || s[i] == '-') {
+                    idx = 1;
                 } else {
-                    if (cur != "") {
-                        ret.push_back(atoi(cur.c_str()));
-                        cur = "";
+                    if (cur[0] != "") {
+                        ret.push_back(atoi(cur[0].c_str()));
+                        if (cur[1] != "") {
+                            ratios[atoi(cur[0].c_str())] = atoi(cur[1].c_str());
+                        }
+                        cur[0] = "";
+                        cur[1] = "";
+                        idx = 0;
                     }
                 }
                 i++;
             }
         }
-        if (cur != "") {
-            ret.push_back(atoi(cur.c_str()));
+        if (cur[0] != "") {
+            ret.push_back(atoi(cur[0].c_str()));
+            if (cur[1] != "") {
+                ratios[atoi(cur[0].c_str())] = atoi(cur[1].c_str());
+            }
         }
         return ret;
     }

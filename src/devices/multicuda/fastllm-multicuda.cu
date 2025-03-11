@@ -14,8 +14,10 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
 #include "fastllm.h"
+#include "utils.h"
 
 #include "devices/cpu/alivethreadpool.h"
+#include "devices/cpu/cpudevice.h"
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
 #include "mma.h"
@@ -57,13 +59,313 @@ extern void LaunchFastllmGemmFp32Int4Group(float *input, uint8_t *weight, float 
 extern __global__ void FastllmReduceKernel(float *output, float* input, int len, int threadNum);
 extern __global__ void FastllmReduceKernel(half *output, half* input, int len, int threadNum);
 
+std::map <int, std::string> specialDeviceIds = {
+    {99999, "cpu"}
+};
+
+void SwitchDeviceAndGetInfos(int deviceId, std::string &specialId, int &mallocType) {
+    specialId = "";
+    if (specialDeviceIds.find(deviceId) == specialDeviceIds.end()) {
+        cudaSetDevice(deviceId);
+    } else {
+        specialId = specialDeviceIds[deviceId];
+    }
+    mallocType = 1;
+    if (specialId == "cpu") {
+        mallocType = 0;
+    }
+}
+
+/*
+type: device type (0 for cpu, 1 for cuda)
+*/
+void *AutoMalloc(size_t size, int type) {
+    if (type == 0) {
+        return (void*)(new uint8_t[size]);
+    } else {
+        return (void*)FastllmCudaMalloc(size);
+    }
+}
+
+cudaError_t AutoMemset(void *a, int value, size_t size, int type) {
+    if (type == 0) {
+        memset(a, value, size);
+        return cudaSuccess;
+    } else {
+        return cudaMemset(a, value, size);
+    }
+}
+
+cudaMemcpyKind GetCudaMemcpyType(int dstType, int srcType) {
+    if (srcType == 0) {
+        if (dstType == 0) {
+            return cudaMemcpyHostToHost;
+        } else {
+            return cudaMemcpyHostToDevice;
+        }
+    } else {
+        if (dstType == 0) {
+            return cudaMemcpyDeviceToHost;
+        } else {
+            return cudaMemcpyDeviceToDevice;
+        }
+    }
+}
+
 std::vector <int> multiCudaCurrentDevices;
+std::map <int, int> multiCudaCurrentRatios;
 
 void FastllmMultiCudaSetDevice(std::vector <int> ids) {
     multiCudaCurrentDevices = ids;
 }
 
+void FastllmMultiCudaSetDeviceRatio(std::map <int, int> &deviceRatio) {
+    multiCudaCurrentRatios = deviceRatio;
+}
+
 namespace fastllm {
+    extern FP16ToFP32Manager fp16tofp32;
+    extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
+    extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
+
+    template <typename T>
+    void RunMatmul(void *weight, DataType weightDataType, T *bias, 
+                        int n, int m, int k, bool hasBias, float *scales, float *mins, uint8_t *zeros, int group, int groupCnt, 
+                        T *curInput, T *curOutput);
+
+    template <typename T>
+    void CpuRunMatmul(Data *oriWeight, void *weight, DataType weightDataType, T *bias, 
+                        int n, int m, int k, bool hasBias, float *scales, float *mins, uint8_t *zeros, int group, int groupCnt, 
+                        T *curInput, T *curOutput, 
+                        AliveThreadPool *pool, int startTid, int threadNum) {
+        if (typeid(T) == typeid(float)) {
+            float *inputData = (float*)curInput;
+            float *outputData = (float*)curOutput;
+            float *biasData = (float*)bias;
+            if (weightDataType == DataType::FLOAT16) {
+                uint16_t *halfWeight = (uint16_t*)weight;
+                int per = k / threadNum;
+                int cur = 0;
+                std::vector<fastllm::MultiThreadFloat16LinearOp*> ops;
+                for (int i = 0; i < threadNum; i++) {
+                    int end = cur + per + (cur + per * (threadNum - i) < k);
+                    if (i == threadNum - 1) {
+                        end = k;
+                    }
+                    ops.push_back(new MultiThreadFloat16LinearOp(inputData, halfWeight, biasData, outputData,
+                                                   n, m, k, cur, end));
+                    cur = end;
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->PushOp(startTid + i, ops[i]);
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->Wait(startTid + i);
+                    delete ops[i];
+                }
+            } else if (weightDataType == DataType::INT8) {
+                printf("Error: CpuRunMatmul unsupport type: %d.\n", weightDataType);;
+                exit(0);
+            } else if (weightDataType == DataType::INT4_NOZERO) {
+                printf("Error: CpuRunMatmul unsupport type: %d.\n", weightDataType);;
+                exit(0);
+            } else if (weightDataType == DataType::INT4_GROUP) {
+// auto st = std::chrono::system_clock::now();
+                uint8_t *weightData = (uint8_t *) weight;
+                if (oriWeight->weightSum.size() == 0) {
+                    auto &weightSum = oriWeight->weightSum;
+                    weightSum.resize(k * group);
+                    for (int i = 0; i < k; i++) {
+                        for (int g = 0; g < group; g++) {
+                            int gid = i * group + g;
+                            int st = g * groupCnt;
+                            int end = std::min(m, (g + 1) * groupCnt);
+                            int j = st;
+                            for (; j + 1 < end; j += 2) {
+                                int id = (i * m + j) / 2;
+                                weightSum[gid] += (weightData[id] & 0xF) + (weightData[id] >> 4);
+                            }
+                            for (; j < end; j++) {
+                                int id = (i * m + j) / 2;
+                                if ((i * m + j) % 2) {
+                                    weightSum[gid] += (weightData[id] & 0xF);
+                                } else {
+                                    weightSum[gid] += (weightData[id] >> 4);
+                                }
+                            }
+                        }
+                    }
+
+                    oriWeight->mins.resize(k * group);
+                    oriWeight->scales.resize(k * group);
+                    Float16ToFloat32((uint16_t*)mins, oriWeight->mins.data(), k * group);
+                    Float16ToFloat32((uint16_t*)scales, oriWeight->scales.data(), k * group);
+                }
+                std::vector<LowBitConfig> inputConfigs;
+                inputConfigs.resize(n * group);
+                std::vector<uint8_t> uinput;
+                uinput.resize(n * m);
+                std::vector <float> inputSums;
+                inputSums.resize(n * group);
+                std::vector <float> iscales, izeros;
+                iscales.resize(n * group);
+                izeros.resize(n * group);
+                MultiThreadOnlineQuantizationOp(inputData, uinput.data(), inputConfigs.data(), n, m, group, groupCnt, inputSums.data(), iscales.data(), izeros.data()).Run();
+                int per = k / threadNum;
+                int cur = 0;
+                std::vector<fastllm::MultiThreadLinearInt4GroupOp*> ops;
+                for (int i = 0; i < threadNum; i++) {
+                    int end = (i == threadNum - 1 ? k : cur + per + (cur + per * (threadNum - i) < k));
+                    ops.push_back(new MultiThreadLinearInt4GroupOp(uinput.data(), weightData + cur * m / 2, (int32_t*)outputData + cur, n, m, end - cur, k,
+                                                    oriWeight->weightSum.data() + cur * group, oriWeight->mins.data() + cur * group, oriWeight->scales.data() + cur * group,
+                                                    (bias == nullptr ? (float *) nullptr : (float*)bias + cur), iscales.data(), izeros.data(),
+                                                    inputSums.data(), group, groupCnt));
+                    cur = end;
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->PushOp(startTid + i, ops[i]);
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->Wait(startTid + i);
+                    delete ops[i];
+                }
+/*
+                int per = k / threadNum;
+                int cur = 0;
+                std::vector<fastllm::MultiThreadInt4GroupLinearOp*> ops;
+                for (int i = 0; i < threadNum; i++) {
+                    int end = cur + per + (cur + per * (threadNum - i) < k);
+                    if (i == threadNum - 1) {
+                        end = k;
+                    }
+                    ops.push_back(new MultiThreadInt4GroupLinearOp(inputData, (uint8_t*)weight, biasData, outputData, (uint16_t*)mins, (uint16_t*)scales,
+                                                   n, m, k, cur, end, group, groupCnt));
+                    cur = end;
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->PushOp(startTid + i, ops[i]);
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->Wait(startTid + i);
+                    delete ops[i];
+                }
+*/
+// float spend = GetSpan(st, std::chrono::system_clock::now());
+// float gops = (float)n * m * k / spend / 1e9;
+// printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
+            } else {
+                printf("Error: CpuRunMatmul unsupport type: %d.\n", weightDataType);;
+                exit(0);
+            }
+        } else if (typeid(T) == typeid(half)) {
+            uint16_t *inputData = (uint16_t*)curInput;
+            uint16_t *outputData = (uint16_t*)curOutput;
+            std::vector <float> floatBias;
+            floatBias.resize(k);
+            Float16ToFloat32((uint16_t*)bias, floatBias.data(), k);
+            if (weightDataType == DataType::FLOAT16) {
+                uint16_t *halfWeight = (uint16_t*)weight;
+                int per = k / threadNum;
+                int cur = 0;
+                std::vector<fastllm::MultiThreadFloat16Float16LinearOp*> ops;
+                for (int i = 0; i < threadNum; i++) {
+                    int end = cur + per + (cur + per * (threadNum - i) < k);
+                    if (i == threadNum - 1) {
+                        end = k;
+                    }
+                    ops.push_back(new MultiThreadFloat16Float16LinearOp(inputData, halfWeight, floatBias.data(), outputData,
+                                                   n, m, k, cur, end));
+                    cur = end;
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->PushOp(startTid + i, ops[i]);
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->Wait(startTid + i);
+                    delete ops[i];
+                }
+            } else if (weightDataType == DataType::INT8) {
+                printf("Error: CpuRunMatmul unsupport type: %d.\n", weightDataType);;
+                exit(0);
+            } else if (weightDataType == DataType::INT4_NOZERO) {
+                printf("Error: CpuRunMatmul unsupport type: %d.\n", weightDataType);;
+                exit(0);
+            } else if (weightDataType == DataType::INT4_GROUP) {
+                std::vector <float> floatInput, floatOutput;
+                floatInput.resize(n * m);
+                floatOutput.resize(n * k);
+                Float16ToFloat32((uint16_t*)inputData, floatInput.data(), n * m);
+
+                uint8_t *weightData = (uint8_t *) weight;
+                if (oriWeight->weightSum.size() == 0) {
+                    auto &weightSum = oriWeight->weightSum;
+                    weightSum.resize(k * group);
+                    for (int i = 0; i < k; i++) {
+                        for (int g = 0; g < group; g++) {
+                            int gid = i * group + g;
+                            int st = g * groupCnt;
+                            int end = std::min(m, (g + 1) * groupCnt);
+                            int j = st;
+                            for (; j + 1 < end; j += 2) {
+                                int id = (i * m + j) / 2;
+                                weightSum[gid] += (weightData[id] & 0xF) + (weightData[id] >> 4);
+                            }
+                            for (; j < end; j++) {
+                                int id = (i * m + j) / 2;
+                                if ((i * m + j) % 2) {
+                                    weightSum[gid] += (weightData[id] & 0xF);
+                                } else {
+                                    weightSum[gid] += (weightData[id] >> 4);
+                                }
+                            }
+                        }
+                    }
+
+                    oriWeight->mins.resize(k * group);
+                    oriWeight->scales.resize(k * group);
+                    Float16ToFloat32((uint16_t*)mins, oriWeight->mins.data(), k * group);
+                    Float16ToFloat32((uint16_t*)scales, oriWeight->scales.data(), k * group);
+                }
+                std::vector<LowBitConfig> inputConfigs;
+                inputConfigs.resize(n * group);
+                std::vector<uint8_t> uinput;
+                uinput.resize(n * m);
+                std::vector <float> inputSums;
+                inputSums.resize(n * group);
+                std::vector <float> iscales, izeros;
+                iscales.resize(n * group);
+                izeros.resize(n * group);
+                MultiThreadOnlineQuantizationOp(floatInput.data(), uinput.data(), inputConfigs.data(), n, m, group, groupCnt, inputSums.data(), iscales.data(), izeros.data()).Run();
+                int per = k / threadNum;
+                int cur = 0;
+                std::vector<fastllm::MultiThreadLinearInt4GroupOp*> ops;
+                for (int i = 0; i < threadNum; i++) {
+                    int end = (i == threadNum - 1 ? k : cur + per + (cur + per * (threadNum - i) < k));
+                    ops.push_back(new MultiThreadLinearInt4GroupOp(uinput.data(), weightData + cur * m / 2, (int32_t*)floatOutput.data() + cur, n, m, end - cur, k,
+                                                    oriWeight->weightSum.data() + cur * group, oriWeight->mins.data() + cur * group, oriWeight->scales.data() + cur * group,
+                                                    floatBias.data() + cur, iscales.data(), izeros.data(),
+                                                    inputSums.data(), group, groupCnt));
+                    cur = end;
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->PushOp(startTid + i, ops[i]);
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->Wait(startTid + i);
+                    delete ops[i];
+                }
+
+                Float32ToFloat16(floatOutput.data(), (uint16_t*)outputData, n * k);
+            } else {
+                printf("Error: CpuRunMatmul unsupport type: %d.\n", weightDataType);;
+                exit(0);
+            }
+        } else {
+            printf("CpuRunMatmul: Unsuppoert type.\n");
+            exit(0);
+        }
+    }
+
     template <typename T>
     void RunMatmul(void *weight, DataType weightDataType, T *bias, 
                         int n, int m, int k, bool hasBias, float *scales, float *mins, uint8_t *zeros, int group, int groupCnt, 
@@ -238,6 +540,35 @@ namespace fastllm {
     };
 
     template <typename T>
+    struct MultiCudaCpuMatMulSingleOp : MultiThreadBaseOp {
+        Data *oriWeight;
+        void *weight;
+        DataType weightDataType;
+        T *cpuInput, *cudaInput, *cudaOutput, *bias;
+        int n, m, k, start, len;
+        bool hasBias;
+        float *scales, *mins;
+        uint8_t *zeros;
+        int group, groupCnt;
+        AliveThreadPool *pool;
+        int curStartTid, curThreadNum;
+
+        MultiCudaCpuMatMulSingleOp(Data *oriWeight, void *weight, DataType weightDataType, T *cpuInput, T *cudaInput, T *cudaOutput, T *bias, 
+                                    int n, int m, int k, int start, int len, bool hasBias, float *scales, float *mins, uint8_t *zeros, int group, int groupCnt,
+                                    AliveThreadPool *pool, int curStartTid, int curThreadNum)
+            : oriWeight(oriWeight), weight(weight), weightDataType(weightDataType), cpuInput(cpuInput), cudaInput(cudaInput), cudaOutput(cudaOutput), bias(bias), 
+            n(n), m(m), k(k), start(start), len(len), hasBias(hasBias), scales(scales), mins(mins), zeros(zeros), group(group), groupCnt(groupCnt),
+            pool(pool), curStartTid(curStartTid), curThreadNum(curThreadNum) {}
+
+        void Run() {
+            T *curOutput = new T[n * len];
+            CpuRunMatmul(oriWeight, weight, weightDataType, bias, n, m, len, hasBias, scales, mins, zeros, group, groupCnt, cpuInput, curOutput, pool, curStartTid, curThreadNum);
+            cudaMemcpy2D(cudaOutput + start, k * sizeof(T), curOutput, len * sizeof(T), len * sizeof(T), n, cudaMemcpyHostToDevice);
+            delete[] curOutput;
+        }
+    };
+
+    template <typename T>
     struct MultiCudaMLPSingleOp : MultiThreadBaseOp {
         int deviceId;
         Data *weight0, *weight1;
@@ -303,23 +634,101 @@ namespace fastllm {
             FastllmCudaFree(mid1);
         }
     };
+
+    template <typename T>
+    struct MultiCudaCpuMLPSingleOp : MultiThreadBaseOp {
+        int deviceId;
+        Data *weight0, *weight1;
+        int n, m, k1, k2;
+        T *cudaInput, *cudaOutput;
+        T **curInput, **curOutput;
+        T *cpuInput, *partOutput;
+        int threadNum, tid;
+        AliveThreadPool *pool;
+        int curStartTid, curThreadNum;
+
+        MultiCudaCpuMLPSingleOp(int deviceId, Data *weight0, Data *weight1, 
+                            int n, int m, int k1, int k2, T *cudaInput, T *cudaOutput, T **curInput, T **curOutput, 
+                            T *cpuInput, T *partOutput, 
+                            int threadNum, int tid, 
+                            AliveThreadPool *pool, int curStartTid, int curThreadNum)
+            : deviceId(deviceId), weight0(weight0), weight1(weight1), 
+            n(n), m(m), k1(k1), k2(k2), cudaInput(cudaInput), cudaOutput(cudaOutput), curInput(curInput), curOutput(curOutput), 
+            cpuInput(cpuInput), partOutput(partOutput),
+            threadNum(threadNum), tid(tid), pool(pool), curStartTid(curStartTid), curThreadNum(curThreadNum) {}
+
+        void Run() {
+            T *mid0 = (T*)AutoMalloc(n * k1 * sizeof(T), 0);
+            T *mid1 = (T*)AutoMalloc(n * k1 / 2 * sizeof(T), 0);
+            *curOutput = (T*)AutoMalloc(n * k2 * sizeof(T), 0);
+
+            bool isQuantWeight = weight0->mins.size() > 0;
+            std::vector <void*> datas0 = weight0->extraCudaData, datas1 = weight1->extraCudaData;
+            if (typeid(T) == typeid(half)) {
+                datas0 = weight0->extraCudaHalfData;
+                datas1 = weight1->extraCudaHalfData;
+            }
+            CpuRunMatmul(weight0, datas0[tid * 2], weight0->dataType,
+                            (T *) datas0[tid * 2 + 1],
+                            n, m, k1, false,
+                            (float*)(isQuantWeight ? datas0[threadNum * 2 + tid * 3] : nullptr),
+                            (float*)(isQuantWeight ? datas0[threadNum * 2 + tid * 3 + 1] : nullptr),
+                            (uint8_t*)(isQuantWeight ? datas0[threadNum * 2 + tid * 3 + 2] : nullptr),
+                            weight0->group, weight0->groupCnt, cpuInput, mid0, 
+                            pool, curStartTid, curThreadNum);
+            if (typeid(T) == typeid(float)) {
+                (MultiThreadSwigluOp((float*)mid0, k1 / 2, k1 / 2, (float*)mid1, n, k1, k1 / 2)).Run();
+            } else if (typeid(T) == typeid(half) || typeid(T) == typeid(uint16_t)) {
+                (MultiThreadSwigluFloat16Op((uint16_t*)mid0, k1 / 2, k1 / 2, (uint16_t*)mid1, n, k1, k1 / 2)).Run();
+            } else {
+                printf("Unsupport swiglu type.");
+            }
+            CpuRunMatmul(weight1, datas1[tid * 2], weight1->dataType,
+                            (T *) datas1[tid * 2 + 1],
+                            n, k1 / 2, k2, false,
+                            (float*)(isQuantWeight ? datas1[threadNum * 2 + tid * 3] : nullptr),
+                            (float*)(isQuantWeight ? datas1[threadNum * 2 + tid * 3 + 1] : nullptr),
+                            (uint8_t*)(isQuantWeight ? datas1[threadNum * 2 + tid * 3 + 2] : nullptr),
+                            weight1->group, weight1->groupCnt, mid1, *curOutput,
+                            pool, curStartTid, curThreadNum);
+            cudaMemcpy(partOutput, *curOutput, n * k2 * sizeof(T), cudaMemcpyHostToDevice);
+            delete[] *curOutput;
+            delete[] mid0;
+            delete[] mid1;
+
+            *curOutput = nullptr;
+        }
+    };
 }
 
 // 将total个计算任务切分
 // 若当前有x个设备，返回一个长度为(x + 1)的vector，第i个设备执行任务[ret[i], ret[i + 1])
-std::vector <int> FastllmMultiCudaGetSplitPoints(int total) {
-    std::vector <int> ret;
+std::vector <int> FastllmMultiCudaGetSplitPoints(int total, int unit = 1) {
     int deviceNum = multiCudaCurrentDevices.size();
-    int cur = 0, per = total / deviceNum;
+    int nodes = total / unit;
+    int totalRatio = 0;
+    if (multiCudaCurrentRatios.size() > 0) {
+        for (auto &it : multiCudaCurrentRatios) {
+            totalRatio += it.second;
+        }
+    } else {
+        totalRatio = deviceNum;
+    }
+    std::vector <int> ret;
+    int cur = 0;
     for (int i = 0; i < deviceNum; i++) {
-        int end = (i == deviceNum - 1 ? total : cur + per + (cur + per * (deviceNum - i) < total));
+        int curRatio = 1;
+        if (multiCudaCurrentRatios.find(multiCudaCurrentDevices[i]) != multiCudaCurrentRatios.end()) {
+            curRatio = multiCudaCurrentRatios[i];
+        }
+        int now = std::max(1, nodes * curRatio / totalRatio) * unit;
+        int end = (i == deviceNum - 1 ? total : cur + now);
         ret.push_back(cur);
         if (i == deviceNum - 1) {
             ret.push_back(end);
         }
         cur = end;
     }
-
     return ret;
 }
 
@@ -337,8 +746,9 @@ bool PrepareMultiCudaWeight(fastllm::Data &weight, const fastllm::Data &bias, Di
     }
         
     for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
-        int deviceId = multiCudaCurrentDevices[i];
-        cudaSetDevice(deviceId);
+        int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
+        std::string specialId = "";
+        SwitchDeviceAndGetInfos(deviceId, specialId, mallocType);
 
         auto &div = divisionScheme[deviceId];
         int len = 0;
@@ -350,19 +760,19 @@ bool PrepareMultiCudaWeight(fastllm::Data &weight, const fastllm::Data &bias, Di
         float *deviceBiasData;
         cudaError_t state = cudaSuccess;
         if (splitAxis == 0) {
-            deviceWeightData = (void*)FastllmCudaMalloc(len * m * weight.unitSize / weight.unitSizeDiv);
-            deviceBiasData = (float*)FastllmCudaMalloc(len * sizeof(float));
+            deviceWeightData = (void*)AutoMalloc(len * m * weight.unitSize / weight.unitSizeDiv, mallocType);
+            deviceBiasData = (float*)AutoMalloc(len * sizeof(float), mallocType);
             int curLen = 0;
             for (auto &it : div) {
                 state = cudaMemcpy((uint8_t*)deviceWeightData + curLen * m * weight.unitSize / weight.unitSizeDiv, 
                                     (uint8_t*)weight.cudaData + it.first * m * weight.unitSize / weight.unitSizeDiv, 
-                                    (it.second - it.first) * m * weight.unitSize / weight.unitSizeDiv, cudaMemcpyDeviceToDevice);
-                state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first, (it.second - it.first) * sizeof(float), cudaMemcpyDeviceToDevice);
+                                    (it.second - it.first) * m * weight.unitSize / weight.unitSizeDiv, GetCudaMemcpyType(mallocType, 1));
+                state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first, (it.second - it.first) * sizeof(float), GetCudaMemcpyType(mallocType, 1));
                 curLen += (it.second - it.first);
             }
         } else {
-            deviceWeightData = (void*)FastllmCudaMalloc(k * len * weight.unitSize / weight.unitSizeDiv);
-            deviceBiasData = (float*)FastllmCudaMalloc(k * sizeof(float));
+            deviceWeightData = (void*)AutoMalloc(k * len * weight.unitSize / weight.unitSizeDiv, mallocType);
+            deviceBiasData = (float*)AutoMalloc(k * sizeof(float), mallocType);
             int curLen = 0;
             for (auto &it : div) {
                 state = cudaMemcpy2D((uint8_t*)deviceWeightData + curLen * weight.unitSize / weight.unitSizeDiv,
@@ -370,13 +780,13 @@ bool PrepareMultiCudaWeight(fastllm::Data &weight, const fastllm::Data &bias, Di
                                     (uint8_t*)weight.cudaData + it.first * weight.unitSize / weight.unitSizeDiv, 
                                     m * weight.unitSize / weight.unitSizeDiv, 
                                     (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
-                                    k, cudaMemcpyDeviceToDevice);
+                                    k, GetCudaMemcpyType(mallocType, 1));
                 curLen += (it.second - it.first);
             }
             if (i == 0) {
-                state = cudaMemcpy(deviceBiasData, cudaBiasData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+                state = cudaMemcpy(deviceBiasData, cudaBiasData, k * sizeof(float), GetCudaMemcpyType(mallocType, 1));
             } else {
-                state = cudaMemset(deviceBiasData, 0, k * sizeof(float));
+                state = AutoMemset(deviceBiasData, 0, k * sizeof(float), mallocType);
             }
         }
 
@@ -397,8 +807,9 @@ bool PrepareMultiCudaWeight(fastllm::Data &weight, const fastllm::Data &bias, Di
             zeropoints[i] = weight.perChannelsConfigs[i].zeroPoint;
         }
         for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
-            int deviceId = multiCudaCurrentDevices[i];
-            cudaSetDevice(deviceId);
+           int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
+            std::string specialId = "";
+            SwitchDeviceAndGetInfos(deviceId, specialId, mallocType);
             
             auto &div = divisionScheme[deviceId];
             int len = 0;
@@ -411,8 +822,8 @@ bool PrepareMultiCudaWeight(fastllm::Data &weight, const fastllm::Data &bias, Di
             uint8_t *cudaZeropoints;
             if (splitAxis == 0) {
                 if (weight.dataType == fastllm::DataType::INT4_GROUP) {
-                    cudaScales = (float*)FastllmCudaMalloc(len * weightGroup * sizeof(half));
-                    cudaMins = (float*)FastllmCudaMalloc(len * weightGroup * sizeof(half));
+                    cudaScales = (float*)AutoMalloc(len * weightGroup * sizeof(half), mallocType);
+                    cudaMins = (float*)AutoMalloc(len * weightGroup * sizeof(half), mallocType);
                     std::vector <half> halfScales, halfMins;
                     for (int i = 0; i < weight.scales.size(); i++) {
                         halfScales.push_back(__float2half(weight.scales[i]));
@@ -422,27 +833,27 @@ bool PrepareMultiCudaWeight(fastllm::Data &weight, const fastllm::Data &bias, Di
                     }
                     int curLen = 0;
                     for (auto &it : div) {
-                        state = cudaMemcpy(((half*)cudaScales) + curLen * weightGroup, halfScales.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(half), cudaMemcpyHostToDevice);
-                        state = cudaMemcpy(((half*)cudaMins) + curLen * weightGroup, halfMins.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(half), cudaMemcpyHostToDevice);
+                        state = cudaMemcpy(((half*)cudaScales) + curLen * weightGroup, halfScales.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(half), GetCudaMemcpyType(mallocType, 0));
+                        state = cudaMemcpy(((half*)cudaMins) + curLen * weightGroup, halfMins.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(half), GetCudaMemcpyType(mallocType, 0));
                         curLen += (it.second - it.first);
                     }
                 } else {
-                    cudaScales = (float*)FastllmCudaMalloc(len * weightGroup * sizeof(float));
-                    cudaMins = (float*)FastllmCudaMalloc(len * weightGroup * sizeof(float));
-                    cudaZeropoints = (uint8_t*)FastllmCudaMalloc(len * weightGroup);
+                    cudaScales = (float*)AutoMalloc(len * weightGroup * sizeof(float), mallocType);
+                    cudaMins = (float*)AutoMalloc(len * weightGroup * sizeof(float), mallocType);
+                    cudaZeropoints = (uint8_t*)AutoMalloc(len * weightGroup, mallocType);
 
                     int curLen = 0;
                     for (auto &it : div) {
-                        state = cudaMemcpy(cudaScales + curLen * weightGroup, weight.scales.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float), cudaMemcpyHostToDevice);
-                        state = cudaMemcpy(cudaMins + curLen * weightGroup, weight.mins.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float), cudaMemcpyHostToDevice);
-                        state = cudaMemcpy(cudaZeropoints + curLen * weightGroup, zeropoints.data() + it.first * weightGroup, (it.second - it.first) * weightGroup, cudaMemcpyHostToDevice);
+                        state = cudaMemcpy(cudaScales + curLen * weightGroup, weight.scales.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float), GetCudaMemcpyType(mallocType, 0));
+                        state = cudaMemcpy(cudaMins + curLen * weightGroup, weight.mins.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float), GetCudaMemcpyType(mallocType, 0));
+                        state = cudaMemcpy(cudaZeropoints + curLen * weightGroup, zeropoints.data() + it.first * weightGroup, (it.second - it.first) * weightGroup, GetCudaMemcpyType(mallocType, 0));
                         curLen += (it.second - it.first);
                     }
                 }
             } else {
                 if (weight.dataType == fastllm::DataType::INT4_GROUP) {
-                    cudaScales = (float*)FastllmCudaMalloc(k * weightGroup * sizeof(half));
-                    cudaMins = (float*)FastllmCudaMalloc(k * weightGroup * sizeof(half));
+                    cudaScales = (float*)AutoMalloc(k * weightGroup * sizeof(half), mallocType);
+                    cudaMins = (float*)AutoMalloc(k * weightGroup * sizeof(half), mallocType);
                     int base = div[0].first / weight.groupCnt;
                     std::vector <half> halfScales, halfMins;
                     for (int i = 0; i < weight.scales.size(); i++) {
@@ -451,15 +862,15 @@ bool PrepareMultiCudaWeight(fastllm::Data &weight, const fastllm::Data &bias, Di
                     for (int i = 0; i < weight.mins.size(); i++) {
                         halfMins.push_back(__float2half(i + base < weight.mins.size() ? weight.mins[i + base] : 0.0f));
                     }
-                    state = cudaMemcpy(cudaScales, halfScales.data(), k * weightGroup * sizeof(half), cudaMemcpyHostToDevice);
-                    state = cudaMemcpy(cudaMins, halfMins.data(), k * weightGroup * sizeof(half), cudaMemcpyHostToDevice);
+                    state = cudaMemcpy(cudaScales, halfScales.data(), k * weightGroup * sizeof(half), GetCudaMemcpyType(mallocType, 0));
+                    state = cudaMemcpy(cudaMins, halfMins.data(), k * weightGroup * sizeof(half), GetCudaMemcpyType(mallocType, 0));
                 } else {
-                    cudaScales = (float*)FastllmCudaMalloc(k * weightGroup * sizeof(float));
-                    cudaMins = (float*)FastllmCudaMalloc(k * weightGroup * sizeof(float));
-                    cudaZeropoints = (uint8_t*)FastllmCudaMalloc(k * weightGroup);
-                    state = cudaMemcpy(cudaScales, weight.scales.data(), k * weightGroup * sizeof(float), cudaMemcpyHostToDevice);
-                    state = cudaMemcpy(cudaMins, weight.mins.data(), k * weightGroup * sizeof(float), cudaMemcpyHostToDevice);
-                    state = cudaMemcpy(cudaZeropoints, zeropoints.data(), k * weightGroup, cudaMemcpyHostToDevice);
+                    cudaScales = (float*)AutoMalloc(k * weightGroup * sizeof(float), mallocType);
+                    cudaMins = (float*)AutoMalloc(k * weightGroup * sizeof(float), mallocType);
+                    cudaZeropoints = (uint8_t*)AutoMalloc(k * weightGroup, mallocType);
+                    state = cudaMemcpy(cudaScales, weight.scales.data(), k * weightGroup * sizeof(float), GetCudaMemcpyType(mallocType, 0));
+                    state = cudaMemcpy(cudaMins, weight.mins.data(), k * weightGroup * sizeof(float), GetCudaMemcpyType(mallocType, 0));
+                    state = cudaMemcpy(cudaZeropoints, zeropoints.data(), k * weightGroup, GetCudaMemcpyType(mallocType, 0));
                 }
             }
                 
@@ -478,6 +889,7 @@ bool PrepareMultiCudaWeight(fastllm::Data &weight, const fastllm::Data &bias, Di
     FastllmCudaFree(weight.cudaData);
     FastllmCudaFree(cudaBiasData);
     weight.cudaData = nullptr;
+    weight.weightSum.clear();
     return true;
 }
 
@@ -496,8 +908,9 @@ bool PrepareMultiCudaHalfWeight(fastllm::Data &weight, const fastllm::Data &bias
     }
         
     for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
-        int deviceId = multiCudaCurrentDevices[i];
-        cudaSetDevice(deviceId);
+        int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
+        std::string specialId = "";
+        SwitchDeviceAndGetInfos(deviceId, specialId, mallocType);
 
         auto &div = divisionScheme[deviceId];
         int len = 0;
@@ -509,18 +922,18 @@ bool PrepareMultiCudaHalfWeight(fastllm::Data &weight, const fastllm::Data &bias
         cudaError_t state = cudaSuccess;
 
         if (splitAxis == 0) {
-            deviceBiasData = (half*)FastllmCudaMalloc(len * sizeof(half));
+            deviceBiasData = (half*)AutoMalloc(len * sizeof(half), mallocType);
             int curLen = 0;
             for (auto &it : div) {
-                state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first, (it.second - it.first) * sizeof(half), cudaMemcpyDeviceToDevice);
+                state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first, (it.second - it.first) * sizeof(half), GetCudaMemcpyType(mallocType, 1));
                 curLen += (it.second - it.first);
             }
         } else {
-            deviceBiasData = (half*)FastllmCudaMalloc(k * sizeof(half));
+            deviceBiasData = (half*)AutoMalloc(k * sizeof(half), mallocType);
             if (i == 0) {
-                state = cudaMemcpy(deviceBiasData, cudaBiasData, k * sizeof(half), cudaMemcpyDeviceToDevice);
+                state = cudaMemcpy(deviceBiasData, cudaBiasData, k * sizeof(half), GetCudaMemcpyType(mallocType, 1));
             } else {
-                state = cudaMemset(deviceBiasData, 0, k * sizeof(half));
+                state = AutoMemset(deviceBiasData, 0, k * sizeof(half), mallocType);
             }
         }
 
@@ -556,7 +969,7 @@ bool PrepareMultiCudaHalfWeight(fastllm::Data &weight, const fastllm::Data &bias
 
 template <typename T>
 bool FastllmMultiCudaMatMulInner(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
-    std::vector <int> points = FastllmMultiCudaGetSplitPoints(k);
+    std::vector <int> points = FastllmMultiCudaGetSplitPoints(k, weight.groupCnt <= 0 ? 1 : weight.groupCnt);
     DivisionScheme divisionScheme;
     for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
         int deviceId = multiCudaCurrentDevices[i];
@@ -577,7 +990,7 @@ bool FastllmMultiCudaMatMulInner(const fastllm::Data &input, fastllm::Data &weig
     T *cudaOutput = (T *) FastllmCudaPrepareOutput(output);
 
     auto *pool = fastllm::GetAlivePool();
-    std::vector<fastllm::MultiCudaMatMulSingleOp <T> *> ops;
+    std::vector<fastllm::MultiThreadBaseOp*> ops;
 
     int isQuantWeight = (weight.mins.size() > 0);
     int threadNum = multiCudaCurrentDevices.size();
@@ -587,7 +1000,35 @@ bool FastllmMultiCudaMatMulInner(const fastllm::Data &input, fastllm::Data &weig
     cudaDeviceSynchronize();
 
     for (int i = 0; i < threadNum; i++) {
-        int deviceId = multiCudaCurrentDevices[i];
+        int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
+        std::string specialId = "";
+        SwitchDeviceAndGetInfos(deviceId, specialId, mallocType);
+        if (specialId != "cpu") {
+            continue;
+        }
+        int start = points[i], len = points[i + 1] - points[i];
+        std::vector <void*> datas = weight.extraCudaData;
+        if (typeid(T) == typeid(half)) {
+            datas = weight.extraCudaHalfData;
+        }
+        ops.push_back(new fastllm::MultiCudaCpuMatMulSingleOp <T> (
+            &weight, datas[i * 2], weight.dataType,
+            cpuInput, cudaInput, cudaOutput, 
+            (T*) datas[i * 2 + 1],
+            n, m, k, start, len, bias.dims.size() > 0,
+            (float*)(isQuantWeight ? datas[threadNum * 2 + i * 3] : nullptr),
+            (float*)(isQuantWeight ? datas[threadNum * 2 + i * 3 + 1] : nullptr),
+            (uint8_t*)(isQuantWeight ? datas[threadNum * 2 + i * 3 + 2] : nullptr),
+            weight.group, weight.groupCnt, pool, threadNum, pool->threads.size() - threadNum
+        ));
+    }
+    for (int i = 0; i < threadNum; i++) {
+        int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
+        std::string specialId = "";
+        SwitchDeviceAndGetInfos(deviceId, specialId, mallocType);
+        if (specialId != "") {
+            continue;
+        }
         int start = points[i], len = points[i + 1] - points[i];
         std::vector <void*> datas = weight.extraCudaData;
         if (typeid(T) == typeid(half)) {
@@ -648,16 +1089,20 @@ template <typename T>
 bool FastllmMultiCudaMLPInner(const fastllm::Data &input, fastllm::Data &weight0, fastllm::Data &weight1, fastllm::Data &output) {
     int deviceNum = multiCudaCurrentDevices.size();
     for (int i = 0; i < deviceNum; i++) {
-        cudaSetDevice(multiCudaCurrentDevices[i]);
+        if (specialDeviceIds.find(multiCudaCurrentDevices[i]) == specialDeviceIds.end()) {
+            cudaSetDevice(multiCudaCurrentDevices[i]);
+        } 
         for (int j = 0; j < deviceNum; j++) {
             if (i != j) {
-                cudaDeviceEnablePeerAccess(multiCudaCurrentDevices[j], 0);
+                if (specialDeviceIds.find(multiCudaCurrentDevices[j]) == specialDeviceIds.end()) {
+                    cudaDeviceEnablePeerAccess(multiCudaCurrentDevices[j], 0);
+                }
             }
         }
     }
     cudaSetDevice(0);
 
-    std::vector <int> points = FastllmMultiCudaGetSplitPoints(weight0.dims[0] / 2);
+    std::vector <int> points = FastllmMultiCudaGetSplitPoints(weight0.dims[0] / 2, weight0.groupCnt <= 0 ? 1 : weight0.groupCnt);
     if ((weight0.extraCudaData.size() == 0)) {
         int mid = weight0.dims[0] / 2;
         DivisionScheme divisionScheme;
@@ -703,7 +1148,7 @@ bool FastllmMultiCudaMLPInner(const fastllm::Data &input, fastllm::Data &weight0
 
         std::vector <uint8_t*> curInputs, curOutputs;
         auto *pool = fastllm::GetAlivePool();
-        std::vector<fastllm::MultiCudaMLPSingleOp <T> *> ops;
+        std::vector<fastllm::MultiThreadBaseOp*> ops;
 
         int threadNum = multiCudaCurrentDevices.size();
         curInputs.resize(threadNum);
@@ -717,9 +1162,29 @@ bool FastllmMultiCudaMLPInner(const fastllm::Data &input, fastllm::Data &weight0
 
         T *partOutput = (T*)FastllmCudaMalloc(output.GetBytes() * threadNum);
 
-        std::vector <int> points = FastllmMultiCudaGetSplitPoints(weight0.dims[0] / 2); // 因为要swiglu，所以先/2
+        std::vector <int> points = FastllmMultiCudaGetSplitPoints(weight0.dims[0] / 2, weight0.groupCnt <= 0 ? 1 : weight0.groupCnt); // 因为要swiglu，所以先/2
         for (int i = 0; i < threadNum; i++) {
-            int deviceId = multiCudaCurrentDevices[i];
+            int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
+            std::string specialId = "";
+            SwitchDeviceAndGetInfos(deviceId, specialId, mallocType);
+            if (specialId != "cpu") {
+                continue;
+            }
+            int start = points[i], len = points[i + 1] - points[i];
+            ops.push_back(new fastllm::MultiCudaCpuMLPSingleOp <T>  (
+                deviceId, &weight0, &weight1,
+                (int)input.Count(0) / input.dims.back(), input.dims.back(), len * 2, weight1.dims[0], 
+                cudaInput, cudaOutput, (T**)&curInputs[i], (T**)&curOutputs[i], 
+                cpuInput, partOutput + output.Count(0) * i, threadNum, i, pool, threadNum, pool->threads.size() - threadNum
+            ));
+        }
+        for (int i = 0; i < threadNum; i++) {
+            int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
+            std::string specialId = "";
+            SwitchDeviceAndGetInfos(deviceId, specialId, mallocType);
+            if (specialId != "") {
+                continue;
+            }
             int start = points[i], len = points[i + 1] - points[i];
             ops.push_back(new fastllm::MultiCudaMLPSingleOp <T>  (
                 deviceId, &weight0, &weight1,
@@ -742,31 +1207,22 @@ bool FastllmMultiCudaMLPInner(const fastllm::Data &input, fastllm::Data &weight0
         if (threadNum > 1) {
             int len = output.Count(0);
             int threadPerBlock = std::min(256, len);
-/*
-            for (int i = 0; i < threadNum; i++) {
-                int deviceId = multiCudaCurrentDevices[i];
-                cudaSetDevice(deviceId);
-                if (deviceId > 0) {
-                    cudaMemcpyAsync(partOutput + len * i, curOutputs[i], len * sizeof(T), cudaMemcpyDeviceToDevice, *GetFastllmStream(deviceId));
-                }
-            }
-            for (int i = 0; i < threadNum; i++) {
-                cudaStreamSynchronize(*GetFastllmStream(multiCudaCurrentDevices[i]));
-            }
-            cudaSetDevice(0);
-*/
             FastllmReduceKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaOutput, partOutput, len, threadNum);
         }
 
+        std::set <void*> releaseSpaces;
         for (int t = 0; t < threadNum; t++) {
             if ((long long)curOutputs[t] != (long long)cudaOutput) {
-                FastllmCudaFree(curOutputs[t]);
+                releaseSpaces.insert(curOutputs[t]);
             }
             if ((long long)curInputs[t] != (long long)cudaInput) {
-                FastllmCudaFree(curInputs[t]);
+                releaseSpaces.insert(curInputs[t]);
             }
         }
-        FastllmCudaFree(partOutput);
+        releaseSpaces.insert(partOutput);
+        for (auto it : releaseSpaces) {
+            FastllmCudaFree(it);
+        }
 
         FastllmCudaFinishInput(input, cudaInput);
         FastllmCudaFinishOutput(output, cudaOutput);
