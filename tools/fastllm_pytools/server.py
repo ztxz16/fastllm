@@ -11,6 +11,7 @@ from .openai_server.protocal.openai_protocol import *
 from .openai_server.fastllm_completion import FastLLmCompletion
 from .openai_server.fastllm_embed import FastLLmEmbed
 from .openai_server.fastllm_reranker import FastLLmReranker
+from .openai_server.fastllm_model import FastLLmModel
 from .util import make_normal_parser
 from .util import make_normal_llm_model
 
@@ -19,6 +20,7 @@ def parse_args():
     parser.add_argument("--model_name", type = str, help = "部署的模型名称, 调用api时会进行名称核验", required=True)
     parser.add_argument("--host", type = str, default="0.0.0.0", help = "API server host")
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
+    parser.add_argument("--think", type=bool, default = False, help="if <think> lost")
     return parser.parse_args()
 
 app = fastapi.FastAPI()
@@ -33,6 +35,7 @@ app.add_middleware(
 
 fastllm_completion:FastLLmCompletion
 fastllm_embed:FastLLmEmbed
+fastllm_model:FastLLmModel
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest,
@@ -63,6 +66,12 @@ async def create_rerank(request: RerankRequest,
     scores = fastllm_reranker.rerank(request, raw_request)    
     return JSONResponse(scores)
 
+
+@app.get("/v1/models")
+async def list_models():
+    model_response = fastllm_model.response
+    return JSONResponse(content = model_response)
+
 def init_logging(log_level = logging.INFO, log_file:str = None):
     logging_format = '%(asctime)s %(process)d %(filename)s[line:%(lineno)d] %(levelname)s: %(message)s'
     root = logging.getLogger()
@@ -80,7 +89,8 @@ if __name__ == "__main__":
     logging.info(args)
     model = make_normal_llm_model(args)
     model.set_verbose(True)
-    fastllm_completion = FastLLmCompletion(model_name = args.model_name, model = model)
+    fastllm_completion = FastLLmCompletion(model_name = args.model_name, model = model, think =  args.think)
     fastllm_embed = FastLLmEmbed(model_name = args.model_name, model = model)
     fastllm_reranker = FastLLmReranker(model_name = args.model_name, model = model)
+    fastllm_model = FastLLmModel(model_name = args.model_name)
     uvicorn.run(app, host = args.host, port = args.port)
