@@ -268,6 +268,7 @@ namespace fastllm {
 
         uint64_t len, bytes;
         uint8_t *buffer = nullptr;
+        float *minsBuffer = nullptr, *scalesBuffer = nullptr;
 
         SafeTensorItem() {} 
 
@@ -356,8 +357,6 @@ namespace fastllm {
             int n = this->shape[0], m = this->shape[1];
 
             ClearBuffer();
-            buffer = new uint8_t[this->bytes * 8];
-            float *floatBuffer = (float*)buffer;
             FILE *fweight = fopen(this->fileName.c_str(), "rb");
             FILE *fqzero  = fopen(qzero.fileName.c_str(), "rb");
 #if defined(_WIN32) || defined(_WIN64)
@@ -376,15 +375,46 @@ namespace fastllm {
             unsigned int* qzero_int32  = (unsigned int*)ori_qzero;
             float* scale_f32 = (float*)scale.buffer;
             static const int awq_shift[8] = {0,16,4,20,8,24,12,28}; // awq order = [0,2,4,8,1,3,5,7]
-            for (int x = 0; x < n; x++) {
-                for (int y = 0; y < m * 8; y++) {
-                    int gx = x / groupCnt;
-                    int gy = y >> 3;
-                    int w = (weight_int32[x * m + gy] >> awq_shift[y & 7]) & 15;
-                    int z = (qzero_int32[gx * m + gy] >> awq_shift[y & 7]) & 15;
-                    float s = scale_f32[gx * m * 8 + y];
-                    floatBuffer[x * m * 8 + y] = (w - z) * s;
+
+            if (dstType == DataType::FLOAT32) {
+                buffer = new uint8_t[this->bytes * 8];
+                float *floatBuffer = (float*)buffer;
+                for (int x = 0; x < n; x++) {
+                    for (int y = 0; y < m * 8; y++) {
+                        int gx = x / groupCnt;
+                        int gy = y >> 3;
+                        int w = (weight_int32[x * m + gy] >> awq_shift[y & 7]) & 15;
+                        int z = (qzero_int32[gx * m + gy] >> awq_shift[y & 7]) & 15;
+                        float s = scale_f32[gx * m * 8 + y];
+                        floatBuffer[y * n + x] = (w - z) * s;
+                    }
                 }
+            } else if (dstType == DataType::INT4_GROUP) {
+                buffer = new uint8_t[this->bytes];
+                memset(buffer, 0, this->bytes);
+                int group = (n - 1) / groupCnt + 1;
+                scalesBuffer = new float[m * 8 * group];
+                minsBuffer = new float[m * 8 * group];
+                for (int x = 0; x < n; x += groupCnt) {
+                    for (int y = 0; y < m * 8; y++) {
+                        int gx = x / groupCnt;
+                        int gy = y >> 3;
+                        int z = (qzero_int32[gx * m + gy] >> awq_shift[y & 7]) & 15;
+                        float s = scale_f32[gx * m * 8 + y];
+                        scalesBuffer[y * group + x / groupCnt] = s;
+                        minsBuffer[y * group + x / groupCnt] = -s * z;
+                    }
+                }
+                for (int x = 0; x < n; x++) {
+                    for (int y = 0; y < m * 8; y++) {
+                        int gx = x / groupCnt;
+                        int gy = y >> 3;
+                        int w = (weight_int32[x * m + gy] >> awq_shift[y & 7]) & 15;
+                        buffer[y * n / 2 + x / 2] += (w << ((1 - (x & 1)) * 4));
+                    }
+                }
+            } else {
+                ErrorInFastLLM("CreateBufferWithAWQ Error: dst type error.");
             }
             delete[] ori_weight;
             delete[] ori_qzero;
@@ -467,6 +497,10 @@ namespace fastllm {
         void ClearBuffer() {
             delete[] buffer;
             buffer = nullptr;
+            delete[] minsBuffer;
+            minsBuffer = nullptr;
+            delete[] scalesBuffer;
+            scalesBuffer = nullptr;
         }
     };
 
@@ -691,6 +725,9 @@ namespace fastllm {
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
                                                     DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig,
                                                     const std::string &loraPath, bool weightOnly, bool useMoeDataType, DataType moeDataType, int moeGroupCnt) {
+        if (moeGroupCnt == -1) {
+            moeGroupCnt = groupCnt;
+        }
         std::map <std::string, std::pair <std::string, std::string> > loraDicts;
         SafeTensors *loraTensors = nullptr;
         float loraScaling;
@@ -741,6 +778,7 @@ namespace fastllm {
         std::string configFile = path + "config.json";
         auto config = weightOnly ? json11::Json() : json11::Json::parse(ReadAllFile(configFile), error);
         bool isAwqModel = false;
+        int awqGroupCnt = 128;
         std::string modelType = "";
         if (weightOnly) {
             modelType = "qwen";
@@ -760,8 +798,9 @@ namespace fastllm {
                                 qconfig["zero_point"].bool_value(), 
                                 "Config error: only 4bits AWQ with zero point and gemm version is supported.");
                 isAwqModel = true;
-                if (linearDataType != DataType::INT4_GROUP || groupCnt != 128) {
-                    printf("WARNING: It is recommended to use \"--dtype int4g128\" for AWQ models.");
+                awqGroupCnt = qconfig["group_size"].int_value();
+                if (linearDataType != DataType::INT4_GROUP || groupCnt != awqGroupCnt) {
+                    printf("WARNING: It is recommended to use \"--dtype int4g%d\" for this AWQ models.\n", awqGroupCnt);
                 }
             }
         }
@@ -844,7 +883,7 @@ namespace fastllm {
                     std::swap(realShape[0], realShape[1]);
                     model->weight.AddEmptyWeight(weightName, realShape, dataType);
                 } else if (isAwqModel && StringEndWith(tensorName, ".qweight")) {
-                    model->weight.AddEmptyWeight(weightName, {tensor.intShape[1]*8, tensor.intShape[0]}, linearDataType);
+                    model->weight.AddEmptyWeight(weightName, {tensor.intShape[1] * 8, tensor.intShape[0]}, dataType);
                 } else {
                     model->weight.AddEmptyWeight(weightName, tensor.intShape, dataType);
                 }
@@ -931,6 +970,9 @@ namespace fastllm {
                                 AssertInFastLLM(safeTensors.itmeDict.find(scaleTensorName) != safeTensors.itmeDict.end() &&
                                                 safeTensors.itmeDict.find(qzeroTensorName) != safeTensors.itmeDict.end(),
                                                 "Tensor error: can't find AWQ scalse / qzeros.");
+                                if (dataType == INT4_GROUP && groupCnt == awqGroupCnt) {
+                                    oriDataType = INT4_GROUP;
+                                }
                             }
 
                             if (scaleTensorName == "") {
@@ -945,12 +987,6 @@ namespace fastllm {
                                 auto &qzeroTensor = safeTensors.itmeDict[qzeroTensorName];
                                 scaleTensor.CreateBuffer(DataType::FLOAT32);
                                 tensor.CreateBufferWithAWQ(oriDataType, scaleTensor, qzeroTensor);
-                                int n = tensor.intShape[0], m = tensor.intShape[1]*8;
-                                int len = n * m;
-                                float *temp = new float[len];
-                                memcpy(temp, tensor.buffer, len * sizeof(float));
-                                fastllm::Transpose((float*)tensor.buffer, temp, n, m, n, m);
-                                delete[] temp;
                             }
 
                             if (loraDicts.find(weightName) != loraDicts.end()) {
@@ -1017,7 +1053,8 @@ namespace fastllm {
                                 if (it.second == DATA_AUTO_CONV) {
                                     tensor.Transpose(oriDataType);
                                 }
-                                model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, tensor.buffer,
+                                model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
+                                        tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
                                         model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt);
                             }
                             tensor.ClearBuffer();
@@ -1156,6 +1193,9 @@ namespace fastllm {
     void ExportLLMModelFromHF(const std::string &modelPath, 
                             DataType linearDataType, int groupCnt, const std::string &exportPath, const std::string &modelConfig,
                             const std::string &loraPath, bool useMoeDataType, DataType moeDataType, int moeGroupCnt) {
+        if (moeGroupCnt == -1) {
+            moeGroupCnt = groupCnt;
+        }
         // 检查源目录是否存在
         if (!fs::exists(modelPath) || !fs::is_directory(modelPath)) {
             std::cerr << "源目录不存在或不是一个目录: " << modelPath << std::endl;
@@ -1407,7 +1447,8 @@ namespace fastllm {
                             if (dataType == DATA_AUTO_CONV) {
                                 tensor.Transpose(oriDataType);
                             }
-                            weights[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, tensor.buffer, 
+                            weights[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
+                                tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
                                 model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt);
                             tensor.ClearBuffer();
                         }

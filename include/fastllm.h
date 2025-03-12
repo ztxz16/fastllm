@@ -307,7 +307,7 @@ namespace fastllm {
 
         Data (const Data &ori); // 深拷贝
 
-        void CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, int groupCnt = -1); // 从oriData中创建
+        void CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, float *oriMins, float *oriScales, int groupCnt = -1); // 从oriData中创建
 
         void CopyFrom(const Data &ori); // 复制
 
