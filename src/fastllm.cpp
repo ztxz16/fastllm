@@ -711,7 +711,7 @@ namespace fastllm {
         }
     };
 
-    void Data::CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, int groupCnt) {
+    void Data::CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, float *oriMins, float *oriScales, int groupCnt) {
         auto &data = *this;
         data.weightType = weightType;
         data.UpdateUnitSize();
@@ -720,6 +720,22 @@ namespace fastllm {
             if (oriData != nullptr) {
                 memcpy(data.cpuData, oriData, data.GetBytes());
             } 
+            if (dataType == DataType::INT4_GROUP) {
+                int k = this->dims[0], m = this->dims[1], group = (m - 1) / groupCnt + 1;
+                this->group = group;
+                this->groupCnt = groupCnt;
+                data.mins.resize(k * group);
+                data.scales.resize(k * group);
+                memcpy(data.mins.data(), oriMins, k * group * sizeof(float));
+                memcpy(data.scales.data(), oriScales, k * group * sizeof(float));
+                data.perChannelAxis = 0;
+                data.perChannelsConfigs.resize(k * group);
+                for (int i = 0; i < k * group; i++) {
+                    data.perChannelsConfigs[i] = LowBitConfig(data.mins[i], data.mins[i] + 15 * data.scales[i], 4, 1);
+                    data.perChannelsConfigs[i].min = data.mins[i];
+                    data.perChannelsConfigs[i].scale = data.scales[i];
+                }
+            }
         } else if (oriDataType == DataType::BFLOAT16
                 && dataType == DataType::FLOAT16) {
             uint16_t *a = (uint16_t*)data.cpuData;
