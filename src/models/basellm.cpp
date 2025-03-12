@@ -151,21 +151,21 @@ namespace fastllm {
                 basellm::GetTensorMap(const std::vector <std::string> &tensorNames) {
         std::map <std::string, std::vector <std::pair <std::string, DataType> > > ret;
         for (auto &name : tensorNames) {
-            WeightType weightType = this->weight.GetWeightType(name);
+            std::string realName = name;
+            if (StringEndWith(name, ".qweight")) {
+                realName = name.substr(0, name.size() - 7) + "weight";
+            }
+            WeightType weightType = this->weight.GetWeightType(realName);
             DataType dataType = DataType::DATA_AUTO_NONE;
             if (weightType == WeightType::LINEAR) {
                 dataType = DataType::DATA_AUTO_LINEAR;
-                if (this->cantQuantLinears.find(name) != this->cantQuantLinears.end()) {
+                if (this->cantQuantLinears.find(realName) != this->cantQuantLinears.end()) {
                     dataType = DataType::FLOAT16;
                 }
             } else if (weightType == WeightType::EMBEDDING) {
                 dataType = DataType::DATA_AUTO_EMBEDDING;
             }
-            if (StringEndWith(name, ".qweight")) {
-                ret[name].push_back(std::make_pair(name.substr(0, name.size()-7) + "weight", dataType));
-            } else {
-                ret[name].push_back(std::make_pair(name, dataType));
-            }
+            ret[name].push_back(std::make_pair(realName, dataType));
         }
         return ret;
     }
