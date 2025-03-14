@@ -110,6 +110,13 @@ if (USE_TFACC)
     include_directories(include/devices/tfacc)
 endif()
 
+if (USE_NUMA)
+    add_compile_definitions(USE_NUMA)
+    set(FASTLLM_CXX_SOURCES ${FASTLLM_CXX_SOURCES} src/devices/numa/numadevice.cpp src/devices/numa/fastllm-numa.cpp src/devices/numa/computeserver.cpp src/devices/numa/kvcache.cpp)
+    include_directories(include/devices/numa)
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} numa)
+endif()
+
 if (USE_TOPS) # For suiyuan
     add_compile_definitions(USE_TOPS)
     set(FASTLLM_TOPS_SOURCES src/devices/tops/topsdevice.cpp)

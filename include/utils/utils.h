@@ -6,6 +6,7 @@
 #ifndef FASTLLM_UTILS_H
 #define FASTLLM_UTILS_H
 
+#include <cmath>
 #include <algorithm>
 #include <map>
 #include <chrono>
@@ -64,6 +65,10 @@ namespace fastllm {
         if (!condition) {
             ErrorInFastLLM(error);
         }
+    }
+
+    static float gelu(float x) {
+        return x * 0.5f * (1.0f + erf(x / sqrt(2.0)));
     }
 
     static uint32_t as_uint(const float x) {

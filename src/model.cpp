@@ -26,6 +26,10 @@
 #include "fastllm-tfacc.h"
 #endif
 
+#ifdef USE_NUMA
+#include "fastllm-numa.h"
+#endif
+
 namespace fastllm {
     std::string ReadAllFile(const std::string &fileName) {
         std::ifstream t(fileName.c_str(), std::ios::in);
@@ -1057,6 +1061,7 @@ namespace fastllm {
                                         tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
                                         model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt);
                             }
+                            model->weight[weightName].CalcWeightSum();
                             tensor.ClearBuffer();
 
                             locker.lock();
@@ -1139,7 +1144,9 @@ namespace fastllm {
                                             memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
                                             offset += model->weight[input].GetBytes();
                                         }
-#ifdef USE_TFACC
+
+                                        mergeData.CalcWeightSum();
+#if defined(USE_TFACC) || defined(USE_NUMA)
                                         locker.lock();
                                         if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
                                             mergeData.weightSum.resize(1);
@@ -1156,7 +1163,7 @@ namespace fastllm {
                                 locker.lock();
                             }
                             locker.unlock();
-#ifdef USE_TFACC
+#if defined(USE_TFACC) || defined(USE_NUMA)
                             if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
                                 locker.lock();
                                     model->weight.weight[weightName].weightSum.resize(1);
