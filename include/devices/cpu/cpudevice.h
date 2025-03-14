@@ -48,35 +48,6 @@ namespace fastllm {
         void Run();
     };
 
-    struct MultiThreadFloat16LinearOp : MultiThreadBaseOp {
-        float *inputData;
-        uint16_t *weightData;
-        float *biasData, *outputData;
-        int n, m, k, st, end;
-
-        MultiThreadFloat16LinearOp(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
-                           int n, int m, int k, int st, int end) : 
-            inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData),
-            n(n), m(m), k(k), st(st), end(end) {}
-
-        void Run();
-    };
-
-    struct MultiThreadFloat16Float16LinearOp : MultiThreadBaseOp {
-        uint16_t *inputData;
-        uint16_t *weightData;
-        float *biasData;
-        uint16_t *outputData;
-        int n, m, k, st, end;
-
-        MultiThreadFloat16Float16LinearOp(uint16_t *inputData, uint16_t *weightData, float *biasData, uint16_t *outputData,
-                           int n, int m, int k, int st, int end) : 
-            inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData),
-            n(n), m(m), k(k), st(st), end(end) {}
-
-        void Run();
-    };
-
     struct MultiThreadInt4GroupLinearOp : MultiThreadBaseOp {
         float *inputData;
         uint8_t *weightData;
@@ -91,30 +62,76 @@ namespace fastllm {
 
         void Run();
     };
+    
+    // Causal Mask: mask[i][j] = (lastlen + i < j)
+    struct MultiThreadSoftmaxOp : MultiThreadBaseOp {
+        float *value;
+        int n, m, lastlen;
 
-    struct MultiThreadLinearInt4GroupOp : MultiThreadBaseOp {
-        uint8_t *a, *b;
-        int32_t *c;
-        int n, m, k, kstride;
-        int *weightSums;
-        float *weightMins;
-        float *scales;
-        float *bias;
-        float *iscales, *izeros;
-        float *inputSums;
-        int group, groupCnt;
-
-        MultiThreadLinearInt4GroupOp(
-                uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride,
-                int *weightSums, float *weightMins, float *scales, float *bias,
-                float *iscales, float *izeros, float *inputSums, int group, int groupCnt
-        ) :
-                a(a), b(b), c(c), n(n), m(m), k(k), kstride(kstride),
-                weightSums(weightSums), weightMins(weightMins), scales(scales), bias(bias),
-                iscales(iscales), izeros(izeros), inputSums(inputSums), group(group), groupCnt(groupCnt) {}
+        MultiThreadSoftmaxOp(float *value, int n, int m, int lastlen) : value(value), n(n), m(m), lastlen(lastlen) {}
 
         void Run();
     };
+
+    struct MultiThreadSiluOp : MultiThreadBaseOp {
+        float *input, *output;
+        int mid, len, n, inputStride, outputStride;
+
+        MultiThreadSiluOp (float *input, int len, float *output,
+                           int n, int inputStride, int outputStride) :
+                input(input), len(len), output(output),
+                n(n), inputStride(inputStride), outputStride(outputStride) {}
+
+        void Run();
+    };
+
+    struct MultiThreadGeluOp : MultiThreadBaseOp {
+        float *input, *output;
+        int mid, len, n, inputStride, outputStride;
+
+        MultiThreadGeluOp (float *input, int len, float *output,
+                           int n, int inputStride, int outputStride) :
+                input(input), len(len), output(output),
+                n(n), inputStride(inputStride), outputStride(outputStride) {}
+
+        void Run();
+    };
+
+    // q布局: [qlen, qdim]
+    // k布局: [klen, qdim]
+    // v布局: [klen, vdim]
+    // output布局: [qlen, vdim]
+    // Causal Mask: mask[i][j] = (lastlen + i < j)
+    struct MultiThreadSingleAttentionCausalOp : MultiThreadBaseOp {
+        float *qd, *kd, *vd, *od;
+        float scale;
+        int qlen, qdim, lastlen, klen, vdim;
+
+        MultiThreadSingleAttentionCausalOp(float *qd, float *kd, float *vd, float *od,
+                                           float scale, int qlen, int qdim, int lastlen, int klen, int vdim) :
+                qd(qd), kd(kd), vd(vd), od(od),
+                scale(scale), qlen(qlen), qdim(qdim),
+                lastlen(lastlen), klen(klen), vdim(vdim) {}
+
+        void Run();
+    };
+
+    void SiluMultiThread(float *input, int len, float *output,
+                         int n, int inputStride, int outputStride, AliveThreadPool *pool);
+
+    void GeluMultiThread(float *input, int len, float *output,
+                         int n, int inputStride, int outputStride, AliveThreadPool *pool);
+
+    void SoftmaxMultiThread(float *input, int n, int m, int lastlen, AliveThreadPool *pool);
+    void SwigluMultiThread(float *input, int mid, int len, float *output,
+        int n, int inputStride, int outputStride, AliveThreadPool *pool);
+
+    void MultiplyInt4GroupMultiThreadLaunch(uint8_t *a, uint8_t *b, float *c, int n, int m, int k,
+        int *weightSums, float *weightMins, float *scales, float *bias,
+        std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros,
+        std::vector <LowBitConfig> &configs, int startTid, int threadNum, int group, int groupCnt,
+        std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool);
+
 
     class CpuDevice : BaseDevice {
     public:
