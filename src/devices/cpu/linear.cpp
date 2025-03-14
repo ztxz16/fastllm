@@ -15,11 +15,438 @@
 #endif
 
 #include "utils.h"
+#include "computeutils.h"
 
 namespace fastllm {
     extern FP16ToFP32Manager fp16tofp32;
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
+    extern void OnlineQuantization(float *inputData, std::vector<uint8_t> &uinput, std::vector<LowBitConfig> &inputConfigs, 
+                                int n, int m, int group, int groupCnt,
+                                std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros);
+#ifdef __AVX2__
+    extern int DotU4U8(uint8_t *a, uint8_t *b, int n);
+#endif
+
+    void MultiThreadLinearFloat32Float32Op::Run() {
+        for (int i = 0; i < n; i++) {
+            for (int j = st; j < end; j++) {
+                float now = biasData ? biasData[j] : 0.0f;
+                int l = 0;
+#ifdef __aarch64__
+                float32x4_t sum = {0, 0, 0, 0};
+                for (; l + 3 < m; l += 4) {
+                    sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(inputData + i * m + l), vld1q_f32(weightData + j * m + l)));
+                }
+                now += sum[0] + sum[1] + sum[2] + sum[3];
+#else
+#ifdef __AVX2__
+                __m256 vsum = _mm256_setzero_ps();
+                for (; l + 7 < m; l += 8) {
+                    __m256 vi = _mm256_loadu_ps(inputData + i * m + l);
+                    __m256 vw = _mm256_loadu_ps(weightData + j * m + l);
+                    vsum = _mm256_fmadd_ps(vi, vw, vsum);
+                }
+                now += Floatsum(vsum);
+#endif
+#endif
+                for (; l < m; l++) {
+                    now += inputData[i * m + l] * weightData[j * m + l];
+                }
+                outputData[i * k + j] = now;
+            }
+        }
+    }
+
+    void MultiThreadLinearFloat32Float16Op::Run() {
+        for (int i = 0; i < n; i++) {
+            for (int j = st; j < end; j++) {
+                float now = biasData ? biasData[j] : 0.0f;
+                int l = 0;
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+                float16x8_t sum = {0, 0, 0, 0, 0, 0, 0, 0};
+                for (; l + 7 < m; l += 8) {
+                    sum = vfmaq_f16(sum, vld1q_f16((float16_t*)inputData + i * m + l),
+                                        vld1q_f16((float16_t*)weightData + j * m + l));
+                }
+                now += sum[0] + sum[1] + sum[2] + sum[3] + sum[4] + sum[5] + sum[6] + sum[7];
+#else
+#ifdef __aarch64__
+                float32x4_t sum = {0, 0, 0, 0};
+                for (; l + 3 < m; l += 4) {
+                    float32x4_t vcur = {fp16tofp32.dict[weightData[j * m + l]], fp16tofp32.dict[weightData[j * m + l + 1]],
+                                        fp16tofp32.dict[weightData[j * m + l + 2]], fp16tofp32.dict[weightData[j * m + l + 3]]};
+                    sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(inputData + i * m + l), vcur));
+                }
+                now += sum[0] + sum[1] + sum[2] + sum[3];
+#else
+#ifdef __AVX2__
+                __m256 vsum = _mm256_setzero_ps();
+                for (; l + 7 < m; l += 8) {
+                    __m256 vi = _mm256_loadu_ps(inputData + i * m + l);
+                    __m256 vw = _mm256_cvtph_ps(_mm_loadu_si128((__m128i *) (weightData + j * m + l)));
+                    vsum = _mm256_fmadd_ps(vi, vw, vsum);
+                }
+                now += Floatsum(vsum);
+#endif
+#endif
+#endif
+                for (; l < m; l++) {
+                    now += inputData[i * m + l] * fp16tofp32.dict[weightData[j * m + l]];
+                }
+                outputData[i * k + j] = now;
+            }
+        }
+    }
+
+    void MultiThreadLinearInt8Int8Op::Run() {
+        MatMulInt8Int8(a, b, c, n, m, k, kstride);
+    }
+
+    void MultiThreadLinearFloat16Float16Op::Run() {
+        MatMulFloat16Float16(
+                inputData, weightData, biasData, outputData, 
+                n, m, k, st, end
+        );
+    }
+
+    void MultiThreadLinearInt8Int4GroupOp::Run() {
+        std::vector <float> values;
+        values.resize(group);
+
+        int block = 0;
+        int realGroup = (m - 1) / groupCnt + 1;
+        std::vector <float> tempValue;
+        tempValue.resize(realGroup);
+        for (; block < n; block++) {
+            for (int g = 0; g < realGroup; g++) {
+                int iid = block * group + g;
+                tempValue[g] = (inputSums[iid] - izeros[iid] * groupCnt) * iscales[iid];
+            }
+
+            uint8_t *weightWalk = b;
+            uint8_t *inputStart = a + block * m;
+
+            for (int i = 0; i < k; i++) {
+                std::fill(values.begin(), values.end(), 0.0f);
+                uint8_t *inputWalk = inputStart;
+                float sum = 0.0;
+
+                for (int g = 0; g < realGroup; g++) {
+                    int st = g * groupCnt, end = std::min(m, (g + 1) * groupCnt);
+                    float &value = values[g];
+                    int j = st;
+#ifdef __ARM_FEATURE_DOTPROD
+                    uint8x8_t maskHigh = vdup_n_u8(0xF0);
+                    uint8x8_t maskLow = vdup_n_u8(0xF);
+                    uint32x2_t sum0 = {0, 0};
+
+                    for (; j + 15 < end; j += 16) {
+                        uint8x8_t ori = vld1_u8(weightWalk + (i * m + j) / 2);
+                        uint8x8x2_t in = vld2_u8(inputWalk + j);
+                        uint8x8_t va = vand_u8(ori, maskLow);
+                        uint8x8_t vb = vshr_n_u8(vand_u8(ori, maskHigh), 4);
+                        sum0 = vdot_u32(sum0, va, in.val[1]);
+                        sum0 = vdot_u32(sum0, vb, in.val[0]);
+                    }
+                    value += sum0[0] + sum0[1];
+#elif defined(__aarch64__)
+                    uint8x8_t maskHigh = vdup_n_u8(0xF0);
+                    uint8x8_t maskLow = vdup_n_u8(0xF);
+                    uint32x4_t sum0 = {0, 0, 0, 0};
+
+                    for (; j + 15 < end; j += 16) {
+                        uint8x8_t ori = vld1_u8(weightWalk + (i * m + j) / 2);
+                        uint8x8x2_t in = vld2_u8(inputWalk + j);
+                        uint8x8_t va = vand_u8(ori, maskLow);
+                        uint8x8_t vb = vshr_n_u8(vand_u8(ori, maskHigh), 4);
+                        sum0 = vpadalq_u16(sum0, vmull_u8(va, in.val[1]));
+                        sum0 = vpadalq_u16(sum0, vmull_u8(vb, in.val[0]));
+                    }
+                    value += sum0[0] + sum0[1] + sum0[2] + sum0[3];
+#elif defined(__AVX2__)
+                    value += DotU4U8(weightWalk + (i * m + st) / 2, inputWalk + st, end - st);
+                    j += (end - st);
+#endif
+                    for (; j + 1 < end; j += 2) {
+                        int id = (i * m + j) / 2;
+                        value += (weightWalk[id] >> 4) * inputWalk[j];
+                        value += (weightWalk[id] & 0xF) * inputWalk[j + 1];
+                    }
+                }
+
+                int g = 0;
+#ifdef __aarch64__
+                float32x4_t vSum = vdupq_n_f32(0.0f);
+                float32x4_t vGroupCnt = vdupq_n_f32(groupCnt);
+                for (; g + 3 < realGroup; g += 4) {
+                    int iid = block * group + g;
+                    int gid = i * group + g;
+                    float32x4_t vValue = vld1q_f32(values.data() + g);
+                    float32x4_t vWeightSum = vcvtq_f32_s32(vld1q_s32(weightSums + gid));
+                    float32x4_t vWeightMin = vld1q_f32(weightMins + gid);
+                    float32x4_t vScale = vld1q_f32(scales + gid);
+                    float32x4_t vIzero = vld1q_f32(izeros + iid);
+                    float32x4_t vIscale = vld1q_f32(iscales + iid);
+                    float32x4_t vInputSum = vld1q_f32(inputSums + iid);
+                    float32x4_t vMiddle = vsubq_f32(vInputSum, vmulq_f32(vIzero, vGroupCnt));
+                    vValue = vsubq_f32(vValue, vmulq_f32(vWeightSum, vIzero));
+                    vSum = vaddq_f32(vSum, vmulq_f32(vScale, vmulq_f32(vIscale, vValue)));
+                    vSum = vaddq_f32(vSum, vmulq_f32(vWeightMin, vmulq_f32(vMiddle, vIscale)));
+                }
+                sum += vSum[0] + vSum[1] + vSum[2] + vSum[3];
+#endif
+                // 处理剩余元素（标量处理）
+                for (; g < realGroup; g++) {
+                    const int iid = block * group + g;
+                    const int gid = i * group + g;
+                    
+                    // 修正value为float类型
+                    const float value = (float)values[g] - weightSums[gid] * izeros[iid];
+                    sum += scales[gid] * iscales[iid] * value + weightMins[gid] * tempValue[g];
+                }
+
+                if (group * groupCnt > m) {
+                    int iid = block * group + group - 1;
+                    int gid = i * group + group - 1;
+                    sum += weightMins[gid] * izeros[iid] * (group * groupCnt - m) * iscales[iid];
+                }
+
+                ((float*)c)[block * kstride + i] = sum + (bias == nullptr ? 0.0 : bias[i]);
+            }
+        }
+    }
+
+    void RunLinearFloat32Float32(float *inputData, float *weightData, float *outputData, float *biasData, 
+                                int n, int m, int k, 
+                                AliveThreadPool *pool, int startTid, int threadNum) {
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLinearFloat32Float32Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            ops.push_back(new MultiThreadLinearFloat32Float32Op(inputData, weightData, biasData, outputData,
+                                                    n, m, k, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+    }
+
+    void RunLinearFloat32Float16(float *inputData, uint16_t *weightData, float *outputData, float *biasData, 
+                                int n, int m, int k, 
+                                AliveThreadPool *pool, int startTid, int threadNum) {
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+        uint16_t *temp = new uint16_t[n * m];
+        for (int i = 0; i < n * m; i++) {
+            temp[i] = float_to_half(inputData[i]);
+        }
+        inputData = (float*)temp;
+#endif
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLinearFloat32Float16Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            if (i == threadNum - 1) {
+                end = k;
+            }
+            ops.push_back(new MultiThreadLinearFloat32Float16Op(inputData, weightData, biasData, outputData,
+                                                n, m, k, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+        delete[] temp;
+#endif
+    }
+
+    //a = [n, m], b = [k, m], c = aT(b') = [n, k]
+    void RunLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
+                            int *weightSums, LowBitConfig *weightConfigs, LowBitConfig *inputConfigs, float *bias,
+                            AliveThreadPool *pool, int startTid, int threadNum) {
+#ifdef __AVX2__
+        for (int i = 0; i < n * m; i++) {
+            a[i] = (a[i] + !a[i]) ^ 128;
+        }
+#endif
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLinearInt8Int8Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            if (i == threadNum - 1) {
+                end = k;
+            }
+            ops.push_back(new MultiThreadLinearInt8Int8Op(a, b + cur * m, (int32_t*)c + cur, n, m, end - cur, k));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+
+        for (int i = 0; i < n; i++) {
+            uint32_t inputSum = 0;
+            for (int j = 0; j < m; j++) {
+#ifdef __AVX2__
+                inputSum += a[i * m + j] ^ 128;
+#else
+                inputSum += a[i * m + j];
+#endif
+            }
+
+            for (int j = 0; j < k; j++) {
+                int value = ((int32_t *) c)[i * k + j];
+#ifdef __AVX2__
+                value += (128 * weightSums[j]);
+                value += (128 * inputSum);
+                value -= m * 128 * 128;
+#endif
+                value -= weightSums[j] * inputConfigs[i].zeroPoint;
+                value -= inputSum * weightConfigs[j].zeroPoint;
+                value += (int) inputConfigs[i].zeroPoint * weightConfigs[j].zeroPoint * m;
+                c[i * k + j] = weightConfigs[j].scale * inputConfigs[i].scale * value +
+                                                (bias == nullptr ? 0.0 : bias[j]);
+            }
+        }
+    }
+
+    //a = [n, m], b = [k, m], c = aT(b') = [n, k]
+    void RunLinearInt8Int4Group(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, int group, int groupCnt,
+                                int *weightSums, float *weightMins, float *scales, float *bias,
+                                float *inputSums, float *iscales, float *izeros,
+                                AliveThreadPool *pool, int startTid, int threadNum) {
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLinearInt8Int4GroupOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? k : cur + per + (cur + per * (threadNum - i) < k));
+            ops.push_back(new MultiThreadLinearInt8Int4GroupOp(a, b + cur * m / 2, c + cur, n, m, end - cur, k,
+                                weightSums + cur * group, weightMins + cur * group, scales + cur * group,
+                                (bias == nullptr ? (float *) nullptr : bias + cur), iscales, izeros,
+                                inputSums, group, groupCnt));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+    }
+
+    void RunLinearFloat32Int8(float *inputData, Data &weight, float *outputData, float *biasData, 
+                                int n, int m, int k, 
+                                AliveThreadPool *pool, int startTid, int threadNum) {
+        weight.CalcWeightSum();
+        std::vector<LowBitConfig> inputConfigs;
+        for (int i = 0; i < n; i++) {
+            float minValue = 1e9, maxValue = -1e9;
+            for (int j = 0; j < m; j++) {
+                minValue = std::min(minValue, inputData[i * m + j]);
+                maxValue = std::max(maxValue, inputData[i * m + j]);
+            }
+            inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
+        }
+        std::vector<uint8_t> uinput;
+        uinput.resize(n * m);
+        for (int i = 0; i < n * m; i++) {
+            uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
+        }
+        RunLinearInt8Int8(uinput.data(), (uint8_t*)weight.cpuData, outputData, n, m, k, 
+                weight.weightSum.data(), weight.perChannelsConfigs.data(), inputConfigs.data(), biasData,
+                pool, startTid, threadNum);
+        /*
+        这部分是float输入，float输出
+        int threadNum = threads;
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<std::thread *> threads;
+        for (int i = 0; i < threadNum - 1; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            threads.push_back(new std::thread(&Int8LinearPart, inputData, weightData, biasData, outputData,
+                                                weight.perChannelsConfigs.data(), n, m, k, cur, end));
+            cur = end;
+        }
+        Int8LinearPart(inputData, weightData, biasData, outputData, weight.perChannelsConfigs.data(), n, m, k, cur, k);
+        for (int i = 0; i < threadNum - 1; i++) {
+            threads[i]->join();
+            delete threads[i];
+        }
+        */
+    }
+
+    void RunLinearFloat32Int4Group(float *inputData, Data &weight, float *outputData, float *biasData, 
+                                int n, int m, int k, int group, int groupCnt,
+                                AliveThreadPool *pool, int startTid, int threadNum) {
+        weight.CalcWeightSum();
+        std::vector<LowBitConfig> inputConfigs;
+        std::vector<uint8_t> uinput;
+        std::vector <float> inputSums, iscales, izeros;
+        OnlineQuantization(inputData, uinput, inputConfigs, n, m, group, groupCnt, inputSums, iscales, izeros);
+        RunLinearInt8Int4Group(uinput.data(), (uint8_t*)weight.cpuData, outputData, n, m, k,
+                                group, groupCnt, weight.weightSum.data(), weight.mins.data(), weight.scales.data(), 
+                                biasData, inputSums.data(), iscales.data(), izeros.data(),
+                                pool, startTid, threadNum);
+    }
+
+    void RunLinearFloat16Float16(uint16_t *inputData, uint16_t *weightData, uint16_t *outputData, float *biasData, 
+                                int n, int m, int k, 
+                                AliveThreadPool *pool, int startTid, int threadNum) {
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLinearFloat16Float16Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            ops.push_back(new MultiThreadLinearFloat16Float16Op(inputData, weightData, biasData, outputData,
+                                                   n, m, k, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+    }
+
+    void RunLinearFloat16Int8(uint16_t *inputData, Data &weight, uint16_t *outputData, float *biasData, 
+                            int n, int m, int k, AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector <float> floatInput, floatOutput;
+        floatInput.resize(n * m);
+        floatOutput.resize(n * k);
+        Float16ToFloat32(inputData, floatInput.data(), n * m);
+        RunLinearFloat32Int8(floatInput.data(), weight, floatOutput.data(), biasData, n, m, k, pool, startTid, threadNum);
+        Float32ToFloat16(floatOutput.data(), outputData, n * k);
+    }
+
+    void RunLinearFloat16Int4Group(uint16_t *inputData, Data &weight, uint16_t *outputData, float *biasData, 
+                            int n, int m, int k, int group, int groupCnt,
+                            AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector <float> floatInput, floatOutput;
+        floatInput.resize(n * m);
+        floatOutput.resize(n * k);
+        Float16ToFloat32(inputData, floatInput.data(), n * m);
+        RunLinearFloat32Int4Group(floatInput.data(), weight, floatOutput.data(), biasData, n, m, k, group, groupCnt, pool, startTid, threadNum);
+        Float32ToFloat16(floatOutput.data(), outputData, n * k);
+    }
 
 #ifdef __AVX2__
     int DotU8U8(uint8_t *a, uint8_t *b, int n) {
