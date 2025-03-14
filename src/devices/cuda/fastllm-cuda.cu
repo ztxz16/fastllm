@@ -17,6 +17,10 @@
 using namespace nvcuda;
 #endif
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 530
+#define CUDA_NO_TENSOR_CORE
+#endif
+
 #define checkCudaErrors(message, val) showError(val, message, __FILE__, __LINE__)
 
 void showError(cudaError_t result, char const* const message, const char* const file,
