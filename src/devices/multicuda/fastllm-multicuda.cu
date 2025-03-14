@@ -18,6 +18,7 @@
 
 #include "devices/cpu/alivethreadpool.h"
 #include "devices/cpu/cpudevice.h"
+#include "devices/cpu/computeutils.h"
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
 #include "mma.h"
@@ -146,13 +147,13 @@ namespace fastllm {
                 uint16_t *halfWeight = (uint16_t*)weight;
                 int per = k / threadNum;
                 int cur = 0;
-                std::vector<fastllm::MultiThreadFloat16LinearOp*> ops;
+                std::vector<fastllm::MultiThreadLinearFloat32Float16Op*> ops;
                 for (int i = 0; i < threadNum; i++) {
                     int end = cur + per + (cur + per * (threadNum - i) < k);
                     if (i == threadNum - 1) {
                         end = k;
                     }
-                    ops.push_back(new MultiThreadFloat16LinearOp(inputData, halfWeight, biasData, outputData,
+                    ops.push_back(new MultiThreadLinearFloat32Float16Op(inputData, halfWeight, biasData, outputData,
                                                    n, m, k, cur, end));
                     cur = end;
                 }
@@ -213,10 +214,10 @@ namespace fastllm {
                 MultiThreadOnlineQuantizationOp(inputData, uinput.data(), inputConfigs.data(), n, m, group, groupCnt, inputSums.data(), iscales.data(), izeros.data()).Run();
                 int per = k / threadNum;
                 int cur = 0;
-                std::vector<fastllm::MultiThreadLinearInt4GroupOp*> ops;
+                std::vector<fastllm::MultiThreadLinearInt8Int4GroupOp*> ops;
                 for (int i = 0; i < threadNum; i++) {
                     int end = (i == threadNum - 1 ? k : cur + per + (cur + per * (threadNum - i) < k));
-                    ops.push_back(new MultiThreadLinearInt4GroupOp(uinput.data(), weightData + cur * m / 2, (int32_t*)outputData + cur, n, m, end - cur, k,
+                    ops.push_back(new MultiThreadLinearInt8Int4GroupOp(uinput.data(), weightData + cur * m / 2, outputData + cur, n, m, end - cur, k,
                                                     oriWeight->weightSum.data() + cur * group, oriWeight->mins.data() + cur * group, oriWeight->scales.data() + cur * group,
                                                     (bias == nullptr ? (float *) nullptr : (float*)bias + cur), iscales.data(), izeros.data(),
                                                     inputSums.data(), group, groupCnt));
@@ -267,13 +268,13 @@ namespace fastllm {
                 uint16_t *halfWeight = (uint16_t*)weight;
                 int per = k / threadNum;
                 int cur = 0;
-                std::vector<fastllm::MultiThreadFloat16Float16LinearOp*> ops;
+                std::vector<fastllm::MultiThreadLinearFloat16Float16Op*> ops;
                 for (int i = 0; i < threadNum; i++) {
                     int end = cur + per + (cur + per * (threadNum - i) < k);
                     if (i == threadNum - 1) {
                         end = k;
                     }
-                    ops.push_back(new MultiThreadFloat16Float16LinearOp(inputData, halfWeight, floatBias.data(), outputData,
+                    ops.push_back(new MultiThreadLinearFloat16Float16Op(inputData, halfWeight, floatBias.data(), outputData,
                                                    n, m, k, cur, end));
                     cur = end;
                 }
@@ -338,13 +339,10 @@ namespace fastllm {
                 MultiThreadOnlineQuantizationOp(floatInput.data(), uinput.data(), inputConfigs.data(), n, m, group, groupCnt, inputSums.data(), iscales.data(), izeros.data()).Run();
                 int per = k / threadNum;
                 int cur = 0;
-                std::vector<fastllm::MultiThreadLinearInt4GroupOp*> ops;
+                std::vector<fastllm::MultiThreadLinearInt8Int4GroupOp*> ops;
                 for (int i = 0; i < threadNum; i++) {
                     int end = (i == threadNum - 1 ? k : cur + per + (cur + per * (threadNum - i) < k));
-                    ops.push_back(new MultiThreadLinearInt4GroupOp(uinput.data(), weightData + cur * m / 2, (int32_t*)floatOutput.data() + cur, n, m, end - cur, k,
-                                                    oriWeight->weightSum.data() + cur * group, oriWeight->mins.data() + cur * group, oriWeight->scales.data() + cur * group,
-                                                    floatBias.data() + cur, iscales.data(), izeros.data(),
-                                                    inputSums.data(), group, groupCnt));
+                    ops.push_back(new MultiThreadLinearInt8Int4GroupOp(uinput.data(), weightData + cur * m / 2, floatOutput.data() + cur, n, m, end - cur, k, oriWeight->weightSum.data() + cur * group, oriWeight->mins.data() + cur * group, oriWeight->scales.data() + cur * group, floatBias.data() + cur, iscales.data(), izeros.data(), inputSums.data(), group, groupCnt));
                     cur = end;
                 }
                 for (int i = 0; i < threadNum; i++) {

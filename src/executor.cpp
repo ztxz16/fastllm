@@ -23,6 +23,10 @@
 #include "devices/tops/topsdevice.h"
 #endif
 
+#ifdef USE_NUMA
+#include "devices/numa/numadevice.h"
+#endif
+
 namespace fastllm {
     Executor::Executor() {
         this->devices.clear();
@@ -35,6 +39,9 @@ namespace fastllm {
 #endif
 #ifdef USE_TFACC
         this->devices.push_back((BaseDevice*) new TfaccDevice());
+#endif
+#ifdef USE_NUMA
+        this->devices.push_back((BaseDevice*) new NumaDevice());
 #endif
         this->devices.push_back((BaseDevice*) new CpuDevice());
     }
