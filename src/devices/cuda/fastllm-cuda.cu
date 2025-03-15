@@ -4388,11 +4388,11 @@ bool FastllmCudaNearlyRotatePosition2D(fastllm::Data &data, const fastllm::Data 
     int n = data.dims[2], m = data.dims[3];
 
     if (data.dataType == fastllm::DataType::FLOAT32) {
-        FastllmNearlyRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 4) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
+        FastllmNearlyRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
                                                                                     len, bs, spatial, n, m,
                                                                                     (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
     } else if (data.dataType == fastllm::DataType::FLOAT16) {
-        FastllmNearlyRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 4) >>> ((half*)cudaData, cudaPositionIds, cudaSin, cudaCos,
+        FastllmNearlyRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> ((half*)cudaData, cudaPositionIds, cudaSin, cudaCos,
                                                                                     len, bs, spatial, n, m,
                                                                                     (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
     }
