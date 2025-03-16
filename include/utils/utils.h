@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <thread>
 #include <vector>
-#if defined(__GNUC__) && __GNUC__ < 8
+#if defined(__GNUC__) && __GNUC__ < 8 && !defined(__clang__)
 #include <experimental/filesystem>
 #else
 #include <filesystem>
@@ -37,7 +37,7 @@
 #endif
 #endif
 
-#if (defined(_MSC_VER) && _MSC_VER <= 1900) || (defined(__GNUC__) && __GNUC__ < 8) // VS 2015) 
+#if (defined(_MSC_VER) && _MSC_VER <= 1900) || (defined(__GNUC__) && __GNUC__ < 8 && !defined(__clang__))  // VS 2015) 
     namespace fs = std::experimental::filesystem;
 #else
     namespace fs = std::filesystem;
