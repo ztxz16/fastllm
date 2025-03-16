@@ -35,3 +35,5 @@ token
 /.chainlit
 /.files
 *.o
+/src/devices/hip
+/src/devices/multihip

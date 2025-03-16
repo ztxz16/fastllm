@@ -43,6 +43,7 @@ bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU�
 
 其他不同平台的编译可参考文档
 [TFACC平台](docs/tfacc.md)
+[AMD和海光平台](docs/rocm.md)
 
 ### 运行demo程序 (python)
 
