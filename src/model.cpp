@@ -1304,7 +1304,7 @@ namespace fastllm {
         auto tensorMap = model->GetTensorMap(tensors);
 
         // 如果有需要，为moe设置特定的量化参数
-        if (model->moeLinears.size() > 0) {
+        if (useMoeDataType && model->moeLinears.size() > 0) {
             for (auto &it : tensorMap) {
                 for (auto &weight : it.second) {
                     if (model->moeLinears.find(weight.first) != model->moeLinears.end()) {
