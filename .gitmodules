@@ -2,3 +2,7 @@
 	path = third_party/pybind11
 	url = https://github.com/pybind/pybind11.git
 	branch = v2.10.5
+[submodule "third_party/hipify_torch"]
+	path = third_party/hipify_torch
+	url = https://github.com/lcpu-club/hipify_torch.git
+	branch = master
