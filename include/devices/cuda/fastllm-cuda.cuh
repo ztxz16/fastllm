@@ -97,6 +97,7 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
 bool FastllmCudaHalfMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 
 void FastllmCudaSetDevice(int gpu_id);
+int FastllmCudaGetDeviceCount();
 #ifdef  __cplusplus
 }
 #endif
