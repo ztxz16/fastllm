@@ -247,8 +247,8 @@ namespace fastllm {
             buffer.WriteInt(data->groupCnt);
             int k = data->perChannelAxis == -1 ? 1 : data->dims[data->perChannelAxis];
             for (int i = 0; i < k * data->group; i++) {
-                buffer.WriteFloat(data->perChannelsConfigs[i].min);
-                buffer.WriteFloat(data->perChannelsConfigs[i].scale);
+                buffer.WriteFloat(data->mins[i]);
+                buffer.WriteFloat(data->scales[i]);
             }
             buffer.WriteBytes(data->cpuData, data->GetBytes());
         }
