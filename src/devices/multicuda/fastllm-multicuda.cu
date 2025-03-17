@@ -801,8 +801,18 @@ bool PrepareMultiCudaWeight(fastllm::Data &weight, const fastllm::Data &bias, Di
     if (weight.mins.size() > 0) {
         int weightGroup = weight.group < 0 ? 1 : weight.group;
         std::vector <uint8_t> zeropoints = std::vector <uint8_t> (k * weightGroup, 0);
-        for (int i = 0; i < k * weightGroup; i++) {
-            zeropoints[i] = weight.perChannelsConfigs[i].zeroPoint;
+        if (weight.perChannelsConfigs.size() > 0) {
+            for (int i = 0; i < k * weightGroup; i++) {
+                zeropoints[i] = weight.perChannelsConfigs[i].zeroPoint;
+            }
+        } else if (weight.zeros.size() > 0) {
+            for (int i = 0; i < k * weightGroup; i++) {
+                zeropoints[i] = weight.zeros[i];
+            }
+        } else {
+            for (int i = 0; i < k * weightGroup; i++) {
+                zeropoints[i] = 0;
+            }
         }
         for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
            int deviceId = multiCudaCurrentDevices[i], mallocType = 0;

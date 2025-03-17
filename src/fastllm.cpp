@@ -729,12 +729,12 @@ namespace fastllm {
                 memcpy(data.mins.data(), oriMins, k * group * sizeof(float));
                 memcpy(data.scales.data(), oriScales, k * group * sizeof(float));
                 data.perChannelAxis = 0;
-                data.perChannelsConfigs.resize(k * group);
+                /* data.perChannelsConfigs.resize(k * group);
                 for (int i = 0; i < k * group; i++) {
                     data.perChannelsConfigs[i] = LowBitConfig(data.mins[i], data.mins[i] + 15 * data.scales[i], 4, 1);
                     data.perChannelsConfigs[i].min = data.mins[i];
                     data.perChannelsConfigs[i].scale = data.scales[i];
-                }
+                } */
             }
         } else if (oriDataType == DataType::BFLOAT16
                 && dataType == DataType::FLOAT16) {
@@ -776,17 +776,17 @@ namespace fastllm {
                 (MultiThreadGroupQuantizationBF16Op(0, k, m, (uint16_t*)oriData, uDatas.data(), configs.data(), bit, group, groupCnt)).Run();
             }
             data.perChannelAxis = 0;
-            data.perChannelsConfigs.resize(k * group);
+            // data.perChannelsConfigs.resize(k * group);
             data.group = group;
             data.groupCnt = groupCnt;
-            data.zeros.resize(k * group);
+            // data.zeros.resize(k * group);
             data.scales.resize(k * group);
             data.mins.resize(k * group);
             for (int i = 0; i < k * group; i++) {
-                data.perChannelsConfigs[i] = LowBitConfig(configs[i].min, configs[i].max, bit, type);
-                data.mins[i] = data.perChannelsConfigs[i].min;
-                data.zeros[i] = data.perChannelsConfigs[i].zeroPoint;
-                data.scales[i] = data.perChannelsConfigs[i].scale;
+                auto config = LowBitConfig(configs[i].min, configs[i].max, bit, type);
+                data.mins[i] = config.min;
+                // data.zeros[i] = config.zeroPoint;
+                data.scales[i] = config.scale;
             }
             memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
         } else if ((oriDataType == DataType::FLOAT32 || oriDataType == DataType::BFLOAT16) &&
@@ -1450,8 +1450,8 @@ namespace fastllm {
             writer.WriteInt(this->groupCnt);
             int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
             for (int i = 0; i < k * this->group; i++) {
-                writer.WriteFloat(this->perChannelsConfigs[i].min);
-                writer.WriteFloat(this->perChannelsConfigs[i].scale);
+                writer.WriteFloat(this->mins[i]);
+                writer.WriteFloat(this->scales[i]);
             }
             writer.WriteBytes(this->cpuData, this->GetBytes());
         } else {
@@ -1501,19 +1501,19 @@ namespace fastllm {
                 this->group = reader.ReadInt();
                 this->groupCnt = reader.ReadInt();
                 int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
-                this->perChannelsConfigs.resize(k * this->group);
+                // this->perChannelsConfigs.resize(k * this->group);
                 this->mins.resize(k * this->group);
                 this->scales.resize(k * this->group);
-                this->zeros.resize(k * this->group);
+                // this->zeros.resize(k * this->group);
                 for (int i = 0; i < k * this->group; i++) {
                     float minValue = reader.ReadFloat();
                     float scale = reader.ReadFloat();
-                    this->perChannelsConfigs[i] = LowBitConfig(minValue, minValue + 15 * scale, 4, 1);
-                    this->perChannelsConfigs[i].min = minValue;
-                    this->perChannelsConfigs[i].scale = scale;
-                    this->mins[i] = this->perChannelsConfigs[i].min;
-                    this->scales[i] = this->perChannelsConfigs[i].scale;
-                    this->zeros[i] = this->perChannelsConfigs[i].zeroPoint;
+                    // this->perChannelsConfigs[i] = LowBitConfig(minValue, minValue + 15 * scale, 4, 1);
+                    // this->perChannelsConfigs[i].min = minValue;
+                    // this->perChannelsConfigs[i].scale = scale;
+                    this->mins[i] = minValue;
+                    this->scales[i] = scale;
+                    // this->zeros[i] = this->perChannelsConfigs[i].zeroPoint;
                 }
                 reader.ReadBytes(this->cpuData, this->GetBytes());
             } else {

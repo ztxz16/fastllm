@@ -250,6 +250,35 @@ namespace fastllm {
                     buffer.ReadBytes(weight[name].cpuData + i * localM / 2, localM / 2);
                     buffer.Skip(m / 2 - base / 2 - localM / 2);
                 }
+            } else if (dataType == DataType::INT4_GROUP) {
+                int bit = 4;
+                weight[name].perChannelAxis = buffer.ReadInt();
+                weight[name].group = buffer.ReadInt();
+                weight[name].groupCnt = buffer.ReadInt();
+                int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
+                int group = weight[name].group;
+                // weight[name].perChannelsConfigs.resize(k);
+                int curGroup = localM / weight[name].groupCnt;
+                weight[name].group = curGroup;
+                weight[name].mins.resize(k * curGroup);
+                weight[name].scales.resize(k * curGroup);
+                int groupBase = partId * localM / weight[name].groupCnt;
+                for (int i = 0; i < k; i++) {
+                    for (int g = 0; g < group; g++) {
+                        float minValue = buffer.ReadFloat();
+                        float scale = buffer.ReadFloat();
+                        if (g - groupBase >= 0 && g - groupBase < curGroup) {
+                            weight[name].mins[i * curGroup + g - groupBase] = minValue;
+                            weight[name].scales[i * curGroup + g - groupBase] = scale;
+                        }
+                    }
+                }
+                
+                for (int i = 0; i < k; i++) {
+                    buffer.Skip(base / 2);
+                    buffer.ReadBytes(weight[name].cpuData + i * localM / 2, localM / 2);
+                    buffer.Skip(m / 2 - base / 2 - localM / 2);
+                }
             } else {
                 ErrorInFastLLM("Register LinearColumn Error: wrong data type");
             }
@@ -457,6 +486,9 @@ namespace fastllm {
                     buffer.ReadBytes(weight[name].cpuData, m * localK);
                     buffer.Skip(weight[name].GetBytes() - (base + m * localK));
                 }
+
+                curWeight.perChannelsConfigs.resize(1);
+                curWeight.perChannelsConfigs.shrink_to_fit();
             }
         }
     }
