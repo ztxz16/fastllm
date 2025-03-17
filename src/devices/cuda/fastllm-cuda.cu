@@ -2715,7 +2715,7 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
         state = cudaMalloc(&cudaMins, k * group * sizeof(half));
         half *mins = new half[k * group];
         for (int i = 0; i < k * group; i++) {
-            mins[i] = (half)weight.perChannelsConfigs[i].min;
+            mins[i] = (half)weight.mins[i];
         }
         state = cudaMemcpy(cudaMins, mins, k * group * sizeof(half), cudaMemcpyHostToDevice);
         delete[] mins;
