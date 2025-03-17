@@ -31,8 +31,10 @@ namespace fastllm {
     Executor::Executor() {
         this->devices.clear();
 #ifdef USE_CUDA
-        this->devices.push_back((BaseDevice*) new CudaDevice());
-        this->devices.push_back((BaseDevice*) new MultiCudaDevice((CudaDevice*)this->devices.back()));
+        if (FastllmCudaGetDeviceCount() > 0) {
+            this->devices.push_back((BaseDevice*) new CudaDevice());
+            this->devices.push_back((BaseDevice*) new MultiCudaDevice((CudaDevice*)this->devices.back()));
+        }
 #endif
 #ifdef USE_TOPS
         this->devices.push_back((BaseDevice*) new TopsDevice());
