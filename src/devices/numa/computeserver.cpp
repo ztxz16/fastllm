@@ -254,13 +254,22 @@ namespace fastllm {
                 ErrorInFastLLM("Register LinearColumn Error: wrong data type");
             }
         } else {
-            weight[name] = Data(dataType, dims);
+            auto curDims = dims;
+            Data oriWeight = Data(dataType, curDims);
+            int k = dims[0];
+            int localK = k / partCnt;
+            if (partId == partCnt - 1) {
+                localK = k - partId * localK;
+            }
+            curDims[0] = localK;
+
+            weight[name] = Data(dataType, curDims);
             weight[name].name = name;
             weight[name].Allocate();
 
             if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
-                int k = weight[name].dims[0];
-                int m = weight[name].GetBytes() / k;
+                int k = oriWeight.dims[0];
+                int m = oriWeight.GetBytes() / k;
                 int localK = k / partCnt;
                 int base = partId * localK * m;
                 if (partId == partCnt - 1) {
@@ -269,13 +278,13 @@ namespace fastllm {
 
                 if (weightType == "linearSwiglu") {
                     buffer.Skip(partId * (localK / 2) * m);
-                    buffer.ReadBytes(weight[name].cpuData + base, (localK / 2) * m);
+                    buffer.ReadBytes(weight[name].cpuData, (localK / 2) * m);
                     buffer.Skip((k / 2 - localK / 2) * m);
-                    buffer.ReadBytes(weight[name].cpuData + base + (localK / 2) * m, (localK / 2) * m);
+                    buffer.ReadBytes(weight[name].cpuData+ (localK / 2) * m, (localK / 2) * m);
                     buffer.Skip(weight[name].GetBytes() - (partId * localK * m) - (k / 2 * m));
                 } else {
                     buffer.Skip(base);
-                    buffer.ReadBytes(weight[name].cpuData + base, m * localK);
+                    buffer.ReadBytes(weight[name].cpuData, m * localK);
                     buffer.Skip(weight[name].GetBytes() - (base + m * localK));
                 }
             } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
@@ -294,7 +303,7 @@ namespace fastllm {
                     weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
                 }
 
-                int m = weight[name].GetBytes() / k;
+                int m = oriWeight.GetBytes() / k;
                 int localK = k / partCnt;
                 int base = partId * localK * m;
                 if (partId == partCnt - 1) {
@@ -309,19 +318,25 @@ namespace fastllm {
                         configs[i + localK / 2] = &weight[name].perChannelsConfigs[partId * (localK / 2) + k / 2 + i];
                     }
                     for (int i = 0; i < localK; i++) {
-                        weight[name].perChannelsConfigs[partId * localK + i] = *configs[i];
-                        weight[name].zeros[partId * localK + i] = weight[name].perChannelsConfigs[partId * localK + i].zeroPoint;
-                        weight[name].scales[partId * localK + i] = weight[name].perChannelsConfigs[partId * localK + i].scale;
+                        weight[name].perChannelsConfigs[i] = *configs[i];
+                        weight[name].zeros[i] = weight[name].perChannelsConfigs[i].zeroPoint;
+                        weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
                     }
 
                     buffer.Skip(partId * (localK / 2) * m);
-                    buffer.ReadBytes(weight[name].cpuData + base, (localK / 2) * m);
+                    buffer.ReadBytes(weight[name].cpuData, (localK / 2) * m);
                     buffer.Skip((k / 2 - localK / 2) * m);
-                    buffer.ReadBytes(weight[name].cpuData + base + (localK / 2) * m, (localK / 2) * m);
+                    buffer.ReadBytes(weight[name].cpuData + (localK / 2) * m, (localK / 2) * m);
                     buffer.Skip(weight[name].GetBytes() - (partId * localK * m) - (k / 2 * m));
                 } else {
+                    for (int i = 0; i < localK; i++) {
+                        weight[name].perChannelsConfigs[i] = weight[name].perChannelsConfigs[i + base / m];
+                        weight[name].zeros[i] = weight[name].zeros[i + base / m];
+                        weight[name].scales[i] = weight[name].scales[i + base / m];
+                    }
+                    
                     buffer.Skip(base);
-                    buffer.ReadBytes(weight[name].cpuData + base, m * localK);
+                    buffer.ReadBytes(weight[name].cpuData, m * localK);
                     buffer.Skip(weight[name].GetBytes() - (base + m * localK));
                 }
             } else if (dataType == DataType::INT4_NOZERO) {
@@ -341,7 +356,7 @@ namespace fastllm {
                     weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
                 }
 
-                int m = weight[name].GetBytes() / k;
+                int m = oriWeight.GetBytes() / k;
                 int localK = k / partCnt;
                 int base = partId * localK * m;
                 if (partId == partCnt - 1) {
@@ -356,19 +371,25 @@ namespace fastllm {
                         configs[i + localK / 2] = &weight[name].perChannelsConfigs[partId * (localK / 2) + k / 2 + i];
                     }
                     for (int i = 0; i < localK; i++) {
-                        weight[name].perChannelsConfigs[partId * localK + i] = *configs[i];
-                        weight[name].mins[partId * localK + i] = weight[name].perChannelsConfigs[partId * localK + i].min;
-                        weight[name].scales[partId * localK + i] = weight[name].perChannelsConfigs[partId * localK + i].scale;
+                        weight[name].perChannelsConfigs[i] = *configs[i];
+                        weight[name].mins[i] = weight[name].perChannelsConfigs[i].min;
+                        weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
                     }
 
                     buffer.Skip(partId * (localK / 2) * m);
-                    buffer.ReadBytes(weight[name].cpuData + base, (localK / 2) * m);
+                    buffer.ReadBytes(weight[name].cpuData, (localK / 2) * m);
                     buffer.Skip((k / 2 - localK / 2) * m);
-                    buffer.ReadBytes(weight[name].cpuData + base + (localK / 2) * m, (localK / 2) * m);
+                    buffer.ReadBytes(weight[name].cpuData + (localK / 2) * m, (localK / 2) * m);
                     buffer.Skip(weight[name].GetBytes() - (partId * localK * m) - (k / 2 * m));
                 } else {
+                    for (int i = 0; i < localK; i++) {
+                        weight[name].perChannelsConfigs[i] = weight[name].perChannelsConfigs[i + base / m];
+                        weight[name].mins[i] = weight[name].mins[i + base / m];
+                        weight[name].scales[i] = weight[name].scales[i + base / m];
+                    }
+
                     buffer.Skip(base);
-                    buffer.ReadBytes(weight[name].cpuData + base, m * localK);
+                    buffer.ReadBytes(weight[name].cpuData, m * localK);
                     buffer.Skip(weight[name].GetBytes() - (base + m * localK));
                 }
             } else if (dataType == DataType::INT4_GROUP) {
@@ -394,7 +415,7 @@ namespace fastllm {
                 }
 
                 int oldK = (k / curWeight.group);
-                int m = weight[name].GetBytes() / oldK;
+                int m = oriWeight.GetBytes() / oldK;
                 int localK = oldK / partCnt;
                 int base = partId * localK * m;
                 if (partId == partCnt - 1) {
@@ -412,20 +433,28 @@ namespace fastllm {
                     }
                     for (int i = 0; i < localK; i++) {
                         for (int j = 0; j < curWeight.group; j++) {
-                            weight[name].perChannelsConfigs[(partId * localK + i) * curWeight.group + j] = *configs[i * curWeight.group + j];
-                            weight[name].mins[(partId * localK + i) * curWeight.group + j] = configs[i * curWeight.group + j]->min;
-                            weight[name].scales[(partId * localK + i) * curWeight.group + j] = configs[i * curWeight.group + j]->scale;
+                            weight[name].perChannelsConfigs[(i) * curWeight.group + j] = *configs[i * curWeight.group + j];
+                            weight[name].mins[(i) * curWeight.group + j] = configs[i * curWeight.group + j]->min;
+                            weight[name].scales[(i) * curWeight.group + j] = configs[i * curWeight.group + j]->scale;
                         }
                     }
 
                     buffer.Skip(partId * (localK / 2) * m);
-                    buffer.ReadBytes(weight[name].cpuData + base, (localK / 2) * m);
+                    buffer.ReadBytes(weight[name].cpuData, (localK / 2) * m);
                     buffer.Skip((oldK / 2 - localK / 2) * m);
-                    buffer.ReadBytes(weight[name].cpuData + base + (localK / 2) * m, (localK / 2) * m);
+                    buffer.ReadBytes(weight[name].cpuData + (localK / 2) * m, (localK / 2) * m);
                     buffer.Skip(weight[name].GetBytes() - (partId * localK * m) - (oldK / 2 * m));
                 } else {
+                    for (int i = 0; i < localK; i++) {
+                        for (int j = 0; j < curWeight.group; j++) {
+                            weight[name].perChannelsConfigs[i * curWeight.group + j] = weight[name].perChannelsConfigs[(i + base / m) * curWeight.group + j];
+                            weight[name].mins[i * curWeight.group + j] = weight[name].mins[(i + base / m) * curWeight.group + j];
+                            weight[name].scales[i * curWeight.group + j] = weight[name].scales[(i + base / m) * curWeight.group + j];
+                        }
+                    }
+
                     buffer.Skip(base);
-                    buffer.ReadBytes(weight[name].cpuData + base, m * localK);
+                    buffer.ReadBytes(weight[name].cpuData, m * localK);
                     buffer.Skip(weight[name].GetBytes() - (base + m * localK));
                 }
             }
@@ -553,29 +582,29 @@ namespace fastllm {
             localK = k - partId * localK;
         }
 
-        float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData + base : nullptr;
+        float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
         bool finish = false;
 #ifdef USE_TFACCX
         if (wType == DataType::INT8 && n > 32 && localK % 32 == 0) {
             finish = true;
-            TfaccMultiplyInt8(localInput, weight + base * m, localOutput,
+            TfaccMultiplyInt8(localInput, weight, localOutput,
                               n, m, localK,
-                              w.weightSum.data() + base, w.zeros.data() + base, w.scales.data() + base, biasData,
+                              w.weightSum.data(), w.zeros.data(), w.scales.data(), biasData,
                               configs, &w, pool);
         }
         if (wType == DataType::INT4_NOZERO && n > 32 && localK % 32 == 0) {
             finish = true;
-            TfaccMultiplyInt4NoZero(localInput, weight + base * m / 2, localOutput,
+            TfaccMultiplyInt4NoZero(localInput, weight, localOutput,
                               n, m, localK,
-                              w.weightSum.data() + base, w.mins.data() + base, w.scales.data() + base, biasData,
+                              w.weightSum.data(), w.mins.data(), w.scales.data(), biasData,
                               configs, &w, pool);
         }
         if (wType == DataType::INT4_GROUP && n > 32 && localK % 32 == 0) {
             finish = true;
-            TfaccMultiplyInt4Group(localInput, weight + base * m / 2, localOutput,
+            TfaccMultiplyInt4Group(localInput, weight , localOutput,
                     n, m, localK,
-                    w.weightSum.data() + base * group, w.mins.data() + base * group,
-                    w.scales.data() + base * group, biasData,
+                    w.weightSum.data(), w.mins.data(),
+                    w.scales.data(), biasData,
                     configs, group, groupCnt, &w, pool);
         }
 #endif
@@ -601,19 +630,19 @@ namespace fastllm {
                 izeros.push_back(configs[i].zeroPoint);
             }
 
-            float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData + base : nullptr;
+            float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
             if (wType == fastllm::DataType::INT4_NOZERO) {
-                fastllm::RunLinearInt8Int4Group(localInput, weight + base * m / 2, (float*)localOutput, 
-                        n, m, localK, 1, m, w.weightSum.data() + base, w.mins.data() + base, w.scales.data() + base, biasData, 
+                fastllm::RunLinearInt8Int4Group(localInput, weight, (float*)localOutput, 
+                        n, m, localK, 1, m, w.weightSum.data(), w.mins.data(), w.scales.data(), biasData, 
                         inputSums.data(), iscales.data(), izeros.data(), pool, 0, pool->threads.size());
             } else if (wType == fastllm::DataType::INT4_GROUP) {
-                fastllm::RunLinearInt8Int4Group(localInput, weight + base * m / 2, (float*)localOutput, 
+                fastllm::RunLinearInt8Int4Group(localInput, weight, (float*)localOutput, 
                     n, m, localK, group, groupCnt, 
-                    w.weightSum.data() + base * group, w.mins.data() + base * group, w.scales.data() + base * group, biasData, 
+                    w.weightSum.data(), w.mins.data(), w.scales.data(), biasData, 
                     inputSums.data(), iscales.data(), izeros.data(), pool, 0, pool->threads.size());
             } else if (wType == fastllm::DataType::INT8) {
-                fastllm::RunLinearInt8Int8(localInput, weight + base * m, (float*)localOutput, n, m, localK, 
-                    w.weightSum.data() + base, w.perChannelsConfigs.data() + base, configs.data(), biasData,
+                fastllm::RunLinearInt8Int8(localInput, weight, (float*)localOutput, n, m, localK, 
+                    w.weightSum.data(), w.perChannelsConfigs.data(), configs.data(), biasData,
                     pool, 0, pool->threads.size());
             }
         }
@@ -679,15 +708,13 @@ namespace fastllm {
             localK = k - partId * localK;
         }
 
-        float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData + base : nullptr;
+        float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
         if (dataType == fastllm::DataType::FLOAT32 && wType == fastllm::DataType::FLOAT16) {
-            float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData + base : nullptr;
             fastllm::RunLinearFloat32Float16(
-                    localInput, ((uint16_t *)weight) + base * m, localOutput, biasData, n, m, localK, pool, 0, pool->threads.size());
+                    localInput, ((uint16_t *)weight), localOutput, biasData, n, m, localK, pool, 0, pool->threads.size());
         } else if (dataType == fastllm::DataType::FLOAT32 && wType == fastllm::DataType::FLOAT32) {
-            float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData + base : nullptr;
             fastllm::RunLinearFloat32Float32(
-                    localInput, ((float*)weight) + base * m, localOutput, biasData, n, m, localK, pool, 0, pool->threads.size());
+                    localInput, ((float*)weight), localOutput, biasData, n, m, localK, pool, 0, pool->threads.size());
         } else {
             printf("RunLinearFloat: wrong data type: dataType = %d, wType = %d.", dataType, wType);
         }
@@ -751,7 +778,7 @@ namespace fastllm {
             }
         }
 
-        std::vector <int> localKs, bases;
+        std::vector <int> localKs;
         std::vector <float*> middles;
         std::vector <float*> results;
         for (int j = 0; j < v.size(); j++) {
@@ -759,15 +786,8 @@ namespace fastllm {
             weights[idx * 2]->CalcWeightSum();
             weights[idx * 2 + 1]->CalcWeightSum();
 
-            int k = weights[idx * 2]->dims[0];
-            int localK = k / partCnt;
-            int base = partId * localK;
-            if (partId == partCnt - 1) {
-                localK = k - partId * localK;
-            }
+            int localK = weights[idx * 2]->dims[0];
             localKs.push_back(localK);
-            bases.push_back(base);
-
             middles.push_back(new float[localK]);
             results.push_back(new float[weights[idx * 2 + 1]->dims[0]]);
         }
@@ -812,10 +832,8 @@ namespace fastllm {
                 float *biasData = nullptr;
                 int curK = localKs[l];
                 int curThread = (curK / k) * base;
-                MultiplyInt4GroupMultiThreadLaunch(localInput, weightData + bases[l] * m / 2, outputData, n, m, curK,
-                                            weight->weightSum.data() + bases[l] * group, 
-                                            weight->mins.data() + bases[l] * group, 
-                                            weight->scales.data() + bases[l] * group, 
+                MultiplyInt4GroupMultiThreadLaunch(localInput, weightData, outputData, n, m, curK,
+                                            weight->weightSum.data(), weight->mins.data(), weight->scales.data(), 
                                             biasData, inputSums, iscales, izeros,
                                             inputConfigs, threadSt, curThread, group, groupCnt, ops, pool);
                 threadSt += curThread;
