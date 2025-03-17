@@ -163,8 +163,8 @@ namespace fastllm {
                 pastKey.lockInCPU = true;
                 pastValue.lockInCPU = true;
             } else {
-                pastKey.ToDevice(DataDevice::CUDA);
-                pastValue.ToDevice(DataDevice::CUDA);
+                pastKey.ToDevice(k.dataDevice);
+                pastValue.ToDevice(k.dataDevice);
             }
             int targetSeqLength = (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqlen : seqlen;
             if (i == 0 && targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
@@ -424,8 +424,8 @@ namespace fastllm {
                         pastKey.lockInCPU = true;
                         pastValue.lockInCPU = true;
                     } else {
-                        pastKey.ToDevice(DataDevice::CUDA);
-                        pastValue.ToDevice(DataDevice::CUDA);
+                        pastKey.ToDevice(k.dataDevice);
+                        pastValue.ToDevice(k.dataDevice);
                     }
                     targetSeqLength = std::max(targetSeqLength, (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqLens[b] : seqLens[b]);
             }

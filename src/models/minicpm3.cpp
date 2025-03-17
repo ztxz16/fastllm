@@ -165,8 +165,8 @@ namespace fastllm {
                 pastKey.lockInCPU = true;
                 pastValue.lockInCPU = true;
             } else {
-                pastKey.ToDevice(DataDevice::CUDA);
-                pastValue.ToDevice(DataDevice::CUDA);
+                pastKey.ToDevice(k_nope.dataDevice);
+                pastValue.ToDevice(k_nope.dataDevice);
             }
             key_states.Reshape({bsz * num_attention_heads, seqlen, -1});
             value_states.Reshape({bsz * num_attention_heads, seqlen, -1});
@@ -367,8 +367,8 @@ namespace fastllm {
                     pastKey.lockInCPU = true;
                     pastValue.lockInCPU = true;
                 } else {
-                    pastKey.ToDevice(DataDevice::CUDA);
-                    pastValue.ToDevice(DataDevice::CUDA);
+                    pastKey.ToDevice(k_nope.dataDevice);
+                    pastValue.ToDevice(k_nope.dataDevice);
                 }
                 key_states.Reshape({bsz * num_attention_heads, seqlen, -1});
                 value_states.Reshape({bsz * num_attention_heads, seqlen, -1});
