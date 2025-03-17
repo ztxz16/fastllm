@@ -119,8 +119,8 @@ namespace fastllm {
                 pastKey.lockInCPU = true;
                 pastValue.lockInCPU = true;
             } else {
-                pastKey.ToDevice(DataDevice::CUDA);
-                pastValue.ToDevice(DataDevice::CUDA);
+                pastKey.ToDevice(k.dataDevice);
+                pastValue.ToDevice(k.dataDevice);
             }
 
             fastllm::LlamaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
@@ -276,8 +276,8 @@ namespace fastllm {
                 pastKey.lockInCPU = true;
                 pastValue.lockInCPU = true;
             } else {
-                pastKey.ToDevice(DataDevice::CUDA);
-                pastValue.ToDevice(DataDevice::CUDA);
+                pastKey.ToDevice(k.dataDevice);
+                pastValue.ToDevice(k.dataDevice);
             }
 
             fastllm::LlamaRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
@@ -454,8 +454,8 @@ namespace fastllm {
                     pastKey.lockInCPU = true;
                     pastValue.lockInCPU = true;
                 } else {
-                    pastKey.ToDevice(DataDevice::CUDA);
-                    pastValue.ToDevice(DataDevice::CUDA);
+                    pastKey.ToDevice(k.dataDevice);
+                    pastValue.ToDevice(k.dataDevice);
                 }
 
                 fastllm::LlamaRotatePosition2D(q, *positionIds[b], sinData, cosData, rotary_dim);
