@@ -463,6 +463,15 @@ namespace fastllm {
                     score0.Reshape({b * s, h, t});
                     ToDataType(attentionMask, DataType::FLOAT32);
                     AttentionMask(score0, attentionMask, -10000);
+                } else if (b == 1 && s > 1 && t > 1) {
+                    std::vector <float> vmasks = std::vector <float> (s * t, 0.0f);
+                    for (int i = 0; i < s; i++) {
+                        for (int j = t - s + i + 1; j < t; j++) {
+                            vmasks[i * t + j] = 1.0;
+                        }
+                    }
+                    ((Data*)&attentionMask)->CopyFrom(Data(DataType::FLOAT32, { s, t }, vmasks));
+                    AttentionMask(score0, attentionMask, -10000);
                 }
 
                 Softmax(score0, score0, -1);

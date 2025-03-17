@@ -751,10 +751,24 @@ auto st = std::chrono::system_clock::now();
                                                           positionIds, seqLens, pastKeyValues, generationConfigs,
                                                           tokensManager, &logits);
                             } else {
-                                if (seqLens[0] > 8192) {
+                                int first = 8192, part = 2048;
+                                if (model->model_struct == "deepseek_v2") {
+                                    // TODO: ds_v2支持更长的切片
+                                    first = 256;
+                                    part = 256;
+                                }
+                                if (seqLens[0] > first) {
                                     int len = seqLens[0];
-                                    int first = 8192, part = 2048;
                                     for (int st = 0; st < len; ) {
+                                        if (model->verbose) {
+                                            genTokens += seqLens.size();
+                                            auto nowTime = std::chrono::system_clock::now();
+                                            float spend = GetSpan(lastRecordTime, nowTime);
+                                            if (spend > 1) {
+                                                printf("Long Prefill ... (%d%%)\n", st * 100 / len);
+                                                lastRecordTime = nowTime;
+                                            }
+                                        }
                                         int curLen = std::min(st == 0 ? first : part, len - st);
                                         Data curInput, curPositionIds;
                                         Split(inputIds, 1, st, st + curLen, curInput);
