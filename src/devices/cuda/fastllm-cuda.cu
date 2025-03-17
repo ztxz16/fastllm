@@ -5202,3 +5202,9 @@ bool FastllmCudaConv2DFloat32(const fastllm::Data &input, fastllm::Data &weight,
 void FastllmCudaSetDevice(int gpu_id) {
     cudaSetDevice(gpu_id);
 }
+
+int FastllmCudaGetDeviceCount() {
+    int deviceCount = 0;
+    cudaError_t error = cudaGetDeviceCount(&deviceCount);
+    return deviceCount;
+}
