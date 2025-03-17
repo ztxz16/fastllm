@@ -206,8 +206,8 @@ namespace fastllm {
                 pastKey.lockInCPU = true;
                 pastValue.lockInCPU = true;
             } else {
-                pastKey.ToDevice(DataDevice::CUDA);
-                pastValue.ToDevice(DataDevice::CUDA);
+                pastKey.ToDevice(k.dataDevice);
+                pastValue.ToDevice(k.dataDevice);
             };
             k.Resize({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});
             v.Resize({v.dims[0], v.dims[1] * v.dims[2], v.dims[3]});
@@ -532,8 +532,8 @@ namespace fastllm {
                     continue;
                 }
 
-                pastKey.ToDevice(DataDevice::CUDA);
-                pastValue.ToDevice(DataDevice::CUDA);
+                pastKey.ToDevice(k.dataDevice);
+                pastValue.ToDevice(k.dataDevice);
 
                 int unitLen = 64;
 #ifdef USE_CUDA
