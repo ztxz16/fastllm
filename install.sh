@@ -6,6 +6,16 @@ if [ ! -d "$folder" ]; then
     mkdir "$folder"
 fi
 
+# 如果有-DUSE_ROCM=ON参数，检查ROCm是否安装
+if [[ "$@" == *"-DUSE_ROCM=ON"* ]]; then
+    if [ ! -d "/opt/rocm" ]; then
+        echo "ROCm is not installed, please install ROCm first."
+        exit -1
+    fi
+    export CC=/opt/rocm/bin/amdclang
+    export CXX=/opt/rocm/bin/amdclang++
+fi
+
 cd $folder
 cmake .. "$@"
 make -j$(nproc)

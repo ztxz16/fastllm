@@ -10,6 +10,10 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#ifdef USE_ROCM
+#include "fastllm-hip.h"
+#endif
+
 #define max(a, b) ((a) > (b) ? (a) : (b))
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
@@ -3132,6 +3136,7 @@ void * FastllmCudaDirectMalloc(size_t size) {
     void * ret;
     cudaError_t state = cudaMalloc(&ret, size);
     if (cudaSuccess != state) {
+        throw("Error: CUDA error when allocating memory!");
         printf("Error: CUDA error when allocating %lu kB memory! maybe there's no enough memory left on device.", size >> 10);
         checkCudaErrors("", state);
         return nullptr;
@@ -5050,7 +5055,7 @@ bool FastllmCudaHalfMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::D
         auto fastllmCublasHandle = getFastllmCublasHandle();
         half *cudaFp16Weight;
 
-        cudaFp16Weight = (half *) FastllmCudaDirectMalloc(k * m * sizeof(half));
+        cudaFp16Weight = (half *) FastllmCudaDirectMalloc(sizeof(half) * k * m);
 
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
