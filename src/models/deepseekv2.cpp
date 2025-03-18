@@ -471,6 +471,7 @@ namespace fastllm {
                         }
                     }
                     ((Data*)&attentionMask)->CopyFrom(Data(DataType::FLOAT32, { s, t }, vmasks));
+                    score0.Reshape({b * s, h, t});
                     AttentionMask(score0, attentionMask, -10000);
                 }
 
