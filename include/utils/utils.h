@@ -18,7 +18,9 @@
 #if defined(__GNUC__) && __GNUC__ < 8
 #include <experimental/filesystem>
 #else
+#ifndef __CUDACC__
 #include <filesystem>
+#endif
 #endif
 
 #if defined(_WIN32) or defined(_WIN64)
@@ -37,12 +39,13 @@
 #endif
 #endif
 
+#ifndef __CUDACC__
 #if (defined(_MSC_VER) && _MSC_VER <= 1900) || (defined(__GNUC__) && __GNUC__ < 8) // VS 2015) 
     namespace fs = std::experimental::filesystem;
 #else
     namespace fs = std::filesystem;
 #endif
-
+#endif
 namespace fastllm {
     static bool StringEndWith(const std::string &s, const std::string &end) {
         return s.size() >= end.size() && s.substr(s.size() - end.size()) == end;
@@ -162,6 +165,7 @@ namespace fastllm {
         return ret;
     }
 
+#ifndef __CUDACC__
     static bool FileExists(std::string filePath) {
 #if defined(__GNUC__) && __GNUC__ < 9
         return access(filePath.c_str(), R_OK) == 0;
@@ -170,6 +174,7 @@ namespace fastllm {
         return fs::exists(path);
 #endif
     }
+#endif
 
     struct TimeRecord {
         std::map<std::string, float> v;

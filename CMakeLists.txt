@@ -37,6 +37,8 @@ message(STATUS "USE_SENTENCEPIECE: ${USE_SENTENCEPIECE}")
 
 message(STATUS "USE_IVCOREX: ${USE_IVCOREX}")
 
+message(STATUS "MAKE_WHL_X86: ${MAKE_WHL_X86}")
+
 set(CMAKE_BUILD_TYPE "Release")
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -45,7 +47,11 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     string(REPLACE "/Ob2" "/Ob1 /Gy" CMAKE_CXX_FLAGS_RELEASE ${CMAKE_CXX_FLAGS_RELEASE})
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNOMINMAX /std:c++17 /arch:AVX2 /source-charset:utf-8")
 else()
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2 -march=native")
+    if (MAKE_WHL_X86)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2 -mavx -mavx2 -mf16c -mfma -static-libstdc++ -static-libgcc")
+    else()
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2 -march=native")
+    endif()
 endif()
 
 
