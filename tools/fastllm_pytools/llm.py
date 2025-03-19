@@ -14,7 +14,18 @@ if platform.system() == 'Windows':
 elif platform.system() == 'Darwin':
     fastllm_lib = ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], "libfastllm_tools.dylib"))
 else:
-    fastllm_lib = ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], "libfastllm_tools.so"))
+    succ = False
+    for libname in ["libfastllm_tools.so", "libfastllm_tools-cu11.so", "libfastllm_tools-cpu.so"]:
+        try:
+            fastllm_lib = ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], libname))
+            print("Use", libname)
+            succ = True
+            break
+        except:
+            continue
+    if (not(succ)):
+        print("Load fastllm failed. (Try install cuda-12)")
+        exit(0)
 
 fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p]
 
