@@ -6,7 +6,7 @@ all_require = server_require + webui_require
 
 setup (
     name = "ftllm",
-    version = "0.0.0.1",
+    version = "0.0.0.2",
     author = "huangyuyang",
     author_email = "ztxz16@foxmail.com",
     description = "Fastllm",
@@ -18,7 +18,7 @@ setup (
     install_requires=[
         'transformers',
         'jinja2>=3.1.0'
-    ],
+    ] + all_require,
     extras_require={
         'all': all_require,
         'server': server_require,
