@@ -649,7 +649,8 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         output.Allocate();
 
-        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Softmax error: Data's type should be float32.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16, 
+                        "Softmax error: Data's type should be float32 or float16.\n");
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
         int dimsLen = input.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
