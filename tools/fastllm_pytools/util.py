@@ -7,7 +7,7 @@ def make_normal_parser(des: str) -> argparse.ArgumentParser:
     parser.add_argument('-t', '--threads', type = int, default = 4,  help = '线程数量')
     parser.add_argument('-l', '--low', action = 'store_true', help = '是否使用低内存模式')
     parser.add_argument('--dtype', type = str, default = "float16", help = '权重类型（读取HF模型时有效）')
-    parser.add_argument('--atype', type = str, default = "float32", help = '推理类型，可使用float32或float16')
+    parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
