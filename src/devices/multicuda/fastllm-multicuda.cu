@@ -36,7 +36,7 @@ extern __global__ void FastllmCudaFloat2HalfKernel(float* a, half *b, int len);
 extern __global__ void FastllmCudaHalf2FloatKernel(half* a, float *b, int len);
 extern __global__ void FastllmCudaInt42HalfKernel(uint8_t* a, float *scales, float *mins, half *b, int len, int per);
 extern __global__ void FastllmCudaInt4Group2HalfKernel(uint8_t* a, float *scales, float *mins, half *b, int len, int per, int group, int groupCnt);
-extern __global__ void FastllmCudaInt4Group2HalfKernel(uint8_t* a, half *scales, half *mins, half *b, int len, int per, int group, int groupCnt);
+extern __global__ void FastllmCudaInt4Group2HalfKernel(uint8_t* a, half *scales, half *mins, half *b, int k, int m, int group, int groupCnt);
 extern __global__ void FastllmCudaInt82HalfKernel(uint8_t* a, float *scales, uint8_t *zeros, half *b, int len, int per);
 
 extern double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2);
@@ -401,7 +401,7 @@ namespace fastllm {
                     int threadPerBlock = std::min(256, k * m);
                     isQuant = true;
                     fp16Weight = (half*)FastllmCudaMalloc(k * m * sizeof(half));
-                    FastllmCudaInt4Group2HalfKernel <<< (k * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, (half*)scales, (half*)mins, fp16Weight, k * m, m, group, groupCnt);
+                    FastllmCudaInt4Group2HalfKernel <<< k, 256 >>>((uint8_t*)weight, (half*)scales, (half*)mins, fp16Weight, k, m, group, groupCnt);
                 } else if (weightDataType == DataType::INT8) {
                     int threadPerBlock = std::min(256, k * m);
                     isQuant = true;
@@ -461,7 +461,7 @@ namespace fastllm {
                     int threadPerBlock = std::min(256, k * m);
                     isQuant = true;
                     fp16Weight = (half*)FastllmCudaMalloc(k * m * sizeof(half));
-                    FastllmCudaInt4Group2HalfKernel <<< (k * m - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight, (half*)scales, (half*)mins, fp16Weight, k * m, m, group, groupCnt);
+                    FastllmCudaInt4Group2HalfKernel <<< k, 256 >>>((uint8_t*)weight, (half*)scales, (half*)mins, fp16Weight, k, m, group, groupCnt);
                 } else if (weightDataType == DataType::INT8) {
                     int threadPerBlock = std::min(256, k * m);
                     isQuant = true;

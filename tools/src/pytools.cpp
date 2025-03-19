@@ -256,7 +256,18 @@ extern "C" {
     DLL_EXPORT void set_model_atype(int modelId, char *atype) {
         auto model = models.GetModel(modelId);
         std::string atypeStr = atype;
-        if (atypeStr == "float16" || atypeStr == "half") {
+        if (atypeStr == "auto") {
+            if (model->model_struct == "chatglm" 
+                || model->model_struct == "llama"
+                // || this->model_struct == "graph" ||
+                // || this->model_struct == "cogvlm" ||
+                // || this->model_struct == "deepseek_v2", 
+                ) {
+                model->SetDataType(fastllm::DataType::FLOAT16);
+            } else {
+                model->SetDataType(fastllm::DataType::FLOAT32);
+            }
+        } else if (atypeStr == "float16" || atypeStr == "half") {
             model->SetDataType(fastllm::DataType::FLOAT16);
         } else if (atypeStr == "float" || atypeStr == "float32") {
             model->SetDataType(fastllm::DataType::FLOAT32);

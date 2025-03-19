@@ -360,16 +360,13 @@ __global__ void FastllmCudaInt4Group2HalfKernel(uint8_t* a, float *scales, float
     }
 }
 
-__global__ void FastllmCudaInt4Group2HalfKernel(uint8_t* a, half *scales, half *mins, half *b, int len, int per,
-    int group, int groupCnt) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    int gid = idx / per * group + (idx % per / groupCnt);
-    if (idx < len) {
-        if (idx % 2 == 1) {
-            b[idx] = __float2half((float)scales[gid] * (a[idx / 2] & 0xF) + (float)mins[gid]);
-        } else {
-            b[idx] = __float2half((float)scales[gid] * (a[idx / 2] >> 4) + (float)mins[gid]);
-        }
+__global__ void FastllmCudaInt4Group2HalfKernel(uint8_t* a, half *scales, half *mins, half *b, int k, int m, int group, int groupCnt) {
+    unsigned int tid = threadIdx.x;
+    unsigned int st = blockIdx.x;
+    for (int i = tid * 2; i < m; i += blockDim.x * 2) {
+        int gid = st * group + (i / groupCnt);
+        b[st * m + i] = __float2half((float)scales[gid] * (a[(st * m + i) / 2] >> 4) + (float)mins[gid]);
+        b[st * m + i + 1] = __float2half((float)scales[gid] * (a[(st * m + i) / 2] & 0xF) + (float)mins[gid]);
     }
 }
 
@@ -1806,49 +1803,59 @@ __global__ void FastllmGemvInt4GroupKernel2(float *A, uint8_t *B, float *C,
 }
 
 template <int THREAD_PER_BLOCK, int PART>
-__global__ void FastllmGemvHalfInt4GroupKernel(half *A, uint8_t *B, half *C,
+__global__ void FastllmGemvHalfInt4GroupKernelMultiRow(half *A, uint8_t *B, half *C,
                                              half *bias, half *scales, half *mins,
                                              int m, int k, int group, int groupCnt) {
-    __shared__ float sdata[THREAD_PER_BLOCK];
+    __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
+
     // 1. 计算
-    int st = blockIdx.x * PART;
-    int end = st + PART;
-    for (int p = st; p < end; p++) {
-        sdata[tid] = 0;
-        for (int i = tid; i < m / 8; i += THREAD_PER_BLOCK) {
-            uint8_t now0 = B[p * m / 2 + i * 4];
-            uint8_t now1 = B[p * m / 2 + i * 4 + 1];
-            uint8_t now2 = B[p * m / 2 + i * 4 + 2];
-            uint8_t now3 = B[p * m / 2 + i * 4 + 3];
+    int st = blockIdx.x;
+    int end = st;
+#pragma unroll
+    for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
+    for (int i = tid; i < m / 8; i += THREAD_PER_BLOCK) {
+        uint8_t now0 = B[st * m / 2 + i * 4];
+        uint8_t now1 = B[st * m / 2 + i * 4 + 1];
+        uint8_t now2 = B[st * m / 2 + i * 4 + 2];
+        uint8_t now3 = B[st * m / 2 + i * 4 + 3];
+        int g = st * group + (i * 8 / groupCnt);
+        float curmin = (float)mins[g], curscale = (float)scales[g];
+        for (int x = 0; x < PART; x++) {
             union_half8 aBuffer;
-            aBuffer.in = *reinterpret_cast<const uint4 *>(A + i * 8);
-            int g = p * group + (i * 8 / groupCnt);
-            float curmin = (float)mins[g], curscale = (float)scales[g];
-        
-            sdata[tid] += ((float)aBuffer.out[0] * (curmin + curscale * (now0 >> 4)) 
+            aBuffer.in = *reinterpret_cast<const uint4 *>(A + x * m + i * 8);
+            sdata[x][tid] += ((float)aBuffer.out[0] * (curmin + curscale * (now0 >> 4)) 
                          + (float)aBuffer.out[1] * (curmin + curscale * (now0 & 15)));
-            sdata[tid] += ((float)aBuffer.out[2] * (curmin + curscale * (now1 >> 4)) 
+            sdata[x][tid] += ((float)aBuffer.out[2] * (curmin + curscale * (now1 >> 4)) 
                          + (float)aBuffer.out[3] * (curmin + curscale * (now1 & 15)));
-            sdata[tid] += ((float)aBuffer.out[4] * (curmin + curscale * (now2 >> 4)) 
+            sdata[x][tid] += ((float)aBuffer.out[4] * (curmin + curscale * (now2 >> 4)) 
                          + (float)aBuffer.out[5] * (curmin + curscale * (now2 & 15)));
-            sdata[tid] += ((float)aBuffer.out[6] * (curmin + curscale * (now3 >> 4)) 
+            sdata[x][tid] += ((float)aBuffer.out[6] * (curmin + curscale * (now3 >> 4)) 
                          + (float)aBuffer.out[7] * (curmin + curscale * (now3 & 15)));
         }
+    }
 
-        __syncthreads();
-        for (unsigned int s = 1; s < THREAD_PER_BLOCK; s *= 2) {
+    __syncthreads();
+    for (unsigned int s = 1; s < THREAD_PER_BLOCK; s *= 2) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
             if ((tid & (2 * s - 1)) == 0) {
-                sdata[tid] += sdata[tid + s];
+                sdata[x][tid] += sdata[x][tid + s];
             }
-            __syncthreads();
-        }
-
-        if (tid == 0) {
-            C[p] = (half)(sdata[0] + (float)bias[p]);
         }
         __syncthreads();
     }
+
+    if (tid == 0) {
+        if (bias != nullptr) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) C[st + k * x] = (half)(sdata[x][0] + (float)(__ldg(bias + st)));
+        } else {
+#pragma unroll
+            for (int x = 0; x < PART; x++) C[st + k * x] = (half)(sdata[x][0]);
+        }
+    }
+    __syncthreads();
 }
 
 template <int THREAD_PER_BLOCK, int PART>
@@ -2755,10 +2762,7 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
                                                                                           len);
 
         len = k * m;
-        FastllmCudaInt4Group2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t *) weight.cudaData,
-                                                                                         cudaScales,
-                                                                                         cudaMins,
-                                                                                         cudaFp16Weight, len, m, group, groupCnt);
+        FastllmCudaInt4Group2HalfKernel <<< k, 64 >>>((uint8_t*)weight.cudaData, cudaScales, cudaMins, cudaFp16Weight, k, m, group, groupCnt);
 
         status = cublasGemmEx(fastllmCublasHandle,
                               CUBLAS_OP_T, CUBLAS_OP_N,
@@ -3591,18 +3595,28 @@ bool FastllmCudaSoftmax(const fastllm::Data &input, fastllm::Data &output, int a
     int outer = input.Count(0) / input.Count(axis);
     int channels = input.dims[axis];
     int inner = input.Count(axis + 1);
-
     if (inner == 1) {
-        if (channels < 8) {
-            FastllmSoftmaxKernelInner1 <1> <<< outer, 1 >>> (cudaInput, cudaOutput, outer, channels);
-        } else if (channels < 64) {
-            FastllmSoftmaxKernelInner1 <8> <<< outer, 8 >>> (cudaInput, cudaOutput, outer, channels);
-        } else if (channels < 512) {
-            FastllmSoftmaxKernelInner1 <64> <<< outer, 64 >>> (cudaInput, cudaOutput, outer, channels);
+        if (input.dataType == fastllm::DataType::FLOAT32) {
+            if (channels < 8) {
+                FastllmSoftmaxKernelInner1 <1> <<< outer, 1 >>> (cudaInput, cudaOutput, outer, channels);
+            } else if (channels < 64) {
+                FastllmSoftmaxKernelInner1 <8> <<< outer, 8 >>> (cudaInput, cudaOutput, outer, channels);
+            } else if (channels < 512) {
+                FastllmSoftmaxKernelInner1 <64> <<< outer, 64 >>> (cudaInput, cudaOutput, outer, channels);
+            } else {
+                FastllmSoftmaxKernelInner1 <256> <<< outer, 256 >>> (cudaInput, cudaOutput, outer, channels);
+            }
         } else {
-            FastllmSoftmaxKernelInner1 <256> <<< outer, 256 >>> (cudaInput, cudaOutput, outer, channels);
+            if (channels < 8) {
+                FastllmSoftmaxKernelInner1 <1> <<< outer, 1 >>> ((half*)cudaInput, (half*)cudaOutput, outer, channels);
+            } else if (channels < 64) {
+                FastllmSoftmaxKernelInner1 <8> <<< outer, 8 >>> ((half*)cudaInput, (half*)cudaOutput, outer, channels);
+            } else if (channels < 512) {
+                FastllmSoftmaxKernelInner1 <64> <<< outer, 64 >>> ((half*)cudaInput, (half*)cudaOutput, outer, channels);
+            } else {
+                FastllmSoftmaxKernelInner1 <256> <<< outer, 256 >>> ((half*)cudaInput, (half*)cudaOutput, outer, channels);
+            }
         }
-
     } else {
         printf("softmax error.\n");
         exit(0);
@@ -4932,9 +4946,45 @@ bool FastllmCudaHalfMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &w
 }
 
 void LaunchFastllmGemmFp16Int4Group(half *input, uint8_t *weight, half *output, half *bias, half *scales, half *mins, int n, int m, int k, int group, int groupCnt) {
-    for (int i = 0; i < n; i++) {
-        FastllmGemvHalfInt4GroupKernel<64, 1> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, scales, mins, m, k, group, groupCnt);
+    if (n == 1) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 1> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 2) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 2> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 3) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 3> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 4) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 4> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 5) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 5> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 6) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 6> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 7) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 7> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 8) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 8> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 9) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 9> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 10) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 10> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 11) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 11> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 12) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 12> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 13) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 13> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 14) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 14> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 15) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 15> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else if (n == 16) {
+        FastllmGemvHalfInt4GroupKernelMultiRow<64, 16> <<< k, 64 >>>(input, weight, output, bias, scales, mins, m, k, group, groupCnt);
+    } else {
+        for (int i = 0; i < n; i++) {
+            FastllmGemvHalfInt4GroupKernelMultiRow<64, 1> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, scales, mins, m, k, group, groupCnt);
+        }
+        return;
     }
+    
 }
 
 bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
@@ -4964,7 +5014,7 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
 
-    if (n >= 8) {
+    if (n > 16) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
         half *cudaFp16Weight;
 
@@ -4979,10 +5029,7 @@ bool FastllmCudaHalfMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Da
 
         len = k * m;
 
-        FastllmCudaInt4Group2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t*)weight.cudaData,
-                                                                                            cudaScales,
-                                                                                            cudaMins,
-                                                                                            cudaFp16Weight, len, m, group, groupCnt);
+        FastllmCudaInt4Group2HalfKernel <<< k, 256 >>>((uint8_t*)weight.cudaData, cudaScales, cudaMins, cudaFp16Weight, k, m, group, groupCnt);
 
         status = cublasGemmEx(fastllmCublasHandle,
                                 CUBLAS_OP_T, CUBLAS_OP_N,
