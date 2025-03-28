@@ -5255,3 +5255,32 @@ int FastllmCudaGetDeviceCount() {
     cudaError_t error = cudaGetDeviceCount(&deviceCount);
     return deviceCount;
 }
+
+__global__ void FastllmCudaResetLogitsOfEOS(int batch, int stride, float *logits, int *res_lens, int *eos_nums, int *eos_ids) {
+    int base = 0;
+    for (int b = 0; b < batch; b++) {
+        if (res_lens[b] > 0) {
+            for (int i = 0; i < eos_nums[b]; i++) {
+                logits[stride * b + eos_ids[base + i]] = 0;
+            }
+        }
+        base += eos_nums[b];
+    }
+    return;
+}
+void FastllmResetLogitsOfEOS(int batch, fastllm::Data *logits, const std::vector<int> res_lens, 
+    const std::vector<int> eos_nums, const std::vector<int> eos_ids) {
+    cudaError_t state = cudaSuccess;
+    int *cuda_res_lens;
+    state = cudaMalloc(&cuda_res_lens, sizeof(int) * res_lens.size());
+    state = cudaMemcpy(cuda_res_lens, res_lens.data(), sizeof(int) *res_lens.size(), cudaMemcpyHostToDevice);
+    int *cuda_eos_nums;
+    state = cudaMalloc(&cuda_eos_nums, sizeof(int) * eos_nums.size());
+    state = cudaMemcpy(cuda_eos_nums, eos_nums.data(), sizeof(int) *eos_nums.size(), cudaMemcpyHostToDevice);
+    int *cuda_eos_ids;
+    state = cudaMalloc(&cuda_eos_ids, sizeof(int) * eos_ids.size());
+    state = cudaMemcpy(cuda_eos_ids, eos_ids.data(), sizeof(int) *eos_ids.size(), cudaMemcpyHostToDevice);
+    FastllmCudaResetLogitsOfEOS <<<1,1>>> (batch, logits->Count(0) / batch, (float*)logits->cudaData, cuda_res_lens, cuda_eos_nums, cuda_eos_ids);
+    checkCudaErrors("Error: CUDA error when reset logtis of EOS!", state);
+    return;
+}

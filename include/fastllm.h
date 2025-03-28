@@ -47,6 +47,8 @@ namespace fastllm {
 
     struct GenerationConfig {
         int output_token_limit = -1; // 最多输出多少, <= 0代表无限制
+        int output_token_least = 0; // 最低输出的多少
+        int input_token_length = 0;
         int last_n = 64; // 末尾last_n个token计入重复惩罚
         float repeat_penalty = 1.0f; // 重复惩罚系数，1.0代表不惩罚
         int top_k = 1; // top_k采样

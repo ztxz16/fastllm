@@ -94,10 +94,11 @@ extern "C" {
         return svalue;
     }
 
-    DLL_EXPORT fastllm::GenerationConfig make_config(int max_length, bool do_sample, float top_p, int top_k,
+    DLL_EXPORT fastllm::GenerationConfig make_config(int max_length, int min_length, bool do_sample, float top_p, int top_k,
                                           float temperature, float repeat_penalty, bool output_logits, bool add_special_tokens) {
         fastllm::GenerationConfig config;
         config.output_token_limit = max_length;
+        config.output_token_least = min_length;
         config.temperature = temperature;
         config.repeat_penalty = repeat_penalty;
         if (do_sample) {
@@ -362,13 +363,13 @@ extern "C" {
                                  int max_length, bool do_sample, float top_p, int top_k,
                                  float temperature, float repeat_penalty, bool output_logits) {
         auto model = models.GetModel(modelId);
-        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, true);
+        auto config = make_config(max_length, 0, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, true);
         std::string s = model->Response(content, nullptr, config);
         return string_to_chars(s);
     }
 
     DLL_EXPORT int launch_response_str_llm_model(int modelId, char *content,
-                                      int max_length, bool do_sample, float top_p, int top_k,
+                                      int max_length, int min_length, bool do_sample, float top_p, int top_k,
                                       float temperature, float repeat_penalty, bool output_logits,
                                       int stop_token_len, int * stop_token_ids) {
         auto model = models.GetModel(modelId);
@@ -377,7 +378,8 @@ extern "C" {
         for (int i = 0; i < v.Count(0); i++) {
             tokens.push_back((int)((float*)v.cpuData)[i]);
         }
-        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, true);
+        auto config = make_config(max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, true);
+        config.input_token_length = tokens.size();
         for(int i = 0; i < stop_token_len; i++ )
         {
             config.stop_token_ids.insert(stop_token_ids[i]);
@@ -405,32 +407,33 @@ extern "C" {
     }
 
     DLL_EXPORT int launch_response_llm_model(int modelId, int len, int *values,
-                                  int max_length, bool do_sample, float top_p, int top_k,
+                                  int max_length, int min_length, bool do_sample, float top_p, int top_k,
                                   float temperature, float repeat_penalty, bool output_logits,
                                   int stop_token_len, int * stop_token_ids) {
         std::vector <int> input;
         for (int i = 0; i < len; i++) {
             input.push_back(values[i]);
         }
-        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, false);
+        auto config = make_config(max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, false);
         for(int i = 0; i < stop_token_len; i++ )
         {
             config.stop_token_ids.insert(stop_token_ids[i]);
         }
+        config.input_token_length = input.size();
         auto model = models.GetModel(modelId);
         return model->LaunchResponseTokens(input, config);
     }
 
     DLL_EXPORT int launch_response_llm_model_multimodal(int modelId, int len, int *values, 
                                   char *multimodal_json, float *multimodal_data,
-                                  int max_length, bool do_sample, float top_p, int top_k,
+                                  int max_length, int min_length, bool do_sample, float top_p, int top_k,
                                   float temperature, float repeat_penalty, bool output_logits,
                                   int stop_token_len, int * stop_token_ids) {
         std::vector <int> input;
         for (int i = 0; i < len; i++) {
             input.push_back(values[i]);
         }
-        auto config = make_config(max_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, false);
+        auto config = make_config(max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty, output_logits, false);
         for(int i = 0; i < stop_token_len; i++ ) {
             config.stop_token_ids.insert(stop_token_ids[i]);
         }
