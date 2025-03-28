@@ -246,6 +246,12 @@ namespace fastllm {
 
         virtual std::vector <int> ApplyChatTemplateToTokens(const JinjaVar &var);
 
+        // 输出未满足最低长度时阻止产生EOS
+        virtual void ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data, Data> > &pastKeyValues, 
+            const GenerationConfig &generationConfig);
+        virtual void ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data*, Data*> > &pastKeyValues, 
+            const std::vector <GenerationConfig> &generationConfigs); 
+
         std::string model_type;
         std::string model_struct;
         bool is_multi_modal = false; // 是否是多模态模型
