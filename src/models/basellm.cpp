@@ -1254,6 +1254,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             const GenerationConfig &generationConfig) {
         auto &config = generationConfig;
         if (logits->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
             bool need_reset = false;
             std::vector<int> res_lens, eos_nums, eos_ids;
             for (int b = 0; b < batch; b++) {
@@ -1270,6 +1271,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 ToDataType(*logits, DataType::FLOAT32);
                 FastllmResetLogitsOfEOS(batch, logits, res_lens, eos_nums, eos_ids);
             }
+#endif
         } else {
             for (int b = 0; b < batch; b++) {
                 if (config.output_token_least > pastKeyValues[0].first.dims[1] - config.input_token_length) {
@@ -1289,6 +1291,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
     void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data*, Data*> > &pastKeyValues, 
             const std::vector <GenerationConfig> &generationConfigs) {
         if (logits->dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
             bool need_reset = false;
             std::vector<int> res_lens, eos_nums, eos_ids;
             for (int b = 0; b < batch; b++) {
@@ -1306,6 +1309,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 ToDataType(*logits, DataType::FLOAT32);
                 FastllmResetLogitsOfEOS(batch, logits, res_lens, eos_nums, eos_ids);
             }
+#endif
         } else {
             for (int b = 0; b < batch; b++) {
                 auto &config = generationConfigs[b];
