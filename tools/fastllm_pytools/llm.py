@@ -50,14 +50,14 @@ fastllm_lib.token_encode_string.argtypes = [ctypes.c_int, ctypes.c_char_p, ctype
 fastllm_lib.token_encode_string.restype = ctypes.c_int
 
 fastllm_lib.launch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
-                                                  ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
+                                                  ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
                                                   ctypes.c_float, ctypes.c_float, ctypes.c_bool,
                                                   ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_llm_model.restype = ctypes.c_int
 
 fastllm_lib.launch_response_llm_model_multimodal.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                                             ctypes.c_char_p, ctypes.c_void_p, 
-                                                            ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
+                                                            ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
                                                             ctypes.c_float, ctypes.c_float, ctypes.c_bool,
                                                             ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_llm_model_multimodal.restype = ctypes.c_int
@@ -77,7 +77,7 @@ fastllm_lib.response_str_llm_model.argtypes = [ctypes.c_int, ctypes.c_char_p,
 fastllm_lib.response_str_llm_model.restype = ctypes.c_char_p
 
 fastllm_lib.launch_response_str_llm_model.argtype = [ctypes.c_int, ctypes.c_char_p,
-                                                     ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
+                                                     ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_float, ctypes.c_int,
                                                      ctypes.c_float, ctypes.c_float, ctypes.c_bool,
                                                      ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_str_llm_model.restype = ctypes.c_int
@@ -603,7 +603,7 @@ class model:
         for i in range(len(inputs)):
             handles.append(fastllm_lib.launch_response_llm_model(self.model, len(inputs[i]),
                                                        (ctypes.c_int * len(inputs[i]))(*inputs[i]),
-                                                       ctypes.c_int(config.max_new_tokens), ctypes.c_bool(config.do_sample), 
+                                                       ctypes.c_int(config.max_new_tokens), ctypes.c_int(0), ctypes.c_bool(config.do_sample), 
                                                        ctypes.c_float(config.top_p), ctypes.c_int(config.top_k),
                                                        ctypes.c_float(config.temperature), ctypes.c_float(config.repetition_penalty), ctypes.c_bool(False),
                                                        stop_token_len, stop_token_list))
@@ -784,7 +784,7 @@ class model:
                 input = real_input[ : idx]
                 stop_token_len, stop_token_list = self.stop_token_ctypes(None)
                 handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
-                                                            1, False, 1, 1, 1, 1, True, stop_token_len, stop_token_list)
+                                                            1, 0, False, 1, 1, 1, 1, True, stop_token_len, stop_token_list)
                 ret = fastllm_lib.fetch_response_logits_llm_model(self.model, handle, array)
                 out = list(array)[:vocab_size]
                 softmax(out)
@@ -822,7 +822,7 @@ class model:
         if (tokenizer == None):
             vocab_size = fastllm_lib.get_tokenizer_vocab_size(self.model)
             handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
-                                                           ctypes.c_int(1), ctypes.c_bool(False), ctypes.c_float(1), ctypes.c_int(1),
+                                                           ctypes.c_int(1), ctypes.c_int(0), ctypes.c_bool(False), ctypes.c_float(1), ctypes.c_int(1),
                                                            ctypes.c_float(1), ctypes.c_float(1), ctypes.c_bool(True),
                                                            stop_token_len, stop_token_list)
         else:
@@ -885,7 +885,7 @@ class model:
                     input = tokenizer.encode(prompt)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
-                                                        max_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                        max_length, 0, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                         False, stop_token_len, stop_token_list)
             tokens = [];
             while True:
@@ -911,7 +911,7 @@ class model:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids);
             handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
-                                                            ctypes.c_int(max_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
+                                                            ctypes.c_int(max_length), ctypes.c_int(0), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
                                                             ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
                                                             stop_token_len, stop_token_list);
             res = "";
@@ -951,7 +951,8 @@ class model:
     def launch_stream_response(self,
                         query: Union[str, List[Dict[str, str]]],
                         history: List[Tuple[str, str]] = None,
-                        max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
+                        max_length: int = 8192, min_length: int = 0, do_sample = True, 
+                        top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                         one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True, 
                         images: List = None):
         conversation = None
@@ -999,7 +1000,7 @@ class model:
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             handle = fastllm_lib.launch_response_llm_model_multimodal(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                         des.encode(), (ctypes.c_float * len(image))(*image),
-                                                        max_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                        max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                         False, stop_token_len, stop_token_list)
             return handle
 
@@ -1023,7 +1024,7 @@ class model:
                 input = tokenizer.encode(prompt)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
-                                                        max_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                        max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                         False, stop_token_len, stop_token_list)
             return handle
         else:
@@ -1034,7 +1035,7 @@ class model:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
-                                                            ctypes.c_int(max_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
+                                                            ctypes.c_int(max_length), ctypes.c_int(min_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
                                                             ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
                                                             stop_token_len, stop_token_list)
             return handle
@@ -1137,7 +1138,7 @@ class model:
                         history: List[Tuple[str, str]] = None,
                         max_length: int = 8192, do_sample = True, top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                         one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True):
-        handle = self.launch_stream_response(query, history, max_length, do_sample, top_p, top_k, temperature, 
+        handle = self.launch_stream_response(query, history, max_length, 0, do_sample, top_p, top_k, temperature, 
                                              repeat_penalty, one_by_one, stop_token_ids, add_generation_prompt)
         async for ret in self.stream_response_handle_async(handle):
             yield ret
@@ -1151,7 +1152,7 @@ class model:
         stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
         handle = fastllm_lib.launch_response_llm_model(self.model, len(input_tokens),
                                                        (ctypes.c_int * len(input_tokens))(*input_tokens),
-                                                       ctypes.c_int(max_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
+                                                       ctypes.c_int(max_length), ctypes.c_int(0), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
                                                        ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
                                                        stop_token_len, stop_token_list)
 
@@ -1180,7 +1181,7 @@ class model:
         input = tokenizer.encode(prompt);
         stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
         handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
-                                                       max_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                       max_length, 0, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                        False, stop_token_len, stop_token_list);
 
         result = [];
@@ -1213,7 +1214,7 @@ class model:
 
         stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
         handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
-                                                       max_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                                                       max_length, 0, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                        False, stop_token_len, stop_token_list);
         tokens = [];
         while True:
