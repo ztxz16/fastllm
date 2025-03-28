@@ -122,6 +122,7 @@ class FastLLmCompletion:
         frequency_penalty = request.frequency_penalty
 
       max_length = request.max_tokens if request.max_tokens else 8192
+      min_length = request.min_tokens if request.min_tokens else 0
       #logging.info(request)
       logging.info(f"fastllm input message: {messages}")
       #logging.info(f"input tokens: {input_token_len}")
@@ -129,7 +130,7 @@ class FastLLmCompletion:
       input_token_len = self.model.get_input_token_len(messages)
 
       handle = self.model.launch_stream_response(messages,
-                        max_length = max_length, do_sample = True,
+                        max_length = max_length, min_length = min_length, do_sample = True,
                         top_p = request.top_p, top_k = request.top_k, temperature = request.temperature,
                         repeat_penalty = frequency_penalty, one_by_one = True)
       result_generator = self.model.stream_response_handle_async(handle)

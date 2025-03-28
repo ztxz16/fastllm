@@ -718,6 +718,7 @@ namespace fastllm {
             RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
             Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
             ToDataType(logits, DataType::FLOAT32);
+            ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfig);
             if (this->weight.dicts["model_type"] != "deepseek_v2") {
                 return GumbelMaxTrick(logits, batch);
             }
@@ -1275,6 +1276,7 @@ namespace fastllm {
         ToDataType(logits, DataType::FLOAT32);
         std::vector <int> lastRet;
 
+        ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfigs);
         if (this->weight.dicts["model_type"] != "deepseek_v2") {
             return GumbelMaxTrick(logits, batch);
         }

@@ -1249,4 +1249,77 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         }
         return tokens;    
     }
+
+    void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data, Data> > &pastKeyValues, 
+            const GenerationConfig &generationConfig) {
+        auto &config = generationConfig;
+        if (logits->dataDevice == DataDevice::CUDA) {
+            bool need_reset = false;
+            std::vector<int> res_lens, eos_nums, eos_ids;
+            for (int b = 0; b < batch; b++) {
+                res_lens.push_back(config.output_token_least - pastKeyValues[0].first.dims[1] + config.input_token_length);
+                need_reset |= res_lens.back() > 0;
+                eos_nums.push_back(1 + this->eos_token_ids.size() + config.stop_token_ids.size());
+                eos_ids.push_back(this->eos_token_id);
+                for (auto id: this->eos_token_ids)
+                    eos_ids.push_back(id);
+                for (auto id: config.stop_token_ids)
+                    eos_ids.push_back(id);
+            }
+            if (need_reset) {
+                ToDataType(*logits, DataType::FLOAT32);
+                FastllmResetLogitsOfEOS(batch, logits, res_lens, eos_nums, eos_ids);
+            }
+        } else {
+            for (int b = 0; b < batch; b++) {
+                if (config.output_token_least > pastKeyValues[0].first.dims[1] - config.input_token_length) {
+                    ToDataType(*logits, DataType::FLOAT32);
+                    float *logit = ((float*)logits->cpuData) + logits->Count(0) / batch * b;
+                    logit[this->eos_token_id] = 0;
+                    for (auto id: this->eos_token_ids)
+                        logit[id] = 0;
+                    for (auto id: config.stop_token_ids)
+                        logit[id] = 0; 
+                }
+            }
+        }
+        return;
+    }
+
+    void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data*, Data*> > &pastKeyValues, 
+            const std::vector <GenerationConfig> &generationConfigs) {
+        if (logits->dataDevice == DataDevice::CUDA) {
+            bool need_reset = false;
+            std::vector<int> res_lens, eos_nums, eos_ids;
+            for (int b = 0; b < batch; b++) {
+                auto &config = generationConfigs[b];
+                res_lens.push_back(config.output_token_least - pastKeyValues[0].first->dims[1] + config.input_token_length);
+                need_reset |= res_lens.back() > 0;
+                eos_nums.push_back(1 + this->eos_token_ids.size() + config.stop_token_ids.size());
+                eos_ids.push_back(this->eos_token_id);
+                for (auto id: this->eos_token_ids)
+                    eos_ids.push_back(id);
+                for (auto id: config.stop_token_ids)
+                    eos_ids.push_back(id);
+            }
+            if (need_reset) {
+                ToDataType(*logits, DataType::FLOAT32);
+                FastllmResetLogitsOfEOS(batch, logits, res_lens, eos_nums, eos_ids);
+            }
+        } else {
+            for (int b = 0; b < batch; b++) {
+                auto &config = generationConfigs[b];
+                if (config.output_token_least > pastKeyValues[0].first->dims[1] - config.input_token_length) {
+                    ToDataType(*logits, DataType::FLOAT32);
+                    float *logit = ((float*)logits->cpuData) + logits->Count(0) / batch * b;
+                    logit[this->eos_token_id] = 0;
+                    for (auto id: this->eos_token_ids)
+                        logit[id] = 0;
+                    for (auto id: config.stop_token_ids)
+                        logit[id] = 0; 
+                }
+            }
+        }
+        return;
+    }
 }

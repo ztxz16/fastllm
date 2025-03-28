@@ -373,6 +373,7 @@ namespace fastllm {
                 }
             }
 
+            ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfig);
             if (generationConfig.IsSimpleGreedy()) {
                 TopK(logits, topk, 1);
                 topk.ToDevice(DataDevice::CPU);
@@ -770,6 +771,7 @@ namespace fastllm {
             maxTopK = std::max(maxTopK, generationConfigs[b].top_k);
         }
 
+        ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfigs);
         if (batch > 1 && allSimple) {
             Data topk;
             TopK(logits, topk, 1);
