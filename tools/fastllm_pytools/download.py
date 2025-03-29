@@ -12,6 +12,26 @@ import requests
 from .util import get_fastllm_cache_path
 from .util import make_download_parser
 
+def find_metadata(repo_id) -> bool:
+    hf_endpoint = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
+    url = f"{hf_endpoint}/api/models/{repo_id}"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        metadata = response.json()
+        return True
+    except requests.HTTPError as e:
+        return False
+
+def search_model(repo_id):
+    hf_endpoint = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
+    url = f"{hf_endpoint}/api/models?search={repo_id}&limit=3"
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        return response.json()
+    except requests.HTTPError as e:
+        return []
 # ANSI颜色代码
 COLORS = {
     "RED": "\033[0;31m",
