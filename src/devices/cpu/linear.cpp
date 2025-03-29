@@ -238,6 +238,17 @@ namespace fastllm {
         }
     }
 
+    void RunLinearFloat16Float32(uint16_t *inputData, float *weightData, uint16_t *outputData, float *biasData, 
+                                int n, int m, int k, 
+                                AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector <float> floatInput, floatOutput;
+        floatInput.resize(n * m);
+        floatOutput.resize(n * k);
+        Float16ToFloat32(inputData, floatInput.data(), n * m);
+        RunLinearFloat32Float32(floatInput.data(), weightData, floatOutput.data(), biasData, n, m, k, pool, startTid, threadNum);
+        Float32ToFloat16(floatOutput.data(), outputData, n * k);
+    }
+
     void RunLinearFloat32Float16(float *inputData, uint16_t *weightData, float *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum) {

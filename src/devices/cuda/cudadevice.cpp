@@ -326,7 +326,9 @@ namespace fastllm {
         if (bias.dataType != DataType::FLOAT32) {
             ErrorInFastLLM("Linear error: unsupport bias' dataType.\n");
         } else if (input.dataType == DataType::FLOAT16) {
-            if (weight.dataType == DataType::FLOAT16) {
+            if (weight.dataType == DataType::FLOAT32) {
+                FastllmCudaHalfMatMulFloat32(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaHalfMatMulFloat16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT8) {
                 FastllmCudaHalfMatMulFloatInt8(input, weight, bias, output, n, m, k);

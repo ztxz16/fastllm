@@ -2138,7 +2138,10 @@ namespace fastllm {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
         } else if (input.dataType == DataType::FLOAT16 && output.dataType == DataType::FLOAT16) {
-            if (weight.dataType == DataType::FLOAT16) {
+            if (weight.dataType == DataType::FLOAT32) {
+                RunLinearFloat16Float32((uint16_t*)input.cpuData, (float*)weight.cpuData, (uint16_t*)output.cpuData, 
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), 0, GetAlivePool()->threads.size());
+            } else if (weight.dataType == DataType::FLOAT16) {
                 RunLinearFloat16Float16((uint16_t*)input.cpuData, (uint16_t*)weight.cpuData, (uint16_t*)output.cpuData, 
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), 0, GetAlivePool()->threads.size());
             } else if (weight.dataType == DataType::INT8) {
