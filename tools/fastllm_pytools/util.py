@@ -1,12 +1,14 @@
 import argparse
-from ftllm import llm
+import os
+import sys
 
-def make_normal_parser(des: str) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description = des)
-    parser.add_argument('-p', '--path', type = str, required = True, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
-    parser.add_argument('-t', '--threads', type = int, default = 4,  help = '线程数量')
+def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description = des, add_help = add_help)
+    parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹')
+    parser.add_argument('-p', '--path', type = str, required = False, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
+    parser.add_argument('-t', '--threads', type = int, default = -1,  help = '线程数量')
     parser.add_argument('-l', '--low', action = 'store_true', help = '是否使用低内存模式')
-    parser.add_argument('--dtype', type = str, default = "float16", help = '权重类型（读取HF模型时有效）')
+    parser.add_argument('--dtype', type = str, default = "auto", help = '权重类型（读取HF模型时有效）')
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
@@ -18,9 +20,68 @@ def make_normal_parser(des: str) -> argparse.ArgumentParser:
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
     return parser
 
+def add_server_args(parser):
+    parser.add_argument("--model_name", type = str, default = '', help = "部署的模型名称, 调用api时会进行名称核验")
+    parser.add_argument("--host", type = str, default="0.0.0.0", help = "API server host")
+    parser.add_argument("--port", type = int, default = 8080, help = "API server port")
+    parser.add_argument("--think", type=bool, default = False, help="if <think> lost")
+
 def make_normal_llm_model(args):
+    usenuma = False
+    try:
+        env_FASTLLM_USE_NUMA = os.getenv("FASTLLM_USE_NUMA")
+        if (env_FASTLLM_USE_NUMA and env_FASTLLM_USE_NUMA != '' and env_FASTLLM_USE_NUMA != "OFF" and env_FASTLLM_USE_NUMA != "0"):
+            usenuma = True
+    except:
+        pass
+    if (args.path == '' or args.path is None):
+        args.path = args.model
+    if (args.path == '' or args.path is None):
+        print("model can't be empty. (Example: ftllm run MODELNAME)")
+        exit(0)
+    if not(os.path.exists(args.path)):
+        if (hasattr(args, "model_name") and args.model_name == ''):
+            args.model_name = args.path
+        from ftllm.download import HFDNormalDownloader
+        downloader = HFDNormalDownloader(args.path, local_dir = get_fastllm_cache_path(args.path))
+        downloader.run()
+        args.path = str(downloader.local_dir)
+    if (os.path.exists(os.path.join(args.path, "config.json"))):
+        try:
+            import json
+            with open(os.path.join(args.path, "config.json"), "r", encoding="utf-8") as file:
+                config = json.load(file)
+            if (config["architectures"][0] == 'DeepseekV3ForCausalLM'):
+                if ((not(args.device and args.device != ""))):
+                    args.device = "cuda"
+                    args.moe_device = "cpu"
+                    if (usenuma):
+                        args.moe_device = "numa"
+            if ("quantization_config" in config):
+                quantization_config = config["quantization_config"]
+                try:
+                    if (args.dtype == "auto" and quantization_config['bits'] == 4 and quantization_config['group_size']):
+                        args.dtype = "int4g" + str(quantization_config["group_size"])
+                except:
+                    pass
+        except:
+            pass
+    if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
+        (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
+        os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"
+        if (args.threads == -1):
+            args.threads = 4
+    if (args.threads == -1):
+        try:
+            available_cores = len(os.sched_getaffinity(0))  # 参数 0 表示当前进程
+            args.threads = max(1, min(32, available_cores - 2))
+        except:
+            args.threads = max(1, min(32, os.cpu_count() - 2))
+    if (args.dtype == "auto"):
+        args.dtype = "float16"
     if (args.moe_device == ""):
         args.moe_device = args.device
+    from ftllm import llm
     if (args.device and args.device != ""):
         try:
             import ast
@@ -64,3 +125,48 @@ def make_normal_llm_model(args):
     if (args.kv_cache_limit != "" and args.kv_cache_limit != "auto"):
         model.set_kv_cache_limit(args.kv_cache_limit)
     return model
+
+def make_download_parser(add_help = True):
+    parser = argparse.ArgumentParser(
+            description="Downloads a model or dataset from Hugging Face",
+            usage="ftllm download [REPO_ID] [OPTIONS]",
+            add_help = add_help
+    )
+        
+    # 位置参数
+    parser.add_argument("repo_id", nargs="?", help="Hugging Face repo ID")
+    # 选项参数
+    parser.add_argument("--include", nargs="+", default=[], help="Include patterns")
+    parser.add_argument("--exclude", nargs="+", default=[], help="Exclude patterns")
+    parser.add_argument("--hf_username", help="HF username")
+    parser.add_argument("--hf_token", help="HF access token")
+    parser.add_argument("--tool", choices=["aria2c", "wget"], default="aria2c", help="Download tool")
+    parser.add_argument("-x", type=int, default=4, help="Threads for aria2c")
+    parser.add_argument("-j", type=int, default=5, help="Concurrent downloads")
+    parser.add_argument("--dataset", action="store_true", help="Download dataset")
+    parser.add_argument("--local-dir", help="Local directory path")
+    parser.add_argument("--revision", default="main", help="Revision to download")
+    #parser.add_argument("-h", "--help", action="store_true", help="Show help")
+        
+    return parser
+
+def get_fastllm_cache_path(model_name: str):
+    system = sys.platform
+
+    if system == "win32":
+        # Windows: %LOCALAPPDATA%\Temp 或 C:\Users\<user>\AppData\Local\Temp
+        cache_path = os.getenv('LOCALAPPDATA', os.path.expanduser('~\\AppData\\Local')) + '\\Temp'
+    elif system == "darwin":
+        # macOS: ~/Library/Caches
+        cache_path = os.path.expanduser('~/Library/Caches')
+    else:
+        # Linux 和其他 Unix-like 系统: ~/.cache 或 $XDG_CACHE_HOME
+        cache_path = os.getenv('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
+    cache_path = os.path.join(cache_path, "fastllm")
+
+    cache_dir = os.getenv("FASTLLM_CACHEDIR")
+    if (cache_dir and os.path.isdir(cache_dir)):
+        cache_path = cache_dir
+
+    cache_path = os.path.join(cache_path, model_name)
+    return cache_path
