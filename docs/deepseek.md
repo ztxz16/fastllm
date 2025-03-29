@@ -17,19 +17,19 @@ pip install ftllm
 #### 命令行聊天：
 
 ```
-ftllm run deepseek-ai/DeepSeek-V3-0324
+ftllm run huangyuyang/DeepSeek-V3-0324-INT4
 ```
 
 #### webui:
 
 ```
-ftllm webui deepseek-ai/DeepSeek-V3-0324
+ftllm webui huangyuyang/DeepSeek-V3-0324-INT4
 ```
 
 #### api server (openai风格):
 
 ```
-ftllm server deepseek-ai/DeepSeek-V3-0324
+ftllm server huangyuyang/DeepSeek-V3-0324-INT4
 ```
 
 #### NUMA加速
