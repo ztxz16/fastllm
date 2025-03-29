@@ -43,7 +43,14 @@ namespace fastllm {
         this->devices.push_back((BaseDevice*) new TfaccDevice());
 #endif
 #ifdef USE_NUMA
-        this->devices.push_back((BaseDevice*) new NumaDevice());
+        try {
+            std::string s = getenv("FASTLLM_ACTIVATE_NUMA");
+            if (s != "" && s != "OFF") {
+                printf("ACTIVATE NUMA = ON\n");
+                this->devices.push_back((BaseDevice*) new NumaDevice());
+            }
+        } catch (...) {
+        }
 #endif
         this->devices.push_back((BaseDevice*) new CpuDevice());
     }

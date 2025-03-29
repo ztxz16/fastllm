@@ -1147,12 +1147,18 @@ namespace fastllm {
 
                                         mergeData.CalcWeightSum();
 #if defined(USE_TFACC) || defined(USE_NUMA)
-                                        locker.lock();
-                                        if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
-                                            mergeData.weightSum.resize(1);
-                                            RegisterFastllmData(&mergeData, it.type);       
+                                        try {
+                                            std::string s = getenv("FASTLLM_ACTIVATE_NUMA");
+                                            if (s != "" && s != "OFF") {
+                                                locker.lock();
+                                                if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
+                                                    mergeData.weightSum.resize(1);
+                                                    RegisterFastllmData(&mergeData, it.type);       
+                                                }
+                                                locker.unlock();
+                                            }
+                                        } catch (...) {
                                         }
-                                        locker.unlock();
 #endif
                                     }
 
@@ -1164,11 +1170,17 @@ namespace fastllm {
                             }
                             locker.unlock();
 #if defined(USE_TFACC) || defined(USE_NUMA)
-                            if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
-                                locker.lock();
-                                    model->weight.weight[weightName].weightSum.resize(1);
-                                    RegisterFastllmData(&model->weight.weight[weightName], model->specialWeights[weightName]);
-                                locker.unlock();
+                            try {
+                                std::string s = getenv("FASTLLM_ACTIVATE_NUMA");
+                                if (s != "" && s != "OFF") {
+                                    if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
+                                        locker.lock();
+                                            model->weight.weight[weightName].weightSum.resize(1);
+                                            RegisterFastllmData(&model->weight.weight[weightName], model->specialWeights[weightName]);
+                                        locker.unlock();
+                                    }
+                                }
+                            } catch (...) {
                             }
 #endif
                         }
