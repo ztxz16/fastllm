@@ -1,7 +1,5 @@
 import argparse
-from ftllm import llm
 from .util import make_normal_parser
-from .util import make_normal_llm_model
 import readline
 
 def args_parser():
@@ -9,8 +7,8 @@ def args_parser():
     args = parser.parse_args()
     return args
 
-if __name__ == "__main__":
-    args = args_parser()
+def fastllm_chat(args):
+    from .util import make_normal_llm_model
     model = make_normal_llm_model(args)
     hint = "输入内容开始对话\n'clear'清空记录\n'stop'终止程序."
     history = []
@@ -31,3 +29,7 @@ if __name__ == "__main__":
             print(response, flush = True, end = "")
         history.append((query, curResponse))
     model.release_memory()
+
+if __name__ == "__main__":
+    args = args_parser()
+    fastllm_chat(args)

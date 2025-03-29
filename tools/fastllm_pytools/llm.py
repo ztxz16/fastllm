@@ -15,10 +15,16 @@ elif platform.system() == 'Darwin':
     fastllm_lib = ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], "libfastllm_tools.dylib"))
 else:
     succ = False
+    for extraLibName in ["libnuma.so.1"]:
+        try:
+            ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], extraLibName))
+            print("Load", extraLibName)
+        except:
+            continue
     for libname in ["libfastllm_tools.so", "libfastllm_tools-cu11.so", "libfastllm_tools-cpu.so"]:
         try:
             fastllm_lib = ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], libname))
-            print("Use", libname)
+            print("Load", libname)
             succ = True
             break
         except:

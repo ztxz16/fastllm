@@ -55,6 +55,14 @@ namespace fastllm {
     };
 
     NumaClient::NumaClient() {
+        try {
+            std::string s = getenv("FASTLLM_ACTIVATE_NUMA");
+            if (!(s != "" && s != "OFF")) {
+                return;
+            }
+        } catch (...) {
+            return;
+        }
         // 获取所有可用NUMA节点
         struct bitmask* validNodes = numa_get_mems_allowed();
         std::vector<int> nodes;
