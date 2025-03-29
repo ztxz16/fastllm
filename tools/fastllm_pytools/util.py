@@ -43,6 +43,16 @@ def make_normal_llm_model(args):
         if (hasattr(args, "model_name") and args.model_name == ''):
             args.model_name = args.path
         from ftllm.download import HFDNormalDownloader
+        from ftllm.download import find_metadata
+        from ftllm.download import search_model
+        if (not(os.path.exists(get_fastllm_cache_path(args.path))) and not(find_metadata(args.path))):
+            print("Can't find model \"" + args.path + "\"")
+            search_result = search_model(args.path)
+            if (len(search_result) > 0):
+                args.path = search_result[0]["id"]
+                print("Replace model to \"" + args.path + "\"")
+            else:
+                exit(0)
         downloader = HFDNormalDownloader(args.path, local_dir = get_fastllm_cache_path(args.path))
         downloader.run()
         args.path = str(downloader.local_dir)
