@@ -2999,6 +2999,62 @@ bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight,
     return true;
 }
 
+bool FastllmCudaHalfMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
+        float *cudaBiasData;
+        cudaError_t state = cudaSuccess;
+        state = cudaMalloc(&cudaBiasData, k * sizeof(float));
+        if (bias.dims.size() > 0) {
+            state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+        } else {
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
+        }
+        checkCudaErrors("Error: CUDA error when moving bias to device!", state);
+        weight.extraCudaData.push_back((void*)cudaBiasData);
+    }
+
+    float *cudaBiasData = (float*)weight.extraCudaData[0];
+    float *cudaInput = (float*)FastllmCudaMalloc(input.Count(0) * sizeof(float));
+    float *cudaOutput = (float*)FastllmCudaMalloc(output.Count(0) * sizeof(float));
+    int inputLen = input.Count(0);
+    FastllmCudaHalf2FloatKernel <<< (inputLen - 1) / 256 + 1, 256 >>>((half*)input.cudaData, cudaInput, inputLen);
+
+    if (n > 1) {
+        float h_alpha = 1.0, h_beta = 0.0;
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+        //cudaDeviceSynchronize();
+        cudaDataType_t AType = CUDA_R_32F, BType = CUDA_R_32F, CType = CUDA_R_32F, ComputeType = CUDA_R_32F;
+        cublasStatus_t status;
+
+        status = cublasGemmEx(fastllmCublasHandle,
+                              CUBLAS_OP_T, CUBLAS_OP_N,
+                              k, n, m,
+                              &h_alpha, weight.cudaData, AType,
+                              m, cudaInput, BType,
+                              m, &h_beta,
+                              cudaOutput, CType,
+                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: cublas error.\n");
+            throw("cublas error");
+            FastllmCudaFinishInput(input, cudaInput);
+            FastllmCudaFinishOutput(output, cudaOutput);
+            exit(0);
+        }
+
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, (float*)weight.extraCudaData[0], k);
+        }
+    } else {
+        FastllmGemvFp32Fp32Kernel2<256, 1> <<< k, 256 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, cudaBiasData, m, k);
+    }
+    
+    int outputLen = output.Count(0);
+    FastllmCudaFloat2HalfKernel <<< (outputLen - 1) / 256 + 1, 256>>>(cudaOutput, (half*)output.cudaData, outputLen);
+    DeviceSync();
+    return true;
+}
+
 void LaunchFastllmGemmFp32Fp16(float *input, half *weight, float *output, float *bias, int n, int m, int k) {
     if (n == 1) {
         FastllmGemvFp32Fp16Kernel2MultiRow<256, 1> <<< k, 256 >>>(input, weight, output, bias, m, k);
