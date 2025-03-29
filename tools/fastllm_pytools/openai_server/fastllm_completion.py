@@ -12,7 +12,6 @@ from openai.types.chat import (ChatCompletionContentPartParam,
 from starlette.background import BackgroundTask
 
 from .protocal.openai_protocol import *
-from ftllm import llm
 
 class ConversationMessage:
     def __init__(self, role:str, content:str):

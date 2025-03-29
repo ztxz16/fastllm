@@ -1,10 +1,7 @@
-
-from ftllm import llm
 import sys
 import os
 import argparse
 from util import make_normal_parser
-from util import make_normal_llm_model
 
 def parse_args():
     parser = make_normal_parser("fastllm webui")
@@ -24,6 +21,7 @@ st.set_page_config(
 @st.cache_resource
 def get_model():
     args = parse_args()
+    from util import make_normal_llm_model
     model = make_normal_llm_model(args)
     model.set_verbose(True)
     return model

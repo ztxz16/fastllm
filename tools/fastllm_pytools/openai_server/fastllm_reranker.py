@@ -5,7 +5,6 @@ import traceback
 from fastapi import Request
 
 from .protocal.openai_protocol import *
-from ftllm import llm
 
 class FastLLmReranker:
   def __init__(self,
