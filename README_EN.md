@@ -1,204 +1,178 @@
 # fastllm
 
+[中文文档](README.md)
+
 ## Introduction
 
-fastllm is a high-performance large model inference library implemented purely in C++ with no third-party dependencies, supporting multiple platforms.
+fastllm is a high-performance large model inference library implemented in C++ with no backend dependencies.
 
-Deployment and communication QQ group: 831641348
+It enables hybrid inference of MOE models, achieving 20+ tps on consumer-grade single GPUs (e.g., 4090) for DeepSeek R1 671B INT4 model inference.
 
-| [Quick Start](#quick-start) | [Model Acquisition](#model-acquisition) |
+Deployment discussion QQ group: 831641348  
+WeChat group: ![QR Code](docs/wechat_group0.jpg)
 
-## Features Overview
+| [Quick Start](#quick-start) | [DeepSeek Deployment Guide](docs/deepseek.md) | [Changelog](docs/version.md) |
 
-- 🚀 Pure C++ implementation, facilitating cross-platform移植, directly compilable on Android
-- 🚀 Supports reading Hugging Face raw models and direct quantization
-- 🚀 Supports deploying OpenAI API server
-- 🚀 Supports multi-card deployment, supports GPU + CPU hybrid deployment
-- 🚀 Supports dynamic batching, streaming output
-- 🚀 Front-end and back-end separation design, easy to support new computing devices
-- 🚀 Currently supports ChatGLM series models, Qwen2 series models, various LLAMA models (ALPACA, VICUNA, etc.), BAICHUAN models, MOSS models, MINICPM models, etc.
+## Key Features
+
+- 🚀 DeepSeek hybrid inference - deploy with multi-concurrency on consumer-grade single GPUs
+- 🚀 Multi-NUMA node acceleration support
+- 🚀 Dynamic batch and streaming output support
+- 🚀 Multi-GPU deployment and GPU+CPU hybrid deployment
+- 🚀 Frontend-backend separation design for easy support of new computing devices
+- 🚀 Pure C++ backend for easy cross-platform porting (can be directly compiled on Android)
+- 🚀 Support for Python custom model structures
 
 ## Quick Start
 
-### Compilation
+### Installation
 
-It is recommended to use cmake for compilation, requiring pre-installed gcc, g++ (recommended 9.4 or above), make, cmake (recommended 3.23 or above).
+- PIP installation
 
-GPU compilation requires a pre-installed CUDA compilation environment, using the latest CUDA version is recommended.
+Linux systems can try direct pip installation:
 
-Compile using the following commands:
-
-``` sh
-bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # Compile GPU version
-# bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 -D CMAKE_CUDA_COMPILER=$(which nvcc) # Specify CUDA architecture, e.g., 4090 uses architecture 89
-# bash install.sh # Compile CPU version only
+```
+pip install ftllm
 ```
 
-For compilation on other platforms, refer to the documentation:
+(Note: Due to PyPI size limitations, the package doesn't include CUDA dependencies - manual installation of CUDA 12+ is recommended)
+
+- Source compilation
+
+If pip installation fails or for special requirements, compile from source:
+
+Recommended to use cmake. Requires pre-installed gcc, g++ (recommended 9.4+), make, cmake (recommended 3.23+)
+
+GPU compilation requires CUDA environment. Use the newest CUDA version possible.
+
+Compilation commands:
+```sh
+bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # GPU version
+# bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 -D CMAKE_CUDA_COMPILER=$(which nvcc) # Specify CUDA arch (e.g. 89 for RTX 4090)
+# bash install.sh # CPU-only version
+```
+
+# Compilation on Different Platforms
+
+For compilation instructions on other platforms, please refer to the documentation:  
 [TFACC Platform](docs/tfacc.md)
 
-### Running the demo program (python)
+### Running Demo Programs
 
-Assuming our model is located in the "~/Qwen2-7B-Instruct/" directory:
+Taking the Qwen/Qwen2-0.5B-Instruct model as an example:
 
-After compilation, you can use the following demos:
+#### Command-line Chat:
+
+```
+ftllm run Qwen/Qwen2-0.5B-Instruct
+```
+
+#### webui:
+
+```
+ftllm webui Qwen/Qwen2-0.5B-Instruct
+```
+
+#### API Server (OpenAI-style):
+
+```
+ftllm server Qwen/Qwen2-0.5B-Instruct
+```
+
+#### Local Models
+
+You can launch a locally downloaded Hugging Face model. Assuming the local model path is `/mnt/Qwen/Qwen2-0.5B-Instruct/`, use the following command (similar for `webui` and `server`):
+
+```
+ftllm run /mnt/Qwen/Qwen2-0.5B-Instruct/
+```
+
+#### Fuzzy Launch
+
+If you can't remember the exact model name, you can input an approximate name (matching is not guaranteed).  
+For example:
+```
+ftllm run qwen2-7b-awq
+```
+
+```
+ftllm run deepseek-v3-0324-int4
+```
+
+#### Setting Cache Directory
+
+If you don't want to use the default cache directory, you can set it via the environment variable `FASTLLM_CACHEDIR`. For example, on Linux:  
+
+```
+export FASTLLM_CACHEDIR=/mnt/
+```
+
+
+#### Parameter Description
+
+The following are common parameters when running the `ftllm` module:
+
+##### General Parameters
+
+- `-t` or `--threads`:  
+  - **Description**: Sets the number of CPU threads to use.  
+  - **Example**: `-t 27`  
+
+- `--dtype`:  
+  - **Description**: Specifies the data type of the model.  
+  - **Options**: `int4` or other supported data types.  
+  - **Example**: `--dtype int4`  
+
+- `--device`:  
+  - **Description**: Specifies the computing device for the model.  
+  - **Common Values**: `cpu`, `cuda`, or `numa`.  
+  - **Example**: `--device cpu` or `--device cuda`  
+
+- `--moe_device`:  
+  - **Description**: Specifies the computing device for the MOE (Mixture of Experts) layer.  
+  - **Common Values**: `cpu`, `cuda`, or `numa`.  
+  - **Example**: `--moe_device cpu`  
+
+- `--moe_experts`:  
+  - **Description**: Specifies the number of experts to use in the MOE layer. If not set, it follows the model's configuration. Reducing the number of experts may speed up inference but could lower accuracy.  
+  - **Example**: `--moe_experts 6`  
+
+- `--port`:  
+  - **Description**: Specifies the port number for the service.  
+  - **Example**: `--port 8080`  
+
+### Model Download
+
+Use the following command to download a model locally:  
+
+```
+ftllm download deepseek-ai/DeepSeek-R1
+```
+
+
+### Model Export
+
+If using quantized model loading (e.g., `--dtype int4`), the model will be quantized online each time it is loaded, which can be slow.  
+
+`ftllm.export` is a tool for exporting and converting model weights. It supports converting model weights to different data types. Below are detailed instructions on how to use `ftllm.export`.  
+
+#### Command Format  
+
+```sh
+python3 -m ftllm.export -p <model_path> -o <output_path> --dtype <data_type> -t <threads>  
+```
+
+#### Example Command
 
 ``` sh
-# OpenAI API server (currently in testing and tuning phase)
-# Requires dependencies: pip install -r requirements-server.txt
-# Opens a server named 'qwen' on port 8080
-python3 -m ftllm.server -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080 --model_name qwen
-
-# Use a model with float16 precision for conversation
-python3 -m ftllm.chat -t 16 -p ~/Qwen2-7B-Instruct/ 
-
-# Online quantization to int8 model for conversation
-python3 -m ftllm.chat -t 16 -p ~/Qwen2-7B-Instruct/ --dtype int8
-
-# webui
-# Requires dependencies: pip install streamlit-chat
-python3 -m ftllm.webui -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080
 ```
+python3 -m ftllm.export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
 
-Detailed parameters can be viewed using the --help argument for all demos.
+#### Loading the Exported Model
+The exported model can be used similarly to the original model. The --dtype parameter will be ignored when using the exported model.
 
-For detailed parameter explanations, please refer to [Parameter Documentation](docs/english_demo_arguments.md).
-
-Current model support can be found at: [Model List](docs/models.md)
-
-For architectures that cannot directly read Hugging Face models, refer to [Model Conversion Documentation](docs/convert_model.md) to convert models to fastllm format.
-
-If you need to customize the model structure, you can refer to the detailed instructions [Custom Model](docs/english_custom.md)
-
-### Running the demo program (c++)
-
-```
-# Enter the fastllm/build-fastllm directory
-
-# Command line chat program, supports typewriter effect (Linux only)
-./main -p ~/Qwen2-7B-Instruct/
-
-# Simple webui, uses streaming output + dynamic batch, supports concurrent access
-./webui -p ~/Qwen2-7B-Instruct/ --port 1234 
-```
-
-Compilation on Windows is recommended using Cmake GUI + Visual Studio, completed in the graphical interface.
-
-For compilation issues, especially on Windows, refer to [FAQ](docs/faq.md).
-
-### Python API
-
-``` python
-# Model creation
-from ftllm import llm
-model = llm.model("~/Qwen2-7B-Instruct/")
-
-# Generate response
-print(model.response("你好"))
-
-# Stream generate response
-for response in model.stream_response("你好"):
-    print(response, flush = True, end = "")
-```
-
-Additional settings such as CPU thread count can be found in the detailed API documentation: [ftllm](docs/ftllm.md)
-
-This package does not include low-level APIs. For deeper functionalities, refer to [Python Binding API](#Python-binding-API).
-
-## Multi-Card Deployment
-
-### Using Multi-Card Deployment in Python Command Line Calls
+For example:
 
 ``` sh
-# Use the --device parameter to set multi-card calls
-#--device cuda:1 # Set single device
-#--device "['cuda:0', 'cuda:1']" # Deploy model evenly across multiple devices
-#--device "{'cuda:0': 10, 'cuda:1': 5, 'cpu': 1} # Deploy model proportionally across multiple devices
+ftllm run /mnt/DeepSeek-V3-INT4/
 ```
-
-### Using Multi-Card Deployment in ftllm
-
-``` python
-from ftllm import llm
-# Supports the following three methods, must be called before model creation
-llm.set_device_map("cuda:0") # Deploy model on a single device
-llm.set_device_map(["cuda:0", "cuda:1"]) # Deploy model evenly across multiple devices
-llm.set_device_map({"cuda:0" : 10, "cuda:1" : 5, "cpu": 1}) # Deploy model proportionally across multiple devices
-```
-
-### Using Multi-Card Deployment in Python Binding API
-
-``` python
-import pyfastllm as llm
-# Supports the following method, must be called before model creation
-llm.set_device_map({"cuda:0" : 10, "cuda:1" : 5, "cpu": 1}) # Deploy model proportionally across multiple devices
-```
-
-### Using Multi-Card Deployment in c++
-
-``` cpp
-// Supports the following method, must be called before model creation
-fastllm::SetDeviceMap({{"cuda:0", 10}, {"cuda:1", 5}, {"cpu", 1}}); // Deploy model proportionally across multiple devices
-```
-
-## Docker Compilation and Running
-Running docker requires the local installation of NVIDIA Runtime and modification of the default runtime to nvidia.
-
-1. Install nvidia-container-runtime
-```
-sudo apt-get install nvidia-container-runtime
-```
-
-2. Modify docker default runtime to nvidia
-
-/etc/docker/daemon.json
-```
-{
-  "registry-mirrors": [
-    "https://hub-mirror.c.163.com",
-    "https://mirror.baidubce.com"
-  ],
-  "runtimes": {
-      "nvidia": {
-          "path": "/usr/bin/nvidia-container-runtime",
-          "runtimeArgs": []
-      }
-   },
-   "default-runtime": "nvidia" // This line is required
-}
-
-```
-
-3. Download the converted models to the models directory
-```
-models
-  chatglm2-6b-fp16.flm
-  chatglm2-6b-int8.flm
-```
-
-4. Compile and start webui
-```
-DOCKER_BUILDKIT=0 docker compose up -d --build
-```
-
-## Usage on Android
-
-### Compilation
-``` sh
-# Compilation on PC requires downloading NDK tools
-# You can also try compiling on the phone, using cmake and gcc in termux (no need for NDK)
-mkdir build-android
-cd build-android
-export NDK=<your_ndk_directory>
-# If the phone does not support, remove "-DCMAKE_CXX_FLAGS=-march=armv8.2a+dotprod" (most new phones support this)
-cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 -DCMAKE_CXX_FLAGS=-march=armv8.2a+dotprod ..
-make -j
-```
-
-### Running
-
-1. Install the termux app on the Android device.
-2. Execute termux-setup-storage in termux to gain permission to read phone files.
-3. Copy the main file and model file compiled with NDK into the phone and into the termux root directory.
-4. Use the command ```chmod 777 main``` to grant permissions.
-5. Run the main file, refer to ```./main --help``` for parameter format.
