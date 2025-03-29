@@ -4,30 +4,43 @@
 
 ## 介绍
 
-fastllm是纯c++实现，无第三方依赖的多平台高性能大模型推理库
+fastllm是c++实现，后端无依赖的高性能大模型推理库
+
+可实现MOE模型混合推理，消费级单卡（如4090）推理DeepSeek R1 671B INT4模型单路可达20+tps
 
 部署交流QQ群： 831641348
 
-| [快速开始](#快速开始) | [模型获取](docs/models.md) |
+部署交流微信群: ![二维码](docs/wechat_group0.jpg)
 
-## 功能概述
+| [快速开始](#快速开始) | [DeepSeek部署指南](docs/deepseek.md) | [版本日志](docs/version.md) |
 
-- 🚀 纯c++实现，便于跨平台移植，可以在安卓上直接编译
-- 🚀 无论ARM平台，X86平台，NVIDIA平台，速度都较快
-- 🚀 支持读取Hugging face原始模型并直接量化
-- 🚀 支持部署Openai api server
-- 🚀 支持多卡部署，支持GPU + CPU混合部署
+## 亮点功能
+
+- 🚀 DeepSeek混合推理，消费级单卡即可多并发部署
+- 🚀 支持多NUMA节点加速
 - 🚀 支持动态Batch，流式输出
+- 🚀 支持多卡部署，支持GPU + CPU混合部署
 - 🚀 前后端分离设计，便于支持新的计算设备
-- 🚀 目前支持ChatGLM系列模型，Qwen系列模型，各种LLAMA模型(ALPACA, VICUNA等)，BAICHUAN模型，MOSS模型，MINICPM模型等
-- 🚀 支持Moe模型的cpu-cuda混合部署
+- 🚀 后端纯c++实现，便于跨平台移植，可在安卓上直接编译
 - 🚀 支持Python自定义模型结构
-
-## [查看DeepSeek部署指南](docs/deepseek.md)
 
 ## 快速开始
 
-### 编译
+### 安装
+
+- PIP安装
+
+Linux系统可尝试直接pip安装，命令如下：
+
+```
+pip install ftllm
+```
+
+（由于目前pypi限制库大小，安装包中不含cuda依赖，建议先手动安装cuda12以上版本）
+
+- 源码安装
+
+若pip安装失败或有其它特殊需求，可以用源码编译安装
 
 建议使用cmake编译，需要提前安装gcc，g++ (建议9.4以上), make, cmake (建议3.23以上)
 
@@ -44,166 +57,122 @@ bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU�
 其他不同平台的编译可参考文档
 [TFACC平台](docs/tfacc.md)
 
-### 运行demo程序 (python)
+### 运行demo程序
 
-假设我们的模型位于"~/Qwen2-7B-Instruct/"目录
+以Qwen/Qwen2-0.5B-Instruct模型为例
 
-编译完成后可以使用下列demo:
+#### 命令行聊天：
+
+```
+ftllm run Qwen/Qwen2-0.5B-Instruct
+```
+
+#### webui:
+
+```
+ftllm webui Qwen/Qwen2-0.5B-Instruct
+```
+
+#### api server (openai风格):
+
+```
+ftllm server Qwen/Qwen2-0.5B-Instruct
+```
+
+#### 本地模型
+
+可以启动本地下载好的Hugging Face模型，假设本地模型路径为 `/mnt/Qwen/Qwen2-0.5B-Instruct/`
+则可以用如下命令启动（webui, server类似）
+
+```
+ftllm run /mnt/Qwen/Qwen2-0.5B-Instruct/
+```
+
+#### 模糊启动
+
+如果记不住模型名，可以输入大概的模型名（不保证能匹配成功）
+例如：
+```
+ftllm run qwen2-7b-awq
+```
+
+```
+ftllm run deepseek-v3-0324-int4
+```
+
+#### 设置缓存目录
+
+如果不想使用默认的缓存目录，可以通过环境变量 `FASTLLM_CACHEDIR` 来设置缓存目录，例如在Linux下:
+
+```
+export FASTLLM_CACHEDIR=/mnt/
+```
+
+#### 参数说明
+
+以下是运行 `ftllm` 模块时常用的参数说明：
+
+##### 通用参数
+
+- `-t` 或 `--threads`:
+  - **描述**: 设置使用的CPU线程数。
+  - **示例**: `-t 27`
+
+- `--dtype`:
+  - **描述**: 指定模型的数据类型。
+  - **可选值**: `int4` 或其他支持的数据类型。
+  - **示例**: `--dtype int4`
+  
+- `--device`:
+  - **描述**: 指定模型运行的计算设备。
+  - **常用值**: `cpu` 或 `cuda`或`numa`
+  - **示例**: `--device cpu` 或 `--device cuda`
+
+- `--moe_device`:
+  - **描述**: 指定 MOE（Mixture of Experts）层的计算设备。
+  - **常用值**: `cpu` 或 `cuda`或`numa`
+  - **示例**: `--moe_device cpu`
+
+- `--moe_experts`:
+  - **描述**: 指定 MOE（Mixture of Experts）层使用的专家数。不设定则根据模型配置设定。减少专家数可以提高推理速度，但可能降低推理准确度
+  - **示例**: `--moe_experts 6`
+
+- `--port`:
+  - **描述**: 指定服务运行的端口号。
+  - **示例**: `--port 8080`
+
+### 模型下载
+
+可以使用如下命令将模型下载到本地
+
+```
+ftllm download deepseek-ai/DeepSeek-R1
+```
+
+### 模型导出
+
+如果使用量化加载模型（如`--dtype int4`），那么每次读取模型时会在线量化，读取速度较慢。
+
+ftllm.export 是一个用于导出和转换模型权重的工具。它支持将模型权重转换为不同的数据类型。以下是如何使用 ftllm.export 的详细说明。
+
+#### 命令格式
 
 ``` sh
-# openai api server
-# 需要安装依赖: pip install -r requirements-server.txt
-# 这里在8080端口打开了一个模型名为qwen的server
-python3 -m ftllm.server -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080 --model_name qwen
-
-# 使用float16精度的模型对话
-python3 -m ftllm.chat -t 16 -p ~/Qwen2-7B-Instruct/ 
-
-# 在线量化为int8模型对话
-python3 -m ftllm.chat -t 16 -p ~/Qwen2-7B-Instruct/ --dtype int8
-
-# webui
-# 需要安装依赖: pip install streamlit-chat
-python3 -m ftllm.webui -t 16 -p ~/Qwen2-7B-Instruct/ --port 8080
+python3 -m ftllm.export -p <模型路径> -o <输出路径> --dtype <数据类型> -t <线程数>
 ```
 
-以上demo均可使用参数 --help 查看详细参数，详细参数说明可参考 [参数说明](docs/demo_arguments.md)
-
-目前模型的支持情况见: [模型列表](docs/models.md)
-
-一些早期的HuggingFace模型无法直接读取，可以参考 [模型转换](docs/models.md#模型导出convert-offline) 转换fastllm格式的模型
-
-可以自定义模型结构，具体见 [自定义模型](docs/custom.md)
-
-### 运行demo程序 (c++)
-
-```
-# 进入fastllm/build-fastllm目录
-
-# 命令行聊天程序, 支持打字机效果
-./main -p ~/Qwen2-7B-Instruct/ 
-
-# 简易webui, 使用流式输出 + 动态batch，可多路并发访问
-./webui -p ~/Qwen2-7B-Instruct/ --port 1234 
-```
-
-Windows下的编译推荐使用Cmake GUI + Visual Studio，在图形化界面中完成。
-
-如编译中存在问题，尤其是Windows下的编译，可参考[FAQ](docs/faq.md)
-
-### python API
-
-``` python
-# 模型创建
-from ftllm import llm
-model = llm.model("~/Qwen2-7B-Instruct/")
-
-# 生成回复
-print(model.response("你好"))
-
-# 流式生成回复
-for response in model.stream_response("你好"):
-    print(response, flush = True, end = "")
-```
-
-另外还可以设置cpu线程数等内容，详细API说明见 [ftllm](docs/ftllm.md)
-
-这个包不包含low level api，如果需要使用更深入的功能请参考 [Python绑定API](#Python绑定API)
-
-## 多卡部署
-
-### python命令行调用中使用多卡部署
+#### 示例命令
 
 ``` sh
-# 使用参数--device来设置多卡调用
-#--device cuda:1 # 设置单一设备
-#--device "['cuda:0', 'cuda:1']" # 将模型平均部署在多个设备上
-#--device "{'cuda:0': 10, 'cuda:1': 5, 'cpu': 1} # 将模型按不同比例部署在多个设备上
-```
-### ftllm中使用多卡部署
-
-``` python
-from ftllm import llm
-# 支持下列三种方式，需要在模型创建之前调用
-llm.set_device_map("cuda:0") # 将模型部署在单一设备上
-llm.set_device_map(["cuda:0", "cuda:1"]) # 将模型平均部署在多个设备上
-llm.set_device_map({"cuda:0" : 10, "cuda:1" : 5, "cpu": 1}) # 将模型按不同比例部署在多个设备上
+python3 -m ftllm.export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
 ```
 
-### Python绑定API中使用多卡部署
+#### 加载导出后的模型
 
-``` python
-import pyfastllm as llm
-# 支持以下方式，需要在模型创建之前调用
-llm.set_device_map({"cuda:0" : 10, "cuda:1" : 5, "cpu": 1}) # 将模型按不同比例部署在多个设备上
-```
+导出后的模型使用方法和原始模型类似，使用导出模型时`--dtype`参数将被忽略
 
-### c++中使用多卡部署
+例如
 
-``` cpp
-// 支持以下方式，需要在模型创建之前调用
-fastllm::SetDeviceMap({{"cuda:0", 10}, {"cuda:1", 5}, {"cpu", 1}}); // 将模型按不同比例部署在多个设备上
-```
-
-## Docker 编译运行
-docker 运行需要本地安装好 NVIDIA Runtime,且修改默认 runtime 为 nvidia
-
-1. 安装 nvidia-container-runtime
-```
-sudo apt-get install nvidia-container-runtime
-```
-
-2. 修改 docker 默认 runtime 为 nvidia
-
-/etc/docker/daemon.json
-```
-{
-  "registry-mirrors": [
-    "https://hub-mirror.c.163.com",
-    "https://mirror.baidubce.com"
-  ],
-  "runtimes": {
-      "nvidia": {
-          "path": "/usr/bin/nvidia-container-runtime",
-          "runtimeArgs": []
-      }
-   },
-   "default-runtime": "nvidia" // 有这一行即可
-}
-
-```
-
-3. 下载已经转好的模型到 models 目录下
-```
-models
-  chatglm2-6b-fp16.flm
-  chatglm2-6b-int8.flm
-```
-
-4. 编译并启动 webui
-```
-DOCKER_BUILDKIT=0 docker compose up -d --build
-```
-
-## Android上使用
-
-### 编译
 ``` sh
-# 在PC上编译需要下载NDK工具
-# 还可以尝试使用手机端编译，在termux中可以使用cmake和gcc（不需要使用NDK）
-mkdir build-android
-cd build-android
-export NDK=<your_ndk_directory>
-# 如果手机不支持，那么去掉 "-DCMAKE_CXX_FLAGS=-march=armv8.2a+dotprod" （比较新的手机都是支持的）
-cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-23 -DCMAKE_CXX_FLAGS=-march=armv8.2a+dotprod ..
-make -j
+ftllm run /mnt/DeepSeek-V3-INT4/
 ```
-
-### 运行
-
-1. 在Android设备上安装termux软件
-2. 在termux中执行termux-setup-storage获得读取手机文件的权限。
-3. 将NDK编译出的main文件，以及模型文件存入手机，并拷贝到termux的根目录
-4. 使用命令```chmod 777 main```赋权
-5. 然后可以运行main文件，参数格式参见```./main --help```
-
