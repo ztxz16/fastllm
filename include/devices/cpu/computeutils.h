@@ -91,6 +91,9 @@ namespace fastllm {
     void RunLinearFloat32Float32(float *inputData, float *weightData, float *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum);
+    void RunLinearFloat16Float32(uint16_t *inputData, float *weightData, uint16_t *outputData, float *biasData, 
+                                int n, int m, int k, 
+                                AliveThreadPool *pool, int startTid, int threadNum);
     void RunLinearFloat32Float16(float *inputData, uint16_t *weightData, float *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum);
