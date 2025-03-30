@@ -17,19 +17,19 @@ pip install ftllm
 #### 命令行聊天：
 
 ```
-ftllm run huangyuyang/DeepSeek-V3-0324-INT4
+ftllm run fastllm/DeepSeek-V3-0324-INT4
 ```
 
 #### webui:
 
 ```
-ftllm webui huangyuyang/DeepSeek-V3-0324-INT4
+ftllm webui fastllm/DeepSeek-V3-0324-INT4
 ```
 
 #### api server (openai风格):
 
 ```
-ftllm server huangyuyang/DeepSeek-V3-0324-INT4
+ftllm server fastllm/DeepSeek-V3-0324-INT4
 ```
 
 #### NUMA加速
@@ -72,7 +72,8 @@ export FASTLLM_CACHEDIR=/mnt/
 
 目前推荐使用的一些模型：
 
-- huangyuyang/DeepSeek-V3-0324-INT4
+- fastllm/DeepSeek-V3-0324-INT4
+- fastllm/DeepSeek-R1-INT4
 - deepseek-ai/DeepSeek-R1
 - deepseek-ai/DeepSeek-V3
 - deepseek-ai/DeepSeek-V3-0324
