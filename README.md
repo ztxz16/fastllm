@@ -38,6 +38,7 @@ pip install ftllm
 ```
 
 （由于目前pypi限制库大小，安装包中不含cuda依赖，建议先手动安装cuda12以上版本）
+
 （若使用时报错，可参考[ftllm报错](docs/faq.md#ftllm报错) )
 
 - 源码安装
