@@ -4,9 +4,9 @@
 
 ## 介绍
 
-fastllm是c++实现，后端无依赖的高性能大模型推理库
+fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）的高性能大模型推理库。
 
-可实现MOE模型混合推理，消费级单卡（如4090）推理DeepSeek R1 671B INT4模型单路可达20+tps
+可实现MOE模型混合推理，eypc 9374f*2 + 24路DDR5 4800 + 4090 24G，推理DeepSeek R1 671B INT4模型单路可达20+tps。
 
 部署交流QQ群： 831641348
 
@@ -16,7 +16,8 @@ fastllm是c++实现，后端无依赖的高性能大模型推理库
 
 ## 亮点功能
 
-- 🚀 DeepSeek混合推理，消费级单卡即可多并发部署
+- 🚀 DeepSeek混合推理，消费级单卡即可多并发部署，后续将支持多卡提速
+- 🚀 双CPU仅占用1份内存，部署DeepSeek R1 671b int4 共占用内存340G
 - 🚀 支持多NUMA节点加速
 - 🚀 支持动态Batch，流式输出
 - 🚀 支持多卡部署，支持GPU + CPU混合部署
@@ -37,6 +38,7 @@ pip install ftllm
 ```
 
 （由于目前pypi限制库大小，安装包中不含cuda依赖，建议先手动安装cuda12以上版本）
+（若使用时报错，可参考[ftllm报错](docs/faq.md#ftllm报错) )
 
 - 源码安装
 
@@ -59,7 +61,7 @@ bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU�
 
 ### 运行demo程序
 
-以Qwen/Qwen2-0.5B-Instruct模型为例
+以Qwen/Qwen2-0.5B-Instruct模型为例，可以运行一个较小模型测试安装是否成功
 
 #### 命令行聊天：
 
@@ -102,7 +104,7 @@ ftllm run deepseek-v3-0324-int4
 
 #### 设置缓存目录
 
-如果不想使用默认的缓存目录，可以通过环境变量 `FASTLLM_CACHEDIR` 来设置缓存目录，例如在Linux下:
+模型会下载到缓存目录（默认~/.cache），可以通过环境变量 `FASTLLM_CACHEDIR` 来设置缓存目录，例如在Linux下:
 
 ```
 export FASTLLM_CACHEDIR=/mnt/
