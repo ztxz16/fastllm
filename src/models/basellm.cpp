@@ -526,7 +526,7 @@ namespace fastllm {
                     kvCacheLimit = 0;
                     for (int id : deviceIds) {
                         if (id < freeSizes.size()) {
-                            kvCacheLimit += std::max(0LL, freeSizes[id] - (2LL << 30));
+                            kvCacheLimit += std::max(freeSizes[id] * 3 / 4, freeSizes[id] - (2LL << 30));
                         } 
                     }
                     if (kvCacheLimit == 0) {
