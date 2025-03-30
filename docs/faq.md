@@ -113,3 +113,31 @@ GPU编译时，根据使用的CUDA版本，将cudart cublas的相关dll文件复
 **原因：** python解释器在终止时常常会优先终止自己的进程，而没有现先析构调用的第三方库，因此在退出python时CUDA Runtime已关闭，释放显存操作失败。由于大多数时候显存已释放，并不会引起问题。
 
 **解决办法：** python程序退出时，先显式调用 `llm.release_memory()`方法。
+
+## ftllm报错
+
+**现象：**
+调用ftllm时报错，显示Load fastllm failed.
+
+**原因：** 
+可能是GLIBC版本低于运行要求，可能发生于Ubuntu 20.04以下版本
+
+**解决办法：** 
+在/etc/apt/sources.list文件末尾增加：
+```
+deb http://mirrors.aliyun.com/ubuntu/ jammy main
+```
+
+然后更新glibc
+```
+sudo apt update
+sudo apt install libc6
+```
+
+更新完成后检查
+```
+ldd --version
+```
+若版本 >= 2.35，说明更新成功，此时应该可以成功载入ftllm了
+
+若仍无法载入，可尝试[源码安装](../README.md#快速开始)
