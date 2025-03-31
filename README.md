@@ -30,6 +30,11 @@ fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）�
 ### 安装
 
 - PIP安装
+由于目前pypi限制库大小，安装包中不含cuda依赖，安装ftllm之前建议先手动安装cuda12以上版本 (已安装cuda可跳过)
+```
+wget https://developer.download.nvidia.com/compute/cuda/12.8.1/local_installers/cuda_12.8.1_570.124.06_linux.run
+sudo sh cuda_12.8.1_570.124.06_linux.run
+```
 
 Linux系统可尝试直接pip安装，命令如下：
 
@@ -37,13 +42,15 @@ Linux系统可尝试直接pip安装，命令如下：
 pip install ftllm
 ```
 
-（由于目前pypi限制库大小，安装包中不含cuda依赖，建议先手动安装cuda12以上版本）
-
 （若使用时报错，可参考[ftllm报错](docs/faq.md#ftllm报错) )
 
 - 源码安装
 
 若pip安装失败或有其它特殊需求，可以用源码编译安装
+源码安装后如果需要卸载，方法和PIP安装一样
+```
+pip uninstall ftllm
+```
 
 建议使用cmake编译，需要提前安装gcc，g++ (建议9.4以上), make, cmake (建议3.23以上)
 
@@ -82,7 +89,7 @@ ftllm webui Qwen/Qwen2-0.5B-Instruct
 ftllm server Qwen/Qwen2-0.5B-Instruct
 ```
 
-#### 本地模型
+#### 启动本地模型
 
 可以启动本地下载好的Hugging Face模型，假设本地模型路径为 `/mnt/Qwen/Qwen2-0.5B-Instruct/`
 则可以用如下命令启动（webui, server类似）
@@ -111,11 +118,28 @@ ftllm run deepseek-v3-0324-int4
 export FASTLLM_CACHEDIR=/mnt/
 ```
 
-#### 参数说明
+#### 常用参数
 
 以下是运行 `ftllm` 模块时常用的参数说明：
 
 ##### 通用参数
+
+- `--device`:
+  - **描述**: 指定模型运行的计算设备。
+  - **常用值**: `cpu` 或 `cuda`或`numa`或`multicuda`
+  - **示例**: `--device cpu` 或 `--device cuda`
+  - **使用多显卡**: `--device multicuda:0,1`
+  - **使用显卡+CPU**: `--device multicuda:0,cpu`
+  - **按比例使用多显卡+CPU**: `--device multicuda:0:4,1:5,cpu:1`
+  (cuda:0计算4/10, cuda:1计算5/10, cpu计算1/10)
+
+- `--moe_device`:
+  - **描述**: 指定 MOE（Mixture of Experts）层的计算设备。
+  - **常用值**: `cpu` 或 `cuda`或`numa`
+  - **示例**: `--moe_device cpu`
+  - **说明**: 一般和device指定为不同的设备实现混合推理，例如
+  `--device cuda --moe_device cpu`来实现MOE模型的单卡+CPU混合推理。
+   `--device cuda --moe_device numa` 来实现MOE模型的单卡+多NUMA节点加速推理
 
 - `-t` 或 `--threads`:
   - **描述**: 设置使用的CPU线程数。
@@ -125,16 +149,11 @@ export FASTLLM_CACHEDIR=/mnt/
   - **描述**: 指定模型的数据类型。
   - **可选值**: `int4` 或其他支持的数据类型。
   - **示例**: `--dtype int4`
-  
-- `--device`:
-  - **描述**: 指定模型运行的计算设备。
-  - **常用值**: `cpu` 或 `cuda`或`numa`
-  - **示例**: `--device cpu` 或 `--device cuda`
-
-- `--moe_device`:
-  - **描述**: 指定 MOE（Mixture of Experts）层的计算设备。
-  - **常用值**: `cpu` 或 `cuda`或`numa`
-  - **示例**: `--moe_device cpu`
+  - **说明**: 使用原始模型时，指定此参数可以在线量化模型。例如下述命令会将DeepSeek-R1在线量化为int4后运行。
+  ```
+  ftllm run deepseek-ai/DeepSeek-R1 --dtype int4
+  ```
+  若使用的模型已经是量化好的模型（例如AWQ模型，Fastllm导出的量化模型等），建议不指定该参数
 
 - `--moe_experts`:
   - **描述**: 指定 MOE（Mixture of Experts）层使用的专家数。不设定则根据模型配置设定。减少专家数可以提高推理速度，但可能降低推理准确度
