@@ -30,7 +30,7 @@ else:
         except:
             continue
     if (not(succ)):
-        print("Load fastllm failed. (Try install cuda-12)")
+        print("Load fastllm failed. (Try update glibc)")
         exit(0)
 
 fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p]
