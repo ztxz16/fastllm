@@ -46,7 +46,7 @@ def make_normal_llm_model(args):
         from ftllm.download import find_metadata
         from ftllm.download import search_model
         if (not(os.path.exists(get_fastllm_cache_path(args.path))) and not(find_metadata(args.path))):
-            print("Can't find model \"" + args.path + "\"")
+            print("Can't find model \"" + args.path + "\", try to find similar one.")
             search_result = search_model(args.path)
             if (len(search_result) > 0):
                 args.path = search_result[0]["id"]
