@@ -691,6 +691,7 @@ namespace fastllm {
 
                         CatDirect(moeFinal, moePart, 0);
                     }
+                    moeFinal.expansionDims.clear();
                 }
 
                 moeFinal.Reshape(hiddenStates.dims);
@@ -1243,6 +1244,7 @@ namespace fastllm {
 
                         CatDirect(moeFinal, moePart, 0);
                     }
+                    moeFinal.expansionDims.clear();
                 }
 
                 moeFinal.Reshape(hiddenStates.dims);
