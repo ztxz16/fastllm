@@ -45,7 +45,7 @@ export FASTLLM_USE_NUMA=ON
 
 #### 本地模型
 
-可以启动本地下载好的模型（支持原始模型，AWQ模型，FASTLLM模型），假设本地模型路径为 `/mnt/DeepSeek-R1`
+可以启动本地下载好的模型（支持原始模型，AWQ模型，FASTLLM模型，暂不支持GGUF模型），假设本地模型路径为 `/mnt/DeepSeek-R1`
 则可以用如下命令启动（webui, server类似）
 
 ```

@@ -29,6 +29,9 @@ fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）�
 
 ### 安装
 
+- Hint
+Conda下安装有时候会出现环境错误，如果出现可以尝试在Conda外或使用venv等虚拟环境尝试
+
 - PIP安装
 由于目前pypi限制库大小，安装包中不含cuda依赖，安装ftllm之前建议先手动安装cuda12以上版本 (已安装cuda可跳过)
 ```
@@ -91,7 +94,7 @@ ftllm server Qwen/Qwen2-0.5B-Instruct
 
 #### 启动本地模型
 
-可以启动本地下载好的Hugging Face模型，假设本地模型路径为 `/mnt/Qwen/Qwen2-0.5B-Instruct/`
+可以启动本地下载好的Hugging Face模型（支持原始模型，AWQ模型，FASTLLM模型，暂不支持GGUF模型），假设本地模型路径为 `/mnt/Qwen/Qwen2-0.5B-Instruct/`
 则可以用如下命令启动（webui, server类似）
 
 ```
