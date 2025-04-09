@@ -142,6 +142,49 @@ namespace fastllm {
         }
     }
 
+    struct MultiThreadMemcpyMultiLinesTask {
+        uint8_t *output, *input;
+        size_t len;
+
+        MultiThreadMemcpyMultiLinesTask (uint8_t *output, uint8_t *input, size_t len) :
+            output(output), input(input), len(len) {}
+    };
+
+    struct MultiThreadMemcpyMultiLinesOp : MultiThreadBaseOp {
+        MultiThreadMemcpyMultiLinesTask *tasks;
+        int st, end;
+
+        MultiThreadMemcpyMultiLinesOp (MultiThreadMemcpyMultiLinesTask *tasks, int st, int end) : 
+            tasks(tasks), st(st), end(end) {}
+
+        void Run() {
+            for (int i = st; i < end; i++) {
+                memcpy(tasks[i].output, tasks[i].input, tasks[i].len);
+            }            
+        }
+    };
+
+    static void RunMultiThreadMemcpyMultiLines(std::vector <MultiThreadMemcpyMultiLinesTask> &tasks, AliveThreadPool *pool) {
+        int threadNum = pool->threads.size();
+        int n = tasks.size();
+        int per = n / pool->threads.size();
+        int cur = 0;
+        std::vector<fastllm::MultiThreadMemcpyMultiLinesOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? n : cur + per + (cur + per * (threadNum - i) < n));
+            ops.push_back(new MultiThreadMemcpyMultiLinesOp(
+                tasks.data(), cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
     // [n, m, k] -> [m, n, k], 以k个元素为单位做转置 
     struct MultiThreadTransposeByLineOp : MultiThreadBaseOp {
         uint8_t *input, *output;

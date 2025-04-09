@@ -323,55 +323,110 @@ namespace fastllm {
         int channels = logits.dims[dimsLen - 1];
         int n = input.dims[0], m = input.dims[1], k = output.dims[1];
 
-        for (int o = 0; o < outer; o++) {
-            std::vector <std::pair <float, int> > oriV;
-            for (int j = 0; j < channels; j++) {
-                oriV.push_back(std::make_pair(-((float*)logits.cpuData)[o * channels + j], j));
-            }
-            if (gateBias.dims.size() > 0) {
-                ToDataType(gateBias, DataType::FLOAT32);
-                gateBias.ToDevice(DataDevice::CPU);
-                float *cpuBias = (float*)gateBias.cpuData;
-                for (int i = 0; i < channels; i++) {
-                    oriV[i].first -= cpuBias[i];
-                }
-            }
-            // sort(oriV.begin(), oriV.end());
-            std::nth_element(oriV.begin(), oriV.begin() + topk, oriV.end());
-            float sum = 1.0;
-            if (needNorm) {
-                sum = 0.0;
-                for (int j = 0; j < topk; j++) {
-                    sum += ((float*)logits.cpuData)[o * channels + oriV[j].second];
-                }
-            }
-
-            std::vector <std::pair <int, float> > v;
-            for (int j = 0; j < topk; j++) {
-                v.push_back(std::make_pair(oriV[j].second + 1, ((float*)logits.cpuData)[o * channels + oriV[j].second] / sum * routeScale));
-            }
-            v.push_back(std::make_pair(0, sharedScale));
-            float *inputData = ((float *) input.cpuData) + o * m;
+        if (n > 31) {
+auto st = std::chrono::system_clock::now();
             int group = weights[0]->group, groupCnt = weights[0]->groupCnt;
             if (weights[0]->dataType != DataType::INT4_GROUP) {
                 group = 1;
                 groupCnt = m;
             }
+            float *inputData = ((float *) input.cpuData);
             std::vector<LowBitConfig> inputConfigs;
             std::vector<uint8_t> uinput;
             std::vector <float> inputSums;
             std::vector <float> iscales, izeros;
-            OnlineQuantization(inputData, uinput, inputConfigs, 1, m, group, groupCnt, 
-                                inputSums, iscales, izeros);
-            
-            std::vector <fastllm::Data*> ws;
-            std::vector <float> factors;
-            for (int i = 0; i < v.size(); i++) {
-                ws.push_back(weights[v[i].first * 2]);
-                ws.push_back(weights[v[i].first * 2 + 1]);
-                factors.push_back(v[i].second);
+            OnlineQuantization(inputData, uinput, inputConfigs, n, m, group, groupCnt, inputSums, iscales, izeros);
+
+            std::vector <std::vector <fastllm::Data*> > ws;
+            std::vector <std::vector <float> > factors;
+            ws.resize(n);
+            factors.resize(n);
+            for (int o = 0; o < n; o++) {
+                std::vector <std::pair <float, int> > oriV;
+                for (int j = 0; j < channels; j++) {
+                    oriV.push_back(std::make_pair(-((float*)logits.cpuData)[o * channels + j], j));
+                }
+                if (gateBias.dims.size() > 0) {
+                    ToDataType(gateBias, DataType::FLOAT32);
+                    gateBias.ToDevice(DataDevice::CPU);
+                    float *cpuBias = (float*)gateBias.cpuData;
+                    for (int i = 0; i < channels; i++) {
+                        oriV[i].first -= cpuBias[i];
+                    }
+                }
+                // sort(oriV.begin(), oriV.end());
+                std::nth_element(oriV.begin(), oriV.begin() + topk, oriV.end());
+                float sum = 1.0;
+                if (needNorm) {
+                    sum = 0.0;
+                    for (int j = 0; j < topk; j++) {
+                        sum += ((float*)logits.cpuData)[o * channels + oriV[j].second];
+                    }
+                }
+
+                std::vector <std::pair <int, float> > v;
+                for (int j = 0; j < topk; j++) {
+                    v.push_back(std::make_pair(oriV[j].second + 1, ((float*)logits.cpuData)[o * channels + oriV[j].second] / sum * routeScale));
+                }
+                v.push_back(std::make_pair(0, sharedScale));
+                for (int i = 0; i < v.size(); i++) {
+                    ws[o].push_back(weights[v[i].first * 2]);
+                    ws[o].push_back(weights[v[i].first * 2 + 1]);
+                    factors[o].push_back(v[i].second);
+                }
             }
-            GetNumaClient()->RunNumaMOEU(1, m, k, group, groupCnt, ws, factors, &inputConfigs, uinput.data(), ((float*)output.cpuData) + o * k, output.dataType);
+            GetNumaClient()->RunNumaMOEUMultiRow(n, m, k, group, groupCnt, ws, factors, &inputConfigs, uinput.data(), ((float*)output.cpuData), output.dataType);
+        } else {
+            for (int o = 0; o < outer; o++) {
+                std::vector <std::pair <float, int> > oriV;
+                for (int j = 0; j < channels; j++) {
+                    oriV.push_back(std::make_pair(-((float*)logits.cpuData)[o * channels + j], j));
+                }
+                if (gateBias.dims.size() > 0) {
+                    ToDataType(gateBias, DataType::FLOAT32);
+                    gateBias.ToDevice(DataDevice::CPU);
+                    float *cpuBias = (float*)gateBias.cpuData;
+                    for (int i = 0; i < channels; i++) {
+                        oriV[i].first -= cpuBias[i];
+                    }
+                }
+                // sort(oriV.begin(), oriV.end());
+                std::nth_element(oriV.begin(), oriV.begin() + topk, oriV.end());
+                float sum = 1.0;
+                if (needNorm) {
+                    sum = 0.0;
+                    for (int j = 0; j < topk; j++) {
+                        sum += ((float*)logits.cpuData)[o * channels + oriV[j].second];
+                    }
+                }
+
+                std::vector <std::pair <int, float> > v;
+                for (int j = 0; j < topk; j++) {
+                    v.push_back(std::make_pair(oriV[j].second + 1, ((float*)logits.cpuData)[o * channels + oriV[j].second] / sum * routeScale));
+                }
+                v.push_back(std::make_pair(0, sharedScale));
+                float *inputData = ((float *) input.cpuData) + o * m;
+                int group = weights[0]->group, groupCnt = weights[0]->groupCnt;
+                if (weights[0]->dataType != DataType::INT4_GROUP) {
+                    group = 1;
+                    groupCnt = m;
+                }
+                std::vector<LowBitConfig> inputConfigs;
+                std::vector<uint8_t> uinput;
+                std::vector <float> inputSums;
+                std::vector <float> iscales, izeros;
+                OnlineQuantization(inputData, uinput, inputConfigs, 1, m, group, groupCnt, 
+                                    inputSums, iscales, izeros);
+                
+                std::vector <fastllm::Data*> ws;
+                std::vector <float> factors;
+                for (int i = 0; i < v.size(); i++) {
+                    ws.push_back(weights[v[i].first * 2]);
+                    ws.push_back(weights[v[i].first * 2 + 1]);
+                    factors.push_back(v[i].second);
+                }
+                GetNumaClient()->RunNumaMOEU(1, m, k, group, groupCnt, ws, factors, &inputConfigs, uinput.data(), ((float*)output.cpuData) + o * k, output.dataType);
+            }
         }
     }
 

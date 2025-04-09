@@ -69,7 +69,8 @@ namespace fastllm {
         this->partCnt = partCnt;
         this->threadNum = threadNum;
 
-        this->pool = new fastllm::AliveThreadPool(threadNum);
+        SetThreads(threadNum);
+        this->pool = GetAlivePool();
 
         // 获取共享内存段
         const char* shm_name = "/fastllm_shm";
@@ -770,26 +771,15 @@ namespace fastllm {
         json11::Json config;
         std::string error;
         config = json11::Json::parse(configString, error);
-        
-        std::vector <fastllm::Data*> weights;
-        std::vector <float> v;
-        for (auto &factor : config["factors"].array_items()) {
-            v.push_back(factor.number_value());
-        }
-        for (auto &weight : config["weights"].array_items()) {
-            weights.push_back(&this->weights[weight.string_value()]);
-        }
 
         int n = config["n"].int_value(), m = config["m"].int_value(), k = config["k"].int_value();
         int group = config["group"].int_value(), groupCnt = config["groupCnt"].int_value();
         int outputType = config["outputType"].int_value();
-
         uint8_t *localInput = (uint8_t *) this->inputBuffer.data();
         float *localOutput = (float *) this->outputBuffer.data();
 
         std::vector <LowBitConfig> inputConfigs;
         std::vector <float> iscales, izeros;
-        
         volatile char *buffer = (volatile char*)this->baseAddr + 4 + configStringLen;
         for (int i = 0; i < n * group; i++) {
             inputConfigs.push_back(fastllm::LowBitConfig(((float*)buffer)[0], ((float*)buffer)[1], 8, 0));
@@ -809,196 +799,335 @@ namespace fastllm {
                 inputSums.push_back(sum);
             }
         }
-
-        std::vector <int> localKs;
-        std::vector <float*> middles;
-        std::vector <float*> results;
-        for (int j = 0; j < v.size(); j++) {
-            int idx = j;
-            weights[idx * 2]->CalcWeightSum();
-            weights[idx * 2 + 1]->CalcWeightSum();
-
-            int localK = weights[idx * 2]->dims[0];
-            localKs.push_back(localK);
-            middles.push_back(new float[localK]);
-            results.push_back(new float[weights[idx * 2 + 1]->dims[0]]);
-        }
-
-        std::vector<fastllm::MultiThreadBaseOp*> ops;
-        int threads = pool->threads.size();
-        ops.resize(threads);
-
-        std::vector <std::vector <LowBitConfig> > inputConfigsDown;
-        std::vector <std::vector <uint8_t> > uinputsDown;
-        std::vector <std::vector <float> > inputSumsDown;
-        std::vector <std::vector <float> > iscalesDown, izerosDown;
-        inputConfigsDown.resize(v.size());
-        uinputsDown.resize(v.size());
-        inputSumsDown.resize(v.size());
-        iscalesDown.resize(v.size());
-        izerosDown.resize(v.size());
-
-        for (int st = 0; st < v.size(); st++) {
-            int k = localKs[st];
-            int end = st, selSum = 1; // 一共处理selSum * k个输出
-
-            int curSum = 1;
-            for (int l = st + 1; l < v.size(); l++) {
-                int curK = localKs[l];
-                if (curK % k != 0) {
-                    break;
+        if (n > 1) {
+            std::vector <std::vector <fastllm::Data*> > weights;
+            std::vector <std::vector <float> > v;
+            weights.resize(n);
+            v.resize(n);
+            int idx = 0;
+            for (auto &factor : config["factors"].array_items()) {
+                for (auto &it : factor.array_items()) {
+                    v[idx].push_back(it.number_value());
                 }
-                curSum += (curK / k);
-                if (threads % curSum == 0) {
-                    end = l;
-                    selSum = curSum;
-                }
+                idx++;
             }
-            int base = threads / selSum;
-            int threadSt = 0;
-            for (int l = st; l <= end; l++) {
-                int idx = l;
-                Data *weight = weights[idx * 2];
-                uint8_t *weightData = (uint8_t *) weight->cpuData;
-                float *outputData = middles[l];
-                float *biasData = nullptr;
-                int curK = localKs[l];
-                int curThread = (curK / k) * base;
-                MultiplyInt4GroupMultiThreadLaunch(localInput, weightData, outputData, n, m, curK,
-                                            weight->weightSum.data(), weight->mins.data(), weight->scales.data(), 
-                                            biasData, inputSums, iscales, izeros,
-                                            inputConfigs, threadSt, curThread, group, groupCnt, ops, pool);
-                threadSt += curThread;
+            idx = 0;
+            for (auto &weight : config["weights"].array_items()) {
+                for (auto &it : weight.array_items()) {
+                    weights[idx].push_back(&this->weights[it.string_value()]);
+                }
+                idx++;
             }
 
-            for (int j = 0; j < ops.size(); j++) {
-                pool->Wait(j);
-                delete ops[j];
-            }
-            // swiglu
-            threadSt = 0;
-            for (int l = st; l <= end; l++) {
-                int idx = l;
-                int spatial = localKs[idx], mid = spatial / 2;
-                float *outputData = middles[l];
-                int curK = localKs[idx];
-                int curThread = (curK / k) * base;
-                int per = mid / curThread;
-                int cur = 0;
-                for (int i = 0; i < curThread; i++) {
-                    int end = (i == curThread - 1 ? mid : cur + per + (cur + per * (curThread - i) < mid));
-                    ops[threadSt + i] = (new fastllm::MultiThreadSwigluOp(outputData + cur, mid, end - cur, outputData + cur,
-                                    n, spatial, spatial));
-                    cur = end;
-                }
-                for (int i = 0; i < curThread; i++) {
-                    pool->PushOp(threadSt + i, ops[threadSt + i]);
-                }
-                threadSt += curThread;
-            }
-            for (int j = 0; j < ops.size(); j++) {
-                pool->Wait(j);
-                delete ops[j];
-            }
-            for (int l = st; l <= end; l++) {
-                int idx = l;
-                int mid = localKs[idx] / 2;
-                Data *weightDown = weights[idx * 2 + 1];
-                int groupDown = weightDown->group, groupCntDown = weightDown->groupCnt;
-                if (weightDown->dataType != DataType::INT4_GROUP) {
-                    groupDown = 1;
-                    groupCntDown = mid;
-                }
-                auto &inputConfigs = inputConfigsDown[l];
-                auto &inputSums = inputSumsDown[l];
-                auto &iscales = iscalesDown[l];
-                auto &izeros = izerosDown[l];
-                auto &uinputDown = uinputsDown[l];
-                inputConfigs.resize(n * groupDown);
-                uinputDown.resize(n * mid);   
-                inputSums.resize(n * groupDown);
-                iscales.resize(n * groupDown);
-                izeros.resize(n * groupDown);
-                ops[l - st] = new MultiThreadOnlineQuantizationOp(
-                                middles[l], uinputDown.data(), inputConfigs.data(),
-                                n, mid, groupDown, groupCntDown,
-                                inputSums.data(), iscales.data(), izeros.data());
-                pool->PushOp(l - st, ops[l - st]);
-            }
-            for (int l = st; l <= end; l++) {
-                pool->Wait(l - st);
-                delete ops[l - st];
-            }
+            int bs = n, dim = k;
+            int inputDim = m;
+            std::vector <float> tempResult, middleResult;
+            tempResult.resize(bs * dim, 0.0f);
+            middleResult.resize(bs * dim, 0.0f);
+            std::map <std::pair <Data*, Data*>, std::vector <std::pair <int, float> > > expertTasks; // expertTasks[x]代表专家x的task, expertTasks[x][j] = (第j个任务对应的行数， 权重)            
 
-            threadSt = 0;
-            for (int l = st; l <= end; l++) {
-                int idx = l;
-                int mid = localKs[idx] / 2;
-                int curK = localKs[idx];
-                Data *weightDown = weights[idx * 2 + 1];
-                int groupDown = weightDown->group, groupCntDown = weightDown->groupCnt;
-                auto &inputConfigs = inputConfigsDown[l];
-                auto &inputSums = inputSumsDown[l];
-                auto &iscales = iscalesDown[l];
-                auto &izeros = izerosDown[l];
-                auto &uinputDown = uinputsDown[l];
-                int curThread = (curK / k) * base;
-                if (weightDown->dataType != DataType::INT4_GROUP) {
-                    groupDown = 1;
-                    groupCntDown = mid;
-                }
-                MultiplyInt4GroupMultiThreadLaunch(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l], 1, mid, m,
-                                            weightDown->weightSum.data(), weightDown->mins.data(), weightDown->scales.data(), nullptr, 
-                                            inputSums, iscales, izeros,
-                                            inputConfigs, threadSt, curThread, groupDown, groupCntDown, ops, pool);
-                threadSt += curThread;               
-            }
+            Data oriInput, tempInput, w1, w2, w3;
 
-            for (int j = 0; j < ops.size(); j++) {
-                pool->Wait(j);
-                delete ops[j];
-            }
-            st = end;
-        }
-
-        for (int k = 0; k < m; k++) {
-            localOutput[k] = 0;
-        }
-        for (int j = 0; j < v.size(); j++) {
-            float value = v[j];
-            float *curOutput = (float*)results[j];
-
-            int i = 0;
+            oriInput.dataType = DataType::FLOAT32;
+            oriInput.Resize({n, m});
+            oriInput.Allocate();
+// printf("server get meta spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            float *floatInput = (float*)oriInput.cpuData;
 #ifdef __AVX2__
-            __m256 value_vec = _mm256_set1_ps(value);
-            // 每次处理 8 个浮点数（AVX2 寄存器可以容纳 8 个 float）
-            for (; i <= m - 8; i += 8) {
-                // 加载 curOutput 的 8 个浮点数
-                __m256 curOutput_vec = _mm256_loadu_ps(&curOutput[i]);
-
-                // 加载 localOutput 的 8 个浮点数
-                __m256 fLastOutput_vec = _mm256_loadu_ps(&localOutput[i]);
-
-                // 计算 curOutput * value
-                __m256 result_vec = _mm256_mul_ps(curOutput_vec, value_vec);
-
-                // 累加到 fLastOutput
-                fLastOutput_vec = _mm256_add_ps(fLastOutput_vec, result_vec);
-
-                // 将结果存回 fLastOutput
-                _mm256_storeu_ps(&localOutput[i], fLastOutput_vec);
+            uint8_t *temp = new uint8_t[32];
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j + 31 < m; j += 32) {
+                    // 将output的32字节块复制到temp
+                    memcpy(temp, localInput + i * m + j, 32);
+                    
+                    // 逆向排列
+                    for (int k = 0; k < 16; k++) {
+                        // 前16字节是原来的奇数索引，放回奇数位置
+                        temp[k * 2 + 1] = localInput[i * m + j + k];
+                        // 后16字节是原来的偶数索引，放回偶数位置
+                        temp[k * 2] = localInput[i * m + j + k + 16];
+                    }
+                    
+                    // 将还原后的数据复制回output
+                    memcpy(localInput + i * m + j, temp, 32);
+                }
             }
+            delete[] temp;
 #endif
-            for (int k = i; k < m; k++) {
-                localOutput[k] += curOutput[k] * value;
+// printf("server revert spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            for (int i = 0; i < n; i++) {
+                for (int g = 0; g < group; g++) {
+                    auto &config = inputConfigs[i * group + g];
+                    for (int j = g * groupCnt; j < (g + 1) * groupCnt && j < m; j++) {
+                        floatInput[i * m + j] = config.invQuantization(localInput[i * m + j]);
+                    }
+                }
             }
-            delete[] results[j];
-            delete[] middles[j];
-        }
-        for (int i = 0; i < n; i++) {
-            memcpy((uint8_t *) baseOutputAddr + partId * n * k * sizeof(float) + (i * k) * sizeof(float),
-                   (uint8_t *) localOutput + (i * k) * sizeof(float),
-                   k * sizeof(float));
+// printf("server get input spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            tempInput.dataType = DataType::FLOAT32;
+            tempInput.Resize({n, m});
+            tempInput.Allocate();
+
+            for (int b = 0; b < bs; b++) {
+                for (int j = 0; j < v[b].size(); j++) {
+                    expertTasks[std::make_pair(weights[b][j * 2], weights[b][j * 2 + 1])].push_back(std::make_pair(b, v[b][j]));
+                }
+            }
+// printf("server ready spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            for (auto &it : expertTasks) {
+                auto &task = it.second;
+                if (task.size() == 0) {
+                    continue;
+                }
+
+                tempInput.Resize({(int)task.size(), inputDim});
+                std::vector <MultiThreadMemcpyMultiLinesTask> memcpyTasks;
+                for (int i = 0; i < (int)task.size(); i++) {
+                    memcpyTasks.push_back(MultiThreadMemcpyMultiLinesTask(tempInput.cpuData + i * inputDim * oriInput.unitSize, oriInput.cpuData + task[i].first * inputDim * oriInput.unitSize, inputDim * oriInput.unitSize));
+                }
+                RunMultiThreadMemcpyMultiLines(memcpyTasks, pool);
+                
+                DoCpuLinearReshape(tempInput, *it.first.first, w3);
+                DoCpuLinear(tempInput, *it.first.first, Data(), w3);
+
+                int mid = w3.dims[1] / 2;
+                w1.Resize({w3.dims[0], mid});
+                w1.dataType = w3.dataType;
+                w1.Allocate();
+                SwigluMultiThread((float *) w3.cpuData, mid, mid, ((float *) w1.cpuData),
+                                    w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                
+                DoCpuLinearReshape(w1, *it.first.second, w2);
+                DoCpuLinear(w1, *it.first.second, Data(), w2);
+
+                float *curOutput;
+                if (w2.dataType == DataType::FLOAT32) {
+                    curOutput = (float*)w2.cpuData;
+                } else if (w2.dataType == DataType::FLOAT16) {
+                    Float16ToFloat32((uint16_t*)w2.cpuData, middleResult.data(), w2.Count(0));
+                    curOutput = middleResult.data();
+                }
+
+                for (int i = 0; i < (int)task.size(); i++) {
+                    float value = task[i].second;
+                    float *lastResult = tempResult.data() + task[i].first * dim;
+                    float *curResult = curOutput + i * dim;
+                    for (int j = 0; j < dim; j++) {
+                        lastResult[j] += value * curResult[j];
+                    }
+                }
+            }
+// printf("server calc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            for (int i = 0; i < n; i++) {
+                memcpy((uint8_t *) baseOutputAddr + partId * n * k * sizeof(float) + (i * k) * sizeof(float),
+                    ((uint8_t *) tempResult.data()) + (i * k) * sizeof(float),
+                    k * sizeof(float));
+            }
+// printf("server write spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            // if (output.dataType == DataType::FLOAT32) {
+                // memcpy(output.cpuData, tempResult.data(), output.GetBytes());
+            // } else if (output.dataType == DataType::FLOAT16) {
+               // Float32ToFloat16(tempResult.data(), (uint16_t*)output.cpuData, output.Count(0));
+            // }
+            return;    
+        } else {
+            std::vector <fastllm::Data*> weights;
+            std::vector <float> v;
+            for (auto &factor : config["factors"].array_items()) {
+                v.push_back(factor.number_value());
+            }
+            for (auto &weight : config["weights"].array_items()) {
+                weights.push_back(&this->weights[weight.string_value()]);
+            }
+
+            std::vector <int> localKs;
+            std::vector <float*> middles;
+            std::vector <float*> results;
+            for (int j = 0; j < v.size(); j++) {
+                int idx = j;
+                weights[idx * 2]->CalcWeightSum();
+                weights[idx * 2 + 1]->CalcWeightSum();
+
+                int localK = weights[idx * 2]->dims[0];
+                localKs.push_back(localK);
+                middles.push_back(new float[localK]);
+                results.push_back(new float[weights[idx * 2 + 1]->dims[0]]);
+            }
+
+            std::vector<fastllm::MultiThreadBaseOp*> ops;
+            int threads = pool->threads.size();
+            ops.resize(threads);
+
+            std::vector <std::vector <LowBitConfig> > inputConfigsDown;
+            std::vector <std::vector <uint8_t> > uinputsDown;
+            std::vector <std::vector <float> > inputSumsDown;
+            std::vector <std::vector <float> > iscalesDown, izerosDown;
+            inputConfigsDown.resize(v.size());
+            uinputsDown.resize(v.size());
+            inputSumsDown.resize(v.size());
+            iscalesDown.resize(v.size());
+            izerosDown.resize(v.size());
+            for (int st = 0; st < v.size(); st++) {
+                int k = localKs[st];
+                int end = st, selSum = 1; // 一共处理selSum * k个输出
+
+                int curSum = 1;
+                for (int l = st + 1; l < v.size(); l++) {
+                    int curK = localKs[l];
+                    if (curK % k != 0) {
+                        break;
+                    }
+                    curSum += (curK / k);
+                    if (threads % curSum == 0) {
+                        end = l;
+                        selSum = curSum;
+                    }
+                }
+                int base = threads / selSum;
+                int threadSt = 0;
+                for (int l = st; l <= end; l++) {
+                    int idx = l;
+                    Data *weight = weights[idx * 2];
+                    uint8_t *weightData = (uint8_t *) weight->cpuData;
+                    float *outputData = middles[l];
+                    float *biasData = nullptr;
+                    int curK = localKs[l];
+                    int curThread = (curK / k) * base;
+                    MultiplyInt4GroupMultiThreadLaunch(localInput, weightData, outputData, n, m, curK,
+                                                weight->weightSum.data(), weight->mins.data(), weight->scales.data(), 
+                                                biasData, inputSums, iscales, izeros,
+                                                inputConfigs, threadSt, curThread, group, groupCnt, ops, pool);
+                    threadSt += curThread;
+                }
+
+                for (int j = 0; j < ops.size(); j++) {
+                    pool->Wait(j);
+                    delete ops[j];
+                }
+                // swiglu
+                threadSt = 0;
+                for (int l = st; l <= end; l++) {
+                    int idx = l;
+                    int spatial = localKs[idx], mid = spatial / 2;
+                    float *outputData = middles[l];
+                    int curK = localKs[idx];
+                    int curThread = (curK / k) * base;
+                    int per = mid / curThread;
+                    int cur = 0;
+                    for (int i = 0; i < curThread; i++) {
+                        int end = (i == curThread - 1 ? mid : cur + per + (cur + per * (curThread - i) < mid));
+                        ops[threadSt + i] = (new fastllm::MultiThreadSwigluOp(outputData + cur, mid, end - cur, outputData + cur,
+                                        n, spatial, spatial));
+                        cur = end;
+                    }
+                    for (int i = 0; i < curThread; i++) {
+                        pool->PushOp(threadSt + i, ops[threadSt + i]);
+                    }
+                    threadSt += curThread;
+                }
+                for (int j = 0; j < ops.size(); j++) {
+                    pool->Wait(j);
+                    delete ops[j];
+                }
+                for (int l = st; l <= end; l++) {
+                    int idx = l;
+                    int mid = localKs[idx] / 2;
+                    Data *weightDown = weights[idx * 2 + 1];
+                    int groupDown = weightDown->group, groupCntDown = weightDown->groupCnt;
+                    if (weightDown->dataType != DataType::INT4_GROUP) {
+                        groupDown = 1;
+                        groupCntDown = mid;
+                    }
+                    auto &inputConfigs = inputConfigsDown[l];
+                    auto &inputSums = inputSumsDown[l];
+                    auto &iscales = iscalesDown[l];
+                    auto &izeros = izerosDown[l];
+                    auto &uinputDown = uinputsDown[l];
+                    inputConfigs.resize(n * groupDown);
+                    uinputDown.resize(n * mid);   
+                    inputSums.resize(n * groupDown);
+                    iscales.resize(n * groupDown);
+                    izeros.resize(n * groupDown);
+                    ops[l - st] = new MultiThreadOnlineQuantizationOp(
+                                    middles[l], uinputDown.data(), inputConfigs.data(),
+                                    n, mid, groupDown, groupCntDown,
+                                    inputSums.data(), iscales.data(), izeros.data());
+                    pool->PushOp(l - st, ops[l - st]);
+                }
+                for (int l = st; l <= end; l++) {
+                    pool->Wait(l - st);
+                    delete ops[l - st];
+                }
+
+                threadSt = 0;
+                for (int l = st; l <= end; l++) {
+                    int idx = l;
+                    int mid = localKs[idx] / 2;
+                    int curK = localKs[idx];
+                    Data *weightDown = weights[idx * 2 + 1];
+                    int groupDown = weightDown->group, groupCntDown = weightDown->groupCnt;
+                    auto &inputConfigs = inputConfigsDown[l];
+                    auto &inputSums = inputSumsDown[l];
+                    auto &iscales = iscalesDown[l];
+                    auto &izeros = izerosDown[l];
+                    auto &uinputDown = uinputsDown[l];
+                    int curThread = (curK / k) * base;
+                    if (weightDown->dataType != DataType::INT4_GROUP) {
+                        groupDown = 1;
+                        groupCntDown = mid;
+                    }
+                    MultiplyInt4GroupMultiThreadLaunch(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l], 1, mid, m,
+                                                weightDown->weightSum.data(), weightDown->mins.data(), weightDown->scales.data(), nullptr, 
+                                                inputSums, iscales, izeros,
+                                                inputConfigs, threadSt, curThread, groupDown, groupCntDown, ops, pool);
+                    threadSt += curThread;               
+                }
+
+                for (int j = 0; j < ops.size(); j++) {
+                    pool->Wait(j);
+                    delete ops[j];
+                }
+                st = end;
+            }
+            for (int k = 0; k < m; k++) {
+                localOutput[k] = 0;
+            }
+            for (int j = 0; j < v.size(); j++) {
+                float value = v[j];
+                float *curOutput = (float*)results[j];
+
+                int i = 0;
+    #ifdef __AVX2__
+                __m256 value_vec = _mm256_set1_ps(value);
+                // 每次处理 8 个浮点数（AVX2 寄存器可以容纳 8 个 float）
+                for (; i <= m - 8; i += 8) {
+                    // 加载 curOutput 的 8 个浮点数
+                    __m256 curOutput_vec = _mm256_loadu_ps(&curOutput[i]);
+
+                    // 加载 localOutput 的 8 个浮点数
+                    __m256 fLastOutput_vec = _mm256_loadu_ps(&localOutput[i]);
+
+                    // 计算 curOutput * value
+                    __m256 result_vec = _mm256_mul_ps(curOutput_vec, value_vec);
+
+                    // 累加到 fLastOutput
+                    fLastOutput_vec = _mm256_add_ps(fLastOutput_vec, result_vec);
+
+                    // 将结果存回 fLastOutput
+                    _mm256_storeu_ps(&localOutput[i], fLastOutput_vec);
+                }
+    #endif
+                for (int k = i; k < m; k++) {
+                    localOutput[k] += curOutput[k] * value;
+                }
+                delete[] results[j];
+                delete[] middles[j];
+            }
+            for (int i = 0; i < n; i++) {
+                memcpy((uint8_t *) baseOutputAddr + partId * n * k * sizeof(float) + (i * k) * sizeof(float),
+                    (uint8_t *) localOutput + (i * k) * sizeof(float),
+                    k * sizeof(float));
+            }
         }
     }
 

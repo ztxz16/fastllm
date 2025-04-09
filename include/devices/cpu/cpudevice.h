@@ -9,6 +9,9 @@
 #include "alivethreadpool.h"
 
 namespace fastllm {
+    void DoCpuLinearReshape(Data &input, Data &weight, Data &output);
+    void DoCpuLinear(Data &input, Data &weight, const Data &bias, Data &output);
+    
     struct MultiThreadOnlineQuantizationOp : MultiThreadBaseOp {
         float *input;
         uint8_t *output;
