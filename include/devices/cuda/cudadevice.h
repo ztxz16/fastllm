@@ -8,6 +8,15 @@
 #include "device.h"
 
 namespace fastllm {
+    void DoCudaAttentionReshape(Data &q, Data &v, Data &output);
+    void DoCudaAttention(Data &q, Data &k, Data &v, Data &mask, Data &output, int group, float scale, int maskType);
+    void DoCudaLinearReshape(Data &input, Data &weight, Data &output);
+    void DoCudaLinear(Data &input, Data &weight, Data &bias, Data &output);
+    void DoCudaSplitReshape(Data &input, int axis, int start, int end, Data &output);
+    void DoCudaSplit(Data &input, int axis, int start, int end, Data &output);
+    void DoCudaCatDirect(Data &input0, Data &input1, int axis);
+    void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis);
+    
     class CudaDevice : BaseDevice {
     public:
         CudaDevice ();
@@ -28,6 +37,11 @@ namespace fastllm {
     };
 
     class CudaAttention : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaMergeAttention : BaseOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };

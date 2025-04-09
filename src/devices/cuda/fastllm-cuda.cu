@@ -189,7 +189,11 @@ CudaInfos *getCudaInfos() {
 }
 
 void DeviceSync() {
-    //cudaDeviceSynchronize();
+    // cudaDeviceSynchronize();
+}
+
+void ForceDeviceSync() {
+    cudaDeviceSynchronize();
 }
 
 double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
@@ -5302,8 +5306,42 @@ bool FastllmCudaConv2DFloat32(const fastllm::Data &input, fastllm::Data &weight,
     return true;
 }
 
+void FastllmReduce(uint8_t *output, uint8_t* partOutput, int len, int threadNum, fastllm::DataType dataType) {
+    int threadPerBlock = std::min(256, len);
+    if (dataType == fastllm::DataType::FLOAT32) {
+        FastllmReduceKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>> ((float*)output, (float*)partOutput, len, threadNum);
+    } else if (dataType == fastllm::DataType::FLOAT16) {
+        FastllmReduceKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>> ((half*)output, (half*)partOutput, len, threadNum);
+    }
+}
+
 void FastllmCudaSetDevice(int gpu_id) {
     cudaSetDevice(gpu_id);
+}
+
+int FastllmCudaGetDevice() {
+    int id = -1;
+    cudaGetDevice(&id);
+    return id;
+}
+
+int GetPointerDeviceId(void *ptr) {
+    cudaPointerAttributes attributes;
+    cudaError_t err = cudaPointerGetAttributes(&attributes, ptr);
+
+    if (err == cudaSuccess) {
+        if (attributes.type == cudaMemoryTypeDevice) {
+            int device = attributes.device;
+            printf("Pointer belongs to device %d\n", device);
+            return device;
+        } else {
+            printf("Pointer is not device memory\n");
+            return -1;
+        }
+    } else {
+        printf("Error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
 }
 
 int FastllmCudaGetDeviceCount() {
