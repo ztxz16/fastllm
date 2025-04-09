@@ -17,6 +17,10 @@
 #include "armMath.h"
 #endif
 
+#ifdef __AVX2__X
+#include "avxMath.h"
+#endif
+
 #include "utils.h"
 
 namespace fastllm {
@@ -113,6 +117,33 @@ namespace fastllm {
         }
 
         return ans + I32sum(acc);
+    };
+#endif
+
+#ifdef __AVX2__X
+    int DotU4U8(uint8_t *a, uint8_t *b, int n) {
+        __m512i acc = _mm512_setzero_si512();
+
+        int i = 0;
+        int ans = 0;
+        const __m512i lowMask = _mm512_set1_epi8(0xf);
+        const __m512i ones = _mm512_set1_epi16(1);
+        for (; i + 63 < n; i += 64) {
+            __m256i orix = _mm256_loadu_si256((const __m256i *) (a + i / 2));
+
+            // __m512i bytex = _mm512_set_m256i(_mm256_srli_epi16(orix, 4), orix);
+            // __m512i bytex = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_srli_epi16(orix, 4)), orix, 1);
+            __m512i bytex = _mm512_inserti64x4(_mm512_castsi256_si512(orix), _mm256_srli_epi16(orix, 4), 1);
+            __m512i bx = _mm512_and_si512(lowMask, bytex);
+
+            __m512i by = _mm512_loadu_si512((const __m512i *) (b + i));
+            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(by, bx), ones));
+        }
+        for (; i < n; i++) {
+            ans += a[i] * b[i];
+        }
+
+        return ans + _mm512_reduce_add_epi32(acc);
     };
 #endif
 
@@ -639,8 +670,8 @@ namespace fastllm {
         float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
         output.Allocate();
         if ((input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16) && 
-            (weights[0]->dataType == DataType::INT4_GROUP || weights[0]->dataType == DataType::INT4_NOZERO)
-            ) {
+            (weights[0]->dataType == DataType::INT4_GROUP || weights[0]->dataType == DataType::INT4_NOZERO) &&
+            input.dims[0] < 32) {
             int dimsLen = logits.dims.size();
             int outer = logits.Count(0) / logits.Count(dimsLen - 1);
             int channels = logits.dims[dimsLen - 1];
@@ -956,6 +987,93 @@ namespace fastllm {
                 Linear(w1, *weights[1], Data(), w2);
                 AddTo(output, w2, sharedScale);
             } else {
+                int bs = input.dims[0], dim = output.dims[1];
+                int inputDim = input.dims[1];
+                std::vector <float> tempResult, middleResult;
+                tempResult.resize(bs * dim, 0.0f);
+                middleResult.resize(bs * dim, 0.0f);
+                std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
+                expertTasks.resize(m + 1);
+                Data tempInput, w1, w2, w3;
+                tempInput.CopyFrom(input);
+                for (int b = 0; b < bs; b++) {
+                    expertTasks[0].push_back(std::make_pair(b, sharedScale));
+                    float *cur = cpuRouterLogits + b * m;
+                    std::vector <std::pair <float, int> > v; // (value, idx)
+                    for (int i = 0; i < m; i++) {
+                        v.push_back(std::make_pair(-cur[i], i));
+                    }
+                    if (gateBias.dims.size() > 0) {
+                        ToDataType(gateBias, DataType::FLOAT32);
+                        gateBias.ToDevice(DataDevice::CPU);
+                        float *cpuBias = (float*)gateBias.cpuData;
+                        for (int i = 0; i < m; i++) {
+                            v[i].first -= cpuBias[i];
+                        }
+                    }
+                    // sort(v.begin(), v.end());
+                    partial_sort(v.begin(), v.begin() + topk, v.end());
+                    float sum = 1.0;
+                    if (needNorm) {
+                        sum = 0.0;
+                        for (int j = 0; j < topk; j++) {
+                            sum += cur[v[j].second];
+                        }
+                    }
+                    
+                    for (int j = 0; j < topk; j++) {
+                        int idx = v[j].second;
+                        float value = cur[idx] / sum * routeScale;
+                        expertTasks[idx + 1].push_back(std::make_pair(b, value));
+                    }
+                }
+                for (int e = 0; e < expertTasks.size(); e++) {
+                    auto &task = expertTasks[e];
+                    if (task.size() == 0) {
+                        continue;
+                    }
+
+                    tempInput.Resize({(int)task.size(), inputDim});
+                    std::vector <MultiThreadMemcpyMultiLinesTask> memcpyTasks;
+                    for (int i = 0; i < (int)task.size(); i++) {
+                        memcpyTasks.push_back(MultiThreadMemcpyMultiLinesTask(tempInput.cpuData + i * inputDim * input.unitSize, input.cpuData + task[i].first * inputDim * input.unitSize, inputDim * input.unitSize));
+                    }
+                    RunMultiThreadMemcpyMultiLines(memcpyTasks, GetAlivePool());
+                    DoCpuLinearReshape(tempInput, *weights[e * 2], w3);
+                    DoCpuLinear(tempInput, *weights[e * 2], Data(), w3);
+
+                    int mid = w3.dims[1] / 2;
+                    w1.Resize({w3.dims[0], mid});
+                    w1.dataType = w3.dataType;
+                    w1.Allocate();
+                    SwigluMultiThread((float *) w3.cpuData, mid, mid, ((float *) w1.cpuData),
+                                    w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                    DoCpuLinearReshape(w1, *weights[e * 2 + 1], w2);
+                    DoCpuLinear(w1, *weights[e * 2 + 1], Data(), w2);
+
+                    float *curOutput;
+                    if (w2.dataType == DataType::FLOAT32) {
+                        curOutput = (float*)w2.cpuData;
+                    } else if (w2.dataType == DataType::FLOAT16) {
+                        Float16ToFloat32((uint16_t*)w2.cpuData, middleResult.data(), w2.Count(0));
+                        curOutput = middleResult.data();
+                    }
+
+                    for (int i = 0; i < (int)task.size(); i++) {
+                        float value = task[i].second;
+                        float *lastResult = tempResult.data() + task[i].first * dim;
+                        float *curResult = curOutput + i * dim;
+                        for (int j = 0; j < dim; j++) {
+                            lastResult[j] += value * curResult[j];
+                        }
+                    }
+                }
+                if (output.dataType == DataType::FLOAT32) {
+                    memcpy(output.cpuData, tempResult.data(), output.GetBytes());
+                } else if (output.dataType == DataType::FLOAT16) {
+                    Float32ToFloat16(tempResult.data(), (uint16_t*)output.cpuData, output.Count(0));
+                }
+/*
                 Data moeFinal = Data();
                 ToDataType(moeFinal, input.dataType);
                 moeFinal.Resize({0, input.dims[1]});
@@ -1008,6 +1126,7 @@ namespace fastllm {
                     CatDirect(moeFinal, moePart, 0);
                 }
                 memcpy(output.cpuData, moeFinal.cpuData, output.GetBytes());
+*/
             }
         }
     }
@@ -1486,6 +1605,15 @@ namespace fastllm {
         output.Resize(dims);
     }
 
+    void DoCpuLinearReshape(Data &input, Data &weight, Data &output) {
+        weight.weightType = WeightType::LINEAR;
+        std::vector <int> dims = input.dims;
+        dims.back() = weight.dims[0];
+
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
     void CpuLinearOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -1495,12 +1623,7 @@ namespace fastllm {
         AssertInFastLLM(weight.dims.size() == 2, "Linear's weight's shape's size should be 2.\n");
         AssertInFastLLM(input.dims.back() == weight.dims[1], "Linear's weight's shape error.\n");
 
-        weight.weightType = WeightType::LINEAR;
-        std::vector <int> dims = input.dims;
-        dims.back() = weight.dims[0];
-
-        output.dataType = input.dataType;
-        output.Resize(dims);
+        DoCpuLinearReshape(input, weight, output);
     }
 
     void MultiThreadInt4GroupLinearOp::Run() {
@@ -2034,6 +2157,19 @@ namespace fastllm {
         }
         delete[] temp;
 #endif
+#ifdef __AVX2__X
+        uint8_t *temp = new uint8_t[64];
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j + 63 < m; j += 64) {
+                memcpy(temp, output + i * m + j, 64);
+                for (int k = 0; k < 32; k++) {
+                    output[i * m + j + k] = temp[k * 2 + 1];
+                    output[i * m + j + k + 32] = temp[k * 2];
+                }
+            }
+        }
+        delete[] temp;
+#endif
         if (inputSums != nullptr) {
             for (int i = 0; i < n; i++) {
                 for (int g = 0; g < realGroup; g++) {
@@ -2057,16 +2193,8 @@ namespace fastllm {
         return true;
     }
 
-    void CpuLinearOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+    void DoCpuLinear(Data &input, Data &weight, const Data &bias, Data &output) {
 //auto st = std::chrono::system_clock::now();
-        Data &input = *(datas.find("input")->second);
-        Data &output = *(datas.find("output")->second);
-        Data &weight = *(datas.find("weight")->second);
-        Data &bias = *(datas.find("bias")->second);
-
-        AssertInFastLLM(bias.dataType == DataType::FLOAT32, "Linear's bias' type should be float32.\n");
-
         output.Allocate(0.0f);
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
@@ -2164,6 +2292,16 @@ namespace fastllm {
 //float spend = GetSpan(st, std::chrono::system_clock::now());
 //float gops = (float)n * m * k / spend / 1e9;
 // printf("n = %d, m = %d, k = %d, spend %f s, gops = %f\n", n, m, k, spend, gops);
+    }
+
+    void CpuLinearOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &bias = *(datas.find("bias")->second);
+        AssertInFastLLM(bias.dataType == DataType::FLOAT32, "Linear's bias' type should be float32.\n");
+        DoCpuLinear(input, weight, bias, output);
     }
 
     void CpuSplitOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -3289,6 +3427,24 @@ namespace fastllm {
                 vx = vdivq_f32(vx, vaddq_f32(c1, exp_ps(vnegq_f32(vx))));
                 vy = vmulq_f32(vx, vy);
                 vst1q_f32(outputData + i, vy);
+            }
+#endif
+
+#ifdef __AVX2__X
+            for (; i + 7 < mid; i += 8) {  // Process 8 elements at a time
+                // Load x values (inputData[i..i+7]) and y values (inputData[i+mid..i+mid+7])
+                __m256 x = _mm256_loadu_ps(&inputData[i]);
+                __m256 y = _mm256_loadu_ps(&inputData[i + mid]);
+                
+                // Compute sigmoid: 1.0 / (1.0 + expf(-x))
+                __m256 neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
+                __m256 exp_neg_x = exp256_ps(neg_x);  // See note below about exp_ps
+                __m256 denom = _mm256_add_ps(_mm256_set1_ps(1.0f), exp_neg_x);
+                __m256 sigmoid = _mm256_div_ps(x, denom);
+                
+                // Multiply by y and store result
+                __m256 result = _mm256_mul_ps(sigmoid, y);
+                _mm256_storeu_ps(&outputData[i], result);
             }
 #endif
             for (; i < mid; i++) {
