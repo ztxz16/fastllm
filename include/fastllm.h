@@ -293,6 +293,9 @@ namespace fastllm {
 
         bool directMemory = false; // 直接分配/释放Memory，不经过缓存
 
+        bool multiDeviceData = false;
+        std::map <int, Data*> multiDeviceDatas;
+        
         Data () {};
 
         Data (DataType type);
@@ -577,6 +580,15 @@ namespace fastllm {
     };
     
     bool CanRunLinearEx(LinearExType exType);
+
+    bool CanRunMergeAttention();
+    
+    void MergeAttention(Data &input, Data &weight0, Data &bias0, Data &weight1, Data &bias1, 
+                        Data &qkv, Data &q, Data &k, Data &v,
+                        int qNum, int kvNum, int headDim, int rotDim, float attentionScale,
+                        const Data &positionIds, Data &sinData, Data &cosData,
+                        std::vector <Data*> &keys, std::vector <Data*> &values, std::vector <Data*> &masks, 
+                        Data &output);
 
     bool CanRunMLP();
 

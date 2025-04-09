@@ -5,6 +5,8 @@ std::vector <long long> FastllmCudaGetFreeSizes();
 #ifdef  __cplusplus
 extern "C" {
 #endif
+
+void ForceDeviceSync();
 void FastllmInitCublas(void);
 
 void FastllmCudaMallocBigBuffer(size_t size);
@@ -31,10 +33,12 @@ bool FastllmFloatToHalf(void *a, void *b, int len);
 bool FastllmHalfToFloat(void *a, void *b, int len);
 bool FastllmBF16ToFloat(void *a, void *b, int len);
 
+void FastllmReduce(uint8_t *output, uint8_t* partOutput, int len, int threadNum, fastllm::DataType dataType);
+
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                           const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType);
-bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output);\
+bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaGelu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaRelu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output);
@@ -101,6 +105,8 @@ void FastllmResetLogitsOfEOS(int batch, fastllm::Data *logits, const std::vector
     const std::vector<int> eos_nums, const std::vector<int> eos_ids);
 
 void FastllmCudaSetDevice(int gpu_id);
+int FastllmCudaGetDevice();
+int GetPointerDeviceId(void *ptr);
 int FastllmCudaGetDeviceCount();
 #ifdef  __cplusplus
 }

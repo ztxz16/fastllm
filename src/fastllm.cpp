@@ -1082,6 +1082,11 @@ namespace fastllm {
     }
 
     Data::~Data() {
+        if (this->multiDeviceData) {
+            for (auto it : this->multiDeviceDatas) {
+                delete it.second;
+            }
+        }
         if (isFake) {
             return;
         }
@@ -1353,7 +1358,7 @@ namespace fastllm {
                     cpuData = new uint8_t[expansionBytes];
                     memcpy(cpuData, this->cpuData, expansionBytes);
 #endif
-                    FastllmCudaSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
+                    // FastllmCudaSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
                     this->cudaData = FastllmCudaMalloc(expansionBytes);
                     FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
 #ifdef USE_MMAP
@@ -3003,6 +3008,10 @@ namespace fastllm {
         return curExecutor->CanRunOnFirstDevice("MLP", {}, {}, {});
     }
 
+    bool CanRunMergeAttention() {
+        return curExecutor->CanRunOnFirstDevice("MergeAttention", {}, {}, {});
+    }
+
     void LinearEx(Data &input, Data &weight, const Data &bias, Data &output, LinearExType exType) {
         curExecutor->Run("Linear", {
                 {"input", &input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}
@@ -3016,6 +3025,27 @@ namespace fastllm {
                 {"weight1", &weight1}, {"bias1", (Data*)&bias1}, 
                 {"output", &output}
         }, {}, {});
+    }
+
+    void MergeAttention(Data &input, Data &weight0, Data &bias0, Data &weight1, Data &bias1, 
+        Data &qkv, Data &q, Data &k, Data &v,
+        int qNum, int kvNum, int headDim, int rotDim, float attentionScale,
+        const Data &positionIds, Data &sinData, Data &cosData,
+        std::vector <Data*> &keys, std::vector <Data*> &values, std::vector <Data*> &masks, 
+        Data &output) {
+        curExecutor->Run("MergeAttention", {
+                {"input", &input}, 
+                {"weight0", &weight0}, {"bias0", &bias0}, 
+                {"weight1", &weight1}, {"bias1", &bias1}, 
+                {"qkv", &qkv}, {"q", &q}, {"k", &k}, {"v", &v}, 
+                {"positionIds", (Data*)&positionIds},
+                {"sinData", (Data*)&sinData},
+                {"cosData", (Data*)&cosData},
+                {"keys", (Data*)keys.data()}, {"values", (Data*)values.data()}, {"masks", (Data*)masks.data()},
+                {"output", &output}
+        }, {{"attentionScale", attentionScale}}, 
+        {{"qNum", qNum}, {"kvNum",kvNum}, {"headDim", headDim}, {"rotDim", rotDim},
+        {"keys___batch", (int)keys.size()}, {"values___batch", (int)values.size()}, {"masks___batch", (int)masks.size()}});
     }
 
     void Split(const Data &input, int axis, int start, int end, Data &output) {

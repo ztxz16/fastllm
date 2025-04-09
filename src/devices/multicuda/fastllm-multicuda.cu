@@ -124,6 +124,17 @@ void FastllmMultiCudaSetDeviceRatio(std::map <int, int> &deviceRatio) {
     multiCudaCurrentRatios = deviceRatio;
 }
 
+void FastllmGetMulticudaDeviceAndRatio(std::vector <int> &devices, std::map <int, int> &ratios, bool noSpecial) {
+    devices.clear();
+    ratios.clear();
+    for (int i : multiCudaCurrentDevices) {
+        if (noSpecial == false || specialDeviceIds.find(i) == specialDeviceIds.end()) {
+            devices.push_back(i);
+            ratios[i] = multiCudaCurrentRatios.find(i) != multiCudaCurrentRatios.end() ? multiCudaCurrentRatios[i] : 1;
+        }
+    }
+}
+
 namespace fastllm {
     extern FP16ToFP32Manager fp16tofp32;
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
@@ -701,7 +712,8 @@ namespace fastllm {
 
 // 将total个计算任务切分
 // 若当前有x个设备，返回一个长度为(x + 1)的vector，第i个设备执行任务[ret[i], ret[i + 1])
-std::vector <int> FastllmMultiCudaGetSplitPoints(int total, int unit = 1) {
+std::vector <int> FastllmMultiCudaGetSplitPoints(std::vector <int> &multiCudaCurrentDevices, 
+                                std::map <int, int> &multiCudaCurrentRatios, int total, int unit = 1) {
     int deviceNum = multiCudaCurrentDevices.size();
     int nodes = total / unit;
     int totalRatio = 0;
@@ -730,8 +742,216 @@ std::vector <int> FastllmMultiCudaGetSplitPoints(int total, int unit = 1) {
     return ret;
 }
 
-// deviceId -> [[l0, r0), [l1, r1), ...]
-using DivisionScheme = std::map <int, std::vector <std::pair <int, int> > >;
+void CopyToMultiDevices(fastllm::Data &data, std::vector <int> devices, bool copyData) {
+    if (data.multiDeviceData) {
+        return;
+    }
+    data.multiDeviceData = true;
+    int oriId = FastllmCudaGetDevice();
+
+    if (copyData) {
+        data.ToDevice(fastllm::DataDevice::CPU);
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            data.multiDeviceDatas[device] = new fastllm::Data();
+            data.multiDeviceDatas[device]->CopyFrom(data);
+            data.multiDeviceDatas[device]->ToDevice(fastllm::DataDevice::CUDA);
+
+            data.multiDeviceDatas[device]->group = data.group;
+            data.multiDeviceDatas[device]->groupCnt = data.groupCnt;
+            data.multiDeviceDatas[device]->scales = data.scales;
+            data.multiDeviceDatas[device]->mins = data.mins;
+            data.multiDeviceDatas[device]->zeros = data.zeros;
+            data.multiDeviceDatas[device]->halfScales = data.halfScales;
+        }
+    } else {
+        for (int device : devices) {
+            if (data.dims.size() == 0) {
+                data.multiDeviceDatas[device] = new fastllm::Data(data.dataType);    
+            } else {
+                data.multiDeviceDatas[device] = new fastllm::Data(data.dataType, data.dims);
+            }
+            data.multiDeviceDatas[device]->dataDevice = data.dataDevice;
+        }
+    }
+    FastllmCudaSetDevice(oriId);
+}
+
+bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias, 
+                    std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme, int splitAxis) {
+    if (weight.multiDeviceData) {
+        return true;
+    }
+    weight.multiDeviceData = true;
+    bias.multiDeviceData = true;
+    int k = weight.dims[0], m = weight.dims[1];
+    cudaError_t state = cudaSuccess;
+    float *cudaBiasData = (float*)FastllmCudaMalloc(k * sizeof(float));
+    if (bias.dims.size() > 0) {
+        state = cudaMemcpy(cudaBiasData, (uint8_t *) bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+    } else {
+        state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
+    }
+        
+    for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
+        int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
+        std::string specialId = "";
+        SwitchDeviceAndGetInfos(deviceId, specialId, mallocType);
+        fastllm::DataDevice dataDevice = (malloc == 0 ? fastllm::DataDevice::CPU :fastllm::DataDevice::CUDA);
+
+        auto &div = divisionScheme[deviceId];
+        int len = 0;
+        for (auto &it : div) {
+            len += it.second - it.first;
+        }
+
+        void *deviceWeightData;
+        float *deviceBiasData;
+        cudaError_t state = cudaSuccess;
+        if (splitAxis == 0) {
+            weight.multiDeviceDatas[deviceId] = new fastllm::Data(weight.dataType, {len, m});
+            weight.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
+            bias.multiDeviceDatas[deviceId] = new fastllm::Data(bias.dataType, {len});
+            bias.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
+            weight.multiDeviceDatas[deviceId]->Allocate();
+            bias.multiDeviceDatas[deviceId]->Allocate();
+
+            deviceWeightData = mallocType == 0 ? weight.multiDeviceDatas[deviceId]->cpuData : weight.multiDeviceDatas[deviceId]->cudaData;
+            deviceBiasData = (float*)(mallocType == 0 ? bias.multiDeviceDatas[deviceId]->cpuData : bias.multiDeviceDatas[deviceId]->cudaData);
+            int curLen = 0;
+            for (auto &it : div) {
+                state = cudaMemcpy((uint8_t*)deviceWeightData + curLen * m * weight.unitSize / weight.unitSizeDiv, 
+                                    (uint8_t*)weight.cudaData + it.first * m * weight.unitSize / weight.unitSizeDiv, 
+                                    (it.second - it.first) * m * weight.unitSize / weight.unitSizeDiv, GetCudaMemcpyType(mallocType, 1));
+                state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first, (it.second - it.first) * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                curLen += (it.second - it.first);
+            }
+        } else {
+            weight.multiDeviceDatas[deviceId] = new fastllm::Data(weight.dataType, {k, len});
+            weight.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
+            bias.multiDeviceDatas[deviceId] = new fastllm::Data(bias.dataType, {k});
+            bias.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
+            weight.multiDeviceDatas[deviceId]->Allocate();
+            bias.multiDeviceDatas[deviceId]->Allocate();
+
+            deviceWeightData = mallocType == 0 ? weight.multiDeviceDatas[deviceId]->cpuData : weight.multiDeviceDatas[deviceId]->cudaData;
+            deviceBiasData = (float*)(mallocType == 0 ? bias.multiDeviceDatas[deviceId]->cpuData : bias.multiDeviceDatas[deviceId]->cudaData);
+
+            int curLen = 0;
+            for (auto &it : div) {
+                state = cudaMemcpy2D((uint8_t*)deviceWeightData + curLen * weight.unitSize / weight.unitSizeDiv,
+                                    (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
+                                    (uint8_t*)weight.cudaData + it.first * weight.unitSize / weight.unitSizeDiv, 
+                                    m * weight.unitSize / weight.unitSizeDiv, 
+                                    (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
+                                    k, GetCudaMemcpyType(mallocType, 1));
+                curLen += (it.second - it.first);
+            }
+            if (i == 0) {
+                state = cudaMemcpy(deviceBiasData, cudaBiasData, k * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+            } else {
+                state = AutoMemset(deviceBiasData, 0, k * sizeof(float), mallocType);
+            }
+        }
+
+        if (cudaSuccess != state) {
+            checkCudaErrors("Error: CUDA error when split weight!", state);
+            return false;
+        }
+    }
+
+    // 1. mins, scales
+    if (weight.mins.size() > 0) {
+        int weightGroup = weight.group < 0 ? 1 : weight.group;
+        std::vector <uint8_t> zeropoints = std::vector <uint8_t> (k * weightGroup, 0);
+        if (weight.perChannelsConfigs.size() > 0) {
+            for (int i = 0; i < k * weightGroup; i++) {
+                zeropoints[i] = weight.perChannelsConfigs[i].zeroPoint;
+            }
+        } else if (weight.zeros.size() > 0) {
+            for (int i = 0; i < k * weightGroup; i++) {
+                zeropoints[i] = weight.zeros[i];
+            }
+        } else {
+            for (int i = 0; i < k * weightGroup; i++) {
+                zeropoints[i] = 0;
+            }
+        }
+        for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
+            int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
+            std::string specialId = "";
+            SwitchDeviceAndGetInfos(deviceId, specialId, mallocType);
+            
+            auto &div = divisionScheme[deviceId];
+            int len = 0;
+            for (auto &it : div) {
+                len += it.second - it.first;
+            }
+
+            float *cudaScales;
+            float *cudaMins;
+            uint8_t *cudaZeropoints;
+            auto curDevice = weight.multiDeviceDatas[deviceId];
+            if (splitAxis == 0) {
+                curDevice->group = weight.group;
+                curDevice->groupCnt = weight.groupCnt;
+                curDevice->scales.resize(len * weightGroup);
+                curDevice->mins.resize(len * weightGroup);
+                if (weight.dataType == fastllm::DataType::INT4_GROUP) {
+                    int curLen = 0;
+                    for (auto &it : div) {
+                        memcpy(curDevice->scales.data() + curLen * weightGroup, weight.scales.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
+                        memcpy(curDevice->mins.data() + curLen * weightGroup, weight.mins.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
+                        curLen += (it.second - it.first);
+                    }
+                } else {
+                    curDevice->zeros.resize(len * weightGroup);
+                    int curLen = 0;
+                    for (auto &it : div) {
+                        memcpy(curDevice->scales.data() + curLen * weightGroup, weight.scales.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
+                        memcpy(curDevice->mins.data() + curLen * weightGroup, weight.mins.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
+                        memcpy(curDevice->zeros.data() + curLen * weightGroup, zeropoints.data() + it.first * weightGroup, (it.second - it.first) * weightGroup);
+                        curLen += (it.second - it.first);
+                    }
+                }
+            } else {
+                curDevice->scales.resize(k * weightGroup);
+                curDevice->mins.resize(k * weightGroup);
+                curDevice->group = weight.group;
+                curDevice->groupCnt = weight.groupCnt;
+                if (weight.dataType == fastllm::DataType::INT4_GROUP) {
+                    int base = div[0].first / weight.groupCnt;
+                    std::vector <float> scales, mins;
+                    for (int i = 0; i < weight.scales.size(); i++) {
+                        scales.push_back((i + base < weight.scales.size() ? weight.scales[i + base] : 0.0f));
+                    }
+                    for (int i = 0; i < weight.mins.size(); i++) {
+                        mins.push_back((i + base < weight.mins.size() ? weight.mins[i + base] : 0.0f));
+                    }
+                    memcpy(curDevice->scales.data(), scales.data(), k * weightGroup * sizeof(float));
+                    memcpy(curDevice->mins.data(), mins.data(), k * weightGroup * sizeof(float));
+                } else {
+                    curDevice->zeros.resize(k * weightGroup);
+                    memcpy(curDevice->scales.data(), weight.scales.data(), k * weightGroup * sizeof(float));
+                    memcpy(curDevice->mins.data(), weight.mins.data(), k * weightGroup * sizeof(float));
+                    memcpy(curDevice->zeros.data(), zeropoints.data(), k * weightGroup);
+                }
+            }
+        }
+    }
+
+    if (cudaSuccess != state) {
+        checkCudaErrors("Error: CUDA error when split weight!", state);
+        return false;
+    }
+
+    cudaSetDevice(0);
+    FastllmCudaFree(weight.cudaData);
+    FastllmCudaFree(cudaBiasData);
+    weight.cudaData = nullptr;
+    weight.weightSum.clear();
+    return true;
+}
 
 bool PrepareMultiCudaWeight(fastllm::Data &weight, const fastllm::Data &bias, DivisionScheme divisionScheme, int splitAxis) {
     int k = weight.dims[0], m = weight.dims[1];
@@ -977,7 +1197,7 @@ bool PrepareMultiCudaHalfWeight(fastllm::Data &weight, const fastllm::Data &bias
 
 template <typename T>
 bool FastllmMultiCudaMatMulInner(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
-    std::vector <int> points = FastllmMultiCudaGetSplitPoints(k, weight.groupCnt <= 0 ? 1 : weight.groupCnt);
+    std::vector <int> points = FastllmMultiCudaGetSplitPoints(multiCudaCurrentDevices, multiCudaCurrentRatios, k, weight.groupCnt <= 0 ? 1 : weight.groupCnt);
     DivisionScheme divisionScheme;
     for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
         int deviceId = multiCudaCurrentDevices[i];
@@ -1110,7 +1330,7 @@ bool FastllmMultiCudaMLPInner(const fastllm::Data &input, fastllm::Data &weight0
     }
     cudaSetDevice(0);
 
-    std::vector <int> points = FastllmMultiCudaGetSplitPoints(weight0.dims[0] / 2, weight0.groupCnt <= 0 ? 1 : weight0.groupCnt);
+    std::vector <int> points = FastllmMultiCudaGetSplitPoints(multiCudaCurrentDevices, multiCudaCurrentRatios, weight0.dims[0] / 2, weight0.groupCnt <= 0 ? 1 : weight0.groupCnt);
     if ((weight0.extraCudaData.size() == 0)) {
         int mid = weight0.dims[0] / 2;
         DivisionScheme divisionScheme;
@@ -1170,7 +1390,7 @@ bool FastllmMultiCudaMLPInner(const fastllm::Data &input, fastllm::Data &weight0
 
         T *partOutput = (T*)FastllmCudaMalloc(output.GetBytes() * threadNum);
 
-        std::vector <int> points = FastllmMultiCudaGetSplitPoints(weight0.dims[0] / 2, weight0.groupCnt <= 0 ? 1 : weight0.groupCnt); // 因为要swiglu，所以先/2
+        std::vector <int> points = FastllmMultiCudaGetSplitPoints(multiCudaCurrentDevices, multiCudaCurrentRatios, weight0.dims[0] / 2, weight0.groupCnt <= 0 ? 1 : weight0.groupCnt); // 因为要swiglu，所以先/2
         for (int i = 0; i < threadNum; i++) {
             int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
             std::string specialId = "";
