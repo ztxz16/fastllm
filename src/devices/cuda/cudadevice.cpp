@@ -15,6 +15,7 @@ namespace fastllm {
         this->ops["ToFloat16"] = (BaseOperator*)(new CudaToFloat16());
         this->ops["ToFloat32"] = (BaseOperator*)(new CudaToFloat32());
         this->ops["Attention"] = (BaseOperator*)(new CudaAttention());
+        this->ops["MergeAttention"] = (BaseOperator*)(new CudaMergeAttention());
         this->ops["CopyKVCache"] = (BaseOperator*)(new CudaCopyKVCacheOp());
         this->ops["Embedding"] = (BaseOperator*)(new CudaEmbedding());
         this->ops["LayerNorm"] = (BaseOperator*)(new CudaLayerNormOp());
@@ -126,6 +127,12 @@ namespace fastllm {
         }
     }
 
+    void DoCudaAttentionReshape(Data &q, Data &v, Data &output) {
+        std::vector <int> dims = {q.dims[0], q.dims[1], v.dims[2]};
+        output.dataType = q.dataType;
+        output.Resize(dims);
+    }
+
     void CudaAttention::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &q = *(datas.find("q")->second);
@@ -146,9 +153,16 @@ namespace fastllm {
                         q.dataType == DataType::FLOAT16, 
                         "Attention's input's type should be float32 or float16.\n");
 
-        std::vector <int> dims = {q.dims[0], q.dims[1], v.dims[2]};
-        output.dataType = q.dataType;
-        output.Resize(dims);
+        DoCudaAttentionReshape(q, v, output);
+    }
+
+    void DoCudaAttention(Data &q, Data &k, Data &v, Data &mask, Data &output, int group, float scale, int maskType) {
+        output.Allocate();
+        if (q.dataType == DataType::FLOAT32) {
+            FastllmCudaAttention(q, k, v, mask, output, group, scale, maskType);
+        } else if (q.dataType == DataType::FLOAT16) {
+            FastllmCudaHalfAttention(q, k, v, mask, output, group, scale, maskType);
+        }
     }
 
     void CudaAttention::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -162,13 +176,8 @@ namespace fastllm {
         int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
         int maskType = intParams.find("maskType") != intParams.end() ? intParams.find("maskType")->second : 0;
-        output.Allocate();
 
-        if (q.dataType == DataType::FLOAT32) {
-            FastllmCudaAttention(q, k, v, mask, output, group, scale, maskType);
-        } else if (q.dataType == DataType::FLOAT16) {
-            FastllmCudaHalfAttention(q, k, v, mask, output, group, scale, maskType);
-        }
+        DoCudaAttention(q, k, v, mask, output, group, scale, maskType);
     }
 
     void CudaCopyKVCacheOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -287,6 +296,15 @@ namespace fastllm {
         FastllmCudaConv2DFloat32(input, weight, bias, inputChannels, outputChannels, kernelH, kernelW, strideH, strideW, padH, padW, output);
     }
 
+    void DoCudaLinearReshape(Data &input, Data &weight, Data &output) {
+        weight.weightType = WeightType::LINEAR;
+        std::vector <int> dims = input.dims;
+        dims.back() = weight.dims[0];
+
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
     void CudaLinearOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -295,13 +313,7 @@ namespace fastllm {
 
         AssertInFastLLM(weight.dims.size() == 2, "Linear's weight's shape's size should be 2.\n");
         AssertInFastLLM(input.dims.back() == weight.dims[1], "Linear's weight's shape error.\n");
-
-        weight.weightType = WeightType::LINEAR;
-        std::vector <int> dims = input.dims;
-        dims.back() = weight.dims[0];
-
-        output.dataType = input.dataType;
-        output.Resize(dims);
+        DoCudaLinearReshape(input, weight, output);
     }
 
     bool CudaLinearOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
@@ -312,13 +324,7 @@ namespace fastllm {
         return true;
     }
 
-    void CudaLinearOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data &input = *(datas.find("input")->second);
-        Data &output = *(datas.find("output")->second);
-        Data &weight = *(datas.find("weight")->second);
-        Data &bias = *(datas.find("bias")->second);
-
+    void DoCudaLinear(Data &input, Data &weight, Data &bias, Data &output) {
         output.Allocate();
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
@@ -360,14 +366,16 @@ namespace fastllm {
         }
     }
 
-    void CudaSplitOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
-                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+    void CudaLinearOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
-        int start = intParams.find("start") != intParams.end() ? intParams.find("start")->second : 0;
-        int end = intParams.find("end") != intParams.end() ? intParams.find("end")->second : 0;
+        Data &weight = *(datas.find("weight")->second);
+        Data &bias = *(datas.find("bias")->second);
+        DoCudaLinear(input, weight, bias, output);
+    }
 
+    void DoCudaSplitReshape(Data &input, int axis, int start, int end, Data &output) {
         int dimsLen = input.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
 
@@ -380,16 +388,18 @@ namespace fastllm {
         output.Resize(dims);
     }
 
-    void CudaSplitOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+    void CudaSplitOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-
-        output.Allocate();
-
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
         int start = intParams.find("start") != intParams.end() ? intParams.find("start")->second : 0;
         int end = intParams.find("end") != intParams.end() ? intParams.find("end")->second : 0;
+        DoCudaSplitReshape(input, axis, start, end, output);
+    }
+
+    void DoCudaSplit(Data &input, int axis, int start, int end, Data &output) {
+        output.Allocate();
 
         int dimsLen = input.dims.size();
         axis = (axis % dimsLen + dimsLen) % dimsLen;
@@ -406,6 +416,16 @@ namespace fastllm {
         FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)output.cudaData, outputStride * unitSize,
                                           (uint8_t*)input.cudaData + start * inner * unitSize, inputStride * unitSize,
                                           (end - start) * inner * unitSize, outer);
+    }
+
+    void CudaSplitOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int start = intParams.find("start") != intParams.end() ? intParams.find("start")->second : 0;
+        int end = intParams.find("end") != intParams.end() ? intParams.find("end")->second : 0;
+        DoCudaSplit(input, axis, start, end, output);
     }
 
     void CudaRepeatOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -465,13 +485,7 @@ namespace fastllm {
                                             input1.dims[axis] * inner * unitSize, outer);
     }
 
-    void CudaCatDirectOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data &input0 = *(datas.find("input0")->second);
-        Data &input1 = *(datas.find("input1")->second);
-
-        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
-
+    void DoCudaCatDirect(Data &input0, Data &input1, int axis) {
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
                                 (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
                         "Cat's input's type should be float32 or float16.\n");
@@ -518,6 +532,15 @@ namespace fastllm {
                                           input0Stride * unitSize,
                                           (uint8_t *) input1.cudaData, input1Stride * unitSize,
                                           input1.dims[axis] * inner * unitSize, outer);
+    }
+
+    void CudaCatDirectOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        DoCudaCatDirect(input0, input1, axis);
     }
 
     void CudaMatMulOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -822,20 +845,7 @@ namespace fastllm {
         FastllmCudaTopK(input, output, topk);
     }
 
-    void CudaPermuteSelfOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data &input = *(datas.find("input")->second);
-        Data &axisData = *(datas.find("axis")->second);
-        std::vector <int> axis;
-        for (int i = 0; i < axisData.Count(0); i++) {
-            axis.push_back(((int32_t *) axisData.cpuData)[i]);
-        }
-
-        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                                input.dataType == DataType::FLOAT16,
-                                "Permute error: datatype should be float32 or float16.");
-        AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
-
+    void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis) {
         bool same = false;
         same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
         same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[2] == 1);
@@ -853,6 +863,22 @@ namespace fastllm {
         }
 
         FastllmCudaPermute(input, axis);
+    }
+
+    void CudaPermuteSelfOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &axisData = *(datas.find("axis")->second);
+        std::vector <int> axis;
+        for (int i = 0; i < axisData.Count(0); i++) {
+            axis.push_back(((int32_t *) axisData.cpuData)[i]);
+        }
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                                input.dataType == DataType::FLOAT16,
+                                "Permute error: datatype should be float32 or float16.");
+        AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
+        DoCudaPermuteSelf(input, axis);
     }
 
     void CudaRotatePosition2DOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -905,5 +931,112 @@ namespace fastllm {
         Data &positionIds = *(datas.find("positionIds")->second);
 
         FastllmCudaApplyLognAttn(input, lognAttn, positionIds);
+    }
+
+    void CudaMergeAttention::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight1 = *(datas.find("weight1")->second);
+        Data &output = *(datas.find("output")->second);
+        std::vector <int> dims = input.dims;
+        dims.back() = weight1.dims[0];
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    void CudaMergeAttention::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight0 = *(datas.find("weight0")->second);
+        Data &bias0 = *(datas.find("bias0")->second);
+        Data &weight1 = *(datas.find("weight1")->second);
+        Data &bias1 = *(datas.find("bias1")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &sinData = *(datas.find("sinData")->second);
+        Data &cosData = *(datas.find("cosData")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &qkv = *(datas.find("qkv")->second);
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        int qNum = intParams.find("qNum")->second;
+        int kvNum = intParams.find("kvNum")->second;
+        int headDim = intParams.find("headDim")->second;
+        int rotDim = intParams.find("rotDim")->second;
+        float attentionScale = floatParams.find("attentionScale")->second;
+        Data **keys = (Data**)(datas.find("keys")->second);
+        Data **values = (Data**)(datas.find("values")->second);
+        Data **masks = (Data**)(datas.find("masks")->second);
+        output.Allocate();
+
+        int bsz = input.dims[0], seqlen = input.dims[1];
+        DoCudaLinearReshape(input, weight0, qkv);
+        DoCudaLinear(input, weight0, bias0, qkv);
+
+        int per = qkv.dims.back() / (qNum / kvNum + 2);
+        int qdim = per * (qNum / kvNum);
+        
+        DoCudaSplitReshape(qkv, -1, 0, qdim, q);
+        DoCudaSplitReshape(qkv, -1, qdim, qdim + per, k);
+        DoCudaSplitReshape(qkv, -1, qdim + per, qdim + per * 2, v);
+        DoCudaSplit(qkv, -1, 0, qdim, q);
+        DoCudaSplit(qkv, -1, qdim, qdim + per, k);
+        DoCudaSplit(qkv, -1, qdim + per, qdim + per * 2, v);
+
+        std::vector <int> qkvSize = {bsz, seqlen, -1, headDim};
+        q.Reshape(qkvSize);
+        k.Reshape(qkvSize);
+        v.Reshape(qkvSize);
+
+        FastllmCudaLlamaRotatePosition2D(q, positionIds, sinData, cosData, rotDim);
+        FastllmCudaLlamaRotatePosition2D(k, positionIds, sinData, cosData, rotDim);
+
+        DoCudaPermuteSelf(q, {0, 2, 1, 3});
+        DoCudaPermuteSelf(k, {0, 2, 1, 3});
+        DoCudaPermuteSelf(v, {0, 2, 1, 3});
+
+        qkvSize = {-1, seqlen, headDim};
+        q.Reshape(qkvSize);
+        k.Reshape(qkvSize);
+        v.Reshape(qkvSize);
+
+        int unitLen = 128;
+        Data &pastKey = *keys[0];
+        Data &pastValue = *values[0];
+        while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || seqlen > pastKey.expansionDims[1]))
+            || (pastKey.dims.size() > 0 && pastKey.dims[1] + seqlen > pastKey.expansionDims[1])) {
+            std::vector <int> newDims;
+            if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
+            } else {
+                newDims = pastKey.dims;
+                newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
+            }
+            pastKey.Expansion(newDims);
+        }
+        while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || seqlen > pastValue.expansionDims[1]))
+            || (pastValue.dims.size() > 0 && pastValue.dims[1] + seqlen > pastValue.expansionDims[1])) {
+            std::vector <int> newDims;
+            if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
+            } else {
+                newDims = pastValue.dims;
+                newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
+            }
+            pastValue.Expansion(newDims);
+        }
+
+        DoCudaCatDirect(pastKey, k, 1);
+        DoCudaCatDirect(pastValue, v, 1);
+
+        DoCudaAttentionReshape(q, pastValue, qkv);
+        DoCudaAttention(q, pastKey, pastValue, *masks[0], qkv, q.dims[0] / pastKey.dims[0], attentionScale, 1);
+
+        DoCudaPermuteSelf(qkv, {1, 0, 2});
+        qkv.Reshape({seqlen, bsz, -1});
+        DoCudaPermuteSelf(qkv, {1, 0, 2});
+
+        DoCudaLinearReshape(qkv, weight1, output);
+        DoCudaLinear(qkv, weight1, bias1, output);
     }
 }
