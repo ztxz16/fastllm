@@ -27,13 +27,16 @@ def add_server_args(parser):
     parser.add_argument("--think", type=bool, default = False, help="if <think> lost")
 
 def make_normal_llm_model(args):
-    if (args.model != ''):
+    if (args.model and args.model != ''):
         if (args.model.endswith(".json") and os.path.exists(args.model)):
             import json
             with open(args.model, "r", encoding = "utf-8") as file:
                 args_config = json.load(file)
                 for it in args_config.keys():
+                    if (it == "FASTLLM_USE_NUMA" or it == "FASTLLM_NUMA_THREADS"):
+                        os.environ[it] = str(args_config[it])
                     setattr(args, it, args_config[it])
+                
     usenuma = False
     try:
         env_FASTLLM_USE_NUMA = os.getenv("FASTLLM_USE_NUMA")
