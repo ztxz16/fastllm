@@ -4,7 +4,7 @@ import sys
 
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description = des, add_help = add_help)
-    parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹')
+    parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹或配置文件')
     parser.add_argument('-p', '--path', type = str, required = False, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
     parser.add_argument('-t', '--threads', type = int, default = -1,  help = '线程数量')
     parser.add_argument('-l', '--low', action = 'store_true', help = '是否使用低内存模式')
@@ -27,6 +27,13 @@ def add_server_args(parser):
     parser.add_argument("--think", type=bool, default = False, help="if <think> lost")
 
 def make_normal_llm_model(args):
+    if (args.model != ''):
+        if (args.model.endswith(".json") and os.path.exists(args.model)):
+            import json
+            with open(args.model, "r", encoding = "utf-8") as file:
+                args_config = json.load(file)
+                for it in args_config.keys():
+                    setattr(args, it, args_config[it])
     usenuma = False
     try:
         env_FASTLLM_USE_NUMA = os.getenv("FASTLLM_USE_NUMA")
