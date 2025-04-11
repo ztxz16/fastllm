@@ -17,7 +17,7 @@
 #include "armMath.h"
 #endif
 
-#ifdef __AVX2__X
+#ifdef __AVX2__
 #include "avxMath.h"
 #endif
 
@@ -500,6 +500,23 @@ namespace fastllm {
                     vst1q_f32(out + i, vy);
                 }
     #endif
+    #ifdef __AVX2__
+                for (; i + 7 < len; i += 8) {  // Process 8 elements at a time
+                    // Load x values (inputData[i..i+7]) and y values (inputData[i+mid..i+mid+7])
+                    __m256 x = _mm256_loadu_ps(&cur[i]);
+                    __m256 y = _mm256_loadu_ps(&cur[i + mid]);
+                    
+                    // Compute sigmoid: 1.0 / (1.0 + expf(-x))
+                    __m256 neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
+                    __m256 exp_neg_x = exp256_ps(neg_x);  // See note below about exp_ps
+                    __m256 denom = _mm256_add_ps(_mm256_set1_ps(1.0f), exp_neg_x);
+                    __m256 sigmoid = _mm256_div_ps(x, denom);
+                    
+                    // Multiply by y and store result
+                    __m256 result = _mm256_mul_ps(sigmoid, y);
+                    _mm256_storeu_ps(&out[i], result);
+                }
+    #endif
                 for (; i < len; i++) {
                     float x = cur[i], y = cur[i + mid];
                     out[i] = (x / (1.0 + expf(-x))) * y;
@@ -657,7 +674,8 @@ namespace fastllm {
     void CpuMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuLinearOp());
-// auto ttt = std::chrono::system_clock::now();
+ // auto ttt = std::chrono::system_clock::now();
+ // std::vector <std::pair <std::string, float> > record;
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &gateBias = *(datas.find("gateBias")->second);
@@ -697,23 +715,27 @@ namespace fastllm {
                 }
                 floatLogits = vLogits.data();
             }
-
             for (int o = 0; o < outer; o++) {
-// printf("very first spend %f s.\n", GetSpan(ttt, std::chrono::system_clock::now()));
                 std::vector <std::pair <float, int> > oriV;
+                oriV.resize(channels);
                 for (int j = 0; j < channels; j++) {
-                    oriV.push_back(std::make_pair(-floatLogits[o * channels + j], j));
+                    oriV[j].first = -floatLogits[o * channels + j];
+                    oriV[j].second = j;
                 }
                 if (gateBias.dims.size() > 0) {
-                    ToDataType(gateBias, DataType::FLOAT32);
-                    gateBias.ToDevice(DataDevice::CPU);
+                    if (gateBias.dataType != DataType::FLOAT32) {
+                        ToDataType(gateBias, DataType::FLOAT32);
+                    }
                     float *cpuBias = (float*)gateBias.cpuData;
                     for (int i = 0; i < channels; i++) {
                         oriV[i].first -= cpuBias[i];
                     }
                 }
-
-                sort(oriV.begin(), oriV.end());
+// record.push_back(std::make_pair("very first", GetSpan(ttt, std::chrono::system_clock::now())));
+                // sort(oriV.begin(), oriV.end());
+                std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
+                // std::nth_element(oriV.begin(), oriV.begin() + topk, oriV.end());
+// record.push_back(std::make_pair("sort", GetSpan(ttt, std::chrono::system_clock::now())));
                 float sum = 1.0;
                 if (needNorm) {
                     sum = 0.0;
@@ -739,20 +761,24 @@ namespace fastllm {
                 std::vector<uint8_t> uinput;
                 std::vector <float> inputSums;
                 std::vector <float> iscales, izeros;
-// printf("before OnlineQuantization spend %f s.\n", GetSpan(ttt, std::chrono::system_clock::now()));
+// record.push_back(std::make_pair("before OnlineQuantization", GetSpan(ttt, std::chrono::system_clock::now())));
                 OnlineQuantization(inputData, uinput, inputConfigs, 1, m, group, groupCnt, 
                                     inputSums, iscales, izeros);
-// printf("OnlineQuantization spend %f s.\n", GetSpan(ttt, std::chrono::system_clock::now()));
+// record.push_back(std::make_pair("OnlineQuantization", GetSpan(ttt, std::chrono::system_clock::now())));
                 std::vector <float*> middles;
                 std::vector <float*> results;
+                middles.resize(v.size());
+                results.resize(v.size());
                 for (int j = 0; j < v.size(); j++) {
                     int idx = v[j].first;
                     weights[idx * 2]->CalcWeightSum();
                     weights[idx * 2 + 1]->CalcWeightSum();
-                    middles.push_back(new float[weights[idx * 2]->dims[0]]);
-                    results.push_back(new float[weights[idx * 2 + 1]->dims[0]]);
                 }
-
+                for (int j = 0; j < v.size(); j++) {
+                    int idx = v[j].first;
+                    middles[j] = new float[weights[idx * 2]->dims[0]];
+                    results[j] = new float[weights[idx * 2 + 1]->dims[0]];
+                }
                 std::vector<fastllm::MultiThreadBaseOp*> ops;
                 auto *pool = GetAlivePool();
                 int threads = pool->threads.size();
@@ -767,7 +793,7 @@ namespace fastllm {
                 inputSumsDown.resize(v.size());
                 iscalesDown.resize(v.size());
                 izerosDown.resize(v.size());
-// printf("prepare input spend %f s.\n", GetSpan(ttt, std::chrono::system_clock::now()));
+ // record.push_back(std::make_pair("prepare", GetSpan(ttt, std::chrono::system_clock::now())));
                 for (int st = 0; st < v.size(); st++) {
                     int k = weights[v[st].first * 2]->dims[0];
                     int end = st, selSum = 1; // 一共处理selSum * k个输出
@@ -785,8 +811,8 @@ namespace fastllm {
                         }
                     }
                     int base = threads / selSum;
-
                     int threadSt = 0;
+// float xxx = 0;
                     for (int l = st; l <= end; l++) {
                         int idx = v[l].first;
                         Data *weight = weights[idx * 2];
@@ -795,18 +821,20 @@ namespace fastllm {
                         float *biasData = nullptr;
                         int curK = weight->dims[0];
                         int curThread = (curK / k) * base;
+// xxx += m * curK;
                         MultiplyInt4GroupMultiThreadLaunch(uinput.data(), weightData, outputData, 1, m, curK,
                                                 weight->weightSum.data(), weight->mins.data(), weight->scales.data(), biasData, 
                                                 inputSums, iscales, izeros,
                                                 inputConfigs, threadSt, curThread, group, groupCnt, ops, pool);
                         threadSt += curThread;
                     }
-
                     for (int j = 0; j < ops.size(); j++) {
                         pool->Wait(j);
                         delete ops[j];
                     }
-// printf("st = %d, end = %d, mul0 spend %f s.\n", st, end, GetSpan(ttt, std::chrono::system_clock::now()));
+// record.push_back(std::make_pair("mul0", GetSpan(ttt, std::chrono::system_clock::now())));
+// float spend = record.back().second - record[record.size() - 2].second;
+// printf("speed = %f gops.\n", xxx / spend / 1e9);
                     // swiglu
                     threadSt = 0;
                     for (int l = st; l <= end; l++) {
@@ -814,28 +842,8 @@ namespace fastllm {
                         int spatial = weights[idx * 2]->dims[0], mid = spatial / 2;
                         float *outputData = middles[l];
                         int curK = weights[idx * 2]->dims[0];
-                        int curThread = (curK / k) * base;
-                        int per = mid / curThread;
-                        int cur = 0;
-                        for (int i = 0; i < curThread; i++) {
-                            int end = (i == curThread - 1 ? mid : cur + per + (cur + per * (curThread - i) < mid));
-                            ops[threadSt + i] = (new fastllm::MultiThreadSwigluOp(outputData + cur, mid, end - cur, outputData + cur,
-                                                                        1, spatial, spatial));
-                            cur = end;
-                        }
-                        for (int i = 0; i < curThread; i++) {
-                            pool->PushOp(threadSt + i, ops[threadSt + i]);
-                        }
-                        threadSt += curThread;
-                    }
-                    for (int j = 0; j < ops.size(); j++) {
-                        pool->Wait(j);
-                        delete ops[j];
-                    }
-// printf("st = %d, end = %d, swiglu spend %f s.\n", st, end, GetSpan(ttt, std::chrono::system_clock::now()));
-                    for (int l = st; l <= end; l++) {
-                        int idx = v[l].first;
-                        int mid = weights[idx * 2]->dims[0] / 2;
+                        ops[l - st] = new fastllm::MultiThreadMultiOps();
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
                         Data *weightDown = weights[idx * 2 + 1];
                         int groupDown = weightDown->group, groupCntDown = weightDown->groupCnt;
                         if (weightDown->dataType != DataType::INT4_GROUP) {
@@ -853,18 +861,18 @@ namespace fastllm {
                         iscales.resize(n * groupDown);
                         izeros.resize(n * groupDown);
 
-                        ops[l - st] = new MultiThreadOnlineQuantizationOp(
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new MultiThreadOnlineQuantizationOp(
                                     middles[l], uinputDown.data(), inputConfigs.data(),
                                     1, mid, groupDown, groupCntDown,
-                                    inputSums.data(), iscales.data(), izeros.data());
+                                    inputSums.data(), iscales.data(), izeros.data()));
                         pool->PushOp(l - st, ops[l - st]);
                     }
-
                     for (int l = st; l <= end; l++) {
                         pool->Wait(l - st);
                         delete ops[l - st];
                     }
-// printf("st = %d, end = %d, quant spend %f s.\n", st, end, GetSpan(ttt, std::chrono::system_clock::now()));
+// record.push_back(std::make_pair("swiglu", GetSpan(ttt, std::chrono::system_clock::now())));
+ // record.push_back(std::make_pair("quant", GetSpan(ttt, std::chrono::system_clock::now())));
                     threadSt = 0;
                     for (int l = st; l <= end; l++) {
                         int idx = v[l].first;
@@ -893,10 +901,10 @@ namespace fastllm {
                         pool->Wait(j);
                         delete ops[j];
                     }
-// printf("st = %d, end = %d, mul1 spend %f s.\n", st, end, GetSpan(ttt, std::chrono::system_clock::now()));
+ // record.push_back(std::make_pair("mul1", GetSpan(ttt, std::chrono::system_clock::now())));
                     st = end;
                 }
-// printf("finish spend %f s.\n", GetSpan(ttt, std::chrono::system_clock::now()));
+// record.push_back(std::make_pair("finish", GetSpan(ttt, std::chrono::system_clock::now())));
                 float *fLastOutput = ((float*)output.cpuData) + o * m;
                 std::vector <float> tempOutput;
                 if (output.dataType == DataType::FLOAT16) {
@@ -935,11 +943,14 @@ namespace fastllm {
                     delete[] results[j];
                     delete[] middles[j];
                 }
-// printf("get f32 output spend %f s.\n", GetSpan(ttt, std::chrono::system_clock::now()));
+ // record.push_back(std::make_pair("get f32 output", GetSpan(ttt, std::chrono::system_clock::now())));
                 if (output.dataType == DataType::FLOAT16) {
                     Float32ToFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
                 }
-//printf("finish output spend %f s.\n", GetSpan(ttt, std::chrono::system_clock::now()));
+// record.push_back(std::make_pair("finish output", GetSpan(ttt, std::chrono::system_clock::now())));
+// for (int i = 0; i < record.size(); i++) {
+    // printf("%s spend %f s.\n", record[i].first.c_str(), record[i].second);
+// }
             }
         } else {
             // normal
@@ -2125,10 +2136,94 @@ namespace fastllm {
             vst1_u8(uValue + j, out);
         }
 #endif
+#ifdef __AVX2__
+        __m256 vScale = _mm256_set1_ps(scale);
+        __m256 vZeroPoint = _mm256_set1_ps(zeroPoint);
+        __m256 vZero = _mm256_setzero_ps();
+        __m256 vHalf = _mm256_set1_ps(0.5f);
+        __m256 vMax = _mm256_set1_ps(255.0f);
+        for (; j + 7 < len; j += 8) {
+            // Load 8 floats
+            __m256 vValue = _mm256_loadu_ps(&fValue[j]);
+            
+            // fValue[j] / scale + zeroPoint + 0.5
+            __m256 vScaled = _mm256_div_ps(vValue, vScale);
+            __m256 vWithZP = _mm256_add_ps(vScaled, vZeroPoint);
+            __m256 vWithHalf = _mm256_add_ps(vWithZP, vHalf);
+            
+            // max(..., 0.0)
+            __m256 vClampedLow = _mm256_max_ps(vWithHalf, vZero);
+            
+            // min(..., 255.0)
+            __m256 vClampedHigh = _mm256_min_ps(vClampedLow, vMax);
+            
+            // Convert to int32 (truncate)
+            __m256i vInt32 = _mm256_cvtps_epi32(vClampedHigh);
+            
+            // Pack into 16-bit integers
+            __m128i vInt16 = _mm_packus_epi32(
+                _mm256_extractf128_si256(vInt32, 0),
+                _mm256_extractf128_si256(vInt32, 1));
+            
+            // Pack into 8-bit integers
+            __m128i vInt8 = _mm_packus_epi16(vInt16, vInt16);
+            
+            // Store the lower 64 bits (8 bytes)
+            _mm_storel_epi64((__m128i*)&uValue[j], vInt8);
+        }
+#endif
         for (; j < len; j++) {
             uValue[j] = (uint8_t) (std::min(255., (double) std::max(fValue[j] / scale + zeroPoint + 0.5, 0.0)));
         }
     }
+
+#ifdef __AVX2__
+    void Avx2InputPermute(uint8_t* output, int n, int m) {
+        /*uint8_t *temp = new uint8_t[32];
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j + 31 < m; j += 32) {
+                memcpy(temp, output + i * m + j, 32);
+                for (int k = 0; k < 16; k++) {
+                    output[i * m + j + k] = temp[k * 2 + 1];
+                    output[i * m + j + k + 16] = temp[k * 2];
+                }
+            }
+        }
+        delete[] temp;
+        return;*/
+
+        const __m256i mask_even = _mm256_setr_epi8(
+            0, 2, 4, 6, 8, 10, 12, 14, 
+            16, 18, 20, 22, 24, 26, 28, 30,
+            0, 2, 4, 6, 8, 10, 12, 14,
+            16, 18, 20, 22, 24, 26, 28, 30
+        );
+        const __m256i mask_odd = _mm256_setr_epi8(
+            1, 3, 5, 7, 9, 11, 13, 15,
+            17, 19, 21, 23, 25, 27, 29, 31,
+            1, 3, 5, 7, 9, 11, 13, 15,
+            17, 19, 21, 23, 25, 27, 29, 31
+        );
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j + 31 < m; j += 32) {
+                // 加载32字节数据
+                __m256i data = _mm256_loadu_si256((__m256i*)(output + i * m + j));
+                __m256i evens = _mm256_shuffle_epi8(data, mask_even);
+                __m256i odds = _mm256_shuffle_epi8(data, mask_odd);
+                __m128i evenLow = _mm256_castsi256_si128(evens); // a[0]~a[15]
+                __m128i evenHigh = _mm256_extracti128_si256(evens, 1); // a[16]~a[31]
+                __m128i low = _mm_unpacklo_epi64(evenLow, evenHigh);
+
+                __m128i oddLow = _mm256_castsi256_si128(odds); // a[0]~a[15]
+                __m128i oddHigh = _mm256_extracti128_si256(odds, 1); // a[16]~a[31]
+                __m128i high = _mm_unpacklo_epi64(oddLow, oddHigh);
+
+                // 存储结果
+                _mm256_storeu_si256((__m256i*)(output + i * m + j), _mm256_set_m128i(low, high));
+            }
+        }
+    }
+#endif
 
     void MultiThreadOnlineQuantizationOp::Run() {
         int realGroup = (m - 1) / groupCnt + 1;
@@ -2144,18 +2239,9 @@ namespace fastllm {
                 QuantizationAll(cur + st, u + st, end - st, &configs[i * group + g]);
             }
         }
+
 #ifdef __AVX2__
-        uint8_t *temp = new uint8_t[32];
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j + 31 < m; j += 32) {
-                memcpy(temp, output + i * m + j, 32);
-                for (int k = 0; k < 16; k++) {
-                    output[i * m + j + k] = temp[k * 2 + 1];
-                    output[i * m + j + k + 16] = temp[k * 2];
-                }
-            }
-        }
-        delete[] temp;
+        Avx2InputPermute(output, n, m);
 #endif
 #ifdef __AVX2__X
         uint8_t *temp = new uint8_t[64];
@@ -2176,7 +2262,18 @@ namespace fastllm {
                     iscales[i * group + g] = configs[i * group + g].scale;
                     izeros[i * group + g] = configs[i * group + g].zeroPoint;
                     int sum = 0;
-                    for (int j = g * groupCnt; j < (g + 1) * groupCnt && j < m; j++) {
+                    int j = g * groupCnt;
+#ifdef __AVX2__
+                    const __m256i ones8 = _mm256_set1_epi8(1);
+                    const __m256i ones16 = _mm256_set1_epi16(1);
+                    __m256i acc = _mm256_setzero_si256();
+                    for (; j + 31 < (g + 1) * groupCnt && j + 31 < m; j += 32) {
+                        __m256i data = _mm256_loadu_si256((__m256i*)(output + i * m + j));
+                        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(data, ones8), ones16));
+                    }
+                    sum += I32sum(acc);
+#endif
+                    for (; j < (g + 1) * groupCnt && j < m; j++) {
                         sum += output[i * m + j];
                     }
                     inputSums[i * group + g] = sum;

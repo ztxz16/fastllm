@@ -429,6 +429,8 @@ namespace fastllm {
                         std::vector <LowBitConfig> *inputConfigs,
                         uint8_t *uinput, float *output, 
                         DataType outputType) {
+// auto ttt = std::chrono::system_clock::now();
+// std::vector <std::pair <std::string, float> > record;
         if (this->registerDataNames.find(weights[0]->name) == this->registerDataNames.end()) {
             for (int i = 0; i < weights.size(); i += 2) {
                 RegisterFastllmData(weights[i], "linearSwiglu");
@@ -467,6 +469,7 @@ namespace fastllm {
         int outputUnitSize = (outputType == DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
         
         maxN = 1;
+// record.push_back(std::make_pair("prepare", GetSpan(ttt, std::chrono::system_clock::now())));
         for (int baseN = 0; baseN < n; baseN += maxN) {
 // auto st0 = std::chrono::system_clock::now();
             int curN = std::min(maxN, n - baseN);
@@ -488,11 +491,14 @@ namespace fastllm {
                 minmaxs.push_back((*inputConfigs)[baseN * group + i].min);
                 minmaxs.push_back((*inputConfigs)[baseN * group + i].max);
             }
+// record.push_back(std::make_pair("finish data", GetSpan(ttt, std::chrono::system_clock::now())));
             RunMultiThreadMemcpy((uint8_t*)this->buf, buffer.buffer.data(), buffer.buffer.size(), GetAlivePool());
             RunMultiThreadMemcpy((uint8_t*)this->buf + buffer.buffer.size(), (uint8_t*)minmaxs.data(), minmaxs.size() * sizeof(float), GetAlivePool());
             RunMultiThreadMemcpy((uint8_t*)this->buf + buffer.buffer.size() + minmaxs.size() * sizeof(float), (uint8_t*)uinput + baseN * m, curN * m, GetAlivePool());
+// record.push_back(std::make_pair("copy data", GetSpan(ttt, std::chrono::system_clock::now())));
             this->Launch(opType);
             this->Wait();
+// record.push_back(std::make_pair("calc", GetSpan(ttt, std::chrono::system_clock::now())));
             auto pool = GetAlivePool();
 
             uint8_t *oriResult = new uint8_t[serverNumaCnt * curN * k * outputUnitSize];
@@ -506,7 +512,11 @@ namespace fastllm {
             RunMultiThreadMemcpy(((uint8_t*) output) + baseN * k * outputUnitSize, (uint8_t*) oriResult,
                     curN * k * outputUnitSize, GetAlivePool());
             delete[] oriResult;
+// record.push_back(std::make_pair("get sum", GetSpan(ttt, std::chrono::system_clock::now())));
         }
+// for (int i = 0; i < record.size(); i++) {
+     // printf("inner %s spend %f s.\n", record[i].first.c_str(), record[i].second);
+// }
     }
 
     void NumaClient::RunNumaMOEUMultiRow(int n, int m, int k, int group, int groupCnt,
