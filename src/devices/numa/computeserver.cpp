@@ -763,15 +763,18 @@ namespace fastllm {
     }
 
     void ComputeServer::RunMOEInt() {
+// auto ttt = std::chrono::system_clock::now();
+// std::vector <std::pair <std::string, float> > record;
         int configStringLen = ((int*)this->baseAddr)[0];
         std::string configString;
         for (int i = 0; i < configStringLen; i++) {
             configString += (char)this->baseAddr[4 + i];
         }
+// record.push_back(std::make_pair("get string", GetSpan(ttt, std::chrono::system_clock::now())));
         json11::Json config;
         std::string error;
         config = json11::Json::parse(configString, error);
-
+// record.push_back(std::make_pair("parse string", GetSpan(ttt, std::chrono::system_clock::now())));
         int n = config["n"].int_value(), m = config["m"].int_value(), k = config["k"].int_value();
         int group = config["group"].int_value(), groupCnt = config["groupCnt"].int_value();
         int outputType = config["outputType"].int_value();
@@ -787,8 +790,9 @@ namespace fastllm {
             izeros.push_back(inputConfigs.back().zeroPoint);
             buffer += 2 * sizeof(float);
         }
+// record.push_back(std::make_pair("get config", GetSpan(ttt, std::chrono::system_clock::now())));
         RunMultiThreadMemcpy(this->inputBuffer.data(), (uint8_t*)buffer, n * m, pool);
-
+// record.push_back(std::make_pair("inputBuffer", GetSpan(ttt, std::chrono::system_clock::now())));
         std::vector <float> inputSums;
         for (int i = 0; i < n; i++) {
             for (int g = 0; g < group; g++) {
@@ -799,6 +803,7 @@ namespace fastllm {
                 inputSums.push_back(sum);
             }
         }
+// record.push_back(std::make_pair("input sum", GetSpan(ttt, std::chrono::system_clock::now())));
         if (n > 1) {
             std::vector <std::vector <fastllm::Data*> > weights;
             std::vector <std::vector <float> > v;
@@ -936,10 +941,11 @@ namespace fastllm {
             for (auto &factor : config["factors"].array_items()) {
                 v.push_back(factor.number_value());
             }
+// record.push_back(std::make_pair("before get weight", GetSpan(ttt, std::chrono::system_clock::now())));
             for (auto &weight : config["weights"].array_items()) {
                 weights.push_back(&this->weights[weight.string_value()]);
             }
-
+// record.push_back(std::make_pair("get weight", GetSpan(ttt, std::chrono::system_clock::now())));
             std::vector <int> localKs;
             std::vector <float*> middles;
             std::vector <float*> results;
@@ -967,6 +973,7 @@ namespace fastllm {
             inputSumsDown.resize(v.size());
             iscalesDown.resize(v.size());
             izerosDown.resize(v.size());
+// record.push_back(std::make_pair("prepare datas", GetSpan(ttt, std::chrono::system_clock::now())));
             for (int st = 0; st < v.size(); st++) {
                 int k = localKs[st];
                 int end = st, selSum = 1; // 一共处理selSum * k个输出
@@ -1004,34 +1011,16 @@ namespace fastllm {
                     pool->Wait(j);
                     delete ops[j];
                 }
+// record.push_back(std::make_pair("mul 0", GetSpan(ttt, std::chrono::system_clock::now())));
                 // swiglu
-                threadSt = 0;
                 for (int l = st; l <= end; l++) {
                     int idx = l;
                     int spatial = localKs[idx], mid = spatial / 2;
                     float *outputData = middles[l];
                     int curK = localKs[idx];
-                    int curThread = (curK / k) * base;
-                    int per = mid / curThread;
-                    int cur = 0;
-                    for (int i = 0; i < curThread; i++) {
-                        int end = (i == curThread - 1 ? mid : cur + per + (cur + per * (curThread - i) < mid));
-                        ops[threadSt + i] = (new fastllm::MultiThreadSwigluOp(outputData + cur, mid, end - cur, outputData + cur,
-                                        n, spatial, spatial));
-                        cur = end;
-                    }
-                    for (int i = 0; i < curThread; i++) {
-                        pool->PushOp(threadSt + i, ops[threadSt + i]);
-                    }
-                    threadSt += curThread;
-                }
-                for (int j = 0; j < ops.size(); j++) {
-                    pool->Wait(j);
-                    delete ops[j];
-                }
-                for (int l = st; l <= end; l++) {
-                    int idx = l;
-                    int mid = localKs[idx] / 2;
+
+                    ops[l - st] = new fastllm::MultiThreadMultiOps();
+                    ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
                     Data *weightDown = weights[idx * 2 + 1];
                     int groupDown = weightDown->group, groupCntDown = weightDown->groupCnt;
                     if (weightDown->dataType != DataType::INT4_GROUP) {
@@ -1048,17 +1037,18 @@ namespace fastllm {
                     inputSums.resize(n * groupDown);
                     iscales.resize(n * groupDown);
                     izeros.resize(n * groupDown);
-                    ops[l - st] = new MultiThreadOnlineQuantizationOp(
+                    ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new MultiThreadOnlineQuantizationOp(
                                     middles[l], uinputDown.data(), inputConfigs.data(),
                                     n, mid, groupDown, groupCntDown,
-                                    inputSums.data(), iscales.data(), izeros.data());
+                                    inputSums.data(), iscales.data(), izeros.data()));
                     pool->PushOp(l - st, ops[l - st]);
                 }
                 for (int l = st; l <= end; l++) {
                     pool->Wait(l - st);
                     delete ops[l - st];
                 }
-
+// record.push_back(std::make_pair("swiglu", GetSpan(ttt, std::chrono::system_clock::now())));
+// record.push_back(std::make_pair("quant", GetSpan(ttt, std::chrono::system_clock::now())));
                 threadSt = 0;
                 for (int l = st; l <= end; l++) {
                     int idx = l;
@@ -1088,6 +1078,7 @@ namespace fastllm {
                     delete ops[j];
                 }
                 st = end;
+// record.push_back(std::make_pair("mul 1", GetSpan(ttt, std::chrono::system_clock::now())));
             }
             for (int k = 0; k < m; k++) {
                 localOutput[k] = 0;
@@ -1123,11 +1114,16 @@ namespace fastllm {
                 delete[] results[j];
                 delete[] middles[j];
             }
+// record.push_back(std::make_pair("get fp32 sum", GetSpan(ttt, std::chrono::system_clock::now())));
             for (int i = 0; i < n; i++) {
-                memcpy((uint8_t *) baseOutputAddr + partId * n * k * sizeof(float) + (i * k) * sizeof(float),
+                RunMultiThreadMemcpy((uint8_t *) baseOutputAddr + partId * n * k * sizeof(float) + (i * k) * sizeof(float),
                     (uint8_t *) localOutput + (i * k) * sizeof(float),
-                    k * sizeof(float));
+                    k * sizeof(float), pool, true);
             }
+// record.push_back(std::make_pair("copy output", GetSpan(ttt, std::chrono::system_clock::now())));
+// for (int i = 0; i < record.size(); i++) {
+     // printf("server %s spend %f s.\n", record[i].first.c_str(), record[i].second);
+// }
         }
     }
 

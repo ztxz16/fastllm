@@ -108,6 +108,22 @@ namespace fastllm {
         }
     };
 
+    struct MultiThreadMultiOps : MultiThreadBaseOp {
+        std::vector <MultiThreadBaseOp*> ops;
+
+        void Run() {
+            for (int i = 0; i < ops.size(); i++) {
+                ops[i]->Run();
+            }
+        }
+
+        ~MultiThreadMultiOps() {
+            for (int i = 0; i < ops.size(); i++) {
+                delete[] ops[i];
+            }
+        }
+    };
+
     struct MultiThreadMemcpyOp : MultiThreadBaseOp {
         uint8_t *input, *output;
         int len;
@@ -119,13 +135,15 @@ namespace fastllm {
         }
     };
 
-    static void RunMultiThreadMemcpy(uint8_t *output, uint8_t *input, int len, AliveThreadPool *pool) {
-        if (len < 256 * 1024) {
+    static void RunMultiThreadMemcpy(uint8_t *output, uint8_t *input, int len, AliveThreadPool *pool, bool force = false) {
+        if (!force && len < 256 * 1024) {
             memcpy(output, input, len);
             return;
         }
         int threadNum = pool->threads.size();
-        int per = len / pool->threads.size();
+        threadNum = std::min(4, threadNum);
+
+        int per = len / threadNum;
         int cur = 0;
         std::vector<fastllm::MultiThreadMemcpyOp*> ops;
         for (int i = 0; i < threadNum; i++) {

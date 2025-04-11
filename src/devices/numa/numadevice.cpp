@@ -307,6 +307,8 @@ namespace fastllm {
                             std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros);
     
     void NumaMergeMOE::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+// auto ttt = std::chrono::system_clock::now();
+// std::vector <std::pair <std::string, float> > record;
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &gateBias = *(datas.find("gateBias")->second);
@@ -324,7 +326,7 @@ namespace fastllm {
         int n = input.dims[0], m = input.dims[1], k = output.dims[1];
 
         if (n > 31) {
-auto st = std::chrono::system_clock::now();
+// auto st = std::chrono::system_clock::now();
             int group = weights[0]->group, groupCnt = weights[0]->groupCnt;
             if (weights[0]->dataType != DataType::INT4_GROUP) {
                 group = 1;
@@ -377,32 +379,35 @@ auto st = std::chrono::system_clock::now();
             }
             GetNumaClient()->RunNumaMOEUMultiRow(n, m, k, group, groupCnt, ws, factors, &inputConfigs, uinput.data(), ((float*)output.cpuData), output.dataType);
         } else {
+            float *floatLogits = ((float*)logits.cpuData);
             for (int o = 0; o < outer; o++) {
                 std::vector <std::pair <float, int> > oriV;
+                oriV.resize(channels);
                 for (int j = 0; j < channels; j++) {
-                    oriV.push_back(std::make_pair(-((float*)logits.cpuData)[o * channels + j], j));
+                    oriV[j].first = -floatLogits[o * channels + j];
+                    oriV[j].second = j;
                 }
                 if (gateBias.dims.size() > 0) {
-                    ToDataType(gateBias, DataType::FLOAT32);
-                    gateBias.ToDevice(DataDevice::CPU);
+                    if (gateBias.dataType != DataType::FLOAT32) {
+                        ToDataType(gateBias, DataType::FLOAT32);
+                    }
                     float *cpuBias = (float*)gateBias.cpuData;
                     for (int i = 0; i < channels; i++) {
                         oriV[i].first -= cpuBias[i];
                     }
                 }
-                // sort(oriV.begin(), oriV.end());
-                std::nth_element(oriV.begin(), oriV.begin() + topk, oriV.end());
+                std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
+
                 float sum = 1.0;
                 if (needNorm) {
                     sum = 0.0;
                     for (int j = 0; j < topk; j++) {
-                        sum += ((float*)logits.cpuData)[o * channels + oriV[j].second];
+                        sum += floatLogits[o * channels + oriV[j].second];
                     }
                 }
-
                 std::vector <std::pair <int, float> > v;
                 for (int j = 0; j < topk; j++) {
-                    v.push_back(std::make_pair(oriV[j].second + 1, ((float*)logits.cpuData)[o * channels + oriV[j].second] / sum * routeScale));
+                    v.push_back(std::make_pair(oriV[j].second + 1, floatLogits[o * channels + oriV[j].second] / sum * routeScale));
                 }
                 v.push_back(std::make_pair(0, sharedScale));
                 float *inputData = ((float *) input.cpuData) + o * m;
@@ -425,8 +430,13 @@ auto st = std::chrono::system_clock::now();
                     ws.push_back(weights[v[i].first * 2 + 1]);
                     factors.push_back(v[i].second);
                 }
+// record.push_back(std::make_pair("prepare", GetSpan(ttt, std::chrono::system_clock::now())));
                 GetNumaClient()->RunNumaMOEU(1, m, k, group, groupCnt, ws, factors, &inputConfigs, uinput.data(), ((float*)output.cpuData) + o * k, output.dataType);
+// record.push_back(std::make_pair("finish output", GetSpan(ttt, std::chrono::system_clock::now())));
             }
+// for (int i = 0; i < record.size(); i++) {
+    // printf("%s spend %f s.\n", record[i].first.c_str(), record[i].second);
+// }
         }
     }
 

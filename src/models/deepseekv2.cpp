@@ -721,7 +721,11 @@ namespace fastllm {
             ToDataType(logits, DataType::FLOAT32);
             ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfig);
             if (this->weight.dicts["model_type"] != "deepseek_v2") {
-                return GumbelMaxTrick(logits, batch);
+                ((GenerationConfig*)&generationConfig)->top_k = 3;
+                ((GenerationConfig*)&generationConfig)->top_p = 0.95;
+                if (fabs(generationConfig.temperature - 1.0f) < 1e-6) {
+                    ((GenerationConfig*)&generationConfig)->temperature = 0.6;
+                } 
             }
             if (generationConfig.output_logits && retLogits != nullptr) {
                 int size = logits.dims.back();
@@ -740,6 +744,31 @@ namespace fastllm {
                 for (int b = 0; b < batch; b++) {
                     int base = b;
                     lastRet.push_back((int) (((float *) topk.cpuData)[base * 2] + 1e-3));
+                }
+            } else if (generationConfig.top_k <= 50 && fabs(generationConfig.repeat_penalty - 1.0f) < 1e-5) {
+                /*int maxTokenSetSize = 0;
+                for (int b = 0; b < batch; b++) {
+                    maxTokenSetSize = std::max(maxTokenSetSize, (int)lastTokens.units[b].tokenSet.size());
+                }
+                std::vector <float> penaltyData = std::vector <float> (batch * maxTokenSetSize, -100.0f);
+                std::vector <float> penaltyScaleData = std::vector <float> (batch, 1.0f);
+                for (int b = 0; b < batch; b++) {
+                    int curId = 0;
+                    for (int i : lastTokens.units[b].tokenSet) {
+                        penaltyData[b * maxTokenSetSize + curId] = i;
+                        curId++;
+                    }
+                    penaltyScaleData[b] = generationConfigs[b].repeat_penalty;
+                }
+                Data penalty, penaltyScale;
+                penalty.CopyFrom(Data(DataType::FLOAT32, {batch, maxTokenSetSize}, penaltyData));
+                penaltyScale.CopyFrom(Data(DataType::FLOAT32, {batch}, penaltyScaleData));
+                RepeatPenalty(logits, penalty, penaltyScale);*/
+                Data topk;
+                TopK(logits, topk, generationConfig.top_k);
+                topk.ToDevice(DataDevice::CPU);
+                for (int b = 0; b < batch; b++) {
+                    lastRet.push_back(LLMSamplingOnly(topk, b, generationConfig));
                 }
             } else {
                 for (int b = 0; b < batch; b++) {
@@ -1280,7 +1309,13 @@ namespace fastllm {
 
         ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfigs);
         if (this->weight.dicts["model_type"] != "deepseek_v2") {
-            return GumbelMaxTrick(logits, batch);
+            for (auto &generationConfig : generationConfigs) {
+                ((GenerationConfig*)&generationConfig)->top_k = 3;
+                ((GenerationConfig*)&generationConfig)->top_p = 0.95;
+                if (fabs(generationConfig.temperature - 1.0f) < 1e-6) {
+                    ((GenerationConfig*)&generationConfig)->temperature = 0.6;
+                } 
+            }
         }
 
         int total = 0;

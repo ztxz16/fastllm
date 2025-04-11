@@ -500,7 +500,7 @@ namespace fastllm {
 
         std::map <std::string, std::string> dicts;
 
-        std::map <std::string, Data> weight;
+        std::unordered_map <std::string, Data> weight;
 
         std::map <std::string, std::map <std::string, std::string>> peftDict;
 
