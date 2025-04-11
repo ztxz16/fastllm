@@ -22,6 +22,7 @@ setup (
         '': ['*.dll', '*.so', '*.dylib', '*.so.*']
     },
     install_requires=[
+        'pyreadline3',
         'transformers',
         'jinja2>=3.1.0'
     ] + all_require,
