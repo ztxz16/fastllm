@@ -29,7 +29,9 @@ def save_defaults_to_json(parser, filename):
             defaults[name] = False  # store_true参数的默认值是False
         else:
             defaults[name] = action.default
-    
+    defaults["FASTLLM_USE_NUMA"] = "OFF"
+    defaults["FASTLLM_NUMA_THREADS"] = 27
+
     # 将字典转换为JSON并保存到文件
     import json
     with open(filename, 'w', encoding='utf-8') as f:
