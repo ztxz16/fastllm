@@ -26,10 +26,13 @@ namespace fastllm {
         ResponseContextErrorNone = 0, ResponseContextErrorPromptTooLong
     };
 
+    class basellm;
+
     struct ResponseContext {
         bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
         bool isAbort = false; // 代表这个请求被中断了，也就是说不会再有人来fetch它了，那么推理完之后就可以删除这个请求了
         
+        std::vector <int> allTokens;
         std::vector <std::pair <Data, Data> > pastKeyValues;
         std::vector <int> currentTokens;
         std::map <std::string, std::vector <Data*> > multimodalInput;
@@ -46,6 +49,7 @@ namespace fastllm {
         int cacheLen = 0;
 
         void Init(int blocks, DataType dataType);
+        void TryRecord(basellm *model);
     };
 
     struct ResponseContextDict {
@@ -87,7 +91,7 @@ namespace fastllm {
         void Remove(const std::vector <int> &inputToken);
 
         // 获取最长匹配的Memory，并加锁
-        PastKVCacheMemory *Get(const std::vector <int> &inputToken);
+        std::pair <PastKVCacheMemory*, int> Get(const std::vector <int> &inputToken);
 
         // 解锁
         void Unlock();
