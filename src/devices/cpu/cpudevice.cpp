@@ -137,11 +137,12 @@ namespace fastllm {
             __m512i bx = _mm512_and_si512(lowMask, bytex);
 
             __m512i by = _mm512_loadu_si512((const __m512i *) (b + i));
-            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(by, bx), ones));
+            // acc = _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(by, bx), ones));
+            acc = _mm512_dpbusd_epi32(acc, by, bx);
         }
-        for (; i < n; i++) {
+        /*for (; i < n; i++) {
             ans += a[i] * b[i];
-        }
+        }*/
 
         return ans + _mm512_reduce_add_epi32(acc);
     };
@@ -680,6 +681,9 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         Data &gateBias = *(datas.find("gateBias")->second);
         Data &logits = *(datas.find("logits")->second);
+        Data &w1 = *(datas.find("w1")->second);
+        Data &w2 = *(datas.find("w2")->second);
+        Data &w3 = *(datas.find("w3")->second);
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
         int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
@@ -2292,7 +2296,7 @@ namespace fastllm {
 
     void DoCpuLinear(Data &input, Data &weight, const Data &bias, Data &output) {
 //auto st = std::chrono::system_clock::now();
-        output.Allocate(0.0f);
+        output.Allocate();
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
