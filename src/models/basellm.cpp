@@ -49,11 +49,18 @@ namespace fastllm {
         }
         intParams.clear();
         currentTokens.clear();
+        allTokens.clear();
         while (resultTokenQueue.size() > 0){
             resultTokenQueue.pop();
         }
         isEnding = false;
         preTokens = 0;
+    }
+
+    void ResponseContext::TryRecord(basellm *model) {
+        if (model->saveHistoryChat) {
+            model->pastKVCacheManager.Record(this->allTokens, this->allTokens.size(), &this->pastKeyValues);
+        }
     }
 
     PastKVCacheMemory::PastKVCacheMemory(const std::vector <int> &inputToken, int tokens, long long flushTime, std::vector<std::pair<Data, Data> > *kv) {
@@ -110,29 +117,30 @@ namespace fastllm {
         }
     }
 
-    PastKVCacheMemory *PastKVCacheManager::Get(const std::vector <int> &inputToken) {
+    std::pair <PastKVCacheMemory*, int> PastKVCacheManager::Get(const std::vector <int> &inputToken) {
         std::lock_guard <std::mutex> lock(this->locker);
-        std::vector <int> maxToken;
+        int maxPrefixToken = 0;
+        PastKVCacheMemory *ret = nullptr;
         for (auto &it : this->memorys) {
             const std::vector <int> &cur = it.first;
-            if (cur.size() > maxToken.size() && cur.size() <= inputToken.size()) {
-                bool match = true;
-                for (int i = 0; i < cur.size(); i++) {
-                    if (inputToken[i] != cur[i]) {
-                        match = false;
-                        break;
-                    }
-                }
-                if (match) {
-                    maxToken = cur;
+            int match = 0;
+            for (int i = 0; i < cur.size() && i < inputToken.size(); i++) {
+                if (inputToken[i] == cur[i]) {
+                    match = i + 1;
+                } else {
+                    break;
                 }
             }
+            if (match > maxPrefixToken) {
+                maxPrefixToken = match;
+                ret = it.second;
+            }
         }
-        if (maxToken.size() == 0) {
-            return nullptr;
+        if (ret != nullptr) {
+            ret->flushTime = ++this->flushTime;
         }
-        this->memorys[maxToken]->flushTime = ++this->flushTime;
-        return this->memorys[maxToken];
+        maxPrefixToken = std::min(maxPrefixToken, (int)inputToken.size() - 1);
+        return std::make_pair(ret, maxPrefixToken);
     }
 
     void PastKVCacheManager::Unlock() {
@@ -759,7 +767,7 @@ auto st = std::chrono::system_clock::now();
                                 int first = 8192, part = 2048;
                                 if (model->model_struct == "deepseek_v2") {
                                     // TODO: ds_v2支持更长的切片
-                                    first = 256;
+                                    first = 1024;
                                     part = 256;
                                 }
                                 if (seqLens[0] > first) {
@@ -834,19 +842,23 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                                 int curRet = ret[i];
                                 if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                                     it.second->isEnding = true;
+                                    it.second->TryRecord(model);
                                 } else {
                                     auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
                                     if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
-                                            it.second->isEnding = true;
+                                        it.second->isEnding = true;
+                                        it.second->TryRecord(model);
                                     }
                                 }
                                 if (it.second->isEnding == false) {
                                     it.second->currentTokens = std::vector<int>{curRet};
                                     it.second->resultTokenQueue.push(curRet);
+                                    it.second->allTokens.push_back(curRet);
                                     it.second->tokens.Push(curRet);
                                     it.second->curTokens++;
                                     if (it.second->curTokens == it.second->generationConfig.output_token_limit) {
                                         it.second->isEnding = true;
+                                        it.second->TryRecord(model);
                                     }
                                 }
                             }
@@ -891,18 +903,27 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         ResponseContext *context = responseContextDict.GetHandle(handleId);
         context->Init(this->block_cnt, this->dataType);
         context->currentTokens = inputTokens;
+        context->allTokens = inputTokens;
         context->generationConfig = generationConfig;
         context->multimodalInput = multimodalInput;
         context->tokens = LastTokensUnit(generationConfig.last_n);
 
         auto cache = pastKVCacheManager.Get(inputTokens);
-        if (cache != nullptr) {
+        if (cache.first != nullptr && cache.second > 0) {
+            int len = cache.second;
             for (int i = 0; i < this->block_cnt; i++) {
-                context->pastKeyValues[i].first.CopyFrom(cache->kv[i].first);
-                context->pastKeyValues[i].second.CopyFrom(cache->kv[i].second);
+                Split(cache.first->kv[i].first, 1, 0, len, context->pastKeyValues[i].first);
+                Split(cache.first->kv[i].second, 1, 0, len, context->pastKeyValues[i].second);
+                auto kdims = context->pastKeyValues[i].first.dims, vdims = context->pastKeyValues[i].second.dims;
+                kdims[1] = ((kdims[1] - 1) / 128 + 1) * 128;
+                vdims[1] = ((vdims[1] - 1) / 128 + 1) * 128;
+                context->pastKeyValues[i].first.Expansion(kdims);
+                context->pastKeyValues[i].second.Expansion(vdims);
+                // context->pastKeyValues[i].first.CopyFrom(cache.first->kv[i].first);
+                // context->pastKeyValues[i].second.CopyFrom(cache.first->kv[i].second);
             }
-            context->currentTokens.erase(context->currentTokens.begin(), context->currentTokens.begin() + cache->inputToken.size());
-            context->cacheLen = cache->inputToken.size();
+            context->currentTokens.erase(context->currentTokens.begin(), context->currentTokens.begin() + len);
+            context->cacheLen = len;
         }
 
         dictLocker.unlock();
@@ -997,7 +1018,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
     void basellm::AddPromptCache(const std::vector <int> &inputTokens) {
         std::unique_lock<std::mutex> dictLocker(this->dictLocker);
         auto cache = pastKVCacheManager.Get(inputTokens);
-        if (cache != nullptr && cache->inputToken.size() == inputTokens.size()) {
+        if (cache.first != nullptr && cache.first->inputToken.size() == inputTokens.size()) {
             return;
         }
         Data inputIds, attentionMask, positionIds;
