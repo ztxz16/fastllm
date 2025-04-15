@@ -2944,10 +2944,12 @@ namespace fastllm {
     }
 
     void MergeMOE(const Data &input, const Data &logits, Data &gateBias, std::vector <Data*> &weights, std::vector <Data*> &biass, 
+                Data &w1, Data &w2, Data &w3,
                 float routeScale, float sharedScale, int topk, bool needNorm, Data &output) {
         curExecutor->Run("MergeMOE", {
                 {"input", (Data*)&input}, {"logits", (Data*)&logits}, {"gateBias", (Data*)&gateBias},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
+                {"w1", (Data*)&w1}, {"w2", (Data*)&w2}, {"w3", (Data*)&w3},
                 {"output", (Data*)&output}
         }, {{"sharedScale", sharedScale}, {"routeScale", routeScale}}, {{"topk", topk}, {"needNorm", needNorm}, 
                                         {"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()}});

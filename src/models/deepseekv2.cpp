@@ -594,6 +594,7 @@ namespace fastllm {
                     MergeMOE (
                         attenInput, routerLogits, weight[gateBiasName],
                         weights[i], biass[i],
+                        w1, w2, w3, 
                         this->routed_scaling_factor, 1.0f,
                         this->num_experts_per_tok, needNorm,
                         moeFinal
@@ -1176,6 +1177,7 @@ namespace fastllm {
                     MergeMOE (
                         attenInput, routerLogits, weight[gateBiasName],
                         weights[i], biass[i],
+                        w1, w2, w3,
                         this->routed_scaling_factor, 1.0f,
                         this->num_experts_per_tok, needNorm,
                         moeFinal
