@@ -50,6 +50,9 @@ def args_parser():
     from ftllm.download import make_download_parser
     download_parser = make_download_parser(add_help = False)
 
+    # 打开ui界面
+    ui_parser_ = subparsers.add_parser('ui', parents = [shared_parser], help = 'ui模式')
+
     # 创建chat子命令（使用共享解析器）
     chat_parser_ = subparsers.add_parser('chat', parents = [shared_parser], help = '聊天模式')
 
@@ -82,6 +85,9 @@ def main():
         print("ftllm version: " + __version__)
         return
     # 根据不同的子命令执行不同的操作
+    if args.command == 'ui':
+        from .ui import FastllmStartUI
+        FastllmStartUI()
     if args.command == 'config':
         file = args.file
         if not(file) or file == '':
