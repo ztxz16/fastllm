@@ -529,6 +529,8 @@ class model:
             elif os.path.isdir(path):
                 if tokenizer_type != "fastllm":
                     try:
+                        from transformers import logging as transformers_logging
+                        transformers_logging.set_verbosity_error()
                         from transformers import AutoTokenizer
                         self.hf_tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
                     except:
