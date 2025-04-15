@@ -70,7 +70,17 @@ class FastLLmCompletion:
           return [], []
       if isinstance(content, str):
           return [ConversationMessage(role=role, content=content)], []
-
+      if isinstance(content, list):
+          content_str = ""
+          for it in content:
+              if ('type' in it and it['type'] == 'text'):
+                 if (content_str != ""):
+                    content_str += "\n"
+                 if ('text' in it):
+                    content_str += it['text']
+              else:
+                 raise NotImplementedError("Complex input not supported yet")
+          return [ConversationMessage(role=role, content=content_str)], []
       # 暂时不支持图像输入
       raise NotImplementedError("Complex input not supported yet")
 
