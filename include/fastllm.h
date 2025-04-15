@@ -553,6 +553,7 @@ namespace fastllm {
 
     bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass);
     void MergeMOE(const Data &input, const Data &logits, Data &gateBias, std::vector <Data*> &weights, std::vector <Data*> &biass, 
+                Data &w1, Data &w2, Data &w3,
                 float routeScale, float sharedScale, int topk, bool needNorm, Data &output);
 
     void Attention(const Data &q, const Data &k, const Data &v, const Data &mask, Data &output,
