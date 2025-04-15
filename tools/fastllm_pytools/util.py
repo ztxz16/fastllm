@@ -16,6 +16,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
+    parser.add_argument("--cache_history", type = bool, default = False, help = "缓存历史对话")
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
     return parser
@@ -73,6 +74,7 @@ def make_normal_llm_model(args):
             with open(os.path.join(args.path, "config.json"), "r", encoding="utf-8") as file:
                 config = json.load(file)
             if (config["architectures"][0] == 'DeepseekV3ForCausalLM'):
+                args.cache_history = True
                 if ((not(args.device and args.device != ""))):
                     args.device = "cuda"
                     args.moe_device = "cpu"
@@ -139,6 +141,8 @@ def make_normal_llm_model(args):
             graph = getattr(custom_module, "__model__")
     model = llm.model(args.path, dtype = args.dtype, graph = graph, tokenizer_type = "auto", lora = args.lora)
     model.set_atype(args.atype)
+    if (args.cache_history):
+        model.set_save_history(True)
     if (args.moe_experts > 0):
         model.set_moe_experts(args.moe_experts)
     if (args.max_batch > 0):
