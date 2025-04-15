@@ -84,6 +84,20 @@ def init_logging(log_level = logging.INFO, log_file:str = None):
     root.addHandler(stdout_handler)
 
 def fastllm_server(args):
+    if args.api_key:
+        @app.middleware("http")
+        async def authentication(request: Request, call_next):
+            print("auth")
+            if request.method == "OPTIONS":
+                return await call_next(request)
+            url_path = request.url.path            
+            if not url_path.startswith("/v1"):
+                return await call_next(request)
+            if request.headers.get("Authorization") != "Bearer " + args.api_key:
+                return JSONResponse(content={"error": "Unauthorized"},
+                                    status_code=401)
+            return await call_next(request)
+        
     global fastllm_completion
     global fastllm_embed
     global fastllm_reranker
