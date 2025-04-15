@@ -71,10 +71,16 @@ def args_parser():
     config_parser_ = subparsers.add_parser('config', help = '创建配置文件')
     config_parser_.add_argument('file', nargs='?', help = '配置文件的路径')
 
+    parser.add_argument('-v', '--version', action='store_true', help='输出版本号并退出')
+
     return parser
 
 def main():
     args = args_parser().parse_args()
+    if (args.version):
+        from . import __version__
+        print("ftllm version: " + __version__)
+        return
     # 根据不同的子命令执行不同的操作
     if args.command == 'config':
         file = args.file
