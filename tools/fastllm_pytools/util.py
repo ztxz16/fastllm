@@ -24,7 +24,8 @@ def add_server_args(parser):
     parser.add_argument("--model_name", type = str, default = '', help = "部署的模型名称, 调用api时会进行名称核验")
     parser.add_argument("--host", type = str, default="0.0.0.0", help = "API server host")
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
-    parser.add_argument("--think", type=bool, default = False, help="if <think> lost")
+    parser.add_argument("--api_key", type = str, default = "", help = "API Key")
+    parser.add_argument("--think", type = bool, default = False, help="if <think> lost")
 
 def make_normal_llm_model(args):
     if (args.model and args.model != ''):
