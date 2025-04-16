@@ -773,7 +773,7 @@ namespace fastllm {
             uint16_t *c = new uint16_t[BN * BK];
             if (biasData == nullptr) {
                 for (int i = 0; i < n; i++) {
-                    memset(outputData + st, 0, (end - st) * sizeof(uint16_t));
+                    memset(outputData + i * k + st, 0, (end - st) * sizeof(uint16_t));
                 }
             } else {
                 for (int i = 0; i < n; i++) {
@@ -928,7 +928,7 @@ namespace fastllm {
             uint16_t *c = new uint16_t[BN * BK];
             if (biasData == nullptr) {
                 for (int i = 0; i < n; i++) {
-                    memset(outputData + st, 0, (end - st) * sizeof(uint16_t));
+                    memset(outputData + i * k + st, 0, (end - st) * sizeof(uint16_t));
                 }
             } else {
                 for (int i = 0; i < n; i++) {
@@ -1063,7 +1063,7 @@ namespace fastllm {
             float *c = new float[BN * BK];
             if (biasData == nullptr) {
                 for (int i = 0; i < n; i++) {
-                    memset(outputData + st, 0, (end - st) * sizeof(uint16_t));
+                    memset(outputData + i * k + st, 0, (end - st) * sizeof(uint16_t));
                 }
             } else {
                 for (int i = 0; i < n; i++) {
