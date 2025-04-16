@@ -33,13 +33,30 @@ fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）�
 Conda下安装有时候会出现环境错误，如果出现可以尝试在Conda外或使用venv等虚拟环境尝试
 
 - PIP安装
+
+#### Windows系统:
+
+第一次安装前需要安装依赖库:
+
+```
+pip install https://hf-mirror.com/fastllm/fastllmdepend-windows/resolve/main/ftllmdepend-0.0.0.1-py3-none-win_amd64.whl
+```
+
+然后用pip安装，命令如下：
+
+```
+pip install ftllm
+```
+
+#### Linux系统:
+
 由于目前pypi限制库大小，安装包中不含cuda依赖，安装ftllm之前建议先手动安装cuda12以上版本 (已安装cuda可跳过)
 ```
 wget https://developer.download.nvidia.com/compute/cuda/12.8.1/local_installers/cuda_12.8.1_570.124.06_linux.run
 sudo sh cuda_12.8.1_570.124.06_linux.run
 ```
 
-Linux系统可尝试直接pip安装，命令如下：
+然后用pip安装，命令如下：
 
 ```
 pip install ftllm
