@@ -1,3 +1,11 @@
+## V0.0.0.8
+
+- api server增加api_key参数，来设定api_key
+- api server支持了一些复合输入
+- 提升了moe模型prefill的速度
+- 隐藏了 "None of PyTorch, TensorFlow >= 2.0 ..." 的警告信息
+- 增加了--version参数查看版本号
+
 ## V0.0.0.7
 
 - 增加config选项，可通过config.json文件来启动模型
