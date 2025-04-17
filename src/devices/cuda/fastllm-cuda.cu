@@ -10,6 +10,10 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#ifdef USE_ROCM
+#include "fastllm-hip.h"
+#endif
+
 #define max(a, b) ((a) > (b) ? (a) : (b))
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
