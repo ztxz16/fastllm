@@ -5,6 +5,8 @@ project(fastllm LANGUAGES CXX)
 option(USE_CUDA "use CUDA" OFF)
 option(CUDA_NO_TENSOR_CORE "Optimize for legacy CUDA GPUs which has Tensor Core." OFF)
 
+option(USE_ROCM "use ROCm" OFF)
+
 option(USE_TFACC "use tfacc" OFF)
 
 option(PY_API "python api" OFF)
@@ -21,7 +23,14 @@ if(NOT DEFINED CUDA_ARCH)
     set(CUDA_ARCH "native")
 endif()
 
+if(NOT DEFINED ROCM_ARCH)
+    set(ROCM_ARCH "gfx908;gfx90a;gfx1100")
+    message(STATUS "ROCM_ARCH not set, using default value: ${ROCM_ARCH}")
+endif()
+
 message(STATUS "USE_CUDA: ${USE_CUDA}")
+
+message(STATUS "USE_ROCM: ${USE_ROCM}")
 
 message(STATUS "CUDA_ARCH: ${CUDA_ARCH}")
 
@@ -98,6 +107,47 @@ if (USE_CUDA)
 
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
     set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
+endif()
+
+if(USE_ROCM)
+    list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/third_party/hipify_torch/cmake")
+    include(Hipify)
+    enable_language(HIP)
+
+    # remove target hip dirs first
+    EXECUTE_PROCESS(COMMAND rm -rf ${PROJECT_SOURCE_DIR}/src/devices/hip)
+    EXECUTE_PROCESS(COMMAND rm -rf ${PROJECT_SOURCE_DIR}/src/devices/multihip)
+    hipify(CUDA_SOURCE_DIR ${PROJECT_SOURCE_DIR}/src/devices/cuda HIP_SOURCE_DIR "${PROJECT_SOURCE_DIR}/src/devices/hip")
+    hipify(CUDA_SOURCE_DIR ${PROJECT_SOURCE_DIR}/src/devices/multicuda HIP_SOURCE_DIR "${PROJECT_SOURCE_DIR}/src/devices/multihip")
+    include_directories(include/devices/cuda)
+    include_directories(include/devices/multicuda)
+    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/hip/fastllm-hip.hip src/devices/multicuda/multicudadevice.cpp src/devices/multihip/fastllm-multihip.hip)
+    add_compile_definitions(USE_ROCM)
+    add_compile_definitions(USE_CUDA)
+    if (DEFINED $ENV{ROCM_PATH})
+        set(ROCM_PATH $ENV{ROCM_PATH})
+    else()
+        set(ROCM_PATH /opt/rocm)
+    endif()
+    set(CMAKE_HIP_COMPILER_ROCM_ROOT ${ROCM_PATH})
+    set(CMAKE_CXX_COMPILER "${CMAKE_HIP_COMPILER_ROCM_ROOT}/bin/amdclang++")
+    message(STATUS "CMAKE_HIP_COMPILER_ROCM_ROOT: ${CMAKE_HIP_COMPILER_ROCM_ROOT}")
+    message(STATUS "CMAKE_HIP_COMPILER: ${CMAKE_HIP_COMPILER}")
+    message(STATUS "CMAKE_CXX_COMPILER: ${CMAKE_CXX_COMPILER}")
+    
+    set(CMAKE_PREFIX_PATH ${ROCM_PATH})
+    find_package(hip REQUIRED) 
+    find_package(hipblas REQUIRED)
+    find_package(rocprim REQUIRED)
+    list(APPEND FASTLLM_LINKED_LIBS hip::device roc::hipblas roc::rocprim)
+    set(CMAKE_HIP_ARCHITECTURES ${ROCM_ARCH})
+    add_compile_definitions(HIPBLAS_V2)
+
+    # if gfx906(MI50) in ROCM_ARCH list, don't use Tensor Core
+    if("gfx906" IN_LIST CMAKE_HIP_ARCHITECTURES)
+        add_compile_definitions(HIP_NO_TENSOR_CORE)
+        message(STATUS "MI50 architecture (gfx906) detected, disabling Tensor Core")
+    endif()
 endif()
 
 if (USE_IVCOREX)
