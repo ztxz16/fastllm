@@ -25,6 +25,10 @@
 using namespace nvcuda;
 #endif
 
+#ifdef USE_ROCM
+#include "fastllm-hip.h"
+#endif
+
 #define checkCudaErrors(message, val) showError(val, message, __FILE__, __LINE__)
 
 extern __global__ void FastllmSwigluKernel(half* __restrict__ a, half* __restrict__ b, int len, int spatial, int mid);

@@ -15,10 +15,10 @@
 #include <cstdint>
 #include <thread>
 #include <vector>
-#if defined(__GNUC__) && __GNUC__ < 8
+#ifndef __CUDACC__
+#if defined(__GNUC__) && __GNUC__ < 8 && !defined(__clang__)
 #include <experimental/filesystem>
 #else
-#ifndef __CUDACC__
 #include <filesystem>
 #endif
 #endif
@@ -40,12 +40,13 @@
 #endif
 
 #ifndef __CUDACC__
-#if (defined(_MSC_VER) && _MSC_VER <= 1900) || (defined(__GNUC__) && __GNUC__ < 8) // VS 2015) 
+#if (defined(_MSC_VER) && _MSC_VER <= 1900) || (defined(__GNUC__) && __GNUC__ < 8 && !defined(__clang__))  // VS 2015) 
     namespace fs = std::experimental::filesystem;
 #else
     namespace fs = std::filesystem;
 #endif
 #endif
+
 namespace fastllm {
     static bool StringEndWith(const std::string &s, const std::string &end) {
         return s.size() >= end.size() && s.substr(s.size() - end.size()) == end;
