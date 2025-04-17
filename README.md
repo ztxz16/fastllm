@@ -18,6 +18,8 @@ fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）�
 
 - 🚀 DeepSeek混合推理，消费级单卡即可多并发部署，后续将支持多卡提速
 - 🚀 双CPU仅占用1份内存，部署DeepSeek R1 671b int4 共占用内存340G
+- 🚀 支持ROCM，可使用AMD GPU推理
+- 🚀 支持国产GPU 天数，沐曦，燧原，均支持单卡混合推理671B模型
 - 🚀 支持多NUMA节点加速
 - 🚀 支持动态Batch，流式输出
 - 🚀 支持多卡部署，支持GPU + CPU混合部署
@@ -32,7 +34,7 @@ fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）�
 - Hint
 Conda下安装有时候会出现环境错误，如果出现可以尝试在Conda外或使用venv等虚拟环境尝试
 
-- PIP安装
+- PIP安装（目前仅支持Nvidia GPU，其余GPU请使用源码安装）
 
 #### Windows系统:
 
@@ -85,7 +87,10 @@ bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU�
 ```
 
 其他不同平台的编译可参考文档
+
 [TFACC平台](docs/tfacc.md)
+
+[ROCM平台](docs/rocm.md)
 
 ### 运行demo程序
 
