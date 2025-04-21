@@ -102,6 +102,20 @@ namespace fastllm {
 
     void MultiThreadLinearInt8Int8Op::Run() {
         MatMulInt8Int8(a, b, c, n, m, k, kstride);
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < k; j++) {
+                float value = ((int32_t *) c)[i * kstride + j];
+#ifdef __AVX2__
+                value += (128 * weightSums[j]);
+                value += (128 * inputSums[i]);
+                value -= m * 128 * 128;
+#endif
+                value -= weightSums[j] * izeros[i];
+                value -= inputSums[i] * weightZeros[j];
+                value += (int) izeros[i] * weightZeros[j] * m;
+                ((float*)c)[i * kstride + j] = scales[j] * iscales[i] * value + (bias == nullptr ? 0.0 : bias[j]);
+            }
+        }
     }
 
     void MultiThreadLinearFloat16Float16Op::Run() {
@@ -527,15 +541,17 @@ namespace fastllm {
 #endif
     }
 
+    void LaunchLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
+        int *weightSums, LowBitConfig *weightConfigs, LowBitConfig *inputConfigs, float *bias,
+        AliveThreadPool *pool, int startTid, int threadNum) {
+
+    }
+    
     //a = [n, m], b = [k, m], c = aT(b') = [n, k]
     void RunLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
-                            int *weightSums, LowBitConfig *weightConfigs, LowBitConfig *inputConfigs, float *bias,
+                            int *weightSums, int *weightZeros, float *scales, float *bias,
+                            float *inputSums, float *iscales, float *izeros,
                             AliveThreadPool *pool, int startTid, int threadNum) {
-#ifdef __AVX2__
-        for (int i = 0; i < n * m; i++) {
-            a[i] = (a[i] + !a[i]) ^ 128;
-        }
-#endif
         int per = k / threadNum;
         int cur = 0;
         std::vector<fastllm::MultiThreadLinearInt8Int8Op*> ops;
@@ -544,7 +560,10 @@ namespace fastllm {
             if (i == threadNum - 1) {
                 end = k;
             }
-            ops.push_back(new MultiThreadLinearInt8Int8Op(a, b + cur * m, (int32_t*)c + cur, n, m, end - cur, k));
+            ops.push_back(new MultiThreadLinearInt8Int8Op(a, b + cur * m, (int32_t*)c + cur, n, m, end - cur, k, 
+                                                        weightSums + cur, weightZeros + cur, scales + cur, 
+                                                        (bias == nullptr ? (float *) nullptr : bias + cur), 
+                                                        iscales, izeros, inputSums));
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
@@ -553,31 +572,6 @@ namespace fastllm {
         for (int i = 0; i < threadNum; i++) {
             pool->Wait(startTid + i);
             delete ops[i];
-        }
-
-        for (int i = 0; i < n; i++) {
-            uint32_t inputSum = 0;
-            for (int j = 0; j < m; j++) {
-#ifdef __AVX2__
-                inputSum += a[i * m + j] ^ 128;
-#else
-                inputSum += a[i * m + j];
-#endif
-            }
-
-            for (int j = 0; j < k; j++) {
-                int value = ((int32_t *) c)[i * k + j];
-#ifdef __AVX2__
-                value += (128 * weightSums[j]);
-                value += (128 * inputSum);
-                value -= m * 128 * 128;
-#endif
-                value -= weightSums[j] * inputConfigs[i].zeroPoint;
-                value -= inputSum * weightConfigs[j].zeroPoint;
-                value += (int) inputConfigs[i].zeroPoint * weightConfigs[j].zeroPoint * m;
-                c[i * k + j] = weightConfigs[j].scale * inputConfigs[i].scale * value +
-                                                (bias == nullptr ? 0.0 : bias[j]);
-            }
         }
     }
 
@@ -614,25 +608,10 @@ namespace fastllm {
         std::vector<uint8_t> uinput;
         std::vector <float> inputSums, iscales, izeros;
         OnlineQuantization(inputData, uinput, inputConfigs, n, m, 1, m, inputSums, iscales, izeros, 0);
-/*
-        weight.CalcWeightSum();
-        std::vector<LowBitConfig> inputConfigs;
-        for (int i = 0; i < n; i++) {
-            float minValue = 1e9, maxValue = -1e9;
-            for (int j = 0; j < m; j++) {
-                minValue = std::min(minValue, inputData[i * m + j]);
-                maxValue = std::max(maxValue, inputData[i * m + j]);
-            }
-            inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
-        }
-        std::vector<uint8_t> uinput;
-        uinput.resize(n * m);
-        for (int i = 0; i < n * m; i++) {
-            uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
-        }
-*/
+
         RunLinearInt8Int8(uinput.data(), (uint8_t*)weight.cpuData, outputData, n, m, k, 
-                weight.weightSum.data(), weight.perChannelsConfigs.data(), inputConfigs.data(), biasData,
+                weight.weightSum.data(), weight.zeros.data(), weight.scales.data(), biasData, 
+                inputSums.data(), iscales.data(), izeros.data(),
                 pool, startTid, threadNum);
         /*
         这部分是float输入，float输出

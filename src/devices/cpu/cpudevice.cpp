@@ -2245,6 +2245,15 @@ namespace fastllm {
             }
         }
 
+        if (permuteType == 0) {
+            // for INT8 * INT8
+#ifdef __AVX2__
+            for (int i = 0; i < n * m; i++) {
+                output[i] = (output[i] + !output[i]);
+            }
+#endif
+        }
+
         if (permuteType == 1) {
             // for INT8 * INT4
 #ifdef __AVX2__
@@ -2288,6 +2297,15 @@ namespace fastllm {
                     inputSums[i * group + g] = sum;
                 }
             }
+        }
+
+        if (permuteType == 0) {
+            // for INT8 * INT8
+#ifdef __AVX2__
+            for (int i = 0; i < n * m; i++) {
+                output[i] ^= 128;
+            }
+#endif
         }
     }
 

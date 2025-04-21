@@ -42,9 +42,16 @@ namespace fastllm {
         uint8_t *b;
         int32_t *c;
         int n, m, k, kstride;
+        int *weightSums, *weightZeros;
+        float *scales, *bias;
+        float *iscales, *izeros, *inputSums;
 
-        MultiThreadLinearInt8Int8Op(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride) : 
-            a(a), b(b), c(c), n(n), m(m), k(k), kstride(kstride) {}
+        MultiThreadLinearInt8Int8Op(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride, 
+                                    int *weightSums, int *weightZeros, float *scales, float *bias,
+                                    float *iscales, float *izeros, float *inputSums) : 
+            a(a), b(b), c(c), n(n), m(m), k(k), kstride(kstride),
+            weightSums(weightSums), weightZeros(weightZeros), scales(scales), bias(bias),
+            iscales(iscales), izeros(izeros), inputSums(inputSums) {}
 
         void Run();
     };
@@ -98,7 +105,8 @@ namespace fastllm {
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum);
     void RunLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
-                            int *weightSums, LowBitConfig *weightConfigs, LowBitConfig *inputConfigs, float *bias,
+                            int *weightSums, int *weightZeros, float *scales, float *bias,
+                            float *inputSums, float *iscales, float *izeros,
                             AliveThreadPool *pool, int startTid, int threadNum);
     void RunLinearInt8Int4Group(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, int group, int groupCnt,
                                 int *weightSums, float *weightMins, float *scales, float *bias,
