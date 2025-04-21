@@ -1040,7 +1040,7 @@ namespace fastllm {
                     ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new MultiThreadOnlineQuantizationOp(
                                     middles[l], uinputDown.data(), inputConfigs.data(),
                                     n, mid, groupDown, groupCntDown,
-                                    inputSums.data(), iscales.data(), izeros.data()));
+                                    inputSums.data(), iscales.data(), izeros.data(), 1));
                     pool->PushOp(l - st, ops[l - st]);
                 }
                 for (int l = st; l <= end; l++) {

@@ -226,7 +226,7 @@ namespace fastllm {
                 std::vector <float> iscales, izeros;
                 iscales.resize(n * group);
                 izeros.resize(n * group);
-                MultiThreadOnlineQuantizationOp(inputData, uinput.data(), inputConfigs.data(), n, m, group, groupCnt, inputSums.data(), iscales.data(), izeros.data()).Run();
+                MultiThreadOnlineQuantizationOp(inputData, uinput.data(), inputConfigs.data(), n, m, group, groupCnt, inputSums.data(), iscales.data(), izeros.data(), 1).Run();
                 int per = k / threadNum;
                 int cur = 0;
                 std::vector<fastllm::MultiThreadLinearInt8Int4GroupOp*> ops;
@@ -351,7 +351,7 @@ namespace fastllm {
                 std::vector <float> iscales, izeros;
                 iscales.resize(n * group);
                 izeros.resize(n * group);
-                MultiThreadOnlineQuantizationOp(floatInput.data(), uinput.data(), inputConfigs.data(), n, m, group, groupCnt, inputSums.data(), iscales.data(), izeros.data()).Run();
+                MultiThreadOnlineQuantizationOp(floatInput.data(), uinput.data(), inputConfigs.data(), n, m, group, groupCnt, inputSums.data(), iscales.data(), izeros.data(), 1).Run();
                 int per = k / threadNum;
                 int cur = 0;
                 std::vector<fastllm::MultiThreadLinearInt8Int4GroupOp*> ops;

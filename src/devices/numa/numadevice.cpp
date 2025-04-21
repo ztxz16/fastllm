@@ -26,6 +26,9 @@
 namespace fastllm {
     extern FP16ToFP32Manager fp16tofp32;
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
+    extern void OnlineQuantization(float *inputData, std::vector<uint8_t> &uinput, std::vector<LowBitConfig> &inputConfigs, 
+        int n, int m, int group, int groupCnt,
+        std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros, int permuteType);
 
     NumaClient *numaClient = new NumaClient();
 
@@ -147,6 +150,12 @@ namespace fastllm {
                 uint8_t *weightData = (uint8_t *) weight.cpuData;
                 float *outputData = (float *) output.cpuData;
                 float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
+
+                int permuteType = 1;
+                if (weight.dataType == DataType::INT8) {
+                    permuteType = 0;
+                }
+
                 weight.CalcWeightSum();
 
                 int group = weight.group, groupCnt = weight.groupCnt;
@@ -160,20 +169,7 @@ namespace fastllm {
                 std::vector<uint8_t> uinput;
                 uinput.resize(n * m);
 
-                if (weight.dataType == DataType::INT8) {
-                    inputConfigs.clear();
-                    for (int i = 0; i < n; i++) {
-                        float minValue = 1e9, maxValue = -1e9;
-                        for (int j = 0; j < m; j++) {
-                            minValue = std::min(minValue, inputData[i * m + j]);
-                            maxValue = std::max(maxValue, inputData[i * m + j]);
-                        }
-                        inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
-                    }
-                    for (int i = 0; i < n * m; i++) {
-                        uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
-                    }
-                } else {
+                {
                     if (n > 1) {
                         auto pool = GetAlivePool();
                         int threadNum = pool->threads.size();
@@ -184,7 +180,7 @@ namespace fastllm {
                             int end = (i == threadNum - 1 ? n : cur + per + (cur + per * (threadNum - i) < n));
                             ops.push_back(new MultiThreadOnlineQuantizationOp(
                                             inputData + cur * m, uinput.data() + cur * m, inputConfigs.data() + cur * group,
-                                            end - cur, m, group, groupCnt, nullptr, nullptr, nullptr));
+                                            end - cur, m, group, groupCnt, nullptr, nullptr, nullptr, permuteType));
                             cur = end;
                         }
                         for (int i = 0; i < threadNum; i++) {
@@ -195,7 +191,7 @@ namespace fastllm {
                             delete ops[i];
                         }
                     } else {
-                        MultiThreadOnlineQuantizationOp(inputData, uinput.data(), inputConfigs.data(), n, m, group, groupCnt, nullptr, nullptr, nullptr).Run();
+                        MultiThreadOnlineQuantizationOp(inputData, uinput.data(), inputConfigs.data(), n, m, group, groupCnt, nullptr, nullptr, nullptr, permuteType).Run();
                     }
                 }
 
@@ -223,6 +219,11 @@ namespace fastllm {
                 float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
                 weight.CalcWeightSum();
 
+                int permuteType = 1;
+                if (weight.dataType == DataType::INT8) {
+                    permuteType = 0;
+                }
+
                 int group = weight.group, groupCnt = weight.groupCnt;
                 if (weight.dataType != DataType::INT4_GROUP) {
                     group = 1;
@@ -249,7 +250,7 @@ namespace fastllm {
                         int end = (i == threadNum - 1 ? n : cur + per + (cur + per * (threadNum - i) < n));
                         ops.push_back(new MultiThreadOnlineQuantizationOp(
                                         floatInputData.data() + cur * m, uinput.data() + cur * m, inputConfigs.data() + cur * group,
-                                        end - cur, m, group, groupCnt, nullptr, nullptr, nullptr));
+                                        end - cur, m, group, groupCnt, nullptr, nullptr, nullptr, permuteType));
                         cur = end;
                     }
                     for (int i = 0; i < threadNum; i++) {
@@ -260,7 +261,7 @@ namespace fastllm {
                         delete ops[i];
                     }
                 } else {
-                    MultiThreadOnlineQuantizationOp(floatInputData.data(), uinput.data(), inputConfigs.data(), n, m, group, groupCnt, nullptr, nullptr, nullptr).Run();
+                    MultiThreadOnlineQuantizationOp(floatInputData.data(), uinput.data(), inputConfigs.data(), n, m, group, groupCnt, nullptr, nullptr, nullptr, permuteType).Run();
                 }
                 if (weight.dataType == DataType::INT4) {
                     ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
@@ -301,10 +302,6 @@ namespace fastllm {
         }
         return true;
     }
-
-    extern void OnlineQuantization(float *inputData, std::vector<uint8_t> &uinput, std::vector<LowBitConfig> &inputConfigs, 
-                            int n, int m, int group, int groupCnt,
-                            std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros);
     
     void NumaMergeMOE::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
 // auto ttt = std::chrono::system_clock::now();
@@ -337,7 +334,7 @@ namespace fastllm {
             std::vector<uint8_t> uinput;
             std::vector <float> inputSums;
             std::vector <float> iscales, izeros;
-            OnlineQuantization(inputData, uinput, inputConfigs, n, m, group, groupCnt, inputSums, iscales, izeros);
+            OnlineQuantization(inputData, uinput, inputConfigs, n, m, group, groupCnt, inputSums, iscales, izeros, 1);
 
             std::vector <std::vector <fastllm::Data*> > ws;
             std::vector <std::vector <float> > factors;
@@ -421,7 +418,7 @@ namespace fastllm {
                 std::vector <float> inputSums;
                 std::vector <float> iscales, izeros;
                 OnlineQuantization(inputData, uinput, inputConfigs, 1, m, group, groupCnt, 
-                                    inputSums, iscales, izeros);
+                                    inputSums, iscales, izeros, 1);
                 
                 std::vector <fastllm::Data*> ws;
                 std::vector <float> factors;

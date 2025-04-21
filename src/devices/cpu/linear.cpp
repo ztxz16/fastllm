@@ -23,7 +23,8 @@ namespace fastllm {
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
     extern void OnlineQuantization(float *inputData, std::vector<uint8_t> &uinput, std::vector<LowBitConfig> &inputConfigs, 
                                 int n, int m, int group, int groupCnt,
-                                std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros);
+                                std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros, 
+                                int permuteType);
 #ifdef __AVX2__
     extern int DotU4U8(uint8_t *a, uint8_t *b, int n);
 #endif
@@ -610,6 +611,12 @@ namespace fastllm {
                                 AliveThreadPool *pool, int startTid, int threadNum) {
         weight.CalcWeightSum();
         std::vector<LowBitConfig> inputConfigs;
+        std::vector<uint8_t> uinput;
+        std::vector <float> inputSums, iscales, izeros;
+        OnlineQuantization(inputData, uinput, inputConfigs, n, m, 1, m, inputSums, iscales, izeros, 0);
+/*
+        weight.CalcWeightSum();
+        std::vector<LowBitConfig> inputConfigs;
         for (int i = 0; i < n; i++) {
             float minValue = 1e9, maxValue = -1e9;
             for (int j = 0; j < m; j++) {
@@ -623,6 +630,7 @@ namespace fastllm {
         for (int i = 0; i < n * m; i++) {
             uinput[i] = inputConfigs[i / m].quantization(inputData[i]);
         }
+*/
         RunLinearInt8Int8(uinput.data(), (uint8_t*)weight.cpuData, outputData, n, m, k, 
                 weight.weightSum.data(), weight.perChannelsConfigs.data(), inputConfigs.data(), biasData,
                 pool, startTid, threadNum);
@@ -653,7 +661,7 @@ namespace fastllm {
         std::vector<LowBitConfig> inputConfigs;
         std::vector<uint8_t> uinput;
         std::vector <float> inputSums, iscales, izeros;
-        OnlineQuantization(inputData, uinput, inputConfigs, n, m, group, groupCnt, inputSums, iscales, izeros);
+        OnlineQuantization(inputData, uinput, inputConfigs, n, m, group, groupCnt, inputSums, iscales, izeros, 1);
         RunLinearInt8Int4Group(uinput.data(), (uint8_t*)weight.cpuData, outputData, n, m, k,
                                 group, groupCnt, weight.weightSum.data(), weight.mins.data(), weight.scales.data(), 
                                 biasData, inputSums.data(), iscales.data(), izeros.data(),
