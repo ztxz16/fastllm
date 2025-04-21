@@ -18,11 +18,14 @@ namespace fastllm {
         LowBitConfig *configs;
         int n, m, group, groupCnt;
         float *inputSums, *iscales, *izeros;
+        int permuteType;
 
         MultiThreadOnlineQuantizationOp (float *input, uint8_t *output, LowBitConfig *configs, int n, int m, int group, int groupCnt,
-                                        float *inputSums, float *iscales, float *izeros) :
+                                        float *inputSums, float *iscales, float *izeros, 
+                                        int permuteType) :
                 input(input), output(output), configs(configs), n(n), m(m), group(group), groupCnt(groupCnt), 
-                inputSums(inputSums), iscales(iscales), izeros(izeros) {} ;
+                inputSums(inputSums), iscales(iscales), izeros(izeros),
+                permuteType(permuteType) {} ;
 
         void Run();
     };

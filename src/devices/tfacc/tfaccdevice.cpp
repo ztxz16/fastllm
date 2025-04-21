@@ -283,7 +283,7 @@ namespace fastllm {
 
     extern void OnlineQuantization(float *inputData, std::vector<uint8_t> &uinput, std::vector<LowBitConfig> &inputConfigs, 
                             int n, int m, int group, int groupCnt,
-                            std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros);
+                            std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros, int permuteType);
     
     void TfaccMergeMOE::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -341,7 +341,7 @@ namespace fastllm {
             std::vector <float> inputSums;
             std::vector <float> iscales, izeros;
             OnlineQuantization(inputData, uinput, inputConfigs, 1, m, group, groupCnt, 
-                                inputSums, iscales, izeros);
+                                inputSums, iscales, izeros, 1);
             
             std::vector <fastllm::Data*> ws;
             std::vector <float> factors;
