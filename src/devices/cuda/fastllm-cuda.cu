@@ -2847,7 +2847,7 @@ bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data 
         state = cudaMalloc(&cudaMins, k * sizeof(float));
         float *mins = new float[k];
         for (int i = 0; i < k; i++) {
-            mins[i] = weight.perChannelsConfigs[i].min;
+            mins[i] = weight.mins[i];
         }
         state = cudaMemcpy(cudaMins, mins, k * sizeof(float), cudaMemcpyHostToDevice);
         delete[] mins;

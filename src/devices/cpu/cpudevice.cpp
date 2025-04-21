@@ -452,7 +452,8 @@ namespace fastllm {
 
     void OnlineQuantization(float *inputData, std::vector<uint8_t> &uinput, std::vector<LowBitConfig> &inputConfigs, 
                             int n, int m, int group, int groupCnt,
-                            std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros) {
+                            std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros, 
+                            int permuteType) {
         inputConfigs.resize(n * group);
         uinput.resize(n * m);
         inputSums.resize(n * group);
@@ -470,7 +471,7 @@ namespace fastllm {
                 ops.push_back(new MultiThreadOnlineQuantizationOp(
                                 inputData + cur * m, uinput.data() + cur * m, inputConfigs.data() + cur * group,
                                 end - cur, m, group, groupCnt,
-                                inputSums.data() + cur * group, iscales.data() + cur * group, izeros.data() + cur * group));
+                                inputSums.data() + cur * group, iscales.data() + cur * group, izeros.data() + cur * group, permuteType));
                 cur = end;
             }
             for (int i = 0; i < threadNum; i++) {
@@ -482,7 +483,7 @@ namespace fastllm {
             }
         } else {
             MultiThreadOnlineQuantizationOp(inputData, uinput.data(), inputConfigs.data(), n, m, group, groupCnt,
-                                            inputSums.data(), iscales.data(), izeros.data()).Run();
+                                            inputSums.data(), iscales.data(), izeros.data(), permuteType).Run();
         }
     }
 
@@ -767,7 +768,7 @@ namespace fastllm {
                 std::vector <float> iscales, izeros;
 // record.push_back(std::make_pair("before OnlineQuantization", GetSpan(ttt, std::chrono::system_clock::now())));
                 OnlineQuantization(inputData, uinput, inputConfigs, 1, m, group, groupCnt, 
-                                    inputSums, iscales, izeros);
+                                    inputSums, iscales, izeros, 1);
 // record.push_back(std::make_pair("OnlineQuantization", GetSpan(ttt, std::chrono::system_clock::now())));
                 std::vector <float*> middles;
                 std::vector <float*> results;
@@ -868,7 +869,7 @@ namespace fastllm {
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new MultiThreadOnlineQuantizationOp(
                                     middles[l], uinputDown.data(), inputConfigs.data(),
                                     1, mid, groupDown, groupCntDown,
-                                    inputSums.data(), iscales.data(), izeros.data()));
+                                    inputSums.data(), iscales.data(), izeros.data(), 1));
                         pool->PushOp(l - st, ops[l - st]);
                     }
                     for (int l = st; l <= end; l++) {
@@ -2244,22 +2245,26 @@ namespace fastllm {
             }
         }
 
+        if (permuteType == 1) {
+            // for INT8 * INT4
 #ifdef __AVX2__
-        Avx2InputPermute(output, n, m);
+            Avx2InputPermute(output, n, m);
 #endif
 #ifdef __AVX2__X
-        uint8_t *temp = new uint8_t[64];
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j + 63 < m; j += 64) {
-                memcpy(temp, output + i * m + j, 64);
-                for (int k = 0; k < 32; k++) {
-                    output[i * m + j + k] = temp[k * 2 + 1];
-                    output[i * m + j + k + 32] = temp[k * 2];
+            uint8_t *temp = new uint8_t[64];
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j + 63 < m; j += 64) {
+                    memcpy(temp, output + i * m + j, 64);
+                    for (int k = 0; k < 32; k++) {
+                        output[i * m + j + k] = temp[k * 2 + 1];
+                        output[i * m + j + k + 32] = temp[k * 2];
+                    }
                 }
             }
-        }
-        delete[] temp;
+            delete[] temp;
 #endif
+        }
+
         if (inputSums != nullptr) {
             for (int i = 0; i < n; i++) {
                 for (int g = 0; g < realGroup; g++) {
@@ -2358,7 +2363,7 @@ namespace fastllm {
                 std::vector<LowBitConfig> inputConfigs;
                 std::vector<uint8_t> uinput;
                 std::vector <float> inputSums, iscales, izeros;
-                OnlineQuantization(inputData, uinput, inputConfigs, n, m, 1, m, inputSums, iscales, izeros);
+                OnlineQuantization(inputData, uinput, inputConfigs, n, m, 1, m, inputSums, iscales, izeros, 1);
                 MultiplyInt4MultiThread(uinput.data(), weightData, (int32_t *) outputData, n, m, k,
                                             weight.weightSum.data(), weight.zeros.data(), weight.scales.data(),
                                             biasData,
