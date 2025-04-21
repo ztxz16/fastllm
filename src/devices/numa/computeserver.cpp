@@ -593,6 +593,32 @@ namespace fastllm {
         }
     }
 
+    void GetInputSums(std::vector <float> &inputSums, uint8_t *input, int n, int m, int group, int groupCnt, DataType weightType) {
+        if (weightType == DataType::INT8) {
+            // for int8 * int8
+            for (int i = 0; i < n; i++) {
+                for (int g = 0; g < group; g++) {
+                    int sum = 0;
+                    for (int j = g * groupCnt; j < (g + 1) * groupCnt && j < m; j++) {
+                        sum += input[i * m + j] ^ 128;
+                    }
+                    inputSums.push_back(sum);
+                }
+            }
+        } else {
+            // for int8 * int4
+            for (int i = 0; i < n; i++) {
+                for (int g = 0; g < group; g++) {
+                    int sum = 0;
+                    for (int j = g * groupCnt; j < (g + 1) * groupCnt && j < m; j++) {
+                        sum += input[i * m + j];
+                    }
+                    inputSums.push_back(sum);
+                }
+            }
+        }
+    }
+
     void ComputeServer::RunLinearInt() {
         int n, m, k, group, groupCnt;
         std::string weightName, biasName;
@@ -648,15 +674,8 @@ namespace fastllm {
                 groupCnt = m;
             }
             std::vector <float> inputSums;
-            for (int i = 0; i < n; i++) {
-                for (int g = 0; g < group; g++) {
-                    int sum = 0;
-                    for (int j = g * groupCnt; j < (g + 1) * groupCnt && j < m; j++) {
-                        sum += localInput[i * m + j];
-                    }
-                    inputSums.push_back(sum);
-                }
-            }
+            GetInputSums(inputSums, localInput, n, m, group, groupCnt, wType);
+            
             std::vector <float> iscales, izeros;
             for (int i = 0; i < configs.size(); i++) {
                 iscales.push_back(configs[i].scale);
@@ -675,8 +694,8 @@ namespace fastllm {
                     inputSums.data(), iscales.data(), izeros.data(), pool, 0, pool->threads.size());
             } else if (wType == fastllm::DataType::INT8) {
                 fastllm::RunLinearInt8Int8(localInput, weight, (float*)localOutput, n, m, localK, 
-                    w.weightSum.data(), w.perChannelsConfigs.data(), configs.data(), biasData,
-                    pool, 0, pool->threads.size());
+                    w.weightSum.data(), w.zeros.data(), w.scales.data(), biasData,
+                    inputSums.data(), iscales.data(), izeros.data(), pool, 0, pool->threads.size());
             }
         }
 
@@ -793,16 +812,7 @@ namespace fastllm {
 // record.push_back(std::make_pair("get config", GetSpan(ttt, std::chrono::system_clock::now())));
         RunMultiThreadMemcpy(this->inputBuffer.data(), (uint8_t*)buffer, n * m, pool);
 // record.push_back(std::make_pair("inputBuffer", GetSpan(ttt, std::chrono::system_clock::now())));
-        std::vector <float> inputSums;
-        for (int i = 0; i < n; i++) {
-            for (int g = 0; g < group; g++) {
-                int sum = 0;
-                for (int j = g * groupCnt; j < (g + 1) * groupCnt && j < m; j++) {
-                    sum += localInput[i * m + j];
-                }
-                inputSums.push_back(sum);
-            }
-        }
+
 // record.push_back(std::make_pair("input sum", GetSpan(ttt, std::chrono::system_clock::now())));
         if (n > 1) {
             std::vector <std::vector <fastllm::Data*> > weights;
@@ -823,6 +833,8 @@ namespace fastllm {
                 }
                 idx++;
             }
+            std::vector <float> inputSums;
+            GetInputSums(inputSums, localInput, n, m, group, groupCnt, weights[0][0]->dataType);
 
             int bs = n, dim = k;
             int inputDim = m;
@@ -945,6 +957,9 @@ namespace fastllm {
             for (auto &weight : config["weights"].array_items()) {
                 weights.push_back(&this->weights[weight.string_value()]);
             }
+            std::vector <float> inputSums;
+            GetInputSums(inputSums, localInput, n, m, group, groupCnt, weights[0]->dataType);
+
 // record.push_back(std::make_pair("get weight", GetSpan(ttt, std::chrono::system_clock::now())));
             std::vector <int> localKs;
             std::vector <float*> middles;
