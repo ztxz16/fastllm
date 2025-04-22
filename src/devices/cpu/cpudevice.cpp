@@ -693,8 +693,15 @@ namespace fastllm {
         float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
         output.Allocate();
         if ((input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16) && 
-            (weights[0]->dataType == DataType::INT4_GROUP || weights[0]->dataType == DataType::INT4_NOZERO) &&
+                (weights[0]->dataType == DataType::INT4_GROUP 
+                || weights[0]->dataType == DataType::INT4_NOZERO 
+                || weights[0]->dataType == DataType::INT8) &&
             input.dims[0] < 32) {
+            int permuteType = 1;
+            if (weights[0]->dataType == DataType::INT8) {
+                permuteType = 0;
+            }
+            
             int dimsLen = logits.dims.size();
             int outer = logits.Count(0) / logits.Count(dimsLen - 1);
             int channels = logits.dims[dimsLen - 1];
@@ -768,7 +775,7 @@ namespace fastllm {
                 std::vector <float> iscales, izeros;
 // record.push_back(std::make_pair("before OnlineQuantization", GetSpan(ttt, std::chrono::system_clock::now())));
                 OnlineQuantization(inputData, uinput, inputConfigs, 1, m, group, groupCnt, 
-                                    inputSums, iscales, izeros, 1);
+                                    inputSums, iscales, izeros, permuteType);
 // record.push_back(std::make_pair("OnlineQuantization", GetSpan(ttt, std::chrono::system_clock::now())));
                 std::vector <float*> middles;
                 std::vector <float*> results;
@@ -827,10 +834,17 @@ namespace fastllm {
                         int curK = weight->dims[0];
                         int curThread = (curK / k) * base;
 // xxx += m * curK;
-                        MultiplyInt4GroupMultiThreadLaunch(uinput.data(), weightData, outputData, 1, m, curK,
+                        if (weight->dataType == DataType::INT8) {
+                            LaunchLinearInt8Int8(uinput.data(), weightData, outputData, 1, m, curK,
+                                                weight->weightSum.data(), weight->zeros.data(), weight->scales.data(), biasData, 
+                                                inputSums.data(), iscales.data(), izeros.data(), 
+                                                ops, pool, threadSt, curThread);
+                        } else {
+                            MultiplyInt4GroupMultiThreadLaunch(uinput.data(), weightData, outputData, 1, m, curK,
                                                 weight->weightSum.data(), weight->mins.data(), weight->scales.data(), biasData, 
                                                 inputSums, iscales, izeros,
                                                 inputConfigs, threadSt, curThread, group, groupCnt, ops, pool);
+                        }
                         threadSt += curThread;
                     }
                     for (int j = 0; j < ops.size(); j++) {
@@ -869,7 +883,7 @@ namespace fastllm {
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new MultiThreadOnlineQuantizationOp(
                                     middles[l], uinputDown.data(), inputConfigs.data(),
                                     1, mid, groupDown, groupCntDown,
-                                    inputSums.data(), iscales.data(), izeros.data(), 1));
+                                    inputSums.data(), iscales.data(), izeros.data(), permuteType));
                         pool->PushOp(l - st, ops[l - st]);
                     }
                     for (int l = st; l <= end; l++) {
@@ -895,10 +909,17 @@ namespace fastllm {
                             groupDown = 1;
                             groupCntDown = mid;
                         }
-                        MultiplyInt4GroupMultiThreadLaunch(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l], 1, mid, m,
+                        if (weightDown->dataType == DataType::INT8) {
+                            LaunchLinearInt8Int8(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l], 1, mid, m,
+                                                    weightDown->weightSum.data(), weightDown->zeros.data(), weightDown->scales.data(), nullptr, 
+                                                    inputSums.data(), iscales.data(), izeros.data(),
+                                                    ops, pool, threadSt, curThread);
+                        } else {
+                            MultiplyInt4GroupMultiThreadLaunch(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l], 1, mid, m,
                                                     weightDown->weightSum.data(), weightDown->mins.data(), weightDown->scales.data(), nullptr, 
                                                     inputSums, iscales, izeros,
                                                     inputConfigs, threadSt, curThread, groupDown, groupCntDown, ops, pool);
+                        }
                         threadSt += curThread;               
                     }
 

@@ -229,7 +229,27 @@ namespace fastllm {
             weight[name] = Data(dataType, {k, localM});
             weight[name].name = name;
             weight[name].Allocate();
-            if (dataType == DataType::INT4_NOZERO) {
+            if (dataType == DataType::INT8) {
+                int bit = 8;
+                weight[name].perChannelAxis = buffer.ReadInt();
+                int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
+                weight[name].perChannelsConfigs.resize(k);
+                weight[name].zeros.resize(k);
+                weight[name].scales.resize(k);
+                for (int i = 0; i < k; i++) {
+                    float minValue = buffer.ReadFloat();
+                    float maxValue = buffer.ReadFloat();
+                    weight[name].perChannelsConfigs[i] = LowBitConfig(minValue, maxValue, bit, 1);
+                    weight[name].zeros[i] = weight[name].perChannelsConfigs[i].zeroPoint;
+                    weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
+                }
+                
+                for (int i = 0; i < k; i++) {
+                    buffer.Skip(base);
+                    buffer.ReadBytes(weight[name].cpuData + i * localM, localM);
+                    buffer.Skip(m - base - localM);
+                }
+            } else if (dataType == DataType::INT4_NOZERO) {
                 int bit = 4;
                 weight[name].perChannelAxis = buffer.ReadInt();
                 int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
@@ -959,6 +979,10 @@ namespace fastllm {
             }
             std::vector <float> inputSums;
             GetInputSums(inputSums, localInput, n, m, group, groupCnt, weights[0]->dataType);
+            int permuteType = 1;
+            if (weights[0]->dataType == DataType::INT8) {
+                permuteType = 0;
+            }
 
 // record.push_back(std::make_pair("get weight", GetSpan(ttt, std::chrono::system_clock::now())));
             std::vector <int> localKs;
@@ -1015,10 +1039,17 @@ namespace fastllm {
                     float *biasData = nullptr;
                     int curK = localKs[l];
                     int curThread = (curK / k) * base;
-                    MultiplyInt4GroupMultiThreadLaunch(localInput, weightData, outputData, n, m, curK,
+                    if (weight->dataType == DataType::INT8) {
+                        LaunchLinearInt8Int8(localInput, weightData, outputData, n, m, curK,
+                                            weight->weightSum.data(), weight->zeros.data(), weight->scales.data(), biasData, 
+                                            inputSums.data(), iscales.data(), izeros.data(), 
+                                            ops, pool, threadSt, curThread);
+                    } else {
+                        MultiplyInt4GroupMultiThreadLaunch(localInput, weightData, outputData, n, m, curK,
                                                 weight->weightSum.data(), weight->mins.data(), weight->scales.data(), 
                                                 biasData, inputSums, iscales, izeros,
                                                 inputConfigs, threadSt, curThread, group, groupCnt, ops, pool);
+                    }
                     threadSt += curThread;
                 }
 
@@ -1055,7 +1086,7 @@ namespace fastllm {
                     ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new MultiThreadOnlineQuantizationOp(
                                     middles[l], uinputDown.data(), inputConfigs.data(),
                                     n, mid, groupDown, groupCntDown,
-                                    inputSums.data(), iscales.data(), izeros.data(), 1));
+                                    inputSums.data(), iscales.data(), izeros.data(), permuteType));
                     pool->PushOp(l - st, ops[l - st]);
                 }
                 for (int l = st; l <= end; l++) {
@@ -1081,10 +1112,18 @@ namespace fastllm {
                         groupDown = 1;
                         groupCntDown = mid;
                     }
-                    MultiplyInt4GroupMultiThreadLaunch(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l], 1, mid, m,
+
+                    if (weightDown->dataType == DataType::INT8) {
+                        LaunchLinearInt8Int8(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l], 1, mid, m,
+                                                weightDown->weightSum.data(), weightDown->zeros.data(), weightDown->scales.data(), nullptr, 
+                                                inputSums.data(), iscales.data(), izeros.data(),
+                                                ops, pool, threadSt, curThread);
+                    } else {
+                        MultiplyInt4GroupMultiThreadLaunch(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l], 1, mid, m,
                                                 weightDown->weightSum.data(), weightDown->mins.data(), weightDown->scales.data(), nullptr, 
                                                 inputSums, iscales, izeros,
                                                 inputConfigs, threadSt, curThread, groupDown, groupCntDown, ops, pool);
+                    }
                     threadSt += curThread;               
                 }
 
