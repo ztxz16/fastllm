@@ -540,13 +540,29 @@ namespace fastllm {
         delete[] temp;
 #endif
     }
-
-    void LaunchLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
-        int *weightSums, LowBitConfig *weightConfigs, LowBitConfig *inputConfigs, float *bias,
-        AliveThreadPool *pool, int startTid, int threadNum) {
-
-    }
     
+    void LaunchLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
+        int *weightSums, int *weightZeros, float *scales, float *bias,
+        float *inputSums, float *iscales, float *izeros,
+        std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
+        int per = k / threadNum;
+        int cur = 0;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            if (i == threadNum - 1) {
+                end = k;
+            }
+            ops[startTid + i] = new MultiThreadLinearInt8Int8Op(a, b + cur * m, (int32_t*)c + cur, n, m, end - cur, k, 
+                                                        weightSums + cur, weightZeros + cur, scales + cur, 
+                                                        (bias == nullptr ? (float *) nullptr : bias + cur), 
+                                                        iscales, izeros, inputSums);
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[startTid + i]);
+        }
+    }
+
     //a = [n, m], b = [k, m], c = aT(b') = [n, k]
     void RunLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
                             int *weightSums, int *weightZeros, float *scales, float *bias,
