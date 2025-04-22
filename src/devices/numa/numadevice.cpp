@@ -322,6 +322,11 @@ namespace fastllm {
         int channels = logits.dims[dimsLen - 1];
         int n = input.dims[0], m = input.dims[1], k = output.dims[1];
 
+        int permuteType = 1;
+        if (weights[0]->dataType == DataType::INT8) {
+            permuteType = 0;
+        }
+
         if (n > 31) {
 // auto st = std::chrono::system_clock::now();
             int group = weights[0]->group, groupCnt = weights[0]->groupCnt;
@@ -334,7 +339,7 @@ namespace fastllm {
             std::vector<uint8_t> uinput;
             std::vector <float> inputSums;
             std::vector <float> iscales, izeros;
-            OnlineQuantization(inputData, uinput, inputConfigs, n, m, group, groupCnt, inputSums, iscales, izeros, 1);
+            OnlineQuantization(inputData, uinput, inputConfigs, n, m, group, groupCnt, inputSums, iscales, izeros, permuteType);
 
             std::vector <std::vector <fastllm::Data*> > ws;
             std::vector <std::vector <float> > factors;
@@ -418,7 +423,7 @@ namespace fastllm {
                 std::vector <float> inputSums;
                 std::vector <float> iscales, izeros;
                 OnlineQuantization(inputData, uinput, inputConfigs, 1, m, group, groupCnt, 
-                                    inputSums, iscales, izeros, 1);
+                                    inputSums, iscales, izeros, permuteType);
                 
                 std::vector <fastllm::Data*> ws;
                 std::vector <float> factors;
