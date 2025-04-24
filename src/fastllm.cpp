@@ -2955,6 +2955,13 @@ namespace fastllm {
                                         {"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()}});
     }
 
+    void MergeMLA(Data &qNope, Data &qPe, Data &kvCache, Data &peCache, const Data &mask, Data &output, float softmaxScale) {
+        curExecutor->Run("MergeMLA", {
+            {"qNope", (Data*)&qNope}, {"qPe", (Data*)&qPe}, {"kvCache", (Data*)&kvCache}, {"peCache", (Data*)&peCache},
+            {"mask", (Data*)&mask}, {"output", (Data*)&output}
+        }, {{"softmaxScale", softmaxScale}}, {});
+    }
+
     // attentionType
     // 1: normal
     // 2: 不做mask

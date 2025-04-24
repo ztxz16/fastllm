@@ -47,6 +47,8 @@ namespace fastllm {
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CudaLlamaRotatePosition2DOp());
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CudaRepeatPenaltyOp());
         this->ops["ApplyLognAttn"] = (BaseOperator*)(new CudaApplyLognAttnOp());
+        this->ops["MergeMOE"] = (BaseOperator*)(new CudaMergeMOE());
+        this->ops["MergeMLA"] = (BaseOperator*)(new CudaMergeMLA());
 
         this->ops["SplitBatch"] = (BaseOperator*)(new CudaSplitBatchOp());
         this->ops["CatBatch"] = (BaseOperator*)(new CudaCatBatchOp());
@@ -324,7 +326,7 @@ namespace fastllm {
         return true;
     }
 
-    void DoCudaLinear(Data &input, Data &weight, Data &bias, Data &output) {
+    void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output) {
         output.Allocate();
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
@@ -931,6 +933,193 @@ namespace fastllm {
         Data &positionIds = *(datas.find("positionIds")->second);
 
         FastllmCudaApplyLognAttn(input, lognAttn, positionIds);
+    }
+
+    void CudaMergeMLA::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qNope = *(datas.find("qNope")->second);
+        Data &output = *(datas.find("output")->second);
+        // int b = qNope.dims[0], s = q_nope.dims[1], h = q_nope.dims[2], d = q_nope.dims[3], c = qNope.dims.back();
+        output.dataType = qNope.dataType;
+        output.Resize(qNope.dims);
+    }
+
+    void CudaMergeMLA::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qNope = *(datas.find("qNope")->second);
+        Data &qPe = *(datas.find("qPe")->second);
+        Data &kvCache = *(datas.find("kvCache")->second);
+        Data &peCache = *(datas.find("peCache")->second);
+        Data &mask = *(datas.find("mask")->second);
+        Data &output = *(datas.find("output")->second);
+        float softmaxScale = floatParams.find("softmaxScale") != floatParams.end() ? floatParams.find("softmaxScale")->second : 1.0f;        
+        int b = qPe.dims[0], s = qPe.dims[1], h = qPe.dims[2], c = qNope.dims.back(), t = kvCache.dims[1], r = qPe.dims[3];
+        output.Allocate();
+
+        // qNope: {b * s, h, c}
+        // qPe: {b, s, h, r}
+        // kvCache : {1, t, r}
+        // peCache : {1, t, c}
+        // output : {b * s, h, c}
+
+        Data score0, score1;
+        if (b == 1 && s == 1) {
+            FastllmCudaMLA(qNope, qPe, kvCache, peCache, score0, output, softmaxScale);
+        } else {
+            qNope.Reshape({b, s * h, c});
+            MatMulTransB(qNope, peCache, score0);
+            score0.Reshape({b, s, h, t});
+
+            qPe.Reshape({qPe.dims[0], -1, qPe.dims[3]});
+            MatMulTransB(qPe, kvCache, score1);
+            score1.Reshape({b, s, h, t});
+
+            AddTo(score1, score0);
+            Mul(score1, softmaxScale, score0);
+
+            if (mask.dims.size() > 0) {
+                score0.Reshape({b * s, h, t});
+                ToDataType(mask, DataType::FLOAT32);
+                AttentionMask(score0, mask, -10000);
+            }
+
+            Softmax(score0, score0, -1);
+            score0.Reshape({b, s * h, t});
+            MatMul(score0, peCache, output);
+        }
+    }
+
+    void CudaMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &gateBias = *(datas.find("gateBias")->second);
+        Data &logits = *(datas.find("logits")->second);
+        Data &w1 = *(datas.find("w1")->second);
+        Data &w2 = *(datas.find("w2")->second);
+        Data &w3 = *(datas.find("w3")->second);
+        Data **weights = (Data**)(datas.find("weights")->second);
+        Data **biass = (Data**)(datas.find("biass")->second);
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        int needNorm = intParams.find("needNorm") != intParams.end() ? intParams.find("needNorm")->second : 0;
+        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
+        float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
+        output.Allocate();
+        {
+            int batch = input.dims[0];
+            Data &bias = gateBias;                  
+            ToDataType(logits, DataType::FLOAT32);
+            logits.ToDevice(DataDevice::CPU);
+            float *cpuRouterLogits = (float*)logits.cpuData;
+            int m = logits.dims.back();
+
+            if (batch == 1) {
+                float *cur = cpuRouterLogits;
+                std::vector <std::pair <float, int> > oriV; // (value, idx)
+                for (int i = 0; i < m; i++) {
+                    oriV.push_back(std::make_pair(-cur[i], i));
+                }
+                if (bias.dims.size() > 0) {
+                    ToDataType(bias, DataType::FLOAT32);
+                    bias.ToDevice(DataDevice::CPU);
+                    float *cpuBias = (float*)bias.cpuData;
+                    for (int i = 0; i < m; i++) {
+                        oriV[i].first -= cpuBias[i];
+                    }
+                }
+                // sort(oriV.begin(), oriV.end());
+                std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
+                float sum = 0.0;
+                for (int j = 0; j < topk; j++) {
+                    float value = cur[oriV[j].second];
+                    sum += value;
+                }
+                if (!needNorm) {
+                    sum = 1.0;
+                }
+                std::vector <std::pair <int, float> > v;
+                v.resize(topk + 1);
+                for (int j = 0; j < topk; j++) {
+                    v[j] = std::make_pair(oriV[j].second + 1, cur[oriV[j].second] / sum * routeScale);
+                }
+                v.back() = (std::make_pair(0, sharedScale));
+                for (int j = 0; j < v.size(); j++) {
+                    int idx = v[j].first;
+                    float value = v[j].second;
+                    DoCudaLinearReshape(input, *weights[idx * 2], w3);
+                    DoCudaLinear(input, *weights[idx * 2], Data(), w3);
+                    Swiglu(w3, w1);
+                    DoCudaLinearReshape(w1, *weights[idx * 2 + 1], w2);
+                    DoCudaLinear(w1, *weights[idx * 2 + 1], Data(), w2);
+
+                    if (j == 0) {
+                        Mul(w2, value, output);
+                    } else {
+                        AddTo(output, w2, value);
+                    }
+                }
+            } else {
+                Data attenPart, moePart;
+                Data moeFinal = Data();
+                moeFinal.Resize({0, input.dims[1]});
+                moeFinal.Expansion(input.dims);
+                
+                for (int b = 0; b < batch; b++) {
+                    float *cur = cpuRouterLogits + b * m;
+                    std::vector <std::pair <float, int> > oriV; // (value, idx)
+                    for (int i = 0; i < m; i++) {
+                        oriV.push_back(std::make_pair(-cur[i], i));
+                    }
+                    if (bias.dims.size() > 0) {
+                        ToDataType(bias, DataType::FLOAT32);
+                        bias.ToDevice(DataDevice::CPU);
+                        float *cpuBias = (float*)bias.cpuData;
+                        for (int i = 0; i < m; i++) {
+                            oriV[i].first -= cpuBias[i];
+                        }
+                    }
+
+                    sort(oriV.begin(), oriV.end());
+                    Data *currentData = &input;
+                    if (batch != 1) {
+                        Split(input, 0, b, b + 1, attenPart);
+                        currentData = &attenPart;
+                    }
+                        
+                    moePart.Resize(currentData->dims);
+                    moePart.Allocate(0.0f);
+
+                    float sum = 0.0;
+                    for (int j = 0; j < topk; j++) {
+                        float value = cur[oriV[j].second];
+                        sum += value;
+                    }
+                    if (!needNorm) {
+                        sum = 1.0;
+                    }
+
+                    std::vector <std::pair <int, float> > v;
+                    for (int j = 0; j < topk; j++) {
+                        v.push_back(std::make_pair(oriV[j].second + 1, cur[oriV[j].second] / sum * routeScale));
+                    }
+                    v.push_back(std::make_pair(0, sharedScale));
+
+                    for (int j = 0; j < v.size(); j++) {
+                        int idx = v[j].first;
+                        float value = v[j].second;
+                        Linear(*currentData, *weights[idx * 2], Data(), w3);
+                        Swiglu(w3, w1);
+                        Linear(w1, *weights[idx * 2 + 1], Data(), w2);
+                        AddTo(moePart, w2, value);
+                    }
+
+                    CatDirect(moeFinal, moePart, 0);
+                    moeFinal.expansionDims.clear();
+
+                    Mul(moeFinal, 1.0f, output);
+                }
+            }
+        }
     }
 
     void CudaMergeAttention::Reshape(const std::string &opType, const fastllm::DataDict &datas,
