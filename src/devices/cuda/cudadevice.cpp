@@ -966,26 +966,62 @@ namespace fastllm {
         if (b == 1 && s == 1) {
             FastllmCudaMLA(qNope, qPe, kvCache, peCache, score0, output, softmaxScale);
         } else {
-            qNope.Reshape({b, s * h, c});
-            MatMulTransB(qNope, peCache, score0);
-            score0.Reshape({b, s, h, t});
+            if ((double)b * s * h * t * 2 * 4 > 1e9) {
+                int parth = 1;
+                Data qNopePart, qPePart;
+                std::vector <Data> outputParts;
+                std::vector <Data*> outputPartPointers;
+                outputParts.resize((h - 1) / parth + 1);
+                for (int i = 0; i < outputParts.size(); i++) {
+                    outputPartPointers.push_back(&outputParts[i]);
+                }
+                for (int sth = 0; sth < h; sth += parth) {
+                    int idx = sth / parth;
+                    int curh = std::min(parth, h - sth);
+                    Split(qNope, 1, sth, sth + curh, qNopePart);
+                    Split(qPe, 2, sth, sth + curh, qPePart);
+                    qNopePart.Reshape({b, s * curh, c});
+                    MatMulTransB(qNopePart, peCache, score0);
+                    score0.Reshape({b, s, curh, t});
+                    qPePart.Reshape({b, s * curh, r});
+                    MatMulTransB(qPePart, kvCache, score1);
+                    score1.Reshape({b, s, curh, t});
+                    AddTo(score1, score0);
+                    Mul(score1, softmaxScale, score0);
+                    if (mask.dims.size() > 0) {
+                        score0.Reshape({b * s, curh, t});
+                        ToDataType(mask, DataType::FLOAT32);
+                        AttentionMask(score0, mask, -10000);
+                    }
 
-            qPe.Reshape({qPe.dims[0], -1, qPe.dims[3]});
-            MatMulTransB(qPe, kvCache, score1);
-            score1.Reshape({b, s, h, t});
+                    Softmax(score0, score0, -1);
+                    score0.Reshape({b, s * curh, t});
+                    MatMul(score0, peCache, outputParts[idx]);
+                    outputParts[idx].Reshape({b, s, curh, c});
+                }
+                CatBatch(outputPartPointers, 2, output);
+                output.Reshape({b * s, h, c});
+            } else {
+                qNope.Reshape({b, s * h, c});
+                MatMulTransB(qNope, peCache, score0);
+                score0.Reshape({b, s, h, t});
 
-            AddTo(score1, score0);
-            Mul(score1, softmaxScale, score0);
+                qPe.Reshape({qPe.dims[0], -1, qPe.dims[3]});
+                MatMulTransB(qPe, kvCache, score1);
+                score1.Reshape({b, s, h, t});
+                AddTo(score1, score0);
+                Mul(score1, softmaxScale, score0);
 
-            if (mask.dims.size() > 0) {
-                score0.Reshape({b * s, h, t});
-                ToDataType(mask, DataType::FLOAT32);
-                AttentionMask(score0, mask, -10000);
+                if (mask.dims.size() > 0) {
+                    score0.Reshape({b * s, h, t});
+                    ToDataType(mask, DataType::FLOAT32);
+                    AttentionMask(score0, mask, -10000);
+                }
+
+                Softmax(score0, score0, -1);
+                score0.Reshape({b, s * h, t});
+                MatMul(score0, peCache, output);
             }
-
-            Softmax(score0, score0, -1);
-            score0.Reshape({b, s * h, t});
-            MatMul(score0, peCache, output);
         }
     }
 
