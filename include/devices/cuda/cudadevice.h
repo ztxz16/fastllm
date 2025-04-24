@@ -11,7 +11,7 @@ namespace fastllm {
     void DoCudaAttentionReshape(Data &q, Data &v, Data &output);
     void DoCudaAttention(Data &q, Data &k, Data &v, Data &mask, Data &output, int group, float scale, int maskType);
     void DoCudaLinearReshape(Data &input, Data &weight, Data &output);
-    void DoCudaLinear(Data &input, Data &weight, Data &bias, Data &output);
+    void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output);
     void DoCudaSplitReshape(Data &input, int axis, int start, int end, Data &output);
     void DoCudaSplit(Data &input, int axis, int start, int end, Data &output);
     void DoCudaCatDirect(Data &input0, Data &input1, int axis);
@@ -180,6 +180,15 @@ namespace fastllm {
     };
 
     class CudaApplyLognAttnOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaMergeMOE : CpuMergeMOE {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaMergeMLA : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
