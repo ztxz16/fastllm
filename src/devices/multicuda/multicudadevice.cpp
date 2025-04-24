@@ -18,6 +18,7 @@ namespace fastllm {
 
         this->ops["MLP"] = (BaseOperator*)(new MultiCudaMLPOp());
         this->ops["Linear"] = (BaseOperator*)(new MultiCudaLinearOp());
+        // this->ops["MergeMOE"] = (BaseOperator*)(new MultiCudaMergeMOE());
         // this->ops["MergeAttention"] = (BaseOperator*)(new MultiCudaMergeAttention());
     }
 
@@ -378,5 +379,241 @@ namespace fastllm {
         values[0]->dims = values[0]->multiDeviceDatas[devices[0]]->dims;
         values[0]->expansionDims = values[0]->multiDeviceDatas[devices[0]]->expansionDims;
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+    }
+
+    struct MultiCudaDoMergeMOEOp : MultiThreadBaseOp {
+        uint8_t *oriCudaInput, *oriCpuInput, *partOutput;
+        Data *input;
+        Data **weights;
+        Data *logits, *gateBias;
+        Data *w1, *w2, *w3;
+        int topk, needNorm;
+        float routeScale, sharedScale;
+        Data *output;
+        int deviceId;
+
+        MultiCudaDoMergeMOEOp(uint8_t *oriCudaInput, uint8_t *oriCpuInput, uint8_t *partOutput, 
+                Data *input, Data **weights, Data *logits, Data *gateBias, 
+                Data *w1, Data *w2, Data *w3, 
+                int topk, int needNorm, float routeScale, float sharedScale,
+                Data *output, int deviceId) : 
+                oriCudaInput(oriCudaInput), oriCpuInput(oriCpuInput), partOutput(partOutput),
+                input(input), weights(weights), logits(logits), gateBias(gateBias), 
+                w1(w1), w2(w2), w3(w3),
+                topk(topk), needNorm(needNorm), routeScale(routeScale), sharedScale(sharedScale),
+                output(output), deviceId(deviceId) {}
+
+        void Run() {
+            FastllmCudaSetDevice(deviceId);
+            if (deviceId == 0) {
+                input->cudaData = oriCudaInput;
+            } else {
+                input->Allocate();
+                FastllmCudaCopyFromHostToDevice(input->cudaData, oriCpuInput, input->GetBytes());
+            }            
+            if (deviceId == 0) {
+                output->UpdateUnitSize();
+                output->cudaData = partOutput;
+                output->expansionSize = output->Count(0);
+                output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
+            }
+            
+            int batch = input->dims[0];
+            Data &bias = *gateBias;                  
+            float *cpuRouterLogits = (float*)logits->cpuData;
+            int m = logits->dims.back();
+
+            if (batch == 1) {
+                float *cur = cpuRouterLogits;
+                std::vector <std::pair <float, int> > oriV; // (value, idx)
+                for (int i = 0; i < m; i++) {
+                    oriV.push_back(std::make_pair(-cur[i], i));
+                }
+                if (bias.dims.size() > 0) {
+                    float *cpuBias = (float*)bias.cpuData;
+                    for (int i = 0; i < m; i++) {
+                        oriV[i].first -= cpuBias[i];
+                    }
+                }
+                // sort(oriV.begin(), oriV.end());
+                std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
+                float sum = 0.0;
+                for (int j = 0; j < topk; j++) {
+                    float value = cur[oriV[j].second];
+                    sum += value;
+                }
+                if (!needNorm) {
+                    sum = 1.0;
+                }
+                std::vector <std::pair <int, float> > v;
+                v.resize(topk + 1);
+                for (int j = 0; j < topk; j++) {
+                    v[j] = std::make_pair(oriV[j].second + 1, cur[oriV[j].second] / sum * routeScale);
+                }
+                v.back() = (std::make_pair(0, sharedScale));
+                for (int j = 0; j < v.size(); j++) {
+                    int idx = v[j].first;
+                    float value = v[j].second;
+                    DoCudaLinearReshape(*input, *weights[idx * 2]->multiDeviceDatas[deviceId], *w3);
+                    DoCudaLinear(*input, *weights[idx * 2]->multiDeviceDatas[deviceId], Data(), *w3);
+                    Swiglu(*w3, *w1);
+                    DoCudaLinearReshape(*w1, *weights[idx * 2 + 1]->multiDeviceDatas[deviceId], *w2);
+                    DoCudaLinear(*w1, *weights[idx * 2 + 1]->multiDeviceDatas[deviceId], Data(), *w2);
+
+                    if (j == 0) {
+                        Mul(*w2, value, *output);
+                    } else {
+                        AddTo(*output, *w2, value);
+                    }
+                }
+            } else {
+                Data attenPart, moePart;
+                Data moeFinal = Data();
+                moeFinal.Resize({0, input->dims[1]});
+                moeFinal.Expansion(input->dims);
+                
+                for (int b = 0; b < batch; b++) {
+                    float *cur = cpuRouterLogits + b * m;
+                    std::vector <std::pair <float, int> > oriV; // (value, idx)
+                    for (int i = 0; i < m; i++) {
+                        oriV.push_back(std::make_pair(-cur[i], i));
+                    }
+                    if (bias.dims.size() > 0) {
+                        float *cpuBias = (float*)bias.cpuData;
+                        for (int i = 0; i < m; i++) {
+                            oriV[i].first -= cpuBias[i];
+                        }
+                    }
+
+                    sort(oriV.begin(), oriV.end());
+                    Data *currentData = input;
+                    if (batch != 1) {
+                        Split(*input, 0, b, b + 1, attenPart);
+                        currentData = &attenPart;
+                    }
+                        
+                    moePart.Resize(currentData->dims);
+                    moePart.Allocate(0.0f);
+
+                    float sum = 0.0;
+                    for (int j = 0; j < topk; j++) {
+                        float value = cur[oriV[j].second];
+                        sum += value;
+                    }
+                    if (!needNorm) {
+                        sum = 1.0;
+                    }
+
+                    std::vector <std::pair <int, float> > v;
+                    for (int j = 0; j < topk; j++) {
+                        v.push_back(std::make_pair(oriV[j].second + 1, cur[oriV[j].second] / sum * routeScale));
+                    }
+                    v.push_back(std::make_pair(0, sharedScale));
+
+                    for (int j = 0; j < v.size(); j++) {
+                        int idx = v[j].first;
+                        float value = v[j].second;
+                        Linear(*currentData, *weights[idx * 2]->multiDeviceDatas[deviceId], Data(), *w3);
+                        Swiglu(*w3, *w1);
+                        Linear(*w1, *weights[idx * 2 + 1]->multiDeviceDatas[deviceId], Data(), *w2);
+                        AddTo(moePart, *w2, value);
+                    }
+
+                    CatDirect(moeFinal, moePart, 0);
+                    moeFinal.expansionDims.clear();
+
+                    Mul(moeFinal, 1.0f, *output);
+                }
+            }
+
+            if (deviceId != 0) {
+                FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
+            }
+        }
+    };
+
+    void MultiCudaMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &gateBias = *(datas.find("gateBias")->second);
+        Data &logits = *(datas.find("logits")->second);
+        Data &w1 = *(datas.find("w1")->second);
+        Data &w2 = *(datas.find("w2")->second);
+        Data &w3 = *(datas.find("w3")->second);
+        Data **weights = (Data**)(datas.find("weights")->second);
+        Data **biass = (Data**)(datas.find("biass")->second);
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        int needNorm = intParams.find("needNorm") != intParams.end() ? intParams.find("needNorm")->second : 0;
+        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
+        float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
+        output.Allocate();
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (!weights[0]->multiDeviceData) {
+            // 这里需要保证已经warmup过了，如果weights[0]切好就代表所有weight都已经切好了
+            Data empty;
+            int wBatch = intParams.find("weights___batch") != intParams.end() ? intParams.find("weights___batch")->second : (topk + 1) * 2;
+            for (int i = 0; i < wBatch; i += 2) {
+                int k = weights[i]->dims[0];
+                std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, k / 2, weights[i]->groupCnt <= 0 ? 1 : weights[i]->groupCnt);
+                DivisionScheme divisionScheme, divisionSchemeO;
+
+                int mid = weights[i]->dims[0] / 2;
+                for (int i = 0; i < devices.size(); i++) {
+                    int st = points[i], end = points[i + 1];
+                    int deviceId = devices[i];
+                    divisionScheme[deviceId].push_back(std::make_pair(st, end));
+
+                    divisionSchemeO[deviceId].push_back(std::make_pair(st, end));
+                    divisionSchemeO[deviceId].push_back(std::make_pair(mid + st, mid + end));
+                }
+
+                SplitMultiCudaWeight(*weights[i], empty, devices, divisionSchemeO, 0);
+                SplitMultiCudaWeight(*weights[i + 1], empty, devices, divisionScheme, 1);
+            }
+        }
+
+        ToDataType(logits, DataType::FLOAT32);
+        logits.ToDevice(DataDevice::CPU);
+        if (gateBias.dims.size() > 0) {
+            ToDataType(gateBias, DataType::FLOAT32);
+            gateBias.ToDevice(DataDevice::CPU);
+        }
+        
+        CopyToMultiDevices(w1, devices, false);
+        CopyToMultiDevices(w2, devices, false);
+        CopyToMultiDevices(w3, devices, false);
+
+        Data curInput, curOutput;
+        CopyToMultiDevices(input, devices, false);
+        curOutput.dataDevice = input.dataDevice;
+        CopyToMultiDevices(curOutput, devices, false);
+        std::vector <uint8_t> cpuInput;
+        cpuInput.resize(input.GetBytes());
+        FastllmCudaSetDevice(0);
+        FastllmCudaCopyFromDeviceToHost(cpuInput.data(), input.cudaData, input.GetBytes());
+        uint8_t *partOutput = (uint8_t*)FastllmCudaMalloc(output.GetBytes() * devices.size());
+        auto *pool = fastllm::GetAlivePool();
+        std::vector<fastllm::MultiThreadBaseOp*> ops;
+        for (int i = 0; i < devices.size(); i++) {
+            auto device = devices[i];
+            ops.push_back(new MultiCudaDoMergeMOEOp(
+                (uint8_t*)input.cudaData, (uint8_t*)cpuInput.data(), partOutput + output.GetBytes() * i,
+                input.multiDeviceDatas[device], weights, &logits, &gateBias, 
+                w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device], 
+                topk, needNorm, routeScale, sharedScale, 
+                curOutput.multiDeviceDatas[device], device
+            ));
+        }
+        for (int i = 0; i < devices.size(); i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < devices.size(); i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+        FastllmReduce((uint8_t*)output.cudaData, partOutput, output.Count(0), devices.size(), output.dataType);
     }
 }
