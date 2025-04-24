@@ -3884,6 +3884,13 @@ bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
         FastllmTransposeByRowKernel <256> <<< n * m, 256 >>>
                 ((uint8_t*)input.cudaData, (uint8_t*)tempData, n, m, k * input.unitSize);
         input.Resize(new_dims);
+    } else if (axis == std::vector <int> {1, 2, 0, 3}) {
+        int n = input.dims[0];
+        int m = input.dims[1] * input.dims[2];
+        int k = input.dims[3];
+        FastllmTransposeByRowKernel <256> <<< n * m, 256 >>>
+                ((uint8_t*)input.cudaData, (uint8_t*)tempData, n, m, k * input.unitSize);
+        input.Resize(new_dims);
     } else if (axis == std::vector <int> {0, 2, 1, 3} && input.dims[0] == 1) {
         int n = input.dims[1];
         int m = input.dims[2];
@@ -3978,6 +3985,46 @@ bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weigh
         
     }
 
+    DeviceSync();
+    return true;
+}
+
+bool FastllmCudaMLA(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCache, const fastllm::Data &peCache, 
+    fastllm::Data &ss, fastllm::Data &output, float softmaxScale) {
+    int b = qPe.dims[0], s = qPe.dims[1], h = qPe.dims[2], c = qNope.dims.back(), t = kvCache.dims[1], r = qPe.dims[3];
+    auto fastllmCublasHandle = getFastllmCublasHandle();
+    cublasStatus_t status;
+
+    // score.ToDevice(fastllm::DataDevice::CUDA);
+    // score.Resize({b, s, h, t});
+    // score.Allocate();
+    float *score = (float*)FastllmCudaMalloc(b * s * h * t * sizeof(float));
+
+    float alpha = softmaxScale, beta0 = 0.0f, beta1 = 1.0f;
+    status = cublasSgemmStridedBatched(fastllmCublasHandle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        t, h, c, &alpha,
+        (float*)peCache.cudaData, c, t * c,
+        (float*)qNope.cudaData, c, h * c,
+        &beta0,
+        score, t, t * h, 1);
+    status = cublasSgemmStridedBatched(fastllmCublasHandle,
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        t, h, r, &alpha,
+        (float*)kvCache.cudaData, r, t * r,
+        (float*)qPe.cudaData, r, h * r,
+        &beta1,
+        score, t, t * h, 1);        
+    int outer = b * s * h, channels = t;
+    FastllmSoftmaxKernelInner1 <64> <<< outer, 64 >>> (score, score, outer, channels);
+    status = cublasSgemmStridedBatched(fastllmCublasHandle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                c, b * s * h, t, &beta1,
+                (float*)peCache.cudaData, c, t * c,
+                score, t, b * s * h * t,
+                &beta0,
+                (float*)output.cudaData, c, c * b * s * h, 1);
+    FastllmCudaFree(score);
     DeviceSync();
     return true;
 }
