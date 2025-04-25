@@ -19,6 +19,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--cache_history", type = bool, default = False, help = "缓存历史对话")
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
+    parser.add_argument('--cache_dir', type = str, default = "", help = '指定缓存模型文件的路径')
     return parser
 
 def add_server_args(parser):
@@ -58,7 +59,7 @@ def make_normal_llm_model(args):
         from ftllm.download import HFDNormalDownloader
         from ftllm.download import find_metadata
         from ftllm.download import search_model
-        if (not(os.path.exists(get_fastllm_cache_path(args.path))) and not(find_metadata(args.path))):
+        if (not(os.path.exists(get_fastllm_cache_path(args.path, args.cache_dir))) and not(find_metadata(args.path))):
             print("Can't find model \"" + args.path + "\", try to find similar one.")
             search_result = search_model(args.path)
             if (len(search_result) > 0):
@@ -66,7 +67,7 @@ def make_normal_llm_model(args):
                 print("Replace model to \"" + args.path + "\"")
             else:
                 exit(0)
-        downloader = HFDNormalDownloader(args.path, local_dir = get_fastllm_cache_path(args.path))
+        downloader = HFDNormalDownloader(args.path, local_dir = get_fastllm_cache_path(args.path, args.cache_dir))
         downloader.run()
         args.path = str(downloader.local_dir)
     if (os.path.exists(os.path.join(args.path, "config.json"))):
@@ -176,23 +177,24 @@ def make_download_parser(add_help = True):
         
     return parser
 
-def get_fastllm_cache_path(model_name: str):
+def get_fastllm_cache_path(model_name: str, cache_path = ""):
     system = sys.platform
 
-    if system == "win32":
-        # Windows: %LOCALAPPDATA%\Temp 或 C:\Users\<user>\AppData\Local\Temp
-        cache_path = os.getenv('LOCALAPPDATA', os.path.expanduser('~\\AppData\\Local')) + '\\Temp'
-    elif system == "darwin":
-        # macOS: ~/Library/Caches
-        cache_path = os.path.expanduser('~/Library/Caches')
-    else:
-        # Linux 和其他 Unix-like 系统: ~/.cache 或 $XDG_CACHE_HOME
-        cache_path = os.getenv('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
-    cache_path = os.path.join(cache_path, "fastllm")
+    if cache_path == "":
+        if system == "win32":
+            # Windows: %LOCALAPPDATA%\Temp 或 C:\Users\<user>\AppData\Local\Temp
+            cache_path = os.getenv('LOCALAPPDATA', os.path.expanduser('~\\AppData\\Local')) + '\\Temp'
+        elif system == "darwin":
+            # macOS: ~/Library/Caches
+            cache_path = os.path.expanduser('~/Library/Caches')
+        else:
+            # Linux 和其他 Unix-like 系统: ~/.cache 或 $XDG_CACHE_HOME
+            cache_path = os.getenv('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
+        cache_path = os.path.join(cache_path, "fastllm")
 
-    cache_dir = os.getenv("FASTLLM_CACHEDIR")
-    if (cache_dir and os.path.isdir(cache_dir)):
-        cache_path = cache_dir
+        cache_dir = os.getenv("FASTLLM_CACHEDIR")
+        if (cache_dir and os.path.isdir(cache_dir)):
+            cache_path = cache_dir
 
     cache_path = os.path.join(cache_path, model_name)
     return cache_path
