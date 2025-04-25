@@ -587,11 +587,13 @@ namespace fastllm {
                         std::vector <std::vector <float>* > logits;
                         
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+                        auto &forwardLocker = model->forwardLocker;
                         
                         // 首先把已经abort的请求删除掉
                         std::set <int> abortHandles;
                         for (auto &it: model->responseContextDict.dicts) {
                             if (it.second->isAbort) {
+                                it.second->TryRecord(model);
                                 abortHandles.insert(it.first);
                             }
                         }
@@ -752,6 +754,7 @@ namespace fastllm {
                                 pastKeyValue1 = &model->responseContextDict.dicts[handles[0]]->pastKeyValues;
                             }
                             dictLocker.unlock();
+                            forwardLocker.lock();
 #ifdef USE_CUDA
                             FastllmCudaClearBigBuffer();
 #endif
@@ -768,7 +771,7 @@ auto st = std::chrono::system_clock::now();
                                 if (model->model_struct == "deepseek_v2") {
                                     // TODO: ds_v2支持更长的切片
                                     first = 1024;
-                                    part = 256;
+                                    part = 1024;
                                 }
                                 if (seqLens[0] > first) {
                                     int len = seqLens[0];
@@ -812,6 +815,7 @@ for (int i : seqLens) total += i;
 float spend = GetSpan(st, std::chrono::system_clock::now());
 printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)total / spend);
 */
+                            forwardLocker.unlock();
                             dictLocker.lock();
 
                             if (model->verbose) {
@@ -911,6 +915,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         auto cache = pastKVCacheManager.Get(inputTokens);
         if (cache.first != nullptr && cache.second > 0) {
             int len = cache.second;
+            
+            forwardLocker.lock();
             for (int i = 0; i < this->block_cnt; i++) {
                 Split(cache.first->kv[i].first, 1, 0, len, context->pastKeyValues[i].first);
                 Split(cache.first->kv[i].second, 1, 0, len, context->pastKeyValues[i].second);
@@ -922,6 +928,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 // context->pastKeyValues[i].first.CopyFrom(cache.first->kv[i].first);
                 // context->pastKeyValues[i].second.CopyFrom(cache.first->kv[i].second);
             }
+            forwardLocker.unlock();
             context->currentTokens.erase(context->currentTokens.begin(), context->currentTokens.begin() + len);
             context->cacheLen = len;
         }

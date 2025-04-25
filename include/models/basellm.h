@@ -288,7 +288,7 @@ namespace fastllm {
         ResponseContextDict responseContextDict;
 
         std::thread *mainLoop = nullptr;
-        std::mutex mainLoopLocker, dictLocker;
+        std::mutex mainLoopLocker, dictLocker, forwardLocker;
         std::condition_variable dictCV;
 
         std::map <std::string, int> deviceMap;
