@@ -117,12 +117,27 @@ GPU编译时，根据使用的CUDA版本，将cudart cublas的相关dll文件复
 ## ftllm报错
 
 **现象：**
-调用ftllm时报错，显示Load fastllm failed.
+调用ftllm时报错，显示Load fastllm failed. (或者version `GLIBCXX_3.4.32' not found)
 
 **原因：** 
 可能是GLIBC版本低于运行要求，可能发生于Ubuntu 20.04以下版本
 
 **解决办法：** 
+
+##### 如果使用conda环境
+
+尝试执行
+```
+conda install conda-forge::libstdcxx-ng
+```
+
+安装完成后，使用下面命令检查
+```
+strings $CONDA_PREFIX/lib/libstdc++.so.6 | grep GLIBCXX | sort | uniq
+```
+
+##### 非conda环境
+
 在/etc/apt/sources.list文件末尾增加：
 ```
 deb http://mirrors.aliyun.com/ubuntu/ jammy main
