@@ -578,9 +578,13 @@ class model:
             elif os.path.isdir(path):
                 if tokenizer_type != "fastllm":
                     try:
-                        from transformers import logging as transformers_logging
-                        transformers_logging.set_verbosity_error()
+                        import logging
+                        # 1. 保存当前的日志级别
+                        original_level = logging.root.manager.disable
+                        # 2. 完全禁止所有 logging 输出
+                        logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
                         from transformers import AutoTokenizer
+                        logging.disable(original_level)  # 恢复原来的日志级别
                         self.hf_tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
                     except:
                         self.hf_tokenizer = None
