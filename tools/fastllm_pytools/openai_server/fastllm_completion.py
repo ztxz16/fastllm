@@ -33,11 +33,13 @@ class FastLLmCompletion:
   def __init__(self,
                model_name,
                model,
-               think):
+               think, 
+               hide_input):
     self.model_name = model_name
     self.model = model
     self.init_fast_llm_model()
     self.think = think
+    self.hide_input = hide_input
     
   def init_fast_llm_model(self):
     pass
@@ -133,7 +135,8 @@ class FastLLmCompletion:
       max_length = request.max_tokens if request.max_tokens else 8192
       min_length = request.min_tokens if request.min_tokens else 0
       #logging.info(request)
-      logging.info(f"fastllm input message: {messages}")
+      if (not(self.hide_input)):
+         logging.info(f"fastllm input message: {messages}")
       #logging.info(f"input tokens: {input_token_len}")
       
       input_token_len = self.model.get_input_token_len(messages)
