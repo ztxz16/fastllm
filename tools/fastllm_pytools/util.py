@@ -27,6 +27,7 @@ def add_server_args(parser):
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
     parser.add_argument("--api_key", type = str, default = "", help = "API Key")
     parser.add_argument("--think", type = bool, default = False, help="if <think> lost")
+    parser.add_argument("--hide_input", action = 'store_true', help = "不显示请求信息")
 
 def make_normal_llm_model(args):
     if (args.model and args.model != ''):
