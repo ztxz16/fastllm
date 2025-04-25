@@ -489,7 +489,7 @@ class TokenizerCache:
         self.caches = deque(maxlen = 100)
     
     def add(self, prompt, tokens):
-        # print("add cache", prompt[:-100:])
+        # print("add cache", prompt[:100], tokens[:100])
         self.caches.append([prompt, tokens])
     
     def prompt_can_match(self, prompt, cur_len, s):
@@ -513,20 +513,22 @@ class TokenizerCache:
                     cur_prompt += it[0][i]
                     cur_len += len(it[0][i])
                     cur_tokens += it[1][i]
+                else:
+                    break
             if cur_len > max_len:
                 max_len = cur_len
                 use_cahce_prompt = cur_prompt
                 import copy
                 use_cache_tokens = copy.deepcopy(cur_tokens)
-        #print("use_cahce_prompt", use_cahce_prompt)
-        #print("use_cache_tokens", use_cache_tokens)
+        #print("use_cahce_prompt", use_cahce_prompt[:100])
+        #print("use_cache_tokens", use_cache_tokens[:100])
 
         if (max_len > 0):
             #print("real prompt", prompt)
             #print("decode", tokenizer.decode(use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)))
             return use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)
         else:
-            return tokenizer.encode(prompt)
+            return tokenizer.encode(prompt, add_special_tokens = False)
 
 class model:
     def __init__ (self, path : str,
@@ -1088,7 +1090,8 @@ class model:
                     input = self.tokenizer_cache.tokenize_with_cache(tokenizer, prompt)
                 else:
                     input = tokenizer.encode(prompt)
-                #print("prompt", prompt)
+                #print("prompt", prompt[:100])
+                #print("input", input[:100])
 
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
