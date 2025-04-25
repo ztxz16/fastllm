@@ -383,7 +383,7 @@ namespace fastllm {
             PermuteSelf(k_pe, {1, 0, 2, 3});
             PermuteSelf(k_pe, {0, 2, 1, 3});
 
-            if (excutor.GetFirstDeviceType() == "cuda") {
+            if (excutor.GetFirstDeviceType() == "cuda" || excutor.GetFirstDeviceType() == "multicuda") {
                 auto &k = k_pe, &v = kv_ln;
                 k_pe.Reshape({k_pe.dims[0], k_pe.dims[2], k_pe.dims[3]});
                 Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
@@ -915,7 +915,7 @@ namespace fastllm {
             PermuteSelf(k_pe, {0, 2, 1, 3});
 
             Data attenOutput = Data(this->dataType);
-            if (excutor.GetFirstDeviceType() == "cuda") {
+            if (excutor.GetFirstDeviceType() == "cuda" || excutor.GetFirstDeviceType() == "multicuda") {
                 k_pe.Reshape({k_pe.dims[0], k_pe.dims[2], k_pe.dims[3]});
                 std::string kv0Name = kvWeightName + "__0", kv1Name = kvWeightName + "__1";
                 Data &kv0 = this->weight[kv0Name];
