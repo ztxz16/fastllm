@@ -483,6 +483,51 @@ class GenerationConfig:
         # Validate the values of the attributes
         # self.validate(is_init = True)
 
+class TokenizerCache:
+    def __init__ (self):
+        from collections import deque
+        self.caches = deque(maxlen = 100)
+    
+    def add(self, prompt, tokens):
+        # print("add cache", prompt[:-100:])
+        self.caches.append([prompt, tokens])
+    
+    def prompt_can_match(self, prompt, cur_len, s):
+        if (cur_len + len(s) > len(prompt)):
+            return False
+        for i in range(len(s)):
+            if (prompt[cur_len + i] != s[i]):
+                return False
+        return True
+    
+    def tokenize_with_cache(self, tokenizer, prompt: str):
+        max_len = 0
+        use_cahce_prompt = ""
+        use_cache_tokens = []
+        for it in self.caches:
+            cur_tokens = []
+            cur_prompt = ""
+            cur_len = 0
+            for i in range(len(it[0])):    
+                if (self.prompt_can_match(prompt, cur_len, it[0][i])):
+                    cur_prompt += it[0][i]
+                    cur_len += len(it[0][i])
+                    cur_tokens += it[1][i]
+            if cur_len > max_len:
+                max_len = cur_len
+                use_cahce_prompt = cur_prompt
+                import copy
+                use_cache_tokens = copy.deepcopy(cur_tokens)
+        #print("use_cahce_prompt", use_cahce_prompt)
+        #print("use_cache_tokens", use_cache_tokens)
+
+        if (max_len > 0):
+            #print("real prompt", prompt)
+            #print("decode", tokenizer.decode(use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)))
+            return use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)
+        else:
+            return tokenizer.encode(prompt)
+
 class model:
     def __init__ (self, path : str,
                   id : int = -99999,
@@ -519,6 +564,10 @@ class model:
         if (dtype not in fastllm_data_type_dict):
             print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
             exit(0)
+        
+        self.save_history = False
+        self.tokenizer_cache = TokenizerCache()
+        self.current_tokenizer_cache = dict()
         
         self.hf_tokenizer = None
         if (id != -99999):
@@ -886,11 +935,13 @@ class model:
             else:
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
-                    #prompt = tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = False)
-                    input = tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = True)
+                    prompt = tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = False)
+                    #input = tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = True)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
-                    input = tokenizer.encode(prompt)
+                input = tokenizer.encode(prompt)
+                #print("prompt", prompt)
+
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                         max_length, 0, do_sample, top_p, top_k, temperature, repeat_penalty,
@@ -1029,11 +1080,18 @@ class model:
                     prompt = tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = False)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
-                input = tokenizer.encode(prompt)
+                if (self.save_history):
+                    input = self.tokenizer_cache.tokenize_with_cache(tokenizer, prompt)
+                else:
+                    input = tokenizer.encode(prompt)
+                #print("prompt", prompt)
+
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                         max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                         False, stop_token_len, stop_token_list)
+            if (self.save_history):
+                self.current_tokenizer_cache[handle] = [[prompt], [input]]
             return handle
         else:
             prompt = ""
@@ -1049,6 +1107,13 @@ class model:
             return handle
     
     def abort_handle(self, handle):
+        # print("into force abort")
+        if (self.save_history):
+            try:
+                cur = self.current_tokenizer_cache.pop(handle)
+                self.tokenizer_cache.add(cur[0], cur[1])
+            except:
+                pass
         fastllm_lib.abort_response_llm_model(self.model, handle)
     
     def stream_response_handle(self, handle):
@@ -1107,15 +1172,27 @@ class model:
                 if (cur <= -1):
                     if (cur == -2):
                         yield "prompt too long"
+                    if (self.save_history):
+                        try:
+                            cur = self.current_tokenizer_cache.pop(handle)
+                            self.tokenizer_cache.add(cur[0], cur[1])
+                        except:
+                            pass
                     break
                 tokens.append(cur)
                 ret = tokenizer.decode(tokens)
                 if (ret.encode().find(b'\xef\xbf\xbd') == -1):
+                    if (self.save_history and handle in self.current_tokenizer_cache):
+                        self.current_tokenizer_cache[handle][0].append(ret)
+                        self.current_tokenizer_cache[handle][1].append([] + tokens)
                     tokens.clear()
                     yield ret
                 else:
                     yield ""
             if len(tokens) > 0:
+                if (self.save_history and handle in self.current_tokenizer_cache):
+                    self.current_tokenizer_cache[handle][0].append(tokenizer.decode(tokens))
+                    self.current_tokenizer_cache[handle][1].append([] + tokens)
                 yield tokenizer.decode(tokens)
         else:
             res = ""
@@ -1251,6 +1328,7 @@ class model:
         fastllm_lib.release_memory(self.model)
     
     def set_save_history(self, save: bool):
+        self.save_history = True
         fastllm_lib.set_save_history(self.model, save)
 
     def set_atype(self, atype: str):
