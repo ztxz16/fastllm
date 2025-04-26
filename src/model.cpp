@@ -933,7 +933,7 @@ namespace fastllm {
                         if (StringEndWith(tensorName, "_scale_inv") ||
                             (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
                             locker.lock();
-                            printf("Convert %d \r", (++cnt) * 100 / (int)tensorMap.size());
+                            printf("Loading %d \r", (++cnt) * 100 / (int)tensorMap.size());
                             fflush(stdout);
                             locker.unlock();
                             continue;
@@ -1186,7 +1186,7 @@ namespace fastllm {
                         }
 
                         locker.lock();
-                        printf("Convert %d \r", (++cnt) * 100 / (int)tensorMap.size());
+                        printf("Loading %d \r", (++cnt) * 100 / (int)tensorMap.size());
                         fflush(stdout);
                         locker.unlock();
                     }
