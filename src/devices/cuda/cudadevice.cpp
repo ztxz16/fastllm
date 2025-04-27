@@ -1255,7 +1255,7 @@ namespace fastllm {
         DoCudaCatDirect(pastValue, v, 1);
 
         DoCudaAttentionReshape(q, pastValue, qkv);
-        DoCudaAttention(q, pastKey, pastValue, *masks[0], qkv, q.dims[0] / pastKey.dims[0], attentionScale, 1);
+        DoCudaAttention(q, pastKey, pastValue, *masks[0], qkv, q.dims[0] / pastKey.dims[0], attentionScale, 0);
 
         DoCudaPermuteSelf(qkv, {1, 0, 2});
         qkv.Reshape({seqlen, bsz, -1});
