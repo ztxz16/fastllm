@@ -3633,8 +3633,13 @@ bool FastllmCudaAttentionMask(fastllm::Data &input, const fastllm::Data &mask, f
     float *cudaData = (float *) FastllmCudaPrepareInput(input);
     float *maskData = (float *) FastllmCudaPrepareInput(mask);
 
+    if (input.dataType == fastllm::DataType::FLOAT32) {
     FastllmAttentionMaskKernel <256> <<< n * m, 256>>>(cudaData, maskData, maskValue,
                                                        n, m, spatial);
+    } else {
+        FastllmAttentionMaskKernel <256> <<< n * m, 256>>>((half*)cudaData, (half*)maskData, __float2half(maskValue),
+                                                        n, m, spatial);
+    }
     FastllmCudaFinishInput(mask, maskData);
     FastllmCudaFinishOutput(input, cudaData);
     return true;

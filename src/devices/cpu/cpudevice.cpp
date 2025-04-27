@@ -531,6 +531,29 @@ namespace fastllm {
             uint16_t *cur = (uint16_t*)input + o * inputStride;
             uint16_t *out = (uint16_t*)output + o * outputStride;
             int i = 0;
+#ifdef __AVX2__
+            for (; i + 7 < len; i += 8) {  // Process 8 elements at a time
+                __m128i x_half = _mm_loadu_si128((const __m128i*)&cur[i]);
+                __m256 x = _mm256_cvtph_ps(x_half);  // Convert float16 to float32
+    
+                // Load 8 float16 values from cur[i+mid..i+mid+7] and convert to float32
+                __m128i y_half = _mm_loadu_si128((const __m128i*)&cur[i + mid]);
+                __m256 y = _mm256_cvtph_ps(y_half);  // Convert float16 to float32
+                    
+                // Compute sigmoid: 1.0 / (1.0 + expf(-x))
+                __m256 neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
+                __m256 exp_neg_x = exp256_ps(neg_x);  // See note below about exp_ps
+                __m256 denom = _mm256_add_ps(_mm256_set1_ps(1.0f), exp_neg_x);
+                __m256 sigmoid = _mm256_div_ps(x, denom);
+                    
+                // Multiply by y and store result
+                __m256 result = _mm256_mul_ps(sigmoid, y);
+                
+                // Convert result back to float16 and store
+                __m128i result_half = _mm256_cvtps_ph(result, _MM_FROUND_TO_NEAREST_INT);
+                _mm_storeu_si128((__m128i*)&out[i], result_half);
+            }
+#endif
             for (; i < len; i++) {
                 float x = fp16tofp32.dict[cur[i]], y = fp16tofp32.dict[cur[i + mid]];
                 out[i] = float_to_half((x / (1.0 + expf(-x))) * y);
@@ -1083,8 +1106,14 @@ namespace fastllm {
                     w1.Resize({w3.dims[0], mid});
                     w1.dataType = w3.dataType;
                     w1.Allocate();
+
+                    if (w3.dataType == DataType::FLOAT32) {
                     SwigluMultiThread((float *) w3.cpuData, mid, mid, ((float *) w1.cpuData),
                                     w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                    } else {
+                        SwigluMultiThreadFloat16((uint16_t *) w3.cpuData, mid, mid, ((uint16_t *) w1.cpuData),
+                                    w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                    }
                     DoCpuLinearReshape(w1, *weights[e * 2 + 1], w2);
                     DoCpuLinear(w1, *weights[e * 2 + 1], Data(), w2);
 
