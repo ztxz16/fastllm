@@ -1,9 +1,19 @@
+## V0.0.0.9
+
+- 优化了使用DeepSeek模型时的多轮对话缓存
+- 略微提升了DeepSeek模型的多并发速度
+- 减少了DeepSeek模型Prefill时的显存消耗，可以支持更长的上下文
+- 支持了DeepSeek模型的INT8量化 （使用原始模型时--dtype int8，或者导出时--dtype int8）
+- 隐藏了 "None of PyTorch, TensorFlow >= 2.0 ..." 的警告信息
+- 增加了--cache_dir参数来指定缓存目录
+- server增加了--hide_input参数来隐藏日志中的请求信息
+- webui增加了--max_token参数来指定最大输出，--think参数来强制思考
+
 ## V0.0.0.8
 
 - api server增加api_key参数，来设定api_key
 - api server支持了一些复合输入
 - 提升了moe模型prefill的速度
-- 隐藏了 "None of PyTorch, TensorFlow >= 2.0 ..." 的警告信息
 - 增加了--version参数查看版本号
 
 ## V0.0.0.7
