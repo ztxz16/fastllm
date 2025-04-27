@@ -32,6 +32,7 @@ fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）�
 ### 安装
 
 - Hint
+
 Conda下安装有时候会出现环境错误，如果出现可以尝试在Conda外或使用venv等虚拟环境尝试
 
 - PIP安装（目前仅支持Nvidia GPU，其余GPU请使用源码安装）
@@ -137,13 +138,23 @@ ftllm run deepseek-v3-0324-int4
 
 #### 设置缓存目录
 
-模型会下载到缓存目录（默认~/.cache），可以通过环境变量 `FASTLLM_CACHEDIR` 来设置缓存目录，例如在Linux下:
+模型会下载到缓存目录（默认~/.cache），可以通过参数--cache_dir来设置，例如
+
+```
+ftllm run deepseek-v3-0324-int4 --cache_dir /mnt/
+```
+
+也可以通过环境变量 `FASTLLM_CACHEDIR` 来设置，例如在Linux下:
 
 ```
 export FASTLLM_CACHEDIR=/mnt/
 ```
 
 #### 常用参数
+
+首次体验ftllm时建议不加任何参数，程序会自动选择参数。
+
+当需要对性能进行调优时，再增加参数测试
 
 以下是运行 `ftllm` 模块时常用的参数说明：
 
@@ -187,6 +198,10 @@ export FASTLLM_CACHEDIR=/mnt/
 - `--port`:
   - **描述**: 指定服务运行的端口号。
   - **示例**: `--port 8080`
+
+- `--help`:
+  - **描述**: 查看模块参数详细信息。
+  - **示例**: `ftllm server --help`
 
 ### 模型下载
 
