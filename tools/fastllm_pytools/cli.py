@@ -64,6 +64,8 @@ def args_parser():
     # 创建webui子命令（独立的解析器）
     webui_parser_ = subparsers.add_parser('webui', parents = [shared_parser], help='Web UI')
     webui_parser_.add_argument('--port', type = int, default = 1616, help = '端口号')
+    webui_parser_.add_argument("--max_token", type = int, default = 4096, help = "输出最大token数")
+    webui_parser_.add_argument("--think", type = bool, default = False, help = "if <think> lost")
 
     server_parser = shared_parser
     from ftllm.util import add_server_args
@@ -119,7 +121,7 @@ def main():
             args_list.append(model)
         for key, value in args_dict.items():
             if value is not None:
-                if isinstance(value, bool):
+                if isinstance(value, bool) and key not in ["think"]:
                     if value:
                         args_list.append(f"--{key}")
                 elif value != '':
