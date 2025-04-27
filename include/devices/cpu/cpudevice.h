@@ -131,6 +131,8 @@ namespace fastllm {
     void SoftmaxMultiThread(float *input, int n, int m, int lastlen, AliveThreadPool *pool);
     void SwigluMultiThread(float *input, int mid, int len, float *output,
         int n, int inputStride, int outputStride, AliveThreadPool *pool);
+    void SwigluMultiThreadFloat16(uint16_t *input, int mid, int len, uint16_t *output,
+        int n, int inputStride, int outputStride, AliveThreadPool *pool);
 
     void MultiplyInt4GroupMultiThreadLaunch(uint8_t *a, uint8_t *b, float *c, int n, int m, int k,
         int *weightSums, float *weightMins, float *scales, float *bias,
