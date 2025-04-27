@@ -91,6 +91,25 @@ namespace fastllm {
             return;
         }
 
+        std::vector <int> replaceCache;
+        for (auto &it : this->memorys) {
+            // 如果当前inputToken覆盖了某一个cahce 90%以上的前缀，那么直接替换掉
+            int lcp = 0;
+            for (int i = 0; i < it.first.size() && i < inputToken.size(); i++) {
+                if (it.first[i] == inputToken[i]) {
+                    lcp++;
+                } else {
+                    break;
+                }
+            }
+            if (lcp > (int)it.first.size() * 9 / 10) {
+                replaceCache = it.first;
+            }
+        }
+        if (replaceCache.size() > 0) {
+            delete this->memorys[replaceCache];
+            this->memorys.erase(this->memorys.find(replaceCache));
+        }
         if (this->memorys.size() >= this->maxRecordNum) {
             std::vector <int> eraseToken;
             long long minFlushTime = (1LL << 60);
