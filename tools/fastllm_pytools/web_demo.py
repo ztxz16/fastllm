@@ -7,6 +7,8 @@ def parse_args():
     parser = make_normal_parser("fastllm webui")
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
     parser.add_argument("--title", type = str, default = "fastllm webui", help = "页面标题")
+    parser.add_argument("--max_token", type = int, default = 4096, help = "输出最大token数")
+    parser.add_argument("--think", type = bool, default = False, help = "if <think> lost")
     return parser.parse_args()
 
 args = parse_args()
@@ -32,7 +34,7 @@ if "images" not in st.session_state:
     st.session_state.images = []
 
 system_prompt = st.sidebar.text_input("system_prompt", "")
-max_new_tokens = st.sidebar.slider("max_new_tokens", 0, 8192, 4096, step = 1)
+max_new_tokens = st.sidebar.slider("max_new_tokens", 0, args.max_token, args.max_token, step = 1)
 top_p = st.sidebar.slider("top_p", 0.0, 1.0, 0.8, step = 0.01)
 top_k = st.sidebar.slider("top_k", 1, 50, 1, step = 1)
 temperature = st.sidebar.slider("temperature", 0.0, 10.0, 1.0, step = 0.1)
@@ -66,6 +68,8 @@ if (uploaded_file := st.file_uploader("上传图片", type=["jpg", "jpeg", "png"
     # 显示图片
     st.markdown(image_html, unsafe_allow_html=True)
 
+model = get_model()
+
 for i, (prompt, response) in enumerate(st.session_state.messages):
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -73,7 +77,6 @@ for i, (prompt, response) in enumerate(st.session_state.messages):
         st.markdown(response)
     
 if prompt := st.chat_input("请开始对话"):
-    model = get_model()
     with st.chat_message("user"):
         st.markdown(prompt)
 
@@ -98,13 +101,17 @@ if prompt := st.chat_input("请开始对话"):
                 message_placeholder.markdown(full_response + "▌")
             message_placeholder.markdown(full_response)
         else:
-            for chunk in model.stream_response(messages,
+            handle = model.launch_stream_response(messages,
                                            max_length = max_new_tokens,
                                            top_k = top_k,
                                            top_p = top_p,
                                            temperature = temperature,
                                            repeat_penalty = repeat_penalty,
-                                           one_by_one = True):
+                                           one_by_one = True)
+            if (args.think):
+                full_response += "<think>"
+                message_placeholder.markdown(full_response + "▌")
+            for chunk in model.stream_response_handle(handle):
                 full_response += chunk
                 message_placeholder.markdown(full_response + "▌")
             message_placeholder.markdown(full_response)
