@@ -548,6 +548,7 @@ namespace fastllm {
                     const GenerationConfig &config, const LastTokensUnit &tokens); // 对logits里[outerOffset * vocabSize, (outerOffset + 1) * vocabSize]做Sampling
 
     void ToDataType(const Data &input, DataType dataType);
+    void ToDataType(const Data &input, Data &output, DataType dataType);
 
     void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset);
 

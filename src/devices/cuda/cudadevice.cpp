@@ -14,6 +14,9 @@ namespace fastllm {
         this->deviceType = "cuda";
         this->ops["ToFloat16"] = (BaseOperator*)(new CudaToFloat16());
         this->ops["ToFloat32"] = (BaseOperator*)(new CudaToFloat32());
+        this->ops["ConvertToFloat16"] = (BaseOperator*)(new CudaConvertToFloat16());
+        this->ops["ConvertToFloat32"] = (BaseOperator*)(new CudaConvertToFloat32());
+
         this->ops["Attention"] = (BaseOperator*)(new CudaAttention());
         this->ops["MergeAttention"] = (BaseOperator*)(new CudaMergeAttention());
         this->ops["CopyKVCache"] = (BaseOperator*)(new CudaCopyKVCacheOp());
@@ -124,6 +127,54 @@ namespace fastllm {
             int len = data.Count(0);
             FastllmHalfToFloat(old, data.cudaData, len);
             FastllmCudaFree(old);
+        } else {
+            ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
+        }
+    }
+
+    void CudaConvertToFloat16::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = (datas.find("input")->second);
+        Data *output = (datas.find("output")->second);
+        output->dataType = DataType::FLOAT16;
+        output->Resize(input->dims);
+    }
+
+    void CudaConvertToFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        if (input.dataType == DataType::FLOAT16) {
+            FastllmCudaCopyFromDeviceToDevice(output.cudaData, input.cudaData, input.GetBytes());
+            return;
+        }
+        if (input.dataType == DataType::FLOAT32) {
+            FastllmFloatToHalf(input.cudaData, output.cudaData, input.Count(0));
+        } else {
+            ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
+        }
+    }
+
+    void CudaConvertToFloat32::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = (datas.find("input")->second);
+        Data *output = (datas.find("output")->second);
+        output->dataType = DataType::FLOAT32;
+        output->Resize(input->dims);
+    }
+
+    void CudaConvertToFloat32::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        if (input.dataType == DataType::FLOAT32) {
+            FastllmCudaCopyFromDeviceToDevice(output.cudaData, input.cudaData, input.GetBytes());
+            return;
+        }
+        if (input.dataType == DataType::FLOAT16) {
+            FastllmHalfToFloat(input.cudaData, output.cudaData, input.Count(0));
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
         }
@@ -990,7 +1041,7 @@ namespace fastllm {
                     Mul(score1, softmaxScale, score0);
                     if (mask.dims.size() > 0) {
                         score0.Reshape({b * s, curh, t});
-                        ToDataType(mask, DataType::FLOAT32);
+                        ToDataType(mask, qNope.dataType);
                         AttentionMask(score0, mask, -10000);
                     }
 
@@ -1014,7 +1065,7 @@ namespace fastllm {
 
                 if (mask.dims.size() > 0) {
                     score0.Reshape({b * s, h, t});
-                    ToDataType(mask, DataType::FLOAT32);
+                    ToDataType(mask, qNope.dataType);
                     AttentionMask(score0, mask, -10000);
                 }
 

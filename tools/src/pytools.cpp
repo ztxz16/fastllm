@@ -262,7 +262,7 @@ extern "C" {
                 || model->model_struct == "llama"
                 // || this->model_struct == "graph" ||
                 // || this->model_struct == "cogvlm" ||
-                // || this->model_struct == "deepseek_v2", 
+                 || model->model_struct == "deepseek_v2"
                 ) {
                 model->SetDataType(fastllm::DataType::FLOAT16);
             } else {
