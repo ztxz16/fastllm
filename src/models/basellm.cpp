@@ -1210,6 +1210,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             this->model_type == "moe" || 
             this->model_type == "internlm" || 
             this->model_type == "qwen2_moe" || 
+            this->model_type == "qwen3_moe" || 
             this->model_type == "deepseek_v2" ||
             this->model_type == "qwen") {
             this->saveHistoryChat = save;
@@ -1230,7 +1231,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             this->model_struct == "llama" ||
                             this->model_struct == "graph" ||
                             this->model_struct == "cogvlm" ||
-                            this->model_struct == "deepseek_v2", 
+                            this->model_struct == "deepseek_v2" ||
+                            this->model_struct == "qwen3_moe", 
                             this->model_struct + " doesn't support float16");
         } else {
             ErrorInFastLLM("SetDataType Error: datatype should be float32 or float16");

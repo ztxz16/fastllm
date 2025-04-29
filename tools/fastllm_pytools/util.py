@@ -18,6 +18,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
     parser.add_argument("--cache_history", type = str, default = "", help = "缓存历史对话")
     parser.add_argument("--cache_fast", type = str, default = "", help = "是否启用快速缓存（会消耗一定显存）")
+    parser.add_argument("--enable_thinking", type = str, default = "", help = "是否开启硬思考开关（需要模型支持）")
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
     parser.add_argument('--cache_dir', type = str, default = "", help = '指定缓存模型文件的路径')
@@ -76,6 +77,9 @@ def make_normal_llm_model(args):
             import json
             with open(os.path.join(args.path, "config.json"), "r", encoding="utf-8") as file:
                 config = json.load(file)
+            if (config["architectures"][0] == 'Qwen3ForCausalLM' or config["architectures"][0] == 'Qwen3MoeForCausalLM'):
+                if (args.enable_thinking == ""):
+                    args.enable_thinking = "true"
             if (config["architectures"][0] == 'DeepseekV3ForCausalLM' or config["architectures"][0] == 'DeepseekV2ForCausalLM' or config["architectures"][0] == 'Qwen3MoeForCausalLM'):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
@@ -144,6 +148,8 @@ def make_normal_llm_model(args):
         if (hasattr(custom_module, "__model__")):
             graph = getattr(custom_module, "__model__")
     model = llm.model(args.path, dtype = args.dtype, graph = graph, tokenizer_type = "auto", lora = args.lora)
+    if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
+        model.enable_thinking = False
     model.set_atype(args.atype)
     if (args.cache_history.lower() not in ["", "false", "0", "off"]):
         model.set_save_history(True)
