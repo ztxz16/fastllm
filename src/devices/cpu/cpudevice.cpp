@@ -768,12 +768,12 @@ namespace fastllm {
         float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
         output.Allocate();
         if ((input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16) && 
-                (weights[0]->dataType == DataType::INT4_GROUP 
-                || weights[0]->dataType == DataType::INT4_NOZERO 
-                || weights[0]->dataType == DataType::INT8) &&
+                (weights[2]->dataType == DataType::INT4_GROUP 
+                || weights[2]->dataType == DataType::INT4_NOZERO 
+                || weights[2]->dataType == DataType::INT8) &&
             input.dims[0] < 32) {
             int permuteType = 1;
-            if (weights[0]->dataType == DataType::INT8) {
+            if (weights[2]->dataType == DataType::INT8) {
                 permuteType = 0;
             }
             
@@ -835,10 +835,12 @@ namespace fastllm {
                 for (int j = 0; j < topk; j++) {
                     v.push_back(std::make_pair(oriV[j].second + 1, floatLogits[o * channels + oriV[j].second] / sum * routeScale));
                 }
-                v.push_back(std::make_pair(0, sharedScale));
+                if (weights[0] != nullptr) {
+                    v.push_back(std::make_pair(0, sharedScale));
+                }
                 int n = input.dims[0], m = input.dims[1];
-                int group = weights[0]->group, groupCnt = weights[0]->groupCnt;
-                if (weights[0]->dataType != DataType::INT4_GROUP) {
+                int group = weights[2]->group, groupCnt = weights[2]->groupCnt;
+                if (weights[2]->dataType != DataType::INT4_GROUP) {
                     group = 1;
                     groupCnt = m;
                 }
@@ -1093,11 +1095,13 @@ namespace fastllm {
                     Linear(w1, *weights[(idx + 1) * 2 + 1], Data(), w2);
                     AddTo(output, w2, value);
                 }
-                    
-                Linear(input, *weights[0], Data(), w3);
-                Swiglu(w3, w1);
-                Linear(w1, *weights[1], Data(), w2);
-                AddTo(output, w2, sharedScale);
+
+                if (weights[0] != nullptr) {
+                    Linear(input, *weights[0], Data(), w3);
+                    Swiglu(w3, w1);
+                    Linear(w1, *weights[1], Data(), w2);
+                    AddTo(output, w2, sharedScale);
+                }
             } else {
                 int bs = input.dims[0], dim = output.dims[1];
                 int inputDim = input.dims[1];
@@ -1142,6 +1146,9 @@ namespace fastllm {
                 for (int e = 0; e < expertTasks.size(); e++) {
                     auto &task = expertTasks[e];
                     if (task.size() == 0) {
+                        continue;
+                    }
+                    if (weights[e * 2] == nullptr) {
                         continue;
                     }
 
