@@ -8,7 +8,7 @@ def parse_args():
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
     parser.add_argument("--title", type = str, default = "fastllm webui", help = "页面标题")
     parser.add_argument("--max_token", type = int, default = 4096, help = "输出最大token数")
-    parser.add_argument("--think", type = bool, default = False, help = "if <think> lost")
+    parser.add_argument("--think", type = str, default = "false", help = "if <think> lost")
     return parser.parse_args()
 
 args = parse_args()
@@ -108,7 +108,7 @@ if prompt := st.chat_input("请开始对话"):
                                            temperature = temperature,
                                            repeat_penalty = repeat_penalty,
                                            one_by_one = True)
-            if (args.think):
+            if ((args.think.lower() != "false")):
                 full_response += "<think>"
                 message_placeholder.markdown(full_response + "▌")
             for chunk in model.stream_response_handle(handle):

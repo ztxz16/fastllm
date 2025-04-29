@@ -47,6 +47,14 @@ extern "C" {
         return fastllm::GetKVCacheInCPU();
     }
 
+    DLL_EXPORT void set_historycache_in_cpu(bool in) {
+        fastllm::SetHistoryCacheInCPU(in);
+    }
+
+    DLL_EXPORT bool get_historycache_in_cpu() {
+        return fastllm::GetHistoryCacheInCPU();
+    }
+
     DLL_EXPORT void set_device_map(int device_cnt, int *lens, char *devices, int *values) {
         std::map <std::string, int> deviceMap;
         int cur = 0;
