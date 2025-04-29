@@ -4,15 +4,17 @@
 
 ## 介绍
 
-fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）的高性能大模型推理库。
+fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）的高性能大模型推理库，兼容Qwen、QWQ等稠密模型和DeepSeek MOE模型。
 
-可实现MOE模型混合推理，eypc 9374f*2 + 24路DDR5 4800 + 4090 24G，推理DeepSeek R1 671B INT4模型单路可达20+tps。
+eypc 9655*2  + 24路DDR5 6400 + 4090 24G 推理DeepSeek R1 671B模型，INT4量化单路可达27+tps，并发40+tps。
+eypc 9374f*2 + 24路DDR5 4800 + 4090 24G 推理DeepSeek R1 671B模型，INT4量化单路可达22+tps，并发35+tps；INT8量化单路可达17+tps,并发30+tps。
+
 
 部署交流QQ群： 831641348
 
 部署交流微信群: ![二维码](docs/wechat_group0.jpg)
 
-| [快速开始](#快速开始) | [DeepSeek部署指南](docs/deepseek.md) | [版本日志](docs/version.md) |
+| [快速开始](#快速开始) | [DeepSeek部署指南](docs/deepseek.md) | [Qwen3部署指南](docs/qwen3.md) | [版本日志](docs/version.md) |
 
 ## 亮点功能
 
@@ -31,9 +33,6 @@ fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）�
 
 ### 安装
 
-- Hint
-
-Conda下安装有时候会出现环境错误，如果出现可以尝试在Conda外或使用venv等虚拟环境尝试
 
 - PIP安装（目前仅支持Nvidia GPU，其余GPU请使用源码安装）
 
@@ -64,6 +63,10 @@ sudo sh cuda_12.8.1_570.124.06_linux.run
 ```
 pip install ftllm
 ```
+
+- Hint
+
+Conda下安装有时候会出现环境错误，如果出现可以尝试在Conda外或使用venv等虚拟环境尝试
 
 （若使用时报错，可参考[ftllm报错](docs/faq.md#ftllm报错) )
 
@@ -113,6 +116,17 @@ ftllm webui Qwen/Qwen2-0.5B-Instruct
 
 ```
 ftllm server Qwen/Qwen2-0.5B-Instruct
+```
+
+#### NUMA加速
+
+若想使用单NUMA节点，建议用numactl绑定numa节点
+
+可以设定环境变量来激活多NUMA节点加速（PIP版本可直接激活，源码安装时需要在编译时加入-DUSE_NUMA=ON选项）
+
+```
+export FASTLLM_USE_NUMA=ON
+# export FASTLLM_NUMA_THREADS=27 # 选用，这个变量用于设定每个numa节点开启的线程数
 ```
 
 #### 启动本地模型
@@ -183,7 +197,7 @@ export FASTLLM_CACHEDIR=/mnt/
 
 - `--dtype`:
   - **描述**: 指定模型的数据类型。
-  - **可选值**: `int4` 或其他支持的数据类型。
+  - **可选值**: `int4` `int8` `float16` 或其他支持的数据类型。
   - **示例**: `--dtype int4`
   - **说明**: 使用原始模型时，指定此参数可以在线量化模型。例如下述命令会将DeepSeek-R1在线量化为int4后运行。
   ```
@@ -202,6 +216,26 @@ export FASTLLM_CACHEDIR=/mnt/
 - `--help`:
   - **描述**: 查看模块参数详细信息。
   - **示例**: `ftllm server --help`
+
+- `--version` 或 `-v`:
+  - **描述**: 查看ftllm版本号。
+  - **示例**: `ftllm -v`
+
+- `--hide_input`:
+  - **描述**: server模式隐藏日志中的请求信息。
+  - **示例**: `ftllm server --hide_input`
+ 
+- `--api_key`:
+  - **描述**: server模式设定api_key。
+  - **示例**: `ftllm server --api_key xxxxxxxx` 
+ 
+- `--max_token`:
+  - **描述**: webui模式指定最大输出。
+  - **示例**: `ftllm webui --max_token`
+ 
+- `--think`:
+  - **描述**: 强制思考。
+  - **示例**: `ftllm webui --think`
 
 ### 模型下载
 
