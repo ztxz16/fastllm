@@ -268,6 +268,7 @@ extern "C" {
         if (atypeStr == "auto") {
             if (model->model_struct == "chatglm" 
                 || model->model_struct == "llama"
+                || model->model_struct == "qwen3_moe"
                 // || this->model_struct == "graph" ||
                 // || this->model_struct == "cogvlm" ||
                  || model->model_struct == "deepseek_v2"
