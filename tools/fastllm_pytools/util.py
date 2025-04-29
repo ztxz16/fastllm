@@ -76,7 +76,7 @@ def make_normal_llm_model(args):
             import json
             with open(os.path.join(args.path, "config.json"), "r", encoding="utf-8") as file:
                 config = json.load(file)
-            if (config["architectures"][0] == 'DeepseekV3ForCausalLM' or config["architectures"][0] == 'DeepseekV2ForCausalLM'):
+            if (config["architectures"][0] == 'DeepseekV3ForCausalLM' or config["architectures"][0] == 'DeepseekV2ForCausalLM' or config["architectures"][0] == 'Qwen3MoeForCausalLM'):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
                 if ((not(args.device and args.device != ""))):

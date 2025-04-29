@@ -454,6 +454,9 @@ namespace fastllm {
                 for (int j = 0; j < v.size(); j++) {
                     int idx = v[j].first;
                     float value = v[j].second;
+                    if (weights[idx * 2] == nullptr) {
+                        continue;
+                    }
                     DoCudaLinearReshape(*input, *weights[idx * 2]->multiDeviceDatas[deviceId], *w3);
                     DoCudaLinear(*input, *weights[idx * 2]->multiDeviceDatas[deviceId], Data(), *w3);
                     Swiglu(*w3, *w1);
@@ -513,6 +516,9 @@ namespace fastllm {
                     for (int j = 0; j < v.size(); j++) {
                         int idx = v[j].first;
                         float value = v[j].second;
+                        if (weights[idx * 2] == nullptr) {
+                            continue;
+                        }
                         Linear(*currentData, *weights[idx * 2]->multiDeviceDatas[deviceId], Data(), *w3);
                         Swiglu(*w3, *w1);
                         Linear(*w1, *weights[idx * 2 + 1]->multiDeviceDatas[deviceId], Data(), *w2);
@@ -551,11 +557,14 @@ namespace fastllm {
         std::vector <int> devices;
         std::map <int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
-        if (!weights[0]->multiDeviceData) {
-            // 这里需要保证已经warmup过了，如果weights[0]切好就代表所有weight都已经切好了
+        if (!weights[2]->multiDeviceData) {
+            // 这里需要保证已经warmup过了，如果weights[2]切好就代表所有weight都已经切好了
             Data empty;
             int wBatch = intParams.find("weights___batch") != intParams.end() ? intParams.find("weights___batch")->second : (topk + 1) * 2;
             for (int i = 0; i < wBatch; i += 2) {
+                if (weights[i] == nullptr) {
+                    continue;
+                }
                 int k = weights[i]->dims[0];
                 std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, k / 2, weights[i]->groupCnt <= 0 ? 1 : weights[i]->groupCnt);
                 DivisionScheme divisionScheme, divisionSchemeO;

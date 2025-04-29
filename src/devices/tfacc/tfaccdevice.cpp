@@ -331,8 +331,8 @@ namespace fastllm {
             }
             v.push_back(std::make_pair(0, sharedScale));
             float *inputData = ((float *) input.cpuData) + o * m;
-            int group = weights[0]->group, groupCnt = weights[0]->groupCnt;
-            if (weights[0]->dataType != DataType::INT4_GROUP) {
+            int group = weights[2]->group, groupCnt = weights[2]->groupCnt;
+            if (weights[2]->dataType != DataType::INT4_GROUP) {
                 group = 1;
                 groupCnt = m;
             }
@@ -346,6 +346,9 @@ namespace fastllm {
             std::vector <fastllm::Data*> ws;
             std::vector <float> factors;
             for (int i = 0; i < v.size(); i++) {
+                if (weights[v[i].first * 2] == nullptr) {
+                    continue;
+                }
                 ws.push_back(weights[v[i].first * 2]);
                 ws.push_back(weights[v[i].first * 2 + 1]);
                 factors.push_back(v[i].second);

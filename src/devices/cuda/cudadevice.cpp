@@ -1133,6 +1133,9 @@ namespace fastllm {
                 for (int j = 0; j < v.size(); j++) {
                     int idx = v[j].first;
                     float value = v[j].second;
+                    if (weights[idx * 2] == nullptr) {
+                        continue;
+                    }
                     DoCudaLinearReshape(input, *weights[idx * 2], w3);
                     DoCudaLinear(input, *weights[idx * 2], Data(), w3);
                     Swiglu(w3, w1);
@@ -1194,6 +1197,9 @@ namespace fastllm {
                     for (int j = 0; j < v.size(); j++) {
                         int idx = v[j].first;
                         float value = v[j].second;
+                        if (weights[idx * 2] == nullptr) {
+                            continue;
+                        }
                         Linear(*currentData, *weights[idx * 2], Data(), w3);
                         Swiglu(w3, w1);
                         Linear(w1, *weights[idx * 2 + 1], Data(), w2);
