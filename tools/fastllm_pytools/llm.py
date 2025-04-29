@@ -188,6 +188,12 @@ def set_cpu_kvcache(cpu_kvcache):
 def get_cpu_kvcache():
     return fastllm_lib.get_kvcache_in_cpu();
 
+def set_cpu_historycache(cpu_historycache):
+    fastllm_lib.set_historycache_in_cpu(ctypes.c_bool(cpu_historycache));
+
+def get_cpu_historycache():
+    return fastllm_lib.get_historycache_in_cpu();
+
 def set_cuda_embedding(cuda_embedding):
     fastllm_lib.set_cuda_embedding(ctypes.c_bool(cuda_embedding));
 

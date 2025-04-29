@@ -107,7 +107,7 @@ namespace fastllm {
                        const fastllm::IntDict &intParams) {
         auto st = std::chrono::system_clock::now();
         bool lockInCPU = false;
-        if (GetKVCacheInCPU()) {
+        if (GetKVCacheInCPU() || GetHistoryCacheInCPU()) {
             // 暂时只有kvcache可能lock在CPU上
             for (auto &it: datas) {
                 if (intParams.find(it.first + "___batch") != intParams.end()) {

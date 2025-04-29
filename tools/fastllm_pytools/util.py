@@ -16,7 +16,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
-    parser.add_argument("--cache_history", type = bool, default = False, help = "缓存历史对话")
+    parser.add_argument("--cache_history", type = str, default = "", help = "缓存历史对话")
+    parser.add_argument("--cache_fast", type = str, default = "", help = "是否启用快速缓存（会消耗一定显存）")
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
     parser.add_argument('--cache_dir', type = str, default = "", help = '指定缓存模型文件的路径')
@@ -27,7 +28,7 @@ def add_server_args(parser):
     parser.add_argument("--host", type = str, default="0.0.0.0", help = "API server host")
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
     parser.add_argument("--api_key", type = str, default = "", help = "API Key")
-    parser.add_argument("--think", type = bool, default = False, help="if <think> lost")
+    parser.add_argument("--think", type = str, default = "false", help="if <think> lost")
     parser.add_argument("--hide_input", action = 'store_true', help = "不显示请求信息")
 
 def make_normal_llm_model(args):
@@ -76,7 +77,8 @@ def make_normal_llm_model(args):
             with open(os.path.join(args.path, "config.json"), "r", encoding="utf-8") as file:
                 config = json.load(file)
             if (config["architectures"][0] == 'DeepseekV3ForCausalLM' or config["architectures"][0] == 'DeepseekV2ForCausalLM'):
-                args.cache_history = True
+                if (args.cache_history == ""):
+                    args.cache_history = "true"
                 if ((not(args.device and args.device != ""))):
                     args.device = "cuda"
                     args.moe_device = "cpu"
@@ -143,8 +145,10 @@ def make_normal_llm_model(args):
             graph = getattr(custom_module, "__model__")
     model = llm.model(args.path, dtype = args.dtype, graph = graph, tokenizer_type = "auto", lora = args.lora)
     model.set_atype(args.atype)
-    if (args.cache_history):
+    if (args.cache_history.lower() not in ["", "false", "0", "off"]):
         model.set_save_history(True)
+        if (args.cache_fast in ["", "false", "0", "off"]):
+            llm.set_cpu_historycache(True)
     if (args.moe_experts > 0):
         model.set_moe_experts(args.moe_experts)
     if (args.max_batch > 0):

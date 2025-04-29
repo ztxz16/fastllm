@@ -65,7 +65,7 @@ def args_parser():
     webui_parser_ = subparsers.add_parser('webui', parents = [shared_parser], help='Web UI')
     webui_parser_.add_argument('--port', type = int, default = 1616, help = '端口号')
     webui_parser_.add_argument("--max_token", type = int, default = 4096, help = "输出最大token数")
-    webui_parser_.add_argument("--think", type = bool, default = False, help = "if <think> lost")
+    webui_parser_.add_argument("--think", type = str, default = "false", help = "if <think> lost")
 
     server_parser = shared_parser
     from ftllm.util import add_server_args
