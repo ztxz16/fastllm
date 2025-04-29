@@ -353,9 +353,9 @@ namespace fastllm {
                         uint8_t *uinput, float *output, 
                         DataType outputType) {
         if (this->registerDataNames.find(weights[0]->name) == this->registerDataNames.end()) {
-        for (int i = 0; i < weights.size(); i += 2) {
-            RegisterFastllmData(weights[i], "linearSwiglu");
-            RegisterFastllmData(weights[i + 1], "linearColumn");
+            for (int i = 0; i < weights.size(); i += 2) {
+                RegisterFastllmData(weights[i], "linearSwiglu");
+                RegisterFastllmData(weights[i + 1], "linearColumn");
             }
         }
         int opType = ComputeTaskType::MOEInt4NoZero;

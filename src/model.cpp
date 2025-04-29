@@ -10,6 +10,8 @@
 #include "moss.h"
 #include "llama.h"
 #include "moe.h"
+#include "qwen3.h"
+#include "qwen3_moe.h"
 #include "deepseekv2.h"
 #include "qwen.h"
 #include "glm.h"
@@ -195,11 +197,16 @@ namespace fastllm {
             model = (basellm*)(new LlamaModel());
         } else if (modelType == "moe" || modelType == "qwen2_moe") {
             model = (basellm*)(new MoeModel());
+        } else if (modelType == "qwen3_moe") {
+            model = (basellm*)(new Qwen3MOEModel());
         } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3") {
             model = (basellm*)(new DeepSeekV2Model());
         } else if (modelType == "qwen2") {
             model = new LlamaModel();
             model->model_type = "qwen";
+        } else if (modelType == "qwen3") {
+            model = new Qwen3Model();
+            model->model_type = "qwen3";
         } else if (modelType == "phi3") {
             model = new Phi3Model();
             model->model_type = "phi3";
