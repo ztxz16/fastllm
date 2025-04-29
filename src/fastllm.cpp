@@ -2931,6 +2931,20 @@ namespace fastllm {
         }
     }
 
+    void ToDataType(const Data &input, Data &output, DataType dataType) {
+        if (dataType == DataType::FLOAT32) {
+            curExecutor->Run("ConvertToFloat32", {
+                    {"input", (Data*)&input}, {"output", (Data*)&output}
+            }, {}, {});
+        } else if (dataType == DataType::FLOAT16) {
+            curExecutor->Run("ConvertToFloat16", {
+                {"input", (Data*)&input}, {"output", (Data*)&output}
+            }, {}, {});
+        } else {
+            ErrorInFastLLM("ToDataType: Unsupport data type.\n");
+        }
+    }
+
     void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset) {
         curExecutor->Run("CopyKVCache", {
                 {"oldCache", (Data*)&oldCache}, {"newCache", (Data*)&newCache}

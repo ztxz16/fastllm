@@ -296,9 +296,11 @@ namespace fastllm {
         Data w1, w2, w3, routerLogits, gate, attenPart, moePart, moeFinal, sharedGate;
         Data* sinDataPtr = &sinData;
         Data* cosDataPtr = &cosData;
+
+        Data resultTemp, qpeTemp, qnopeTemp, kTemp, vTemp;
 //inputIds.Print();
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
-        ToDataType(hiddenStates, this->dataType);
+        // ToDataType(hiddenStates, this->dataType);
 
         int seqlen = hiddenStates.dims[1];
 
@@ -322,11 +324,14 @@ namespace fastllm {
         float softmax_scale = 1.0 / sqrt(q_head_dim);
         float mscale = 0.1 * rope_scaling_mscale * log(rope_factor) + 1.0;
         softmax_scale = softmax_scale * mscale * mscale;
-                    
+        
+        Data attenInputTemp, x, result, score0, score1;
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     rms_norm_eps, attenInput);
+            
+            ToDataType(attenInput, attenInputTemp, this->dataType);
 
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
@@ -355,18 +360,18 @@ namespace fastllm {
             // 1.1 Get q, k, v
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             if (this->weight.weight.find(qaWeightName) != this->weight.weight.end()) { 
-                Linear(attenInput, this->weight[qaWeightName], this->weight[qaBiasName], qa);
+                Linear(attenInputTemp, this->weight[qaWeightName], this->weight[qaBiasName], qa);
                 RMSNorm(qa, this->weight[qRmsNormName], this->rms_norm_eps, qa);
                 Linear(qa, this->weight[qbWeightName], this->weight[qbBiasName], q);
             } else {
-                Linear(attenInput, this->weight[qWeightName], this->weight[qBiasName], q);
+                Linear(attenInputTemp, this->weight[qWeightName], this->weight[qBiasName], q);
             }
             
             q.Reshape({bsz, seqlen, -1, q_head_dim});
             PermuteSelf(q, {0, 2, 1, 3});
             Split(q, -1, 0, qk_nope_head_dim, q_nope);
             Split(q, -1, qk_nope_head_dim, q_head_dim, q_pe);
-            Linear(attenInput, this->weight[compressedKvWeightName], this->weight[compressedKvBiasName], compressed_kv_ori);
+            Linear(attenInputTemp, this->weight[compressedKvWeightName], this->weight[compressedKvBiasName], compressed_kv_ori);
             Split(compressed_kv_ori, -1, 0, kv_lora_rank, compressed_kv);
             Split(compressed_kv_ori, -1, kv_lora_rank, kv_lora_rank + qk_rope_head_dim, k_pe);
             RMSNorm(compressed_kv, this->weight[kvRmsNormName], this->rms_norm_eps, kv_ln);
@@ -417,8 +422,12 @@ namespace fastllm {
                     }
                     pastValue.Expansion(newDims);
                 }
+
+                // ToDataType(k, kTemp, this->dataType);
+                // ToDataType(v, vTemp, this->dataType);
                 CatDirect(pastKey, k, 1);
                 CatDirect(pastValue, v, 1);
+                
 // printf("matmul catdirect spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // absorb
                 PermuteSelf(q_pe, {0, 2, 1, 3});
@@ -439,8 +448,7 @@ namespace fastllm {
                 Data &kv0 = this->weight[kv0Name];
                 Data &kv1 = this->weight[kv1Name];
 
-                Data result, score0, score1;
-// printf("matmul prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                // ToDataType(q_nope, qnopeTemp, this->dataType);
                 MatMul(q_nope, kv0, result);
 // printf("matmul0 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 int c = result.dims.back(), t = pastValue.dims[1];
@@ -454,9 +462,10 @@ namespace fastllm {
                     ((Data*)&attentionMask)->CopyFrom(Data(DataType::FLOAT32, { s, t }, vmasks));
                 }
 
-                Data x;
                 PermuteSelf(result, {1, 0, 2});
                 if (true) {
+                    ToDataType(attentionMask, this->dataType);
+                    // ToDataType(q_pe, qpeTemp, this->dataType);
                     MergeMLA(result, q_pe, pastKey, pastValue, *((Data*)&attentionMask), x, softmax_scale);
                 } else {
                     result.Reshape({b, s * h, c});
@@ -472,7 +481,7 @@ namespace fastllm {
 
                     if (attentionMask.dims.size() > 0) {
                         score0.Reshape({b * s, h, t});
-                        ToDataType(attentionMask, DataType::FLOAT32);
+                        ToDataType(attentionMask, this->dataType);
                         AttentionMask(score0, attentionMask, -10000);
                     }
 
@@ -484,13 +493,12 @@ namespace fastllm {
                 PermuteSelf(x, {2, 0, 1, 3});
                 x.Reshape({h, b * s, c});
                 MatMulTransB(x, kv1, attenOutput);
-// attenOutput.Print();
-// exit(0);
-// printf("matmul1 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 attenOutput.Reshape({h, b, s, -1});
                 PermuteSelf(attenOutput, {1, 2, 0, 3});
                 attenOutput.Reshape({seqlen, bsz, -1});
                 PermuteSelf(attenOutput, {1, 0, 2});
+
+                ToDataType(attenOutput, DataType::FLOAT32);
             } else {
                 Linear(kv_ln, this->weight[kvWeightName], this->weight[kvBiasName], kv);
                 kv.Reshape({bsz, seqlen, num_attention_heads, qk_nope_head_dim + v_head_dim});
@@ -550,6 +558,8 @@ namespace fastllm {
                 PermuteSelf(attenOutput, {1, 0, 2});
                 attenOutput.Reshape({seqlen, bsz, -1});
                 PermuteSelf(attenOutput, {1, 0, 2});
+
+                ToDataType(attenOutput, DataType::FLOAT32);
             }
 
             Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
@@ -849,16 +859,19 @@ namespace fastllm {
         }
 
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
-        ToDataType(hiddenStates, this->dataType);
+        // ToDataType(hiddenStates, this->dataType);
         int seqlen = hiddenStates.dims[1];
         float softmax_scale = 1.0 / sqrt(q_head_dim);
         float mscale = 0.1 * rope_scaling_mscale * log(rope_factor) + 1.0;
         softmax_scale = softmax_scale * mscale * mscale;
 
+        Data attenInputTemp;
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     rms_norm_eps, attenInput);
+            
+            ToDataType(attenInput, attenInputTemp, this->dataType);
             std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string qaWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_a_proj.weight";
@@ -886,18 +899,18 @@ namespace fastllm {
             // 1.1 Get q, k, v
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             if (this->weight.weight.find(qaWeightName) != this->weight.weight.end()) { 
-                Linear(attenInput, this->weight[qaWeightName], this->weight[qaBiasName], qa);
+                Linear(attenInputTemp, this->weight[qaWeightName], this->weight[qaBiasName], qa);
                 RMSNorm(qa, this->weight[qRmsNormName], this->rms_norm_eps, qa);
                 Linear(qa, this->weight[qbWeightName], this->weight[qbBiasName], q);
             } else {
-                Linear(attenInput, this->weight[qWeightName], this->weight[qBiasName], q);
+                Linear(attenInputTemp, this->weight[qWeightName], this->weight[qBiasName], q);
             }
 
             q.Reshape({bsz, seqlen, -1, q_head_dim});
             PermuteSelf(q, {0, 2, 1, 3});
             Split(q, -1, 0, qk_nope_head_dim, q_nope);
             Split(q, -1, qk_nope_head_dim, q_head_dim, q_pe);
-            Linear(attenInput, this->weight[compressedKvWeightName], this->weight[compressedKvBiasName], compressed_kv_ori);
+            Linear(attenInputTemp, this->weight[compressedKvWeightName], this->weight[compressedKvBiasName], compressed_kv_ori);
             Split(compressed_kv_ori, -1, 0, kv_lora_rank, compressed_kv);
             Split(compressed_kv_ori, -1, kv_lora_rank, kv_lora_rank + qk_rope_head_dim, k_pe);
             RMSNorm(compressed_kv, this->weight[kvRmsNormName], this->rms_norm_eps, kv_ln);
@@ -990,14 +1003,15 @@ namespace fastllm {
                 PermuteSelf(q_pe, {0, 2, 1, 3});
                 std::vector <int> qpedims = {1, 1, h, r};
                 std::vector <uint64_t> qpestrides = {(uint64_t)h * r, (uint64_t)h * r, (uint64_t)r, 1};
-                cur_q_pe.dims = qpedims;
-                cur_q_pe.strides = qpestrides;
 
-                result.dims = xdims;
-                result.strides = xstrides;
-                
                 for (int bid = 0; bid < batch; bid++) {
                     Data &pastKey = *pastKeyValues[bid * block_cnt + i].first, &pastValue = *pastKeyValues[bid * block_cnt + i].second;
+                    cur_q_pe.dims = qpedims;
+                    cur_q_pe.strides = qpestrides;
+
+                    result.dims = xdims;
+                    result.strides = xstrides;
+
                     cur_q_pe.FakeFrom(q_pe, bid * h * r * q_pe.unitSize);
                     result.FakeFrom(allResult, bid * h * c * allResult.unitSize);
                     x.FakeFrom(lastx, bid * xstrides[0] * lastx.unitSize);
@@ -1013,6 +1027,7 @@ namespace fastllm {
                 PermuteSelf(attenOutput, {1, 2, 0, 3});
                 attenOutput.Reshape({seqlen, bsz, -1});
                 PermuteSelf(attenOutput, {1, 0, 2});
+                ToDataType(attenOutput, DataType::FLOAT32);
             } else {
                 Linear(kv_ln, this->weight[kvWeightName], this->weight[kvBiasName], kv);
                 kv.Reshape({bsz, seqlen, num_attention_heads, qk_nope_head_dim + v_head_dim});
@@ -1132,6 +1147,8 @@ namespace fastllm {
                     contexts[b] = (&curContextLayer[b]);
                 }
                 AttentionBatch(qs, keys, values, masks, contexts, qs[0]->dims[0] / values[0]->dims[0], 1.0 / scale_attn, 1);
+
+                ToDataType(attenOutput, DataType::FLOAT32);
             }
 
             Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
