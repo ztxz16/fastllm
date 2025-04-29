@@ -4267,6 +4267,8 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
         int alignQ1 = q1, alignK1 = k1;
         int part = alignK1;
         bool useFastAttn = getCudaInfos()->hasTensorCore && batch == 1 && (q2 == 128 && v2 == 128) && maskType == 0;
+        useFastAttn &= (q1 % 1024 == 0 && k1 % 1024 == 0);
+
         if (useFastAttn) {
             alignQ1 = ((q1 - 1) / 128 + 1) * 128;
             alignK1 = ((k1 - 1) / 128 + 1) * 128;
@@ -5528,16 +5530,16 @@ __global__ void FastllmCudaResetLogitsOfEOS(int batch, int stride, float *logits
 void FastllmResetLogitsOfEOS(int batch, fastllm::Data *logits, const std::vector<int> res_lens, 
     const std::vector<int> eos_nums, const std::vector<int> eos_ids) {
     cudaError_t state = cudaSuccess;
-    int *cuda_res_lens;
-    state = cudaMalloc(&cuda_res_lens, sizeof(int) * res_lens.size());
+    int *cuda_res_lens = (int*)FastllmCudaMalloc(sizeof(int) * res_lens.size());
     state = cudaMemcpy(cuda_res_lens, res_lens.data(), sizeof(int) *res_lens.size(), cudaMemcpyHostToDevice);
-    int *cuda_eos_nums;
-    state = cudaMalloc(&cuda_eos_nums, sizeof(int) * eos_nums.size());
+    int *cuda_eos_nums = (int*)FastllmCudaMalloc(sizeof(int) * eos_nums.size());
     state = cudaMemcpy(cuda_eos_nums, eos_nums.data(), sizeof(int) *eos_nums.size(), cudaMemcpyHostToDevice);
-    int *cuda_eos_ids;
-    state = cudaMalloc(&cuda_eos_ids, sizeof(int) * eos_ids.size());
+    int *cuda_eos_ids = (int*)FastllmCudaMalloc(sizeof(int) * eos_ids.size());    
     state = cudaMemcpy(cuda_eos_ids, eos_ids.data(), sizeof(int) *eos_ids.size(), cudaMemcpyHostToDevice);
     FastllmCudaResetLogitsOfEOS <<<1,1>>> (batch, logits->Count(0) / batch, (float*)logits->cudaData, cuda_res_lens, cuda_eos_nums, cuda_eos_ids);
     checkCudaErrors("Error: CUDA error when reset logtis of EOS!", state);
+    FastllmCudaFree(cuda_res_lens);
+    FastllmCudaFree(cuda_eos_nums);
+    FastllmCudaFree(cuda_eos_ids);
     return;
 }
