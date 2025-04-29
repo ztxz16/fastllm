@@ -28,8 +28,12 @@ namespace fastllm {
         this->deviceType = "cpu";
         this->ops["ToFloat16"] = (BaseOperator*)(new CpuToFloat16());
         this->ops["ToFloat32"] = (BaseOperator*)(new CpuToFloat32());
+        this->ops["ConvertToFloat16"] = (BaseOperator*)(new CpuConvertToFloat16());
+        this->ops["ConvertToFloat32"] = (BaseOperator*)(new CpuConvertToFloat32());
+
         this->ops["Attention"] = (BaseOperator*)(new CpuAttention());
         this->ops["MergeMOE"] = (BaseOperator*)(new CpuMergeMOE());
+        this->ops["MergeMLA"] = (BaseOperator*)(new CpuMergeMLA());
         this->ops["CopyKVCache"] = (BaseOperator*)(new CpuCopyKVCacheOp());
         this->ops["Embedding"] = (BaseOperator*)(new CpuEmbedding());
         this->ops["LayerNorm"] = (BaseOperator*)(new CpuLayerNormOp());
@@ -236,6 +240,54 @@ namespace fastllm {
                 cur[i] = fp16tofp32.dict[old[i]];
             }
             delete[] old;
+        } else {
+            ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
+        }
+    }
+
+    void CpuConvertToFloat16::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = (datas.find("input")->second);
+        Data *output = (datas.find("output")->second);
+        output->dataType = DataType::FLOAT16;
+        output->Resize(input->dims);
+    }
+
+    void CpuConvertToFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        if (input.dataType == DataType::FLOAT16) {
+            memcpy(output.cpuData, input.cpuData, input.GetBytes());
+            return;
+        }
+        if (input.dataType == DataType::FLOAT32) {
+            Float32ToFloat16((float*)input.cpuData, (uint16_t*)output.cpuData, input.Count(0));
+        } else {
+            ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
+        }
+    }
+
+    void CpuConvertToFloat32::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = (datas.find("input")->second);
+        Data *output = (datas.find("output")->second);
+        output->dataType = DataType::FLOAT32;
+        output->Resize(input->dims);
+    }
+
+    void CpuConvertToFloat32::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        if (input.dataType == DataType::FLOAT32) {
+            memcpy(output.cpuData, input.cpuData, input.GetBytes());
+            return;
+        }
+        if (input.dataType == DataType::FLOAT16) {
+            Float16ToFloat32((uint16_t*)input.cpuData, (float*)output.cpuData, input.Count(0));
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
         }
@@ -1193,6 +1245,96 @@ namespace fastllm {
                 }
                 memcpy(output.cpuData, moeFinal.cpuData, output.GetBytes());
 */
+            }
+        }
+    }
+
+    void CpuMergeMLA::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qNope = *(datas.find("qNope")->second);
+        Data &output = *(datas.find("output")->second);
+        // int b = qNope.dims[0], s = q_nope.dims[1], h = q_nope.dims[2], d = q_nope.dims[3], c = qNope.dims.back();
+        output.dataType = qNope.dataType;
+        output.Resize(qNope.dims);
+    }
+
+    void CpuMergeMLA::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qNope = *(datas.find("qNope")->second);
+        Data &qPe = *(datas.find("qPe")->second);
+        Data &kvCache = *(datas.find("kvCache")->second);
+        Data &peCache = *(datas.find("peCache")->second);
+        Data &mask = *(datas.find("mask")->second);
+        Data &output = *(datas.find("output")->second);
+        float softmaxScale = floatParams.find("softmaxScale") != floatParams.end() ? floatParams.find("softmaxScale")->second : 1.0f;        
+        int b = qPe.dims[0], s = qPe.dims[1], h = qPe.dims[2], c = qNope.dims.back(), t = kvCache.dims[1], r = qPe.dims[3];
+        output.Allocate();
+
+        // qNope: {b * s, h, c}
+        // qPe: {b, s, h, r}
+        // kvCache : {1, t, r}
+        // peCache : {1, t, c}
+        // output : {b * s, h, c}
+
+        Data score0, score1;
+        if (b == 1 && s == 1 && false) {
+            // FastllmCudaMLA(qNope, qPe, kvCache, peCache, score0, output, softmaxScale);
+        } else {
+            if ((double)b * s * h * t * 2 * 4 > 1e9) {
+                int parth = 1;
+                Data qNopePart, qPePart;
+                std::vector <Data> outputParts;
+                std::vector <Data*> outputPartPointers;
+                outputParts.resize((h - 1) / parth + 1);
+                for (int i = 0; i < outputParts.size(); i++) {
+                    outputPartPointers.push_back(&outputParts[i]);
+                }
+                for (int sth = 0; sth < h; sth += parth) {
+                    int idx = sth / parth;
+                    int curh = std::min(parth, h - sth);
+                    Split(qNope, 1, sth, sth + curh, qNopePart);
+                    Split(qPe, 2, sth, sth + curh, qPePart);
+                    qNopePart.Reshape({b, s * curh, c});
+                    MatMulTransB(qNopePart, peCache, score0);
+                    score0.Reshape({b, s, curh, t});
+                    qPePart.Reshape({b, s * curh, r});
+                    MatMulTransB(qPePart, kvCache, score1);
+                    score1.Reshape({b, s, curh, t});
+                    AddTo(score1, score0);
+                    Mul(score1, softmaxScale, score0);
+                    if (mask.dims.size() > 0) {
+                        score0.Reshape({b * s, curh, t});
+                        ToDataType(mask, qNope.dataType);
+                        AttentionMask(score0, mask, -10000);
+                    }
+
+                    Softmax(score0, score0, -1);
+                    score0.Reshape({b, s * curh, t});
+                    MatMul(score0, peCache, outputParts[idx]);
+                    outputParts[idx].Reshape({b, s, curh, c});
+                }
+                CatBatch(outputPartPointers, 2, output);
+                output.Reshape({b * s, h, c});
+            } else {
+                qNope.Reshape({b, s * h, c});
+                MatMulTransB(qNope, peCache, score0);
+                score0.Reshape({b, s, h, t});
+
+                qPe.Reshape({qPe.dims[0], -1, qPe.dims[3]});
+                MatMulTransB(qPe, kvCache, score1);
+                score1.Reshape({b, s, h, t});
+                AddTo(score1, score0);
+                Mul(score1, softmaxScale, score0);
+
+                if (mask.dims.size() > 0) {
+                    score0.Reshape({b * s, h, t});
+                    ToDataType(mask, qNope.dataType);
+                    AttentionMask(score0, mask, -10000);
+                }
+
+                Softmax(score0, score0, -1);
+                score0.Reshape({b, s * h, t});
+                MatMul(score0, peCache, output);
             }
         }
     }
@@ -2895,6 +3037,15 @@ namespace fastllm {
                     for (int j = 0; j < k; j++) {
                         float now = 0.0f;
                         int l = 0;
+#if defined(__AVX__)
+                        __m256 vsum = _mm256_set1_ps(0.0f);
+                        for (; l + 7 < m; l += 8) {
+                            __m256 vx = _mm256_cvtph_ps(_mm_loadu_si128((__m128i *) (input0Data + i * input0Stride + l)));
+                            __m256 vy = _mm256_cvtph_ps(_mm_loadu_si128((__m128i *) (input1Data + j * input1Stride + l)));
+                            vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
+                        }
+                        now += Floatsum(vsum);
+#endif
                         for (; l < m; l++) {
                             now += fp16tofp32.dict[input0Data[i * input0Stride + l]] *
                                     fp16tofp32.dict[input1Data[j * input1Stride + l]];
@@ -2914,7 +3065,8 @@ namespace fastllm {
 
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMul error: inputs should use same device.\n");
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
-                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+                        (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT16),
                         "MatMul's input's type should be float32 or float16.\n");
         AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
                         "MatMul's input's shape's size should be >= 2.\n");
@@ -2967,7 +3119,7 @@ namespace fastllm {
         // TODO: 汇编优化
         int per = batch0 / threadNum;
         int cur = 0;
-        if (input0.dataType == DataType::FLOAT32) {
+        if (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) {
             auto *pool = GetAlivePool();
             int threads = pool->threads.size();
             std::vector<fastllm::MultiThreadMatMulSingleOp*> ops;
@@ -2986,16 +3138,53 @@ namespace fastllm {
                     pool->Wait(i - st);
                 }
             }
-        } else if (input0.dataType == DataType::FLOAT16) {
+        } else if (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT16) {
+            std::vector <uint16_t> fp16InputData;
+            fp16InputData.resize(input0.Count(0));
+            Float32ToFloat16((float*)input0.cpuData, fp16InputData.data(), input0.Count(0));
+
             auto *pool = GetAlivePool();
             int threads = pool->threads.size();
             std::vector<fastllm::MultiThreadMatMulFloat16SingleOp*> ops;
             for (int o = 0; o < batch0; o++) {
                 ops.push_back(new MultiThreadMatMulFloat16SingleOp(
-                    (uint16_t *) input0.cpuData, (uint16_t *) input1.cpuData, (uint16_t *) output.cpuData,
+                    (uint16_t *) fp16InputData.data(), (uint16_t *) input1.cpuData, (uint16_t *) output.cpuData,
                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                     n, m, k, alpha, o, o + 1
                 ));
+            }
+            for (int st = 0; st < ops.size(); st += threads) {
+                for (int i = st; i < ops.size() && i < st + threads; i++) {
+                    pool->PushOp(i - st, ops[i]);
+                }
+                for (int i = st; i < ops.size() && i < st + threads; i++) {
+                    pool->Wait(i - st);
+                }
+            }
+        } else if (input0.dataType == DataType::FLOAT16) {
+            auto *pool = GetAlivePool();
+            int threads = pool->threads.size();
+            std::vector<fastllm::MultiThreadMatMulFloat16SingleOp*> ops;
+            if (batch0 == 1) {
+                int partn = std::max(1, n / threads);
+                for (int o = 0; o < n; o += partn) {
+                    int len = std::min(partn, n - o);
+                    ops.push_back(new MultiThreadMatMulFloat16SingleOp(
+                        ((uint16_t *) input0.cpuData) + o * m, 
+                        (uint16_t *) input1.cpuData, 
+                        ((uint16_t *) output.cpuData) + o * k,
+                        input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                        len, m, k, alpha, 0, 1
+                    ));
+                }
+            } else {
+                for (int o = 0; o < batch0; o++) {
+                    ops.push_back(new MultiThreadMatMulFloat16SingleOp(
+                        (uint16_t *) input0.cpuData, (uint16_t *) input1.cpuData, (uint16_t *) output.cpuData,
+                        input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                        n, m, k, alpha, o, o + 1
+                    ));
+                }
             }
             for (int st = 0; st < ops.size(); st += threads) {
                 for (int i = st; i < ops.size() && i < st + threads; i++) {
@@ -3016,7 +3205,8 @@ namespace fastllm {
 
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "MatMulTransB error: inputs should use same device.\n");
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
-                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+                        (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT16),
                         "MatMulTransB's input's type should be float32 or float16.\n");
         AssertInFastLLM(input0.dims.size() >= 2 && input1.dims.size() >= 2,
                         "MatMulTransB's input's shape's size should be >= 2.\n");
@@ -3067,7 +3257,7 @@ namespace fastllm {
         threadNum = std::min(threadNum, 4);
         int per = batch0 / threadNum;
         int cur = 0;
-        if (input0.dataType == DataType::FLOAT32) {
+        if (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) {
             auto *pool = GetAlivePool();
             int threads = pool->threads.size();
             std::vector<fastllm::MultiThreadMatMulTransBSingleOp*> ops;
@@ -3086,16 +3276,53 @@ namespace fastllm {
                     pool->Wait(i - st);
                 }
             }
-        } else {
+        } else if (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT16) {
+            std::vector <uint16_t> fp16InputData;
+            fp16InputData.resize(input0.Count(0));
+            Float32ToFloat16((float*)input0.cpuData, fp16InputData.data(), input0.Count(0));
+
             auto *pool = GetAlivePool();
             int threads = pool->threads.size();
             std::vector<fastllm::MultiThreadMatMulTransBFloat16SingleOp*> ops;
             for (int o = 0; o < batch0; o++) {
                 ops.push_back(new MultiThreadMatMulTransBFloat16SingleOp(
-                    (uint16_t *) input0.cpuData, (uint16_t *) input1.cpuData, (uint16_t *) output.cpuData,
+                    (uint16_t *) fp16InputData.data(), (uint16_t *) input1.cpuData, (uint16_t *) output.cpuData,
                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                     n, m, k, alpha, o, o + 1
                 ));
+            }
+            for (int st = 0; st < ops.size(); st += threads) {
+                for (int i = st; i < ops.size() && i < st + threads; i++) {
+                    pool->PushOp(i - st, ops[i]);
+                }
+                for (int i = st; i < ops.size() && i < st + threads; i++) {
+                    pool->Wait(i - st);
+                }
+            }
+        } else {
+            auto *pool = GetAlivePool();
+            int threads = pool->threads.size();
+            std::vector<fastllm::MultiThreadMatMulTransBFloat16SingleOp*> ops;
+            if (batch0 == 1) {
+                int partn = std::max(1, n / threads);
+                for (int o = 0; o < n; o += partn) {
+                    int len = std::min(partn, n - o);
+                    ops.push_back(new MultiThreadMatMulTransBFloat16SingleOp(
+                        ((uint16_t *) input0.cpuData) + o * m, 
+                        (uint16_t *) input1.cpuData, 
+                        ((uint16_t *) output.cpuData) + o * k,
+                        input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                        len, m, k, alpha, 0, 1
+                    ));
+                }
+            } else {
+                for (int o = 0; o < batch0; o++) {
+                    ops.push_back(new MultiThreadMatMulTransBFloat16SingleOp(
+                        (uint16_t *) input0.cpuData, (uint16_t *) input1.cpuData, (uint16_t *) output.cpuData,
+                        input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
+                        n, m, k, alpha, o, o + 1
+                    ));
+                }
             }
             for (int st = 0; st < ops.size(); st += threads) {
                 for (int i = st; i < ops.size() && i < st + threads; i++) {
@@ -3797,7 +4024,7 @@ namespace fastllm {
         float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -10000.0;
         int spatial = input.Count(2), n = input.dims[0], m = input.dims[1];
 
-        AssertInFastLLM(mask.dataType == DataType::FLOAT32, "AttentionMask: mask's datatype should be float32.");
+        AssertInFastLLM(mask.dataType == DataType::FLOAT32 || mask.dataType == input.dataType, "AttentionMask: mask's datatype should be float32.");
         if (input.dataType == DataType::FLOAT32) {
             float *maskData = (float *) mask.cpuData;
             float *attnData = (float *) input.cpuData;
@@ -3811,8 +4038,25 @@ namespace fastllm {
                     }
                 }
             }
-        } else if (input.dataType == DataType::FLOAT16) {
+        } else if (input.dataType == DataType::FLOAT16 && mask.dataType == DataType::FLOAT32) {
             float *maskData = (float *) mask.cpuData;
+            uint16_t *attnData = (uint16_t *) input.cpuData;
+            uint16_t hMaskValue = float_to_half(maskValue);
+            for (int on = 0; on < n; on++) {
+                for (int om = 0; om < m; om++) {
+                    int o = on * m + om;
+                    for (int i = 0; i < spatial; i++) {
+                        if (maskData[on * spatial + i] > 0.99) {
+                            attnData[o * spatial + i] = hMaskValue;
+                        }
+                    }
+                }
+            }
+        } else if (input.dataType == DataType::FLOAT16 && mask.dataType == DataType::FLOAT16) {
+            std::vector <float> floatMaskData;
+            floatMaskData.resize(mask.Count(0));
+            Float16ToFloat32((uint16_t*)mask.cpuData, floatMaskData.data(), mask.Count(0));
+            float *maskData = floatMaskData.data();
             uint16_t *attnData = (uint16_t *) input.cpuData;
             uint16_t hMaskValue = float_to_half(maskValue);
             for (int on = 0; on < n; on++) {
