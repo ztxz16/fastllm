@@ -38,11 +38,13 @@ namespace fastllm {
     void SetThreads(int t);
     void SetLowMemMode(bool m);
     void SetKVCacheInCPU(bool kvCacheInCPU);
+    void SetHistoryCacheInCPU(bool v);
     bool GetLowMemMode();
     void SetCudaEmbedding(bool v);
     bool GetCudaEmbedding();
     int GetThreads();
     bool GetKVCacheInCPU();
+    bool GetHistoryCacheInCPU();
     AliveThreadPool *GetAlivePool();
 
     struct GenerationConfig {
