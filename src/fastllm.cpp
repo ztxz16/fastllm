@@ -50,6 +50,7 @@ namespace fastllm {
     static AliveThreadPool *fastllmAliveThreadPool = nullptr;
     static bool lowMemMode = false;
     static bool kvCacheInCPU = false;
+    static bool historyCacheInCPU = false;
     static bool cudaEmbedding = false;
 
     void PrintInstructionInfo() {
@@ -88,6 +89,10 @@ namespace fastllm {
         kvCacheInCPU = v;
     }
 
+    void SetHistoryCacheInCPU(bool v) {
+        historyCacheInCPU = v;
+    }
+
     void SetAliveThreads(int t) {
 #ifdef PY_API
         py::gil_scoped_release release;
@@ -115,6 +120,10 @@ namespace fastllm {
 
     bool GetKVCacheInCPU() {
         return kvCacheInCPU;
+    }
+
+    bool GetHistoryCacheInCPU() {
+        return historyCacheInCPU;
     }
 
     bool GetLowMemMode() {

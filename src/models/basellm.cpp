@@ -75,6 +75,13 @@ namespace fastllm {
         for (int i = 0; i < kv->size(); i++) {
             this->kv[i].first.CopyFrom((*kv)[i].first);
             this->kv[i].second.CopyFrom((*kv)[i].second);
+
+            if (GetHistoryCacheInCPU()) {
+                this->kv[i].first.ToDevice(DataDevice::CPU);
+                this->kv[i].first.lockInCPU = true;
+                this->kv[i].second.ToDevice(DataDevice::CPU);
+                this->kv[i].second.lockInCPU = true;
+            }
         }
     }
 
