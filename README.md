@@ -205,6 +205,12 @@ export FASTLLM_CACHEDIR=/mnt/
   ```
   若使用的模型已经是量化好的模型（例如AWQ模型，Fastllm导出的量化模型等），建议不指定该参数
 
+- `--moe_dtype`:
+  - **描述**: 指定模型MOE层的数据类型。
+  - **可选值**: `int4` `int8` `float16` 或其他支持的数据类型。
+  - **示例**: `--moe_dtype int4`
+  若使用的模型已经是量化好的模型（例如AWQ模型，Fastllm导出的量化模型等），建议不指定该参数
+
 - `--moe_experts`:
   - **描述**: 指定 MOE（Mixture of Experts）层使用的专家数。不设定则根据模型配置设定。减少专家数可以提高推理速度，但可能降低推理准确度
   - **示例**: `--moe_experts 6`
@@ -249,18 +255,26 @@ ftllm download deepseek-ai/DeepSeek-R1
 
 如果使用量化加载模型（如`--dtype int4`），那么每次读取模型时会在线量化，读取速度较慢。
 
-ftllm.export 是一个用于导出和转换模型权重的工具。它支持将模型权重转换为不同的数据类型。以下是如何使用 ftllm.export 的详细说明。
+ftllm export 是一个用于导出和转换模型权重的工具。它支持将模型权重转换为不同的数据类型。以下是如何使用 ftllm export 的详细说明。
 
 #### 命令格式
 
 ``` sh
-python3 -m ftllm.export -p <模型路径> -o <输出路径> --dtype <数据类型> -t <线程数>
+ftllm export <模型路径> -o <输出路径> --dtype <数据类型> -t <线程数>
 ```
 
 #### 示例命令
 
 ``` sh
-python3 -m ftllm.export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
+ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
+```
+
+#### 混合精度
+
+可以通过指定moe_dtype来实现混合精度，例如
+
+``` sh
+ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-FP16INT4 --dtype float16 --moe_dtype int4 -t 16
 ```
 
 #### 加载导出后的模型
