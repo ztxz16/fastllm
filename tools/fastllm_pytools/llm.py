@@ -33,12 +33,12 @@ else:
         print("Load fastllm failed. (Try update glibc)")
         exit(0)
 
-fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p]
+fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int]
 
 fastllm_lib.create_llm_model.argtypes = [ctypes.c_char_p]
 fastllm_lib.create_llm_model.restype = ctypes.c_int
 
-fastllm_lib.create_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_char_p]
+fastllm_lib.create_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int]
 fastllm_lib.create_llm_model_fromhf.restype = ctypes.c_int
 
 fastllm_lib.create_llm_model_fromhf_with_config.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_char_p]
@@ -138,6 +138,7 @@ fastllm_lib.t2s_decode.argtypes = [ctypes.c_char_p,
 fastllm_lib.t2s_decode.restype = ctypes.POINTER(ctypes.c_int64)
 
 fastllm_data_type_dict = {
+    "": 0,
     "int4g": 9,
     "int4": 8,
     "int8": 3,
@@ -148,6 +149,7 @@ fastllm_data_type_dict = {
 def export_llm_model_fromhf(path : str,
                             output : str,
                             dtype : str = "float16",
+                            moe_dtype : str = "",
                             lora: str = ""):
     int4g_groupcnt = 128;
     if (dtype.startswith("int4g") and len(dtype) > 5):
@@ -156,11 +158,28 @@ def export_llm_model_fromhf(path : str,
             dtype = "int4g";
         except:
             print("dtype should be like \"int4g256\"")
-            exit(0)    
+            exit(0)
     if (dtype not in fastllm_data_type_dict):
         print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
         exit(0)
-    fastllm_lib.export_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, lora.encode(), output.encode());
+
+    moe_int4g_groupcnt = 128
+    use_moe_dtype = False
+    if (moe_dtype != ""):
+        if (moe_dtype.startswith("int4g") and len(moe_dtype) > 5):
+            try:
+                moe_int4g_groupcnt = int(moe_dtype[5:])
+                moe_dtype = "int4g";
+            except:
+                print("dtype should be like \"int4g256\"")
+                exit(0)
+        if (moe_dtype not in fastllm_data_type_dict):
+            print("moe_dtype should be one of ", list(fastllm_data_type_dict.keys()))
+            exit(0)
+        use_moe_dtype = True
+
+    fastllm_lib.export_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, lora.encode(), output.encode(), 
+                                        use_moe_dtype, fastllm_data_type_dict[moe_dtype], moe_int4g_groupcnt);
 
 def softmax(a):
     max_value = a[0]
@@ -540,6 +559,7 @@ class model:
     def __init__ (self, path : str,
                   id : int = -99999,
                   dtype : str = "float16",
+                  moe_dtype : str = "",
                   system_prompt : str = "",
                   eos_token: List[str] = [],
                   tokenizer_type = "auto", 
@@ -572,6 +592,21 @@ class model:
         if (dtype not in fastllm_data_type_dict):
             print("dtype should be one of ", list(fastllm_data_type_dict.keys()))
             exit(0)
+
+        moe_int4g_groupcnt = 128
+        use_moe_dtype = False
+        if (moe_dtype != ""):
+            if (moe_dtype.startswith("int4g") and len(moe_dtype) > 5):
+                try:
+                    moe_int4g_groupcnt = int(moe_dtype[5:])
+                    moe_dtype = "int4g";
+                except:
+                    print("dtype should be like \"int4g256\"")
+                    exit(0)
+            if (moe_dtype not in fastllm_data_type_dict):
+                print("moe_dtype should be one of ", list(fastllm_data_type_dict.keys()))
+                exit(0)
+            use_moe_dtype = True
         
         self.save_history = False
         self.tokenizer_cache = TokenizerCache()
@@ -605,7 +640,8 @@ class model:
                                                                  ctypes.c_bool(self.hf_tokenizer != None), model_json.encode());
                 else:
                     self.model = fastllm_lib.create_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, 
-                                                                 ctypes.c_bool(self.hf_tokenizer != None), lora.encode());
+                                                                 ctypes.c_bool(self.hf_tokenizer != None), lora.encode(), 
+                                                                 use_moe_dtype, fastllm_data_type_dict[moe_dtype], moe_int4g_groupcnt);
                 if (os.path.isfile(os.path.join(path, "config.json"))):
                     self.config = json.load(open(os.path.join(path, "config.json"), "r"))
             else:

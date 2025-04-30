@@ -9,6 +9,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('-t', '--threads', type = int, default = -1,  help = '线程数量')
     parser.add_argument('-l', '--low', action = 'store_true', help = '是否使用低内存模式')
     parser.add_argument('--dtype', type = str, default = "auto", help = '权重类型（读取HF模型时有效）')
+    parser.add_argument('--moe_dtype', type = str, default = "", help = 'MOE层使用的权重类型（读取HF模型时有效）')
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
@@ -147,7 +148,7 @@ def make_normal_llm_model(args):
         spec.loader.exec_module(custom_module)
         if (hasattr(custom_module, "__model__")):
             graph = getattr(custom_module, "__model__")
-    model = llm.model(args.path, dtype = args.dtype, graph = graph, tokenizer_type = "auto", lora = args.lora)
+    model = llm.model(args.path, dtype = args.dtype, moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora)
     if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
         model.enable_thinking = False
     model.set_atype(args.atype)

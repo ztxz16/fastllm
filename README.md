@@ -2,6 +2,8 @@
 
 [English Document](README_EN.md)
 
+| [快速开始](#快速开始) | [DeepSeek部署指南](docs/deepseek.md) | [Qwen3部署指南](docs/qwen3.md) | [版本日志](docs/version.md) |
+
 ## 介绍
 
 fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）的高性能大模型推理库，兼容Qwen、QWQ等稠密模型和DeepSeek MOE模型。
@@ -13,8 +15,6 @@ eypc 9374f*2 + 24路DDR5 4800 + 4090 24G 推理DeepSeek R1 671B模型，INT4量�
 部署交流QQ群： 831641348
 
 部署交流微信群: ![二维码](docs/wechat_group0.jpg)
-
-| [快速开始](#快速开始) | [DeepSeek部署指南](docs/deepseek.md) | [Qwen3部署指南](docs/qwen3.md) | [版本日志](docs/version.md) |
 
 ## 亮点功能
 
@@ -192,7 +192,7 @@ export FASTLLM_CACHEDIR=/mnt/
    `--device cuda --moe_device numa` 来实现MOE模型的单卡+多NUMA节点加速推理
 
 - `-t` 或 `--threads`:
-  - **描述**: 设置使用的CPU线程数。
+  - **描述**: 设置使用的CPU线程数。但当device为numa时，会开启计算服务器，计算线程数由环境变量`FASTLLM_NUMA_THREADS`决定，threads参数请设得小一点（可以设为1）
   - **示例**: `-t 27`
 
 - `--dtype`:
