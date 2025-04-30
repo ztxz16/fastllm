@@ -126,17 +126,21 @@ extern "C" {
         return id;
     }
 
-    DLL_EXPORT void export_llm_model_fromhf(char *path, int dataType, int groupCnt, char *lora, char *outputPath) {
+    DLL_EXPORT void export_llm_model_fromhf(char *path, int dataType, int groupCnt, char *lora, char *outputPath, 
+                                            bool useMoe, int moeDataType, int moeGroupCnt) {
         models.locker.lock();
-        fastllm::ExportLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt, outputPath, "", lora);
+        fastllm::ExportLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt, outputPath, "", lora, 
+                        useMoe, (fastllm::DataType)moeDataType, moeGroupCnt);
         models.locker.unlock();
         return;
     }
 
-    DLL_EXPORT int create_llm_model_fromhf(char *path, int dataType, int groupCnt, bool skipTokenizer, char *lora) {
+    DLL_EXPORT int create_llm_model_fromhf(char *path, int dataType, int groupCnt, bool skipTokenizer, char *lora, 
+                                        bool useMoe, int moeDataType, int moeGroupCnt) {
         models.locker.lock();
         int id = models.models.size();
-        models.models[id] = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt, skipTokenizer, "", lora);
+        models.models[id] = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType, groupCnt, skipTokenizer, "", lora, 
+                            false, useMoe, (fastllm::DataType)moeDataType, moeGroupCnt);
         models.locker.unlock();
         return id;
     }
