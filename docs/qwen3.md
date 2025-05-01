@@ -17,18 +17,21 @@ pip install ftllm
 #### 命令行聊天：
 
 ```
+ftllm run fastllm/Qwen3-235B-A22B-INT4MIX
 ftllm run Qwen/Qwen3-30B-A3B
 ```
 
 #### webui:
 
 ```
+ftllm webui fastllm/Qwen3-235B-A22B-INT4MIX
 ftllm webui Qwen/Qwen3-30B-A3B
 ```
 
 #### api server (openai风格):
 
 ```
+ftllm server fastllm/Qwen3-235B-A22B-INT4MIX
 ftllm server Qwen/Qwen3-30B-A3B
 ```
 
