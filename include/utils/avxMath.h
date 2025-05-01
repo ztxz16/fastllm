@@ -32,8 +32,13 @@
 #include <immintrin.h>
 
 /* yes I know, the top of this file is quite ugly */
+# if defined(_MSC_VER)
+# define ALIGN32_BEG __declspec(align(32))
+# define ALIGN32_END
+# else
 # define ALIGN32_BEG
 # define ALIGN32_END __attribute__((aligned(32)))
+# endif
 
 /* __m128 is ugly to write */
 typedef __m256  v8sf; // vector of 8 float (avx)
@@ -94,9 +99,22 @@ typedef union imm_xmm_union {
   v4si xmm[2];
 } imm_xmm_union;
 
+# if defined(_MSC_VER)
+#define COPY_IMM_TO_XMM(imm_, xmm0_, xmm1_) {    \
+    __declspec((aligned(32))) imm_xmm_union u;   \
+    u.imm = imm_;                	             \
+    xmm0_ = u.xmm[0];                            \
+    xmm1_ = u.xmm[1];                            \
+}
+
+#define COPY_XMM_TO_IMM(xmm0_, xmm1_, imm_) {                       \
+    __declspec((aligned(32))) imm_xmm_union u;  \
+    u.xmm[0]=xmm0_; u.xmm[1]=xmm1_; imm_ = u.imm; \
+  }
+# else
 #define COPY_IMM_TO_XMM(imm_, xmm0_, xmm1_) {    \
     imm_xmm_union u __attribute__((aligned(32)));  \
-    u.imm = imm_;				   \
+    u.imm = imm_;                                \
     xmm0_ = u.xmm[0];                            \
     xmm1_ = u.xmm[1];                            \
 }
@@ -105,6 +123,7 @@ typedef union imm_xmm_union {
     imm_xmm_union u __attribute__((aligned(32))); \
     u.xmm[0]=xmm0_; u.xmm[1]=xmm1_; imm_ = u.imm; \
   }
+# endif
 
 
 #define AVX2_BITOP_USING_SSE2(fn) \
@@ -233,8 +252,8 @@ v8sf log256_ps(v8sf x) {
   return x;
 }
 
-_PS256_CONST(exp_hi,	88.3762626647949f);
-_PS256_CONST(exp_lo,	-88.3762626647949f);
+_PS256_CONST(exp_hi,    88.3762626647949f);
+_PS256_CONST(exp_lo,    -88.3762626647949f);
 
 _PS256_CONST(cephes_LOG2EF, 1.44269504088896341);
 _PS256_CONST(cephes_exp_C1, 0.693359375);
