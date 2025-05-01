@@ -98,24 +98,24 @@ bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU�
 
 ### 运行demo程序
 
-以Qwen/Qwen2-0.5B-Instruct模型为例，可以运行一个较小模型测试安装是否成功
+可以运行一个较小模型测试安装是否成功, 以Qwen/Qwen3-0.6B模型为例
 
 #### 命令行聊天：
 
 ```
-ftllm run Qwen/Qwen2-0.5B-Instruct
+ftllm run Qwen/Qwen3-0.6B
 ```
 
 #### webui:
 
 ```
-ftllm webui Qwen/Qwen2-0.5B-Instruct
+ftllm webui Qwen/Qwen3-0.6B
 ```
 
 #### api server (openai风格):
 
 ```
-ftllm server Qwen/Qwen2-0.5B-Instruct
+ftllm server Qwen/Qwen3-0.6B
 ```
 
 #### NUMA加速
