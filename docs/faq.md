@@ -35,12 +35,12 @@ cmake .. -DUSE_CUDA=ON -DCUDA_ARCH="61;75;86;89"
 
 若需要支持多种GPU架构，请使用“;”分隔（如上面例子）。
 
-### identifier "__hdiv" is undefined
+### identifier "\__hdiv" is undefined
 
 **现象：**
 
 > src/devices/cuda/fastllm-cuda.cu(247): error: identifier "hexp" is undefined  
-> src/devices/cuda/fastllm-cuda.cu(247): error: identifier "__hdiv" is undefined  
+> src/devices/cuda/fastllm-cuda.cu(247): error: identifier "\__hdiv" is undefined  
 > ...
 
 **原因：** [计算能力（Compute Capability）](https://developer.nvidia.com/cuda-gpus) <= 5.3 的GPU不支持半精度计算。
@@ -48,7 +48,23 @@ cmake .. -DUSE_CUDA=ON -DCUDA_ARCH="61;75;86;89"
 **解决办法：** 如需要支持这些GPU，执行cmake时使用编译选项`CUDA_NO_TENSOR_CORE`：
 
 ```shell
-cmake .. -DUSE_CUDA=ON -DCUDA_NO_TENSOR_CORE=ON
+cmake .. -DUSE_CUDA=ON -DCUDA_ARCH="52;61" -DCUDA_NO_TENSOR_CORE=ON
+```
+
+### undefined reference to `std::filesystem'
+
+**现象：** 
+
+> CMakeFiles/fastllm.dir/src/model.cpp.o: In function `fastllm::ExportLLMModelFromHF(std::string const&, fastllm::DataType, int, std::string const&, std::string const&, std::string const&, bool, fastllm::DataType, int)':
+> model.cpp:(.text+0x10748): undefined reference to `std::experimental::filesystem::v1::status(std::experimental::filesystem::v1::path const&)'
+> ...
+
+**原因：** 8.0 版本之前的GCC （包括某些 GCC 8.X版本）并不完全支持C++ 17的 `<filesystem>` 库，某些环境需要手动链接。
+
+**解决办法：** 设置`FASTLLM_LINKED_LIBS`，手动指定链接`stdc++fs`
+
+```shell
+cmake .. -DFASTLLM_LINKED_LIBS=stdc++fs
 ```
 
 ## Windows
@@ -74,7 +90,7 @@ cmake .. -DUSE_CUDA=ON -DCUDA_NO_TENSOR_CORE=ON
 
 **原因：** MSVC编译器优化选项 "`/Ob2`"、"`/Ob3`"与的现有代码冲突，
 
-**解决办法：** 编译时，在”属性“中找到"C/C++" -> "优化" -> "内联函数扩展" 中选择“只适用于 __inline (/Ob1)”。
+**解决办法：** 编译时，在”属性“中找到"C/C++" -> "优化" -> "内联函数扩展" 中选择“只适用于 \__inline (/Ob1)”。
 
 ### 导入提示 FileNotFoundError
 
@@ -114,7 +130,7 @@ GPU编译时，根据使用的CUDA版本，将cudart cublas的相关dll文件复
 
 **解决办法：** python程序退出时，先显式调用 `llm.release_memory()`方法。
 
-## ftllm报错
+### ftllm加载报错
 
 **现象：**
 调用ftllm时报错，显示Load fastllm failed.
