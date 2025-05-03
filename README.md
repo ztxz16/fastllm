@@ -27,7 +27,7 @@ eypc 9374f*2 + 24路DDR5 4800 + 4090 24G 推理DeepSeek R1 671B模型，INT4量�
 - 🚀 支持多卡部署，支持GPU + CPU混合部署
 - 🚀 前后端分离设计，便于支持新的计算设备
 - 🚀 后端纯c++实现，便于跨平台移植，可在安卓上直接编译
-- 🚀 支持Python自定义模型结构
+- 🚀 支持Python[自定义模型结构](docs/custom.md)
 
 ## 快速开始
 
@@ -52,7 +52,7 @@ pip install ftllm
 
 #### Linux系统:
 
-由于目前pypi限制库大小，安装包中不含cuda依赖，安装ftllm之前建议先手动安装cuda12以上版本 (已安装cuda可跳过)
+由于目前PyPI限制库大小，安装包中不含CUDA依赖，安装ftllm之前建议先手动安装CUDA 12以上版本 (已安装cuda可跳过)
 ```
 wget https://developer.download.nvidia.com/compute/cuda/12.8.1/local_installers/cuda_12.8.1_570.124.06_linux.run
 sudo sh cuda_12.8.1_570.124.06_linux.run
@@ -68,9 +68,9 @@ pip install ftllm
 
 Conda下安装有时候会出现环境错误，如果出现可以尝试在Conda外或使用venv等虚拟环境尝试
 
-（若使用时报错，可参考[ftllm报错](docs/faq.md#ftllm报错) )
+（若使用时报错，可参考[ftllm报错](docs/faq.md#ftllm加载报错) )
 
-- 源码安装
+#### 源码安装
 
 若pip安装失败或有其它特殊需求，可以用源码编译安装
 源码安装后如果需要卸载，方法和PIP安装一样
@@ -90,11 +90,14 @@ bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU�
 # bash install.sh # 仅编译CPU版本
 ```
 
+##### 其他平台编译
+
 其他不同平台的编译可参考文档
 
-[TFACC平台](docs/tfacc.md)
+[TFACC平台](docs/tfacc.md)  
+[ROCm平台](docs/rocm.md)
 
-[ROCM平台](docs/rocm.md)
+编译中遇到问题可参考 [FAQ文档](docs/faq.md)
 
 ### 运行demo程序
 
@@ -106,13 +109,13 @@ bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU�
 ftllm run Qwen/Qwen3-0.6B
 ```
 
-#### webui:
+#### WebUI:
 
 ```
 ftllm webui Qwen/Qwen3-0.6B
 ```
 
-#### api server (openai风格):
+#### API Server (OpenAI 风格):
 
 ```
 ftllm server Qwen/Qwen3-0.6B
@@ -152,7 +155,7 @@ ftllm run deepseek-v3-0324-int4
 
 #### 设置缓存目录
 
-模型会下载到缓存目录（默认~/.cache），可以通过参数--cache_dir来设置，例如
+模型会下载到缓存目录（默认~/.cache），可以通过参数`--cache_dir`来设置，例如
 
 ```
 ftllm run deepseek-v3-0324-int4 --cache_dir /mnt/
@@ -164,7 +167,7 @@ ftllm run deepseek-v3-0324-int4 --cache_dir /mnt/
 export FASTLLM_CACHEDIR=/mnt/
 ```
 
-#### 常用参数
+## 参数设置
 
 首次体验ftllm时建议不加任何参数，程序会自动选择参数。
 
@@ -172,7 +175,7 @@ export FASTLLM_CACHEDIR=/mnt/
 
 以下是运行 `ftllm` 模块时常用的参数说明：
 
-##### 通用参数
+### 通用参数
 
 - `--device`:
   - **描述**: 指定模型运行的计算设备。
@@ -243,6 +246,12 @@ export FASTLLM_CACHEDIR=/mnt/
   - **描述**: 强制思考。
   - **示例**: `ftllm webui --think`
 
+### 模块参数
+  
+各个模块的参数说明请参考[参数说明](docs/demo_arguments.md)
+
+## 模型获取
+
 ### 模型下载
 
 可以使用如下命令将模型下载到本地
@@ -250,6 +259,7 @@ export FASTLLM_CACHEDIR=/mnt/
 ```
 ftllm download deepseek-ai/DeepSeek-R1
 ```
+
 
 ### 模型导出
 
@@ -260,7 +270,7 @@ ftllm export 是一个用于导出和转换模型权重的工具。它支持将�
 #### 命令格式
 
 ``` sh
-ftllm export <模型路径> -o <输出路径> --dtype <数据类型> -t <线程数>
+ftllm export -p <模型路径> -o <输出路径> --dtype <数据类型> -t <线程数>
 ```
 
 #### 示例命令
@@ -271,7 +281,7 @@ ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
 
 #### 混合精度
 
-可以通过指定moe_dtype来实现混合精度，例如
+可以通过指定`--moe_dtype`来实现混合精度，例如
 
 ``` sh
 ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-FP16INT4 --dtype float16 --moe_dtype int4 -t 16
@@ -286,3 +296,7 @@ ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-FP16INT4 --dtype float16 --
 ``` sh
 ftllm run /mnt/DeepSeek-V3-INT4/
 ```
+
+### 支持的模型
+
+如果需要运行更多早期的模型，请参考[支持模型列表](docs/models.md)
