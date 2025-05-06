@@ -49,6 +49,8 @@ set(PROJECT_SOURCE
         ../../../../../../../src/models/moss.cpp
         ../../../../../../../src/models/phi3.cpp
         ../../../../../../../src/models/qwen.cpp
+        ../../../../../../../src/models/qwen3.cpp
+        ../../../../../../../src/models/qwen3_moe.cpp
         ../../../../../../../src/models/xlmroberta.cpp
         )
 
