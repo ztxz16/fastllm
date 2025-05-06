@@ -801,6 +801,14 @@ namespace fastllm {
             } else {
                 modelType = config["architectures"].array_items()[0].string_value();
             }
+
+            if (!config["architectures"].is_null()) {
+                std::string arch = config["architectures"].array_items()[0].string_value();
+                if (arch == "InternLM2ForCausalLM") {
+                    modelType = "internlm2";
+                }
+            }
+
             if (!config["quantization_config"].is_null() && config["quantization_config"]["quant_method"] == "awq") {
                 auto qconfig = config["quantization_config"];
                 AssertInFastLLM(qconfig["quant_method"] == "awq" &&
