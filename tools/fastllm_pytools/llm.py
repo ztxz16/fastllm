@@ -27,7 +27,11 @@ else:
             print("Load", libname)
             succ = True
             break
-        except:
+        except OSError:
+            continue
+        except Exception as e:
+            # e.g. Error loading libfastllm_tools.so: /root/anaconda3/envs/ftllm/bin/../lib/libstdc++.so.6: version `GLIBCXX_3.4.32' not found (required by /root/anaconda3/envs/ftllm/lib/python3.12/site-packages/ftllm/libfastllm_tools.so)
+            print(f"Error loading {libname}: {e}")
             continue
     if (not(succ)):
         print("Load fastllm failed. (Try update glibc)")
