@@ -209,7 +209,7 @@ new_model = llm.model("model.flm"); # 导入flm模型
 
 可以在以下链接中找到一部分已经转换好的模型
 
-[huggingface](https://huggingface.co/huangyuyang) [modelscope](https://modelscope.cn/profile/huangyuyang)
+[huggingface](https://huggingface.co/fastllm) [modelscope](https://modelscope.cn/profile/huangyuyang)
 
 ### 模型导出(convert offline)
 
