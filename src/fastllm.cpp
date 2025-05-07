@@ -1291,7 +1291,7 @@ namespace fastllm {
                     }
                     weightSum[gid] += sum0[0] + sum0[1] + sum0[2] + sum0[3];
 #endif
-#ifdef __AVX2__X
+#ifdef __AVX2__
                     __m256i acc = _mm256_setzero_si256();
                     const __m256i lowMask = _mm256_set1_epi8(0xf);
                     const __m256i ones = _mm256_set1_epi16(1);
