@@ -1068,7 +1068,8 @@ namespace fastllm {
                                         tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
                                         model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt);
                             }
-                            model->weight[weightName].CalcWeightSum();
+                            if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV)
+                                model->weight[weightName].CalcWeightSum();
                             tensor.ClearBuffer();
 
                             locker.lock();
