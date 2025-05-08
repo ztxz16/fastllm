@@ -146,7 +146,7 @@ namespace fastllm {
 
         JinjaTemplate (const std::string &temp);
 
-        JinjaVar ComputeExpression(JinjaVar &local, std::vector <JinjaToken> tokens, int st, int end);
+        JinjaVar ComputeExpression(JinjaVar &local, std::vector <JinjaToken> tokens, int st, int end, JinjaVar *setValue = nullptr);
 
         void Parse(int st, int end, JinjaVar &var, std::string &ret);
 
