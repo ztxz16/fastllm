@@ -147,7 +147,12 @@ fastllm_data_type_dict = {
     "int4": 8,
     "int8": 3,
     "float16": 7,
+    "fp16": 7,
+    "half": 7,
     "float32": 0,
+    "fp8": 10,
+    "float8": 10,
+    "fp8_e4m3": 10,
 }
 
 def export_llm_model_fromhf(path : str,

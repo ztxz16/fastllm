@@ -191,6 +191,65 @@ namespace fastllm {
         }
     }
 
+    void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len) {
+        int i = 0;
+        
+#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
+        for (; i + 3 < len; i += 4) {
+            // Load 4 float32 values
+            float32x4_t f32x4 = vld1q_f32(&float32[i]);
+            
+            // Reinterpret as uint32 to access bits
+            uint32x4_t u32x4 = vreinterpretq_u32_f32(f32x4);
+            
+            // Shift right by 16 bits to get bfloat16 bits
+            uint32x4_t shifted = vshrq_n_u32(u32x4, 16);
+            
+            // Narrow to 16-bit (takes bottom 16 bits from each 32-bit element)
+            uint16x4_t bf16x4 = vmovn_u32(shifted);
+            
+            // Store 4 bfloat16 values
+            vst1_u16(&bfloat16[i], bf16x4);
+        }
+#endif
+    
+#ifdef __AVX__
+        for (; i + 7 < len; i += 8) {
+            __m256i float_vec = _mm256_loadu_si256((__m256i*)&float32[i]);
+            __m256i shifted = _mm256_srli_epi32(float_vec, 16);
+            __m128i lo = _mm256_castsi256_si128(shifted);
+            __m128i hi = _mm256_extracti128_si256(shifted, 1);
+            __m128i packed = _mm_packus_epi32(lo, hi);
+            _mm_storeu_si128((__m128i*)&bfloat16[i], packed);
+        }
+#endif
+        // 标量处理剩余元素
+        for (; i < len; i++) {
+            uint32_t val;
+            memcpy(&val, &float32[i], sizeof(val));
+            bfloat16[i] = (uint16_t)(val >> 16);
+        }
+    }
+
+    void Float16ToBFloat16(uint16_t *float16, uint16_t *bfloat16, int len) {
+        int i = 0;
+#ifdef __AVX__
+        for (; i + 7 < len; i += 8) {
+            __m256i float_vec = (__m256i)_mm256_cvtph_ps(_mm_loadu_si128((__m128i *) (float16 + i)));
+            __m256i shifted = _mm256_srli_epi32(float_vec, 16);
+            __m128i lo = _mm256_castsi256_si128(shifted);
+            __m128i hi = _mm256_extracti128_si256(shifted, 1);
+            __m128i packed = _mm_packus_epi32(lo, hi);
+            _mm_storeu_si128((__m128i*)&bfloat16[i], packed);
+        }
+#endif
+        for (; i < len; i++) {
+            uint32_t val;
+            memcpy(&val, &fp16tofp32.dict[float16[i]], sizeof(val));
+            bfloat16[i] = (uint16_t)(val >> 16);
+        }
+    }
+
     void CpuToFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &data = *(datas.find("input")->second);
@@ -1054,6 +1113,203 @@ namespace fastllm {
 // for (int i = 0; i < record.size(); i++) {
     // printf("%s spend %f s.\n", record[i].first.c_str(), record[i].second);
 // }
+            }
+        } else if ((input.dataType == DataType::FLOAT32) && 
+                (weights[2]->dataType == DataType::FP8_E4M3) &&
+                input.dims[0] < 32) {
+            int dimsLen = logits.dims.size();
+            int outer = logits.Count(0) / logits.Count(dimsLen - 1);
+            int channels = logits.dims[dimsLen - 1];
+
+            std::vector <float> vLogits, vInputs;
+            float *floatLogits = ((float*)logits.cpuData);
+            float *floatInput = (float*)input.cpuData;
+            output.Allocate(0.0f);
+
+            if (input.dataType == DataType::FLOAT16) {
+                int len = input.Count(0);
+                vInputs.resize(len);
+                for (int i = 0; i < len; i++) {
+                    vInputs[i] = fp16tofp32.dict[((uint16_t*)input.cpuData)[i]];
+                }
+                floatInput = vInputs.data();
+            }
+            if (logits.dataType == DataType::FLOAT16) {
+                int len = logits.Count(0);
+                vLogits.resize(len);
+                for (int i = 0; i < len; i++) {
+                    vLogits[i] = fp16tofp32.dict[((uint16_t*)logits.cpuData)[i]];
+                }
+                floatLogits = vLogits.data();
+            }
+            for (int o = 0; o < outer; o++) {
+                std::vector <std::pair <float, int> > oriV;
+                oriV.resize(channels);
+                for (int j = 0; j < channels; j++) {
+                    oriV[j].first = -floatLogits[o * channels + j];
+                    oriV[j].second = j;
+                }
+                if (gateBias.dims.size() > 0) {
+                    if (gateBias.dataType != DataType::FLOAT32) {
+                        ToDataType(gateBias, DataType::FLOAT32);
+                    }
+                    float *cpuBias = (float*)gateBias.cpuData;
+                    for (int i = 0; i < channels; i++) {
+                        oriV[i].first -= cpuBias[i];
+                    }
+                }
+                std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
+                float sum = 1.0;
+                if (needNorm) {
+                    sum = 0.0;
+                    for (int j = 0; j < topk; j++) {
+                        sum += floatLogits[o * channels + oriV[j].second];
+                    }
+                }
+
+                std::vector <std::pair <int, float> > v;
+                for (int j = 0; j < topk; j++) {
+                    v.push_back(std::make_pair(oriV[j].second + 1, floatLogits[o * channels + oriV[j].second] / sum * routeScale));
+                }
+                if (weights[0] != nullptr) {
+                    v.push_back(std::make_pair(0, sharedScale));
+                }
+                int n = input.dims[0], m = input.dims[1];
+                float *inputData = floatInput + o * m;
+                std::vector <uint16_t> bf16Input;
+                bf16Input.resize(m);
+                Float32ToBFloat16(inputData, bf16Input.data(), m);
+
+                std::vector <float*> middles;
+                std::vector <float*> results;
+                middles.resize(v.size());
+                results.resize(v.size());
+                for (int j = 0; j < v.size(); j++) {
+                    int idx = v[j].first;
+                    middles[j] = new float[weights[idx * 2]->dims[0]];
+                    results[j] = new float[weights[idx * 2 + 1]->dims[0]];
+                }
+                std::vector<fastllm::MultiThreadBaseOp*> ops;
+                auto *pool = GetAlivePool();
+                int threads = pool->threads.size();
+                ops.resize(threads);
+
+                for (int st = 0; st < v.size(); st++) {
+                    int k = weights[v[st].first * 2]->dims[0];
+                    int end = st, selSum = 1; // 一共处理selSum * k个输出
+
+                    int curSum = 1;
+                    for (int l = st + 1; l < v.size(); l++) {
+                        int curK = weights[v[l].first * 2]->dims[0];
+                        if (curK % k != 0) {
+                            break;
+                        }
+                        curSum += (curK / k);
+                        if (threads % curSum == 0) {
+                            end = l;
+                            selSum = curSum;
+                        }
+                    }
+                    int base = threads / selSum;
+                    int threadSt = 0;
+                    for (int l = st; l <= end; l++) {
+                        int idx = v[l].first;
+                        Data *weight = weights[idx * 2];
+                        float *outputData = middles[l];
+                        float *biasData = nullptr;
+                        int curK = weight->dims[0];
+                        int curThread = (curK / k) * base;
+                        if (weight->dataType == DataType::FP8_E4M3) {                            
+                            LaunchLinearBFloat16FP8E4M3(bf16Input.data(), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                        } else {
+                            // TODO: other
+                        }
+                        threadSt += curThread;
+                    }
+                    for (int j = 0; j < ops.size(); j++) {
+                        pool->Wait(j);
+                        delete ops[j];
+                    }
+
+                    // swiglu
+                    threadSt = 0;
+                    for (int l = st; l <= end; l++) {
+                        int idx = v[l].first;
+                        int spatial = weights[idx * 2]->dims[0], mid = spatial / 2;
+                        float *outputData = middles[l];
+                        int curK = weights[idx * 2]->dims[0];
+                        ops[l - st] = new fastllm::MultiThreadMultiOps();
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(middles[l], (uint16_t*)middles[l], mid));
+                        pool->PushOp(l - st, ops[l - st]);
+                    }
+                    for (int l = st; l <= end; l++) {
+                        pool->Wait(l - st);
+                        delete ops[l - st];
+                    }
+
+                    threadSt = 0;
+                    for (int l = st; l <= end; l++) {
+                        int idx = v[l].first;
+                        int mid = weights[idx * 2]->dims[0] / 2;
+                        int curK = weights[idx * 2]->dims[0];
+                        Data *weightDown = weights[idx * 2 + 1];
+                        int curThread = (curK / k) * base;
+                        if (weightDown->dataType == DataType::FP8_E4M3) {
+                            LaunchLinearBFloat16FP8E4M3((uint16_t*)middles[l], *weightDown, results[l], nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                        } else {
+                            // TODO: other
+                        }
+                        threadSt += curThread;               
+                    }
+
+                    for (int j = 0; j < ops.size(); j++) {
+                        pool->Wait(j);
+                        delete ops[j];
+                    }
+                    st = end;
+                }
+                float *fLastOutput = ((float*)output.cpuData) + o * m;
+                std::vector <float> tempOutput;
+                if (output.dataType == DataType::FLOAT16) {
+                    tempOutput.resize(m, 0);
+                    fLastOutput = tempOutput.data();
+                }
+                for (int j = 0; j < v.size(); j++) {
+                    float value = v[j].second;
+                    float *curOutput = (float*)results[j];
+                    int i = 0;
+#ifdef __AVX2__
+                    __m256 value_vec = _mm256_set1_ps(value);
+
+                    // 每次处理 8 个浮点数（AVX2 寄存器可以容纳 8 个 float）
+                    for (; i <= m - 8; i += 8) {
+                        // 加载 curOutput 的 8 个浮点数
+                        __m256 curOutput_vec = _mm256_loadu_ps(&curOutput[i]);
+
+                        // 加载 fLastOutput 的 8 个浮点数
+                        __m256 fLastOutput_vec = _mm256_loadu_ps(&fLastOutput[i]);
+
+                        // 计算 curOutput * value
+                        __m256 result_vec = _mm256_mul_ps(curOutput_vec, value_vec);
+
+                        // 累加到 fLastOutput
+                        fLastOutput_vec = _mm256_add_ps(fLastOutput_vec, result_vec);
+
+                        // 将结果存回 fLastOutput
+                        _mm256_storeu_ps(&fLastOutput[i], fLastOutput_vec);
+                    }
+#endif
+                    // 处理剩余的不足 8 个的元素
+                    for (; i < m; i++) {
+                        fLastOutput[i] += curOutput[i] * value;
+                    }
+                    delete[] results[j];
+                    delete[] middles[j];
+                }
+                if (output.dataType == DataType::FLOAT16) {
+                    Float32ToFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
+                }
             }
         } else {
             // normal
@@ -2429,6 +2685,10 @@ namespace fastllm {
     }
 #endif
 
+    void MultiThreadFloat32ToBFloat16Op::Run() {
+        Float32ToBFloat16(input, output, len);
+    }
+
     void MultiThreadOnlineQuantizationOp::Run() {
         int realGroup = (m - 1) / groupCnt + 1;
         for (int i = 0; i < n; i++) {
@@ -2585,6 +2845,9 @@ namespace fastllm {
                                             weight.weightSum.data(), weight.zeros.data(), weight.scales.data(),
                                             biasData,
                                             inputConfigs, GetThreads());
+            } else if (weight.dataType == DataType::FP8_E4M3) {
+                RunLinearFloat32FP8E4M3((float*)input.cpuData, weight, (float*)output.cpuData, 
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), 0, GetAlivePool()->threads.size());
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
@@ -2606,6 +2869,9 @@ namespace fastllm {
                 RunLinearFloat16Int4Group((uint16_t*)input.cpuData, weight, (uint16_t*)output.cpuData, 
                                         bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, group, groupCnt,
                                         GetAlivePool(), 0, GetAlivePool()->threads.size());
+            } else if (weight.dataType == DataType::FP8_E4M3) {
+                RunLinearFloat16FP8E4M3((uint16_t*)input.cpuData, weight, (uint16_t*)output.cpuData, 
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), 0, GetAlivePool()->threads.size());
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
@@ -4178,6 +4444,31 @@ namespace fastllm {
             }
         } else {
             for (int o = 0; o < outer; o++) {
+                std::set <std::pair <float, int> > ans;
+                for (int j = 0; j < channels; j++) {
+                    if (ans.size() == topk) {
+                        if (ans.begin()->first < inputData[j]) {
+                            ans.erase(ans.begin());
+                            ans.insert(std::make_pair(inputData[j], j));
+                        }
+                    } else {
+                        ans.insert(std::make_pair(inputData[j], j));
+                    }
+                }
+
+                int j = topk - 1;
+                for (auto &it : ans) {
+                    outputData[j * 2] = it.second;
+                    outputData[j * 2 + 1] = it.first;
+                    j--;
+                }
+
+                inputData += channels;
+                outputData += 2 * topk;
+            }
+            return;
+/*
+            for (int o = 0; o < outer; o++) {
                 std::vector <std::pair <float, int> > v;
                 for (int j = 0; j < channels; j++) {
                     v.push_back(std::make_pair(-inputData[j], j));
@@ -4191,6 +4482,7 @@ namespace fastllm {
                 inputData += channels;
                 outputData += 2 * topk;
             }
+*/
         }
     }
 

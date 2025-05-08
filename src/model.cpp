@@ -280,8 +280,13 @@ namespace fastllm {
         uint64_t len, bytes;
         uint8_t *buffer = nullptr;
         float *minsBuffer = nullptr, *scalesBuffer = nullptr;
+        int blockK, blockM;
 
         SafeTensorItem() {} 
+
+        ~SafeTensorItem() {
+            ClearBuffer();
+        }
 
         SafeTensorItem(const std::string &tensorName, const std::string &fileName, const json11::Json &config, uint64_t baseOffset) {
             this->tensorName = tensorName;
@@ -303,11 +308,7 @@ namespace fastllm {
             bytes = this->data_offsets[1] - this->data_offsets[0];
         }
 
-        struct FP8E4M3ToFP32Manager {
-            float dict[256] = {
-                0.0, 0.001953125, 0.00390625, 0.005859375, 0.0078125, 0.009765625, 0.01171875, 0.013671875, 0.015625, 0.017578125, 0.01953125, 0.021484375, 0.0234375, 0.025390625, 0.02734375, 0.029296875, 0.03125, 0.03515625, 0.0390625, 0.04296875, 0.046875, 0.05078125, 0.0546875, 0.05859375, 0.0625, 0.0703125, 0.078125, 0.0859375, 0.09375, 0.1015625, 0.109375, 0.1171875, 0.125, 0.140625, 0.15625, 0.171875, 0.1875, 0.203125, 0.21875, 0.234375, 0.25, 0.28125, 0.3125, 0.34375, 0.375, 0.40625, 0.4375, 0.46875, 0.5, 0.5625, 0.625, 0.6875, 0.75, 0.8125, 0.875, 0.9375, 1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 30.0, 32.0, 36.0, 40.0, 44.0, 48.0, 52.0, 56.0, 60.0, 64.0, 72.0, 80.0, 88.0, 96.0, 104.0, 112.0, 120.0, 128.0, 144.0, 160.0, 176.0, 192.0, 208.0, 224.0, 240.0, 256.0, 288.0, 320.0, 352.0, 384.0, 416.0, 448.0, 480, -0.0, -0.001953125, -0.00390625, -0.005859375, -0.0078125, -0.009765625, -0.01171875, -0.013671875, -0.015625, -0.017578125, -0.01953125, -0.021484375, -0.0234375, -0.025390625, -0.02734375, -0.029296875, -0.03125, -0.03515625, -0.0390625, -0.04296875, -0.046875, -0.05078125, -0.0546875, -0.05859375, -0.0625, -0.0703125, -0.078125, -0.0859375, -0.09375, -0.1015625, -0.109375, -0.1171875, -0.125, -0.140625, -0.15625, -0.171875, -0.1875, -0.203125, -0.21875, -0.234375, -0.25, -0.28125, -0.3125, -0.34375, -0.375, -0.40625, -0.4375, -0.46875, -0.5, -0.5625, -0.625, -0.6875, -0.75, -0.8125, -0.875, -0.9375, -1.0, -1.125, -1.25, -1.375, -1.5, -1.625, -1.75, -1.875, -2.0, -2.25, -2.5, -2.75, -3.0, -3.25, -3.5, -3.75, -4.0, -4.5, -5.0, -5.5, -6.0, -6.5, -7.0, -7.5, -8.0, -9.0, -10.0, -11.0, -12.0, -13.0, -14.0, -15.0, -16.0, -18.0, -20.0, -22.0, -24.0, -26.0, -28.0, -30.0, -32.0, -36.0, -40.0, -44.0, -48.0, -52.0, -56.0, -60.0, -64.0, -72.0, -80.0, -88.0, -96.0, -104.0, -112.0, -120.0, -128.0, -144.0, -160.0, -176.0, -192.0, -208.0, -224.0, -240.0, -256.0, -288.0, -320.0, -352.0, -384.0, -416.0, -448.0, -480
-            };
-        } fp8e4m3tofp32;
+        struct FP8E4M3ToFP32Manager fp8e4m3tofp32;
 
         void CreateBufferWithScale(DataType dstType, SafeTensorItem &scale) {
             AssertInFastLLM(this->shape.size() == 2 && scale.shape.size() == 2, "CreateBufferWithScale error: shape.size() should be 2.");
@@ -324,36 +325,53 @@ namespace fastllm {
             while ((blockN & -blockN) != blockN) {
                 blockN++;
             }
-            while ((blockM & -blockM) != blockN) {
-                blockN++;
+            while ((blockM & -blockM) != blockM) {
+                blockM++;
             }
-
             ClearBuffer();
-            buffer = new uint8_t[n * m * sizeof(float)];
-            float *floatBuffer = (float*)buffer;
 
-            FILE *fi = fopen(this->fileName.c_str(), "rb");
-            int ret;
+            if (dstType == DataType::FP8_E4M3) {
+                this->blockK = blockN;
+                this->blockM = blockM;
+                buffer = new uint8_t[n * m];
+                FILE *fi = fopen(this->fileName.c_str(), "rb");
 #if defined(_WIN32) || defined(_WIN64)
-            _fseeki64(fi, this->data_offsets[0], 0);
+                _fseeki64(fi, this->data_offsets[0], 0);
 #else
-            fseek(fi, this->data_offsets[0], 0);
+                fseek(fi, this->data_offsets[0], 0);
 #endif
-            uint8_t *ori = new uint8_t[this->bytes];
-            ret = fread(ori, 1, this->bytes, fi);
-            for (int bi = 0; bi < ns; bi++) {
-                for (int bj = 0; bj < ms; bj++) {
-                    float curScale = ((float*)scale.buffer)[bi * ms + bj];
-                    for (int i = bi * blockN; i < (bi + 1) * blockN && i < n; i++) {
-                        for (int j = bj * blockM; j < (bj + 1) * blockM && j < m; j++) {
-                            floatBuffer[i * m + j] = curScale * fp8e4m3tofp32.dict[ori[i * m + j]];
+                int ret = fread(buffer, 1, this->bytes, fi);
+                fclose(fi);
+
+                scalesBuffer = new float[ns * ms];
+                memcpy(scalesBuffer, scale.buffer, ns * ms * sizeof(float));
+            } else {
+                buffer = new uint8_t[n * m * sizeof(float)];
+                float *floatBuffer = (float*)buffer;
+
+                FILE *fi = fopen(this->fileName.c_str(), "rb");
+                int ret;
+    #if defined(_WIN32) || defined(_WIN64)
+                _fseeki64(fi, this->data_offsets[0], 0);
+    #else
+                fseek(fi, this->data_offsets[0], 0);
+    #endif
+                uint8_t *ori = new uint8_t[this->bytes];
+                ret = fread(ori, 1, this->bytes, fi);
+                for (int bi = 0; bi < ns; bi++) {
+                    for (int bj = 0; bj < ms; bj++) {
+                        float curScale = ((float*)scale.buffer)[bi * ms + bj];
+                        for (int i = bi * blockN; i < (bi + 1) * blockN && i < n; i++) {
+                            for (int j = bj * blockM; j < (bj + 1) * blockM && j < m; j++) {
+                                floatBuffer[i * m + j] = curScale * fp8e4m3tofp32.dict[ori[i * m + j]];
+                            }
                         }
                     }
                 }
-            }
 
-            delete[] ori;
-            fclose(fi);
+                delete[] ori;
+                fclose(fi);
+            }
         }
 
         void CreateBufferWithAWQ(DataType dstType, SafeTensorItem &scale, SafeTensorItem &qzero) {
@@ -896,6 +914,11 @@ namespace fastllm {
                 if (dataType >= DATA_AUTO_NONE) {
                     // AUTO类型
                     dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
+                    
+                    // 如果原始权重不是FP8_E4M3格式，目前不做转换
+                    if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
+                        dataType = DataType::FLOAT16;
+                    }
                 }
                 if (it.second == DATA_AUTO_CONV) {
                     std::vector <int> realShape = tensor.intShape;
@@ -981,6 +1004,15 @@ namespace fastllm {
                                     scaleTensorName = "";
                                 }
                             }
+                            if (tensor.dtype == "F8_E4M3" && 
+                                (dataType == FP8_E4M3)) {
+                                oriDataType = DataType::FP8_E4M3;
+                                scaleTensorName = tensorName + "_scale_inv";
+                                if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
+                                    scaleTensorName = "";
+                                }
+                            }
+
                             if (tensor.dtype == "I32" && isAwqModel && StringEndWith(tensorName, "qweight")) {
                                 std::string name = tensorName.substr(0, tensorName.size() - strlen("qweight"));
                                 oriDataType = DataType::FLOAT32;
@@ -998,7 +1030,8 @@ namespace fastllm {
                                 tensor.CreateBuffer(oriDataType);
                             } else if(!isAwqModel) {
                                 auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
-                                AssertInFastLLM(scaleTensor.dtype == "F32", "Tensor scale error: scale's dtype should be F32.");
+                                AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16"
+                                    , "Tensor scale error: scale's dtype should be F32 or BF16.");
                                 scaleTensor.CreateBuffer(DataType::FLOAT32);
                                 tensor.CreateBufferWithScale(oriDataType, scaleTensor);
                             } else {
@@ -1074,7 +1107,8 @@ namespace fastllm {
                                 }
                                 model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
                                         tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
-                                        model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt);
+                                        model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt, 
+                                        tensor.blockK, tensor.blockM);
                             }
                             model->weight[weightName].CalcWeightSum();
                             tensor.ClearBuffer();
@@ -1103,6 +1137,16 @@ namespace fastllm {
                                         if (model->weight[input].dims.size() == 2) {
                                             if (model->weight[input].groupCnt != -1 && 
                                                 model->weight[input].dims[1] % model->weight[input].groupCnt != 0) {
+                                                canMerge = false;
+                                                break;
+                                            }
+                                            if (model->weight[input].blockK != -1 && 
+                                                model->weight[input].dims[0] % model->weight[input].blockK != 0) {
+                                                canMerge = false;
+                                                break;
+                                            }
+                                            if (model->weight[input].blockM != -1 && 
+                                                model->weight[input].dims[1] % model->weight[input].blockM != 0) {
                                                 canMerge = false;
                                                 break;
                                             }
@@ -1147,6 +1191,8 @@ namespace fastllm {
                                         mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
                                         mergeData.group = model->weight[input0].group;
                                         mergeData.groupCnt = model->weight[input0].groupCnt;
+                                        mergeData.blockK = model->weight[input0].blockK;
+                                        mergeData.blockM = model->weight[input0].blockM;
 
                                         mergeData.Allocate();
                                         uint64_t offset = 0;
@@ -1362,6 +1408,11 @@ namespace fastllm {
                 if (dataType >= DATA_AUTO_NONE) {
                     // AUTO类型
                     dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
+
+                    // 如果原始权重不是FP8_E4M3格式，目前不做转换
+                    if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
+                        dataType = DataType::FLOAT16;
+                    }
                 }
                 if (dataType== DATA_AUTO_CONV) {
                     std::vector <int> realShape = tensor.intShape;
@@ -1409,12 +1460,21 @@ namespace fastllm {
                                     scaleTensorName = "";
                                 }
                             }
+                            if (tensor.dtype == "F8_E4M3" && 
+                                (dataType == FP8_E4M3)) {
+                                oriDataType = DataType::FP8_E4M3;
+                                scaleTensorName = tensor.tensorName + "_scale_inv";
+                                if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
+                                    scaleTensorName = "";
+                                }
+                            }
 
                             if (scaleTensorName == "") {
                                 tensor.CreateBuffer(oriDataType);
                             } else {
                                 auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
-                                AssertInFastLLM(scaleTensor.dtype == "F32", "Tensor scale error: scale's dtype should be F32.");
+                                AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16"
+                                    , "Tensor scale error: scale's dtype should be F32 or BF16.");
                                 scaleTensor.CreateBuffer(DataType::FLOAT32);
                                 tensor.CreateBufferWithScale(oriDataType, scaleTensor);
                             }
@@ -1483,7 +1543,8 @@ namespace fastllm {
                             }
                             weights[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
                                 tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
-                                model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt);
+                                model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt, 
+                                tensor.blockK, tensor.blockM);
                             tensor.ClearBuffer();
                         }
                     }, st, end)
