@@ -373,7 +373,7 @@ namespace fastllm {
             initFunctionMap();
     }
 
-    JinjaVar JinjaTemplate::ComputeExpression(JinjaVar &local, std::vector <JinjaToken> tokens, int st, int end) {
+    JinjaVar JinjaTemplate::ComputeExpression(JinjaVar &local, std::vector <JinjaToken> tokens, int st, int end, JinjaVar *setValue) {
         std::vector <JinjaToken> suffixExp; // 后缀表达式
         std::vector <JinjaToken> ops; // 符号栈
 
@@ -461,7 +461,11 @@ namespace fastllm {
                 AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
                 JinjaVar a = vars[vars.size() - 2], b = vars.back();
                 if (a.type == JinjaVar::JinjaNone) {
+                    if (setValue != nullptr)
+                        local[a][b] = *setValue;
                     a = local[a];
+                } else if (setValue != nullptr) {
+                    a[b] = *setValue;
                 }
                 vars.pop_back();
                 vars.pop_back();
@@ -469,11 +473,15 @@ namespace fastllm {
             } else if (it.type == JinjaToken::JinjaTokenRMB) {
                 AssertInFastLLM(vars.size() > 1, "Jinja Error: expression error.");
                 JinjaVar a = vars[vars.size() - 2], b = vars.back();
-                if (a.type == JinjaVar::JinjaNone) {
-                    a = local[a];
-                }
                 if (b.type == JinjaVar::JinjaNone) {
                     b = local[b];
+                }
+                if (a.type == JinjaVar::JinjaNone) {
+                    if (setValue != nullptr)
+                        local[a][b] = *setValue;
+                    a = local[a];
+                } else if (setValue != nullptr) {
+                    a[b] = *setValue;
                 }
                 vars.pop_back();
                 vars.pop_back();
@@ -715,19 +723,13 @@ namespace fastllm {
                         curBlock.tokens[2].type == JinjaToken::JinjaTokenAssign) {
                     std::string iterId = curBlock.tokens[1].value;
                     var[iterId] = ComputeExpression(var, curBlock.tokens, 3, curBlock.tokens.size());
-                } else if (curBlock.tokens.size() >= 4 &&
-                        curBlock.tokens[1].type == JinjaToken::JinjaTokenID &&
-                        curBlock.tokens[curBlock.tokens.size() - 2].type == JinjaToken::JinjaTokenAssign) {
-                    JinjaVar value = ComputeExpression(var, curBlock.tokens, curBlock.tokens.size() - 1, curBlock.tokens.size());
-                    JinjaVar key = ComputeExpression(var, curBlock.tokens, 1, curBlock.tokens.size() - 2);
-                    key.type = value.type;
-                    key.intValue = value.intValue;
-                    key.floatValue = value.floatValue;
-                    key.stringValue = value.stringValue;
-                    key.arrayValue = value.arrayValue;
-                    key.dictValue = value.dictValue;
                 } else {
-                    ErrorInFastLLM("Jinja error: only support format \"set var = expression\".");
+                    int assignPos = 0;
+                    for (; curBlock.tokens[assignPos].type != JinjaToken::JinjaTokenAssign && assignPos < curBlock.tokens.size(); assignPos++);
+                    AssertInFastLLM(assignPos > 0 && assignPos < curBlock.tokens.size() - 1,
+                        "Jinja error: only support format \"set var = expression\".");
+                    JinjaVar value = ComputeExpression(var, curBlock.tokens, assignPos + 1, curBlock.tokens.size());
+                    ComputeExpression(var, curBlock.tokens, 1, assignPos, &value);
                 }
             } else {
                 ErrorInFastLLM("Jinja usupport block: " + curBlock.value);
