@@ -35,7 +35,7 @@ cp tools/ftllm/libfastllm_tools.so tools/ftllm/libfastllm_tools-cu11.so
 
 # cuda-12
 rm -rf CMakeCache.txt CMakeFiles
-cmake .. -DMAKE_WHL_X86=ON -DUSE_CUDA=ON -DUSE_NUMA=ON -DCUDA_ARCH="52;53;70;89" -D CMAKE_CXX_COMPILER=g++-11 -D CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-11 -D CMAKE_CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc
+cmake .. -DMAKE_WHL_X86=ON -DUSE_CUDA=ON -DUSE_NUMA=ON -DCUDA_ARCH="52;53;70;89;90;120" -D CMAKE_CXX_COMPILER=g++-11 -D CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-11 -D CMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc
 make fastllm_tools -j$(nproc)
 if [ $? != 0 ]; then
     exit -1

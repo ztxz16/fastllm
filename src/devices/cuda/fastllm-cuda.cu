@@ -513,7 +513,7 @@ __global__ void FastllmSiluKernel(half* a, half *b, int len) {
     }
 }
 
-__global__ void FastllmSwigluKernel(float* a, float *b, int len, int spatial, int mid) {
+__global__ void FastllmSwigluKernel(float* __restrict__ a, float* __restrict__ b, int len, int spatial, int mid) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
         int id = idx / mid * spatial + idx % mid;
@@ -522,7 +522,7 @@ __global__ void FastllmSwigluKernel(float* a, float *b, int len, int spatial, in
     }
 }
 
-__global__ void FastllmSwigluKernel(half* a, half* b, int len, int spatial, int mid) {
+__global__ void FastllmSwigluKernel(half* __restrict__ a, half* __restrict__ b, int len, int spatial, int mid) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
         int id = idx / mid * spatial + idx % mid;
@@ -5495,7 +5495,11 @@ int GetPointerDeviceId(void *ptr) {
     cudaError_t err = cudaPointerGetAttributes(&attributes, ptr);
 
     if (err == cudaSuccess) {
+#if (CUDART_VERSION < 10000)
+        if (attributes.memoryType == cudaMemoryTypeDevice) {
+#else
         if (attributes.type == cudaMemoryTypeDevice) {
+#endif
             int device = attributes.device;
             printf("Pointer belongs to device %d\n", device);
             return device;
