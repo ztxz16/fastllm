@@ -6,6 +6,7 @@
 #define FASTLLM_TEMPLATE_H
 
 #include "utils/utils.h"
+#include <functional>
 
 namespace fastllm {
     struct JinjaVar {
@@ -49,7 +50,7 @@ namespace fastllm {
     // 词法分析后的Token
     struct JinjaToken {
         enum JinjaToKenType {
-            JinjaTokenID = 0, JinjaTokenBOOL, JinjaTokenNUM, JinjaTokenSTRING, JinjaTokenDOT,
+            JinjaTokenID = 0, JinjaTokenBOOL, JinjaTokenNUM, JinjaTokenSTRING, JinjaTokenFUNC, JinjaTokenDOT,
             JinjaTokenLMB, JinjaTokenRMB, JinjaTokenLSB, JinjaTokenRSB,
             JinjaTokenSet, JinjaTokenFor, JinjaTokenEndFor, JinjaTokenIf, JinjaTokenElse, JinjaTokenElseIf, JinjaTokenEndif,
             JinjaTokenIn,
@@ -133,6 +134,8 @@ namespace fastllm {
     JinjaVar JinjaTrim(const JinjaVar &a);
 
     int GetOpLevel(JinjaToken::JinjaToKenType type);
+
+    using JinjaFunction = std::function<JinjaVar(const JinjaVar &)>;
 
     // Jinja模板
     struct JinjaTemplate {
