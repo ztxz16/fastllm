@@ -11,7 +11,18 @@
 namespace fastllm {
     void DoCpuLinearReshape(Data &input, Data &weight, Data &output);
     void DoCpuLinear(Data &input, Data &weight, const Data &bias, Data &output);
-    
+
+    struct MultiThreadFloat32ToBFloat16Op : MultiThreadBaseOp {
+        float *input;
+        uint16_t *output;
+        int len;
+
+        MultiThreadFloat32ToBFloat16Op (float *input, uint16_t *output, int len) :
+                input(input), output(output), len(len) {}
+
+        void Run();
+    };
+
     struct MultiThreadOnlineQuantizationOp : MultiThreadBaseOp {
         float *input;
         uint8_t *output;

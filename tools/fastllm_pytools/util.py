@@ -96,6 +96,11 @@ def make_normal_llm_model(args):
                         args.dtype = "int4g" + str(quantization_config["group_size"])
                 except:
                     pass
+                try:
+                    if (args.dtype == "auto" and quantization_config['quant_method'] == "fp8" and quantization_config['fmt'] == "e4m3"):
+                        args.dtype = "fp8_e4m3"
+                except:
+                    pass
         except:
             pass
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
@@ -109,6 +114,9 @@ def make_normal_llm_model(args):
             args.threads = max(1, min(32, available_cores - 2))
         except:
             args.threads = max(1, min(32, os.cpu_count() - 2))
+    if (args.atype == "auto"):
+        if (args.device in ["cpu", "numa", "tfacc"]):
+            args.atype = "float32"
     if (args.dtype == "auto"):
         args.dtype = "float16"
     if (args.moe_device == ""):
