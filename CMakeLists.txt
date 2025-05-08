@@ -76,6 +76,12 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executo
         ${CPU_DEVICE_FILES}
         ${GRAPH_MODEL_FILES})
 
+set_source_files_properties(
+    "src/devices/cpu/avx512bf16.cpp"
+    PROPERTIES
+    COMPILE_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f -mavx512bf16"
+)
+
 include_directories(include)
 include_directories(include/utils)
 include_directories(include/models)

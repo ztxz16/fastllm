@@ -720,7 +720,8 @@ namespace fastllm {
         }
     };
 
-    void Data::CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, float *oriMins, float *oriScales, int groupCnt) {
+    void Data::CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, float *oriMins, float *oriScales, 
+            int groupCnt, int blockK, int blockM) {
         auto &data = *this;
         data.weightType = weightType;
         data.UpdateUnitSize();
@@ -744,6 +745,13 @@ namespace fastllm {
                     data.perChannelsConfigs[i].min = data.mins[i];
                     data.perChannelsConfigs[i].scale = data.scales[i];
                 } */
+            } else if (dataType == DataType::FP8_E4M3) {
+                this->blockK = blockK;
+                this->blockM = blockM;
+                int ks = (this->dims[0] - 1) / this->blockK + 1;
+                int ms = (this->dims[1] - 1) / this->blockM + 1;
+                data.scales.resize(ks * ms);
+                memcpy(data.scales.data(), oriScales, ks * ms * sizeof(float));
             }
         } else if (oriDataType == DataType::BFLOAT16
                 && dataType == DataType::FLOAT16) {
@@ -876,7 +884,7 @@ namespace fastllm {
                 this->dataType == DataType::FLOAT16) {
             this->unitSize = 2;
             this->unitSizeDiv = 1;
-        } else if (this->dataType == DataType::INT8) {
+        } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT4 
@@ -1419,7 +1427,11 @@ namespace fastllm {
         } 
         uint64_t ret = 0;
         ret += sizeof(int) * 2;
-        if (this->dataType == INT4_NOZERO ||
+        if (this->dataType == FP8_E4M3) {
+            ret += sizeof(int) * 3;
+            ret += this->scales.size() * sizeof(float);
+            ret += this->GetBytes();
+        } else if (this->dataType == INT4_NOZERO ||
                     this->dataType == INT4 ||
                     this->dataType == INT8) {
             ret += sizeof(int);
@@ -1446,7 +1458,13 @@ namespace fastllm {
         } 
         writer.WriteInt(1); // 版本号
         writer.WriteInt((int)this->dataType);
-        if (this->dataType == INT8 || this->dataType == INT4 || this->dataType == INT4_NOZERO) {
+        if (this->dataType == FP8_E4M3) {
+            writer.WriteInt(this->blockK);
+            writer.WriteInt(this->blockM);
+            writer.WriteInt((int)this->scales.size());
+            writer.WriteBytes((uint8_t*)this->scales.data(), (int)this->scales.size() * sizeof(float));
+            writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else if (this->dataType == INT8 || this->dataType == INT4 || this->dataType == INT4_NOZERO) {
             writer.WriteInt(this->perChannelAxis);
             int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
             for (int i = 0; i < k; i++) {
@@ -1485,6 +1503,12 @@ namespace fastllm {
             if (this->dataType == FLOAT16 || this->dataType == FLOAT32 || this->dataType == BFLOAT16) {
                 reader.ReadBytes(this->cpuData, len);
                 return;
+            } else if (this->dataType == FP8_E4M3) {
+                this->blockK = reader.ReadInt();
+                this->blockM = reader.ReadInt();
+                this->scales.resize(reader.ReadInt());
+                reader.ReadBytes((uint8_t*)this->scales.data(), (int)this->scales.size() * sizeof(float));
+                reader.ReadBytes(this->cpuData, this->GetBytes());
             } else if (this->dataType == INT8 || this->dataType == INT4 || this->dataType == INT4_NOZERO) {
                 this->perChannelAxis = reader.ReadInt();
                 int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
