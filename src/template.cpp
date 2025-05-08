@@ -393,7 +393,7 @@ namespace fastllm {
                 }
                 AssertInFastLLM(ops.size() > 0 && ops.back().type == JinjaToken::JinjaTokenLSB, "Error: barckets doesn't match.");
                 ops.pop_back();
-                if (ops.back().type == JinjaToken::JinjaTokenFUNC) {
+                if (ops.size() > 0 && ops.back().type == JinjaToken::JinjaTokenFUNC) {
                     suffixExp.push_back(ops.back());
                     ops.pop_back();
                 }
