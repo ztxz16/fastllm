@@ -354,6 +354,15 @@ namespace fastllm {
                 }
             }
 
+            if (generationConfig.top_k <= 1) {
+                // 禁用simple greedy
+                ((GenerationConfig*)&generationConfig)->top_k = 5;
+                ((GenerationConfig*)&generationConfig)->top_p = 0.95;
+                if (fabs(generationConfig.temperature - 1.0f) < 1e-9) {
+                    ((GenerationConfig*)&generationConfig)->temperature = 0.6;
+                }
+            }
+
             ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfig);
             if (generationConfig.IsSimpleGreedy()) {
                 TopK(logits, topk, 1);
@@ -361,6 +370,34 @@ namespace fastllm {
                 for (int b = 0; b < batch; b++) {
                     int base = b;
                     lastRet.push_back((int) (((float *) topk.cpuData)[base * 2] + 1e-3));
+                }
+            } else if (generationConfig.top_k <= 50 && !generationConfig.output_logits) {
+                if ((generationConfig.repeat_penalty - 1.0f) > 1e-9) {
+                    int maxTokenSetSize = 0;
+                    for (int b = 0; b < batch; b++) {
+                        maxTokenSetSize = std::max(maxTokenSetSize, (int)lastTokens.units[b].tokenSet.size());
+                    }
+                    std::vector <float> penaltyData = std::vector <float> (batch * maxTokenSetSize, -100.0f);
+                    std::vector <float> penaltyScaleData = std::vector <float> (batch, 1.0f);
+                    for (int b = 0; b < batch; b++) {
+                        int curId = 0;
+                        for (int i : lastTokens.units[b].tokenSet) {
+                            penaltyData[b * maxTokenSetSize + curId] = i;
+                            curId++;
+                        }
+                        penaltyScaleData[b] = generationConfig.repeat_penalty;
+                    }
+                    Data penalty, penaltyScale;
+                    penalty.CopyFrom(Data(DataType::FLOAT32, {batch, maxTokenSetSize}, penaltyData));
+                    penaltyScale.CopyFrom(Data(DataType::FLOAT32, {batch}, penaltyScaleData));
+                    RepeatPenalty(logits, penalty, penaltyScale);
+                }
+
+                Data topk;
+                TopK(logits, topk, generationConfig.top_k);
+                topk.ToDevice(DataDevice::CPU);
+                for (int b = 0; b < batch; b++) {
+                    lastRet.push_back(LLMSamplingOnly(topk, b, generationConfig));
                 }
             } else {
                 for (int b = 0; b < batch; b++) {
@@ -696,6 +733,17 @@ namespace fastllm {
         ToDataType(logits, DataType::FLOAT32);
         std::vector <int> lastRet;
         int total = 0;
+
+        for (int b = 0; b < batch; b++) {
+            if (generationConfigs[b].top_k <= 1) {
+                // 禁用simple greedy
+                ((GenerationConfig*)&generationConfigs[b])->top_k = 5;
+                ((GenerationConfig*)&generationConfigs[b])->top_p = 0.95;
+                if (fabs(generationConfigs[b].temperature - 1.0f) < 1e-9) {
+                    ((GenerationConfig*)&generationConfigs[b])->temperature = 0.6;
+                }
+            }
+        }
 
         bool allSimple = true, needLogits = false;
         int maxTopK = 1;

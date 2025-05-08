@@ -277,6 +277,9 @@ namespace fastllm {
         int perChannelAxis = -1; // 沿哪个轴分通道量化，-1代表没有分通道
         int group = -1, groupCnt = -1; // 分组量化，group代表组数，groupCnt代表每组有多少个元素，-1代表不使用分组量化
 
+        // FP8的分组量化， [blockK, blockM]的小矩阵为一组
+        int blockK = -1, blockM = -1;
+
         // 以下为每个通道/分组的量化参数
         // 1. 若不使用分通道量化，那么总组数 = 1
         // 2. 若使用分通道量化，那么总组数 = 通道数
@@ -314,7 +317,8 @@ namespace fastllm {
 
         Data (const Data &ori); // 深拷贝
 
-        void CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, float *oriMins, float *oriScales, int groupCnt = -1); // 从oriData中创建
+        void CreateFromOriData(WeightType weightType, DataType oriDataType, uint8_t *oriData, float *oriMins, float *oriScales, 
+                int groupCnt = -1, int blockK = -1, int blockM = -1); // 从oriData中创建
 
         void CopyFrom(const Data &ori); // 复制
 

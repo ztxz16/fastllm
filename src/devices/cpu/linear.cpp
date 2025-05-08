@@ -16,15 +16,104 @@
 
 #include "utils.h"
 #include "computeutils.h"
+#include <array>  // For std::array
+
+// Intrinsics for CPUID
+#if defined(_MSC_VER)
+    #include <intrin.h> // For __cpuid, __cpuidex, _xgetbv
+#elif defined(__GNUC__) || defined(__clang__)
+    #include <cpuid.h> // For __get_cpuid, __get_cpuid_count
+    #include <x86intrin.h> // For _xgetbv (usually included by cpuid.h or available)
+    // GCC/Clang might not have _xgetbv as an intrinsic like MSVC,
+    // or it might be in a different header.
+    // If _xgetbv is not found, you might need to implement it with inline assembly.
+    #ifndef _XCR_XFEATURE_ENABLED_MASK // Often defined with _xgetbv
+    #define _XCR_XFEATURE_ENABLED_MASK 0
+    #endif
+#else
+    #warning "CPUID detection not implemented for this compiler."
+#endif
 
 namespace fastllm {
     extern FP16ToFP32Manager fp16tofp32;
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
+    extern void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
+    extern void Float16ToBFloat16(uint16_t *float16, uint16_t *bfloat16, int len);
     extern void OnlineQuantization(float *inputData, std::vector<uint8_t> &uinput, std::vector<LowBitConfig> &inputConfigs, 
                                 int n, int m, int group, int groupCnt,
                                 std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros, 
                                 int permuteType);
+                                
+    struct CPUInstructInfo {
+        bool hasAVX512F = false;
+        bool hasAVX512BF16 = false;
+        bool hasAVX512VNNI = false;
+        // You could add more, e.g., hasAVX, hasAVX2
+        CPUInstructInfo() {
+            #if defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)
+            std::array<int, 4> regs; // For EAX, EBX, ECX, EDX
+            // Step 1: Check OSXSAVE bit (CPUID EAX=1, ECX bit 27)
+            // This indicates if the OS supports XGETBV to query enabled AVX features
+            bool os_supports_xsave = false;
+            #if defined(_MSC_VER)
+            __cpuid(regs.data(), 1);
+            #else // GCC/Clang
+            __get_cpuid(1, (unsigned int*)&regs[0], (unsigned int*)&regs[1], (unsigned int*)&regs[2], (unsigned int*)&regs[3]);
+            #endif
+            if (regs[2] & (1 << 27)) { // Check ECX bit 27 (OSXSAVE)
+                os_supports_xsave = true;
+            }
+            bool os_avx_enabled = false;
+            if (os_supports_xsave) {
+                // Step 2: Check if AVX states (and by extension AVX512 states) are enabled by OS
+                // XCR0 register:
+                // Bit 1 (SSE state) must be 1
+                // Bit 2 (AVX state - YMM registers) must be 1
+                // Bits 5,6,7 (AVX512 OPMASK, ZMM_Hi256, Hi16_ZMM states) must be 1 for AVX512
+                // We check for mask 0xE6 (binary 11100110) which means SSE, AVX, and AVX512 states are enabled
+                uint64_t xcr0 = _xgetbv(_XCR_XFEATURE_ENABLED_MASK); // _XCR_XFEATURE_ENABLED_MASK is typically 0
+                if ((xcr0 & 0xE6) == 0xE6) {
+                    os_avx_enabled = true;
+                }
+            }
+            if (os_avx_enabled) {
+                // CPUID with EAX=7, ECX=0 for extended features
+                #if defined(_MSC_VER)
+                __cpuidex(regs.data(), 7, 0);
+                #else // GCC/Clang
+                __get_cpuid_count(7, 0, (unsigned int*)&regs[0], (unsigned int*)&regs[1], (unsigned int*)&regs[2], (unsigned int*)&regs[3]);
+                #endif
+                // AVX512F: EAX=7, ECX=0, EBX bit 16
+                hasAVX512F = (regs[1] & (1 << 16)) != 0;
+                // AVX512VNNI: EAX=7, ECX=0, ECX bit 11
+                hasAVX512VNNI = (regs[2] & (1 << 11)) != 0;
+                // AVX512_BF16: EAX=7, ECX=1, EAX bit 5
+                // Need to make another CPUID call with ECX=1
+                #if defined(_MSC_VER)
+                __cpuidex(regs.data(), 7, 1);
+                #else // GCC/Clang
+                __get_cpuid_count(7, 1, (unsigned int*)&regs[0], (unsigned int*)&regs[1], (unsigned int*)&regs[2], (unsigned int*)&regs[3]);
+                #endif
+                hasAVX512BF16 = (regs[0] & (1 << 5)) != 0;
+                // Important: If a feature (like AVX512_BF16) depends on another (like AVX512F),
+                // you might want to ensure the base feature is also true.
+                // e.g., hasAVX512BF16 = hasAVX512BF16 && hasAVX512F; (Though CPUID should report correctly)
+            }
+            // If os_avx_enabled is false, all 'has...' flags will remain false.
+            #endif // Compiler check
+            // Print the results
+            std::string x[2] = {"OFF", "ON"};
+            printf("CPU Instruction Info: ");
+            printf("[AVX512F: %s] ", x[hasAVX512F].c_str());
+            printf("[AVX512_VNNI: %s] ", x[hasAVX512VNNI].c_str());
+            printf("[AVX512_BF16: %s] ", x[hasAVX512BF16].c_str());
+            printf("\n");
+        }
+    };
+
+    static CPUInstructInfo cpuInstructInfo;
+
 #ifdef __AVX2__
     extern int DotU4U8(uint8_t *a, uint8_t *b, int n);
 #endif
@@ -96,6 +185,154 @@ namespace fastllm {
                     now += inputData[i * m + l] * fp16tofp32.dict[weightData[j * m + l]];
                 }
                 outputData[i * k + j] = now;
+            }
+        }
+    }
+
+    // 2. Vectorized FP8 E4M3 to FP32 conversion (AVX2)
+    //    Input: 8 uint8_t values packed into the lower 64 bits of an __m128i
+    //    Output: 8 float values in an __m256 vector
+    //    This is the most complex part to implement correctly and efficiently.
+    inline __m256 _mm256_fp8e4m3_to_fp32_ps(__m128i v_u8) {
+        // --- Implementation Sketch ---
+        // a. Unpack 8 uint8_t values into 8 32-bit integers (__m256i)
+        __m256i v_u32 = _mm256_cvtepu8_epi32(v_u8); // Zero-extends uint8 -> int32
+        // b. Define masks and constants for AVX2 registers
+        const __m256i sign_mask = _mm256_set1_epi32(0x80);
+        const __m256i exp_mask  = _mm256_set1_epi32(0x78); // E4
+        const __m256i mant_mask = _mm256_set1_epi32(0x07); // M3
+        const __m256i exp_shift = _mm256_set1_epi32(3);
+        const __m256i mant_shift = _mm256_set1_epi32(23 - 3); // Shift M3 to FP32 mantissa position
+        const __m256i fp32_sign_shift = _mm256_set1_epi32(24); // Shift sign bit
+        const __m256i fp32_exp_shift = _mm256_set1_epi32(23); // Shift exponent bits
+        const __m256i bias_delta = _mm256_set1_epi32(127 - 7); // FP32 bias - FP8 bias
+        const __m256i zero = _mm256_setzero_si256();
+        // Mask for checking if exp and mantissa are both zero (value is zero)
+        const __m256i non_sign_mask = _mm256_set1_epi32(0x7F);
+        // c. Extract components using bitwise operations
+        __m256i signs = _mm256_and_si256(v_u32, sign_mask);
+        __m256i exp8  = _mm256_srli_epi32(_mm256_and_si256(v_u32, exp_mask), 3);
+        __m256i mant8 = _mm256_and_si256(v_u32, mant_mask);
+        // d. Convert exponent bias
+        __m256i exp32 = _mm256_add_epi32(exp8, bias_delta);
+        // e. Shift components to their FP32 positions
+        __m256i fp32_sign = _mm256_sllv_epi32(signs, fp32_sign_shift); // Shift sign bit
+        __m256i fp32_exp  = _mm256_sllv_epi32(exp32, fp32_exp_shift); // Shift exponent
+        __m256i fp32_mant = _mm256_sllv_epi32(mant8, mant_shift);  // Shift mantissa
+        // f. Combine components (assuming normal numbers for now)
+        __m256i fp32_bits = _mm256_or_si256(fp32_sign, _mm256_or_si256(fp32_exp, fp32_mant));
+        // g. Handle zeros (where exponent and mantissa bits are 0)
+        //    Check if bits 0-6 are zero
+        __m256i is_zero_mask = _mm256_cmpeq_epi32(_mm256_and_si256(v_u32, non_sign_mask), zero);
+        //    Select 0.0f where the input was zero, otherwise keep calculated bits
+        fp32_bits = _mm256_andnot_si256(is_zero_mask, fp32_bits); // Bitwise SELECT(mask, 0, fp32_bits)
+        // h. Handle other special cases (NaN, Inf, subnormals) based on E4M3 spec - SKIPPED IN THIS SKETCH
+        // i. Cast the integer bits representation to float vector
+        return _mm256_castsi256_ps(fp32_bits);
+        // --- End Implementation Sketch ---
+    }
+
+    // 2. Vectorized FP8 E4M3 to FP32 conversion (AVX2)
+    //    Input: 8 uint8_t values packed into the lower 64 bits of an __m128i
+    //    Output: 8 float values in an __m256 vector
+    //    This is the most complex part to implement correctly and efficiently.
+    inline __m256 _mm256_fp8e4m3_to_fp32_fast_ps(__m128i v_u8) {
+        // --- Implementation Sketch ---
+        // a. Unpack 8 uint8_t values into 8 32-bit integers (__m256i)
+        __m256i v_u32 = _mm256_cvtepu8_epi32(v_u8); // Zero-extends uint8 -> int32
+        // b. Define masks and constants for AVX2 registers
+        const __m256i sign_mask = _mm256_set1_epi32(0x80);
+        const __m256i last_mask  = _mm256_set1_epi32(0x7F); // last
+        const __m256i fp32_sign_shift = _mm256_set1_epi32(24); // Shift sign bit
+        const __m256i fp32_last_shift = _mm256_set1_epi32(20); // Shift last bits
+        // c. Extract components using bitwise operations
+        __m256i signs = _mm256_and_si256(v_u32, sign_mask);
+        __m256i lasts = _mm256_and_si256(v_u32, last_mask);
+
+        __m256i fp32_sign = _mm256_sllv_epi32(signs, fp32_sign_shift); // Shift sign bit
+        __m256i fp32_last  = _mm256_sllv_epi32(lasts, fp32_last_shift); // Shift last
+
+        // f. Combine components (assuming normal numbers for now)
+        __m256i fp32_bits = _mm256_or_si256(fp32_sign, fp32_last);
+        return _mm256_castsi256_ps(fp32_bits);
+        // --- End Implementation Sketch ---
+    }
+
+    bool LinearBFloat16FP8E4M3_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+        int n, int m, int k, int st, int end, int blockK, int blockM, float *scales, 
+        int ks, int ms, float magicScale);
+
+    void MultiThreadLinearBFloat16FP8E4M3Op::Run() {
+        static struct FP8E4M3ToFP32Manager fp8e4m3tofp32;
+        static float magicScale = pow(2, 120);
+        int ks = (k - 1) / blockK + 1;
+        int ms = (m - 1) / blockM + 1;
+
+        if (cpuInstructInfo.hasAVX512BF16) {
+            if (LinearBFloat16FP8E4M3_AVX512BF16_Kernel(
+                inputData, weightData, biasData, outputData, n, m, k, st, end, blockK, blockM, scales, ks, ms, magicScale
+            )) {
+                return;
+            }
+        }
+
+        if (m % blockM == 0 && blockM % 8 == 0) {
+            for (int i = 0; i < n; i++) {
+                for (int j = st; j < end; j++) {
+                    float now = biasData ? biasData[j] : 0.0f;
+                    __m256 lastSum = _mm256_setzero_ps();
+                    for (int midx = 0; midx < ms; midx++) {
+                        float curScale = scales[j / blockK * ms + midx];
+                        int l = midx * blockM;
+#ifdef __AVX2__
+                        __m256 vsum = _mm256_setzero_ps();
+                        for (; l + 7 < (midx + 1) * blockM; l += 8) {
+                            // __m256 vi = _mm256_loadu_ps(inputData + i * m + l);
+                            __m128i bf16_vec_128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(inputData + i * m + l));
+                            __m256i bf16_extended_to_32 = _mm256_cvtepu16_epi32(bf16_vec_128);
+                            __m256i fp32_bits_int = _mm256_slli_epi32(bf16_extended_to_32, 16);
+                            __m256 vi = _mm256_castsi256_ps(fp32_bits_int);
+                            
+                            __m128i vw_u8 = _mm_loadl_epi64((const __m128i*)(weightData + j * m + l));
+                            __m256 vw = _mm256_fp8e4m3_to_fp32_fast_ps(vw_u8);
+                            vsum = _mm256_fmadd_ps(vi, vw, vsum);
+                        }
+                        // now += Floatsum(vsum) * curScale;
+                        lastSum = _mm256_fmadd_ps(vsum, _mm256_set1_ps(curScale), lastSum);
+#endif                        
+                    }
+                    now += Floatsum(lastSum) * pow(2, 120);
+                    outputData[i * k + j] = now;
+                }
+            }
+        } else {
+            for (int i = 0; i < n; i++) {
+                for (int j = st; j < end; j++) {
+                    float now = biasData ? biasData[j] : 0.0f;
+                    for (int midx = 0; midx < ms; midx++) {
+                        float curScale = scales[j / blockK * ms + midx] * magicScale;
+                        int l = midx * blockM;
+#ifdef __AVX2__
+                        __m256 vsum = _mm256_setzero_ps();
+                        for (; l + 7 < m && l + 7 < (midx + 1) * blockM; l += 8) {
+                            // __m256 vi = _mm256_loadu_ps(inputData + i * m + l);
+                            __m128i bf16_vec_128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(inputData + i * m + l));
+                            __m256i bf16_extended_to_32 = _mm256_cvtepu16_epi32(bf16_vec_128);
+                            __m256i fp32_bits_int = _mm256_slli_epi32(bf16_extended_to_32, 16);
+                            __m256 vi = _mm256_castsi256_ps(fp32_bits_int);
+
+                            __m128i vw_u8 = _mm_loadl_epi64((const __m128i*)(weightData + j * m + l));
+                            __m256 vw = _mm256_fp8e4m3_to_fp32_fast_ps(vw_u8);
+                            vsum = _mm256_fmadd_ps(vi, vw, vsum);
+                        }
+                        now += Floatsum(vsum) * curScale;
+#endif
+                        for (; l < m && l < (midx + 1) * blockM; l++) {
+                            now += curScale * inputData[i * m + l] * fp8e4m3tofp32.dict[weightData[j * m + l]];
+                        }
+                    }
+                    outputData[i * k + j] = now;
+                }
             }
         }
     }
@@ -649,6 +886,50 @@ namespace fastllm {
         */
     }
 
+    void RunLinearFloat32FP8E4M3(float *inputData, Data &weight, float *outputData, float *biasData, 
+                    int n, int m, int k, 
+                    AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector <uint16_t> bf16Input;
+        bf16Input.resize(n * m);
+        Float32ToBFloat16(inputData, bf16Input.data(), n * m);
+
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLinearBFloat16FP8E4M3Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            ops.push_back(new MultiThreadLinearBFloat16FP8E4M3Op(bf16Input.data(), weight.cpuData, biasData, outputData,
+                                                    n, m, k, cur, end, weight.scales.data(), weight.blockK, weight.blockM));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+    }
+
+    void LaunchLinearBFloat16FP8E4M3(uint16_t *inputData, Data &weight, float *outputData, float *biasData, 
+        int n, int m, int k, 
+        std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
+        int per = k / threadNum;
+        int cur = 0;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            if (i == threadNum - 1) {
+                end = k;
+            }
+            ops[startTid + i] = new MultiThreadLinearBFloat16FP8E4M3Op(inputData, weight.cpuData, biasData, outputData,
+                                    n, m, k, cur, end, weight.scales.data(), weight.blockK, weight.blockM);
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[startTid + i]);
+        }
+    }
+
     void RunLinearFloat32Int4Group(float *inputData, Data &weight, float *outputData, float *biasData, 
                                 int n, int m, int k, int group, int groupCnt,
                                 AliveThreadPool *pool, int startTid, int threadNum) {
@@ -702,6 +983,36 @@ namespace fastllm {
         floatOutput.resize(n * k);
         Float16ToFloat32(inputData, floatInput.data(), n * m);
         RunLinearFloat32Int4Group(floatInput.data(), weight, floatOutput.data(), biasData, n, m, k, group, groupCnt, pool, startTid, threadNum);
+        Float32ToFloat16(floatOutput.data(), outputData, n * k);
+    }
+
+    void RunLinearFloat16FP8E4M3(uint16_t *inputData, Data &weight, uint16_t *outputData, float *biasData, 
+        int n, int m, int k, 
+        AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector <float> floatOutput;
+        floatOutput.resize(n * k);
+        
+        std::vector <uint16_t> bf16Input;
+        bf16Input.resize(n * m);
+        Float16ToBFloat16(inputData, bf16Input.data(), n * m);
+
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLinearBFloat16FP8E4M3Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            ops.push_back(new MultiThreadLinearBFloat16FP8E4M3Op(bf16Input.data(), weight.cpuData, biasData, floatOutput.data(),
+                                                    n, m, k, cur, end, weight.scales.data(), weight.blockK, weight.blockM));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+
         Float32ToFloat16(floatOutput.data(), outputData, n * k);
     }
 
