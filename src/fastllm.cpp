@@ -1299,7 +1299,7 @@ namespace fastllm {
                     }
                     weightSum[gid] += sum0[0] + sum0[1] + sum0[2] + sum0[3];
 #endif
-#ifdef __AVX2__X
+#ifdef __AVX2__
                     __m256i acc = _mm256_setzero_si256();
                     const __m256i lowMask = _mm256_set1_epi8(0xf);
                     const __m256i ones = _mm256_set1_epi16(1);
@@ -1671,11 +1671,12 @@ namespace fastllm {
             specialRoot = new TrieNode();
         for (auto &it : specialTokenMap) {
             TrieNode *now = this->specialRoot;
-            for (int i = 0; i < it.first.size(); i++) {
-                if (now->next.find(it.first[i]) == now->next.end()) {
-                    now->next[it.first[i]] = new TrieNode();
+            std::string normalized = Normalize(it.first);
+            for (int i = 0; i < normalized.size(); i++) {
+                if (now->next.find(normalized[i]) == now->next.end()) {
+                    now->next[normalized[i]] = new TrieNode();
                 }
-                now = now->next[it.first[i]];
+                now = now->next[normalized[i]];
             }
             now->tokenId = it.second;
             now->score = 0.0f;
