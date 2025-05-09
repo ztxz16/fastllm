@@ -239,6 +239,13 @@ namespace fastllm {
         if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
             buffer.WriteInt((int) dataType);
             buffer.WriteBytes(data->cpuData, data->GetBytes());
+        } else if (dataType == DataType::FP8_E4M3) {
+            buffer.WriteInt((int) dataType);
+            buffer.WriteInt(data->blockK);
+            buffer.WriteInt(data->blockM);
+            buffer.WriteInt((int)data->scales.size());
+            buffer.WriteBytes((uint8_t*)data->scales.data(), (int)data->scales.size() * sizeof(float));
+            buffer.WriteBytes(data->cpuData, data->GetBytes());
         } else if (dataType == DataType::INT8 || dataType == DataType::INT4 || dataType == DataType::INT4_NOZERO) {
             buffer.WriteInt((int) dataType);
             buffer.WriteInt(data->perChannelAxis);
@@ -382,6 +389,9 @@ namespace fastllm {
         if (weight->dataType == DataType::FLOAT16) {
             opType = ComputeTaskType::LinearFloat16;
         }
+        if (weight->dataType == DataType::FP8_E4M3) {
+            opType = ComputeTaskType::LinearFP8E4M3;
+        }
         float *biasData = bias->dims.size() > 0 ? (float *) bias->cpuData : nullptr;
         std::string biasName = biasData == nullptr ? "" : bias->name;
 
@@ -422,6 +432,153 @@ namespace fastllm {
             }
             memcpy(((uint8_t*) output) + baseN * outK * unitSize, (uint8_t*) result, curN * outK * unitSize);
         }
+    }
+
+    void NumaClient::RunNumaMOEF(int n, int m, int k,
+        std::vector <fastllm::Data*> weights, std::vector <float> factors,
+        float *input, float *output, 
+        DataType outputType) {
+        if (this->registerDataNames.find(weights[0]->name) == this->registerDataNames.end()) {
+            for (int i = 0; i < weights.size(); i += 2) {
+                RegisterFastllmData(weights[i], "linearSwiglu");
+                RegisterFastllmData(weights[i + 1], "linearColumn");
+            }
+        }
+        int opType = ComputeTaskType::MOEFP8E4M3;
+        int maxN = 1;
+
+        std::string factorString = "[", weightString = "[";
+        for (int i = 0; i < factors.size(); i++) {
+            if (i > 0) {
+                factorString += ",\n";
+            }
+            factorString += std::to_string(factors[i]);
+        }
+        for (int i = 0; i < weights.size(); i++) {
+            if (i > 0) {
+                weightString += ",\n";
+            }
+            weightString += ('\"') + weights[i]->name + ('\"');
+        }
+        factorString += "]";
+        weightString += "]";
+        int outputUnitSize = (outputType == DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
+        
+        for (int baseN = 0; baseN < n; baseN += maxN) {
+            int curN = std::min(maxN, n - baseN);
+            std::string configString = "{";
+            configString += "\"factors\":" +  factorString + ",";
+            configString += "\"n\":" +  std::to_string(n) + ",";
+            configString += "\"m\":" +  std::to_string(m) + ",";
+            configString += "\"k\":" +  std::to_string(k) + ",";
+            configString += "\"op\":\"moe\",";
+            configString += "\"outputType\":" +  std::to_string(0) + ",";
+            configString += "\"weights\":" +  weightString + "}";
+            U8Buffer buffer;
+            buffer.WriteInt(configString.size());
+            buffer.WriteBytes((uint8_t*)configString.data(), configString.size());
+            RunMultiThreadMemcpy((uint8_t*)this->buf, buffer.buffer.data(), buffer.buffer.size(), GetAlivePool());
+            RunMultiThreadMemcpy((uint8_t*)this->buf + buffer.buffer.size(), (uint8_t*)(input + baseN * m), curN * m * sizeof(float), GetAlivePool());
+            this->Launch(opType);
+            this->Wait();
+            auto pool = GetAlivePool();
+
+            uint8_t *oriResult = new uint8_t[serverNumaCnt * curN * k * outputUnitSize];
+            RunMultiThreadMemcpy(oriResult, (uint8_t*)result, serverNumaCnt * curN * k * outputUnitSize, GetAlivePool());
+            float *floatResult = (float*)oriResult;
+            for (int i = 1; i < serverNumaCnt; i++) {
+                for (int j = 0; j < curN * k; j++) {
+                    floatResult[j] += floatResult[i * curN * k + j];
+                }
+            }
+            RunMultiThreadMemcpy(((uint8_t*) output) + baseN * k * outputUnitSize, (uint8_t*) oriResult,
+                    curN * k * outputUnitSize, GetAlivePool());
+            delete[] oriResult;
+        }
+    }
+
+    void NumaClient::RunNumaMOEFMultiRow(int n, int m, int k,
+                        std::vector <std::vector <fastllm::Data*> > &weights, std::vector <std::vector <float> > &factors,
+                        float *input, float *output, 
+                        DataType outputType) {
+        if (this->registerDataNames.find(weights[0][0]->name) == this->registerDataNames.end()) {
+            for (auto &w : weights) {
+                for (int i = 0; i < w.size(); i += 2) {
+                    RegisterFastllmData(w[i], "linearSwiglu");
+                    RegisterFastllmData(w[i + 1], "linearColumn");
+                }
+            }
+        }
+        int opType = ComputeTaskType::MOEFP8E4M3;
+
+        int maxN = n;
+        maxN = std::min(maxN, transLimit / m);
+        maxN = std::min(maxN, (int)(transLimit / (k * sizeof(float))));
+
+        int outputUnitSize = (outputType == DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
+        for (int baseN = 0; baseN < n; baseN += maxN) {
+            int curN = std::min(maxN, n - baseN);
+
+            std::string factorString = "[", weightString = "[";
+            for (int fid = 0; fid < factors.size(); fid++) {
+                if (fid > 0) {
+                    factorString += ",\n";
+                }
+                factorString += "[";
+                for (int i = 0; i < factors[fid].size(); i++) {
+                    if (i > 0) {
+                        factorString += ",\n";
+                    }
+                    factorString += std::to_string(factors[fid][i]);
+                }
+                factorString += "]";
+            }
+            factorString += "]";
+
+            for (int wid = 0; wid < weights.size(); wid++) {
+                if (wid > 0) {
+                    weightString += ",\n";
+                }
+                weightString += "[";
+                for (int i = 0; i < weights[wid].size(); i++) {
+                    if (i > 0) {
+                        weightString += ",\n";
+                    }
+                    weightString += ('\"') + weights[wid][i]->name + ('\"');
+                }
+                weightString += "]";
+            }
+            weightString += "]";
+
+            std::string configString = "{";
+            configString += "\"factors\":" +  factorString + ",";
+            configString += "\"n\":" +  std::to_string(n) + ",";
+            configString += "\"m\":" +  std::to_string(m) + ",";
+            configString += "\"k\":" +  std::to_string(k) + ",";
+            configString += "\"op\":\"moe\",";
+            configString += "\"outputType\":" +  std::to_string(0) + ",";
+            configString += "\"weights\":" +  weightString + "}";
+            U8Buffer buffer;
+            buffer.WriteInt(configString.size());
+            buffer.WriteBytes((uint8_t*)configString.data(), configString.size());
+            RunMultiThreadMemcpy((uint8_t*)this->buf, buffer.buffer.data(), buffer.buffer.size(), GetAlivePool());
+            RunMultiThreadMemcpy((uint8_t*)this->buf + buffer.buffer.size(), (uint8_t*)(input + baseN * m), curN * m * sizeof(float), GetAlivePool());
+            this->Launch(opType);
+            this->Wait();
+            auto pool = GetAlivePool();
+
+            uint8_t *oriResult = new uint8_t[serverNumaCnt * curN * k * outputUnitSize];
+            RunMultiThreadMemcpy(oriResult, (uint8_t*)result, serverNumaCnt * curN * k * outputUnitSize, GetAlivePool());
+            float *floatResult = (float*)oriResult;
+            for (int i = 1; i < serverNumaCnt; i++) {
+                for (int j = 0; j < curN * k; j++) {
+                    floatResult[j] += floatResult[i * curN * k + j];
+                }
+            }
+            RunMultiThreadMemcpy(((uint8_t*) output) + baseN * k * outputUnitSize, (uint8_t*) oriResult,
+                    curN * k * outputUnitSize, GetAlivePool());
+            delete[] oriResult;
+        }   
     }
 
     void NumaClient::RunNumaMOEU(int n, int m, int k, int group, int groupCnt,

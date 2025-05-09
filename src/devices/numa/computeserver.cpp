@@ -26,6 +26,7 @@ namespace fastllm {
     extern FP16ToFP32Manager fp16tofp32;
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
+    extern void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
     
     struct U8ReaderBuffer {
         uint8_t *cur;
@@ -130,10 +131,12 @@ namespace fastllm {
                 taskType == ComputeTaskType::LinearInt4Group ||
                 taskType == ComputeTaskType::LinearInt8) {
                 RunLinearInt();
-            } else if (taskType == ComputeTaskType::LinearFloat16 || taskType == ComputeTaskType::LinearFloat32) {
+            } else if (taskType == ComputeTaskType::LinearFloat16 || taskType == ComputeTaskType::LinearFloat32 || taskType == ComputeTaskType::LinearFP8E4M3) {
                 RunLinearFloat();
             } else if (taskType == ComputeTaskType::MOEInt4NoZero || taskType == ComputeTaskType::MOEInt4Group) {
                 RunMOEInt();
+            } else if (taskType == ComputeTaskType::MOEFP8E4M3) {
+                RunMOEFloat();
             } else if (taskType == ComputeTaskType::AppendKVCache) {
                 AppendKVCache();
             } else if (taskType == ComputeTaskType::DoAttention) {
@@ -196,6 +199,20 @@ namespace fastllm {
         this->longBuffer.clear();
     }
 
+    // 矩阵膨胀
+    // ori = [oriN, oriM]
+    // ret = [oriN * factorN, oriM * factorM]
+    template <typename T>
+    void InflateMatrix (std::vector <T> &ori, std::vector <T> &ret, int oriN, int oriM, int factorN, int factorM) {
+        int newN = oriN * factorN, newM = oriM * factorM;
+        ret.resize(newN * newM);
+        for (int i = 0; i < newN; i++) {
+            for (int j = 0; j < newM; j++) {
+                ret[i * newM + j] = ori[i / oriN * oriM + j / oriM];
+            }
+        }        
+    }
+
     void ComputeServer::RegisterData(json11::Json *config, uint8_t *base) {
         std::string name = (*config)["dataName"].string_value();
         if (this->weights.weight.find(name) != this->weights.weight.end()) {
@@ -244,6 +261,29 @@ namespace fastllm {
                     weight[name].scales[i] = weight[name].perChannelsConfigs[i].scale;
                 }
                 
+                for (int i = 0; i < k; i++) {
+                    buffer.Skip(base);
+                    buffer.ReadBytes(weight[name].cpuData + i * localM, localM);
+                    buffer.Skip(m - base - localM);
+                }
+            } else if (dataType == DataType::FP8_E4M3) {
+                weight[name].blockK = buffer.ReadInt();
+                weight[name].blockM = buffer.ReadInt();                
+                std::vector <float> oriScales;
+                oriScales.resize(buffer.ReadInt());
+                buffer.ReadBytes((uint8_t*)oriScales.data(), (int)oriScales.size() * sizeof(float));
+                
+                int ks = (k - 1) / weight[name].blockK + 1;
+                int ms = (localM - 1) / weight[name].blockM + 1;
+                int oldMs = (m - 1) / weight[name].blockM + 1;
+                weight[name].scales.resize(ks * ms);
+
+                for (int i = 0; i < ks; i++) {
+                    memcpy(weight[name].scales.data() + i * ms, 
+                            oriScales.data() + i * oldMs + partId * ms, 
+                            ms * sizeof(float));
+                }
+
                 for (int i = 0; i < k; i++) {
                     buffer.Skip(base);
                     buffer.ReadBytes(weight[name].cpuData + i * localM, localM);
@@ -336,6 +376,47 @@ namespace fastllm {
                     buffer.Skip(base);
                     buffer.ReadBytes(weight[name].cpuData, m * localK);
                     buffer.Skip(weight[name].GetBytes() - (base + m * localK));
+                }
+            } else if (dataType == DataType::FP8_E4M3) {
+                weight[name].blockK = buffer.ReadInt();
+                weight[name].blockM = buffer.ReadInt();                
+                std::vector <float> oriScales;
+                oriScales.resize(buffer.ReadInt());
+                buffer.ReadBytes((uint8_t*)oriScales.data(), (int)oriScales.size() * sizeof(float));
+                
+                int k = oriWeight.dims[0];
+                int m = oriWeight.GetBytes() / k;
+                int localK = k / partCnt;
+                localK = ((localK - 1) / weight[name].blockK + 1) * weight[name].blockK;
+
+                int base = partId * localK * m;
+                if (partId == partCnt - 1) {
+                    localK = k - partId * localK;
+                }
+                
+                int ks = (localK - 1) / weight[name].blockK + 1;
+                int ms = (m - 1) / weight[name].blockM + 1;
+                weight[name].scales.resize(ks * ms);
+
+                if (weightType == "linearSwiglu") {
+                    buffer.Skip(partId * (localK / 2) * m);
+                    buffer.ReadBytes(weight[name].cpuData, (localK / 2) * m);
+                    buffer.Skip((k / 2 - localK / 2) * m);
+                    buffer.ReadBytes(weight[name].cpuData+ (localK / 2) * m, (localK / 2) * m);
+                    buffer.Skip(weight[name].GetBytes() - (partId * localK * m) - (k / 2 * m));
+
+                    memcpy(weight[name].scales.data(), 
+                        oriScales.data() + partId * (localK / 2) / weight[name].blockK * ms, 
+                        (localK / 2 / weight[name].blockK) * ms * sizeof(float));
+                    memcpy(weight[name].scales.data() + (localK / 2 / weight[name].blockK) * ms, 
+                        oriScales.data() + (k / 2 + partId * (localK / 2)) / weight[name].blockK * ms, 
+                        (localK / 2 / weight[name].blockK) * ms * sizeof(float));
+                } else {
+                    buffer.Skip(base);
+                    buffer.ReadBytes(weight[name].cpuData, m * localK);
+                    buffer.Skip(weight[name].GetBytes() - (base + m * localK));
+
+                    memcpy(weight[name].scales.data(), oriScales.data() + base / m / weight[name].blockK * ms, ks * ms * sizeof(float));
                 }
             } else if (dataType == DataType::INT8 || dataType == DataType::INT4) {
                 int bit = (dataType == DataType::INT4 ? 4 : 8);
@@ -782,11 +863,11 @@ namespace fastllm {
 
         float *biasData = bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr;
         if (dataType == fastllm::DataType::FLOAT32 && wType == fastllm::DataType::FLOAT16) {
-            fastllm::RunLinearFloat32Float16(
-                    localInput, ((uint16_t *)weight), localOutput, biasData, n, m, localK, pool, 0, pool->threads.size());
+            fastllm::RunLinearFloat32Float16(localInput, ((uint16_t *)weight), localOutput, biasData, n, m, localK, pool, 0, pool->threads.size());
         } else if (dataType == fastllm::DataType::FLOAT32 && wType == fastllm::DataType::FLOAT32) {
-            fastllm::RunLinearFloat32Float32(
-                    localInput, ((float*)weight), localOutput, biasData, n, m, localK, pool, 0, pool->threads.size());
+            fastllm::RunLinearFloat32Float32(localInput, ((float*)weight), localOutput, biasData, n, m, localK, pool, 0, pool->threads.size());
+        } else if (dataType == fastllm::DataType::FLOAT32 && wType == fastllm::DataType::FP8_E4M3) {
+            fastllm::RunLinearFloat32FP8E4M3(localInput, w, localOutput, biasData, n, m, localK, pool, 0, pool->threads.size());
         } else {
             printf("RunLinearFloat: wrong data type: dataType = %d, wType = %d.", dataType, wType);
         }
@@ -1123,6 +1204,294 @@ namespace fastllm {
                                                 weightDown->weightSum.data(), weightDown->mins.data(), weightDown->scales.data(), nullptr, 
                                                 inputSums, iscales, izeros,
                                                 inputConfigs, threadSt, curThread, groupDown, groupCntDown, ops, pool);
+                    }
+                    threadSt += curThread;               
+                }
+
+                for (int j = 0; j < ops.size(); j++) {
+                    pool->Wait(j);
+                    delete ops[j];
+                }
+                st = end;
+// record.push_back(std::make_pair("mul 1", GetSpan(ttt, std::chrono::system_clock::now())));
+            }
+            for (int k = 0; k < m; k++) {
+                localOutput[k] = 0;
+            }
+            for (int j = 0; j < v.size(); j++) {
+                float value = v[j];
+                float *curOutput = (float*)results[j];
+
+                int i = 0;
+    #ifdef __AVX2__
+                __m256 value_vec = _mm256_set1_ps(value);
+                // 每次处理 8 个浮点数（AVX2 寄存器可以容纳 8 个 float）
+                for (; i <= m - 8; i += 8) {
+                    // 加载 curOutput 的 8 个浮点数
+                    __m256 curOutput_vec = _mm256_loadu_ps(&curOutput[i]);
+
+                    // 加载 localOutput 的 8 个浮点数
+                    __m256 fLastOutput_vec = _mm256_loadu_ps(&localOutput[i]);
+
+                    // 计算 curOutput * value
+                    __m256 result_vec = _mm256_mul_ps(curOutput_vec, value_vec);
+
+                    // 累加到 fLastOutput
+                    fLastOutput_vec = _mm256_add_ps(fLastOutput_vec, result_vec);
+
+                    // 将结果存回 fLastOutput
+                    _mm256_storeu_ps(&localOutput[i], fLastOutput_vec);
+                }
+    #endif
+                for (int k = i; k < m; k++) {
+                    localOutput[k] += curOutput[k] * value;
+                }
+                delete[] results[j];
+                delete[] middles[j];
+            }
+// record.push_back(std::make_pair("get fp32 sum", GetSpan(ttt, std::chrono::system_clock::now())));
+            for (int i = 0; i < n; i++) {
+                RunMultiThreadMemcpy((uint8_t *) baseOutputAddr + partId * n * k * sizeof(float) + (i * k) * sizeof(float),
+                    (uint8_t *) localOutput + (i * k) * sizeof(float),
+                    k * sizeof(float), pool, true);
+            }
+// record.push_back(std::make_pair("copy output", GetSpan(ttt, std::chrono::system_clock::now())));
+// for (int i = 0; i < record.size(); i++) {
+     // printf("server %s spend %f s.\n", record[i].first.c_str(), record[i].second);
+// }
+        }
+    }
+
+    void ComputeServer::RunMOEFloat() {
+// auto ttt = std::chrono::system_clock::now();
+// std::vector <std::pair <std::string, float> > record;
+        int configStringLen = ((int*)this->baseAddr)[0];
+        std::string configString;
+        for (int i = 0; i < configStringLen; i++) {
+            configString += (char)this->baseAddr[4 + i];
+        }
+// record.push_back(std::make_pair("get string", GetSpan(ttt, std::chrono::system_clock::now())));
+        json11::Json config;
+        std::string error;
+        config = json11::Json::parse(configString, error);
+// record.push_back(std::make_pair("parse string", GetSpan(ttt, std::chrono::system_clock::now())));
+        int n = config["n"].int_value(), m = config["m"].int_value(), k = config["k"].int_value();
+        int outputType = config["outputType"].int_value();
+        float *localInput = (float *) this->inputBuffer.data();
+        float *localOutput = (float *) this->outputBuffer.data();
+
+        volatile char *buffer = (volatile char*)this->baseAddr + 4 + configStringLen;
+// record.push_back(std::make_pair("get config", GetSpan(ttt, std::chrono::system_clock::now())));
+        RunMultiThreadMemcpy(this->inputBuffer.data(), (uint8_t*)buffer, n * m * sizeof(float), pool);
+// record.push_back(std::make_pair("inputBuffer", GetSpan(ttt, std::chrono::system_clock::now())));
+
+// record.push_back(std::make_pair("input sum", GetSpan(ttt, std::chrono::system_clock::now())));
+        if (n > 1) {
+            std::vector <std::vector <fastllm::Data*> > weights;
+            std::vector <std::vector <float> > v;
+            weights.resize(n);
+            v.resize(n);
+
+            if (n == 1) {
+                for (auto &factor : config["factors"].array_items()) {
+                    v[0].push_back(factor.number_value());
+                }
+                for (auto &weight : config["weights"].array_items()) {
+                    weights[0].push_back(&this->weights[weight.string_value()]);
+                }
+            } else {
+                int idx = 0;
+                for (auto &factor : config["factors"].array_items()) {
+                    for (auto &it : factor.array_items()) {
+                        v[idx].push_back(it.number_value());
+                    }
+                    idx++;
+                }
+                idx = 0;
+                for (auto &weight : config["weights"].array_items()) {
+                    for (auto &it : weight.array_items()) {
+                        weights[idx].push_back(&this->weights[it.string_value()]);
+                    }
+                    idx++;
+                }
+            }
+
+            int bs = n, dim = k;
+            int inputDim = m;
+            std::vector <float> tempResult, middleResult;
+            tempResult.resize(bs * dim, 0.0f);
+            middleResult.resize(bs * dim, 0.0f);
+            std::map <std::pair <Data*, Data*>, std::vector <std::pair <int, float> > > expertTasks; // expertTasks[x]代表专家x的task, expertTasks[x][j] = (第j个任务对应的行数， 权重)            
+
+            Data oriInput, tempInput, w1, w2, w3;
+
+            oriInput.dataType = DataType::FLOAT32;
+            oriInput.Resize({n, m});
+            oriInput.Allocate();
+// printf("server get meta spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            float *floatInput = (float*)oriInput.cpuData;
+            memcpy(floatInput, localInput, n * m * sizeof(float));
+// printf("server revert spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("server get input spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            tempInput.dataType = DataType::FLOAT32;
+            tempInput.Resize({n, m});
+            tempInput.Allocate();
+
+            for (int b = 0; b < bs; b++) {
+                for (int j = 0; j < v[b].size(); j++) {
+                    expertTasks[std::make_pair(weights[b][j * 2], weights[b][j * 2 + 1])].push_back(std::make_pair(b, v[b][j]));
+                }
+            }
+// printf("server ready spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            for (auto &it : expertTasks) {
+                auto &task = it.second;
+                if (task.size() == 0) {
+                    continue;
+                }
+
+                tempInput.Resize({(int)task.size(), inputDim});
+                std::vector <MultiThreadMemcpyMultiLinesTask> memcpyTasks;
+                for (int i = 0; i < (int)task.size(); i++) {
+                    memcpyTasks.push_back(MultiThreadMemcpyMultiLinesTask(tempInput.cpuData + i * inputDim * oriInput.unitSize, oriInput.cpuData + task[i].first * inputDim * oriInput.unitSize, inputDim * oriInput.unitSize));
+                }
+                RunMultiThreadMemcpyMultiLines(memcpyTasks, pool);
+                
+                DoCpuLinearReshape(tempInput, *it.first.first, w3);
+                DoCpuLinear(tempInput, *it.first.first, Data(), w3);
+
+                int mid = w3.dims[1] / 2;
+                w1.Resize({w3.dims[0], mid});
+                w1.dataType = w3.dataType;
+                w1.Allocate();
+                SwigluMultiThread((float *) w3.cpuData, mid, mid, ((float *) w1.cpuData),
+                                    w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                
+                DoCpuLinearReshape(w1, *it.first.second, w2);
+                DoCpuLinear(w1, *it.first.second, Data(), w2);
+
+                float *curOutput;
+                if (w2.dataType == DataType::FLOAT32) {
+                    curOutput = (float*)w2.cpuData;
+                } else if (w2.dataType == DataType::FLOAT16) {
+                    Float16ToFloat32((uint16_t*)w2.cpuData, middleResult.data(), w2.Count(0));
+                    curOutput = middleResult.data();
+                }
+
+                for (int i = 0; i < (int)task.size(); i++) {
+                    float value = task[i].second;
+                    float *lastResult = tempResult.data() + task[i].first * dim;
+                    float *curResult = curOutput + i * dim;
+                    for (int j = 0; j < dim; j++) {
+                        lastResult[j] += value * curResult[j];
+                    }
+                }
+            }
+// printf("server calc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            for (int i = 0; i < n; i++) {
+                memcpy((uint8_t *) baseOutputAddr + partId * n * k * sizeof(float) + (i * k) * sizeof(float),
+                    ((uint8_t *) tempResult.data()) + (i * k) * sizeof(float),
+                    k * sizeof(float));
+            }
+            return;    
+        } else {
+            std::vector <fastllm::Data*> weights;
+            std::vector <float> v;
+            for (auto &factor : config["factors"].array_items()) {
+                v.push_back(factor.number_value());
+            }
+// record.push_back(std::make_pair("before get weight", GetSpan(ttt, std::chrono::system_clock::now())));
+            for (auto &weight : config["weights"].array_items()) {
+                weights.push_back(&this->weights[weight.string_value()]);
+            }
+// record.push_back(std::make_pair("get weight", GetSpan(ttt, std::chrono::system_clock::now())));
+            std::vector <int> localKs;
+            std::vector <float*> middles;
+            std::vector <float*> results;
+            for (int j = 0; j < v.size(); j++) {
+                int idx = j;
+                int localK = weights[idx * 2]->dims[0];
+                localKs.push_back(localK);
+                middles.push_back(new float[localK]);
+                results.push_back(new float[weights[idx * 2 + 1]->dims[0]]);
+            }
+
+            std::vector<fastllm::MultiThreadBaseOp*> ops;
+            int threads = pool->threads.size();
+            ops.resize(threads);
+
+            std::vector <uint16_t> bf16Input;
+            bf16Input.resize(m);
+            Float32ToBFloat16((float*)localInput, bf16Input.data(), m);
+
+// record.push_back(std::make_pair("prepare datas", GetSpan(ttt, std::chrono::system_clock::now())));
+            for (int st = 0; st < v.size(); st++) {
+                int k = localKs[st];
+                int end = st, selSum = 1; // 一共处理selSum * k个输出
+
+                int curSum = 1;
+                for (int l = st + 1; l < v.size(); l++) {
+                    int curK = localKs[l];
+                    if (curK % k != 0) {
+                        break;
+                    }
+                    curSum += (curK / k);
+                    if (threads % curSum == 0) {
+                        end = l;
+                        selSum = curSum;
+                    }
+                }
+                int base = threads / selSum;
+                int threadSt = 0;
+                for (int l = st; l <= end; l++) {
+                    int idx = l;
+                    Data *weight = weights[idx * 2];
+                    uint8_t *weightData = (uint8_t *) weight->cpuData;
+                    float *outputData = middles[l];
+                    float *biasData = nullptr;
+                    int curK = localKs[l];
+                    int curThread = (curK / k) * base;
+                    if (weight->dataType == DataType::FP8_E4M3) {                            
+                        LaunchLinearBFloat16FP8E4M3(bf16Input.data(), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                    } else {
+                        // TODO: other
+                    }
+                    threadSt += curThread;
+                }
+
+                for (int j = 0; j < ops.size(); j++) {
+                    pool->Wait(j);
+                    delete ops[j];
+                }
+// record.push_back(std::make_pair("mul 0", GetSpan(ttt, std::chrono::system_clock::now())));
+                // swiglu
+                for (int l = st; l <= end; l++) {
+                    int idx = l;
+                    int spatial = localKs[idx], mid = spatial / 2;
+                    float *outputData = middles[l];
+                    int curK = localKs[idx];
+
+                    ops[l - st] = new fastllm::MultiThreadMultiOps();
+                    ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
+                    ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(middles[l], (uint16_t*)middles[l], mid));
+                    pool->PushOp(l - st, ops[l - st]);
+                }
+                for (int l = st; l <= end; l++) {
+                    pool->Wait(l - st);
+                    delete ops[l - st];
+                }
+// record.push_back(std::make_pair("swiglu", GetSpan(ttt, std::chrono::system_clock::now())));
+// record.push_back(std::make_pair("quant", GetSpan(ttt, std::chrono::system_clock::now())));
+                threadSt = 0;
+                for (int l = st; l <= end; l++) {
+                    int idx = l;
+                    int mid = localKs[idx] / 2;
+                    int curK = localKs[idx];
+                    Data *weightDown = weights[idx * 2 + 1];
+                    int curThread = (curK / k) * base;
+                    if (weightDown->dataType == DataType::FP8_E4M3) {
+                        LaunchLinearBFloat16FP8E4M3((uint16_t*)middles[l], *weightDown, results[l], nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                    } else {
+                        // TODO: other
                     }
                     threadSt += curThread;               
                 }
