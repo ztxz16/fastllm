@@ -127,6 +127,8 @@ def main():
                 if isinstance(value, bool) and key not in ["think"]:
                     if value:
                         args_list.append(f"--{key}")
+                elif key in ["moe_device"] and value != '':
+                    args_list.append(f"--{key} \"{value}\"")
                 elif value != '':
                     args_list.append(f"--{key} {value}")
         
