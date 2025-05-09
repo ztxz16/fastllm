@@ -657,7 +657,6 @@ namespace fastllm {
             for (auto &it : tokenizer["added_tokens"].array_items()) {
                 spTokens[it["content"].string_value()] = it["id"].int_value();
             }
-            model->weight.tokenizer.SetSpecialTokens(spTokens);
             if (!spTokens.empty())
                 model->weight.AddDict("tokenizer_has_special_tokens", "1");
 
@@ -666,6 +665,7 @@ namespace fastllm {
                 model->weight.tokenizer.byteAsChar = true;
                 model->weight.AddDict("tokenizer_byte_as_char", "True");
             }
+            model->weight.tokenizer.SetSpecialTokens(spTokens);
         } else if (tokenizerClass == "ChatGLM4Tokenizer") {
             // GLM4御用的分词
             std::vector <std::string> lines, line;
@@ -1068,7 +1068,8 @@ namespace fastllm {
                                         tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
                                         model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt);
                             }
-                            model->weight[weightName].CalcWeightSum();
+                            if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV)
+                                model->weight[weightName].CalcWeightSum();
                             tensor.ClearBuffer();
 
                             locker.lock();
