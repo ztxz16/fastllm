@@ -6,6 +6,7 @@
 #define FASTLLM_TEMPLATE_H
 
 #include "utils/utils.h"
+#include <functional>
 
 namespace fastllm {
     struct JinjaVar {
@@ -49,7 +50,7 @@ namespace fastllm {
     // 词法分析后的Token
     struct JinjaToken {
         enum JinjaToKenType {
-            JinjaTokenID = 0, JinjaTokenBOOL, JinjaTokenNUM, JinjaTokenSTRING, JinjaTokenDOT,
+            JinjaTokenID = 0, JinjaTokenBOOL, JinjaTokenNUM, JinjaTokenSTRING, JinjaTokenFUNC, JinjaTokenDOT,
             JinjaTokenLMB, JinjaTokenRMB, JinjaTokenLSB, JinjaTokenRSB,
             JinjaTokenSet, JinjaTokenFor, JinjaTokenEndFor, JinjaTokenIf, JinjaTokenElse, JinjaTokenElseIf, JinjaTokenEndif,
             JinjaTokenIn,
@@ -76,6 +77,7 @@ namespace fastllm {
             {'/', JinjaToken::JinjaToKenType::JinjaTokenDiv},
             {'%', JinjaToken::JinjaToKenType::JinjaTokenMod},
             {'|', JinjaToken::JinjaToKenType::JinjaTokenFilter},
+            {',', JinjaToken::JinjaToKenType::JinjaTokenNamespace},
             {':', JinjaToken::JinjaToKenType::JinjaTokenSlice}
     };
 
@@ -133,6 +135,8 @@ namespace fastllm {
 
     int GetOpLevel(JinjaToken::JinjaToKenType type);
 
+    using JinjaFunction = std::function<JinjaVar(const JinjaVar &)>;
+
     // Jinja模板
     struct JinjaTemplate {
         std::string temp;
@@ -142,7 +146,7 @@ namespace fastllm {
 
         JinjaTemplate (const std::string &temp);
 
-        JinjaVar ComputeExpression(JinjaVar &local, std::vector <JinjaToken> tokens, int st, int end);
+        JinjaVar ComputeExpression(JinjaVar &local, std::vector <JinjaToken> tokens, int st, int end, JinjaVar *setValue = nullptr);
 
         void Parse(int st, int end, JinjaVar &var, std::string &ret);
 
