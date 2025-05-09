@@ -19,11 +19,13 @@ option(USE_IVCOREX "use iluvatar corex gpu" OFF)
 
 option(BUILD_CLI "build cli" OFF)
 
+option(UNIT_TEST "build unit tests" OFF)
+
 if(NOT DEFINED CUDA_ARCH)
     set(CUDA_ARCH "native")
 endif()
 
-if(NOT DEFINED ROCM_ARCH)
+if(USE_ROCM AND NOT DEFINED ROCM_ARCH)
     set(ROCM_ARCH "gfx908;gfx90a;gfx1100")
     message(STATUS "ROCM_ARCH not set, using default value: ${ROCM_ARCH}")
 endif()
@@ -236,8 +238,13 @@ target_link_libraries(main fastllm)
 add_executable(quant tools/src/quant.cpp)
 target_link_libraries(quant fastllm)
 
-add_executable(testOps test/ops/cppOps.cpp)
-target_link_libraries(testOps fastllm)
+if (UNIT_TEST)
+    add_executable(testOps test/ops/cppOps.cpp)
+    target_link_libraries(testOps fastllm)
+
+    add_executable(testTokenizer test/ops/tokenizerTest.cpp)
+    target_link_libraries(testTokenizer fastllm)
+endif()
 
 add_executable(webui example/webui/webui.cpp)
 target_link_libraries(webui fastllm)
