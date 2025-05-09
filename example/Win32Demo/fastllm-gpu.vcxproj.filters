@@ -123,6 +123,12 @@
     <ClInclude Include="..\..\include\models\qwen.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\qwen3.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\qwen3_moe.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\xlmroberta.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
@@ -224,13 +230,19 @@
     <ClCompile Include="..\..\src\models\qwen.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\qwen3.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\qwen3_moe.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\xlmroberta.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\graph\fastllmjson.cpp">
       <Filter>源文件\models\graph</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\src\models\graph\phi3.cpp">
+    <ClCompile Include="..\..\src\models\graph\gemma2.cpp">
       <Filter>源文件\models\graph</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\graph\qwen2.cpp">
