@@ -55,6 +55,16 @@ namespace fastllm {
                         uint8_t *uinput, float *output, 
                         DataType outputType);
         
+        void RunNumaMOEF(int n, int m, int k,
+                        std::vector <fastllm::Data*> weights, std::vector <float> factors,
+                        float *input, float *output, 
+                        DataType outputType);
+        
+        void RunNumaMOEFMultiRow(int n, int m, int k,
+                        std::vector <std::vector <fastllm::Data*> > &weights, std::vector <std::vector <float> > &factors,
+                        float *input, float *output, 
+                        DataType outputType);
+        
         void AppendKVCache(long long uid, Data *content);
 
         void Attention(Data *q, Data *k, Data *v, int group, float scale, int maskType, Data *output);
