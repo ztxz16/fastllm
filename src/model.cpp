@@ -883,6 +883,25 @@ namespace fastllm {
 
         // 4.1 读取权重
         auto tensors = safeTensors.GetSortedItemNames();
+
+if (false) {
+    auto temp = tensors;
+    tensors.clear();
+    for (int i = 0; i < temp.size(); i++) {
+        std::string tensorName = temp[i];
+        std::string prefix = "model.layers.";
+        if (StartWith(tensorName, prefix)) {
+            int id = 0;
+            for (int i = prefix.size(); tensorName[i] >= '0' && tensorName[i] <= '9'; i++) {
+                id = id * 10 + tensorName[i] - '0';
+            }
+            if (id > 9) {
+                continue;
+            }
+        }
+        tensors.push_back(tensorName);
+    }
+}
         
         // tensorMap[name]代表本名为name的tensor，创建后的名字以及类型
         // 有些tensor被共享，可能需要创建多次
