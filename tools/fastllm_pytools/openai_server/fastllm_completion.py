@@ -132,7 +132,7 @@ class FastLLmCompletion:
       if request.frequency_penalty and request.frequency_penalty != 0.0:
         frequency_penalty = request.frequency_penalty
 
-      max_length = request.max_tokens if request.max_tokens else 8192
+      max_length = request.max_tokens if request.max_tokens else 32768
       min_length = request.min_tokens if request.min_tokens else 0
       #logging.info(request)
       if (not(self.hide_input)):
