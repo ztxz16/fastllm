@@ -436,7 +436,9 @@ namespace fastllm {
                 std::vector<uint8_t> uinput;
                 std::vector <float> inputSums;
                 std::vector <float> iscales, izeros;
-                OnlineQuantization(inputData, uinput, inputConfigs, n, m, group, groupCnt, inputSums, iscales, izeros, permuteType);
+
+                // 注意，这里因为ComputeServer会做反量化，所以不用管输入本身是什么type，直接按permuteType 1旋转（然后computeServer会转回来）
+                OnlineQuantization(inputData, uinput, inputConfigs, n, m, group, groupCnt, inputSums, iscales, izeros, 1);
 
                 std::vector <std::vector <fastllm::Data*> > ws;
                 std::vector <std::vector <float> > factors;
