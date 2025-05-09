@@ -26,6 +26,9 @@ namespace fastllm {
         MOEInt4NoZero = 8,
         MOEInt4Group = 9,
 
+        LinearFP8E4M3 = 10,
+        MOEFP8E4M3 = 11,
+
         GetComputeServerInfo = 10000,
         StartLongData = 10001,
         FinishLongData = 10002,
@@ -84,6 +87,8 @@ namespace fastllm {
                                   LinearExType &exType, DataType &outputDataType, AliveThreadPool *pool);
 
         void RunMOEInt();
+
+        void RunMOEFloat();
 
         void AppendKVCache();
 
