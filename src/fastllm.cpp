@@ -1299,11 +1299,11 @@ namespace fastllm {
                     }
                     weightSum[gid] += sum0[0] + sum0[1] + sum0[2] + sum0[3];
 #endif
-#ifdef __AVX2__X
+#ifdef __AVX2__
                     __m256i acc = _mm256_setzero_si256();
                     const __m256i lowMask = _mm256_set1_epi8(0xf);
                     const __m256i ones = _mm256_set1_epi16(1);
-                    for (; j + 31 < m; j += 32) {
+                    for (; j + 31 < end; j += 32) {
                         __m128i orix = _mm_loadu_si128((const __m128i *) (cpuData + (i * m + j) / 2));
                         __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
                         __m256i bx = _mm256_and_si256(lowMask, bytex);
@@ -1314,7 +1314,7 @@ namespace fastllm {
                         acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx0, ones));
                         acc = _mm256_add_epi32(acc, _mm256_madd_epi16(mx1, ones));
                     }
-                    weightSum[i] += I32sum(acc);
+                    weightSum[gid] += I32sum(acc);
 #endif
                     for (; j + 1 < end; j += 2) {
                         int id = (i * m + j) / 2;
@@ -1671,11 +1671,12 @@ namespace fastllm {
             specialRoot = new TrieNode();
         for (auto &it : specialTokenMap) {
             TrieNode *now = this->specialRoot;
-            for (int i = 0; i < it.first.size(); i++) {
-                if (now->next.find(it.first[i]) == now->next.end()) {
-                    now->next[it.first[i]] = new TrieNode();
+            std::string normalized = Normalize(it.first);
+            for (int i = 0; i < normalized.size(); i++) {
+                if (now->next.find(normalized[i]) == now->next.end()) {
+                    now->next[normalized[i]] = new TrieNode();
                 }
-                now = now->next[it.first[i]];
+                now = now->next[normalized[i]];
             }
             now->tokenId = it.second;
             now->score = 0.0f;

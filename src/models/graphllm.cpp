@@ -425,15 +425,19 @@ namespace fastllm {
     void GraphLLMModelConfig::InitParams(GraphLLMModel *model) {
     }
 
-    static std::map<std::string, GraphLLMModelConfigCreator> graphLLMModelConfigFactoryCreator;
+    static std::map<std::string, GraphLLMModelConfigCreator> *graphLLMModelConfigFactoryCreator = nullptr;
 
     void GraphLLMModelConfigFactory::RegisterGraphLLMModelConfig(const std::string& type, GraphLLMModelConfigCreator creator) {
-        graphLLMModelConfigFactoryCreator[type] = creator;
+        if (graphLLMModelConfigFactoryCreator == nullptr)
+            graphLLMModelConfigFactoryCreator = new std::map<std::string, GraphLLMModelConfigCreator>();
+        (*graphLLMModelConfigFactoryCreator)[type] = creator;
     }
 
     GraphLLMModelConfig* GraphLLMModelConfigFactory::CreateGraphLLMModelConfig(const std::string& type) {
-        auto it = graphLLMModelConfigFactoryCreator.find(type);
-        if (it != graphLLMModelConfigFactoryCreator.end()) {
+        if (graphLLMModelConfigFactoryCreator == nullptr)
+            return nullptr;
+        auto it = graphLLMModelConfigFactoryCreator->find(type);
+        if (it != graphLLMModelConfigFactoryCreator->end()) {
             return it->second();
         } else {
             return nullptr;
