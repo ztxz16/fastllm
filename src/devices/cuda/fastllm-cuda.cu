@@ -3635,7 +3635,7 @@ void * FastllmCudaMalloc(size_t size) {
         if (cudaBuffers[i].size >= size && !cudaBuffers[i].busy) {
             cudaBuffers[i].busy = true;
             noBusyCnt[id] -= cudaBuffers[i].size;
-            while (cudaBuffers[cudaBuffersMinId[id]].busy) {
+            while (cudaBuffersMinId[id] < cudaBuffers.size() && cudaBuffers[cudaBuffersMinId[id]].busy) {
                 cudaBuffersMinId[id]++;
             }
             return cudaBuffers[i].data;
