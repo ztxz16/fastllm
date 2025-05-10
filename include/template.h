@@ -95,7 +95,7 @@ namespace fastllm {
             {"endif", JinjaToken::JinjaToKenType::JinjaTokenEndif},
             {"set", JinjaToken::JinjaToKenType::JinjaTokenSet},
             {"in", JinjaToken::JinjaToKenType::JinjaTokenIn},
-            {"is", JinjaToken::JinjaToKenType::JinjaTokenIn},
+            {"is", JinjaToken::JinjaToKenType::JinjaTokenEqual},
             {"true", JinjaToken::JinjaToKenType::JinjaTokenBOOL},
             {"false", JinjaToken::JinjaToKenType::JinjaTokenBOOL},
             {"and", JinjaToken::JinjaToKenType::JinjaTokenAnd},
