@@ -14,6 +14,8 @@ namespace fastllm {
             return !this->stringValue.empty();
         } else if (this->type == JinjaArray) {
             return !this->arrayValue.empty();
+        } else if (this->type == JinjaNone) {
+            return false;
         }
         ErrorInFastLLM("Jinja error: " + this->Dump() + " is not bool.");
         return false;
@@ -244,8 +246,8 @@ namespace fastllm {
                 return a.type == JinjaVar::JinjaNone;
             }
         } else if (op == JinjaToken::JinjaTokenEqual) {
-            if (a.type != JinjaVar::JinjaNone && b.type == JinjaVar::JinjaNone && b.stringValue == "defined") {
-                return true;
+            if (b.type == JinjaVar::JinjaNone && b.stringValue == "defined") {
+                return (a.type != JinjaVar::JinjaNone);
             }
             if (a.type != b.type) {
                 return false;
@@ -350,7 +352,8 @@ namespace fastllm {
                     part.erase(0, part.find_first_not_of(" \n\r\t"));
                 if (trimNext)
                     part.erase(part.find_last_not_of(" \n\r\t") + 1);
-                blocks.push_back(JinjaBlock(part));
+                if (!part.empty())
+                    blocks.push_back(JinjaBlock(part));
                 // 处理切片语法糖
                 part = temp.substr(i, curEnd + 2 - i);
                 std::string::size_type slicepos = part.find("[:");
@@ -393,7 +396,7 @@ namespace fastllm {
                 }
                 AssertInFastLLM(ops.size() > 0 && ops.back().type == JinjaToken::JinjaTokenLSB, "Error: barckets doesn't match.");
                 ops.pop_back();
-                if (ops.size() > 0 && ops.back().type == JinjaToken::JinjaTokenFUNC) {
+                if (!ops.empty() && ops.back().type == JinjaToken::JinjaTokenFUNC) {
                     suffixExp.push_back(ops.back());
                     ops.pop_back();
                 }
@@ -417,7 +420,7 @@ namespace fastllm {
                     suffixExp.push_back(tokens[i]);
                 ops.pop_back();
             } else if (tokens[i].type == JinjaToken::JinjaTokenFUNC) {
-                if (ops.back().type == JinjaToken::JinjaTokenDOT)
+                if (!ops.empty() && ops.back().type == JinjaToken::JinjaTokenDOT)
                     ops.pop_back();
                 ops.push_back(tokens[i]);
             } else if (tokens[i].type == JinjaToken::JinjaTokenDOT ||
@@ -452,7 +455,7 @@ namespace fastllm {
             if (it.type == JinjaToken::JinjaTokenID) {
                 vars.push_back(JinjaVar(JinjaVar::JinjaNone, it.value));
             } else if (it.type == JinjaToken::JinjaTokenBOOL) {
-                vars.push_back(JinjaVar(it.value));
+                vars.push_back(JinjaVar((int) (it.value == "false" ? 0 : 1)));
             } else if (it.type == JinjaToken::JinjaTokenSTRING) {
                 vars.push_back(JinjaVar(it.value));
             } else if (it.type == JinjaToken::JinjaTokenNUM) {
@@ -709,7 +712,8 @@ namespace fastllm {
                     }
                 } else {
                     if (elsePos != -1) {
-                        Parse(elsePos + 1, endPos, var, ret);
+                        int nextPos = (blocks[elsePos].type == JinjaBlock::JinjaBlockType::JinjaBlockElse) ? elsePos + 1 : elsePos;
+                        Parse(nextPos, endPos, var, ret);
                     }
                 }
                 if (blocks[endPos].type == JinjaBlock::JinjaBlockType::JinjaBlockElseIf)
