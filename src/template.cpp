@@ -124,6 +124,22 @@ namespace fastllm {
                     if (IsWhite(now)) {
                         st++;
                         continue;
+                    } else if (now == '>') {
+                        if (st + 1 < end && value[st + 1] == '=') {
+                            tokens.push_back(JinjaToken(JinjaToken::JinjaTokenMoreEqual));
+                            st += 2;    
+                        } else {
+                            tokens.push_back(JinjaToken(JinjaToken::JinjaTokenMore));
+                            st++;
+                        }
+                    } else if (now == '<') {
+                        if (st + 1 < end && value[st + 1] == '=') {
+                            tokens.push_back(JinjaToken(JinjaToken::JinjaTokenLessEqual));
+                            st += 2;    
+                        } else {
+                            tokens.push_back(JinjaToken(JinjaToken::JinjaTokenLess));
+                            st++;
+                        }
                     } else if (now == '=') {
                         if (st + 1 < end && value[st + 1] == '=') {
                             tokens.push_back(JinjaToken(JinjaToken::JinjaTokenEqual));
@@ -233,6 +249,12 @@ namespace fastllm {
             } else if (a.type == JinjaVar::JinjaInt && b.type == JinjaVar::JinjaInt) {
                 return a.intValue + b.intValue;
             }
+        } else if (op == JinjaToken::JinjaTokenSub) {
+            if (a.type == JinjaVar::JinjaFloat && b.type == JinjaVar::JinjaFloat) {
+                return a.floatValue - b.floatValue;
+            } else if (a.type == JinjaVar::JinjaInt && b.type == JinjaVar::JinjaInt) {
+                return a.intValue - b.intValue;
+            }
         } else if (op == JinjaToken::JinjaTokenMod) {
             if (a.type == JinjaVar::JinjaInt && b.type == JinjaVar::JinjaInt) {
                 return a.intValue % b.intValue;
@@ -267,6 +289,22 @@ namespace fastllm {
             if (a.type == JinjaVar::JinjaNone) {
                 return a.stringValue == b.stringValue;
             }
+        } else if (op == JinjaToken::JinjaTokenLess) {
+            if (a.type == JinjaVar::JinjaInt && b.type == JinjaVar::JinjaInt) {
+                return a.intValue < b.intValue;
+            } else if (a.type == JinjaVar::JinjaFloat && b.type == JinjaVar::JinjaFloat) {
+                return a.floatValue < b.floatValue;
+            }
+        } else if (op == JinjaToken::JinjaTokenLessEqual) {
+            if (a.type == JinjaVar::JinjaInt && b.type == JinjaVar::JinjaInt) {
+                return a.intValue <= b.intValue;
+            } else if (a.type == JinjaVar::JinjaFloat && b.type == JinjaVar::JinjaFloat) {
+                return a.floatValue <= b.floatValue;
+            }
+        } else if (op == JinjaToken::JinjaTokenMore) {
+            return JinjaBinaryOp(b, a, JinjaToken::JinjaTokenLess);
+        } else if (op == JinjaToken::JinjaTokenMoreEqual) {
+            return JinjaBinaryOp(b, a, JinjaToken::JinjaTokenLessEqual);
         } else if (op == JinjaToken::JinjaTokenNotEqual) {
             JinjaVar temp = JinjaBinaryOp(a, b, JinjaToken::JinjaTokenEqual);
             return (int)(!temp.BoolValue());
@@ -285,24 +323,25 @@ namespace fastllm {
     }
 
     int GetOpLevel(JinjaToken::JinjaToKenType type) {
-        if (type == JinjaToken::JinjaTokenOr) {
-            return -2;
-        } else if (type == JinjaToken::JinjaTokenAnd) {
+        if (type == JinjaToken::JinjaTokenNamespace) {
+            return -3;
+        } else if (type == JinjaToken::JinjaTokenAnd || type == JinjaToken::JinjaTokenOr) {
             return -2;
         } else if (type == JinjaToken::JinjaTokenNot) {
             return -1;
-        } else if (type == JinjaToken::JinjaTokenEqual || type == JinjaToken::JinjaTokenNotEqual || type == JinjaToken::JinjaTokenIn) {
+        } else if (type == JinjaToken::JinjaTokenEqual || type == JinjaToken::JinjaTokenNotEqual || type == JinjaToken::JinjaTokenIn
+                || type == JinjaToken::JinjaTokenLess || type == JinjaToken::JinjaTokenMore) {
             return 0;
         } else if (type == JinjaToken::JinjaTokenAdd || type == JinjaToken::JinjaTokenSub) {
             return 1;
         } else if (type == JinjaToken::JinjaTokenMul || type == JinjaToken::JinjaTokenDiv || type == JinjaToken::JinjaTokenMod) {
             return 2;
-        } else if (type == JinjaToken::JinjaTokenFilter) {
+        } else if (type == JinjaToken::JinjaTokenFilter || type == JinjaToken::JinjaTokenFUNC) {
             return 3;
         } else if (type == JinjaToken::JinjaTokenDOT) {
             return 4;
         } else if (type == JinjaToken::JinjaTokenSlice) {
-            return 5;
+            return 0;
         } else if (type == JinjaToken::JinjaTokenLSB || type == JinjaToken::JinjaTokenLMB) {
             return -5;
         } else {
@@ -318,8 +357,8 @@ namespace fastllm {
     static void initFunctionMap() {
         functionMap["trim"] = JinjaTrim;
         functionMap["split"] = [](const JinjaVar &a) {
-            JinjaVar string = a.arrayValue[1];
-            JinjaVar delimiter = a.arrayValue[0];
+            JinjaVar string = a.arrayValue[0];
+            JinjaVar delimiter = a.arrayValue[1];
             std::vector<JinjaVar> tokens;
             size_t start = 0;
             size_t end = string.stringValue.find(delimiter.stringValue);
@@ -335,6 +374,59 @@ namespace fastllm {
         };
         functionArgCount["trim"] = 1;
         functionArgCount["split"] = 2;
+        functionMap["length"] = [](const JinjaVar &element) {
+            if (element.type == JinjaVar::JinjaVarType::JinjaString)
+                return JinjaVar((long long) element.stringValue.length());
+            else if (element.type == JinjaVar::JinjaVarType::JinjaArray)
+                return JinjaVar((long long) element.arrayValue.size());
+            else if (element.type == JinjaVar::JinjaVarType::JinjaDict)
+                return JinjaVar((long long) element.dictValue.size());
+            return element;
+        };
+        functionArgCount["length"] = 2;
+        functionMap["startswith"] = [](const JinjaVar &a) {
+            std::string string = a.arrayValue[0].stringValue;
+            std::string prefix = a.arrayValue[1].stringValue;
+            if (prefix.size() > string.size()) return JinjaVar(0);
+            JinjaVar temp(string.compare(0, prefix.size(), prefix));
+            return JinjaVar((int)(!temp.BoolValue()));
+        };
+        functionArgCount["startswith"] = 2;
+        functionMap["endswith"] = [](const JinjaVar &a) {
+            std::string string = a.arrayValue[0].stringValue;
+            std::string suffix = a.arrayValue[1].stringValue;
+            if (suffix.size() > string.size()) return JinjaVar(0);
+            JinjaVar temp(string.compare(string.size() - suffix.size(), suffix.size(), suffix));
+            return JinjaVar((int)(!temp.BoolValue()));
+        };
+        functionArgCount["endswith"] = 2;
+        functionMap["lstrip"] = [](const JinjaVar &a) {
+            std::string string = a.arrayValue[0].stringValue;
+            std::string delimiter = " \t\n\r\f\v";
+            if (a.arrayValue.size() > 1)
+                delimiter = a.arrayValue[1].stringValue;
+            std::string::size_type pos = string.find_first_not_of(delimiter);
+            return JinjaVar(string.erase(0, string.find_first_not_of(delimiter)));
+        };
+        functionArgCount["lstrip"] = 2;
+        functionMap["rstrip"] = [](const JinjaVar &a) {
+            std::string string = a.arrayValue[0].stringValue;
+            std::string delimiter = " \t\n\r\f\v";
+            if (a.arrayValue.size() > 1)
+                delimiter = a.arrayValue[1].stringValue;
+            return JinjaVar(string.erase(string.find_last_not_of(delimiter) + 1));
+        };
+        functionArgCount["rstrip"] = 2;
+        functionMap["strip"] = [](const JinjaVar &a) {
+            std::string string = a.arrayValue[0].stringValue;
+            std::string delimiter = " \t\n\r\f\v";
+            if (a.arrayValue.size() > 1)
+                delimiter = a.arrayValue[1].stringValue;
+            string.erase(0, string.find_first_not_of(delimiter));
+            string.erase(string.find_last_not_of(delimiter) + 1);
+            return JinjaVar(string);
+        };
+        functionArgCount["strip"] = 2;
     }
 
     JinjaTemplate::JinjaTemplate (const std::string &temp) {
@@ -356,12 +448,21 @@ namespace fastllm {
                     blocks.push_back(JinjaBlock(part));
                 // 处理切片语法糖
                 part = temp.substr(i, curEnd + 2 - i);
-                std::string::size_type slicepos = part.find("[:");
+                std::string::size_type slicepos = part.find("[::");
+                if (slicepos != std::string::npos)
+                    part.replace(slicepos, 3, "[0:0:");
+                slicepos = part.find("[:");
                 if (slicepos != std::string::npos)
                     part.replace(slicepos, 2, "[0:");
+                slicepos = part.find("::]");
+                if (slicepos != std::string::npos)
+                    part.replace(slicepos, 3, ":0:1]");
                 slicepos = part.find(":]");
                 if (slicepos != std::string::npos)
                     part.replace(slicepos, 2, ":0]");
+                slicepos = part.find(":-");
+                if (slicepos != std::string::npos)
+                    part.replace(slicepos, 2, ":0-");
                 slicepos = part.find("is not");
                 if (slicepos != std::string::npos)
                     part.replace(slicepos, 6, "!=");
@@ -419,9 +520,17 @@ namespace fastllm {
                 if (suffixExp.back().type != JinjaToken::JinjaTokenSlice)
                     suffixExp.push_back(tokens[i]);
                 ops.pop_back();
+            } else if (tokens[i].type == JinjaToken::JinjaTokenSlice) {
+                if (!ops.empty() && ops.back().type == JinjaToken::JinjaTokenSlice)
+                    ops.pop_back();
+                ops.push_back(tokens[i]);
             } else if (tokens[i].type == JinjaToken::JinjaTokenFUNC) {
                 if (!ops.empty() && ops.back().type == JinjaToken::JinjaTokenDOT)
                     ops.pop_back();
+                while (ops.size() > 0 && GetOpLevel(ops.back().type) > GetOpLevel(tokens[i].type)) {
+                    suffixExp.push_back(ops.back());
+                    ops.pop_back();
+                }
                 ops.push_back(tokens[i]);
             } else if (tokens[i].type == JinjaToken::JinjaTokenDOT ||
                         tokens[i].type == JinjaToken::JinjaTokenAdd ||
@@ -431,6 +540,8 @@ namespace fastllm {
                         tokens[i].type == JinjaToken::JinjaTokenMod ||
                         tokens[i].type == JinjaToken::JinjaTokenEqual ||
                         tokens[i].type == JinjaToken::JinjaTokenNotEqual ||
+                        tokens[i].type == JinjaToken::JinjaTokenLess ||
+                        tokens[i].type == JinjaToken::JinjaTokenMore ||
                         tokens[i].type == JinjaToken::JinjaTokenSlice ||
                         tokens[i].type == JinjaToken::JinjaTokenIn ||
                         tokens[i].type == JinjaToken::JinjaTokenAnd ||
@@ -516,7 +627,7 @@ namespace fastllm {
                         if (a.type == JinjaVar::JinjaNone) {
                             a = local[a];
                         }
-                        args.arrayValue.push_back(a);
+                        args.arrayValue.insert(args.arrayValue.begin(), a);
                         vars.pop_back();
                     }
                     vars.push_back(functionMap[it.value](args));
@@ -563,7 +674,7 @@ namespace fastllm {
                     if (b.type == JinjaVar::JinjaInt || b.type == JinjaVar::JinjaFloat) {
                         vars.pop_back();
                         vars.pop_back();
-                        vars.push_back(JinjaBinaryOp(a, b, it.type));
+                        vars.push_back(JinjaBinaryOp(b, a, it.type));
                         continue;
                     }
                 }
@@ -579,6 +690,8 @@ namespace fastllm {
                         it.type == JinjaToken::JinjaTokenAssign ||
                         it.type == JinjaToken::JinjaTokenEqual ||
                         it.type == JinjaToken::JinjaTokenNotEqual ||
+                        it.type == JinjaToken::JinjaTokenLess ||
+                        it.type == JinjaToken::JinjaTokenMore ||
                         it.type == JinjaToken::JinjaTokenIn ||
                         it.type == JinjaToken::JinjaTokenAnd ||
                         it.type == JinjaToken::JinjaTokenOr) {
@@ -587,26 +700,40 @@ namespace fastllm {
                 if (a.type == JinjaVar::JinjaNone && it.type != JinjaToken::JinjaTokenIn) {
                     a = local[a];
                 }
-                if (b.type == JinjaVar::JinjaNone) {
+                if (b.type == JinjaVar::JinjaNone && b.stringValue != "defined" && b.stringValue != "none") {
                     b = local[b];
                 }
                 vars.pop_back();
                 vars.pop_back();
                 vars.push_back(JinjaBinaryOp(a, b, it.type));
             } else if (it.type == JinjaToken::JinjaTokenSlice) {
-                AssertInFastLLM(vars.size() >= 3, "Jinja Error: expression error.");
-                JinjaVar a = vars[vars.size() - 3], b = vars[vars.size() - 2], c = vars.back();
-                if (a.type == JinjaVar::JinjaNone) {
-                    a = local[a];
+                AssertInFastLLM(vars.size() >= 3, "Jinja Error: slice expression error.");
+                JinjaVar a = vars[vars.size() - 3], b = vars[vars.size() - 2], e = vars.back(), s = JinjaVar(1);
+                if (a.type == JinjaVar::JinjaInt) {
+                    a = vars[vars.size() - 4], b = vars[vars.size() - 3], e = vars[vars.size() - 2], s = vars.back();
+                    vars.pop_back();
                 }
-                AssertInFastLLM(a.type == JinjaVar::JinjaArray && b.type == JinjaVar::JinjaInt && c.type == JinjaVar::JinjaInt,
-                    "Jinja Error: slice expression error.");
+                if (a.type == JinjaVar::JinjaNone)
+                    a = local[a];
+                AssertInFastLLM(a.type == JinjaVar::JinjaArray && b.type == JinjaVar::JinjaInt && e.type == JinjaVar::JinjaInt
+                    && s.type == JinjaVar::JinjaInt,"Jinja Error: slice expression error.");
                 vars.pop_back();
                 vars.pop_back();
                 vars.pop_back();
-                if (c.intValue <= 0)
-                    c.intValue += a.arrayValue.size();
-                std::vector<JinjaVar> subArray(a.arrayValue.begin() + b.intValue, a.arrayValue.begin() + c.intValue);
+                if (e.intValue <= 0)
+                    e.intValue += a.arrayValue.size();
+                std::vector<JinjaVar> subArray;
+                if (s.intValue == 1) {
+                    subArray = std::vector<JinjaVar>(a.arrayValue.begin() + b.intValue, a.arrayValue.begin() + e.intValue);
+                } else {
+                    if (s.intValue < 0) {
+                        for (size_t i = e.intValue; i > b.intValue; i += s.intValue)
+                            subArray.push_back(a.arrayValue[i-1]);
+                    } else {
+                        for (size_t i = b.intValue; i < e.intValue; i += s.intValue)
+                            subArray.push_back(a.arrayValue[i]);
+                    }
+                }
                 vars.push_back(JinjaVar(subArray));
             }
         }
