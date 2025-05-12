@@ -16,15 +16,16 @@ fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）�
 
 ## 亮点功能
 
-- 🚀 DeepSeek混合推理，消费级单卡即可多并发部署，后续将支持多卡提速
-- 🚀 双CPU仅占用1份内存，部署DeepSeek R1 671b int4 共占用内存340G
-- 🚀 支持ROCM，可使用AMD GPU推理
-- 🚀 支持国产GPU 天数，沐曦，燧原，均支持单卡混合推理671B模型
-- 🚀 支持多NUMA节点加速
-- 🚀 支持动态Batch，流式输出
-- 🚀 支持多卡部署，支持GPU + CPU混合部署
-- 🚀 前后端分离设计，便于支持新的计算设备
-- 🚀 后端纯c++实现，便于跨平台移植，可在安卓上直接编译
+- 🚀 安装使用简单方便，一条命令就能成功安装，一条命令就能成功运行。
+- 🚀 支持CPU + GPU混合推理MOE大参数模型（单4090即可推理DEEPSEEK 671B）。
+- 🚀 使用C++实现自有底层算子，不依赖PyTorch。
+- 🚀 兼容性好，PIP安装支持可以支持到P100、MI50等老卡，源码安装支持更多设备。
+- 🚀 支持多卡张量并行推理，支持3、5、7等奇数张卡。
+- 🚀 支持GPU + CPU混合张量并行推理
+- 🚀 支持CPU和显卡实现FP8运算，老设备也可以运行
+- 🚀 支持双CPU加速，且只占用1份内存，DeepSeek R1 671b int4 需内存340G。
+- 🚀 支持ROCM，AMD GPU；支持天数，沐曦，燧原；支持华为昇腾。
+- 🚀 支持动态Batch，流式输出；前后端分离设计，可跨平台移植，可在安卓上直接编译。
 - 🚀 支持Python[自定义模型结构](docs/custom.md)
 
 ## 快速开始
@@ -32,23 +33,9 @@ fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）�
 ### 安装
 
 
-- PIP安装（目前仅支持Nvidia GPU，其余GPU请使用源码安装）
+- PIP安装（目前仅支持Nvidia GPU和AMD GPU，其余GPU请使用[源码安装](#源码安装)
 
-#### Windows系统:
-
-第一次安装前需要安装依赖库:
-
-```
-pip install https://hf-mirror.com/fastllm/fastllmdepend-windows/resolve/main/ftllmdepend-0.0.0.1-py3-none-win_amd64.whl
-```
-
-然后用pip安装，命令如下：
-
-```
-pip install ftllm -U
-```
-
-#### Linux系统:
+#### Linux系统 + Nvidia GPU:
 
 由于目前PyPI限制库大小，安装包中不含CUDA依赖，安装ftllm之前建议先手动安装CUDA 12以上版本 (已安装cuda可跳过)
 ```
@@ -62,40 +49,40 @@ sudo sh cuda_12.8.1_570.124.06_linux.run
 pip install ftllm -U
 ```
 
+#### Linux系统 + AMD GPU:
+
+由于目前PyPI限制库大小，安装包中不含ROCM依赖，安装ftllm之前建议先手动安装ROCM 6.3.3 (若已安装ROCM可跳过)
+```
+wget wget https://repo.radeon.com/amdgpu-install/6.3.3/ubuntu/jammy/amdgpu-install_6.3.60303-1_all.deb
+apt install ./amdgpu-install_6.3.60303-1_all.deb -y
+amdgpu-install --usecase=hiplibsdk,rocm,dkms -y
+```
+
+然后用pip安装，命令如下：
+
+```
+pip install ftllm-rocm -U
+```
+
+#### Windows系统 （仅支持Nvidia GPU）:
+
+第一次安装前需要安装依赖库:
+
+```
+pip install https://hf-mirror.com/fastllm/fastllmdepend-windows/resolve/main/ftllmdepend-0.0.0.1-py3-none-win_amd64.whl
+```
+
+然后用pip安装，命令如下：
+
+```
+pip install ftllm -U
+```
+
 - Hint
 
 Conda下安装有时候会出现环境错误，如果出现可以尝试在Conda外或使用venv等虚拟环境尝试
 
 （若使用时报错，可参考[ftllm报错](docs/faq.md#ftllm加载报错) )
-
-#### 源码安装
-
-若pip安装失败或有其它特殊需求，可以用源码编译安装
-源码安装后如果需要卸载，方法和PIP安装一样
-```
-pip uninstall ftllm
-```
-
-建议使用cmake编译，需要提前安装gcc，g++ (建议9.4以上), make, cmake (建议3.23以上)
-
-GPU编译需要提前安装好CUDA编译环境，建议使用尽可能新的CUDA版本
-
-使用如下命令编译
-
-``` sh
-bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU版本
-# bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 -D CMAKE_CUDA_COMPILER=$(which nvcc) # 可以指定CUDA架构，如4090使用89架构
-# bash install.sh # 仅编译CPU版本
-```
-
-##### 其他平台编译
-
-其他不同平台的编译可参考文档
-
-[TFACC平台](docs/tfacc.md)  
-[ROCm平台](docs/rocm.md)
-
-编译中遇到问题可参考 [FAQ文档](docs/faq.md)
 
 ### 运行demo程序
 
@@ -119,98 +106,132 @@ ftllm webui Qwen/Qwen3-0.6B
 ftllm server Qwen/Qwen3-0.6B
 ```
 
-#### NUMA加速
+## 使用指南
 
-若想使用单NUMA节点，建议用numactl绑定numa节点
+### 1. 如何启动模型
 
-可以设定环境变量来激活多NUMA节点加速（PIP版本可直接激活，源码安装时需要在编译时加入-DUSE_NUMA=ON选项）
-
-```
-export FASTLLM_USE_NUMA=ON
-# export FASTLLM_NUMA_THREADS=27 # 选用，这个变量用于设定每个numa节点开启的线程数
-```
-
-#### 启动本地模型
-
-可以启动本地下载好的Hugging Face模型（支持原始模型，AWQ模型，FASTLLM模型，暂不支持GGUF模型），假设本地模型路径为 `/mnt/Qwen/Qwen2-0.5B-Instruct/`
-则可以用如下命令启动（webui, server类似）
+基本的启动命令格式如下：
 
 ```
-ftllm run /mnt/Qwen/Qwen2-0.5B-Instruct/
+ftllm run Qwen/Qwen3-0.6B # 启动本地对话
+ftllm webui Qwen/Qwen3-0.6B # 启动WebUI
+ftllm server Qwen/Qwen3-0.6B # 启动API Server
 ```
 
-#### 模糊启动
-
-如果记不住模型名，可以输入大概的模型名（不保证能匹配成功）
-例如：
-```
-ftllm run qwen2-7b-awq
-```
+根据你需要开启的服务，选择相应的命令。以 `server` 命令为例，格式如下：
 
 ```
-ftllm run deepseek-v3-0324-int4
+ftllm server model
 ```
 
-#### 设置缓存目录
+这里的`model`可以是:
 
-模型会下载到缓存目录（默认~/.cache），可以通过参数`--cache_dir`来设置，例如
+- Huggingface上的模型，例如 `Qwen/Qwen3-0.6B` 代表 [千问3-0.6B模型](https://hf-mirror.com/Qwen/Qwen3-0.6B)
+- 本地模型路径。例如`/mnt/Qwen3-0.6B`，下载模型可以参考 [模型下载](#模型下载)
 
-```
-ftllm run deepseek-v3-0324-int4 --cache_dir /mnt/
-```
+无论是在线模型还是本地模型，目前支持以下几种格式 （均以在线模型举例，可以在Huggingface上搜到对应模型）:
 
-也可以通过环境变量 `FASTLLM_CACHEDIR` 来设置，例如在Linux下:
+- `FP16`, `BF16`格式的原始模型，例如`Qwen/Qwen3-0.6B`
+- `FP8`格式的模型，例如`Qwen/Qwen3-0.6B-FP8`
+- `AWQ`格式的模型，例如`Qwen/Qwen3-14B-AWQ`
+- `Fastllm`格式的模型，例如`fastllm/DeepSeek-V3-0324-INT4`。也可以下载原始模型后通过 [模型导出](#模型导出) 中的命令导出
+- 目前暂不支持 `GGUF` 格式的模型
 
-```
-export FASTLLM_CACHEDIR=/mnt/
-```
+如果您是第一次使用ftllm，建议直接使用基本的启动命令启动，所有的参数都会自动设置。如果您希望继续调参，请参照下面的参数设置说明
 
-## 参数设置
+### 2. 如何设定推理精度
 
-首次体验ftllm时建议不加任何参数，程序会自动选择参数。
-
-当需要对性能进行调优时，再增加参数测试
-
-以下是运行 `ftllm` 模块时常用的参数说明：
-
-### 通用参数
-
-- `--device`:
-  - **描述**: 指定模型运行的计算设备。
-  - **常用值**: `cpu` 或 `cuda`或`numa`或`multicuda`
-  - **示例**: `--device cpu` 或 `--device cuda`
-  - **使用多显卡**: `--device multicuda:0,1`
-  - **使用显卡+CPU**: `--device multicuda:0,cpu`
-  - **按比例使用多显卡+CPU**: `--device multicuda:0:4,1:5,cpu:1`
-  (cuda:0计算4/10, cuda:1计算5/10, cpu计算1/10)
-
-- `--moe_device`:
-  - **描述**: 指定 MOE（Mixture of Experts）层的计算设备。
-  - **常用值**: `cpu` 或 `cuda`或`numa`
-  - **示例**: `--moe_device cpu`
-  - **说明**: 一般和device指定为不同的设备实现混合推理，例如
-  `--device cuda --moe_device cpu`来实现MOE模型的单卡+CPU混合推理。
-   `--device cuda --moe_device numa` 来实现MOE模型的单卡+多NUMA节点加速推理
-
-- `-t` 或 `--threads`:
-  - **描述**: 设置使用的CPU线程数。但当device为numa时，会开启计算服务器，计算线程数由环境变量`FASTLLM_NUMA_THREADS`决定，threads参数请设得小一点（可以设为1）
-  - **示例**: `-t 27`
+当启动的模型为浮点精度时（`BF16`, `FP16`, `FP8`）时，可以通过以下参数来设置模型的推理精度：
 
 - `--dtype`:
   - **描述**: 指定模型的数据类型。
-  - **可选值**: `int4` `int8` `float16` 或其他支持的数据类型。
+  - **可选值**: `int4g` `int4` `int8` `fp8` `float16` 或其他支持的数据类型。
   - **示例**: `--dtype int4`
-  - **说明**: 使用原始模型时，指定此参数可以在线量化模型。例如下述命令会将DeepSeek-R1在线量化为int4后运行。
-  ```
-  ftllm run deepseek-ai/DeepSeek-R1 --dtype int4
-  ```
-  若使用的模型已经是量化好的模型（例如AWQ模型，Fastllm导出的量化模型等），建议不指定该参数
 
 - `--moe_dtype`:
   - **描述**: 指定模型MOE层的数据类型。
-  - **可选值**: `int4` `int8` `float16` 或其他支持的数据类型。
+  - **可选值**: `int4g` `int4` `int8` `fp8` `float16` 或其他支持的数据类型。
   - **示例**: `--moe_dtype int4`
-  若使用的模型已经是量化好的模型（例如AWQ模型，Fastllm导出的量化模型等），建议不指定该参数
+  - **说明**: 如果指定的模型不是`moe`结构的模型，这个参数不会生效
+
+命令示例：
+
+```
+ftllm server Qwen/Qwen3-0.6B --dtype int8 
+# 上面的命令会读取原始模型（这个模型是BF16精度），并在线量化为INT8精度推理
+
+ftllm server deepseek-ai/DeepSeek-V3-0324 --dtype fp8 --moe_dtype int4
+# 上面的命令会读取原始模型（这个模型是FP8精度），并使用FP8 + INT4的混合精度推理
+```
+
+若不设定这些参数，ftllm会使用模型中设定的精度来进行推理
+
+若使用的模型已经是量化好的模型（例如AWQ模型，Fastllm导出的量化模型等），建议不指定这些参数
+
+### 3. 如何设定运行设备
+
+可以通过以下参数来设定执行推理的设备
+
+- `--device`:
+  - **描述**: 指定模型运行的计算设备。
+  - **示例**: `--device cpu`, `--device cuda`
+  - **常用值说明**: 
+    - `cpu` 使用`cpu`推理
+    - `cuda` 使用`gpu`推理 
+    - `numa` 使用多路`numa`节点加速推理，在多CPU的机器才会有提升
+    - `multicuda` 使用多设备张量并行推理
+      - **使用多显卡**: `--device multicuda:0,1` （`FP8`精度暂不支持多显卡）
+      - **使用多显卡+CPU**: `--device multicuda:0,cpu`
+      - **按比例使用多显卡+CPU**: `--device multicuda:0:4,1:5,cpu:1` (`cuda:0`计算4/10, `cuda:1`计算5/10, `cpu`计算1/10)
+
+- `--moe_device`:
+  - **描述**: 指定 MOE（Mixture of Experts）层的计算设备。
+  - **示例**: `--moe_device cpu`, `--moe_device numa`
+  - **常用值说明**: 
+    - `cpu` 使用`cpu`推理
+    - `numa` 使用多路`numa`节点加速推理，在多CPU的机器才会有提升
+    - `cuda` 使用`gpu`推理 （MOE层需要大量显存，一般不建议指定为`cuda`）
+  - **说明**: 一般和device指定为不同的设备实现混合推理，例如
+  `--device cuda --moe_device cpu`来实现MOE模型的单卡+CPU混合推理。
+   `--device cuda --moe_device numa` 来实现MOE模型的单卡+多NUMA节点加速推理
+   如果指定的模型不是`moe`结构的模型，这个参数不会生效
+
+若不设定这些参数，会使用默认配置来推理，默认配置如下：
+
+| 模型类型 | device | moe_device |
+|-------:|--------|------------:|
+| 稠密模型 | cuda   |   不生效    |
+| MOE模型  | cuda   |   cpu    |
+
+### 4. 如何设定运行参数
+
+可以通过下列参数设置运行参数。
+
+需要注意的是，速度和参数设置并不一定正相关，如果对性能要求高，可以多方向尝试一下
+
+- `-t` 或 `--threads`:
+  - **描述**: 设置使用的CPU线程数。
+    - 当`device`为`cpu`时，这个参数决定了推理使用的线程数
+    - 当`device`为`numa`时，推理线程数主要由环境变量`FASTLLM_NUMA_THREADS`决定，`threads`参数请设得小一点（推荐设为1）
+  - **示例**: `-t 27`
+
+例如我们在多CPU设备上用GPU + 多CPU混合部署一个`MOE`模型`fastllm/DeepSeek-V3-0324-INT4`，可以尝试这些命令：
+
+``` bash
+export FASTLLM_NUMA_THREADS=27 && ftllm server fastllm/DeepSeek-V3-0324-INT4 --device cuda --moe_device numa -t 1 
+# 使用多numa推理，每个numa节点使用27个线程
+
+export FASTLLM_NUMA_THREADS=16 && ftllm server fastllm/DeepSeek-V3-0324-INT4 --device cuda --moe_device numa -t 1 
+# 使用多numa推理，每个numa节点使用16个线程
+
+numactl -C 0-31 -m 0 ftllm server fastllm/DeepSeek-V3-0324-INT4 --device cuda --moe_device cpu -t 27 
+# 绑定单numa节点，使用CPU推理，使用27线程
+```
+
+不同硬件上，不同参数发挥出的性能有很大不同。一般而言，CPU上使用的线程数不建议超过物理核数
+
+
+### 5. 其它参数
 
 - `--moe_experts`:
   - **描述**: 指定 MOE（Mixture of Experts）层使用的专家数。不设定则根据模型配置设定。减少专家数可以提高推理速度，但可能降低推理准确度
@@ -244,9 +265,9 @@ export FASTLLM_CACHEDIR=/mnt/
   - **描述**: 强制思考。
   - **示例**: `ftllm webui --think`
 
-### 模块参数
-  
-各个模块的参数说明请参考[参数说明](docs/demo_arguments.md)
+- `--cache_dir`:
+  - **描述**: 指定在线Huggingface模型的缓存目录
+  - **示例**: `ftllm cache_dir /mnt`
 
 ## 模型获取
 
@@ -298,3 +319,32 @@ ftllm run /mnt/DeepSeek-V3-INT4/
 ### 支持的模型
 
 如果需要运行更多早期的模型，请参考[支持模型列表](docs/models.md)
+
+### 源码安装
+
+若pip安装失败或有其它特殊需求，可以用源码编译安装
+源码安装后如果需要卸载，方法和PIP安装一样
+```
+pip uninstall ftllm
+```
+
+建议使用cmake编译，需要提前安装gcc，g++ (建议9.4以上), make, cmake (建议3.23以上)
+
+GPU编译需要提前安装好CUDA编译环境，建议使用尽可能新的CUDA版本
+
+使用如下命令编译
+
+``` sh
+bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU版本
+# bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 -D CMAKE_CUDA_COMPILER=$(which nvcc) # 可以指定CUDA架构，如4090使用89架构
+# bash install.sh # 仅编译CPU版本
+```
+
+##### 其他平台编译
+
+其他不同平台的编译可参考文档
+
+[TFACC平台](docs/tfacc.md)  
+[ROCm平台](docs/rocm.md)
+
+编译中遇到问题可参考 [FAQ文档](docs/faq.md)
