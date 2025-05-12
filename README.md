@@ -1,15 +1,13 @@
 # fastllm
 
-[English Document](README_EN.md)
-
-| [快速开始](#快速开始) | [DeepSeek部署指南](docs/deepseek.md) | [Qwen3部署指南](docs/qwen3.md) | [版本日志](docs/version.md) |
+| [快速开始](#快速开始) | [部署DeepSeek](docs/deepseek.md) | [部署Qwen3](docs/qwen3.md) | [版本日志](docs/version.md) | [English Document](README_EN.md)
 
 ## 介绍
 
 fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）的高性能大模型推理库，兼容Qwen、QWQ等稠密模型和DeepSeek MOE模型。
 
-eypc 9655*2  + 24路DDR5 6400 + 4090 24G 推理DeepSeek R1 671B模型，INT4量化单路可达27+tps，并发40+tps。
-eypc 9374f*2 + 24路DDR5 4800 + 4090 24G 推理DeepSeek R1 671B模型，INT4量化单路可达22+tps，并发35+tps；INT8量化单路可达17+tps,并发30+tps。
+2块eypc 9655  + 24根DDR5 6400 + 1张4090 推理DeepSeek R1 671B模型，INT4量化单路27+tps，并发40+tps。
+2块eypc 9374f + 24根DDR5 4800 + 1张4090 推理DeepSeek R1 671B模型，INT4量化单路22+tps，并发35+tps；INT8量化单路17+tps,并发30+tps。
 
 
 部署交流QQ群： 831641348
@@ -47,7 +45,7 @@ pip install https://hf-mirror.com/fastllm/fastllmdepend-windows/resolve/main/ftl
 然后用pip安装，命令如下：
 
 ```
-pip install ftllm
+pip install ftllm -U
 ```
 
 #### Linux系统:
@@ -61,7 +59,7 @@ sudo sh cuda_12.8.1_570.124.06_linux.run
 然后用pip安装，命令如下：
 
 ```
-pip install ftllm
+pip install ftllm -U
 ```
 
 - Hint
@@ -270,13 +268,13 @@ ftllm export 是一个用于导出和转换模型权重的工具。它支持将�
 #### 命令格式
 
 ``` sh
-ftllm export -p <模型路径> -o <输出路径> --dtype <数据类型> -t <线程数>
+ftllm export <模型路径> -o <输出路径> --dtype <数据类型> -t <线程数>
 ```
 
 #### 示例命令
 
 ``` sh
-ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
+ftllm export /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
 ```
 
 #### 混合精度
@@ -284,7 +282,7 @@ ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
 可以通过指定`--moe_dtype`来实现混合精度，例如
 
 ``` sh
-ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-FP16INT4 --dtype float16 --moe_dtype int4 -t 16
+ftllm export /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-FP16INT4 --dtype float16 --moe_dtype int4 -t 16
 ```
 
 #### 加载导出后的模型

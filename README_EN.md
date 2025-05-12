@@ -35,7 +35,7 @@ WeChat group: ![QR Code](docs/wechat_group0.jpg)
 Linux systems can try direct pip installation:
 
 ```
-pip install ftllm
+pip install ftllm -U
 ```
 
 (Note: Due to PyPI size limitations, the package doesn't include CUDA dependencies - manual installation of CUDA 12+ is recommended)
@@ -182,13 +182,13 @@ If using quantized model loading (e.g., `--dtype int4`), the model will be quant
 #### Command Format  
 
 ``` sh
-ftllm export -p <model_path> -o <output_path> --dtype <data_type> -t <threads>  
+ftllm export <model_path> -o <output_path> --dtype <data_type> -t <threads>  
 ```
 
 #### Example Command
 
 ``` sh
-ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
+ftllm export /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
 ```
 
 #### Mixed Precisions
@@ -196,7 +196,7 @@ ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
 You can specify `--moe_dtype` for mixed precision of a MoE model, for example:
 
 ``` sh
-ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-FP16INT4 --dtype float16 --moe_dtype int4 -t 16
+ftllm export /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-FP16INT4 --dtype float16 --moe_dtype int4 -t 16
 ```
 
 #### Loading the Exported Model
