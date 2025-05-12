@@ -64,6 +64,22 @@ extern void LaunchFastllmGemmFp32Int4Group(float *input, uint8_t *weight, float 
 extern __global__ void FastllmReduceKernel(float *output, float* input, int len, int threadNum);
 extern __global__ void FastllmReduceKernel(half *output, half* input, int len, int threadNum);
 
+void FastllmCudaMemcpy2D(void * 	dst, size_t 	dpitch, const void * 	src,
+    size_t 	spitch, size_t 	width, size_t 	height, cudaMemcpyKind type, int dstDeviceId, int srcDeviceId) {
+#ifdef USE_ROCM        
+    if (type == cudaMemcpyDeviceToDevice) {
+        std::vector <uint8_t> now;
+        now.resize(height * width);
+        cudaSetDevice(srcDeviceId);
+        cudaMemcpy2D(now.data(), width, src, spitch, width, height, cudaMemcpyDeviceToHost);
+        cudaSetDevice(dstDeviceId);
+        cudaMemcpy2D(dst, dpitch, now.data(), width, width, height, cudaMemcpyHostToDevice);
+        return;
+    }
+#endif
+    cudaMemcpy2D(dst, dpitch, src, spitch, width, height, type);
+}
+
 std::map <int, std::string> specialDeviceIds = {
     {99999, "cpu"}
 };
@@ -546,7 +562,7 @@ namespace fastllm {
                 FastllmCudaFree(curInput);
             }
             if (deviceId != 0 || n > 1) {
-                cudaMemcpy2D(cudaOutput + start, k * sizeof(T), curOutput, len * sizeof(T), len * sizeof(T), n, cudaMemcpyDeviceToDevice);
+                FastllmCudaMemcpy2D(cudaOutput + start, k * sizeof(T), curOutput, len * sizeof(T), len * sizeof(T), n, cudaMemcpyDeviceToDevice, 0, deviceId);
                 FastllmCudaFree(curOutput);
             }
         }
@@ -843,12 +859,12 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
 
             int curLen = 0;
             for (auto &it : div) {
-                state = cudaMemcpy2D((uint8_t*)deviceWeightData + curLen * weight.unitSize / weight.unitSizeDiv,
+                FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + curLen * weight.unitSize / weight.unitSizeDiv,
                                     (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
                                     (uint8_t*)weight.cudaData + it.first * weight.unitSize / weight.unitSizeDiv, 
                                     m * weight.unitSize / weight.unitSizeDiv, 
                                     (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
-                                    k, GetCudaMemcpyType(mallocType, 1));
+                                    k, GetCudaMemcpyType(mallocType, 1), deviceId, 0);
                 curLen += (it.second - it.first);
             }
             if (i == 0) {
@@ -997,12 +1013,12 @@ bool PrepareMultiCudaWeight(fastllm::Data &weight, const fastllm::Data &bias, Di
             deviceBiasData = (float*)AutoMalloc(k * sizeof(float), mallocType);
             int curLen = 0;
             for (auto &it : div) {
-                state = cudaMemcpy2D((uint8_t*)deviceWeightData + curLen * weight.unitSize / weight.unitSizeDiv,
-                                    (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
-                                    (uint8_t*)weight.cudaData + it.first * weight.unitSize / weight.unitSizeDiv, 
-                                    m * weight.unitSize / weight.unitSizeDiv, 
-                                    (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
-                                    k, GetCudaMemcpyType(mallocType, 1));
+                FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + curLen * weight.unitSize / weight.unitSizeDiv,
+                    (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
+                    (uint8_t*)weight.cudaData + it.first * weight.unitSize / weight.unitSizeDiv, 
+                    m * weight.unitSize / weight.unitSizeDiv, 
+                    (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
+                    k, GetCudaMemcpyType(mallocType, 1), deviceId, 0);
                 curLen += (it.second - it.first);
             }
             if (i == 0) {

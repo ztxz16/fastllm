@@ -270,6 +270,9 @@ extern "C" {
         auto model = models.GetModel(modelId);
         std::string atypeStr = atype;
         if (atypeStr == "auto") {
+#ifdef USE_ROCM
+            model->SetDataType(fastllm::DataType::FLOAT32);
+#else
             if (model->model_struct == "chatglm" 
                 || model->model_struct == "llama"
                 || model->model_struct == "qwen3_moe"
@@ -281,6 +284,7 @@ extern "C" {
             } else {
                 model->SetDataType(fastllm::DataType::FLOAT32);
             }
+#endif
         } else if (atypeStr == "float16" || atypeStr == "half") {
             model->SetDataType(fastllm::DataType::FLOAT16);
         } else if (atypeStr == "float" || atypeStr == "float32") {

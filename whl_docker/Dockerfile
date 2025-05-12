@@ -28,11 +28,11 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/11.3.0/local_install
     --no-drm --no-man-page --no-opengl-libs --installpath=/usr/local/cuda-11.3 \
     && rm cuda_11.3.0_465.19.01_linux.run
 
-# 安装CUDA 12.8
-RUN wget https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_570.86.10_linux.run \
-    && sh cuda_12.8.0_570.86.10_linux.run --silent --toolkit --override \
-    --no-drm --no-man-page --no-opengl-libs --installpath=/usr/local/cuda-12.8 \
-    && rm cuda_12.8.0_570.86.10_linux.run
+# 安装CUDA 12.1
+RUN wget https://developer.download.nvidia.com/compute/cuda/12.1.0/local_installers/cuda_12.1.0_530.30.02_linux.run \
+    && sh cuda_12.1.0_530.30.02_linux.run --silent --toolkit --override \
+    --no-drm --no-man-page --no-opengl-libs --installpath=/usr/local/cuda-12.1 \
+    && rm cuda_12.1.0_530.30.02_linux.run
 
 # 配置CUDA环境变量（默认使用11.3）
 ENV PATH=/usr/local/cuda-11.3/bin:${PATH}
