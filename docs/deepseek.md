@@ -8,7 +8,7 @@ DeepSeek是深度求索公司出品的模型，目前主要产品为DeepSeek-V3�
 
 Linux系统可尝试直接pip安装，命令如下：
 ```
-pip install ftllm
+pip install ftllm -U
 ```
 若安装失败则参考[源码安装](../README.md#安装)
 
@@ -137,7 +137,7 @@ ftllm export <模型路径> -o <输出路径> --dtype <数据类型> -t <线程�
 #### 示例命令
 
 ``` sh
-ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
+ftllm export /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
 ```
 
 #### 混合精度
@@ -145,7 +145,7 @@ ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-INT4 --dtype int4 -t 16
 可以通过指定moe_dtype来实现混合精度，例如
 
 ``` sh
-ftllm export -p /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-FP16INT4 --dtype float16 --moe_dtype int4 -t 16
+ftllm export /mnt/DeepSeek-V3 -o /mnt/DeepSeek-V3-FP16INT4 --dtype float16 --moe_dtype int4 -t 16
 ```
 
 #### 加载导出后的模型

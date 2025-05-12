@@ -8,7 +8,7 @@ Qwen3是阿里巴巴出品的系列模型
 
 Linux系统可尝试直接pip安装，命令如下：
 ```
-pip install ftllm
+pip install ftllm -U
 ```
 若安装失败则参考[源码安装](../README.md#安装)
 
