@@ -116,6 +116,7 @@ if (USE_CUDA)
 endif()
 
 if(USE_ROCM)
+    set(CMAKE_HIP_ARCHITECTURES ${ROCM_ARCH})
     list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/third_party/hipify_torch/cmake")
     include(Hipify)
     enable_language(HIP)
@@ -146,7 +147,6 @@ if(USE_ROCM)
     find_package(hipblas REQUIRED)
     find_package(rocprim REQUIRED)
     list(APPEND FASTLLM_LINKED_LIBS hip::device roc::hipblas roc::rocprim)
-    set(CMAKE_HIP_ARCHITECTURES ${ROCM_ARCH})
     add_compile_definitions(HIPBLAS_V2)
 
     # if gfx906(MI50) in ROCM_ARCH list, don't use Tensor Core
