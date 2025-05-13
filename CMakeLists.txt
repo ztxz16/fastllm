@@ -50,16 +50,32 @@ message(STATUS "MAKE_WHL_X86: ${MAKE_WHL_X86}")
 
 set(CMAKE_BUILD_TYPE "Release")
 
+string(REGEX REPLACE "^([0-9]+)\\.[0-9]+\\.[0-9]+$" "\\1" CXX_MAJOR_VERSION "${CMAKE_CXX_COMPILER_VERSION}")
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     string(REPLACE "/Ob2" "/Ob1 /Gy" CMAKE_CXX_FLAGS_RELEASE ${CMAKE_CXX_FLAGS_RELEASE})
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNOMINMAX /std:c++17 /arch:AVX2 /source-charset:utf-8")
+    if (CXX_MAJOR_VERSION GREATER_EQUAL 19)
+        set_source_files_properties(
+            "src/devices/cpu/avx512bf16.cpp"
+            PROPERTIES
+            COMPILE_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX10.1"
+        )
+    endif()
 else()
     if (MAKE_WHL_X86)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2 -mavx -mavx2 -mf16c -mfma -static-libstdc++ -static-libgcc")
     else()
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread --std=c++17 -O2 -march=native")
+    endif()
+    if (CXX_MAJOR_VERSION GREATER_EQUAL 10)
+        set_source_files_properties(
+            "src/devices/cpu/avx512bf16.cpp"
+            PROPERTIES
+            COMPILE_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f -mavx512bf16"
+        )
     endif()
 endif()
 
@@ -75,12 +91,6 @@ set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executo
         third_party/json11/json11.cpp
         ${CPU_DEVICE_FILES}
         ${GRAPH_MODEL_FILES})
-
-set_source_files_properties(
-    "src/devices/cpu/avx512bf16.cpp"
-    PROPERTIES
-    COMPILE_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f -mavx512bf16"
-)
 
 include_directories(include)
 include_directories(include/utils)
@@ -116,7 +126,6 @@ if (USE_CUDA)
 endif()
 
 if(USE_ROCM)
-    set(CMAKE_HIP_ARCHITECTURES ${ROCM_ARCH})
     list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/third_party/hipify_torch/cmake")
     include(Hipify)
     enable_language(HIP)
@@ -147,6 +156,7 @@ if(USE_ROCM)
     find_package(hipblas REQUIRED)
     find_package(rocprim REQUIRED)
     list(APPEND FASTLLM_LINKED_LIBS hip::device roc::hipblas roc::rocprim)
+    set(CMAKE_HIP_ARCHITECTURES ${ROCM_ARCH})
     add_compile_definitions(HIPBLAS_V2)
 
     # if gfx906(MI50) in ROCM_ARCH list, don't use Tensor Core
