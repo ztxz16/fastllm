@@ -185,14 +185,15 @@ int chatllm(const char* prompt, int type) {
 	return ret.length();
 }
 
-void runConslusion() {
+void runConslusion(RunConfig &config) {
 	printf("欢迎使用 %s 模型. 输入内容对话，reset清空历史记录，stop退出程序.\n", modelType.c_str());
 	while (true) {
 		printf("用户: ");
 		std::string input;
 		std::getline(std::cin, input);
 		if (input == "reset" || input.empty()) {
-			messages->erase(std::next(messages->begin()), messages->end());
+			auto begin = config.systemPrompt.empty() ? messages->begin() : std::next(messages->begin());
+			messages->erase(begin, messages->end());
 			continue;
 		}
 		if (input == "stop") {
@@ -202,7 +203,7 @@ void runConslusion() {
 	}
 }
 
-void runWebUI()
+void runWebUI(RunConfig &config)
 {
 	system("chcp 65001");
 
@@ -253,9 +254,9 @@ int main(int argc, char **argv) {
 	initLLMConf(config);
 
 	if (!config.webuiType) {
-		runConslusion();
+		runConslusion(config);
 	} else {
-		runWebUI();
+		runWebUI(config);
 	}
 	delete generationConfig;
 	return 0;
