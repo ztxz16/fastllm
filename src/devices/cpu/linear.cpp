@@ -18,23 +18,8 @@
 #include "computeutils.h"
 #include <array>  // For std::array
 
-// Intrinsics for CPUID
-#if defined(_MSC_VER)
-    #include <intrin.h> // For __cpuid, __cpuidex, _xgetbv
-#elif defined(__GNUC__) || defined(__clang__)
-    #include <cpuid.h> // For __get_cpuid, __get_cpuid_count
-    #include <x86intrin.h> // For _xgetbv (usually included by cpuid.h or available)
-    // GCC/Clang might not have _xgetbv as an intrinsic like MSVC,
-    // or it might be in a different header.
-    // If _xgetbv is not found, you might need to implement it with inline assembly.
-    #ifndef _XCR_XFEATURE_ENABLED_MASK // Often defined with _xgetbv
-    #define _XCR_XFEATURE_ENABLED_MASK 0
-    #endif
-#else
-    #warning "CPUID detection not implemented for this compiler."
-#endif
-
 namespace fastllm {
+    extern CPUInstructInfo cpuInstructInfo;
     extern FP16ToFP32Manager fp16tofp32;
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
@@ -44,76 +29,6 @@ namespace fastllm {
                                 int n, int m, int group, int groupCnt,
                                 std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros, 
                                 int permuteType);
-                                
-    struct CPUInstructInfo {
-        bool hasAVX512F = false;
-        bool hasAVX512BF16 = false;
-        bool hasAVX512VNNI = false;
-        // You could add more, e.g., hasAVX, hasAVX2
-        CPUInstructInfo() {
-            #if defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)
-            std::array<int, 4> regs; // For EAX, EBX, ECX, EDX
-            // Step 1: Check OSXSAVE bit (CPUID EAX=1, ECX bit 27)
-            // This indicates if the OS supports XGETBV to query enabled AVX features
-            bool os_supports_xsave = false;
-            #if defined(_MSC_VER)
-            __cpuid(regs.data(), 1);
-            #else // GCC/Clang
-            __get_cpuid(1, (unsigned int*)&regs[0], (unsigned int*)&regs[1], (unsigned int*)&regs[2], (unsigned int*)&regs[3]);
-            #endif
-            if (regs[2] & (1 << 27)) { // Check ECX bit 27 (OSXSAVE)
-                os_supports_xsave = true;
-            }
-            bool os_avx_enabled = false;
-            if (os_supports_xsave) {
-                // Step 2: Check if AVX states (and by extension AVX512 states) are enabled by OS
-                // XCR0 register:
-                // Bit 1 (SSE state) must be 1
-                // Bit 2 (AVX state - YMM registers) must be 1
-                // Bits 5,6,7 (AVX512 OPMASK, ZMM_Hi256, Hi16_ZMM states) must be 1 for AVX512
-                // We check for mask 0xE6 (binary 11100110) which means SSE, AVX, and AVX512 states are enabled
-                uint64_t xcr0 = _xgetbv(_XCR_XFEATURE_ENABLED_MASK); // _XCR_XFEATURE_ENABLED_MASK is typically 0
-                if ((xcr0 & 0xE6) == 0xE6) {
-                    os_avx_enabled = true;
-                }
-            }
-            if (os_avx_enabled) {
-                // CPUID with EAX=7, ECX=0 for extended features
-                #if defined(_MSC_VER)
-                __cpuidex(regs.data(), 7, 0);
-                #else // GCC/Clang
-                __get_cpuid_count(7, 0, (unsigned int*)&regs[0], (unsigned int*)&regs[1], (unsigned int*)&regs[2], (unsigned int*)&regs[3]);
-                #endif
-                // AVX512F: EAX=7, ECX=0, EBX bit 16
-                hasAVX512F = (regs[1] & (1 << 16)) != 0;
-                // AVX512VNNI: EAX=7, ECX=0, ECX bit 11
-                hasAVX512VNNI = (regs[2] & (1 << 11)) != 0;
-                // AVX512_BF16: EAX=7, ECX=1, EAX bit 5
-                // Need to make another CPUID call with ECX=1
-                #if defined(_MSC_VER)
-                __cpuidex(regs.data(), 7, 1);
-                #else // GCC/Clang
-                __get_cpuid_count(7, 1, (unsigned int*)&regs[0], (unsigned int*)&regs[1], (unsigned int*)&regs[2], (unsigned int*)&regs[3]);
-                #endif
-                hasAVX512BF16 = (regs[0] & (1 << 5)) != 0;
-                // Important: If a feature (like AVX512_BF16) depends on another (like AVX512F),
-                // you might want to ensure the base feature is also true.
-                // e.g., hasAVX512BF16 = hasAVX512BF16 && hasAVX512F; (Though CPUID should report correctly)
-            }
-            // If os_avx_enabled is false, all 'has...' flags will remain false.
-            #endif // Compiler check
-            // Print the results
-            std::string x[2] = {"OFF", "ON"};
-            printf("CPU Instruction Info: ");
-            printf("[AVX512F: %s] ", x[hasAVX512F].c_str());
-            printf("[AVX512_VNNI: %s] ", x[hasAVX512VNNI].c_str());
-            printf("[AVX512_BF16: %s] ", x[hasAVX512BF16].c_str());
-            printf("\n");
-        }
-    };
-
-    static CPUInstructInfo cpuInstructInfo;
-
 #ifdef __AVX2__
     extern int DotU4U8(uint8_t *a, uint8_t *b, int n);
 #endif
@@ -362,6 +277,8 @@ namespace fastllm {
         );
     }
 
+    extern bool MatMulInt8Int4_AVX512VNNI(uint8_t *a, uint8_t *b, float *c, int n, int m, int k);
+
     void MultiThreadLinearInt8Int4GroupOp::Run() {
 #ifdef __AVX2__
         if (group == 1) {
@@ -374,223 +291,130 @@ namespace fastllm {
                 tempValue[block] = (inputSums[block] - izeros[block] * groupCnt) * iscales[block];
             }
 
-/*
-            block = 0;
-            for (; block + 3 < n; block += 4) {
-                uint8_t *weightWalk = b;
-                uint8_t *inputStart = a + block * m;
+            if (cpuInstructInfo.hasAVX512VNNI && 
+                MatMulInt8Int4_AVX512VNNI(a, b, values.data(), n, m, k)) {
+            } else {
+                block = 0;
+                for (; block + 3 < n; block += 4) {
+                    uint8_t *weightWalk = b;
+                    uint8_t *inputStart = a + block * m;
 
-                for (int i = 0; i < k; i++) {
-                    uint8_t *a = weightWalk + (i * m) / 2;
-                    uint8_t *b = inputStart;
+                    for (int i = 0; i < k; i++) {
+                        uint8_t *a = weightWalk + (i * m) / 2;
+                        uint8_t *b = inputStart;
 
-                    __m512i acc0 = _mm512_setzero_si512();
-                    __m512i acc1 = _mm512_setzero_si512();
-                    __m512i acc2 = _mm512_setzero_si512();
-                    __m512i acc3 = _mm512_setzero_si512();
+                        __m256i acc0 = _mm256_setzero_si256();
+                        __m256i acc1 = _mm256_setzero_si256();
+                        __m256i acc2 = _mm256_setzero_si256();
+                        __m256i acc3 = _mm256_setzero_si256();
 
-                    const __m512i lowMask = _mm512_set1_epi8(0xf);
-                    const __m512i ones = _mm512_set1_epi16(1);
-                    int j = 0, ans = 0;
-                    for (; j + 63 < m; j += 64) {
-                        __m256i orix = _mm256_loadu_si256((const __m256i *) (a + j / 2));
-                        __m512i by0 = _mm512_loadu_si512((const __m512i *) (b + j));
-                        __m512i by1 = _mm512_loadu_si512((const __m512i *) (b + m * 1 + j));
-                        __m512i by2 = _mm512_loadu_si512((const __m512i *) (b + m * 2 + j));
-                        __m512i by3 = _mm512_loadu_si512((const __m512i *) (b + m * 3 + j));
+                        const __m256i lowMask = _mm256_set1_epi8(0xf);
+                        const __m256i ones = _mm256_set1_epi16(1);
+                        int j = 0, ans = 0;
+                        for (; j + 31 < m; j += 32) {
+                            __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
+                            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+                            __m256i bx = _mm256_and_si256(lowMask, bytex);
+                            __m256i by0 = _mm256_loadu_si256((const __m256i *) (b + j));
+                            __m256i by1 = _mm256_loadu_si256((const __m256i *) (b + m * 1 + j));
+                            __m256i by2 = _mm256_loadu_si256((const __m256i *) (b + m * 2 + j));
+                            __m256i by3 = _mm256_loadu_si256((const __m256i *) (b + m * 3 + j));
 
-                        __m512i bytex = _mm512_inserti64x4(_mm512_castsi256_si512(orix), _mm256_srli_epi16(orix, 4), 1);
-                        __m512i bx = _mm512_and_si512(lowMask, bytex);
-
-                        acc0 = _mm512_dpbusd_epi32(acc0, by0, bx);
-                        acc1 = _mm512_dpbusd_epi32(acc1, by1, bx);
-                        acc2 = _mm512_dpbusd_epi32(acc2, by2, bx);
-                        acc3 = _mm512_dpbusd_epi32(acc3, by3, bx);
+                            acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(by0, bx), ones));
+                            acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(by1, bx), ones));
+                            acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(by2, bx), ones));
+                            acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(by3, bx), ones));
+                        }
+                        values[block * k + i] = I32sum(acc0);
+                        values[(block + 1) * k + i] = I32sum(acc1);
+                        values[(block + 2) * k + i] = I32sum(acc2);
+                        values[(block + 3) * k + i] = I32sum(acc3);
                     }
-
-                    values[block * k + i] = _mm512_reduce_add_epi32(acc0);
-                    values[(block + 1) * k + i] = _mm512_reduce_add_epi32(acc1);
-                    values[(block + 2) * k + i] = _mm512_reduce_add_epi32(acc2);
-                    values[(block + 3) * k + i] = _mm512_reduce_add_epi32(acc3);
                 }
-            }
 
-            for (; block + 1 < n; block += 2) {
-                uint8_t *weightWalk = b;
-                uint8_t *inputStart = a + block * m;
+                for (; block + 2 < n; block += 3) {
+                    uint8_t *weightWalk = b;
+                    uint8_t *inputStart = a + block * m;
 
-                for (int i = 0; i < k; i++) {
-                    uint8_t *a = weightWalk + (i * m) / 2;
-                    uint8_t *b = inputStart;
+                    for (int i = 0; i < k; i++) {
+                        uint8_t *a = weightWalk + (i * m) / 2;
+                        uint8_t *b = inputStart;
 
-                    __m512i acc0 = _mm512_setzero_si512();
-                    __m512i acc1 = _mm512_setzero_si512();
+                        __m256i acc0 = _mm256_setzero_si256();
+                        __m256i acc1 = _mm256_setzero_si256();
+                        __m256i acc2 = _mm256_setzero_si256();
 
-                    const __m512i lowMask = _mm512_set1_epi8(0xf);
-                    const __m512i ones = _mm512_set1_epi16(1);
-                    int j = 0, ans = 0;
-                    for (; j + 63 < m; j += 64) {
-                        __m256i orix = _mm256_loadu_si256((const __m256i *) (a + j / 2));
-                        __m512i by0 = _mm512_loadu_si512((const __m512i *) (b + j));
-                        __m512i by1 = _mm512_loadu_si512((const __m512i *) (b + m * 1 + j));
+                        const __m256i lowMask = _mm256_set1_epi8(0xf);
+                        const __m256i ones = _mm256_set1_epi16(1);
+                        int j = 0, ans = 0;
+                        for (; j + 31 < m; j += 32) {
+                            __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
+                            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+                            __m256i bx = _mm256_and_si256(lowMask, bytex);
+                            __m256i by0 = _mm256_loadu_si256((const __m256i *) (b + j));
+                            __m256i by1 = _mm256_loadu_si256((const __m256i *) (b + m * 1 + j));
+                            __m256i by2 = _mm256_loadu_si256((const __m256i *) (b + m * 2 + j));                        
 
-                        __m512i bytex = _mm512_inserti64x4(_mm512_castsi256_si512(orix), _mm256_srli_epi16(orix, 4), 1);
-                        __m512i bx = _mm512_and_si512(lowMask, bytex);
-
-                        acc0 = _mm512_dpbusd_epi32(acc0, by0, bx);
-                        acc1 = _mm512_dpbusd_epi32(acc1, by1, bx);
+                            acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(by0, bx), ones));
+                            acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(by1, bx), ones));
+                            acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(by2, bx), ones));
+                        }
+                        values[block * k + i] = I32sum(acc0);
+                        values[(block + 1) * k + i] = I32sum(acc1);
+                        values[(block + 2) * k + i] = I32sum(acc2);
                     }
-
-                    values[block * k + i] = _mm512_reduce_add_epi32(acc0);
-                    values[(block + 1) * k + i] = _mm512_reduce_add_epi32(acc1);
                 }
-            }
 
-            for (; block < n; block++) {
-                uint8_t *weightWalk = b;
-                uint8_t *inputStart = a + block * m;
+                for (; block + 1 < n; block += 2) {
+                    uint8_t *weightWalk = b;
+                    uint8_t *inputStart = a + block * m;
 
-                for (int i = 0; i < k; i++) {
-                    uint8_t *a = weightWalk + (i * m) / 2;
-                    uint8_t *b = inputStart;
+                    for (int i = 0; i < k; i++) {
+                        uint8_t *a = weightWalk + (i * m) / 2;
+                        uint8_t *b = inputStart;
 
-                    __m512i acc = _mm512_setzero_si512();
-                    const __m512i lowMask = _mm512_set1_epi8(0xf);
-                    const __m512i ones = _mm512_set1_epi16(1);
-                    int j = 0, ans = 0;
-                    for (; j + 63 < m; j += 64) {
-                        __m256i orix = _mm256_loadu_si256((const __m256i *) (a + j / 2));
-                        __m512i by = _mm512_loadu_si512((const __m512i *) (b + j));
+                        __m256i acc0 = _mm256_setzero_si256();
+                        __m256i acc1 = _mm256_setzero_si256();
 
-                        __m512i bytex = _mm512_inserti64x4(_mm512_castsi256_si512(orix), _mm256_srli_epi16(orix, 4), 1);
-                        __m512i bx = _mm512_and_si512(lowMask, bytex);
-                        acc = _mm512_dpbusd_epi32(acc, by, bx);
+                        const __m256i lowMask = _mm256_set1_epi8(0xf);
+                        const __m256i ones = _mm256_set1_epi16(1);
+                        int j = 0, ans = 0;
+                        for (; j + 31 < m; j += 32) {
+                            __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
+                            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+                            __m256i bx = _mm256_and_si256(lowMask, bytex);
+                            __m256i by0 = _mm256_loadu_si256((const __m256i *) (b + j));
+                            __m256i by1 = _mm256_loadu_si256((const __m256i *) (b + m * 1 + j));
+
+                            acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(by0, bx), ones));
+                            acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(by1, bx), ones));
+                        }
+                        values[block * k + i] = I32sum(acc0);
+                        values[(block + 1) * k + i] = I32sum(acc1);
                     }
-
-                    values[block * k + i] = _mm512_reduce_add_epi32(acc);
                 }
-            }
-*/
-            block = 0;
-            for (; block + 3 < n; block += 4) {
-                uint8_t *weightWalk = b;
-                uint8_t *inputStart = a + block * m;
 
-                for (int i = 0; i < k; i++) {
-                    uint8_t *a = weightWalk + (i * m) / 2;
-                    uint8_t *b = inputStart;
+                for (; block < n; block++) {
+                    uint8_t *weightWalk = b;
+                    uint8_t *inputStart = a + block * m;
 
-                    __m256i acc0 = _mm256_setzero_si256();
-                    __m256i acc1 = _mm256_setzero_si256();
-                    __m256i acc2 = _mm256_setzero_si256();
-                    __m256i acc3 = _mm256_setzero_si256();
+                    for (int i = 0; i < k; i++) {
+                        uint8_t *a = weightWalk + (i * m) / 2;
+                        uint8_t *b = inputStart;
 
-                    const __m256i lowMask = _mm256_set1_epi8(0xf);
-                    const __m256i ones = _mm256_set1_epi16(1);
-                    int j = 0, ans = 0;
-                    for (; j + 31 < m; j += 32) {
-                        __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
-                        __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
-                        __m256i bx = _mm256_and_si256(lowMask, bytex);
-                        __m256i by0 = _mm256_loadu_si256((const __m256i *) (b + j));
-                        __m256i by1 = _mm256_loadu_si256((const __m256i *) (b + m * 1 + j));
-                        __m256i by2 = _mm256_loadu_si256((const __m256i *) (b + m * 2 + j));
-                        __m256i by3 = _mm256_loadu_si256((const __m256i *) (b + m * 3 + j));
-
-                        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(by0, bx), ones));
-                        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(by1, bx), ones));
-                        acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(by2, bx), ones));
-                        acc3 = _mm256_add_epi32(acc3, _mm256_madd_epi16(_mm256_maddubs_epi16(by3, bx), ones));
+                        __m256i acc = _mm256_setzero_si256();
+                        const __m256i lowMask = _mm256_set1_epi8(0xf);
+                        const __m256i ones = _mm256_set1_epi16(1);
+                        int j = 0, ans = 0;
+                        for (; j + 31 < m; j += 32) {
+                            __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
+                            __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+                            __m256i bx = _mm256_and_si256(lowMask, bytex);
+                            __m256i by = _mm256_loadu_si256((const __m256i *) (b + j));
+                            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(by, bx), ones));
+                        }
+                        values[block * k + i] = I32sum(acc);
                     }
-                    values[block * k + i] = I32sum(acc0);
-                    values[(block + 1) * k + i] = I32sum(acc1);
-                    values[(block + 2) * k + i] = I32sum(acc2);
-                    values[(block + 3) * k + i] = I32sum(acc3);
-                }
-            }
-
-            for (; block + 2 < n; block += 3) {
-                uint8_t *weightWalk = b;
-                uint8_t *inputStart = a + block * m;
-
-                for (int i = 0; i < k; i++) {
-                    uint8_t *a = weightWalk + (i * m) / 2;
-                    uint8_t *b = inputStart;
-
-                    __m256i acc0 = _mm256_setzero_si256();
-                    __m256i acc1 = _mm256_setzero_si256();
-                    __m256i acc2 = _mm256_setzero_si256();
-
-                    const __m256i lowMask = _mm256_set1_epi8(0xf);
-                    const __m256i ones = _mm256_set1_epi16(1);
-                    int j = 0, ans = 0;
-                    for (; j + 31 < m; j += 32) {
-                        __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
-                        __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
-                        __m256i bx = _mm256_and_si256(lowMask, bytex);
-                        __m256i by0 = _mm256_loadu_si256((const __m256i *) (b + j));
-                        __m256i by1 = _mm256_loadu_si256((const __m256i *) (b + m * 1 + j));
-                        __m256i by2 = _mm256_loadu_si256((const __m256i *) (b + m * 2 + j));                        
-
-                        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(by0, bx), ones));
-                        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(by1, bx), ones));
-                        acc2 = _mm256_add_epi32(acc2, _mm256_madd_epi16(_mm256_maddubs_epi16(by2, bx), ones));
-                    }
-                    values[block * k + i] = I32sum(acc0);
-                    values[(block + 1) * k + i] = I32sum(acc1);
-                    values[(block + 2) * k + i] = I32sum(acc2);
-                }
-            }
-
-            for (; block + 1 < n; block += 2) {
-                uint8_t *weightWalk = b;
-                uint8_t *inputStart = a + block * m;
-
-                for (int i = 0; i < k; i++) {
-                    uint8_t *a = weightWalk + (i * m) / 2;
-                    uint8_t *b = inputStart;
-
-                    __m256i acc0 = _mm256_setzero_si256();
-                    __m256i acc1 = _mm256_setzero_si256();
-
-                    const __m256i lowMask = _mm256_set1_epi8(0xf);
-                    const __m256i ones = _mm256_set1_epi16(1);
-                    int j = 0, ans = 0;
-                    for (; j + 31 < m; j += 32) {
-                        __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
-                        __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
-                        __m256i bx = _mm256_and_si256(lowMask, bytex);
-                        __m256i by0 = _mm256_loadu_si256((const __m256i *) (b + j));
-                        __m256i by1 = _mm256_loadu_si256((const __m256i *) (b + m * 1 + j));
-
-                        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(_mm256_maddubs_epi16(by0, bx), ones));
-                        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(_mm256_maddubs_epi16(by1, bx), ones));
-                    }
-                    values[block * k + i] = I32sum(acc0);
-                    values[(block + 1) * k + i] = I32sum(acc1);
-                }
-            }
-
-            for (; block < n; block++) {
-                uint8_t *weightWalk = b;
-                uint8_t *inputStart = a + block * m;
-
-                for (int i = 0; i < k; i++) {
-                    uint8_t *a = weightWalk + (i * m) / 2;
-                    uint8_t *b = inputStart;
-
-                    __m256i acc = _mm256_setzero_si256();
-                    const __m256i lowMask = _mm256_set1_epi8(0xf);
-                    const __m256i ones = _mm256_set1_epi16(1);
-                    int j = 0, ans = 0;
-                    for (; j + 31 < m; j += 32) {
-                        __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
-                        __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
-                        __m256i bx = _mm256_and_si256(lowMask, bytex);
-                        __m256i by = _mm256_loadu_si256((const __m256i *) (b + j));
-                        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(by, bx), ones));
-                    }
-                    values[block * k + i] = I32sum(acc);
                 }
             }
 
