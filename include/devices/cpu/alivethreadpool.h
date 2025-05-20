@@ -49,6 +49,7 @@ namespace fastllm {
         }
 
         void operator()() {
+            int cnt = 0;
             auto lastRunTime = std::chrono::system_clock::now();
             while (true) {
                 barrier();
@@ -59,10 +60,13 @@ namespace fastllm {
                     lastRunTime = std::chrono::system_clock::now();
                 }
 
-                auto duration = std::chrono::duration_cast<std::chrono::microseconds> (std::chrono::system_clock::now() - lastRunTime);
-                double gap = double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
-                if (gap > 3) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(2));
+                cnt = (cnt + 1) & ((1 << 16) - 1);
+                if (cnt == 0) {
+                    auto duration = std::chrono::duration_cast<std::chrono::microseconds> (std::chrono::system_clock::now() - lastRunTime);
+                    double gap = double(duration.count()) * std::chrono::microseconds::period::num / std::chrono::microseconds::period::den;
+                    if (gap > 3) {
+                        std::this_thread::sleep_for(std::chrono::microseconds(2));
+                    }
                 }
             }
         }
@@ -192,6 +196,53 @@ namespace fastllm {
             int end = (i == threadNum - 1 ? n : cur + per + (cur + per * (threadNum - i) < n));
             ops.push_back(new MultiThreadMemcpyMultiLinesOp(
                 tasks.data(), cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
+    struct MultiThreadMoeReduceOp : MultiThreadBaseOp {
+        std::vector <std::pair <int, float> > *task;
+        std::vector <float> *tempResult;
+        float *curOutput; 
+        int dim, st, end;
+
+        MultiThreadMoeReduceOp (std::vector <std::pair <int, float> > *task, 
+                                std::vector <float> *tempResult,
+                                float *curOutput, 
+                                int dim, int st, int end) : 
+            task(task), tempResult(tempResult), curOutput(curOutput), dim(dim), st(st), end(end) {}
+
+        void Run() {
+            for (int i = st; i < end; i++) {
+                float value = (*task)[i].second;
+                float *lastResult = tempResult->data() + (*task)[i].first * dim;
+                float *curResult = curOutput + i * dim;
+                for (int j = 0; j < dim; j++) {
+                    lastResult[j] += value * curResult[j];
+                }
+            }   
+        }
+    };
+
+    static void RunMultiThreadMoeReduce(std::vector <std::pair <int, float> > *task, 
+                                        std::vector <float> *tempResult, float *curOutput, int dim, AliveThreadPool *pool) {
+        int threadNum = pool->threads.size();
+        threadNum = std::min(threadNum, 8);
+
+        int n = task->size();
+        int per = n / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadMoeReduceOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? n : cur + per + (cur + per * (threadNum - i) < n));
+            ops.push_back(new MultiThreadMoeReduceOp(task, tempResult, curOutput, dim, cur, end));
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {

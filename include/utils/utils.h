@@ -47,6 +47,22 @@
 #endif
 #endif
 
+// Intrinsics for CPUID
+#if defined(_MSC_VER)
+    #include <intrin.h> // For __cpuid, __cpuidex, _xgetbv
+#elif defined(__GNUC__) || defined(__clang__)
+    #include <cpuid.h> // For __get_cpuid, __get_cpuid_count
+    #include <x86intrin.h> // For _xgetbv (usually included by cpuid.h or available)
+    // GCC/Clang might not have _xgetbv as an intrinsic like MSVC,
+    // or it might be in a different header.
+    // If _xgetbv is not found, you might need to implement it with inline assembly.
+    #ifndef _XCR_XFEATURE_ENABLED_MASK // Often defined with _xgetbv
+    #define _XCR_XFEATURE_ENABLED_MASK 0
+    #endif
+#else
+    #warning "CPUID detection not implemented for this compiler."
+#endif
+
 namespace fastllm {
     static bool StringEndWith(const std::string &s, const std::string &end) {
         return s.size() >= end.size() && s.substr(s.size() - end.size()) == end;
@@ -99,6 +115,74 @@ namespace fastllm {
                ((e < 113) & (e > 101)) * ((((0x007FF000 + m) >> (125 - e)) + 1) >> 1) |
                (e > 143) * 0x7FFF; // sign : normalized : denormalized : saturate
     }
+
+    struct CPUInstructInfo {
+        bool hasAVX512F = false;
+        bool hasAVX512BF16 = false;
+        bool hasAVX512VNNI = false;
+        // You could add more, e.g., hasAVX, hasAVX2
+        CPUInstructInfo() {
+            #if defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)
+            std::array<int, 4> regs; // For EAX, EBX, ECX, EDX
+            // Step 1: Check OSXSAVE bit (CPUID EAX=1, ECX bit 27)
+            // This indicates if the OS supports XGETBV to query enabled AVX features
+            bool os_supports_xsave = false;
+            #if defined(_MSC_VER)
+            __cpuid(regs.data(), 1);
+            #else // GCC/Clang
+            __get_cpuid(1, (unsigned int*)&regs[0], (unsigned int*)&regs[1], (unsigned int*)&regs[2], (unsigned int*)&regs[3]);
+            #endif
+            if (regs[2] & (1 << 27)) { // Check ECX bit 27 (OSXSAVE)
+                os_supports_xsave = true;
+            }
+            bool os_avx_enabled = false;
+            if (os_supports_xsave) {
+                // Step 2: Check if AVX states (and by extension AVX512 states) are enabled by OS
+                // XCR0 register:
+                // Bit 1 (SSE state) must be 1
+                // Bit 2 (AVX state - YMM registers) must be 1
+                // Bits 5,6,7 (AVX512 OPMASK, ZMM_Hi256, Hi16_ZMM states) must be 1 for AVX512
+                // We check for mask 0xE6 (binary 11100110) which means SSE, AVX, and AVX512 states are enabled
+                uint64_t xcr0 = _xgetbv(_XCR_XFEATURE_ENABLED_MASK); // _XCR_XFEATURE_ENABLED_MASK is typically 0
+                if ((xcr0 & 0xE6) == 0xE6) {
+                    os_avx_enabled = true;
+                }
+            }
+            if (os_avx_enabled) {
+                // CPUID with EAX=7, ECX=0 for extended features
+                #if defined(_MSC_VER)
+                __cpuidex(regs.data(), 7, 0);
+                #else // GCC/Clang
+                __get_cpuid_count(7, 0, (unsigned int*)&regs[0], (unsigned int*)&regs[1], (unsigned int*)&regs[2], (unsigned int*)&regs[3]);
+                #endif
+                // AVX512F: EAX=7, ECX=0, EBX bit 16
+                hasAVX512F = (regs[1] & (1 << 16)) != 0;
+                // AVX512VNNI: EAX=7, ECX=0, ECX bit 11
+                hasAVX512VNNI = (regs[2] & (1 << 11)) != 0;
+                // AVX512_BF16: EAX=7, ECX=1, EAX bit 5
+                // Need to make another CPUID call with ECX=1
+                #if defined(_MSC_VER)
+                __cpuidex(regs.data(), 7, 1);
+                #else // GCC/Clang
+                __get_cpuid_count(7, 1, (unsigned int*)&regs[0], (unsigned int*)&regs[1], (unsigned int*)&regs[2], (unsigned int*)&regs[3]);
+                #endif
+                hasAVX512BF16 = (regs[0] & (1 << 5)) != 0;
+                // Important: If a feature (like AVX512_BF16) depends on another (like AVX512F),
+                // you might want to ensure the base feature is also true.
+                // e.g., hasAVX512BF16 = hasAVX512BF16 && hasAVX512F; (Though CPUID should report correctly)
+            }
+            // If os_avx_enabled is false, all 'has...' flags will remain false.
+            #endif // Compiler check
+            // Print the results
+            std::string x[2] = {"OFF", "ON"};
+            printf("CPU Instruction Info: ");
+            printf("[AVX512F: %s] ", x[hasAVX512F].c_str());
+            printf("[AVX512_VNNI: %s] ", x[hasAVX512VNNI].c_str());
+            printf("[AVX512_BF16: %s] ", x[hasAVX512BF16].c_str());
+            printf("\n");
+        }
+    };
+    // static CPUInstructInfo cpuInstructInfo;
 
     struct FP16ToFP32Manager {
         float dict[65536];
