@@ -36,4 +36,5 @@ token
 /.files
 /src/devices/hip
 /src/devices/multihip
+/test/mmlu
 *.o
