@@ -882,7 +882,14 @@ namespace fastllm {
                                           AliveThreadPool *pool) {
     }
 
+    struct MOEVarManager {
+        Data oriInput, tempInput, w1, w2, w3;
+        std::vector <float> tempResult, middleResult;
+    };
+    MOEVarManager moeVarManager;
+
     void ComputeServer::RunMOEInt() {
+// auto st = std::chrono::system_clock::now();
 // auto ttt = std::chrono::system_clock::now();
 // std::vector <std::pair <std::string, float> > record;
         int configStringLen = ((int*)this->baseAddr)[0];
@@ -916,6 +923,7 @@ namespace fastllm {
 
 // record.push_back(std::make_pair("input sum", GetSpan(ttt, std::chrono::system_clock::now())));
         if (n > 1) {
+// printf("server prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             std::vector <std::vector <fastllm::Data*> > weights;
             std::vector <std::vector <float> > v;
             weights.resize(n);
@@ -934,44 +942,30 @@ namespace fastllm {
                 }
                 idx++;
             }
-            std::vector <float> inputSums;
-            GetInputSums(inputSums, localInput, n, m, group, groupCnt, weights[0][0]->dataType);
-
+// printf("server get meta spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             int bs = n, dim = k;
             int inputDim = m;
-            std::vector <float> tempResult, middleResult;
-            tempResult.resize(bs * dim, 0.0f);
-            middleResult.resize(bs * dim, 0.0f);
             std::map <std::pair <Data*, Data*>, std::vector <std::pair <int, float> > > expertTasks; // expertTasks[x]代表专家x的task, expertTasks[x][j] = (第j个任务对应的行数， 权重)            
+// printf("server get middle spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            Data &oriInput = moeVarManager.oriInput;
+            Data &tempInput = moeVarManager.tempInput;
+            Data &w1 = moeVarManager.w1;
+            Data &w2 = moeVarManager.w2;
+            Data &w3 = moeVarManager.w3;
 
-            Data oriInput, tempInput, w1, w2, w3;
+            std::vector <float> &tempResult = moeVarManager.tempResult;
+            std::vector <float> &middleResult = moeVarManager.middleResult;
+
+            tempResult.resize(bs * dim);
+            std::fill(tempResult.begin(), tempResult.begin() + bs * dim, 0.0f);
+            middleResult.resize(bs * dim);
+            std::fill(middleResult.begin(), middleResult.begin() + bs * dim, 0.0f);
 
             oriInput.dataType = DataType::FLOAT32;
             oriInput.Resize({n, m});
             oriInput.Allocate();
-// printf("server get meta spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("server get oriInput spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             float *floatInput = (float*)oriInput.cpuData;
-#ifdef __AVX2__
-            uint8_t *temp = new uint8_t[32];
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j + 31 < m; j += 32) {
-                    // 将output的32字节块复制到temp
-                    memcpy(temp, localInput + i * m + j, 32);
-                    
-                    // 逆向排列
-                    for (int k = 0; k < 16; k++) {
-                        // 前16字节是原来的奇数索引，放回奇数位置
-                        temp[k * 2 + 1] = localInput[i * m + j + k];
-                        // 后16字节是原来的偶数索引，放回偶数位置
-                        temp[k * 2] = localInput[i * m + j + k + 16];
-                    }
-                    
-                    // 将还原后的数据复制回output
-                    memcpy(localInput + i * m + j, temp, 32);
-                }
-            }
-            delete[] temp;
-#endif
 // printf("server revert spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             for (int i = 0; i < n; i++) {
                 for (int g = 0; g < group; g++) {
@@ -1041,7 +1035,7 @@ namespace fastllm {
                     ((uint8_t *) tempResult.data()) + (i * k) * sizeof(float),
                     k * sizeof(float));
             }
-// printf("server write spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+//printf("server write spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             // if (output.dataType == DataType::FLOAT32) {
                 // memcpy(output.cpuData, tempResult.data(), output.GetBytes());
             // } else if (output.dataType == DataType::FLOAT16) {

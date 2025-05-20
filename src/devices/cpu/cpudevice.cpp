@@ -100,11 +100,16 @@ namespace fastllm {
         return true;
     }
 
+    CPUInstructInfo cpuInstructInfo;
 
 #ifdef __AVX2__
-    int DotU4U8(uint8_t *a, uint8_t *b, int n) {
-        __m256i acc = _mm256_setzero_si256();
+    extern int DotU4U8_AVX512VNNI(uint8_t *a, uint8_t *b, int n);
 
+    int DotU4U8(uint8_t *a, uint8_t *b, int n) {
+        if (cpuInstructInfo.hasAVX512VNNI) {
+            return DotU4U8_AVX512VNNI(a, b, n);
+        }
+        __m256i acc = _mm256_setzero_si256();
         int i = 0;
         int ans = 0;
         const __m256i lowMask = _mm256_set1_epi8(0xf);
@@ -121,34 +126,6 @@ namespace fastllm {
         }
 
         return ans + I32sum(acc);
-    };
-#endif
-
-#ifdef __AVX2__X
-    int DotU4U8(uint8_t *a, uint8_t *b, int n) {
-        __m512i acc = _mm512_setzero_si512();
-
-        int i = 0;
-        int ans = 0;
-        const __m512i lowMask = _mm512_set1_epi8(0xf);
-        const __m512i ones = _mm512_set1_epi16(1);
-        for (; i + 63 < n; i += 64) {
-            __m256i orix = _mm256_loadu_si256((const __m256i *) (a + i / 2));
-
-            // __m512i bytex = _mm512_set_m256i(_mm256_srli_epi16(orix, 4), orix);
-            // __m512i bytex = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_srli_epi16(orix, 4)), orix, 1);
-            __m512i bytex = _mm512_inserti64x4(_mm512_castsi256_si512(orix), _mm256_srli_epi16(orix, 4), 1);
-            __m512i bx = _mm512_and_si512(lowMask, bytex);
-
-            __m512i by = _mm512_loadu_si512((const __m512i *) (b + i));
-            // acc = _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(by, bx), ones));
-            acc = _mm512_dpbusd_epi32(acc, by, bx);
-        }
-        /*for (; i < n; i++) {
-            ans += a[i] * b[i];
-        }*/
-
-        return ans + _mm512_reduce_add_epi32(acc);
     };
 #endif
 
@@ -1312,8 +1289,11 @@ namespace fastllm {
                 }
             }
         } else {
+ // auto st = std::chrono::system_clock::now();
+ // auto veryst = std::chrono::system_clock::now();
+ // std::map <std::string, float> cnt;
             // normal
-            Data gate, attenPart, moePart, w1, w2, w3;
+            Data gate, attenPart, moePart;
             ToDataType(logits, DataType::FLOAT32);
             logits.ToDevice(DataDevice::CPU);
             float *cpuRouterLogits = (float*)logits.cpuData;
@@ -1366,14 +1346,19 @@ namespace fastllm {
                 middleResult.resize(bs * dim, 0.0f);
                 std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
                 expertTasks.resize(m + 1);
-                Data tempInput, w1, w2, w3;
-                tempInput.CopyFrom(input);
+                Data &tempInput = w2;
+                tempInput.ToDevice(input.dataDevice);
+                tempInput.Resize(input.dims);
+ // cnt["prepare 0"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                tempInput.Allocate();
+ // cnt["allocate"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                std::vector <std::pair <float, int> > v; // (value, idx)
+                v.resize(m);
                 for (int b = 0; b < bs; b++) {
                     expertTasks[0].push_back(std::make_pair(b, sharedScale));
                     float *cur = cpuRouterLogits + b * m;
-                    std::vector <std::pair <float, int> > v; // (value, idx)
                     for (int i = 0; i < m; i++) {
-                        v.push_back(std::make_pair(-cur[i], i));
+                        v[i] = (std::make_pair(-cur[i], i));
                     }
                     if (gateBias.dims.size() > 0) {
                         ToDataType(gateBias, DataType::FLOAT32);
@@ -1399,6 +1384,7 @@ namespace fastllm {
                         expertTasks[idx + 1].push_back(std::make_pair(b, value));
                     }
                 }
+ // cnt["prepare"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 for (int e = 0; e < expertTasks.size(); e++) {
                     auto &task = expertTasks[e];
                     if (task.size() == 0) {
@@ -1409,106 +1395,56 @@ namespace fastllm {
                     }
 
                     tempInput.Resize({(int)task.size(), inputDim});
+                    tempInput.Allocate();
+
                     std::vector <MultiThreadMemcpyMultiLinesTask> memcpyTasks;
                     for (int i = 0; i < (int)task.size(); i++) {
                         memcpyTasks.push_back(MultiThreadMemcpyMultiLinesTask(tempInput.cpuData + i * inputDim * input.unitSize, input.cpuData + task[i].first * inputDim * input.unitSize, inputDim * input.unitSize));
                     }
                     RunMultiThreadMemcpyMultiLines(memcpyTasks, GetAlivePool());
                     DoCpuLinearReshape(tempInput, *weights[e * 2], w3);
+// cnt["linear 0 prepare"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                     DoCpuLinear(tempInput, *weights[e * 2], Data(), w3);
-
+// cnt["linear 0"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();                    
                     int mid = w3.dims[1] / 2;
                     w1.Resize({w3.dims[0], mid});
                     w1.dataType = w3.dataType;
                     w1.Allocate();
 
                     if (w3.dataType == DataType::FLOAT32) {
-                    SwigluMultiThread((float *) w3.cpuData, mid, mid, ((float *) w1.cpuData),
+                        SwigluMultiThread((float *) w3.cpuData, mid, mid, ((float *) w1.cpuData),
                                     w3.dims[0], w3.dims[1], mid, GetAlivePool());
                     } else {
                         SwigluMultiThreadFloat16((uint16_t *) w3.cpuData, mid, mid, ((uint16_t *) w1.cpuData),
                                     w3.dims[0], w3.dims[1], mid, GetAlivePool());
                     }
-                    DoCpuLinearReshape(w1, *weights[e * 2 + 1], w2);
-                    DoCpuLinear(w1, *weights[e * 2 + 1], Data(), w2);
-
+ // cnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                    DoCpuLinearReshape(w1, *weights[e * 2 + 1], w3);
+ // cnt["linear 1 prepare"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                    DoCpuLinear(w1, *weights[e * 2 + 1], Data(), w3);
+ // cnt["linear 1"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();                    
                     float *curOutput;
-                    if (w2.dataType == DataType::FLOAT32) {
-                        curOutput = (float*)w2.cpuData;
-                    } else if (w2.dataType == DataType::FLOAT16) {
-                        Float16ToFloat32((uint16_t*)w2.cpuData, middleResult.data(), w2.Count(0));
+                    if (w3.dataType == DataType::FLOAT32) {
+                        curOutput = (float*)w3.cpuData;
+                    } else if (w3.dataType == DataType::FLOAT16) {
+                        Float16ToFloat32((uint16_t*)w3.cpuData, middleResult.data(), w3.Count(0));
                         curOutput = middleResult.data();
                     }
 
-                    for (int i = 0; i < (int)task.size(); i++) {
-                        float value = task[i].second;
-                        float *lastResult = tempResult.data() + task[i].first * dim;
-                        float *curResult = curOutput + i * dim;
-                        for (int j = 0; j < dim; j++) {
-                            lastResult[j] += value * curResult[j];
-                        }
-                    }
+                    RunMultiThreadMoeReduce(&task, &tempResult, curOutput, dim, GetAlivePool());
+ // cnt["reduce"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 }
                 if (output.dataType == DataType::FLOAT32) {
                     memcpy(output.cpuData, tempResult.data(), output.GetBytes());
                 } else if (output.dataType == DataType::FLOAT16) {
                     Float32ToFloat16(tempResult.data(), (uint16_t*)output.cpuData, output.Count(0));
                 }
-/*
-                Data moeFinal = Data();
-                ToDataType(moeFinal, input.dataType);
-                moeFinal.Resize({0, input.dims[1]});
-                moeFinal.Expansion(input.dims);
-                for (int b = 0; b < input.dims[0]; b++) {
-                    Data *currentData = &input;
-                    Split(input, 0, b, b + 1, attenPart);
-                    currentData = &attenPart;
-                    moePart.Resize(currentData->dims);
-                    moePart.Allocate(0.0f);
-                    ToDataType(moePart, input.dataType);
-
-                    float *cur = cpuRouterLogits + b * m;
-                    std::vector <std::pair <float, int> > v; // (value, idx)
-                    for (int i = 0; i < m; i++) {
-                        v.push_back(std::make_pair(-cur[i], i));
-                    }
-                    if (gateBias.dims.size() > 0) {
-                        ToDataType(gateBias, DataType::FLOAT32);
-                        gateBias.ToDevice(DataDevice::CPU);
-                        float *cpuBias = (float*)gateBias.cpuData;
-                        for (int i = 0; i < m; i++) {
-                            v[i].first -= cpuBias[i];
-                        }
-                    }
-                    sort(v.begin(), v.end());
-                    float sum = 1.0;
-                    if (needNorm) {
-                        sum = 0.0;
-                        for (int j = 0; j < topk; j++) {
-                            sum += cur[v[j].second];
-                        }
-                    }
-                    
-                    for (int j = 0; j < topk; j++) {
-                        int idx = v[j].second;
-                        float value = cur[idx] / sum * routeScale;
-
-                        Linear(*currentData, *weights[(idx + 1) * 2], Data(), w3);
-                        Swiglu(w3, w1);
-                        Linear(w1, *weights[(idx + 1) * 2 + 1], Data(), w2);
-                        AddTo(moePart, w2, value);
-                    }
-                    
-                    Linear(*currentData, *weights[0], Data(), w3);
-                    Swiglu(w3, w1);
-                    Linear(w1, *weights[1], Data(), w2);
-                    AddTo(moePart, w2, sharedScale);
-
-                    CatDirect(moeFinal, moePart, 0);
-                }
-                memcpy(output.cpuData, moeFinal.cpuData, output.GetBytes());
-*/
+ // cnt["output memcpy"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
             }
+ // printf("moe spend %f s.\n", GetSpan(veryst, std::chrono::system_clock::now()));
+ // for (auto &it : cnt) {
+    // printf("%s spend %f s.\n", it.first.c_str(), it.second);
+ // }
         }
     }
 
@@ -2639,6 +2575,21 @@ namespace fastllm {
 
 #ifdef __AVX2__
     void Avx2InputPermute(uint8_t* output, int n, int m) {
+        if (cpuInstructInfo.hasAVX512VNNI) {
+            uint8_t *temp = new uint8_t[64];
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j + 63 < m; j += 64) {
+                    memcpy(temp, output + i * m + j, 64);
+                    for (int k = 0; k < 32; k++) {
+                        output[i * m + j + k] = temp[k * 2 + 1];
+                        output[i * m + j + k + 32] = temp[k * 2];
+                    }
+                }
+            }
+            delete[] temp;
+            return;
+        }
+        
         /*uint8_t *temp = new uint8_t[32];
         for (int i = 0; i < n; i++) {
             for (int j = 0; j + 31 < m; j += 32) {
@@ -2717,19 +2668,6 @@ namespace fastllm {
             // for INT8 * INT4
 #ifdef __AVX2__
             Avx2InputPermute(output, n, m);
-#endif
-#ifdef __AVX2__X
-            uint8_t *temp = new uint8_t[64];
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j + 63 < m; j += 64) {
-                    memcpy(temp, output + i * m + j, 64);
-                    for (int k = 0; k < 32; k++) {
-                        output[i * m + j + k] = temp[k * 2 + 1];
-                        output[i * m + j + k + 32] = temp[k * 2];
-                    }
-                }
-            }
-            delete[] temp;
 #endif
         }
 

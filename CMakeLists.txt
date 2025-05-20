@@ -82,6 +82,12 @@ set_source_files_properties(
     COMPILE_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f -mavx512bf16"
 )
 
+set_source_files_properties(
+    "src/devices/cpu/avx512vnni.cpp"
+    PROPERTIES
+    COMPILE_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f -mavx512vnni"
+)
+
 include_directories(include)
 include_directories(include/utils)
 include_directories(include/models)
