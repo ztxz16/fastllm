@@ -25,8 +25,6 @@ void FastllmMultiCudaSetDeviceRatio(std::map <int, int> &deviceRatio);
 bool FastllmMultiCudaHalfMatMul(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmMultiCudaMatMul(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 
-bool FastllmMultiCudaMLP(const fastllm::Data &input, fastllm::Data &weight0, fastllm::Data &weight1, fastllm::Data &output);
-
 #ifdef  __cplusplus
 }
 #endif
