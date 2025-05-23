@@ -188,19 +188,6 @@ namespace fastllm {
     }
 
     void MultiCudaMLPOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-        if (false) {
-            Data &input = *(datas.find("input")->second);
-            Data &output = *(datas.find("output")->second);
-            Data &weight0 = *(datas.find("weight0")->second);
-            Data &bias0 = *(datas.find("bias0")->second);
-            Data &weight1 = *(datas.find("weight1")->second);
-            Data &bias1 = *(datas.find("bias1")->second);
-
-            output.Allocate();
-            FastllmMultiCudaMLP(input, weight0, weight1, output);
-            return;
-        }
-
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &weight0 = *(datas.find("weight0")->second);
@@ -304,18 +291,6 @@ namespace fastllm {
         FastllmReduce((uint8_t*)output.cudaData, partOutput, output.Count(0), devices.size(), output.dataType);
         FastllmCudaFree(partOutput);
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-
-/*
-        Data &input = *(datas.find("input")->second);
-        Data &output = *(datas.find("output")->second);
-        Data &weight0 = *(datas.find("weight0")->second);
-        Data &bias0 = *(datas.find("bias0")->second);
-        Data &weight1 = *(datas.find("weight1")->second);
-        Data &bias1 = *(datas.find("bias1")->second);
-
-        output.Allocate();
-        FastllmMultiCudaMLP(input, weight0, weight1, output);
-*/
     }
 
     struct MultiCudaDoLinearOp : MultiThreadBaseOp {
