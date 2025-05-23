@@ -767,26 +767,33 @@ namespace fastllm {
         FastllmCudaRelu(input, output);
     }
 
-    void CudaSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
-                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data &input = *(datas.find("input")->second);
-        Data &output = *(datas.find("output")->second);
-
+    void DoCudaSwigluReshape(Data &input, Data &output) {
         std::vector <int> dims = input.dims;
         dims[dims.size() - 1] /= 2;
         output.dataType = input.dataType;
         output.Resize(dims);
     }
 
+    void CudaSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        DoCudaSwigluReshape(input, output);
+    }
+
+    void DoCudaSwiglu(Data &input, Data &output) {
+        output.Allocate();
+        FastllmCudaSwiglu(input, output);
+    }
+
     void CudaSwigluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        output.Allocate();
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16, 
                         "Swiglu error: Data's type should be float32 or float16.\n");
-        FastllmCudaSwiglu(input, output);
+        DoCudaSwiglu(input, output);
     }
 
     void CudaSiluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
