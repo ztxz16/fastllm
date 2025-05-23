@@ -602,7 +602,8 @@ namespace fastllm {
 
     bool CanRunMLP();
 
-    void MLP(Data &input, Data &weight0, const Data &bias0, Data &weight1, const Data &bias1, Data &output); // mlp
+    void MLP(Data &input, Data &weight0, const Data &bias0, Data &weight1, const Data &bias1, 
+            Data &w1, Data &w2, Data &w3, Data &output); // mlp
 
     void LinearEx(Data &input, Data &weight, const Data &bias, Data &output,
                     LinearExType exType); // 扩展Linear，可以接后续操作
