@@ -12,6 +12,8 @@ namespace fastllm {
     void DoCudaAttention(Data &q, Data &k, Data &v, Data &mask, Data &output, int group, float scale, int maskType);
     void DoCudaLinearReshape(Data &input, Data &weight, Data &output);
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output);
+    void DoCudaSwigluReshape(Data &input, Data &output);
+    void DoCudaSwiglu(Data &input, Data &output);
     void DoCudaSplitReshape(Data &input, int axis, int start, int end, Data &output);
     void DoCudaSplit(Data &input, int axis, int start, int end, Data &output);
     void DoCudaCatDirect(Data &input0, Data &input1, int axis);

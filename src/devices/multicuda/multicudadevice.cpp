@@ -18,7 +18,7 @@ namespace fastllm {
 
         this->ops["MLP"] = (BaseOperator*)(new MultiCudaMLPOp());
         this->ops["Linear"] = (BaseOperator*)(new MultiCudaLinearOp());
-        // this->ops["MergeMOE"] = (BaseOperator*)(new MultiCudaMergeMOE());
+        this->ops["MergeMOE"] = (BaseOperator*)(new MultiCudaMergeMOE());
         // this->ops["MergeAttention"] = (BaseOperator*)(new MultiCudaMergeAttention());
     }
 
@@ -72,6 +72,54 @@ namespace fastllm {
         }
     }
 
+    struct MultiCudaDoMergeMLPOp : MultiThreadBaseOp {
+        uint8_t *oriCudaInput, *oriCpuInput, *partOutput;
+        Data *input, *weight0, *bias0, *weight1, *bias1;
+        Data *w1, *w2, *w3;
+        Data *output;
+        int deviceId;
+
+        MultiCudaDoMergeMLPOp(uint8_t *oriCudaInput, uint8_t *oriCpuInput, uint8_t *partOutput,
+                            Data *input, Data *weight0, Data *bias0, Data *weight1, Data *bias1, 
+                            Data *w1, Data *w2, Data *w3,
+                            Data *output, int deviceId) : 
+                oriCudaInput(oriCudaInput), oriCpuInput(oriCpuInput), partOutput(partOutput),
+                input(input), weight0(weight0), bias0(bias0), weight1(weight1), bias1(bias1), 
+                w1(w1), w2(w2), w3(w3), 
+                output(output), deviceId(deviceId) {}
+
+        void Run() {
+            FastllmCudaSetDevice(deviceId);
+            if (deviceId == 0) {
+                input->cudaData = oriCudaInput;
+            } else {
+                input->Allocate();
+                FastllmCudaCopyFromHostToDevice(input->cudaData, oriCpuInput, input->GetBytes());
+            }
+
+            int bsz = input->dims[0], seqlen = input->dims[1];            
+
+            DoCudaLinearReshape(*input, *weight0, *w3);
+            DoCudaLinear(*input, *weight0, bias0 == nullptr ? Data() : *bias0, *w3);
+
+            DoCudaSwigluReshape(*w3, *w1);
+            DoCudaSwiglu(*w3, *w1);
+
+            DoCudaLinearReshape(*w1, *weight1, *output);
+            if (deviceId == 0) {
+                output->isFake = true;
+                output->UpdateUnitSize();
+                output->cudaData = partOutput;
+                output->expansionSize = output->Count(0);
+                output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
+            }
+            DoCudaLinear(*w1, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
+            if (deviceId != 0) {
+                FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
+            }
+        }
+    };
+
     void MultiCudaMLPOp::Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
@@ -100,9 +148,125 @@ namespace fastllm {
         Data &weight1 = *(datas.find("weight1")->second);
         Data &bias1 = *(datas.find("bias1")->second);
 
+        Data &w1 = *(datas.find("w1")->second);
+        Data &w2 = *(datas.find("w2")->second);
+        Data &w3 = *(datas.find("w3")->second);
+
+        output.Allocate();
+// auto st = std::chrono::system_clock::now();
+        int mid = weight0.dims[0] / 2;
+        int unit = weight0.groupCnt <= 0 ? 1 : weight0.groupCnt;
+        if (weight0.dataType == fastllm::DataType::FP8_E4M3) {
+            unit = weight0.blockM;
+        }
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, mid, unit);
+
+        DivisionScheme divisionScheme, divisionSchemeO;
+        for (int i = 0; i < devices.size(); i++) {
+            int st = points[i], end = points[i + 1];
+            int deviceId = devices[i];
+
+            divisionScheme[deviceId].push_back(std::make_pair(st, end));
+            divisionScheme[deviceId].push_back(std::make_pair(mid + st, mid + end));
+
+            divisionSchemeO[deviceId].push_back(std::make_pair(st, end));
+        }
+        SplitMultiCudaWeight(weight0, bias0, devices, divisionScheme, 0);
+        SplitMultiCudaWeight(weight1, bias1, devices, divisionSchemeO, 1);
+        CopyToMultiDevices(w1, devices, false);
+        CopyToMultiDevices(w2, devices, false);
+        CopyToMultiDevices(w3, devices, false);
+        
+        Data curOutput;
+        CopyToMultiDevices(input, devices, false);
+        curOutput.dataDevice = input.dataDevice;
+        CopyToMultiDevices(curOutput, devices, false);
+        std::vector <uint8_t> cpuInput;
+        cpuInput.resize(input.GetBytes());
+        FastllmCudaSetDevice(0);
+        FastllmCudaCopyFromDeviceToHost(cpuInput.data(), input.cudaData, input.GetBytes());
+        uint8_t *partOutput = (uint8_t*)FastllmCudaMalloc(output.GetBytes() * devices.size());
+        auto *pool = fastllm::GetAlivePool();
+        std::vector<fastllm::MultiThreadBaseOp*> ops;
+        for (int i = 0; i < devices.size(); i++) {
+            auto device = devices[i];
+            ops.push_back(new MultiCudaDoMergeMLPOp (
+                (uint8_t*)input.cudaData, (uint8_t*)cpuInput.data(), partOutput + output.GetBytes() * i,
+                input.multiDeviceDatas[device], 
+                weight0.multiDeviceDatas[device], bias0.multiDeviceDatas[device], 
+                weight1.multiDeviceDatas[device], bias1.multiDeviceDatas[device], 
+                w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device],
+                curOutput.multiDeviceDatas[device], device));
+        }
+        for (int i = 0; i < devices.size(); i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        // ops[0]->Run();
+        for (int i = 0; i < devices.size(); i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+// printf("calc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+        FastllmReduce((uint8_t*)output.cudaData, partOutput, output.Count(0), devices.size(), output.dataType);
+        FastllmCudaFree(partOutput);
+// printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+
+/*
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight0 = *(datas.find("weight0")->second);
+        Data &bias0 = *(datas.find("bias0")->second);
+        Data &weight1 = *(datas.find("weight1")->second);
+        Data &bias1 = *(datas.find("bias1")->second);
+
         output.Allocate();
         FastllmMultiCudaMLP(input, weight0, weight1, output);
+*/
     }
+
+    struct MultiCudaDoLinearOp : MultiThreadBaseOp {
+        uint8_t *oriCudaInput, *oriCpuInput;
+        Data *input, *weight, *bias;
+        Data *output;
+        int n, m, k, start, len;
+        uint8_t *lastOutput;
+        int deviceId;
+
+        MultiCudaDoLinearOp(uint8_t *oriCudaInput, uint8_t *oriCpuInput,
+                            Data *input, Data *weight, Data *bias, Data *output, 
+                            int n, int m, int k, int start, int len, uint8_t *lastOutput, int deviceId) : 
+                oriCudaInput(oriCudaInput), oriCpuInput(oriCpuInput),
+                input(input), weight(weight), bias(bias),
+                output(output), 
+                n(n), m(m), k(k), start(start), len(len), lastOutput(lastOutput),
+                deviceId(deviceId) {}
+
+        void Run() {
+            FastllmCudaSetDevice(deviceId);
+            if (deviceId == 0) {
+                input->cudaData = oriCudaInput;
+            } else {
+                input->Allocate();
+                FastllmCudaCopyFromHostToDevice(input->cudaData, oriCpuInput, input->GetBytes());
+            }
+            DoCudaLinearReshape(*input, *weight, *output);
+            if (deviceId == 0 && n == 1) {
+                output->isFake = true;
+                output->UpdateUnitSize();
+                output->cudaData = lastOutput;
+                output->expansionSize = output->Count(0);
+                output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
+            }
+            DoCudaLinear(*input, *weight, bias == nullptr ? Data() : *bias, *output);
+            if (deviceId != 0 || n > 1) {
+                FastllmCudaMemcpy2DDeviceToDeviceAuto(lastOutput + start * output->unitSize, k * output->unitSize, output->cudaData, 
+                    len * output->unitSize, len * output->unitSize, n, 0, deviceId);
+            }
+        }
+    };
 
     bool MultiCudaLinearOp::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
         if (intParams.find("exType") != intParams.end()) {
@@ -113,41 +277,60 @@ namespace fastllm {
     }
 
     void MultiCudaLinearOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-// auto st = std::chrono::system_clock::now();
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
         Data &bias = *(datas.find("bias")->second);
 
         output.Allocate();
+// auto st = std::chrono::system_clock::now();
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
 
-        if (input.dataType == DataType::FLOAT16) {
-            if (weight.dataType == DataType::FLOAT16 ||
-                weight.dataType == DataType::INT8 ||
-                weight.dataType == DataType::INT4_NOZERO ||
-                weight.dataType == DataType::INT4_GROUP) {
-                FastllmMultiCudaMatMul(input, weight, bias, output, n, m, k);
-            } else {
-                ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
-            }
-        } else if (input.dataType == DataType::FLOAT32) {
-            if (weight.dataType == DataType::FLOAT32) {
-                FastllmCudaMatMulFloat32(input, weight, bias, output, n, m, k);
-            } else if (weight.dataType == DataType::FLOAT16 ||
-                        weight.dataType == DataType::INT8 ||
-                        weight.dataType == DataType::INT4_NOZERO ||
-                        weight.dataType == DataType::INT4_GROUP) {
-                FastllmMultiCudaMatMul(input, weight, bias, output, n, m, k);
-            } else if (weight.dataType == DataType::INT4) {
-                FastllmCudaMatMulFloatInt4(input, weight, bias, output, n, m, k);
-            } else {
-                ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
-            }
-        } else {
-            ErrorInFastLLM("Linear error: unsupport input's dataType.\n");
+        int unit = weight.groupCnt <= 0 ? 1 : weight.groupCnt;
+        if (weight.dataType == fastllm::DataType::FP8_E4M3) {
+            unit = weight.blockM;
+        }
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, weight.dims[0], unit);
+
+        DivisionScheme divisionScheme;
+        for (int i = 0; i < devices.size(); i++) {
+            int st = points[i], end = points[i + 1];
+            int deviceId = devices[i];
+            divisionScheme[deviceId].push_back(std::make_pair(st, end));
+        }
+        SplitMultiCudaWeight(weight, bias, devices, divisionScheme, 0);
+        Data curOutput;
+        CopyToMultiDevices(input, devices, false);
+        curOutput.dataDevice = input.dataDevice;
+        CopyToMultiDevices(curOutput, devices, false);
+        std::vector <uint8_t> cpuInput;
+        cpuInput.resize(input.GetBytes());
+        FastllmCudaSetDevice(0);
+        FastllmCudaCopyFromDeviceToHost(cpuInput.data(), input.cudaData, input.GetBytes());
+        auto *pool = fastllm::GetAlivePool();
+        std::vector<fastllm::MultiThreadBaseOp*> ops;
+        for (int i = 0; i < devices.size(); i++) {
+            auto device = devices[i];
+            int start = points[i], len = points[i + 1] - points[i];
+            ops.push_back(new MultiCudaDoLinearOp (
+                (uint8_t*)input.cudaData, (uint8_t*)cpuInput.data(),
+                input.multiDeviceDatas[device], 
+                weight.multiDeviceDatas[device], bias.multiDeviceDatas[device], 
+                curOutput.multiDeviceDatas[device], 
+                n, m, k, start, len, (uint8_t*)output.cudaData, device));
+        }
+        for (int i = 0; i < devices.size(); i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        // ops[0]->Run();
+        for (int i = 0; i < devices.size(); i++) {
+            pool->Wait(i);
+            delete ops[i];
         }
 // float spend = GetSpan(st, std::chrono::system_clock::now());
 // float gops = (float)n * m * k / spend / 1e9;
@@ -203,7 +386,7 @@ namespace fastllm {
             int bsz = input->dims[0], seqlen = input->dims[1];
 
             DoCudaLinearReshape(*input, *weight0, *qkv);
-            DoCudaLinear(*input, *weight0, *bias0, *qkv);
+            DoCudaLinear(*input, *weight0, bias0 == nullptr ? Data() : *bias0, *qkv);
             int per = qkv->dims.back() / (qNum / kvNum + 2);
             int qdim = per * (qNum / kvNum);
             DoCudaSplitReshape(*qkv, -1, 0, qdim, *q);
@@ -265,12 +448,13 @@ namespace fastllm {
             DoCudaLinearReshape(*qkv, *weight1, *output);
 
             if (deviceId == 0) {
+                output->isFake = true;
                 output->UpdateUnitSize();
                 output->cudaData = partOutput;
                 output->expansionSize = output->Count(0);
                 output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
             }
-            DoCudaLinear(*qkv, *weight1, *bias1, *output);
+            DoCudaLinear(*qkv, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
             if (deviceId != 0) {
                 FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
             }
@@ -321,10 +505,10 @@ namespace fastllm {
         }
         SplitMultiCudaWeight(weight0, bias0, devices, divisionScheme, 0);
         SplitMultiCudaWeight(weight1, bias1, devices, divisionSchemeO, 1);
-        CopyToMultiDevices(qkv, devices, true);
-        CopyToMultiDevices(q, devices, true);
-        CopyToMultiDevices(k, devices, true);
-        CopyToMultiDevices(v, devices, true);
+        CopyToMultiDevices(qkv, devices, false);
+        CopyToMultiDevices(q, devices, false);
+        CopyToMultiDevices(k, devices, false);
+        CopyToMultiDevices(v, devices, false);
         CopyToMultiDevices(positionIds, devices, true);
         CopyToMultiDevices(sinData, devices, true);
         CopyToMultiDevices(cosData, devices, true);
@@ -373,6 +557,7 @@ namespace fastllm {
         }
 // printf("calc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         FastllmReduce((uint8_t*)output.cudaData, partOutput, output.Count(0), devices.size(), output.dataType);
+        FastllmCudaFree(partOutput);
 // printf("FastllmReduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         keys[0]->dims = keys[0]->multiDeviceDatas[devices[0]]->dims;
         keys[0]->expansionDims = keys[0]->multiDeviceDatas[devices[0]]->expansionDims;
@@ -412,6 +597,7 @@ namespace fastllm {
                 FastllmCudaCopyFromHostToDevice(input->cudaData, oriCpuInput, input->GetBytes());
             }            
             if (deviceId == 0) {
+                output->isFake = true;
                 output->UpdateUnitSize();
                 output->cudaData = partOutput;
                 output->expansionSize = output->Count(0);
@@ -624,5 +810,6 @@ namespace fastllm {
             delete ops[i];
         }
         FastllmReduce((uint8_t*)output.cudaData, partOutput, output.Count(0), devices.size(), output.dataType);
+        FastllmCudaFree(partOutput);
     }
 }
