@@ -321,7 +321,7 @@ namespace fastllm {
             std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
             if (weight.weight.find(swigluWeightName) != weight.weight.end() && CanRunMLP()) {
                 std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
-                MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), k);
+                MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), w1, w2, w3, k);
                 AddTo(hiddenStates, k);
             } else {
                 if (weight.weight.find(swigluWeightName) != weight.weight.end()) {
@@ -709,7 +709,7 @@ namespace fastllm {
             std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
             if (weight.weight.find(swigluWeightName) != weight.weight.end() && CanRunMLP()) {
                 std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
-                MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), k);
+                MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), w1, w2, w3, k);
                 AddTo(hiddenStates, k);
             } else {
                 if (weight.weight.find(swigluWeightName) != weight.weight.end()) {

@@ -2792,7 +2792,7 @@ bool FastllmCudaMatMulFloatInt8(const fastllm::Data &input, fastllm::Data &weigh
         state = cudaMalloc(&cudaZeropoints, k);
         uint8_t *zeropoints = new uint8_t[k];
         for (int i = 0; i < k; i++) {
-            zeropoints[i] = weight.perChannelsConfigs[i].zeroPoint;
+            zeropoints[i] = weight.zeros[i];
         }
         state = cudaMemcpy(cudaZeropoints, zeropoints, k, cudaMemcpyHostToDevice);
         delete[] zeropoints;
@@ -3294,9 +3294,8 @@ bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data
             throw("cublas error");
             exit(0);
         }
-
         if (bias.dims.size() > 0) {
-            half *cudaBiasData = (half*)weight.extraCudaHalfData[2];
+            half *cudaBiasData = (half*)weight.extraCudaHalfData[0];
             FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
         }
 

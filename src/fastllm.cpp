@@ -3075,11 +3075,13 @@ namespace fastllm {
         }, {}, {{"exType", (int)exType}});
     }
 
-    void MLP(Data &input, Data &weight0, const Data &bias0, Data &weight1, const Data &bias1, Data &output) {
+    void MLP(Data &input, Data &weight0, const Data &bias0, Data &weight1, const Data &bias1, 
+            Data &w1, Data &w2, Data &w3, Data &output) {
         curExecutor->Run("MLP", {
                 {"input", &input}, 
                 {"weight0", &weight0}, {"bias0", (Data*)&bias0}, 
                 {"weight1", &weight1}, {"bias1", (Data*)&bias1}, 
+                {"w1", &w1}, {"w2", &w2}, {"w3", &w3},
                 {"output", &output}
         }, {}, {});
     }

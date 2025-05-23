@@ -80,6 +80,11 @@ void FastllmCudaMemcpy2D(void * 	dst, size_t 	dpitch, const void * 	src,
     cudaMemcpy2D(dst, dpitch, src, spitch, width, height, type);
 }
 
+void FastllmCudaMemcpy2DDeviceToDeviceAuto(void * 	dst, size_t 	dpitch, const void * 	src,
+    size_t 	spitch, size_t 	width, size_t 	height, int dstDeviceId, int srcDeviceId) {
+    FastllmCudaMemcpy2D(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToDevice, dstDeviceId, srcDeviceId);
+}
+
 std::map <int, std::string> specialDeviceIds = {
     {99999, "cpu"}
 };
@@ -799,6 +804,21 @@ void CopyToMultiDevices(fastllm::Data &data, std::vector <int> devices, bool cop
 
 bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias, 
                     std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme, int splitAxis) {
+    int deviceNum = multiCudaCurrentDevices.size();
+    for (int i = 0; i < deviceNum; i++) {
+        if (specialDeviceIds.find(multiCudaCurrentDevices[i]) == specialDeviceIds.end()) {
+            cudaSetDevice(multiCudaCurrentDevices[i]);
+        } 
+        for (int j = 0; j < deviceNum; j++) {
+            if (i != j) {
+                if (specialDeviceIds.find(multiCudaCurrentDevices[j]) == specialDeviceIds.end()) {
+                    cudaDeviceEnablePeerAccess(multiCudaCurrentDevices[j], 0);
+                }
+            }
+        }
+    }
+    cudaSetDevice(0);
+
     if (weight.multiDeviceData) {
         return true;
     }
@@ -880,23 +900,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
         }
     }
 
-    // 1. mins, scales
-    if (weight.mins.size() > 0) {
-        int weightGroup = weight.group < 0 ? 1 : weight.group;
-        std::vector <uint8_t> zeropoints = std::vector <uint8_t> (k * weightGroup, 0);
-        if (weight.perChannelsConfigs.size() > 0) {
-            for (int i = 0; i < k * weightGroup; i++) {
-                zeropoints[i] = weight.perChannelsConfigs[i].zeroPoint;
-            }
-        } else if (weight.zeros.size() > 0) {
-            for (int i = 0; i < k * weightGroup; i++) {
-                zeropoints[i] = weight.zeros[i];
-            }
-        } else {
-            for (int i = 0; i < k * weightGroup; i++) {
-                zeropoints[i] = 0;
-            }
-        }
+    if (weight.dataType == fastllm::DataType::FP8_E4M3) {
         for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
             int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
             std::string specialId = "";
@@ -912,49 +916,107 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
             float *cudaMins;
             uint8_t *cudaZeropoints;
             auto curDevice = weight.multiDeviceDatas[deviceId];
+            curDevice->blockK = weight.blockK;
+            curDevice->blockM = weight.blockM;
+            int ks = (curDevice->dims[0] - 1) / curDevice->blockK + 1;
+            int ms = (curDevice->dims[1] - 1) / curDevice->blockM + 1;
+            curDevice->scales.resize(ks * ms);
             if (splitAxis == 0) {
-                curDevice->group = weight.group;
-                curDevice->groupCnt = weight.groupCnt;
-                curDevice->scales.resize(len * weightGroup);
-                curDevice->mins.resize(len * weightGroup);
-                if (weight.dataType == fastllm::DataType::INT4_GROUP) {
-                    int curLen = 0;
-                    for (auto &it : div) {
-                        memcpy(curDevice->scales.data() + curLen * weightGroup, weight.scales.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
-                        memcpy(curDevice->mins.data() + curLen * weightGroup, weight.mins.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
-                        curLen += (it.second - it.first);
-                    }
-                } else {
-                    curDevice->zeros.resize(len * weightGroup);
-                    int curLen = 0;
-                    for (auto &it : div) {
-                        memcpy(curDevice->scales.data() + curLen * weightGroup, weight.scales.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
-                        memcpy(curDevice->mins.data() + curLen * weightGroup, weight.mins.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
-                        memcpy(curDevice->zeros.data() + curLen * weightGroup, zeropoints.data() + it.first * weightGroup, (it.second - it.first) * weightGroup);
-                        curLen += (it.second - it.first);
-                    }
+                int curLen = 0;
+                for (auto &it : div) {
+                    memcpy(curDevice->scales.data() + curLen * ms, weight.scales.data() + it.first / curDevice->blockM * ms, 
+                        (it.second - it.first) / curDevice->blockM * ms * sizeof(float));
+                    curLen += (it.second - it.first) / curDevice->blockM;
                 }
             } else {
-                curDevice->scales.resize(k * weightGroup);
-                curDevice->mins.resize(k * weightGroup);
-                curDevice->group = weight.group;
-                curDevice->groupCnt = weight.groupCnt;
-                if (weight.dataType == fastllm::DataType::INT4_GROUP) {
-                    int base = div[0].first / weight.groupCnt;
-                    std::vector <float> scales, mins;
-                    for (int i = 0; i < weight.scales.size(); i++) {
-                        scales.push_back((i + base < weight.scales.size() ? weight.scales[i + base] : 0.0f));
+                int oriMs = weight.scales.size() / ks;
+                for (int i = 0; i < ks; i++) {
+                    int curLen = 0;
+                    for (auto &it : div) {
+                        memcpy(curDevice->scales.data() + i * ms, weight.scales.data() + i * oriMs + it.first / curDevice->blockM, 
+                            (it.second - it.first) / curDevice->blockM * sizeof(float));
+                        curLen += (it.second - it.first) / curDevice->blockM;
+                    }   
+                }
+            }
+        }
+    } else {
+        // 1. mins, scales
+        if (weight.mins.size() > 0) {
+            int weightGroup = weight.group < 0 ? 1 : weight.group;
+            std::vector <int> zeropoints = std::vector <int> (k * weightGroup, 0);
+            if (weight.perChannelsConfigs.size() > 0) {
+                for (int i = 0; i < k * weightGroup; i++) {
+                    zeropoints[i] = weight.perChannelsConfigs[i].zeroPoint;
+                }
+            } else if (weight.zeros.size() > 0) {
+                for (int i = 0; i < k * weightGroup; i++) {
+                    zeropoints[i] = weight.zeros[i];
+                }
+            } else {
+                for (int i = 0; i < k * weightGroup; i++) {
+                    zeropoints[i] = 0;
+                }
+            }
+            for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
+                int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
+                std::string specialId = "";
+                SwitchDeviceAndGetInfos(deviceId, specialId, mallocType);
+                
+                auto &div = divisionScheme[deviceId];
+                int len = 0;
+                for (auto &it : div) {
+                    len += it.second - it.first;
+                }
+
+                float *cudaScales;
+                float *cudaMins;
+                uint8_t *cudaZeropoints;
+                auto curDevice = weight.multiDeviceDatas[deviceId];
+                if (splitAxis == 0) {
+                    curDevice->group = weight.group;
+                    curDevice->groupCnt = weight.groupCnt;
+                    curDevice->scales.resize(len * weightGroup);
+                    curDevice->mins.resize(len * weightGroup);
+                    if (weight.dataType == fastllm::DataType::INT4_GROUP) {
+                        int curLen = 0;
+                        for (auto &it : div) {
+                            memcpy(curDevice->scales.data() + curLen * weightGroup, weight.scales.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
+                            memcpy(curDevice->mins.data() + curLen * weightGroup, weight.mins.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
+                            curLen += (it.second - it.first);
+                        }
+                    } else {
+                        curDevice->zeros.resize(len * weightGroup);
+                        int curLen = 0;
+                        for (auto &it : div) {
+                            memcpy(curDevice->scales.data() + curLen * weightGroup, weight.scales.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
+                            memcpy(curDevice->mins.data() + curLen * weightGroup, weight.mins.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(float));
+                            memcpy(curDevice->zeros.data() + curLen * weightGroup, zeropoints.data() + it.first * weightGroup, (it.second - it.first) * weightGroup * sizeof(int));
+                            curLen += (it.second - it.first);
+                        }
                     }
-                    for (int i = 0; i < weight.mins.size(); i++) {
-                        mins.push_back((i + base < weight.mins.size() ? weight.mins[i + base] : 0.0f));
-                    }
-                    memcpy(curDevice->scales.data(), scales.data(), k * weightGroup * sizeof(float));
-                    memcpy(curDevice->mins.data(), mins.data(), k * weightGroup * sizeof(float));
                 } else {
-                    curDevice->zeros.resize(k * weightGroup);
-                    memcpy(curDevice->scales.data(), weight.scales.data(), k * weightGroup * sizeof(float));
-                    memcpy(curDevice->mins.data(), weight.mins.data(), k * weightGroup * sizeof(float));
-                    memcpy(curDevice->zeros.data(), zeropoints.data(), k * weightGroup);
+                    curDevice->scales.resize(k * weightGroup);
+                    curDevice->mins.resize(k * weightGroup);
+                    curDevice->group = weight.group;
+                    curDevice->groupCnt = weight.groupCnt;
+                    if (weight.dataType == fastllm::DataType::INT4_GROUP) {
+                        int base = div[0].first / weight.groupCnt;
+                        std::vector <float> scales, mins;
+                        for (int i = 0; i < weight.scales.size(); i++) {
+                            scales.push_back((i + base < weight.scales.size() ? weight.scales[i + base] : 0.0f));
+                        }
+                        for (int i = 0; i < weight.mins.size(); i++) {
+                            mins.push_back((i + base < weight.mins.size() ? weight.mins[i + base] : 0.0f));
+                        }
+                        memcpy(curDevice->scales.data(), scales.data(), k * weightGroup * sizeof(float));
+                        memcpy(curDevice->mins.data(), mins.data(), k * weightGroup * sizeof(float));
+                    } else {
+                        curDevice->zeros.resize(k * weightGroup);
+                        memcpy(curDevice->scales.data(), weight.scales.data(), k * weightGroup * sizeof(float));
+                        memcpy(curDevice->mins.data(), weight.mins.data(), k * weightGroup * sizeof(float));
+                        memcpy(curDevice->zeros.data(), zeropoints.data(), k * weightGroup * sizeof(int));
+                    }
                 }
             }
         }
