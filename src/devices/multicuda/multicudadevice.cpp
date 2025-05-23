@@ -120,6 +120,39 @@ namespace fastllm {
         }
     };
 
+    struct MultiCudaCpuDoMergeMLPOp : MultiThreadBaseOp {
+        uint8_t *oriCpuInput, *partOutput;
+        Data *input, *weight0, *bias0, *weight1, *bias1;
+        Data *w1, *w2, *w3;
+        Data *output;
+        int deviceId;
+
+        MultiCudaCpuDoMergeMLPOp(uint8_t *oriCpuInput, uint8_t *partOutput,
+                            Data *input, Data *weight0, Data *bias0, Data *weight1, Data *bias1, 
+                            Data *w1, Data *w2, Data *w3,
+                            Data *output, int deviceId) : 
+                oriCpuInput(oriCpuInput), partOutput(partOutput),
+                input(input), weight0(weight0), bias0(bias0), weight1(weight1), bias1(bias1), 
+                w1(w1), w2(w2), w3(w3), 
+                output(output), deviceId(deviceId) {}
+
+        void Run() {
+            input->Allocate();
+            memcpy(input->cpuData, oriCpuInput, input->GetBytes());
+
+            DoCpuLinearReshape(*input, *weight0, *w3);
+            DoCpuLinear(*input, *weight0, bias0 == nullptr ? Data() : *bias0, *w3);
+
+            DoCpuSwigluReshape(*w3, *w1);
+            DoCpuSwiglu(*w3, *w1);
+
+            DoCpuLinearReshape(*w1, *weight1, *output);
+            DoCpuLinear(*w1, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
+
+            FastllmCudaCopyFromHostToDevice(partOutput, output->cpuData, output->GetBytes());
+        }
+    };
+
     void MultiCudaMLPOp::Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
@@ -139,8 +172,35 @@ namespace fastllm {
         output.dataType = input.dataType;
         output.Resize(dims);
     }
+    
+    void DeviceGetInfos(int deviceId, std::string &specialId, int &mallocType) {
+        static std::map <int, std::string> specialDeviceIds = {
+            {99999, "cpu"}
+        };
+        specialId = "";
+        if (specialDeviceIds.find(deviceId) != specialDeviceIds.end()) {
+            specialId = specialDeviceIds[deviceId];
+        }
+        mallocType = 1;
+        if (specialId == "cpu") {
+            mallocType = 0;
+        }
+    }
 
     void MultiCudaMLPOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        if (false) {
+            Data &input = *(datas.find("input")->second);
+            Data &output = *(datas.find("output")->second);
+            Data &weight0 = *(datas.find("weight0")->second);
+            Data &bias0 = *(datas.find("bias0")->second);
+            Data &weight1 = *(datas.find("weight1")->second);
+            Data &bias1 = *(datas.find("bias1")->second);
+
+            output.Allocate();
+            FastllmMultiCudaMLP(input, weight0, weight1, output);
+            return;
+        }
+
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &weight0 = *(datas.find("weight0")->second);
@@ -155,13 +215,13 @@ namespace fastllm {
         output.Allocate();
 // auto st = std::chrono::system_clock::now();
         int mid = weight0.dims[0] / 2;
-        int unit = weight0.groupCnt <= 0 ? 1 : weight0.groupCnt;
+        int unit = weight0.groupCnt <= 0 ? 128 : weight0.groupCnt;
         if (weight0.dataType == fastllm::DataType::FP8_E4M3) {
             unit = weight0.blockM;
         }
         std::vector <int> devices;
         std::map <int, int> ratios;
-        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, false);
         std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, mid, unit);
 
         DivisionScheme divisionScheme, divisionSchemeO;
@@ -189,23 +249,54 @@ namespace fastllm {
         FastllmCudaSetDevice(0);
         FastllmCudaCopyFromDeviceToHost(cpuInput.data(), input.cudaData, input.GetBytes());
         uint8_t *partOutput = (uint8_t*)FastllmCudaMalloc(output.GetBytes() * devices.size());
+        
+        // Launch cuda op
         auto *pool = fastllm::GetAlivePool();
+
         std::vector<fastllm::MultiThreadBaseOp*> ops;
         for (int i = 0; i < devices.size(); i++) {
             auto device = devices[i];
-            ops.push_back(new MultiCudaDoMergeMLPOp (
-                (uint8_t*)input.cudaData, (uint8_t*)cpuInput.data(), partOutput + output.GetBytes() * i,
-                input.multiDeviceDatas[device], 
-                weight0.multiDeviceDatas[device], bias0.multiDeviceDatas[device], 
-                weight1.multiDeviceDatas[device], bias1.multiDeviceDatas[device], 
-                w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device],
-                curOutput.multiDeviceDatas[device], device));
+            std::string specialId = "";
+            int mallocType;
+            DeviceGetInfos(device, specialId, mallocType);
+
+            if (specialId != "cpu") {
+                ops.push_back(new MultiCudaDoMergeMLPOp (
+                    (uint8_t*)input.cudaData, (uint8_t*)cpuInput.data(), partOutput + output.GetBytes() * i,
+                    input.multiDeviceDatas[device], 
+                    weight0.multiDeviceDatas[device], bias0.multiDeviceDatas[device], 
+                    weight1.multiDeviceDatas[device], bias1.multiDeviceDatas[device], 
+                    w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device],
+                    curOutput.multiDeviceDatas[device], device));
+            }
         }
-        for (int i = 0; i < devices.size(); i++) {
+        for (int i = 0; i < ops.size(); i++) {
             pool->PushOp(i, ops[i]);
         }
-        // ops[0]->Run();
+
+        // run cpu op
+        auto temp = pool->curActivateThreadInterval;
+        pool->curActivateThreadInterval = std::make_pair(ops.size(), pool->threads.size());
         for (int i = 0; i < devices.size(); i++) {
+            auto device = devices[i];
+            std::string specialId = "";
+            int mallocType;
+            DeviceGetInfos(device, specialId, mallocType);
+
+            if (specialId == "cpu") {
+                MultiCudaCpuDoMergeMLPOp (
+                    (uint8_t*)cpuInput.data(), partOutput + output.GetBytes() * i,
+                    input.multiDeviceDatas[device], 
+                    weight0.multiDeviceDatas[device], bias0.multiDeviceDatas[device], 
+                    weight1.multiDeviceDatas[device], bias1.multiDeviceDatas[device], 
+                    w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device],
+                    curOutput.multiDeviceDatas[device], device).Run();
+            }
+        }
+        pool->curActivateThreadInterval = temp;
+
+        // wait cuda op
+        for (int i = 0; i < ops.size(); i++) {
             pool->Wait(i);
             delete ops[i];
         }
@@ -288,7 +379,7 @@ namespace fastllm {
         int m = input.dims.back();
         int k = output.dims.back();
 
-        int unit = weight.groupCnt <= 0 ? 1 : weight.groupCnt;
+        int unit = weight.groupCnt <= 0 ? 128 : weight.groupCnt;
         if (weight.dataType == fastllm::DataType::FP8_E4M3) {
             unit = weight.blockM;
         }
@@ -491,7 +582,7 @@ namespace fastllm {
         std::vector <int> devices;
         std::map <int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
-        std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, kvNum, 1);
+        std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, kvNum, 128);
         DivisionScheme divisionScheme, divisionSchemeO;
         for (int i = 0; i < devices.size(); i++) {
             int st = points[i], end = points[i + 1];
@@ -752,7 +843,7 @@ namespace fastllm {
                     continue;
                 }
                 int k = weights[i]->dims[0];
-                std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, k / 2, weights[i]->groupCnt <= 0 ? 1 : weights[i]->groupCnt);
+                std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, k / 2, weights[i]->groupCnt <= 0 ? 128 : weights[i]->groupCnt);
                 DivisionScheme divisionScheme, divisionSchemeO;
 
                 int mid = weights[i]->dims[0] / 2;
