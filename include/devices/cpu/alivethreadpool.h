@@ -89,6 +89,8 @@ namespace fastllm {
     };
 
     struct AliveThreadPool {
+        std::pair <int, int> curActivateThreadInterval; // 设定当前激活 [curActivateThreadInterval.first, curActivateThreadInterval.second) 的线程
+
         std::vector <AliveThreadLoop*> loops;
         std::vector <std::thread*> threads;
         
@@ -97,6 +99,7 @@ namespace fastllm {
                 this->loops.push_back(new AliveThreadLoop(i));
                 this->threads.push_back(new std::thread(*(this->loops[i])));
             }
+            curActivateThreadInterval = std::make_pair(0, threadNum);
         }
 
         void PushOp(int tid, MultiThreadBaseOp *op) {

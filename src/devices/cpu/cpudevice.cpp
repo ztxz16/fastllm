@@ -2720,17 +2720,19 @@ namespace fastllm {
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
+        int threadSt = GetAlivePool()->curActivateThreadInterval.first;
+        int threadLen = GetAlivePool()->curActivateThreadInterval.second - GetAlivePool()->curActivateThreadInterval.first;
 
         if (input.dataType == DataType::FLOAT32 && output.dataType == DataType::FLOAT32) {
             if (weight.dataType == DataType::FLOAT32) {
                 RunLinearFloat32Float32((float*)input.cpuData, (float*)weight.cpuData, (float*)output.cpuData, 
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), 0, GetAlivePool()->threads.size());
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::FLOAT16) {
                 RunLinearFloat32Float16((float*)input.cpuData, (uint16_t*)weight.cpuData, (float*)output.cpuData, 
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), 0, GetAlivePool()->threads.size());
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::INT8) {
                 RunLinearFloat32Int8((float*)input.cpuData, weight, (float*)output.cpuData, 
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), 0, GetAlivePool()->threads.size());
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::INT4_GROUP || weight.dataType == DataType::INT4_NOZERO) {
                 int group = weight.group, groupCnt = weight.groupCnt;
                 if (weight.dataType == DataType::INT4_NOZERO) {
@@ -2738,7 +2740,7 @@ namespace fastllm {
                 }
                 RunLinearFloat32Int4Group((float*)input.cpuData, weight, (float*)output.cpuData, 
                                         bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, group, groupCnt,
-                                        GetAlivePool(), 0, GetAlivePool()->threads.size());
+                                        GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::BASE3_GROUP) {
                 std::vector <uint8_t> base = {1, 3, 9, 27, 81};
                 float *inputData = (float *) input.cpuData;
@@ -2785,20 +2787,20 @@ namespace fastllm {
                                             inputConfigs, GetThreads());
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 RunLinearFloat32FP8E4M3((float*)input.cpuData, weight, (float*)output.cpuData, 
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), 0, GetAlivePool()->threads.size());
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
         } else if (input.dataType == DataType::FLOAT16 && output.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT32) {
                 RunLinearFloat16Float32((uint16_t*)input.cpuData, (float*)weight.cpuData, (uint16_t*)output.cpuData, 
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), 0, GetAlivePool()->threads.size());
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::FLOAT16) {
                 RunLinearFloat16Float16((uint16_t*)input.cpuData, (uint16_t*)weight.cpuData, (uint16_t*)output.cpuData, 
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), 0, GetAlivePool()->threads.size());
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::INT8) {
                 RunLinearFloat16Int8((uint16_t*)input.cpuData, weight, (uint16_t*)output.cpuData, 
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), 0, GetAlivePool()->threads.size());
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::INT4_GROUP || weight.dataType == DataType::INT4_NOZERO) {
                 int group = weight.group, groupCnt = weight.groupCnt;
                 if (weight.dataType == DataType::INT4_NOZERO) {
@@ -2806,10 +2808,10 @@ namespace fastllm {
                 }
                 RunLinearFloat16Int4Group((uint16_t*)input.cpuData, weight, (uint16_t*)output.cpuData, 
                                         bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, group, groupCnt,
-                                        GetAlivePool(), 0, GetAlivePool()->threads.size());
+                                        GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 RunLinearFloat16FP8E4M3((uint16_t*)input.cpuData, weight, (uint16_t*)output.cpuData, 
-                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), 0, GetAlivePool()->threads.size());
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
@@ -3996,6 +3998,13 @@ namespace fastllm {
         }
     }
 
+    void DoCpuSwigluReshape(Data &input, Data &output) {
+        std::vector <int> dims = input.dims;
+        dims[dims.size() - 1] /= 2;
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
     void CpuSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -4007,6 +4016,26 @@ namespace fastllm {
         output.Resize(dims);
     }
 
+    void DoCpuSwiglu(Data &input, Data &output) {
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "Swiglu error: Data's type should be float32 or float16.\n");
+
+        float *inputData = (float*)input.cpuData;
+        float *outputData = (float*)output.cpuData;
+
+        int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
+        int outer = input.Count(0) / spatial;
+
+        if (input.dataType == DataType::FLOAT32) {
+            (MultiThreadSwigluOp((float*)inputData, spatial / 2, spatial / 2, (float*)outputData, outer, spatial, spatial / 2)).Run();
+        } else if (input.dataType == DataType::FLOAT16) {
+            (MultiThreadSwigluFloat16Op((uint16_t*)inputData, spatial / 2, spatial / 2, (uint16_t*)outputData, outer, spatial, spatial / 2)).Run();
+        } else {
+            printf("Unsupport swiglu type.");
+        }
+    }
+
     void CpuSwigluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -4014,9 +4043,11 @@ namespace fastllm {
         output.Allocate();
         AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
                         "Swiglu error: Data's type should be float32 or float16.\n");
-
         float *inputData = (float*)input.cpuData;
         float *outputData = (float*)output.cpuData;
+
+        int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
+        int outer = input.Count(0) / spatial;
 
         if (input.dataType == DataType::FLOAT16) {
             int len = input.Count(0);
@@ -4027,8 +4058,6 @@ namespace fastllm {
             }
         }
 
-        int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
-        int outer = input.Count(0) / spatial;
         for (int o = 0; o < outer; o++) {
             int i = 0;
 #ifdef __aarch64__
