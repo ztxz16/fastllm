@@ -14,6 +14,8 @@ namespace fastllm {
 
     void DoCpuSwigluReshape(Data &input, Data &output);
     void DoCpuSwiglu(Data &input, Data &output);
+    
+    void DoCpuCatDirect(Data &input0, Data &input1, int axis);
 
     struct MultiThreadFloat32ToBFloat16Op : MultiThreadBaseOp {
         float *input;

@@ -1087,21 +1087,8 @@ namespace fastllm {
         }
     }
 
-    void CudaMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
-                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data &input = *(datas.find("input")->second);
-        Data &output = *(datas.find("output")->second);
-        Data &gateBias = *(datas.find("gateBias")->second);
-        Data &logits = *(datas.find("logits")->second);
-        Data &w1 = *(datas.find("w1")->second);
-        Data &w2 = *(datas.find("w2")->second);
-        Data &w3 = *(datas.find("w3")->second);
-        Data **weights = (Data**)(datas.find("weights")->second);
-        Data **biass = (Data**)(datas.find("biass")->second);
-        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
-        int needNorm = intParams.find("needNorm") != intParams.end() ? intParams.find("needNorm")->second : 0;
-        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
-        float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
+    void DoCudaMergeMOE(Data &input, Data &output, Data &gateBias, Data &logits, Data &w1, Data &w2, Data &w3, 
+                        Data **weights, Data **biass, int topk, int needNorm, float sharedScale, float routeScale) {
         output.Allocate();
         {
             int batch = input.dims[0];
@@ -1110,7 +1097,6 @@ namespace fastllm {
             logits.ToDevice(DataDevice::CPU);
             float *cpuRouterLogits = (float*)logits.cpuData;
             int m = logits.dims.back();
-
             if (batch == 1) {
                 float *cur = cpuRouterLogits;
                 std::vector <std::pair <float, int> > oriV; // (value, idx)
@@ -1147,16 +1133,21 @@ namespace fastllm {
                     if (weights[idx * 2] == nullptr) {
                         continue;
                     }
+
                     DoCudaLinearReshape(input, *weights[idx * 2], w3);
                     DoCudaLinear(input, *weights[idx * 2], Data(), w3);
-                    Swiglu(w3, w1);
+
+                    DoCudaSwigluReshape(w3, w1);
+                    DoCudaSwiglu(w3, w1);
+
                     DoCudaLinearReshape(w1, *weights[idx * 2 + 1], w2);
                     DoCudaLinear(w1, *weights[idx * 2 + 1], Data(), w2);
-
                     if (j == 0) {
-                        Mul(w2, value, output);
+                        output.dataType = w2.dataType;
+                        output.Resize(w2.dims);
+                        FastllmCudaMul(w2, value, output);
                     } else {
-                        AddTo(output, w2, value);
+                        FastllmCudaAddTo(output, w2, value);
                     }
                 }
             } else {
@@ -1164,6 +1155,9 @@ namespace fastllm {
                 Data moeFinal = Data();
                 moeFinal.Resize({0, input.dims[1]});
                 moeFinal.Expansion(input.dims);
+                attenPart.ToDevice(input.dataDevice);
+                moePart.ToDevice(input.dataDevice);
+                moeFinal.ToDevice(input.dataDevice);
                 
                 for (int b = 0; b < batch; b++) {
                     float *cur = cpuRouterLogits + b * m;
@@ -1183,7 +1177,8 @@ namespace fastllm {
                     sort(oriV.begin(), oriV.end());
                     Data *currentData = &input;
                     if (batch != 1) {
-                        Split(input, 0, b, b + 1, attenPart);
+                        DoCudaSplitReshape(input, 0, b, b + 1, attenPart);
+                        DoCudaSplit(input, 0, b, b + 1, attenPart);
                         currentData = &attenPart;
                     }
                         
@@ -1211,19 +1206,48 @@ namespace fastllm {
                         if (weights[idx * 2] == nullptr) {
                             continue;
                         }
-                        Linear(*currentData, *weights[idx * 2], Data(), w3);
-                        Swiglu(w3, w1);
-                        Linear(w1, *weights[idx * 2 + 1], Data(), w2);
-                        AddTo(moePart, w2, value);
+                        
+                        DoCudaLinearReshape(*currentData, *weights[idx * 2], w3);
+                        DoCudaLinear(*currentData, *weights[idx * 2], Data(), w3);
+
+                        DoCudaSwigluReshape(w3, w1);
+                        DoCudaSwiglu(w3, w1);
+
+                        DoCudaLinearReshape(w1, *weights[idx * 2 + 1], w2);
+                        DoCudaLinear(w1, *weights[idx * 2 + 1], Data(), w2);
+
+                        FastllmCudaAddTo(moePart, w2, value);
                     }
 
-                    CatDirect(moeFinal, moePart, 0);
+                    DoCudaCatDirect(moeFinal, moePart, 0);
                     moeFinal.expansionDims.clear();
 
-                    Mul(moeFinal, 1.0f, output);
+                    FastllmCudaMul(moeFinal, 1.0f, output);
                 }
             }
         }
+    }
+
+    void CudaMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &gateBias = *(datas.find("gateBias")->second);
+        Data &logits = *(datas.find("logits")->second);
+        Data &w1 = *(datas.find("w1")->second);
+        Data &w2 = *(datas.find("w2")->second);
+        Data &w3 = *(datas.find("w3")->second);
+        Data **weights = (Data**)(datas.find("weights")->second);
+        Data **biass = (Data**)(datas.find("biass")->second);
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        int needNorm = intParams.find("needNorm") != intParams.end() ? intParams.find("needNorm")->second : 0;
+        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
+        float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
+    
+        DoCudaMergeMOE (
+            input, output, gateBias, logits, w1, w2, w3, weights, biass, 
+            topk, needNorm, sharedScale, routeScale
+        );
     }
 
     void CudaMergeAttention::Reshape(const std::string &opType, const fastllm::DataDict &datas,
