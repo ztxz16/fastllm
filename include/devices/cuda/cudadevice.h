@@ -18,6 +18,8 @@ namespace fastllm {
     void DoCudaSplit(Data &input, int axis, int start, int end, Data &output);
     void DoCudaCatDirect(Data &input0, Data &input1, int axis);
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis);
+    void DoCudaMergeMOE(Data &input, Data &output, Data &gateBias, Data &logits, Data &w1, Data &w2, Data &w3, 
+        Data **weights, Data **biass, int topk, int needNorm, float sharedScale, float routeScale);
     
     class CudaDevice : BaseDevice {
     public:

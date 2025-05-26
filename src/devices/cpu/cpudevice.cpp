@@ -3037,13 +3037,7 @@ namespace fastllm {
         }
     }
 
-    void CpuCatDirectOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data &input0 = *(datas.find("input0")->second);
-        Data &input1 = *(datas.find("input1")->second);
-
-        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
-
+    void DoCpuCatDirect(Data &input0, Data &input1, int axis) {
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
                         (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
                         "CatDirect's input's type should be float32 or float16.\n");
@@ -3084,6 +3078,15 @@ namespace fastllm {
                    input1.cpuData + (o * input1Stride) * unitSize,
                    input1.dims[axis] * inner * unitSize);
         }
+    }
+
+    void CpuCatDirectOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        DoCpuCatDirect(input0, input1, axis);
     }
 
     struct MultiThreadMatMulSingleOp : MultiThreadBaseOp {
