@@ -931,25 +931,6 @@ namespace fastllm {
         FastllmCudaCopyFromDeviceToHost(cpuInput.data(), input.cudaData, input.GetBytes());
         uint8_t *partOutput = (uint8_t*)FastllmCudaMalloc(output.GetBytes() * devices.size());
 
-        // run cpu op
-        // auto temp = pool->curActivateThreadInterval;
-        // pool->curActivateThreadInterval = std::make_pair(ops.size(), pool->threads.size());
-        for (int i = 0; i < devices.size(); i++) {
-            auto device = devices[i];
-            std::string specialId = "";
-            int mallocType;
-            DeviceGetInfos(device, specialId, mallocType);
-            if (specialId == "cpu") {
-                MultiCudaCpuDoMergeMOEOp (
-                    (uint8_t*)cpuInput.data(), partOutput + output.GetBytes() * i,
-                    input.multiDeviceDatas[device], weights, &logits, &gateBias, 
-                    w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device], 
-                    wBatch, topk, needNorm, routeScale, sharedScale, 
-                    curOutput.multiDeviceDatas[device], device).Run();
-            }
-        }
-        // pool->curActivateThreadInterval = temp;
-
         auto *pool = fastllm::GetAlivePool();
         std::vector<fastllm::MultiThreadBaseOp*> ops;
         for (int i = 0; i < devices.size(); i++) {
@@ -971,6 +952,27 @@ namespace fastllm {
         for (int i = 0; i < ops.size(); i++) {
             pool->PushOp(i, ops[i]);
         }
+
+        // run cpu op
+        auto temp = pool->curActivateThreadInterval;
+        pool->curActivateThreadInterval = std::make_pair(ops.size(), pool->threads.size());
+        for (int i = 0; i < devices.size(); i++) {
+            auto device = devices[i];
+            std::string specialId = "";
+            int mallocType;
+            DeviceGetInfos(device, specialId, mallocType);
+            if (specialId == "cpu") {
+                MultiCudaCpuDoMergeMOEOp (
+                    (uint8_t*)cpuInput.data(), partOutput + output.GetBytes() * i,
+                    input.multiDeviceDatas[device], weights, &logits, &gateBias, 
+                    w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device], 
+                    wBatch, topk, needNorm, routeScale, sharedScale, 
+                    curOutput.multiDeviceDatas[device], device).Run();
+            }
+        }
+        pool->curActivateThreadInterval = temp;
+
+        // wait cuda op
         for (int i = 0; i < ops.size(); i++) {
             pool->Wait(i);
             delete ops[i];
