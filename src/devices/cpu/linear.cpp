@@ -291,9 +291,9 @@ namespace fastllm {
                 tempValue[block] = (inputSums[block] - izeros[block] * groupCnt) * iscales[block];
             }
 
-            if (cpuInstructInfo.hasAVX512VNNI && 
+            /* if (cpuInstructInfo.hasAVX512VNNI && 
                 MatMulInt8Int4_AVX512VNNI(a, b, values.data(), n, m, k)) {
-            } else {
+            } else */ {
                 block = 0;
                 for (; block + 3 < n; block += 4) {
                     uint8_t *weightWalk = b;
