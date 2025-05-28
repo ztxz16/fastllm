@@ -593,6 +593,13 @@ namespace fastllm {
                 curWeight.perChannelsConfigs.shrink_to_fit();
             }
         }
+
+        int weightId = this->weightsList.size();
+        this->weightsList.push_back(&weight[name]);
+        if (partId == 0) {
+            // 传回weight id
+            ((int32_t*)baseOutputAddr)[0] = weightId;
+        }
     }
 
     void ComputeServer::UnregisterData(json11::Json *config) {
@@ -888,41 +895,40 @@ namespace fastllm {
     };
     MOEVarManager moeVarManager;
 
+    struct MOEIntSingleVarManager {
+
+    };
+
     void ComputeServer::RunMOEInt() {
-// auto st = std::chrono::system_clock::now();
-// auto ttt = std::chrono::system_clock::now();
-// std::vector <std::pair <std::string, float> > record;
-        int configStringLen = ((int*)this->baseAddr)[0];
-        std::string configString;
-        for (int i = 0; i < configStringLen; i++) {
-            configString += (char)this->baseAddr[4 + i];
-        }
-// record.push_back(std::make_pair("get string", GetSpan(ttt, std::chrono::system_clock::now())));
-        json11::Json config;
-        std::string error;
-        config = json11::Json::parse(configString, error);
-// record.push_back(std::make_pair("parse string", GetSpan(ttt, std::chrono::system_clock::now())));
-        int n = config["n"].int_value(), m = config["m"].int_value(), k = config["k"].int_value();
-        int group = config["group"].int_value(), groupCnt = config["groupCnt"].int_value();
-        int outputType = config["outputType"].int_value();
-        uint8_t *localInput = (uint8_t *) this->inputBuffer.data();
-        float *localOutput = (float *) this->outputBuffer.data();
+ // auto st = std::chrono::system_clock::now();
+ // auto ttt = std::chrono::system_clock::now();
+ // std::vector <std::pair <std::string, float> > record;
+        if (((int*)this->baseAddr)[0] > 1) {
+            int configStringLen = ((int*)this->baseAddr)[0];
+            std::string configString;
+            for (int i = 0; i < configStringLen; i++) {
+                configString += (char)this->baseAddr[4 + i];
+            }
+            json11::Json config;
+            std::string error;
+            config = json11::Json::parse(configString, error);
+            int n = config["n"].int_value(), m = config["m"].int_value(), k = config["k"].int_value();
+            int group = config["group"].int_value(), groupCnt = config["groupCnt"].int_value();
+            int outputType = config["outputType"].int_value();
+            uint8_t *localInput = (uint8_t *) this->inputBuffer.data();
+            float *localOutput = (float *) this->outputBuffer.data();
 
-        std::vector <LowBitConfig> inputConfigs;
-        std::vector <float> iscales, izeros;
-        volatile char *buffer = (volatile char*)this->baseAddr + 4 + configStringLen;
-        for (int i = 0; i < n * group; i++) {
-            inputConfigs.push_back(fastllm::LowBitConfig(((float*)buffer)[0], ((float*)buffer)[1], 8, 0));
-            iscales.push_back(inputConfigs.back().scale);
-            izeros.push_back(inputConfigs.back().zeroPoint);
-            buffer += 2 * sizeof(float);
-        }
-// record.push_back(std::make_pair("get config", GetSpan(ttt, std::chrono::system_clock::now())));
-        RunMultiThreadMemcpy(this->inputBuffer.data(), (uint8_t*)buffer, n * m, pool);
-// record.push_back(std::make_pair("inputBuffer", GetSpan(ttt, std::chrono::system_clock::now())));
-
-// record.push_back(std::make_pair("input sum", GetSpan(ttt, std::chrono::system_clock::now())));
-        if (n > 1) {
+            std::vector <LowBitConfig> inputConfigs;
+            std::vector <float> iscales, izeros;
+            volatile char *buffer = (volatile char*)this->baseAddr + 4 + configStringLen;
+            for (int i = 0; i < n * group; i++) {
+                inputConfigs.push_back(fastllm::LowBitConfig(((float*)buffer)[0], ((float*)buffer)[1], 8, 0));
+                iscales.push_back(inputConfigs.back().scale);
+                izeros.push_back(inputConfigs.back().zeroPoint);
+                buffer += 2 * sizeof(float);
+            }
+            RunMultiThreadMemcpy(this->inputBuffer.data(), (uint8_t*)buffer, n * m, pool);
+    
 // printf("server prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             std::vector <std::vector <fastllm::Data*> > weights;
             std::vector <std::vector <float> > v;
@@ -1043,15 +1049,51 @@ namespace fastllm {
             // }
             return;    
         } else {
+            volatile char *buffer = (volatile char*)this->baseAddr;
+            int n = ((int*)buffer)[0];
+            int m = ((int*)buffer)[1];
+            int k = ((int*)buffer)[2];
+            int group = ((int*)buffer)[3];
+            int groupCnt = ((int*)buffer)[4];
+            buffer += 5 * sizeof(int);
             std::vector <fastllm::Data*> weights;
             std::vector <float> v;
+// record.push_back(std::make_pair("before get weight", GetSpan(ttt, std::chrono::system_clock::now())));
+            int vSize = ((int*)buffer)[0];
+            buffer += sizeof(int);
+            for (int i = 0; i < vSize; i++) {
+                v.push_back(((float*)buffer)[0]);
+                buffer += sizeof(float);
+            }
+            int wSize = ((int*)buffer)[0];
+            buffer += sizeof(int);
+            for (int i = 0; i < wSize; i++) {
+                weights.push_back(this->weightsList[((int*)buffer)[0]]);
+                buffer += sizeof(int);
+            }
+
+            uint8_t *localInput = (uint8_t *) this->inputBuffer.data();
+            float *localOutput = (float *) this->outputBuffer.data();
+
+            std::vector <LowBitConfig> inputConfigs;
+            std::vector <float> iscales, izeros;
+            for (int i = 0; i < n * group; i++) {
+                inputConfigs.push_back(fastllm::LowBitConfig(((float*)buffer)[0], ((float*)buffer)[1], 8, 0));
+                iscales.push_back(inputConfigs.back().scale);
+                izeros.push_back(inputConfigs.back().zeroPoint);
+                buffer += 2 * sizeof(float);
+            }
+// record.push_back(std::make_pair("get config", GetSpan(ttt, std::chrono::system_clock::now())));
+            RunMultiThreadMemcpy(this->inputBuffer.data(), (uint8_t*)buffer, n * m, pool);
+/*
             for (auto &factor : config["factors"].array_items()) {
                 v.push_back(factor.number_value());
             }
-// record.push_back(std::make_pair("before get weight", GetSpan(ttt, std::chrono::system_clock::now())));
             for (auto &weight : config["weights"].array_items()) {
-                weights.push_back(&this->weights[weight.string_value()]);
+                // weights.push_back(&this->weights[weight.string_value()]);
+                weights.push_back(this->weightsList[weight.int_value()]);
             }
+*/
             std::vector <float> inputSums;
             GetInputSums(inputSums, localInput, n, m, group, groupCnt, weights[0]->dataType);
             int permuteType = 1;
@@ -1059,7 +1101,7 @@ namespace fastllm {
                 permuteType = 0;
             }
 
-// record.push_back(std::make_pair("get weight", GetSpan(ttt, std::chrono::system_clock::now())));
+ // record.push_back(std::make_pair("get weight", GetSpan(ttt, std::chrono::system_clock::now())));
             std::vector <int> localKs;
             std::vector <float*> middles;
             std::vector <float*> results;
@@ -1087,7 +1129,7 @@ namespace fastllm {
             inputSumsDown.resize(v.size());
             iscalesDown.resize(v.size());
             izerosDown.resize(v.size());
-// record.push_back(std::make_pair("prepare datas", GetSpan(ttt, std::chrono::system_clock::now())));
+ // record.push_back(std::make_pair("prepare datas", GetSpan(ttt, std::chrono::system_clock::now())));
             for (int st = 0; st < v.size(); st++) {
                 int k = localKs[st];
                 int end = st, selSum = 1; // 一共处理selSum * k个输出
@@ -1132,7 +1174,7 @@ namespace fastllm {
                     pool->Wait(j);
                     delete ops[j];
                 }
-// record.push_back(std::make_pair("mul 0", GetSpan(ttt, std::chrono::system_clock::now())));
+ // record.push_back(std::make_pair("mul 0", GetSpan(ttt, std::chrono::system_clock::now())));
                 // swiglu
                 for (int l = st; l <= end; l++) {
                     int idx = l;
@@ -1168,7 +1210,7 @@ namespace fastllm {
                     pool->Wait(l - st);
                     delete ops[l - st];
                 }
-// record.push_back(std::make_pair("swiglu", GetSpan(ttt, std::chrono::system_clock::now())));
+ // record.push_back(std::make_pair("swiglu", GetSpan(ttt, std::chrono::system_clock::now())));
 // record.push_back(std::make_pair("quant", GetSpan(ttt, std::chrono::system_clock::now())));
                 threadSt = 0;
                 for (int l = st; l <= end; l++) {
@@ -1207,11 +1249,15 @@ namespace fastllm {
                     delete ops[j];
                 }
                 st = end;
-// record.push_back(std::make_pair("mul 1", GetSpan(ttt, std::chrono::system_clock::now())));
+ // record.push_back(std::make_pair("mul 1", GetSpan(ttt, std::chrono::system_clock::now())));
             }
-            for (int k = 0; k < m; k++) {
-                localOutput[k] = 0;
-            }
+            memset(localOutput, 0, m * sizeof(float));
+
+            RunMultiThreadReduce (
+                (int)v.size(), results.data(), v.data(), localOutput, 
+                (float*)baseOutputAddr + partId * n * k, m, pool
+            );
+/*
             for (int j = 0; j < v.size(); j++) {
                 float value = v[j];
                 float *curOutput = (float*)results[j];
@@ -1240,8 +1286,7 @@ namespace fastllm {
                 for (int k = i; k < m; k++) {
                     localOutput[k] += curOutput[k] * value;
                 }
-                delete[] results[j];
-                delete[] middles[j];
+
             }
 // record.push_back(std::make_pair("get fp32 sum", GetSpan(ttt, std::chrono::system_clock::now())));
             for (int i = 0; i < n; i++) {
@@ -1249,10 +1294,16 @@ namespace fastllm {
                     (uint8_t *) localOutput + (i * k) * sizeof(float),
                     k * sizeof(float), pool, true);
             }
-// record.push_back(std::make_pair("copy output", GetSpan(ttt, std::chrono::system_clock::now())));
-// for (int i = 0; i < record.size(); i++) {
-     // printf("server %s spend %f s.\n", record[i].first.c_str(), record[i].second);
-// }
+*/
+            for (int j = 0; j < v.size(); j++) {
+                delete[] results[j];
+                delete[] middles[j];
+            }
+
+ // record.push_back(std::make_pair("copy output", GetSpan(ttt, std::chrono::system_clock::now())));
+ // for (int i = 0; i < record.size(); i++) {
+    //  printf("server %s spend %f s.\n", record[i].first.c_str(), record[i].second);
+ // }
         }
     }
 
