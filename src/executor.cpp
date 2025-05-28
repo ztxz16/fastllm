@@ -142,14 +142,17 @@ namespace fastllm {
                 for (auto &it: datas) {
                     if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
                         int batch = intParams.find(it.first + "___batch")->second;
-                        if ((it.first == "weights" || it.first == "biass") && ((Data**)it.second)[0]) {
+                        if ((it.first == "weights" || it.first == "biass") && ((Data**)it.second)[2]) {
                             if ((device->deviceType == "cpu" || device->deviceType == "numa" || device->deviceType == "tfacc") && 
-                                ((Data**)it.second)[0]->dataDevice == DataDevice::CPU) {
+                                ((Data**)it.second)[2]->dataDevice == DataDevice::CPU) {
                                 continue;
                             }
-                            if ((device->deviceType == "cuda" || device->deviceType == "multicuda") && ((Data**)it.second)[0]->dataDevice == DataDevice::CUDA) {
+                            if ((device->deviceType == "cuda" || device->deviceType == "multicuda") && ((Data**)it.second)[2]->dataDevice == DataDevice::CUDA) {
                                 continue;
                             }
+                        }
+                        if ((it.first == "biass") && !((Data**)it.second)[2]) {
+                            continue;
                         }
                         for (int i = 0; i < batch; i++) {
                             if (((Data**)it.second)[i]) {
