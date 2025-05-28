@@ -165,7 +165,7 @@ namespace fastllm {
     }
 
     NumaClient::~NumaClient() {
-        std::set <std::string> names = this->registerDataNames;
+        auto names = this->registerDataNames;
         for (auto &dataName : names) {
             this->UnregisterFastllmData(dataName);
         }
@@ -212,6 +212,7 @@ namespace fastllm {
             return;
         }
         this->registerDataNames.insert(data->name);
+        data->isRegistered = true;
         ((int*)this->buf)[0] = data->name.size();
         memcpy((uint8_t*)this->buf + 4, data->name.data(), data->name.size());
         this->Launch(ComputeTaskType::FindData);
@@ -271,6 +272,7 @@ namespace fastllm {
         SendLongMessage(buffer.buffer.data(), buffer.buffer.size());
 
         /// TODO: data->clear()
+        data->weightId = ((int32_t*)this->result)[0];
         delete[] data->cpuData;
         data->cpuData = new uint8_t[1];
         // data->weightSum.clear();
@@ -586,9 +588,10 @@ namespace fastllm {
                         std::vector <LowBitConfig> *inputConfigs,
                         uint8_t *uinput, float *output, 
                         DataType outputType) {
-// auto ttt = std::chrono::system_clock::now();
-// std::vector <std::pair <std::string, float> > record;
-        if (this->registerDataNames.find(weights[0]->name) == this->registerDataNames.end()) {
+ // auto ttt = std::chrono::system_clock::now();
+ // std::vector <std::pair <std::string, float> > record;
+        // if (this->registerDataNames.find(weights[0]->name) == this->registerDataNames.end()) {
+        if (!weights[0]->isRegistered) {
             for (int i = 0; i < weights.size(); i += 2) {
                 RegisterFastllmData(weights[i], "linearSwiglu");
                 RegisterFastllmData(weights[i + 1], "linearColumn");
@@ -608,41 +611,31 @@ namespace fastllm {
         maxN = std::min(maxN, (int)(transLimit / (k * sizeof(float))));
 
         // printf("maxN = %d\n", maxN);
-        std::string factorString = "[", weightString = "[";
-        for (int i = 0; i < factors.size(); i++) {
-            if (i > 0) {
-                factorString += ",\n";
-            }
-            factorString += std::to_string(factors[i]);
-        }
-        for (int i = 0; i < weights.size(); i++) {
-            if (i > 0) {
-                weightString += ",\n";
-            }
-            weightString += ('\"') + weights[i]->name + ('\"');
-        }
-        factorString += "]";
-        weightString += "]";
+ // record.push_back(std::make_pair("before make strings", GetSpan(ttt, std::chrono::system_clock::now())));
+ // record.push_back(std::make_pair("make strings", GetSpan(ttt, std::chrono::system_clock::now())));
         int outputUnitSize = (outputType == DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
         
         maxN = 1;
-// record.push_back(std::make_pair("prepare", GetSpan(ttt, std::chrono::system_clock::now())));
         for (int baseN = 0; baseN < n; baseN += maxN) {
 // auto st0 = std::chrono::system_clock::now();
             int curN = std::min(maxN, n - baseN);
-            std::string configString = "{";
-            configString += "\"factors\":" +  factorString + ",";
-            configString += "\"group\":" +  std::to_string(group) + ",";
-            configString += "\"groupCnt\":" +  std::to_string(groupCnt) + ",";
-            configString += "\"n\":" +  std::to_string(n) + ",";
-            configString += "\"m\":" +  std::to_string(m) + ",";
-            configString += "\"k\":" +  std::to_string(k) + ",";
-            configString += "\"op\":\"moe\",";
-            configString += "\"outputType\":" +  std::to_string(0) + ",";
-            configString += "\"weights\":" +  weightString + "}";
             U8Buffer buffer;
-            buffer.WriteInt(configString.size());
-            buffer.WriteBytes((uint8_t*)configString.data(), configString.size());
+            buffer.WriteInt(n);
+            buffer.WriteInt(m);
+            buffer.WriteInt(k);
+            buffer.WriteInt(group);
+            buffer.WriteInt(groupCnt);
+
+            buffer.WriteInt((int)factors.size());
+            for (int i = 0; i < factors.size(); i++) {
+                buffer.WriteFloat(factors[i]);
+            }
+
+            buffer.WriteInt((int)weights.size());
+            for (int i = 0; i < weights.size(); i++) {
+                buffer.WriteInt(weights[i]->weightId);
+            }
+
             std::vector <float> minmaxs;
             for (int i = 0; i < curN * group; i++) {
                 minmaxs.push_back((*inputConfigs)[baseN * group + i].min);

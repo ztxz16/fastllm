@@ -210,6 +210,51 @@ namespace fastllm {
         }
     }
 
+    struct MultiThreadReduceOp : MultiThreadBaseOp {
+        int inputLen;
+        float **inputs, *values;
+        float *output, *lastOutput;
+        int st, end;
+
+        MultiThreadReduceOp (int inputLen, float **inputs, float *values, float *output, float *lastOutput, int st, int end) : 
+            inputLen(inputLen), inputs(inputs), values(values), output(output), lastOutput(lastOutput), st(st), end(end) {}
+
+        void Run() {
+            for (int i = 0; i < inputLen; i++) {
+                float value = values[i];
+                for (int j = st; j < end; j++) {
+                    output[j] += value * inputs[i][j];
+                }
+            }
+
+            if (lastOutput != nullptr) {
+                memcpy(lastOutput + st, output + st, (end - st) * sizeof(float));
+            }
+        }
+    };
+
+    static void RunMultiThreadReduce(int inputLen, float **inputs, float *values, 
+                                float *output, float *lastOutput, int dim, AliveThreadPool *pool) {
+        int threadNum = pool->threads.size();
+        threadNum = std::min(threadNum, 8);
+
+        int per = dim / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadReduceOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? dim : cur + per + (cur + per * (threadNum - i) < dim));
+            ops.push_back(new MultiThreadReduceOp(inputLen, inputs, values, output, lastOutput, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
     struct MultiThreadMoeReduceOp : MultiThreadBaseOp {
         std::vector <std::pair <int, float> > *task;
         std::vector <float> *tempResult;

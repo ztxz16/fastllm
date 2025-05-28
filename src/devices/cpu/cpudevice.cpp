@@ -1050,6 +1050,18 @@ namespace fastllm {
                     tempOutput.resize(m, 0);
                     fLastOutput = tempOutput.data();
                 }
+/*
+                std::vector <float> vv;
+                vv.resize(v.size());
+                for (int i = 0; i < v.size(); i++) {
+                    vv[i] = v[i].second;
+                }
+                RunMultiThreadReduce (
+                    (int)vv.size(), results.data(), vv.data(), fLastOutput, 
+                    nullptr, m, pool
+                );
+*/
+
                 for (int j = 0; j < v.size(); j++) {
                     float value = v[j].second;
                     float *curOutput = (float*)results[j];

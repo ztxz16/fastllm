@@ -45,6 +45,7 @@ namespace fastllm {
         int threadNum;
 
         WeightMap weights;
+        std::vector <fastllm::Data*> weightsList;
 
         AliveThreadPool *pool;
 

@@ -13,6 +13,7 @@
 #include <set>
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -300,6 +301,9 @@ namespace fastllm {
 
         bool multiDeviceData = false;
         std::map <int, Data*> multiDeviceDatas;
+
+        int weightId;
+        bool isRegistered = false;
         
         Data () {};
 
