@@ -106,9 +106,9 @@ namespace fastllm {
     extern int DotU4U8_AVX512VNNI(uint8_t *a, uint8_t *b, int n);
 
     int DotU4U8(uint8_t *a, uint8_t *b, int n) {
-        if (cpuInstructInfo.hasAVX512VNNI) {
-            return DotU4U8_AVX512VNNI(a, b, n);
-        }
+        // if (cpuInstructInfo.hasAVX512VNNI) {
+           // return DotU4U8_AVX512VNNI(a, b, n);
+        // }
         __m256i acc = _mm256_setzero_si256();
         int i = 0;
         int ans = 0;
@@ -2575,7 +2575,7 @@ namespace fastllm {
 
 #ifdef __AVX2__
     void Avx2InputPermute(uint8_t* output, int n, int m) {
-        if (cpuInstructInfo.hasAVX512VNNI) {
+        /* if (cpuInstructInfo.hasAVX512VNNI) {
             uint8_t *temp = new uint8_t[64];
             for (int i = 0; i < n; i++) {
                 for (int j = 0; j + 63 < m; j += 64) {
@@ -2588,7 +2588,7 @@ namespace fastllm {
             }
             delete[] temp;
             return;
-        }
+        } */
         
         /*uint8_t *temp = new uint8_t[32];
         for (int i = 0; i < n; i++) {
