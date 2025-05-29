@@ -1100,8 +1100,8 @@ namespace fastllm {
             izeros.resize(n * group);
             for (int i = 0; i < n * group; i++) {
                 inputConfigs[i] = (fastllm::LowBitConfig(((float*)buffer)[0], ((float*)buffer)[1], 8, 0));
-                iscales[i] = (inputConfigs.back().scale);
-                izeros[i] = (inputConfigs.back().zeroPoint);
+                iscales[i] = (inputConfigs[i].scale);
+                izeros[i] = (inputConfigs[i].zeroPoint);
                 buffer += 2 * sizeof(float);
             }
 // record.push_back(std::make_pair("get config", GetSpan(ttt, std::chrono::system_clock::now())));
