@@ -440,7 +440,8 @@ namespace fastllm {
         std::vector <fastllm::Data*> weights, std::vector <float> factors,
         float *input, float *output, 
         DataType outputType) {
-        if (this->registerDataNames.find(weights[0]->name) == this->registerDataNames.end()) {
+        // if (this->registerDataNames.find(weights[0]->name) == this->registerDataNames.end()) {
+        if (!weights[0]->isRegistered) {
             for (int i = 0; i < weights.size(); i += 2) {
                 RegisterFastllmData(weights[i], "linearSwiglu");
                 RegisterFastllmData(weights[i + 1], "linearColumn");
@@ -448,43 +449,29 @@ namespace fastllm {
         }
         int opType = ComputeTaskType::MOEFP8E4M3;
         int maxN = 1;
-
-        std::string factorString = "[", weightString = "[";
-        for (int i = 0; i < factors.size(); i++) {
-            if (i > 0) {
-                factorString += ",\n";
-            }
-            factorString += std::to_string(factors[i]);
-        }
-        for (int i = 0; i < weights.size(); i++) {
-            if (i > 0) {
-                weightString += ",\n";
-            }
-            weightString += ('\"') + weights[i]->name + ('\"');
-        }
-        factorString += "]";
-        weightString += "]";
         int outputUnitSize = (outputType == DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
         
         for (int baseN = 0; baseN < n; baseN += maxN) {
             int curN = std::min(maxN, n - baseN);
-            std::string configString = "{";
-            configString += "\"factors\":" +  factorString + ",";
-            configString += "\"n\":" +  std::to_string(n) + ",";
-            configString += "\"m\":" +  std::to_string(m) + ",";
-            configString += "\"k\":" +  std::to_string(k) + ",";
-            configString += "\"op\":\"moe\",";
-            configString += "\"outputType\":" +  std::to_string(0) + ",";
-            configString += "\"weights\":" +  weightString + "}";
             U8Buffer buffer;
-            buffer.WriteInt(configString.size());
-            buffer.WriteBytes((uint8_t*)configString.data(), configString.size());
+            buffer.WriteInt(n);
+            buffer.WriteInt(m);
+            buffer.WriteInt(k);
+            buffer.WriteInt((int)factors.size());
+            for (int i = 0; i < factors.size(); i++) {
+                buffer.WriteFloat(factors[i]);
+            }
+            buffer.WriteInt((int)weights.size());
+            for (int i = 0; i < weights.size(); i++) {
+                buffer.WriteInt(weights[i]->weightId);
+            }
+
             RunMultiThreadMemcpy((uint8_t*)this->buf, buffer.buffer.data(), buffer.buffer.size(), GetAlivePool());
             RunMultiThreadMemcpy((uint8_t*)this->buf + buffer.buffer.size(), (uint8_t*)(input + baseN * m), curN * m * sizeof(float), GetAlivePool());
             this->Launch(opType);
             this->Wait();
-            auto pool = GetAlivePool();
 
+            auto pool = GetAlivePool();
             uint8_t *oriResult = new uint8_t[serverNumaCnt * curN * k * outputUnitSize];
             RunMultiThreadMemcpy(oriResult, (uint8_t*)result, serverNumaCnt * curN * k * outputUnitSize, GetAlivePool());
             float *floatResult = (float*)oriResult;

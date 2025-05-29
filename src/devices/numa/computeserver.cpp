@@ -895,9 +895,26 @@ namespace fastllm {
     };
     MOEVarManager moeVarManager;
 
-    struct MOEIntSingleVarManager {
+    struct moeIntSingleVarManagerServer {
+        std::vector<LowBitConfig> inputConfigs;
+        std::vector<uint8_t> uinput;
+        std::vector <float> inputSums;
+        std::vector <float> iscales, izeros;
+        std::vector <std::vector <float> > middles, results;
+        std::vector <std::vector <LowBitConfig> > inputConfigsDown;
+        std::vector <std::vector <uint8_t> > uinputsDown;
+        std::vector <std::vector <float> > inputSumsDown;
+        std::vector <std::vector <float> > iscalesDown, izerosDown;
+        std::vector <int> localKs;
+        std::vector <float*> tempResults;
+    } moeIntSingleVarManagerServer;
 
-    };
+    struct moeFloatSingleVarManagerServer {
+        std::vector <std::vector <float> > middles, results;
+        std::vector <int> localKs;
+        std::vector <float*> tempResults;
+        std::vector <uint16_t> bf16Input;
+    } moeFloatSingleVarManagerServer;
 
     void ComputeServer::RunMOEInt() {
  // auto st = std::chrono::system_clock::now();
@@ -1075,12 +1092,16 @@ namespace fastllm {
             uint8_t *localInput = (uint8_t *) this->inputBuffer.data();
             float *localOutput = (float *) this->outputBuffer.data();
 
-            std::vector <LowBitConfig> inputConfigs;
-            std::vector <float> iscales, izeros;
+            std::vector <LowBitConfig> &inputConfigs = moeIntSingleVarManagerServer.inputConfigs;
+            std::vector <float> &iscales = moeIntSingleVarManagerServer.iscales;
+            std::vector <float> &izeros = moeIntSingleVarManagerServer.izeros;
+            inputConfigs.resize(n * group);
+            iscales.resize(n * group);
+            izeros.resize(n * group);
             for (int i = 0; i < n * group; i++) {
-                inputConfigs.push_back(fastllm::LowBitConfig(((float*)buffer)[0], ((float*)buffer)[1], 8, 0));
-                iscales.push_back(inputConfigs.back().scale);
-                izeros.push_back(inputConfigs.back().zeroPoint);
+                inputConfigs[i] = (fastllm::LowBitConfig(((float*)buffer)[0], ((float*)buffer)[1], 8, 0));
+                iscales[i] = (inputConfigs.back().scale);
+                izeros[i] = (inputConfigs.back().zeroPoint);
                 buffer += 2 * sizeof(float);
             }
 // record.push_back(std::make_pair("get config", GetSpan(ttt, std::chrono::system_clock::now())));
@@ -1094,7 +1115,8 @@ namespace fastllm {
                 weights.push_back(this->weightsList[weight.int_value()]);
             }
 */
-            std::vector <float> inputSums;
+            std::vector <float> &inputSums = moeIntSingleVarManagerServer.inputSums;
+            inputSums.clear();
             GetInputSums(inputSums, localInput, n, m, group, groupCnt, weights[0]->dataType);
             int permuteType = 1;
             if (weights[0]->dataType == DataType::INT8) {
@@ -1102,28 +1124,32 @@ namespace fastllm {
             }
 
  // record.push_back(std::make_pair("get weight", GetSpan(ttt, std::chrono::system_clock::now())));
-            std::vector <int> localKs;
-            std::vector <float*> middles;
-            std::vector <float*> results;
+            std::vector <int> &localKs = moeIntSingleVarManagerServer.localKs;
+            std::vector <std::vector <float> > &middles = moeIntSingleVarManagerServer.middles;
+            std::vector <std::vector <float> > &results = moeIntSingleVarManagerServer.results;
+            middles.resize(v.size());
+            results.resize(v.size());
+            localKs.resize(v.size());
             for (int j = 0; j < v.size(); j++) {
                 int idx = j;
                 weights[idx * 2]->CalcWeightSum();
                 weights[idx * 2 + 1]->CalcWeightSum();
 
                 int localK = weights[idx * 2]->dims[0];
-                localKs.push_back(localK);
-                middles.push_back(new float[localK]);
-                results.push_back(new float[weights[idx * 2 + 1]->dims[0]]);
+                localKs[j] = (localK);
+                middles[j].resize(localK);
+                results[j].resize(weights[idx * 2 + 1]->dims[0]);
             }
 
             std::vector<fastllm::MultiThreadBaseOp*> ops;
             int threads = pool->threads.size();
             ops.resize(threads);
 
-            std::vector <std::vector <LowBitConfig> > inputConfigsDown;
-            std::vector <std::vector <uint8_t> > uinputsDown;
-            std::vector <std::vector <float> > inputSumsDown;
-            std::vector <std::vector <float> > iscalesDown, izerosDown;
+            std::vector <std::vector <LowBitConfig> > &inputConfigsDown = moeIntSingleVarManagerServer.inputConfigsDown;
+            std::vector <std::vector <uint8_t> > &uinputsDown = moeIntSingleVarManagerServer.uinputsDown;
+            std::vector <std::vector <float> > &inputSumsDown = moeIntSingleVarManagerServer.inputSumsDown;
+            std::vector <std::vector <float> > &iscalesDown = moeIntSingleVarManagerServer.iscalesDown;
+            std::vector <std::vector <float> > &izerosDown = moeIntSingleVarManagerServer.izerosDown;
             inputConfigsDown.resize(v.size());
             uinputsDown.resize(v.size());
             inputSumsDown.resize(v.size());
@@ -1152,7 +1178,7 @@ namespace fastllm {
                     int idx = l;
                     Data *weight = weights[idx * 2];
                     uint8_t *weightData = (uint8_t *) weight->cpuData;
-                    float *outputData = middles[l];
+                    float *outputData = middles[l].data();
                     float *biasData = nullptr;
                     int curK = localKs[l];
                     int curThread = (curK / k) * base;
@@ -1179,7 +1205,7 @@ namespace fastllm {
                 for (int l = st; l <= end; l++) {
                     int idx = l;
                     int spatial = localKs[idx], mid = spatial / 2;
-                    float *outputData = middles[l];
+                    float *outputData = middles[l].data();
                     int curK = localKs[idx];
 
                     ops[l - st] = new fastllm::MultiThreadMultiOps();
@@ -1201,7 +1227,7 @@ namespace fastllm {
                     iscales.resize(n * groupDown);
                     izeros.resize(n * groupDown);
                     ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new MultiThreadOnlineQuantizationOp(
-                                    middles[l], uinputDown.data(), inputConfigs.data(),
+                                    middles[l].data(), uinputDown.data(), inputConfigs.data(),
                                     n, mid, groupDown, groupCntDown,
                                     inputSums.data(), iscales.data(), izeros.data(), permuteType));
                     pool->PushOp(l - st, ops[l - st]);
@@ -1231,12 +1257,12 @@ namespace fastllm {
                     }
 
                     if (weightDown->dataType == DataType::INT8) {
-                        LaunchLinearInt8Int8(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l], 1, mid, m,
+                        LaunchLinearInt8Int8(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l].data(), 1, mid, m,
                                                 weightDown->weightSum.data(), weightDown->zeros.data(), weightDown->scales.data(), nullptr, 
                                                 inputSums.data(), iscales.data(), izeros.data(),
                                                 ops, pool, threadSt, curThread);
                     } else {
-                        MultiplyInt4GroupMultiThreadLaunch(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l], 1, mid, m,
+                        MultiplyInt4GroupMultiThreadLaunch(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l].data(), 1, mid, m,
                                                 weightDown->weightSum.data(), weightDown->mins.data(), weightDown->scales.data(), nullptr, 
                                                 inputSums, iscales, izeros,
                                                 inputConfigs, threadSt, curThread, groupDown, groupCntDown, ops, pool);
@@ -1253,8 +1279,13 @@ namespace fastllm {
             }
             memset(localOutput, 0, m * sizeof(float));
 
+            std::vector <float*> &tempResults = moeIntSingleVarManagerServer.tempResults;
+            tempResults.resize(results.size());
+            for (int i = 0; i < results.size(); i++) {
+                tempResults[i] = results[i].data();
+            }
             RunMultiThreadReduce (
-                (int)v.size(), results.data(), v.data(), localOutput, 
+                (int)v.size(), tempResults.data(), v.data(), localOutput, 
                 (float*)baseOutputAddr + partId * n * k, m, pool
             );
 /*
@@ -1295,10 +1326,6 @@ namespace fastllm {
                     k * sizeof(float), pool, true);
             }
 */
-            for (int j = 0; j < v.size(); j++) {
-                delete[] results[j];
-                delete[] middles[j];
-            }
 
  // record.push_back(std::make_pair("copy output", GetSpan(ttt, std::chrono::system_clock::now())));
  // for (int i = 0; i < record.size(); i++) {
@@ -1310,28 +1337,22 @@ namespace fastllm {
     void ComputeServer::RunMOEFloat() {
 // auto ttt = std::chrono::system_clock::now();
 // std::vector <std::pair <std::string, float> > record;
-        int configStringLen = ((int*)this->baseAddr)[0];
-        std::string configString;
-        for (int i = 0; i < configStringLen; i++) {
-            configString += (char)this->baseAddr[4 + i];
-        }
-// record.push_back(std::make_pair("get string", GetSpan(ttt, std::chrono::system_clock::now())));
-        json11::Json config;
-        std::string error;
-        config = json11::Json::parse(configString, error);
-// record.push_back(std::make_pair("parse string", GetSpan(ttt, std::chrono::system_clock::now())));
-        int n = config["n"].int_value(), m = config["m"].int_value(), k = config["k"].int_value();
-        int outputType = config["outputType"].int_value();
-        float *localInput = (float *) this->inputBuffer.data();
-        float *localOutput = (float *) this->outputBuffer.data();
+        if (((int*)this->baseAddr)[0] > 1) {
+            int configStringLen = ((int*)this->baseAddr)[0];
+            std::string configString;
+            for (int i = 0; i < configStringLen; i++) {
+                configString += (char)this->baseAddr[4 + i];
+            }
+            json11::Json config;
+            std::string error;
+            config = json11::Json::parse(configString, error);
+            int n = config["n"].int_value(), m = config["m"].int_value(), k = config["k"].int_value();
+            int outputType = config["outputType"].int_value();
+            float *localInput = (float *) this->inputBuffer.data();
+            float *localOutput = (float *) this->outputBuffer.data();
+            volatile char *buffer = (volatile char*)this->baseAddr + 4 + configStringLen;
+            RunMultiThreadMemcpy(this->inputBuffer.data(), (uint8_t*)buffer, n * m * sizeof(float), pool);
 
-        volatile char *buffer = (volatile char*)this->baseAddr + 4 + configStringLen;
-// record.push_back(std::make_pair("get config", GetSpan(ttt, std::chrono::system_clock::now())));
-        RunMultiThreadMemcpy(this->inputBuffer.data(), (uint8_t*)buffer, n * m * sizeof(float), pool);
-// record.push_back(std::make_pair("inputBuffer", GetSpan(ttt, std::chrono::system_clock::now())));
-
-// record.push_back(std::make_pair("input sum", GetSpan(ttt, std::chrono::system_clock::now())));
-        if (n > 1) {
             std::vector <std::vector <fastllm::Data*> > weights;
             std::vector <std::vector <float> > v;
             weights.resize(n);
@@ -1439,32 +1460,50 @@ namespace fastllm {
             }
             return;    
         } else {
+            volatile char *buffer = (volatile char*)this->baseAddr;
+            int n = ((int*)buffer)[0];
+            int m = ((int*)buffer)[1];
+            int k = ((int*)buffer)[2];
+            buffer += 3 * sizeof(int);
             std::vector <fastllm::Data*> weights;
             std::vector <float> v;
-            for (auto &factor : config["factors"].array_items()) {
-                v.push_back(factor.number_value());
+            int vSize = ((int*)buffer)[0];
+            buffer += sizeof(int);
+            for (int i = 0; i < vSize; i++) {
+                v.push_back(((float*)buffer)[0]);
+                buffer += sizeof(float);
             }
-// record.push_back(std::make_pair("before get weight", GetSpan(ttt, std::chrono::system_clock::now())));
-            for (auto &weight : config["weights"].array_items()) {
-                weights.push_back(&this->weights[weight.string_value()]);
+            int wSize = ((int*)buffer)[0];
+            buffer += sizeof(int);
+            for (int i = 0; i < wSize; i++) {
+                weights.push_back(this->weightsList[((int*)buffer)[0]]);
+                buffer += sizeof(int);
             }
-// record.push_back(std::make_pair("get weight", GetSpan(ttt, std::chrono::system_clock::now())));
-            std::vector <int> localKs;
-            std::vector <float*> middles;
-            std::vector <float*> results;
+            float *localInput = (float *) this->inputBuffer.data();
+            float *localOutput = (float *) this->outputBuffer.data();
+            RunMultiThreadMemcpy(this->inputBuffer.data(), (uint8_t*)buffer, n * m * sizeof(float), pool);
+
+            
+            auto &localKs = moeFloatSingleVarManagerServer.localKs;
+            auto &middles = moeFloatSingleVarManagerServer.middles;
+            auto &results = moeFloatSingleVarManagerServer.results;
+
+            localKs.resize(v.size());
+            middles.resize(v.size());
+            results.resize(v.size());
             for (int j = 0; j < v.size(); j++) {
                 int idx = j;
                 int localK = weights[idx * 2]->dims[0];
-                localKs.push_back(localK);
-                middles.push_back(new float[localK]);
-                results.push_back(new float[weights[idx * 2 + 1]->dims[0]]);
+                localKs[j] = (localK);
+                middles[j].resize(localK);
+                results[j].resize(weights[idx * 2 + 1]->dims[0]);
             }
 
             std::vector<fastllm::MultiThreadBaseOp*> ops;
             int threads = pool->threads.size();
             ops.resize(threads);
 
-            std::vector <uint16_t> bf16Input;
+            auto &bf16Input = moeFloatSingleVarManagerServer.bf16Input;
             bf16Input.resize(m);
             Float32ToBFloat16((float*)localInput, bf16Input.data(), m);
 
@@ -1491,7 +1530,7 @@ namespace fastllm {
                     int idx = l;
                     Data *weight = weights[idx * 2];
                     uint8_t *weightData = (uint8_t *) weight->cpuData;
-                    float *outputData = middles[l];
+                    float *outputData = middles[l].data();
                     float *biasData = nullptr;
                     int curK = localKs[l];
                     int curThread = (curK / k) * base;
@@ -1512,12 +1551,12 @@ namespace fastllm {
                 for (int l = st; l <= end; l++) {
                     int idx = l;
                     int spatial = localKs[idx], mid = spatial / 2;
-                    float *outputData = middles[l];
+                    float *outputData = middles[l].data();
                     int curK = localKs[idx];
 
                     ops[l - st] = new fastllm::MultiThreadMultiOps();
                     ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
-                    ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(middles[l], (uint16_t*)middles[l], mid));
+                    ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(middles[l].data(), (uint16_t*)middles[l].data(), mid));
                     pool->PushOp(l - st, ops[l - st]);
                 }
                 for (int l = st; l <= end; l++) {
@@ -1534,7 +1573,7 @@ namespace fastllm {
                     Data *weightDown = weights[idx * 2 + 1];
                     int curThread = (curK / k) * base;
                     if (weightDown->dataType == DataType::FP8_E4M3) {
-                        LaunchLinearBFloat16FP8E4M3((uint16_t*)middles[l], *weightDown, results[l], nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                        LaunchLinearBFloat16FP8E4M3((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
                     } else {
                         // TODO: other
                     }
@@ -1553,7 +1592,7 @@ namespace fastllm {
             }
             for (int j = 0; j < v.size(); j++) {
                 float value = v[j];
-                float *curOutput = (float*)results[j];
+                float *curOutput = (float*)results[j].data();
 
                 int i = 0;
     #ifdef __AVX2__
@@ -1579,8 +1618,6 @@ namespace fastllm {
                 for (int k = i; k < m; k++) {
                     localOutput[k] += curOutput[k] * value;
                 }
-                delete[] results[j];
-                delete[] middles[j];
             }
 // record.push_back(std::make_pair("get fp32 sum", GetSpan(ttt, std::chrono::system_clock::now())));
             for (int i = 0; i < n; i++) {

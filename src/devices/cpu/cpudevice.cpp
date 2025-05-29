@@ -784,6 +784,25 @@ namespace fastllm {
         }
     };
 
+    struct MOEIntSingleVarManager {
+        std::vector<LowBitConfig> inputConfigs;
+        std::vector<uint8_t> uinput;
+        std::vector <float> inputSums;
+        std::vector <float> iscales, izeros;
+        std::vector <std::vector <float> > middles, results;
+        std::vector <std::vector <LowBitConfig> > inputConfigsDown;
+        std::vector <std::vector <uint8_t> > uinputsDown;
+        std::vector <std::vector <float> > inputSumsDown;
+        std::vector <std::vector <float> > iscalesDown, izerosDown;
+    } moeIntSingleVarManager;
+
+    struct moeFloatSingleVarManager {
+        std::vector <std::vector <float> > middles, results;
+        std::vector <int> localKs;
+        std::vector <float*> tempResults;
+        std::vector <uint16_t> bf16Input;
+    } moeFloatSingleVarManager;
+
     void CpuMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuLinearOp());
@@ -882,16 +901,17 @@ namespace fastllm {
                 }
                 float *inputData = floatInput + o * m;
 
-                std::vector<LowBitConfig> inputConfigs;
-                std::vector<uint8_t> uinput;
-                std::vector <float> inputSums;
-                std::vector <float> iscales, izeros;
+                std::vector<LowBitConfig> &inputConfigs = moeIntSingleVarManager.inputConfigs;
+                std::vector<uint8_t> &uinput = moeIntSingleVarManager.uinput;
+                std::vector <float> &inputSums = moeIntSingleVarManager.inputSums;
+                std::vector <float> &iscales = moeIntSingleVarManager.iscales;
+                std::vector <float> &izeros = moeIntSingleVarManager.izeros;
 // record.push_back(std::make_pair("before OnlineQuantization", GetSpan(ttt, std::chrono::system_clock::now())));
                 OnlineQuantization(inputData, uinput, inputConfigs, 1, m, group, groupCnt, 
                                     inputSums, iscales, izeros, permuteType);
 // record.push_back(std::make_pair("OnlineQuantization", GetSpan(ttt, std::chrono::system_clock::now())));
-                std::vector <float*> middles;
-                std::vector <float*> results;
+                std::vector <std::vector <float> > &middles = moeIntSingleVarManager.middles;
+                std::vector <std::vector <float> > &results = moeIntSingleVarManager.results;
                 middles.resize(v.size());
                 results.resize(v.size());
                 for (int j = 0; j < v.size(); j++) {
@@ -901,18 +921,19 @@ namespace fastllm {
                 }
                 for (int j = 0; j < v.size(); j++) {
                     int idx = v[j].first;
-                    middles[j] = new float[weights[idx * 2]->dims[0]];
-                    results[j] = new float[weights[idx * 2 + 1]->dims[0]];
+                    middles[j].resize(weights[idx * 2]->dims[0]);
+                    results[j].resize(weights[idx * 2 + 1]->dims[0]);
                 }
                 std::vector<fastllm::MultiThreadBaseOp*> ops;
                 auto *pool = GetAlivePool();
                 int threads = pool->threads.size();
                 ops.resize(threads);
 
-                std::vector <std::vector <LowBitConfig> > inputConfigsDown;
-                std::vector <std::vector <uint8_t> > uinputsDown;
-                std::vector <std::vector <float> > inputSumsDown;
-                std::vector <std::vector <float> > iscalesDown, izerosDown;
+                std::vector <std::vector <LowBitConfig> > &inputConfigsDown = moeIntSingleVarManager.inputConfigsDown;
+                std::vector <std::vector <uint8_t> > &uinputsDown = moeIntSingleVarManager.uinputsDown;
+                std::vector <std::vector <float> > &inputSumsDown = moeIntSingleVarManager.inputSumsDown;
+                std::vector <std::vector <float> > &iscalesDown = moeIntSingleVarManager.iscalesDown;
+                std::vector <std::vector <float> > &izerosDown = moeIntSingleVarManager.izerosDown;
                 inputConfigsDown.resize(v.size());
                 uinputsDown.resize(v.size());
                 inputSumsDown.resize(v.size());
@@ -942,7 +963,7 @@ namespace fastllm {
                         int idx = v[l].first;
                         Data *weight = weights[idx * 2];
                         uint8_t *weightData = (uint8_t *) weight->cpuData;
-                        float *outputData = middles[l];
+                        float *outputData = middles[l].data();
                         float *biasData = nullptr;
                         int curK = weight->dims[0];
                         int curThread = (curK / k) * base;
@@ -972,7 +993,7 @@ namespace fastllm {
                     for (int l = st; l <= end; l++) {
                         int idx = v[l].first;
                         int spatial = weights[idx * 2]->dims[0], mid = spatial / 2;
-                        float *outputData = middles[l];
+                        float *outputData = middles[l].data();
                         int curK = weights[idx * 2]->dims[0];
                         ops[l - st] = new fastllm::MultiThreadMultiOps();
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
@@ -994,7 +1015,7 @@ namespace fastllm {
                         izeros.resize(n * groupDown);
 
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new MultiThreadOnlineQuantizationOp(
-                                    middles[l], uinputDown.data(), inputConfigs.data(),
+                                    middles[l].data(), uinputDown.data(), inputConfigs.data(),
                                     1, mid, groupDown, groupCntDown,
                                     inputSums.data(), iscales.data(), izeros.data(), permuteType));
                         pool->PushOp(l - st, ops[l - st]);
@@ -1023,12 +1044,12 @@ namespace fastllm {
                             groupCntDown = mid;
                         }
                         if (weightDown->dataType == DataType::INT8) {
-                            LaunchLinearInt8Int8(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l], 1, mid, m,
+                            LaunchLinearInt8Int8(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l].data(), 1, mid, m,
                                                     weightDown->weightSum.data(), weightDown->zeros.data(), weightDown->scales.data(), nullptr, 
                                                     inputSums.data(), iscales.data(), izeros.data(),
                                                     ops, pool, threadSt, curThread);
                         } else {
-                            MultiplyInt4GroupMultiThreadLaunch(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l], 1, mid, m,
+                            MultiplyInt4GroupMultiThreadLaunch(uinputDown.data(), (uint8_t*)weightDown->cpuData, results[l].data(), 1, mid, m,
                                                     weightDown->weightSum.data(), weightDown->mins.data(), weightDown->scales.data(), nullptr, 
                                                     inputSums, iscales, izeros,
                                                     inputConfigs, threadSt, curThread, groupDown, groupCntDown, ops, pool);
@@ -1064,7 +1085,7 @@ namespace fastllm {
 
                 for (int j = 0; j < v.size(); j++) {
                     float value = v[j].second;
-                    float *curOutput = (float*)results[j];
+                    float *curOutput = (float*)results[j].data();
                     int i = 0;
 #ifdef __AVX2__
                     __m256 value_vec = _mm256_set1_ps(value);
@@ -1091,8 +1112,6 @@ namespace fastllm {
                     for (; i < m; i++) {
                         fLastOutput[i] += curOutput[i] * value;
                     }
-                    delete[] results[j];
-                    delete[] middles[j];
                 }
  // record.push_back(std::make_pair("get f32 output", GetSpan(ttt, std::chrono::system_clock::now())));
                 if (output.dataType == DataType::FLOAT16) {
@@ -1165,18 +1184,18 @@ namespace fastllm {
                 }
                 int n = input.dims[0], m = input.dims[1];
                 float *inputData = floatInput + o * m;
-                std::vector <uint16_t> bf16Input;
+                auto &bf16Input = moeFloatSingleVarManager.bf16Input;
                 bf16Input.resize(m);
                 Float32ToBFloat16(inputData, bf16Input.data(), m);
-
-                std::vector <float*> middles;
-                std::vector <float*> results;
+                
+                auto &middles = moeFloatSingleVarManager.middles;
+                auto &results = moeFloatSingleVarManager.results;
                 middles.resize(v.size());
                 results.resize(v.size());
                 for (int j = 0; j < v.size(); j++) {
                     int idx = v[j].first;
-                    middles[j] = new float[weights[idx * 2]->dims[0]];
-                    results[j] = new float[weights[idx * 2 + 1]->dims[0]];
+                    middles[j].resize(weights[idx * 2]->dims[0]);
+                    results[j].resize(weights[idx * 2 + 1]->dims[0]);
                 }
                 std::vector<fastllm::MultiThreadBaseOp*> ops;
                 auto *pool = GetAlivePool();
@@ -1204,7 +1223,7 @@ namespace fastllm {
                     for (int l = st; l <= end; l++) {
                         int idx = v[l].first;
                         Data *weight = weights[idx * 2];
-                        float *outputData = middles[l];
+                        float *outputData = middles[l].data();
                         float *biasData = nullptr;
                         int curK = weight->dims[0];
                         int curThread = (curK / k) * base;
@@ -1225,11 +1244,11 @@ namespace fastllm {
                     for (int l = st; l <= end; l++) {
                         int idx = v[l].first;
                         int spatial = weights[idx * 2]->dims[0], mid = spatial / 2;
-                        float *outputData = middles[l];
+                        float *outputData = middles[l].data();
                         int curK = weights[idx * 2]->dims[0];
                         ops[l - st] = new fastllm::MultiThreadMultiOps();
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
-                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(middles[l], (uint16_t*)middles[l], mid));
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(middles[l].data(), (uint16_t*)middles[l].data(), mid));
                         pool->PushOp(l - st, ops[l - st]);
                     }
                     for (int l = st; l <= end; l++) {
@@ -1245,7 +1264,7 @@ namespace fastllm {
                         Data *weightDown = weights[idx * 2 + 1];
                         int curThread = (curK / k) * base;
                         if (weightDown->dataType == DataType::FP8_E4M3) {
-                            LaunchLinearBFloat16FP8E4M3((uint16_t*)middles[l], *weightDown, results[l], nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                            LaunchLinearBFloat16FP8E4M3((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
                         } else {
                             // TODO: other
                         }
@@ -1266,7 +1285,7 @@ namespace fastllm {
                 }
                 for (int j = 0; j < v.size(); j++) {
                     float value = v[j].second;
-                    float *curOutput = (float*)results[j];
+                    float *curOutput = (float*)results[j].data();
                     int i = 0;
 #ifdef __AVX2__
                     __m256 value_vec = _mm256_set1_ps(value);
@@ -1293,8 +1312,6 @@ namespace fastllm {
                     for (; i < m; i++) {
                         fLastOutput[i] += curOutput[i] * value;
                     }
-                    delete[] results[j];
-                    delete[] middles[j];
                 }
                 if (output.dataType == DataType::FLOAT16) {
                     Float32ToFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
