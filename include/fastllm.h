@@ -484,7 +484,7 @@ namespace fastllm {
 
         void SetTokenizerConfig(const json11::Json &config);
 
-        std::string Normalize(const std::string &ori); // 字符规范化
+        std::string Normalize(const std::string &ori, const bool addDummyPrefix=true); // 字符规范化
 
         Data Encode(const std::string &s); // 编码
 
