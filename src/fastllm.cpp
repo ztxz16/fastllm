@@ -1671,7 +1671,7 @@ namespace fastllm {
             specialRoot = new TrieNode();
         for (auto &it : specialTokenMap) {
             TrieNode *now = this->specialRoot;
-            std::string normalized = Normalize(it.first);
+            std::string normalized = Normalize(it.first, false);
             for (int i = 0; i < normalized.size(); i++) {
                 if (now->next.find(normalized[i]) == now->next.end()) {
                     now->next[normalized[i]] = new TrieNode();
@@ -1738,7 +1738,7 @@ namespace fastllm {
         return std::numeric_limits<int>::max();
     }
 
-    std::string Tokenizer::Normalize(const std::string &ori) {
+    std::string Tokenizer::Normalize(const std::string &ori, const bool addDummyPrefix) {
         if (this->byteAsChar) {
             std::wstring ws(ori.size(), L' ');
             for (int i=0; i < ori.length(); i++) {
@@ -1752,7 +1752,7 @@ namespace fastllm {
         }
         std::string blank = "";
         blank += 226, blank += 150, blank += 129;
-        std::string s = this->addDummyPrefix ? blank : "";
+        std::string s = (addDummyPrefix && this->addDummyPrefix) ? blank : "";
         if (15 < ori.size() && ori.substr(0, 15) == "<FLM_FIX_TOKEN_") {
             s = "";
         }
