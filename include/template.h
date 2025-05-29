@@ -54,7 +54,8 @@ namespace fastllm {
             JinjaTokenLMB, JinjaTokenRMB, JinjaTokenLSB, JinjaTokenRSB,
             JinjaTokenSet, JinjaTokenFor, JinjaTokenEndFor, JinjaTokenIf, JinjaTokenElse, JinjaTokenElseIf, JinjaTokenEndif,
             JinjaTokenIn,
-            JinjaTokenAssign, JinjaTokenNotEqual, JinjaTokenEqual, JinjaTokenAdd, JinjaTokenSub, JinjaTokenMul, JinjaTokenDiv, JinjaTokenMod,
+            JinjaTokenAssign, JinjaTokenNotEqual, JinjaTokenEqual, JinjaTokenLess, JinjaTokenLessEqual, JinjaTokenMore, JinjaTokenMoreEqual,
+            JinjaTokenAdd, JinjaTokenSub, JinjaTokenMul, JinjaTokenDiv, JinjaTokenMod,
             JinjaTokenNot, JinjaTokenAnd, JinjaTokenOr,
             JinjaTokenFilter, JinjaTokenNamespace, JinjaTokenSlice
         };
@@ -95,7 +96,7 @@ namespace fastllm {
             {"endif", JinjaToken::JinjaToKenType::JinjaTokenEndif},
             {"set", JinjaToken::JinjaToKenType::JinjaTokenSet},
             {"in", JinjaToken::JinjaToKenType::JinjaTokenIn},
-            {"is", JinjaToken::JinjaToKenType::JinjaTokenIn},
+            {"is", JinjaToken::JinjaToKenType::JinjaTokenEqual},
             {"true", JinjaToken::JinjaToKenType::JinjaTokenBOOL},
             {"false", JinjaToken::JinjaToKenType::JinjaTokenBOOL},
             {"and", JinjaToken::JinjaToKenType::JinjaTokenAnd},
