@@ -702,7 +702,7 @@ namespace fastllm {
             ((ChatGLMModel*)model)->tokenizerClass = tokenizerClass;
 
             // ChatGLM采用拼接token的方法，需要强行指定分割词的TokenID
-            model->pre_prompt = "";
+            model->pre_prompt = "[gMASK]<sop>";
             model->user_role = ("<FLM_FIX_TOKEN_" + std::to_string(model->weight.tokenizer.GetTokenId("<|user|>"))  + ">\n");
             model->bot_role = ("<FLM_FIX_TOKEN_" + std::to_string(model->weight.tokenizer.GetTokenId("<|assistant|>")) + ">\n");
             model->history_sep = "";
