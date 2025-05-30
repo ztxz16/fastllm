@@ -2,7 +2,7 @@
 
 - 优化了numa加速
 - 略微提升了prefill和decode速度
-- 支持了moe的混合张量并行，参考[混合推理指南](docs/mixforward.md)
+- 支持了moe的混合张量并行，参考[混合推理指南](mixforward.md)
 - 修复了multicuda的一些bug，支持了所有精度的混合张量并行
 - 修复了C++下Jinja模板的一些bug，支持Qwen3, DS等一系列模型的内置分词器
 
