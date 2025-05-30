@@ -731,7 +731,10 @@ namespace fastllm {
             ToDataType(logits, DataType::FLOAT32);
             ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfig);
             if (this->weight.dicts["model_type"] != "deepseek_v2") {
-                ((GenerationConfig*)&generationConfig)->top_k = 3;
+                if (((GenerationConfig*)&generationConfig)->top_k <= 1) { 
+                    ((GenerationConfig*)&generationConfig)->top_k = 10;
+                }
+
                 ((GenerationConfig*)&generationConfig)->top_p = 0.95;
                 if (fabs(generationConfig.temperature - 1.0f) < 1e-6) {
                     ((GenerationConfig*)&generationConfig)->temperature = 0.6;
@@ -1326,7 +1329,10 @@ namespace fastllm {
         ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfigs);
         if (this->weight.dicts["model_type"] != "deepseek_v2") {
             for (auto &generationConfig : generationConfigs) {
-                ((GenerationConfig*)&generationConfig)->top_k = 3;
+                if (((GenerationConfig*)&generationConfig)->top_k <= 1) { 
+                    ((GenerationConfig*)&generationConfig)->top_k = 10;
+                }
+
                 ((GenerationConfig*)&generationConfig)->top_p = 0.95;
                 if (fabs(generationConfig.temperature - 1.0f) < 1e-6) {
                     ((GenerationConfig*)&generationConfig)->temperature = 0.6;
