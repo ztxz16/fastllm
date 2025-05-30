@@ -280,6 +280,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
 
             int curLen = 0;
             for (auto &it : div) {
+                if (mallocType == 0) {
+                    cudaSetDevice(0);
+                }
                 FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + curLen * weight.unitSize / weight.unitSizeDiv,
                                     (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
                                     (uint8_t*)weight.cudaData + it.first * weight.unitSize / weight.unitSizeDiv, 
