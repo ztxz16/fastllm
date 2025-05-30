@@ -11,10 +11,6 @@
 #include "json11.hpp"
 #include "cpudevice.h"
 
-#ifdef __aarch64__
-#include "arm_math.h"
-#endif
-
 const int VERSION = 1;
 
 const int DDRLEN = 256 * 1024 * 1024;

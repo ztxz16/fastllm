@@ -3,7 +3,10 @@
 //
 
 #include <cstdint>
+
+#ifdef __AVX2__
 #include "immintrin.h"
+#endif
 
 namespace fastllm {
     bool LinearBFloat16FP8E4M3_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,

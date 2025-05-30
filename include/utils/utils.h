@@ -48,6 +48,7 @@
 #endif
 #endif
 
+#ifndef __aarch64__
 // Intrinsics for CPUID
 #if defined(_MSC_VER)
     #include <intrin.h> // For __cpuid, __cpuidex, _xgetbv
@@ -63,6 +64,7 @@
 #else
     #warning "CPUID detection not implemented for this compiler."
 #endif
+#endif // ifndef __aarch64__
 
 namespace fastllm {
     static bool StringEndWith(const std::string &s, const std::string &end) {
@@ -123,6 +125,7 @@ namespace fastllm {
         bool hasAVX512VNNI = false;
         // You could add more, e.g., hasAVX, hasAVX2
         CPUInstructInfo() {
+#ifndef __aarch64__
             #if defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)
             std::array<int, 4> regs; // For EAX, EBX, ECX, EDX
             // Step 1: Check OSXSAVE bit (CPUID EAX=1, ECX bit 27)
@@ -181,6 +184,7 @@ namespace fastllm {
             printf("[AVX512_VNNI: %s] ", x[hasAVX512VNNI].c_str());
             printf("[AVX512_BF16: %s] ", x[hasAVX512BF16].c_str());
             printf("\n");
+#endif // ifndef __aarch64__
         }
     };
     // static CPUInstructInfo cpuInstructInfo;
