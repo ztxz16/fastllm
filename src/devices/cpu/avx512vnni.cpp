@@ -3,7 +3,9 @@
 //
 
 #include <cstdint>
+#ifdef __AVX2__
 #include "immintrin.h"
+#endif
 
 namespace fastllm {
     int DotU4U8_AVX512VNNI(uint8_t *a, uint8_t *b, int n) {
@@ -17,7 +19,6 @@ namespace fastllm {
             __m256i orix = _mm256_loadu_si256((const __m256i *) (a + i / 2));
             __m512i bytex = _mm512_inserti64x4(_mm512_castsi256_si512(orix), _mm256_srli_epi16(orix, 4), 1);
             __m512i bx = _mm512_and_si512(lowMask, bytex);
-
             __m512i by = _mm512_loadu_si512((const __m512i *) (b + i));
             acc = _mm512_dpbusd_epi32(acc, by, bx);
         }
@@ -25,9 +26,6 @@ namespace fastllm {
             ans += a[i] * b[i];
         }
         return ans + _mm512_reduce_add_epi32(acc);
-#else
-        printf("Wrong: need AVX512VNNI.\n");
-        exit(0);
 #endif
     };
 
