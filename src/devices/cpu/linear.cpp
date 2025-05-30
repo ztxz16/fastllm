@@ -104,6 +104,7 @@ namespace fastllm {
         }
     }
 
+#ifdef __AVX2__
     // 2. Vectorized FP8 E4M3 to FP32 conversion (AVX2)
     //    Input: 8 uint8_t values packed into the lower 64 bits of an __m128i
     //    Output: 8 float values in an __m256 vector
@@ -172,6 +173,7 @@ namespace fastllm {
         return _mm256_castsi256_ps(fp32_bits);
         // --- End Implementation Sketch ---
     }
+#endif
 
     bool LinearBFloat16FP8E4M3_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end, int blockK, int blockM, float *scales, 
@@ -190,7 +192,7 @@ namespace fastllm {
                 return;
             }
         }
-
+#ifdef __AVX2__
         if (m % blockM == 0 && blockM % 8 == 0) {
             for (int i = 0; i < n; i++) {
                 for (int j = st; j < end; j++) {
@@ -199,7 +201,7 @@ namespace fastllm {
                     for (int midx = 0; midx < ms; midx++) {
                         float curScale = scales[j / blockK * ms + midx];
                         int l = midx * blockM;
-#ifdef __AVX2__
+
                         __m256 vsum = _mm256_setzero_ps();
                         for (; l + 7 < (midx + 1) * blockM; l += 8) {
                             // __m256 vi = _mm256_loadu_ps(inputData + i * m + l);
@@ -213,8 +215,7 @@ namespace fastllm {
                             vsum = _mm256_fmadd_ps(vi, vw, vsum);
                         }
                         // now += Floatsum(vsum) * curScale;
-                        lastSum = _mm256_fmadd_ps(vsum, _mm256_set1_ps(curScale), lastSum);
-#endif                        
+                        lastSum = _mm256_fmadd_ps(vsum, _mm256_set1_ps(curScale), lastSum);                        
                     }
                     now += Floatsum(lastSum) * pow(2, 120);
                     outputData[i * k + j] = now;
@@ -227,7 +228,6 @@ namespace fastllm {
                     for (int midx = 0; midx < ms; midx++) {
                         float curScale = scales[j / blockK * ms + midx] * magicScale;
                         int l = midx * blockM;
-#ifdef __AVX2__
                         __m256 vsum = _mm256_setzero_ps();
                         for (; l + 7 < m && l + 7 < (midx + 1) * blockM; l += 8) {
                             // __m256 vi = _mm256_loadu_ps(inputData + i * m + l);
@@ -241,7 +241,6 @@ namespace fastllm {
                             vsum = _mm256_fmadd_ps(vi, vw, vsum);
                         }
                         now += Floatsum(vsum) * curScale;
-#endif
                         for (; l < m && l < (midx + 1) * blockM; l++) {
                             now += curScale * inputData[i * m + l] * fp8e4m3tofp32.dict[weightData[j * m + l]];
                         }
@@ -250,6 +249,9 @@ namespace fastllm {
                 }
             }
         }
+#else
+        ErrorInFastLLM("Unsupport MultiThreadLinearBFloat16FP8E4M3Op");
+#endif
     }
 
     void MultiThreadLinearInt8Int8Op::Run() {
