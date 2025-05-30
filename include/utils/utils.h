@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <thread>
 #include <vector>
+#include <array>
 #ifndef __CUDACC__
 #if defined(__GNUC__) && __GNUC__ < 8 && !defined(__clang__)
 #include <experimental/filesystem>
