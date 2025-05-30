@@ -4,11 +4,11 @@
 
 ## 介绍
 
-fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）的高性能大模型推理库，兼容Qwen、QWQ等稠密模型和DeepSeek MOE模型。
-
-2块eypc 9655  + 24根DDR5 6400 + 1张4090 推理DeepSeek R1 671B模型，INT4量化单路27+tps，并发40+tps。
-2块eypc 9374f + 24根DDR5 4800 + 1张4090 推理DeepSeek R1 671B模型，INT4量化单路22+tps，并发35+tps；INT8量化单路17+tps,并发30+tps。
-
+fastllm是c++实现自有算子替代Pytorch的高性能全功能大模型推理库，可以推理Qwen, Llama, Phi等稠密模型，以及DeepSeek, Qwen-moe等moe模型
+- 具有优良的兼容性，支持M40, K80到5090全系列N卡，支持MI50，7900等A卡，支持天数，沐曦等国产卡，支持ThinkForce NPU推理
+- 支持任意显卡的FP8推理
+- 任意显卡只需要显存 > 10G就可以支持单卡推理满血DeepSeek R1 671B模型
+- 双路9004/9005服务器 + 单显卡部署DeepSeek R1 671B - FP8原版模型，单并发速度可达20左右，部署INT4模型单并发速度可达30左右，最高并发速度可达60+
 
 部署交流QQ群： 831641348
 
@@ -17,13 +17,13 @@ fastllm是c++实现，后端无依赖（仅依赖CUDA，无需依赖PyTorch）�
 ## 亮点功能
 
 - 🚀 安装使用简单方便，一条命令就能成功安装，一条命令就能成功运行。
-- 🚀 支持CPU + GPU混合推理MOE大参数模型（单4090即可推理DEEPSEEK 671B）。
+- 🚀 支持CPU + GPU混合推理MOE大参数模型（单显卡即可推理DEEPSEEK 671B）。
 - 🚀 使用C++实现自有底层算子，不依赖PyTorch。
 - 🚀 兼容性好，PIP安装支持可以支持到P100、MI50等老卡，源码安装支持更多设备。
 - 🚀 支持多卡张量并行推理，支持3、5、7等奇数张卡。
 - 🚀 支持GPU + CPU混合张量并行推理
 - 🚀 支持CPU和显卡实现FP8运算，老设备也可以运行
-- 🚀 支持双CPU加速，且只占用1份内存，DeepSeek R1 671b int4 需内存340G。
+- 🚀 支持多CPU加速，且只占用1份内存
 - 🚀 支持ROCM，AMD GPU；支持天数，沐曦，燧原；支持华为昇腾。
 - 🚀 支持动态Batch，流式输出；前后端分离设计，可跨平台移植，可在安卓上直接编译。
 - 🚀 支持Python[自定义模型结构](docs/custom.md)
@@ -127,7 +127,7 @@ ftllm server model
 这里的`model`可以是:
 
 - Huggingface上的模型，例如 `Qwen/Qwen3-0.6B` 代表 [千问3-0.6B模型](https://hf-mirror.com/Qwen/Qwen3-0.6B)
-- 本地模型路径。例如`/mnt/Qwen3-0.6B`，下载模型可以参考 [模型下载](#模型下载)
+- 本地模型路径。例如`/mnt/Qwen3-0.6B`，高速下载模型可以参考 [模型下载](#模型下载)
 
 无论是在线模型还是本地模型，目前支持以下几种格式 （均以在线模型举例，可以在Huggingface上搜到对应模型）:
 
@@ -203,6 +203,8 @@ ftllm server deepseek-ai/DeepSeek-V3-0324 --dtype fp8 --moe_dtype int4
 | 稠密模型 | cuda   |   不生效    |
 | MOE模型  | cuda   |   cpu    |
 
+对于发烧友而言，如果想更进一步榨干硬件，可以参考 [混合推理指南](docs/mixforward.md)
+
 ### 4. 如何设定运行参数
 
 可以通过下列参数设置运行参数。
@@ -267,13 +269,13 @@ numactl -C 0-31 -m 0 ftllm server fastllm/DeepSeek-V3-0324-INT4 --device cuda --
 
 - `--cache_dir`:
   - **描述**: 指定在线Huggingface模型的缓存目录
-  - **示例**: `ftllm cache_dir /mnt`
+  - **示例**: `ftllm --cache_dir /mnt`
 
 ## 模型获取
 
 ### 模型下载
 
-可以使用如下命令将模型下载到本地
+可以使用如下命令将模型下载到本地（使用高速镜像，无需科学上网）
 
 ```
 ftllm download deepseek-ai/DeepSeek-R1
