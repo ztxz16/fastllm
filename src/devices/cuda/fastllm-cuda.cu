@@ -3211,13 +3211,6 @@ bool FastllmCudaMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &we
         }
 
         len = n * k;
-#ifdef CUDA_NO_TENSOR_CORE
-        if (bias.dims.size() > 0) {
-            FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
-        }
-        FastllmCudaFree(cudaFp16Input);
-        FastllmCudaFree(cudaFp16Weight);
-#else
         FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
                                                                                            len);
         if (bias.dims.size() > 0) {
@@ -3227,7 +3220,6 @@ bool FastllmCudaMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &we
         FastllmCudaFree(cudaFp16Input);
         FastllmCudaFree(cudaFp16Output);
         FastllmCudaFree(cudaFp16Weight);
-#endif
     } else {
         LaunchFastllmGemmFp32FP8E4M3(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBiasData, cudaScales, n, m, k, weight.blockM, weight.blockK);
     }
@@ -3268,7 +3260,7 @@ bool FastllmCudaHalfMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data
 
         cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
 
-        __half h_alpha = __float2half_rn(exp2f(8.0f)); // fp8 -> fp16的转换系数
+        __half h_alpha = __float2half_rn(exp2f(8.0f)); // fp8 -> fp16的转换系数  
         __half h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
         cublasStatus_t status;
@@ -4313,25 +4305,25 @@ bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fast
 }
 
 #ifndef USE_ROCM
-// 自定义函子，用于处理每一行的 TopK 操作
+// 自定义函子，用于处理每一行的 TopK 操作  
 struct TopKFunctor {
-    float* cudaInput;        // 指向原始输入数据的设备指针
-    float* cudaOutput;       // 指向输出数据的设备指针
+    float* cudaInput;        // 指向原始输入数据的设备指针  
+    float* cudaOutput;       // 指向输出数据的设备指针  
     int channels;
     int topk;
 
-    // 构造函数
+    // 构造函数  
     TopKFunctor(float* cudaInput, float* cudaOutput, int channels, int topk)
         : cudaInput(cudaInput), cudaOutput(cudaOutput), channels(channels), topk(topk) {}
 
-    // thrust::for_each 会为每个行索引 i 调用这个操作符
-    // __host__ __device__ 使得函子可以在主机和设备上被调用（Thrust 要求）
+    // thrust::for_each 会为每个行索引 i 调用这个操作符  
+    // __host__ __device__ 使得函子可以在主机和设备上被调用（Thrust 要求）  
     __host__ __device__
     void operator()(int i) const {
         thrust::device_ptr<float> d_input(cudaInput);
         thrust::device_ptr<float> d_output(cudaOutput);
 
-        // 当前行的起始位置
+        // 当前行的起始位置  
         thrust::device_ptr<float> row_start = d_input + i * channels;
         thrust::device_ptr<float> row_end = row_start + channels;
         
@@ -4339,34 +4331,34 @@ struct TopKFunctor {
         thrust::device_vector<int> indices(channels);
         thrust::sequence(indices.begin(), indices.end());
         
-        // 使用zip迭代器将值和索引组合在一起
+        // 使用zip迭代器将值和索引组合在一起  
         auto begin = thrust::make_zip_iterator(
             thrust::make_tuple(row_start, indices.begin()));
         auto end = thrust::make_zip_iterator(
             thrust::make_tuple(row_end, indices.end()));
         
-        // 按值降序排序
+        // 按值降序排序  
         thrust::sort(begin, end, 
             thrust::greater<thrust::tuple<float, int>>());
         
-        // 复制前topk个结果到输出
+        // 复制前topk个结果到输出  
         for (int k = 0; k < topk; ++k) {
-            d_output[i * topk * 2 + k * 2] = indices[k];     // 索引
-            d_output[i * topk * 2 + k * 2 + 1] = row_start[k]; // 值
+            d_output[i * topk * 2 + k * 2] = indices[k];     // 索引  
+            d_output[i * topk * 2 + k * 2 + 1] = row_start[k]; // 值  
         }
     }
 };
 
-// 主函数/调用部分
+// 主函数/调用部分  
 void topk_parallel_thrust(float* d_input, float* d_output, int outer, int channels, int topk) {
-    // 创建函子实例
+    // 创建函子实例  
     TopKFunctor functor(d_input, d_output, channels, topk);
 
-    // 使用 thrust::for_each 和 counting_iterator 来并行处理每一行
+    // 使用 thrust::for_each 和 counting_iterator 来并行处理每一行  
     thrust::for_each(
         thrust::counting_iterator<int>(0),      // 起始迭代器 (0)
         thrust::counting_iterator<int>(outer),  // 结束迭代器 (outer)
-        functor                                 // 应用于每个元素的函子
+        functor                                 // 应用于每个元素的函子  
     );
 }
 #endif
@@ -5981,7 +5973,7 @@ int GetPointerDeviceId(void *ptr) {
     cudaError_t err = cudaPointerGetAttributes(&attributes, ptr);
 
     if (err == cudaSuccess) {
-#if (CUDART_VERSION < 10000) && not(defined(USE_ROCM))
+#if (CUDART_VERSION < 10000) && !(defined(USE_ROCM))
         if (attributes.memoryType == cudaMemoryTypeDevice) {
 #else
         if (attributes.type == cudaMemoryTypeDevice) {

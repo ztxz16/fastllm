@@ -251,6 +251,12 @@
     <ClCompile Include="..\..\src\models\graph\telechat.cpp">
       <Filter>源文件\models\graph</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\devices\cpu\avx512bf16.cpp">
+      <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\devices\cpu\avx512vnni.cpp">
+      <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\cpudevice.cpp">
       <Filter>源文件\devices\cpu</Filter>
     </ClCompile>

@@ -212,7 +212,8 @@ namespace fastllm {
         int i = 0;
 #ifdef __AVX__
         for (; i + 7 < len; i += 8) {
-            __m256i float_vec = (__m256i)_mm256_cvtph_ps(_mm_loadu_si128((__m128i *) (float16 + i)));
+            __m256 _float_vec = _mm256_cvtph_ps(_mm_loadu_si128((__m128i *) (float16 + i)));
+            __m256i float_vec = *((__m256i *)&_float_vec);
             __m256i shifted = _mm256_srli_epi32(float_vec, 16);
             __m128i lo = _mm256_castsi256_si128(shifted);
             __m128i hi = _mm256_extracti128_si256(shifted, 1);
