@@ -12,7 +12,7 @@ fastllm是c++实现自有算子替代Pytorch的高性能全功能大模型推理
 
 部署交流QQ群： 831641348
 
-部署交流微信群: ![二维码](docs/wechat_group0.jpg)
+微信群：目前群聊超过200人，请添加小助手微信号`fastllmxzs`加群: 
 
 ## 亮点功能
 
@@ -180,7 +180,7 @@ ftllm server deepseek-ai/DeepSeek-V3-0324 --dtype fp8 --moe_dtype int4
     - `cuda` 使用`gpu`推理 
     - `numa` 使用多路`numa`节点加速推理，在多CPU的机器才会有提升
     - `multicuda` 使用多设备张量并行推理
-      - **使用多显卡**: `--device multicuda:0,1` （`FP8`精度暂不支持多显卡）
+      - **使用多显卡**: `--device multicuda:0,1`
       - **使用多显卡+CPU**: `--device multicuda:0,cpu`
       - **按比例使用多显卡+CPU**: `--device multicuda:0:4,1:5,cpu:1` (`cuda:0`计算4/10, `cuda:1`计算5/10, `cpu`计算1/10)
 
