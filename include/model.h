@@ -25,7 +25,7 @@ namespace fastllm {
                                                     bool weightOnly = false, 
                                                     bool useMoeDataType = false, 
                                                     DataType moeDataType = DataType::FLOAT32, 
-                                                    int moeGroupCnt = -1);
+                                                    int moeGroupCnt = -1, const std::string &dtypeConfigString = "");
     
     void ExportLLMModelFromHF(const std::string &modelPath, 
                             DataType linearDataType, 
@@ -35,7 +35,7 @@ namespace fastllm {
                             const std::string &loraPath = "", 
                             bool useMoeDataType = false, 
                             DataType moeDataType = DataType::FLOAT32, 
-                            int moeGroupCnt = -1);
+                            int moeGroupCnt = -1, const std::string &dtypeConfigString = "");
     
     std::unique_ptr<basellm> CreateLLMTokenizerFromHF(const std::string &modelPath);
 }
