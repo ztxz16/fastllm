@@ -37,12 +37,12 @@ else:
         print("Load fastllm failed. (Try update glibc)")
         exit(0)
 
-fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int]
+fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
 
 fastllm_lib.create_llm_model.argtypes = [ctypes.c_char_p]
 fastllm_lib.create_llm_model.restype = ctypes.c_int
 
-fastllm_lib.create_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int]
+fastllm_lib.create_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.create_llm_model_fromhf.restype = ctypes.c_int
 
 fastllm_lib.create_llm_model_fromhf_with_config.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_char_p]
@@ -159,7 +159,11 @@ def export_llm_model_fromhf(path : str,
                             output : str,
                             dtype : str = "float16",
                             moe_dtype : str = "",
-                            lora: str = ""):
+                            lora: str = "",
+                            dtype_config: str = ""):
+    if (dtype == "auto"):
+        dtype = "float16"
+
     int4g_groupcnt = 128;
     if (dtype.startswith("int4g") and len(dtype) > 5):
         try:
@@ -186,9 +190,13 @@ def export_llm_model_fromhf(path : str,
             print("moe_dtype should be one of ", list(fastllm_data_type_dict.keys()))
             exit(0)
         use_moe_dtype = True
+    
+    if (dtype_config != "" and os.path.exists(dtype_config)):
+        with open(dtype_config, "r", encoding="utf-8") as file:
+            dtype_config = file.read()
 
     fastllm_lib.export_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, lora.encode(), output.encode(), 
-                                        use_moe_dtype, fastllm_data_type_dict[moe_dtype], moe_int4g_groupcnt);
+                                        use_moe_dtype, fastllm_data_type_dict[moe_dtype], moe_int4g_groupcnt, dtype_config.encode());
 
 def softmax(a):
     max_value = a[0]
@@ -574,7 +582,8 @@ class model:
                   tokenizer_type = "auto", 
                   model_json: str = "", 
                   graph: type = None, 
-                  lora: str = ""):
+                  lora: str = "", 
+                  dtype_config: str = ""):
         if (graph != None):
             current_graph = graph()
             if (os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json"))):
@@ -650,7 +659,7 @@ class model:
                 else:
                     self.model = fastllm_lib.create_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, 
                                                                  ctypes.c_bool(self.hf_tokenizer != None), lora.encode(), 
-                                                                 use_moe_dtype, fastllm_data_type_dict[moe_dtype], moe_int4g_groupcnt);
+                                                                 use_moe_dtype, fastllm_data_type_dict[moe_dtype], moe_int4g_groupcnt, dtype_config.encode());
                 if (os.path.isfile(os.path.join(path, "config.json"))):
                     self.config = json.load(open(os.path.join(path, "config.json"), "r"))
             else:
