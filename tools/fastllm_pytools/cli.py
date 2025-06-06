@@ -144,7 +144,7 @@ def main():
         from ftllm import llm
         if (args.path == '' or args.path is None):
             args.path = args.model
-        llm.export_llm_model_fromhf(path = args.path, dtype = args.dtype, moe_dtype = args.moe_dtype, lora = args.lora, output = args.output)
+        llm.export_llm_model_fromhf(path = args.path, dtype = args.dtype, moe_dtype = args.moe_dtype, lora = args.lora, output = args.output, dtype_config = args.dtype_config)
     else:
         print("Invalid command: ", args.command)
         exit(0)

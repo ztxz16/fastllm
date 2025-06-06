@@ -23,6 +23,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
     parser.add_argument('--cache_dir', type = str, default = "", help = '指定缓存模型文件的路径')
+    parser.add_argument('--dtype_config', type = str, default = "", help = '指定权重类型配置文件')
     return parser
 
 def add_server_args(parser):
@@ -156,7 +157,11 @@ def make_normal_llm_model(args):
         spec.loader.exec_module(custom_module)
         if (hasattr(custom_module, "__model__")):
             graph = getattr(custom_module, "__model__")
-    model = llm.model(args.path, dtype = args.dtype, moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora)
+    if (args.dtype_config != "" and os.path.exists(args.dtype_config)):
+        with open(args.dtype_config, "r", encoding="utf-8") as file:
+            args.dtype_config = file.read()
+    model = llm.model(args.path, dtype = args.dtype, moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora, 
+                        dtype_config = args.dtype_config)
     if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
         model.enable_thinking = False
     model.set_atype(args.atype)
