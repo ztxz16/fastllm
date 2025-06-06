@@ -189,10 +189,23 @@ namespace fastllm {
         INT4_NOZERO = 8, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale
         INT4_GROUP = 9, // 不用zeroPoint的int4, floatValue = min + uint4Value * scale, 且使用分组量化
         FP8_E4M3 = 10,
-        INT2_GROUP = 11, // 不用zeroPoint的int2, floatValue = min + uint4Value * scale, 且使用分组量化
+        INT2_GROUP = 11, // 不用zeroPoint的int2, floatValue = min + uint2Value * scale, 且使用分组量化
         BASE3_GROUP = 12, // 三元量化，-1 0 1
         INT32PARAM = 100, // int32的参数，这种类型的数据永远存在CPU上
         DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV
+    };
+
+    static std::map <DataType, std::vector <std::string> > dataTypeNames = {
+        {DataType::FLOAT32, {"float32", "fp32"}}, {DataType::BFLOAT16, {"bfloat32", "bf32"}}, {DataType::INT16, {"int16"}}, 
+        {DataType::INT8, {"int8"}}, {DataType::INT4, {"int4o"}}, {DataType::INT2, {"int2"}}, {DataType::BIT, {"bit"}}, 
+        {DataType::FLOAT16, {"float16", "fp16", "half"}}, {DataType::INT4_NOZERO, {"int4"}}, {DataType::INT4_GROUP, {"int4g"}},
+        {DataType::FP8_E4M3, {"float8", "fp8", "fp8_e4m3"}}, {DataType::INT2_GROUP, {"int2g"}}, {DataType::BASE3_GROUP, {"base3g"}}
+    };
+
+    static std::map <DataType, int> DefaultGroupCnts = {
+        {DataType::INT4_GROUP, 128},
+        {DataType::INT2_GROUP, 128}, 
+        {DataType::BASE3_GROUP, 128}
     };
 
     static std::map <DataType, int> DataTypeBits = {

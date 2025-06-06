@@ -5,6 +5,7 @@
 #include "fastllm.h"
 #include <sstream>
 #include <fstream>
+#include <regex>
 
 #include "chatglm.h"
 #include "moss.h"
@@ -750,10 +751,43 @@ namespace fastllm {
         }
     }
 
+    void ParseDataType(std::string weightName, std::vector <std::pair <std::string, std::string> > &dtypeRules, 
+                        DataType &dataType, int &groupCnt) {
+        std::string matchedType = "";
+        for (int i = 0; i < dtypeRules.size(); i++) {
+            std::regex pattern(dtypeRules[i].first);
+            if (std::regex_search(weightName, pattern)) {
+                matchedType = dtypeRules[i].second;
+            }
+        }
+        transform(matchedType.begin(), matchedType.end(), matchedType.begin(), ::tolower);
+        if (matchedType != "") {
+            for (auto &it : dataTypeNames) {
+                for (auto &dataTypeName : it.second) {
+                    if (DefaultGroupCnts.find(it.first) != DefaultGroupCnts.end()) {
+                        if (StringStartWith(matchedType, dataTypeName)) {
+                            dataType = it.first;
+                            if (matchedType != dataTypeName) {
+                                groupCnt = std::atoi(matchedType.substr(dataTypeName.size()).c_str());
+                            } else {
+                                groupCnt = DefaultGroupCnts[it.first];
+                            }
+                        }
+                    } else {
+                        if (matchedType == dataTypeName) {
+                            dataType = it.first;
+                        }
+                    }
+                }
+            }
+        }        
+    }
+
     // 从hf文件夹读取，仅支持safetensor格式的模型
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
                                                     DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig,
-                                                    const std::string &loraPath, bool weightOnly, bool useMoeDataType, DataType moeDataType, int moeGroupCnt) {
+                                                    const std::string &loraPath, bool weightOnly, bool useMoeDataType, DataType moeDataType, int moeGroupCnt,
+                                                    const std::string &dtypeConfigString) {
         if (moeGroupCnt == -1) {
             moeGroupCnt = groupCnt;
         }
@@ -918,6 +952,20 @@ if (false) {
             }
         }
 
+        std::vector <std::pair <std::string, std::string> > dtypeRules;
+        if (dtypeConfigString.size() > 0) {
+            auto dtypeConfig = json11::Json::parse(dtypeConfigString, error);
+            if (error != "") {
+                printf("Parse dtype config faild.\n");
+                printf("config = %s\n", dtypeConfigString.c_str());
+                printf("error = %s\n", error.c_str());
+            } else {
+                for (auto &it : dtypeConfig.array_items()) {
+                    dtypeRules.push_back(std::make_pair(it["key"].string_value(), it["dtype"].string_value()));
+                }
+            }
+        }
+
         int cur = 0;
         long long totalBytes = 0;
         std::set <std::string> allWeightNames; // 所有创建了的weight name
@@ -930,6 +978,11 @@ if (false) {
                 std::string weightName = it.first;
                 allWeightNames.insert(weightName);
                 auto dataType = it.second;
+                if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
+                    int groupCnt = -1;
+                    ParseDataType(weightName, dtypeRules, dataType, groupCnt);
+                }
+
                 if (dataType >= DATA_AUTO_NONE) {
                     // AUTO类型
                     dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
@@ -1003,6 +1056,19 @@ if (false) {
                             auto oriDataType = DataType::FLOAT32;
                             std::string weightName = it.first;
                             auto dataType = it.second;
+
+                            int curGroupCnt = model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt;
+
+                            if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
+                                ParseDataType(weightName, dtypeRules, dataType, curGroupCnt);
+/*
+                                printf("weight \"%s\" -> %s", weightName.c_str(), dataTypeNames[dataType][0].c_str());
+                                if (DefaultGroupCnts.find(dataType) != DefaultGroupCnts.end()) {
+                                    printf("%d", curGroupCnt);
+                                }
+                                printf("\n");
+*/
+                            }
                             if (dataType >= DATA_AUTO_NONE) {
                                 // AUTO类型
                                 dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
@@ -1126,8 +1192,7 @@ if (false) {
                                 }
                                 model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
                                         tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
-                                        model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt, 
-                                        tensor.blockK, tensor.blockM);
+                                        curGroupCnt, tensor.blockK, tensor.blockM);
                             }
                             if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV)
                                 model->weight[weightName].CalcWeightSum();
@@ -1292,7 +1357,8 @@ if (false) {
     // 从hf文件夹读取，仅支持safetensor格式的模型，然后导出成safetensor格式
     void ExportLLMModelFromHF(const std::string &modelPath, 
                             DataType linearDataType, int groupCnt, const std::string &exportPath, const std::string &modelConfig,
-                            const std::string &loraPath, bool useMoeDataType, DataType moeDataType, int moeGroupCnt) {
+                            const std::string &loraPath, bool useMoeDataType, DataType moeDataType, int moeGroupCnt,
+                            const std::string &dtypeConfigString) {
         if (moeGroupCnt == -1) {
             moeGroupCnt = groupCnt;
         }
@@ -1407,6 +1473,27 @@ if (false) {
             }
         }
 
+        std::vector <std::pair <std::string, std::string> > dtypeRules;
+        if (dtypeConfigString.size() > 0) {
+            auto dtypeConfig = json11::Json::parse(dtypeConfigString, error);
+            if (error != "") {
+                printf("Parse dtype config faild.\n");
+                printf("config = %s\n", dtypeConfigString.c_str());
+                printf("error = %s\n", error.c_str());
+            } else {
+                for (auto &it : dtypeConfig.array_items()) {
+                    dtypeRules.push_back(std::make_pair(it["key"].string_value(), it["dtype"].string_value()));
+                }
+            }
+        }
+
+        if (dtypeRules.size() > 0) {
+            printf("Dtype rules:\n");
+            for (auto &it : dtypeRules) {
+                printf("%s: %s\n", it.first.c_str(), it.second.c_str());
+            }
+        }
+
         for (auto &file : safeTensors.fileNames) {
             std::map <std::string, Data> weights;
             std::string outputFileName = outputFileDict[file];
@@ -1425,6 +1512,12 @@ if (false) {
                 auto oriDataType = DataType::FLOAT32;
                 auto dataType = tensorMap[tensor.tensorName][0].second;
                 auto weightName = tensor.tensorName;
+
+                if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
+                    int groupCnt = -1;
+                    ParseDataType(weightName, dtypeRules, dataType, groupCnt);
+                }
+
                 if (dataType >= DATA_AUTO_NONE) {
                     // AUTO类型
                     dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
@@ -1458,8 +1551,21 @@ if (false) {
                                 continue;
                             }
                             std::string scaleTensorName = "";
+                            std::string weightName = tensor.tensorName;
+
                             auto dataType = tensorMap[tensor.tensorName][0].second;
                             auto oriDataType = DataType::FLOAT32;
+
+                            int curGroupCnt = model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt;
+                            if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
+                                ParseDataType(weightName, dtypeRules, dataType, curGroupCnt);
+                                printf("weight \"%s\" -> %s", weightName.c_str(), dataTypeNames[dataType][0].c_str());
+                                if (DefaultGroupCnts.find(dataType) != DefaultGroupCnts.end()) {
+                                    printf("%d", curGroupCnt);
+                                }
+                                printf("\n");
+                            }
+
                             if (dataType >= DATA_AUTO_NONE) {
                                 // AUTO类型
                                 dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
@@ -1499,7 +1605,6 @@ if (false) {
                                 tensor.CreateBufferWithScale(oriDataType, scaleTensor);
                             }
 
-                            std::string weightName = tensor.tensorName;
                             if (loraDicts.find(weightName) != loraDicts.end()) {
                                 std::string loraA = loraDicts[weightName].first;
                                 std::string loraB = loraDicts[weightName].second;
@@ -1563,8 +1668,7 @@ if (false) {
                             }
                             weights[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
                                 tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
-                                model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt, 
-                                tensor.blockK, tensor.blockM);
+                                curGroupCnt, tensor.blockK, tensor.blockM);
                             tensor.ClearBuffer();
                         }
                     }, st, end)
