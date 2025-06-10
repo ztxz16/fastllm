@@ -770,6 +770,58 @@ namespace fastllm {
                                 pool, startTid, threadNum);
     }
 
+    struct MultiThreadLinearFloat32Int2GroupOp : MultiThreadBaseOp {
+        float *inputData;
+        Data *weight;
+        float *biasData, *outputData;
+        int n, m, k, st, end;
+
+        MultiThreadLinearFloat32Int2GroupOp(float *inputData, Data *weight, float *biasData, float *outputData,
+                           int n, int m, int k, int st, int end) : 
+            inputData(inputData), weight(weight), biasData(biasData), outputData(outputData),
+            n(n), m(m), k(k), st(st), end(end) {}
+
+        void Run() {
+            int group = weight->group, groupCnt = weight->groupCnt;
+            for (int i = 0; i < n; i++) {
+                for (int j = st; j < end; j++) {
+                    float now = biasData ? biasData[j] : 0.0f;
+                    int l = 0;
+                    for (; l < m; l++) {
+                        int gid = j * group + (l / groupCnt);
+                        float scale = weight->scales[gid];
+                        float min = weight->mins[gid];
+                        uint8_t w = weight->cpuData[(j * m + l) / 4];
+                        w = (w >> ((3 - l % 4) * 2)) & 3;
+                        now += inputData[i * m + l] * (min + scale * w);
+                    }
+                    outputData[i * k + j] = now;
+                }
+            }
+        }
+    };
+
+    void RunLinearFloat32Int2Group(float *inputData, Data &weight, float *outputData, float *biasData, 
+        int n, int m, int k, int group, int groupCnt,
+        AliveThreadPool *pool, int startTid, int threadNum) {
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLinearFloat32Int2GroupOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            ops.push_back(new MultiThreadLinearFloat32Int2GroupOp(inputData, &weight, biasData, outputData,
+                                                    n, m, k, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+    }
+
     void RunLinearFloat16Float16(uint16_t *inputData, uint16_t *weightData, uint16_t *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum) {
