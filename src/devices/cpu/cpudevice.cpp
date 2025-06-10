@@ -2770,6 +2770,11 @@ namespace fastllm {
                 RunLinearFloat32Int4Group((float*)input.cpuData, weight, (float*)output.cpuData, 
                                         bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, group, groupCnt,
                                         GetAlivePool(), threadSt, threadLen);
+            } else if (weight.dataType == DataType::INT2_GROUP) {
+                int group = weight.group, groupCnt = weight.groupCnt;
+                RunLinearFloat32Int2Group((float*)input.cpuData, weight, (float*)output.cpuData, 
+                                        bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, group, groupCnt,
+                                        GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::BASE3_GROUP) {
                 std::vector <uint8_t> base = {1, 3, 9, 27, 81};
                 float *inputData = (float *) input.cpuData;

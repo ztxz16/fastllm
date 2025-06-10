@@ -475,7 +475,7 @@ namespace fastllm {
                                         st(st), end(end), m(m), bf(bf), u8(u8), configs(configs), bit(bit), group(group), groupCnt(groupCnt) {}
         
         void Run() {
-            int type = (bit == 4) ? 1 : 0;
+            int type = (bit == 4 || bit == 2) ? 1 : 0;
             for (int i = st; i < end; i++) {
                 for (int g = 0; g < group; g++) {
                     int cid = i * group + g;
@@ -492,7 +492,7 @@ namespace fastllm {
                         for (int j = groupStart; j < groupEnd; j++) {
                             u8[i * m + j] = configs[cid].quantization(bf16tofp32.dict[bf[i * m + j]]);
                         }
-                    } else {
+                    } else if (bit == 4) {
                         configs[cid] = LowBitConfig(minValue, maxValue, 4, type);
                         for (int j = groupStart; j < groupEnd; j++) {
                             int id = (i * m + j) / 2;
@@ -502,6 +502,16 @@ namespace fastllm {
                             } else {
                                 u8[id] = (u8[id] & 0xF) | (value << 4);
                             }
+                        }
+                    } else if (bit == 2) {
+                        configs[cid] = LowBitConfig(minValue, maxValue, 2, type);
+                        for (int j = groupStart; j + 3 < groupEnd; j += 4) {
+                            int id = (i * m + j) / 4;
+                            uint8_t value0 = configs[cid].quantization(bf16tofp32.dict[bf[i * m + j + 0]]);
+                            uint8_t value1 = configs[cid].quantization(bf16tofp32.dict[bf[i * m + j + 1]]);
+                            uint8_t value2 = configs[cid].quantization(bf16tofp32.dict[bf[i * m + j + 2]]);
+                            uint8_t value3 = configs[cid].quantization(bf16tofp32.dict[bf[i * m + j + 3]]);
+                            u8[id] = (value0 << 6) | (value1 << 4) | (value2 << 2) | (value3);
                         }
                     }
                 }
@@ -522,7 +532,7 @@ namespace fastllm {
                                         st(st), end(end), m(m), f(f), u8(u8), configs(configs), bit(bit), group(group), groupCnt(groupCnt) {}
         
         void Run() {
-            int type = (bit == 4) ? 1 : 0;
+            int type = (bit == 4 || bit == 2) ? 1 : 0;
             for (int i = st; i < end; i++) {
                 for (int g = 0; g < group; g++) {
                     int cid = i * group + g;
@@ -539,7 +549,7 @@ namespace fastllm {
                         for (int j = groupStart; j < groupEnd; j++) {
                             u8[i * m + j] = configs[cid].quantization(f[i * m + j]);
                         }
-                    } else {
+                    } else if (bit == 4) {
                         configs[cid] = LowBitConfig(minValue, maxValue, 4, type);
                         for (int j = groupStart; j < groupEnd; j++) {
                             int id = (i * m + j) / 2;
@@ -549,6 +559,16 @@ namespace fastllm {
                             } else {
                                 u8[id] = (u8[id] & 0xF) | (value << 4);
                             }
+                        }
+                    } else if (bit == 2) {
+                        configs[cid] = LowBitConfig(minValue, maxValue, 2, type);
+                        for (int j = groupStart; j + 3 < groupEnd; j += 4) {
+                            int id = (i * m + j) / 4;
+                            uint8_t value0 = configs[cid].quantization(f[i * m + j + 0]);
+                            uint8_t value1 = configs[cid].quantization(f[i * m + j + 1]);
+                            uint8_t value2 = configs[cid].quantization(f[i * m + j + 2]);
+                            uint8_t value3 = configs[cid].quantization(f[i * m + j + 3]);
+                            u8[id] = (value0 << 6) | (value1 << 4) | (value2 << 2) | (value3);
                         }
                     }
                 }
@@ -860,8 +880,39 @@ namespace fastllm {
                (MultiThreadBase3GroupQuantizationBF16Op(0, k, m, (uint16_t*)oriData, uDatas.data(), data.halfScales.data(), group, groupCnt)).Run();
             }
             memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
+        } else if ((oriDataType == DataType::FLOAT32 || oriDataType == DataType::BFLOAT16)
+                && dataType == DataType::INT2_GROUP) {
+            int bit = 2;
+            int type = 1;
+            int k = data.dims[0], m = data.dims[1];
+            if (groupCnt == -1) {
+                groupCnt = 32;
+            }
+            int group = (m - 1) / groupCnt + 1;
+            std::vector<LowBitConfig> configs;
+            std::vector<uint8_t> uDatas;
+            configs.resize(k * group);
+
+            int bytes = k * m / 4;
+            uDatas.resize(bytes);
+            if (oriDataType == DataType::FLOAT32) {
+                (MultiThreadGroupQuantizationOp(0, k, m, (float*)oriData, uDatas.data(), configs.data(), bit, group, groupCnt)).Run();
+            } else if (oriDataType == DataType::BFLOAT16) {
+                (MultiThreadGroupQuantizationBF16Op(0, k, m, (uint16_t*)oriData, uDatas.data(), configs.data(), bit, group, groupCnt)).Run();
+            }
+            data.perChannelAxis = 0;
+            data.group = group;
+            data.groupCnt = groupCnt;
+            data.scales.resize(k * group);
+            data.mins.resize(k * group);
+            for (int i = 0; i < k * group; i++) {
+                auto config = LowBitConfig(configs[i].min, configs[i].max, bit, type);
+                data.mins[i] = config.min;
+                data.scales[i] = config.scale;
+            }
+            memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
         } else {
-            ErrorInFastLLM("wrong data type");
+            ErrorInFastLLM("wrong data type " + dataTypeNames[oriDataType][0] + " -> " + dataTypeNames[dataType][0]);
         }
     }
 
@@ -892,7 +943,8 @@ namespace fastllm {
                 || this->dataType == DataType::INT4_GROUP) {
             this->unitSize = 1;
             this->unitSizeDiv = 2;
-        } else if (this->dataType == DataType::INT2) {
+        } else if (this->dataType == DataType::INT2
+                || this->dataType == DataType::INT2_GROUP) {
             this->unitSize = 1;
             this->unitSizeDiv = 4;
         } else if (this->dataType == DataType::BIT) {
@@ -2925,7 +2977,7 @@ namespace fastllm {
             }
             memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
         } else {
-            ErrorInFastLLM("wrong data type");
+            ErrorInFastLLM("wrong data type " + dataTypeNames[oriDataType][0] + " -> " + dataTypeNames[dataType][0]);
         }
     }
 
