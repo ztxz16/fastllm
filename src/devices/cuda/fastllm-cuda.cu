@@ -1821,25 +1821,17 @@ __global__ void FastllmGemvInt4GroupKernel2(float *A, uint8_t *B, float *C,
         sdata[p][tid] = 0;
     }
 
-    for (int i = tid; i < m / 8; i += THREAD_PER_BLOCK) {
-        float4 aBuffer = FETCH_FLOAT4(A[i * 8]);
-        float4 bBuffer = FETCH_FLOAT4(A[i * 8 + 4]);
+    for (int i = tid * 2; i < m / 2; i += THREAD_PER_BLOCK * 2) {
+        float4 aBuffer = FETCH_FLOAT4(A[i * 2]);
 
         for (int p = st; p < end; p++) {
-            uint8_t now0 = B[p * m / 2 + i * 4];
-            uint8_t now1 = B[p * m / 2 + i * 4 + 1];
-            uint8_t now2 = B[p * m / 2 + i * 4 + 2];
-            uint8_t now3 = B[p * m / 2 + i * 4 + 3];
-            int g = p * group + (i * 8 / groupCnt);
-            float curmin = (float)mins[g], curscale = (float)scales[g];
-            sdata[p - st][tid] += (aBuffer.x * (curmin + (float)curscale * (now0 >> 4)) 
-                         + aBuffer.y * (curmin + (float)curscale * (now0 & 15)));
-            sdata[p - st][tid] += (aBuffer.z * (curmin + (float)curscale * (now1 >> 4)) 
-                         + aBuffer.w * (curmin + (float)curscale * (now1 & 15)));
-            sdata[p - st][tid] += (bBuffer.x * (curmin + (float)curscale * (now2 >> 4)) 
-                         + bBuffer.y * (curmin + (float)curscale * (now2 & 15)));
-            sdata[p - st][tid] += (bBuffer.z * (curmin + (float)curscale * (now3 >> 4)) 
-                         + bBuffer.w * (curmin + (float)curscale * (now3 & 15)));
+            uint16_t bBuffer = *reinterpret_cast<const uint16_t *>(B + p * m / 2 + i);
+            int g = p * group + (i * 2 / groupCnt);
+            float curmin = __half2float(__ldg(mins + g)), curscale = __half2float(__ldg(scales + g));
+            sdata[p - st][tid] += aBuffer.x * (curmin + curscale * (float)((bBuffer >> 4) & 15)) 
+                         + aBuffer.y * (curmin + curscale * (float)(bBuffer & 15));
+            sdata[p - st][tid] += aBuffer.z * (curmin + curscale * (float)(bBuffer >> 12)) 
+                         + aBuffer.w * (curmin + curscale * (float)((bBuffer >> 8) & 15));
         }
     }
     __syncthreads();
@@ -2998,12 +2990,20 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
     if (n >= 8) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
         half *cudaFp16Input, *cudaFp16Output, *cudaFp16Weight;
+#ifdef CUDA_NO_TENSOR_CORE
+        cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
+        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+
+        float h_alpha = 1.0, h_beta = 0.0;
+        cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_32F, ComputeType = CUDA_R_32F;
+#else
         cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
         cudaFp16Output = (half *) FastllmCudaMalloc(n * k * sizeof(half));
         cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
 
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+#endif
         cublasStatus_t status;
 
         int len = n * m;
@@ -3014,6 +3014,16 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
         len = k * m;
         FastllmCudaInt4Group2HalfKernel <<< k, 64 >>>((uint8_t*)weight.cudaData, cudaScales, cudaMins, cudaFp16Weight, k, m, group, groupCnt);
 
+#ifdef CUDA_NO_TENSOR_CORE
+        status = cublasGemmEx(fastllmCublasHandle,
+                              CUBLAS_OP_T, CUBLAS_OP_N,
+                              k, n, m,
+                              &h_alpha, cudaFp16Weight, AType,
+                              m, cudaFp16Input, BType,
+                              m, &h_beta,
+                              cudaOutput, CType,
+                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+#else
         status = cublasGemmEx(fastllmCublasHandle,
                               CUBLAS_OP_T, CUBLAS_OP_N,
                               k, n, m,
@@ -3022,13 +3032,21 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
                               m, &h_beta,
                               cudaFp16Output, CType,
                               k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+#endif
         if (status != CUBLAS_STATUS_SUCCESS) {
-            printf("Error: cublas error.\n");
+            printf("Error: cublas error. status = %d\n", status);
             throw("cublas error");
             exit(0);
         }
 
         len = n * k;
+#ifdef CUDA_NO_TENSOR_CORE
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
+        }
+        FastllmCudaFree(cudaFp16Input);
+        FastllmCudaFree(cudaFp16Weight);
+#else
         FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
                                                                                            len);
         if (bias.dims.size() > 0) {
@@ -3038,6 +3056,7 @@ bool FastllmCudaMatMulFloatInt4Group(const fastllm::Data &input, fastllm::Data &
         FastllmCudaFree(cudaFp16Input);
         FastllmCudaFree(cudaFp16Output);
         FastllmCudaFree(cudaFp16Weight);
+#endif
     } else {
         LaunchFastllmGemmFp32Int4Group(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBiasData, cudaScales, cudaMins, n, m, k, group, groupCnt);
     }
