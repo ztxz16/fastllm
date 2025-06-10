@@ -143,6 +143,7 @@ fastllm_lib.t2s_decode.restype = ctypes.POINTER(ctypes.c_int64)
 
 fastllm_data_type_dict = {
     "": 0,
+    "int2g": 11,
     "int4g": 9,
     "int4": 8,
     "int8": 3,
@@ -165,10 +166,10 @@ def export_llm_model_fromhf(path : str,
         dtype = "float16"
 
     int4g_groupcnt = 128;
-    if (dtype.startswith("int4g") and len(dtype) > 5):
+    if ((dtype.startswith("int4g") or dtype.startswith("int2g")) and len(dtype) > 5):
         try:
             int4g_groupcnt = int(dtype[5:])
-            dtype = "int4g";
+            dtype = dtype[:5]
         except:
             print("dtype should be like \"int4g256\"")
             exit(0)
@@ -179,10 +180,10 @@ def export_llm_model_fromhf(path : str,
     moe_int4g_groupcnt = 128
     use_moe_dtype = False
     if (moe_dtype != ""):
-        if (moe_dtype.startswith("int4g") and len(moe_dtype) > 5):
+        if ((moe_dtype.startswith("int4g") or moe_dtype.startswith("int2g")) and len(moe_dtype) > 5):
             try:
                 moe_int4g_groupcnt = int(moe_dtype[5:])
-                moe_dtype = "int4g";
+                moe_dtype = moe_dtype[:5]
             except:
                 print("dtype should be like \"int4g256\"")
                 exit(0)
@@ -597,13 +598,13 @@ class model:
                 model_json = str(current_graph)
             else:
                 print("When using a custom Graph, only model folders in HF format can be read.")
-                exit(0)
-        
+                exit(0)    
+
         int4g_groupcnt = 128;
-        if (dtype.startswith("int4g") and len(dtype) > 5):
+        if ((dtype.startswith("int4g") or dtype.startswith("int2g")) and len(dtype) > 5):
             try:
                 int4g_groupcnt = int(dtype[5:])
-                dtype = "int4g";
+                dtype = dtype[:5]
             except:
                 print("dtype should be like \"int4g256\"")
                 exit(0)    
@@ -614,10 +615,10 @@ class model:
         moe_int4g_groupcnt = 128
         use_moe_dtype = False
         if (moe_dtype != ""):
-            if (moe_dtype.startswith("int4g") and len(moe_dtype) > 5):
+            if ((moe_dtype.startswith("int4g") or moe_dtype.startswith("int2g")) and len(moe_dtype) > 5):
                 try:
                     moe_int4g_groupcnt = int(moe_dtype[5:])
-                    moe_dtype = "int4g";
+                    moe_dtype = moe_dtype[:5]
                 except:
                     print("dtype should be like \"int4g256\"")
                     exit(0)

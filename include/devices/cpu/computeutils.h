@@ -147,6 +147,9 @@ namespace fastllm {
     void RunLinearFloat32Int4Group(float *inputData, Data &weight, float *outputData, float *biasData, 
                             int n, int m, int k, int group, int groupCnt,
                             AliveThreadPool *pool, int startTid, int threadNum);
+    void RunLinearFloat32Int2Group(float *inputData, Data &weight, float *outputData, float *biasData, 
+                            int n, int m, int k, int group, int groupCnt,
+                            AliveThreadPool *pool, int startTid, int threadNum);
     void RunLinearFloat16Float16(uint16_t *inputData, uint16_t *weightData, uint16_t *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum);

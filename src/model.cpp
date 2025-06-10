@@ -981,6 +981,11 @@ if (false) {
                 if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
                     int groupCnt = -1;
                     ParseDataType(weightName, dtypeRules, dataType, groupCnt);
+
+                    // 如果原始权重不是FP8_E4M3格式，目前不做转换
+                    if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
+                        dataType = DataType::FLOAT16;
+                    }
                 }
 
                 if (dataType >= DATA_AUTO_NONE) {
@@ -1082,7 +1087,9 @@ if (false) {
                                 oriDataType = DataType::FLOAT16;
                             }
                             if (tensor.dtype == "F8_E4M3" && 
-                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)){
+                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8 
+                                || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO
+                                || dataType == DataType::INT2_GROUP)) {
                                 oriDataType = DataType::FLOAT32;
                                 scaleTensorName = tensorName + "_scale_inv";
                                 if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
@@ -1516,6 +1523,11 @@ if (false) {
                 if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
                     int groupCnt = -1;
                     ParseDataType(weightName, dtypeRules, dataType, groupCnt);
+
+                    // 如果原始权重不是FP8_E4M3格式，目前不做转换
+                    if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
+                        dataType = DataType::FLOAT16;
+                    }
                 }
 
                 if (dataType >= DATA_AUTO_NONE) {
