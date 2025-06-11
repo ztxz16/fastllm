@@ -25,9 +25,85 @@ if(NOT DEFINED CUDA_ARCH)
     set(CUDA_ARCH "native")
 endif()
 
-if(USE_ROCM AND NOT DEFINED ROCM_ARCH)
-    set(ROCM_ARCH "gfx908;gfx90a;gfx1100")
-    message(STATUS "ROCM_ARCH not set, using default value: ${ROCM_ARCH}")
+# ROCm device detection function
+function(detect_rocm_devices)
+    if(USE_ROCM)
+        # Try to find rocminfo
+        find_program(ROCMINFO rocminfo PATHS ${ROCM_PATH}/bin /opt/rocm/bin)
+        
+        if(ROCMINFO)
+            # Execute rocminfo to get device info
+            execute_process(
+                COMMAND ${ROCMINFO}
+                OUTPUT_VARIABLE ROCMINFO_OUTPUT
+                ERROR_QUIET
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+            )
+            
+            # Parse the output to find device architectures
+            set(DETECTED_ARCHS "")
+            set(HAS_MI50 FALSE)
+            
+            # Extract gfx architectures from rocminfo output
+            string(REGEX MATCHALL "Name:[ \t]+gfx[0-9a-f]+" GFX_MATCHES "${ROCMINFO_OUTPUT}")
+            foreach(MATCH ${GFX_MATCHES})
+                string(REGEX REPLACE "Name:[ \t]+" "" ARCH ${MATCH})
+                list(APPEND DETECTED_ARCHS ${ARCH})
+                if(${ARCH} STREQUAL "gfx906")
+                    set(HAS_MI50 TRUE)
+                endif()
+            endforeach()
+            
+            # Also check for device names containing MI50
+            string(REGEX MATCH "Marketing Name:[ \t]+[^\n]*MI50" MI50_MATCH "${ROCMINFO_OUTPUT}")
+            if(MI50_MATCH)
+                set(HAS_MI50 TRUE)
+            endif()
+            
+            # Remove duplicates
+            if(DETECTED_ARCHS)
+                list(REMOVE_DUPLICATES DETECTED_ARCHS)
+            endif()
+            
+            # Set parent scope variables
+            set(ROCM_DETECTED_ARCHS "${DETECTED_ARCHS}" PARENT_SCOPE)
+            set(ROCM_HAS_MI50 ${HAS_MI50} PARENT_SCOPE)
+        else()
+            message(WARNING "rocminfo not found, cannot auto-detect ROCm devices")
+            set(ROCM_DETECTED_ARCHS "" PARENT_SCOPE)
+            set(ROCM_HAS_MI50 FALSE PARENT_SCOPE)
+        endif()
+    endif()
+endfunction()
+
+# Call device detection
+detect_rocm_devices()
+
+# Set ROCM_ARCH based on detection or use default
+if(USE_ROCM)
+    if(NOT DEFINED ROCM_ARCH)
+        if(ROCM_DETECTED_ARCHS)
+            # Use detected architectures
+            set(ROCM_ARCH "${ROCM_DETECTED_ARCHS}")
+            message(STATUS "Auto-detected ROCm architectures: ${ROCM_ARCH}")
+        else()
+            # Use default if detection failed
+            set(ROCM_ARCH "gfx908;gfx90a;gfx1100")
+            message(STATUS "ROCM_ARCH not set and auto-detection failed, using default: ${ROCM_ARCH}")
+        endif()
+    else()
+        message(STATUS "Using user-specified ROCM_ARCH: ${ROCM_ARCH}")
+        # Check if user specified gfx906
+        if("gfx906" IN_LIST ROCM_ARCH)
+            set(ROCM_HAS_MI50 TRUE)
+            message(STATUS "gfx906 (MI50) found in user-specified ROCM_ARCH")
+        endif()
+    endif()
+    
+    # Report MI50 detection status
+    if(ROCM_HAS_MI50)
+        message(STATUS "MI50 device detected (gfx906)")
+    endif()
 endif()
 
 message(STATUS "USE_CUDA: ${USE_CUDA}")
@@ -172,10 +248,20 @@ if(USE_ROCM)
     set(CMAKE_HIP_ARCHITECTURES ${ROCM_ARCH})
     add_compile_definitions(HIPBLAS_V2)
 
-    # if gfx906(MI50) in ROCM_ARCH list, don't use Tensor Core
-    if("gfx906" IN_LIST CMAKE_HIP_ARCHITECTURES)
+    # Check if gfx906(MI50) is in the architecture list
+    set(HAS_MI50_IN_TARGETS FALSE)
+    foreach(ARCH IN LISTS CMAKE_HIP_ARCHITECTURES)
+        if(${ARCH} STREQUAL "gfx906")
+            set(HAS_MI50_IN_TARGETS TRUE)
+            break()
+        endif()
+    endforeach()
+    
+    # Enable MI50 workaround if MI50 is detected or in target architectures
+    if(ROCM_HAS_MI50 OR HAS_MI50_IN_TARGETS)
+        add_compile_definitions(USE_MI50_WORKAROUND)
         add_compile_definitions(HIP_NO_TENSOR_CORE)
-        message(STATUS "MI50 architecture (gfx906) detected, disabling Tensor Core")
+        message(STATUS "MI50 support enabled (USE_MI50_WORKAROUND defined)")
     endif()
 endif()
 
