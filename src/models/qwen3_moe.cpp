@@ -159,10 +159,11 @@ namespace fastllm {
         int maxLen = inputIds.dims[1];
         Data hiddenStates;
         Data attenInput;
-        Data q, k, v, qkv;
+        Data q, k, v, qkv, curInput, curOutput;
         Data attenWeights, attenOutput;
         Data attenLastOutput;
         Data w1, w2, w3, routerLogits, gate, attenPart, moePart, moeFinal, sharedGate;
+        Data tempInput, tempOutput;
         Data* sinDataPtr = &sinData;
         Data* cosDataPtr = &cosData;
 
@@ -222,7 +223,7 @@ namespace fastllm {
                     attenInputTemp, 
                     weight[mergeQkvWeightName], weight[mergeQkvBiasName], 
                     weight[oWeightName], weight[oBiasName],
-                    qkv, q, k, v,  
+                    qkv, q, k, v, curInput, curOutput,
                     num_attention_heads, num_key_value_heads, head_dim, rotary_dim, 1.0 / sqrt(head_dim),
                     positionIds, *sinDataPtr, *cosDataPtr, 
                     keys, values, masks, w1
@@ -348,7 +349,7 @@ namespace fastllm {
                     MergeMOE (
                         attenInput, routerLogits, weight[gateBiasName],
                         weights[i], biass[i],
-                        w1, w2, w3, 
+                        w1, w2, w3, tempInput, tempOutput,
                         this->routed_scaling_factor, 1.0f,
                         this->num_experts_per_tok, needNorm,
                         moeFinal
@@ -545,6 +546,7 @@ namespace fastllm {
         Data attenWeights, curAttenOutput;
         Data attenLastOutput;
         Data w1, w2, w3, routerLogits, gate, attenPart, moePart, moeFinal, sharedGate;
+        Data tempInput, tempOutput;
         Data* sinDataPtr = &sinData;
         Data* cosDataPtr = &cosData;
         std::vector <Data> curContextLayer;
@@ -853,7 +855,7 @@ namespace fastllm {
                     MergeMOE (
                         attenInput, routerLogits, weight[gateBiasName],
                         weights[i], biass[i],
-                        w1, w2, w3, 
+                        w1, w2, w3, tempInput, tempOutput,
                         this->routed_scaling_factor, 1.0f,
                         this->num_experts_per_tok, needNorm,
                         moeFinal
