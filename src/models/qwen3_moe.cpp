@@ -982,6 +982,13 @@ namespace fastllm {
         return lastRet;
     }
 
+    bool Qwen3MOEModel::NeedAttentionMask(int qlen, int klen) {
+        if (((qlen == 1) || (qlen >= 1024))) {
+            return false;
+        }
+        return true;
+    }
+
     void Qwen3MOEModel::FillLLMInputsBatch(std::vector<std::vector<float>> &inputTokens,
                                           const std::vector<std::map<std::string, int>> &params,
                                           fastllm::Data &inputIds, fastllm::Data &attentionMask,

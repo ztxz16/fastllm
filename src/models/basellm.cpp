@@ -673,7 +673,8 @@ namespace fastllm {
                                     continue;
                                 }
 
-                                if (it.second->currentTokens.size() > maxTotalLens) {
+                                if (it.second->cacheLen + it.second->currentTokens.size() > maxTotalLens ||
+                                    it.second->cacheLen + it.second->currentTokens.size() > model->max_positions) {
                                     it.second->isEnding = true;
                                     it.second->error = ResponseContextErrorPromptTooLong;
                                     continue;
@@ -886,7 +887,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                                     it.second->allTokens.push_back(curRet);
                                     it.second->tokens.Push(curRet);
                                     it.second->curTokens++;
-                                    if (it.second->curTokens == it.second->generationConfig.output_token_limit) {
+                                    if (it.second->curTokens == it.second->generationConfig.output_token_limit
+                                        || it.second->allTokens.size() >= model->max_positions) {
                                         it.second->isEnding = true;
                                         it.second->TryRecord(model);
                                     }
