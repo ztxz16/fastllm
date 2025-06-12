@@ -55,6 +55,9 @@ namespace fastllm {
                                         const std::vector <std::map <std::string, int> > &params,
                                         Data &inputIds, Data &attentionMask, Data &positionIds);
 
+        // 是否需要生成AttentionMask
+        virtual bool NeedAttentionMask(int qlen, int klen);
+        
         virtual void WarmUp(); // 预热
 
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
