@@ -557,7 +557,7 @@ namespace fastllm {
         std::vector <int> devices;
         std::map <int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
-        std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, kvNum, 128);
+        std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, kvNum, 1);
         DivisionScheme divisionScheme, divisionSchemeO;
         for (int i = 0; i < devices.size(); i++) {
             int st = points[i], end = points[i + 1];
@@ -589,7 +589,10 @@ namespace fastllm {
                 curMasks[device].push_back(masks[i]->multiDeviceDatas[device]);
             }
         }
-        Data curInput, curOutput;
+
+        Data &curInput = *(datas.find("curInput")->second);
+        Data &curOutput = *(datas.find("curOutput")->second);
+
         CopyToMultiDevices(input, devices, false);
         curOutput.dataDevice = input.dataDevice;
         CopyToMultiDevices(curOutput, devices, false);
@@ -921,7 +924,9 @@ namespace fastllm {
         CopyToMultiDevices(w2, devices, false);
         CopyToMultiDevices(w3, devices, false);
 
-        Data curInput, curOutput;
+        Data &curInput = *(datas.find("curInput")->second);
+        Data &curOutput = *(datas.find("curOutput")->second);
+
         CopyToMultiDevices(input, devices, false);
         curOutput.dataDevice = input.dataDevice;
         CopyToMultiDevices(curOutput, devices, false);
