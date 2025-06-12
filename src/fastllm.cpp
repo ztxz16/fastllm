@@ -3044,12 +3044,13 @@ namespace fastllm {
     }
 
     void MergeMOE(const Data &input, const Data &logits, Data &gateBias, std::vector <Data*> &weights, std::vector <Data*> &biass, 
-                Data &w1, Data &w2, Data &w3,
+                Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float routeScale, float sharedScale, int topk, bool needNorm, Data &output) {
         curExecutor->Run("MergeMOE", {
                 {"input", (Data*)&input}, {"logits", (Data*)&logits}, {"gateBias", (Data*)&gateBias},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
                 {"w1", (Data*)&w1}, {"w2", (Data*)&w2}, {"w3", (Data*)&w3},
+                {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"output", (Data*)&output}
         }, {{"sharedScale", sharedScale}, {"routeScale", routeScale}}, {{"topk", topk}, {"needNorm", needNorm}, 
                                         {"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()}});
@@ -3139,7 +3140,7 @@ namespace fastllm {
     }
 
     void MergeAttention(Data &input, Data &weight0, Data &bias0, Data &weight1, Data &bias1, 
-        Data &qkv, Data &q, Data &k, Data &v,
+        Data &qkv, Data &q, Data &k, Data &v, Data &curInput, Data &curOutput,
         int qNum, int kvNum, int headDim, int rotDim, float attentionScale,
         const Data &positionIds, Data &sinData, Data &cosData,
         std::vector <Data*> &keys, std::vector <Data*> &values, std::vector <Data*> &masks, 
@@ -3149,6 +3150,7 @@ namespace fastllm {
                 {"weight0", &weight0}, {"bias0", &bias0}, 
                 {"weight1", &weight1}, {"bias1", &bias1}, 
                 {"qkv", &qkv}, {"q", &q}, {"k", &k}, {"v", &v}, 
+                {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"positionIds", (Data*)&positionIds},
                 {"sinData", (Data*)&sinData},
                 {"cosData", (Data*)&cosData},

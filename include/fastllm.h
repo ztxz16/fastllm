@@ -577,7 +577,7 @@ namespace fastllm {
 
     bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass);
     void MergeMOE(const Data &input, const Data &logits, Data &gateBias, std::vector <Data*> &weights, std::vector <Data*> &biass, 
-                Data &w1, Data &w2, Data &w3,
+                Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
                 float routeScale, float sharedScale, int topk, bool needNorm, Data &output);
     
     void MergeMLA(Data &qNope, Data &qPe, Data &kvCache, Data &peCache, const Data &mask, Data &output, float softmaxScale);
@@ -611,7 +611,7 @@ namespace fastllm {
     bool CanRunMergeAttention();
     
     void MergeAttention(Data &input, Data &weight0, Data &bias0, Data &weight1, Data &bias1, 
-                        Data &qkv, Data &q, Data &k, Data &v,
+                        Data &qkv, Data &q, Data &k, Data &v, Data &curInput, Data &curOutput,
                         int qNum, int kvNum, int headDim, int rotDim, float attentionScale,
                         const Data &positionIds, Data &sinData, Data &cosData,
                         std::vector <Data*> &keys, std::vector <Data*> &values, std::vector <Data*> &masks, 

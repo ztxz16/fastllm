@@ -295,6 +295,7 @@ namespace fastllm {
         Data attenWeights, attenOutput;
         Data attenLastOutput;
         Data w1, w2, w3, routerLogits, gate, attenPart, moePart, moeFinal, sharedGate;
+        Data curInput, curOutput;
         Data* sinDataPtr = &sinData;
         Data* cosDataPtr = &cosData;
 
@@ -603,7 +604,7 @@ namespace fastllm {
                     MergeMOE (
                         attenInput, routerLogits, weight[gateBiasName],
                         weights[i], biass[i],
-                        w1, w2, w3, 
+                        w1, w2, w3, curInput, curOutput, 
                         this->routed_scaling_factor, 1.0f,
                         this->num_experts_per_tok, needNorm,
                         moeFinal
@@ -822,6 +823,7 @@ namespace fastllm {
         Data attenWeights, attenOutput;
         Data attenLastOutput;
         Data w1, w2, w3, routerLogits, gate, attenPart, moePart, moeFinal, sharedGate;
+        Data curInput, curOutput;
         Data* sinDataPtr = &sinData;
         Data* cosDataPtr = &cosData;
         Data  curAttenOutput;
@@ -1194,7 +1196,7 @@ namespace fastllm {
                     MergeMOE (
                         attenInput, routerLogits, weight[gateBiasName],
                         weights[i], biass[i],
-                        w1, w2, w3,
+                        w1, w2, w3, curInput, curOutput,
                         this->routed_scaling_factor, 1.0f,
                         this->num_experts_per_tok, needNorm,
                         moeFinal
