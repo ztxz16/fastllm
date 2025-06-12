@@ -1421,6 +1421,13 @@ namespace fastllm {
         return lastRet;
     }
 
+    bool DeepSeekV2Model::NeedAttentionMask(int qlen, int klen) {
+        if (((qlen == 1) || (qlen >= 8192))) {
+            return false;
+        }
+        return true;
+    }
+
     void DeepSeekV2Model::FillLLMInputsBatch(std::vector<std::vector<float>> &inputTokens,
                                           const std::vector<std::map<std::string, int>> &params,
                                           fastllm::Data &inputIds, fastllm::Data &attentionMask,
