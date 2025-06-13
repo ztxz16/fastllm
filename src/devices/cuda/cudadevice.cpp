@@ -18,7 +18,7 @@ namespace fastllm {
         this->ops["ConvertToFloat32"] = (BaseOperator*)(new CudaConvertToFloat32());
 
         this->ops["Attention"] = (BaseOperator*)(new CudaAttention());
-        this->ops["MergeAttention"] = (BaseOperator*)(new CudaMergeAttention());
+        // this->ops["MergeAttention"] = (BaseOperator*)(new CudaMergeAttention());
         this->ops["CopyKVCache"] = (BaseOperator*)(new CudaCopyKVCacheOp());
         this->ops["Embedding"] = (BaseOperator*)(new CudaEmbedding());
         this->ops["LayerNorm"] = (BaseOperator*)(new CudaLayerNormOp());
