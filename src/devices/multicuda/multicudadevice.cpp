@@ -19,7 +19,7 @@ namespace fastllm {
         this->ops["MLP"] = (BaseOperator*)(new MultiCudaMLPOp());
         this->ops["Linear"] = (BaseOperator*)(new MultiCudaLinearOp());
         this->ops["MergeMOE"] = (BaseOperator*)(new MultiCudaMergeMOE());
-        // this->ops["MergeAttention"] = (BaseOperator*)(new MultiCudaMergeAttention());
+        this->ops["MergeAttention"] = (BaseOperator*)(new MultiCudaMergeAttention());
     }
 
     bool MultiCudaDevice::Malloc(void **ret, size_t size) {
@@ -423,6 +423,7 @@ namespace fastllm {
         Data *positionIds, *sinData, *cosData;
         Data **keys, **values, **masks;
         Data *output;
+        int batch;
         int deviceId;
 
         MultiCudaDoMergeAttentionOp(uint8_t *oriCudaInput, uint8_t *oriCpuInput, uint8_t *partOutput,
@@ -431,14 +432,14 @@ namespace fastllm {
                             int qNum, int kvNum, int headDim, int rotDim, float attentionScale,
                             Data *positionIds, Data *sinData, Data *cosData,
                             Data** keys, Data** values, Data** masks, 
-                            Data *output, int deviceId) : 
+                            Data *output, int batch, int deviceId) : 
                 oriCudaInput(oriCudaInput), oriCpuInput(oriCpuInput), partOutput(partOutput),
                 input(input), weight0(weight0), bias0(bias0), weight1(weight1), bias1(bias1), 
                 qkv(qkv), q(q), k(k), v(v), 
                 qNum(qNum), kvNum(kvNum), headDim(headDim), rotDim(rotDim), attentionScale(attentionScale),
                 positionIds(positionIds), sinData(sinData), cosData(cosData),
                 keys(keys), values(values), masks(masks), 
-                output(output), deviceId(deviceId) {}
+                output(output), batch(batch), deviceId(deviceId) {}
 
         void Run() {
             FastllmCudaSetDevice(deviceId);
@@ -449,80 +450,215 @@ namespace fastllm {
                 FastllmCudaCopyFromHostToDevice(input->cudaData, oriCpuInput, input->GetBytes());
             }
 
-            int bsz = input->dims[0], seqlen = input->dims[1];
+            if (batch > 1) {
+                int bsz = batch, seqlen = input->dims[1];
+                std::vector <Data*> vKeys, vValues, vMasks;
+                std::vector <Data> curKs, curVs, curQs;
+                Data curAttenOutput;
+                curKs.resize(bsz);
+                curVs.resize(bsz);
+                curQs.resize(bsz);
+                std::vector <Data*> pointersK, pointersV, pointersQ;
+                pointersK.resize(bsz);
+                pointersV.resize(bsz);
+                pointersQ.resize(bsz);
+                std::vector <Data*> qs, attns, contexts;
+                qs.resize(bsz);
+                attns.resize(bsz);
+                contexts.resize(bsz);
+                std::vector <Data> curContextLayer;
+                curContextLayer.resize(bsz);
 
-            DoCudaLinearReshape(*input, *weight0, *qkv);
-            DoCudaLinear(*input, *weight0, bias0 == nullptr ? Data() : *bias0, *qkv);
-            int per = qkv->dims.back() / (qNum / kvNum + 2);
-            int qdim = per * (qNum / kvNum);
-            DoCudaSplitReshape(*qkv, -1, 0, qdim, *q);
-            DoCudaSplitReshape(*qkv, -1, qdim, qdim + per, *k);
-            DoCudaSplitReshape(*qkv, -1, qdim + per, qdim + per * 2, *v);
-            DoCudaSplit(*qkv, -1, 0, qdim, *q);
-            DoCudaSplit(*qkv, -1, qdim, qdim + per, *k);
-            DoCudaSplit(*qkv, -1, qdim + per, qdim + per * 2, *v);
-
-            std::vector <int> qkvSize = {bsz, seqlen, -1, headDim};
-            q->Reshape(qkvSize);
-            k->Reshape(qkvSize);
-            v->Reshape(qkvSize);
-
-            FastllmCudaLlamaRotatePosition2D(*q, *positionIds, *sinData, *cosData, rotDim);
-            FastllmCudaLlamaRotatePosition2D(*k, *positionIds, *sinData, *cosData, rotDim);
-
-            DoCudaPermuteSelf(*q, {0, 2, 1, 3});
-            DoCudaPermuteSelf(*k, {0, 2, 1, 3});
-            DoCudaPermuteSelf(*v, {0, 2, 1, 3});
-
-            qkvSize = {-1, seqlen, headDim};
-            q->Reshape(qkvSize);
-            k->Reshape(qkvSize);
-            v->Reshape(qkvSize);
-
-            int unitLen = 128;
-            Data &pastKey = *keys[0];
-            Data &pastValue = *values[0];
-            while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || seqlen > pastKey.expansionDims[1]))
-                || (pastKey.dims.size() > 0 && pastKey.dims[1] + seqlen > pastKey.expansionDims[1])) {
-                std::vector <int> newDims;
-                if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
-                    newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
-                } else {
-                    newDims = pastKey.dims;
-                    newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
+                vKeys.resize(bsz);
+                vValues.resize(bsz);
+                vMasks.resize(bsz);
+                for (int i = 0; i < bsz; i++) {
+                    vKeys[i] = keys[i];
+                    vValues[i] = values[i];
+                    vMasks[i] = masks[i];
                 }
-                pastKey.Expansion(newDims);
-            }
-            while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || seqlen > pastValue.expansionDims[1]))
-                || (pastValue.dims.size() > 0 && pastValue.dims[1] + seqlen > pastValue.expansionDims[1])) {
-                std::vector <int> newDims;
-                if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
-                    newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
-                } else {
-                    newDims = pastValue.dims;
-                    newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
-                }
-                pastValue.Expansion(newDims);
-            }
-            DoCudaCatDirect(pastKey, *k, 1);
-            DoCudaCatDirect(pastValue, *v, 1);
-            DoCudaAttentionReshape(*q, pastValue, *qkv);
-            DoCudaAttention(*q, pastKey, pastValue, *masks[0], *qkv, q->dims[0] / pastKey.dims[0], attentionScale, 1);
-            DoCudaPermuteSelf(*qkv, {1, 0, 2});
-            qkv->Reshape({seqlen, bsz, -1});
-            DoCudaPermuteSelf(*qkv, {1, 0, 2});
-            DoCudaLinearReshape(*qkv, *weight1, *output);
+                DoCudaLinearReshape(*input, *weight0, *qkv);
+                DoCudaLinear(*input, *weight0, bias0 == nullptr ? Data() : *bias0, *qkv);
+                int per = qkv->dims.back() / (qNum / kvNum + 2);
+                int qdim = per * (qNum / kvNum);
+                DoCudaSplitReshape(*qkv, -1, 0, qdim, *q);
+                DoCudaSplitReshape(*qkv, -1, qdim, qdim + per, *k);
+                DoCudaSplitReshape(*qkv, -1, qdim + per, qdim + per * 2, *v);
+                DoCudaSplit(*qkv, -1, 0, qdim, *q);
+                DoCudaSplit(*qkv, -1, qdim, qdim + per, *k);
+                DoCudaSplit(*qkv, -1, qdim + per, qdim + per * 2, *v);
 
-            if (deviceId == 0) {
-                output->isFake = true;
-                output->UpdateUnitSize();
-                output->cudaData = partOutput;
-                output->expansionSize = output->Count(0);
-                output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
-            }
-            DoCudaLinear(*qkv, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
-            if (deviceId != 0) {
-                FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
+                std::vector <int> qkvSize = {1, seqlen, -1, headDim};
+                q->Reshape(qkvSize);
+                k->Reshape(qkvSize);
+                v->Reshape(qkvSize);
+
+                int unitLen = 128;
+                for (int i = 0; i < bsz; i++) {
+                    Data &pastKey = *keys[i];
+                    Data &pastValue = *values[i];
+                    int seqlen = 1;
+                    while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || seqlen > pastKey.expansionDims[1]))
+                        || (pastKey.dims.size() > 0 && pastKey.dims[1] + seqlen > pastKey.expansionDims[1])) {
+                        std::vector <int> newDims;
+                        if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                            newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
+                        } else {
+                            newDims = pastKey.dims;
+                            newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
+                        }
+                        pastKey.Expansion(newDims);
+                    }
+                    while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || seqlen > pastValue.expansionDims[1]))
+                        || (pastValue.dims.size() > 0 && pastValue.dims[1] + seqlen > pastValue.expansionDims[1])) {
+                        std::vector <int> newDims;
+                        if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                            newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
+                        } else {
+                            newDims = pastValue.dims;
+                            newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
+                        }
+                        pastValue.Expansion(newDims);
+                    }
+                }
+
+                FastllmCudaLlamaRotatePosition2D(*q, *positionIds, *sinData, *cosData, rotDim);
+                FastllmCudaLlamaRotatePosition2D(*k, *positionIds, *sinData, *cosData, rotDim);
+
+                int total = 0;
+                q->Reshape({-1, q->dims[2], q->dims[3]});
+                k->Reshape({-1, k->dims[2], k->dims[3]});
+                v->Reshape({-1, v->dims[2], v->dims[3]});
+
+                std::vector <int> qdims = {q->dims[1], 1, q->dims[2]};
+                std::vector <uint64_t> qstrides = {(uint64_t)q->dims[2], (uint64_t)q->dims[2], 1};
+                std::vector <int> kdims = {k->dims[1], 1, k->dims[2]};
+                std::vector <uint64_t> kstrides = {(uint64_t)k->dims[2], (uint64_t)k->dims[2], 1};
+                std::vector <int> vdims = {v->dims[1], 1, v->dims[2]};
+                std::vector <uint64_t> vstrides = {(uint64_t)v->dims[2], (uint64_t)v->dims[2], 1};
+                for (int b = 0; b < bsz; b++) {
+                    curQs[b].dims = qdims;
+                    curQs[b].strides = qstrides;
+                    curQs[b].FakeFrom(*q, b * q->strides[0] * q->unitSize);
+                    curKs[b].dims = kdims;
+                    curKs[b].strides = kstrides;
+                    curKs[b].FakeFrom(*k, b * k->strides[0] * k->unitSize);
+                    curVs[b].dims = vdims;
+                    curVs[b].strides = vstrides;
+                    curVs[b].FakeFrom(*v, b * v->strides[0] * v->unitSize);
+                }
+
+                for (int b = 0; b < bsz; b++) {
+                    pointersK[b] = (&curKs[b]);
+                    pointersV[b] = (&curVs[b]);
+                }
+
+                DoCudaCatDirectBatch(vKeys.data(), pointersK.data(), bsz, 1);
+                DoCudaCatDirectBatch(vValues.data(), pointersV.data(), bsz, 1);
+
+                int embed_dim = weight1->dims[1];
+                Data &attenOutput = *qkv;
+                attenOutput.ToDevice(q->dataDevice);
+                attenOutput.Resize({1, bsz, embed_dim});
+                attenOutput.Allocate();
+                for (int b = 0; b < bsz; b++) {
+                    qs[b] = (&curQs[b]);
+                    curContextLayer[b].FakeFrom(attenOutput, b * embed_dim * attenOutput.unitSize);
+                    contexts[b] = (&curContextLayer[b]);
+                }
+
+                DoCudaAttentionBatchReshape(qs.data(), vValues.data(), contexts.data(), bsz);
+                DoCudaAttentionBatch(qs.data(), vKeys.data(), vValues.data(), vMasks.data(), contexts.data(), 
+                                qs[0]->dims[0] / values[0]->dims[0], attentionScale, bsz);                
+
+                DoCudaLinearReshape(*qkv, *weight1, *output);
+                if (deviceId == 0) {
+                    output->isFake = true;
+                    output->UpdateUnitSize();
+                    output->cudaData = partOutput;
+                    output->expansionSize = output->Count(0);
+                    output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
+                }
+                DoCudaLinear(*qkv, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
+                if (deviceId != 0) {
+                    FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
+                }
+            } else {
+                int bsz = input->dims[0], seqlen = input->dims[1];
+
+                DoCudaLinearReshape(*input, *weight0, *qkv);
+                DoCudaLinear(*input, *weight0, bias0 == nullptr ? Data() : *bias0, *qkv);
+                int per = qkv->dims.back() / (qNum / kvNum + 2);
+                int qdim = per * (qNum / kvNum);
+                DoCudaSplitReshape(*qkv, -1, 0, qdim, *q);
+                DoCudaSplitReshape(*qkv, -1, qdim, qdim + per, *k);
+                DoCudaSplitReshape(*qkv, -1, qdim + per, qdim + per * 2, *v);
+                DoCudaSplit(*qkv, -1, 0, qdim, *q);
+                DoCudaSplit(*qkv, -1, qdim, qdim + per, *k);
+                DoCudaSplit(*qkv, -1, qdim + per, qdim + per * 2, *v);
+
+                std::vector <int> qkvSize = {bsz, seqlen, -1, headDim};
+                q->Reshape(qkvSize);
+                k->Reshape(qkvSize);
+                v->Reshape(qkvSize);
+
+                FastllmCudaLlamaRotatePosition2D(*q, *positionIds, *sinData, *cosData, rotDim);
+                FastllmCudaLlamaRotatePosition2D(*k, *positionIds, *sinData, *cosData, rotDim);
+
+                DoCudaPermuteSelf(*q, {0, 2, 1, 3});
+                DoCudaPermuteSelf(*k, {0, 2, 1, 3});
+                DoCudaPermuteSelf(*v, {0, 2, 1, 3});
+
+                qkvSize = {-1, seqlen, headDim};
+                q->Reshape(qkvSize);
+                k->Reshape(qkvSize);
+                v->Reshape(qkvSize);
+
+                int unitLen = 128;
+                Data &pastKey = *keys[0];
+                Data &pastValue = *values[0];
+                while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || seqlen > pastKey.expansionDims[1]))
+                    || (pastKey.dims.size() > 0 && pastKey.dims[1] + seqlen > pastKey.expansionDims[1])) {
+                    std::vector <int> newDims;
+                    if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                        newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
+                    } else {
+                        newDims = pastKey.dims;
+                        newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
+                    }
+                    pastKey.Expansion(newDims);
+                }
+                while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || seqlen > pastValue.expansionDims[1]))
+                    || (pastValue.dims.size() > 0 && pastValue.dims[1] + seqlen > pastValue.expansionDims[1])) {
+                    std::vector <int> newDims;
+                    if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                        newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
+                    } else {
+                        newDims = pastValue.dims;
+                        newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
+                    }
+                    pastValue.Expansion(newDims);
+                }
+                DoCudaCatDirect(pastKey, *k, 1);
+                DoCudaCatDirect(pastValue, *v, 1);
+                DoCudaAttentionReshape(*q, pastValue, *qkv);
+                DoCudaAttention(*q, pastKey, pastValue, *masks[0], *qkv, q->dims[0] / pastKey.dims[0], attentionScale, 1);
+                DoCudaPermuteSelf(*qkv, {1, 0, 2});
+                qkv->Reshape({seqlen, bsz, -1});
+                DoCudaPermuteSelf(*qkv, {1, 0, 2});
+                DoCudaLinearReshape(*qkv, *weight1, *output);
+
+                if (deviceId == 0) {
+                    output->isFake = true;
+                    output->UpdateUnitSize();
+                    output->cudaData = partOutput;
+                    output->expansionSize = output->Count(0);
+                    output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
+                }
+                DoCudaLinear(*qkv, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
+                if (deviceId != 0) {
+                    FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
+                }
             }
         }
     };
@@ -550,6 +686,8 @@ namespace fastllm {
         Data **keys = (Data**)(datas.find("keys")->second);
         Data **values = (Data**)(datas.find("values")->second);
         Data **masks = (Data**)(datas.find("masks")->second);
+
+        int batch = intParams.find("keys___batch")->second;
         output.Allocate();
 // auto st = std::chrono::system_clock::now();
         int group = qNum / kvNum;
@@ -578,15 +716,19 @@ namespace fastllm {
         CopyToMultiDevices(positionIds, devices, true);
         CopyToMultiDevices(sinData, devices, true);
         CopyToMultiDevices(cosData, devices, true);
-        CopyToMultiDevices(*keys[0], devices, true);
-        CopyToMultiDevices(*values[0], devices, true);
-        CopyToMultiDevices(*masks[0], devices, true);
+        for (int i = 0; i < batch; i++) {
+            CopyToMultiDevices(*keys[i], devices, true);
+            CopyToMultiDevices(*values[i], devices, true);
+            if (masks[i] != nullptr) {
+                CopyToMultiDevices(*masks[i], devices, true);
+            } 
+        }
         std::map <int, std::vector <Data*> > curKeys, curValues, curMasks;
         for (int device : devices) {
-            for (int i = 0; i < 1; i++) {
+            for (int i = 0; i < batch; i++) {
                 curKeys[device].push_back(keys[i]->multiDeviceDatas[device]);
                 curValues[device].push_back(values[i]->multiDeviceDatas[device]);
-                curMasks[device].push_back(masks[i]->multiDeviceDatas[device]);
+                curMasks[device].push_back(masks[i] == nullptr ? nullptr : masks[i]->multiDeviceDatas[device]);
             }
         }
 
@@ -614,7 +756,7 @@ namespace fastllm {
                 qNum, kvNum, headDim, rotDim, attentionScale, 
                 positionIds.multiDeviceDatas[device], sinData.multiDeviceDatas[device], cosData.multiDeviceDatas[device], 
                 curKeys[device].data(), curValues[device].data(), curMasks[device].data(), 
-                curOutput.multiDeviceDatas[device], device));
+                curOutput.multiDeviceDatas[device], batch, device));
         }
         for (int i = 0; i < devices.size(); i++) {
             pool->PushOp(i, ops[i]);
@@ -628,10 +770,12 @@ namespace fastllm {
         FastllmReduce((uint8_t*)output.cudaData, partOutput, output.Count(0), devices.size(), output.dataType);
         FastllmCudaFree(partOutput);
 // printf("FastllmReduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-        keys[0]->dims = keys[0]->multiDeviceDatas[devices[0]]->dims;
-        keys[0]->expansionDims = keys[0]->multiDeviceDatas[devices[0]]->expansionDims;
-        values[0]->dims = values[0]->multiDeviceDatas[devices[0]]->dims;
-        values[0]->expansionDims = values[0]->multiDeviceDatas[devices[0]]->expansionDims;
+        for (int i = 0; i < batch; i++) {
+            keys[i]->dims = keys[i]->multiDeviceDatas[devices[0]]->dims;
+            keys[i]->expansionDims = keys[i]->multiDeviceDatas[devices[0]]->expansionDims;
+            values[i]->dims = values[i]->multiDeviceDatas[devices[0]]->dims;
+            values[i]->expansionDims = values[i]->multiDeviceDatas[devices[0]]->expansionDims;
+        }
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
     }
 

@@ -10,6 +10,8 @@
 namespace fastllm {
     void DoCudaAttentionReshape(Data &q, Data &v, Data &output);
     void DoCudaAttention(Data &q, Data &k, Data &v, Data &mask, Data &output, int group, float scale, int maskType);
+    void DoCudaAttentionBatchReshape(Data **qs, Data **vs, Data **outputs, int batch);
+    void DoCudaAttentionBatch(Data **qs, Data **ks, Data **vs, Data **masks, Data **outputs, int group, float scale, int batch);
     void DoCudaLinearReshape(Data &input, Data &weight, Data &output);
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output);
     void DoCudaSwigluReshape(Data &input, Data &output);
@@ -17,6 +19,7 @@ namespace fastllm {
     void DoCudaSplitReshape(Data &input, int axis, int start, int end, Data &output);
     void DoCudaSplit(Data &input, int axis, int start, int end, Data &output);
     void DoCudaCatDirect(Data &input0, Data &input1, int axis);
+    void DoCudaCatDirectBatch(Data **input0s, Data **input1s, int batch, int axis);
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis);
     void DoCudaMergeMOE(Data &input, Data &output, Data &gateBias, Data &logits, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, int topk, int needNorm, float sharedScale, float routeScale);
