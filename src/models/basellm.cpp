@@ -659,8 +659,9 @@ namespace fastllm {
                             // for (auto &it: model->responseContextDict.dicts) {
                             for (auto &ii : orders) {
                                 auto &it = *model->responseContextDict.dicts.find(ii.second);
-                                if (model->model_struct == "deepseek_v2" && isPrompt && seqLens.size() > 0) {
-                                    // TODO: ds_v2支持多prompt
+                                // if (model->model_struct == "deepseek_v2" && isPrompt && seqLens.size() > 0) {
+                                if (isPrompt && seqLens.size() > 0) {
+                                    // TODO: multicuda支持多prompt一起推理
                                     continue;
                                 }
                                 if (it.second->isEnding) {
