@@ -234,6 +234,9 @@ def get_cpu_historycache():
 def set_cuda_embedding(cuda_embedding):
     fastllm_lib.set_cuda_embedding(ctypes.c_bool(cuda_embedding));
 
+def set_cuda_shared_expert(cuda_shared_expert):
+    fastllm_lib.set_cuda_shared_expert(ctypes.c_bool(cuda_shared_expert));
+
 def set_cpu_low_mem(low_mem):
     fastllm_lib.set_cpu_low_mem(ctypes.c_bool(low_mem));
 
@@ -1406,6 +1409,9 @@ class model:
 
     def set_moe_experts(self, experts: int):
         fastllm_lib.set_moe_experts(self.model, experts)
+    
+    def set_cuda_shared_expert(self, cuda_shared_expert: bool):
+        fastllm_lib.set_cuda_shared_expert(cuda_shared_expert)
 
     def set_kv_cache_limit(self, limit: str):
         limit_bytes = 0
