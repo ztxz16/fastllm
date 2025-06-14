@@ -77,10 +77,6 @@ namespace fastllm {
 
         float rms_norm_eps = 1e-6;
 
-        int num_experts_per_tok;
-        int num_experts;
-        bool norm_topk_prob;
-
         bool mergeQKV = false;
         bool mergeSwiglu = false;
 
