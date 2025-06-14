@@ -52,6 +52,7 @@ namespace fastllm {
     static bool kvCacheInCPU = false;
     static bool historyCacheInCPU = false;
     static bool cudaEmbedding = false;
+    static bool cudaSharedExpert = false;
 
     void PrintInstructionInfo() {
         std::string avx = "OFF", avx2 = "OFF", aarch64 = "OFF", neonFp16 = "OFF", neonDot = "OFF";
@@ -83,6 +84,14 @@ namespace fastllm {
 
     bool GetCudaEmbedding() {
         return cudaEmbedding;
+    }
+
+    void SetCudaSharedExpert(bool v) {
+        cudaSharedExpert = v;
+    }
+
+    bool GetCudaSharedExpert() {
+        return cudaSharedExpert;
     }
 
     void SetKVCacheInCPU(bool v) {
