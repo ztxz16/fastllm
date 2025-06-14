@@ -427,7 +427,8 @@ namespace fastllm {
             } else {
                 this->expansionDims.clear();
                 this->Resize(ori.dims);
-                this->Allocate();
+                this->FreeSpace();
+                this->MallocSpace(Count(0));
             }
         }
 
