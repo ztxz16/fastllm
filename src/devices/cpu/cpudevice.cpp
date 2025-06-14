@@ -288,6 +288,8 @@ namespace fastllm {
         Data *output = (datas.find("output")->second);
         output->dataType = DataType::FLOAT16;
         output->Resize(input->dims);
+        if (input->expansionDims.size() != 0)
+            output->Expansion(input->expansionDims);
     }
 
     void CpuConvertToFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -312,6 +314,8 @@ namespace fastllm {
         Data *output = (datas.find("output")->second);
         output->dataType = DataType::FLOAT32;
         output->Resize(input->dims);
+        if (input->expansionDims.size() != 0)
+            output->Expansion(input->expansionDims);
     }
 
     void CpuConvertToFloat32::Run(const std::string &opType, const fastllm::DataDict &datas,
