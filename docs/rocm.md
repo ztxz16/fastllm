@@ -30,11 +30,19 @@ ROCm 编译目前仅支持Linux平台。
 
 
 
-把需要编译的GPU架构用`;`分隔，填入`-DROCM_ARCH`参数中。默认为`gfx908;gfx90a;gfx1100`。
+把需要编译的GPU架构用`;`分隔，填入`-DROCM_ARCH`参数中。如果不填这个参数，会自动检测。
 
 注意，部分GPU（比如RX6000系列、MI50不支持矩阵乘法加速`rocwmma`，只要列表中有一个GPU不支持`rocwmma`，则编译时不会使用`rocwmma`。
 
 ## 2. 编译
+
+如果使用自动检测，直接运行以下命令。适用于只在本机运行，不拷贝到有其他GPU的机器上运行的情况。
+
+``` sh
+bash install.sh -DUSE_ROCM=ON
+```
+
+如果需要编译成支持多个GPU的版本，或者在其他机器上运行，需要手动指定`ROCM_ARCH`参数。
 
 ``` sh
 bash install.sh -DUSE_ROCM=ON -DROCM_ARCH="gfx908;gfx90a;gfx1100"

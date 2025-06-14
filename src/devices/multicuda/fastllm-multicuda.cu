@@ -32,20 +32,35 @@ using namespace nvcuda;
 #define checkCudaErrors(message, val) showError(val, message, __FILE__, __LINE__)
 extern void showError(cudaError_t result, char const* const message, const char* const file, int const line);
 
-void FastllmCudaMemcpy2D(void * 	dst, size_t 	dpitch, const void * 	src,
-    size_t 	spitch, size_t 	width, size_t 	height, cudaMemcpyKind type, int dstDeviceId, int srcDeviceId) {
-#ifdef USE_ROCM        
-    if (type == cudaMemcpyDeviceToDevice) {
-        std::vector <uint8_t> now;
-        now.resize(height * width);
+void FastllmCudaMemcpy2D(void* dst, size_t dpitch, const void* src,
+    size_t spitch, size_t width, size_t height, cudaMemcpyKind type, 
+    int dstDeviceId, int srcDeviceId) {
+    
+#if defined(USE_ROCM) && defined(USE_MI50_WORKAROUND)
+    // MI50 的 2D D2D 拷贝会导致数据错误
+    if (type == cudaMemcpyDeviceToDevice && srcDeviceId != dstDeviceId) {
+        std::vector<uint8_t> hostBuffer(height * width);
+        
         cudaSetDevice(srcDeviceId);
-        cudaMemcpy2D(now.data(), width, src, spitch, width, height, cudaMemcpyDeviceToHost);
+        cudaMemcpy2D(hostBuffer.data(), width, src, spitch, width, height, cudaMemcpyDeviceToHost);
+        
         cudaSetDevice(dstDeviceId);
-        cudaMemcpy2D(dst, dpitch, now.data(), width, width, height, cudaMemcpyHostToDevice);
+        cudaMemcpy2D(dst, dpitch, hostBuffer.data(), width, width, height, cudaMemcpyHostToDevice);
+        
+        cudaDeviceSynchronize();
         return;
     }
 #endif
-    cudaMemcpy2D(dst, dpitch, src, spitch, width, height, type);
+
+    auto state = cudaMemcpy2D(dst, dpitch, src, spitch, width, height, type);
+    
+#ifdef USE_ROCM
+    cudaDeviceSynchronize();
+#endif
+    
+    if (state != cudaSuccess) {
+        checkCudaErrors("Error: CUDA error when memcpy2D!", state);
+    }
 }
 
 void FastllmCudaMemcpy2DDeviceToDeviceAuto(void * 	dst, size_t 	dpitch, const void * 	src,
