@@ -493,35 +493,6 @@ namespace fastllm {
                 k->Reshape(qkvSize);
                 v->Reshape(qkvSize);
 
-                int unitLen = 128;
-                for (int i = 0; i < bsz; i++) {
-                    Data &pastKey = *keys[i];
-                    Data &pastValue = *values[i];
-                    int seqlen = 1;
-                    while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || seqlen > pastKey.expansionDims[1]))
-                        || (pastKey.dims.size() > 0 && pastKey.dims[1] + seqlen > pastKey.expansionDims[1])) {
-                        std::vector <int> newDims;
-                        if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
-                            newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
-                        } else {
-                            newDims = pastKey.dims;
-                            newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
-                        }
-                        pastKey.Expansion(newDims);
-                    }
-                    while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || seqlen > pastValue.expansionDims[1]))
-                        || (pastValue.dims.size() > 0 && pastValue.dims[1] + seqlen > pastValue.expansionDims[1])) {
-                        std::vector <int> newDims;
-                        if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
-                            newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
-                        } else {
-                            newDims = pastValue.dims;
-                            newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
-                        }
-                        pastValue.Expansion(newDims);
-                    }
-                }
-
                 FastllmCudaLlamaRotatePosition2D(*q, *positionIds, *sinData, *cosData, rotDim);
                 FastllmCudaLlamaRotatePosition2D(*k, *positionIds, *sinData, *cosData, rotDim);
 
@@ -614,31 +585,9 @@ namespace fastllm {
                 k->Reshape(qkvSize);
                 v->Reshape(qkvSize);
 
-                int unitLen = 128;
                 Data &pastKey = *keys[0];
                 Data &pastValue = *values[0];
-                while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || seqlen > pastKey.expansionDims[1]))
-                    || (pastKey.dims.size() > 0 && pastKey.dims[1] + seqlen > pastKey.expansionDims[1])) {
-                    std::vector <int> newDims;
-                    if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
-                        newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
-                    } else {
-                        newDims = pastKey.dims;
-                        newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
-                    }
-                    pastKey.Expansion(newDims);
-                }
-                while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || seqlen > pastValue.expansionDims[1]))
-                    || (pastValue.dims.size() > 0 && pastValue.dims[1] + seqlen > pastValue.expansionDims[1])) {
-                    std::vector <int> newDims;
-                    if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
-                        newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
-                    } else {
-                        newDims = pastValue.dims;
-                        newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
-                    }
-                    pastValue.Expansion(newDims);
-                }
+
                 DoCudaCatDirect(pastKey, *k, 1);
                 DoCudaCatDirect(pastValue, *v, 1);
                 DoCudaAttentionReshape(*q, pastValue, *qkv);
@@ -745,6 +694,45 @@ namespace fastllm {
         uint8_t *partOutput = (uint8_t*)FastllmCudaMalloc(output.GetBytes() * devices.size());
         auto *pool = fastllm::GetAlivePool();
         std::vector<fastllm::MultiThreadBaseOp*> ops;
+
+        for (int i = 0; i < devices.size(); i++) {
+            int device = devices[i];
+            FastllmCudaSetDevice(device);
+            int bsz = batch, seqlen = input.dims[1];
+            if (bsz > 1) {
+                seqlen = 1;
+            }
+            
+            int unitLen = 128;
+            for (int i = 0; i < bsz; i++) {
+                Data &pastKey = *keys[i]->multiDeviceDatas[device];
+                Data &pastValue = *values[i]->multiDeviceDatas[device];
+                while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || seqlen > pastKey.expansionDims[1]))
+                    || (pastKey.dims.size() > 0 && pastKey.dims[1] + seqlen > pastKey.expansionDims[1])) {
+                    std::vector <int> newDims;
+                    if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                        newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
+                    } else {
+                        newDims = pastKey.dims;
+                        newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
+                    }
+                    pastKey.Expansion(newDims);
+                }
+                while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || seqlen > pastValue.expansionDims[1]))
+                    || (pastValue.dims.size() > 0 && pastValue.dims[1] + seqlen > pastValue.expansionDims[1])) {
+                    std::vector <int> newDims;
+                    if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                        newDims = std::vector <int> {kvNum, ((seqlen - 1) / unitLen + 1) * unitLen, headDim};
+                    } else {
+                        newDims = pastValue.dims;
+                        newDims[1] += ((seqlen - 1) / unitLen + 1) * unitLen;
+                    }
+                    pastValue.Expansion(newDims);
+                }
+            }
+        }
+        FastllmCudaSetDevice(0);
+        
         for (int i = 0; i < devices.size(); i++) {
             auto device = devices[i];
             ops.push_back(new MultiCudaDoMergeAttentionOp (
