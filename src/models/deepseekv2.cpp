@@ -144,8 +144,10 @@ namespace fastllm {
                     WeightMergeRule({WeightMergeRuleSingle({w1WeightName, w3WeightName}, swigluWeightName, std::string("linearSwiglu"))})
                 );
 
-                this->specialWeights[swigluWeightName] = "linearSwiglu";
-                this->specialWeights[downWeightName] = "linearColumn";
+                if (j != -1 || !GetCudaSharedExpert()) {
+                    this->specialWeights[swigluWeightName] = "linearSwiglu";
+                    this->specialWeights[downWeightName] = "linearColumn";
+                }
                 
                 this->moeLinears.insert(w1WeightName);
                 this->moeLinears.insert(w3WeightName);
@@ -298,6 +300,7 @@ namespace fastllm {
         Data curInput, curOutput;
         Data* sinDataPtr = &sinData;
         Data* cosDataPtr = &cosData;
+        Data ww1, ww2, ww3, moeFinal2;
 
         Data resultTemp, qpeTemp, qnopeTemp, kTemp, vTemp;
 //inputIds.Print();
@@ -328,6 +331,7 @@ namespace fastllm {
         softmax_scale = softmax_scale * mscale * mscale;
         
         Data attenInputTemp, x, result, score0, score1;
+        bool cudaSe = GetCudaSharedExpert();
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
@@ -588,6 +592,14 @@ namespace fastllm {
 
                 int batch = attenInput.dims[0], len = attenInput.dims[1];
                 attenInput.Reshape({batch * len, attenInput.dims[2]});
+
+                if (cudaSe) {
+                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gateup_proj.weight"], Data(), ww3);
+                    Swiglu(ww3, ww1);
+                    Linear(ww1, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.down_proj.weight"], Data(), moeFinal2);
+                    weights[i][0] = weights[i][1] = nullptr;
+                }
+
                 Linear(attenInput, weight[gateWeightName], Data(), routerLogits);
 
                 bool needNorm = false;
@@ -711,6 +723,11 @@ namespace fastllm {
                 tempMoeFinal.CopyFrom(moeFinal);
                 ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
                 AddTo(hiddenStates, tempMoeFinal);
+
+                if (cudaSe) {
+                    moeFinal2.Reshape(hiddenStates.dims);
+                    AddTo(hiddenStates, moeFinal2);
+                }
             }
         }
 
@@ -827,6 +844,8 @@ namespace fastllm {
         Data* sinDataPtr = &sinData;
         Data* cosDataPtr = &cosData;
         Data  curAttenOutput;
+        Data ww1, ww2, ww3, moeFinal2;
+
         std::vector <Data> curContextLayer;
         curContextLayer.resize(batch);
         std::vector <Data> curKs, curVs, curQs;
@@ -872,6 +891,8 @@ namespace fastllm {
         softmax_scale = softmax_scale * mscale * mscale;
 
         Data attenInputTemp;
+        bool cudaSe = GetCudaSharedExpert();
+
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
@@ -1180,6 +1201,14 @@ namespace fastllm {
 
                 int batch = attenInput.dims[0], len = attenInput.dims[1];
                 attenInput.Reshape({batch * len, attenInput.dims[2]});
+
+                if (cudaSe) {
+                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gateup_proj.weight"], Data(), ww3);
+                    Swiglu(ww3, ww1);
+                    Linear(ww1, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.down_proj.weight"], Data(), moeFinal2);
+                    weights[i][0] = weights[i][1] = nullptr;
+                }
+
                 Linear(attenInput, weight[gateWeightName], Data(), routerLogits);
 
                 bool needNorm = false;
@@ -1303,6 +1332,11 @@ namespace fastllm {
                 tempMoeFinal.CopyFrom(moeFinal);
                 ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
                 AddTo(hiddenStates, tempMoeFinal);
+
+                if (cudaSe) {
+                    moeFinal2.Reshape(hiddenStates.dims);
+                    AddTo(hiddenStates, moeFinal2);
+                }
             }
         }
 
@@ -1531,9 +1565,5 @@ namespace fastllm {
              pastKeyValues[0].second.dims[0] * pastKeyValues[0].second.dims[2]);
         printf("finish.\n");
         this->num_experts_per_tok = oldTopk;
-    }
-
-    void DeepSeekV2Model::SetMoeExperts(int experts) {
-        this->num_experts_per_tok = std::max(1, experts - this->n_shared_experts);
     }
 }

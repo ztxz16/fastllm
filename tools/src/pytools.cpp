@@ -35,6 +35,10 @@ extern "C" {
         fastllm::SetCudaEmbedding(cuda_embedding);
     }
 
+    DLL_EXPORT void set_cuda_shared_expert(bool cuda_shared_expert) {
+        fastllm::SetCudaSharedExpert(cuda_shared_expert);
+    }
+
     DLL_EXPORT bool get_cpu_low_mem(bool low) {
         return fastllm::GetLowMemMode();
     }
