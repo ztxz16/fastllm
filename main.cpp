@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
         generationConfig.stop_token_ids.insert(model->weight.tokenizer.GetTokenId(it));
     }
     std::string systemConfig = config.systemPrompt;
-    fastllm::ChatMessages messages = {{"system", systemConfig}};
+    fastllm::ChatMessages messages = config.systemPrompt.empty() ? fastllm::ChatMessages() : fastllm::ChatMessages({{"system", systemConfig}});
 
     static std::string modelType = model->model_type;
     printf(u8"欢迎使用 %s 模型. 输入内容对话，reset清空历史记录，stop退出程序.\n", model->model_type.c_str());
@@ -127,7 +127,7 @@ int main(int argc, char **argv) {
         std::string input;
         std::getline(std::cin, input);
         if (input == "reset") {
-            messages = {{"system", config.systemPrompt}};
+            messages = config.systemPrompt.empty() ? fastllm::ChatMessages() : fastllm::ChatMessages({{"system", config.systemPrompt}});
             continue;
         }
         if (input == "stop") {
