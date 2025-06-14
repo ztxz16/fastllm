@@ -206,7 +206,7 @@ namespace fastllm {
             model->bot_role = "\n<bot>:";
             model->history_sep = "\n";
             model->weight.tokenizer.type = Tokenizer::TokenizerType::BPE;
-        } else if (modelType == "internlm") {
+        } else if (modelType == "internlm" || modelType == "internlm3") {
             model = new LlamaModel();
             model->model_type = "internlm";
         } else if (modelType == "internlm2") {
@@ -728,6 +728,8 @@ namespace fastllm {
             std::string&& tokenizerProto = ReadAllFile(tokenizerFile);
             model->weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();
             model->weight.tokenizer.spProcessor->LoadFromSerializedProto(tokenizerProto);
+            if (tokenizerClass == "InternLM2Tokenizer")
+                model->eos_token_ids.insert(92542);
 #endif
         } else if (tokenizerClass == "ChatGLM4Tokenizer") {
             // GLM4御用的分词
