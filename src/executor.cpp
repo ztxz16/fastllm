@@ -87,6 +87,8 @@ namespace fastllm {
                 this->devices.push_back(temp[i]);
             }
         }
+
+        this->firstDevice = device;
     }
 
     std::vector <int> Executor::GetDeviceIds(const std::string &device) {

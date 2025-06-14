@@ -334,6 +334,8 @@ namespace fastllm {
         bool cudaSe = GetCudaSharedExpert();
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+            UpdateRotaryPtr(&sinDataPtr, &cosDataPtr, excutor.firstDevice);
+
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     rms_norm_eps, attenInput);
             
@@ -808,12 +810,6 @@ namespace fastllm {
                 }
             }
         }
-/*
-        if (sinDataPtr != &sinData)
-            delete sinDataPtr;
-        if (cosDataPtr != &cosData)
-            delete cosDataPtr;
-*/
         return lastRet;
     }
 
@@ -895,6 +891,8 @@ namespace fastllm {
 
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+            UpdateRotaryPtr(&sinDataPtr, &cosDataPtr, excutor.firstDevice);
+            
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
                     rms_norm_eps, attenInput);
             
@@ -1448,10 +1446,6 @@ namespace fastllm {
                 }
             }
         }
-        if (sinDataPtr != &sinData)
-            delete sinDataPtr;
-        if (cosDataPtr != &cosData)
-            delete cosDataPtr;
         return lastRet;
     }
 
