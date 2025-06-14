@@ -241,6 +241,8 @@ namespace fastllm {
 
         virtual void SetDataType(DataType dataType);
 
+        virtual void UpdateRotaryPtr(Data **sinDataPtr, Data **cosDataPtr, const std::string &device);
+
         // messages: [ (role, content) ... ]
         virtual std::string ApplyChatTemplate(const ChatMessages &messages);
 
@@ -291,6 +293,7 @@ namespace fastllm {
         WeightMap weight; // 权重
 
         Data sinData, cosData;
+        std::map <std::string, Data*> deviceSinDatas, deviceCosDatas; // deviceSinDatas[xxx]代表xxx设备上的sinData
 
         ResponseContextDict responseContextDict;
 

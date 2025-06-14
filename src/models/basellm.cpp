@@ -1244,6 +1244,18 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         this->dataType = dataType;
     }
 
+    void basellm::UpdateRotaryPtr(Data **sinDataPtr, Data **cosDataPtr, const std::string &device) {
+        if (this->deviceSinDatas.find(device) == this->deviceSinDatas.end()) {
+            this->deviceSinDatas[device] = new Data();
+            this->deviceCosDatas[device] = new Data();
+            Mul(sinData, 1.0f, *this->deviceSinDatas[device]);
+            Mul(cosData, 1.0f, *this->deviceCosDatas[device]);
+        }
+
+        *sinDataPtr = this->deviceSinDatas[device];
+        *cosDataPtr = this->deviceCosDatas[device];
+    }
+
     JinjaVar ChatMessagesToJinjaVar(const ChatMessages &messages) {
         JinjaVar ret = {{"messages", fastllm::JinjaArray {}}};
         for (auto &message : messages) {
