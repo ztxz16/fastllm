@@ -20,6 +20,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--cache_history", type = str, default = "", help = "缓存历史对话")
     parser.add_argument("--cache_fast", type = str, default = "", help = "是否启用快速缓存（会消耗一定显存）")
     parser.add_argument("--enable_thinking", type = str, default = "", help = "是否开启硬思考开关（需要模型支持）")
+    parser.add_argument("--cuda_shared_expert", "--cuda_se", type = str, default = "true", help = "是否使用cuda来执行共享专家")
+    
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
     parser.add_argument('--cache_dir', type = str, default = "", help = '指定缓存模型文件的路径')
@@ -147,6 +149,8 @@ def make_normal_llm_model(args):
     llm.set_cpu_low_mem(args.low)
     if (args.cuda_embedding):
         llm.set_cuda_embedding(True)
+    if (args.cuda_shared_expert.lower() not in ["", "false", "0", "off"]):
+        llm.set_cuda_shared_expert(True)
     graph = None
     if (args.custom != ""):
         import importlib.util
