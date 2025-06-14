@@ -696,9 +696,9 @@ namespace fastllm {
 #ifdef USE_SENTENCEPIECE
                 tokenizerFile = path + "tokenizer.model";
                 if (fastllm::FileExists(tokenizerFile)) {
-                    std::string& tokenizerProto = ReadAllFile(tokenizerFile);
-                    weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();
-                    weight.tokenizer.spProcessor->LoadFromSerializedProto(tokenizerProto);
+                    std::string&& tokenizerProto = ReadAllFile(tokenizerFile);
+                    model->weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+                    model->weight.tokenizer.spProcessor->LoadFromSerializedProto(tokenizerProto);
                     return;
                 }
 #endif
@@ -725,9 +725,9 @@ namespace fastllm {
         } else if (tokenizerClass == "PreTrainedTokenizer"
             || tokenizerClass == "InternLM2Tokenizer" || tokenizerClass == "InternLM3Tokenizer") {
             std::string tokenizerFile = path + "tokenizer.model";
-            std::string& tokenizerProto = ReadAllFile(tokenizerFile);
-            weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();
-            weight.tokenizer.spProcessor->LoadFromSerializedProto(tokenizerProto);
+            std::string&& tokenizerProto = ReadAllFile(tokenizerFile);
+            model->weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+            model->weight.tokenizer.spProcessor->LoadFromSerializedProto(tokenizerProto);
 #endif
         } else if (tokenizerClass == "ChatGLM4Tokenizer") {
             // GLM4御用的分词
