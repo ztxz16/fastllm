@@ -33,7 +33,12 @@ fastllm是c++实现自有算子替代Pytorch的高性能全功能大模型推理
 ### 安装
 
 
-- PIP安装（目前仅支持Nvidia GPU和AMD GPU，其余GPU请使用[源码安装](#源码安装)
+- `pip`安装支持`Nvidia GPU`和`AMD GPU`，其余`GPU`请使用[源码安装](#源码安装)
+- `pip`安装速度慢时，可使用镜像加速
+
+```
+pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+```
 
 #### Linux系统 + Nvidia GPU:
 
@@ -164,6 +169,10 @@ ftllm server deepseek-ai/DeepSeek-V3-0324 --dtype fp8 --moe_dtype int4
 # 上面的命令会读取原始模型（这个模型是FP8精度），并使用FP8 + INT4的混合精度推理
 ```
 
+- `--dtype_config`:
+  - **描述**: 指定动态量化配置文件。
+  - **说明**: 参考[动态量化说明](docs/dtype_config.md)
+
 若不设定这些参数，ftllm会使用模型中设定的精度来进行推理
 
 若使用的模型已经是量化好的模型（例如AWQ模型，Fastllm导出的量化模型等），建议不指定这些参数
@@ -178,11 +187,15 @@ ftllm server deepseek-ai/DeepSeek-V3-0324 --dtype fp8 --moe_dtype int4
   - **常用值说明**: 
     - `cpu` 使用`cpu`推理
     - `cuda` 使用`gpu`推理 
-    - `numa` 使用多路`numa`节点加速推理，在多CPU的机器才会有提升
+    - `numa` 使用多路`numa`节点加速推理，在多CPU的机器才会有提升。使用numa加速时，强烈建议关闭系统numa平衡。（ubuntu中可使用命令`sudo sysctl -w kernel.numa_balancing=0`)
     - `multicuda` 使用多设备张量并行推理
       - **使用多显卡**: `--device multicuda:0,1`
       - **使用多显卡+CPU**: `--device multicuda:0,cpu`
-      - **按比例使用多显卡+CPU**: `--device multicuda:0:4,1:5,cpu:1` (`cuda:0`计算4/10, `cuda:1`计算5/10, `cpu`计算1/10)
+      - **按比例使用多显卡+CPU**: `--device multicuda:0:4,1:5,cpu:1` 
+      (`cuda:0`计算4/10, `cuda:1`计算5/10, `cpu`计算1/10)
+  - **串行计算**: 一些场景下可以指定不同的device串行执行。例如
+    - `--device "{'cuda:0':3,'cuda:1':2}"`: 这样`3/5`的层会运行在`cuda:0`上，`2/5`的层会运行在`cuda:1`上
+    - `--device "{'multicuda:0,1':3,'cuda:1':2}"`: 这样`3/5`的层会使用`cuda:0`,`cuda:1`张量并行，`2/5`的层仅仅运行在`cuda:1`上
 
 - `--moe_device`:
   - **描述**: 指定 MOE（Mixture of Experts）层的计算设备。
@@ -238,6 +251,10 @@ numactl -C 0-31 -m 0 ftllm server fastllm/DeepSeek-V3-0324-INT4 --device cuda --
 - `--moe_experts`:
   - **描述**: 指定 MOE（Mixture of Experts）层使用的专家数。不设定则根据模型配置设定。减少专家数可以提高推理速度，但可能降低推理准确度
   - **示例**: `--moe_experts 6`
+
+- `--cuda_se`:
+  - **描述**: 指定 MOE中的共享专家 是否在cuda上执行，默认为true
+  - **示例**: `--cuda_se false`
 
 - `--port`:
   - **描述**: 指定服务运行的端口号。
