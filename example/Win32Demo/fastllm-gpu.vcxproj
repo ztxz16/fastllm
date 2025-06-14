@@ -274,6 +274,7 @@
     <ClCompile Include="..\..\src\models\qwen3_moe.cpp" />
     <ClCompile Include="..\..\src\models\xlmroberta.cpp" />
     <ClCompile Include="..\..\src\template.cpp" />
+    <ClCompile Include="..\..\src\tokenizer.cpp" />
     <ClCompile Include="..\..\third_party\json11\json11.cpp" />
   </ItemGroup>
   <ItemGroup>
