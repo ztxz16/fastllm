@@ -1223,6 +1223,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
     }
 
     void basellm::SetMoeExperts(int experts) {
+        this->num_experts_per_tok = std::max(1, experts - this->n_shared_experts);
         return;
     }
 
