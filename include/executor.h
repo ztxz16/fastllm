@@ -38,6 +38,8 @@ namespace fastllm {
         void ClearProfiler();
 
         void PrintProfiler();
+
+        std::string firstDevice;
     };
 }
 
