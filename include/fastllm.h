@@ -39,6 +39,8 @@ namespace fastllm {
     void SetThreads(int t);
     void SetLowMemMode(bool m);
     void SetKVCacheInCPU(bool kvCacheInCPU);
+    void SetCudaSharedExpert(bool v);
+    bool GetCudaSharedExpert();
     void SetHistoryCacheInCPU(bool v);
     bool GetLowMemMode();
     void SetCudaEmbedding(bool v);
