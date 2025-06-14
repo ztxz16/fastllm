@@ -197,6 +197,9 @@
     <ClCompile Include="..\..\src\template.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\tokenizer.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\basellm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>

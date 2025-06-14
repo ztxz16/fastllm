@@ -31,6 +31,7 @@ set(PROJECT_SOURCE
         ../../../../../../../src/model.cpp
         ../../../../../../../src/executor.cpp
         ../../../../../../../src/template.cpp
+        ../../../../../../../src/tokenizer.cpp
         ../../../../../../../src/devices/cpu/cpudevice.cpp
         ../../../../../../../src/devices/cpu/cpudevicebatch.cpp
         ../../../../../../../src/devices/cpu/linear.cpp
