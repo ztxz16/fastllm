@@ -274,6 +274,13 @@ namespace fastllm {
         const float scale_attn = sqrt(head_dim);
         int block_cnt = 28;
 
+        // 以下是moe相关参数
+        float routed_scaling_factor = 1.0f;
+        int n_shared_experts = 0;
+        int num_experts_per_tok;
+        int num_experts;
+        bool norm_topk_prob;
+
         std::vector <WeightMergeRule> weightMergeRules;
         std::map <std::string, std::string> specialWeights; //一些特殊层，可以提前注册（一般用于TFACC）
         std::set <std::string> cantQuantLinears; // 不能量化的Linear层
