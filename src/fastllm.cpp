@@ -2082,7 +2082,8 @@ namespace fastllm {
                             v.push_back(id);
                         }
                     } else {
-                        std::vector<float> &&subTokenIds = BytePairEncode(subStr);
+                        std::string s = Normalize(subStr);
+                        std::vector<float> &&subTokenIds = BytePairEncode(s);
                         v.insert(v.end(), subTokenIds.begin(), subTokenIds.end());
                     }
                 }
@@ -2338,6 +2339,13 @@ namespace fastllm {
         for (int i = 0; i < data.Count(0); i++) {
             tokens.push_back((int) ((float *) data.cpuData)[i]);
         }
+#ifdef USE_SENTENCEPIECE
+        if (spProcessor != nullptr) {
+            std::string result;
+            spProcessor->Decode(tokens, &result);
+            return result;
+        }
+#endif
         return DecodeTokens(tokens);
     }
 
