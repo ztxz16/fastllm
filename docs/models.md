@@ -89,9 +89,6 @@
 | deepseek-ai/DeepSeek-Coder-V2-Instruct      | √ | ✔ | √ |
 | deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct | √ | ✔ | ✔ |
 
-> 注4： Python ftllm用AutoTokenizer而不使用Fastllm Tokenizer可以实现加载，但是C++程序尚不支持加载该模型的Tokenizer。
-
-
 ### LLaMA类模型
 
 |              模型  | 加载后转换 |  离线转换  |  直接读取  |
@@ -105,16 +102,22 @@
 |  |  |  |  |
 | internlm/internlm-chat-7b | [✔](llama_cookbook.md#internlm书生) | [✔](llama_cookbook.md#internlm书生) |  |
 | internlm/internlm-chat-20b | [✔](llama_cookbook.md#internlm书生) | [✔](llama_cookbook.md#internlm书生) |  |
-| internlm/internlm2-chat-1_8b | [✔](llama_cookbook.md#internlm书生) | [✔](llama_cookbook.md#internlm书生) | ❌<sup>4</sup> |
-| internlm/internlm2-chat-7b | [✔](llama_cookbook.md#internlm书生) | [✔](llama_cookbook.md#internlm书生) | ❌<sup>4</sup> |
-| internlm/internlm2-chat-20b | [✔](llama_cookbook.md#internlm书生) | [✔](llama_cookbook.md#internlm书生) | ❌<sup>4</sup> |
+| internlm/internlm2-chat-1_8b | [✔](llama_cookbook.md#internlm书生) | [✔](llama_cookbook.md#internlm书生) | ✔<sup>4</sup> |
+| internlm/internlm2-chat-7b | [✔](llama_cookbook.md#internlm书生) | [✔](llama_cookbook.md#internlm书生) | ✔<sup>4</sup> |
+| internlm/internlm2-chat-20b | [✔](llama_cookbook.md#internlm书生) | [✔](llama_cookbook.md#internlm书生) | ✔<sup>4</sup> |
+| internlm/internlm3-8b-instruct | [✔](llama_cookbook.md#internlm书生) | [✔](llama_cookbook.md#internlm书生) | ✔<sup>4</sup> |
 |  |  |  |  |
-| 01-ai/Yi-6B-Chat | [✔](llama_cookbook.md#yi) | [✔](llama_cookbook.md#yi) | ❌<sup>4</sup> |
-| 01-ai/Yi-34B-Chat | [✔](llama_cookbook.md#yi) | [✔](llama_cookbook.md#yi) | ❌<sup>4</sup> |
+| 01-ai/Yi-6B-Chat | [✔](llama_cookbook.md#yi) | [✔](llama_cookbook.md#yi) | ✔<sup>4</sup> |
+| 01-ai/Yi-34B-Chat | [✔](llama_cookbook.md#yi) | [✔](llama_cookbook.md#yi) | ✔<sup>4</sup> |
 | SUSTech/SUS-Chat-34B | [✔](llama_cookbook.md#llama2-chat) | [✔](llama_cookbook.md#llama2-chat) |  |
+| 01-ai/Yi-Coder-1.5B-Chat | [✔](llama_cookbook.md#yi) | [✔](llama_cookbook.md#yi) | ✔<sup>4</sup> |
+| 01-ai/Yi-Coder-9B-Chat | [✔](llama_cookbook.md#yi) | [✔](llama_cookbook.md#yi) | ✔<sup>4</sup> |
 |  |  |  |  |
 | meta-llama/Meta-Llama-3-8B-Instruct |  | [✔](tools/scripts/llama3_to_flm.py) | ✔ |
 | meta-llama/Meta-Llama-3-70B-Instruct |  | [✔](tools/scripts/llama3_to_flm.py) | ✔ |
+
+> 注4： Python ftllm用AutoTokenizer而不使用Fastllm Tokenizer可以实现加载，C++程序需要安装`libsentencepiece.so`，并在编译时打开`USE_SENTENCEPIECE`选项才能加载Tokenizer。
+
 
 ### 其它模型
 
