@@ -7,13 +7,13 @@
 ## 基本用法
 
 ```
-ftllm server fastllm/DeepSeek-V3-0324 --dtype dtype_config.json
+ftllm server fastllm/DeepSeek-V3-0324 --dtype_config dtype_config.json
 ```
 
-这时候会使用`dtype_config.json`文件中的规则来进行动态量化，并部署`api server`
+这时候会使用`dtype_config.json`文件中（可以直接使用下面的示例）的规则来进行动态量化，并部署`api server`
 
 ```
-ftllm export fastllm/DeepSeek-V3-0324 --dtype dtype_config.json -o DeepSeek-V3-0324-MIX
+ftllm export fastllm/DeepSeek-V3-0324 --dtype_config dtype_config.json -o DeepSeek-V3-0324-MIX
 ```
 
 这时候会使用`dtype_config.json`文件中的规则来进行动态量化，并导出模型
