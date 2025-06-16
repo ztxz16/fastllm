@@ -404,11 +404,43 @@ __global__ void FastllmCudaInt4Group2HalfKernel(uint8_t* a, float *scales, float
 __global__ void FastllmCudaInt4Group2HalfKernel(uint8_t* a, half *scales, half *mins, half *b, int k, int m, int group, int groupCnt) {
     unsigned int tid = threadIdx.x;
     unsigned int st = blockIdx.x;
+#ifdef CUDA_NO_TENSOR_CORE
+    half2 scalesBuffer;
+    half2 minBuffer;
+    int threshold = ST128_FP16_COUNT;
+    for (int i = tid * ST128_FP16_COUNT; i < m; i += blockDim.x * ST128_FP16_COUNT) {
+        int index = st * m + i;
+        int startIdx = st * group + i / groupCnt;
+        int endIdx = st * group + (i + ST128_FP16_COUNT - 1) / groupCnt;
+        scalesBuffer.x = scalesBuffer.y = __ldg(scales + startIdx);
+        minBuffer.x = minBuffer.y = __ldg(mins + startIdx);
+        if (endIdx > startIdx) {
+            threshold = (i + ST128_FP16_COUNT - 1) % groupCnt;
+            scalesBuffer.y = __ldg(scales + endIdx);
+            minBuffer.y = __ldg(mins + endIdx);
+        }
+        // 读取
+        union_char4 aBuffer;
+        union_half8 bBuffer;
+        aBuffer.in = *reinterpret_cast<const uint32_t *>(a + index / 2);
+        // 处理
+        for (int j = 0; j < ST128_FP16_COUNT / 2; j++) {
+            if (i + j * 2 + 1 < m) {
+                float scale = __half2float(j * 2 < threshold ? scalesBuffer.x : scalesBuffer.y);
+                float min = __half2float(j * 2 < threshold ? minBuffer.x : minBuffer.y);
+                bBuffer.out[j * 2] = __float2half(scale * (aBuffer.out[j] >> 4) + min);
+                bBuffer.out[j * 2 + 1] = __float2half(scale * (aBuffer.out[j] & 0xF) + min);
+            }
+        }
+        reinterpret_cast<uint4 *>(b)[index / ST128_FP16_COUNT] = bBuffer.in;
+    }
+#else
     for (int i = tid * 2; i < m; i += blockDim.x * 2) {
         int gid = st * group + (i / groupCnt);
         b[st * m + i] = __float2half((float)scales[gid] * (a[(st * m + i) / 2] >> 4) + (float)mins[gid]);
         b[st * m + i + 1] = __float2half((float)scales[gid] * (a[(st * m + i) / 2] & 0xF) + (float)mins[gid]);
     }
+#endif
 }
 
 __global__ void FastllmCudaInt42HalfKernel(uint8_t* a, float *scales, float *mins, half *b, int len, int per) {
