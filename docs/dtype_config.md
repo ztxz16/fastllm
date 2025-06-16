@@ -6,17 +6,19 @@
 
 ## 基本用法
 
+首先我们要编写一个配置文件（可以直接使用[下一节](#如何编写配置文件)中的示例）
+
+假设配置文件保存在 `/root/dtype_config.json`
+
+下面这条命令会读会读取`/root/dtype_config.json`中的的规则来进行动态量化，并部署`api server`
 ```
-ftllm server fastllm/DeepSeek-V3-0324 --dtype_config dtype_config.json
+ftllm server fastllm/DeepSeek-V3-0324 --dtype_config /root/dtype_config.json
 ```
 
-这时候会使用`dtype_config.json`文件中（可以直接使用下面的示例）的规则来进行动态量化，并部署`api server`
-
+下面这条命令会读会读取`/root/dtype_config.json`中的的规则来进行动态量化，并导出模型
 ```
-ftllm export fastllm/DeepSeek-V3-0324 --dtype_config dtype_config.json -o DeepSeek-V3-0324-MIX
+ftllm export fastllm/DeepSeek-V3-0324 --dtype_config /root/dtype_config.json -o DeepSeek-V3-0324-MIX
 ```
-
-这时候会使用`dtype_config.json`文件中的规则来进行动态量化，并导出模型
 
 ## 如何编写配置文件
 
@@ -51,7 +53,8 @@ ftllm export fastllm/DeepSeek-V3-0324 --dtype_config dtype_config.json -o DeepSe
     }
 ]
 ```
-将以上json代码保存为`dtype_config.json`，然后就可以使用`--dtype dtype_config.json`来读取其中的配置）
+将以上json代码保存为`/root/dtype_config.json`（这里的路径只是举例，你可以保存到任意位置）
+然后就可以使用`--dtype_config /root/dtype_config.json`来读取其中的配置（如果你的文件不是保存在`/root/dtype_config.json`，那么请使用你保存文件的路径）
 
 **说明**：
 - 配置文件中是一个json的数组，数组中每个元素代表一条量化规则。
