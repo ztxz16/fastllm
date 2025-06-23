@@ -437,7 +437,6 @@ __global__ void FastllmCudaInt4Group2HalfKernel(uint8_t* a, half *scales, half *
 
 __global__ void FastllmCudaInt42HalfKernel(uint8_t* a, float *scales, float *mins, half *b, int len, int per) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-#ifdef CUDA_NO_TENSOR_CORE
     float2 scalesBuffer;
     float2 minBuffer;
     int threshold = ST128_FP16_COUNT;
@@ -468,15 +467,6 @@ __global__ void FastllmCudaInt42HalfKernel(uint8_t* a, float *scales, float *min
         }
         reinterpret_cast<uint4 *>(b)[idx] = bBuffer.in;
     }
-#else
-    if (idx < len) {
-        if (idx % 2 == 1) {
-            b[idx] = __float2half(scales[idx / per] * (a[idx / 2] & 0xF) + mins[idx / per]);
-        } else {
-            b[idx] = __float2half(scales[idx / per] * (a[idx / 2] >> 4) + mins[idx / per]);
-        }
-    }
-#endif
 }
 
 __global__ void FastllmCudaHalf2FloatKernel(half* a, float *b, int len) {
@@ -3481,12 +3471,12 @@ bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data 
                                                                                           len);
 
         len = k * m;
-#ifdef CUDA_NO_TENSOR_CORE
         int gridSize = (len - 1) / (threadPerBlock * 4) + 1;
         FastllmCudaInt42HalfKernel <<< gridSize, threadPerBlock>>>((uint8_t *) weight.cudaData,
                                                                    cudaScales, cudaMins,
                                                                    cudaFp16Weight, len, m);
 
+#ifdef CUDA_NO_TENSOR_CORE
         status = cublasGemmEx(fastllmCublasHandle,
                               CUBLAS_OP_T, CUBLAS_OP_N,
                               k, n, m,
@@ -3496,11 +3486,6 @@ bool FastllmCudaMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::Data 
                               cudaOutput, CType,
                               k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
 #else
-        FastllmCudaInt42HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t *) weight.cudaData,
-                                                                                         cudaScales,
-                                                                                         cudaMins,
-                                                                                         cudaFp16Weight, len, m);
-
         status = cublasGemmEx(fastllmCublasHandle,
                               CUBLAS_OP_T, CUBLAS_OP_N,
                               k, n, m,
@@ -5987,7 +5972,7 @@ bool FastllmCudaHalfMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::D
         auto fastllmCublasHandle = getFastllmCublasHandle();
         half *cudaFp16Weight;
 
-        cudaFp16Weight = (half *) FastllmCudaDirectMalloc(k * m * sizeof(half));
+        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
 
 #ifdef CUDA_NO_TENSOR_CORE
         float *cudaFp32Output = (float *) FastllmCudaMalloc(n * k * sizeof(float));
@@ -6003,11 +5988,11 @@ bool FastllmCudaHalfMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::D
         int threadPerBlock = std::min(256, len);
 
         len = k * m;
-
-        FastllmCudaInt42HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((uint8_t *) weight.cudaData,
-                                                                                         cudaScales,
-                                                                                         cudaMins,
-                                                                                         cudaFp16Weight, len, m);
+        int gridSize = (len - 1) / (threadPerBlock * 4) + 1;
+        FastllmCudaInt42HalfKernel <<< gridSize, threadPerBlock>>>((uint8_t *) weight.cudaData,
+                                                                    cudaScales,
+                                                                    cudaMins,
+                                                                    cudaFp16Weight, len, m);
 
 #ifdef CUDA_NO_TENSOR_CORE
         status = cublasGemmEx(fastllmCublasHandle,
@@ -6045,7 +6030,7 @@ bool FastllmCudaHalfMatMulFloatInt4NoZero(const fastllm::Data &input, fastllm::D
             FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
         }
 
-        FastllmCudaDirectFree(cudaFp16Weight);
+        FastllmCudaFree(cudaFp16Weight);
     } else {
         half *cudaBiasData = (half*)weight.extraCudaHalfData[2];
         LaunchFastllmGemmFp16Int4NoZero(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBiasData, cudaScales, cudaMins, n, m, k);
