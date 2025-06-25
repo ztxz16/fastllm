@@ -24,6 +24,7 @@
 #include "graphllm.h"
 #include "phi3.h"
 #include "cogvlm.h"
+#include "minimax.h"
 
 #ifdef USE_TFACC
 #include "fastllm-tfacc.h"
@@ -224,6 +225,8 @@ namespace fastllm {
             model = (basellm*)(new XlmRobertaModel());
         } else if (modelType == "cogvlm" || modelType == "CogVLMForCausalLM") {
             model = (basellm*)(new CogvlmModel());
+        } else if (modelType == "minimax_m1" || modelType == "minimax_text_01") {
+            model = (basellm*)(new MinimaxModel());
         } else if (modelType == "fastllmJson") {
             model = new GraphLLMModel("fastllmJson");
         } else {
@@ -881,14 +884,26 @@ namespace fastllm {
         }
         AddDictRecursion(model, "", config);
         // 设置eos_token_id
-        if (config["eos_token_id"].is_array()) {
+        if (config["eos_token_id"].is_null()) {
+            auto tokenizer = json11::Json::parse(ReadAllFile(path + "tokenizer.json"), error);
+            if (error == "") {
+                std::string tokenizerConfigFile = path + "tokenizer_config.json";
+                auto tokenizerConfig = json11::Json::parse(ReadAllFile(tokenizerConfigFile), error);
+                std::string eos_token = tokenizerConfig["eos_token"].string_value();
+                printf("eos_token = %s\n", eos_token.c_str());
+                for (auto added_token : tokenizer["added_tokens"].array_items()) {
+                    if (added_token["content"] == eos_token) {
+                        model->eos_token_ids.insert(added_token["id"].int_value());
+                    }
+                }
+            }
+        } else if (config["eos_token_id"].is_array()) {
             for (auto &it : config["eos_token_id"].array_items()) {
-                model->eos_token_ids.insert(it.int_value());
+                model->eos_token_ids.insert(it.int_value()); 
             }
         } else {
             model->eos_token_id = config["eos_token_id"].int_value();
         }
-
         std::string generatetionConfigFile = path + "generation_config.json";
         if (FileExists(generatetionConfigFile)) {
             auto generation_config = json11::Json::parse(ReadAllFile(generatetionConfigFile), error);

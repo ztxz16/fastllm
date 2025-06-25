@@ -125,6 +125,9 @@ fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
 fastllm_lib.get_max_input_len_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_max_input_len_llm_model.restype = ctypes.c_int
 
+fastllm_lib.get_struct_llm_model.argtypes = [ctypes.c_int]
+fastllm_lib.get_struct_llm_model.restype = ctypes.c_char_p
+
 fastllm_lib.embedding_sentence.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_bool, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.embedding_sentence.restype = ctypes.POINTER(ctypes.c_float)
 
@@ -854,9 +857,16 @@ class model:
         else:
             return ctypes.c_int(len(stop_token_ids)), (ctypes.c_int * len(stop_token_ids))(*stop_token_ids)
     
+    def trans_conversation(self, conversation: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        if (self.get_struct() in ["minimax"]):
+            for i in range(len(conversation)):
+                if ("content" in conversation[i] and isinstance(conversation[i]["content"], str)):
+                    conversation[i]["content"] = [{"type": "text", "text": conversation[i]["content"]}]
+        return conversation
+
     def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True) -> int:
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
-            prompt = self.hf_tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
+            prompt = self.hf_tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
             return len(self.hf_tokenizer.encode(prompt))
         else:
             prompt = self.apply_chat_template(conversation)
@@ -1007,8 +1017,8 @@ class model:
             else:
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
-                    prompt = tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
-                    #input = tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = True)
+                    prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
+                    #input = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = True)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
                 input = tokenizer.encode(prompt)
@@ -1089,6 +1099,7 @@ class model:
         conversation = None
         if (isinstance(query, List)):
             conversation = query
+            conversation = self.trans_conversation(conversation)
         if (images != None):
             architecture = ""
             try:
@@ -1124,7 +1135,7 @@ class model:
             tokenizer = self.hf_tokenizer
             prompt = ""
             if (conversation != None and len(conversation) != 0):
-                prompt = tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
+                prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
             else:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
             input = tokenizer.encode(prompt)
@@ -1149,7 +1160,7 @@ class model:
             else:
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
-                    prompt = tokenizer.apply_chat_template(conversation, add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
+                    prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
                 if (self.save_history):
@@ -1438,6 +1449,9 @@ class model:
     
     def get_max_input_len(self):
         return fastllm_lib.get_max_input_len_llm_model(self.model)
+
+    def get_struct(self):
+        return fastllm_lib.get_struct_llm_model(self.model).decode()
 
     def embedding_sentence(self, input: str, normalize = True):
         embedding_len = ctypes.c_int(0)
