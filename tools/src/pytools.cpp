@@ -523,6 +523,12 @@ extern "C" {
         return model->max_positions;
     }
 
+    DLL_EXPORT char *get_struct_llm_model(int modelId) {
+        auto model = models.GetModel(modelId);
+        char *ret = string_to_chars(model->model_struct);
+        return ret;
+    }
+
     DLL_EXPORT float* embedding_sentence(int modelId, char *input, bool normalize, int *embeddingLen) {
         fastllm::BertModel *model = (fastllm::BertModel*)models.GetModel(modelId);
         std::string str(input);
