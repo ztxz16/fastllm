@@ -2,10 +2,12 @@ import asyncio
 import logging
 import json
 import traceback
+import time
+import shortuuid
 from fastapi import Request
 from http import HTTPStatus
-from typing import (AsyncGenerator, AsyncIterator, Awaitable, Iterable, List,
-                    Optional, Tuple, TypedDict, Union, final)
+from typing import (AsyncGenerator, AsyncIterator, Awaitable, Dict, Iterable, List,
+                    Optional, Tuple, TypedDict, Union, Any, final)
 import uuid
 from openai.types.chat import (ChatCompletionContentPartParam,
                                ChatCompletionRole)
@@ -40,6 +42,8 @@ class FastLLmCompletion:
     self.init_fast_llm_model()
     self.think = think
     self.hide_input = hide_input
+    # Store mapping between conversation IDs and handles
+    self.conversation_handles = {}
     
   def init_fast_llm_model(self):
     pass
@@ -145,6 +149,9 @@ class FastLLmCompletion:
                         max_length = max_length, min_length = min_length, do_sample = True,
                         top_p = request.top_p, top_k = request.top_k, temperature = request.temperature,
                         repeat_penalty = frequency_penalty, one_by_one = True)
+      # Store the mapping between conversation ID and handle
+      self.conversation_handles[request_id] = handle
+      logging.info(f"Created conversation: {request_id}, handle: {handle}")
       result_generator = self.model.stream_response_handle_async(handle)
       # Streaming response
       if request.stream:
@@ -201,6 +208,11 @@ class FastLLmCompletion:
                             total_tokens = input_token_len + completion_tokens,
                             completion_tokens = completion_tokens)
       )
+
+      # After completion, remove the conversation from tracking dictionary
+      if request_id in self.conversation_handles:
+          del self.conversation_handles[request_id]
+          logging.info(f"Removed completed conversation from tracking: {request_id}")
 
       return response
       
@@ -297,6 +309,12 @@ class FastLLmCompletion:
         data = self.create_streaming_error_response(str(e))
         yield f"data: {data}\n\n"
         await asyncio.sleep(0)
+      
+      # After completion, remove the conversation from tracking dictionary
+      if request_id in self.conversation_handles:
+          del self.conversation_handles[request_id]
+          logging.info(f"Removed completed stream conversation from tracking: {request_id}")
+      
       yield "data: [DONE]\n\n"
       await asyncio.sleep(0)
       
@@ -312,4 +330,28 @@ class FastLLmCompletion:
                                       status_code=status_code).model_dump()
       })
       return json_str
-    
+
+  def abort_conversation(self, conversation_id: str) -> bool:
+    if conversation_id in self.conversation_handles:
+      handle = self.conversation_handles[conversation_id]
+      try:
+        self.model.abort_handle(handle)
+        logging.info(f"Aborted conversation: {conversation_id}, handle: {handle}")
+        # Remove the conversation from the mapping
+        del self.conversation_handles[conversation_id]
+        return True
+      except Exception as e:
+        logging.error(f"Error aborting conversation {conversation_id}: {e}")
+        return False
+    else:
+      logging.warning(f"Conversation ID not found: {conversation_id}")
+      return False
+      
+  def get_active_conversations(self) -> List[Dict[str, Any]]:
+    result = []
+    for conversation_id, handle in self.conversation_handles.items():
+      result.append({
+        "conversation_id": conversation_id,
+        "handle": handle
+      })
+    return result
