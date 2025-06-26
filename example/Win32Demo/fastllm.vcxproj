@@ -206,6 +206,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\src\device.cpp" />
+    <ClCompile Include="..\..\src\devices\cpu\avx512bf16.cpp" />
+    <ClCompile Include="..\..\src\devices\cpu\avx512vnni.cpp" />
     <ClCompile Include="..\..\src\devices\cpu\cpudevice.cpp" />
     <ClCompile Include="..\..\src\devices\cpu\cpudevicebatch.cpp" />
     <ClCompile Include="..\..\src\devices\cpu\linear.cpp" />
