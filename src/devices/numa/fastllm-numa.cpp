@@ -110,7 +110,11 @@ namespace fastllm {
                 }
 
                 // 设置内存分配策略
-                numa_set_preferred(numaId);
+                struct bitmask *mask = numa_bitmask_alloc(numa_num_configured_nodes());
+                numa_bitmask_clearall(mask);
+                numa_bitmask_setbit(mask, numaId);
+                numa_set_membind(mask);
+                numa_bitmask_free(mask);
                 
                 printf("numa server running on node %d. (part %d / %d, %d threads)\n", numaId, partId, partCnt, numaThreads);
                 fastllm::ComputeServer *computeServer = new fastllm::ComputeServer(partId, partCnt, numaThreads);

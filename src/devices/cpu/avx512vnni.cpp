@@ -27,12 +27,13 @@ namespace fastllm {
         }
         return ans + _mm512_reduce_add_epi32(acc);
 #endif
+        return 0;
     };
 
-    // int8和int4的矩阵乘法
+    // int8和int4的矩阵乘法  
     // a: [n * m]的int8矩阵
     // b: [k * m]的int4矩阵
-    // c: [n * k]的float32的结果矩阵
+    // c: [n * k]的float32的结果矩阵  
     bool MatMulInt8Int4_AVX512VNNI(uint8_t *a, uint8_t *b, float *c, int n, int m, int k) {
 #ifdef __AVX512VNNI__
         float *values = c;
