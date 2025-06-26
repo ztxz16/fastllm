@@ -18,6 +18,7 @@ global fastllm_completion
 global fastllm_embed
 global fastllm_reranker
 global fastllm_model
+global dev_mode_enabled
 
 def parse_args():
     parser = make_normal_parser("OpenAI-compatible API server")
@@ -37,6 +38,7 @@ app.add_middleware(
 fastllm_completion:FastLLmCompletion
 fastllm_embed:FastLLmEmbed
 fastllm_model:FastLLmModel
+dev_mode_enabled:bool = False
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest,
@@ -73,6 +75,50 @@ async def list_models():
     model_response = fastllm_model.response
     return JSONResponse(content = model_response)
 
+@app.post("/v1/cancel")
+async def cancel_generation(request: Request):
+    # Check if development mode is enabled
+    if not dev_mode_enabled:
+        return JSONResponse(content = {"error": "This API is only available in development mode"}, 
+                            status_code = 403)
+    
+    try:
+        json_data = await request.json()
+        if 'conversation_id' not in json_data:
+            return JSONResponse(content = {"error": "Missing required parameter: conversation_id"},
+                                status_code = 400)
+        
+        conversation_id = json_data['conversation_id']
+        success = fastllm_completion.abort_conversation(conversation_id)
+        
+        if success:
+            return JSONResponse(content = {"message": f"Conversation {conversation_id} cancelled successfully"})
+        else:
+            return JSONResponse(content = {"error": f"Failed to cancel conversation {conversation_id}. Conversation not found or already finished."},
+                                status_code = 404)
+    except Exception as e:
+        logging.error(f"Error cancelling conversation: {e}")
+        return JSONResponse(content = {"error": f"Internal server error: {str(e)}"},
+                            status_code = 500)
+
+@app.get("/v1/active_conversations")
+async def get_active_conversations():
+    # Check if development mode is enabled
+    if not dev_mode_enabled:
+        return JSONResponse(content = {"error": "This API is only available in development mode"}, 
+                            status_code = 403)
+        
+    try:
+        conversations = fastllm_completion.get_active_conversations()
+        return JSONResponse(content = {
+            "active_conversations": conversations,
+            "count": len(conversations)
+        })
+    except Exception as e:
+        logging.error(f"Error getting active conversations: {e}")
+        return JSONResponse(content = {"error": f"Internal server error: {str(e)}"},
+                            status_code = 500)
+
 def init_logging(log_level = logging.INFO, log_file:str = None):
     logging_format = '%(asctime)s %(process)d %(filename)s[line:%(lineno)d] %(levelname)s: %(message)s'
     root = logging.getLogger()
@@ -102,6 +148,13 @@ def fastllm_server(args):
     global fastllm_embed
     global fastllm_reranker
     global fastllm_model
+    global dev_mode_enabled
+    
+    # Set development mode from args
+    dev_mode_enabled = args.dev_mode
+    if dev_mode_enabled:
+        logging.info("Development mode enabled - conversation management APIs are active")
+    
     init_logging()
     logging.info(args)
     from .util import make_normal_llm_model
