@@ -26,7 +26,7 @@ namespace fastllm {
 
     class BaseBatchOperator : BaseOperator {
     public:
-        // 对某一个算子进行形状推理
+        // 对某一个算子进行形状推理  
         virtual void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams,
                              const IntDict &intParams);
     };

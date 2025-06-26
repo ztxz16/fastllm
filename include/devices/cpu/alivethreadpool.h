@@ -89,7 +89,7 @@ namespace fastllm {
     };
 
     struct AliveThreadPool {
-        std::pair <int, int> curActivateThreadInterval; // 设定当前激活 [curActivateThreadInterval.first, curActivateThreadInterval.second) 的线程
+        std::pair <int, int> curActivateThreadInterval; // 设定当前激活 [curActivateThreadInterval.first, curActivateThreadInterval.second) 的线程  
 
         std::vector <AliveThreadLoop*> loops;
         std::vector <std::thread*> threads;
@@ -302,7 +302,7 @@ namespace fastllm {
         }
     }
 
-    // [n, m, k] -> [m, n, k], 以k个元素为单位做转置 
+    // [n, m, k] -> [m, n, k], 以k个元素为单位做转置   
     struct MultiThreadTransposeByLineOp : MultiThreadBaseOp {
         uint8_t *input, *output;
         int n, m, k, st, end;
@@ -318,7 +318,7 @@ namespace fastllm {
         }
     };
 
-    // [n, m, k] -> [m, n, k], 以k个元素为单位做转置 
+    // [n, m, k] -> [m, n, k], 以k个元素为单位做转置   
     static void RunMultiThreadTransposeByLine(uint8_t *output, uint8_t *input, int n, int m, int k, AliveThreadPool *pool) {
         /*if (len < 256 * 1024) {
             memcpy(output, input, len);

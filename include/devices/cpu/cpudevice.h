@@ -162,10 +162,13 @@ namespace fastllm {
         CpuDevice ();
 
         bool Malloc (void **ret, size_t size); // 分配尺寸为size的空间
+        using BaseDevice::Malloc;
         bool Free(void *ret); // 释放ret
 
         bool CopyDataToCPU(void *dst, void *src, size_t size); // 不重要, cpu device不会进行这个操作
+        using BaseDevice::CopyDataToCPU;
         bool CopyDataFromCPU(void *dst, void *src, size_t size); // 不重要, cpu device不会进行这个操作
+        using BaseDevice::CopyDataFromCPU;
 
         int threads = 4;
     };
