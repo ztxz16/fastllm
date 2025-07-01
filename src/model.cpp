@@ -26,6 +26,7 @@
 #include "phi3.h"
 #include "cogvlm.h"
 #include "minimax.h"
+#include "ernie4_5.h"
 
 #ifdef USE_TFACC
 #include "fastllm-tfacc.h"
@@ -229,6 +230,8 @@ namespace fastllm {
             model = (basellm*)(new MinimaxModel());
         } else if (modelType == "hunyuan") {
             model = (basellm*)(new HunyuanModel());
+        } else if (modelType == "ernie4_5_moe") {
+            model = (basellm*)(new Ernie4_5Model());
         } else if (modelType == "fastllmJson") {
             model = new GraphLLMModel("fastllmJson");
         } else {
