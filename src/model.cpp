@@ -13,6 +13,7 @@
 #include "moe.h"
 #include "qwen3.h"
 #include "qwen3_moe.h"
+#include "hunyuan.h"
 #include "deepseekv2.h"
 #include "qwen.h"
 #include "glm.h"
@@ -100,8 +101,7 @@ namespace fastllm {
                     this->eos_token_id = atoi(this->weight.dicts["eos_token_id"].c_str());
                 }
             }
-        }
-        if (this->weight.dicts.find("im_start_id") != this->weight.dicts.end()) {
+        } else if (this->weight.dicts.find("im_start_id") != this->weight.dicts.end()) {
             this->bos_token_id = atoi(this->weight.dicts["im_start_id"].c_str());
             this->eos_token_id = atoi(this->weight.dicts["im_end_id"].c_str());
         }
@@ -227,6 +227,8 @@ namespace fastllm {
             model = (basellm*)(new CogvlmModel());
         } else if (modelType == "minimax_m1" || modelType == "minimax_text_01") {
             model = (basellm*)(new MinimaxModel());
+        } else if (modelType == "hunyuan") {
+            model = (basellm*)(new HunyuanModel());
         } else if (modelType == "fastllmJson") {
             model = new GraphLLMModel("fastllmJson");
         } else {

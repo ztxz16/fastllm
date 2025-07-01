@@ -138,6 +138,8 @@ namespace fastllm {
         Data *output = (datas.find("output")->second);
         output->dataType = DataType::FLOAT16;
         output->Resize(input->dims);
+        if (input->expansionDims.size() != 0)
+            output->Expansion(input->expansionDims);
     }
 
     void CudaConvertToFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -162,6 +164,8 @@ namespace fastllm {
         Data *output = (datas.find("output")->second);
         output->dataType = DataType::FLOAT32;
         output->Resize(input->dims);
+        if (input->expansionDims.size() != 0)
+            output->Expansion(input->expansionDims);
     }
 
     void CudaConvertToFloat32::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -214,7 +218,19 @@ namespace fastllm {
         if (q.dataType == DataType::FLOAT32) {
             FastllmCudaAttention(q, k, v, mask, output, group, scale, maskType);
         } else if (q.dataType == DataType::FLOAT16) {
+#ifdef CUDA_NO_TENSOR_CORE
+            Data q32, k32, v32, mask32, output32;
+            ToDataType(q, q32, DataType::FLOAT32);
+            ToDataType(k, k32, DataType::FLOAT32);
+            ToDataType(v, v32, DataType::FLOAT32);
+            ToDataType(output, output32, DataType::FLOAT32);
+            if (mask.dims.size() > 0)
+                ToDataType(mask, mask32, DataType::FLOAT32);
+            FastllmCudaAttention(q32, k32, v32, mask32, output32, group, scale, maskType);
+            ToDataType(output32, output, DataType::FLOAT16);
+#else
             FastllmCudaHalfAttention(q, k, v, mask, output, group, scale, maskType);
+#endif
         }
     }
 

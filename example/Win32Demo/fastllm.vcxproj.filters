@@ -37,12 +37,6 @@
     <Filter Include="头文件\devices\cpu">
       <UniqueIdentifier>{c17acf48-126f-4578-aaf9-aef7cfcb9fd9}</UniqueIdentifier>
     </Filter>
-    <Filter Include="头文件\devices\cuda">
-      <UniqueIdentifier>{d7bfe0ea-81a6-4dc4-b526-a5a4eb114296}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="源文件\devices\cuda">
-      <UniqueIdentifier>{fa0efa1b-9d09-40d3-811d-5a2cfb37d536}</UniqueIdentifier>
-    </Filter>
     <Filter Include="头文件\third_party">
       <UniqueIdentifier>{1aa28959-8e28-496c-9bb2-e81e86c2b998}</UniqueIdentifier>
     </Filter>
@@ -126,10 +120,13 @@
     <ClInclude Include="..\..\include\models\xlmroberta.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\include\devices\cpu\cpudevice.h">
+    <ClInclude Include="..\..\include\devices\cpu\alivethreadpool.h">
       <Filter>头文件\devices\cpu</Filter>
     </ClInclude>
-    <ClInclude Include="..\..\include\devices\cpu\alivethreadpool.h">
+    <ClInclude Include="..\..\include\devices\cpu\computeutils.h">
+      <Filter>头文件\devices\cpu</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\devices\cpu\cpudevice.h">
       <Filter>头文件\devices\cpu</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\devices\cpu\cputhreadpool.h">
@@ -230,10 +227,19 @@
     <ClCompile Include="..\..\src\models\graph\telechat.cpp">
       <Filter>源文件\models\graph</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\devices\cpu\avx512bf16.cpp">
+      <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\devices\cpu\avx512vnni.cpp">
+      <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\cpudevice.cpp">
       <Filter>源文件\devices\cpu</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\cpudevicebatch.cpp">
+      <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\devices\cpu\linear.cpp">
       <Filter>源文件\devices\cpu</Filter>
     </ClCompile>
     <ClCompile Include="..\..\third_party\json11\json11.cpp">
