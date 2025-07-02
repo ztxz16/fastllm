@@ -85,7 +85,14 @@ def make_normal_llm_model(args):
             if (config["architectures"][0] == 'Qwen3ForCausalLM' or config["architectures"][0] == 'Qwen3MoeForCausalLM'):
                 if (args.enable_thinking == ""):
                     args.enable_thinking = "true"
-            if (config["architectures"][0] == 'DeepseekV3ForCausalLM' or config["architectures"][0] == 'DeepseekV2ForCausalLM' or config["architectures"][0] == 'Qwen3MoeForCausalLM'):
+            if (config["architectures"][0] == 'DeepseekV3ForCausalLM' or 
+                config["architectures"][0] == 'DeepseekV2ForCausalLM' or 
+                config["architectures"][0] == 'Qwen3MoeForCausalLM' or 
+                config["architectures"][0] == 'MiniMaxM1ForCausalLM' or 
+                config["architectures"][0] == 'MiniMaxText01ForCausalLM' or 
+                config["architectures"][0] == 'HunYuanMoEV1ForCausalLM' or 
+                config["architectures"][0] == 'Ernie4_5_MoeForCausalLM' or 
+                config["architectures"][0] == 'PanguProMoEForCausalLM'):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
                 if ((not(args.device and args.device != ""))):
