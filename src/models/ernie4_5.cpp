@@ -114,10 +114,9 @@ namespace fastllm {
                     WeightMergeRule({WeightMergeRuleSingle({w1WeightName, w3WeightName}, swigluWeightName, std::string("linearSwiglu"))})
                 );
 
-                if (j != -1 || !GetCudaSharedExpert()) {
-                    this->specialWeights[swigluWeightName] = "linearSwiglu";
-                    this->specialWeights[downWeightName] = "linearColumn";
-                }
+
+                this->specialWeights[swigluWeightName] = "linearSwiglu";
+                this->specialWeights[downWeightName] = "linearColumn";
                 
                 this->moeLinears.insert(w1WeightName);
                 this->moeLinears.insert(w3WeightName);
