@@ -120,6 +120,9 @@ namespace fastllm {
     void LaunchLinearBFloat16FP8E4M3(uint16_t *inputData, Data &weight, float *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum);
+    void LaunchLinearFloat32Float16(float *inputData, Data &weight, float *outputData, float *biasData, 
+                                int n, int m, int k, 
+                                std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum);
 
     void RunLinearFloat32Float32(float *inputData, float *weightData, float *outputData, float *biasData, 
                                 int n, int m, int k, 
