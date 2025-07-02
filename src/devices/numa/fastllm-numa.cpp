@@ -506,7 +506,7 @@ namespace fastllm {
 
         int maxN = n;
         maxN = std::min(maxN, transLimit / m);
-        maxN = std::min(maxN, (int)(transLimit / (k * sizeof(float))));
+        maxN = std::min(maxN, (int)(transLimit / (serverNumaCnt * k * sizeof(float))));
 
         int outputUnitSize = (outputType == DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
         for (int baseN = 0; baseN < n; baseN += maxN) {
@@ -599,7 +599,7 @@ namespace fastllm {
 
         int maxN = n;
         maxN = std::min(maxN, transLimit / m);
-        maxN = std::min(maxN, (int)(transLimit / (k * sizeof(float))));
+        maxN = std::min(maxN, (int)(transLimit / (serverNumaCnt * k * sizeof(float))));
 
         // printf("maxN = %d\n", maxN);
  // record.push_back(std::make_pair("before make strings", GetSpan(ttt, std::chrono::system_clock::now())));
@@ -683,7 +683,7 @@ namespace fastllm {
 
         int maxN = n;
         maxN = std::min(maxN, transLimit / m);
-        maxN = std::min(maxN, (int)(transLimit / (k * sizeof(float))));
+        maxN = std::min(maxN, (int)(transLimit / (serverNumaCnt * k * sizeof(float))));
 
         int outputUnitSize = (outputType == DataType::FLOAT32 ? sizeof(float) : sizeof(uint16_t));
         for (int baseN = 0; baseN < n; baseN += maxN) {
