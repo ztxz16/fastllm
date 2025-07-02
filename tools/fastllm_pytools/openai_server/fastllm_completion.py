@@ -269,6 +269,10 @@ class FastLLmCompletion:
         # 2. content部分
         completion_tokens = 0
         async for res in result_generator:
+            if (res == "[unused16]"):
+                res = "<think>"
+            elif (res == "[unused17]"):
+                res = "</think>" 
             completion_tokens += 1
             delta_text = res            
             # Send token-by-token response for each request.n
