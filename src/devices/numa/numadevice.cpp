@@ -323,7 +323,8 @@ namespace fastllm {
         int channels = logits.dims[dimsLen - 1];
         int n = input.dims[0], m = input.dims[1], k = output.dims[1];
 
-        if (weights[2]->dataType == DataType::FP8_E4M3) {
+        if (weights[2]->dataType == DataType::FP8_E4M3 ||
+            weights[2]->dataType == DataType::FLOAT16) {
             if (n > 31) {
                 std::vector <std::vector <fastllm::Data*> > ws;
                 std::vector <std::vector <float> > factors;

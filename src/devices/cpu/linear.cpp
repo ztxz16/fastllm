@@ -756,6 +756,25 @@ namespace fastllm {
         }
     }
 
+    void LaunchLinearFloat32Float16(float *inputData, Data &weight, float *outputData, float *biasData, 
+                                int n, int m, int k, 
+                                std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
+                                    int per = k / threadNum;
+        int cur = 0;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            if (i == threadNum - 1) {
+                end = k;
+            }
+            ops[startTid + i] = new MultiThreadLinearFloat32Float16Op(inputData, (uint16_t*)weight.cpuData, biasData, outputData,
+                                    n, m, k, cur, end);
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[startTid + i]);
+        }
+    }
+
     void RunLinearFloat32Int4Group(float *inputData, Data &weight, float *outputData, float *biasData, 
                                 int n, int m, int k, int group, int groupCnt,
                                 AliveThreadPool *pool, int startTid, int threadNum) {
