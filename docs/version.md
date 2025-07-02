@@ -1,3 +1,14 @@
+## V0.1.3.1
+
+- 支持Hunyuan模型 （混元）
+- 支持Ernie_4.5模型 （文心）
+- 支持PanguPro模型 （盘古）
+- 支持Minimax 01, Minimax M1模型
+- 优化旧GPU上的一些计算性能
+- 在dev_mode下支持主动终止请求 [查看详情](https://github.com/ztxz16/fastllm/pull/535)
+- 修复numa模式下无法计算float16的问题
+- 修复numa个数过多时可能出现的一些错误
+
 ## V0.1.3.0
 
 - DeepSeek模型中，默认改用cuda执行共享专家，可通过参数`--cuda_se false`来关闭
