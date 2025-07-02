@@ -1215,7 +1215,11 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             this->model_type == "qwen2_moe" || 
             this->model_type == "qwen3_moe" || 
             this->model_type == "deepseek_v2" ||
-            this->model_type == "qwen") {
+            this->model_type == "qwen" ||
+            this->model_type == "ernie4_5" ||
+            this->model_type == "pangu_moe" ||
+            this->model_type == "hunyuan" ||
+            this->model_type == "minimax") {
             this->saveHistoryChat = save;
             return true;
         }
