@@ -242,7 +242,13 @@ namespace fastllm {
             weight[name] = Data(dataType, {k, localM});
             weight[name].name = name;
             weight[name].Allocate();
-            if (dataType == DataType::INT8) {
+            if (dataType == DataType::FLOAT16) {
+                for (int i = 0; i < k; i++) {
+                    buffer.Skip(base * 2);
+                    buffer.ReadBytes(weight[name].cpuData + i * localM * 2, localM * 2);
+                    buffer.Skip((m - base - localM) * 2);
+                }
+            } else if (dataType == DataType::INT8) {
                 int bit = 8;
                 weight[name].perChannelAxis = buffer.ReadInt();
                 int k = weight[name].perChannelAxis == -1 ? 1 : dims[weight[name].perChannelAxis];
@@ -1532,6 +1538,8 @@ namespace fastllm {
                     int curThread = (curK / k) * base;
                     if (weight->dataType == DataType::FP8_E4M3) {                            
                         LaunchLinearBFloat16FP8E4M3(bf16Input.data(), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                    } else if (weight->dataType == DataType::FLOAT16) {
+                        LaunchLinearFloat32Float16(localInput, *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                     } else {
                         // TODO: other
                     }
@@ -1547,12 +1555,17 @@ namespace fastllm {
                 for (int l = st; l <= end; l++) {
                     int idx = l;
                     int spatial = localKs[idx], mid = spatial / 2;
+                    Data *weightDown = weights[idx * 2 + 1];
                     float *outputData = middles[l].data();
                     int curK = localKs[idx];
 
                     ops[l - st] = new fastllm::MultiThreadMultiOps();
                     ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
-                    ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(middles[l].data(), (uint16_t*)middles[l].data(), mid));
+                    
+                    if (weightDown->dataType == DataType::FP8_E4M3) {
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(middles[l].data(), (uint16_t*)middles[l].data(), mid));
+                    }
+
                     pool->PushOp(l - st, ops[l - st]);
                 }
                 for (int l = st; l <= end; l++) {
@@ -1570,6 +1583,8 @@ namespace fastllm {
                     int curThread = (curK / k) * base;
                     if (weightDown->dataType == DataType::FP8_E4M3) {
                         LaunchLinearBFloat16FP8E4M3((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                    } else if (weightDown->dataType == DataType::FLOAT16) {
+                        LaunchLinearFloat32Float16((float*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
                     } else {
                         // TODO: other
                     }
