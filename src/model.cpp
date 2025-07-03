@@ -1400,7 +1400,7 @@ if (false) {
         float loraScaling;
         if (loraPath != "") {
             std::string path = loraPath;
-            if (path.back() != '/' || path.back() != '\\') {
+            if (path.back() != '/' && path.back() != '\\') {
                 path += "/";
             }
             loraTensors = new SafeTensors({path + "adapter_model.safetensors"});
