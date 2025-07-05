@@ -8,6 +8,11 @@ import json
 import math
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
+try:
+    import sentencepiece # 先加载sentencepiece，防止libc冲突
+except:
+    pass
+
 import platform
 if platform.system() == 'Windows':
     fastllm_lib = ctypes.CDLL(os.path.join(os.path.split(os.path.realpath(__file__))[0], "fastllm_tools.dll"), winmode=0)
