@@ -8,6 +8,11 @@ import json
 import math
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
+try:
+    import sentencepiece # 先加载sentencepiece，防止libc冲突
+except:
+    pass
+
 import platform
 if platform.system() == 'Windows':
     fastllm_lib = ctypes.CDLL(os.path.join(os.path.split(os.path.realpath(__file__))[0], "fastllm_tools.dll"), winmode=0)
@@ -577,7 +582,7 @@ class TokenizerCache:
             #print("decode", tokenizer.decode(use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)))
             return use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)
         else:
-            return tokenizer.encode(prompt, add_special_tokens = False)
+            return tokenizer.encode(prompt)
 
 class model:
     def __init__ (self, path : str,
