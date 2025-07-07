@@ -283,6 +283,9 @@ extern "C" {
                 // || this->model_struct == "graph" ||
                 // || this->model_struct == "cogvlm" ||
                  || model->model_struct == "deepseek_v2"
+                 || model->model_struct == "hunyuan"
+                 || model->model_struct == "ernie4_5"
+                 || model->model_struct == "pangu_moe"
                 ) {
                 model->SetDataType(fastllm::DataType::FLOAT16);
             } else {
