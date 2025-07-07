@@ -1240,7 +1240,10 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             this->model_struct == "graph" ||
                             this->model_struct == "cogvlm" ||
                             this->model_struct == "deepseek_v2" ||
-                            this->model_struct == "qwen3_moe", 
+                            this->model_struct == "qwen3_moe" ||
+                            this->model_struct == "hunyuan" || 
+                            this->model_struct == "ernie4_5" || 
+                            this->model_struct == "pangu_moe",  
                             this->model_struct + " doesn't support float16");
         } else {
             ErrorInFastLLM("SetDataType Error: datatype should be float32 or float16");
