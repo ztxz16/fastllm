@@ -13,11 +13,6 @@
 
 const int VERSION = 1;
 
-const int DDRLEN = 256 * 1024 * 1024;
-const int OUTPUTOFFSET = 128 * 1024 * 1024;
-const int FLAGOFFSET = 255 * 1024 * 1024;
-const int PAGE = 64 * 1024;
-
 namespace fastllm {
     extern FP16ToFP32Manager fp16tofp32;
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);

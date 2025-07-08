@@ -11,6 +11,11 @@
 #include "json11.hpp"
 #include "kvcache.h"
 
+const int DDRLEN = 512 * 1024 * 1024;
+const int OUTPUTOFFSET = 256 * 1024 * 1024;
+const int FLAGOFFSET = 511 * 1024 * 1024;
+const int PAGE = 64 * 1024;
+
 namespace fastllm {
     enum ComputeTaskType {
         None = 0,
