@@ -582,7 +582,7 @@ class TokenizerCache:
             #print("decode", tokenizer.decode(use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)))
             return use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)
         else:
-            return tokenizer.encode(prompt, add_special_tokens = False)
+            return tokenizer.encode(prompt)
 
 class model:
     def __init__ (self, path : str,

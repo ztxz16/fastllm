@@ -280,7 +280,9 @@ namespace fastllm {
     }
 
     extern bool MatMulInt8Int4_AVX512VNNI(uint8_t *a, uint8_t *b, float *c, int n, int m, int k);
-
+    extern bool MatMulInt8Int4Group_AVX512VNNI(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
+        int group, int realGroup, int groupCnt, float *iscales, float *scales, float *izeros, float *weightMins);
+    
     void MultiThreadLinearInt8Int4GroupOp::Run() {
 #ifdef __AVX2__
         if (group == 1) {
@@ -426,6 +428,92 @@ namespace fastllm {
                 for (; i < k; i++) {
                     const float vv = (float)values[block * k + i] - weightSums[i] * izeros[block];
                     float sum = scales[i] * iscales[block] * vv + weightMins[i] * tempValue[block];
+                    ((float*)c)[block * kstride + i] = sum + (bias == nullptr ? 0.0 : bias[i]);
+                }
+            }
+            return;
+        } else if (true) {
+            int block = 0;
+            int realGroup = (m - 1) / groupCnt + 1;            
+            std::vector <float> values;
+            values.resize(n * k);
+
+            if (cpuInstructInfo.hasAVX512VNNI && 
+                MatMulInt8Int4Group_AVX512VNNI(a, b, values.data(), n, m, k, group, realGroup, groupCnt, iscales, scales, izeros, weightMins)) {
+                    
+            } else  {
+                const __m256i lowMask = _mm256_set1_epi8(0xf);
+                const __m256i ones = _mm256_set1_epi16(1);
+
+                block = 0;
+                for (; block < n; block++) {
+                    uint8_t *weightWalk = b;
+                    uint8_t *inputStart = a + block * m;
+
+                    for (int i = 0; i < k; i++) {
+                        uint8_t *a = weightWalk + (i * m) / 2;
+                        uint8_t *b = inputStart;
+                        __m256 lastSum = _mm256_setzero_ps();
+                        for (int g = 0; g < realGroup; g++) {
+                            const int iid = block * group + g;
+                            const int gid = i * group + g;
+                            int st = g * groupCnt, end = std::min(m, (g + 1) * groupCnt);
+
+                            __m256i acc = _mm256_setzero_si256();
+                            __m256i sub = _mm256_setzero_si256();
+                            __m256i zeros = _mm256_set1_epi8((uint8_t)izeros[iid]);
+
+                            for (int j = st; j + 31 < end; j += 32) {
+                                __m128i orix = _mm_loadu_si128((const __m128i *) (a + j / 2));
+                                __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+                                __m256i bx = _mm256_and_si256(lowMask, bytex);
+                                __m256i by = _mm256_loadu_si256((const __m256i *) (b + j));
+
+                                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(by, bx), ones));
+                                sub = _mm256_add_epi32(sub, _mm256_madd_epi16(_mm256_maddubs_epi16(zeros, bx), ones));
+                            }
+
+                            lastSum = _mm256_add_ps (
+                                    lastSum, 
+                                    _mm256_mul_ps(
+                                        _mm256_cvtepi32_ps(_mm256_sub_epi32(acc, sub)), 
+                                        _mm256_set1_ps(iscales[iid] * scales[gid])
+                                    ));
+                        }
+
+                        values[block * k + i] = Floatsum(lastSum);
+                    }
+                }
+            }
+
+            std::vector <float> tempValue;
+            tempValue.resize(realGroup);
+            block = 0;
+            for (; block < n; block++) {
+                for (int g = 0; g < realGroup; g++) {
+                    int iid = block * group + g;
+                    tempValue[g] = (inputSums[iid] - izeros[iid] * groupCnt) * iscales[iid];
+                }
+
+                int i = 0;
+                for (; i < k; i++) {
+                    float sum = (float)values[block * k + i];
+                    int g = 0;
+                    __m256 sum_vec = _mm256_setzero_ps();
+                    for (; g + 7 < realGroup; g += 8) {
+                        sum_vec = _mm256_add_ps(sum_vec, _mm256_mul_ps(
+                            _mm256_loadu_ps(&tempValue[g]), 
+                            _mm256_loadu_ps(&weightMins[i * group + g])
+                        ));
+                    }
+                    sum += Floatsum(sum_vec);
+
+                    for (; g < realGroup; g++) {
+                        const int iid = block * group + g;
+                        const int gid = i * group + g;
+                        sum += tempValue[g] * weightMins[gid];
+                    }
+
                     ((float*)c)[block * kstride + i] = sum + (bias == nullptr ? 0.0 : bias[i]);
                 }
             }
