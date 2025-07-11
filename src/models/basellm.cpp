@@ -664,6 +664,21 @@ namespace fastllm {
                                     // TODO: multicuda支持多prompt一起推理
                                     continue;
                                 }
+                                if (isPrompt) {
+                                    int alive = 0;
+                                    for (auto &it: model->responseContextDict.dicts) {
+                                        if (it.second->isEnding) {
+                                            continue;
+                                        }
+                                        if (it.second->pastKeyValues[0].first.expansionDims.size() > 0) {
+                                            alive++;
+                                        }
+                                    }
+                                    if (alive >= maxBatch) {
+                                        continue;
+                                    }
+                                }
+
                                 if (it.second->isEnding) {
                                     continue;
                                 }
