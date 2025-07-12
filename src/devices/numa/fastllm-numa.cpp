@@ -19,8 +19,7 @@
 namespace fastllm {
     extern AliveThreadPool *GetAlivePool();
 
-    const int PAGE = 16 * 1024;
-    static int transLimit = 126 * 1024 * 1024;
+    static int transLimit = 255 * 1024 * 1024;
 
     struct U8Buffer {
         std::vector <uint8_t> buffer;
@@ -129,11 +128,11 @@ namespace fastllm {
             printf("err\n");
             exit(0);
         }
-        if (ftruncate(shm_fd,  256 * 1024 * 1024) == -1) {
+        if (ftruncate(shm_fd, DDRLEN) == -1) {
             printf("err\n");
             exit(0);
         }
-        void* ptr = mmap(nullptr,  256 * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+        void* ptr = mmap(nullptr, DDRLEN, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
         if (ptr == MAP_FAILED) {
             printf("err\n");
             exit(0);
@@ -145,8 +144,8 @@ namespace fastllm {
         // fd = open("/dev/thinkforce0", O_RDWR);
         // buf = (volatile uint8_t *)mmap(NULL, 256 * 1024 * 1024, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 9997 * 0x1000);
 
-        result = buf + 128 * 1024 * 1024;
-        flag = (volatile int32_t*)(buf + 255 * 1024 * 1024);
+        result = buf + OUTPUTOFFSET;
+        flag = (volatile int32_t*)(buf + FLAGOFFSET);
 
         serverNumaCnt = 4;
         this->Launch(ComputeTaskType::GetComputeServerInfo);
