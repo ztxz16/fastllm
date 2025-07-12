@@ -203,7 +203,7 @@ namespace fastllm {
             model = (basellm*)(new MoeModel());
         } else if (modelType == "qwen3_moe") {
             model = (basellm*)(new Qwen3MOEModel());
-        } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3") {
+        } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3" || modelType == "kimi_k2") {
             model = (basellm*)(new DeepSeekV2Model());
         } else if (modelType == "qwen2") {
             model = new LlamaModel();
