@@ -582,7 +582,7 @@ class TokenizerCache:
             #print("decode", tokenizer.decode(use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)))
             return use_cache_tokens + tokenizer.encode(prompt[max_len : ], add_special_tokens = False)
         else:
-            return tokenizer.encode(prompt)
+            return tokenizer.encode(prompt, add_special_tokens = True)
 
 class model:
     def __init__ (self, path : str,
@@ -872,7 +872,7 @@ class model:
     def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True) -> int:
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             prompt = self.hf_tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
-            return len(self.hf_tokenizer.encode(prompt))
+            return len(self.hf_tokenizer.encode(prompt, add_special_tokens = True))
         else:
             prompt = self.apply_chat_template(conversation)
             return len(self.encode(prompt))
@@ -893,7 +893,7 @@ class model:
         logits = list(range(vocab_size))
         array = (ctypes.c_float * (vocab_size * 4))(*logits)
 
-        common_token = tokenizer.encode(prompt)
+        common_token = tokenizer.encode(prompt, add_special_tokens = True)
         for i in range(1, len(prompt) - 1):
             cur_prompt = prompt[:-i]
             right_prompt = prompt[len(cur_prompt):]
@@ -903,7 +903,7 @@ class model:
                         cur_set.remove(id)
             if (len(cur_set) == 0):
                 break
-            cur_token = tokenizer.encode(cur_prompt)
+            cur_token = tokenizer.encode(cur_prompt, add_special_tokens = True)
             for l in range(len(common_token)):
                 if (l >= len(cur_token) or cur_token[l] != common_token[l]):
                     common_token = common_token[:l]
@@ -923,7 +923,7 @@ class model:
                 break
 
             cur_prob = 0.0
-            real_input = tokenizer.encode(cur_prompt)
+            real_input = tokenizer.encode(cur_prompt, add_special_tokens = True)
             for idx in range(len(common_token), len(real_input) + 1):
                 input = real_input[ : idx]
                 stop_token_len, stop_token_list = self.stop_token_ctypes(None)
@@ -970,7 +970,7 @@ class model:
                                                            ctypes.c_float(1), ctypes.c_float(1), ctypes.c_bool(True),
                                                            stop_token_len, stop_token_list)
         else:
-            input = tokenizer.encode(prompt)
+            input = tokenizer.encode(prompt, add_special_tokens = True)
             handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                            1, False, 1, 1, 1, 1, True, stop_token_len, stop_token_list)
             vocab_size = len(tokenizer.get_vocab())
@@ -1026,7 +1026,7 @@ class model:
                     #input = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = True)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
-                input = tokenizer.encode(prompt)
+                input = tokenizer.encode(prompt, add_special_tokens = True)
                 #print("prompt", prompt)
 
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
@@ -1088,7 +1088,7 @@ class model:
                         prompt: str):
         if (self.hf_tokenizer != None):
             tokenizer = self.hf_tokenizer
-            input = tokenizer.encode(prompt);
+            input = tokenizer.encode(prompt, add_special_tokens = True);
             fastllm_lib.add_cache_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input));
         else:
             print("add_cache failed: need hf_tokenizer.")
@@ -1143,7 +1143,7 @@ class model:
                 prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
             else:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
-            input = tokenizer.encode(prompt)
+            input = tokenizer.encode(prompt, add_special_tokens = True)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
             handle = fastllm_lib.launch_response_llm_model_multimodal(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                         des.encode(), (ctypes.c_float * len(image))(*image),
@@ -1352,7 +1352,7 @@ class model:
         if (not(history)):
             history = [];
         prompt = query if self.direct_query else self.get_prompt(query, history);
-        input = tokenizer.encode(prompt);
+        input = tokenizer.encode(prompt, add_special_tokens = True);
         stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
         handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                        max_length, 0, do_sample, top_p, top_k, temperature, repeat_penalty,
@@ -1384,7 +1384,7 @@ class model:
             input = tokenizer.build_chat_input(query, history=history)["input_ids"].reshape(-1).tolist()
         else:
             prompt = query if self.direct_query else self.get_prompt(query, history);
-            input = tokenizer.encode(prompt);
+            input = tokenizer.encode(prompt, add_special_tokens = True);
 
         stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
         handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
