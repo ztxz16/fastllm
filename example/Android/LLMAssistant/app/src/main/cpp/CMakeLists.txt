@@ -39,14 +39,18 @@ set(PROJECT_SOURCE
         ../../../../../../../src/models/chatglm.cpp
         ../../../../../../../src/models/cogvlm.cpp
         ../../../../../../../src/models/deepseekv2.cpp
+        ../../../../../../../src/models/ernie4_5.cpp
         ../../../../../../../src/models/glm.cpp
         ../../../../../../../src/models/graphllm.cpp
+        ../../../../../../../src/models/hunyuan.cpp
         ../../../../../../../src/models/llama.cpp
         ../../../../../../../src/models/internlm2.cpp
         ../../../../../../../src/models/minicpm.cpp
         ../../../../../../../src/models/minicpm3.cpp
+        ../../../../../../../src/models/minimax.cpp
         ../../../../../../../src/models/moe.cpp
         ../../../../../../../src/models/moss.cpp
+        ../../../../../../../src/models/pangu_moe.cpp
         ../../../../../../../src/models/phi3.cpp
         ../../../../../../../src/models/qwen.cpp
         ../../../../../../../src/models/qwen3.cpp
