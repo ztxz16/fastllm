@@ -2827,6 +2827,9 @@ namespace fastllm {
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 RunLinearFloat32FP8E4M3((float*)input.cpuData, weight, (float*)output.cpuData, 
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+            } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+                RunLinearFloat32GGUF((float*)input.cpuData, (uint8_t*)weight.cpuData, (float*)output.cpuData, bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, 
+                    (void*)weight.ggmlTensor, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
