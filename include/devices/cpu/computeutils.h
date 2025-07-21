@@ -23,6 +23,20 @@ namespace fastllm {
         void Run();
     };
 
+    struct MultiThreadLinearFloat32GGUFOp : MultiThreadBaseOp {
+        void *ggmlTensor;
+        uint8_t *q8kInputData, *weightData;
+        float *biasData, *outputData;
+        int n, m, k, st, end;
+
+        MultiThreadLinearFloat32GGUFOp(uint8_t *q8kInputData, uint8_t *weightData, float *biasData, float *outputData, void *ggmlTensor,
+                           int n, int m, int k, int st, int end) : 
+            q8kInputData(q8kInputData), weightData(weightData), biasData(biasData), outputData(outputData), ggmlTensor(ggmlTensor),
+            n(n), m(m), k(k), st(st), end(end) {}
+
+        void Run();
+    };
+
     struct MultiThreadLinearFloat32Float16Op : MultiThreadBaseOp {
         float *inputData;
         uint16_t *weightData;
@@ -153,6 +167,10 @@ namespace fastllm {
     void RunLinearFloat32Int2Group(float *inputData, Data &weight, float *outputData, float *biasData, 
                             int n, int m, int k, int group, int groupCnt,
                             AliveThreadPool *pool, int startTid, int threadNum);
+    void RunLinearFloat32GGUF(float *inputData, uint8_t *weightData, float *outputData, float *biasData, 
+                                void *ggmlTensor, int n, int m, int k, 
+                                AliveThreadPool *pool, int startTid, int threadNum);
+
     void RunLinearFloat16Float16(uint16_t *inputData, uint16_t *weightData, uint16_t *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum);
