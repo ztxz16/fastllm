@@ -17,6 +17,8 @@
 #include "utils.h"
 #include "computeutils.h"
 #include <array>  // For std::array
+#include "gguf.h"
+#include <assert.h>
 
 namespace fastllm {
     extern CPUInstructInfo cpuInstructInfo;
@@ -60,6 +62,29 @@ namespace fastllm {
                 }
                 outputData[i * k + j] = now;
             }
+        }
+    }
+
+    void MultiThreadLinearFloat32GGUFOp::Run() {
+        ggml_tensor *tensor = (ggml_tensor*)this->ggmlTensor;
+        int rowCount = m / QK_K; // 每行有多少个block
+
+        auto vec_dot = ggml_type_vec_dot(tensor->type);
+        if (vec_dot != nullptr) {
+            for (int i = 0; i < n; i++) {
+                for (int j = st; j < end; j++) {
+                    float now = 0.0f;
+                    vec_dot (
+                        m, &outputData[i * k + j], 0, 
+                        weightData + j * ggml_row_size(tensor->type, m), 0, 
+                        q8kInputData + i * ggml_row_size(GGML_TYPE_Q8_K, m), 0, 
+                        1
+                    );
+                    outputData[i * k + j] += (biasData ? biasData[j] : 0.0f);
+                } 
+            }
+        } else {
+            ErrorInFastLLM("Linear error: unsupport GGUF's dataType " + std::string(ggml_type_name(tensor->type)) + ".\n");
         }
     }
 
@@ -999,6 +1024,105 @@ namespace fastllm {
         }
 
         Float32ToFloat16(floatOutput.data(), outputData, n * k);
+    }
+
+    float GGML_FP16_TO_FP32(ggml_half f) {
+        uint16_t s;
+        memcpy(&s, &f, sizeof(uint16_t));
+        return fp16tofp32.dict[s];
+    }
+
+    static inline void get_scale_min_k4(int j, const uint8_t * GGML_RESTRICT q, uint8_t * GGML_RESTRICT d, uint8_t * GGML_RESTRICT m) {
+        if (j < 4) {
+            *d = q[j] & 63; *m = q[j + 4] & 63;
+        } else {
+            *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+            *m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
+        }
+    }
+
+    void dequantize_row_q4_K(const block_q4_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+        assert(k % QK_K == 0);
+        const int nb = k / QK_K;
+
+        for (int i = 0; i < nb; i++) {
+            const uint8_t * q = x[i].qs;
+
+            const float d   = GGML_FP16_TO_FP32(x[i].d);
+            const float min = GGML_FP16_TO_FP32(x[i].dmin);
+
+            int is = 0;
+            uint8_t sc, m;
+            for (int j = 0; j < QK_K; j += 64) {
+                get_scale_min_k4(is + 0, x[i].scales, &sc, &m);
+                const float d1 = d * sc; const float m1 = min * m;
+                get_scale_min_k4(is + 1, x[i].scales, &sc, &m);
+                const float d2 = d * sc; const float m2 = min * m;
+                for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
+                for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l]  >> 4) - m2;
+                q += 32; is += 2;
+            }
+        }
+    }
+
+    void RunLinearFloat32GGUF(float *inputData, uint8_t *weightData, float *outputData, float *biasData, 
+                                void *ggmlTensor, int n, int m, int k, 
+                                AliveThreadPool *pool, int startTid, int threadNum) {
+        ggml_tensor *tensor = (ggml_tensor*)ggmlTensor;
+        // printf("gguf tensor %s: %s\n", tensor->name.c_str(), ggml_type_name(tensor->type));
+        
+        std::vector <block_q8_K> q8kInputs;
+        int rowCount = m / QK_K; // 每行有多少个block
+
+        if (ggml_is_quantized(tensor->type)) {
+            q8kInputs.resize(n * rowCount);
+            for (int i = 0; i < n; i++) {
+                iqk_quantize_row_q8_K (
+                    inputData + i * m, q8kInputs.data() + i * rowCount, m
+                );
+            }
+
+            int per = k / threadNum;
+            int cur = 0;
+            std::vector<fastllm::MultiThreadLinearFloat32GGUFOp*> ops;
+            for (int i = 0; i < threadNum; i++) {
+                int end = cur + per + (cur + per * (threadNum - i) < k);
+                ops.push_back(new MultiThreadLinearFloat32GGUFOp((uint8_t*)q8kInputs.data(), weightData, biasData, outputData,
+                                                        (void*)tensor, n, m, k, cur, end));
+                cur = end;
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->PushOp(startTid + i, ops[i]);
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->Wait(startTid + i);
+                delete ops[i];
+            }
+            return;
+        }
+/*
+// 下面这段是反量化再计算的代码
+        std::vector <float> floatWeight;
+        floatWeight.resize(k * m);
+        dequantize_row_q4_K((block_q4_K*)weightData, floatWeight.data(), k * m);
+        
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLinearFloat32Float32Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            ops.push_back(new MultiThreadLinearFloat32Float32Op(inputData, floatWeight.data(), biasData, outputData,
+                                                    n, m, k, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+*/
     }
 
 #ifdef __AVX2__
