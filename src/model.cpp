@@ -205,6 +205,7 @@ namespace fastllm {
             model = (basellm*)(new Qwen3MOEModel());
         } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3" || modelType == "kimi_k2") {
             model = (basellm*)(new DeepSeekV2Model());
+            model->model_type = modelType;
         } else if (modelType == "qwen2") {
             model = new LlamaModel();
             model->model_type = "qwen";
@@ -229,7 +230,7 @@ namespace fastllm {
             model = (basellm*)(new CogvlmModel());
         } else if (modelType == "minimax_m1" || modelType == "minimax_text_01") {
             model = (basellm*)(new MinimaxModel());
-        } else if (modelType == "hunyuan") {
+        } else if (modelType == "hunyuan" || modelType == "hunyuan_v1_moe") {
             model = (basellm*)(new HunyuanModel());
         } else if (modelType == "ernie4_5_moe") {
             model = (basellm*)(new Ernie4_5Model());
@@ -720,18 +721,22 @@ namespace fastllm {
             model->history_sep = "";
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
             model->weight.tokenizer.chatTemplate = "";
-        } else if (tokenizerClass == "QWenTokenizer") {
-            // Qwen用的分词
+        } else if (tokenizerClass == "QWenTokenizer" || tokenizerClass == "HYTokenizer" || tokenizerClass == "TikTokenTokenizer") {
+            // tiktoken分词
+            std::map<std::string,std::string> nameMap = {{"QWenTokenizer","qwen.tiktoken"},{"HYTokenizer","hy.tiktoken"},{"TikTokenTokenizer","tiktoken.model"}};
             std::vector <std::string> lines, line;
-            SplitString(ReadAllFile(path + "qwen.tiktoken"), {'\n'}, lines);
+            SplitString(ReadAllFile(path + nameMap[tokenizerClass]), {'\n'}, lines);
             for (int i = 0; i < lines.size(); i++) {
                 SplitString(lines[i], {' '}, line);
                 model->weight.AddTokenizerWord(Base64Decode(line[0]), atoi(line[1].c_str()), 1.0f);
             }
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
-            model->weight.tokenizer.chatTemplate = "";
-            model->weight.dicts["im_start_id"] = std::to_string(lines.size() + 1);
-            model->weight.dicts["im_end_id"] = std::to_string(lines.size() + 2);
+            if (tokenizerClass == "QWenTokenizer") {
+                // Qwen用的分词
+                model->weight.tokenizer.chatTemplate = "";
+                model->weight.dicts["im_start_id"] = std::to_string(lines.size() + 1);
+                model->weight.dicts["im_end_id"] = std::to_string(lines.size() + 2);
+            }
         } else {
             ErrorInFastLLM("Unsupport tokenizer_class: " + tokenizerClass);
         }
