@@ -268,8 +268,11 @@ namespace fastllm {
                 return a.type == JinjaVar::JinjaNone;
             }
         } else if (op == JinjaToken::JinjaTokenEqual) {
-            if (b.type == JinjaVar::JinjaNone && b.stringValue == "defined") {
-                return (a.type != JinjaVar::JinjaNone);
+            if (b.type == JinjaVar::JinjaNone) {
+                if (b.stringValue == "defined")
+                    return (a.type != JinjaVar::JinjaNone);
+                else if (b.stringValue == "string")
+                    return (a.type == JinjaVar::JinjaString);
             }
             if (a.type != b.type) {
                 return false;
@@ -700,7 +703,7 @@ namespace fastllm {
                 if (a.type == JinjaVar::JinjaNone && it.type != JinjaToken::JinjaTokenIn) {
                     a = local[a];
                 }
-                if (b.type == JinjaVar::JinjaNone && b.stringValue != "defined" && b.stringValue != "none") {
+                if (b.type == JinjaVar::JinjaNone && b.stringValue != "defined" && b.stringValue != "none" && b.stringValue != "string") {
                     b = local[b];
                 }
                 vars.pop_back();
