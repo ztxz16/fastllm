@@ -22,6 +22,7 @@
 #endif
 
 #include "utils.h"
+#include "gguf.h"
 
 namespace fastllm {
     CpuDevice::CpuDevice() {
@@ -1088,6 +1089,238 @@ namespace fastllm {
                 );
 */
 
+                for (int j = 0; j < v.size(); j++) {
+                    float value = v[j].second;
+                    float *curOutput = (float*)results[j].data();
+                    int i = 0;
+#ifdef __AVX2__
+                    __m256 value_vec = _mm256_set1_ps(value);
+
+                    // 每次处理 8 个浮点数（AVX2 寄存器可以容纳 8 个 float）
+                    for (; i <= m - 8; i += 8) {
+                        // 加载 curOutput 的 8 个浮点数
+                        __m256 curOutput_vec = _mm256_loadu_ps(&curOutput[i]);
+
+                        // 加载 fLastOutput 的 8 个浮点数
+                        __m256 fLastOutput_vec = _mm256_loadu_ps(&fLastOutput[i]);
+
+                        // 计算 curOutput * value
+                        __m256 result_vec = _mm256_mul_ps(curOutput_vec, value_vec);
+
+                        // 累加到 fLastOutput
+                        fLastOutput_vec = _mm256_add_ps(fLastOutput_vec, result_vec);
+
+                        // 将结果存回 fLastOutput
+                        _mm256_storeu_ps(&fLastOutput[i], fLastOutput_vec);
+                    }
+#endif
+                    // 处理剩余的不足 8 个的元素
+                    for (; i < m; i++) {
+                        fLastOutput[i] += curOutput[i] * value;
+                    }
+                }
+ // record.push_back(std::make_pair("get f32 output", GetSpan(ttt, std::chrono::system_clock::now())));
+                if (output.dataType == DataType::FLOAT16) {
+                    Float32ToFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
+                }
+// record.push_back(std::make_pair("finish output", GetSpan(ttt, std::chrono::system_clock::now())));
+// for (int i = 0; i < record.size(); i++) {
+    // printf("%s spend %f s.\n", record[i].first.c_str(), record[i].second);
+// }
+            }
+        } else if ((input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16) && 
+                (weights[2]->dataType == DataType::DATA_GGUF_FORMAT) &&
+            input.dims[0] < 32) {
+            int dimsLen = logits.dims.size();
+            int outer = logits.Count(0) / logits.Count(dimsLen - 1);
+            int channels = logits.dims[dimsLen - 1];
+
+            std::vector <float> vLogits, vInputs;
+            float *floatLogits = ((float*)logits.cpuData);
+            float *floatInput = (float*)input.cpuData;
+            output.Allocate(0.0f);
+
+            if (input.dataType == DataType::FLOAT16) {
+                int len = input.Count(0);
+                vInputs.resize(len);
+                for (int i = 0; i < len; i++) {
+                    vInputs[i] = fp16tofp32.dict[((uint16_t*)input.cpuData)[i]];
+                }
+                floatInput = vInputs.data();
+            }
+            if (logits.dataType == DataType::FLOAT16) {
+                int len = logits.Count(0);
+                vLogits.resize(len);
+                for (int i = 0; i < len; i++) {
+                    vLogits[i] = fp16tofp32.dict[((uint16_t*)logits.cpuData)[i]];
+                }
+                floatLogits = vLogits.data();
+            }
+            for (int o = 0; o < outer; o++) {
+                std::vector <std::pair <float, int> > oriV;
+                oriV.resize(channels);
+                for (int j = 0; j < channels; j++) {
+                    oriV[j].first = -floatLogits[o * channels + j];
+                    oriV[j].second = j;
+                }
+                if (gateBias.dims.size() > 0) {
+                    if (gateBias.dataType != DataType::FLOAT32) {
+                        ToDataType(gateBias, DataType::FLOAT32);
+                    }
+                    float *cpuBias = (float*)gateBias.cpuData;
+                    for (int i = 0; i < channels; i++) {
+                        oriV[i].first -= cpuBias[i];
+                    }
+                }
+// record.push_back(std::make_pair("very first", GetSpan(ttt, std::chrono::system_clock::now())));
+                // sort(oriV.begin(), oriV.end());
+                std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
+                // std::nth_element(oriV.begin(), oriV.begin() + topk, oriV.end());
+// record.push_back(std::make_pair("sort", GetSpan(ttt, std::chrono::system_clock::now())));
+                float sum = 1.0;
+                if (needNorm) {
+                    sum = 0.0;
+                    for (int j = 0; j < topk; j++) {
+                        sum += floatLogits[o * channels + oriV[j].second];
+                    }
+                }
+
+                std::vector <std::pair <int, float> > v;
+                for (int j = 0; j < topk; j++) {
+                    v.push_back(std::make_pair(oriV[j].second + 1, floatLogits[o * channels + oriV[j].second] / sum * routeScale));
+                }
+                if (weights[0] != nullptr) {
+                    v.push_back(std::make_pair(0, sharedScale));
+                }
+                int n = input.dims[0], m = input.dims[1];
+                float *inputData = floatInput + o * m;
+
+                std::vector <uint8_t> &q8kInputs = moeIntSingleVarManager.uinput;
+                int rowCount = m / QK_K; // 每行有多少个block
+                q8kInputs.resize(n * rowCount * sizeof(block_q8_K));
+                for (int i = 0; i < n; i++) {
+                    iqk_quantize_row_q8_K (
+                        inputData + i * m, q8kInputs.data() + i * rowCount * sizeof(block_q8_K), m
+                    );
+                }
+
+                std::vector <std::vector <float> > &middles = moeIntSingleVarManager.middles;
+                std::vector <std::vector <float> > &results = moeIntSingleVarManager.results;
+                middles.resize(v.size());
+                results.resize(v.size());
+                for (int j = 0; j < v.size(); j++) {
+                    int idx = v[j].first;
+                    middles[j].resize(weights[idx * 2]->dims[0]);
+                    results[j].resize(weights[idx * 2 + 1]->dims[0]);
+                }
+                std::vector<fastllm::MultiThreadBaseOp*> ops;
+                auto *pool = GetAlivePool();
+                int threads = pool->threads.size();
+                ops.resize(threads);
+
+                std::vector <std::vector <uint8_t> > &q8kInputsDown = moeIntSingleVarManager.uinputsDown;
+                q8kInputsDown.resize(v.size());
+
+                for (int st = 0; st < v.size(); st++) {
+                    int k = weights[v[st].first * 2]->dims[0];
+                    int end = st, selSum = 1; // 一共处理selSum * k个输出
+
+                    int curSum = 1;
+                    for (int l = st + 1; l < v.size(); l++) {
+                        int curK = weights[v[l].first * 2]->dims[0];
+                        if (curK % k != 0) {
+                            break;
+                        }
+                        curSum += (curK / k);
+                        if (threads % curSum == 0) {
+                            end = l;
+                            selSum = curSum;
+                        }
+                    }
+                    int base = threads / selSum;
+                    int threadSt = 0;
+                    for (int l = st; l <= end; l++) {
+                        int idx = v[l].first;
+                        Data *weight = weights[idx * 2];
+                        uint8_t *weightData = (uint8_t *) weight->cpuData;
+                        float *outputData = middles[l].data();
+                        float *biasData = nullptr;
+                        int curK = weight->dims[0];
+                        int curThread = (curK / k) * base;
+                        
+                        LaunchLinearQ8KGGUF(q8kInputs.data(), weightData, outputData, biasData, weight->ggmlTensor, 
+                            1, m, curK, ops, pool, threadSt, curThread);
+                        threadSt += curThread;
+                    }
+                    for (int j = 0; j < ops.size(); j++) {
+                        pool->Wait(j);
+                        delete ops[j];
+                    }
+
+                    // swiglu
+                    threadSt = 0;
+                    for (int l = st; l <= end; l++) {
+                        int idx = v[l].first;
+                        int spatial = weights[idx * 2]->dims[0], mid = spatial / 2;
+                        float *outputData = middles[l].data();
+                        int curK = weights[idx * 2]->dims[0];
+                        ops[l - st] = new fastllm::MultiThreadMultiOps();
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial)); 
+                        /* ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new MultiThreadOnlineQuantizationOp(
+                                    middles[l].data(), uinputDown.data(), inputConfigs.data(),
+                                    1, mid, groupDown, groupCntDown,
+                                    inputSums.data(), iscales.data(), izeros.data(), permuteType)); */
+                        pool->PushOp(l - st, ops[l - st]);
+                    }
+                    for (int l = st; l <= end; l++) {
+                        pool->Wait(l - st);
+                        delete ops[l - st];
+                    }
+
+                    for (int l = st; l <= end; l++) {
+                        int idx = v[l].first;
+                        int spatial = weights[idx * 2]->dims[0], mid = spatial / 2;
+                        
+                        auto &uinputDown = q8kInputsDown[l];
+                        int rowCount = mid / QK_K; // 每行有多少个block
+
+                        uinputDown.resize(n * rowCount * sizeof(block_q8_K));
+                        for (int i = 0; i < n; i++) {
+                            iqk_quantize_row_q8_K (
+                                middles[l].data() + i * mid, uinputDown.data() + i * rowCount * sizeof(block_q8_K), mid
+                            );
+                        }
+                    }
+
+                    threadSt = 0;
+                    for (int l = st; l <= end; l++) {
+                        int idx = v[l].first;
+                        int mid = weights[idx * 2]->dims[0] / 2;
+                        int curK = weights[idx * 2]->dims[0];
+                        Data *weightDown = weights[idx * 2 + 1];
+
+                        auto &uinputDown = q8kInputsDown[l];
+                        int curThread = (curK / k) * base;
+
+                        LaunchLinearQ8KGGUF(uinputDown.data(), weightDown->cpuData, results[l].data(), nullptr, weightDown->ggmlTensor, 
+                            1, mid, m, ops, pool, threadSt, curThread);
+                        threadSt += curThread;               
+                    }
+
+                    for (int j = 0; j < ops.size(); j++) {
+                        pool->Wait(j);
+                        delete ops[j];
+                    }
+                    st = end;
+                }
+
+                float *fLastOutput = ((float*)output.cpuData) + o * m;
+                std::vector <float> tempOutput;
+                if (output.dataType == DataType::FLOAT16) {
+                    tempOutput.resize(m, 0);
+                    fLastOutput = tempOutput.data();
+                }
+                
                 for (int j = 0; j < v.size(); j++) {
                     float value = v[j].second;
                     float *curOutput = (float*)results[j].data();

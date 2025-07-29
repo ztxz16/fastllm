@@ -29,6 +29,8 @@
 #include "ernie4_5.h"
 #include "pangu_moe.h"
 
+#include "gguf.h"
+
 #ifdef USE_TFACC
 #include "fastllm-tfacc.h"
 #endif
@@ -792,6 +794,42 @@ namespace fastllm {
                 }
             }
         }        
+    }
+
+    std::vector<std::string> GenerateGGUFFileList(const std::string& filename) {
+        std::vector<std::string> fileList;
+        
+        // 正则表达式匹配文件名格式：基础名-当前序号-of-总数.扩展名
+        std::regex pattern(R"(^(.+)-(\d+)-of-(\d+)\.(.+)$)");
+        std::smatch matches;
+        
+        if (!std::regex_match(filename, matches, pattern)) {
+            // 如果不匹配分片格式，返回原文件名
+            fileList.push_back(filename);
+            return fileList;
+        }
+        
+        // 提取各部分
+        std::string baseName = matches[1].str();
+        int currentNum = std::stoi(matches[2].str());
+        int totalNum = std::stoi(matches[3].str());
+        std::string extension = matches[4].str();
+        
+        // 获取序号的位数（用于补零）
+        int digits = matches[2].str().length();
+        
+        // 生成所有文件名
+        for (int i = 1; i <= totalNum; ++i) {
+            std::ostringstream oss;
+            oss << baseName << "-" 
+                << std::setfill('0') << std::setw(digits) << i 
+                << "-of-" 
+                << std::setfill('0') << std::setw(digits) << totalNum 
+                << "." << extension;
+            fileList.push_back(oss.str());
+        }
+        
+        return fileList;
     }
 
     // 从hf文件夹读取，仅支持safetensor格式的模型
