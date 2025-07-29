@@ -1065,6 +1065,24 @@ namespace fastllm {
         }
     }
 
+    void LaunchLinearQ8KGGUF(uint8_t *a, uint8_t *b, float *c, float *bias, void *ggmlTensor, 
+                            int n, int m, int k,
+                            std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
+        int per = k / threadNum;
+        int cur = 0;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            if (i == threadNum - 1) {
+                end = k;
+            }
+            ops[startTid + i] = new MultiThreadLinearFloat32GGUFOp(a, b, bias, c, ggmlTensor, n, m, k, cur, end);
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[startTid + i]);
+        }
+    }
+
     void RunLinearFloat32GGUF(float *inputData, uint8_t *weightData, float *outputData, float *biasData, 
                                 void *ggmlTensor, int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum) {

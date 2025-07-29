@@ -230,13 +230,22 @@ namespace fastllm {
                 );
                 AddTo(hiddenStates, w1);
             } else {
-                Linear(attenInputTemp, weight[mergeQkvWeightName], weight[mergeQkvBiasName], qkv);
-                int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
-                int qdim = per * (num_attention_heads / num_key_value_heads);
+                if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
+                    Linear(attenInputTemp, weight[mergeQkvWeightName], weight[mergeQkvBiasName], qkv);
+                    int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
+                    int qdim = per * (num_attention_heads / num_key_value_heads);
 
-                Split(qkv, -1, 0, qdim, q);
-                Split(qkv, -1, qdim, qdim + per, k);
-                Split(qkv, -1, qdim + per, qdim + per * 2, v);
+                    Split(qkv, -1, 0, qdim, q);
+                    Split(qkv, -1, qdim, qdim + per, k);
+                    Split(qkv, -1, qdim + per, qdim + per * 2, v);
+                } else {
+                    Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
+                    Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
+                    Data vBias = (weight.weight.find(vBiasName) != weight.weight.end()) ? weight[vBiasName] : Data();
+                    Linear(attenInput, weight[qWeightName], qBias, q);
+                    Linear(attenInput, weight[kWeightName], kBias, k);
+                    Linear(attenInput, weight[vWeightName], vBias, v);
+                }
 
                 std::vector <int> qkvSize = {bsz, seqlen, -1, head_dim};
                 q.Reshape(qkvSize);
