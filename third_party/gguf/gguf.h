@@ -433,11 +433,17 @@ struct ggml_tensor {
 
 size_t ggml_row_size(enum ggml_type type, int64_t ne);
 
+int64_t ggml_blck_size(enum ggml_type type);
+
+size_t ggml_type_size(enum ggml_type type);
+
 const char * ggml_type_name(enum ggml_type type);
 
 ggml_vec_dot_t ggml_type_vec_dot(enum ggml_type type);
 
 bool ggml_is_quantized(enum ggml_type type);
+
+size_t ggml_nbytes(const struct ggml_tensor * tensor);
 
 static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
 
@@ -565,7 +571,25 @@ namespace fastllm {
         ~GGUFBuffer();
     };
 
-    void ReadGGUF(basellm *model, const std::string &fileName);
+    struct ReadGGUFTask {
+        std::string name;
+        Data *weight;
+        ggml_tensor tensor;
+        std::string fileName;
+        uint64_t offset;
+
+        ReadGGUFTask (std::string &name, Data *weight, ggml_tensor tensor, std::string fileName, uint64_t offset) {
+            this->name = name;
+            this->weight = weight;
+            this->tensor = tensor;
+            this->fileName = fileName;
+            this->offset = offset;
+        }
+    };
+
+    void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset);
+
+    void ReadGGUF(basellm *model, const std::string &fileName, std::vector <ReadGGUFTask> &tasks);
 }
 
 #endif // FASTLLM_GGUF_H
