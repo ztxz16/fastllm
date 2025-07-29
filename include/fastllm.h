@@ -322,7 +322,8 @@ namespace fastllm {
         bool isRegistered = false;
 
         bool isGGUFData = false; // gguf格式的数据
-        void *ggmlTensor;
+        void *ggmlTensor = nullptr;
+        int ggmlType = -1;
         
         Data () {};
 

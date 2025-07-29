@@ -40,6 +40,9 @@ namespace py = pybind11;
 #endif
 
 #include <mutex>
+
+#include "gguf.h"
+
 namespace fastllm {
     std::map <std::string, int> defaultDeviceMap, defaultMoeDeviceMap;
     Executor defaultExecutor;
@@ -927,6 +930,9 @@ namespace fastllm {
     }
 
     uint64_t Data::Count(int i) const {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT && i == 0) {
+            return ggml_nbytes((ggml_tensor*)this->ggmlTensor);
+        }
         if (i >= this->dims.size()) {
             return 1;
         }
@@ -963,6 +969,10 @@ namespace fastllm {
         } else if (this->dataType == DataType::INT32PARAM) {
             this->unitSize = 4;
             this->unitSizeDiv = 1;
+        } else if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            // 用GGUF的函数来计算长度
+            this->unitSize = 1;
+            this->unitSizeDiv = 1;
         }
 
         this->expansionBytes = (this->expansionSize * this->unitSize - 1) / this->unitSizeDiv + 1;
@@ -971,6 +981,34 @@ namespace fastllm {
     void Data::Resize(const std::vector<int> &dims) {
         this->dims = dims;
         this->UpdateUnitSize();
+
+        if (this->dataType == DATA_GGUF_FORMAT) {
+            std::vector <int> cur = dims;
+            std::reverse(cur.begin(), cur.end());
+
+            if (this->ggmlTensor == nullptr) {
+                this->ggmlTensor = new ggml_tensor();
+            }
+            ggml_tensor* tensor = (ggml_tensor*)this->ggmlTensor;
+            tensor->type = (ggml_type)this->ggmlType;
+            for (int j = 0; j < GGML_MAX_DIMS; j++) {
+                tensor->ne[j] = 1;
+                if (j < cur.size()) {
+                    tensor->ne[j] = cur[j];
+                }
+            }
+
+            {
+                tensor->type = (ggml_type)this->ggmlType;
+                const size_t  type_size = ggml_type_size(tensor->type);
+                const int64_t blck_size = ggml_blck_size(tensor->type);
+                tensor->nb[0] = type_size;
+                tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / blck_size);
+                for (int j = 2; j < GGML_MAX_DIMS; ++j) {
+                    tensor->nb[j] = tensor->nb[j - 1] * tensor->ne[j - 1];
+                }
+            }
+        }
 
         if (this->expansionDims.size() == 0) {
             this->strides.resize(dims.size(), 1);
@@ -1015,6 +1053,9 @@ namespace fastllm {
     }
 
     uint64_t Data::GetBytes() const {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            return ggml_nbytes((ggml_tensor*)this->ggmlTensor);
+        }
         return (this->strides[0] * this->dims[0] * this->unitSize - 1) / this->unitSizeDiv + 1;
     }
 

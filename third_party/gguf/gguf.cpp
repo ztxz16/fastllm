@@ -386,6 +386,11 @@ namespace fastllm {
 
         weight->dims = tensor->dims;
         weight->ggmlTensor = (void*)(new ggml_tensor());
+        weight->ggmlType = tensor->type;
+
+        weight->expansionBytes = ggml_nbytes(tensor);
+        weight->cpuData = new uint8_t[ggml_nbytes(tensor)];
+        
         (*(ggml_tensor*)weight->ggmlTensor) = *tensor;
 
         FILE *fi = fopen(fileName.c_str(), "rb");
@@ -396,13 +401,34 @@ namespace fastllm {
 #endif
         int ret = fread(weight->cpuData, 1, ggml_nbytes(tensor), fi);
         fclose(fi);
-
-        printf("after: ");
-        weight->PrintShape();
-        printf("\n");
     }
 
-    void ReadGGUF(basellm *model, const std::string &fileName) {
+    struct GGUFWeightReplaceRule {
+        enum GGUFWeightReplaceType {
+            GGUFWeightReplaceDirect = 0, // 直接替换
+            GGUFWeightReplacePacked = 1 // 拆包替换，例如[128, 2048, 2048]的矩阵替换为128个2048 * 2048，常见于moe
+        };
+
+        GGUFWeightReplaceType type;
+        std::regex pattern;
+        std::vector <std::string> names;
+
+        GGUFWeightReplaceRule (std::regex pattern, const std::string &name, 
+                                GGUFWeightReplaceType type = GGUFWeightReplaceDirect) {
+            this->type = type;
+            this->pattern = pattern;
+            this->names = {name};
+        }
+
+        GGUFWeightReplaceRule (std::regex pattern, const std::vector <std::string> &names, 
+                                GGUFWeightReplaceType type = GGUFWeightReplaceDirect) {
+            this->type = type;
+            this->pattern = pattern;
+            this->names = names;
+        }
+    };
+
+    void ReadGGUF(basellm *model, const std::string &fileName, std::vector <ReadGGUFTask> &tasks) {
         // 仅做测试用
         int ggufAlignment = GGUF_DEFAULT_ALIGNMENT;
         GGUFBuffer ggufBuffer = GGUFBuffer(fileName);
@@ -505,9 +531,9 @@ namespace fastllm {
 
                 // calculate byte offsets given the tensor shape and type
                 tensors[i].first.nb[0] = type_size;
-                tensors[i].first.nb[1] = tensors[i].first.nb[0]*(tensors[i].first.ne[0]/blck_size);
+                tensors[i].first.nb[1] = tensors[i].first.nb[0] * (tensors[i].first.ne[0] / blck_size);
                 for (int j = 2; j < GGML_MAX_DIMS; ++j) {
-                    tensors[i].first.nb[j] = tensors[i].first.nb[j - 1]*tensors[i].first.ne[j - 1];
+                    tensors[i].first.nb[j] = tensors[i].first.nb[j - 1] * tensors[i].first.ne[j - 1];
                 }
             }
 
@@ -525,60 +551,115 @@ namespace fastllm {
 
         uint64_t curPos = baseOffset;
 
-        std::vector <std::pair <std::regex, std::string> > weightNameConverterRules = {
-            {
+        std::vector <GGUFWeightReplaceRule> weightNameConverterRules = {
+            GGUFWeightReplaceRule ( 
                 std::regex(R"(blk\.(\d+)\.attn_(q|k|v)\.(weight|bias))"),
                 "model.layers.$1.self_attn.$2_proj.$3"
-            }, // qkv
-            {
+            ), // qkv
+            GGUFWeightReplaceRule (
                 std::regex(R"(blk\.(\d+)\.attn_output\.(weight|bias))"),
                 "model.layers.$1.self_attn.o_proj.$2"
-            }, // o
-            {
+            ), // o 
+            GGUFWeightReplaceRule (
                 std::regex(R"(blk\.(\d+)\.ffn_(gate|up|down)\.(weight|bias))"),
                 "model.layers.$1.mlp.$2_proj.$3"
-            }, // mlp
-            {
+            ), // mlp 
+            GGUFWeightReplaceRule (
                 std::regex(R"(blk\.(\d+)\.attn_norm\.weight)"),
                 "model.layers.$1.input_layernorm.weight"
-            },
-            {
+            ),
+            GGUFWeightReplaceRule (
                 std::regex(R"(blk\.(\d+)\.ffn_norm\.weight)"),
                 "model.layers.$1.post_attention_layernorm.weight"
-            },
+            ),
             /*{
                 std::regex(R"(token_embd.weight)"),
                 "model.embed_tokens.weight"
             },*/
-            {
+            GGUFWeightReplaceRule (
                 std::regex(R"(output.weight)"),
                 "lm_head.weight"
-            },
-            {
+            ), 
+            GGUFWeightReplaceRule (
                 std::regex(R"(output_norm.weight)"),
                 "model.norm.weight"
-            }
+            ),
+
+            GGUFWeightReplaceRule (
+                std::regex(R"(blk.(\d+).ffn_(gate|up|down)_exps.weight)"),
+                std::vector <std::string> ({"model.layers.$1.mlp.experts.", ".$2_proj.weight"}),
+                GGUFWeightReplaceRule::GGUFWeightReplacePacked
+            ), // experts
+            GGUFWeightReplaceRule (
+                std::regex(R"(blk.(\d+).ffn_(gate|up|down)_shexp.weight)"),
+                "model.layers.$1.mlp.shared_experts.$2_proj.weight"
+            ) // shared experts
         };
 
         for (int i = 0; i < tensorCount; i++) {
-            std::string name = tensors[i].first.name;
-
-            for (auto &it : weightNameConverterRules) {
-                if (std::regex_search(name, it.first)) {
-                    name = std::regex_replace(name, it.first, it.second);
-                }
-            } 
-
             if (curPos != baseOffset + tensors[i].second) {
                 ErrorInFastLLM("read weight " + tensors[i].first.name + " error.\n");
                 exit(0);
             } 
 
-            if (model->weight.weight.find(name) != model->weight.weight.end()) {
-                WeightImportGGUFTensor(&model->weight.weight[name], &tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second);
-                // printf("replace %s\n", name.c_str());
-            } else {
-                printf("unmatched weight %s:\n", name.c_str());
+            std::string name = tensors[i].first.name;
+            bool matched = false;
+
+            for (auto &it : weightNameConverterRules) {
+                if (std::regex_search(name, it.pattern)) {
+                    matched = true;
+
+                    if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
+                        name = std::regex_replace(name, it.pattern, it.names[0]);
+                        if (model->weight.weight.find(name) != model->weight.weight.end()) {
+                            tasks.push_back (
+                                ReadGGUFTask (
+                                    name, &model->weight.weight[name], tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second
+                                )
+                            );
+                            // printf("replace %s\n", name.c_str());
+                        }
+                    } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplacePacked) {
+                        std::string prefix = std::regex_replace(name, it.pattern, it.names[0]);
+                        std::string suffix = std::regex_replace(name, it.pattern, it.names[1]);
+
+                        int packedBatch = tensors[i].first.ne[2];
+                        ggml_tensor singleTensor = tensors[i].first;
+                        singleTensor.dims.erase(singleTensor.dims.begin());
+                        singleTensor.ne[2] = 1;
+                        singleTensor.nb[2] = singleTensor.nb[3] = singleTensor.nb[1];
+
+                        for (int idx = 0; idx < packedBatch; idx++) {
+                            std::string modelName = prefix + std::to_string(idx) + suffix;
+                            if (model->weight.weight.find(modelName) != model->weight.weight.end()) {
+                                tasks.push_back (
+                                    ReadGGUFTask (
+                                        modelName, &model->weight.weight[modelName], singleTensor, 
+                                        ggufBuffer.fileName, baseOffset + tensors[i].second + idx * ggml_nbytes(&singleTensor)
+                                    )
+                                );
+                            }
+                        }
+/*
+                        printf("name = %s\n", name.c_str());
+                        printf("prefix = %s\n", prefix.c_str());
+                        printf("suffix = %s\n", suffix.c_str());
+                        printf("nbytes = %d\n", ggml_nbytes(&tensors[i].first));
+
+                        for (int j = 0; j < GGML_MAX_DIMS; j++) {
+                            printf("i = %d, ne = %d\n", j, tensors[i].first.ne[j]);
+                        }
+*/
+                    }
+                }
+            } 
+
+            if (!matched) {
+                printf("unmatched weight %s (", name.c_str());
+                for (auto it : tensors[i].first.dims) {
+                    printf("%d ", it);
+                }
+                printf(") type = %s\n", ggml_type_name(tensors[i].first.type));
             }
 
             curPos += GGML_PAD(ggml_nbytes(&tensors[i].first), ggufAlignment);
