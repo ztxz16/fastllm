@@ -1200,7 +1200,8 @@ namespace fastllm {
                 q8kInputs.resize(n * rowCount * sizeof(block_q8_K));
                 for (int i = 0; i < n; i++) {
                     iqk_quantize_row_q8_K (
-                        inputData + i * m, q8kInputs.data() + i * rowCount * sizeof(block_q8_K), m
+                        inputData + i * m, q8kInputs.data() + i * rowCount * sizeof(block_q8_K), m, 
+                        ggml_type_vec_dot_type((ggml_type)weights[2]->ggmlType)
                     );
                 }
 
@@ -1287,7 +1288,8 @@ namespace fastllm {
                         uinputDown.resize(n * rowCount * sizeof(block_q8_K));
                         for (int i = 0; i < n; i++) {
                             iqk_quantize_row_q8_K (
-                                middles[l].data() + i * mid, uinputDown.data() + i * rowCount * sizeof(block_q8_K), mid
+                                middles[l].data() + i * mid, uinputDown.data() + i * rowCount * sizeof(block_q8_K), mid, 
+                                ggml_type_vec_dot_type((ggml_type)weights[idx * 2 + 1]->ggmlType)
                             );
                         }
                     }
