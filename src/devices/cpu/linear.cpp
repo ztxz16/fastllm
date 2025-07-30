@@ -65,12 +65,37 @@ namespace fastllm {
         }
     }
 
+    
     void MultiThreadLinearFloat32GGUFOp::Run() {
         ggml_tensor *tensor = (ggml_tensor*)this->ggmlTensor;
         int rowCount = m / QK_K; // 每行有多少个block
 
         auto vec_dot = ggml_type_vec_dot(tensor->type);
-        if (vec_dot != nullptr) {
+        if (tensor->type == GGML_TYPE_Q2_K_R4 || 
+            tensor->type == GGML_TYPE_Q3_K_R4 ||
+            tensor->type == GGML_TYPE_Q4_K_R4 ||
+            tensor->type == GGML_TYPE_Q6_K_R4) {
+            for (int i = 0; i < n; i++) {
+                DataInfo info{&outputData[i * k + st], 
+                    (const char*)q8kInputData + i * ggml_row_size(GGML_TYPE_Q8_K, m), 
+                    (size_t)k, ggml_row_size(GGML_TYPE_Q8_K, m), 
+                    0, 1, nullptr, 0};
+                if (tensor->type == GGML_TYPE_Q2_K_R4) {
+                    mul_mat_q2_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
+                } else if (tensor->type == GGML_TYPE_Q3_K_R4) {
+                    mul_mat_q3_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
+                } else if (tensor->type == GGML_TYPE_Q4_K_R4) {
+                    mul_mat_q4_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
+                } else if (tensor->type == GGML_TYPE_Q6_K_R4) {
+                    mul_mat_q6_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
+                }
+                if (biasData) {
+                    for (int j = st; j < end; j++) {
+                        outputData[i * k + j] += (biasData ? biasData[j] : 0.0f);
+                    }
+                }
+            }
+        } else if (vec_dot != nullptr) {
             for (int i = 0; i < n; i++) {
                 for (int j = st; j < end; j++) {
                     float now = 0.0f;
@@ -87,7 +112,7 @@ namespace fastllm {
             ErrorInFastLLM("Linear error: unsupport GGUF's dataType " + std::string(ggml_type_name(tensor->type)) + ".\n");
         }
     }
-
+    
     void MultiThreadLinearFloat32Float16Op::Run() {
         for (int i = 0; i < n; i++) {
             for (int j = st; j < end; j++) {
@@ -1068,14 +1093,17 @@ namespace fastllm {
     void LaunchLinearQ8KGGUF(uint8_t *a, uint8_t *b, float *c, float *bias, void *ggmlTensor, 
                             int n, int m, int k,
                             std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
-        int per = k / threadNum;
+        ggml_tensor *tensor = (ggml_tensor*)ggmlTensor;
+        int rows = 8;
+        int ks = (k / rows);
+        int per = ks / threadNum;
         int cur = 0;
         for (int i = 0; i < threadNum; i++) {
-            int end = cur + per + (cur + per * (threadNum - i) < k);
+            int end = cur + per + (cur + per * (threadNum - i) < ks);
             if (i == threadNum - 1) {
-                end = k;
+                end = ks;
             }
-            ops[startTid + i] = new MultiThreadLinearFloat32GGUFOp(a, b, bias, c, ggmlTensor, n, m, k, cur, end);
+            ops[startTid + i] = new MultiThreadLinearFloat32GGUFOp(a, b, bias, c, ggmlTensor, n, m, k, cur * rows, end * rows);
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
@@ -1096,17 +1124,20 @@ namespace fastllm {
             q8kInputs.resize(n * rowCount);
             for (int i = 0; i < n; i++) {
                 iqk_quantize_row_q8_K (
-                    inputData + i * m, q8kInputs.data() + i * rowCount, m
+                    inputData + i * m, q8kInputs.data() + i * rowCount, m, 
+                    ggml_type_vec_dot_type(tensor->type)
                 );
             }
 
-            int per = k / threadNum;
+            int rows = 8;
+            int ks = (k / rows);
+            int per = ks / threadNum;
             int cur = 0;
             std::vector<fastllm::MultiThreadLinearFloat32GGUFOp*> ops;
             for (int i = 0; i < threadNum; i++) {
-                int end = cur + per + (cur + per * (threadNum - i) < k);
+                int end = cur + per + (cur + per * (threadNum - i) < ks);
                 ops.push_back(new MultiThreadLinearFloat32GGUFOp((uint8_t*)q8kInputs.data(), weightData, biasData, outputData,
-                                                        (void*)tensor, n, m, k, cur, end));
+                                                        (void*)tensor, n, m, k, cur * rows, end * rows));
                 cur = end;
             }
             for (int i = 0; i < threadNum; i++) {
@@ -1115,7 +1146,7 @@ namespace fastllm {
             for (int i = 0; i < threadNum; i++) {
                 pool->Wait(startTid + i);
                 delete ops[i];
-            }
+            }        
             return;
         }
 /*

@@ -174,6 +174,13 @@ typedef struct {
 } block_q2_K;
 static_assert(sizeof(block_q2_K) == 2*sizeof(ggml_half) + QK_K/16 + QK_K/4, "wrong q2_K block size/padding");
 
+typedef struct {
+    ggml_half d[8];
+    uint8_t scales[QK_K/4]; // scales and mins, quantized with 4 bits
+    uint8_t qs[QK_K];       // quants
+} block_q2_k_r4;
+static_assert(sizeof(block_q2_k_r4) == 8*sizeof(ggml_half) + QK_K/4 + QK_K, "wrong q2_k_r4 block size/padding");
+
 // 3-bit quantization
 // weight is represented as x = a * q
 // 16 blocks of 16 elements each
@@ -186,6 +193,15 @@ typedef struct {
 } block_q3_K;
 static_assert(sizeof(block_q3_K) == sizeof(ggml_half) + QK_K / 4 + QK_K / 8 + 12, "wrong q3_K block size/padding");
 
+typedef struct {
+    ggml_half d[4];             // super-block scales
+    uint8_t scales_h[QK_K/16];  // scales quantized with 6 bits (high 2 bits)
+    uint8_t scales_l[QK_K/8];   // scales quantized with 6 bits (low  4 bits)
+    uint8_t qh[QK_K/2];         // quants - high bit
+    uint8_t qs[QK_K];           // quants - low 2 bits
+} block_q3_k_r4;
+static_assert(sizeof(block_q3_k_r4) == 4*sizeof(ggml_half) + QK_K/16 + QK_K/8 + QK_K/2 + QK_K, "wrong q3_k_r4 block size/padding");
+
 // 4-bit quantization
 // 8 blocks of 32 elements each
 // weight is represented as x = a * q + b
@@ -197,6 +213,14 @@ typedef struct {
     uint8_t qs[QK_K/2];           // 4--bit quants
 } block_q4_K;
 static_assert(sizeof(block_q4_K) == 2*sizeof(ggml_half) + K_SCALE_SIZE + QK_K/2, "wrong q4_K block size/padding");
+
+typedef struct {
+    ggml_half d[8];
+    uint8_t scales_h[QK_K/16];// scales and mins, quantized with 6 bits
+    uint8_t scales_l[QK_K/8]; // scales and mins, quantized with 6 bits
+    uint8_t qs[QK_K*2];           // 4--bit quants
+} block_q4_k_r4;
+static_assert(sizeof(block_q4_k_r4) == 8*sizeof(ggml_half) + QK_K/16 + QK_K/8 + QK_K*2, "wrong q4_k_r4 block size/padding");
 
 // 5-bit quantization
 // 8 blocks of 32 elements each
@@ -216,6 +240,15 @@ typedef struct {
 } block_q5_K;
 static_assert(sizeof(block_q5_K) == 2*sizeof(ggml_half) + K_SCALE_SIZE + QK_K/2 + QK_K/8, "wrong q5_K block size/padding");
 
+typedef struct {
+    ggml_half d[8];
+    uint8_t scales_h[QK_K/16];// scales and mins, quantized with 6 bits
+    uint8_t scales_l[QK_K/8]; // scales and mins, quantized with 6 bits
+    uint8_t qh[QK_K/2];           // quants, high bit
+    uint8_t qs[QK_K*2];           // quants, low 4 bits
+} block_q5_k_r4;
+static_assert(sizeof(block_q5_k_r4) == 8*sizeof(ggml_half) + QK_K/16 + QK_K/8 + QK_K/2 + QK_K*2, "wrong q5_k_r4 block size/padding");
+
 // 6-bit quantization
 // weight is represented as x = a * q
 // 16 blocks of 16 elements each
@@ -227,6 +260,14 @@ typedef struct {
     ggml_half d;             // super-block scale
 } block_q6_K;
 static_assert(sizeof(block_q6_K) == sizeof(ggml_half) + QK_K / 16 + 3*QK_K/4, "wrong q6_K block size/padding");
+
+typedef struct {
+    ggml_half d[4];          // super-block scale
+    int8_t  scales[QK_K/4];  // scales, quantized with 8 bits
+    uint8_t qh[QK_K];        // quants, upper 2 bits
+    uint8_t ql[QK_K*2];      // quants, lower 4 bits
+} block_q6_k_r4;
+static_assert(sizeof(block_q6_k_r4) == 4*sizeof(ggml_half) + QK_K/4 + 3*QK_K, "wrong q6_k_r4 block size/padding");
 
 // This is only used for intermediate quantization and dot products
 typedef struct {
@@ -391,7 +432,38 @@ enum ggml_type {
         // GGML_TYPE_IQ4_NL_4_4 = 36,
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
-        GGML_TYPE_COUNT   = 39,
+        GGML_TYPE_Q8_K32  = 148,
+
+        GGML_TYPE_Q4_0_R8   = 202,
+        GGML_TYPE_Q5_0_R4   = 206,
+        GGML_TYPE_Q8_0_R8   = 208,
+        GGML_TYPE_Q2_K_R4   = 210,
+        GGML_TYPE_Q3_K_R4   = 211,
+        GGML_TYPE_Q4_K_R4   = 212,
+        GGML_TYPE_Q5_K_R4   = 213,
+        GGML_TYPE_Q6_K_R4   = 214,
+        GGML_TYPE_IQ2_XXS_R4= 216,
+        GGML_TYPE_IQ2_XS_R4 = 217,
+        GGML_TYPE_IQ3_XXS_R4= 218,
+        GGML_TYPE_IQ1_S_R4  = 219,
+        GGML_TYPE_IQ4_NL_R4 = 220,
+        GGML_TYPE_IQ3_S_R4  = 221,
+        GGML_TYPE_IQ2_S_R4  = 222,
+        GGML_TYPE_IQ4_XS_R8 = 223,
+        GGML_TYPE_IQ1_M_R4  = 229,
+        GGML_TYPE_BF16_R16  = 230,
+        GGML_TYPE_Q6_0_R4   = 233,
+        GGML_TYPE_IQ2_BN_R4 = 335,
+        GGML_TYPE_IQ2_K_R4  = 337,
+        GGML_TYPE_IQ3_K_R4  = 338,
+        GGML_TYPE_IQ4_K_R4  = 339,
+        GGML_TYPE_IQ5_K_R4  = 340,
+        GGML_TYPE_IQ4_KS_R4 = 344,
+        GGML_TYPE_IQ5_KS_R4 = 352,
+        GGML_TYPE_Q8_KV_R8  = 398,
+        GGML_TYPE_Q8_K_R8   = 399,
+
+        GGML_TYPE_COUNT
 };
 
     // n-dimensional tensor
@@ -441,6 +513,8 @@ const char * ggml_type_name(enum ggml_type type);
 
 ggml_vec_dot_t ggml_type_vec_dot(enum ggml_type type);
 
+ggml_type ggml_type_vec_dot_type(enum ggml_type type);
+
 bool ggml_is_quantized(enum ggml_type type);
 
 size_t ggml_nbytes(const struct ggml_tensor * tensor);
@@ -453,11 +527,11 @@ struct ggml_type_traits {
     size_t                   type_size;
     bool                     is_quantized;
     ggml_vec_dot_t           vec_dot = nullptr;
+    enum ggml_type           vec_dot_type;
     ggml_to_float_t          to_float;
     ggml_from_float_t        from_float_ref;
     int64_t                  blck_size_interleave; // interleave elements in blocks
     ggml_from_float_to_mat_t from_float_to_mat;
-    enum ggml_type           vec_dot_type;
     int64_t                  nrows; // number of rows to process simultaneously
     int64_t                  ncols; // number of columns to process simultaneously
     ggml_gemv_t              gemv;
@@ -543,11 +617,82 @@ GGML_API size_t quantize_q5_0(const float * GGML_RESTRICT src, void * GGML_RESTR
 GGML_API size_t quantize_q5_1(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 GGML_API size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
-void iqk_quantize_row_q8_K(const float * x, void * vy, int64_t k);
+void iqk_quantize_row_q8_K(const float * x, void * vy, int64_t k, ggml_type type);
 void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+typedef struct {
+        int32_t i1;
+        int32_t i2;
+} mmid_row_mapping;
+
+struct DataInfo {
+        float       * s;
+        const char  * cy;
+        size_t        bs;
+        size_t        by;
+        int           cur_y = 0;
+        int           ne11;
+        const mmid_row_mapping * row_mapping = nullptr;
+        size_t        bs2 = 0;
+
+        inline const char * src1_row(int iy) const {
+            if (!row_mapping) return cy + (cur_y + iy)*by;
+            int i11 = row_mapping[cur_y + iy].i1 % ne11;
+            int i12 = row_mapping[cur_y + iy].i2;
+            return cy + (i11 + i12*ne11)*by;
+        }
+
+        inline void store(int ix, int iy, float result) const {
+            *(dst_row(iy) + ix) = result;
+        }
+    #ifdef __AVX__
+        inline void store(int ix, int iy, __m128 result) const {
+            _mm_storeu_ps(dst_row(iy) + ix, result);
+        }
+        inline void store(int ix, int iy, __m256 result) const {
+            _mm256_storeu_ps(dst_row(iy) + ix, result);
+        }
+    #endif
+    #ifdef __AVX512F__
+        inline void store(int ix, int iy, __m512 result) const {
+            _mm512_storeu_ps(dst_row(iy) + ix, result);
+        }
+    #endif
+    #ifdef __ARM_NEON
+        inline void store(int ix, int iy, float32x4_t result) const {
+            vst1q_f32(dst_row(iy) + ix, result);
+        }
+    #endif
+        inline float * dst_row(int iy) const {
+            if (!row_mapping) return s + (cur_y + iy)*bs;
+            int i12 = row_mapping[cur_y + iy].i2;
+            int i1  = row_mapping[cur_y + iy].i1;
+            int i2  = i12;
+            return s + i1*bs + i2*bs2;
+        }
+};
+
+struct Repack {
+    using repack_func = void (*) (int nrows, int n_per_row, const char * src, char * dst, bool online);
+    ggml_type   new_type;
+    int         num_rows;
+    repack_func repack;
+};
+const Repack * get_repack_info(ggml_type type);
+
+template <int nrc_y>
+void mul_mat_q2_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x);
+template <int nrc_y>
+void mul_mat_q3_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x);
+template <int nrc_y>
+void mul_mat_q4_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x);
+template <int nrc_y>
+void mul_mat_q5_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x);
+template <int nrc_y>
+void mul_mat_q6_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x);
 
 namespace fastllm {
     const std::string GGUF_KEY_GENERAL_ALIGNMENT = "general.alignment";
