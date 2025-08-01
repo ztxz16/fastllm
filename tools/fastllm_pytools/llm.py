@@ -53,6 +53,9 @@ fastllm_lib.create_llm_model_fromhf.restype = ctypes.c_int
 fastllm_lib.create_llm_model_fromhf_with_config.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_char_p]
 fastllm_lib.create_llm_model_fromhf_with_config.restype = ctypes.c_int
 
+fastllm_lib.create_llm_model_from_gguf.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+fastllm_lib.create_llm_model_from_gguf.restype = ctypes.c_int
+
 fastllm_lib.create_llm_tokenizer_fromhf.argtypes = [ctypes.c_char_p]
 fastllm_lib.create_llm_tokenizer_fromhf.restype = ctypes.c_int
 
@@ -584,6 +587,22 @@ class TokenizerCache:
         else:
             return tokenizer.encode(prompt, add_special_tokens = True)
 
+def try_load_hf_tokenizer(path):
+    try:
+        import logging
+        # 1. 保存当前的日志级别
+        original_level = logging.root.manager.disable
+        # 2. 完全禁止所有 logging 输出
+        logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
+        from transformers import AutoTokenizer
+        logging.disable(original_level)  # 恢复原来的日志级别
+        ret = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
+    except:
+        ret = None
+        print("Load AutoTokenizer failed. (you can try install transformers)")
+        print("Try load fastllm tokenizer.")
+    return ret
+
 class model:
     def __init__ (self, path : str,
                   id : int = -99999,
@@ -595,7 +614,8 @@ class model:
                   model_json: str = "", 
                   graph: type = None, 
                   lora: str = "", 
-                  dtype_config: str = ""):
+                  dtype_config: str = "",
+                  ori_model_path: str = ""):
         if (graph != None):
             current_graph = graph()
             if (os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json"))):
@@ -648,23 +668,14 @@ class model:
         if (id != -99999):
             self.model = id;
         else:
-            if os.path.isfile(path):
+            if len(path) > 5 and path[-5:].lower() == ".gguf":
+                self.hf_tokenizer = try_load_hf_tokenizer(ori_model_path)
+                self.model = fastllm_lib.create_llm_model_from_gguf(path.encode(), ori_model_path.encode())
+            elif os.path.isfile(path):
                 self.model = fastllm_lib.create_llm_model(path.encode());
             elif os.path.isdir(path):
                 if tokenizer_type != "fastllm":
-                    try:
-                        import logging
-                        # 1. 保存当前的日志级别
-                        original_level = logging.root.manager.disable
-                        # 2. 完全禁止所有 logging 输出
-                        logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
-                        from transformers import AutoTokenizer
-                        logging.disable(original_level)  # 恢复原来的日志级别
-                        self.hf_tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
-                    except:
-                        self.hf_tokenizer = None
-                        print("Load AutoTokenizer failed. (you can try install transformers)")
-                        print("Try load fastllm tokenizer.")
+                    self.hf_tokenizer = try_load_hf_tokenizer(path)
                 if model_json != "":
                     self.model = fastllm_lib.create_llm_model_fromhf_with_config(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, 
                                                                  ctypes.c_bool(self.hf_tokenizer != None), model_json.encode());
