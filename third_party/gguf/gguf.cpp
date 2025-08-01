@@ -1,5 +1,4 @@
 #include <map>
-#include <regex>
 
 #include <assert.h>
 #include "gguf.h"
@@ -116,8 +115,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .type_size                = sizeof(block_q2_K),
             .is_quantized             = true,
             .vec_dot                  = ggml_vec_dot_q2_K_q8_K,
-            .vec_dot_type             = GGML_TYPE_Q8_K
-            // .to_float                 = (ggml_to_float_t) dequantize_row_q2_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
+            .to_float                 = (ggml_to_float_t) dequantize_row_q2_K,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q2_K_ref,
         }},
         {GGML_TYPE_Q2_K_R4, {
@@ -136,8 +135,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .type_size                = sizeof(block_q3_K),
             .is_quantized             = true,
             .vec_dot                  = ggml_vec_dot_q3_K_q8_K,
-            .vec_dot_type             = GGML_TYPE_Q8_K
-            // .to_float                 = (ggml_to_float_t) dequantize_row_q3_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
+            .to_float                 = (ggml_to_float_t) dequantize_row_q3_K,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q3_K_ref,
         }},
         {GGML_TYPE_Q3_K_R4, {
@@ -156,8 +155,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .type_size                = sizeof(block_q4_K),
             .is_quantized             = true,
             .vec_dot                  = ggml_vec_dot_q4_K_q8_K,
-            .vec_dot_type             = GGML_TYPE_Q8_K
-            // .to_float                 = (ggml_to_float_t) dequantize_row_q4_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
+            .to_float                 = (ggml_to_float_t) dequantize_row_q4_K,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q4_K_ref,
         }},
         {GGML_TYPE_Q4_K_R4, {
@@ -184,8 +183,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .type_size                = sizeof(block_q6_K),
             .is_quantized             = true,
             .vec_dot                  = ggml_vec_dot_q6_K_q8_K,
-            .vec_dot_type             = GGML_TYPE_Q8_K
-            // .to_float                 = (ggml_to_float_t) dequantize_row_q6_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
+            .to_float                 = (ggml_to_float_t) dequantize_row_q6_K,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q6_K_ref,
         }},
         {GGML_TYPE_Q6_K_R4, {
@@ -323,6 +322,10 @@ const char * ggml_type_name(enum ggml_type type) {
     return type < GGML_TYPE_COUNT ? type_traits[type].type_name : "NONE";
 }
 
+ggml_to_float_t ggml_type_to_float(enum ggml_type type) {
+    return type < GGML_TYPE_COUNT ? type_traits[type].to_float : nullptr;
+}
+
 ggml_vec_dot_t ggml_type_vec_dot(enum ggml_type type) {
     return type < GGML_TYPE_COUNT ? type_traits[type].vec_dot : nullptr;
 }
@@ -416,75 +419,301 @@ namespace fastllm {
     template int64_t GGUFBuffer::Read<int64_t>();
     template float GGUFBuffer::Read<float>();
 
-    void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset) {
+    void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
+                                GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType) {
         if (tensor->type == ggml_type::GGML_TYPE_F32) {
             weight->dataType = DataType::FLOAT32;    
         } else {
             weight->dataType = DataType::DATA_GGUF_FORMAT;
         }
 
-        weight->dims = tensor->dims;
-        weight->ggmlTensor = (void*)(new ggml_tensor());
-        weight->ggmlType = tensor->type;
+        if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
+            weight->dims = tensor->dims;
+            weight->ggmlTensor = (void*)(new ggml_tensor());
+            weight->ggmlType = tensor->type;
 
-        weight->expansionBytes = ggml_nbytes(tensor);
-        weight->cpuData = new uint8_t[ggml_nbytes(tensor)];
-        
-        (*(ggml_tensor*)weight->ggmlTensor) = *tensor;
+            weight->expansionBytes = ggml_nbytes(tensor);
+            weight->cpuData = new uint8_t[ggml_nbytes(tensor)];
+            
+            (*(ggml_tensor*)weight->ggmlTensor) = *tensor;
 
-        FILE *fi = fopen(fileName.c_str(), "rb");
-#if defined(_WIN32) || defined(_WIN64)
-        _fseeki64(fi, offset, 0);
-#else
-        fseek(fi, offset, 0);
-#endif
-        int ret = fread(weight->cpuData, 1, ggml_nbytes(tensor), fi);
-        fclose(fi);
+            FILE *fi = fopen(fileName.c_str(), "rb");
+    #if defined(_WIN32) || defined(_WIN64)
+            _fseeki64(fi, offset, 0);
+    #else
+            fseek(fi, offset, 0);
+    #endif
+            int ret = fread(weight->cpuData, 1, ggml_nbytes(tensor), fi);
+            fclose(fi);
 
-        auto repack = get_repack_info(tensor->type);
-        if (repack != nullptr && true) {
-            int nrows = tensor->ne[1], n_per_row = tensor->ne[0];
-            auto row_size = ggml_row_size(tensor->type, n_per_row);
-            std::vector<uint8_t> qtmp(repack->num_rows * row_size);
-            uint8_t *qcur = (uint8_t*)weight->cpuData;
-            for (int row = 0; row < nrows; row += repack->num_rows) {
-                memcpy(qtmp.data(), qcur, repack->num_rows * row_size);
-                repack->repack(repack->num_rows, n_per_row, (const char *)qtmp.data(), (char *)qcur, false);
-                qcur += repack->num_rows * row_size;
+            auto repack = get_repack_info(tensor->type);
+            if (repack != nullptr && true) {
+                int nrows = tensor->ne[1], n_per_row = tensor->ne[0];
+                auto row_size = ggml_row_size(tensor->type, n_per_row);
+                std::vector<uint8_t> qtmp(repack->num_rows * row_size);
+                uint8_t *qcur = (uint8_t*)weight->cpuData;
+                for (int row = 0; row < nrows; row += repack->num_rows) {
+                    memcpy(qtmp.data(), qcur, repack->num_rows * row_size);
+                    repack->repack(repack->num_rows, n_per_row, (const char *)qtmp.data(), (char *)qcur, false);
+                    qcur += repack->num_rows * row_size;
+                }
+
+                ((ggml_tensor*)weight->ggmlTensor)->type = repack->new_type;
+                weight->ggmlType = (int)repack->new_type;
+            } else {
+                // printf("name = %s, type = %s\n", tensor->name.c_str(), ggml_type_name(tensor->type));
+                // weight->PrintShape();
             }
+        } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32) {
+            weight->dataType = DataType::FLOAT32;    
+            weight->Resize(tensor->dims);
+            weight->Allocate();
 
-            ((ggml_tensor*)weight->ggmlTensor)->type = repack->new_type;
-            weight->ggmlType = (int)repack->new_type;
+            auto len = ggml_nbytes(tensor);
+            std::vector <uint8_t*> oriData;
+            oriData.resize(len);
+
+            FILE *fi = fopen(fileName.c_str(), "rb");
+    #if defined(_WIN32) || defined(_WIN64)
+            _fseeki64(fi, offset, 0);
+    #else
+            fseek(fi, offset, 0);
+    #endif
+            int ret = fread(oriData.data(), 1, ggml_nbytes(tensor), fi);
+            fclose(fi);
+
+            auto toFloat = ggml_type_to_float(tensor->type);
+            AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight " + tensor->name + "(type " + 
+                ggml_type_name(tensor->type) + ") can't convert to fp32.");
+            toFloat(oriData.data(), (float*)weight->cpuData, weight->Count(0));
         } else {
-            printf("name = %s, type = %s\n", tensor->name.c_str(), ggml_type_name(tensor->type));
-            weight->PrintShape();
+            ErrorInFastLLM("WeightImportGGUFTensor: Unsupport replace type.");
         }
     }
 
-    struct GGUFWeightReplaceRule {
-        enum GGUFWeightReplaceType {
-            GGUFWeightReplaceDirect = 0, // 直接替换
-            GGUFWeightReplacePacked = 1 // 拆包替换，例如[128, 2048, 2048]的矩阵替换为128个2048 * 2048，常见于moe
-        };
+    void ReadGGUFMetaData(const std::string &fileName, json11::Json &config) {
+        int ggufAlignment = GGUF_DEFAULT_ALIGNMENT;
+        GGUFBuffer ggufBuffer = GGUFBuffer(fileName);
+        int magic = ggufBuffer.Read<int> ();
+        int version = ggufBuffer.Read<int> ();
+        uint64_t tensorCount = ggufBuffer.Read <uint64_t> ();
+        uint64_t metaDataCount = ggufBuffer.Read <uint64_t> ();
 
-        GGUFWeightReplaceType type;
-        std::regex pattern;
-        std::vector <std::string> names;
+        json11::Json::object jsonConfig;
+        jsonConfig["magic"] = magic;
+        jsonConfig["version"] = version;
+        jsonConfig["tensorCount"] = (int)tensorCount;
+        jsonConfig["metaDataCount"] = (int)metaDataCount;
 
-        GGUFWeightReplaceRule (std::regex pattern, const std::string &name, 
-                                GGUFWeightReplaceType type = GGUFWeightReplaceDirect) {
-            this->type = type;
-            this->pattern = pattern;
-            this->names = {name};
+        json11::Json::object paramsConfig;
+
+        for (int i = 0; i < metaDataCount; i++) {
+            std::string key = ggufBuffer.ReadString();
+            // printf("key = %s\n", key.c_str());
+            int type = ggufBuffer.Read <int> ();            
+            if (type == GGUF_TYPE_STRING) {
+                std::string value = ggufBuffer.ReadString();
+                paramsConfig[key] = value;
+            } else if (type == GGUF_TYPE_UINT8) {
+                int8_t value = ggufBuffer.Read <int8_t> ();
+                paramsConfig[key] = value;
+            } else if (type == GGUF_TYPE_UINT16) {
+                uint16_t value = ggufBuffer.Read <uint16_t> ();
+                paramsConfig[key] = value;
+            } else if (type == GGUF_TYPE_UINT32) {
+                uint32_t value = ggufBuffer.Read <uint32_t> ();
+                paramsConfig[key] = (int)value;
+            } else if (type == GGUF_TYPE_FLOAT32) {
+                float value = ggufBuffer.Read <float> ();
+                paramsConfig[key] = value;
+            } else if (type == GGUF_TYPE_INT32) {
+                int value = ggufBuffer.Read <int> ();
+                paramsConfig[key] = value;
+            } else if (type == GGUF_TYPE_BOOL) {
+                bool value = ggufBuffer.ReadBool();
+                paramsConfig[key] = value;
+            } else if (type == GGUF_TYPE_ARRAY) {
+                int type = ggufBuffer.Read <int> ();
+                uint64_t n = ggufBuffer.Read <uint64_t> ();
+                if (type == GGUF_TYPE_STRING) {
+                    std::vector <std::string> value;
+                    for (int i = 0; i < n; i++) {
+                        value.push_back(ggufBuffer.ReadString());
+                    }
+                    paramsConfig[key] = value; // std::vector <std::string> ({value[0], value[1]});
+                } else if (type == GGUF_TYPE_INT32) {
+                    std::vector <int> value;
+                    for (int i = 0; i < n; i++) {
+                        value.push_back(ggufBuffer.Read <int> ());
+                    }
+                    paramsConfig[key] = value; // std::vector <int> ({value[0], value[1]});
+                } else {
+                    ErrorInFastLLM("Read GGUF_TYPE_ARRAY type " + std::to_string(type) + " error.\n");
+                }
+            } else {
+                ErrorInFastLLM("Read GGUF_TYPE type " + std::to_string(type) + " error.\n");
+            }
         }
 
-        GGUFWeightReplaceRule (std::regex pattern, const std::vector <std::string> &names, 
-                                GGUFWeightReplaceType type = GGUFWeightReplaceDirect) {
-            this->type = type;
-            this->pattern = pattern;
-            this->names = names;
+        jsonConfig["params"] = paramsConfig;
+        config = json11::Json(jsonConfig);
+    }
+
+    void AppendGGUFTasks(std::string arch, const std::string &fileName, std::vector <ReadGGUFTask> &tasks) {
+        int ggufAlignment = GGUF_DEFAULT_ALIGNMENT;
+        GGUFBuffer ggufBuffer = GGUFBuffer(fileName);
+        int magic = ggufBuffer.Read<int> ();
+        int version = ggufBuffer.Read<int> ();
+        uint64_t tensorCount = ggufBuffer.Read <uint64_t> ();
+        uint64_t metaDataCount = ggufBuffer.Read <uint64_t> ();
+
+        for (int i = 0; i < metaDataCount; i++) {
+            std::string key = ggufBuffer.ReadString();
+            int type = ggufBuffer.Read <int> ();            
+            if (type == GGUF_TYPE_STRING) {
+                std::string value = ggufBuffer.ReadString();
+            } else if (type == GGUF_TYPE_UINT8) {
+                int8_t value = ggufBuffer.Read <int8_t> ();
+            } else if (type == GGUF_TYPE_UINT16) {
+                uint16_t value = ggufBuffer.Read <uint16_t> ();
+            } else if (type == GGUF_TYPE_UINT32) {
+                uint32_t value = ggufBuffer.Read <uint32_t> ();
+            } else if (type == GGUF_TYPE_FLOAT32) {
+                float value = ggufBuffer.Read <float> ();
+            } else if (type == GGUF_TYPE_INT32) {
+                int value = ggufBuffer.Read <int> ();
+            } else if (type == GGUF_TYPE_BOOL) {
+                bool value = ggufBuffer.ReadBool();
+            } else if (type == GGUF_TYPE_ARRAY) {
+                int type = ggufBuffer.Read <int> ();
+                uint64_t n = ggufBuffer.Read <uint64_t> ();
+                for (int i = 0; i < n; i++) {
+                    if (type == GGUF_TYPE_STRING) {
+                        std::string value = ggufBuffer.ReadString();
+                    } else if (type == GGUF_TYPE_INT32) {
+                        int a = ggufBuffer.Read <int> ();
+                    }
+                }
+            } else {
+                printf("AppendGGUFTasks error, type = %d\n", type);
+                exit(0);
+            }
         }
-    };
+
+        std::vector <std::pair <ggml_tensor, uint64_t> > tensors; // <tensors, offset>
+        tensors.resize(tensorCount);
+
+        for (int i = 0; i < tensorCount; i++) {
+            std::string tensorName = ggufBuffer.ReadString();
+            uint32_t ndims = ggufBuffer.Read <uint32_t> ();
+        
+            for (int j = 0; j < ndims; j++) {
+                int64_t dim = ggufBuffer.Read <int64_t> ();
+                tensors[i].first.dims.push_back(dim);
+            }
+
+            for (int j = 0; j < GGML_MAX_DIMS; j++) {
+                tensors[i].first.ne[j] = 1;
+                if (j < ndims) {
+                    tensors[i].first.ne[j] = tensors[i].first.dims[j];
+                }
+            }
+
+            std::reverse(tensors[i].first.dims.begin(), tensors[i].first.dims.end());
+
+            int type = ggufBuffer.Read <int> ();
+            uint64_t offset = ggufBuffer.Read <uint64_t> ();
+
+            {
+                tensors[i].first.type = (ggml_type)type;
+                const size_t  type_size = ggml_type_size(tensors[i].first.type);
+                const int64_t blck_size = ggml_blck_size(tensors[i].first.type);
+
+                // calculate byte offsets given the tensor shape and type
+                tensors[i].first.nb[0] = type_size;
+                tensors[i].first.nb[1] = tensors[i].first.nb[0] * (tensors[i].first.ne[0] / blck_size);
+                for (int j = 2; j < GGML_MAX_DIMS; ++j) {
+                    tensors[i].first.nb[j] = tensors[i].first.nb[j - 1] * tensors[i].first.ne[j - 1];
+                }
+            }
+
+            tensors[i].first.name = tensorName;
+            tensors[i].second = offset;
+        }
+
+        // we require the data section to be aligned, so take into account any padding
+        if (fseek(ggufBuffer.f, GGML_PAD(ftell(ggufBuffer.f), ggufAlignment), SEEK_SET) != 0) {
+            printf("alignment error\n");
+            exit(0);
+        }
+
+        uint64_t baseOffset = ftell(ggufBuffer.f);
+        uint64_t curPos = baseOffset;
+
+        std::vector <GGUFWeightReplaceRule> weightNameConverterRules = GetGGUFWeightReplaceRules(arch);
+
+        for (int i = 0; i < tensorCount; i++) {
+            if (curPos != baseOffset + tensors[i].second) {
+                ErrorInFastLLM("read weight " + tensors[i].first.name + " error.\n");
+                exit(0);
+            } 
+
+            std::string name = tensors[i].first.name;
+            bool matched = false;
+
+            for (auto &it : weightNameConverterRules) {
+                if (std::regex_search(name, it.pattern)) {
+                    matched = true;
+
+                    if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
+                        name = std::regex_replace(name, it.pattern, it.names[0]);
+                        tasks.push_back (
+                                ReadGGUFTask (
+                                    name, nullptr, tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second
+                                )
+                        );
+                    } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32) {
+                        name = std::regex_replace(name, it.pattern, it.names[0]);
+                        tasks.push_back (
+                            ReadGGUFTask (
+                                name, nullptr, tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second, 
+                                it.type
+                            )
+                        );
+                    } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplacePacked) {
+                        std::string prefix = std::regex_replace(name, it.pattern, it.names[0]);
+                        std::string suffix = std::regex_replace(name, it.pattern, it.names[1]);
+
+                        int packedBatch = tensors[i].first.ne[2];
+                        ggml_tensor singleTensor = tensors[i].first;
+                        singleTensor.dims.erase(singleTensor.dims.begin());
+                        singleTensor.ne[2] = 1;
+                        singleTensor.nb[2] = singleTensor.nb[3] = singleTensor.nb[1];
+
+                        for (int idx = 0; idx < packedBatch; idx++) {
+                            std::string modelName = prefix + std::to_string(idx) + suffix;
+                            tasks.push_back (
+                                ReadGGUFTask (
+                                    modelName, nullptr, singleTensor, 
+                                    ggufBuffer.fileName, baseOffset + tensors[i].second + idx * ggml_nbytes(&singleTensor)
+                                )
+                            );
+                        }
+                    }
+                }
+            } 
+
+            if (!matched) {
+                printf("unmatched weight %s (", name.c_str());
+                for (auto it : tensors[i].first.dims) {
+                    printf("%d ", it);
+                }
+                printf(") type = %s\n", ggml_type_name(tensors[i].first.type));
+            }
+
+            curPos += GGML_PAD(ggml_nbytes(&tensors[i].first), ggufAlignment);
+        }
+    }
 
     void ReadGGUF(basellm *model, const std::string &fileName, std::vector <ReadGGUFTask> &tasks) {
         // 仅做测试用
@@ -609,51 +838,7 @@ namespace fastllm {
 
         uint64_t curPos = baseOffset;
 
-        std::vector <GGUFWeightReplaceRule> weightNameConverterRules = {
-            GGUFWeightReplaceRule ( 
-                std::regex(R"(blk\.(\d+)\.attn_(q|k|v)\.(weight|bias))"),
-                "model.layers.$1.self_attn.$2_proj.$3"
-            ), // qkv
-            GGUFWeightReplaceRule (
-                std::regex(R"(blk\.(\d+)\.attn_output\.(weight|bias))"),
-                "model.layers.$1.self_attn.o_proj.$2"
-            ), // o 
-            GGUFWeightReplaceRule (
-                std::regex(R"(blk\.(\d+)\.ffn_(gate|up|down)\.(weight|bias))"),
-                "model.layers.$1.mlp.$2_proj.$3"
-            ), // mlp 
-            GGUFWeightReplaceRule (
-                std::regex(R"(blk\.(\d+)\.attn_norm\.weight)"),
-                "model.layers.$1.input_layernorm.weight"
-            ),
-            GGUFWeightReplaceRule (
-                std::regex(R"(blk\.(\d+)\.ffn_norm\.weight)"),
-                "model.layers.$1.post_attention_layernorm.weight"
-            ),
-            /*{
-                std::regex(R"(token_embd.weight)"),
-                "model.embed_tokens.weight"
-            },*/
-            GGUFWeightReplaceRule (
-                std::regex(R"(output.weight)"),
-                "lm_head.weight"
-            ), 
-            GGUFWeightReplaceRule (
-                std::regex(R"(output_norm.weight)"),
-                "model.norm.weight"
-            ),
-
-            GGUFWeightReplaceRule (
-                std::regex(R"(blk.(\d+).ffn_(gate|up|down)_exps.weight)"),
-                std::vector <std::string> ({"model.layers.$1.mlp.experts.", ".$2_proj.weight"}),
-                GGUFWeightReplaceRule::GGUFWeightReplacePacked
-            ), // experts
-            GGUFWeightReplaceRule (
-                std::regex(R"(blk.(\d+).ffn_(gate|up|down)_shexp.weight)"),
-                "model.layers.$1.mlp.shared_experts.$2_proj.weight"
-            ) // shared experts
-        };
-
+        std::vector <GGUFWeightReplaceRule> weightNameConverterRules = GetGGUFWeightReplaceRules(model->model_type);
         for (int i = 0; i < tensorCount; i++) {
             if (curPos != baseOffset + tensors[i].second) {
                 ErrorInFastLLM("read weight " + tensors[i].first.name + " error.\n");
@@ -673,6 +858,17 @@ namespace fastllm {
                             tasks.push_back (
                                 ReadGGUFTask (
                                     name, &model->weight.weight[name], tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second
+                                )
+                            );
+                            // printf("replace %s\n", name.c_str());
+                        }
+                    } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32) {
+                        name = std::regex_replace(name, it.pattern, it.names[0]);
+                        if (model->weight.weight.find(name) != model->weight.weight.end()) {
+                            tasks.push_back (
+                                ReadGGUFTask (
+                                    name, &model->weight.weight[name], tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second, 
+                                    it.type
                                 )
                             );
                             // printf("replace %s\n", name.c_str());
