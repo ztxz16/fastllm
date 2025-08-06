@@ -431,6 +431,8 @@ namespace fastllm {
                 FastllmCudaMatMulFloatInt4Group(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 FastllmCudaMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+                FastllmCudaMatMulFloatGGUF(input, weight, bias, output, n, m, k);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }

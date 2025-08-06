@@ -67,7 +67,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK4_0,
             .type_size                = sizeof(block_q4_0),
             .is_quantized             = true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_q4_0,
+            .to_float                 = (ggml_to_float_t) dequantize_row_q4_0,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q4_0_ref,
         }},
         {GGML_TYPE_Q4_1, {
@@ -419,6 +419,8 @@ namespace fastllm {
     template int64_t GGUFBuffer::Read<int64_t>();
     template float GGUFBuffer::Read<float>();
 
+    extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
+
     void WeightImportGGUFTensor(Data* weight, ggml_tensor *tensor, std::string &fileName, uint64_t offset, 
                                 GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType) {
         if (tensor->type == ggml_type::GGML_TYPE_F32) {
@@ -470,7 +472,7 @@ namespace fastllm {
             weight->Allocate();
 
             auto len = ggml_nbytes(tensor);
-            std::vector <uint8_t*> oriData;
+            std::vector <uint8_t> oriData;
             oriData.resize(len);
 
             FILE *fi = fopen(fileName.c_str(), "rb");
@@ -486,6 +488,31 @@ namespace fastllm {
             AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight " + tensor->name + "(type " + 
                 ggml_type_name(tensor->type) + ") can't convert to fp32.");
             toFloat(oriData.data(), (float*)weight->cpuData, weight->Count(0));
+        } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
+            weight->dataType = DataType::FLOAT16;    
+            weight->Resize(tensor->dims);
+            weight->Allocate();
+
+            auto len = ggml_nbytes(tensor);
+            std::vector <uint8_t> oriData;
+            std::vector <float> floatData;
+            oriData.resize(len);
+            floatData.resize(weight->Count(0));
+
+            FILE *fi = fopen(fileName.c_str(), "rb");
+    #if defined(_WIN32) || defined(_WIN64)
+            _fseeki64(fi, offset, 0);
+    #else
+            fseek(fi, offset, 0);
+    #endif
+            int ret = fread(oriData.data(), 1, ggml_nbytes(tensor), fi);
+            fclose(fi);
+
+            auto toFloat = ggml_type_to_float(tensor->type);
+            AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight " + tensor->name + "(type " + 
+                ggml_type_name(tensor->type) + ") can't convert to fp32.");
+            toFloat(oriData.data(), floatData.data(), weight->Count(0));
+            Float32ToFloat16(floatData.data(), (uint16_t*)weight->cpuData, weight->Count(0));
         } else {
             ErrorInFastLLM("WeightImportGGUFTensor: Unsupport replace type.");
         }
@@ -672,7 +699,8 @@ namespace fastllm {
                                     name, nullptr, tensors[i].first, ggufBuffer.fileName, baseOffset + tensors[i].second
                                 )
                         );
-                    } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32) {
+                    } else if (it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32 ||
+                                it.type == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16) {
                         name = std::regex_replace(name, it.pattern, it.names[0]);
                         tasks.push_back (
                             ReadGGUFTask (

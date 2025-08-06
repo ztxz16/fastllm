@@ -2,7 +2,7 @@
 
 namespace fastllm {
     std::vector <GGUFWeightReplaceRule> GetGGUFWeightReplaceRules(const std::string &arch) {
-        static std::map <std::string, std::vector <GGUFWeightReplaceRule> > archRulesDict = {
+        static std::map <std::string, std::vector <GGUFWeightReplaceRule> > originalArchRulesDict = {
             {
                 "default", 
                 {
@@ -125,7 +125,7 @@ namespace fastllm {
                     GGUFWeightReplaceRule (
                         std::regex(R"(blk\.(\d+)\.attn_kv_b\.(weight|bias))"),
                         "model.layers.$1.self_attn.kv_b_proj.$2",
-                        GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32
+                        GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16
                     ), // kv_b
                     GGUFWeightReplaceRule (
                         std::regex(R"(blk\.(\d+)\.attn_output\.(weight|bias))"),
@@ -180,6 +180,16 @@ namespace fastllm {
                 }
             },
         };
+
+        static std::map <std::string, std::vector <GGUFWeightReplaceRule> > archRulesDict = {
+            {"qwen2", originalArchRulesDict["default"]},
+        };
+
+        for (auto &it : originalArchRulesDict) {
+            if (archRulesDict.find(it.first) == archRulesDict.end()) {
+                archRulesDict[it.first] = it.second;
+            }
+        }
 
         if (archRulesDict.find(arch) != archRulesDict.end()) {
             return archRulesDict[arch];

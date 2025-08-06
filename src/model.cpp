@@ -830,7 +830,7 @@ namespace fastllm {
     std::string ConvertGGUFTypeToFastllmType(const std::string &type) {
         static std::map <std::string, std::string> ggufTypeToFastllmTypeDict = {
             {"qwen2", "qwen2"}, // llama
-            {"qwen3moe", "qwen3_moe"}, // qwen3_moe
+            {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
             {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"} // deepseek_v2
         };
         if (ggufTypeToFastllmTypeDict.find(type) != ggufTypeToFastllmTypeDict.end()) {
