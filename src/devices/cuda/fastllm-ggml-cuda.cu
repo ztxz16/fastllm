@@ -41,6 +41,8 @@ extern void *FastllmCudaPrepareOutput(fastllm::Data &output);
 extern void FastllmCudaFinishInput(const fastllm::Data &input, void *data);
 extern void FastllmCudaFinishOutput(fastllm::Data &output, void *data);
 extern __global__ void FastllmCudaBiasKernel(float *a, float *bias, int k);
+extern __global__ void FastllmCudaBiasKernel(half *a, half *bias, int k);
+extern __global__ void FastllmCudaFloat2HalfKernel(float* a, half *b, int len);
 
 static __device__ __forceinline__ float warp_reduce_max(float x) {
 #pragma unroll
@@ -61,7 +63,8 @@ static __device__ __forceinline__ float warp_reduce_sum(float x) {
 #define CUDA_QUANTIZE_BLOCK_SIZE     256
 #define CUDA_QUANTIZE_BLOCK_SIZE_MMQ 128
 
-static __global__ void quantize_q8_1(const float * __restrict__ x, void * __restrict__ vy, const int64_t kx, const int64_t kx0_padded) {
+template <typename T>
+static __global__ void quantize_q8_1(const T * __restrict__ x, void * __restrict__ vy, const int64_t kx, const int64_t kx0_padded) {
     const int64_t ix0 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
 
     if (ix0 >= kx0_padded) {
@@ -77,7 +80,7 @@ static __global__ void quantize_q8_1(const float * __restrict__ x, void * __rest
     const int64_t ib = i_padded / QK8_1; // block index
     const int64_t iqs = i_padded % QK8_1; // quant index
 
-    const float xi = ix0 < kx ? x[ix1*kx + ix0] : 0.0f;
+    const float xi = ix0 < kx ? (float)x[ix1*kx + ix0] : 0.0f;
     float amax = fabsf(xi);
     float sum = xi;
 
@@ -97,8 +100,9 @@ static __global__ void quantize_q8_1(const float * __restrict__ x, void * __rest
     reinterpret_cast<half&>(y[ib].ds.y) = sum;
 }
 
+template <typename T>
 void quantize_row_q8_1_cuda(
-    const float * x, void * vy, const int64_t kx0, const int64_t kx1, const int64_t channels,
+    const T * x, void * vy, const int64_t kx0, const int64_t kx1, const int64_t channels,
     const int64_t kx0_padded, const ggml_type type_x, cudaStream_t stream) {
 
     assert(kx0_padded % QK8_1 == 0);
@@ -323,9 +327,9 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q6_K> {
     static constexpr int qi = QI6_K;
 };
 
-template <ggml_type type, int ncols_y, int nwarps>
+template <ggml_type type, int ncols_y, int nwarps, typename OType>
 static __device__ void mul_mat_vec_q(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const void * __restrict__ vx, const void * __restrict__ vy, OType * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -395,14 +399,14 @@ static __device__ void mul_mat_vec_q(
         }
 
         if (threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || row0 + threadIdx.x < nrows_dst)) {
-            dst[j*nrows_dst + row0 + threadIdx.x] = tmp[j][threadIdx.x];
+            dst[j*nrows_dst + row0 + threadIdx.x] = (OType)tmp[j][threadIdx.x];
         }
     }
 }
 
-template <ggml_type type, int ncols_y, int nwarps>
+template <ggml_type type, int ncols_y, int nwarps, typename OType>
 static __global__ void mul_mat_vec_q(
-    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst, const char * __restrict__ ids_data,
+    const void * __restrict__ vx, const void * __restrict__ vy, OType * __restrict__ dst, const char * __restrict__ ids_data,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst,
     const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0) {
     int i2 = blockIdx.y;
@@ -428,12 +432,12 @@ static __global__ void mul_mat_vec_q(
     }
     const char * cx = (const char *)vx + i02*nb02;
     const char * cy = (const char *)vy + i2*nb12;
-    mul_mat_vec_q<type, ncols_y, nwarps>(cx, cy, (float *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
+    mul_mat_vec_q<type, ncols_y, nwarps, OType>(cx, cy, (OType *)cdst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
-template <ggml_type type, int nwarps>
+template <ggml_type type, int nwarps, typename OType>
 static void mul_mat_vec_q_cuda_T(
-    const void * vx, const void * vy, float * dst, const char * ids_data,
+    const void * vx, const void * vy, OType * dst, const char * ids_data,
     const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
     const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0, cudaStream_t stream) {
 
@@ -447,28 +451,28 @@ static void mul_mat_vec_q_cuda_T(
 
     switch (ncols_y) {
         case 1:
-            mul_mat_vec_q<type, 1, nwarps><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 1, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 2:
-            mul_mat_vec_q<type, 2, nwarps><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 2, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 3:
-            mul_mat_vec_q<type, 3, nwarps><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 3, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 4:
-            mul_mat_vec_q<type, 4, nwarps><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 4, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 5:
-            mul_mat_vec_q<type, 5, nwarps><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 5, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 6:
-            mul_mat_vec_q<type, 6, nwarps><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 6, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 7:
-            mul_mat_vec_q<type, 7, nwarps><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 7, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         case 8:
-            mul_mat_vec_q<type, 8, nwarps><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            mul_mat_vec_q<type, 8, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
         default:
             printf("fatal error\n");
@@ -477,51 +481,54 @@ static void mul_mat_vec_q_cuda_T(
     }
 }
 
-template <ggml_type type>
+template <ggml_type type, typename OType>
 static void mul_mat_vec_q_cuda(
-    const void * vx, const void * vy, float * dst, const char * ids_data,
+    const void * vx, const void * vy, OType * dst, const char * ids_data,
     const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
     const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0, cudaStream_t stream) {
     int nwarps = 1;
     switch (nwarps) {
         case 1:
-            mul_mat_vec_q_cuda_T<type, 1>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst,
+            mul_mat_vec_q_cuda_T<type, 1, OType>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst,
                     ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;
         case 2:
-            mul_mat_vec_q_cuda_T<type, 2>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst,
+            mul_mat_vec_q_cuda_T<type, 2, OType>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst,
                     ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;
         default:
-            mul_mat_vec_q_cuda_T<type, 4>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst,
+            mul_mat_vec_q_cuda_T<type, 4, OType>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst,
                     ne2, nb02, nb12, nb2, ids_nb0, stream);
     }
 }
 
+template <typename OType>
 static void mul_mat_vec_q4_K_q8_1_cuda(
-    const void * vx, const void * vy, float * dst, const char * ids_data,
+    const void * vx, const void * vy, OType * dst, const char * ids_data,
     const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
     const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, int64_t ids_nb0, cudaStream_t stream) {
 
-    mul_mat_vec_q_cuda<GGML_TYPE_Q4_K>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+    mul_mat_vec_q_cuda<GGML_TYPE_Q4_K, OType>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
 }
 
+template <typename OType>
 static void mul_mat_vec_q6_K_q8_1_cuda(
-    const void * vx, const void * vy, float * dst, const char * ids_data,
+    const void * vx, const void * vy, OType * dst, const char * ids_data,
     const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
     const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, int64_t ids_nb0, cudaStream_t stream) {
 
-    mul_mat_vec_q_cuda<GGML_TYPE_Q6_K>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+    mul_mat_vec_q_cuda<GGML_TYPE_Q6_K, OType>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
 }
 
 struct ggml_backend_cuda_context {
 
 };
 
+template <typename OType>
 static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggml_type type,
         const int64_t ne00, const int64_t ne0, const int64_t ne2,
         const int64_t nb02, const int64_t nb12, const int64_t nb2, const int64_t ids_nb0,
-        const char * src0_dd_i, const char * src1_ddq_i, float * dst_dd_i, const char * ids_data,
+        const char * src0_dd_i, const char * src1_ddq_i, OType * dst_dd_i, const char * ids_data,
         const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
         const int64_t src1_padded_row_size, cudaStream_t stream) {
 
@@ -535,13 +542,13 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
 
     switch (type) {
         case GGML_TYPE_Q4_K:
-            mul_mat_vec_q4_K_q8_1_cuda(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            mul_mat_vec_q4_K_q8_1_cuda<OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;
         case GGML_TYPE_Q6_K:
-            mul_mat_vec_q6_K_q8_1_cuda(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            mul_mat_vec_q6_K_q8_1_cuda<OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;
         default:
-            printf("fatal error\n");
+            printf("Error: unsupport cuda linear type %s\n", ggml_type_name(type));
             exit(0);
             break;
     }
@@ -552,7 +559,7 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream) {
-
+/*
     const int64_t ne00 = src0->ne[0];
     const int64_t ne10 = src1->ne[0];
     assert(ne10 % QK8_1 == 0);
@@ -566,6 +573,7 @@ void ggml_cuda_op_mul_mat_vec_q(
         src1_padded_row_size, stream);
 
     GGML_UNUSED(src1_ddf_i);
+*/
 }
 
 template <typename T>
@@ -627,4 +635,66 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
+}
+
+bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    if (weight.cudaData == nullptr || 
+        (weight.extraCudaHalfData.size() == 0 && bias.dims.size() > 0)) {
+        half *cudaBiasData;
+        cudaError_t state = cudaSuccess;
+        state = cudaMalloc(&cudaBiasData, k * sizeof(half));
+        if (bias.dims.size() > 0) {
+            float *tempBiasData;
+            state = cudaMalloc(&tempBiasData, k * sizeof(float));
+            state = cudaMemcpy(tempBiasData, (uint8_t *) bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            int threadPerBlock = std::min(256, k);
+            FastllmCudaFloat2HalfKernel <<< (k - 1) / threadPerBlock + 1, threadPerBlock>>>(tempBiasData, cudaBiasData, k);
+            state = cudaFree(tempBiasData);
+        } else {
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(half));
+        }
+        checkCudaErrors("Error: CUDA error when moving bias to device!", state);
+        weight.extraCudaHalfData.push_back((void *) cudaBiasData);
+    }
+
+    // float *cudaBiasData = (float*)weight.extraCudaData[0];
+    half *cudaBiasData = bias.dims.size() == 0 ? nullptr : (half *) weight.extraCudaHalfData[0];
+    half *cudaInput = (half*)FastllmCudaPrepareInput(input);
+    half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
+
+    block_q8_1 * q8Input = (block_q8_1*)FastllmCudaMalloc(n * m * sizeof(half));
+    quantize_row_q8_1_cuda (
+        cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, nullptr
+    );
+
+    ggml_backend_cuda_context ctx;
+    if (n > 1) {
+        for (int i = 0; i < n; i++) {
+            ggml_cuda_op_mul_mat_vec_q_impl (
+                    ctx, (ggml_type)weight.ggmlType, m, k, 1, 
+                    0, 0, 0, 0,
+                    (char*)weight.cudaData, 
+                    (char*)(q8Input + i * (m / QK8_1)), 
+                    cudaOutput + i * k, 
+                    nullptr, 
+                    0, k, 1, m, nullptr 
+            );        
+        }
+    } else {
+        ggml_cuda_op_mul_mat_vec_q_impl (
+                ctx, (ggml_type)weight.ggmlType, m, k, 1, 
+                0, 0, 0, 0,
+                (char*)weight.cudaData, (char*)q8Input, cudaOutput, nullptr, 
+                0, k, n, m, nullptr 
+        );
+    }
+    if (bias.dims.size() > 0) {
+        FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
+    }
+
+    FastllmCudaFree(q8Input);
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+
+    return true;   
 }

@@ -447,9 +447,9 @@ namespace fastllm {
     #endif
             int ret = fread(weight->cpuData, 1, ggml_nbytes(tensor), fi);
             fclose(fi);
-
+/*
             auto repack = get_repack_info(tensor->type);
-            if (repack != nullptr && true) {
+            if (repack != nullptr && regex_search(tensor->name, std::regex(R"(blk.(\d+).ffn_(gate|up|down)_exps.weight)"))) {
                 int nrows = tensor->ne[1], n_per_row = tensor->ne[0];
                 auto row_size = ggml_row_size(tensor->type, n_per_row);
                 std::vector<uint8_t> qtmp(repack->num_rows * row_size);
@@ -466,6 +466,7 @@ namespace fastllm {
                 // printf("name = %s, type = %s\n", tensor->name.c_str(), ggml_type_name(tensor->type));
                 // weight->PrintShape();
             }
+*/
         } else if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32) {
             weight->dataType = DataType::FLOAT32;    
             weight->Resize(tensor->dims);

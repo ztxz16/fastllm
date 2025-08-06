@@ -324,6 +324,7 @@ namespace fastllm {
         bool isGGUFData = false; // gguf格式的数据
         void *ggmlTensor = nullptr;
         int ggmlType = -1;
+        bool IsRepacked = false;
         
         Data () {};
 
@@ -381,6 +382,8 @@ namespace fastllm {
         void ToDevice(DataDevice device, const std::vector <int> &deviceIds); // 移动到指定device
 
         void ToDevice(void *device);
+
+        void Repack(); // 重新打包数据，便于计算
 
         void SetMapFile(std::shared_ptr<FileMmap> file) {
         	mapFile = file;
