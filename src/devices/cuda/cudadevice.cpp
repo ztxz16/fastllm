@@ -413,6 +413,8 @@ namespace fastllm {
                 FastllmCudaHalfMatMulFloatInt4NoZero(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 FastllmCudaHalfMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+                FastllmCudaHalfMatMulGGUF(input, weight, bias, output, n, m, k);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
