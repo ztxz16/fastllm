@@ -1518,6 +1518,33 @@ namespace fastllm {
         this->dataDevice = device;
     }
 
+    void Data::Repack() {
+        if (this->IsRepacked || this->dataType != DATA_GGUF_FORMAT) {
+            return;
+        }
+        this->IsRepacked = true;
+        ggml_tensor *tensor = (ggml_tensor*)this->ggmlTensor;
+        auto repack = get_repack_info(tensor->type);
+        if (repack != nullptr) {
+// printf("repack %s.\n", tensor->name.c_str());
+            int nrows = tensor->ne[1], n_per_row = tensor->ne[0];
+            auto row_size = ggml_row_size(tensor->type, n_per_row);
+            std::vector<uint8_t> qtmp(repack->num_rows * row_size);
+            uint8_t *qcur = (uint8_t*)this->cpuData;
+            for (int row = 0; row < nrows; row += repack->num_rows) {
+                memcpy(qtmp.data(), qcur, repack->num_rows * row_size);
+                repack->repack(repack->num_rows, n_per_row, (const char *)qtmp.data(), (char *)qcur, false);
+                qcur += repack->num_rows * row_size;
+            }
+
+            ((ggml_tensor*)this->ggmlTensor)->type = repack->new_type;
+            this->ggmlType = (int)repack->new_type;
+        } else {
+            // printf("name = %s, type = %s\n", tensor->name.c_str(), ggml_type_name(tensor->type));
+            // weight->PrintShape();
+        }
+    }
+
     void Data::SetKVCache() {
         this->isKVCache = true;
         this->cacheUid = ((long long)this) * rand() * rand() * rand() * rand();

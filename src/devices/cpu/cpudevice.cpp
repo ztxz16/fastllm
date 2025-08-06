@@ -1197,13 +1197,11 @@ namespace fastllm {
 
                 std::vector <uint8_t> &q8kInputs = moeIntSingleVarManager.uinput;
                 int rowCount = m / QK_K; // 每行有多少个block
-                q8kInputs.resize(n * rowCount * sizeof(block_q8_K));
-                for (int i = 0; i < n; i++) {
-                    iqk_quantize_row_q8_K (
-                        inputData + i * m, q8kInputs.data() + i * rowCount * sizeof(block_q8_K), m, 
-                        ggml_type_vec_dot_type((ggml_type)weights[2]->ggmlType)
-                    );
-                }
+                q8kInputs.resize(rowCount * sizeof(block_q8_K));
+                iqk_quantize_row_q8_K (
+                    inputData, q8kInputs.data(), m, 
+                    ggml_type_vec_dot_type((ggml_type)weights[2]->ggmlType)
+                );
 
                 std::vector <std::vector <float> > &middles = moeIntSingleVarManager.middles;
                 std::vector <std::vector <float> > &results = moeIntSingleVarManager.results;
@@ -1249,7 +1247,7 @@ namespace fastllm {
                         int curK = weight->dims[0];
                         int curThread = (curK / k) * base;
                         
-                        LaunchLinearQ8KGGUF(q8kInputs.data(), weightData, outputData, biasData, weight->ggmlTensor, 
+                        LaunchLinearQ8KGGUF(q8kInputs.data(), weightData, outputData, biasData, weight, 
                             1, m, curK, ops, pool, threadSt, curThread);
                         threadSt += curThread;
                     }
@@ -1285,13 +1283,11 @@ namespace fastllm {
                         auto &uinputDown = q8kInputsDown[l];
                         int rowCount = mid / QK_K; // 每行有多少个block
 
-                        uinputDown.resize(n * rowCount * sizeof(block_q8_K));
-                        for (int i = 0; i < n; i++) {
-                            iqk_quantize_row_q8_K (
-                                middles[l].data() + i * mid, uinputDown.data() + i * rowCount * sizeof(block_q8_K), mid, 
+                        uinputDown.resize(rowCount * sizeof(block_q8_K));
+                        iqk_quantize_row_q8_K (
+                                middles[l].data(), uinputDown.data(), mid, 
                                 ggml_type_vec_dot_type((ggml_type)weights[idx * 2 + 1]->ggmlType)
-                            );
-                        }
+                        );
                     }
 
                     threadSt = 0;
@@ -1304,7 +1300,7 @@ namespace fastllm {
                         auto &uinputDown = q8kInputsDown[l];
                         int curThread = (curK / k) * base;
 
-                        LaunchLinearQ8KGGUF(uinputDown.data(), weightDown->cpuData, results[l].data(), nullptr, weightDown->ggmlTensor, 
+                        LaunchLinearQ8KGGUF(uinputDown.data(), weightDown->cpuData, results[l].data(), nullptr, weightDown, 
                             1, mid, m, ops, pool, threadSt, curThread);
                         threadSt += curThread;               
                     }
@@ -3064,7 +3060,7 @@ namespace fastllm {
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
                 RunLinearFloat32GGUF((float*)input.cpuData, (uint8_t*)weight.cpuData, (float*)output.cpuData, bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, 
-                    (void*)weight.ggmlTensor, n, m, k, GetAlivePool(), threadSt, threadLen);
+                    &weight, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
@@ -3089,6 +3085,9 @@ namespace fastllm {
             } else if (weight.dataType == DataType::FP8_E4M3) {
                 RunLinearFloat16FP8E4M3((uint16_t*)input.cpuData, weight, (uint16_t*)output.cpuData, 
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+            } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+                RunLinearFloat16GGUF((uint16_t*)input.cpuData, (uint8_t*)weight.cpuData, (uint16_t*)output.cpuData, bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, 
+                    &weight, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }

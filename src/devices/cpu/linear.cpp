@@ -1051,10 +1051,21 @@ namespace fastllm {
         Float32ToFloat16(floatOutput.data(), outputData, n * k);
     }
 
-    void LaunchLinearQ8KGGUF(uint8_t *a, uint8_t *b, float *c, float *bias, void *ggmlTensor, 
+    void RunLinearFloat16GGUF(uint16_t *inputData, uint8_t *weightData, uint16_t *outputData, float *biasData, 
+                                Data *weight, int n, int m, int k, 
+                                AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector <float> floatInput, floatOutput;
+        floatInput.resize(n * m);
+        floatOutput.resize(n * k);
+        Float16ToFloat32(inputData, floatInput.data(), n * m);
+        RunLinearFloat32GGUF(floatInput.data(), weightData, floatOutput.data(), biasData, weight, n, m, k, pool, startTid, threadNum);
+        Float32ToFloat16(floatOutput.data(), outputData, n * k);
+    }
+
+    void LaunchLinearQ8KGGUF(uint8_t *a, uint8_t *b, float *c, float *bias, Data *weight, 
                             int n, int m, int k,
                             std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
-        ggml_tensor *tensor = (ggml_tensor*)ggmlTensor;
+        weight->Repack();
         int rows = 8;
         int ks = (k / rows);
         int per = ks / threadNum;
@@ -1064,7 +1075,7 @@ namespace fastllm {
             if (i == threadNum - 1) {
                 end = ks;
             }
-            ops[startTid + i] = new MultiThreadLinearFloat32GGUFOp(a, b, bias, c, ggmlTensor, n, m, k, cur * rows, end * rows);
+            ops[startTid + i] = new MultiThreadLinearFloat32GGUFOp(a, b, bias, c, weight->ggmlTensor, n, m, k, cur * rows, end * rows);
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
@@ -1073,9 +1084,10 @@ namespace fastllm {
     }
 
     void RunLinearFloat32GGUF(float *inputData, uint8_t *weightData, float *outputData, float *biasData, 
-                                void *ggmlTensor, int n, int m, int k, 
+                                Data *weight, int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum) {
-        ggml_tensor *tensor = (ggml_tensor*)ggmlTensor;
+        weight->Repack();
+        ggml_tensor *tensor = (ggml_tensor*)weight->ggmlTensor;
         // printf("gguf tensor %s: %s\n", tensor->name.c_str(), ggml_type_name(tensor->type));
         
         std::vector <block_q8_K> q8kInputs;
