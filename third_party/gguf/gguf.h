@@ -1167,8 +1167,90 @@ GGML_TABLE_BEGIN(uint64_t, iq1s_grid, NGRID_IQ1S)
     0x010101010101ffff, 0x010101010101ff01, 0x01010101010101ff, 0x0101010101010101,
 GGML_TABLE_END()
 
+#ifdef GGML_COMMON_DECL_CUDA
+typedef half ggml_half;
+typedef half2 ggml_half2;
+
+#define QI4_0 (QK4_0 / (4 * QR4_0))
+#define QR4_0 2
+
+#define QI4_1 (QK4_1 / (4 * QR4_1))
+#define QR4_1 2
+
+#define QI5_0 (QK5_0 / (4 * QR5_0))
+#define QR5_0 2
+
+#define QI5_1 (QK5_1 / (4 * QR5_1))
+#define QR5_1 2
+
+#define QI6_0 (QK6_0 / (4 * QR6_0))
+#define QR6_0 2
+
+#define QI8_0 (QK8_0 / (4 * QR8_0))
+#define QR8_0 1
+
+#define QI8_1 (QK8_1 / (4 * QR8_1))
+#define QR8_1 1
+
+#define QI2_K (QK_K / (4*QR2_K))
+#define QR2_K 4
+
+#define QI3_K (QK_K / (4*QR3_K))
+#define QR3_K 4
+
+#define QI4_K (QK_K / (4*QR4_K))
+#define QR4_K 2
+
+#define QI5_K (QK_K / (4*QR5_K))
+#define QR5_K 2
+
+#define QI6_K (QK_K / (4*QR6_K))
+#define QR6_K 2
+
+#define QI2_XXS (QK_K / (4*QR2_XXS))
+#define QR2_XXS 4
+
+#define QI2_XS (QK_K / (4*QR2_XS))
+#define QR2_XS 4
+
+#define QI2_S (QK_K / (4*QR2_S))
+#define QR2_S 4
+
+#define QI3_XXS (QK_K / (4*QR3_XXS))
+#define QR3_XXS 4
+
+#define QI3_XS (QK_K / (4*QR3_XS))
+#define QR3_XS 4
+
+#define QI1_S (QK_K / (4*QR1_S))
+#define QR1_S 8
+
+#define QI1_M (QK_K / (4*QR1_M))
+#define QR1_M 8
+
+#define QI4_NL (QK4_NL / (4*QR4_NL))
+#define QR4_NL 2
+
+#define QI4_XS (QK_K / (4*QR4_XS))
+#define QR4_XS 2
+
+#define QI5_XS (QK_K / (4*QR5_XS))
+#define QR5_XS 2
+
+#define QI6_XS (QK_K / (4*QR6_XS))
+#define QR6_XS 2
+
+#define QI3_S (QK_K / (4*QR3_S))
+#define QR3_S 4
+
+#define QI1_BN (QK_IQ1BN / (4*QR1_BN))
+#define QR1_BN 8
+#define GGML_SCALE_TYPE1(m, dm) union { struct { ggml_half d; ggml_half m; } data; ggml_half2 dm; }
+#else
 typedef uint16_t ggml_half;
 typedef uint32_t ggml_half2;
+#define GGML_SCALE_TYPE1(m, dm) ggml_half d; ggml_half m
+#endif
 
 #define QK_K 256
 #define K_SCALE_SIZE 12
@@ -1303,8 +1385,7 @@ static_assert(sizeof(block_q3_k_r4) == 4*sizeof(ggml_half) + QK_K/16 + QK_K/8 + 
 // weight is represented as x = a * q + b
 // Effectively 4.5 bits per weight
 typedef struct {
-    ggml_half d;    // super-block scale for quantized scales
-    ggml_half dmin; // super-block scale for quantized mins
+    GGML_SCALE_TYPE1(dmin, dm);
     uint8_t scales[K_SCALE_SIZE]; // scales and mins, quantized with 6 bits
     uint8_t qs[QK_K/2];           // 4--bit quants
 } block_q4_K;
@@ -1827,6 +1908,7 @@ namespace fastllm {
             GGUFWeightReplaceDirect = 0, // 直接替换
             GGUFWeightReplacePacked = 1, // 拆包替换，例如[128, 2048, 2048]的矩阵替换为128个2048 * 2048，常见于moe
             GGUFWeightReplaceForceFP32 = 2, // 强行转为FP32, 主要是Embedding
+            GGUFWeightReplaceForceFP16 = 3 // 强行转为FP16
         };
 
         GGUFWeightReplaceType type;

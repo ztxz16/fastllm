@@ -209,7 +209,8 @@ if (USE_CUDA)
     endif()
     include_directories(include/devices/cuda)
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
-    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/cuda/fastllm-cuda.cu)
+    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
+        src/devices/cuda/fastllm-cuda.cu src/devices/cuda/fastllm-ggml-cuda.cu)
 
     include_directories(include/devices/multicuda)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES} src/devices/multicuda/multicudadevice.cpp src/devices/multicuda/fastllm-multicuda.cu)
@@ -230,7 +231,9 @@ if(USE_ROCM)
     hipify(CUDA_SOURCE_DIR ${PROJECT_SOURCE_DIR}/src/devices/multicuda HIP_SOURCE_DIR "${PROJECT_SOURCE_DIR}/src/devices/multihip")
     include_directories(include/devices/cuda)
     include_directories(include/devices/multicuda)
-    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/hip/fastllm-hip.hip src/devices/multicuda/multicudadevice.cpp src/devices/multihip/fastllm-multihip.hip)
+    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
+        src/devices/hip/fastllm-hip.hip src/devices/hip/fastllm-ggml-hip.hip 
+        src/devices/multicuda/multicudadevice.cpp src/devices/multihip/fastllm-multihip.hip)
     add_compile_definitions(USE_ROCM)
     add_compile_definitions(USE_CUDA)
     if (DEFINED $ENV{ROCM_PATH})
