@@ -5,6 +5,17 @@
 
 fastllm::FP16ToFP32Manager fp16tofp32;
 
+//
+// ===================== Helper functions
+//
+static inline int nearest_int(float fval) {
+    assert(fval <= 4194303.f);
+    float val = fval + 12582912.f;
+    int i; memcpy(&i, &val, sizeof(int));
+    return (i & 0x007fffff) - 0x00400000;
+}
+
+
 float GGML_FP16_TO_FP32(ggml_half f) {
     uint16_t s;
     memcpy(&s, &f, sizeof(uint16_t));
@@ -210,7 +221,7 @@ void iqk_quantize_row_q8_K_T(const float * x, void * vy, int64_t k) {
         const float iscale = -127.f/max;
         for (int j = 0; j < QK_K; ++j) {
             int v = nearest_int(iscale*x[j]);
-            y[i].qs[j] = MIN(127, v);
+            y[i].qs[j] = std::min(127, v);
         }
         float d = 1/iscale;
         if constexpr (q8_type == 1) {
