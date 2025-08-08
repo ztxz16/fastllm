@@ -979,6 +979,20 @@ namespace fastllm {
         }
         for (int i = 0; i < readGGUFTasks.size(); i++) {
             std::string &weightName = readGGUFTasks[i].name;
+/*
+if (false) {
+    std::string prefix = "model.layers.";
+    if (StartWith(weightName, prefix)) {
+        int id = 0;
+        for (int i = prefix.size(); weightName[i] >= '0' && weightName[i] <= '9'; i++) {
+            id = id * 10 + weightName[i] - '0';
+        }
+        if (id > 3) {
+            continue;
+        }
+    }
+}
+*/
             tensors.push_back(weightName);
             allWeightNames.insert(weightName);
             model->weight.AddEmptyWeight(weightName, {1}, DataType::FLOAT32);

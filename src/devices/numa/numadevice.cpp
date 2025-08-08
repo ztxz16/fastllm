@@ -81,7 +81,8 @@ namespace fastllm {
                 weight->dataType == DataType::INT4_GROUP ||
                 weight->dataType == DataType::FLOAT32 ||
                 weight->dataType == DataType::FLOAT16 || 
-                weight->dataType == DataType::FP8_E4M3;
+                weight->dataType == DataType::FP8_E4M3 ||
+                weight->dataType == DataType::DATA_GGUF_FORMAT;
     }
 
     void NumaLinearOp::Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
@@ -128,7 +129,8 @@ namespace fastllm {
         }
 
         if (input.dataType == DataType::FLOAT32 && output.dataType == DataType::FLOAT32) {
-            if (weight.dataType == DataType::FLOAT32 || weight.dataType == DataType::FLOAT16 || weight.dataType == DataType::FP8_E4M3) {
+            if (weight.dataType == DataType::FLOAT32 || weight.dataType == DataType::FLOAT16 || weight.dataType == DataType::FP8_E4M3
+                || weight.dataType == DataType::DATA_GGUF_FORMAT) {
                 GetNumaClient()->RunNumaLinearF(n, m, k, &weight, &bias, (float*)input.cpuData, (float*)output.cpuData, exType, input.dataType);
 /*
                 std::vector <float> tempOutputs;
@@ -206,6 +208,8 @@ namespace fastllm {
 // inner = spend;
 // if (n > 0) printf("n = %d, m = %d, k = %d, spend %f s, gops = %f (inner)\n", n, m, k, spend, gops);
                 }
+            } else {
+                ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
         } else if (input.dataType == DataType::FLOAT16 && output.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT32 || weight.dataType == DataType::FLOAT16) {
@@ -274,6 +278,8 @@ namespace fastllm {
 // inner = spend;
 // if (n > 0) printf("n = %d, m = %d, k = %d, spend %f s, gops = %f (inner)\n", n, m, k, spend, gops);
                 }
+            } else {
+                ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
         } else {
             ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
@@ -324,7 +330,8 @@ namespace fastllm {
         int n = input.dims[0], m = input.dims[1], k = output.dims[1];
 
         if (weights[2]->dataType == DataType::FP8_E4M3 ||
-            weights[2]->dataType == DataType::FLOAT16) {
+            weights[2]->dataType == DataType::FLOAT16 ||
+            weights[2]->dataType == DataType::DATA_GGUF_FORMAT) {
             if (n > 31) {
                 std::vector <std::vector <fastllm::Data*> > ws;
                 std::vector <std::vector <float> > factors;
