@@ -128,6 +128,16 @@ namespace fastllm {
                         GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16
                     ), // kv_b
                     GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_k_b\.(weight|bias))"),
+                        "model.layers.$1.self_attn.kv_b_proj.$2__1",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16
+                    ), // k_b, v_b，有时候这两个分开了
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_v_b\.(weight|bias))"),
+                        "model.layers.$1.self_attn.kv_b_proj.$2__0",
+                        GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16
+                    ), // k_b, v_b，有时候这两个分开了
+                    GGUFWeightReplaceRule (
                         std::regex(R"(blk\.(\d+)\.attn_output\.(weight|bias))"),
                         "model.layers.$1.self_attn.o_proj.$2"
                     ), // o 
@@ -183,6 +193,7 @@ namespace fastllm {
 
         static std::map <std::string, std::vector <GGUFWeightReplaceRule> > archRulesDict = {
             {"qwen2", originalArchRulesDict["default"]},
+            {"kimi_k2", originalArchRulesDict["deepseek_v2"]},
         };
 
         for (auto &it : originalArchRulesDict) {
