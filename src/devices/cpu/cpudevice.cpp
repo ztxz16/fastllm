@@ -809,6 +809,22 @@ namespace fastllm {
         std::vector <uint16_t> bf16Input;
     } moeFloatSingleVarManager;
 
+    struct MultiThreadRepackWeightsOp : MultiThreadBaseOp {
+        Data **weights;
+        int st, end;      
+
+        MultiThreadRepackWeightsOp (Data **weights, int st, int end) : 
+            weights(weights), st(st), end(end) {}
+
+        void Run() {
+            for (int i = st; i < end; i++) {
+                if (weights[i] != nullptr) {
+                    weights[i]->Repack();
+                }
+            }
+        }
+    };
+
     void CpuMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuLinearOp());
@@ -828,6 +844,36 @@ namespace fastllm {
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
         float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
         output.Allocate();
+
+        if (weights[2]->dataType == DataType::DATA_GGUF_FORMAT && 
+            !weights[2]->IsRepacked) {
+            int dimsLen = logits.dims.size();
+            int outer = logits.Count(0) / logits.Count(dimsLen - 1);
+            int channels = logits.dims[dimsLen - 1];
+            int len = channels * 2;
+            
+            auto *pool = GetAlivePool();
+            int threadNum = pool->threads.size();
+            int per = len / threadNum;
+            int cur = 0;            
+            std::vector<fastllm::MultiThreadRepackWeightsOp*> ops;
+            for (int i = 0; i < threadNum; i++) {
+                int end = cur + per;
+                if (i == threadNum - 1) {
+                    end = len;
+                }
+                ops.push_back(new MultiThreadRepackWeightsOp(weights, cur, end));
+                cur = end;
+            }
+            for (int i = 0; i < ops.size(); i++) {
+                pool->PushOp(i, ops[i]);
+            }
+            for (int i = 0; i < ops.size(); i++) {
+                pool->Wait(i);
+                delete ops[i];
+            }
+        }
+
         if ((input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16) && 
                 (weights[2]->dataType == DataType::INT4_GROUP 
                 || weights[2]->dataType == DataType::INT4_NOZERO 
@@ -2903,6 +2949,13 @@ namespace fastllm {
 
     void MultiThreadFloat32ToBFloat16Op::Run() {
         Float32ToBFloat16(input, output, len);
+    }
+
+    void MultiThreadFloat32ToQ8KOp::Run() {
+        iqk_quantize_row_q8_K (
+            input, output, len, 
+            ggml_type_vec_dot_type((ggml_type)ggmlType)
+        );
     }
 
     void MultiThreadOnlineQuantizationOp::Run() {

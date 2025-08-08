@@ -332,6 +332,8 @@ namespace fastllm {
 
         Data (DataType type, const std::vector <int> &dims); // 构造函数
 
+        Data (DataType type, int ggmlType, const std::vector <int> &dims); // ggml类型
+
         Data (DataType type, const std::vector <int> &dims, DataDevice device, void *ptr); // 构造函数，使用已有数据地址的Fake data
 
         // 构造函数，创建好之后从data复制数据
