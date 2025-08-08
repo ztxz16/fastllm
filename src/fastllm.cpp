@@ -360,6 +360,12 @@ namespace fastllm {
         Resize(dims);
     }
 
+    Data::Data(fastllm::DataType type, int ggmlType, const std::vector <int> &dims) {
+        this->dataType = type;
+        this->ggmlType = (ggml_type)ggmlType;
+        Resize(dims);
+    }
+
     Data::Data (DataType type, const std::vector <int> &dims, DataDevice device, void *ptr): Data::Data(type, dims) {
         this->isFake = true;
         this->expansionSize = this->Count(0);

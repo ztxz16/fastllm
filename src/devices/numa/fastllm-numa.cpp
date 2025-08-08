@@ -270,6 +270,10 @@ namespace fastllm {
                 buffer.WriteFloat(data->scales[i]);
             }
             buffer.WriteBytes(data->cpuData, data->GetBytes());
+        } else if (dataType == DataType::DATA_GGUF_FORMAT) {
+            buffer.WriteInt((int) dataType);
+            buffer.WriteInt((int) data->ggmlType);
+            buffer.WriteBytes(data->cpuData, data->GetBytes());
         }
 
         SendLongMessage(buffer.buffer.data(), buffer.buffer.size());
