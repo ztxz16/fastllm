@@ -4,6 +4,12 @@
 #define restrict GGML_RESTRICT
 extern float GGML_FP16_TO_FP32(ggml_half f);
 
+void ggml_fp16_to_fp32_row(const uint16_t * x, float * y, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        y[i] = GGML_FP16_TO_FP32(x[i]);
+    }
+}
+
 void dequantize_row_q4_0(const block_q4_0 * restrict x, float * restrict y, int64_t k) {
     static const int qk = QK4_0;
 
@@ -259,8 +265,8 @@ void dequantize_row_q5_K(const block_q5_K * restrict x, float * restrict y, int6
         const uint8_t * ql = x[i].qs;
         const uint8_t * qh = x[i].qh;
 
-        const float d = GGML_FP16_TO_FP32(x[i].GGML_COMMON_AGGR_S.d);
-        const float min = GGML_FP16_TO_FP32(x[i].GGML_COMMON_AGGR_S.dmin);
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float min = GGML_FP16_TO_FP32(x[i].dmin);
 
         int is = 0;
         uint8_t sc, m;
