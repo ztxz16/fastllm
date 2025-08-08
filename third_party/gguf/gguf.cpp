@@ -59,7 +59,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = 1,
             .type_size                = sizeof(ggml_fp16_t),
             .is_quantized             = false,
-            // .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
+            .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
             // .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
         }},
         {GGML_TYPE_Q4_0, {
@@ -174,8 +174,20 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_q5_K),
             .is_quantized             = true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_q5_K,
+            .vec_dot                  = ggml_vec_dot_q5_K_q8_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
+            .to_float                 = (ggml_to_float_t) dequantize_row_q5_K,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q5_K_ref,
+        }},
+        {GGML_TYPE_Q5_K_R4, {
+            .type_name                = "q5_k_r4",
+            .blck_size                = QK_K,
+            .type_size                = sizeof(block_q5_K),
+            .is_quantized             = true,
+            .vec_dot                  = nullptr,
+            .vec_dot_type             = GGML_TYPE_Q8_K32
+            // .to_float                 = (ggml_to_float_t) dequantize_row_q2_K,
+            // .from_float_ref           = (ggml_from_float_t) quantize_row_q2_K_ref,
         }},
         {GGML_TYPE_Q6_K, {
             .type_name                = "q6_K",
@@ -202,7 +214,9 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq2_xxs),
             .is_quantized             = true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xxs,
+            .vec_dot                  = ggml_vec_dot_iq2_xxs_q8_K,
+            .vec_dot_type             = GGML_TYPE_Q8_K,
+            .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xxs,
             // .from_float_ref           = nullptr,
         }},
         {GGML_TYPE_IQ2_XS, {
