@@ -831,7 +831,7 @@ namespace fastllm {
         static std::map <std::string, std::string> ggufTypeToFastllmTypeDict = {
             {"qwen2", "qwen2"}, // llama
             {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
-            {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"} // deepseek_v2
+            {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"} // deepseek_v2
         };
         if (ggufTypeToFastllmTypeDict.find(type) != ggufTypeToFastllmTypeDict.end()) {
             return ggufTypeToFastllmTypeDict[type];
@@ -916,7 +916,7 @@ namespace fastllm {
             }
 
             // 2. 读取分词
-            if (true) {
+            if (false) {
                 LoadLLMTokenizerFromHFToModel(path, model);
             } else {
                 DealLLMTokenizerFromHFToModel(path, model);
@@ -962,6 +962,25 @@ namespace fastllm {
                 model->eos_token_id = params["tokenizer.ggml.eos_token_id"].number_value();
                 printf("Load eos_token_id = %d\n", model->eos_token_id);
             }
+
+            if (!params["tokenizer.chat_template"].is_null()) {
+                model->weight.tokenizer.chatTemplate = params["tokenizer.chat_template"].string_value();
+                printf("Load chatTemplate = %s\n", model->weight.tokenizer.chatTemplate.c_str());
+            }
+
+            int idx = 0;
+            for (auto &it : params["tokenizer.ggml.tokens"].array_items()) {
+                if (idx < 10) {
+                    // printf("%s: %d\n", it.string_value().c_str(), idx);
+                }
+                model->weight.AddTokenizerWord(it.string_value(), idx, 1.0f);
+                idx++;
+            }
+
+            model->weight.tokenizer.byteAsChar = true;
+            model->weight.AddDict("tokenizer_byte_as_char", "True");
+
+            // printf("config = %s\n", config.dump().c_str());
         }
 
         arch = ConvertGGUFTypeToFastllmType(arch);

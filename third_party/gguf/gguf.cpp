@@ -99,7 +99,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK8_0,
             .type_size                = sizeof(block_q8_0),
             .is_quantized             = true,
-            // .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
+            .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
         }},
         {GGML_TYPE_Q8_1, {
@@ -218,6 +218,16 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .vec_dot_type             = GGML_TYPE_Q8_K,
             .to_float                 = (ggml_to_float_t) dequantize_row_iq2_xxs,
             // .from_float_ref           = nullptr,
+        }},
+        {GGML_TYPE_IQ2_XXS_R4, {
+            .type_name                = "iq2_xxs_r4",
+            .blck_size                = QK_K,
+            .type_size                = sizeof(block_iq2_xxs),
+            .is_quantized             = true,
+            .vec_dot                  = nullptr,
+            .vec_dot_type             = GGML_TYPE_Q8_K
+            // .to_float                 = (ggml_to_float_t) dequantize_row_q2_K,
+            // .from_float_ref           = (ggml_from_float_t) quantize_row_q2_K_ref,
         }},
         {GGML_TYPE_IQ2_XS, {
             .type_name                = "iq2_xs",

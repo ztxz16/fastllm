@@ -71,7 +71,8 @@ namespace fastllm {
         int rowCount = m / QK_K; // 每行有多少个block
 
         auto vec_dot = ggml_type_vec_dot(tensor->type);
-        if (tensor->type == GGML_TYPE_Q2_K_R4 || 
+        if (tensor->type == GGML_TYPE_IQ2_XXS_R4 ||
+            tensor->type == GGML_TYPE_Q2_K_R4 || 
             tensor->type == GGML_TYPE_Q3_K_R4 ||
             tensor->type == GGML_TYPE_Q4_K_R4 ||
             tensor->type == GGML_TYPE_Q5_K_R4 ||
@@ -81,7 +82,9 @@ namespace fastllm {
                     (const char*)q8kInputData + i * ggml_row_size(GGML_TYPE_Q8_K, m), 
                     (size_t)k, ggml_row_size(GGML_TYPE_Q8_K, m), 
                     0, 1, nullptr, 0};
-                if (tensor->type == GGML_TYPE_Q2_K_R4) {
+                if (tensor->type == GGML_TYPE_IQ2_XXS_R4) {
+                    mul_mat_iq2_xxs_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
+                } else if (tensor->type == GGML_TYPE_Q2_K_R4) {
                     mul_mat_q2_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
                 } else if (tensor->type == GGML_TYPE_Q3_K_R4) {
                     mul_mat_q3_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
