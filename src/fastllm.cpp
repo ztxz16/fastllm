@@ -1532,7 +1532,7 @@ namespace fastllm {
         ggml_tensor *tensor = (ggml_tensor*)this->ggmlTensor;
         auto repack = get_repack_info(tensor->type);
         if (repack != nullptr) {
-// printf("repack %s.\n", tensor->name.c_str());
+// printf("repack %s (%s).\n", tensor->name.c_str(), ggml_type_name(tensor->type));
             int nrows = tensor->ne[1], n_per_row = tensor->ne[0];
             auto row_size = ggml_row_size(tensor->type, n_per_row);
             std::vector<uint8_t> qtmp(repack->num_rows * row_size);
