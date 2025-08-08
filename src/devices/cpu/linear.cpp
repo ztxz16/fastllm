@@ -74,6 +74,7 @@ namespace fastllm {
         if (tensor->type == GGML_TYPE_Q2_K_R4 || 
             tensor->type == GGML_TYPE_Q3_K_R4 ||
             tensor->type == GGML_TYPE_Q4_K_R4 ||
+            tensor->type == GGML_TYPE_Q5_K_R4 ||
             tensor->type == GGML_TYPE_Q6_K_R4) {
             for (int i = 0; i < n; i++) {
                 DataInfo info{&outputData[i * k + st], 
@@ -86,6 +87,8 @@ namespace fastllm {
                     mul_mat_q3_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
                 } else if (tensor->type == GGML_TYPE_Q4_K_R4) {
                     mul_mat_q4_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
+                } else if (tensor->type == GGML_TYPE_Q5_K_R4) {
+                    mul_mat_q5_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
                 } else if (tensor->type == GGML_TYPE_Q6_K_R4) {
                     mul_mat_q6_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
                 }
