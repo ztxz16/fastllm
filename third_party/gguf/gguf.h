@@ -1404,13 +1404,7 @@ static_assert(sizeof(block_q4_k_r4) == 8*sizeof(ggml_half) + QK_K/16 + QK_K/8 + 
 // weight is represented as x = a * q + b
 // Effectively 5.5 bits per weight
 typedef struct {
-    GGML_EXTENSION union {
-        struct {
-            ggml_half d;    // super-block scale for quantized scales
-            ggml_half dmin; // super-block scale for quantized mins
-        } GGML_COMMON_AGGR_S;
-        ggml_half2 dm;
-    } GGML_COMMON_AGGR_U;
+    GGML_SCALE_TYPE1(dmin, dm);
     uint8_t scales[K_SCALE_SIZE]; // scales and mins, quantized with 6 bits
     uint8_t qh[QK_K/8];           // quants, high bit
     uint8_t qs[QK_K/2];           // quants, low 4 bits
@@ -1805,10 +1799,14 @@ GGML_API size_t quantize_q5_1(const float * GGML_RESTRICT src, void * GGML_RESTR
 GGML_API size_t quantize_q8_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 
 void iqk_quantize_row_q8_K(const float * x, void * vy, int64_t k, ggml_type type);
+
 void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 typedef struct {
         int32_t i1;

@@ -180,6 +180,53 @@ inline void convert_q6_k(const block_q6_K& x, uint8_t * L) {
     }
 }
 
+inline void convert_q5_k(const block_q5_K& x, uint8_t * L, uint8_t * Ld, uint8_t * Lm) {
+    for (int ib64 = 0; ib64 < QK_K/64; ++ib64) {
+        get_scale_min_k4(2*ib64+0, x.scales, Ld[2*ib64+0], Lm[2*ib64+0]);
+        get_scale_min_k4(2*ib64+1, x.scales, Ld[2*ib64+1], Lm[2*ib64+1]);
+        for (int j = 0; j < 32; ++j) {
+            L[64*ib64+j+ 0] = (x.qs[32*ib64+j] & 0xf) | (((x.qh[j] >> (2*ib64+0)) & 1) << 4);
+            L[64*ib64+j+32] = (x.qs[32*ib64+j] >>  4) | (((x.qh[j] >> (2*ib64+1)) & 1) << 4);
+        }
+    }
+}
+
+static void repack_q5_k(int nrows, int n_per_row, const block_q5_K * x, block_q5_k_r4 * y, [[maybe_unused]] bool online) {
+    assert(nrows%4 == 0);
+    assert(n_per_row%QK_K == 0);
+    int nblock = n_per_row/QK_K;
+    const block_q5_K * x4[4];
+    uint8_t L[QK_K], Ld[QK_K/32], Lm[QK_K/32];
+    for (int row = 0; row < nrows; row += 4) {
+        for (int k = 0; k < 4; ++k) x4[k] = x + nblock*k;
+        for (int ibl = 0; ibl < nblock; ++ibl) {
+            std::memset(y[ibl].scales_l, 0, QK_K/8);
+            std::memset(y[ibl].scales_h, 0, QK_K/16);
+            for (int k = 0; k < 4; ++k) {
+                y[ibl].d[k+0] = x4[k][ibl].d;
+                y[ibl].d[k+4] = x4[k][ibl].dmin;
+                convert_q5_k(x4[k][ibl], L, Ld, Lm);
+                for (int ib = 0; ib < QK_K/32; ++ib) {
+                    y[ibl].scales_l[4*ib+k] = (Ld[ib] & 0xf) | ((Lm[ib] & 0xf) << 4);
+                    uint8_t h = (Ld[ib] >> 4) | ((Lm[ib] >> 4) << 2);
+                    y[ibl].scales_h[(4*ib+k)%16] |= (h << 4*((4*ib+k)/16));
+                    for (int i = 0; i < 4; ++i) {
+                        y[ibl].qs[64*ib+4*k+i+ 0] = (L[32*ib+i+ 0] & 0xf) | ((L[32*ib+i+ 8] & 0xf) << 4);
+                        y[ibl].qs[64*ib+4*k+i+16] = (L[32*ib+i+16] & 0xf) | ((L[32*ib+i+24] & 0xf) << 4);
+                        y[ibl].qs[64*ib+4*k+i+32] = (L[32*ib+i+ 4] & 0xf) | ((L[32*ib+i+12] & 0xf) << 4);
+                        y[ibl].qs[64*ib+4*k+i+48] = (L[32*ib+i+20] & 0xf) | ((L[32*ib+i+28] & 0xf) << 4);
+                        y[ibl].qh[16*ib+4*k+i+ 0] = ((L[32*ib+i+ 0] >> 4) << 0) | ((L[32*ib+i+ 8] >> 4) << 1) | ((L[32*ib+i+ 4] >> 4) << 2) | ((L[32*ib+i+12] >> 4) << 3) |
+                                                    ((L[32*ib+i+16] >> 4) << 4) | ((L[32*ib+i+24] >> 4) << 5) | ((L[32*ib+i+20] >> 4) << 6) | ((L[32*ib+i+28] >> 4) << 7);
+                    }
+                }
+            }
+        }
+        x += 4*nblock;
+        y += nblock;
+    }
+}
+
+
 static void repack_q6_k(int nrows, int n_per_row, const block_q6_K * x, block_q6_k_r4 * y, [[maybe_unused]] bool online) {
     assert(nrows%4 == 0);
     assert(n_per_row%QK_K == 0);
@@ -230,7 +277,7 @@ const Repack * get_repack_info(ggml_type type) {
         { GGML_TYPE_Q2_K,   { GGML_TYPE_Q2_K_R4,   4,  (Repack::repack_func)repack_q2_k}    },
         { GGML_TYPE_Q3_K,   { GGML_TYPE_Q3_K_R4,   4,  (Repack::repack_func)repack_q3_k}    },
         { GGML_TYPE_Q4_K,   { GGML_TYPE_Q4_K_R4,   4,  (Repack::repack_func)repack_q4_k}    },
-        // { GGML_TYPE_Q5_K,   { GGML_TYPE_Q5_K_R4,   4,  (Repack::repack_func)repack_q5_k}    },
+        { GGML_TYPE_Q5_K,   { GGML_TYPE_Q5_K_R4,   4,  (Repack::repack_func)repack_q5_k}    },
         { GGML_TYPE_Q6_K,   { GGML_TYPE_Q6_K_R4,   4,  (Repack::repack_func)repack_q6_k}    },
         // { GGML_TYPE_Q4_0,   { GGML_TYPE_Q4_0_R8,   8,  (Repack::repack_func)repack_q4_0}    },
         // { GGML_TYPE_Q5_0,   { GGML_TYPE_Q5_0_R4,   4,  (Repack::repack_func)repack_q5_0}    },
