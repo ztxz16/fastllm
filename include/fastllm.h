@@ -426,7 +426,8 @@ namespace fastllm {
             NORMAL = 1,
             QWEN = 2,
             GLM = 3,
-            BERT = 4
+            BERT = 4,
+            UNIGRAM = 5
         };
 
         struct TrieNode {
@@ -524,6 +525,10 @@ namespace fastllm {
         int GetTokenId(const std::string &s); // 获取s对应的tokenid
 
         std::string GetToken(int id); // 获取id对应的token
+    private:
+        std::vector<float> BytePairEncode(const std::string &s);
+
+        std::vector<float> UnigramEncode(const std::string &s);
     };
 
     std::string GetModelTypeFromFile(const std::string &fileName);
