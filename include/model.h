@@ -12,6 +12,10 @@
 namespace fastllm {
     std::unique_ptr<BertModel> CreateEmbeddingModelFromFile(const std::string &fileName);
 
+    std::unique_ptr<basellm> CreateLLMModelFromGGUF(const std::string &modelPath);
+
+    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(const std::string &fileName, const std::string &originalPath);
+
     std::unique_ptr<basellm> CreateLLMModelFromFile(const std::string &fileName);
 
     std::unique_ptr<basellm> CreateEmptyLLMModel(const std::string &modelType);

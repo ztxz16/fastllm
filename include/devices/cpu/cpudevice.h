@@ -28,6 +28,18 @@ namespace fastllm {
         void Run();
     };
 
+    struct MultiThreadFloat32ToQ8KOp : MultiThreadBaseOp {
+        float *input;
+        uint8_t *output;
+        int len;
+        int ggmlType;
+
+        MultiThreadFloat32ToQ8KOp (float *input, uint8_t *output, int len, int ggmlType) :
+                input(input), output(output), len(len), ggmlType(ggmlType) {}
+
+        void Run();
+    };
+
     struct MultiThreadOnlineQuantizationOp : MultiThreadBaseOp {
         float *input;
         uint8_t *output;
