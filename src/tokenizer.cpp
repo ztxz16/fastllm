@@ -171,6 +171,17 @@ namespace fastllm {
             }
             return converter.to_bytes(ws);
         }
+        if (blankRepeatCount > 1) {
+            std::string blankReplaced(ori);
+            for (int c = blankRepeatCount; c > 1; c--) {
+                std::string blank("<|blank_" + std::to_string(c) + "|>");
+                size_t pos = 0;
+                while ((pos = blankReplaced.find(std::string(c, ' '), pos)) != std::string::npos) {
+                    blankReplaced.replace(pos, c, blank);
+                    pos += blank.length();
+                }
+            }
+        }
         std::string blank = "";
         blank += 226, blank += 150, blank += 129;
         std::string s = (addDummyPrefix && this->addDummyPrefix) ? blank : "";
@@ -182,6 +193,10 @@ namespace fastllm {
                 if (!(this->removeExtraWhitespaces && i > 0 && ori[i - 1] == ' ')) {
                     s += blank;
                 }
+            } else if (!this->tokenizerConfig["replacements"].is_null()) {
+                json11::Json replacement = tokenizerConfig["replacements"][ori.substr(i, 1)];
+                if (replacement.is_string())
+                    s += replacement.string_value();
             } else {
                 s += ori[i];
             }
@@ -193,7 +208,7 @@ namespace fastllm {
         return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
     }
 
-	std::vector<float> Tokenizer::UnigramEncode(const std::string &s) {
+    std::vector<float> Tokenizer::UnigramEncode(const std::string &s) {
         // SymbolPairs.l 表示上一个位置
         // SymbolPairs.r 表示选择上一个位置的第几个TrieNode
         std::vector<TrieNode *> specialIds;
