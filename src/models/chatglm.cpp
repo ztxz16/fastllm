@@ -87,6 +87,11 @@ namespace fastllm {
             if (this->weight.dicts.find("gmask_token_id") != this->weight.dicts.end()) {
                 this->gmask_token_id = atoi(this->weight.dicts["gmask_token_id"].c_str());
             }
+            this->weight.tokenizer.type = Tokenizer::UNIGRAM;
+            this->weight.tokenizer.tokenizerConfig = json11::Json({"replacements", json11::Json({
+                {"\t",json11::Json("<|tab|>")},{"\n",json11::Json("<n>")}
+            })});
+            this->weight.tokenizer.blankRepeatCount = 80;
         } else if (GetVersion() == 2 && this->tokenizerClass != "ChatGLM4Tokenizer") {
             this->gmask_token_id = 64790;
             this->bos_token_id = 64792;
