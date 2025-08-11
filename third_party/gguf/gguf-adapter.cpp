@@ -129,12 +129,12 @@ namespace fastllm {
                     ), // kv_b
                     GGUFWeightReplaceRule (
                         std::regex(R"(blk\.(\d+)\.attn_k_b\.(weight|bias))"),
-                        "model.layers.$1.self_attn.kv_b_proj.$2__1",
+                        "model.layers.$1.self_attn.kv_b_proj.$2__0",
                         GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16
                     ), // k_b, v_b，有时候这两个分开了
                     GGUFWeightReplaceRule (
                         std::regex(R"(blk\.(\d+)\.attn_v_b\.(weight|bias))"),
-                        "model.layers.$1.self_attn.kv_b_proj.$2__0",
+                        "model.layers.$1.self_attn.kv_b_proj.$2__1",
                         GGUFWeightReplaceRule::GGUFWeightReplaceForceFP16
                     ), // k_b, v_b，有时候这两个分开了
                     GGUFWeightReplaceRule (
