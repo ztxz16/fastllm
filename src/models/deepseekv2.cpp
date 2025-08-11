@@ -456,6 +456,10 @@ namespace fastllm {
                 Data &kv0 = this->weight[kv0Name];
                 Data &kv1 = this->weight[kv1Name];
 
+                if (kv0.dims != kv1.dims) {
+                    PermuteSelf(kv0, {0, 2, 1});
+                }
+                
                 // ToDataType(q_nope, qnopeTemp, this->dataType);
                 MatMul(q_nope, kv0, result);
 // printf("matmul0 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
