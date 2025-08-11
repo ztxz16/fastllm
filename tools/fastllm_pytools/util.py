@@ -78,10 +78,14 @@ def make_normal_llm_model(args):
         downloader = HFDNormalDownloader(args.path, local_dir = get_fastllm_cache_path(args.path, args.cache_dir))
         downloader.run()
         args.path = str(downloader.local_dir)
-    if (os.path.exists(os.path.join(args.path, "config.json"))):
+    
+    config_path = os.path.join(args.path, "config.json")
+    if (not(os.path.exists(config_path)) and args.ori != "" and os.path.exists(os.path.join(args.ori, "config.json"))):
+        config_path = os.path.join(args.ori, "config.json")
+    if (os.path.exists(config_path)):
         try:
             import json
-            with open(os.path.join(args.path, "config.json"), "r", encoding="utf-8") as file:
+            with open(config_path, "r", encoding="utf-8") as file:
                 config = json.load(file)
             if (config["architectures"][0] == 'Qwen3ForCausalLM' or config["architectures"][0] == 'Qwen3MoeForCausalLM'):
                 if (args.enable_thinking == ""):
