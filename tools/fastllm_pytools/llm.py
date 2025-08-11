@@ -1182,7 +1182,7 @@ class model:
                 if (self.save_history):
                     input = self.tokenizer_cache.tokenize_with_cache(tokenizer, prompt)
                 else:
-                    input = tokenizer.encode(prompt)
+                    input = tokenizer.encode(prompt, add_special_tokens = True)
                 #print("prompt", prompt[:100])
                 #print("input", input[:100])
 
