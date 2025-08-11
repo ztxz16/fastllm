@@ -449,19 +449,25 @@ namespace fastllm {
                                 GGUFWeightReplaceRule::GGUFWeightReplaceType replaceType) {
         if (tensor->type == ggml_type::GGML_TYPE_F32) {
             weight->dataType = DataType::FLOAT32;    
+        } else if (tensor->type == ggml_type::GGML_TYPE_F16) {
+            weight->dataType = DataType::FLOAT16;    
         } else {
             weight->dataType = DataType::DATA_GGUF_FORMAT;
         }
 
         if (replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
-            weight->dims = tensor->dims;
-            weight->ggmlTensor = (void*)(new ggml_tensor());
-            weight->ggmlType = tensor->type;
+            if (weight->dataType != DataType::DATA_GGUF_FORMAT) {
+                weight->Resize(tensor->dims);
+                weight->Allocate();
+            } else {
+                weight->dims = tensor->dims;
+                weight->ggmlTensor = (void*)(new ggml_tensor());
+                weight->ggmlType = tensor->type;
 
-            weight->expansionBytes = ggml_nbytes(tensor);
-            weight->cpuData = new uint8_t[ggml_nbytes(tensor)];
-            
-            (*(ggml_tensor*)weight->ggmlTensor) = *tensor;
+                weight->expansionBytes = ggml_nbytes(tensor);
+                weight->cpuData = new uint8_t[ggml_nbytes(tensor)];
+                (*(ggml_tensor*)weight->ggmlTensor) = *tensor;
+            }
 
             FILE *fi = fopen(fileName.c_str(), "rb");
     #if defined(_WIN32) || defined(_WIN64)
