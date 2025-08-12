@@ -254,13 +254,13 @@ void iqk_quantize_row_q8_K_T(const float * x, void * vy, int64_t k) {
 #endif
 }
 
-void iqk_quantize_row_q8_K(const float * x, void * vy, int64_t k, ggml_type type) {
+void iqk_quantize_row_q8_K(const float * x, void * vy, int64_t k, ggml_type type, ggml_type oriType) {
     if (type == GGML_TYPE_Q8_K) {
         iqk_quantize_row_q8_K_T<0>(x, vy, k);
     } else if (type == GGML_TYPE_Q8_K32) {
         iqk_quantize_row_q8_K_T<1>(x, vy, k);
     } else {
-        printf("iqk_quantize_row_q8_K error with type %s", ggml_type_name(type));
+        printf("iqk_quantize_row_q8_K error with type %s (vec dot type = %s)", ggml_type_name(oriType), ggml_type_name(type));
         exit(0);
     }
 }
