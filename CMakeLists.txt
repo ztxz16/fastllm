@@ -172,13 +172,15 @@ endif()
 message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 file(GLOB GRAPH_MODEL_FILES "src/models/graph/*.cpp")
 file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
-set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executor.cpp src/template.cpp src/graph.cpp src/gguf.cpp src/tokenizer.cpp
+set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
         src/devices/cpu/cpudevice.cpp src/devices/cpu/cpudevicebatch.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp
         src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp
         third_party/json11/json11.cpp
+        third_party/gguf/gguf.cpp third_party/gguf/ggml-quant.cpp third_party/gguf/ggml-iqk.cpp third_party/gguf/ggml-dequantize.cpp
+        third_party/gguf/gguf-adapter.cpp
         ${CPU_DEVICE_FILES}
         ${GRAPH_MODEL_FILES})
 
@@ -187,6 +189,7 @@ include_directories(include/utils)
 include_directories(include/models)
 include_directories(include/devices/cpu)
 include_directories(third_party/json11)
+include_directories(third_party/gguf)
 
 if (USE_MMAP)
     add_compile_definitions(USE_MMAP)
@@ -206,7 +209,8 @@ if (USE_CUDA)
     endif()
     include_directories(include/devices/cuda)
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
-    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/cuda/fastllm-cuda.cu)
+    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
+        src/devices/cuda/fastllm-cuda.cu src/devices/cuda/fastllm-ggml-cuda.cu)
 
     include_directories(include/devices/multicuda)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES} src/devices/multicuda/multicudadevice.cpp src/devices/multicuda/fastllm-multicuda.cu)
@@ -227,7 +231,9 @@ if(USE_ROCM)
     hipify(CUDA_SOURCE_DIR ${PROJECT_SOURCE_DIR}/src/devices/multicuda HIP_SOURCE_DIR "${PROJECT_SOURCE_DIR}/src/devices/multihip")
     include_directories(include/devices/cuda)
     include_directories(include/devices/multicuda)
-    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp src/devices/hip/fastllm-hip.hip src/devices/multicuda/multicudadevice.cpp src/devices/multihip/fastllm-multihip.hip)
+    set(FASTLLM_CUDA_SOURCES src/devices/cuda/cudadevice.cpp src/devices/cuda/cudadevicebatch.cpp 
+        src/devices/hip/fastllm-hip.hip src/devices/hip/fastllm-ggml-hip.hip 
+        src/devices/multicuda/multicudadevice.cpp src/devices/multihip/fastllm-multihip.hip)
     add_compile_definitions(USE_ROCM)
     add_compile_definitions(USE_CUDA)
     if (DEFINED $ENV{ROCM_PATH})
