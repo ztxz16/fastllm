@@ -1104,7 +1104,7 @@ namespace fastllm {
             for (int i = 0; i < n; i++) {
                 iqk_quantize_row_q8_K (
                     inputData + i * m, q8kInputs.data() + i * rowCount, m, 
-                    ggml_type_vec_dot_type(tensor->type)
+                    ggml_type_vec_dot_type(tensor->type), tensor->type
                 );
             }
 
