@@ -194,7 +194,8 @@ namespace fastllm {
         INT2_GROUP = 11, // 不用zeroPoint的int2, floatValue = min + uint2Value * scale, 且使用分组量化
         BASE3_GROUP = 12, // 三元量化，-1 0 1
         INT32PARAM = 100, // int32的参数，这种类型的数据永远存在CPU上
-        DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV
+        DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV,
+        DATA_GGUF_FORMAT = 999999 // GGUF格式的数据
     };
 
     static std::map <DataType, std::vector <std::string> > dataTypeNames = {
@@ -319,12 +320,19 @@ namespace fastllm {
 
         int weightId;
         bool isRegistered = false;
+
+        bool isGGUFData = false; // gguf格式的数据
+        void *ggmlTensor = nullptr;
+        int ggmlType = -1;
+        bool IsRepacked = false;
         
         Data () {};
 
         Data (DataType type);
 
         Data (DataType type, const std::vector <int> &dims); // 构造函数
+
+        Data (DataType type, int ggmlType, const std::vector <int> &dims); // ggml类型
 
         Data (DataType type, const std::vector <int> &dims, DataDevice device, void *ptr); // 构造函数，使用已有数据地址的Fake data
 
@@ -376,6 +384,8 @@ namespace fastllm {
         void ToDevice(DataDevice device, const std::vector <int> &deviceIds); // 移动到指定device
 
         void ToDevice(void *device);
+
+        void Repack(); // 重新打包数据，便于计算
 
         void SetMapFile(std::shared_ptr<FileMmap> file) {
         	mapFile = file;

@@ -270,6 +270,8 @@ namespace fastllm {
         std::set <int> eos_token_ids;
         int embed_dim = 4096;
         int num_attention_heads = 32;
+        int num_key_value_heads = num_attention_heads;
+        float rms_norm_eps = 1e-6;
         int head_dim = embed_dim / num_attention_heads;
         int max_positions = 32768;
         int rotary_dim = 64;
