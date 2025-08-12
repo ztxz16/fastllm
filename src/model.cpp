@@ -29,6 +29,8 @@
 #include "ernie4_5.h"
 #include "pangu_moe.h"
 
+#include "gguf.h"
+
 #ifdef USE_TFACC
 #include "fastllm-tfacc.h"
 #endif
@@ -267,19 +269,14 @@ namespace fastllm {
         return std::unique_ptr<fastllm::BertModel> (model);
     }
 
-    std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
-        std::string modelType = GetModelTypeFromFile(fileName);
-        basellm *model = CreateModelWithType(modelType);
-        if(modelType == "bert"){
-            BertModel *bertModel = (BertModel*)model;
-            bertModel->weight.tokenizer.type = Tokenizer::BERT;
-            bertModel->LoadFromFile(fileName);
-            bertModel->WarmUp();
-        }else{
-            model->LoadFromFile(fileName);
-            model->WarmUp();
+    bool IsGGUFFile(const std::string &fileName) {
+        int ggufAlignment = GGUF_DEFAULT_ALIGNMENT;
+        GGUFBuffer ggufBuffer = GGUFBuffer(fileName);
+        int magic = ggufBuffer.Read<int> ();
+        if (magic == 1179993927) { // GGUF
+            return true;
         }
-        return std::unique_ptr<fastllm::basellm> (model);
+        return false;
     }
 
     std::unique_ptr<basellm> CreateEmptyLLMModel(const std::string &modelType) {
@@ -831,6 +828,460 @@ namespace fastllm {
                 }
             }
         }        
+    }
+
+    std::vector<std::string> GenerateGGUFFileList(const std::string& filename) {
+        std::vector<std::string> fileList;
+        
+        // 正则表达式匹配文件名格式：基础名-当前序号-of-总数.扩展名
+        std::regex pattern(R"(^(.+)-(\d+)-of-(\d+)\.(.+)$)");
+        std::smatch matches;
+        
+        if (!std::regex_match(filename, matches, pattern)) {
+            // 如果不匹配分片格式，返回原文件名
+            fileList.push_back(filename);
+            return fileList;
+        }
+        
+        // 提取各部分
+        std::string baseName = matches[1].str();
+        int currentNum = std::stoi(matches[2].str());
+        int totalNum = std::stoi(matches[3].str());
+        std::string extension = matches[4].str();
+        
+        // 获取序号的位数（用于补零）
+        int digits = matches[2].str().length();
+        
+        // 生成所有文件名
+        for (int i = 1; i <= totalNum; ++i) {
+            std::ostringstream oss;
+            oss << baseName << "-" 
+                << std::setfill('0') << std::setw(digits) << i 
+                << "-of-" 
+                << std::setfill('0') << std::setw(digits) << totalNum 
+                << "." << extension;
+            fileList.push_back(oss.str());
+        }
+        
+        return fileList;
+    }
+
+    std::string ConvertGGUFTypeToFastllmType(const std::string &type) {
+        static std::map <std::string, std::string> ggufTypeToFastllmTypeDict = {
+            {"qwen2", "qwen2"}, // llama
+            {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
+            {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"} // deepseek_v2
+        };
+        if (ggufTypeToFastllmTypeDict.find(type) != ggufTypeToFastllmTypeDict.end()) {
+            return ggufTypeToFastllmTypeDict[type];
+        } else {
+            printf("Warning: Can't convert type \"%s\", try use original type.\n", type.c_str());
+            return type;
+        }
+    }
+
+    std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(const std::string &fileName, const std::string &originalPath) {
+        std::vector <ReadGGUFTask> readGGUFTasks;
+        std::map <std::string, ReadGGUFTask*> readGGUFTaskDict;
+        std::vector <std::string> ggufFileNames = GenerateGGUFFileList(fileName);
+        AssertInFastLLM(ggufFileNames.size() > 0, "0 gguf file found!");
+
+        printf("Load model from files:\n");
+        for (auto &s : ggufFileNames) {
+            printf("%s\n", s.c_str());
+        }
+        json11::Json config;
+        ReadGGUFMetaData(ggufFileNames[0], config);
+        json11::Json params = config["params"];
+        std::string arch = params["general.architecture"].string_value();        
+
+        basellm *model = nullptr; 
+        std::string path = originalPath;
+        std::vector <std::string> tensors;
+        if (path != "") {
+            // Load from original config
+            if (path.back() != '/' || path.back() != '\\') {
+                path += "/";
+            }
+            std::string error;
+            std::string configFile = path + "config.json";
+            auto config = json11::Json::parse(ReadAllFile(configFile), error);
+
+            // 1. 创建网络基本信息
+            std::string modelType;
+            if (!config["model_type"].is_null()) {
+                modelType = config["model_type"].string_value();
+            } else {
+                modelType = config["architectures"].array_items()[0].string_value();
+            }
+            arch = modelType;
+            model = CreateModelWithType(modelType);
+            AddDictRecursion(model, "", config);
+            // 设置eos_token_id
+            if (config["eos_token_id"].is_null()) {
+                auto tokenizer = json11::Json::parse(ReadAllFile(path + "tokenizer.json"), error);
+                if (error == "") {
+                    std::string tokenizerConfigFile = path + "tokenizer_config.json";
+                    auto tokenizerConfig = json11::Json::parse(ReadAllFile(tokenizerConfigFile), error);
+                    std::string eos_token = tokenizerConfig["eos_token"].string_value();
+                    printf("eos_token = %s\n", eos_token.c_str());
+                    for (auto added_token : tokenizer["added_tokens"].array_items()) {
+                        if (added_token["content"] == eos_token) {
+                            model->eos_token_ids.insert(added_token["id"].int_value());
+                        }
+                    }
+                }
+            } else if (config["eos_token_id"].is_array()) {
+                for (auto &it : config["eos_token_id"].array_items()) {
+                    model->eos_token_ids.insert(it.int_value()); 
+                }
+            } else {
+                model->eos_token_id = config["eos_token_id"].int_value();
+            }
+            std::string generatetionConfigFile = path + "generation_config.json";
+            if (FileExists(generatetionConfigFile)) {
+                auto generation_config = json11::Json::parse(ReadAllFile(generatetionConfigFile), error);
+                for (auto &it : generation_config.object_items()) {
+                    if ("eos_token_id" == it.first && it.second.type() == json11::Json::ARRAY)
+                        continue;
+                    model->weight.AddDict(it.first, it.second.is_string() ? it.second.string_value() : it.second.dump());
+                }
+                // 更新eos_token_id
+                if (generation_config["eos_token_id"].is_array()) {
+                    for (auto &it : generation_config["eos_token_id"].array_items()) {
+                        model->eos_token_ids.insert(it.int_value());
+                    }
+                }
+            }
+
+            // 2. 读取分词
+            if (false) {
+                LoadLLMTokenizerFromHFToModel(path, model);
+            } else {
+                DealLLMTokenizerFromHFToModel(path, model);
+            }
+        } else {
+            // Load params from gguf
+            printf("general.architecture = %s\n", arch.c_str());
+            printf("general.name = %s\n", params["general.name"].string_value().c_str());
+
+            model = CreateModelWithType(ConvertGGUFTypeToFastllmType(arch));
+            if (!params[arch + ".block_count"].is_null()) {
+                model->block_cnt = params[arch + ".block_count"].int_value();
+                printf("Load block_cnt = %d\n", model->block_cnt);
+            }
+
+            if (!params[arch + ".attention.head_count"].is_null()) {
+                model->num_attention_heads = params[arch + ".attention.head_count"].int_value();
+                printf("Load num_attention_heads = %d\n", model->num_attention_heads);
+            }
+
+            if (!params[arch + ".attention.head_count_kv"].is_null()) {
+                model->num_key_value_heads = params[arch + ".attention.head_count_kv"].int_value();
+                model->weight.dicts["num_key_value_heads"] = std::to_string(model->num_key_value_heads);
+                printf("Load num_key_value_heads = %d\n", model->num_key_value_heads);
+            }
+
+            if (!params[arch + ".embedding_length"].is_null()) {
+                model->embed_dim = params[arch + ".embedding_length"].int_value();
+                printf("Load embed_dim = %d\n", model->embed_dim);
+            }
+
+            if (!params[arch + ".context_length"].is_null()) {
+                model->max_positions = params[arch + ".context_length"].int_value();
+                printf("Load max_positions = %d\n", model->max_positions);
+            }
+
+            if (!params[arch + ".attention.layer_norm_rms_epsilon"].is_null()) {
+                model->rms_norm_eps = params[arch + ".attention.layer_norm_rms_epsilon"].number_value();
+                printf("Load rms_norm_eps = %f\n", model->rms_norm_eps);
+            }
+
+            if (!params["tokenizer.ggml.eos_token_id"].is_null()) {
+                model->eos_token_id = params["tokenizer.ggml.eos_token_id"].number_value();
+                printf("Load eos_token_id = %d\n", model->eos_token_id);
+            }
+
+            if (!params["tokenizer.chat_template"].is_null()) {
+                model->weight.tokenizer.chatTemplate = params["tokenizer.chat_template"].string_value();
+                printf("Load chatTemplate = %s\n", model->weight.tokenizer.chatTemplate.c_str());
+            }
+
+            int idx = 0;
+            for (auto &it : params["tokenizer.ggml.tokens"].array_items()) {
+                if (idx < 10) {
+                    // printf("%s: %d\n", it.string_value().c_str(), idx);
+                }
+                model->weight.AddTokenizerWord(it.string_value(), idx, 1.0f);
+                idx++;
+            }
+
+            model->weight.tokenizer.byteAsChar = true;
+            model->weight.AddDict("tokenizer_byte_as_char", "True");
+
+            // printf("config = %s\n", config.dump().c_str());
+        }
+
+        arch = ConvertGGUFTypeToFastllmType(arch);
+
+        // 3.0 更新模型信息
+        model->InitParams();
+
+        int cur = 0;
+        long long totalBytes = 0;
+        std::set <std::string> allWeightNames; // 所有创建了的weight name
+        std::set <std::string> allFinishNames; // 转换好的weight name
+
+        for (auto &s : ggufFileNames) {
+            AppendGGUFTasks(arch, s, readGGUFTasks);
+        }
+        for (int i = 0; i < readGGUFTasks.size(); i++) {
+            std::string &weightName = readGGUFTasks[i].name;
+/*
+if (false) {
+    std::string prefix = "model.layers.";
+    if (StartWith(weightName, prefix)) {
+        int id = 0;
+        for (int i = prefix.size(); weightName[i] >= '0' && weightName[i] <= '9'; i++) {
+            id = id * 10 + weightName[i] - '0';
+        }
+        if (id > 3) {
+            continue;
+        }
+    }
+}
+*/
+            tensors.push_back(weightName);
+            allWeightNames.insert(weightName);
+            model->weight.AddEmptyWeight(weightName, {1}, DataType::FLOAT32);
+            readGGUFTasks[i].weight = &model->weight.weight[weightName];
+            readGGUFTaskDict[readGGUFTasks[i].name] = &readGGUFTasks[i];
+        }
+
+        std::vector <std::thread*> threads;
+        int threadNum = std::min(16, std::max(4, (int)GetAlivePool()->threads.size()));
+        std::mutex locker;
+        int cnt = 0;
+
+        totalBytes = tensors.size();
+        std::vector <std::pair <int, int> > parts;
+        int start = 0;
+        for (int i = 0; i < threadNum; i++) {
+            int cur = start;
+            long long now = 0;
+            while (true) {
+                if (now * threadNum >= totalBytes || start >= tensors.size()) {
+                    break;
+                }
+
+                // now += safeTensors.itmeDict[tensors[start]].bytes;
+                now += 1;
+
+                start++;
+            }
+            parts.push_back(std::make_pair(cur, start));
+        }
+        parts.back().second = tensors.size();
+        while (parts.size() < threadNum) {
+            parts.push_back(std::make_pair(-1, -1));
+        }
+
+        // Load 
+        for (int i = 0; i < threadNum; i++) {
+            threads.push_back(
+                new std::thread([&](int st, int end) {
+                    for (int i = st; i < end; i++) {
+                        auto &weightName = tensors[i];
+                        if (readGGUFTaskDict.find(weightName) != readGGUFTaskDict.end()) {
+                            WeightImportGGUFTensor(readGGUFTaskDict[weightName]->weight, 
+                                        &readGGUFTaskDict[weightName]->tensor, readGGUFTaskDict[weightName]->fileName, 
+                                        readGGUFTaskDict[weightName]->offset, readGGUFTaskDict[weightName]->replaceType);
+                        } 
+                        {
+                            // try merge                                
+                            locker.lock();
+                            allFinishNames.insert(weightName);
+                            // 检查是否需要合并权重
+                            bool needMerge = false;
+                            for (auto &rule : model->weightMergeRules) {
+                                if (rule.allInputs.find(weightName) == rule.allInputs.end()) {
+                                    continue;
+                                }
+                                needMerge = true;
+                                bool canMerge = true;
+                                for (auto &name : rule.allInputs) {
+                                    if (allWeightNames.find(name) != allWeightNames.end() && 
+                                        allFinishNames.find(name) == allFinishNames.end()) {
+                                        canMerge = false;
+                                    }
+                                }
+                                if (!canMerge) {
+                                    continue;
+                                }
+                                for (auto &it : rule.rules) {
+                                    for (auto input : it.inputs) {
+                                        if (model->weight[input].dims.size() == 2) {
+                                            if (model->weight[input].groupCnt != -1 && 
+                                                model->weight[input].dims[1] % model->weight[input].groupCnt != 0) {
+                                                canMerge = false;
+                                                break;
+                                            }
+                                            if (model->weight[input].blockK != -1 && 
+                                                model->weight[input].dims[0] % model->weight[input].blockK != 0) {
+                                                canMerge = false;
+                                                break;
+                                            }
+                                            if (model->weight[input].blockM != -1 && 
+                                                model->weight[input].dims[1] % model->weight[input].blockM != 0) {
+                                                canMerge = false;
+                                                break;
+                                            }
+                                            if (model->weight[input].dataType != model->weight[it.inputs[0]].dataType ||
+                                                model->weight[input].ggmlType != model->weight[it.inputs[0]].ggmlType ||
+                                                model->weight[input].dims[1] != model->weight[it.inputs[0]].dims[1]) {
+                                                canMerge = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (!canMerge) {
+                                    continue;
+                                }
+
+                                locker.unlock();
+                                for (auto &it : rule.rules) {
+                                    if (allWeightNames.find(it.inputs[0]) == allWeightNames.end()) {
+                                        continue;
+                                    }
+                                    int dim0Len = 0;
+                                    for (auto input : it.inputs) {
+                                        dim0Len += model->weight[input].dims[0];
+                                    }
+                                    if (model->weight[it.inputs[0]].dims.size() == 1) {
+                                        std::string input0 = it.inputs[0];
+                                        std::string mergeName = it.output;
+                                        if (model->weight[input0].dataType == DATA_GGUF_FORMAT) {
+                                            model->weight[mergeName] = Data(model->weight[input0].dataType);
+                                            model->weight[mergeName].ggmlType = ((ggml_tensor*) model->weight[input0].ggmlTensor)->type;
+                                            model->weight[mergeName].Resize({dim0Len});
+                                        } else {
+                                            model->weight[mergeName] = Data(model->weight[input0].dataType, {dim0Len});
+                                        }
+
+                                        Data &mergeData = model->weight[mergeName];
+                                        mergeData.name = mergeName;
+                                        mergeData.Allocate();
+                                        uint64_t offset = 0;
+                                        for (auto input : it.inputs) {
+                                            memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
+                                            offset += model->weight[input].GetBytes();
+                                        }
+                                    } else {
+                                        std::string input0 = it.inputs[0];
+                                        std::string mergeName = it.output;
+                                        if (model->weight[input0].dataType == DATA_GGUF_FORMAT) {
+                                            model->weight[mergeName] = Data(model->weight[input0].dataType);
+                                            model->weight[mergeName].ggmlType = ((ggml_tensor*) model->weight[input0].ggmlTensor)->type;
+                                            model->weight[mergeName].Resize({dim0Len, model->weight[input0].dims[1]});
+                                        } else {
+                                            model->weight[mergeName] = Data(model->weight[input0].dataType, {dim0Len, model->weight[input0].dims[1]});
+                                        }
+                                        Data &mergeData = model->weight[mergeName];
+                                        mergeData.name = mergeName;
+                                        mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
+                                        mergeData.group = model->weight[input0].group;
+                                        mergeData.groupCnt = model->weight[input0].groupCnt;
+                                        mergeData.blockK = model->weight[input0].blockK;
+                                        mergeData.blockM = model->weight[input0].blockM;
+
+                                        mergeData.Allocate();
+                                        uint64_t offset = 0;
+                                        for (auto input : it.inputs) {
+                                            mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, model->weight[input].perChannelsConfigs);
+                                            mergeData.zeros = AppendVector(mergeData.zeros, model->weight[input].zeros);
+                                            mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
+                                            mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
+                                            mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
+                                            memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
+                                            offset += model->weight[input].GetBytes();
+                                        }
+
+                                        mergeData.CalcWeightSum();
+#if defined(USE_TFACC) || defined(USE_NUMA)
+                                        try {
+                                            std::string s = getenv("FASTLLM_ACTIVATE_NUMA");
+                                            if (s != "" && s != "OFF") {
+                                            locker.lock();
+                                                if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
+                                                    mergeData.weightSum.resize(1);
+                                                    RegisterFastllmData(&mergeData, it.type);       
+                                                }
+                                                locker.unlock();
+                                            }
+                                        } catch (...) {
+                                        }
+#endif
+                                    }
+
+                                    for (auto input : it.inputs) {
+                                        model->weight.weight.erase(input);
+                                    }
+                                }
+                                locker.lock();
+                            }
+                            locker.unlock();
+#if defined(USE_TFACC) || defined(USE_NUMA)
+                            try {
+                                std::string s = getenv("FASTLLM_ACTIVATE_NUMA");
+                                if (s != "" && s != "OFF") {
+                                    if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
+                                        locker.lock();
+                                            model->weight.weight[weightName].weightSum.resize(1);
+                                            RegisterFastllmData(&model->weight.weight[weightName], model->specialWeights[weightName]);
+                                        locker.unlock();
+                                    }
+                                }
+                            } catch (...) {
+                            }
+#endif
+                        }
+
+                        if (tensors.size() != 0) {
+                            locker.lock();
+                            printf("Loading %d \r", (++cnt) * 100 / (int)tensors.size());
+                            fflush(stdout);
+                            locker.unlock();
+                        }
+                    }
+                }, parts[i].first, parts[i].second)
+            );
+        }
+        for (int i = 0; i < threads.size(); i++) {
+            threads[i]->join();
+            delete threads[i];
+        }
+
+        printf("\n");
+        fflush(stdout);
+
+        model->WarmUp();
+        return std::unique_ptr<fastllm::basellm> (model);
+    }
+
+    std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
+        std::string modelType = GetModelTypeFromFile(fileName);
+        basellm *model = CreateModelWithType(modelType);
+        if(modelType == "bert"){
+            BertModel *bertModel = (BertModel*)model;
+            bertModel->weight.tokenizer.type = Tokenizer::BERT;
+            bertModel->LoadFromFile(fileName);
+            bertModel->WarmUp();
+        }else{
+            model->LoadFromFile(fileName);
+            model->WarmUp();
+        }
+        return std::unique_ptr<fastllm::basellm> (model);
     }
 
     // 从hf文件夹读取，仅支持safetensor格式的模型

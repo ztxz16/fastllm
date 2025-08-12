@@ -10,6 +10,7 @@
 #include "computeserver.h"
 #include "json11.hpp"
 #include "cpudevice.h"
+#include "gguf.h"
 
 const int VERSION = 1;
 
@@ -230,11 +231,18 @@ namespace fastllm {
             while (localM % 2 == 1) {
                 localM++;
             }
+            
+            int ggmlType = -1;
+            if (dataType == DataType::DATA_GGUF_FORMAT) {
+                ggmlType = buffer.ReadInt();
+                localM = localM / QK_K * QK_K;
+            }
+
             int base = partId * localM;
             if (partId == partCnt - 1) {
                 localM = m - partId * localM;
             }
-            weight[name] = Data(dataType, {k, localM});
+            weight[name] = Data(dataType, ggmlType, {k, localM});
             weight[name].name = name;
             weight[name].Allocate();
             if (dataType == DataType::FLOAT16) {
@@ -242,6 +250,15 @@ namespace fastllm {
                     buffer.Skip(base * 2);
                     buffer.ReadBytes(weight[name].cpuData + i * localM * 2, localM * 2);
                     buffer.Skip((m - base - localM) * 2);
+                }
+            } else if (dataType == DataType::DATA_GGUF_FORMAT) {
+                int skip0 = ggml_row_size((ggml_type)ggmlType, base);
+                int len = ggml_row_size((ggml_type)ggmlType, localM);
+                int skip1 = ggml_row_size((ggml_type)ggmlType, m - base - localM);
+                for (int i = 0; i < k; i++) {
+                    buffer.Skip(skip0);
+                    buffer.ReadBytes(weight[name].cpuData + i * len, len);
+                    buffer.Skip(skip1);
                 }
             } else if (dataType == DataType::INT8) {
                 int bit = 8;
@@ -341,22 +358,48 @@ namespace fastllm {
                 ErrorInFastLLM("Register LinearColumn Error: wrong data type");
             }
         } else {
+            int ggmlType = -1;
+            if (dataType == DataType::DATA_GGUF_FORMAT) {
+                ggmlType = buffer.ReadInt();
+            }
             auto curDims = dims;
-            Data oriWeight = Data(dataType, curDims);
+            Data oriWeight = Data(dataType, ggmlType, curDims);
             int k = dims[0];
             int localK = k / partCnt;
             if (partId == partCnt - 1) {
                 localK = k - partId * localK;
             }
+            
             curDims[0] = localK;
 
-            weight[name] = Data(dataType, curDims);
+            weight[name] = Data(dataType, ggmlType, curDims);
             weight[name].name = name;
             weight[name].Allocate();
 
             if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
                 int k = oriWeight.dims[0];
                 int m = oriWeight.GetBytes() / k;
+                int localK = k / partCnt;
+                int base = partId * localK * m;
+                if (partId == partCnt - 1) {
+                    localK = k - partId * localK;
+                }
+
+                if (weightType == "linearSwiglu") {
+                    buffer.Skip(partId * (localK / 2) * m);
+                    buffer.ReadBytes(weight[name].cpuData, (localK / 2) * m);
+                    buffer.Skip((k / 2 - localK / 2) * m);
+                    buffer.ReadBytes(weight[name].cpuData+ (localK / 2) * m, (localK / 2) * m);
+                    buffer.Skip(weight[name].GetBytes() - (partId * localK * m) - (k / 2 * m));
+                } else {
+                    buffer.Skip(base);
+                    buffer.ReadBytes(weight[name].cpuData, m * localK);
+                    buffer.Skip(weight[name].GetBytes() - (base + m * localK));
+                }
+            } else if (dataType == DataType::DATA_GGUF_FORMAT) {
+                int k = oriWeight.dims[0];
+                int m = ggml_row_size((ggml_type)ggmlType, oriWeight.dims[1]);
+
                 int localK = k / partCnt;
                 int base = partId * localK * m;
                 if (partId == partCnt - 1) {
@@ -872,6 +915,8 @@ namespace fastllm {
             fastllm::RunLinearFloat32Float32(localInput, ((float*)weight), localOutput, biasData, n, m, localK, pool, 0, pool->threads.size());
         } else if (dataType == fastllm::DataType::FLOAT32 && wType == fastllm::DataType::FP8_E4M3) {
             fastllm::RunLinearFloat32FP8E4M3(localInput, w, localOutput, biasData, n, m, localK, pool, 0, pool->threads.size());
+        } else if (dataType == fastllm::DataType::FLOAT32 && wType == fastllm::DataType::DATA_GGUF_FORMAT) {
+            fastllm::RunLinearFloat32GGUF(localInput, ((uint8_t *)weight), localOutput, biasData, &w, n, m, localK, pool, 0, pool->threads.size());
         } else {
             printf("RunLinearFloat: wrong data type: dataType = %d, wType = %d.", dataType, wType);
         }
@@ -1502,7 +1547,14 @@ namespace fastllm {
 
             auto &bf16Input = moeFloatSingleVarManagerServer.bf16Input;
             bf16Input.resize(m);
-            Float32ToBFloat16((float*)localInput, bf16Input.data(), m);
+            if (weights[0]->dataType == DataType::DATA_GGUF_FORMAT) {
+                iqk_quantize_row_q8_K (
+                    (float*)localInput, bf16Input.data(), m, 
+                    ggml_type_vec_dot_type((ggml_type)weights[0]->ggmlType)
+                );
+            } else {
+                Float32ToBFloat16((float*)localInput, bf16Input.data(), m);
+            }
 
 // record.push_back(std::make_pair("prepare datas", GetSpan(ttt, std::chrono::system_clock::now())));
             for (int st = 0; st < v.size(); st++) {
@@ -1535,6 +1587,8 @@ namespace fastllm {
                         LaunchLinearBFloat16FP8E4M3(bf16Input.data(), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                     } else if (weight->dataType == DataType::FLOAT16) {
                         LaunchLinearFloat32Float16(localInput, *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                    } else if (weight->dataType == DataType::DATA_GGUF_FORMAT) {
+                        LaunchLinearQ8KGGUF((uint8_t*)bf16Input.data(), weightData, outputData, biasData, weight, 1, m, curK, ops, pool, threadSt, curThread);
                     } else {
                         // TODO: other
                     }
@@ -1559,6 +1613,8 @@ namespace fastllm {
                     
                     if (weightDown->dataType == DataType::FP8_E4M3) {
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(middles[l].data(), (uint16_t*)middles[l].data(), mid));
+                    } else if (weightDown->dataType == DataType::DATA_GGUF_FORMAT) {
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToQ8KOp(middles[l].data(), (uint8_t*)middles[l].data(), mid, weightDown->ggmlType));
                     }
 
                     pool->PushOp(l - st, ops[l - st]);
@@ -1580,6 +1636,8 @@ namespace fastllm {
                         LaunchLinearBFloat16FP8E4M3((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
                     } else if (weightDown->dataType == DataType::FLOAT16) {
                         LaunchLinearFloat32Float16((float*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                    } else if (weightDown->dataType == DataType::DATA_GGUF_FORMAT) {
+                        LaunchLinearQ8KGGUF((uint8_t*)middles[l].data(), (uint8_t*)weightDown->cpuData, results[l].data(), nullptr, weightDown, 1, mid, m, ops, pool, threadSt, curThread);
                     } else {
                         // TODO: other
                     }
