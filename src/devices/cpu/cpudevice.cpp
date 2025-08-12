@@ -1246,7 +1246,8 @@ namespace fastllm {
                 q8kInputs.resize(rowCount * sizeof(block_q8_K));
                 iqk_quantize_row_q8_K (
                     inputData, q8kInputs.data(), m, 
-                    ggml_type_vec_dot_type((ggml_type)weights[2]->ggmlType)
+                    ggml_type_vec_dot_type((ggml_type)weights[2]->ggmlType),
+                    (ggml_type)weights[2]->ggmlType
                 );
 
                 std::vector <std::vector <float> > &middles = moeIntSingleVarManager.middles;
@@ -1332,7 +1333,8 @@ namespace fastllm {
                         uinputDown.resize(rowCount * sizeof(block_q8_K));
                         iqk_quantize_row_q8_K (
                                 middles[l].data(), uinputDown.data(), mid, 
-                                ggml_type_vec_dot_type((ggml_type)weights[idx * 2 + 1]->ggmlType)
+                                ggml_type_vec_dot_type((ggml_type)weights[idx * 2 + 1]->ggmlType),
+                                (ggml_type)weights[idx * 2 + 1]->ggmlType
                         );
                     }
 
@@ -2954,7 +2956,7 @@ namespace fastllm {
     void MultiThreadFloat32ToQ8KOp::Run() {
         iqk_quantize_row_q8_K (
             input, output, len, 
-            ggml_type_vec_dot_type((ggml_type)ggmlType)
+            ggml_type_vec_dot_type((ggml_type)ggmlType), (ggml_type)ggmlType
         );
     }
 

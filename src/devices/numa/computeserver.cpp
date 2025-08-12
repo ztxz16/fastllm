@@ -1550,7 +1550,8 @@ namespace fastllm {
             if (weights[0]->dataType == DataType::DATA_GGUF_FORMAT) {
                 iqk_quantize_row_q8_K (
                     (float*)localInput, bf16Input.data(), m, 
-                    ggml_type_vec_dot_type((ggml_type)weights[0]->ggmlType)
+                    ggml_type_vec_dot_type((ggml_type)weights[0]->ggmlType),
+                    (ggml_type)weights[0]->ggmlType
                 );
             } else {
                 Float32ToBFloat16((float*)localInput, bf16Input.data(), m);
