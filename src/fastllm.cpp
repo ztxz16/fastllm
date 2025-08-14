@@ -2740,10 +2740,10 @@ namespace fastllm {
         }, {}, {{"rotaryDim", rotaryDim}});
     }
 
-    void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
+    void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim, int positionStride) {
         curExecutor->Run("NearlyRotatePosition2D", {
                 {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
-        }, {}, {{"rotaryDim", rotaryDim}});
+        }, {}, {{"rotaryDim", rotaryDim}, {"positionStride", positionStride}});
     }
 
     void LlamaRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
