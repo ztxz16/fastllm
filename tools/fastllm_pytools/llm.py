@@ -161,6 +161,8 @@ fastllm_data_type_dict = {
     "float16": 7,
     "fp16": 7,
     "half": 7,
+    "bfloat16": 1,
+    "bf16": 1,
     "float32": 0,
     "fp8": 10,
     "float8": 10,
