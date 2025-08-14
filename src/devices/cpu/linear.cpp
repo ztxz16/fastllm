@@ -23,6 +23,7 @@
 namespace fastllm {
     extern CPUInstructInfo cpuInstructInfo;
     extern FP16ToFP32Manager fp16tofp32;
+    extern BF16ToFP32Manager bf16tofp32;
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
     extern void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
@@ -118,8 +119,19 @@ namespace fastllm {
             ErrorInFastLLM("Linear error: unsupport GGUF's dataType " + std::string(ggml_type_name(tensor->type)) + ".\n");
         }
     }
-    
+
+    extern bool LinearFloat32Float16_AVX512F_Kernel(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+
     void MultiThreadLinearFloat32Float16Op::Run() {
+        if (cpuInstructInfo.hasAVX512BF16) {
+            if (LinearFloat32Float16_AVX512F_Kernel(
+                inputData, weightData, biasData, outputData, n, m, k, st, end
+                )) {
+                return;
+            }
+        }   
+
         for (int i = 0; i < n; i++) {
             for (int j = st; j < end; j++) {
                 float now = biasData ? biasData[j] : 0.0f;
@@ -154,6 +166,55 @@ namespace fastllm {
 #endif
                 for (; l < m; l++) {
                     now += inputData[i * m + l] * fp16tofp32.dict[weightData[j * m + l]];
+                }
+                outputData[i * k + j] = now;
+            }
+        }
+    }
+
+    extern bool LinearBFloat16BFloat16_AVX512BF16_Kernel(uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+
+    void MultiThreadLinearBFloat16BFloat16Op::Run() {
+        if (cpuInstructInfo.hasAVX512BF16) {
+            if (LinearBFloat16BFloat16_AVX512BF16_Kernel(
+                inputData, weightData, biasData, outputData, n, m, k, st, end
+                )) {
+                return;
+            }
+        }
+
+        for (int i = 0; i < n; i++) {
+            for (int j = st; j < end; j++) {
+                float now = biasData ? biasData[j] : 0.0f;
+                int l = 0;
+#ifdef __AVX2__
+                __m256 vsum = _mm256_setzero_ps();
+                for (; l + 7 < m; l += 8) {
+                    // 从内存加载 8 个 bfloat16 值（16 字节）
+                    __m128i vi_bf16 = _mm_loadu_si128((__m128i *) (inputData + i * m + l));
+                    
+                    // 将 bfloat16 转换为 float32
+                    // bfloat16 转换需要将每个 16 位值左移 16 位到 float32 的高位
+                    __m256i vi_shifted = _mm256_cvtepu16_epi32(vi_bf16);
+                    vi_shifted = _mm256_slli_epi32(vi_shifted, 16);
+                    __m256 vi = _mm256_castsi256_ps(vi_shifted);
+
+                    // 从内存加载 8 个 bfloat16 值（16 字节）
+                    __m128i vw_bf16 = _mm_loadu_si128((__m128i *) (weightData + j * m + l));
+                    
+                    // 将 bfloat16 转换为 float32
+                    // bfloat16 转换需要将每个 16 位值左移 16 位到 float32 的高位
+                    __m256i vw_shifted = _mm256_cvtepu16_epi32(vw_bf16);
+                    vw_shifted = _mm256_slli_epi32(vw_shifted, 16);
+                    __m256 vw = _mm256_castsi256_ps(vw_shifted);
+                    
+                    vsum = _mm256_fmadd_ps(vi, vw, vsum);
+                }
+                now += Floatsum(vsum);
+#endif
+                for (; l < m; l++) {
+                    now += bf16tofp32.dict[inputData[i * m + l]] * bf16tofp32.dict[weightData[j * m + l]];
                 }
                 outputData[i * k + j] = now;
             }
@@ -231,7 +292,7 @@ namespace fastllm {
     }
 #endif
 
-    bool LinearBFloat16FP8E4M3_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+    extern bool LinearBFloat16FP8E4M3_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end, int blockK, int blockM, float *scales, 
         int ks, int ms, float magicScale);
 
@@ -746,6 +807,34 @@ namespace fastllm {
 #ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
         delete[] temp;
 #endif
+    }
+
+    void RunLinearFloat32BFloat16(float *inputData, uint16_t *weightData, float *outputData, float *biasData, 
+                                int n, int m, int k, 
+                                AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector <uint16_t> bf16Input;
+        bf16Input.resize(n * m);
+        Float32ToBFloat16(inputData, bf16Input.data(), n * m);
+        
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLinearBFloat16BFloat16Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            if (i == threadNum - 1) {
+                end = k;
+            }
+            ops.push_back(new MultiThreadLinearBFloat16BFloat16Op(bf16Input.data(), weightData, biasData, outputData,
+                                                n, m, k, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
     }
     
     void LaunchLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
