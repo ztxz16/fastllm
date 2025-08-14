@@ -470,16 +470,7 @@ namespace fastllm {
         }
     } bf16tofp16;
 
-    struct BF16ToFP32Manager {
-        float dict[65536];
-
-        BF16ToFP32Manager() {
-            for (uint16_t i = 0; i < 65535; i++) {
-                uint32_t x = (i << 16);
-                dict[i] = *((float*)&x);
-            }
-        }
-    } bf16tofp32;
+    extern BF16ToFP32Manager bf16tofp32;
 
     struct MultiThreadGroupQuantizationBF16Op : MultiThreadBaseOp {
         int st, end, m;

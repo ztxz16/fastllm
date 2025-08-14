@@ -137,6 +137,11 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DNOMINMAX /std:c++17 /arch:AVX2 /source-charset:utf-8")
     if (CXX_MAJOR_VERSION GREATER_EQUAL 19 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
         set_source_files_properties(
+            "src/devices/cpu/avx512f.cpp"
+            PROPERTIES
+            COMPILE_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX10.1"
+        )
+        set_source_files_properties(
             "src/devices/cpu/avx512bf16.cpp"
             PROPERTIES
             COMPILE_FLAGS "${CMAKE_CXX_FLAGS} /arch:AVX10.1"
@@ -156,14 +161,29 @@ else()
     message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")
     if (CXX_MAJOR_VERSION GREATER_EQUAL 10 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
         set_source_files_properties(
+            "src/devices/cpu/avx512f.cpp"
+            PROPERTIES
+            COMPILE_OPTIONS "-mavx512f"
+        )
+        set_source_files_properties(
             "src/devices/cpu/avx512bf16.cpp"
             PROPERTIES
-            COMPILE_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f -mavx512bf16"
+            COMPILE_OPTIONS "-mavx512bf16"
+        )
+        set_source_files_properties(
+            "src/devices/cpu/avx512bf16.cpp"
+            PROPERTIES
+            COMPILE_OPTIONS "-mavx512f"
         )
         set_source_files_properties(
             "src/devices/cpu/avx512vnni.cpp"
             PROPERTIES
-            COMPILE_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f -mavx512vnni"
+            COMPILE_OPTIONS "-mavx512vnni"
+        )
+        set_source_files_properties(
+            "src/devices/cpu/avx512vnni.cpp"
+            PROPERTIES
+            COMPILE_OPTIONS "-mavx512f"
         )
     endif()
 endif()
