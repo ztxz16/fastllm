@@ -50,6 +50,20 @@ namespace fastllm {
 
         void Run();
     };
+
+    struct MultiThreadLinearBFloat16BFloat16Op : MultiThreadBaseOp {
+        uint16_t *inputData;
+        uint16_t *weightData;
+        float *biasData, *outputData;
+        int n, m, k, st, end;
+
+        MultiThreadLinearBFloat16BFloat16Op(uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
+                           int n, int m, int k, int st, int end) : 
+            inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData),
+            n(n), m(m), k(k), st(st), end(end) {}
+
+        void Run();
+    };
     
     struct MultiThreadLinearBFloat16FP8E4M3Op : MultiThreadBaseOp {
         uint16_t *inputData;
@@ -148,6 +162,9 @@ namespace fastllm {
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum);
     void RunLinearFloat32Float16(float *inputData, uint16_t *weightData, float *outputData, float *biasData, 
+                                int n, int m, int k, 
+                                AliveThreadPool *pool, int startTid, int threadNum);
+    void RunLinearFloat32BFloat16(float *inputData, uint16_t *weightData, float *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum);
     void RunLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 

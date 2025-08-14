@@ -1553,7 +1553,8 @@ if (false) {
                                 dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
                             }
                             if (tensor.dtype == "BF16" &&
-                                (dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)) {
+                                (dataType == DataType::FLOAT16 || dataType == DataType::BFLOAT16 ||
+                                    dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)) {
                                 oriDataType = DataType::BFLOAT16;
                             }
                             if (tensor.dtype == "F16" && 
