@@ -4378,73 +4378,25 @@ namespace fastllm {
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
+        
         output.Allocate();
         AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
                         "Swiglu error: Data's type should be float32 or float16.\n");
+
         float *inputData = (float*)input.cpuData;
         float *outputData = (float*)output.cpuData;
 
         int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
         int outer = input.Count(0) / spatial;
 
-        if (input.dataType == DataType::FLOAT16) {
-            int len = input.Count(0);
-            inputData = new float[len];
-            outputData = new float[output.Count(0)];
-            for (int i = 0; i < len; i++) {
-                inputData[i] = fp16tofp32.dict[((uint16_t *) input.cpuData)[i]];
-            }
+        if (input.dataType == DataType::FLOAT32) {
+            (SwigluMultiThread((float*)inputData, spatial / 2, spatial / 2, (float*)outputData, outer, spatial, spatial / 2, GetAlivePool()));
+        } else if (input.dataType == DataType::FLOAT16) {
+            (SwigluMultiThreadFloat16((uint16_t*)inputData, spatial / 2, spatial / 2, (uint16_t*)outputData, outer, spatial, spatial / 2, GetAlivePool()));
+        } else {
+            printf("Unsupport swiglu type.");
         }
-
-        for (int o = 0; o < outer; o++) {
-            int i = 0;
-#ifdef __aarch64__
-            float32x4_t c1 = vdupq_n_f32(1.0f);
-            for (; i + 3 < mid; i += 4) {
-                float32x4_t vx = vld1q_f32(inputData + i);
-                float32x4_t vy = vld1q_f32(inputData + i + mid);
-                vx = vdivq_f32(vx, vaddq_f32(c1, exp_ps(vnegq_f32(vx))));
-                vy = vmulq_f32(vx, vy);
-                vst1q_f32(outputData + i, vy);
-            }
-#endif
-
-#ifdef __AVX2__X
-            for (; i + 7 < mid; i += 8) {  // Process 8 elements at a time
-                // Load x values (inputData[i..i+7]) and y values (inputData[i+mid..i+mid+7])
-                __m256 x = _mm256_loadu_ps(&inputData[i]);
-                __m256 y = _mm256_loadu_ps(&inputData[i + mid]);
-                
-                // Compute sigmoid: 1.0 / (1.0 + expf(-x))
-                __m256 neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
-                __m256 exp_neg_x = exp256_ps(neg_x);  // See note below about exp_ps
-                __m256 denom = _mm256_add_ps(_mm256_set1_ps(1.0f), exp_neg_x);
-                __m256 sigmoid = _mm256_div_ps(x, denom);
-                
-                // Multiply by y and store result
-                __m256 result = _mm256_mul_ps(sigmoid, y);
-                _mm256_storeu_ps(&outputData[i], result);
-            }
-#endif
-            for (; i < mid; i++) {
-                float x = inputData[i], y = inputData[i + mid];
-                outputData[i] = (x / (1.0 + expf(-x))) * y;
-            }
-            inputData += spatial;
-            outputData += spatial / 2;
-        }
-
-        if (input.dataType == DataType::FLOAT16) {
-            inputData -= input.Count(0);
-            outputData -= output.Count(0);
-            int len = output.Count(0);
-            for (int i = 0; i < len; i++) {
-                ((uint16_t *) output.cpuData)[i] = float_to_half(outputData[i]);
-            }
-
-            delete[] inputData;
-            delete[] outputData;
-        }
+        return;
     }
 
     void CpuMulOp::Run(const std::string &opType, const fastllm::DataDict &datas,
