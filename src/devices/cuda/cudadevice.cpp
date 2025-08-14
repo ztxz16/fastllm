@@ -983,8 +983,9 @@ namespace fastllm {
         Data &sinData = *(datas.find("sin")->second);
         Data &cosData = *(datas.find("cos")->second);
         int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 64;
+        int positionStride = intParams.find("positionStride") != intParams.end() ? intParams.find("positionStride")->second : 1;
 
-        FastllmCudaNearlyRotatePosition2D(data, positionIds, sinData, cosData, rotaryDim);
+        FastllmCudaNearlyRotatePosition2D(data, positionIds, sinData, cosData, rotaryDim, positionStride);
     }
 
     void CudaLlamaRotatePosition2DOp::Run(const std::string &opType, const fastllm::DataDict &datas,
