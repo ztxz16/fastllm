@@ -1311,8 +1311,13 @@ namespace fastllm {
                         int spatial = weights[idx * 2]->dims[0], mid = spatial / 2;
                         float *outputData = middles[l].data();
                         int curK = weights[idx * 2]->dims[0];
+                        auto &uinputDown = q8kInputsDown[l];
+                        int rowCount = mid / QK_K; // 每行有多少个block
+                        uinputDown.resize(rowCount * sizeof(block_q8_K));
+
                         ops[l - st] = new fastllm::MultiThreadMultiOps();
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial)); 
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToQ8KOp(middles[l].data(), (uint8_t*)uinputDown.data(), mid, (ggml_type)weights[idx * 2 + 1]->ggmlType));
                         /* ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new MultiThreadOnlineQuantizationOp(
                                     middles[l].data(), uinputDown.data(), inputConfigs.data(),
                                     1, mid, groupDown, groupCntDown,
@@ -1323,7 +1328,7 @@ namespace fastllm {
                         pool->Wait(l - st);
                         delete ops[l - st];
                     }
-
+/*
                     for (int l = st; l <= end; l++) {
                         int idx = v[l].first;
                         int spatial = weights[idx * 2]->dims[0], mid = spatial / 2;
@@ -1338,7 +1343,7 @@ namespace fastllm {
                                 (ggml_type)weights[idx * 2 + 1]->ggmlType
                         );
                     }
-
+*/
                     threadSt = 0;
                     for (int l = st; l <= end; l++) {
                         int idx = v[l].first;
