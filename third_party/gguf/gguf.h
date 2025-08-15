@@ -1875,6 +1875,8 @@ struct Repack {
 };
 const Repack * get_repack_info(ggml_type type);
 
+typedef void (*mul_mat_t)(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x);
+mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y);
 template <int nrc_y>
 void mul_mat_iq2_xxs_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x);
 template <int nrc_y>

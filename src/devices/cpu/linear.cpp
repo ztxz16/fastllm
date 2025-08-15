@@ -3,6 +3,7 @@
 //
 
 #include "devices/cpu/computeutils.h"
+#include "devices/cpu/cpudevice.h"
 
 #include <cstring>
 #include <thread>
@@ -70,37 +71,45 @@ namespace fastllm {
     void MultiThreadLinearFloat32GGUFOp::Run() {
         ggml_tensor *tensor = (ggml_tensor*)this->ggmlTensor;
         int rowCount = m / QK_K; // 每行有多少个block
-
         auto vec_dot = ggml_type_vec_dot(tensor->type);
-        if (tensor->type == GGML_TYPE_IQ2_XXS_R4 ||
-            tensor->type == GGML_TYPE_Q2_K_R4 || 
-            tensor->type == GGML_TYPE_Q3_K_R4 ||
-            tensor->type == GGML_TYPE_Q4_K_R4 ||
-            tensor->type == GGML_TYPE_Q5_K_R4 ||
-            tensor->type == GGML_TYPE_Q6_K_R4) {
-            for (int i = 0; i < n; i++) {
-                DataInfo info{&outputData[i * k + st], 
-                    (const char*)q8kInputData + i * ggml_row_size(GGML_TYPE_Q8_K, m), 
-                    (size_t)k, ggml_row_size(GGML_TYPE_Q8_K, m), 
-                    0, 1, nullptr, 0};
-                if (tensor->type == GGML_TYPE_IQ2_XXS_R4) {
-                    mul_mat_iq2_xxs_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
-                } else if (tensor->type == GGML_TYPE_Q2_K_R4) {
-                    mul_mat_q2_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
-                } else if (tensor->type == GGML_TYPE_Q3_K_R4) {
-                    mul_mat_q3_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
-                } else if (tensor->type == GGML_TYPE_Q4_K_R4) {
-                    mul_mat_q4_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
-                } else if (tensor->type == GGML_TYPE_Q5_K_R4) {
-                    mul_mat_q5_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
-                } else if (tensor->type == GGML_TYPE_Q6_K_R4) {
-                    mul_mat_q6_k_r4_q8_k<1>(m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
+        if (GetMulMatFunction(tensor->type, 1) != nullptr) {
+            int part = (n == 1 ? (end - st) : 64);
+            int oldSt = st, oldEnd = end;
+
+            int maxRows = 8;
+            std::vector <mul_mat_t> mats;
+            mats.resize(maxRows + 1);
+            for (int i = 1; i <= maxRows; i++) {
+                mats[i] = GetMulMatFunction(tensor->type, i);
+            }
+            while (st < oldEnd) {
+                end = std::min(st + part, oldEnd);
+                int i = 0;
+
+                for (; i + 7 < n; i += 8) {
+                    DataInfo info{&outputData[i * k + st], 
+                        (const char*)q8kInputData + i * ggml_row_size(GGML_TYPE_Q8_K, m), 
+                        (size_t)k, ggml_row_size(GGML_TYPE_Q8_K, m), 
+                        0, 1, nullptr, 0};
+                    mats[8](m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
                 }
+
+                if (i < n) {
+                    DataInfo info{&outputData[i * k + st], 
+                        (const char*)q8kInputData + i * ggml_row_size(GGML_TYPE_Q8_K, m), 
+                        (size_t)k, ggml_row_size(GGML_TYPE_Q8_K, m), 
+                        0, 1, nullptr, 0};
+                    mats[n - i](m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
+                }
+
                 if (biasData) {
-                    for (int j = st; j < end; j++) {
-                        outputData[i * k + j] += (biasData ? biasData[j] : 0.0f);
+                    for (int i = 0; i < n; i++) {
+                        for (int j = st; j < end; j++) {
+                            outputData[i * k + j] += biasData[j];
+                        }
                     }
                 }
+                st = end;
             }
         } else if (vec_dot != nullptr) {
             for (int i = 0; i < n; i++) {
@@ -1178,6 +1187,10 @@ namespace fastllm {
         }
     }
 
+    struct GGUFMemoryManager {
+        std::vector <block_q8_K> q8kInputs;
+    } ggufMemoryManager;
+
     void RunLinearFloat32GGUF(float *inputData, uint8_t *weightData, float *outputData, float *biasData, 
                                 Data *weight, int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum) {
@@ -1185,16 +1198,35 @@ namespace fastllm {
         ggml_tensor *tensor = (ggml_tensor*)weight->ggmlTensor;
         // printf("gguf tensor %s: %s\n", tensor->name.c_str(), ggml_type_name(tensor->type));
         
-        std::vector <block_q8_K> q8kInputs;
+        std::vector <block_q8_K> &q8kInputs = ggufMemoryManager.q8kInputs;
         int rowCount = m / QK_K; // 每行有多少个block
 
         if (ggml_is_quantized(tensor->type)) {
             q8kInputs.resize(n * rowCount);
-            for (int i = 0; i < n; i++) {
-                iqk_quantize_row_q8_K (
-                    inputData + i * m, q8kInputs.data() + i * rowCount, m, 
-                    ggml_type_vec_dot_type(tensor->type), tensor->type
-                );
+            if (n > 1) {
+                std::vector<fastllm::MultiThreadFloat32ToQ8KOp*> ops;
+                int per = n / threadNum;
+                int cur = 0;
+                for (int i = 0; i < threadNum; i++) {
+                    int end = cur + per + (cur + per * (threadNum - i) < n);
+                    ops.push_back(new MultiThreadFloat32ToQ8KOp(
+                        inputData + cur * m, (uint8_t*)(q8kInputs.data() + cur * rowCount), (end - cur) * m, tensor->type));
+                    cur = end;
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->PushOp(startTid + i, ops[i]);
+                }
+                for (int i = 0; i < threadNum; i++) {
+                    pool->Wait(startTid + i);
+                    delete ops[i];
+                }
+            } else {
+                for (int i = 0; i < n; i++) {
+                    iqk_quantize_row_q8_K (
+                        inputData + i * m, q8kInputs.data() + i * rowCount, m, 
+                        ggml_type_vec_dot_type(tensor->type), tensor->type
+                    );
+                }
             }
 
             int rows = 8;
