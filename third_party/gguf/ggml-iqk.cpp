@@ -5,6 +5,8 @@
 // some compilers don't provide _mm256_set_m128i, e.g. gcc 7
 #define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
 
+// #define HAVE_FANCY_SIMD
+
 inline uint8_t scrambled_sign(uint8_t s) {
     static const uint8_t k_table[128] = {
         0x00, 0x7f, 0x7e, 0x01, 0x7c, 0x03, 0x02, 0x7d, 0x78, 0x07, 0x06, 0x79, 0x04, 0x7b, 0x7a, 0x05,
@@ -443,7 +445,6 @@ static void mul_mat_iq2_xxs_r4_q8_k(int n, const void * vx, size_t bx, const Dat
         }
     }
 }
-template void mul_mat_iq2_xxs_r4_q8_k<1>(int, const void*, size_t, const DataInfo&, int);
 
 template <int nrc_y>
 void mul_mat_q2_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
@@ -560,7 +561,6 @@ void mul_mat_q2_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& inf
         }
     }
 }
-template void mul_mat_q2_k_r4_q8_k<1>(int, const void*, size_t, const DataInfo&, int);
 
 template <int nrc_y>
 static void mul_mat_q3_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
@@ -690,7 +690,6 @@ static void mul_mat_q3_k_r4_q8_k(int n, const void * vx, size_t bx, const DataIn
         }
     }
 }
-template void mul_mat_q3_k_r4_q8_k<1>(int, const void*, size_t, const DataInfo&, int);
 
 template <int nrc_y>
 inline void process_min_r4_b32(int ibl, __m256 m4, __m256i mins, const Q8<nrc_y, block_q8_K>& q8, __m256 * acc) {
@@ -791,7 +790,6 @@ static void mul_mat_q4_k_r4_q8_k(int n, const void * vx, size_t bx, const DataIn
         }
     }
 }
-template void mul_mat_q4_k_r4_q8_k<1>(int, const void*, size_t, const DataInfo&, int);
 
 template <int nrc_y>
 static void mul_mat_q5_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
@@ -865,7 +863,6 @@ static void mul_mat_q5_k_r4_q8_k(int n, const void * vx, size_t bx, const DataIn
         }
     }
 }
-template void mul_mat_q5_k_r4_q8_k<1>(int, const void*, size_t, const DataInfo&, int);
 
 template <int nrc_y>
 static void mul_mat_q6_k_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
@@ -984,5 +981,36 @@ static void mul_mat_q6_k_r4_q8_k(int n, const void * vx, size_t bx, const DataIn
         }
     }
 }
-template void mul_mat_q6_k_r4_q8_k<1>(int, const void*, size_t, const DataInfo&, int);
 
+static void mul_mat_empty(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    return;
+}
+
+#define RETURN_MATMUL_FUNCTION(FUNC, X) \
+    if ((X) == 1) return FUNC <1>; \
+    if ((X) == 2) return FUNC <2>; \
+    if ((X) == 3) return FUNC <3>; \
+    if ((X) == 4) return FUNC <4>; \
+    if ((X) == 5) return FUNC <5>; \
+    if ((X) == 6) return FUNC <6>; \
+    if ((X) == 7) return FUNC <7>; \
+    if ((X) == 8) return FUNC <8>; \
+    return nullptr;
+
+mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
+    if (type == GGML_TYPE_IQ2_XXS_R4) {
+        RETURN_MATMUL_FUNCTION(mul_mat_iq2_xxs_r4_q8_k, nrc_y)
+    } else if (type == GGML_TYPE_Q2_K_R4) {
+        RETURN_MATMUL_FUNCTION(mul_mat_q2_k_r4_q8_k, nrc_y)
+    } else if (type == GGML_TYPE_Q3_K_R4) {
+        RETURN_MATMUL_FUNCTION(mul_mat_q3_k_r4_q8_k, nrc_y)
+    } else if (type == GGML_TYPE_Q4_K_R4) {
+        RETURN_MATMUL_FUNCTION(mul_mat_q4_k_r4_q8_k, nrc_y)
+    } else if (type == GGML_TYPE_Q5_K_R4) {
+        RETURN_MATMUL_FUNCTION(mul_mat_q5_k_r4_q8_k, nrc_y)
+    } else if (type == GGML_TYPE_Q6_K_R4) {
+        RETURN_MATMUL_FUNCTION(mul_mat_q6_k_r4_q8_k, nrc_y)
+    } else {
+        return nullptr;
+    }
+}
