@@ -506,7 +506,7 @@ static __device__ void mul_mat_vec_q(
 #if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && (defined(RDNA2) || defined(RDNA3))
     constexpr int rows_per_cuda_block = 1;
 #else
-    constexpr int rows_per_cuda_block = ncols_y < 4 ? 1 : 2;
+    constexpr int rows_per_cuda_block = ncols_y < 4 ? 1 : 1;
 #endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__) && !defined(RDNA2) && !defined(RDNA3)
 
     const     int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
@@ -794,7 +794,8 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
 
     ggml_backend_cuda_context ctx;
     if (n > 1) {
-        for (int i = 0; i < n; i++) {
+        int i = 0;
+        for (; i + 7 < n; i += 8) {
             ggml_cuda_op_mul_mat_vec_q_impl (
                     ctx, (ggml_type)weight.ggmlType, m, k, 1, 
                     0, 0, 0, 0,
@@ -802,7 +803,19 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                     (char*)(q8Input + i * (m / QK8_1)), 
                     cudaOutput + i * k, 
                     nullptr, 
-                    0, k, 1, m, nullptr 
+                    0, k, 8, m, nullptr 
+            );        
+        }
+
+        if (n - i > 0) {
+            ggml_cuda_op_mul_mat_vec_q_impl (
+                    ctx, (ggml_type)weight.ggmlType, m, k, 1, 
+                    0, 0, 0, 0,
+                    (char*)weight.cudaData, 
+                    (char*)(q8Input + i * (m / QK8_1)), 
+                    cudaOutput + i * k, 
+                    nullptr, 
+                    0, k, n - i, m, nullptr 
             );        
         }
     } else {
@@ -855,7 +868,8 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
 
     ggml_backend_cuda_context ctx;
     if (n > 1) {
-        for (int i = 0; i < n; i++) {
+        int i = 0;
+        for (; i + 7 < n; i += 8) {
             ggml_cuda_op_mul_mat_vec_q_impl (
                     ctx, (ggml_type)weight.ggmlType, m, k, 1, 
                     0, 0, 0, 0,
@@ -863,7 +877,19 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
                     (char*)(q8Input + i * (m / QK8_1)), 
                     cudaOutput + i * k, 
                     nullptr, 
-                    0, k, 1, m, nullptr 
+                    0, k, 8, m, nullptr 
+            );        
+        }
+
+        if (n - i > 0) {
+            ggml_cuda_op_mul_mat_vec_q_impl (
+                    ctx, (ggml_type)weight.ggmlType, m, k, 1, 
+                    0, 0, 0, 0,
+                    (char*)weight.cudaData, 
+                    (char*)(q8Input + i * (m / QK8_1)), 
+                    cudaOutput + i * k, 
+                    nullptr, 
+                    0, k, n - i, m, nullptr 
             );        
         }
     } else {
