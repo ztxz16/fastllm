@@ -58,6 +58,7 @@ void Usage() {
     std::cout << "<-b|--batch> <args>:          batch数"      << std::endl;
     std::cout << "<-f|--file> <args>:           输入文件，文件中每行一个prompt，如果行数不足batch则用之前的prompt补充"      << std::endl;
     std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
+    std::cout << "<--atype> <args>:             设置推理使用的数据类型（float32/float16）" << std::endl;
 }
 
 void ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
