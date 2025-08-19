@@ -30,6 +30,7 @@ namespace fastllm {
         int stx, int blockK, int ms, int blockM, 
         float magicScale
     ) {
+#ifdef __AVX512BF16__
         constexpr int SIMD_WIDTH = 32;  // AVX512 一次处理 16 个 float
         int nb = n / SIMD_WIDTH;
         int remainder = n % SIMD_WIDTH;
@@ -87,6 +88,7 @@ namespace fastllm {
                 c_row[ix] = result * magicScale;
             }
         }
+#endif
     }
 
     template <int BROW, int AROW>
@@ -99,6 +101,7 @@ namespace fastllm {
         float* C,
         size_t stride_c
     ) {
+#ifdef __AVX512BF16__
         constexpr int SIMD_WIDTH = 16;  // AVX512 一次处理 16 个 float
         int nb = n / SIMD_WIDTH;
         int remainder = n % SIMD_WIDTH;
@@ -167,6 +170,7 @@ namespace fastllm {
                 c_row[ix] = result;
             }
         }
+#endif
     }
     
     template <int BROW, int AROW>
@@ -179,6 +183,7 @@ namespace fastllm {
         float* C,
         size_t stride_c
     ) {
+#ifdef __AVX512BF16__
         constexpr int SIMD_WIDTH = 32;  // AVX512 一次处理 32 个 bf16
         int nb = n / SIMD_WIDTH;
         int remainder = n % SIMD_WIDTH;
@@ -220,6 +225,7 @@ namespace fastllm {
                 c_row[ix] = result;
             }
         }
+#endif
     }
 
     template <int BRow>
