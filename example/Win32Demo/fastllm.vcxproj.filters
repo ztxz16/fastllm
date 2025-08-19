@@ -78,6 +78,9 @@
     <ClInclude Include="..\..\include\models\deepseekv2.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\ernie4_5.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\factoryllm.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
@@ -85,6 +88,9 @@
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\models\graphllm.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\hunyuan.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\models\internlm2.h">
@@ -99,10 +105,16 @@
     <ClInclude Include="..\..\include\models\minicpm3.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\minimax.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\moe.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\models\moss.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\pangu_moe.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
     <ClInclude Include="..\..\include\models\phi3.h">
@@ -161,6 +173,9 @@
     <ClCompile Include="..\..\src\template.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\tokenizer.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\basellm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
@@ -176,10 +191,16 @@
     <ClCompile Include="..\..\src\models\deepseekv2.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\ernie4_5.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\glm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\graphllm.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\hunyuan.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\internlm2.cpp">
@@ -194,10 +215,16 @@
     <ClCompile Include="..\..\src\models\minicpm3.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\minimax.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\moe.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\moss.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\pangu_moe.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\models\phi3.cpp">

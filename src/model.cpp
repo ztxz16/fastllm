@@ -155,6 +155,21 @@ namespace fastllm {
             iss >> std::boolalpha >> this->weight.tokenizer.byteAsChar;
         }
 
+#ifdef USE_SENTENCEPIECE
+        if (this->weight.dicts.find("tokenizer_serialized") != this->weight.dicts.end()) {
+            const std::string &hexString = this->weight.dicts["tokenizer_serialized"];
+            if (hexString.length() % 2 != 0) {
+                std::cerr << "warning: Invalid SentencePiece hex string.\n";
+            } else {
+                std::string decoded;
+                for (unsigned int i = 0; i < hexString.length(); i += 2) {
+                    decoded.push_back(std::stoi(hexString.substr(i, 2), nullptr, 16));
+                }
+                weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+                weight.tokenizer.spProcessor->LoadFromSerializedProto(decoded);
+            }
+        }
+#endif
         this->deviceMap = GetDeviceMap();
         this->moeDeviceMap = GetMoeDeviceMap();
     }
@@ -193,7 +208,7 @@ namespace fastllm {
             model->bot_role = "\n<bot>:";
             model->history_sep = "\n";
             model->weight.tokenizer.type = Tokenizer::TokenizerType::BPE;
-        } else if (modelType == "internlm") {
+        } else if (modelType == "internlm" || modelType == "internlm3") {
             model = new LlamaModel();
             model->model_type = "internlm";
         } else if (modelType == "internlm2") {
@@ -207,6 +222,7 @@ namespace fastllm {
             model = (basellm*)(new Qwen3MOEModel());
         } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3" || modelType == "kimi_k2") {
             model = (basellm*)(new DeepSeekV2Model());
+            model->model_type = modelType;
         } else if (modelType == "qwen2") {
             model = new LlamaModel();
             model->model_type = "qwen";
@@ -231,7 +247,7 @@ namespace fastllm {
             model = (basellm*)(new CogvlmModel());
         } else if (modelType == "minimax_m1" || modelType == "minimax_text_01") {
             model = (basellm*)(new MinimaxModel());
-        } else if (modelType == "hunyuan") {
+        } else if (modelType == "hunyuan" || modelType == "hunyuan_v1_moe") {
             model = (basellm*)(new HunyuanModel());
         } else if (modelType == "ernie4_5_moe") {
             model = (basellm*)(new Ernie4_5Model());
@@ -674,6 +690,15 @@ namespace fastllm {
             // PreTrainedTokenizerFast
             std::string tokenizerFile = path + "tokenizer.json";
             if (!fastllm::FileExists(tokenizerFile)) {
+#ifdef USE_SENTENCEPIECE
+                tokenizerFile = path + "tokenizer.model";
+                if (fastllm::FileExists(tokenizerFile)) {
+                    std::string&& tokenizerProto = ReadAllFile(tokenizerFile);
+                    model->weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+                    model->weight.tokenizer.spProcessor->LoadFromSerializedProto(tokenizerProto);
+                    return;
+                }
+#endif
                 ErrorInFastLLM("Model with a supported tokenizer_class: " + tokenizerClass + "，but has no \"tokenizer.json\"!");
             }
             auto tokenizer = json11::Json::parse(ReadAllFile(tokenizerFile), error);
@@ -693,6 +718,16 @@ namespace fastllm {
                 model->weight.AddDict("tokenizer_byte_as_char", "True");
             }
             model->weight.tokenizer.SetSpecialTokens(spTokens);
+#ifdef USE_SENTENCEPIECE
+        } else if (tokenizerClass == "PreTrainedTokenizer"
+            || tokenizerClass == "InternLM2Tokenizer" || tokenizerClass == "InternLM3Tokenizer") {
+            std::string tokenizerFile = path + "tokenizer.model";
+            std::string&& tokenizerProto = ReadAllFile(tokenizerFile);
+            model->weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+            model->weight.tokenizer.spProcessor->LoadFromSerializedProto(tokenizerProto);
+            if (tokenizerClass == "InternLM2Tokenizer")
+                model->eos_token_ids.insert(92542);
+#endif
         } else if (tokenizerClass == "ChatGLM4Tokenizer") {
             // GLM4御用的分词
             std::vector <std::string> lines, line;
@@ -717,18 +752,22 @@ namespace fastllm {
             model->history_sep = "";
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
             model->weight.tokenizer.chatTemplate = "";
-        } else if (tokenizerClass == "QWenTokenizer") {
-            // Qwen用的分词
+        } else if (tokenizerClass == "QWenTokenizer" || tokenizerClass == "HYTokenizer" || tokenizerClass == "TikTokenTokenizer") {
+            // tiktoken分词
+            std::map<std::string,std::string> nameMap = {{"QWenTokenizer","qwen.tiktoken"},{"HYTokenizer","hy.tiktoken"},{"TikTokenTokenizer","tiktoken.model"}};
             std::vector <std::string> lines, line;
-            SplitString(ReadAllFile(path + "qwen.tiktoken"), {'\n'}, lines);
+            SplitString(ReadAllFile(path + nameMap[tokenizerClass]), {'\n'}, lines);
             for (int i = 0; i < lines.size(); i++) {
                 SplitString(lines[i], {' '}, line);
                 model->weight.AddTokenizerWord(Base64Decode(line[0]), atoi(line[1].c_str()), 1.0f);
             }
             model->weight.tokenizer.type = Tokenizer::TokenizerType::QWEN;
-            model->weight.tokenizer.chatTemplate = "";
-            model->weight.dicts["im_start_id"] = std::to_string(lines.size() + 1);
-            model->weight.dicts["im_end_id"] = std::to_string(lines.size() + 2);
+            if (tokenizerClass == "QWenTokenizer") {
+                // Qwen用的分词
+                model->weight.tokenizer.chatTemplate = "";
+                model->weight.dicts["im_start_id"] = std::to_string(lines.size() + 1);
+                model->weight.dicts["im_end_id"] = std::to_string(lines.size() + 2);
+            }
         } else {
             ErrorInFastLLM("Unsupport tokenizer_class: " + tokenizerClass);
         }
