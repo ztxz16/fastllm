@@ -1200,9 +1200,10 @@ namespace fastllm {
         
         std::vector <block_q8_K> &q8kInputs = ggufMemoryManager.q8kInputs;
         int rowCount = m / QK_K; // 每行有多少个block
-
         if (ggml_is_quantized(tensor->type)) {
-            q8kInputs.resize(n * rowCount);
+            if (q8kInputs.size() < n * rowCount) {
+                q8kInputs.resize(n * rowCount);
+            }
             if (n > 1) {
                 std::vector<fastllm::MultiThreadFloat32ToQ8KOp*> ops;
                 int per = n / threadNum;
