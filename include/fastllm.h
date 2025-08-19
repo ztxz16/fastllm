@@ -426,7 +426,8 @@ namespace fastllm {
             NORMAL = 1,
             QWEN = 2,
             GLM = 3,
-            BERT = 4
+            BERT = 4,
+            UNIGRAM = 5
         };
 
         struct TrieNode {
@@ -479,6 +480,7 @@ namespace fastllm {
 
         TokenizerType type = TokenizerType::BPE;
 
+        int blankRepeatCount = 0;     // 重复空格替换数量，0表示不替换
         bool addDummyPrefix = true;   // 是否在首位添加空格
         bool removeExtraWhitespaces = true;   // 是否将多个空格合并为一个
         bool byteAsChar = false;  // 是否将byte变为展示字符
@@ -524,6 +526,10 @@ namespace fastllm {
         int GetTokenId(const std::string &s); // 获取s对应的tokenid
 
         std::string GetToken(int id); // 获取id对应的token
+    private:
+        std::vector<float> BytePairEncode(const std::string &s);
+
+        std::vector<float> UnigramEncode(const std::string &s);
     };
 
     std::string GetModelTypeFromFile(const std::string &fileName);
@@ -643,7 +649,7 @@ namespace fastllm {
 
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 
-	void CatDirect(Data &input0, const Data &input1, int axis); // 直接把input1的数据拷贝到input0后面（需要input0提前扩容了足够的空间）
+    void CatDirect(Data &input0, const Data &input1, int axis); // 直接把input1的数据拷贝到input0后面（需要input0提前扩容了足够的空间）
 
     void MatMul(const Data &input0, const Data &input1, Data &output, float alpha = 1.0, int group = 1);
 

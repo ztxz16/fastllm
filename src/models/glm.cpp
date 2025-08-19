@@ -285,18 +285,18 @@ namespace fastllm {
     {
         basellm::InitParams();
         head_dim = embed_dim / num_attention_heads;
-        scale_attn_1 = 1.0f/sqrt(head_dim);
+        scale_attn_1 = 1.0f / sqrt(head_dim);
 #ifdef USE_SENTENCEPIECE
         if (this->weight.dicts.find("tokenizer_serialized") != this->weight.dicts.end()) {
-            const std::string &hexString=this->weight.dicts["tokenizer_serialized"];
-            if(hexString.length()%2!=0){
+            const std::string &hexString = this->weight.dicts["tokenizer_serialized"];
+            if (hexString.length() % 2 != 0) {
                 std::cerr << "Invalid hex string\n";
-            }else{
+            } else {
                 std::string decoded;
-                for(unsigned int i=0;i<hexString.length();i+=2){
-                    decoded.push_back(std::stoi(hexString.substr(i,2),nullptr,16));
+                for (unsigned int i = 0; i < hexString.length(); i += 2) {
+                    decoded.push_back(std::stoi(hexString.substr(i, 2), nullptr, 16));
                 }
-                weight.tokenizer.spProcessor=std::make_unique<sentencepiece::SentencePieceProcessor>();
+                weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();
                 weight.tokenizer.spProcessor->LoadFromSerializedProto(decoded);
             }
         }

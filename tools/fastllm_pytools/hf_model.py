@@ -118,7 +118,8 @@ def create(model,
                 token_set.add(str(token))
             if len(tokenizer.all_special_tokens) > len(token_set):
                 modelInfo["tokenizer_has_special_tokens"] = "1"
-        if hasattr(tokenizer, "sp_model") or (hasattr(tokenizer, "tokenizer") and hasattr(tokenizer.tokenizer, "sp_model")):
+        if hasattr(tokenizer, "sp_model") or (hasattr(tokenizer, "tokenizer") and hasattr(tokenizer.tokenizer, "sp_model")) \
+                or (hasattr(tokenizer, "sp_tokenizer") and hasattr(tokenizer.sp_tokenizer, "text_tokenizer")):
             try:
                 import sentencepiece.sentencepiece_model_pb2 as model_pb2
                 with open(tokenizer.vocab_file, "rb") as f:
@@ -190,11 +191,13 @@ def create(model,
         if (hasattr(tokenizer, "tokenizer")):
             if (str(type(tokenizer.tokenizer)).find("Encoding") == -1):
                 tokenizer = tokenizer.tokenizer
-        if (hasattr(tokenizer, "sp_model")):
-            piece_size = tokenizer.sp_model.piece_size()
+        if (hasattr(tokenizer, "sp_model") or hasattr(tokenizer, "sp_tokenizer")):
+            sp_model = tokenizer.sp_tokenizer.text_tokenizer.sp if hasattr(tokenizer, "sp_tokenizer") else tokenizer.sp_model
+            delta = tokenizer.sp_tokenizer.num_image_tokens if hasattr(tokenizer, "sp_tokenizer") else 0
+            piece_size = sp_model.piece_size()
             for i in range(piece_size):
-                llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, tokenizer.sp_model.id_to_piece(i).encode(),
-                                                             i, ctypes.c_float(tokenizer.sp_model.get_score(i)));
+                llm.fastllm_lib.add_tokenizer_word_llm_model(model_handle, sp_model.id_to_piece(i).encode(),
+                                                             i + delta, ctypes.c_float(sp_model.get_score(i)));
         else:
             if hasattr(tokenizer, "bpe_ranks"):
                 merges = {("".join(bpe_tokens), token_index) for bpe_tokens, token_index in sorted(tokenizer.bpe_ranks.items(), key=lambda kv: kv[1])}
