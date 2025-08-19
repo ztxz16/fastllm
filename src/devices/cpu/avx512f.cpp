@@ -12,6 +12,7 @@
 
 namespace fastllm {
     void AddBiasAVX512(float *outputData, float *biasData, int n, int k, int st, int end) {
+#ifdef __AVX512F__
         if (biasData) {
             for (int i = 0; i < n; i++) {
                 int j = st;
@@ -24,6 +25,7 @@ namespace fastllm {
                 }
             }
         }
+#endif
     }
 
     template <int BROW, int AROW>
@@ -36,6 +38,7 @@ namespace fastllm {
         float* C,
         size_t stride_c
     ) {
+#ifdef __AVX512F__
         constexpr int SIMD_WIDTH = 16;  // AVX512 一次处理 16 个 float
         int nb = n / SIMD_WIDTH;
         int remainder = n % SIMD_WIDTH;
@@ -97,6 +100,7 @@ namespace fastllm {
                 c_row[ix] = result;
             }
         }
+#endif
     }
 
     template <int BRow>
