@@ -38,7 +38,7 @@ namespace fastllm {
         float* C,
         size_t stride_c
     ) {
-#ifdef __AVX512F__
+#if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
         constexpr int SIMD_WIDTH = 16;  // AVX512 一次处理 16 个 float
         int nb = n / SIMD_WIDTH;
         int remainder = n % SIMD_WIDTH;
