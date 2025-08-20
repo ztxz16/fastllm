@@ -45,11 +45,12 @@ namespace fastllm {
 
     void HunyuanModel::InitParams() {
         basellm::InitParams();
-        num_experts = atoi(this->weight.dicts["num_experts"].c_str());
-        // num_experts_per_tok = atoi(this->weight.dicts["num_experts_per_tok"].c_str());
-        num_experts_per_tok = 8; // atoi(this->weight.dicts["num_experts_per_tok"].c_str());
+        if (this->weight.dicts.find("num_experts") != this->weight.dicts.end()) {
+            num_experts = atoi(this->weight.dicts["num_experts"].c_str());
+            num_experts_per_tok = 8; // atoi(this->weight.dicts["moe_topk"].c_str());
 
-        norm_topk_prob = (this->weight.dicts["norm_topk_prob"] == "true");
+            norm_topk_prob = (this->weight.dicts["norm_topk_prob"] == "true");
+        }
 
         num_key_value_heads = num_attention_heads;
         if (this->weight.dicts.find("num_key_value_heads") != this->weight.dicts.end()) {
