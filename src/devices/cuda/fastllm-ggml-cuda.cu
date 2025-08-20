@@ -43,6 +43,9 @@ extern void FastllmCudaFinishOutput(fastllm::Data &output, void *data);
 extern __global__ void FastllmCudaBiasKernel(float *a, float *bias, int k);
 extern __global__ void FastllmCudaBiasKernel(half *a, half *bias, int k);
 extern __global__ void FastllmCudaFloat2HalfKernel(float* a, half *b, int len);
+extern __global__ void FastllmCudaHalf2FloatKernel(half* a, float *b, int len);
+
+extern cublasHandle_t getFastllmCublasHandle();
 
 static __device__ __forceinline__ float warp_reduce_max(float x) {
 #pragma unroll
@@ -637,6 +640,30 @@ static void mul_mat_vec_q_cuda_T(
         case 8:
             mul_mat_vec_q<type, 8, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
+        case 9:
+            mul_mat_vec_q<type, 9, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            break;
+        case 10:
+            mul_mat_vec_q<type, 10, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            break;
+        case 11:
+            mul_mat_vec_q<type, 11, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            break;
+        case 12:
+            mul_mat_vec_q<type, 12, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            break;
+        case 13:
+            mul_mat_vec_q<type, 13, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            break;
+        case 14:
+            mul_mat_vec_q<type, 14, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            break;
+        case 15:
+            mul_mat_vec_q<type, 15, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            break;
+        case 16:
+            mul_mat_vec_q<type, 16, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
+            break;
         default:
             printf("fatal error\n");
             exit(0);
@@ -769,6 +796,216 @@ void LaunchFastllmGemvGGUFKernel(float *input, uint8_t *weight, float *output, f
     }
 }
 
+// Device function
+__device__ inline void get_scale_min_k4_device(int j, const uint8_t * __restrict__ q, 
+                                               uint8_t * __restrict__ d, 
+                                               uint8_t * __restrict__ m) {
+    if (j < 4) {
+        *d = q[j] & 63; 
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        *m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
+    }
+}
+ 
+// 直接处理float数组
+__global__ void dequantize_q4_K_cuda_simple(const block_q4_K * __restrict__ x, 
+                                            half * __restrict__ y, 
+                                            int64_t k) {
+    const int nb = k / QK_K;
+    
+    // 每个block处理一个q4_K块
+    const int block_id = blockIdx.x;
+    if (block_id >= nb) return;
+    
+    const block_q4_K * xi = &x[block_id];
+    half * yi = y + block_id * QK_K;
+    
+    const float d   = __half2float(xi->data.d);
+    const float min = __half2float(xi->data.dmin);
+    
+    // 每个线程处理一个或多个元素
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    
+    for (int idx = tid; idx < QK_K; idx += stride) {
+        // 确定这个元素属于哪个32元素的子块
+        const int sub_block = idx / 32;
+        // const int elem_in_block = idx % 32;
+        
+        // 获取scale和min
+        uint8_t sc, m;
+        get_scale_min_k4_device(sub_block, xi->scales, &sc, &m);
+        
+        const float d_scaled = d * sc;
+        const float min_scaled = min * m;
+        
+        // 确定quantized值的位置
+        // 每64个元素共享32个字节的qs
+        const int group_of_64 = idx / 64;
+        const int elem_in_64 = idx % 64;
+        const int qs_idx = group_of_64 * 32 + elem_in_64 % 32;
+        
+        if (qs_idx < QK_K/2) {  // 边界检查
+            uint8_t q_val = xi->qs[qs_idx];
+            
+            float result;
+            if (elem_in_64 < 32) {
+                // 前32个元素使用低4位
+                result = d_scaled * (q_val & 0xF) - min_scaled;
+            } else {
+                // 后32个元素使用高4位
+                result = d_scaled * (q_val >> 4) - min_scaled;
+            }
+            
+            yi[idx] = __float2half(result);
+        }
+    }
+}
+ 
+// 封装函数
+void dequantize_row_q4_K_cuda(const block_q4_K* d_x, half* d_y, int64_t k, 
+                              cudaStream_t stream = 0) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+    
+    // 使用简单版本或共享内存版本
+    const int threads_per_block = 128;
+    const int blocks = nb;  // 每个block处理一个q4_K块
+    
+    // 选择一个kernel
+    dequantize_q4_K_cuda_simple<<<blocks, threads_per_block, 0, stream>>>(d_x, d_y, k);
+    // dequantize_q4_K_cuda_shared<<<blocks, threads_per_block, 0, stream>>>(d_x, d_y, k);
+    
+    // 检查错误
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("Kernel launch error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+// Device function for q6_K - not needed since scales are directly accessible
+// But keeping for consistency if needed for other operations
+
+// CUDA kernel for dequantizing q6_K blocks
+__global__ void dequantize_q6_K_cuda_simple(const block_q6_K * __restrict__ x, 
+                                            half * __restrict__ y, 
+                                            int64_t k) {
+    const int nb = k / QK_K;
+    
+    // Each block processes one q6_K block
+    const int block_id = blockIdx.x;
+    if (block_id >= nb) return;
+    
+    const block_q6_K * xi = &x[block_id];
+    half * yi = y + block_id * QK_K;
+    
+    const float d = __half2float(xi->d);
+    
+    // Each thread processes one or more elements
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    
+    // Process QK_K elements (256 elements)
+    for (int idx = tid; idx < QK_K; idx += stride) {
+        // QK_K is processed in 2 groups of 128
+        const int group_128 = idx / 128;  // Which 128-element group (0 or 1)
+        const int idx_in_128 = idx % 128; // Position within the 128-element group
+        
+        // Within each 128-element group:
+        // - 64 ql values (each storing 2 4-bit values)
+        // - 32 qh values (each storing 4 2-bit values)
+        // - 8 scale values (each used for 16 elements)
+        
+        // Calculate offsets for this group
+        const int ql_offset = group_128 * 64;
+        const int qh_offset = group_128 * 32;
+        const int sc_offset = group_128 * 8;
+        
+        // Determine position within the 128-element group
+        int l, pos_in_32;
+        if (idx_in_128 < 32) {
+            l = idx_in_128;
+            pos_in_32 = 0;
+        } else if (idx_in_128 < 64) {
+            l = idx_in_128 - 32;
+            pos_in_32 = 1;
+        } else if (idx_in_128 < 96) {
+            l = idx_in_128 - 64;
+            pos_in_32 = 2;
+        } else {
+            l = idx_in_128 - 96;
+            pos_in_32 = 3;
+        }
+        
+        // Get the scale index (each scale covers 16 elements)
+        const int is = l / 16;
+        
+        // Get ql and qh values
+        uint8_t ql_val, qh_val;
+        int8_t q_result;
+        
+        if (pos_in_32 == 0) {
+            // First 32 elements: use lower 4 bits of ql[l] and bits 0-1 of qh[l]
+            ql_val = xi->ql[ql_offset + l];
+            qh_val = xi->qh[qh_offset + l];
+            q_result = (int8_t)((ql_val & 0xF) | (((qh_val >> 0) & 3) << 4)) - 32;
+            yi[idx] = __float2half(d * xi->scales[sc_offset + is + 0] * q_result);
+        } else if (pos_in_32 == 1) {
+            // Second 32 elements: use lower 4 bits of ql[l+32] and bits 2-3 of qh[l]
+            ql_val = xi->ql[ql_offset + l + 32];
+            qh_val = xi->qh[qh_offset + l];
+            q_result = (int8_t)((ql_val & 0xF) | (((qh_val >> 2) & 3) << 4)) - 32;
+            yi[idx] = __float2half(d * xi->scales[sc_offset + is + 2] * q_result);
+        } else if (pos_in_32 == 2) {
+            // Third 32 elements: use upper 4 bits of ql[l] and bits 4-5 of qh[l]
+            ql_val = xi->ql[ql_offset + l];
+            qh_val = xi->qh[qh_offset + l];
+            q_result = (int8_t)((ql_val >> 4) | (((qh_val >> 4) & 3) << 4)) - 32;
+            yi[idx] = __float2half(d * xi->scales[sc_offset + is + 4] * q_result);
+        } else { // pos_in_32 == 3
+            // Fourth 32 elements: use upper 4 bits of ql[l+32] and bits 6-7 of qh[l]
+            ql_val = xi->ql[ql_offset + l + 32];
+            qh_val = xi->qh[qh_offset + l];
+            q_result = (int8_t)((ql_val >> 4) | (((qh_val >> 6) & 3) << 4)) - 32;
+            yi[idx] = __float2half(d * xi->scales[sc_offset + is + 6] * q_result);
+        }
+    }
+}
+
+// Wrapper function for q6_K dequantization
+void dequantize_row_q6_K_cuda(const block_q6_K* d_x, half* d_y, int64_t k, 
+                              cudaStream_t stream = 0) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+    
+    // Use 128 threads per block for good occupancy
+    const int threads_per_block = 128;
+    const int blocks = nb;  // Each block processes one q6_K block
+    
+    // Launch the kernel
+    dequantize_q6_K_cuda_simple<<<blocks, threads_per_block, 0, stream>>>(d_x, d_y, k);
+    
+    // Check for errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("Kernel launch error: %s\n", cudaGetErrorString(err));
+    }
+}
+
+using ggml_cuda_dequant_func = void (*) (const char *d_x, half *d_y, int64_t k, cudaStream_t stream);
+
+ggml_cuda_dequant_func GetGGMLDequantFunc(ggml_type type) {
+    if (type == GGML_TYPE_Q4_K) {
+        return (ggml_cuda_dequant_func)dequantize_row_q4_K_cuda;
+    } else if (type == GGML_TYPE_Q6_K) {
+        return (ggml_cuda_dequant_func)dequantize_row_q6_K_cuda;
+    } else {
+        return nullptr;
+    }
+}
+
 bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         float *cudaBiasData;
@@ -793,9 +1030,55 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
     );
 
     ggml_backend_cuda_context ctx;
-    if (n > 1) {
+    auto dequant = GetGGMLDequantFunc((ggml_type)weight.ggmlType);
+    if (n > 32 && dequant != nullptr) {
+        half *cudaFp16Input, *cudaFp16Output;
+        cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
+        cudaFp16Output = (half *) FastllmCudaMalloc(n * k * sizeof(half));
+
+        {
+            int len = n * m;
+            int threadPerBlock = std::min(256, len);
+            FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaFp16Input, len);
+        }
+
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+        half *cudaFp16Weight;
+        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+
+        __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
+        cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+        cublasStatus_t status;
+
+        int len = k * m;
+        int threadPerBlock = std::min(256, len);
+        dequant((const char *)weight.cudaData, cudaFp16Weight, len, nullptr);
+
+        status = cublasGemmEx(fastllmCublasHandle,
+                                CUBLAS_OP_T, CUBLAS_OP_N,
+                                k, n, m,
+                                &h_alpha, cudaFp16Weight, AType,
+                                m, cudaFp16Input, BType,
+                                m, &h_beta,
+                                cudaFp16Output, CType,
+                                k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: cublas error.\n");
+            throw("cublas error");
+            exit(0);
+        }
+
+        {
+            len = n * k;
+            FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput, len);
+        }
+
+        FastllmCudaFree(cudaFp16Input);
+        FastllmCudaFree(cudaFp16Output);
+        FastllmCudaFree(cudaFp16Weight);
+    } else if (n > 1) {
         int i = 0;
-        for (; i + 7 < n; i += 8) {
+        for (; i + 15 < n; i += 16) {
             ggml_cuda_op_mul_mat_vec_q_impl (
                     ctx, (ggml_type)weight.ggmlType, m, k, 1, 
                     0, 0, 0, 0,
@@ -803,7 +1086,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                     (char*)(q8Input + i * (m / QK8_1)), 
                     cudaOutput + i * k, 
                     nullptr, 
-                    0, k, 8, m, nullptr 
+                    0, k, 16, m, nullptr 
             );        
         }
 
@@ -867,9 +1150,40 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
     );
 
     ggml_backend_cuda_context ctx;
-    if (n > 1) {
+
+    auto dequant = GetGGMLDequantFunc((ggml_type)weight.ggmlType);
+    if (n > 32 && dequant != nullptr) {
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+
+        half *cudaFp16Weight;
+        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+
+        __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
+        cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+        cublasStatus_t status;
+
+        int len = k * m;
+        int threadPerBlock = std::min(256, len);
+        dequant((const char *)weight.cudaData, cudaFp16Weight, len, nullptr);
+
+        status = cublasGemmEx(fastllmCublasHandle,
+                                CUBLAS_OP_T, CUBLAS_OP_N,
+                                k, n, m,
+                                &h_alpha, cudaFp16Weight, AType,
+                                m, cudaInput, BType,
+                                m, &h_beta,
+                                cudaOutput, CType,
+                                k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: cublas error.\n");
+            throw("cublas error");
+            exit(0);
+        }
+
+        FastllmCudaFree(cudaFp16Weight);
+    } else if (n > 1) {
         int i = 0;
-        for (; i + 7 < n; i += 8) {
+        for (; i + 15 < n; i += 16) {
             ggml_cuda_op_mul_mat_vec_q_impl (
                     ctx, (ggml_type)weight.ggmlType, m, k, 1, 
                     0, 0, 0, 0,
@@ -877,7 +1191,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
                     (char*)(q8Input + i * (m / QK8_1)), 
                     cudaOutput + i * k, 
                     nullptr, 
-                    0, k, 8, m, nullptr 
+                    0, k, 16, m, nullptr 
             );        
         }
 
