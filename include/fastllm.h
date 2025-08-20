@@ -95,7 +95,7 @@ namespace fastllm {
         }
 
         void Push(int id) {
-            if (tokenQueue.size() == tot) {
+            if (tokenQueue.size() == tot && tot > 0) {
                 tokenSet.erase(tokenSet.find(tokenQueue.front()));
                 tokenQueue.pop();
             }
@@ -693,9 +693,9 @@ namespace fastllm {
 
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position
 
-    void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position, 相邻的元素旋转
+    void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim, int positionStride = 1); // 2D position embedding, 相邻的维度旋转
 
-    void LlamaRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position for llama
+    void LlamaRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position embedding for llama，前后各一半的维度旋转
 
     void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale); // 重复惩罚
 

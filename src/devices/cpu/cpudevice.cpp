@@ -5063,15 +5063,17 @@ namespace fastllm {
         Data &sinData = *(datas.find("sin")->second);
         Data &cosData = *(datas.find("cos")->second);
         int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 64;
+        int positionStride = intParams.find("positionStride") != intParams.end() ? intParams.find("positionStride")->second : 1;
 
         int len = data.dims[0], bs = data.dims[1];
         int spatial = data.Count(2);
         int n = data.dims[2], m = data.dims[3];
         int stride = (int)sinData.dims[1];
+        positionStride *= positionIds.dims.back();
         for (int l = 0; l < len; l++) {
             for (int b = 0; b < bs; b++) {
                 if (data.dataType == DataType::FLOAT32) {
-                    int index = (int) ((float *) positionIds.cpuData)[(b * 2) * positionIds.dims.back() + l];
+                    int index = (int) ((float *) positionIds.cpuData)[b * positionStride + l];
                     float *sin = ((float*)sinData.cpuData) + stride * index;
                     float *cos = ((float*)cosData.cpuData) + stride * index;
 
@@ -5086,7 +5088,7 @@ namespace fastllm {
                         d += m;
                     }
                 } else if (data.dataType == DataType::FLOAT16) {
-                    int index = (int) ((float *) positionIds.cpuData)[(b * 2) * positionIds.dims.back() + l];
+                    int index = (int) ((float *) positionIds.cpuData)[b * positionStride + l];
                     float *sin = ((float*)sinData.cpuData) + stride * index;
                     float *cos = ((float*)cosData.cpuData) + stride * index;
 
