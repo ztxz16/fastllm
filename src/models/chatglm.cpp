@@ -202,8 +202,8 @@ namespace fastllm {
                 q.Reshape({q.dims[0], q.dims[1], -1, embed_dim / num_attention_heads});
                 k.Reshape({k.dims[0], k.dims[1], -1, embed_dim / num_attention_heads});
                 v.Reshape({v.dims[0], v.dims[1], -1, embed_dim / num_attention_heads});
-                fastllm::NearlyRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim);
-                fastllm::NearlyRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim);
+                fastllm::NearlyRotatePosition2D(q, positionIds, sinData, cosData, rotary_dim / 2, 2);
+                fastllm::NearlyRotatePosition2D(k, positionIds, sinData, cosData, rotary_dim / 2, 2);
             }
 
             Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
@@ -498,8 +498,8 @@ namespace fastllm {
                 fastllm::RotatePosition2D(q, *positionIds[0], sinData, cosData, rotary_dim);
                 fastllm::RotatePosition2D(k, *positionIds[0], sinData, cosData, rotary_dim);
             } else if (version == 2) {
-                fastllm::NearlyRotatePosition2D(q, *positionIds[0], sinData, cosData, rotary_dim);
-                fastllm::NearlyRotatePosition2D(k, *positionIds[0], sinData, cosData, rotary_dim);
+                fastllm::NearlyRotatePosition2D(q, *positionIds[0], sinData, cosData, rotary_dim / 2, 2);
+                fastllm::NearlyRotatePosition2D(k, *positionIds[0], sinData, cosData, rotary_dim / 2, 2);
             }
 
             k.Resize({k.dims[0], k.dims[1] * k.dims[2], k.dims[3]});

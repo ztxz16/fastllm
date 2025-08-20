@@ -247,9 +247,9 @@ namespace fastllm {
             model = (basellm*)(new CogvlmModel());
         } else if (modelType == "minimax_m1" || modelType == "minimax_text_01") {
             model = (basellm*)(new MinimaxModel());
-        } else if (modelType == "hunyuan" || modelType == "hunyuan_v1_moe") {
+        } else if (modelType == "hunyuan" || modelType == "hunyuan_v1_dense" || modelType == "hunyuan_v1_moe") {
             model = (basellm*)(new HunyuanModel());
-        } else if (modelType == "ernie4_5_moe") {
+        } else if (modelType == "ernie4_5_moe" || modelType == "ernie4_5") {
             model = (basellm*)(new Ernie4_5Model());
         } else if (modelType == "PanguProMoE") {
             model = (basellm*)(new PanguMOEModel());
@@ -720,7 +720,8 @@ namespace fastllm {
             model->weight.tokenizer.SetSpecialTokens(spTokens);
 #ifdef USE_SENTENCEPIECE
         } else if (tokenizerClass == "PreTrainedTokenizer"
-            || tokenizerClass == "InternLM2Tokenizer" || tokenizerClass == "InternLM3Tokenizer") {
+            || tokenizerClass == "InternLM2Tokenizer" || tokenizerClass == "InternLM3Tokenizer"
+            || tokenizerClass == "Ernie4_5_Tokenizer") {
             std::string tokenizerFile = path + "tokenizer.model";
             std::string&& tokenizerProto = ReadAllFile(tokenizerFile);
             model->weight.tokenizer.spProcessor = std::make_unique<sentencepiece::SentencePieceProcessor>();

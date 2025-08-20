@@ -43,10 +43,12 @@ namespace fastllm {
     void Ernie4_5Model::InitParams() {
         basellm::InitParams();
 
-        n_shared_experts = atoi(this->weight.dicts["moe_num_shared_experts"].c_str());
-        num_experts = atoi(this->weight.dicts["moe_num_experts"].c_str());
-        num_experts_per_tok = atoi(this->weight.dicts["moe_k"].c_str());
-        norm_topk_prob = (this->weight.dicts["norm_topk_prob"] == "true");
+        if (this->weight.dicts.find("") != this->weight.dicts.end()) {
+            n_shared_experts = atoi(this->weight.dicts["moe_num_shared_experts"].c_str());
+            num_experts = atoi(this->weight.dicts["moe_num_experts"].c_str());
+            num_experts_per_tok = atoi(this->weight.dicts["moe_k"].c_str());
+            norm_topk_prob = (this->weight.dicts["norm_topk_prob"] == "true");
+        }
 
         num_key_value_heads = num_attention_heads;
         if (this->weight.dicts.find("num_key_value_heads") != this->weight.dicts.end()) {

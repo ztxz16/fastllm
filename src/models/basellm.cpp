@@ -240,12 +240,15 @@ namespace fastllm {
         Data inputIds, attentionMask, positionIds;
 
         Data inputTokenData = this->weight.tokenizer.Encode(prompt);
+        LastTokensManager tokens(1, generationConfig.last_n <= 0 ? max_positions : generationConfig.last_n);
         std::vector<std::vector<float> > inputTokens;
         inputTokens.resize(1);
         for (int i = 0; i < inputTokenData.Count(0); i++) {
             inputTokens[0].push_back(((float *) inputTokenData.cpuData)[i]);
+            if (generationConfig.last_n <= 0)
+                tokens.units[0].Push((int) ((float *) inputTokenData.cpuData)[i]);
         }
-        
+
         if (lastKeyValues == nullptr) {
             lastKeyValues = new std::vector<std::pair<Data, Data> >();
             for (int i = 0; i < block_cnt; i++) {
@@ -258,7 +261,7 @@ namespace fastllm {
         std::vector<std::pair<Data, Data> > &pastKeyValues = (*lastKeyValues);
         std::string retString = "";
         std::vector<float> results;
-        LastTokensManager tokens(1, generationConfig.last_n);
+        // LastTokensManager tokens(1, generationConfig.last_n);
         int promptLen = lastPromptTokens + inputTokens[0].size(), index = 0;
         int add_special_tokens = generationConfig.add_special_tokens? 1: 0;
         FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}, {"add_special_tokens", add_special_tokens}},
@@ -351,6 +354,7 @@ namespace fastllm {
         outputs.clear();
         outputs.resize(batch, "");
 
+        LastTokensManager tokensManager(batch, generationConfig.last_n <= 0 ? max_positions : generationConfig.last_n);
         std::vector<std::vector<float> > inputTokens;
         inputTokens.resize(batch);
 
@@ -358,6 +362,8 @@ namespace fastllm {
             Data now = this->weight.tokenizer.Encode(prompts[i]);
             for (int j = 0; j < now.Count(0); j++) {
                 inputTokens[i].push_back(((float *) now.cpuData)[j]);
+                if (generationConfig.last_n <= 0)
+                    tokensManager.units[i].Push((int) ((float *)now.cpuData)[j]);
             }
         }
 
@@ -378,7 +384,7 @@ namespace fastllm {
         int index = 0;
         params[0]["add_special_tokens"] = generationConfig.add_special_tokens? 1: 0;
 
-        LastTokensManager tokensManager (batch, generationConfig.last_n);
+        // LastTokensManager tokensManager (batch, generationConfig.last_n);
         std::vector <bool> isEnding = std::vector <bool> (batch, false);
         FillLLMInputsBatch(inputTokens, params, inputIds, attentionMask, positionIds);
         ToDataType(attentionMask, this->dataType);

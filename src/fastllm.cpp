@@ -1077,10 +1077,18 @@ namespace fastllm {
     }
 
     void Data::FreeSpace() {
+        if (isFake)
+            return;
         this->expansionSize = 0;
         this->expansionBytes = 0;
         if (this->dataDevice == DataDevice::CPU) {
+#ifdef USE_MMAP
+            if (this->name.empty())
+                delete[] this->cpuData;
+#else
             delete[] this->cpuData;
+#endif
+            this->cpuData = nullptr;
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             if (this->directMemory) {
@@ -1088,6 +1096,7 @@ namespace fastllm {
             } else {
                 FastllmCudaFree(this->cudaData);
             }
+            this->cudaData = nullptr;
 #else
             ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif
@@ -1207,8 +1216,12 @@ namespace fastllm {
         if (isFake) {
             return;
         }
-#ifndef USE_MMAP
-        delete[] this->cpuData;
+        if (this->cpuData != nullptr)
+#ifdef USE_MMAP
+            if (this->name.empty())
+                delete[] this->cpuData;
+#else
+           delete[] this->cpuData;
 #endif
 #ifdef USE_CUDA
         if (this->cudaData != nullptr) {
@@ -1743,7 +1756,15 @@ namespace fastllm {
         float *base = ((float*)logits.cpuData) + outerOffset * vocabSize;
 
         if (fabs(config.repeat_penalty - 1.0) > 1e-6) {
-            for (int id : tokens.tokenSet) {
+            std::multiset<int>::iterator begin = tokens.tokenSet.begin();
+            std::multiset<int>::iterator end = tokens.tokenSet.end();
+            std::set<int> unique(tokens.tokenSet.begin(), tokens.tokenSet.end());
+            if (config.last_n <= 0) {
+                begin = unique.begin();
+                end = unique.end();
+            }
+            for (std::multiset<int>::iterator iter = begin; iter != end; ++iter) {
+                int id = *iter;
                 base[id] = (base[id] < 0 ? base[id] * config.repeat_penalty : base[id] / config.repeat_penalty);
             }
         }
@@ -2402,17 +2423,11 @@ namespace fastllm {
 
     void WeightMap::ReleaseWeight() {
         for (auto &w : this->weight) {
-#ifndef USE_MMAP
-            delete[] w.second.cpuData;
-            w.second.cpuData = nullptr;
-#endif
-#ifdef USE_CUDA
-            if (w.second.cudaData != nullptr) {
-                FastllmCudaDirectFree(w.second.cudaData);
-                w.second.cudaData = nullptr;
-            }
-#endif
+            w.second.FreeSpace();
         }
+#ifdef USE_CUDA
+        FastllmCudaClearBigBuffer();
+#endif
     }
 
     Data &WeightMap::operator[](const std::string &key) {
@@ -2740,10 +2755,10 @@ namespace fastllm {
         }, {}, {{"rotaryDim", rotaryDim}});
     }
 
-    void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
+    void NearlyRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim, int positionStride) {
         curExecutor->Run("NearlyRotatePosition2D", {
                 {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
-        }, {}, {{"rotaryDim", rotaryDim}});
+        }, {}, {{"rotaryDim", rotaryDim}, {"positionStride", positionStride}});
     }
 
     void LlamaRotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
