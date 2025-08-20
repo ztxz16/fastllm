@@ -1017,13 +1017,17 @@ namespace fastllm {
         }
     }
 
+    struct FastllmQuantManager {
+        std::vector <uint8_t> uinput;
+    } fastllmQuantManager;
+
     void RunLinearFloat32Int4Group(float *inputData, Data &weight, float *outputData, float *biasData, 
                                 int n, int m, int k, int group, int groupCnt,
                                 AliveThreadPool *pool, int startTid, int threadNum) {
         weight.CalcWeightSum();
         std::vector<LowBitConfig> inputConfigs;
-        std::vector<uint8_t> uinput;
         std::vector <float> inputSums, iscales, izeros;
+        std::vector <uint8_t> &uinput = fastllmQuantManager.uinput;
         OnlineQuantization(inputData, uinput, inputConfigs, n, m, group, groupCnt, inputSums, iscales, izeros, 1);
         RunLinearInt8Int4Group(uinput.data(), (uint8_t*)weight.cpuData, outputData, n, m, k,
                                 group, groupCnt, weight.weightSum.data(), weight.mins.data(), weight.scales.data(), 

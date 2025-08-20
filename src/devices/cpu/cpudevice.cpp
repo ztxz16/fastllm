@@ -549,8 +549,10 @@ namespace fastllm {
                             int n, int m, int group, int groupCnt,
                             std::vector <float> &inputSums, std::vector <float> &iscales, std::vector <float> &izeros, 
                             int permuteType) {
+        if (uinput.size() < n * m) {
+            uinput.resize(n * m);
+        }
         inputConfigs.resize(n * group);
-        uinput.resize(n * m);
         inputSums.resize(n * group);
         iscales.resize(n * group);
         izeros.resize(n * group);
