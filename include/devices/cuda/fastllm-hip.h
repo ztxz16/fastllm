@@ -10,6 +10,34 @@
 #include <rocwmma/rocwmma.hpp>
 #endif
 
+#define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
+
+typedef int8_t int8x4_t __attribute__((ext_vector_type(4)));
+typedef uint8_t uint8x4_t __attribute__((ext_vector_type(4)));
+static __device__ __forceinline__ int __vsubss4(const int a, const int b) {
+    const int8x4_t va = reinterpret_cast<const int8x4_t&>(a);
+    const int8x4_t vb = reinterpret_cast<const int8x4_t&>(b);
+#if __has_builtin(__builtin_elementwise_sub_sat)
+    const int8x4_t c = __builtin_elementwise_sub_sat(va, vb);
+    return reinterpret_cast<const int &>(c);
+#else
+    int8x4_t c;
+    int16_t tmp;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        tmp = va[i] - vb[i];
+        if(tmp > std::numeric_limits<int8_t>::max()) tmp = std::numeric_limits<int8_t>::max();
+        if(tmp < std::numeric_limits<int8_t>::min()) tmp = std::numeric_limits<int8_t>::min();
+        c[i] = tmp;
+    }
+    return reinterpret_cast<int &>(c);
+#endif // __has_builtin(__builtin_elementwise_sub_sat)
+}
+
+static __device__ __forceinline__ int __vsub4(const int a, const int b) {
+    return __vsubss4(a, b);
+}
+
 namespace fastllm_hip {
 
     inline const hipblasHalf* ToHipblasHalfConst(const half* x) {
