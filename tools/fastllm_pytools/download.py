@@ -211,6 +211,7 @@ class HFDDownloader:
         if self.args.tool == "aria2c":
             cmd = [
                 "aria2c",
+                "--check-certificate=false",
                 "--console-log-level=error",
                 "--file-allocation=none",
                 "-x", str(self.args.x),
