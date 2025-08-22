@@ -14,6 +14,10 @@ fastllm是c++实现自有算子替代Pytorch的高性能全功能大模型推理
 
 微信群：目前群聊超过200人，请添加小助手微信号`fastllmxzs`加群: 
 
+## 新功能速览
+
+- Fastllm目前可以支持部分GGUF模型的读取了！需要注意，目前需要使用--ori参数指定源模型配置文件夹，请阅读 [使用指南](#使用指南)
+
 ## 亮点功能
 
 - 🚀 安装使用简单方便，一条命令就能成功安装，一条命令就能成功运行。
@@ -140,7 +144,18 @@ ftllm server model
 - `FP8`格式的模型，例如`Qwen/Qwen3-0.6B-FP8`
 - `AWQ`格式的模型，例如`Qwen/Qwen3-14B-AWQ`
 - `Fastllm`格式的模型，例如`fastllm/DeepSeek-V3-0324-INT4`。也可以下载原始模型后通过 [模型导出](#模型导出) 中的命令导出
-- 目前暂不支持 `GGUF` 格式的模型
+- `GGUF` 格式的模型，需要用`--ori`参数指定原始模型路径，例如
+
+``` sh
+ftllm server DeepSeek-V3-0324-Q4_K_M-00001-of-00009.gguf --ori DeepSeek-V3
+```
+
+这里的`DeepSeek-V3`是原始模型文件夹，无需下载权重文件，可以参考如下命令下载：
+
+``` sh
+ftllm download deepseek-ai/DeepSeek-V3 --exclude "*safetensors*"
+```
+
 
 如果您是第一次使用ftllm，建议直接使用基本的启动命令启动，所有的参数都会自动设置。如果您希望继续调参，请参照下面的参数设置说明
 
