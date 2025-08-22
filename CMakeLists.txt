@@ -163,49 +163,18 @@ else()
         set_source_files_properties(
             "src/devices/cpu/avx512f.cpp"
             PROPERTIES
-            COMPILE_OPTIONS "-mavx512f"
-        )
-        set_source_files_properties(
-            "src/devices/cpu/avx512f.cpp"
-            PROPERTIES
-            COMPILE_OPTIONS "-mavx512bw"
-        )
-        set_source_files_properties(
-            "src/devices/cpu/avx512f.cpp"
-            PROPERTIES
-            COMPILE_OPTIONS "-mavx512vl"
+            COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl"
         )
         
         set_source_files_properties(
             "src/devices/cpu/avx512bf16.cpp"
             PROPERTIES
-            COMPILE_OPTIONS "-mavx512bf16"
-        )
-        set_source_files_properties(
-            "src/devices/cpu/avx512bf16.cpp"
-            PROPERTIES
-            COMPILE_OPTIONS "-mavx512f"
-        )
-        set_source_files_properties(
-            "src/devices/cpu/avx512bf16.cpp"
-            PROPERTIES
-            COMPILE_OPTIONS "-mavx512bw"
-        )
-        set_source_files_properties(
-            "src/devices/cpu/avx512bf16.cpp"
-            PROPERTIES
-            COMPILE_OPTIONS "-mavx512vl"
-        )
-
-        set_source_files_properties(
-            "src/devices/cpu/avx512vnni.cpp"
-            PROPERTIES
-            COMPILE_OPTIONS "-mavx512vnni"
+            COMPILE_OPTIONS "-mavx512bf16;-mavx512f;-mavx512bw;-mavx512vl"
         )
         set_source_files_properties(
             "src/devices/cpu/avx512vnni.cpp"
             PROPERTIES
-            COMPILE_OPTIONS "-mavx512f"
+            COMPILE_OPTIONS "-mavx512vnni;-mavx512f"
         )
     endif()
 endif()
