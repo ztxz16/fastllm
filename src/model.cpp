@@ -6,6 +6,7 @@
 #include <sstream>
 #include <fstream>
 #include <regex>
+#include <iomanip>
 
 #include "chatglm.h"
 #include "moss.h"
