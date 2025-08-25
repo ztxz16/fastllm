@@ -54,7 +54,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .type_size                = sizeof(float),
             .is_quantized             = false,
         }},
-        {GGML_TYPE_F16, {
+        {GGML_TYPE_F16, ggml_type_traits{
             .type_name                = "f16",
             .blck_size                = 1,
             .type_size                = sizeof(ggml_fp16_t),
@@ -62,7 +62,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
             // .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
         }},
-        {GGML_TYPE_Q4_0, {
+        {GGML_TYPE_Q4_0, ggml_type_traits{
             .type_name                = "q4_0",
             .blck_size                = QK4_0,
             .type_size                = sizeof(block_q4_0),
@@ -70,7 +70,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .to_float                 = (ggml_to_float_t) dequantize_row_q4_0,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q4_0_ref,
         }},
-        {GGML_TYPE_Q4_1, {
+        {GGML_TYPE_Q4_1, ggml_type_traits{
             .type_name                = "q4_1",
             .blck_size                = QK4_1,
             .type_size                = sizeof(block_q4_1),
@@ -78,7 +78,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .to_float                 = (ggml_to_float_t) dequantize_row_q4_1,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q4_1_ref,
         }},
-        {GGML_TYPE_Q5_0, {
+        {GGML_TYPE_Q5_0, ggml_type_traits{
             .type_name                = "q5_0",
             .blck_size                = QK5_0,
             .type_size                = sizeof(block_q5_0),
@@ -86,7 +86,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .to_float                 = (ggml_to_float_t) dequantize_row_q5_0,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q5_0_ref,
         }},
-        {GGML_TYPE_Q5_1, {
+        {GGML_TYPE_Q5_1, ggml_type_traits{
             .type_name                = "q5_1",
             .blck_size                = QK5_1,
             .type_size                = sizeof(block_q5_1),
@@ -94,7 +94,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .to_float                 = (ggml_to_float_t) dequantize_row_q5_1,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q5_1_ref,
         }},
-        {GGML_TYPE_Q8_0, {
+        {GGML_TYPE_Q8_0, ggml_type_traits{
             .type_name                = "q8_0",
             .blck_size                = QK8_0,
             .type_size                = sizeof(block_q8_0),
@@ -109,7 +109,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .is_quantized             = true,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q8_1_ref,
         }},
-        {GGML_TYPE_Q2_K, {
+        {GGML_TYPE_Q2_K, ggml_type_traits{
             .type_name                = "q2_K",
             .blck_size                = QK_K,
             .type_size                = sizeof(block_q2_K),
@@ -129,7 +129,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             // .to_float                 = (ggml_to_float_t) dequantize_row_q2_K,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q2_K_ref,
         }},
-        {GGML_TYPE_Q3_K, {
+        {GGML_TYPE_Q3_K, ggml_type_traits{
             .type_name                = "q3_K",
             .blck_size                = QK_K,
             .type_size                = sizeof(block_q3_K),
@@ -149,7 +149,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             // .to_float                 = (ggml_to_float_t) dequantize_row_q2_K,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q2_K_ref,
         }},
-        {GGML_TYPE_Q4_K, {
+        {GGML_TYPE_Q4_K, ggml_type_traits{
             .type_name                = "q4_K",
             .blck_size                = QK_K,
             .type_size                = sizeof(block_q4_K),
@@ -169,7 +169,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             // .to_float                 = (ggml_to_float_t) dequantize_row_q2_K,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q2_K_ref,
         }},
-        {GGML_TYPE_Q5_K, {
+        {GGML_TYPE_Q5_K, ggml_type_traits{
             .type_name                = "q5_K",
             .blck_size                = QK_K,
             .type_size                = sizeof(block_q5_K),
@@ -189,7 +189,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             // .to_float                 = (ggml_to_float_t) dequantize_row_q2_K,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q2_K_ref,
         }},
-        {GGML_TYPE_Q6_K, {
+        {GGML_TYPE_Q6_K, ggml_type_traits{
             .type_name                = "q6_K",
             .blck_size                = QK_K,
             .type_size                = sizeof(block_q6_K),
@@ -209,7 +209,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             // .to_float                 = (ggml_to_float_t) dequantize_row_q2_K,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q2_K_ref,
         }},
-        {GGML_TYPE_IQ2_XXS, {
+        {GGML_TYPE_IQ2_XXS, ggml_type_traits{
             .type_name                = "iq2_xxs",
             .blck_size                = QK_K,
             .type_size                = sizeof(block_iq2_xxs),
