@@ -5,6 +5,7 @@
 #include "model.h"
 
 #include <cstring>
+#include <csignal>
 
 #ifdef WIN32
 #define DLL_EXPORT _declspec(dllexport)
@@ -13,6 +14,19 @@
 #endif
 
 #include "pytools_t2s.cpp"
+
+void signal_handler(int signal) {
+    if (signal == SIGINT) {
+        printf("into exit\n");
+        exit(0);
+    }
+}
+
+struct FASTLLM_PYTOOLS_INIT {
+    FASTLLM_PYTOOLS_INIT () {
+        std::signal(SIGINT, signal_handler);
+    }
+} fastllm_pytools_init;
 
 extern "C" {
     DLL_EXPORT void print_cpu_ins() {
