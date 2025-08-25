@@ -434,6 +434,40 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
 }
 
+#define VDR_Q8_0_Q8_1_MMVQ 2
+#define VDR_Q8_0_Q8_1_MMQ 8
+
+template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(
+    const int * v, const int * u, const T & d8_0, const T & d8_1) {
+
+    int sumi = 0;
+
+#pragma unroll
+    for (int i = 0; i < vdr; ++i) {
+        // SIMD dot product of quantized values
+        sumi = ggml_cuda_dp4a(v[i], u[i], sumi);
+    }
+
+    return d8_0*d8_1 * ((T) sumi);
+}
+
+static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q8_0 * bq8_0 = (const block_q8_0 *) vbq + kbx;
+
+    int v[VDR_Q8_0_Q8_1_MMVQ];
+    int u[VDR_Q8_0_Q8_1_MMVQ];
+
+#pragma unroll
+    for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+        v[i] = get_int_b2(bq8_0->qs, iqs + i);
+        u[i] = get_int_b4(bq8_1->qs, iqs + i);
+    }
+
+    return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
+}
+
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 #define WARP_SIZE 32
 
@@ -445,6 +479,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q4_K   : return vec_dot_q4_K_q8_1;
         case GGML_TYPE_Q5_K   : return vec_dot_q5_K_q8_1;
         case GGML_TYPE_Q6_K   : return vec_dot_q6_K_q8_1;
+        case GGML_TYPE_Q8_0   : return vec_dot_q8_0_q8_1;
         default               : return nullptr;
     }
 }
@@ -458,6 +493,7 @@ static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q4_K    : return VDR_Q4_K_Q8_1_MMVQ;
         case GGML_TYPE_Q5_K    : return VDR_Q5_K_Q8_1_MMVQ;
         case GGML_TYPE_Q6_K    : return VDR_Q6_K_Q8_1_MMVQ;
+        case GGML_TYPE_Q8_0    : return VDR_Q8_0_Q8_1_MMVQ;
         default                : return 1;
     }
 }
@@ -491,6 +527,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q6_K> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR6_K;
     static constexpr int qi = QI6_K;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q8_0> {
+    static constexpr int qk = QK8_0;
+    static constexpr int qr = QR8_0;
+    static constexpr int qi = QI8_0;
 };
 
 template <ggml_type type, int ncols_y, int nwarps, typename OType>
@@ -671,62 +714,6 @@ static void mul_mat_vec_q_cuda_T(
     }
 }
 
-template <ggml_type type, typename OType>
-static void mul_mat_vec_q_cuda(
-    const void * vx, const void * vy, OType * dst, const char * ids_data,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
-    const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, const int64_t ids_nb0, cudaStream_t stream) {
-    int nwarps = 1;
-    switch (nwarps) {
-        case 1:
-            mul_mat_vec_q_cuda_T<type, 1, OType>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst,
-                    ne2, nb02, nb12, nb2, ids_nb0, stream);
-            break;
-        case 2:
-            mul_mat_vec_q_cuda_T<type, 2, OType>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst,
-                    ne2, nb02, nb12, nb2, ids_nb0, stream);
-            break;
-        default:
-            mul_mat_vec_q_cuda_T<type, 4, OType>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst,
-                    ne2, nb02, nb12, nb2, ids_nb0, stream);
-    }
-}
-
-template <typename OType>
-static void mul_mat_vec_q3_K_q8_1_cuda(
-    const void * vx, const void * vy, OType * dst, const char * ids_data,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
-    const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, int64_t ids_nb0, cudaStream_t stream) {
-
-    mul_mat_vec_q_cuda<GGML_TYPE_Q3_K, OType>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
-}
-
-template <typename OType>
-static void mul_mat_vec_q4_K_q8_1_cuda(
-    const void * vx, const void * vy, OType * dst, const char * ids_data,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
-    const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, int64_t ids_nb0, cudaStream_t stream) {
-
-    mul_mat_vec_q_cuda<GGML_TYPE_Q4_K, OType>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
-}
-
-template <typename OType>
-static void mul_mat_vec_q5_K_q8_1_cuda(
-    const void * vx, const void * vy, OType * dst, const char * ids_data,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
-    const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, int64_t ids_nb0, cudaStream_t stream) {
-    mul_mat_vec_q_cuda<GGML_TYPE_Q5_K, OType>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
-}
-
-template <typename OType>
-static void mul_mat_vec_q6_K_q8_1_cuda(
-    const void * vx, const void * vy, OType * dst, const char * ids_data,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int ncols_y, const int nrows_dst,
-    const int ne2, const uint64_t nb02, const uint64_t nb12, const uint64_t nb2, int64_t ids_nb0, cudaStream_t stream) {
-
-    mul_mat_vec_q_cuda<GGML_TYPE_Q6_K, OType>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, ncols_y, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
-}
-
 struct ggml_backend_cuda_context {
 
 };
@@ -749,16 +736,19 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
 
     switch (type) {
         case GGML_TYPE_Q3_K:
-            mul_mat_vec_q3_K_q8_1_cuda<OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            mul_mat_vec_q_cuda_T<GGML_TYPE_Q3_K, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;
         case GGML_TYPE_Q4_K:
-            mul_mat_vec_q4_K_q8_1_cuda<OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            mul_mat_vec_q_cuda_T<GGML_TYPE_Q4_K, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;
         case GGML_TYPE_Q5_K:
-            mul_mat_vec_q5_K_q8_1_cuda<OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            mul_mat_vec_q_cuda_T<GGML_TYPE_Q5_K, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;
         case GGML_TYPE_Q6_K:
-            mul_mat_vec_q6_K_q8_1_cuda<OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            mul_mat_vec_q_cuda_T<GGML_TYPE_Q6_K, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            break;
+        case GGML_TYPE_Q8_0:
+            mul_mat_vec_q_cuda_T<GGML_TYPE_Q8_0, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;
         default:
             printf("Error: unsupport cuda linear type %s\n", ggml_type_name(type));
@@ -767,12 +757,13 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
     }
 }
 
+/*
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream) {
-/*
+
     const int64_t ne00 = src0->ne[0];
     const int64_t ne10 = src1->ne[0];
     assert(ne10 % QK8_1 == 0);
@@ -786,15 +777,8 @@ void ggml_cuda_op_mul_mat_vec_q(
         src1_padded_row_size, stream);
 
     GGML_UNUSED(src1_ddf_i);
+}
 */
-}
-
-template <typename T>
-void LaunchFastllmGemvGGUFKernel(float *input, uint8_t *weight, float *output, float *bias, int n, int m, int k) {
-    for (int i = 0; i < n; i++) {
-        // FastllmGemvGGUFKernel <256, 1, T> <<< k, 256 >>> (input + i * m, weight, output + i * k, bias, m, k);
-    }
-}
 
 // Device function
 __device__ inline void get_scale_min_k4_device(int j, const uint8_t * __restrict__ q, 
@@ -887,7 +871,6 @@ void dequantize_row_q4_K_cuda(const block_q4_K* d_x, half* d_y, int64_t k,
 
 // Device function for q6_K - not needed since scales are directly accessible
 // But keeping for consistency if needed for other operations
-
 // CUDA kernel for dequantizing q6_K blocks
 __global__ void dequantize_q6_K_cuda_simple(const block_q6_K * __restrict__ x, 
                                             half * __restrict__ y, 
@@ -994,6 +977,51 @@ void dequantize_row_q6_K_cuda(const block_q6_K* d_x, half* d_y, int64_t k,
     }
 }
 
+// 简单版本的kernel - 直接处理float数组
+__global__ void dequantize_q8_0_cuda_simple(const block_q8_0 * __restrict__ x, 
+                                            float * __restrict__ y, 
+                                            int64_t k) {
+    const int nb = k / QK8_0;
+    
+    // 每个block处理一个q8_0块
+    const int block_id = blockIdx.x;
+    if (block_id >= nb) return;
+    
+    const block_q8_0 * xi = &x[block_id];
+    float * yi = y + block_id * QK8_0;
+    
+    // 获取scale因子
+    const float d = __half2float(xi->d);
+    
+    // 每个线程处理一个或多个元素
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    
+    for (int idx = tid; idx < QK8_0; idx += stride) {
+        // q8_0的dequantize很简单：y = q * d
+        yi[idx] = xi->qs[idx] * d;
+    }
+}
+
+// 封装函数
+void dequantize_row_q8_0_cuda(const block_q8_0* d_x, float* d_y, int64_t k, 
+                              cudaStream_t stream = 0) {
+    assert(k % QK8_0 == 0);
+    const int nb = k / QK8_0;
+    
+    // 选择合适的kernel配置
+    // 方案1: 简单版本 - 每个CUDA block处理一个q8_0 block
+    const int threads_per_block = 32;  // QK8_0 = 32，使用32个线程正好
+    const int blocks = nb;
+    dequantize_q8_0_cuda_simple<<<blocks, threads_per_block, 0, stream>>>(d_x, d_y, k);
+
+    // 检查错误
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("Kernel launch error: %s\n", cudaGetErrorString(err));
+    }
+}
+
 using ggml_cuda_dequant_func = void (*) (const char *d_x, half *d_y, int64_t k, cudaStream_t stream);
 
 ggml_cuda_dequant_func GetGGMLDequantFunc(ggml_type type) {
@@ -1001,6 +1029,8 @@ ggml_cuda_dequant_func GetGGMLDequantFunc(ggml_type type) {
         return (ggml_cuda_dequant_func)dequantize_row_q4_K_cuda;
     } else if (type == GGML_TYPE_Q6_K) {
         return (ggml_cuda_dequant_func)dequantize_row_q6_K_cuda;
+    } else if (type == GGML_TYPE_Q8_0) {
+        return (ggml_cuda_dequant_func)dequantize_row_q8_0_cuda;
     } else {
         return nullptr;
     }
