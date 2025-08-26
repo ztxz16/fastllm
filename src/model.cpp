@@ -1942,7 +1942,7 @@ if (false) {
             path += "/";
         }
         std::string outputPath = exportPath;
-        if (outputPath.back() != '/' || outputPath.back() != '\\') {
+        if (outputPath.back() != '/' && outputPath.back() != '\\') {
             outputPath += "/";
         }
 
