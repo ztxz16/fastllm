@@ -12,7 +12,7 @@ RUN pip install setuptools streamlit-chat
 ENV WORKDIR /fastllm
 
 # Install cmake
-RUN wget -c https://cmake.org/files/LatestRelease/cmake-3.28.3-linux-x86_64.sh && bash ./cmake-3.28.3-linux-x86_64.sh  --skip-license --prefix=/usr/
+RUN wget -c https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-x86_64.sh && bash ./cmake-3.28.3-linux-x86_64.sh  --skip-license --prefix=/usr/
 
 WORKDIR $WORKDIR
 ADD . $WORKDIR/
