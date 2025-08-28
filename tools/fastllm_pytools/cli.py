@@ -133,7 +133,7 @@ def main():
                     args_list.append(f"--{key} {value}")
         
         # Build the command
-        cmd = f"streamlit run --server.port {port} {web_demo_path} -- {' '.join(args_list)}"
+        cmd = f"streamlit run --server.port {port} {web_demo_path} --browser.gatherUsageStats false -- {' '.join(args_list)}"
         print(f"Running: {cmd}")
         os.system(cmd)
         return
