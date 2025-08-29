@@ -952,7 +952,7 @@ namespace fastllm {
     } moeIntSingleVarManagerServer;
 
     struct moeFloatSingleVarManagerServer {
-        std::vector <std::vector <float> > middles, results;
+        std::vector <std::vector <float> > middles, swigluResults, results;
         std::vector <int> localKs;
         std::vector <float*> tempResults;
         std::vector <uint16_t> bf16Input;
@@ -1528,16 +1528,19 @@ namespace fastllm {
             
             auto &localKs = moeFloatSingleVarManagerServer.localKs;
             auto &middles = moeFloatSingleVarManagerServer.middles;
+            auto &swigluResults = moeFloatSingleVarManagerServer.swigluResults;
             auto &results = moeFloatSingleVarManagerServer.results;
 
             localKs.resize(v.size());
             middles.resize(v.size());
+            swigluResults.resize(v.size());
             results.resize(v.size());
             for (int j = 0; j < v.size(); j++) {
                 int idx = j;
                 int localK = weights[idx * 2]->dims[0];
                 localKs[j] = (localK);
                 middles[j].resize(localK);
+                swigluResults[j].resize(localK);
                 results[j].resize(weights[idx * 2 + 1]->dims[0]);
             }
 
@@ -1607,15 +1610,16 @@ namespace fastllm {
                     int spatial = localKs[idx], mid = spatial / 2;
                     Data *weightDown = weights[idx * 2 + 1];
                     float *outputData = middles[l].data();
+                    float *swigluData = swigluResults[l].data();
                     int curK = localKs[idx];
 
                     ops[l - st] = new fastllm::MultiThreadMultiOps();
-                    ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
+                    ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, swigluData, 1, spatial, spatial));
                     
                     if (weightDown->dataType == DataType::FP8_E4M3) {
-                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(middles[l].data(), (uint16_t*)middles[l].data(), mid));
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(swigluData, (uint16_t*)middles[l].data(), mid));
                     } else if (weightDown->dataType == DataType::DATA_GGUF_FORMAT) {
-                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToQ8KOp(middles[l].data(), (uint8_t*)middles[l].data(), mid, weightDown->ggmlType));
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToQ8KOp(swigluData, (uint8_t*)middles[l].data(), mid, weightDown->ggmlType));
                     }
 
                     pool->PushOp(l - st, ops[l - st]);
