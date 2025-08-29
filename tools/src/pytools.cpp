@@ -173,6 +173,7 @@ extern "C" {
 
     DLL_EXPORT int create_llm_model_from_gguf(char *path, char *oriPath) {
         models.locker.lock();
+        fastllm::SetCudaSharedExpert(true);
         int id = models.models.size();
         models.models[id] = fastllm::CreateLLMModelFromGGUFFile(path, oriPath);
         models.locker.unlock();
