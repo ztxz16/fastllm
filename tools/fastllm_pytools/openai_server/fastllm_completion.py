@@ -166,6 +166,11 @@ class FastLLmCompletion:
               return self.create_error_response(str(e))
 
   async def check_disconnect(self, raw_request: Request, request_id, handle: int):
+    # 进入BackgroundTask之后，说明流式请求已经断开了，那么这里直接abort
+    self.model.abort_handle(handle)
+    logging.info(f"Abort request: {request_id}")
+    return
+  
     while True:
       if await raw_request.is_disconnected():
         self.model.abort_handle(handle)
@@ -187,6 +192,7 @@ class FastLLmCompletion:
         result += res
         completion_tokens += 1
         if await raw_request.is_disconnected():
+           print("is_disconnected!!!")
            self.model.abort_handle(handle)
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
