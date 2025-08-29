@@ -2962,6 +2962,7 @@ namespace fastllm {
     }
 
     void MultiThreadFloat32ToQ8KOp::Run() {
+        AssertInFastLLM((void*)input != (void*)output, "MultiThreadFloat32ToQ8KOp's input and output should be diff.\n");
         iqk_quantize_row_q8_K (
             input, output, len, 
             ggml_type_vec_dot_type((ggml_type)ggmlType), (ggml_type)ggmlType

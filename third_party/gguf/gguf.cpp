@@ -17,6 +17,13 @@ GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *, float *, int64_t
 GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
 GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
 
+GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *bf16, float *fp32, int64_t len) {
+    for (int i = 0; i < len; i++) {
+        uint32_t x = ((int)bf16[i].bits << 16);
+        fp32[i] = *((float*)&x);
+    }
+}
+
 #if (defined(_MSC_VER) && _MSC_VER <= 1922) || (defined(__GNUC__) && __GNUC__ < 8 && !defined(__clang__))  // VS 2015/2017
 std::map <ggml_type, ggml_type_traits> type_traits = {
         {GGML_TYPE_I8, {/* type_name */"i8", /* blck_size */1,
@@ -303,6 +310,8 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = QK8_0,
             .type_size                = sizeof(block_q8_0),
             .is_quantized             = true,
+            .vec_dot                  = ggml_vec_dot_q8_0_q8_0,
+            .vec_dot_type             = GGML_TYPE_Q8_0,
             .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
             // .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
         }},
@@ -508,7 +517,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .blck_size                = 1,
             .type_size                = sizeof(ggml_bf16_t),
             .is_quantized             = false,
-            // .to_float                 = (ggml_to_float_t) ggml_bf16_to_fp32_row,
+            .to_float                 = (ggml_to_float_t) ggml_bf16_to_fp32_row,
             // .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_bf16_row_ref,
         }},
         {GGML_TYPE_TQ1_0, {
