@@ -36,6 +36,8 @@
 #if __GNUC__ < 8
 #define _mm256_set_m128i(/* __m128i */ hi, /* __m128i */ lo) \
     _mm256_insertf128_si256(_mm256_castsi128_si256(lo), (hi), 0x1)
+#define _mm256_set_m128(/* __m128 */ hi, /* __m128 */ lo) \
+    (__m256) _mm256_insertf128_ps(_mm256_castps128_ps256(lo), (hi), 0x1)
 #endif
 #endif
 #endif
@@ -60,6 +62,18 @@
     // If _xgetbv is not found, you might need to implement it with inline assembly.
     #ifndef _XCR_XFEATURE_ENABLED_MASK // Often defined with _xgetbv
     #define _XCR_XFEATURE_ENABLED_MASK 0
+    #if __GNUC__ < 8
+    static uint64_t _xgetbv(uint32_t xcr_index) {
+        uint32_t eax, edx;
+        __asm__ __volatile__ (
+            "xgetbv"
+            : "=a" (eax), "=d" (edx)  // Output operands: eax, edx
+            : "c" (xcr_index)         // Input operand: ecx (xcr_index)
+            :                         // Clobbered registers (none explicitly clobbered by xgetbv beyond outputs)
+        );
+        return ((uint64_t)edx << 32) | eax;
+    }
+    #endif
     #endif
 #else
     #warning "CPUID detection not implemented for this compiler."

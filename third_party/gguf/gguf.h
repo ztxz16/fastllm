@@ -1686,7 +1686,7 @@ struct ggml_tensor {
 
     char padding[8];
 
-    std::vector <int> dims; // vector格式的dims信息，原始的ggml_tensor中没有
+    std::vector <int> dims; // vector格式的dims信息，原始的ggml_tensor中没有的
 };
 
 size_t ggml_row_size(enum ggml_type type, int64_t ne);
@@ -1916,7 +1916,7 @@ namespace fastllm {
     struct GGUFWeightReplaceRule {
         enum GGUFWeightReplaceType {
             GGUFWeightReplaceDirect = 0, // 直接替换
-            GGUFWeightReplacePacked = 1, // 拆包替换，例如[128, 2048, 2048]的矩阵替换为128个2048 * 2048，常见于moe
+            GGUFWeightReplacePacked = 1, // 拆包替换，例如[128, 2048, 2048]的矩阵替换为128个 2048 * 2048，常见于moe
             GGUFWeightReplaceForceFP32 = 2, // 强行转为FP32, 主要是Embedding
             GGUFWeightReplaceForceFP16 = 3 // 强行转为FP16
         };
