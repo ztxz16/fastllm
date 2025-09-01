@@ -1062,7 +1062,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
     ggml_backend_cuda_context ctx;
 
     auto dequant = GetGGMLDequantFunc((ggml_type)weight.ggmlType);
-    auto dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
+    dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
 
     if (n > 32 && dequant != nullptr) {
         half *cudaFp16Input, *cudaFp16Output;
