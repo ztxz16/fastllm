@@ -979,7 +979,7 @@ void dequantize_row_q6_K_cuda(const block_q6_K* d_x, half* d_y, int64_t k,
 
 // 简单版本的kernel - 直接处理float数组
 __global__ void dequantize_q8_0_cuda_simple(const block_q8_0 * __restrict__ x, 
-                                            float * __restrict__ y, 
+                                            half * __restrict__ y, 
                                             int64_t k) {
     const int nb = k / QK8_0;
     
@@ -988,7 +988,7 @@ __global__ void dequantize_q8_0_cuda_simple(const block_q8_0 * __restrict__ x,
     if (block_id >= nb) return;
     
     const block_q8_0 * xi = &x[block_id];
-    float * yi = y + block_id * QK8_0;
+    half * yi = y + block_id * QK8_0;
     
     // 获取scale因子
     const float d = __half2float(xi->d);
@@ -999,12 +999,12 @@ __global__ void dequantize_q8_0_cuda_simple(const block_q8_0 * __restrict__ x,
     
     for (int idx = tid; idx < QK8_0; idx += stride) {
         // q8_0的dequantize很简单：y = q * d
-        yi[idx] = xi->qs[idx] * d;
+        yi[idx] = __float2half(xi->qs[idx] * d);
     }
 }
 
 // 封装函数
-void dequantize_row_q8_0_cuda(const block_q8_0* d_x, float* d_y, int64_t k, 
+void dequantize_row_q8_0_cuda(const block_q8_0* d_x, half* d_y, int64_t k, 
                               cudaStream_t stream = 0) {
     assert(k % QK8_0 == 0);
     const int nb = k / QK8_0;
@@ -1060,7 +1060,10 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
     );
 
     ggml_backend_cuda_context ctx;
+
     auto dequant = GetGGMLDequantFunc((ggml_type)weight.ggmlType);
+    auto dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
+
     if (n > 32 && dequant != nullptr) {
         half *cudaFp16Input, *cudaFp16Output;
         cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
@@ -1182,6 +1185,8 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
     ggml_backend_cuda_context ctx;
 
     auto dequant = GetGGMLDequantFunc((ggml_type)weight.ggmlType);
+    dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
+
     if (n > 32 && dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
