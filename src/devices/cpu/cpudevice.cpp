@@ -1246,7 +1246,7 @@ namespace fastllm {
 
                 std::vector <uint8_t> &q8kInputs = moeIntSingleVarManager.uinput;
                 int rowCount = m / QK_K; // 每行有多少个block
-                q8kInputs.resize(rowCount * sizeof(block_q8_K));
+                q8kInputs.resize(ggml_row_size(ggml_type_vec_dot_type((ggml_type)weights[2]->ggmlType), m));
                 iqk_quantize_row_q8_K (
                     inputData, q8kInputs.data(), m, 
                     ggml_type_vec_dot_type((ggml_type)weights[2]->ggmlType),
@@ -1315,7 +1315,7 @@ namespace fastllm {
                         int curK = weights[idx * 2]->dims[0];
                         auto &uinputDown = q8kInputsDown[l];
                         int rowCount = mid / QK_K; // 每行有多少个block
-                        uinputDown.resize(rowCount * sizeof(block_q8_K));
+                        uinputDown.resize(ggml_row_size(ggml_type_vec_dot_type((ggml_type)weights[idx * 2 + 1]->ggmlType), m));
 
                         ops[l - st] = new fastllm::MultiThreadMultiOps();
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial)); 
@@ -1338,7 +1338,7 @@ namespace fastllm {
                         auto &uinputDown = q8kInputsDown[l];
                         int rowCount = mid / QK_K; // 每行有多少个block
 
-                        uinputDown.resize(rowCount * sizeof(block_q8_K));
+                        uinputDown.resize(ggml_row_size(ggml_type_vec_dot_type((ggml_type)weights[idx * 2 + 1]->ggmlType), m));
                         iqk_quantize_row_q8_K (
                                 middles[l].data(), uinputDown.data(), mid, 
                                 ggml_type_vec_dot_type((ggml_type)weights[idx * 2 + 1]->ggmlType),

@@ -235,7 +235,10 @@ namespace fastllm {
             int ggmlType = -1;
             if (dataType == DataType::DATA_GGUF_FORMAT) {
                 ggmlType = buffer.ReadInt();
-                localM = localM / QK_K * QK_K;
+                localM = localM / 32 * 32;
+                if (localM % 32 != 0) {
+                    printf("warning: localM % 32 != 0.\n");
+                }
             }
 
             int base = partId * localM;
@@ -1619,12 +1622,12 @@ namespace fastllm {
                     if (weightDown->dataType == DataType::FLOAT16) {
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));    
                     } else {
-                    ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, swigluData, 1, spatial, spatial));
-                    
-                    if (weightDown->dataType == DataType::FP8_E4M3) {
-                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(swigluData, (uint16_t*)middles[l].data(), mid));
-                    } else if (weightDown->dataType == DataType::DATA_GGUF_FORMAT) {
-                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToQ8KOp(swigluData, (uint8_t*)middles[l].data(), mid, weightDown->ggmlType));
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, swigluData, 1, spatial, spatial));
+                        
+                        if (weightDown->dataType == DataType::FP8_E4M3) {
+                            ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(swigluData, (uint16_t*)middles[l].data(), mid));
+                        } else if (weightDown->dataType == DataType::DATA_GGUF_FORMAT) {
+                            ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToQ8KOp(swigluData, (uint8_t*)middles[l].data(), mid, weightDown->ggmlType));
                         }
                     }
 

@@ -71,6 +71,7 @@ namespace fastllm {
     void MultiThreadLinearFloat32GGUFOp::Run() {
         ggml_tensor *tensor = (ggml_tensor*)this->ggmlTensor;
         int rowCount = m / QK_K; // 每行有多少个block
+        auto vec_dot_type = ggml_type_vec_dot_type(tensor->type);
         auto vec_dot = ggml_type_vec_dot(tensor->type);
         if (GetMulMatFunction(tensor->type, 1) != nullptr) {
             int part = (n == 1 ? (end - st) : 64);
@@ -88,16 +89,16 @@ namespace fastllm {
 
                 for (; i + 7 < n; i += 8) {
                     DataInfo info{&outputData[i * k + st], 
-                        (const char*)q8kInputData + i * ggml_row_size(GGML_TYPE_Q8_K, m), 
-                        (size_t)k, ggml_row_size(GGML_TYPE_Q8_K, m), 
+                        (const char*)q8kInputData + i * ggml_row_size(vec_dot_type, m), 
+                        (size_t)k, ggml_row_size(vec_dot_type, m), 
                         0, 1, nullptr, 0};
                     mats[8](m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
                 }
 
                 if (i < n) {
                     DataInfo info{&outputData[i * k + st], 
-                        (const char*)q8kInputData + i * ggml_row_size(GGML_TYPE_Q8_K, m), 
-                        (size_t)k, ggml_row_size(GGML_TYPE_Q8_K, m), 
+                        (const char*)q8kInputData + i * ggml_row_size(vec_dot_type, m), 
+                        (size_t)k, ggml_row_size(vec_dot_type, m), 
                         0, 1, nullptr, 0};
                     mats[n - i](m, weightData + st * ggml_row_size(tensor->type, m), ggml_row_size(tensor->type, m), info, end - st);
                 }
@@ -118,7 +119,7 @@ namespace fastllm {
                     vec_dot (
                         m, &outputData[i * k + j], 0, 
                         weightData + j * ggml_row_size(tensor->type, m), 0, 
-                        q8kInputData + i * ggml_row_size(GGML_TYPE_Q8_K, m), 0, 
+                        q8kInputData + i * ggml_row_size(vec_dot_type, m), 0, 
                         1
                     );
                     outputData[i * k + j] += (biasData ? biasData[j] : 0.0f);
@@ -1192,7 +1193,7 @@ namespace fastllm {
     }
 
     struct GGUFMemoryManager {
-        std::vector <block_q8_K> q8kInputs;
+        std::vector <uint8_t> q8kInputs;
     } ggufMemoryManager;
 
     void RunLinearFloat32GGUF(float *inputData, uint8_t *weightData, float *outputData, float *biasData, 
@@ -1202,8 +1203,8 @@ namespace fastllm {
         ggml_tensor *tensor = (ggml_tensor*)weight->ggmlTensor;
         // printf("gguf tensor %s: %s\n", tensor->name.c_str(), ggml_type_name(tensor->type));
         
-        std::vector <block_q8_K> &q8kInputs = ggufMemoryManager.q8kInputs;
-        int rowCount = m / QK_K; // 每行有多少个block
+        std::vector <uint8_t> &q8kInputs = ggufMemoryManager.q8kInputs;
+        int rowCount = ggml_row_size(ggml_type_vec_dot_type(tensor->type), m);
         if (ggml_is_quantized(tensor->type)) {
             if (q8kInputs.size() < n * rowCount) {
                 q8kInputs.resize(n * rowCount);
