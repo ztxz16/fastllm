@@ -468,7 +468,7 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
 }
 
-#define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+#define MMVQ_MAX_BATCH_SIZE 16 // Max. batch size for which to use MMVQ kernels.
 #define WARP_SIZE 32
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
