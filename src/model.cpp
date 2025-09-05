@@ -29,6 +29,7 @@
 #include "minimax.h"
 #include "ernie4_5.h"
 #include "pangu_moe.h"
+#include "glm4_moe.h"
 
 #include "gguf.h"
 
@@ -155,6 +156,12 @@ namespace fastllm {
             std::istringstream iss(value);
             iss >> std::boolalpha >> this->weight.tokenizer.byteAsChar;
         }
+        if (this->weight.dicts.find("use_qk_norm") != this->weight.dicts.end()) {
+            std::string value = this->weight.dicts["use_qk_norm"];
+            transform(value.begin(), value.end(), value.begin(), ::tolower);
+            std::istringstream iss(value);
+            iss >> std::boolalpha >> this->use_qk_norm;
+        }
 
 #ifdef USE_SENTENCEPIECE
         if (this->weight.dicts.find("tokenizer_serialized") != this->weight.dicts.end()) {
@@ -254,6 +261,8 @@ namespace fastllm {
             model = (basellm*)(new Ernie4_5Model());
         } else if (modelType == "PanguProMoE") {
             model = (basellm*)(new PanguMOEModel());
+        } else if (modelType == "glm4_moe") {
+            model = (basellm*)(new Glm4MOEModel());
         } else if (modelType == "fastllmJson") {
             model = new GraphLLMModel("fastllmJson");
         } else {
@@ -872,6 +881,7 @@ namespace fastllm {
         static std::map <std::string, std::string> ggufTypeToFastllmTypeDict = {
             {"qwen2", "qwen2"}, // llama
             {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
+            {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"} // deepseek_v2
         };
         if (ggufTypeToFastllmTypeDict.find(type) != ggufTypeToFastllmTypeDict.end()) {

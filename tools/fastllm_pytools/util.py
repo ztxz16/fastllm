@@ -87,7 +87,8 @@ def make_normal_llm_model(args):
             import json
             with open(config_path, "r", encoding="utf-8") as file:
                 config = json.load(file)
-            if (config["architectures"][0] == 'Qwen3ForCausalLM' or config["architectures"][0] == 'Qwen3MoeForCausalLM'):
+            if (config["architectures"][0] == 'Qwen3ForCausalLM' or config["architectures"][0] == 'Qwen3MoeForCausalLM' or
+                config["architectures"][0] == 'Glm4MoeForCausalLM'):
                 if (args.enable_thinking == ""):
                     args.enable_thinking = "true"
             if (config["architectures"][0] == 'DeepseekV3ForCausalLM' or 
@@ -97,7 +98,8 @@ def make_normal_llm_model(args):
                 config["architectures"][0] == 'MiniMaxText01ForCausalLM' or 
                 config["architectures"][0] == 'HunYuanMoEV1ForCausalLM' or 
                 config["architectures"][0] == 'Ernie4_5_MoeForCausalLM' or 
-                config["architectures"][0] == 'PanguProMoEForCausalLM'):
+                config["architectures"][0] == 'PanguProMoEForCausalLM' or
+                config["architectures"][0] == 'Glm4MoeForCausalLM'):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
                 if ((not(args.device and args.device != ""))):

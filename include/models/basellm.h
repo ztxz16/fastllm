@@ -278,6 +278,7 @@ namespace fastllm {
         const float scale_attn = sqrt(head_dim);
         int block_cnt = 28;
 
+        bool use_qk_norm = false;
         // 以下是moe相关参数
         float routed_scaling_factor = 1.0f;
         int n_shared_experts = 0;
