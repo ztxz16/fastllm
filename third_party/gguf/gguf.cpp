@@ -512,6 +512,12 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .type_size                = sizeof(block_q8_K),
             .is_quantized             = true,
         }},
+        {GGML_TYPE_Q8_K32, {
+            .type_name                = "q8_K",
+            .blck_size                = QK_K,
+            .type_size                = sizeof(block_q8_K),
+            .is_quantized             = true,
+        }},
         {GGML_TYPE_BF16, {
             .type_name                = "bf16",
             .blck_size                = 1,

@@ -189,6 +189,69 @@ namespace fastllm {
                     ) // shared experts
                 }
             },
+            {
+                "glm4_moe", 
+                {
+                    GGUFWeightReplaceRule ( 
+                        std::regex(R"(blk\.(\d+)\.attn_(q|k|v)\.(weight|bias))"),
+                        "model.layers.$1.self_attn.$2_proj.$3"
+                    ), // qkv
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_output\.(weight|bias))"),
+                        "model.layers.$1.self_attn.o_proj.$2"
+                    ), // o 
+                    GGUFWeightReplaceRule ( 
+                        std::regex(R"(blk\.(\d+)\.attn_(q|k)_norm\.weight)"),
+                        "model.layers.$1.self_attn.$2_norm.weight"
+                    ), // qk norm
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_(gate|up|down)\.(weight|bias))"),
+                        "model.layers.$1.mlp.$2_proj.$3"
+                    ), // mlp 
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_gate_inp\.weight)"),
+                        "model.layers.$1.mlp.gate.weight"
+                    ), // gate weight
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.exp_probs_b\.bias)"),
+                        "model.layers.$1.mlp.gate.e_score_correction_bias"
+                    ), // gate bias
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk.(\d+).ffn_(gate|up|down)_exps.weight)"),
+                        std::vector <std::string> ({"model.layers.$1.mlp.experts.", ".$2_proj.weight"}),
+                        GGUFWeightReplaceRule::GGUFWeightReplacePacked
+                    ), // experts
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk.(\d+).ffn_(gate|up|down)_shexp.weight)"),
+                        "model.layers.$1.mlp.shared_experts.$2_proj.weight"
+                    ), // shared experts
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.post_attention_norm\.weight)"),
+                        "model.layers.$1.post_attention_layernorm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_norm\.weight)"),
+                        "model.layers.$1.input_layernorm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(token_embd.weight)"),
+                        "model.embed_tokens.weight", 
+                        GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(output.weight)"),
+                        "lm_head.weight"
+                    ), 
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(output_norm.weight)"),
+                        "model.norm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(.*nextn.*)"),
+                        "ignore"
+                    ), // ignore
+                }
+            }
         };
 
         static std::map <std::string, std::vector <GGUFWeightReplaceRule> > archRulesDict = {
