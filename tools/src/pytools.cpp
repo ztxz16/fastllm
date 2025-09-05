@@ -309,6 +309,7 @@ extern "C" {
                  || model->model_struct == "hunyuan"
                  || model->model_struct == "ernie4_5"
                  || model->model_struct == "pangu_moe"
+                 || model->model_struct == "glm4_moe"
                 ) {
                 model->SetDataType(fastllm::DataType::FLOAT16);
             } else {
