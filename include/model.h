@@ -42,6 +42,18 @@ namespace fastllm {
                             int moeGroupCnt = -1, const std::string &dtypeConfigString = "");
     
     std::unique_ptr<basellm> CreateLLMTokenizerFromHF(const std::string &modelPath);
+
+    struct ModelMetaInfo {
+        DataType autoAtype = fastllm::DataType::FLOAT32; // 当atype设置为auto时采用的atype
+        bool autoSaveHistoryChat = false; // 默认是否开启前缀缓存（一般moe模型会开启）
+        bool supportFP16Atype = false; // 是否支持atype设置为FP16
+        bool isMOE = false; // 是否是MOE模型
+        bool isMLP = false; // 是否是MLP模型
+    };
+
+    ModelMetaInfo *GetModelMetaInfoByType(const std::string &modelType);
+    ModelMetaInfo *GetModelMetaInfoByStruct(const std::string &modelStruct);
+
 }
 
 #endif //FASTLLM_MODEL_H
