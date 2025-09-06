@@ -1230,22 +1230,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
     }
 
     bool basellm::SetSaveHistoryChat(bool save) {
-        if (this->model_type == "llama" || 
-            this->model_type == "moe" || 
-            this->model_type == "internlm" || 
-            this->model_type == "qwen2_moe" || 
-            this->model_type == "qwen3_moe" || 
-            this->model_type == "deepseek_v2" ||
-            this->model_type == "qwen" ||
-            this->model_type == "ernie4_5" ||
-            this->model_type == "pangu_moe" ||
-            this->model_type == "hunyuan" ||
-            this->model_type == "minimax" ||
-            this->model_type == "glm4_moe") {
-            this->saveHistoryChat = save;
+        this->saveHistoryChat = save;
             return true;
-        }
-        return false;
     }
 
     void basellm::SetMoeExperts(int experts) {
