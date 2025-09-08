@@ -556,6 +556,12 @@ extern "C" {
         return ret;
     }
 
+    DLL_EXPORT char *get_type_llm_model(int modelId) {
+        auto model = models.GetModel(modelId);
+        char *ret = string_to_chars(model->model_type);
+        return ret;
+    }
+
     DLL_EXPORT float* embedding_sentence(int modelId, char *input, bool normalize, int *embeddingLen) {
         fastllm::BertModel *model = (fastllm::BertModel*)models.GetModel(modelId);
         std::string str(input);

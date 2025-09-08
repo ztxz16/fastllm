@@ -27,6 +27,10 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--cache_dir', type = str, default = "", help = '指定缓存模型文件的路径')
     parser.add_argument('--dtype_config', type = str, default = "", help = '指定权重类型配置文件')
     parser.add_argument('--ori', type = str, default = "", help = '原始模型权重，读取GGUF文件时可以使用')
+
+    parser.add_argument('--tool_call_parser', type = str, default = "auto", help = '使用的tool_call_parser类型')
+    parser.add_argument('--chat_template', type = str, default = "", help = '使用的chat_template文件')
+
     return parser
 
 def add_server_args(parser):
@@ -179,8 +183,11 @@ def make_normal_llm_model(args):
     if (args.dtype_config != "" and os.path.exists(args.dtype_config)):
         with open(args.dtype_config, "r", encoding="utf-8") as file:
             args.dtype_config = file.read()
+    if (args.chat_template != "" and os.path.exists(args.chat_template)):
+        with open(args.chat_template, "r", encoding="utf-8") as file:
+            args.chat_template = file.read()
     model = llm.model(args.path, dtype = args.dtype, moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora, 
-                        dtype_config = args.dtype_config, ori_model_path = args.ori)
+                        dtype_config = args.dtype_config, ori_model_path = args.ori, chat_template = args.chat_template, tool_call_parser = args.tool_call_parser)
     if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
         model.enable_thinking = False
     model.set_atype(args.atype)

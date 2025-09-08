@@ -44,6 +44,7 @@ class FastLLmCompletion:
     self.hide_input = hide_input
     # Store mapping between conversation IDs and handles
     self.conversation_handles = {}
+    self.tool_parser = None
     
   def init_fast_llm_model(self):
     pass
@@ -112,6 +113,7 @@ class FastLLmCompletion:
       if request.prompt:
          request.messages.append({"role": "user", "content": request.prompt})
       try:
+          # print("request", str(request))
           conversation: List[ConversationMessage] = []
           for m in request.messages:
               messages, _ = self._parse_chat_message_content(
@@ -145,10 +147,14 @@ class FastLLmCompletion:
       
       input_token_len = self.model.get_input_token_len(messages)
 
+      tools = [tool.model_dump(exclude_none=True) for tool in request.tools] if request.tools is not None else None
+      # print("tools", tools)
+
+      # from request.tools
       handle = self.model.launch_stream_response(messages,
                         max_length = max_length, min_length = min_length, do_sample = True,
                         top_p = request.top_p, top_k = request.top_k, temperature = request.temperature,
-                        repeat_penalty = frequency_penalty, one_by_one = True)
+                        repeat_penalty = frequency_penalty, tools = tools, one_by_one = True)
       # Store the mapping between conversation ID and handle
       self.conversation_handles[request_id] = handle
       logging.info(f"Created conversation: {request_id}, handle: {handle}")
@@ -273,28 +279,70 @@ class FastLLmCompletion:
             has_sent_label = True      # 标记已发送标签
 
         # 2. content部分
+
+        if (request.tools and self.tool_parser is None):
+            # tools不为空
+            from .tool_parsers import ToolParser, ToolParserManager            
+            self.tool_parser = ToolParserManager.get_tool_parser_auto (
+                self.model.get_type(), self.model.hf_tokenizer.chat_template, 
+                force_chat_template = self.model.force_chat_template, 
+                force_type = self.model.tool_call_parser) (self.model.hf_tokenizer)
+        
         completion_tokens = 0
+
+        previous_token_ids = []
+        current_token_ids = []
+        previous_text = ""
+        current_text = ""
+
         async for res in result_generator:
             if (res == "[unused16]"):
                 res = "<think>"
             elif (res == "[unused17]"):
                 res = "</think>" 
             completion_tokens += 1
-            delta_text = res            
+            delta_text = res
+
+            # print("delta_text", delta_text)
+
             # Send token-by-token response for each request.n
-            choice_data = ChatCompletionResponseStreamChoice(
-                index = 0,
-                delta = DeltaMessage(content = delta_text),
-                logprobs = None,
-                finish_reason = None)
-            chunk = ChatCompletionStreamResponseWithUsage(
-                id = request_id,
-                object = chunk_object_type,
-                created = created_time,
-                choices = [choice_data],
-                model = model_name)
-            data = chunk.model_dump_json(exclude_unset=True)
-            yield f"data: {data}\n\n"
+            if self.tool_parser and request.tools: 
+                now_ids = self.tool_parser.get_token_ids(delta_text)
+                # print("delta_text", delta_text, "now_ids", now_ids)
+
+                current_text += delta_text
+                current_token_ids += now_ids
+
+                delta_message = self.tool_parser.extract_tool_calls_streaming(
+                                previous_text = previous_text,
+                                current_text = current_text,
+                                delta_text = delta_text,
+                                previous_token_ids = previous_token_ids,
+                                current_token_ids = current_token_ids,
+                                delta_token_ids = [0],
+                                request = request)
+
+                previous_text += delta_text
+                previous_token_ids += now_ids
+                # print("delta", delta_message)
+            else:
+                delta_message = DeltaMessage(content = delta_text)
+
+            if (delta_message):
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index = 0,
+                    #delta = DeltaMessage(content = delta_text),
+                    delta = delta_message,
+                    logprobs = None,
+                    finish_reason = None)
+                chunk = ChatCompletionStreamResponseWithUsage(
+                    id = request_id,
+                    object = chunk_object_type,
+                    created = created_time,
+                    choices = [choice_data],
+                    model = model_name)
+                data = chunk.model_dump_json(exclude_unset=True)
+                yield f"data: {data}\n\n"
             #await asyncio.sleep(0)
 
         # 3. 结束标志

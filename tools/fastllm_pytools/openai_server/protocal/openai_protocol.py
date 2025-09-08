@@ -3,6 +3,7 @@
 from typing import Literal, Optional, List, Dict, Any, Union
 
 import time
+import uuid
 
 import shortuuid
 from pydantic import BaseModel, Field
@@ -57,6 +58,25 @@ class LogProbs(BaseModel):
     top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
 
 
+class FunctionDefinition(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[dict[str, Any]] = None
+
+
+class ChatCompletionToolsParam(BaseModel):
+    type: Literal["function"] = "function"
+    function: FunctionDefinition
+
+
+class ChatCompletionNamedFunction(BaseModel):
+    name: str
+
+
+class ChatCompletionNamedToolChoiceParam(BaseModel):
+    function: ChatCompletionNamedFunction
+    type: Literal["function"] = "function"
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: Optional[Union[
@@ -76,6 +96,13 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
     user: Optional[str] = None
+    tools: Optional[list[ChatCompletionToolsParam]] = None
+    tool_choice: Optional[Union[
+        Literal["none"],
+        Literal["auto"],
+        Literal["required"],
+        ChatCompletionNamedToolChoiceParam,
+    ]] = "none"
 
 
 class ChatMessage(BaseModel):
@@ -98,9 +125,42 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo
 
 
+class DeltaFunctionCall(BaseModel):
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+
+class DeltaToolCall(BaseModel):
+    id: Optional[str] = None
+    type: Optional[Literal["function"]] = None
+    index: int
+    function: Optional[DeltaFunctionCall] = None
+
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    tool_calls: list[DeltaToolCall] = Field(default_factory=list)
+
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str
+
+class ToolCall(BaseModel):
+    id: str = Field(default_factory=lambda: "fastllm-tool-" + str(uuid.uuid4().hex))
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+class ExtractedToolCallInformation(BaseModel):
+    # indicate if tools were called
+    tools_called: bool
+
+    # extracted tool calls
+    tool_calls: list[ToolCall]
+
+    # content - per OpenAI spec, content AND tool calls can be returned rarely
+    # But some models will do this intentionally
+    content: Optional[str] = None
+
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
