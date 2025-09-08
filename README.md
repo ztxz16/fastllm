@@ -303,6 +303,20 @@ numactl -C 0-31 -m 0 ftllm server fastllm/DeepSeek-V3-0324-INT4 --device cuda --
   - **描述**: 指定在线Huggingface模型的缓存目录
   - **示例**: `ftllm --cache_dir /mnt`
 
+- `--chat_template`:
+  - **描述**: 指定chat_template文件
+  - **示例**: `ftllm --chat_template deepseekv31.jinja`
+
+## 工具调用
+
+目前以下模型支持工具调用：
+
+- GLM4.5, GLM4.5-AIR
+- Qwen3-Instruct系列
+- Qwen3-Coder系列
+- Kimi-K2
+- DeepSeekV3.1, 需要指定chat_template, 文件位于本项目`example/chat_template/deepseekv31.jinja`
+
 ## 模型获取
 
 ### 模型下载
