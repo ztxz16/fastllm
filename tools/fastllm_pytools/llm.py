@@ -136,6 +136,9 @@ fastllm_lib.get_max_input_len_llm_model.restype = ctypes.c_int
 fastllm_lib.get_struct_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_struct_llm_model.restype = ctypes.c_char_p
 
+fastllm_lib.get_type_llm_model.argtypes = [ctypes.c_int]
+fastllm_lib.get_type_llm_model.restype = ctypes.c_char_p
+
 fastllm_lib.embedding_sentence.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_bool, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.embedding_sentence.restype = ctypes.POINTER(ctypes.c_float)
 
@@ -617,7 +620,9 @@ class model:
                   graph: type = None, 
                   lora: str = "", 
                   dtype_config: str = "",
-                  ori_model_path: str = ""):
+                  ori_model_path: str = "", 
+                  chat_template: str = "",
+                  tool_call_parser: str = "auto"):
         if (graph != None):
             current_graph = graph()
             if (os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json"))):
@@ -667,6 +672,9 @@ class model:
         self.hf_tokenizer = None
         self.enable_thinking = True
 
+        self.tool_call_parser = tool_call_parser
+        self.force_chat_template = False
+
         if (id != -99999):
             self.model = id;
         else:
@@ -678,6 +686,9 @@ class model:
             elif os.path.isdir(path):
                 if tokenizer_type != "fastllm":
                     self.hf_tokenizer = try_load_hf_tokenizer(path)
+                    if (chat_template != ""):
+                        self.hf_tokenizer.chat_template = chat_template
+                        self.force_chat_template = True
                 if model_json != "":
                     self.model = fastllm_lib.create_llm_model_fromhf_with_config(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, 
                                                                  ctypes.c_bool(self.hf_tokenizer != None), model_json.encode());
@@ -1113,11 +1124,16 @@ class model:
                         max_length: int = 8192, min_length: int = 0, do_sample = True, 
                         top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                         one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True, 
-                        images: List = None):
+                        images: List = None, tools: List = None):
         conversation = None
         if (isinstance(query, List)):
             conversation = query
             conversation = self.trans_conversation(conversation)
+
+        #print("query", query)
+        #print("conversation", conversation)
+        #print("tools", tools)
+
         if (images != None):
             architecture = ""
             try:
@@ -1178,7 +1194,8 @@ class model:
             else:
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
-                    prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
+                    prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, 
+                        enable_thinking = self.enable_thinking, thinking = self.enable_thinking, tools = tools)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
                 if (self.save_history):
@@ -1478,6 +1495,9 @@ class model:
 
     def get_struct(self):
         return fastllm_lib.get_struct_llm_model(self.model).decode()
+    
+    def get_type(self):
+        return fastllm_lib.get_type_llm_model(self.model).decode()
 
     def embedding_sentence(self, input: str, normalize = True):
         embedding_len = ctypes.c_int(0)
