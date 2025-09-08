@@ -1263,13 +1263,21 @@ class model:
                 yield cur
 
     async def stream_response_handle_async(self, handle):
+        import time
+        is_prefill = True
+        start_time = time.time()
+
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             tokenizer = self.hf_tokenizer
             tokens = []
             while True:
                 if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
+                    if (is_prefill and time.time() - start_time > 5):
+                        start_time = time.time()
+                        yield ""
                     await asyncio.sleep(0)
                     continue
+                is_prefill = False
                 cur = fastllm_lib.fetch_response_llm_model(self.model, handle)
                 if (cur <= -1):
                     if (cur == -2):
