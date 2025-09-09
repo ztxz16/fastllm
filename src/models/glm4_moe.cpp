@@ -63,7 +63,10 @@ namespace fastllm {
         if (this->weight.dicts.find("partial_rotary_factor") != this->weight.dicts.end()) {
             rotary_dim = (int)(rotary_dim * atof(this->weight.dicts["partial_rotary_factor"].c_str()) + 1e-5);
         }
-        
+
+        if (this->weight.dicts.find("routed_scaling_factor") != this->weight.dicts.end()) {
+            routed_scaling_factor = atof(this->weight.dicts["routed_scaling_factor"].c_str());
+        }
         if (this->weight.dicts.find("max_position_embeddings") != this->weight.dicts.end()) {
             max_positions = atoi(this->weight.dicts["max_position_embeddings"].c_str());
         }
