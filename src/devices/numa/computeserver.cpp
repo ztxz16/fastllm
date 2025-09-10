@@ -237,7 +237,7 @@ namespace fastllm {
                 ggmlType = buffer.ReadInt();
                 localM = localM / 32 * 32;
                 if (localM % 32 != 0) {
-                    printf("warning: localM % 32 != 0.\n");
+                    printf("warning: localM %% 32 != 0.\n");
                 }
             }
 
