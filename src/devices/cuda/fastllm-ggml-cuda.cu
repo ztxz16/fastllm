@@ -367,6 +367,112 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
     return d * sumi;
 }
 
+#define VDR_IQ3_XXS_Q8_1_MMVQ 2
+#define VDR_IQ3_XXS_Q8_1_MMQ  2
+
+static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_iq3_xxs * bq3 = (const block_iq3_xxs *) vbq + kbx;
+
+    const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs+1));
+    const uint8_t * q3 = (const uint8_t *) &q3_packed;
+    const uint32_t aux32 = get_int_b2(bq3->qs, QK_K/16 + iqs/2);
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+
+        const int * signs = (const int *)(ksigns64 + ((aux32 >> (7*l0/2)) & 0x7F));
+
+        const int grid_l = __vsub4(grid_pos.x ^ signs[0], signs[0]);
+        const int grid_h = __vsub4(grid_pos.y ^ signs[1], signs[1]);
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+    }
+
+    const int ls = aux32 >> 28;
+    sumi = (ls*sumi + sumi/2)/2;
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+#define VDR_IQ3_S_Q8_1_MMVQ 2
+#define VDR_IQ3_S_Q8_1_MMQ  2
+
+// TODO: don't use lookup table for signs
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+
+    const int2      qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq3->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(
+            iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+
+        const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+        const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+
+        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+    }
+
+    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+#define VDR_IQ4_XS_Q8_1_MMVQ 4
+#define VDR_IQ4_XS_Q8_1_MMQ  4
+
+static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
+
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        const int2 v = get_int_from_table_16(aux_q4);
+
+        const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/4].qs, j + 4);
+
+        sumi = ggml_cuda_dp4a(v.x, u0, sumi);
+        sumi = ggml_cuda_dp4a(v.y, u1, sumi);
+    }
+
+    const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
+    sumi *= ls - 32;
+
+    const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
+    return d * sumi;
+}
+
 #define VDR_Q5_0_Q8_1_MMVQ 2
 #define VDR_Q5_0_Q8_1_MMQ  4
 
@@ -653,8 +759,11 @@ typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {        
         case GGML_TYPE_Q3_K   : return vec_dot_q3_K_q8_1;
+        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
+        case GGML_TYPE_IQ3_S  : return vec_dot_iq3_s_q8_1;
         case GGML_TYPE_Q4_K   : return vec_dot_q4_K_q8_1;
         case GGML_TYPE_IQ4_NL : return vec_dot_iq4_nl_q8_1;
+        case GGML_TYPE_IQ4_XS : return vec_dot_iq4_xs_q8_1;
         case GGML_TYPE_Q5_0   : return vec_dot_q5_0_q8_1;
         case GGML_TYPE_Q5_1   : return vec_dot_q5_1_q8_1;
         case GGML_TYPE_Q5_K   : return vec_dot_q5_K_q8_1;
@@ -670,8 +779,11 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
 static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q3_K    : return VDR_Q3_K_Q8_1_MMVQ;
+        case GGML_TYPE_IQ3_XXS : return VDR_IQ3_XXS_Q8_1_MMVQ;
+        case GGML_TYPE_IQ3_S : return VDR_IQ3_S_Q8_1_MMVQ;
         case GGML_TYPE_Q4_K    : return VDR_Q4_K_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_NL  : return VDR_IQ4_NL_Q8_1_MMVQ;
+        case GGML_TYPE_IQ4_XS  : return VDR_IQ4_XS_Q8_1_MMVQ;
         case GGML_TYPE_Q5_0    : return VDR_Q5_0_Q8_1_MMVQ;
         case GGML_TYPE_Q5_1    : return VDR_Q5_1_Q8_1_MMVQ;
         case GGML_TYPE_Q5_K    : return VDR_Q5_K_Q8_1_MMVQ;
@@ -692,6 +804,20 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q3_K> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ3_XXS> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR3_XXS;
+    static constexpr int qi = QI3_XXS;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR3_S;
+    static constexpr int qi = QI3_S;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q4_K> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR4_K;
@@ -703,6 +829,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ4_NL> {
     static constexpr int qk = QK4_NL;
     static constexpr int qr = QR4_NL;
     static constexpr int qi = QI4_NL;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_IQ4_XS> {
+    static constexpr int qk = QK_K;
+    static constexpr int qr = QR4_XS;
+    static constexpr int qi = QI4_XS;
 };
 
 template<>
@@ -942,11 +1075,20 @@ static void ggml_cuda_op_mul_mat_vec_q_impl(ggml_backend_cuda_context & ctx, ggm
         case GGML_TYPE_Q3_K:
             mul_mat_vec_q_cuda_T<GGML_TYPE_Q3_K, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;
+        case GGML_TYPE_IQ3_XXS:
+            mul_mat_vec_q_cuda_T<GGML_TYPE_IQ3_XXS, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            break;
+        case GGML_TYPE_IQ3_S:
+            mul_mat_vec_q_cuda_T<GGML_TYPE_IQ3_S, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            break;
         case GGML_TYPE_Q4_K:
             mul_mat_vec_q_cuda_T<GGML_TYPE_Q4_K, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;
         case GGML_TYPE_IQ4_NL:
             mul_mat_vec_q_cuda_T<GGML_TYPE_IQ4_NL, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            mul_mat_vec_q_cuda_T<GGML_TYPE_IQ4_XS, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
             break;
         case GGML_TYPE_Q5_0:
             mul_mat_vec_q_cuda_T<GGML_TYPE_Q5_0, 1, OType>(src0_dd_i, src1_ddq_i, dst_dd_i, ids_data, ne00, row_diff, src1_padded_row_size, src1_ncols, nrows_dst, ne2, nb02, nb12, nb2, ids_nb0, stream);
