@@ -1285,13 +1285,7 @@ static_assert(sizeof(block_q5_0) == sizeof(ggml_half) + sizeof(uint32_t) + QK5_0
 
 #define QK5_1 32
 typedef struct {
-    GGML_EXTENSION union {
-        struct {
-            ggml_half d; // delta
-            ggml_half m; // min
-        } GGML_COMMON_AGGR_S;
-        ggml_half2 dm;
-    } GGML_COMMON_AGGR_U;
+    GGML_SCALE_TYPE1(m, dm);
     uint8_t qh[4];         // 5-th bit of quants
     uint8_t qs[QK5_1 / 2]; // nibbles / quants
 } block_q5_1;
@@ -1306,13 +1300,7 @@ static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block
 
 #define QK8_1 32
 typedef struct {
-    GGML_EXTENSION union {
-        struct {
-            ggml_half d; // delta
-            ggml_half s; // d * sum(qs[i])
-        } GGML_COMMON_AGGR_S;
-        ggml_half2 ds;
-    } GGML_COMMON_AGGR_U;
+    GGML_SCALE_TYPE1(s, ds);
     int8_t qs[QK8_1]; // quants
 } block_q8_1;
 static_assert(sizeof(block_q8_1) == 2*sizeof(ggml_half) + QK8_1, "wrong q8_1 block size/padding");
@@ -1810,6 +1798,9 @@ void iqk_quantize_row_q8_K(const float * x, void * vy, int64_t k, ggml_type type
 void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+void ggml_vec_dot_q5_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);

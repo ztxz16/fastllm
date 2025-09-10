@@ -85,8 +85,8 @@ void dequantize_row_q5_1(const block_q5_1 * restrict x, float * restrict y, int6
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
-        const float d = GGML_FP16_TO_FP32(x[i].GGML_COMMON_AGGR_S.d);
-        const float m = GGML_FP16_TO_FP32(x[i].GGML_COMMON_AGGR_S.m);
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float m = GGML_FP16_TO_FP32(x[i].m);
 
         uint32_t qh;
         memcpy(&qh, x[i].qh, sizeof(qh));
