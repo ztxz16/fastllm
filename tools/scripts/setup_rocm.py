@@ -7,7 +7,7 @@ all_require = server_require + webui_require + download_require
 
 setup (
     name = "ftllm_rocm",
-    version = "0.1.4.5",
+    version = "0.1.4.6",
     author = "huangyuyang",
     author_email = "ztxz16@foxmail.com",
     description = "Fastllm",
