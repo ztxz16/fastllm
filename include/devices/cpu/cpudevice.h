@@ -58,6 +58,18 @@ namespace fastllm {
         void Run();
     };
 
+    struct MultiThreadSwigluGptOssOp : MultiThreadBaseOp {
+        float *input, *output;
+        int mid, len, n, inputStride, outputStride;
+
+        MultiThreadSwigluGptOssOp (float *input, int mid, int len, float *output,
+                             int n, int inputStride, int outputStride) :
+            input(input), mid(mid), len(len), output(output),
+            n(n), inputStride(inputStride), outputStride(outputStride) {}
+
+        void Run();
+    };
+
     struct MultiThreadSwigluOp : MultiThreadBaseOp {
         float *input, *output;
         int mid, len, n, inputStride, outputStride;
@@ -160,6 +172,8 @@ namespace fastllm {
     void SwigluMultiThread(float *input, int mid, int len, float *output,
         int n, int inputStride, int outputStride, AliveThreadPool *pool);
     void SwigluMultiThreadFloat16(uint16_t *input, int mid, int len, uint16_t *output,
+        int n, int inputStride, int outputStride, AliveThreadPool *pool);
+    void SwigluGptOssMultiThread(float *input, int mid, int len, float *output,
         int n, int inputStride, int outputStride, AliveThreadPool *pool);
 
     void MultiplyInt4GroupMultiThreadLaunch(uint8_t *a, uint8_t *b, float *c, int n, int m, int k,
@@ -309,6 +323,11 @@ namespace fastllm {
     };
 
     class CpuSwigluOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CpuSwigluGptOssOp : BaseOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
