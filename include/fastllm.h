@@ -673,6 +673,8 @@ namespace fastllm {
 
     void Swiglu(const fastllm::Data &input, fastllm::Data &output);
 
+    void SwigluGptOss(const fastllm::Data &input, fastllm::Data &output);
+
     void Mul(const Data &input, float v, Data &output);
 
     void MulTo(Data &input0, const Data &input1); // input0 *= input1

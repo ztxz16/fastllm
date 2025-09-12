@@ -30,6 +30,7 @@
 #include "ernie4_5.h"
 #include "pangu_moe.h"
 #include "glm4_moe.h"
+#include "gpt_oss.h"
 
 #include "gguf.h"
 
@@ -263,6 +264,8 @@ namespace fastllm {
             model = (basellm*)(new PanguMOEModel());
         } else if (modelType == "glm4_moe") {
             model = (basellm*)(new Glm4MOEModel());
+        } else if (modelType == "gpt_oss") {
+            model = (basellm*)(new GptOssModel());
         } else if (modelType == "fastllmJson") {
             model = new GraphLLMModel("fastllmJson");
         } else {
