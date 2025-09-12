@@ -2685,6 +2685,12 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void SwigluGptOss(const fastllm::Data &input, fastllm::Data &output) {
+        curExecutor->Run("SwigluGptOss", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
     void Mul(const fastllm::Data &input, float v, fastllm::Data &output) {
         curExecutor->Run("Mul", {
                 {"input", (Data*)&input}, {"output", &output}

@@ -56,6 +56,7 @@ namespace fastllm {
         this->ops["Gelu"] = (BaseOperator*)(new CpuGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CpuGeluNewOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CpuSwigluOp());
+        this->ops["SwigluGptOss"] = (BaseOperator*)(new CpuSwigluGptOssOp());
         this->ops["Mul"] = (BaseOperator*)(new CpuMulOp());
         this->ops["MulTo"] = (BaseOperator*)(new CpuMulToOp());
         this->ops["Add"] = (BaseOperator*)(new CpuAddOp());
@@ -581,6 +582,48 @@ namespace fastllm {
         } else {
             MultiThreadOnlineQuantizationOp(inputData, uinput.data(), inputConfigs.data(), n, m, group, groupCnt,
                                             inputSums.data(), iscales.data(), izeros.data(), permuteType).Run();
+        }
+    }
+
+    void MultiThreadSwigluGptOssOp::Run() {
+        for (int o = 0; o < n; o++) {
+                float *cur = (float*)input + o * inputStride;
+                float *out = (float*)output + o * outputStride;
+                int i = 0;
+    #ifdef __aarch64__X
+                float32x4_t c1 = vdupq_n_f32(1.0f);
+                for (; i + 3 < len; i += 4) {
+                    float32x4_t vx = vld1q_f32(cur + i);
+                    float32x4_t vy = vld1q_f32(cur + i + mid);
+                    vx = vdivq_f32(vx, vaddq_f32(c1, exp_ps(vnegq_f32(vx))));
+                    vy = vmulq_f32(vx, vy);
+                    vst1q_f32(out + i, vy);
+                }
+    #endif
+    #ifdef __AVX2__X
+                for (; i + 7 < len; i += 8) {  // Process 8 elements at a time
+                    // Load x values (inputData[i..i+7]) and y values (inputData[i+mid..i+mid+7])
+                    __m256 x = _mm256_loadu_ps(&cur[i]);
+                    __m256 y = _mm256_loadu_ps(&cur[i + mid]);
+                    
+                    // Compute sigmoid: 1.0 / (1.0 + expf(-x))
+                    __m256 neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
+                    __m256 exp_neg_x = exp256_ps(neg_x);  // See note below about exp_ps
+                    __m256 denom = _mm256_add_ps(_mm256_set1_ps(1.0f), exp_neg_x);
+                    __m256 sigmoid = _mm256_div_ps(x, denom);
+                    
+                    // Multiply by y and store result
+                    __m256 result = _mm256_mul_ps(sigmoid, y);
+                    _mm256_storeu_ps(&out[i], result);
+                }
+    #endif
+                for (; i < len; i++) {
+                    float x = cur[i * 2], y = cur[i * 2 + 1];
+                    float gate = std::min(x, 7.0f);
+                    float up = std::max(-7.0f, std::min(y, 7.0f));
+                    float glu = gate * (1.0 / (1.0 + exp(-(gate * 1.702))));
+                    out[i] = (up + 1) * glu;                    
+                }
         }
     }
 
@@ -4407,6 +4450,43 @@ namespace fastllm {
         return;
     }
 
+    void CpuSwigluGptOssOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+
+        std::vector <int> dims = input.dims;
+        dims[dims.size() - 1] /= 2;
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    void CpuSwigluGptOssOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "Swiglu error: Data's type should be float32 or float16.\n");
+
+        float *inputData = (float*)input.cpuData;
+        float *outputData = (float*)output.cpuData;
+
+        int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
+        int outer = input.Count(0) / spatial;
+
+        if (input.dataType == DataType::FLOAT32) {
+            (SwigluGptOssMultiThread((float*)inputData, spatial / 2, spatial / 2, (float*)outputData, outer, spatial, spatial / 2, GetAlivePool()));
+        } else if (input.dataType == DataType::FLOAT16) {
+            ErrorInFastLLM("Error: Gpt oss swiglu, data type should be f32.");
+            // (SwigluMultiThreadFloat16((uint16_t*)inputData, spatial / 2, spatial / 2, (uint16_t*)outputData, outer, spatial, spatial / 2, GetAlivePool()));
+        } else {
+            printf("Unsupport swiglu type.");
+        }
+        return;
+    }
+
     void CpuMulOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -5286,6 +5366,27 @@ namespace fastllm {
         for (int i = 0; i < threadNum; i++) {
             int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
             ops.push_back(new fastllm::MultiThreadGeluOp(input + cur, end - cur, output + cur,
+                                                           n, inputStride, outputStride));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
+    void SwigluGptOssMultiThread(float *input, int mid, int len, float *output,
+                           int n, int inputStride, int outputStride, AliveThreadPool *pool) {
+        int threadNum = pool->threads.size();
+        int per = len / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadSwigluGptOssOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
+            ops.push_back(new fastllm::MultiThreadSwigluGptOssOp(input + cur, mid, end - cur, output + cur,
                                                            n, inputStride, outputStride));
             cur = end;
         }
