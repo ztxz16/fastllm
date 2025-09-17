@@ -40,6 +40,7 @@ namespace fastllm {
         this->ops["LayerNorm"] = (BaseOperator*)(new CpuLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CpuRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CpuLinearOp());
+        this->ops["Conv1DPerChannel"] = (BaseOperator*)(new CpuConv1DPerChannel());
         this->ops["Conv2D"] = (BaseOperator*)(new CpuConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CpuSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CpuRepeatOp());
@@ -52,11 +53,13 @@ namespace fastllm {
         this->ops["Silu"] = (BaseOperator*)(new CpuSiluOp());
         this->ops["TanH"] = (BaseOperator*)(new CpuTanHOp());
         this->ops["Relu"] = (BaseOperator*)(new CpuReluOp());
+        this->ops["Exp"] = (BaseOperator*)(new CpuExpOp());
         this->ops["Sigmoid"] = (BaseOperator*)(new CpuSigmoidOp());
         this->ops["Gelu"] = (BaseOperator*)(new CpuGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CpuGeluNewOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CpuSwigluOp());
         this->ops["SwigluGptOss"] = (BaseOperator*)(new CpuSwigluGptOssOp());
+        this->ops["MambaSoftplus"] = (BaseOperator*)(new CpuMambaSoftplusOp());
         this->ops["Mul"] = (BaseOperator*)(new CpuMulOp());
         this->ops["MulTo"] = (BaseOperator*)(new CpuMulToOp());
         this->ops["Add"] = (BaseOperator*)(new CpuAddOp());
@@ -64,6 +67,9 @@ namespace fastllm {
         this->ops["AttentionMask"] = (BaseOperator*)(new CpuAttentionMaskOp());
         this->ops["AttentionExtendedMask"] = (BaseOperator*)(new CpuAttentionExtendedMaskOp());
         this->ops["AlibiMask"] = (BaseOperator*)(new CpuAlibiMaskOp());
+        this->ops["TransferAttn"] = (BaseOperator*)(new CpuTransferAttnOp());
+        this->ops["RecurrentGatedDeltaRule"] = (BaseOperator*)(new CpuRecurrentGatedDeltaRuleOp());
+        this->ops["CausalMask"] = (BaseOperator*)(new CpuCausalMaskOp());
         this->ops["TopK"] = (BaseOperator*)(new CpuTopKOp());
         this->ops["Permute"] = (BaseOperator*)(new CpuPermuteOp());
         this->ops["PermuteSelf"] = (BaseOperator*)(new CpuPermuteSelfOp());
@@ -72,6 +78,8 @@ namespace fastllm {
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CpuLlamaRotatePosition2DOp());
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CpuRepeatPenaltyOp());
         this->ops["ApplyLognAttn"] = (BaseOperator*)(new CpuApplyLognAttnOp());
+        this->ops["CumSumLastDim"] = (BaseOperator*)(new CpuCumSumLastDimOp());
+        this->ops["MakeDecayMask"] = (BaseOperator*)(new CpuMakeDecayMaskOp());
 
         this->ops["SplitBatch"] = (BaseOperator*)(new CpuSplitBatchOp());
         this->ops["CatBatch"] = (BaseOperator*)(new CpuCatBatchOp());
@@ -2285,6 +2293,113 @@ namespace fastllm {
         }
     }
 
+    bool CpuConv1DPerChannel::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        return true;
+    }
+
+    void CpuConv1DPerChannel::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+
+        int inputChannels = intParams.find("inputChannels")->second;
+        int outputChannels = intParams.find("outputChannels")->second;
+        int kernel = intParams.find("kernel")->second;
+        int pad = intParams.find("pad")->second;
+        int stride = intParams.find("stride")->second;
+        
+        AssertInFastLLM(weight.dims.size() == 3, "Conv1D's weight's shape's size should be 3.\n");
+        AssertInFastLLM(input.dims[1] == inputChannels, "Conv1D's input's shape error.\n");
+
+        weight.weightType = WeightType::CONV1D;
+
+        std::vector <int> dims = input.dims;
+        int inputLen = dims[2];
+        int outputLen = (inputLen + pad + pad - kernel) / stride + 1;
+        dims[1] = outputChannels;
+        dims[2] = outputLen;
+
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    void CpuConv1DPerChannel::Run(const std::string &opType, const fastllm::DataDict &datas,
+                      const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &bias = *(datas.find("bias")->second);
+        output.Allocate(0.0f);
+        int inputChannels = intParams.find("inputChannels")->second;    
+        int outputChannels = intParams.find("outputChannels")->second; 
+        int kernelSize = intParams.find("kernel")->second;
+        int padding = intParams.find("pad")->second; 
+        int stride = intParams.find("stride")->second;
+        int groups = inputChannels;  // 组数等于通道数，实现逐通道卷积
+        
+        // 如果有groups参数，使用它
+        if (intParams.find("groups") != intParams.end()) {
+            groups = intParams.find("groups")->second;
+        }
+        
+        std::vector<int> dims = input.dims;
+        int batchSize = dims[0];        
+        int inputLength = dims[2];      
+        int outputLength = (inputLength + 2 * padding - kernelSize) / stride + 1;
+        float *floatInput = (float*)input.cpuData;
+        float *floatWeight = (float*)weight.cpuData;
+        float *floatBias = bias.dims.size() > 0 ? nullptr : (float*)bias.cpuData;
+        float *floatOutput = (float*)output.cpuData;
+        
+        int channelsPerGroup = inputChannels / groups;   // 对于逐通道卷积，这是1
+        int outputChannelsPerGroup = outputChannels / groups;  // 对于逐通道卷积，这也是1
+        
+        // 遍历批次
+        for (int b = 0; b < batchSize; b++) {
+            float *batchInput = floatInput + b * (inputChannels * inputLength);
+            float *batchOutput = floatOutput + b * (outputChannels * outputLength);
+            
+            // 对于逐通道卷积，每个通道独立处理
+            for (int g = 0; g < groups; g++) {
+                // 对于每个组内的输出通道
+                for (int oc = 0; oc < outputChannelsPerGroup; oc++) {
+                    int globalOc = g * outputChannelsPerGroup + oc;
+                    float *curWeight = floatWeight + globalOc * (channelsPerGroup * kernelSize);
+                    float *curOutput = batchOutput + globalOc * outputLength;
+                    
+                    // 遍历输出序列位置
+                    for (int ol = 0; ol < outputLength; ol++) {
+                        int il = ol * stride - padding;
+                        float value = floatBias ? floatBias[globalOc] : 0.0f;
+                        
+                        // 对于逐通道卷积，只处理对应的一个输入通道
+                        for (int ic = 0; ic < channelsPerGroup; ic++) {
+                            int globalIc = g * channelsPerGroup + ic;
+                            float *curInput = batchInput + globalIc * inputLength;
+                            
+                            // 遍历kernel
+                            for (int k = 0; k < kernelSize; k++) {
+                                float inputValue = 0;
+                                int inputPos = il + k;
+                                
+                                // 检查边界
+                                if (inputPos >= 0 && inputPos < inputLength) {
+                                    inputValue = curInput[inputPos];
+                                }
+                                
+                                value += inputValue * curWeight[ic * kernelSize + k];
+                            }
+                        }
+                        
+                        curOutput[ol] = value;
+                    }
+                }
+            }
+        }
+    }
+
     bool CpuConv2DOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         return true;
@@ -4286,6 +4401,23 @@ namespace fastllm {
         }
     }
 
+    void CpuExpOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Exp error: Data's type should be float32.\n");
+
+        float *inputData = (float*)input.cpuData;
+        float *outputData = (float*)output.cpuData;
+        int len = input.Count(0);
+        int i = 0;
+        for (; i < len; i++) {
+            float x = inputData[i];
+            outputData[i] = exp(x);
+        }
+    }
+
     void CpuGeluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -4487,6 +4619,56 @@ namespace fastllm {
         return;
     }
 
+    inline float softplus(float x) {
+        return  x > 20.0f ? x : std::log1p(std::exp(x));
+    }
+
+    void CpuMambaSoftplusOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &aLogData = *(datas.find("aLog")->second);
+        Data &dtBiasData = *(datas.find("dtBias")->second);
+        output.Allocate();
+
+        float v = floatParams.find("v") != floatParams.end() ? floatParams.find("v")->second : 1.0;
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "CpuMambaSoftplusOp error: Data's type should be float32 or float16.\n");
+        AssertInFastLLM(aLogData.dataType == DataType::FLOAT32 && dtBiasData.dataType == DataType::FLOAT32,
+                        "CpuMambaSoftplusOp error: alog's type and dtbias's type should be float32.\n");
+
+        int dimsLen = input.dims.size();
+        int outer = input.Count(0) / input.Count(dimsLen - 1);
+        int channels = input.dims[dimsLen - 1];
+
+        float *aLog = (float*)aLogData.cpuData;
+        float *dtBias = (float*)dtBiasData.cpuData;
+
+        // g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        if (input.dataType == DataType::FLOAT32) {
+            float *inputData = (float *) input.cpuData;
+            float *outputData = (float *) output.cpuData;
+            for (int o = 0; o < outer; o++) {
+                for (int i = 0; i < channels; i++) {
+                    outputData[o * channels + i] = -exp(aLog[i]) * softplus(inputData[o * channels + i] + dtBias[i]);
+                }
+            }
+        } else if (input.dataType == DataType::FLOAT16) {
+            uint16_t *inputData = (uint16_t *) input.cpuData;
+            uint16_t *outputData = (uint16_t *) output.cpuData;
+
+            for (int o = 0; o < outer; o++) {
+                for (int i = 0; i < channels; i++) {
+                    outputData[i] = float_to_half(-exp(aLog[i]) * softplus(
+                        fp16tofp32.dict[inputData[o * channels + i]] + dtBias[i]));
+                }
+            }
+            // for (int i = 0; i < len; i++) {
+               // outputData[i] = float_to_half(fp16tofp32.dict[inputData[i]] * v);
+            // }
+        }
+    }
+
     void CpuMulOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -4631,6 +4813,145 @@ namespace fastllm {
             uint16_t *input1Data = (uint16_t *) input1.cpuData;
             for (int i = 0; i < len; i++) {
                 input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] + fp16tofp32.dict[input1Data[i]] * alpha);
+            }
+        }
+    }
+
+    void CpuRecurrentGatedDeltaRuleOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &last_recurrent_state = *(datas.find("last_recurrent_state")->second);
+        Data &core_attn_out = *(datas.find("core_attn_out")->second);
+        
+        std::vector <int> dims = last_recurrent_state.dims;
+        core_attn_out.dataType = last_recurrent_state.dataType;
+        core_attn_out.Resize({dims[0], dims[1], 1, dims[3]});
+    }
+
+    void CpuRecurrentGatedDeltaRuleOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &g = *(datas.find("g")->second);
+        Data &b = *(datas.find("b")->second);
+        Data &last_recurrent_state = *(datas.find("last_recurrent_state")->second);
+        Data &core_attn_out = *(datas.find("core_attn_out")->second);
+        core_attn_out.Allocate();
+        
+        Data &q_t = q, &k_t = k, &v_t = v, &g_t = g, &b_t = b;
+
+        q_t.Resize({q_t.dims[0], q_t.dims[1], q_t.dims[3], 1});
+        k_t.Resize({k_t.dims[0], k_t.dims[1], k_t.dims[3], 1});
+        v_t.Resize({v_t.dims[0], v_t.dims[1], v_t.dims[3]});
+        Exp(g_t, g_t);
+        g_t.Resize({g_t.dims[0], g_t.dims[1], 1, 1});
+        b_t.Resize({b_t.dims[0], b_t.dims[1], 1});
+
+        // last_recurrent_state = last_recurrent_state * g_t
+        float *flast = (float*)last_recurrent_state.cpuData;
+        float *fgt = (float*)g_t.cpuData;
+        int n0 = last_recurrent_state.dims[0], n1 = last_recurrent_state.dims[1], n2 = last_recurrent_state.dims[2], n3 = last_recurrent_state.dims[3];
+        for (int i = 0; i < n0 * n1; i++) {
+            float v = fgt[i];
+            for (int j = 0; j < n2 * n3; j++) {
+                flast[i * n2 * n3 + j] *= v;
+            }
+        }
+
+        // kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
+        std::vector <float> fkv_mem;
+        fkv_mem.resize(n0 * n1 * n3, 0.0f);
+        float *fkt = (float*)k_t.cpuData;
+        for (int i = 0; i < n0 * n1; i++) {
+            for (int j = 0; j < n2; j++) {
+                float curfkt = fkt[i * n2 + j];
+                for (int k = 0; k < n3; k++) {
+                    fkv_mem[i * n3 + k] += flast[i * n2 * n3 + j * n3 + k] * curfkt;
+                }
+            }
+        }
+
+        // delta = (v_t - kv_mem) * beta_t
+        // last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        float *fvt = (float*)v_t.cpuData;
+        float *fbt = (float*)b_t.cpuData;
+        for (int i = 0; i < n0 * n1; i++) {
+            for (int j = 0; j < n2; j++) {
+                for (int k = 0; k < n3; k++) {
+                    flast[i * n2 * n3 + j * n3 + k] += 
+                        fkt[i * n2 + j] * ((fvt[i * n3 + k] - fkv_mem[i * n3 + k]) * fbt[i]);
+                }
+            }
+        }
+
+        // core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
+        float *fqt = (float*)q_t.cpuData;
+        float *fatv = (float*)core_attn_out.cpuData;
+        for (int i = 0; i < n0 * n1; i++) {
+            for (int j = 0; j < n2; j++) {
+                float curfqt = fqt[i * n2 + j];
+                for (int k = 0; k < n3; k++) {
+                    fatv[i * n3 + k] += flast[i * n2 * n3 + j * n3 + k] * curfqt;
+                }
+            }
+        }
+    }
+
+    void CpuTransferAttnOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        float *inputData = (float*)input.cpuData;
+        int dimsLen = input.dims.size();
+        int n = input.dims[dimsLen - 2], m = input.dims[dimsLen - 1], outer = input.Count(0) / input.Count(dimsLen - 2);
+        // 预分配最大所需的临时空间
+        std::vector<float> tempRow(m);
+        std::vector<float> tempSub(m * m);
+        for (int o = 0; o < outer; o++) {
+            float *batchData = inputData + o * n * m;
+            
+            for (int i = 1; i < n; i++) {
+                // 复制第 i 行的前 i 个元素到临时数组
+                std::memcpy(tempRow.data(), batchData + i * m, i * sizeof(float));
+                
+                // 复制子矩阵到临时数组
+                for (int k = 0; k < i; k++) {
+                    std::memcpy(tempSub.data() + k * m, batchData + k * m, i * sizeof(float));
+                }
+                
+                // 更新第 i 行的前 i 个元素
+                for (int j = 0; j < i; j++) {
+                    float sum = tempRow[j];
+                    for (int k = 0; k < i; k++) {
+                        sum += tempRow[k] * tempSub[k * m + j];
+                    }
+                    batchData[i * m + j] = sum;
+                }
+            }
+        }
+
+        // attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+        for (int o = 0; o < outer; o++) {
+            for (int i = 0; i < n; i++) {
+                inputData[o * n * n + i * m + i] += 1.0f;
+            }
+        }
+    }
+
+    void CpuCausalMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int base = intParams.find("base") != intParams.end() ? intParams.find("base")->second : 0;
+        float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -10000.0;
+
+        float *inputData = (float*)input.cpuData;
+
+        int dimsLen = input.dims.size();
+        int n = input.dims[dimsLen - 2], m = input.dims[dimsLen - 1], outer = input.Count(0) / input.Count(dimsLen - 2);
+        for (int o = 0; o < outer; o++) {
+            for (int i = 0; i < n; i++) {
+                for (int j = i + base; j < m; j++) {
+                    inputData[o * n * m + i * m + j] = maskValue;
+                }
             }
         }
     }
@@ -5332,6 +5653,59 @@ namespace fastllm {
                     curInput[s] *= logn;
                 }
                 curInput += spatial;
+            }
+        }
+    }
+
+    void CpuCumSumLastDimOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+
+        float *inputData = (float *) input.cpuData;
+        int dim = input.dims.back();
+        int outer = input.Count(0) / dim;
+        for (int o = 0; o < outer; o++) {
+            for (int j = 1; j < dim; j++) {
+                inputData[o * dim + j] += inputData[o * dim + j - 1];
+            }
+        }
+    }
+
+    void CpuMakeDecayMaskOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, 
+                        "CpuMakeDecayMaskOp's input's type should be float32.\n");
+
+        std::vector <int> dims = input.dims;
+        dims.push_back(dims.back());
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    void CpuMakeDecayMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+
+        int dim = input.dims.back();
+        int outer = input.Count(0) / dim;
+
+        float *inputData = (float *) input.cpuData;
+        float *outputData = (float *) output.cpuData;
+
+        // decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+        for (int o = 0; o < outer; o++) {
+            for (int i = 0; i < dim; i++) {
+                for (int j = 0; j <= i && j < dim; j++) {
+                    outputData[o * dim * dim + i * dim + j] = std::exp(inputData[o * dim + i] - inputData[o * dim + j]);
+                }
+                for (int j = i + 1; j < dim; j++) {
+                    outputData[o * dim * dim + i * dim + j] = 0.0f;
+                }
             }
         }
     }

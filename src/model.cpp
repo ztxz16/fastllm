@@ -14,6 +14,7 @@
 #include "moe.h"
 #include "qwen3.h"
 #include "qwen3_moe.h"
+#include "qwen3_next.h"
 #include "hunyuan.h"
 #include "deepseekv2.h"
 #include "qwen.h"
@@ -229,6 +230,8 @@ namespace fastllm {
             model = (basellm*)(new MoeModel());
         } else if (modelType == "qwen3_moe") {
             model = (basellm*)(new Qwen3MOEModel());
+        } else if (modelType == "qwen3_next") {
+            model = (basellm*)(new Qwen3NextModel());
         } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3" || modelType == "kimi_k2") {
             model = (basellm*)(new DeepSeekV2Model());
             model->model_type = modelType;
