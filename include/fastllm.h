@@ -223,7 +223,7 @@ namespace fastllm {
     };
 
     enum WeightType {
-        NONE = 0, LINEAR = 1, EMBEDDING = 2, CONV2D = 3, AUTO = 99999
+        NONE = 0, LINEAR = 1, EMBEDDING = 2, CONV2D = 3, CONV1D = 4, AUTO = 99999
     };
 
     struct FileMmap {
@@ -606,6 +606,9 @@ namespace fastllm {
     void AttentionBatch(std::vector <Data*> &q, std::vector <Data*> &k, std::vector <Data*> &v,
                         std::vector <Data*> &mask, std::vector <Data*> &output,
                         int group, float scale, int attentionType);
+    
+    void Conv1DPerChannel(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, 
+            int kernel, int stride, int pad, Data &output);
 
     void Conv2D(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, Data &output);
 
@@ -667,6 +670,8 @@ namespace fastllm {
 
     void Normalize(const Data &input, Data &output, int axis);
 
+    void Exp(const Data &input, Data &output);
+
     void Gelu(const Data &input, Data &output);
     
     void GeluNew(const Data &input, Data &output);
@@ -675,9 +680,18 @@ namespace fastllm {
 
     void SwigluGptOss(const fastllm::Data &input, fastllm::Data &output);
 
+    void MambaSoftplus(const Data &input, Data &aLog, Data &dtBias, Data &output);
+
     void Mul(const Data &input, float v, Data &output);
 
     void MulTo(Data &input0, const Data &input1); // input0 *= input1
+
+    void CausalMask(Data &input, int base, float maskValue);
+
+    void TransferAttn(Data &input);
+
+    void RecurrentGatedDeltaRule(Data &q, Data &k, Data &v, Data &g, Data &b, 
+                                Data &last_recurrent_state, Data &core_attn_out);
 
     void AddTo(Data &input0, const Data &input1, float alpha = 1.0); // input0 += input1 * alpha
 
@@ -702,6 +716,10 @@ namespace fastllm {
     void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale); // 重复惩罚
 
     void ApplyLognAttn(Data &input, const Data &lognAttn, const Data &positionIds);
+
+    void CumSumLastDim(Data &input);
+
+    void MakeDecayMask(Data &input, Data &output);
 
     void MulBatch(std::vector <Data*> &input, float v, std::vector <Data*> &output);
 
