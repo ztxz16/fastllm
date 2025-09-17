@@ -2513,6 +2513,14 @@ namespace fastllm {
         }, {{"scale", scale}}, {{"group", group}, {"maskType", maskType}});
     }
 
+    void Conv1DPerChannel(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, 
+            int kernel, int stride, int pad, Data &output) {
+        curExecutor->Run("Conv1DPerChannel", {
+                {"input", (Data*)&input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}
+        }, {}, {{"inputChannels", inputChannels}, {"outputChannels", outputChannels}, {"kernel", kernel}, 
+                {"stride", stride}, {"pad", pad}});
+    }
+
     void Conv2D(const Data &input, Data &weight, Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, Data &output) {
         curExecutor->Run("Conv2D", {
                 {"input", (Data*)&input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}
@@ -2667,6 +2675,12 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void Exp(const fastllm::Data &input, fastllm::Data &output) {
+        curExecutor->Run("Exp", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
     void Gelu(const fastllm::Data &input, fastllm::Data &output) {
         curExecutor->Run("Gelu", {
                 {"input", (Data*)&input}, {"output", &output}
@@ -2682,6 +2696,12 @@ namespace fastllm {
     void Swiglu(const fastllm::Data &input, fastllm::Data &output) {
         curExecutor->Run("Swiglu", {
                 {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
+    void MambaSoftplus(const Data &input, Data &aLog, Data &dtBias, Data &output) {
+        curExecutor->Run("MambaSoftplus", {
+                {"input", (Data*)&input}, {"aLog", &aLog}, {"dtBias", &dtBias}, {"output", &output}
         }, {}, {});
     }
 
@@ -2701,6 +2721,26 @@ namespace fastllm {
         curExecutor->Run("MulTo", {
                 {"input0", &input0}, {"input1", (Data*)&input1}
         }, {}, {});
+    }
+
+    void CausalMask(Data &input, int base, float maskValue) {
+        curExecutor->Run("CausalMask", {
+                {"input", &input}
+        }, {{"maskValue", maskValue}}, {{"base", base}});
+    }
+
+    void TransferAttn(Data &input) {
+        curExecutor->Run("TransferAttn", {
+                {"input", &input}
+        }, {}, {});
+    }
+
+    void RecurrentGatedDeltaRule(Data &q, Data &k, Data &v, Data &g, Data &b, 
+                                Data &last_recurrent_state, Data &core_attn_out) {
+        curExecutor->Run("RecurrentGatedDeltaRule", {
+            {"q", &q}, {"k", &k}, {"v", &v}, {"g", &g}, {"b", &b}, 
+            {"last_recurrent_state", &last_recurrent_state}, {"core_attn_out", &core_attn_out}
+        }, {}, {});                 
     }
 
     void AddTo(Data &input0, const Data &input1, float alpha) {
@@ -2782,6 +2822,18 @@ namespace fastllm {
     void ApplyLognAttn(Data &input, const Data &lognAttn, const Data &positionIds) {
         curExecutor->Run("ApplyLognAttn", {
             {"input", &input}, {"lognAttn", (Data *) &lognAttn}, {"positionIds", (Data *) &positionIds}
+        }, {}, {});
+    }
+
+    void CumSumLastDim(Data &input) {
+        curExecutor->Run("CumSumLastDim", {
+            {"input", &input}
+        }, {}, {});
+    }
+
+    void MakeDecayMask(Data &input, Data &output) {
+        curExecutor->Run("MakeDecayMask", {
+            {"input", &input}, {"output", &output}
         }, {}, {});
     }
 
