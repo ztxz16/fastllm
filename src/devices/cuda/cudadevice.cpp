@@ -24,6 +24,7 @@ namespace fastllm {
         this->ops["LayerNorm"] = (BaseOperator*)(new CudaLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
+        this->ops["Conv1DPerChannel"] = (BaseOperator*)(new CudaConv1DPerChannel());
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CudaRepeatOp());
@@ -36,6 +37,8 @@ namespace fastllm {
         this->ops["Gelu"] = (BaseOperator*)(new CudaGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CudaGeluNewOp());
         this->ops["Silu"] = (BaseOperator*)(new CudaSiluOp());
+        this->ops["Sigmoid"] = (BaseOperator*)(new CudaSigmoidOp());
+        this->ops["MambaSoftplus"] = (BaseOperator*)(new CudaMambaSoftplusOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CudaSwigluOp());
         this->ops["Add"] = (BaseOperator*)(new CudaAddOp());
         this->ops["Mul"] = (BaseOperator*)(new CudaMulOp());
@@ -52,6 +55,7 @@ namespace fastllm {
         this->ops["ApplyLognAttn"] = (BaseOperator*)(new CudaApplyLognAttnOp());
         this->ops["MergeMOE"] = (BaseOperator*)(new CudaMergeMOE());
         this->ops["MergeMLA"] = (BaseOperator*)(new CudaMergeMLA());
+        this->ops["RecurrentGatedDeltaRule"] = (BaseOperator*)(new CudaRecurrentGatedDeltaRuleOp());
 
         this->ops["SplitBatch"] = (BaseOperator*)(new CudaSplitBatchOp());
         this->ops["CatBatch"] = (BaseOperator*)(new CudaCatBatchOp());
@@ -338,6 +342,24 @@ namespace fastllm {
         output.Allocate();
 
         FastllmCudaEmbedding(input, weight, output);
+    }
+
+    void CudaConv1DPerChannel::Run(const std::string &opType, const fastllm::DataDict &datas,
+                      const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &bias = *(datas.find("bias")->second);
+
+        int inputChannels = intParams.find("inputChannels")->second;    
+        int outputChannels = intParams.find("outputChannels")->second; 
+        int kernelSize = intParams.find("kernel")->second;
+        int padding = intParams.find("pad")->second; 
+        int stride = intParams.find("stride")->second;
+        int groups = inputChannels;  // 组数等于通道数，实现逐通道卷积
+
+        output.Allocate();
+        FastllmCudaConv1DPerChannelFloat32(input, weight, bias, inputChannels, outputChannels, kernelSize, stride, padding, output);
     }
 
     void CudaConv2DOp::Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
@@ -827,6 +849,32 @@ namespace fastllm {
         FastllmCudaSilu(input, output);
     }
 
+    void CudaSigmoidOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16, 
+                        "Sigmoid error: Data's type should be float32 or float16.\n");
+        FastllmCudaSigmoid(input, output);
+    }
+
+    void CudaMambaSoftplusOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &aLogData = *(datas.find("aLog")->second);
+        Data &dtBiasData = *(datas.find("dtBias")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "CudaMambaSoftplusOp error: Data's type should be float32 or float16.\n");
+        AssertInFastLLM(aLogData.dataType == DataType::FLOAT32 && dtBiasData.dataType == DataType::FLOAT32,
+                        "CudaMambaSoftplusOp error: alog's type and dtbias's type should be float32.\n");
+        
+        FastllmCudaMambaSoftplus(input, output, aLogData, dtBiasData);
+    }
+
     void CudaAddOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -1016,6 +1064,19 @@ namespace fastllm {
         Data &positionIds = *(datas.find("positionIds")->second);
 
         FastllmCudaApplyLognAttn(input, lognAttn, positionIds);
+    }
+
+    void CudaRecurrentGatedDeltaRuleOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &g = *(datas.find("g")->second);
+        Data &b = *(datas.find("b")->second);
+        Data &last_recurrent_state = *(datas.find("last_recurrent_state")->second);
+        Data &core_attn_out = *(datas.find("core_attn_out")->second);
+        core_attn_out.Allocate();
+        FastllmRecurrentGatedDeltaRule(q, k, v, g, b, last_recurrent_state, core_attn_out);
     }
 
     void CudaMergeMLA::Reshape(const std::string &opType, const fastllm::DataDict &datas,
