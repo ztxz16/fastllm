@@ -556,6 +556,45 @@ __global__ void FastllmSiluKernel(half* a, half *b, int len) {
     }
 }
 
+__global__ void FastllmSigmoidKernel(float* a, float *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = a[idx];
+        b[idx] = 1.0 / (1.0 + expf(-x));
+    }
+}
+
+__global__ void FastllmSigmoidKernel(half* a, half *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+#ifdef CUDA_NO_TENSOR_CORE
+        float x = __half2float(a[idx]);
+        b[idx] = __float2half(1.0 / (1.0 + expf(-x)););
+#else
+        half x = a[idx];
+        b[idx] = __hdiv(1.0, __hadd(__float2half(1.0), hexp(-x)));
+#endif
+    }
+}
+
+__device__ float softplus(float x) {
+    return  x > 20.0f ? x : log1p(expf(x));
+}
+
+__global__ void FastllmMambaSoftplusKernel(float* inputData, float *outputData, float *aLog, float *dtBias, int channels) {
+    int o = blockIdx.x;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        outputData[o * channels + i] = -expf((double)aLog[i]) * softplus(inputData[o * channels + i] + dtBias[i]);
+    }
+}
+
+__global__ void FastllmMambaSoftplusKernel(half* inputData, half *outputData, float *aLog, float *dtBias, int channels) {
+    int o = blockIdx.x;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        outputData[o * channels + i] = __float2half(-exp((double)aLog[i]) * softplus(__half2float(inputData[o * channels + i]) + dtBias[i]));
+    }
+}
+
 __global__ void FastllmSwigluKernel(float* __restrict__ a, float* __restrict__ b, int len, int spatial, int mid) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -4113,6 +4152,44 @@ bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output) {
     return true;
 }
 
+bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output) {
+    int len = input.Count(0);
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
+    int threadPerBlock = std::min(1024, len);
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmSigmoidKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        FastllmSigmoidKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, len);
+    }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData) {
+    int dimsLen = input.dims.size();
+    int outer = input.Count(0) / input.Count(dimsLen - 1);
+    int channels = input.dims[dimsLen - 1];
+
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
+    float *aLog = (float*) FastllmCudaPrepareInput(aLogData);
+    float *dtBias = (float*) FastllmCudaPrepareInput(dtBiasData);
+
+    int threadPerBlock = std::min(64, channels);
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmMambaSoftplusKernel <<< outer, threadPerBlock >>> (cudaInput, cudaOutput, aLog, dtBias, channels);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        FastllmMambaSoftplusKernel <<< outer, threadPerBlock >>> ((half*)cudaInput, (half*)cudaOutput, aLog, dtBias, channels);
+    }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishInput(aLogData, aLog);
+    FastllmCudaFinishInput(dtBiasData, dtBias);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
 bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
     int len = output.Count(0);
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
@@ -6101,6 +6178,105 @@ __global__ void FastllmCudaNaiveConv2DHalfKernel(float *input, half *weight, flo
     }
 }
 
+// CUDA kernel for per-channel 1D convolution
+__global__ void Conv1DPerChannelKernel(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int batchSize,
+    int inputChannels,
+    int outputChannels,
+    int inputLength,
+    int outputLength,
+    int kernelSize,
+    int stride,
+    int padding,
+    int groups) {
+    
+    // 计算当前线程处理的位置
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int totalElements = batchSize * outputChannels * outputLength;
+    
+    if (tid >= totalElements) return;
+    
+    // 解析输出位置 (batch, channel, position)
+    int ol = tid % outputLength;
+    int oc = (tid / outputLength) % outputChannels;
+    int b = tid / (outputChannels * outputLength);
+    
+    // 对于逐通道卷积，每个输出通道对应一个输入通道
+    int g = oc;  // group index (因为 groups = inputChannels)
+    int ic = g;  // 对应的输入通道
+    
+    // 计算输入起始位置
+    int il_start = ol * stride - padding;
+    
+    // 初始化输出值（加上bias）
+    float value = bias ? bias[oc] : 0.0f;
+    
+    // 获取权重和输入的指针
+    const float* curWeight = weight + oc * kernelSize;
+    const float* curInput = input + b * inputChannels * inputLength + ic * inputLength;
+    
+    // 执行卷积
+    #pragma unroll
+    for (int k = 0; k < kernelSize; k++) {
+        int inputPos = il_start + k;
+        
+        // 边界检查
+        if (inputPos >= 0 && inputPos < inputLength) {
+            value += curInput[inputPos] * curWeight[k];
+        }
+    }
+    
+    // 写入输出
+    output[tid] = value;
+}
+
+// 主函数
+bool FastllmCudaConv1DPerChannelFloat32(
+    const fastllm::Data &input, 
+    fastllm::Data &weight, 
+    fastllm::Data &bias, 
+    int inputChannels, 
+    int outputChannels, 
+    int kernelSize, 
+    int stride, 
+    int padding, 
+    fastllm::Data &output) {
+    
+    int groups = inputChannels;
+    std::vector<int> dims = input.dims;
+    int batchSize = dims[0];
+    int inputLength = dims[2];
+    int outputLength = (inputLength + 2 * padding - kernelSize) / stride + 1;
+    
+    // 准备输出维度
+    output.Resize({batchSize, outputChannels, outputLength});
+    
+    // 获取设备指针
+    float *d_input = (float*)input.cudaData;
+    float *d_weight = (float*)weight.cudaData;
+    float *d_bias = bias.dims.size() > 0 ? (float*)bias.cudaData : nullptr;
+    float *d_output = (float*)output.cudaData;
+    
+    // 配置kernel参数
+    int totalElements = batchSize * outputChannels * outputLength;
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (totalElements + threadsPerBlock - 1) / threadsPerBlock;
+    
+    Conv1DPerChannelKernel<<<blocksPerGrid, threadsPerBlock>>>(
+            d_input, d_weight, d_bias, d_output,
+            batchSize, inputChannels, outputChannels,
+            inputLength, outputLength,
+            kernelSize, stride, padding, groups
+    );
+
+    DeviceSync();
+    return true;
+}
+
 bool FastllmCudaConv2DFloat32(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, fastllm::Data &output) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         float *cudaBiasData;
@@ -6219,4 +6395,113 @@ void FastllmResetLogitsOfEOS(int batch, fastllm::Data *logits, const std::vector
     FastllmCudaFree(cuda_eos_nums);
     FastllmCudaFree(cuda_eos_ids);
     return;
+}
+
+__global__ void FastllmRecurrentGatedDeltaRuleKernel(
+    float* last_recurrent_state,  // [n0, n1, n2, n3]
+    const float* g_t,              // [n0, n1]
+    const float* k_t,              // [n0, n1, n2]
+    const float* v_t,              // [n0, n1, n3]
+    const float* b_t,              // [n0, n1]
+    const float* q_t,              // [n0, n1, n2]
+    float* core_attn_out,          // [n0, n1, n3]
+    int n0, int n1, int n2, int n3)
+{
+    // Each block handles one (n0, n1) position
+    int batch_idx = blockIdx.x;
+    int head_idx = blockIdx.y;
+    
+    if (batch_idx >= n0 || head_idx >= n1) return;
+    
+    int base_idx = batch_idx * n1 + head_idx;
+    int tid = threadIdx.x;
+    
+    // Shared memory for temporary storage
+    extern __shared__ float shared_mem[];
+    float* kv_mem = shared_mem;  // size: n3
+    float* delta = &shared_mem[n3];  // size: n3
+    
+    // Step 1: Scale last_recurrent_state by g_t
+    float g_val = expf(g_t[base_idx]);
+    
+    // Each thread handles multiple elements if n2*n3 > blockDim.x
+    for (int idx = tid; idx < n2 * n3; idx += blockDim.x) {
+        int state_idx = base_idx * n2 * n3 + idx;
+        last_recurrent_state[state_idx] *= g_val;
+    }
+    __syncthreads();
+    
+    // Step 2: Compute kv_mem = sum(last_recurrent_state * k_t.unsqueeze(-1), dim=-2)
+    if (tid < n3) {
+        float sum = 0.0f;
+        for (int j = 0; j < n2; j++) {
+            float k_val = k_t[base_idx * n2 + j];
+            int state_idx = base_idx * n2 * n3 + j * n3 + tid;
+            sum += last_recurrent_state[state_idx] * k_val;
+        }
+        kv_mem[tid] = sum;
+    }
+    __syncthreads();
+    
+    // Step 3: Compute delta = (v_t - kv_mem) * b_t
+    float b_val = b_t[base_idx];
+    if (tid < n3) {
+        float v_val = v_t[base_idx * n3 + tid];
+        delta[tid] = (v_val - kv_mem[tid]) * b_val;
+    }
+    __syncthreads();
+    
+    // Step 4: Update last_recurrent_state += k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+    for (int idx = tid; idx < n2 * n3; idx += blockDim.x) {
+        int j = idx / n3;
+        int k = idx % n3;
+        float k_val = k_t[base_idx * n2 + j];
+        int state_idx = base_idx * n2 * n3 + idx;
+        last_recurrent_state[state_idx] += k_val * delta[k];
+    }
+    __syncthreads();
+    
+    // Step 5: Compute core_attn_out = sum(last_recurrent_state * q_t.unsqueeze(-1), dim=-2)
+    if (tid < n3) {
+        float sum = 0.0f;
+        for (int j = 0; j < n2; j++) {
+            float q_val = q_t[base_idx * n2 + j];
+            int state_idx = base_idx * n2 * n3 + j * n3 + tid;
+            sum += last_recurrent_state[state_idx] * q_val;
+        }
+        core_attn_out[base_idx * n3 + tid] = sum;
+    }
+}
+
+void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out) {
+    // Get dimensions
+    int n0 = last_recurrent_state.dims[0];
+    int n1 = last_recurrent_state.dims[1];
+    int n2 = last_recurrent_state.dims[2];
+    int n3 = last_recurrent_state.dims[3];
+    
+    // Move data to GPU if not already there
+    float *d_last_state = (float*)last_recurrent_state.cudaData;
+    float *d_g = (float*)g.cudaData;
+    float *d_k = (float*)k.cudaData;
+    float *d_v = (float*)v.cudaData;
+    float *d_b = (float*)b.cudaData;
+    float *d_q = (float*)q.cudaData;
+    float *d_out = (float*)core_attn_out.cudaData;
+    
+    // Configure kernel launch parameters
+    dim3 gridDim(n0, n1);  // One block per (batch, head) pair
+    int threadsPerBlock = min(256, max(n2 * n3, n3));
+    
+    // Calculate shared memory size
+    size_t sharedMemSize = 2 * n3 * sizeof(float);  // for kv_mem and delta
+    
+    // Launch kernel
+    FastllmRecurrentGatedDeltaRuleKernel<<<gridDim, threadsPerBlock, sharedMemSize>>>(
+        d_last_state, d_g, d_k, d_v, d_b, d_q, d_out,
+        n0, n1, n2, n3
+    ); 
+    
+    // Synchronize if needed
+    DeviceSync();
 }
