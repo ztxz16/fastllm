@@ -39,7 +39,10 @@ namespace fastllm {
             "model.layers.*.gate_proj.weight",  "model.layers.*.gate_proj.weight", "model.layers.*.gateup_proj.weight",
             "model.layers.*.self_attn.o_proj.weight", "model.layers.*.self_attn.q_proj.weight", "model.layers.*.self_attn.k_proj.weight",
             "model.layers.*.self_attn.v_proj.weight", "model.layers.*.self_attn.mergeqkv.weight", "model.layers.*.self_attn.W_pack.weight",
-            "model.layers.*.mlp.*.weight"
+            "model.layers.*.mlp.*.weight",
+            "model.layers.*.linear_attn.in_proj_ba.weight",
+            "model.layers.*.linear_attn.in_proj_qkvz.weight",
+            "model.layers.*.linear_attn.out_proj.weight"
         };
     }
 
@@ -261,10 +264,7 @@ namespace fastllm {
             if (GetKVCacheInCPU()) {
                 pastKey.lockInCPU = true;
                 pastValue.lockInCPU = true;
-            } else {
-                pastKey.ToDevice(k.dataDevice);
-                pastValue.ToDevice(k.dataDevice);
-            }
+            } 
 
             if (weight.weight.find("model.layers." + std::to_string(i) + ".self_attn.o_proj.weight") != weight.weight.end()) {
                 std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
@@ -462,7 +462,6 @@ namespace fastllm {
 
                 Sigmoid(b, b); // beta = b.sigmoid()
                 MambaSoftplus(a, weight[aLogName], weight[dtBiasName], g); // g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-
                 Data &last_recurrent_state = pastValue;
                 Data core_attn_out, core_attn_out_temp;
                 if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
@@ -926,9 +925,6 @@ namespace fastllm {
                     if (GetKVCacheInCPU()) {
                         pastKey.lockInCPU = true;
                         pastValue.lockInCPU = true;
-                    } else {
-                        pastKey.ToDevice(k.dataDevice);
-                        pastValue.ToDevice(k.dataDevice);
                     }
                     targetSeqLength = std::max(targetSeqLength, (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqLens[b] : seqLens[b]);
             }
@@ -1365,7 +1361,6 @@ namespace fastllm {
     }
 
     void Qwen3NextModel::WarmUp() {
-// return;
         printf("Warmup...\n");
         int oldTopk = this->num_experts_per_tok;
         this->num_experts_per_tok = this->num_experts;
