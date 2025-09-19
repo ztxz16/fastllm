@@ -812,9 +812,22 @@ namespace fastllm {
 auto st = std::chrono::system_clock::now();
 //ClearProfiler();
                             if (seqLens.size() > 1) {
-                                ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
-                                                          positionIds, seqLens, pastKeyValues, generationConfigs,
-                                                          tokensManager, &logits);
+                                if (!model->canDoBatchForward) {
+                                    dictLocker.lock();
+                                    for (int i = 0; i < handles.size(); i++) {
+                                        Data inputIdNow = Data(DataType::FLOAT32, {1, 1}, {ids[i]});
+                                        ret.push_back(model->Forward(inputIdNow,
+                                                            attentionMasks[i] == nullptr ? Data() : *attentionMasks[i],
+                                                            *positionIds[i],
+                                                            model->responseContextDict.dicts[handles[i]]->pastKeyValues, 
+                                                            generationConfigs[i], tokensManager, logits[i]));
+                                    }
+                                    dictLocker.unlock();
+                                } else {
+                                    ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
+                                                            positionIds, seqLens, pastKeyValues, generationConfigs,
+                                                            tokensManager, &logits);
+                                }
                             } else {
                                 int first = 8192, part = 2048;
                                 if (model->model_struct == "deepseek_v2") {
