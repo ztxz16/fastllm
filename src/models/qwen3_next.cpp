@@ -136,13 +136,10 @@ namespace fastllm {
                     WeightMergeRule({WeightMergeRuleSingle({w1WeightName, w3WeightName}, swigluWeightName, std::string("linearSwiglu"))})
                 );
 
-                if (j != -1 || !GetCudaSharedExpert()) {
+                if (j != -1) {
                     this->specialWeights[swigluWeightName] = "linearSwiglu";
                     this->specialWeights[downWeightName] = "linearColumn";
                 }
-
-                this->specialWeights[swigluWeightName] = "linearSwiglu";
-                this->specialWeights[downWeightName] = "linearColumn";
                 
                 this->moeLinears.insert(w1WeightName);
                 this->moeLinears.insert(w3WeightName);
@@ -599,18 +596,19 @@ namespace fastllm {
                         Mul(v_prime, -1.0f, v_new);
                         AddTo(v_new, v_i);
 
-                        Data attn_inter, g_i, g_i_exp, q_i_temp;
+                        Data attn_inter, g_i, g_i_exp, g_i_exp_repeat, q_i_temp;
                         Split(gg, 2, i, i + 1, g_i);
                         g_i.Resize({g_i.dims[0], g_i.dims[1], g_i.dims[3], 1});
                         Exp(g_i, g_i_exp);
                         Mul(q_i, 1.0f, q_i_temp);
-                        MatMul(q_i_temp, last_recurrent_state, attn_inter);
+                        Repeat(g_i_exp, 3, q_i_temp.dims[3], g_i_exp_repeat);
+                        MulTo(q_i_temp, g_i_exp_repeat);
 
+                        MatMul(q_i_temp, last_recurrent_state, attn_inter);
                         Data atv;
                         MatMul(attn, v_new, atv);
-                        AddTo(attn_inter, atv);
+                        AddTo(atv, attn_inter);
                         atv.Resize({atv.dims[0], atv.dims[1], 1, atv.dims[2], atv.dims[3]});
-
                         if (i == 0) {
                             Mul(atv, 1.0f, core_attn_out);
                         } else {
