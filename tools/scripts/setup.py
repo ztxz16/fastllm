@@ -8,7 +8,7 @@ all_require = server_require + webui_require + download_require + tokenizer_requ
 
 setup (
     name = "ftllm",
-    version = "0.1.4.6",
+    version = "0.1.4.7",
     author = "huangyuyang",
     author_email = "ztxz16@foxmail.com",
     description = "Fastllm",
