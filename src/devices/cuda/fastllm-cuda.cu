@@ -511,6 +511,22 @@ __global__ void FastllmReluKernel(float* a, float *b, int len) {
     }
 }
 
+__global__ void FastllmExpKernel(float* a, float *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = a[idx];
+        b[idx] = exp((double)x);
+    }
+}
+
+__global__ void FastllmExpKernel(half* a, half *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        float x = __half2float(a[idx]);
+        b[idx] = __float2half(exp((double)x));
+    }
+}
+
 __global__ void FastllmGeluKernel(float* a, float *b, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -4093,6 +4109,22 @@ void FastllmCudaMemcpy2DDeviceToDeviceBatch(void ** 	dsts, size_t *	dpitchs, voi
     delete[] cpuPointers;
 
     DeviceSync();
+}
+
+bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output) {
+    int len = input.Count(0);
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
+    int threadPerBlock = std::min(256, len);
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmExpKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
+    } else {
+        printf("Exp datatype error.\n");
+        exit(0);
+    }
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
 }
 
 bool FastllmCudaRelu(const fastllm::Data &input, fastllm::Data &output) {
