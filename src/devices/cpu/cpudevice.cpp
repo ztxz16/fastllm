@@ -5005,6 +5005,60 @@ namespace fastllm {
         core_attn_out.Resize({dims[0], dims[1], 1, dims[3]});
     }
 
+    struct MultiThreadRecurrentGatedDeltaRuleOp : MultiThreadBaseOp {
+        int n0, n1, n2, n3;
+        float *flast, *fgt, *fkt, *fvt, *fbt, *fqt, *fatv;
+        int st, end;
+
+        MultiThreadRecurrentGatedDeltaRuleOp(
+            int n0, int n1, int n2, int n3,
+            float *flast, float *fgt, float *fkt, float *fvt, 
+            float *fbt, float *fqt, float *fatv,
+            int st, int end
+        ) : n0(n0), n1(n1), n2(n2), n3(n3),
+            flast(flast), fgt(fgt), fkt(fkt), fvt(fvt),
+            fbt(fbt), fqt(fqt), fatv(fatv),
+            st(st), end(end) {}
+        
+        void Run() {
+            std::vector <float> fkv_mem, temp;
+            fkv_mem.resize(n3);
+            temp.resize(n3);
+            for (int i = st; i < end; i++) {
+                float v = exp(fgt[i]);
+                for (int j = 0; j < n2 * n3; j++) {
+                    flast[i * n2 * n3 + j] *= v;
+                }
+
+                std::fill(fkv_mem.begin(), fkv_mem.end(), 0.0f);
+                for (int j = 0; j < n2; j++) {
+                    float curfkt = fkt[i * n2 + j];
+                    for (int k = 0; k < n3; k++) {
+                        fkv_mem[k] += flast[i * n2 * n3 + j * n3 + k] * curfkt;
+                    }
+                }
+
+                float curfbt = fbt[i];
+                for (int k = 0; k < n3; k++) {
+                    temp[k] = ((fvt[i * n3 + k] - fkv_mem[k]) * curfbt);
+                }
+
+                for (int j = 0; j < n2; j++) {
+                    for (int k = 0; k < n3; k++) {
+                        flast[i * n2 * n3 + j * n3 + k] += fkt[i * n2 + j] * temp[k];
+                    }
+                }
+
+                for (int j = 0; j < n2; j++) {
+                    float curfqt = fqt[i * n2 + j];
+                    for (int k = 0; k < n3; k++) {
+                        fatv[i * n3 + k] += flast[i * n2 * n3 + j * n3 + k] * curfqt;
+                    }
+                }
+            }
+        }
+    };
+
     void CpuRecurrentGatedDeltaRuleOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &q = *(datas.find("q")->second);
@@ -5014,7 +5068,7 @@ namespace fastllm {
         Data &b = *(datas.find("b")->second);
         Data &last_recurrent_state = *(datas.find("last_recurrent_state")->second);
         Data &core_attn_out = *(datas.find("core_attn_out")->second);
-        core_attn_out.Allocate();
+        core_attn_out.Allocate(0.0f);
         
         Data &q_t = q, &k_t = k, &v_t = v, &g_t = g, &b_t = b;
 
@@ -5031,41 +5085,24 @@ namespace fastllm {
         float *fbt = (float*)b_t.cpuData;
         float *fqt = (float*)q_t.cpuData;
         float *fatv = (float*)core_attn_out.cpuData;
-        std::vector <float> fkv_mem;
-        std::vector <float> temp;
-        temp.resize(n3);
-        fkv_mem.resize(n3);
-        for (int i = 0; i < n0 * n1; i++) {
-            float v = exp(fgt[i]);
-            for (int j = 0; j < n2 * n3; j++) {
-                flast[i * n2 * n3 + j] *= v;
-            }
 
-            std::fill(fkv_mem.begin(), fkv_mem.end(), 0.0f);
-            for (int j = 0; j < n2; j++) {
-                float curfkt = fkt[i * n2 + j];
-                for (int k = 0; k < n3; k++) {
-                    fkv_mem[k] += flast[i * n2 * n3 + j * n3 + k] * curfkt;
-                }
-            }
-
-            float curfbt = fbt[i];
-            for (int k = 0; k < n3; k++) {
-                temp[k] = ((fvt[i * n3 + k] - fkv_mem[k]) * curfbt);
-            }
-
-            for (int j = 0; j < n2; j++) {
-                for (int k = 0; k < n3; k++) {
-                    flast[i * n2 * n3 + j * n3 + k] += fkt[i * n2 + j] * temp[k];
-                }
-            }
-
-            for (int j = 0; j < n2; j++) {
-                float curfqt = fqt[i * n2 + j];
-                for (int k = 0; k < n3; k++) {
-                    fatv[i * n3 + k] += flast[i * n2 * n3 + j * n3 + k] * curfqt;
-                }
-            }
+        int n = n0 * n1;
+        auto pool = GetAlivePool();
+        int threadNum = pool->threads.size();
+        int per = n / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadRecurrentGatedDeltaRuleOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? n : cur + per + (cur + per * (threadNum - i) < n));
+            ops.push_back(new MultiThreadRecurrentGatedDeltaRuleOp(n0, n1, n2, n3, flast, fgt, fkt, fvt, fbt, fqt, fatv, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
         }
     }
 
