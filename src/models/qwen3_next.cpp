@@ -1374,13 +1374,16 @@ namespace fastllm {
         }
         Forward(inputIds, attentionMask, positionIds, pastKeyValues);
         this->num_experts_per_tok = oldTopk;
-        elementsInKVCachePerToken = (long long)block_cnt * 
-            (pastKeyValues[0].first.dims[0] * pastKeyValues[0].first.dims[2] + 
-             pastKeyValues[0].second.dims[0] * pastKeyValues[0].second.dims[2]);
+        elementsInKVCachePerToken = 0;
         for (int i = 0; i < block_cnt; i++) {
             if (!pastKeyValues[i].first.isLinearAttention) {
-                this->kvCacheId = i;
-                break;
+                if (this->kvCacheId == 0) {
+                    this->kvCacheId = i;
+                }
+
+                elementsInKVCachePerToken += 
+                    (pastKeyValues[i].first.dims[0] * pastKeyValues[i].first.dims[2] + 
+                    pastKeyValues[i].second.dims[0] * pastKeyValues[i].second.dims[2]);
             }
         }
         printf("finish.\n");
