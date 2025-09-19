@@ -585,7 +585,7 @@ __global__ void FastllmSigmoidKernel(half* a, half *b, int len) {
     if (idx < len) {
 #ifdef CUDA_NO_TENSOR_CORE
         float x = __half2float(a[idx]);
-        b[idx] = __float2half(1.0 / (1.0 + expf(-x));
+        b[idx] = __float2half(1.0 / (1.0 + expf(-x)));
 #else
         half x = a[idx];
         b[idx] = __hdiv(1.0, __hadd(__float2half(1.0), hexp(-x)));
@@ -3735,7 +3735,7 @@ bool FastllmCudaMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
-    if (n < 800) {
+    if (n < 8) {
         LaunchFastllmGemmFp32Fp16(cudaInput, (half*)weight.cudaData, cudaOutput, cudaBiasData, n, m, k);
     } else {
         auto fastllmCublasHandle = getFastllmCublasHandle();
