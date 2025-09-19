@@ -33,6 +33,7 @@ namespace fastllm {
         this->ops["MatMul"] = (BaseOperator*)(new CudaMatMulOp());
         this->ops["MatMulTransB"] = (BaseOperator*)(new CudaMatMulTransBOp());
         this->ops["SoftMax"] = (BaseOperator*)(new CudaSoftMaxOp());
+        this->ops["Exp"] = (BaseOperator*)(new CudaExpOp());
         this->ops["Relu"] = (BaseOperator*)(new CudaReluOp());
         this->ops["Gelu"] = (BaseOperator*)(new CudaGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CudaGeluNewOp());
@@ -798,6 +799,15 @@ namespace fastllm {
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16, "Gelu error: Data's type should be float32 or float16.\n");
         FastllmCudaGelu(input, output);
+    }
+
+    void CudaExpOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32, "Relu error: Data's type should be float32\n");
+        FastllmCudaExp(input, output);
     }
 
     void CudaReluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
