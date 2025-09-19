@@ -49,6 +49,7 @@ bool FastllmCudaGelu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaRelu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output);
+bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output, fastllm::Data &aLogData, fastllm::Data &dtBiasData);
 bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaAdd(const fastllm::Data &input, float v, fastllm::Data &output);
