@@ -359,7 +359,7 @@ namespace fastllm {
                 Linear(qkv, weight[oWeightName], oBias, attenInput);
             } else {
                 Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
-
+                pastKey.isLinearAttention = pastValue.isLinearAttention = true;
                 std::string qkvzWeightName = "model.layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
                 std::string qkvzBiasName = "model.layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.bias";
                 std::string baWeightName = "model.layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
@@ -1377,6 +1377,12 @@ namespace fastllm {
         elementsInKVCachePerToken = (long long)block_cnt * 
             (pastKeyValues[0].first.dims[0] * pastKeyValues[0].first.dims[2] + 
              pastKeyValues[0].second.dims[0] * pastKeyValues[0].second.dims[2]);
+        for (int i = 0; i < block_cnt; i++) {
+            if (!pastKeyValues[i].first.isLinearAttention) {
+                this->kvCacheId = i;
+                break;
+            }
+        }
         printf("finish.\n");
     }
 }
