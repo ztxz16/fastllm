@@ -103,7 +103,8 @@ def make_normal_llm_model(args):
                 config["architectures"][0] == 'HunYuanMoEV1ForCausalLM' or 
                 config["architectures"][0] == 'Ernie4_5_MoeForCausalLM' or 
                 config["architectures"][0] == 'PanguProMoEForCausalLM' or
-                config["architectures"][0] == 'Glm4MoeForCausalLM'):
+                config["architectures"][0] == 'Glm4MoeForCausalLM' or 
+                config["architectures"][0] == 'Qwen3NextForCausalLM'):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
                 if ((not(args.device and args.device != ""))):
