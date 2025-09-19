@@ -415,6 +415,7 @@ namespace fastllm {
         this->ToDevice(ori.dataDevice);
         this->name = ori.name;
         this->isKVCache = ori.isKVCache;
+        this->isLinearAttention = ori.isLinearAttention;
         this->cacheUid = ori.cacheUid;
         this->dataDevice = ori.dataDevice;
         
