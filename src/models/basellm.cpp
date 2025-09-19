@@ -638,8 +638,8 @@ namespace fastllm {
 
                         int lenSum = 0, currentActivate = 0;
                         for (auto &it: model->responseContextDict.dicts) {
-                            if (it.second->pastKeyValues[0].first.expansionDims.size() > 0) {
-                                lenSum += it.second->pastKeyValues[0].first.expansionDims[1];
+                            if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
+                                lenSum += it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
                                 currentActivate++;
                             }
                         }
@@ -676,7 +676,7 @@ namespace fastllm {
                                         if (it.second->isEnding) {
                                             continue;
                                         }
-                                        if (it.second->pastKeyValues[0].first.expansionDims.size() > 0) {
+                                        if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
                                             alive++;
                                         }
                                     }
@@ -714,7 +714,7 @@ namespace fastllm {
                                 }
 
                                 if (!isPrompt) {
-                                    if (it.second->pastKeyValues[0].first.expansionDims[1] == it.second->pastKeyValues[0].first.dims[1]) {
+                                    if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1] == it.second->pastKeyValues[0].first.dims[1]) {
                                         int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;                                        
                                         int predictLen = 256;
                                         if (sur > 0) {
@@ -877,9 +877,9 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                                         if (it.second->isEnding) {
                                             continue;
                                         }
-                                        if (it.second->pastKeyValues[0].first.expansionDims.size() > 0) {
+                                        if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
                                             alive++;
-                                            aliveLen += it.second->pastKeyValues[0].first.expansionDims[1];
+                                            aliveLen += it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
                                         } else {
                                             pending++;
                                         }
@@ -922,8 +922,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                                 if (it.second->isEnding) {
                                     continue;
                                 }
-                                if (it.second->pastKeyValues[0].first.expansionDims.size() > 0) {
-                                    int curLen = it.second->pastKeyValues[0].first.expansionDims[1];
+                                if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
+                                    int curLen = it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
                                     if (curLen > maxLen) {
                                         maxLen = curLen;
                                         select = it.first;
@@ -968,15 +968,20 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             
             forwardLocker.lock();
             for (int i = 0; i < this->block_cnt; i++) {
-                Split(cache.first->kv[i].first, 1, 0, len, context->pastKeyValues[i].first);
-                Split(cache.first->kv[i].second, 1, 0, len, context->pastKeyValues[i].second);
-                auto kdims = context->pastKeyValues[i].first.dims, vdims = context->pastKeyValues[i].second.dims;
-                kdims[1] = ((kdims[1] - 1) / 128 + 1) * 128;
-                vdims[1] = ((vdims[1] - 1) / 128 + 1) * 128;
-                context->pastKeyValues[i].first.Expansion(kdims);
-                context->pastKeyValues[i].second.Expansion(vdims);
-                // context->pastKeyValues[i].first.CopyFrom(cache.first->kv[i].first);
-                // context->pastKeyValues[i].second.CopyFrom(cache.first->kv[i].second);
+                if (cache.first->kv[i].first.isLinearAttention) {
+                    context->pastKeyValues[i].first.CopyFrom(cache.first->kv[i].first);
+                    context->pastKeyValues[i].second.CopyFrom(cache.first->kv[i].second);
+                } else {
+                    Split(cache.first->kv[i].first, 1, 0, len, context->pastKeyValues[i].first);
+                    Split(cache.first->kv[i].second, 1, 0, len, context->pastKeyValues[i].second);
+                    auto kdims = context->pastKeyValues[i].first.dims, vdims = context->pastKeyValues[i].second.dims;
+                    kdims[1] = ((kdims[1] - 1) / 128 + 1) * 128;
+                    vdims[1] = ((vdims[1] - 1) / 128 + 1) * 128;
+                    context->pastKeyValues[i].first.Expansion(kdims);
+                    context->pastKeyValues[i].second.Expansion(vdims);
+                    // context->pastKeyValues[i].first.CopyFrom(cache.first->kv[i].first);
+                    // context->pastKeyValues[i].second.CopyFrom(cache.first->kv[i].second);
+                }
             }
             forwardLocker.unlock();
             context->currentTokens.erase(context->currentTokens.begin(), context->currentTokens.begin() + len);

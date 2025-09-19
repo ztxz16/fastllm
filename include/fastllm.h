@@ -265,6 +265,7 @@ namespace fastllm {
 
         long long cacheUid = 0; // 用来标注Cache id
         bool isKVCache = false; // 是否是KV Cache TODO: 做一些KVCache的管理
+        bool isLinearAttention = false; // 是否是线性attention的缓存（永远保持同样的形状）
 
         bool lockInCPU = false; // 如果lock在CPU上，那么不允许移动到其余设备
         WeightType weightType = WeightType::NONE; // 权重类型，NONE代表非权重（或未知权重）
