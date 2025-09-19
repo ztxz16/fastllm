@@ -738,7 +738,7 @@ namespace fastllm {
             RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
             Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
 
-            logits.Print();
+            // logits.Print();
             // exit(0);
 
             if (generationConfig.output_logits && retLogits != nullptr) {
