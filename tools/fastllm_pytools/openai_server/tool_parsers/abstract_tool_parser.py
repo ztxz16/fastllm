@@ -218,7 +218,8 @@ class ToolParserManager:
                 print("Auto tool parse detect type: " + target)
             return cls.get_tool_parser(target)
 
-        if (model_type == 'qwen3' or model_type == 'qwen2' or model_type == 'qwen3_moe'):
+        if (model_type == 'qwen3' or model_type == 'qwen2' or model_type == 'qwen3_moe'
+            or model_type == "qwen3_next"):
             # 判断是否是coder系列模型（使用xml工具调用）
             if ('<function>' in chat_template):
                 target = 'qwen3_coder'
