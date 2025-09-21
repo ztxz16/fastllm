@@ -91,6 +91,13 @@ namespace fastllm {
     }
 
     void PastKVCacheManager::Record(const std::vector <int> &inputToken, int tokens, std::vector<std::pair<Data, Data> > *kv) {
+        bool isLinear = false;
+        for (int i = 0; i < kv->size(); i++) {
+            if ((*kv)[i].first.isLinearAttention) {
+                isLinear = true;
+                break;
+            }
+        }
         std::lock_guard <std::mutex> lock(this->locker);
         if (this->memorys.find(inputToken) != this->memorys.end()) {
             this->memorys[inputToken]->recordTimes++;
@@ -99,18 +106,20 @@ namespace fastllm {
         }
 
         std::vector <int> replaceCache;
-        for (auto &it : this->memorys) {
-            // 如果当前inputToken覆盖了某一个cahce 90%以上的前缀，那么直接替换掉
-            int lcp = 0;
-            for (int i = 0; i < it.first.size() && i < inputToken.size(); i++) {
-                if (it.first[i] == inputToken[i]) {
-                    lcp++;
-                } else {
-                    break;
+        if (!isLinear) {
+            for (auto &it : this->memorys) {
+                // 如果当前inputToken覆盖了某一个cahce 90%以上的前缀，那么直接替换掉
+                int lcp = 0;
+                for (int i = 0; i < it.first.size() && i < inputToken.size(); i++) {
+                    if (it.first[i] == inputToken[i]) {
+                        lcp++;
+                    } else {
+                        break;
+                    }
                 }
-            }
-            if (lcp > (int)it.first.size() * 9 / 10) {
-                replaceCache = it.first;
+                if (lcp > (int)it.first.size() * 9 / 10) {
+                    replaceCache = it.first;
+                }
             }
         }
         if (replaceCache.size() > 0) {
@@ -144,6 +153,16 @@ namespace fastllm {
     }
 
     std::pair <PastKVCacheMemory*, int> PastKVCacheManager::Get(const std::vector <int> &inputToken) {
+        bool isLinear = false;
+        if (this->memorys.size() > 0) {
+            auto &kv = this->memorys.begin()->second->kv;
+            for (int i = 0; i < kv.size(); i++) {
+                if (kv[i].first.isLinearAttention) {
+                    isLinear = true;
+                    break;
+                }
+            }
+        }
         std::lock_guard <std::mutex> lock(this->locker);
         int maxPrefixToken = 0;
         PastKVCacheMemory *ret = nullptr;
@@ -156,6 +175,9 @@ namespace fastllm {
                 } else {
                     break;
                 }
+            }
+            if (isLinear && match != cur.size()) {
+                continue;
             }
             if (match > maxPrefixToken) {
                 maxPrefixToken = match;
