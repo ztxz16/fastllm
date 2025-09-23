@@ -254,6 +254,14 @@ namespace fastllm {
         
         Data attenInputTemp;
         Data hidden_states_new;
+        Data mixed_qkvz, mixed_ba, z, b, a, g;
+        Data core_attn_out, core_attn_out_temp;
+        Data sharedGateRepeat;
+
+        float inv_scale = pow((float)head_k_dim, -0.5);
+        std::vector <float> v_inv_scale = std::vector <float> (head_k_dim, inv_scale);
+        Data inv_scale_data = Data(DataType::FLOAT32, {head_k_dim}, v_inv_scale);
+
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
 
@@ -376,7 +384,6 @@ namespace fastllm {
                 std::string aLogName = "model.layers." + std::to_string(i) + ".linear_attn.A_log";
                 std::string dtBiasName = "model.layers." + std::to_string(i) + ".linear_attn.dt_bias";
 
-                Data mixed_qkvz, mixed_ba, q, k, v, z, b, a, g;
                 Linear(attenInputTemp, weight[qkvzWeightName], Data(), mixed_qkvz);
                 Linear(attenInputTemp, weight[baWeightName], Data(), mixed_ba);
 
@@ -474,10 +481,6 @@ namespace fastllm {
                     // torch_recurrent_gated_delta_rule
                     {
                         // rms norm
-                        float inv_scale = pow((float)head_k_dim, -0.5);
-                        std::vector <float> v_inv_scale = std::vector <float> (head_k_dim, inv_scale);
-                        Data inv_scale_data = Data(DataType::FLOAT32, {head_k_dim}, v_inv_scale);
-
                         RMSNorm(q, inv_scale_data, rms_norm_eps, q);
                         RMSNorm(k, inv_scale_data, rms_norm_eps, k);
                     }
