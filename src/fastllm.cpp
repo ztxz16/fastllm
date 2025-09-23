@@ -2814,6 +2814,12 @@ namespace fastllm {
         }, {}, {{"rotaryDim", rotaryDim}});
     }
 
+    void LlamaRotatePosition2DPart(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim, int part) {
+        curExecutor->Run("LlamaRotatePosition2DPart", {
+                {"input", &input}, {"positionIds", (Data*)&positionIds}, {"sin", &sinData}, {"cos", &cosData}
+        }, {}, {{"rotaryDim", rotaryDim}, {"part", part}});
+    }
+
     void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale) {
         curExecutor->Run("RepeatPenalty", {
                 {"input", &input}, {"penalty", (Data*)&penalty}, {"penaltyScale", (Data*)&penaltyScale}

@@ -896,6 +896,41 @@ __global__ void FastllmLlamaRotatePosition2DKernel(half *data, float *positionId
     d[i * m + m / 2] = __float2half(va * curSin + vb * curCos);
 }
 
+__global__ void FastllmLlamaRotatePosition2DPartKernel(float *data, float *positionIds, float *sin, float *cos,
+                                                   int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int part) {
+    int o = (blockIdx.x / n);
+    int l = o % len;
+    int b = o / len;
+    int j = threadIdx.x;
+    int index = (int) (positionIds[b * partStride + l]);
+
+    float curSin = sin[index * sinCosStride + j];
+    float curCos = cos[index * sinCosStride + j];
+    float *d = (float *) data + o * spatial + j;
+    int i = blockIdx.x % n;
+    float va = d[i * m], vb = d[i * m + part / 2];
+    d[i * m] = va * curCos - vb * curSin;
+    d[i * m + part / 2] = va * curSin + vb * curCos;
+}
+
+__global__ void FastllmLlamaRotatePosition2DPartKernel(half *data, float *positionIds, float *sin, float *cos,
+                                                   int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int part) {
+    int o = (blockIdx.x / n);
+    int l = o % len;
+    int b = o / len;
+    int j = threadIdx.x;
+    int index = (int) (positionIds[b * partStride + l]);
+
+    float curSin = sin[index * sinCosStride + j];
+    float curCos = cos[index * sinCosStride + j];
+    half *d = (half *) data + o * spatial + j;
+    int i = blockIdx.x % n;
+    float va = __half2float(d[i * m]), vb = __half2float(d[i * m + part / 2]);
+    d[i * m] = __float2half(va * curCos - vb * curSin);
+    d[i * m + part / 2] = __float2half(va * curSin + vb * curCos);
+}
+
+
 __global__ void FastllmNearlyRotatePosition2DKernel(float *data, float *positionIds, float *sin, float *cos,
                                                     int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int rotateDim) {
     int o = (blockIdx.x / n);
@@ -4118,6 +4153,8 @@ bool FastllmCudaExp(const fastllm::Data &input, fastllm::Data &output) {
     int threadPerBlock = std::min(256, len);
     if (input.dataType == fastllm::DataType::FLOAT32) {
         FastllmExpKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        FastllmExpKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, len);
     } else {
         printf("Exp datatype error.\n");
         exit(0);
@@ -5345,9 +5382,34 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
                                                                                  len, bs, spatial, n, m,
                                                                                  (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
     }
+    FastllmCudaFinishInput(positionIds, cudaPositionIds);
+    FastllmCudaFinishInput(sinData, cudaSin);
+    FastllmCudaFinishInput(cosData, cudaCos);
+    FastllmCudaFinishOutput(data, cudaData);
+    return true;
+}
 
-    
+bool FastllmCudaLlamaRotatePosition2DPart(fastllm::Data &data, const fastllm::Data &positionIds,
+                                      const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim, int part) {
+    float *cudaData = (float *) FastllmCudaPrepareInput(data);
+    float *cudaPositionIds = (float *) FastllmCudaPrepareInput(positionIds);
+    float *cudaSin = (float *) FastllmCudaPrepareInput(sinData);
+    float *cudaCos = (float *) FastllmCudaPrepareInput(cosData);
 
+    int outer = data.dims[0] * data.dims[1];
+    int spatial = data.Count(2);
+    int bs = data.dims[0], len = data.dims[1];
+    int n = data.dims[2], m = data.dims[3];
+
+    if (data.dataType == fastllm::DataType::FLOAT32) {
+        FastllmLlamaRotatePosition2DPartKernel <<< outer * n, std::min(rotaryDim, part / 2) >>> (cudaData, cudaPositionIds, cudaSin, cudaCos,
+                                                                                 len, bs, spatial, n, m,
+                                                                                 (int)positionIds.dims.back(), (int)sinData.dims[1], part);
+    } else if (data.dataType == fastllm::DataType::FLOAT16) {
+        FastllmLlamaRotatePosition2DPartKernel <<< outer * n, std::min(rotaryDim, part / 2) >>> ((half*)cudaData, cudaPositionIds, cudaSin, cudaCos,
+                                                                                 len, bs, spatial, n, m,
+                                                                                 (int)positionIds.dims.back(), (int)sinData.dims[1], part);
+    }
     FastllmCudaFinishInput(positionIds, cudaPositionIds);
     FastllmCudaFinishInput(sinData, cudaSin);
     FastllmCudaFinishInput(cosData, cudaCos);
@@ -6210,12 +6272,13 @@ __global__ void FastllmCudaNaiveConv2DHalfKernel(float *input, half *weight, flo
     }
 }
 
+template <typename T>
 // CUDA kernel for per-channel 1D convolution
 __global__ void Conv1DPerChannelKernel(
-    const float* input,
+    T* input,
     const float* weight,
     const float* bias,
-    float* output,
+    T* output,
     int batchSize,
     int inputChannels,
     int outputChannels,
@@ -6249,7 +6312,7 @@ __global__ void Conv1DPerChannelKernel(
     
     // 获取权重和输入的指针
     const float* curWeight = weight + oc * kernelSize;
-    const float* curInput = input + b * inputChannels * inputLength + ic * inputLength;
+    const T* curInput = input + b * inputChannels * inputLength + ic * inputLength;
     
     // 执行卷积
     #pragma unroll
@@ -6258,12 +6321,12 @@ __global__ void Conv1DPerChannelKernel(
         
         // 边界检查
         if (inputPos >= 0 && inputPos < inputLength) {
-            value += curInput[inputPos] * curWeight[k];
+            value += (float)curInput[inputPos] * curWeight[k];
         }
     }
     
     // 写入输出
-    output[tid] = value;
+    output[tid] = (T)value;
 }
 
 // 主函数
@@ -6297,13 +6360,22 @@ bool FastllmCudaConv1DPerChannelFloat32(
     int totalElements = batchSize * outputChannels * outputLength;
     int threadsPerBlock = 256;
     int blocksPerGrid = (totalElements + threadsPerBlock - 1) / threadsPerBlock;
-    
-    Conv1DPerChannelKernel<<<blocksPerGrid, threadsPerBlock>>>(
-            d_input, d_weight, d_bias, d_output,
-            batchSize, inputChannels, outputChannels,
-            inputLength, outputLength,
-            kernelSize, stride, padding, groups
-    );
+
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        Conv1DPerChannelKernel<float> <<<blocksPerGrid, threadsPerBlock>>>(
+                d_input, d_weight, d_bias, d_output,
+                batchSize, inputChannels, outputChannels,
+                inputLength, outputLength,
+                kernelSize, stride, padding, groups
+        );
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        Conv1DPerChannelKernel<half> <<<blocksPerGrid, threadsPerBlock>>>(
+                (half*)d_input, d_weight, d_bias, (half*)d_output,
+                batchSize, inputChannels, outputChannels,
+                inputLength, outputLength,
+                kernelSize, stride, padding, groups
+        );
+    }
 
     DeviceSync();
     return true;
@@ -6429,15 +6501,16 @@ void FastllmResetLogitsOfEOS(int batch, fastllm::Data *logits, const std::vector
     return;
 }
 
+template <typename T>
 __global__ void FastllmRecurrentGatedDeltaRuleKernel(
-    float* last_recurrent_state,  // [n0, n1, n2, n3]
-    const float* g_t,              // [n0, n1]
-    const float* k_t,              // [n0, n1, n2]
-    const float* v_t,              // [n0, n1, n3]
-    const float* b_t,              // [n0, n1]
-    const float* q_t,              // [n0, n1, n2]
-    float* core_attn_out,          // [n0, n1, n3]
-    int n0, int n1, int n2, int n3)
+    T* last_recurrent_state,  // [n0, n1, n2, n3]
+    const T* g_t,              // [n0, n1]
+    const T* k_t,              // [n0, n1, n2]
+    const T* v_t,              // [n0, n1, n3]
+    const T* b_t,              // [n0, n1]
+    const T* q_t,              // [n0, n1, n2]
+    T* core_attn_out,          // [n0, n1, n3]
+    int n0, int n1, int n2, int n3, int group)
 {
     // Each block handles one (n0, n1) position
     int batch_idx = blockIdx.x;
@@ -6454,12 +6527,12 @@ __global__ void FastllmRecurrentGatedDeltaRuleKernel(
     float* delta = &shared_mem[n3];  // size: n3
     
     // Step 1: Scale last_recurrent_state by g_t
-    float g_val = expf(g_t[base_idx]);
+    float g_val = expf((float)g_t[base_idx]);
     
     // Each thread handles multiple elements if n2*n3 > blockDim.x
     for (int idx = tid; idx < n2 * n3; idx += blockDim.x) {
         int state_idx = base_idx * n2 * n3 + idx;
-        last_recurrent_state[state_idx] *= g_val;
+        last_recurrent_state[state_idx] = (T)((float)last_recurrent_state[state_idx] * g_val);
     }
     __syncthreads();
     
@@ -6467,18 +6540,18 @@ __global__ void FastllmRecurrentGatedDeltaRuleKernel(
     if (tid < n3) {
         float sum = 0.0f;
         for (int j = 0; j < n2; j++) {
-            float k_val = k_t[base_idx * n2 + j];
+            float k_val = (float)k_t[base_idx / group * n2 + j];
             int state_idx = base_idx * n2 * n3 + j * n3 + tid;
-            sum += last_recurrent_state[state_idx] * k_val;
+            sum += (float)last_recurrent_state[state_idx] * k_val;
         }
         kv_mem[tid] = sum;
     }
     __syncthreads();
     
     // Step 3: Compute delta = (v_t - kv_mem) * b_t
-    float b_val = b_t[base_idx];
+    float b_val = (float)b_t[base_idx];
     if (tid < n3) {
-        float v_val = v_t[base_idx * n3 + tid];
+        float v_val = (float)v_t[base_idx * n3 + tid];
         delta[tid] = (v_val - kv_mem[tid]) * b_val;
     }
     __syncthreads();
@@ -6487,9 +6560,10 @@ __global__ void FastllmRecurrentGatedDeltaRuleKernel(
     for (int idx = tid; idx < n2 * n3; idx += blockDim.x) {
         int j = idx / n3;
         int k = idx % n3;
-        float k_val = k_t[base_idx * n2 + j];
+        float k_val = (float)k_t[base_idx / group * n2 + j];
         int state_idx = base_idx * n2 * n3 + idx;
-        last_recurrent_state[state_idx] += k_val * delta[k];
+
+        last_recurrent_state[state_idx] = (T)((float)last_recurrent_state[state_idx] + k_val * delta[k]);
     }
     __syncthreads();
     
@@ -6497,11 +6571,11 @@ __global__ void FastllmRecurrentGatedDeltaRuleKernel(
     if (tid < n3) {
         float sum = 0.0f;
         for (int j = 0; j < n2; j++) {
-            float q_val = q_t[base_idx * n2 + j];
+            float q_val = (float)q_t[base_idx / group * n2 + j];
             int state_idx = base_idx * n2 * n3 + j * n3 + tid;
-            sum += last_recurrent_state[state_idx] * q_val;
+            sum += (float)last_recurrent_state[state_idx] * q_val;
         }
-        core_attn_out[base_idx * n3 + tid] = sum;
+        core_attn_out[base_idx * n3 + tid] = (T)sum;
     }
 }
 
@@ -6520,6 +6594,8 @@ void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm:
     float *d_b = (float*)b.cudaData;
     float *d_q = (float*)q.cudaData;
     float *d_out = (float*)core_attn_out.cudaData;
+
+    int group = v.dims[1] / q.dims[1];
     
     // Configure kernel launch parameters
     dim3 gridDim(n0, n1);  // One block per (batch, head) pair
@@ -6529,10 +6605,17 @@ void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm:
     size_t sharedMemSize = 2 * n3 * sizeof(float);  // for kv_mem and delta
     
     // Launch kernel
-    FastllmRecurrentGatedDeltaRuleKernel<<<gridDim, threadsPerBlock, sharedMemSize>>>(
-        d_last_state, d_g, d_k, d_v, d_b, d_q, d_out,
-        n0, n1, n2, n3
-    ); 
+    if (q.dataType == fastllm::DataType::FLOAT32) {
+        FastllmRecurrentGatedDeltaRuleKernel <float> <<<gridDim, threadsPerBlock, sharedMemSize>>>(
+            d_last_state, d_g, d_k, d_v, d_b, d_q, d_out,
+            n0, n1, n2, n3, group
+        ); 
+    } else if (q.dataType == fastllm::DataType::FLOAT16) {
+        FastllmRecurrentGatedDeltaRuleKernel <half> <<<gridDim, threadsPerBlock, sharedMemSize>>>(
+            (half*)d_last_state, (half*)d_g, (half*)d_k, (half*)d_v, (half*)d_b, (half*)d_q, (half*)d_out,
+            n0, n1, n2, n3, group
+        ); 
+    }
     
     // Synchronize if needed
     DeviceSync();
