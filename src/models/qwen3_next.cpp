@@ -185,11 +185,16 @@ namespace fastllm {
     }
 
     void FakePad(Data &input, Data &output, int axis, int dim) {
+        if (dim == 0) {
+            Mul(input, 1.0f, output);
+            return;
+        }
         Data temp;
         std::vector <int> dims = input.dims;
         dims[axis] = dim;
         temp.Resize(dims);
         temp.Allocate(0.0f);
+        ToDataType(temp, input.dataType);
         Cat(input, temp, axis, output);
     }
 
@@ -248,6 +253,7 @@ namespace fastllm {
         }
         
         Data attenInputTemp;
+        Data hidden_states_new;
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
 
@@ -290,19 +296,22 @@ namespace fastllm {
                 RMSNorm(q, this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"], rms_norm_eps, q);
                 RMSNorm(k, this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"], rms_norm_eps, k);
 
-                {
+                if (false) {
                     int dim = cosDataPtr->dims.back();
                     Data qRot, qPass, kRot, kPass;
                     Split(q, -1, 0, dim, qRot);
                     Split(q, -1, dim, q.dims.back(), qPass);
                     Split(k, -1, 0, dim, kRot);
                     Split(k, -1, dim, k.dims.back(), kPass);
-
                     fastllm::LlamaRotatePosition2D(qRot, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
                     fastllm::LlamaRotatePosition2D(kRot, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
 
                     Cat(qRot, qPass, -1, q);
                     Cat(kRot, kPass, -1, k);
+                } else {
+                    int dim = cosDataPtr->dims.back();
+                    fastllm::LlamaRotatePosition2DPart(q, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim, dim);
+                    fastllm::LlamaRotatePosition2DPart(k, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim, dim);
                 }
 
                 PermuteSelf(q, {0, 2, 1, 3});
@@ -416,6 +425,7 @@ namespace fastllm {
                 } else {
                     if (qkv.dims.back() >= 4) {
                         Split(qkv, -1, qkv.dims.back() - 4, qkv.dims.back(), pastKey);
+                        // PermuteSelf(pastKey, {0, 2, 1});
                         pastKey.expansionDims = pastKey.dims;
                     } else {
                         ErrorInFastLLM("qkv.dims.back() < 4");
@@ -432,6 +442,7 @@ namespace fastllm {
 
                 int kd = num_k_heads * head_k_dim, vd = num_v_heads * head_v_dim;
                 PermuteSelf(qkv, {0, 2, 1});
+
                 Split(qkv, -1, 0, kd, q);
                 Split(qkv, -1, kd, kd + kd, k);
                 Split(qkv, -1, kd + kd, kd + kd + vd, v);
@@ -440,7 +451,7 @@ namespace fastllm {
                 k.Reshape({k.dims[0], k.dims[1], -1, head_k_dim});
                 v.Reshape({v.dims[0], v.dims[1], -1, head_v_dim});
 
-                {
+                if (!(bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0)) {
                     Data qtemp, ktemp;
                     Mul(q, 1.0f, qtemp);
                     Mul(k, 1.0f, ktemp);
@@ -454,7 +465,7 @@ namespace fastllm {
                     q.Reshape({q.dims[0], q.dims[1], -1, q.dims.back()});
                     k.Reshape({k.dims[0], k.dims[1], -1, k.dims.back()});
                 }
-
+                
                 Sigmoid(b, b); // beta = b.sigmoid()
                 MambaSoftplus(a, weight[aLogName], weight[dtBiasName], g); // g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
                 Data &last_recurrent_state = pastValue;
@@ -738,7 +749,7 @@ namespace fastllm {
             RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
             Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
 
-            // logits.Print();
+            logits.Print();
             // exit(0);
 
             if (generationConfig.output_logits && retLogits != nullptr) {
