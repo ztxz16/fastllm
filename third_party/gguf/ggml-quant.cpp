@@ -187,6 +187,317 @@ static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
     return mul_sum_us8_pairs_float(ax, sy);
 }
 
+#define MAX(a, b) (a) > (b) ? (a) : (b)
+#define MIN(a, b) (a) < (b) ? (a) : (b)
+#define GROUP_MAX_EPS 1e-15f
+#define GROUP_MAX_EPS_IQ3_XXS 1e-8f
+#define GROUP_MAX_EPS_IQ2_S 1e-8f
+#define GROUP_MAX_EPS_IQ1_M 1e-7f
+#define GROUP_MAX_EPS_IQ1_S 1e-12f
+
+static inline void get_scale_min_k4(int j, const uint8_t * GGML_RESTRICT q, uint8_t * GGML_RESTRICT d, uint8_t * GGML_RESTRICT m) {
+    if (j < 4) {
+        *d = q[j] & 63; *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        *m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
+    }
+}
+
+static float make_qx_quants(int n, int nmax, const float * GGML_RESTRICT x, int8_t * GGML_RESTRICT L, int rmse_type,
+        const float * GGML_RESTRICT qw) {
+    float max = 0;
+    float amax = 0;
+    for (int i = 0; i < n; ++i) {
+        float ax = fabsf(x[i]);
+        if (ax > amax) { amax = ax; max = x[i]; }
+    }
+    if (amax < GROUP_MAX_EPS) { // all zero
+        for (int i = 0; i < n; ++i) {
+            L[i] = 0;
+        }
+        return 0.f;
+    }
+    float iscale = -nmax / max;
+    if (rmse_type == 0) {
+        for (int i = 0; i < n; ++i) {
+            int l = nearest_int(iscale * x[i]);
+            L[i] = nmax + MAX(-nmax, MIN(nmax-1, l));
+        }
+        return 1/iscale;
+    }
+    bool return_early = false;
+    if (rmse_type < 0) {
+        rmse_type = -rmse_type;
+        return_early = true;
+    }
+    float sumlx = 0;
+    float suml2 = 0;
+#ifdef HAVE_BUGGY_APPLE_LINKER
+    // use 'volatile' to prevent unroll and work around a bug in Apple ld64 1015.7
+    for (volatile int i = 0; i < n; ++i) {
+#else
+    for (int i = 0; i < n; ++i) {
+#endif
+        int l = nearest_int(iscale * x[i]);
+        l = MAX(-nmax, MIN(nmax-1, l));
+        L[i] = l + nmax;
+        float w = qw ? qw[i] : rmse_type == 1 ? x[i] * x[i] : rmse_type == 2 ? 1 : rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
+        sumlx += w*x[i]*l;
+        suml2 += w*l*l;
+    }
+    float scale = suml2 ? sumlx/suml2 : 0.0f;
+    if (return_early) return suml2 > 0 ? 0.5f*(scale + 1/iscale) : 1/iscale;
+    float best = scale * sumlx;
+    for (int is = -9; is <= 9; ++is) {
+        if (is == 0) {
+            continue;
+        }
+        iscale = -(nmax + 0.1f*is) / max;
+        sumlx = suml2 = 0;
+        for (int i = 0; i < n; ++i) {
+            int l = nearest_int(iscale * x[i]);
+            l = MAX(-nmax, MIN(nmax-1, l));
+            float w = qw ? qw[i] : rmse_type == 1 ? x[i] * x[i] : rmse_type == 2 ? 1 : rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
+            sumlx += w*x[i]*l;
+            suml2 += w*l*l;
+        }
+        if (suml2 > 0 && sumlx*sumlx > best*suml2) {
+            for (int i = 0; i < n; ++i) {
+                int l = nearest_int(iscale * x[i]);
+                L[i] = nmax + MAX(-nmax, MIN(nmax-1, l));
+            }
+            scale = sumlx/suml2; best = scale*sumlx;
+        }
+    }
+    return scale;
+}
+
+static float make_qkx2_quants(int n, int nmax, const float * GGML_RESTRICT x, const float * GGML_RESTRICT weights,
+        uint8_t * GGML_RESTRICT L, float * GGML_RESTRICT the_min, uint8_t * GGML_RESTRICT Laux,
+        float rmin, float rdelta, int nstep, bool use_mad) {
+    float min = x[0];
+    float max = x[0];
+    float sum_w = weights[0];
+    float sum_x = sum_w * x[0];
+#ifdef HAVE_BUGGY_APPLE_LINKER
+    // use 'volatile' to prevent unroll and work around a bug in Apple ld64 1015.7
+    for (volatile int i = 1; i < n; ++i) {
+#else
+    for (int i = 1; i < n; ++i) {
+#endif
+        if (x[i] < min) min = x[i];
+        if (x[i] > max) max = x[i];
+        float w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    if (min > 0) min = 0;
+    if (max == min) {
+        for (int i = 0; i < n; ++i) L[i] = 0;
+        *the_min = -min;
+        return 0.f;
+    }
+    float iscale = nmax/(max - min);
+    float scale = 1/iscale;
+    float best_error = 0;
+    for (int i = 0; i < n; ++i) {
+        int l = nearest_int(iscale*(x[i] - min));
+        L[i] = MAX(0, MIN(nmax, l));
+        float diff = scale * L[i] + min - x[i];
+        diff = use_mad ? fabsf(diff) : diff * diff;
+        float w = weights[i];
+        best_error += w * diff;
+    }
+    if (nstep < 1) {
+        *the_min = -min;
+        return scale;
+    }
+    for (int is = 0; is <= nstep; ++is) {
+        iscale = (rmin + rdelta*is + nmax)/(max - min);
+        float sum_l = 0, sum_l2 = 0, sum_xl = 0;
+        for (int i = 0; i < n; ++i) {
+            int l = nearest_int(iscale*(x[i] - min));
+            l = MAX(0, MIN(nmax, l));
+            Laux[i] = l;
+            float w = weights[i];
+            sum_l += w*l;
+            sum_l2 += w*l*l;
+            sum_xl += w*l*x[i];
+        }
+        float D = sum_w * sum_l2 - sum_l * sum_l;
+        if (D > 0) {
+            float this_scale = (sum_w * sum_xl - sum_x * sum_l)/D;
+            float this_min   = (sum_l2 * sum_x - sum_l * sum_xl)/D;
+            if (this_min > 0) {
+                this_min = 0;
+                this_scale = sum_xl / sum_l2;
+            }
+            float cur_error = 0;
+            for (int i = 0; i < n; ++i) {
+                float diff = this_scale * Laux[i] + this_min - x[i];
+                diff = use_mad ? fabsf(diff) : diff * diff;
+                float w = weights[i];
+                cur_error += w * diff;
+            }
+            if (cur_error < best_error) {
+                for (int i = 0; i < n; ++i) {
+                    L[i] = Laux[i];
+                }
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    *the_min = -min;
+    return scale;
+}
+
+// ====================== 4-bit quantization
+void quantize_row_q4_K_ref(const float * GGML_RESTRICT x, block_q4_K * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+
+    uint8_t L[QK_K];
+    uint8_t Laux[32];
+    float   weights[32];
+    float mins[QK_K/32];
+    float scales[QK_K/32];
+
+    for (int i = 0; i < nb; i++) {
+        float max_scale = 0; // as we are deducting the min, scales are always positive
+        float max_min = 0;
+        for (int j = 0; j < QK_K/32; ++j) {
+            //scales[j] = make_qkx1_quants(32, 15, x + 32*j, L + 32*j, &mins[j], 9, 0.5f);
+            float sum_x2 = 0;
+            for (int l = 0; l < 32; ++l) sum_x2 += x[32*j + l] * x[32*j + l];
+            float av_x = sqrtf(sum_x2/32);
+            for (int l = 0; l < 32; ++l) weights[l] = av_x + fabsf(x[32*j + l]);
+            scales[j] = make_qkx2_quants(32, 15, x + 32*j, weights, L + 32*j, &mins[j], Laux, -1.f, 0.1f, 20, false);
+            float scale = scales[j];
+            if (scale > max_scale) {
+                max_scale = scale;
+            }
+            float min = mins[j];
+            if (min > max_min) {
+                max_min = min;
+            }
+        }
+
+        float inv_scale = max_scale > 0 ? 63.f/max_scale : 0.f;
+        float inv_min   = max_min   > 0 ? 63.f/max_min   : 0.f;
+        for (int j = 0; j < QK_K/32; ++j) {
+            uint8_t ls = nearest_int(inv_scale*scales[j]);
+            uint8_t lm = nearest_int(inv_min*mins[j]);
+            ls = MIN(63, ls);
+            lm = MIN(63, lm);
+            if (j < 4) {
+                y[i].scales[j] = ls;
+                y[i].scales[j+4] = lm;
+            } else {
+                y[i].scales[j+4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                y[i].scales[j-4] |= ((ls >> 4) << 6);
+                y[i].scales[j-0] |= ((lm >> 4) << 6);
+            }
+        }
+        y[i].d = GGML_FP32_TO_FP16(max_scale/63.f);
+        y[i].dmin = GGML_FP32_TO_FP16(max_min/63.f);
+
+        uint8_t sc, m;
+        for (int j = 0; j < QK_K/32; ++j) {
+            get_scale_min_k4(j, y[i].scales, &sc, &m);
+            const float d = GGML_FP16_TO_FP32(y[i].d) * sc;
+            if (!d) continue;
+            const float dm = GGML_FP16_TO_FP32(y[i].dmin) * m;
+            for (int ii = 0; ii < 32; ++ii) {
+                int l = nearest_int((x[32*j + ii] + dm)/d);
+                l = MAX(0, MIN(15, l));
+                L[32*j + ii] = l;
+            }
+        }
+
+        uint8_t * q = y[i].qs;
+        for (int j = 0; j < QK_K; j += 64) {
+            for (int l = 0; l < 32; ++l) q[l] = L[j + l] | (L[j + l + 32] << 4);
+            q += 32;
+        }
+
+        x += QK_K;
+    }
+}
+
+// ====================== 6-bit (de)-quantization
+void quantize_row_q6_K_ref(const float * GGML_RESTRICT x, block_q6_K * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    int8_t L[QK_K];
+    float   scales[QK_K/16];
+
+    for (int i = 0; i < nb; i++) {
+
+        float max_scale = 0;
+        float max_abs_scale = 0;
+
+        for (int ib = 0; ib < QK_K/16; ++ib) {
+
+            const float scale = make_qx_quants(16, 32, x + 16*ib, L + 16*ib, 1, NULL);
+            scales[ib] = scale;
+
+            const float abs_scale = fabsf(scale);
+            if (abs_scale > max_abs_scale) {
+                max_abs_scale = abs_scale;
+                max_scale = scale;
+            }
+
+        }
+
+        if (max_abs_scale < GROUP_MAX_EPS) {
+            memset(&y[i], 0, sizeof(block_q6_K));
+            y[i].d = GGML_FP32_TO_FP16(0.f);
+            x += QK_K;
+            continue;
+        }
+
+        float iscale = -128.f/max_scale;
+        y[i].d = GGML_FP32_TO_FP16(1/iscale);
+        for (int ib = 0; ib < QK_K/16; ++ib) {
+            y[i].scales[ib] = MIN(127, nearest_int(iscale*scales[ib]));
+        }
+
+        for (int j = 0; j < QK_K/16; ++j) {
+            float d = GGML_FP16_TO_FP32(y[i].d) * y[i].scales[j];
+            if (!d) {
+                continue;
+            }
+            for (int ii = 0; ii < 16; ++ii) {
+                int l = nearest_int(x[16*j + ii]/d);
+                l = MAX(-32, MIN(31, l));
+                L[16*j + ii] = l + 32;
+            }
+        }
+
+        uint8_t * GGML_RESTRICT ql = y[i].ql;
+        uint8_t * GGML_RESTRICT qh = y[i].qh;
+        for (int j = 0; j < QK_K; j += 128) {
+            for (int l = 0; l < 32; ++l) {
+                const uint8_t q1 = L[j + l +  0] & 0xF;
+                const uint8_t q2 = L[j + l + 32] & 0xF;
+                const uint8_t q3 = L[j + l + 64] & 0xF;
+                const uint8_t q4 = L[j + l + 96] & 0xF;
+                ql[l+ 0] = q1 | (q3 << 4);
+                ql[l+32] = q2 | (q4 << 4);
+                qh[l] = (L[j + l] >> 4) | ((L[j + l + 32] >> 4) << 2) | ((L[j + l + 64] >> 4) << 4) | ((L[j + l + 96] >> 4) << 6);
+            }
+            ql += 64;
+            qh += 32;
+        }
+
+        x += QK_K;
+    }
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q8_0_ref(const float * restrict x, block_q8_0 * restrict y, int64_t k) {
     assert(k % QK8_0 == 0);
