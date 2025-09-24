@@ -354,7 +354,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .vec_dot                  = ggml_vec_dot_q3_K_q8_K,
             .vec_dot_type             = GGML_TYPE_Q8_K,
             .to_float                 = (ggml_to_float_t) dequantize_row_q3_K,
-            // .from_float_ref           = (ggml_from_float_t) quantize_row_q3_K_ref,
+            .from_float_ref           = (ggml_from_float_t) quantize_row_q3_K_ref,
         }},
         {GGML_TYPE_Q3_K_R4, {
             .type_name                = "q3_k_r4",
@@ -394,7 +394,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .vec_dot                  = ggml_vec_dot_q5_K_q8_K,
             .vec_dot_type             = GGML_TYPE_Q8_K,
             .to_float                 = (ggml_to_float_t) dequantize_row_q5_K,
-            // .from_float_ref           = (ggml_from_float_t) quantize_row_q5_K_ref,
+            .from_float_ref           = (ggml_from_float_t) quantize_row_q5_K_ref,
         }},
         {GGML_TYPE_Q5_K_R4, {
             .type_name                = "q5_k_r4",
