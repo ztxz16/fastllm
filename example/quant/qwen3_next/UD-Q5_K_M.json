@@ -1,0 +1,22 @@
+[
+    {
+        "key" : "(.)*",
+        "dtype" : "float16",
+        "comment": "default use dtype ggml"
+    },
+    {
+        "key" : "(.)*expert(.)*[gate|up]_proj(.)*",
+        "dtype" : "ggml_q5_k",
+        "comment": ""
+    },
+    {
+        "key" : "(.)*expert(.)*[down]_proj(.)*",
+        "dtype" : "ggml_q5_k",
+        "comment": ""
+    },
+    {
+        "key" : "(.)*shared_expert(.)*[gate|up|down]_proj(.)*",
+        "dtype" : "float16",
+        "comment": ""
+    }
+]
