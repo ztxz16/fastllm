@@ -374,7 +374,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .vec_dot                  = ggml_vec_dot_q4_K_q8_K,
             .vec_dot_type             = GGML_TYPE_Q8_K,
             .to_float                 = (ggml_to_float_t) dequantize_row_q4_K,
-            // .from_float_ref           = (ggml_from_float_t) quantize_row_q4_K_ref,
+            .from_float_ref           = (ggml_from_float_t) quantize_row_q4_K_ref,
         }},
         {GGML_TYPE_Q4_K_R4, {
             .type_name                = "q4_k_r4",
@@ -414,7 +414,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
             .vec_dot                  = ggml_vec_dot_q6_K_q8_K,
             .vec_dot_type             = GGML_TYPE_Q8_K,
             .to_float                 = (ggml_to_float_t) dequantize_row_q6_K,
-            // .from_float_ref           = (ggml_from_float_t) quantize_row_q6_K_ref,
+            .from_float_ref           = (ggml_from_float_t) quantize_row_q6_K_ref,
         }},
         {GGML_TYPE_Q6_K_R4, {
             .type_name                = "q6_k_r4",
@@ -606,6 +606,10 @@ double ggml_type_sizef(enum ggml_type type) {
 
 const char * ggml_type_name(enum ggml_type type) {
     return type < GGML_TYPE_COUNT ? type_traits[type].type_name : "NONE";
+}
+
+ggml_from_float_t ggml_type_from_float_ref(enum ggml_type type) {
+    return type < GGML_TYPE_COUNT ? type_traits[type].from_float_ref : nullptr;
 }
 
 ggml_to_float_t ggml_type_to_float(enum ggml_type type) {

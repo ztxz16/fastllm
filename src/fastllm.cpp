@@ -922,6 +922,19 @@ namespace fastllm {
                 data.scales[i] = config.scale;
             }
             memcpy((uint8_t*)data.cpuData, (uint8_t*)uDatas.data(), bytes);
+        } else if (oriDataType == DataType::FLOAT32 && dataType == DATA_GGUF_FORMAT) {
+            uint8_t *a = (uint8_t*)data.cpuData;
+            float *b = (float*)oriData;
+            int len = data.dims[0] * data.dims[1];
+
+            auto from_float = ggml_type_from_float_ref((ggml_type)data.ggmlType);
+            if (from_float == nullptr) {
+                printf("Failed to find convert function for %s\n", ggml_type_name((ggml_type)data.ggmlType));
+                exit(0);
+            }
+            from_float (
+                b, a, len
+            );
         } else {
             ErrorInFastLLM("wrong data type " + dataTypeNames[oriDataType][0] + " -> " + dataTypeNames[dataType][0]);
         }
@@ -1584,6 +1597,9 @@ namespace fastllm {
             int k = this->perChannelAxis == -1 ? 1 : this->dims[this->perChannelAxis];
             ret += k * this->group * 2 * sizeof(float);
             ret += this->GetBytes();
+        } else if (this->dataType == DATA_GGUF_FORMAT) {
+            ret += sizeof(int);
+            ret += this->GetBytes();
         } else {
             ErrorInFastLLM("ExportFastllmFormat Error: data type error.");
         }
@@ -1627,6 +1643,9 @@ namespace fastllm {
                 writer.WriteFloat(this->scales[i]);
             }
             writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else if (this->dataType == DATA_GGUF_FORMAT) {
+            writer.WriteInt(this->ggmlType);
+            writer.WriteBytes(this->cpuData, this->GetBytes());
         } else {
             ErrorInFastLLM("ExportFastllmFormat Error: data type error.");
         }
@@ -1639,6 +1658,9 @@ namespace fastllm {
         int version = reader.ReadInt();
         if (version == 1) {
             this->dataType = (DataType)reader.ReadInt();
+            if (this->dataType == DATA_GGUF_FORMAT) {
+                this->ggmlType = reader.ReadInt();
+            }
             this->Resize(this->dims);
             this->Allocate();
             if (this->dataType == FLOAT16 || this->dataType == FLOAT32 || this->dataType == BFLOAT16) {
@@ -1694,6 +1716,8 @@ namespace fastllm {
                     this->scales[i] = scale;
                     // this->zeros[i] = this->perChannelsConfigs[i].zeroPoint;
                 }
+                reader.ReadBytes(this->cpuData, this->GetBytes());
+            } else if (this->dataType == DATA_GGUF_FORMAT) {
                 reader.ReadBytes(this->cpuData, this->GetBytes());
             } else {
                 ErrorInFastLLM("CreateFromFastllmFormat Error: data type error.");

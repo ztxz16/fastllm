@@ -1749,6 +1749,8 @@ size_t ggml_type_size(enum ggml_type type);
 
 const char * ggml_type_name(enum ggml_type type);
 
+ggml_from_float_t ggml_type_from_float_ref(enum ggml_type type);
+
 ggml_to_float_t ggml_type_to_float(enum ggml_type type);
 
 ggml_vec_dot_t ggml_type_vec_dot(enum ggml_type type);
@@ -1769,7 +1771,7 @@ struct ggml_type_traits {
     ggml_vec_dot_t           vec_dot = nullptr;
     enum ggml_type           vec_dot_type;
     ggml_to_float_t          to_float = nullptr;
-    ggml_from_float_t        from_float_ref;
+    ggml_from_float_t        from_float_ref = nullptr;
     int64_t                  blck_size_interleave; // interleave elements in blocks
     ggml_from_float_to_mat_t from_float_to_mat;
     int64_t                  nrows; // number of rows to process simultaneously
