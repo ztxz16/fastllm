@@ -1,26 +1,30 @@
-# 动态量化使用说明
-
-这个文档以`DeepSeek-V3-0324`模型为例，介绍如何使用动态量化功能
-
-（注意，目前的量化功能为初版，后续会支持动态设定量化方法，以及设置重要性矩阵来提高量化精度）
-
 ## 基本用法
 
-首先我们要编写一个配置文件（可以直接使用[下一节](#如何编写配置文件)中的示例）
+通过 原始模型 + 量化配置文件，可以使用、导出不同格式的量化模型
 
-假设配置文件保存在 `/root/dtype_config.json`
+例如我们使用模型
 
-下面这条命令会读会读取`/root/dtype_config.json`中的的规则来进行动态量化，并部署`api server`
+`Qwen3-Next-80B-A3B-Instruct` （https://hf-mirror.com/Qwen/Qwen3-Next-80B-A3B-Instruct）
+
+和量化配置文件：
+
+`UD-Q2_K_S.json` : （[这个文件](../example/quant/qwen3_next/UD-Q2_K_S.json)）
+
+下面这条命令会读会读取`UD-Q2_K_S.json`中的的规则来进行动态量化，并部署`api server`
 ```
-ftllm server fastllm/DeepSeek-V3-0324 --dtype_config /root/dtype_config.json
+ftllm server Qwen3-Next-80B-A3B-Instruct --dtype_config UD-Q2_K_S.json
 ```
 
 下面这条命令会读会读取`/root/dtype_config.json`中的的规则来进行动态量化，并导出模型
 ```
-ftllm export fastllm/DeepSeek-V3-0324 --dtype_config /root/dtype_config.json -o DeepSeek-V3-0324-MIX
+ftllm export Qwen3-Next-80B-A3B-Instruct --dtype_config UD-Q2_K_S.json -o Qwen3-Next-80B-A3B-Instruct-UD-Q2_K_S
 ```
 
-## 如何编写配置文件
+# 如何编写配置文件
+
+这个文档以`DeepSeek-V3-0324`模型为例，介绍如何使用动态量化功能
+
+（注意，目前的量化功能为初版，后续会支持动态设定量化方法，以及设置重要性矩阵来提高量化精度）
 
 编写动态量化配置时，最好先了解如下知识：
 - 需要对`正则表达式`有一定了解

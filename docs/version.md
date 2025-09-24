@@ -1,3 +1,9 @@
+## V0.1.4.8
+
+- 增加 通用动态量化（Universal Dynamic Quantization）功能，参考[动态量化指南](dtype_config.md)
+- 修复Qwen3-Next缓存错误的Bug
+- 提升Qwen3-Next混合推理速度
+
 ## V0.1.4.7
 
 - 初步适配Qwen3-Next模型
