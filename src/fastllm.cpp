@@ -2311,6 +2311,11 @@ namespace fastllm {
         this->weight[key].name = std::string(key);
     }
 
+    void WeightMap::AddEmptyGGMLWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType, int ggmlType) {
+        this->weight[key] = Data(dataType, ggmlType, dims);
+        this->weight[key].name = std::string(key);
+    }
+
     void WeightMap::AddWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType,
                               fastllm::WeightType weightType, fastllm::DataType oriDataType, uint8_t *oriData, int groupCnt) {
         if (weightType == WeightType::AUTO) {
