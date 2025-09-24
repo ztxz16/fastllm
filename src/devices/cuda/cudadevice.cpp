@@ -931,11 +931,10 @@ namespace fastllm {
         Data &input0 = *(datas.find("input0")->second);
         Data &input1 = *(datas.find("input1")->second);
         float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0;
-
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
                         (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
                         "MulTo error: Data's type should be float32 or float16.\n");
-        AssertInFastLLM(input0.dims == input1.dims, "MulTo error: input's shape should be same.\n");
+        AssertInFastLLM(input0.dims == input1.dims || input1.Count(0) == 1, "MulTo error: input's shape should be same.\n");
         FastllmCudaMulTo(input0, input1, alpha);
     }
 

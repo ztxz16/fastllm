@@ -737,6 +737,24 @@ __global__ void FastllmMulToKernel(half* a, half *b, float alpha, int len) {
     }
 }
 
+__global__ void FastllmMulSingleToKernel(float* a, float *b, float alpha, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        a[idx] *= b[0] * alpha;
+    }
+}
+
+__global__ void FastllmMulSingleToKernel(half* a, half *b, float alpha, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+#ifdef CUDA_NO_TENSOR_CORE
+        a[idx] = __float2half(__half2float(b[0]) * alpha * __half2float(a[idx]));
+#else
+        a[idx] *= (half)((float)b[0] * alpha);
+#endif
+    }
+}
+
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmAttentionMaskKernel(float* a, float *b, float maskValue, int n, int m, int spatial) {
     int on = blockIdx.x / m;
@@ -4334,10 +4352,18 @@ bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float 
     float *input1Data = (float *) FastllmCudaPrepareInput(input1);
 
     int threadPerBlock = std::min(256, len);
-    if (input0.dataType == fastllm::DataType::FLOAT32) {
-        FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
+    if (input1.Count(0) == 1) {
+        if (input0.dataType == fastllm::DataType::FLOAT32) {
+            FastllmMulSingleToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
+        } else {
+            FastllmMulSingleToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaData, (half*)input1Data, alpha, len);
+        }
     } else {
-        FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaData, (half*)input1Data, alpha, len);
+        if (input0.dataType == fastllm::DataType::FLOAT32) {
+            FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
+        } else {
+            FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaData, (half*)input1Data, alpha, len);
+        }
     }
     FastllmCudaFinishInput(input1, input1Data);
     FastllmCudaFinishOutput(input0, cudaData);
