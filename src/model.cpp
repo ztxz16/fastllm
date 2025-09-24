@@ -829,7 +829,7 @@ namespace fastllm {
         ggmlType = -1;
         if (matchedType.size() >= 5 && matchedType.substr(0, 5) == "ggml_") {            
             static std::set <ggml_type> types = {
-                GGML_TYPE_Q4_K, GGML_TYPE_Q6_K
+                GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0
             };
             dataType = DATA_GGUF_FORMAT;
             std::string type = matchedType.substr(5);
@@ -1529,8 +1529,9 @@ if (false) {
                 std::string weightName = it.first;
                 allWeightNames.insert(weightName);
                 auto dataType = it.second;
+                int ggmlType = -1;
                 if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
-                    int groupCnt = -1, ggmlType = -1;
+                    int groupCnt = -1;
                     ParseDataType(weightName, dtypeRules, dataType, groupCnt, ggmlType);
 
                     // 如果原始权重不是FP8_E4M3格式，目前不做转换
@@ -1555,7 +1556,11 @@ if (false) {
                 } else if (isAwqModel && StringEndWith(tensorName, ".qweight")) {
                     model->weight.AddEmptyWeight(weightName, {tensor.intShape[1] * 8, tensor.intShape[0]}, dataType);
                 } else {
-                    model->weight.AddEmptyWeight(weightName, tensor.intShape, dataType);
+                    if (ggmlType != -1) {
+                        model->weight.AddEmptyGGMLWeight(weightName, tensor.intShape, dataType, ggmlType);    
+                    } else {
+                        model->weight.AddEmptyWeight(weightName, tensor.intShape, dataType);
+                    }
                 }
             }
 
@@ -1642,7 +1647,8 @@ if (false) {
                             if (tensor.dtype == "F8_E4M3" && 
                                 (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8 
                                 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO
-                                || dataType == DataType::INT2_GROUP)) {
+                                || dataType == DataType::INT2_GROUP)
+                                || dataType == DataType::DATA_GGUF_FORMAT) {
                                 oriDataType = DataType::FLOAT32;
                                 scaleTensorName = tensorName + "_scale_inv";
                                 if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
