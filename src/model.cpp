@@ -816,7 +816,7 @@ namespace fastllm {
     }
 
     void ParseDataType(std::string weightName, std::vector <std::pair <std::string, std::string> > &dtypeRules, 
-                        DataType &dataType, int &groupCnt) {
+                        DataType &dataType, int &groupCnt, int &ggmlType) {
         std::string matchedType = "";
         for (int i = 0; i < dtypeRules.size(); i++) {
             std::regex pattern(dtypeRules[i].first);
@@ -825,7 +825,27 @@ namespace fastllm {
             }
         }
         transform(matchedType.begin(), matchedType.end(), matchedType.begin(), ::tolower);
-        if (matchedType != "") {
+
+        ggmlType = -1;
+        if (matchedType.size() >= 5 && matchedType.substr(0, 5) == "ggml_") {            
+            static std::set <ggml_type> types = {
+                GGML_TYPE_Q4_K, GGML_TYPE_Q6_K
+            };
+            dataType = DATA_GGUF_FORMAT;
+            std::string type = matchedType.substr(5);
+            for (ggml_type t : types) {
+                std::string x = ggml_type_name(t);
+                transform(x.begin(), x.end(), x.begin(), ::tolower);
+                if (x == type) {
+                    ggmlType = t;
+                    break;
+                }
+            }
+
+            if (ggmlType == -1) {
+                ErrorInFastLLM("Failed: Unsupport type " + matchedType);
+            }
+        } else if (matchedType != "") {
             for (auto &it : dataTypeNames) {
                 for (auto &dataTypeName : it.second) {
                     if (DefaultGroupCnts.find(it.first) != DefaultGroupCnts.end()) {
@@ -1510,8 +1530,8 @@ if (false) {
                 allWeightNames.insert(weightName);
                 auto dataType = it.second;
                 if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
-                    int groupCnt = -1;
-                    ParseDataType(weightName, dtypeRules, dataType, groupCnt);
+                    int groupCnt = -1, ggmlType = -1;
+                    ParseDataType(weightName, dtypeRules, dataType, groupCnt, ggmlType);
 
                     // 如果原始权重不是FP8_E4M3格式，目前不做转换
                     if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
@@ -1592,11 +1612,12 @@ if (false) {
                             auto oriDataType = DataType::FLOAT32;
                             std::string weightName = it.first;
                             auto dataType = it.second;
+                            int ggmlType = -1;
 
                             int curGroupCnt = model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt;
 
                             if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
-                                ParseDataType(weightName, dtypeRules, dataType, curGroupCnt);
+                                ParseDataType(weightName, dtypeRules, dataType, curGroupCnt, ggmlType);
 /*
                                 printf("weight \"%s\" -> %s", weightName.c_str(), dataTypeNames[dataType][0].c_str());
                                 if (DefaultGroupCnts.find(dataType) != DefaultGroupCnts.end()) {
@@ -1796,8 +1817,15 @@ if (false) {
                                         dim0Len += model->weight[input].dims[0];
                                     }
                                     if (model->weight[it.inputs[0]].dims.size() == 1) {
+                                        std::string input0 = it.inputs[0];
                                         std::string mergeName = it.output;
-                                        model->weight[mergeName] = Data(model->weight[it.inputs[0]].dataType, {dim0Len});
+                                        if (model->weight[input0].dataType == DATA_GGUF_FORMAT) {
+                                            model->weight[mergeName] = Data(model->weight[input0].dataType);
+                                            model->weight[mergeName].ggmlType = ((ggml_tensor*) model->weight[input0].ggmlTensor)->type;
+                                            model->weight[mergeName].Resize({dim0Len});
+                                        } else {
+                                            model->weight[mergeName] = Data(model->weight[input0].dataType, {dim0Len});
+                                        }
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
                                         mergeData.Allocate();
@@ -1809,7 +1837,13 @@ if (false) {
                                     } else {
                                         std::string input0 = it.inputs[0];
                                         std::string mergeName = it.output;
-                                        model->weight[mergeName] = Data(model->weight[input0].dataType, {dim0Len, model->weight[input0].dims[1]});
+                                        if (model->weight[input0].dataType == DATA_GGUF_FORMAT) {
+                                            model->weight[mergeName] = Data(model->weight[input0].dataType);
+                                            model->weight[mergeName].ggmlType = ((ggml_tensor*) model->weight[input0].ggmlTensor)->type;
+                                            model->weight[mergeName].Resize({dim0Len, model->weight[input0].dims[1]});
+                                        } else {
+                                            model->weight[mergeName] = Data(model->weight[input0].dataType, {dim0Len, model->weight[input0].dims[1]});
+                                        }
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
                                         mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
@@ -2051,10 +2085,11 @@ if (false) {
                 auto oriDataType = DataType::FLOAT32;
                 auto dataType = tensorMap[tensor.tensorName][0].second;
                 auto weightName = tensor.tensorName;
+                int ggmlType = -1;
 
                 if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
                     int groupCnt = -1;
-                    ParseDataType(weightName, dtypeRules, dataType, groupCnt);
+                    ParseDataType(weightName, dtypeRules, dataType, groupCnt, ggmlType);
 
                     // 如果原始权重不是FP8_E4M3格式，目前不做转换
                     if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
@@ -2076,7 +2111,11 @@ if (false) {
                     std::swap(realShape[0], realShape[1]);
                     weights[weightName] = Data(dataType, realShape);
                 } else {
-                    weights[weightName] = Data(dataType, tensor.intShape);
+                    if (dataType == DATA_GGUF_FORMAT) {
+                        weights[weightName] = Data(dataType, ggmlType, tensor.intShape);    
+                    } else {
+                        weights[weightName] = Data(dataType, tensor.intShape);
+                    }
                 }
             }
 
@@ -2099,15 +2138,19 @@ if (false) {
 
                             auto dataType = tensorMap[tensor.tensorName][0].second;
                             auto oriDataType = DataType::FLOAT32;
-
+                            int ggmlType = -1;
                             int curGroupCnt = model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt;
                             if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
-                                ParseDataType(weightName, dtypeRules, dataType, curGroupCnt);
-                                printf("weight \"%s\" -> %s", weightName.c_str(), dataTypeNames[dataType][0].c_str());
-                                if (DefaultGroupCnts.find(dataType) != DefaultGroupCnts.end()) {
-                                    printf("%d", curGroupCnt);
+                                ParseDataType(weightName, dtypeRules, dataType, curGroupCnt, ggmlType);
+                                if (dataType == DATA_GGUF_FORMAT) {
+                                    printf("weight \"%s\" -> %s\n", weightName.c_str(), ggml_type_name((ggml_type)ggmlType));
+                                } else {
+                                    printf("weight \"%s\" -> %s", weightName.c_str(), dataTypeNames[dataType][0].c_str());
+                                    if (DefaultGroupCnts.find(dataType) != DefaultGroupCnts.end()) {
+                                        printf("%d", curGroupCnt);
+                                    }
+                                    printf("\n");
                                 }
-                                printf("\n");
                             }
 
                             if (dataType >= DATA_AUTO_NONE) {
@@ -2123,7 +2166,7 @@ if (false) {
                                 oriDataType = DataType::FLOAT16;
                             }
                             if (tensor.dtype == "F8_E4M3" && 
-                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)) {
+                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO || dataType == DataType::DATA_GGUF_FORMAT)) {
                                 oriDataType = DataType::FLOAT32;
                                 scaleTensorName = tensor.tensorName + "_scale_inv";
                                 if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
