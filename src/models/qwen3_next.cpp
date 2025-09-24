@@ -43,7 +43,9 @@ namespace fastllm {
             "model.layers.*.mlp.*.weight",
             "model.layers.*.linear_attn.in_proj_ba.weight",
             "model.layers.*.linear_attn.in_proj_qkvz.weight",
-            "model.layers.*.linear_attn.out_proj.weight"
+            "model.layers.*.linear_attn.out_proj.weight",
+            "mtp.layers.*.gate_proj.weight", "mtp.layers.*.up_proj.weight", "mtp.layers.*.down_proj.weight",
+            "mtp.layers.*.self_attn.q_proj.weight", "mtp.layers.*.self_attn.k_proj.weight", "mtp.layers.*.self_attn.v_proj.weight", "mtp.layers.*.self_attn.o_proj.weight"
         };
     }
 
