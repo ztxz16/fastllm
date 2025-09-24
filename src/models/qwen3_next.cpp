@@ -695,20 +695,24 @@ namespace fastllm {
 
                 int batch = attenInput.dims[0], len = attenInput.dims[1];
                 attenInput.Reshape({batch * len, attenInput.dims[2]});
+                Data sharedGate, sharedGateRepeat;
                 Linear(attenInput, weight[gateWeightName], Data(), routerLogits);
-
+                Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert.gateup_proj.weight"], Data(), w3);
+                Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert_gate.weight"], Data(), sharedGate);
                 bool needNorm = true;
                 Softmax(routerLogits, routerLogits, -1);
 
-                Data sharedGate, sharedGateRepeat;
-                Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert.gateup_proj.weight"], Data(), w3);
                 Swiglu(w3, w1);
                 Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert.down_proj.weight"], Data(), moeFinal2);
-                Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert_gate.weight"], Data(), sharedGate);
                 Sigmoid(sharedGate, sharedGate);
-                Repeat(sharedGate, 1, moeFinal2.dims.back(), sharedGateRepeat);
-                MulTo(moeFinal2, sharedGateRepeat);
-
+            
+                if (sharedGate.Count(0) == 1) {
+                    MulTo(moeFinal2, sharedGate);
+                } else {
+                    Repeat(sharedGate, 1, moeFinal2.dims.back(), sharedGateRepeat);
+                    MulTo(moeFinal2, sharedGateRepeat);
+                }
+                
                 ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
                 MergeMOE (
                         attenInput, routerLogits, weight[gateBiasName],

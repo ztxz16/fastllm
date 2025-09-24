@@ -4935,30 +4935,41 @@ namespace fastllm {
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input0 = *(datas.find("input0")->second);
         Data &input1 = *(datas.find("input1")->second);
-        AssertInFastLLM(input0.dims == input1.dims, "MulTo error: input's shape should be same.\n");
+        int input1Len = input1.Count(0);
+        AssertInFastLLM(input0.dims == input1.dims || input1Len == 1, "MulTo error: input's shape should be same.\n");
 
         int len = input0.Count(0);
         int inner = input1.Count(0);
         AssertInFastLLM(len % inner == 0, "MulTo error: Data`s shape can`t perform MulTo operation.\n");
         int round = (len / inner);
 
-        if (input0.dataType == DataType::FLOAT16) {
-            uint16_t *input0Data = (uint16_t*)input0.cpuData;
-            uint16_t *input1Data = (uint16_t*)input1.cpuData;
-            for (int j = 0; j < round; j++) {
+        if (input1Len == 1) {
+            if (input0.dataType == DataType::FLOAT16) {
+                uint16_t *input0Data = (uint16_t*)input0.cpuData;
+                uint16_t *input1Data = (uint16_t*)input1.cpuData;
+                for (int i = 0; i < len; i++) {
+                    input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] * fp16tofp32.dict[input1Data[0]]);
+                }
+            } else {
+                float *input0Data = (float*)input0.cpuData;
+                float *input1Data = (float*)input1.cpuData;
+                for (int i = 0; i < len; i++) {
+                    input0Data[i] *= input1Data[0];
+                }
+            }
+        } else {
+            if (input0.dataType == DataType::FLOAT16) {
+                uint16_t *input0Data = (uint16_t*)input0.cpuData;
+                uint16_t *input1Data = (uint16_t*)input1.cpuData;
                 for (int i = 0; i < len; i++) {
                     input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] * fp16tofp32.dict[input1Data[i]]);
                 }
-                input0Data += inner;
-            }
-        } else {
-            float *input0Data = (float*)input0.cpuData;
-            float *input1Data = (float*)input1.cpuData;
-            for (int j = 0; j < round; j++) {
+            } else {
+                float *input0Data = (float*)input0.cpuData;
+                float *input1Data = (float*)input1.cpuData;
                 for (int i = 0; i < len; i++) {
-                input0Data[i] *= input1Data[i];
+                    input0Data[i] *= input1Data[i];
                 }
-                input0Data += inner;
             }
         }
     }
