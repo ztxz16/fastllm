@@ -562,6 +562,8 @@ namespace fastllm {
 
         void AddEmptyWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType);
 
+        void AddEmptyGGMLWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType, int ggmlType);
+
         void AddWeight(const std::string &key, const std::vector <int> &dims,
                        DataType dataType, WeightType weightType, DataType oriDataType, uint8_t *oriData,
                        int groupCnt = -1); // 插入一个权重
