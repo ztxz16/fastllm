@@ -1243,7 +1243,7 @@ namespace fastllm {
             for (int i = 0; i < threadNum; i++) {
                 int end = cur + per + (cur + per * (threadNum - i) < ks);
                 ops.push_back(new MultiThreadLinearFloat32GGUFOp((uint8_t*)q8kInputs.data(), weightData, biasData, outputData,
-                                                        (void*)tensor, n, m, k, cur * rows, end * rows));
+                                                        (void*)tensor, n, m, k, cur * rows, i == threadNum - 1 ? k : end * rows));
                 cur = end;
             }
             for (int i = 0; i < threadNum; i++) {
