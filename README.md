@@ -80,7 +80,7 @@ pip install ftllm-rocm -U
 第一次安装前需要安装依赖库:
 
 ```
-pip install https://hf-mirror.com/fastllm/fastllmdepend-windows/resolve/main/ftllmdepend-0.0.0.1-py3-none-win_amd64.whl
+pip install https://www.modelscope.cn/models/huangyuyang/fastllmdepend-windows/resolve/master/ftllmdepend-0.0.0.1-py3-none-win_amd64.whl
 ```
 
 然后用pip安装，命令如下：
