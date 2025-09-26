@@ -582,8 +582,10 @@ namespace fastllm {
                     MulTo(k_temp, g);
                     MatMul(attn, k_temp, k_cumdecay);
 
-                    last_recurrent_state.Resize({key_batch_size, key_sequence_length, key_k_head_dim, v_head_dim});
-                    last_recurrent_state.Allocate(0.0f);
+                    if (last_recurrent_state.dims.size() == 0) {
+                        last_recurrent_state.Resize({key_batch_size, key_sequence_length, key_k_head_dim, v_head_dim});
+                        last_recurrent_state.Allocate(0.0f);
+                    }
 
                     for (int i = 0; i < tot_heads / chunk_size; i++) {
                         Data q_i, k_i, v_i, decay_mask_i, k_cumdecay_i;
