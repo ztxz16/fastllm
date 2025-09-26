@@ -1,3 +1,7 @@
+## V0.1.4.9
+
+- 修复Qwen3-Next长上下文中出现的bug
+
 ## V0.1.4.8
 
 - 增加 通用动态量化（Universal Dynamic Quantization）功能，参考[动态量化指南](dtype_config.md)
