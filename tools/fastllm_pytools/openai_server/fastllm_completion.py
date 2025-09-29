@@ -78,18 +78,42 @@ class FastLLmCompletion:
       if isinstance(content, str):
           return [ConversationMessage(role=role, content=content)], []
       if isinstance(content, list):
-          content_str = ""
-          for it in content:
-              if ('type' in it and it['type'] == 'text'):
-                 if (content_str != ""):
-                    content_str += "\n"
-                 if ('text' in it):
-                    content_str += it['text']
+          normalized_parts: List[str] = []
+          for idx, it in enumerate(content):
+              if not isinstance(it, dict):
+                  raise ValueError(
+                      f"Invalid message content part at position {idx}: "
+                      f"expected dict, got {type(it).__name__}")
+
+              part_type = it.get("type")
+              if part_type in {"text", "input_text"}:
+                  text_value = it.get("text")
+                  if text_value is None:
+                      # Some payloads may use the same key as their type
+                      text_value = it.get(part_type)
+                  if text_value is None:
+                      raise ValueError(
+                          f"Missing 'text' field for content part of type '{part_type}' "
+                          f"at position {idx}")
+                  normalized_parts.append(text_value)
+              elif part_type == "image_url":
+                  image_info = it.get("image_url")
+                  image_url: Optional[str] = None
+                  if isinstance(image_info, dict):
+                      image_url = image_info.get("url")
+                  elif isinstance(image_info, str):
+                      image_url = image_info
+
+                  if image_url:
+                      normalized_parts.append(f"[Image: {image_url}]")
+                  else:
+                      normalized_parts.append("[Image]")
               else:
-                 raise NotImplementedError("Complex input not supported yet")
-          return [ConversationMessage(role=role, content=content_str)], []
-      # 暂时不支持图像输入
-      raise NotImplementedError("Complex input not supported yet")
+                  raise ValueError(
+                      f"Unsupported message content type '{part_type}' at position {idx}")
+
+          return [ConversationMessage(role=role, content="\n".join(normalized_parts))], []
+      raise ValueError("Unsupported message content format")
 
   async def create_chat_completion(
       self, request: ChatCompletionRequest, raw_request: Request
