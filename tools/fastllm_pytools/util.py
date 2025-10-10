@@ -128,7 +128,6 @@ def make_normal_llm_model(args):
             pass
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
-        os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"
         if (args.threads == -1):
             args.threads = 4
     if (args.threads == -1):

@@ -302,9 +302,24 @@ endif()
 
 if (USE_NUMA)
     add_compile_definitions(USE_NUMA)
-    set(FASTLLM_CXX_SOURCES ${FASTLLM_CXX_SOURCES} src/devices/numa/numadevice.cpp src/devices/numa/fastllm-numa.cpp src/devices/numa/computeserver.cpp src/devices/numa/kvcache.cpp)
+    # Modular thread-based NUMA implementation
+    set(FASTLLM_CXX_SOURCES ${FASTLLM_CXX_SOURCES}
+        src/devices/numa/numatopology.cpp
+        src/devices/numa/numascheduler.cpp
+        src/devices/numa/numamemory.cpp
+        src/devices/numa/numathreadpool.cpp 
+        src/devices/numa/numaweight.cpp 
+        src/devices/numa/numaopcpu.cpp
+        src/devices/numa/numamoe.cpp)
     include_directories(include/devices/numa)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} numa)
+    
+    # Optional AMX support
+    if (ENABLE_AMX)
+        add_compile_definitions(__AMX_INT8__ __AVX512VNNI__)
+        # AMX implementation to be added: src/devices/numa/amxgemm.cpp
+        message(STATUS "AMX support enabled (implementation pending)")
+    endif()
 endif()
 
 if (USE_TOPS) # For suiyuan

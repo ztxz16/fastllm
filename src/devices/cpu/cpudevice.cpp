@@ -24,6 +24,10 @@
 #include "utils.h"
 #include "gguf.h"
 
+#ifdef USE_NUMA
+#include "devices/numa/numaopcpu.h"
+#endif
+
 namespace fastllm {
     CpuDevice::CpuDevice() {
         this->deviceType = "cpu";
@@ -3405,6 +3409,46 @@ namespace fastllm {
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
+
+#ifdef USE_NUMA
+        // Use NUMA-aware operations when NUMA is activated
+        if (ShouldActivateNuma()) {
+            if (input.dataType == DataType::FLOAT32 && output.dataType == DataType::FLOAT32) {
+                if (weight.dataType == DataType::FLOAT32) {
+                    RunNumaLinearFloat32Float32((float*)input.cpuData, (float*)weight.cpuData, (float*)output.cpuData, 
+                        bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k);
+                    return;
+                } else if (weight.dataType == DataType::BFLOAT16) {
+                    RunNumaLinearFloat32BFloat16((float*)input.cpuData, (uint16_t*)weight.cpuData, (float*)output.cpuData, 
+                        bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k);
+                    return;
+                } else if (weight.dataType == DataType::FLOAT16) {
+                    RunNumaLinearFloat32Float16((float*)input.cpuData, (uint16_t*)weight.cpuData, (float*)output.cpuData, 
+                        bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k);
+                    return;
+                } else if (weight.dataType == DataType::INT8) {
+                    RunNumaLinearInt8((float*)input.cpuData, weight, (float*)output.cpuData, 
+                        bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k);
+                    return;
+                } else if (weight.dataType == DataType::INT4_GROUP) {
+                    int group = weight.group, groupCnt = weight.groupCnt;
+                    RunNumaLinearInt4Group((float*)input.cpuData, weight, (float*)output.cpuData, 
+                        bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, group, groupCnt);
+                    return;
+                } else if (weight.dataType == DataType::INT4_NOZERO) {
+                    RunNumaLinearInt4NoZero((float*)input.cpuData, weight, (float*)output.cpuData, 
+                        bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k);
+                    return;
+                } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+                    RunNumaLinearGGUF((float*)input.cpuData, weight, (float*)output.cpuData, 
+                        bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k);
+                    return;
+                }
+            }
+        }
+#endif
+
+        // Standard CPU implementation (when NUMA not activated)
         int threadSt = GetAlivePool()->curActivateThreadInterval.first;
         int threadLen = GetAlivePool()->curActivateThreadInterval.second - GetAlivePool()->curActivateThreadInterval.first;
 

@@ -8,6 +8,10 @@
 
 #include "executor.h"
 
+#ifdef USE_NUMA
+#include "devices/numa/numaopcpu.h"
+#endif
+
 #include <cstring>
 #include <cmath>
 #include <cfloat>
@@ -116,6 +120,7 @@ namespace fastllm {
             delete fastllmAliveThreadPool;
         }
         fastllmAliveThreadPool = new AliveThreadPool(t);
+        
         globalLocker.unlock();
 #ifdef PY_API
         py::gil_scoped_acquire acquire;

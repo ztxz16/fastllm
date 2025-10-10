@@ -24,6 +24,7 @@
 #endif
 
 #ifdef USE_NUMA
+#include "devices/numa/numathreadpool.h"
 #include "devices/numa/numadevice.h"
 #endif
 
@@ -43,15 +44,9 @@ namespace fastllm {
         this->devices.push_back((BaseDevice*) new TfaccDevice());
 #endif
 #ifdef USE_NUMA
-        try {
-            std::string s = getenv("FASTLLM_ACTIVATE_NUMA");
-            if (s != "" && s != "OFF") {
-                printf("ACTIVATE NUMA = ON\n");
-                this->devices.push_back((BaseDevice*) new NumaDevice());
-            }
-        } catch (...) {
-        }
+        this->devices.push_back((BaseDevice*) new NumaDevice());
 #endif
+        // CPU device should be last as fallback
         this->devices.push_back((BaseDevice*) new CpuDevice());
     }
 
@@ -89,6 +84,15 @@ namespace fastllm {
         }
 
         this->firstDevice = device;
+        
+#ifdef USE_NUMA
+        // Initialize NUMA thread pool when numa device is selected
+        if (device.find("numa") != std::string::npos) {
+            int thread_count = GetThreads();
+            NumaThreadPool::GetInstance().Initialize(thread_count);
+            std::cout << "[Executor] NUMA device activated with " << thread_count << " threads" << std::endl;
+        }
+#endif
     }
 
     std::vector <int> Executor::GetDeviceIds(const std::string &device) {

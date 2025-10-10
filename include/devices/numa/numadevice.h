@@ -1,53 +1,79 @@
 //
-// Created by huangyuyang on 4/11/24.
+// Created by fastllm-numa on 12/25/24.
 //
 
 #ifndef FASTLLM_NUMADEVICE_H
 #define FASTLLM_NUMADEVICE_H
 
 #include "device.h"
-#include "devices/cpu/cpudevice.h"
+#include "numathreadpool.h"
+#include "numamoe.h"
 
 namespace fastllm {
-    class NumaDevice : BaseDevice {
+    class NumaDevice : public BaseDevice {
     public:
         NumaDevice();
 
-        // numa use cpu DDR
-        bool Malloc (void **ret, size_t size);
-        bool Free(void *ret);
+        bool Malloc(void **ret, size_t size); // 在NUMA节点上分配内存
 
-        bool CopyDataToCPU(void *dst, void *src, size_t size);
-        bool CopyDataFromCPU(void *dst, void *src, size_t size);
+        bool Free(void *ret); // 释放NUMA内存
+
+        bool CopyDataToCPU(void *dst, void *src, size_t size); // 从NUMA内存复制到CPU
+
+        bool CopyDataFromCPU(void *dst, void *src, size_t size); // 从CPU复制到NUMA内存
     };
 
-    class NumaLinearOp : CpuLinearOp {
-        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
-        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
-        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
-        long long int Ops(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    // NUMA Linear操作
+    class NumaLinearOp : public BaseOperator {
+    public:
+        void Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams);
+
+        void Run(const std::string &opType, const fastllm::DataDict &datas,
+                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams);
+
+        bool CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams);
     };
 
-    class NumaMergeMOE : CpuMergeMOE {
-        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
-        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    // NUMA MoE Merge操作
+    class NumaMergeMOEOp : public BaseOperator {
+    public:
+        void Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams);
+
+        void Run(const std::string &opType, const fastllm::DataDict &datas,
+                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams);
+
+        bool CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams);
     };
 
-    class NumaCatDirectOp : CpuCatDirectOp {
-        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    // NUMA Attention操作
+    class NumaAttentionOp : public BaseOperator {
+    public:
+        void Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams);
+
+        void Run(const std::string &opType, const fastllm::DataDict &datas,
+                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams);
+
+        bool CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams);
     };
 
-    class NumaAttention : CpuAttention {
-        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
-    };
+    // NUMA CatDirect操作
+    class NumaCatDirectOp : public BaseOperator {
+    public:
+        void Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams);
 
-    class NumaAttentionBatchOp : CpuAttentionBatchOp {
-        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
-    };
+        void Run(const std::string &opType, const fastllm::DataDict &datas,
+                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams);
 
-    class NumaCatDirectBatchOp : CpuCatDirectBatchOp {
-        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        bool CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams);
     };
 }
 
-#endif
+#endif //FASTLLM_NUMADEVICE_H
