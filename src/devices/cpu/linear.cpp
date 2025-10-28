@@ -819,13 +819,97 @@ namespace fastllm {
 #endif
     }
 
+    struct FastllmBF16Manager {
+        std::vector <uint16_t> bf16Input;
+        std::vector <uint16_t> bf16Weight;
+    } fastllmBf16Manager;
+
     void RunLinearFloat32BFloat16(float *inputData, uint16_t *weightData, float *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum) {
-        std::vector <uint16_t> bf16Input;
-        bf16Input.resize(n * m);
-        Float32ToBFloat16(inputData, bf16Input.data(), n * m);
-        
+        std::vector <uint16_t> &bf16Input = fastllmBf16Manager.bf16Input;
+        if (bf16Input.size() < n * m) {
+            bf16Input.resize(n * m);
+        }
+        if (n > 4) {
+            int per = n * m / threadNum;
+            int cur = 0;
+            std::vector<fastllm::MultiThreadFloat32ToBFloat16Op*> ops;
+            for (int i = 0; i < threadNum; i++) {
+                int end = cur + per + (cur + per * (threadNum - i) < n * m);
+                if (i == threadNum - 1) {
+                    end = n * m;
+                }
+                ops.push_back(new MultiThreadFloat32ToBFloat16Op(inputData + cur, bf16Input.data() + cur, end - cur));
+                cur = end;
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->PushOp(startTid + i, ops[i]);
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->Wait(startTid + i);
+                delete ops[i];
+            }
+        } else {
+            Float32ToBFloat16(inputData, bf16Input.data(), n * m);
+        }
+/*
+        int stride = 64;
+        std::vector<fastllm::MultiThreadLinearBFloat16BFloat16Op*> ops;
+        for (int i = 0; i < k; i += stride) {
+            ops.push_back(new MultiThreadLinearBFloat16BFloat16Op(bf16Input.data(), weightData, biasData, outputData,
+                                                n, m, k, i, i + stride));
+        }
+
+        int per = ops.size() / threadNum, remain = ops.size() % threadNum;
+        std::vector <std::deque <int> > tasks;
+        tasks.resize(threadNum);
+        int cur = 0;
+        for (int i = 0; i < threadNum; i++) {
+            int now = per + (i < remain);
+            for (int j = cur; j < cur + now; j++) {
+                tasks[i].push_back(j);
+            }
+            cur += now;
+        }
+
+        int pushTasks = 0;
+        while (pushTasks < ops.size()) {
+            for (int i = 0; i < threadNum; i++) {
+                if (pool->TryWait(startTid + i)) {
+                    if (tasks[i].size() > 0) {
+                        int taskId = tasks[i].front();
+                        tasks[i].pop_front();
+// printf("thread %d do task [%d, %d)\n", i, ops[taskId]->st, ops[taskId]->end);
+                        pool->PushOp(startTid + i, ops[taskId]);
+                        pushTasks++;
+                    } else {
+                        int sel = -1, maxS = 0;
+                        for (int j = 0; j < threadNum; j++) {
+                            if (tasks[j].size() > maxS) {
+                                maxS = tasks[j].size();
+                                sel = j;
+                            }
+                        }
+                        if (sel != -1) {
+                            int taskId = tasks[sel].back();
+                            tasks[sel].pop_back();
+// printf("thread %d do task [%d, %d)\n", i, ops[taskId]->st, ops[taskId]->end);
+                            pool->PushOp(startTid + i, ops[taskId]);
+                            pushTasks++;
+                        }
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+        }
+// printf("finish...\n");
+        for (int i = 0; i < ops.size(); i++) {
+            delete ops[i];
+        }
+*/
         int per = k / threadNum;
         int cur = 0;
         std::vector<fastllm::MultiThreadLinearBFloat16BFloat16Op*> ops;
@@ -958,9 +1042,42 @@ namespace fastllm {
     void RunLinearFloat32FP8E4M3(float *inputData, Data &weight, float *outputData, float *biasData, 
                     int n, int m, int k, 
                     AliveThreadPool *pool, int startTid, int threadNum) {
-        std::vector <uint16_t> bf16Input;
-        bf16Input.resize(n * m);
-        Float32ToBFloat16(inputData, bf16Input.data(), n * m);
+        // std::vector <uint16_t> bf16Input;
+        // bf16Input.resize(n * m);
+        // Float32ToBFloat16(inputData, bf16Input.data(), n * m);
+
+        std::vector <uint16_t> &bf16Input = fastllmBf16Manager.bf16Input;
+        if (bf16Input.size() < n * m) {
+            bf16Input.resize(n * m);
+        }
+        
+        if (n > 4) {
+            int per = n * m / threadNum;
+            int cur = 0;
+            std::vector<fastllm::MultiThreadFloat32ToBFloat16Op*> ops;
+            for (int i = 0; i < threadNum; i++) {
+                int end = cur + per + (cur + per * (threadNum - i) < n * m);
+                if (i == threadNum - 1) {
+                    end = n * m;
+                }
+                ops.push_back(new MultiThreadFloat32ToBFloat16Op(inputData + cur, bf16Input.data() + cur, end - cur));
+                cur = end;
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->PushOp(startTid + i, ops[i]);
+            }
+            for (int i = 0; i < threadNum; i++) {
+                pool->Wait(startTid + i);
+                delete ops[i];
+            }
+        } else {
+            Float32ToBFloat16(inputData, bf16Input.data(), n * m);
+        }
+
+        std::vector <uint16_t> &bf16Weight = fastllmBf16Manager.bf16Weight;
+        if (bf16Weight.size() < k * m) {
+            bf16Weight.resize(k * m);
+        }
 
         int per = k / threadNum;
         int cur = 0;
@@ -992,6 +1109,25 @@ namespace fastllm {
             }
             ops[startTid + i] = new MultiThreadLinearBFloat16FP8E4M3Op(inputData, weight.cpuData, biasData, outputData,
                                     n, m, k, cur, end, weight.scales.data(), weight.blockK, weight.blockM);
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[startTid + i]);
+        }
+    }
+
+    void LaunchLinearBFloat16BFloat16(uint16_t *inputData, Data &weight, float *outputData, float *biasData, 
+                                int n, int m, int k, 
+                                std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
+        int per = k / threadNum;
+        int cur = 0;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            if (i == threadNum - 1) {
+                end = k;
+            }
+            ops[startTid + i] = new MultiThreadLinearBFloat16BFloat16Op(inputData, (uint16_t*)weight.cpuData, biasData, outputData,
+                                    n, m, k, cur, end);
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
@@ -1145,7 +1281,7 @@ namespace fastllm {
         std::vector<fastllm::MultiThreadLinearBFloat16FP8E4M3Op*> ops;
         for (int i = 0; i < threadNum; i++) {
             int end = cur + per + (cur + per * (threadNum - i) < k);
-            ops.push_back(new MultiThreadLinearBFloat16FP8E4M3Op(bf16Input.data(), weight.cpuData, biasData, floatOutput.data(),
+            ops.push_back(new MultiThreadLinearBFloat16FP8E4M3Op(bf16Input.data(), weight.cpuData, biasData, floatOutput.data(), 
                                                     n, m, k, cur, end, weight.scales.data(), weight.blockK, weight.blockM));
             cur = end;
         }
