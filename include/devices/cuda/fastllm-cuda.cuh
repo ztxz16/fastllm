@@ -59,6 +59,11 @@ bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float 
 bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float alpha);
 bool FastllmCudaAttentionMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue);
 bool FastllmCudaAlibiMask(fastllm::Data &input, const fastllm::Data &mask, float maskValue);
+bool FastllmCudaTransferAttn(fastllm::Data &input);
+bool FastllmCudaCumSumLastDim(fastllm::Data &input);
+bool FastllmCudaCausalMask(fastllm::Data &input, int base, float maskValue);
+bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output);
+
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps);
 bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fastllm::Data &beta, fastllm::Data &output, int axis);
 bool FastllmCudaTopK(const fastllm::Data &input, fastllm::Data &output, int topk);
