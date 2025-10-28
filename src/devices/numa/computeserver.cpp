@@ -248,7 +248,7 @@ namespace fastllm {
             weight[name] = Data(dataType, ggmlType, {k, localM});
             weight[name].name = name;
             weight[name].Allocate();
-            if (dataType == DataType::FLOAT16) {
+            if (dataType == DataType::FLOAT16 || dataType == DataType::BFLOAT16) {
                 for (int i = 0; i < k; i++) {
                     buffer.Skip(base * 2);
                     buffer.ReadBytes(weight[name].cpuData + i * localM * 2, localM * 2);
@@ -1592,6 +1592,8 @@ namespace fastllm {
                     int curThread = (curK / k) * base;
                     if (weight->dataType == DataType::FP8_E4M3) {                            
                         LaunchLinearBFloat16FP8E4M3(bf16Input.data(), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                    } else if (weight->dataType == DataType::BFLOAT16) {                            
+                        LaunchLinearBFloat16BFloat16(bf16Input.data(), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                     } else if (weight->dataType == DataType::FLOAT16) {
                         LaunchLinearFloat32Float16(localInput, *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                     } else if (weight->dataType == DataType::DATA_GGUF_FORMAT) {
@@ -1624,7 +1626,7 @@ namespace fastllm {
                     } else {
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, swigluData, 1, spatial, spatial));
                         
-                        if (weightDown->dataType == DataType::FP8_E4M3) {
+                        if (weightDown->dataType == DataType::FP8_E4M3 || weightDown->dataType == DataType::BFLOAT16) {
                             ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(swigluData, (uint16_t*)middles[l].data(), mid));
                         } else if (weightDown->dataType == DataType::DATA_GGUF_FORMAT) {
                             ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToQ8KOp(swigluData, (uint8_t*)middles[l].data(), mid, weightDown->ggmlType));
@@ -1648,6 +1650,8 @@ namespace fastllm {
                     int curThread = (curK / k) * base;
                     if (weightDown->dataType == DataType::FP8_E4M3) {
                         LaunchLinearBFloat16FP8E4M3((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                    } else if (weightDown->dataType == DataType::BFLOAT16) {
+                        LaunchLinearBFloat16BFloat16((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
                     } else if (weightDown->dataType == DataType::FLOAT16) {
                         LaunchLinearFloat32Float16((float*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
                     } else if (weightDown->dataType == DataType::DATA_GGUF_FORMAT) {

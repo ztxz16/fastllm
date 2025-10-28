@@ -86,6 +86,11 @@ namespace fastllm {
                 }
             }
         }
+
+        bool TryWait() {
+            int a = task->signal;
+            return a == 0;
+        }
     };
 
     struct AliveThreadPool {
@@ -108,6 +113,10 @@ namespace fastllm {
 
         void Wait(int tid) {
             this->loops[tid]->Wait();
+        }
+
+        bool TryWait(int tid) {
+            return this->loops[tid]->TryWait();
         }
 
         void Shutdown() {
@@ -173,6 +182,21 @@ namespace fastllm {
 
         MultiThreadMemcpyMultiLinesTask (uint8_t *output, uint8_t *input, size_t len) :
             output(output), input(input), len(len) {}
+    };
+
+    struct MultiThreadMemcpySingleMultiLinesOp : MultiThreadBaseOp {
+        uint8_t *input, *output;
+        uint64_t rows, lens, inputStride, outputStride;
+
+        MultiThreadMemcpySingleMultiLinesOp (uint8_t *input, uint8_t *output, 
+            uint64_t rows, uint64_t lens, uint64_t inputStride, uint64_t outputStride) : 
+            input(input), output(output), rows(rows), lens(lens), inputStride(inputStride), outputStride(outputStride) {}
+
+        void Run() {
+            for (int i = 0; i < rows; i++) {
+                memcpy(output + i * outputStride, input + i * inputStride, lens);
+            }            
+        }
     };
 
     struct MultiThreadMemcpyMultiLinesOp : MultiThreadBaseOp {
