@@ -755,6 +755,24 @@ __global__ void FastllmMulSingleToKernel(half* a, half *b, float alpha, int len)
     }
 }
 
+__global__ void FastllmChannelMulToKernel(float* a, float *b, float alpha, int len, int channelLen) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        a[idx] *= b[idx / channelLen] * alpha;
+    }
+}
+
+__global__ void FastllmChannelMulToKernel(half* a, half *b, float alpha, int len, int channelLen) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+#ifdef CUDA_NO_TENSOR_CORE
+        a[idx] = __float2half(__half2float(b[idx / channelLen]) * alpha * __half2float(a[idx]));
+#else
+        a[idx] *= (half)((float)b[idx / channelLen] * alpha);
+#endif
+    }
+}
+
 template <int THREAD_PER_BLOCK>
 __global__ void FastllmAttentionMaskKernel(float* a, float *b, float maskValue, int n, int m, int spatial) {
     int on = blockIdx.x / m;
