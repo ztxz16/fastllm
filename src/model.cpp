@@ -1652,6 +1652,9 @@ if (false) {
                                 oriDataType = DataType::FLOAT32;
                                 scaleTensorName = tensorName + "_scale_inv";
                                 if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
+                                    scaleTensorName = tensorName + "_scale";
+                                }
+                                if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
                                     scaleTensorName = "";
                                 }
                             }
@@ -1659,6 +1662,9 @@ if (false) {
                                 (dataType == FP8_E4M3)) {
                                 oriDataType = DataType::FP8_E4M3;
                                 scaleTensorName = tensorName + "_scale_inv";
+                                if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
+                                    scaleTensorName = tensorName + "_scale";
+                                }
                                 if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
                                     scaleTensorName = "";
                                 }
