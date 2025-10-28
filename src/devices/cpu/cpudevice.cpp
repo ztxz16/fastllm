@@ -1650,7 +1650,8 @@ namespace fastllm {
                 }
             }
         } else if ((input.dataType == DataType::FLOAT32) && 
-                (weights[2]->dataType == DataType::FP8_E4M3) &&
+                (weights[2]->dataType == DataType::FP8_E4M3 ||
+                 weights[2]->dataType == DataType::BFLOAT16) &&
                 input.dims[0] < 32) {
             int dimsLen = logits.dims.size();
             int outer = logits.Count(0) / logits.Count(dimsLen - 1);
@@ -1756,6 +1757,8 @@ namespace fastllm {
                         int curThread = (curK / k) * base;
                         if (weight->dataType == DataType::FP8_E4M3) {                            
                             LaunchLinearBFloat16FP8E4M3(bf16Input.data(), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                        } if (weight->dataType == DataType::BFLOAT16) {
+                            LaunchLinearBFloat16BFloat16(bf16Input.data(), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                         } else {
                             // TODO: other
                         }
@@ -1792,6 +1795,8 @@ namespace fastllm {
                         int curThread = (curK / k) * base;
                         if (weightDown->dataType == DataType::FP8_E4M3) {
                             LaunchLinearBFloat16FP8E4M3((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
+                        } else if (weightDown->dataType == DataType::BFLOAT16) {
+                            LaunchLinearBFloat16BFloat16((uint16_t*)middles[l].data(), *weightDown, results[l].data(), nullptr, 1, mid, m, ops, pool, threadSt, curThread);
                         } else {
                             // TODO: other
                         }
