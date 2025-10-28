@@ -331,6 +331,7 @@ namespace fastllm {
 
         if (weights[2]->dataType == DataType::FP8_E4M3 ||
             weights[2]->dataType == DataType::FLOAT16 ||
+            weights[2]->dataType == DataType::BFLOAT16 ||
             weights[2]->dataType == DataType::DATA_GGUF_FORMAT) {
             if (n > 31) {
                 std::vector <std::vector <fastllm::Data*> > ws;
