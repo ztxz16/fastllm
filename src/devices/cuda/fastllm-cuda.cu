@@ -4134,6 +4134,7 @@ __global__ void FastllmRepeatKernel (void *inputOri, void *outputOri, int outer,
 
 void FastllmCudaRepeat(void *input, void *output, int outer, int repeatTimes, int inputStride, int outputStride0, int outputStride1, int copyLen) {
     FastllmRepeatKernel <256> <<< outer * repeatTimes, 256 >>> (input, output, outer, repeatTimes, inputStride, outputStride0, outputStride1, copyLen);
+    DeviceSync();
 }
 
 void FastllmCudaMemcpy2DDeviceToDeviceBatch(void ** 	dsts, size_t *	dpitchs, void ** 	srcs,
@@ -4358,11 +4359,18 @@ bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float 
         } else {
             FastllmMulSingleToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaData, (half*)input1Data, alpha, len);
         }
-    } else {
+    } else if (input0.dims == input1.dims) {
         if (input0.dataType == fastllm::DataType::FLOAT32) {
             FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
         } else {
             FastllmMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaData, (half*)input1Data, alpha, len);
+        }
+    } else {
+        int channelLen = input0.Count(0) / input1.Count(0);
+        if (input0.dataType == fastllm::DataType::FLOAT32) {
+            FastllmChannelMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len, channelLen);
+        } else {
+            FastllmChannelMulToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaData, (half*)input1Data, alpha, len, channelLen);
         }
     }
     FastllmCudaFinishInput(input1, input1Data);
@@ -4400,6 +4408,274 @@ bool FastllmCudaAlibiMask(fastllm::Data &input, const fastllm::Data &mask, float
     FastllmCudaFinishOutput(input, cudaData);
     return true;
 }
+
+// CUDA kernel for the main transformation
+__global__ void TransferAttnKernel(float *data, int n, int m, int outer, int row_idx) {
+    int o = blockIdx.z;  // batch index
+    if (o >= outer) return;
+    
+    int j = threadIdx.x + blockIdx.x * blockDim.x;  // column index
+    if (j >= row_idx) return;  // 只处理前row_idx个元素
+    
+    float *batchData = data + o * n * m;
+    
+    // 保存原始的第row_idx行的值
+    float original_val = batchData[row_idx * m + j];
+    
+    // 计算新值: original_val + sum(row[k] * matrix[k][j] for k in [0, row_idx))
+    float sum = original_val;
+    for (int k = 0; k < row_idx; k++) {
+        sum += batchData[row_idx * m + k] * batchData[k * m + j];
+    }
+    
+    // 更新值
+    batchData[row_idx * m + j] = sum;
+}
+
+// 使用共享内存的优化版本
+__global__ void TransferAttnKernelShared(float *data, int n, int m, int outer, int row_idx) {
+    extern __shared__ float shared[];
+    
+    int o = blockIdx.z;
+    if (o >= outer) return;
+    
+    int tid = threadIdx.x;
+    int j = tid + blockIdx.x * blockDim.x;
+    
+    float *batchData = data + o * n * m;
+    float *row_i = shared;  // 存储第row_idx行的前row_idx个元素
+    
+    // 协作加载第row_idx行的前row_idx个元素到共享内存
+    for (int idx = tid; idx < row_idx; idx += blockDim.x) {
+        row_i[idx] = batchData[row_idx * m + idx];
+    }
+    __syncthreads();
+    
+    if (j < row_idx) {
+        // 使用共享内存中的原始值计算
+        float sum = row_i[j];
+        
+        // 累加：注意这里row_i[k]是原始值，batchData[k * m + j]是可能已更新的值
+        for (int k = 0; k < row_idx; k++) {
+            sum += row_i[k] * batchData[k * m + j];
+        }
+        
+        // 写回结果
+        batchData[row_idx * m + j] = sum;
+    }
+}
+
+// CUDA kernel for adding identity matrix
+__global__ void AddIdentityKernel(float *data, int n, int m, int outer) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outer * n;
+    
+    if (idx < total) {
+        int o = idx / n;
+        int i = idx % n;
+        data[o * n * m + i * m + i] += 1.0f;
+    }
+}
+
+bool FastllmCudaTransferAttn(fastllm::Data &input) {
+    float *inputData = (float *) FastllmCudaPrepareInput(input);
+
+    int dimsLen = input.dims.size();
+    int n = input.dims[dimsLen - 2];
+    int m = input.dims[dimsLen - 1]; 
+    int outer = input.Count(0) / input.Count(dimsLen - 2);
+
+    // 逐行处理，从第1行开始（第0行不需要处理）
+    for (int i = 1; i < n; i++) {
+        // 每行只需要处理前i个元素
+        int elementsToProcess = i;
+        int threadsPerBlock = min(256, elementsToProcess);
+        int blocksPerGrid = (elementsToProcess + threadsPerBlock - 1) / threadsPerBlock;
+        
+        dim3 blocks(blocksPerGrid, 1, outer);
+        dim3 threads(threadsPerBlock, 1, 1);
+        
+        // 使用共享内存版本
+        int sharedMemSize = elementsToProcess * sizeof(float);
+        TransferAttnKernelShared<<<blocks, threads, sharedMemSize>>>(
+            inputData, n, m, outer, i);
+        
+        // 必须同步，因为下一行的计算依赖于当前行的结果
+        cudaDeviceSynchronize();
+    }
+
+    // 添加单位矩阵
+    int totalDiag = outer * n;
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (totalDiag + threadsPerBlock - 1) / threadsPerBlock;
+    
+    AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>(inputData, n, m, outer);
+
+    DeviceSync();
+    FastllmCudaFinishOutput(input, inputData);
+    return true;
+}
+
+// CUDA核函数模板，支持float和half类型
+template<typename T>
+__global__ void CumSumLastDimKernel(T* data, int dim, int outer) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (tid < outer) {
+        T* row = data + tid * dim;
+        
+        // 对每一行进行累积和
+        for (int j = 1; j < dim; j++) {
+            row[j] += row[j - 1];
+        }
+    }
+}
+
+bool FastllmCudaCumSumLastDim(fastllm::Data &input) {
+    void *inputData = FastllmCudaPrepareInput(input);
+    
+    int dim = input.dims.back();
+    int outer = input.Count(0) / dim;
+    
+    // 配置CUDA执行参数
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (outer + threadsPerBlock - 1) / threadsPerBlock;
+    
+    // 根据数据类型调用相应的核函数
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        CumSumLastDimKernel<<<blocksPerGrid, threadsPerBlock>>>(
+            (float*)inputData, dim, outer);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        CumSumLastDimKernel<<<blocksPerGrid, threadsPerBlock>>>(
+            (half*)inputData, dim, outer);
+    }
+
+    DeviceSync();
+    FastllmCudaFinishOutput(input, inputData);
+    
+    return true; // 添加返回值
+}
+
+// CUDA核函数模板，支持float和half
+template<typename T>
+__global__ void CausalMaskKernel(T *data, int n, int m, int outer, int base, T maskValue) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outer * n * m;
+    
+    if (idx < total) {
+        int o = idx / (n * m);
+        int remainder = idx % (n * m);
+        int i = remainder / m;
+        int j = remainder % m;
+        
+        if (j >= i + base) {
+            data[idx] = maskValue;
+        }
+    }
+}
+
+bool FastllmCudaCausalMask(fastllm::Data &input, int base, float maskValue) {
+    void *inputData = FastllmCudaPrepareInput(input);
+    int dimsLen = input.dims.size();
+    int n = input.dims[dimsLen - 2], m = input.dims[dimsLen - 1], outer = input.Count(0) / input.Count(dimsLen - 2);
+    
+    int total = outer * n * m;
+    int blockSize = 256;
+    int gridSize = (total + blockSize - 1) / blockSize;
+    
+    // 根据数据类型调用相应的核函数
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        float *floatData = (float *)inputData;
+        CausalMaskKernel<float><<<gridSize, blockSize>>>(floatData, n, m, outer, base, maskValue);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        __half *halfData = (__half *)inputData;
+        __half halfMaskValue = __float2half(maskValue);
+        CausalMaskKernel<__half><<<gridSize, blockSize>>>(halfData, n, m, outer, base, halfMaskValue);
+    }
+    
+    // 等待核函数执行完成
+    DeviceSync();
+    
+    FastllmCudaFinishOutput(input, inputData);
+    return true;
+}
+
+// CUDA核函数定义
+template<typename T>
+__global__ void MakeDecayMaskKernel(const T* input, T* output, int dim, int outer) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = outer * dim * dim;
+    
+    if (idx < total_elements) {
+        int o = idx / (dim * dim);
+        int remainder = idx % (dim * dim);
+        int i = remainder / dim;
+        int j = remainder % dim;
+        
+        if (j <= i) {
+            // 计算 exp(input[o * dim + i] - input[o * dim + j])
+            T val_i = input[o * dim + i];
+            T val_j = input[o * dim + j];
+            output[idx] = exp(val_i - val_j);
+        } else {
+            output[idx] = T(0);
+        }
+    }
+}
+
+// 特化版本处理half类型
+template<>
+__global__ void MakeDecayMaskKernel<half>(const half* input, half* output, int dim, int outer) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = outer * dim * dim;
+    
+    if (idx < total_elements) {
+        int o = idx / (dim * dim);
+        int remainder = idx % (dim * dim);
+        int i = remainder / dim;
+        int j = remainder % dim;
+        
+        if (j <= i) {
+            // 对于half类型，需要转换为float进行计算
+            float val_i = __half2float(input[o * dim + i]);
+            float val_j = __half2float(input[o * dim + j]);
+            output[idx] = __float2half(expf(val_i - val_j));
+        } else {
+            output[idx] = __float2half(0.0f);
+        }
+    }
+}
+
+bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output) {
+    void *inputData = FastllmCudaPrepareInput(input);
+    void *outputData = FastllmCudaPrepareInput(output);
+
+    int dim = input.dims.back();
+    int outer = input.Count(0) / dim;
+    int total_elements = outer * dim * dim;
+    
+    // 配置CUDA执行参数
+    int blockSize = 256;
+    int gridSize = (total_elements + blockSize - 1) / blockSize;
+    
+    // 根据数据类型调用相应的核函数
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        MakeDecayMaskKernel<float><<<gridSize, blockSize>>>(
+            (float*)inputData, (float*)outputData, dim, outer);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        MakeDecayMaskKernel<half><<<gridSize, blockSize>>>(
+            (half*)inputData, (half*)outputData, dim, outer);
+    }
+
+    // 等待核函数执行完成
+    DeviceSync();
+    
+    FastllmCudaFinishInput(input, inputData);
+    FastllmCudaFinishOutput(output, outputData);
+    
+    return true;
+}
+
 
 bool FastllmCudaSoftmax(const fastllm::Data &input, fastllm::Data &output, int axis) {
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
