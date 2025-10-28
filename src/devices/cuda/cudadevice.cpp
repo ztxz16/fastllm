@@ -47,6 +47,8 @@ namespace fastllm {
         this->ops["MulTo"] = (BaseOperator*)(new CudaMulToOp());
         this->ops["AttentionMask"] = (BaseOperator*)(new CudaAttentionMaskOp());
         this->ops["AlibiMask"] = (BaseOperator*)(new CudaAlibiMaskOp());
+        this->ops["TransferAttn"] = (BaseOperator*)(new CudaTransferAttnOp());
+        this->ops["CumSumLastDim"] = (BaseOperator*)(new CudaCumSumLastDimOp());
         this->ops["TopK"] = (BaseOperator*)(new CudaTopKOp());
         this->ops["PermuteSelf"] = (BaseOperator*)(new CudaPermuteSelfOp());
         this->ops["RotatePosition2D"] = (BaseOperator*)(new CudaRotatePosition2DOp());
@@ -58,6 +60,8 @@ namespace fastllm {
         this->ops["MergeMOE"] = (BaseOperator*)(new CudaMergeMOE());
         this->ops["MergeMLA"] = (BaseOperator*)(new CudaMergeMLA());
         this->ops["RecurrentGatedDeltaRule"] = (BaseOperator*)(new CudaRecurrentGatedDeltaRuleOp());
+        this->ops["CausalMask"] = (BaseOperator*)(new CudaCausalMaskOp());
+        this->ops["MakeDecayMask"] = (BaseOperator*)(new CudaMakeDecayMaskOp());
 
         this->ops["SplitBatch"] = (BaseOperator*)(new CudaSplitBatchOp());
         this->ops["CatBatch"] = (BaseOperator*)(new CudaCatBatchOp());
@@ -546,7 +550,6 @@ namespace fastllm {
         int channels = input.dims[axis];
         int inner = input.strides[axis];
         int unitSize = input.unitSize;
-
         FastllmCudaRepeat(input.cudaData, output.cudaData, outer, repeatTimes, inputStride * unitSize, outputStride * unitSize, channels * inner * unitSize, channels * inner * unitSize);
     }
 
@@ -934,7 +937,8 @@ namespace fastllm {
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
                         (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
                         "MulTo error: Data's type should be float32 or float16.\n");
-        AssertInFastLLM(input0.dims == input1.dims || input1.Count(0) == 1, "MulTo error: input's shape should be same.\n");
+        AssertInFastLLM(input0.dims == input1.dims || input1.Count(0) == 1
+                        || input0.Count(0) % input1.Count(0) == 0, "MulTo error: input's shape should be same.\n");
         FastllmCudaMulTo(input0, input1, alpha);
     }
 
@@ -952,6 +956,18 @@ namespace fastllm {
         Data &mask = *(datas.find("mask")->second);
         float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -10000.0;
         FastllmCudaAlibiMask(input, mask, maskValue);
+    }
+
+    void CudaTransferAttnOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        FastllmCudaTransferAttn(input);
+    }
+
+    void CudaCumSumLastDimOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        FastllmCudaCumSumLastDim(input);
     }
 
     void CudaTopKOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -1100,6 +1116,22 @@ namespace fastllm {
         Data &core_attn_out = *(datas.find("core_attn_out")->second);
         core_attn_out.Allocate();
         FastllmRecurrentGatedDeltaRule(q, k, v, g, b, last_recurrent_state, core_attn_out);
+    }
+
+    void CudaCausalMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int base = intParams.find("base") != intParams.end() ? intParams.find("base")->second : 0;
+        float maskValue = floatParams.find("maskValue") != floatParams.end() ? floatParams.find("maskValue")->second : -10000.0;
+        FastllmCudaCausalMask(input, base, maskValue);
+    }
+
+    void CudaMakeDecayMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        FastllmCudaMakeDecayMask(input, output);
     }
 
     void CudaMergeMLA::Reshape(const std::string &opType, const fastllm::DataDict &datas,
