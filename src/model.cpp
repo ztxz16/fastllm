@@ -363,10 +363,10 @@ namespace fastllm {
             int ns = scale.shape[0], ms = scale.shape[1];
             int blockN = n / ns, blockM = m / ms;
 
-            while ((blockN & -blockN) != blockN) {
+            while ((blockN & -blockN) != blockN && blockN < n) {
                 blockN++;
             }
-            while ((blockM & -blockM) != blockM) {
+            while ((blockM & -blockM) != blockM && blockM < m) {
                 blockM++;
             }
             ClearBuffer();
