@@ -152,6 +152,14 @@ namespace fastllm {
         }
         return fastllmAliveThreadPool;
     }
+
+    std::string GetDataTypeName(DataType type) {
+        if (dataTypeNames.find(type) != dataTypeNames.end()) {
+            return dataTypeNames[type][0];
+        } else {
+            return "Type " + std::to_string((int)type);
+        }
+    }
     
 #ifdef USE_MMAP
     FileMmap::FileMmap(const std::string &path) {
