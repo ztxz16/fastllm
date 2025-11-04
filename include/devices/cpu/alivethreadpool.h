@@ -180,6 +180,8 @@ namespace fastllm {
         uint8_t *output, *input;
         size_t len;
 
+        MultiThreadMemcpyMultiLinesTask () {}
+
         MultiThreadMemcpyMultiLinesTask (uint8_t *output, uint8_t *input, size_t len) :
             output(output), input(input), len(len) {}
     };
