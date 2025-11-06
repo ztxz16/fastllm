@@ -50,6 +50,27 @@ namespace fastllm {
     bool GetHistoryCacheInCPU();
     AliveThreadPool *GetAlivePool();
 
+    template<typename T, std::size_t Alignment>
+    class alignedAllocator {
+    public:
+        using value_type = T;
+        
+        T* allocate(std::size_t n) {
+            void* ptr = std::aligned_alloc(Alignment, n * sizeof(T));
+            if (!ptr) throw std::bad_alloc();
+            return static_cast<T*>(ptr);
+        }
+        
+        void deallocate(T* p, std::size_t) noexcept {
+            std::free(p);
+        }
+        
+        template<typename U>
+        struct rebind {
+            using other = alignedAllocator<U, Alignment>;
+        };
+    };
+
     struct GenerationConfig {
         int output_token_limit = -1; // 最多输出多少, <= 0代表无限制
         int output_token_least = 0; // 最低输出的多少
@@ -208,6 +229,8 @@ namespace fastllm {
     };
 
     std::string GetDataTypeName(DataType type);
+
+    size_t GetDataBytes(DataType type, size_t rows, size_t columns);
 
     static std::map <DataType, int> DefaultGroupCnts = {
         {DataType::INT4_GROUP, 128},
