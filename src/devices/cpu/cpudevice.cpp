@@ -11,6 +11,7 @@
 
 #include <cfloat>
 #include <cmath>
+#include <atomic>
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -864,6 +865,11 @@ namespace fastllm {
         std::vector <uint16_t> bf16Input;
     } moeFloatSingleVarManager;
 
+    struct FastllmMoeDataManager {
+            std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
+            std::vector <uint8_t, alignedAllocator<uint8_t, 64> > realInput, expandInput, downInput;
+    } fastllmMoeDataManager;
+
     struct MultiThreadRepackWeightsOp : MultiThreadBaseOp {
         Data **weights;
         int st, end;      
@@ -879,6 +885,463 @@ namespace fastllm {
             }
         }
     };
+
+    void FastllmGemm (int n, int m, int k, 
+        const void *A, long lda, // A [n * m], lda = bytes for 1 row in A
+        const void *B, long ldb, // B [k * m], ldb = bytes for 1 row in B
+        void *C, long ldc, // C[n * k], ldc = bytes for 1 row in C
+        int st, int end, // calc C[0 : n, st : end]
+        DataType AType, DataType BType, DataType CType
+    ) {
+        if (AType == DataType::FLOAT32) {
+            if (CType == DataType::FLOAT32) {
+                if (BType == DataType::FLOAT32) {
+                    for (int i = 0; i < n; i++) {
+                        float *floatA = (float*)((uint8_t*)A + i * lda);
+                        float *floatC = (float*)((uint8_t*)C + i * ldc);
+                        for (int j = st; j < end; j++) {
+                            float *floatB = (float*)((uint8_t*)B + j * ldb);
+                            float sum = 0.0f;
+                            for (int l = 0; l < m; l++) {
+                                sum += floatA[l] * floatB[l];
+                            }
+                            floatC[j] = sum;
+                        }
+                    }
+                } else if (BType == DataType::BFLOAT16) {
+                    for (int i = 0; i < n; i++) {
+                        float *floatA = (float*)((uint8_t*)A + i * lda);
+                        float *floatC = (float*)((uint8_t*)C + i * ldc);
+                        for (int j = st; j < end; j++) {
+                            uint16_t *floatB = (uint16_t*)((uint8_t*)B + j * ldb);
+                            float sum = 0.0f;
+                            for (int l = 0; l < m; l++) {
+                                sum += floatA[l] * bf16tofp32.dict[floatB[l]];
+                            }
+                            floatC[j] = sum;
+                        }
+                    }
+                }
+            }
+        } else if (AType == DataType::BFLOAT16) {
+            if (CType == DataType::FLOAT32) {
+                if (BType == DataType::BFLOAT16) {                    
+                    // LinearBFloat16BFloat16_Kernel((uint16_t*)A, (uint16_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
+                    MultiThreadLinearBFloat16BFloat16Op (
+                        (uint16_t*)A, (uint16_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end
+                    ).Run();
+                } else if (BType == FP8_E4M3_BLOCK_128) {
+                    // A是BFLOAT16, B是FP8_E4M3_BLOCK_128格式（fp8数据+scale）, C是FLOAT32
+                    // 为需要计算的行分配临时bf16缓冲区
+                    /* if (n > 31) {
+                        std::vector<uint16_t> bf16B_temp((end - st) * m);
+                        // 转换fp8到bf16，仅转换需要计算的行[st:end]
+                        int block_size = 128;
+                        int num_blocks = (m + block_size - 1) / block_size;
+                        int last_block_size = (m % block_size == 0) ? block_size : (m % block_size);
+                        for (int j = st; j < end; j++) {
+                            uint8_t *rowStart = (uint8_t*)B + j * ldb;  // ldb应该是每行的总字节数
+                            uint16_t *bf16B_row = bf16B_temp.data() + (j - st) * m;
+                            
+                            // 按block进行处理
+                            for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
+                                // 计算当前block的大小（最后一个block可能不完整）
+                                int current_block_size = (block_idx == num_blocks - 1) ? last_block_size : block_size;
+                                
+                                // 计算当前block的起始位置
+                                // 每个block占用 128字节(fp8) + 4字节(float scale)
+                                uint8_t *block_start = rowStart + block_idx * (block_size + sizeof(float));
+                                uint8_t *fp8_ptr = block_start;
+                                float *scale_ptr = (float*)(block_start + block_size);
+                                
+                                // 转换当前block中的每个fp8到bf16
+                                int base_idx = block_idx * block_size;
+                                for (int l = 0; l < current_block_size; l++) {
+                                    // fp8转fp32并乘以scale
+                                    float fp32_val = fp8e4m3tofp32.dict[fp8_ptr[l]] * (*scale_ptr);
+                                    
+                                    // fp32转bf16
+                                    uint32_t val;
+                                    memcpy(&val, &fp32_val, sizeof(val));
+                                    bf16B_row[base_idx + l] = (uint16_t)(val >> 16);
+                                }
+                            }
+                        }
+                        LinearBFloat16BFloat16_Kernel((uint16_t*)A, bf16B_temp.data(), nullptr, ((float*)C) + st, n, m, ldc / sizeof(float), 0, end - st);
+                    } else {
+                        LinearBFloat16_FP8E4M3BLOCK128_Kernel((uint16_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
+                    } */
+                } else if (BType == AWQ_4BIT_128) {
+                    // A是BFLOAT16, B是AWQ_4BIT_128格式（uint4权重+zero+scale）, C是FLOAT32
+                    // 为需要计算的行分配临时bf16缓冲区
+                    /* if (n > 31) {
+                        std::vector<uint16_t> bf16B_temp((end - st) * m);
+                        bool success = AWQ4BIT128_TO_BFloat16_Kernel((uint8_t*)B, bf16B_temp.data(), m, st, end, ldb);
+                        LinearBFloat16BFloat16_Kernel((uint16_t*)A, bf16B_temp.data(), nullptr, ((float*)C) + st, n, m, ldc / sizeof(float), 0, end - st);
+                    } else {
+                        LinearBFloat16_AWQ4BIT128_Kernel((uint16_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
+                    } */ 
+                }
+            }
+        }
+    }
+
+    struct MultiThreadGemmOp : MultiThreadBaseOp {
+        uint8_t *inputData;   // [n * m]
+        uint8_t *weightData;  // [k * m]
+        uint8_t *outputData;  // [n * k]
+        DataType inputDataType, weightDataType, outputDataType;
+        int n, m, k, st, end;
+        MultiThreadGemmOp(uint8_t *inputData, DataType inputDataType,
+                        uint8_t *weightData, DataType weightDataType,
+                        uint8_t *outputData, DataType outputDataType,
+                        int n, int m, int k, int st, int end) :
+            inputData(inputData), inputDataType(inputDataType),
+            weightData(weightData), weightDataType(weightDataType),
+            outputData(outputData), outputDataType(outputDataType),
+            n(n), m(m), k(k), st(st), end(end) {}
+
+        void Run() {
+            FastllmGemm(
+                n, m, k,
+                inputData, GetDataBytes(inputDataType, 1, m),
+                weightData, GetDataBytes(weightDataType, 1, m),
+                outputData, GetDataBytes(outputDataType, 1, k),
+                st, end,
+                inputDataType, weightDataType, outputDataType
+            );
+        }
+    };
+
+    struct MultiThreadReduceBatchOp : MultiThreadBaseOp {
+        uint8_t *downOutData;
+        DataType downOutDataType;
+        float *weights;
+        float *lastOutput;
+        int *pos;
+        int bsz, k;
+        int hidden_size;
+        int batch_st, batch_end;  // batch维度的范围
+        int hidden_st, hidden_end; // hidden维度的范围
+        
+        MultiThreadReduceBatchOp(uint8_t *downOutData, DataType downOutDataType,
+            float *weights, float *lastOutput,
+            int *pos, int bsz, int k, 
+            int hidden_size, 
+            int batch_st, int batch_end,
+            int hidden_st, int hidden_end) : 
+            downOutData(downOutData), downOutDataType(downOutDataType),
+            weights(weights), lastOutput(lastOutput),
+            pos(pos), bsz(bsz), k(k),
+            hidden_size(hidden_size), 
+            batch_st(batch_st), batch_end(batch_end),
+            hidden_st(hidden_st), hidden_end(hidden_end) {}
+            
+        void Run() {
+            for (int i = batch_st; i < batch_end; i++) {
+                // 处理第一个专家（初始化输出）
+                int curPos = pos[i * k];
+                float weight = weights[curPos];
+                for (int h = hidden_st; h < hidden_end; h++) {
+                    lastOutput[i * hidden_size + h] = weight * ((float*)downOutData)[curPos * hidden_size + h];
+                }
+                
+                // 累加其余专家的贡献
+                for (int expert_idx = 1; expert_idx < k; expert_idx++) {
+                    curPos = pos[i * k + expert_idx];
+                    weight = weights[curPos];
+                    for (int h = hidden_st; h < hidden_end; h++) {
+                        lastOutput[i * hidden_size + h] += weight * ((float*)downOutData)[curPos * hidden_size + h];
+                    }
+                }
+            }
+        }
+    };
+
+    void MultiThreadReduceBatch(uint8_t *downOutData, DataType downOutDataType,
+                    float *weights, float *lastOutput,
+                    int *pos, int bsz, int k,
+                    int hidden_size) {
+        auto *pool = GetAlivePool();
+        int threadNum = pool->threads.size();
+        
+        // 决定如何划分：尝试创建一个接近正方形的网格
+        int batch_blocks = 1, hidden_blocks = threadNum;
+        
+        // 简单的启发式：如果bsz足够大，尝试在两个维度上划分
+        if (bsz >= 4 && threadNum >= 4) {
+            // 找到最佳的2D网格划分
+            for (int b = 2; b <= std::min(bsz, threadNum); b++) {
+                if (threadNum % b == 0) {
+                    int h = threadNum / b;
+                    if (h <= hidden_size) {
+                        batch_blocks = b;
+                        hidden_blocks = h;
+                    }
+                }
+            }
+        }
+        
+        std::vector<fastllm::MultiThreadReduceBatchOp*> ops;
+        ops.reserve(threadNum);
+        
+        int batch_per = bsz / batch_blocks;
+        int hidden_per = hidden_size / hidden_blocks;
+        
+        int op_idx = 0;
+        for (int b = 0; b < batch_blocks; b++) {
+            int batch_st = b * batch_per;
+            int batch_end = (b == batch_blocks - 1) ? bsz : (b + 1) * batch_per;
+            
+            for (int h = 0; h < hidden_blocks; h++) {
+                int hidden_st = h * hidden_per;
+                int hidden_end = (h == hidden_blocks - 1) ? hidden_size : (h + 1) * hidden_per;
+                
+                ops.push_back(new MultiThreadReduceBatchOp(
+                    downOutData, downOutDataType,
+                    weights, lastOutput,
+                    pos, bsz, k,
+                    hidden_size,
+                    batch_st, batch_end,
+                    hidden_st, hidden_end));
+                
+                pool->PushOp(op_idx++, ops.back());
+            }
+        }
+        
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
+    void ConvertFromFloat32(void *dstData, DataType dstDataType, const float *floatData, size_t rows, size_t columns) {
+        if (dstDataType == DataType::FLOAT32) {
+            memcpy(dstData, floatData, rows * columns * sizeof(float));
+        } else if (dstDataType == DataType::FLOAT16) {
+            Float32ToFloat16((float*)floatData, (uint16_t*)dstData, rows * columns);
+        } else if (dstDataType == DataType::BFLOAT16) {
+            Float32ToBFloat16((float*)floatData, (uint16_t*)dstData, rows * columns);
+        } else {
+            ErrorInFastLLM("ConvertFromFloat32 failed.\n");
+        }
+    }
+
+    // 新增一个专门的Op来处理数据类型转换
+    struct MultiThreadConvertFromFloat32Op : MultiThreadBaseOp {
+        void *dstData;
+        DataType dstDataType;
+        const float *floatData;
+        size_t columns;
+        size_t startRow, endRow;  // 处理的行范围 [startRow, endRow)
+        MultiThreadConvertFromFloat32Op(void *dstData, DataType dstDataType, 
+                                    const float *floatData, size_t columns,
+                                    size_t startRow, size_t endRow) :
+            dstData(dstData), dstDataType(dstDataType), 
+            floatData(floatData), columns(columns),
+            startRow(startRow), endRow(endRow) {}
+        void Run() {
+            // 计算每行的字节大小
+            size_t elementSize = 0;
+            switch (dstDataType) {
+                case DataType::FLOAT16: elementSize = 2; break;
+                case DataType::BFLOAT16: elementSize = 2; break;
+                // 根据实际的DataType枚举添加更多类型
+                default: ErrorInFastLLM("MultiThreadConvertFromFloat32Op error: unsupport dataType.\n");
+            }
+            
+            // 调用原始函数处理指定行范围
+            void *dstStart = (char*)dstData + startRow * columns * elementSize;
+            const float *srcStart = floatData + startRow * columns;
+            size_t rowsToProcess = endRow - startRow;
+            
+            ConvertFromFloat32(dstStart, dstDataType, srcStart, rowsToProcess, columns);
+        }
+    };
+
+    // 对应的多线程运行函数
+    void RunMultiThreadConvertFromFloat32(void *dstData, DataType dstDataType, 
+                                                const float *floatData, size_t rows, 
+                                                size_t columns, AliveThreadPool *pool) {
+        // 如果数据量较小，直接单线程处理
+        if (rows * columns < 10000) {
+            ConvertFromFloat32(dstData, dstDataType, floatData, rows, columns);
+            return;
+        }
+        
+        int threadNum = pool->threads.size();
+        threadNum = std::min(threadNum, (int)rows);  // 线程数不超过行数
+        
+        // 如果行数太少，减少线程数
+        if (rows < threadNum) {
+            ConvertFromFloat32(dstData, dstDataType, floatData, rows, columns);
+            return;
+        }
+        
+        size_t rowsPerThread = rows / threadNum;
+        size_t curRow = 0;
+        
+        std::vector<MultiThreadConvertFromFloat32Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            size_t endRow = (i == threadNum - 1) ? rows : curRow + rowsPerThread;
+            ops.push_back(new MultiThreadConvertFromFloat32Op(
+                dstData, dstDataType, floatData, columns, curRow, endRow));
+            curRow = endRow;
+        }
+        
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
+    struct WorkStealingOp : MultiThreadBaseOp {
+        struct alignas(64) TaskState {
+            std::atomic<int> curr;
+            int end;
+            std::vector<MultiThreadBaseOp*> tasks;
+            std::atomic<bool> completed;
+        };
+        
+        int threadId;
+        std::vector<TaskState*>* allStates;
+        TaskState* myState;
+        int totalThreads;
+        
+        WorkStealingOp(int tid, std::vector<TaskState*>* states, 
+                    TaskState* state, int numThreads) 
+            : threadId(tid), allStates(states), 
+            myState(state), totalThreads(numThreads) {}
+        
+        void Run() override {
+            // 首先执行自己的任务
+            processOwnTasks();
+            
+            // 然后从其他线程偷取任务
+            stealFromOthers();
+            
+            // 标记完成
+            myState->completed.store(true, std::memory_order_release);
+        }
+        
+    private:
+        void processOwnTasks() {
+            while (true) {
+                int taskId = myState->curr.fetch_add(1, std::memory_order_acq_rel);
+                if (taskId >= myState->end) {
+                    break;
+                }
+                if (taskId < myState->tasks.size()) {
+                    myState->tasks[taskId]->Run();
+                }
+            }
+        }
+        
+        void stealFromOthers() {
+            // 从当前线程开始，环形遍历其他线程
+            for (int offset = 1; offset < totalThreads; offset++) {
+                int targetId = (threadId + offset) % totalThreads;
+                
+                TaskState* otherState = (*allStates)[targetId];
+                if (otherState == nullptr) continue;
+                
+                // 检查是否还有任务可偷
+                while (true) {
+                    int taskId = otherState->curr.fetch_add(1, std::memory_order_acq_rel);
+                    if (taskId >= otherState->end) {
+                        break;
+                    }
+                    if (taskId < otherState->tasks.size()) {
+                        otherState->tasks[taskId]->Run();
+                    }
+                }
+            }
+        }
+    };
+
+    // 重构的动态任务调度函数，支持work-stealing
+    void DynamicScheduleTasks(std::vector<MultiThreadBaseOp*>& ops) {
+        auto *pool = GetAlivePool();
+        int numThreads = pool->threads.size(); // 假设线程池有获取线程数的方法
+        
+        // 创建任务状态数组
+        using TaskState = typename WorkStealingOp::TaskState;
+        std::vector<TaskState*> taskStates(numThreads, nullptr);
+        
+        // 为每个线程分配任务状态
+        for (int i = 0; i < numThreads; i++) {
+            taskStates[i] = new (std::align_val_t{64}) TaskState();
+            taskStates[i]->curr.store(0, std::memory_order_relaxed);
+            taskStates[i]->end = 0;
+            taskStates[i]->completed.store(false, std::memory_order_relaxed);
+        }
+        
+        // 分配任务到各个线程
+        int totalOps = ops.size();
+        if (totalOps > 0) {
+            // 计算每个线程的任务数量
+            int tasksPerThread = totalOps / numThreads;
+            int remainingTasks = totalOps % numThreads;
+            
+            int taskIndex = 0;
+            for (int i = 0; i < numThreads; i++) {
+                int numTasks = tasksPerThread + (i < remainingTasks ? 1 : 0);
+                
+                if (numTasks > 0) {
+                    // 分配任务到该线程
+                    taskStates[i]->tasks.clear();
+                    taskStates[i]->tasks.reserve(numTasks);
+                    
+                    for (int j = 0; j < numTasks && taskIndex < totalOps; j++) {
+                        taskStates[i]->tasks.push_back(ops[taskIndex++]);
+                    }
+                    
+                    taskStates[i]->curr.store(0, std::memory_order_relaxed);
+                    taskStates[i]->end = taskStates[i]->tasks.size();
+                } else {
+                    taskStates[i]->end = 0;
+                }
+            }
+        }
+        
+        // 创建work-stealing ops并提交到线程池
+        std::vector<WorkStealingOp*> wsOps(numThreads);
+        for (int i = 0; i < numThreads; i++) {
+            wsOps[i] = new WorkStealingOp(
+                i, &taskStates, taskStates[i], numThreads
+            );
+            
+            pool->PushOp(i, wsOps[i]);
+        }
+        
+        // 等待所有线程完成
+        for (int i = 0; i < numThreads; i++) {
+            pool->Wait(i);
+        }
+        
+        // 清理资源
+        for (int i = 0; i < numThreads; i++) {
+            delete wsOps[i];
+            if (taskStates[i] != nullptr) {
+                taskStates[i]->~TaskState();
+                #if __cpp_aligned_new >= 201606
+                    operator delete(taskStates[i], std::align_val_t{64});
+                #else
+                    free_aligned(taskStates[i], sizeof(TaskState));
+                #endif
+            }
+        }
+        
+        // 删除原始ops
+        for (auto* op : ops) {
+            delete op;
+        }
+    }
+
 
     void CpuMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
@@ -1849,10 +2312,289 @@ namespace fastllm {
                     Float32ToFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
                 }
             }
+        } else if (input.dataType == DataType::FLOAT32 && output.dataType == DataType::FLOAT32
+                && weights[2]->dataType == DataType::BFLOAT16) {
+auto st = std::chrono::system_clock::now();
+            Data gate, attenPart, moePart;
+            ToDataType(logits, DataType::FLOAT32);
+            logits.ToDevice(DataDevice::CPU);
+            float *cpuRouterLogits = (float*)logits.cpuData;
+            int m = logits.dims.back();
+
+            {
+                auto *pool = GetAlivePool();
+
+                int bs = input.dims[0], dim = output.dims[1];
+                int inputDim = input.dims[1];
+                int interDim = weights[2]->dims[0] / 2;
+                int outputDim = output.dims[1];
+                std::vector <std::pair <float, int> > v; // (value, idx)
+                v.resize(m);
+
+                std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
+                expertTasks.resize(m + 1);
+                for (int b = 0; b < bs; b++) {
+                    expertTasks[0].push_back(std::make_pair(b, sharedScale));
+                    float *cur = cpuRouterLogits + b * m;
+                    for (int i = 0; i < m; i++) {
+                        v[i] = (std::make_pair(-cur[i], i));
+                    }
+                    if (gateBias.dims.size() > 0) {
+                        ToDataType(gateBias, DataType::FLOAT32);
+                        gateBias.ToDevice(DataDevice::CPU);
+                        float *cpuBias = (float*)gateBias.cpuData;
+                        for (int i = 0; i < m; i++) {
+                            v[i].first -= cpuBias[i];
+                        }
+                    }
+                    // sort(v.begin(), v.end());
+                    partial_sort(v.begin(), v.begin() + topk, v.end());
+                    float sum = 1.0;
+                    if (needNorm) {
+                        sum = 0.0;
+                        for (int j = 0; j < topk; j++) {
+                            sum += cur[v[j].second];
+                        }
+                    }
+                    
+                    for (int j = 0; j < topk; j++) {
+                        int idx = v[j].second;
+                        float value = cur[idx] / sum * routeScale;
+                        expertTasks[idx + 1].push_back(std::make_pair(b, value));
+                    }
+                }
+
+                int totalLines = 0;
+                for (int e = 0; e < expertTasks.size(); e++) {
+                    if (weights[e * 2] != nullptr) {
+                        totalLines += expertTasks[e].size();
+                    }
+                }
+printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                DataType startDataType = DataType::BFLOAT16;
+                DataType downInputDataType = DataType::BFLOAT16;
+
+                // 从 fastllmMoeDataManager 获取缓存的 vector，并根据需要调整大小
+                auto& realInput = fastllmMoeDataManager.realInput;
+                auto& expandInput = fastllmMoeDataManager.expandInput;
+                auto& gateUpOutput = fastllmMoeDataManager.gateUpOutput;
+                auto& swigluOutput = fastllmMoeDataManager.swigluOutput;
+                auto& downInput = fastllmMoeDataManager.downInput;
+                auto& downOutput = fastllmMoeDataManager.downOutput;
+                auto& reduceOutput = fastllmMoeDataManager.reduceOutput;
+
+                // 计算所需大小
+                size_t realInputSize = GetDataBytes(startDataType, bs, inputDim);
+                size_t expandInputSize = GetDataBytes(startDataType, totalLines, inputDim);
+                size_t gateUpOutputSize = totalLines * interDim * 2;
+                size_t swigluOutputSize = totalLines * interDim;
+                size_t downInputSize = GetDataBytes(downInputDataType, totalLines, outputDim);
+                size_t downOutputSize = totalLines * outputDim;
+                size_t reduceOutputSize = bs * outputDim;
+
+                // 只在当前容量不足时才进行 resize
+                if (realInput.size() < realInputSize) {
+                    realInput.resize(realInputSize);
+                }
+                if (expandInput.size() < expandInputSize) {
+                    expandInput.resize(expandInputSize);
+                }
+                if (gateUpOutput.size() < gateUpOutputSize) {
+                    gateUpOutput.resize(gateUpOutputSize);
+                }
+                if (swigluOutput.size() < swigluOutputSize) {
+                    swigluOutput.resize(swigluOutputSize);
+                }
+                if (downInput.size() < downInputSize) {
+                    downInput.resize(downInputSize);
+                }
+                if (downOutput.size() < downOutputSize) {
+                    downOutput.resize(downOutputSize);
+                }
+                if (reduceOutput.size() < reduceOutputSize) {
+                    reduceOutput.resize(reduceOutputSize);
+                }
+
+printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                // 0. input -> realInput
+                RunMultiThreadConvertFromFloat32(realInput.data(), DataType::BFLOAT16, (float*)input.cpuData, bs, inputDim, GetAlivePool());
+printf("Float32ToBFloat16 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+
+                // 1. realInput -> expandInput
+                std::vector <MultiThreadMemcpyMultiLinesTask> memcpyTasks;
+                memcpyTasks.resize(totalLines);
+                {
+                    int offset = 0;
+                    uint8_t* realInputPtr = realInput.data();
+                    uint8_t* expandInputPtr = expandInput.data();
+                    int bytesPerLine = GetDataBytes(startDataType, 1, inputDim);
+                    
+                    for (int e = 0; e < expertTasks.size(); e++) {
+                        if (weights[e * 2] != nullptr) {
+                            for (auto& task : expertTasks[e]) {
+                                int rowIdx = task.first;
+
+                                memcpyTasks[offset] = MultiThreadMemcpyMultiLinesTask(
+                                    expandInputPtr + offset * bytesPerLine, 
+                                    realInputPtr + rowIdx * bytesPerLine, 
+                                    bytesPerLine
+                                );
+                                offset++;
+                            }
+                        }
+                    }
+                }
+                RunMultiThreadMemcpyMultiLines(memcpyTasks, GetAlivePool());
+printf("expand spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                // 2. gateUp
+                {
+                    int offset = 0;
+                    int stride = 64;
+                    std::vector<MultiThreadBaseOp*> gemmOps;
+                    for (int e = 0; e < expertTasks.size(); e++) {
+                        if (weights[e * 2] != nullptr && expertTasks[e].size() > 0) {
+                            int lines = expertTasks[e].size();
+
+                            // Prepare input pointer for this expert's batch
+                            uint16_t* expertInputPtr = (uint16_t*)(expandInput.data() + offset * GetDataBytes(startDataType, 1, inputDim));
+                            
+                            // Prepare output pointer for this expert's batch
+                            float* expertGateUpOutputPtr = gateUpOutput.data() + offset * interDim * 2;
+                            
+                            // Get weight data (assuming weights are stored as BFloat16)
+                            uint16_t* weightPtr = (uint16_t*)(weights[e * 2]->cpuData);
+
+                            for (int st = 0; st < interDim * 2; st += stride) {
+                                int end = std::min(st + stride, interDim * 2);
+                                gemmOps.push_back(new MultiThreadGemmOp(
+                                    (uint8_t*)expertInputPtr, DataType::BFLOAT16,
+                                    (uint8_t*)weightPtr, DataType::BFLOAT16,
+                                    (uint8_t*)expertGateUpOutputPtr, DataType::FLOAT32,
+                                    lines, inputDim, interDim * 2, st, end
+                                ));
+                            }
+                            offset += lines;
+                        }
+                    }
+                    DynamicScheduleTasks(gemmOps);
+                }
+printf("gateup spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+
+                // 3. swiglu
+                SwigluMultiThread((float *) gateUpOutput.data(), interDim, interDim, ((float *) swigluOutput.data()),
+                                    totalLines, interDim * 2, interDim, GetAlivePool());
+printf("swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+
+                // 4. swigluOutput -> downInput
+                RunMultiThreadConvertFromFloat32(downInput.data(), DataType::BFLOAT16, (float*)swigluOutput.data(), totalLines, interDim, GetAlivePool());
+
+printf("Float32ToBFloat16 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                // 5. down
+                {
+                    int offset = 0;
+                    int stride = 64;
+                    std::vector <MultiThreadBaseOp*> gemmOps;
+                    for (int e = 0; e < expertTasks.size(); e++) {
+                        if (weights[e * 2 + 1] != nullptr && expertTasks[e].size() > 0) {
+                            int lines = expertTasks[e].size();
+                            
+                            // Prepare input pointer for this expert's batch
+                            uint16_t* expertDownInputPtr = (uint16_t*)(downInput.data() + offset * GetDataBytes(downInputDataType, 1, interDim));
+                            
+                            // Prepare output pointer for this expert's batch
+                            float* expertDownOutputPtr = downOutput.data() + offset * dim;
+                            
+                            // Get weight data (assuming weights are stored as BFloat16)
+                            uint16_t* weightPtr = (uint16_t*)(weights[e * 2 + 1]->cpuData);
+
+                            for (int st = 0; st < dim; st += stride) {
+                                int end = std::min(st + stride, dim);
+                                gemmOps.push_back(new MultiThreadGemmOp (
+                                    (uint8_t*)expertDownInputPtr, DataType::BFLOAT16, 
+                                    (uint8_t*)weightPtr, DataType::BFLOAT16, 
+                                    (uint8_t*)expertDownOutputPtr, DataType::FLOAT32, 
+                                    lines, interDim, dim, st, end
+                                ));
+                            }
+                            offset += lines;
+                        }
+                    }
+                    DynamicScheduleTasks(gemmOps);
+                }
+
+printf("down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                // 6. reduce
+                {
+                    // 准备数据结构
+                    int total_tasks = 0;
+                    for (int e = 0; e < expertTasks.size(); e++) {
+                        if (weights[e * 2] != nullptr) {
+                            total_tasks += expertTasks[e].size();
+                        }
+                    }
+                    // 假设每个样本最多选择k个专家
+                    int k = 0; // 需要确定每个样本选择的专家数量
+                    std::vector<int> samples_expert_count(bs, 0);
+                    // 第一遍：统计每个样本的专家数量
+                    for (int e = 0; e < expertTasks.size(); e++) {
+                        if (weights[e * 2] != nullptr) {
+                            for (auto& task : expertTasks[e]) {
+                                int rowIdx = task.first;
+                                samples_expert_count[rowIdx]++;
+                                k = std::max(k, samples_expert_count[rowIdx]);
+                            }
+                        }
+                    }
+                    // 分配内存
+                    std::vector<int> pos(bs * k, -1);  // 初始化为-1表示无效位置
+                    std::vector<float> task_weights(total_tasks, 0.0f);
+                    std::vector<int> sample_expert_idx(bs, 0);  // 记录每个样本当前填充到第几个专家
+                    // 第二遍：填充pos和weights数组
+                    int offset = 0;
+                    for (int e = 0; e < expertTasks.size(); e++) {
+                        if (weights[e * 2] != nullptr) {
+                            for (auto& task : expertTasks[e]) {
+                                int rowIdx = task.first;
+                                float weight = task.second;
+                                
+                                // 在pos数组中记录这个任务的位置
+                                int expert_idx = sample_expert_idx[rowIdx]++;
+                                pos[rowIdx * k + expert_idx] = offset;
+                                task_weights[offset] = weight;
+                                
+                                offset++;
+                            }
+                        }
+                    }
+
+                    // 调用多线程函数
+                    MultiThreadReduceBatch(
+                        (uint8_t*)downOutput.data(),  // downOutData
+                        DataType::FLOAT32,             // downOutDataType (假设是float32)
+                        task_weights.data(),           // weights
+                        output.dataType == DataType::FLOAT32 ? (float*)output.cpuData : reduceOutput.data(),           // lastOutput
+                        pos.data(),                    // pos
+                        bs,                           // bsz
+                        k,                            // k (每个样本的专家数)
+                        dim                           // hidden_size
+                    );
+                    // 注意：如果某些样本的专家数少于k，需要特殊处理
+                    // 可以在MultiThreadReduceBatchOp::Run()中添加检查：
+                    // if (curPos == -1) continue; // 跳过无效位置
+                }
+printf("reduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                // 7. reduceOutput -> last Output
+                if (output.dataType != DataType::FLOAT32) {
+                    if (output.dataType == DataType::FLOAT16) {
+                        Float32ToFloat16(reduceOutput.data(), (uint16_t*)output.cpuData, output.Count(0));
+                    }
+                }
+printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            }
         } else {
- // auto st = std::chrono::system_clock::now();
- // auto veryst = std::chrono::system_clock::now();
- // std::map <std::string, float> cnt;
+  auto st = std::chrono::system_clock::now();
+  auto veryst = std::chrono::system_clock::now();
+  std::map <std::string, float> cnt;
             // normal
             Data gate, attenPart, moePart;
             ToDataType(logits, DataType::FLOAT32);
@@ -1910,9 +2652,9 @@ namespace fastllm {
                 Data &tempInput = w2;
                 tempInput.ToDevice(input.dataDevice);
                 tempInput.Resize(input.dims);
- // cnt["prepare 0"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+  cnt["prepare 0"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 tempInput.Allocate();
- // cnt["allocate"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+  cnt["allocate"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 std::vector <std::pair <float, int> > v; // (value, idx)
                 v.resize(m);
                 for (int b = 0; b < bs; b++) {
@@ -1945,7 +2687,7 @@ namespace fastllm {
                         expertTasks[idx + 1].push_back(std::make_pair(b, value));
                     }
                 }
- // cnt["prepare"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+  cnt["prepare"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 for (int e = 0; e < expertTasks.size(); e++) {
                     auto &task = expertTasks[e];
                     if (task.size() == 0) {
@@ -1964,9 +2706,9 @@ namespace fastllm {
                     }
                     RunMultiThreadMemcpyMultiLines(memcpyTasks, GetAlivePool());
                     DoCpuLinearReshape(tempInput, *weights[e * 2], w3);
-// cnt["linear 0 prepare"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+ cnt["linear 0 prepare"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                     DoCpuLinear(tempInput, *weights[e * 2], Data(), w3);
-// cnt["linear 0"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();                    
+ cnt["linear 0"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();                    
                     int mid = w3.dims[1] / 2;
                     w1.Resize({w3.dims[0], mid});
                     w1.dataType = w3.dataType;
@@ -1979,11 +2721,11 @@ namespace fastllm {
                         SwigluMultiThreadFloat16((uint16_t *) w3.cpuData, mid, mid, ((uint16_t *) w1.cpuData),
                                     w3.dims[0], w3.dims[1], mid, GetAlivePool());
                     }
- // cnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+  cnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                     DoCpuLinearReshape(w1, *weights[e * 2 + 1], w3);
- // cnt["linear 1 prepare"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+  cnt["linear 1 prepare"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                     DoCpuLinear(w1, *weights[e * 2 + 1], Data(), w3);
- // cnt["linear 1"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();                    
+  cnt["linear 1"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();                    
                     float *curOutput;
                     if (w3.dataType == DataType::FLOAT32) {
                         curOutput = (float*)w3.cpuData;
@@ -1993,19 +2735,19 @@ namespace fastllm {
                     }
 
                     RunMultiThreadMoeReduce(&task, &tempResult, curOutput, dim, GetAlivePool());
- // cnt["reduce"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+  cnt["reduce"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 }
                 if (output.dataType == DataType::FLOAT32) {
                     memcpy(output.cpuData, tempResult.data(), output.GetBytes());
                 } else if (output.dataType == DataType::FLOAT16) {
                     Float32ToFloat16(tempResult.data(), (uint16_t*)output.cpuData, output.Count(0));
                 }
- // cnt["output memcpy"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+  cnt["output memcpy"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
             }
- // printf("moe spend %f s.\n", GetSpan(veryst, std::chrono::system_clock::now()));
- // for (auto &it : cnt) {
-    // printf("%s spend %f s.\n", it.first.c_str(), it.second);
- // }
+  printf("moe spend %f s.\n", GetSpan(veryst, std::chrono::system_clock::now()));
+  for (auto &it : cnt) {
+     printf("%s spend %f s.\n", it.first.c_str(), it.second);
+  }
         }
     }
 
