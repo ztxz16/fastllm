@@ -930,6 +930,30 @@ namespace fastllm {
             delete ops[i];
         }
     }
+
+    void RunLinearBFloat16BFloat16(uint16_t *inputData, uint16_t *weightData, float *outputData, float *biasData, 
+                                int n, int m, int k, 
+                                AliveThreadPool *pool, int startTid, int threadNum) {
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadLinearBFloat16BFloat16Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            if (i == threadNum - 1) {
+                end = k;
+            }
+            ops.push_back(new MultiThreadLinearBFloat16BFloat16Op(inputData, weightData, biasData, outputData,
+                                                n, m, k, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+    }
     
     void LaunchLinearInt8Int8(uint8_t *a, uint8_t *b, float *c, int n, int m, int k, 
         int *weightSums, int *weightZeros, float *scales, float *bias,

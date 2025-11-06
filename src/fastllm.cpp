@@ -160,6 +160,26 @@ namespace fastllm {
             return "Type " + std::to_string((int)type);
         }
     }
+
+    size_t GetDataBytes(DataType type, size_t rows, size_t columns) {
+        if (type == DataType::FLOAT32) {
+            return rows * columns * sizeof(float);
+        } else if (type == DataType::BFLOAT16 || type == DataType::FLOAT16) {
+            return rows * columns * sizeof(uint16_t);
+        } else if (type == DataType::FP8_E4M3_BLOCK_128) {
+            // columns * [fp8] + ((columns - 1) / 128 + 1) * [float]
+            return rows * (columns + ((columns - 1) / 128 + 1) * sizeof(float));
+        } else if (type == DataType::FP8_E4M3) {
+            return rows * columns * sizeof(uint8_t);
+        } else if (type == DataType::AWQ_4BIT_128) {
+            int groups = (columns - 1) / 128 + 1;
+            size_t colBytes = columns / 2 + groups + groups * sizeof(float);
+            return rows * colBytes;
+        } else {
+            ErrorInFastLLM("GetDataBytes failed. " + GetDataTypeName(type) + "\n");
+            return 0;
+        }
+    }
     
 #ifdef USE_MMAP
     FileMmap::FileMmap(const std::string &path) {
