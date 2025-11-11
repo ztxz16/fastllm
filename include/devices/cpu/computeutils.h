@@ -6,9 +6,118 @@
 #define FASTLLM_COMPUTE_LINEAR_H
 
 #include <cstdint>
+#include <atomic>
+
 #include "fastllm.h"
 
 namespace fastllm {
+    void FastllmGemm (int n, int m, int k, 
+        const void *A, long lda, // A [n * m], lda = bytes for 1 row in A
+        const void *B, long ldb, // B [k * m], ldb = bytes for 1 row in B
+        void *C, long ldc, // C[n * k], ldc = bytes for 1 row in C
+        int st, int end, // calc C[0 : n, st : end]
+        DataType AType, DataType BType, DataType CType);
+
+    struct MultiThreadGemmOp : MultiThreadBaseOp {
+        uint8_t *inputData;   // [n * m]
+        uint8_t *weightData;  // [k * m]
+        uint8_t *outputData;  // [n * k]
+        DataType inputDataType, weightDataType, outputDataType;
+        int n, m, k, st, end;
+        MultiThreadGemmOp(uint8_t *inputData, DataType inputDataType,
+                        uint8_t *weightData, DataType weightDataType,
+                        uint8_t *outputData, DataType outputDataType,
+                        int n, int m, int k, int st, int end) :
+            inputData(inputData), inputDataType(inputDataType),
+            weightData(weightData), weightDataType(weightDataType),
+            outputData(outputData), outputDataType(outputDataType),
+            n(n), m(m), k(k), st(st), end(end) {}
+        void Run();
+    };
+
+    struct MultiThreadReduceBatchOp : MultiThreadBaseOp {
+        uint8_t *downOutData;
+        DataType downOutDataType;
+        float *weights;
+        float *lastOutput;
+        int *pos;
+        int bsz, k;
+        int hidden_size;
+        int batch_st, batch_end;  // batch维度的范围
+        int hidden_st, hidden_end; // hidden维度的范围
+        
+        MultiThreadReduceBatchOp(uint8_t *downOutData, DataType downOutDataType,
+            float *weights, float *lastOutput,
+            int *pos, int bsz, int k, 
+            int hidden_size, 
+            int batch_st, int batch_end,
+            int hidden_st, int hidden_end) : 
+            downOutData(downOutData), downOutDataType(downOutDataType),
+            weights(weights), lastOutput(lastOutput),
+            pos(pos), bsz(bsz), k(k),
+            hidden_size(hidden_size), 
+            batch_st(batch_st), batch_end(batch_end),
+            hidden_st(hidden_st), hidden_end(hidden_end) {}
+        
+        void Run();
+    };
+
+    void MultiThreadReduceBatch(uint8_t *downOutData, DataType downOutDataType,
+                    float *weights, float *lastOutput, int *pos, int bsz, int k, int hidden_size);
+
+    void ConvertFromFloat32(void *dstData, DataType dstDataType, const float *floatData, size_t rows, size_t columns);
+
+    // 新增一个专门的Op来处理数据类型转换
+    struct MultiThreadConvertFromFloat32Op : MultiThreadBaseOp {
+        void *dstData;
+        DataType dstDataType;
+        const float *floatData;
+        size_t columns;
+        size_t startRow, endRow;  // 处理的行范围 [startRow, endRow)
+        MultiThreadConvertFromFloat32Op(void *dstData, DataType dstDataType, 
+                                    const float *floatData, size_t columns,
+                                    size_t startRow, size_t endRow) :
+            dstData(dstData), dstDataType(dstDataType), 
+            floatData(floatData), columns(columns),
+            startRow(startRow), endRow(endRow) {}
+
+        void Run();
+    };
+
+    // 对应的多线程运行函数
+    void RunMultiThreadConvertFromFloat32(void *dstData, DataType dstDataType, 
+                                                const float *floatData, size_t rows, 
+                                                size_t columns, AliveThreadPool *pool);
+
+    struct WorkStealingOp : MultiThreadBaseOp {
+        struct alignas(64) TaskState {
+            std::atomic<int> curr;
+            int end;
+            std::vector<MultiThreadBaseOp*> tasks;
+            std::atomic<bool> completed;
+        };
+        
+        int threadId;
+        std::vector<TaskState*>* allStates;
+        TaskState* myState;
+        int totalThreads;
+        
+        WorkStealingOp(int tid, std::vector<TaskState*>* states, 
+                    TaskState* state, int numThreads) 
+            : threadId(tid), allStates(states), 
+            myState(state), totalThreads(numThreads) {}
+        
+        void Run() override;
+        
+    private:
+        void processOwnTasks();
+        
+        void stealFromOthers();
+    };
+
+    // 重构的动态任务调度函数，支持work-stealing
+    void DynamicScheduleTasks(std::vector<MultiThreadBaseOp*>& ops);
+
     struct MultiThreadLinearFloat32Float32Op : MultiThreadBaseOp {
         float *inputData;
         float *weightData;
@@ -217,6 +326,9 @@ namespace fastllm {
                             int n, int m, int k, int st, int end);
 
     void MatMulInt8Int8(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride);
+
+    bool LinearBFloat16_FP8E4M3BLOCK128_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
 }
 
 #endif // FASTLLM_COMPUTE_LINEAR_H

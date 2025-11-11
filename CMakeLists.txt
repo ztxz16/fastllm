@@ -307,6 +307,13 @@ if (USE_NUMA)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} numa)
 endif()
 
+if (USE_NUMAS)
+    add_compile_definitions(USE_NUMAS)
+    set(FASTLLM_CXX_SOURCES ${FASTLLM_CXX_SOURCES} src/devices/numas/numasdevice.cpp src/devices/numas/numas.cpp)
+    include_directories(include/devices/numas)
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} numa)
+endif()
+
 if (USE_TOPS) # For suiyuan
     add_compile_definitions(USE_TOPS)
     set(FASTLLM_TOPS_SOURCES src/devices/tops/topsdevice.cpp)
