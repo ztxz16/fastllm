@@ -911,6 +911,10 @@ namespace fastllm {
                             floatC[j] = sum;
                         }
                     }
+                } else if (BType == DataType::FLOAT16) {
+                    MultiThreadLinearFloat32Float16Op (
+                        (float*)A, (uint16_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end
+                    ).Run();
                 }
             }
         } else if (AType == DataType::BFLOAT16) {
