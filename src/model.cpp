@@ -1322,6 +1322,8 @@ if (false) {
         return std::unique_ptr<fastllm::basellm> (model);
     }
 
+    extern void RegisterNumas(fastllm::Data *data);
+
     // 从hf文件夹读取，仅支持safetensor格式的模型
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
                                                     DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig,
@@ -1891,6 +1893,18 @@ if (false) {
                                         } catch (...) {
                                         }
 #endif
+#if defined(USE_NUMAS)
+                                        try {
+                                            std::string s = getenv("FASTLLM_ACTIVATE_NUMA");
+                                            if (s != "" && s != "OFF") {
+                                                if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
+                                                    mergeData.weightSum.resize(1);
+                                                    RegisterNumas(&mergeData);       
+                                                }
+                                            }
+                                        } catch (...) {
+                                        }
+#endif
                                     }
 
                                     for (auto input : it.inputs) {
@@ -1909,6 +1923,18 @@ if (false) {
                                             model->weight.weight[weightName].weightSum.resize(1);
                                             RegisterFastllmData(&model->weight.weight[weightName], model->specialWeights[weightName]);
                                         locker.unlock();
+                                    }
+                                }
+                            } catch (...) {
+                            }
+#endif
+#if defined(USE_NUMAS)
+                            try {
+                                std::string s = getenv("FASTLLM_ACTIVATE_NUMA");
+                                if (s != "" && s != "OFF") {
+                                    if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
+                                        model->weight.weight[weightName].weightSum.resize(1);
+                                        RegisterNumas(&model->weight.weight[weightName]);       
                                     }
                                 }
                             } catch (...) {
