@@ -1771,6 +1771,8 @@ namespace fastllm {
     DataType Data::GetLinearActDataType() {
         if (this->dataType == DataType::DATA_GGUF_FORMAT) {
             return (DataType)((int)DataType::DATA_GGUF_FORMAT + ggml_type_vec_dot_type((ggml_type)this->ggmlType));
+        } else if (this->dataType == DataType::FLOAT16) {
+            return DataType::FLOAT32;
         } else if (this->dataType == DataType::BFLOAT16 || 
                     this->dataType == DataType::FP8_E4M3 ||
                     this->dataType == DataType::FP8_E4M3_BLOCK_128) {
