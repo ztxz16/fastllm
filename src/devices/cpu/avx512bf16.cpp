@@ -9,6 +9,7 @@
 #endif
 
 #include "utils.h"
+#include "fastllm.h"
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -326,6 +327,88 @@ namespace fastllm {
                 }
                 now += _mm512_reduce_add_ps(last_sum) * magicScale;
                 outputData[i * k + j] = now;
+            }
+        }
+        return true;
+#endif
+        return false;
+    }
+
+    bool LinearBFloat16_FP8E4M3BLOCK128_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+#ifdef __AVX512BF16__
+        static int block_size = 128;
+        size_t perRow = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, m);
+        float magicScale = pow(2, 120);
+        
+        for (int i = 0; i < n; i++) {
+            uint16_t *bf16A = inputData + i * m;
+            float *floatC = outputData + i * k;
+
+            int j = st;
+            __m256i v_a_mask_byte = _mm256_set1_epi8(0x80); 
+            __m256i v_b_mask_byte = _mm256_set1_epi8(0x7F); 
+            
+            for (; j < end; j++) {
+                float now = 0.0f;
+                __m512 last_sum = _mm512_setzero_ps(); // Accumulator for 16 parallel sums
+
+                // 获取当前行的起始位置
+                uint8_t *rowData = (uint8_t*)weightData + j * perRow;
+                
+                // 计算需要多少个block（每个block有128个FP8 + 1个float scale）
+                const int blockM = 128;
+                int numBlocks = (m + blockM - 1) / blockM;
+                
+                for (int blockIdx = 0; blockIdx < numBlocks; blockIdx++) {
+                    // 计算当前block在rowData中的偏移
+                    // 每个block占用 128 bytes (FP8) + 4 bytes (float scale)
+                    size_t blockOffset = blockIdx * (blockM + sizeof(float));
+                    
+                    // 获取当前block的FP8数据和scale
+                    uint8_t *fp8B = rowData + blockOffset;
+                    
+                    // 计算当前block处理的元素范围
+                    int blockStart = blockIdx * blockM;
+                    int blockEnd = std::min(blockStart + blockM, m);
+                    
+                    __m512 v_sum = _mm512_setzero_ps(); // Accumulator for 16 parallel sums
+                    
+                    // 处理当前block内的数据
+                    int l = blockStart;
+                    for (; l + 31 < blockEnd; l += 32) {
+                        // 1. Load 32 BF16 inputs
+                        __m512bh v_input_bf16 = (__m512bh)_mm512_loadu_si512((__m512i const*)(bf16A + l));
+                        
+                        // 2. Load 32 FP8 weights from current block
+                        // 注意：fp8B指向当前block的开始，所以需要用 (l - blockStart) 作为偏移
+                        __m256i va_bytes = _mm256_loadu_si256((__m256i*)(fp8B + (l - blockStart)));
+
+                        __m256i va_masked_bytes = _mm256_and_si256(va_bytes, v_a_mask_byte);
+                        __m512i va_promoted_words = _mm512_cvtepu8_epi16(va_masked_bytes);
+                        __m512i v_a_term_shifted = _mm512_slli_epi16(va_promoted_words, 8);
+
+                        __m256i vb_masked_bytes = _mm256_and_si256(va_bytes, v_b_mask_byte);
+                        __m512i vb_promoted_words = _mm512_cvtepu8_epi16(vb_masked_bytes);
+                        __m512i v_b_term_shifted = _mm512_slli_epi16(vb_promoted_words, 4);
+
+                        __m512i v_result = _mm512_or_si512(v_a_term_shifted, v_b_term_shifted);
+                        __m512bh v_weights_bf16 = (__m512bh)v_result;
+                        
+                        // 3. Compute dot product: v_sum += v_input_bf16 * v_weights_bf16
+                        v_sum = _mm512_dpbf16_ps(v_sum, v_input_bf16, v_weights_bf16);
+                    }
+                    
+                    // 处理剩余的元素（如果有）
+                    // TODO: 这里可能需要处理不足32个元素的情况
+                    
+                    float curScale = *(float*)(fp8B + blockM);  // scale在128个FP8之后
+                    __m512 vScale = _mm512_set1_ps(curScale);
+                    last_sum = _mm512_fmadd_ps(v_sum, vScale, last_sum);
+                }
+                
+                now += _mm512_reduce_add_ps(last_sum) * magicScale;
+                floatC[j] = now;
             }
         }
         return true;
