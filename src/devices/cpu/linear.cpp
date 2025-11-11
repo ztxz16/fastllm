@@ -221,6 +221,72 @@ namespace fastllm {
         }
     }
 
+    bool LinearQ8K_GGUF_Kernel(uint8_t *q8kInputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end, DataType AType, DataType BType) {
+        ggml_type inputType = (ggml_type)((int)AType - (int)DataType::DATA_GGUF_FORMAT);
+        ggml_type weightType = (ggml_type)((int)BType - (int)DataType::DATA_GGUF_FORMAT);
+
+        auto vec_dot_type = ggml_type_vec_dot_type(weightType);
+        auto vec_dot = ggml_type_vec_dot(weightType);
+        if (GetMulMatFunction(weightType, 1) != nullptr) {
+            int part = (n == 1 ? (end - st) : 64);
+            int oldSt = st, oldEnd = end;
+
+            int maxRows = 8;
+            std::vector <mul_mat_t> mats;
+            mats.resize(maxRows + 1);
+            for (int i = 1; i <= maxRows; i++) {
+                mats[i] = GetMulMatFunction(weightType, i);
+            }
+            while (st < oldEnd) {
+                end = std::min(st + part, oldEnd);
+                int i = 0;
+
+                for (; i + 7 < n; i += 8) {
+                    DataInfo info{&outputData[i * k + st], 
+                        (const char*)q8kInputData + i * ggml_row_size(vec_dot_type, m), 
+                        (size_t)k, ggml_row_size(vec_dot_type, m), 
+                        0, 1, nullptr, 0};
+                    mats[8](m, weightData + st * ggml_row_size(weightType, m), ggml_row_size(weightType, m), info, end - st);
+                }
+
+                if (i < n) {
+                    DataInfo info{&outputData[i * k + st], 
+                        (const char*)q8kInputData + i * ggml_row_size(vec_dot_type, m), 
+                        (size_t)k, ggml_row_size(vec_dot_type, m), 
+                        0, 1, nullptr, 0};
+                    mats[n - i](m, weightData + st * ggml_row_size(weightType, m), ggml_row_size(weightType, m), info, end - st);
+                }
+
+                if (biasData) {
+                    for (int i = 0; i < n; i++) {
+                        for (int j = st; j < end; j++) {
+                            outputData[i * k + j] += biasData[j];
+                        }
+                    }
+                }
+                st = end;
+            }
+        } else if (vec_dot != nullptr) {
+            for (int i = 0; i < n; i++) {
+                for (int j = st; j < end; j++) {
+                    float now = 0.0f;
+                    vec_dot (
+                        m, &outputData[i * k + j], 0, 
+                        weightData + j * ggml_row_size(weightType, m), 0, 
+                        q8kInputData + i * ggml_row_size(vec_dot_type, m), 0, 
+                        1
+                    );
+                    outputData[i * k + j] += (biasData ? biasData[j] : 0.0f);
+                } 
+            }
+        } else {
+            ErrorInFastLLM("Linear error: unsupport GGUF's dataType " + std::string(ggml_type_name(weightType)) + ".\n");
+            return false;
+        }
+        return true;
+    }
+
     extern bool LinearFloat32Float16_AVX512F_Kernel(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end);
 
