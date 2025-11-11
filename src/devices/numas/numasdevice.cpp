@@ -122,6 +122,7 @@ namespace fastllm {
     } fastllmMoeDataManagerNumas;
 
     void RegisterNumas(fastllm::Data *data) {
+        data->Repack();
         auto *numaConfig = GetNumaConfig();
         if (data == nullptr) {
             return;
@@ -154,6 +155,12 @@ namespace fastllm {
                 for (int i = 0; i < numaConfig->numaCnt; i++) {
                     data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
                     memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                }
+            } else if (data->dataType == DataType::DATA_GGUF_FORMAT) {
+                size_t bytesPerRow = GetDataBytes((DataType)((int)data->dataType + data->ggmlType), 1, m);
+                for (int i = 0; i < numaConfig->numaCnt; i++) {
+                    data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
+                    memcpy(data->numasData[i], data->cpuData + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
                 }
             } else {
                 ErrorInFastLLM("RegisterNumas can't support data type " + GetDataTypeName(data->dataType));
@@ -351,8 +358,8 @@ namespace fastllm {
         int needNorm = intParams.find("needNorm") != intParams.end() ? intParams.find("needNorm")->second : 0;
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
         float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
-
         output.Allocate();
+
         if (input.dims[0] < 32) {
 auto st = std::chrono::system_clock::now();
             ToDataType(logits, DataType::FLOAT32);
@@ -401,8 +408,8 @@ auto st = std::chrono::system_clock::now();
                         v.push_back(std::make_pair(0, sharedScale));
                     }
 
-                    DataType startDataType = DataType::BFLOAT16;
-                    DataType downInputDataType = DataType::BFLOAT16;
+                    DataType startDataType = weights[2]->GetLinearActDataType();
+                    DataType downInputDataType = weights[3]->GetLinearActDataType();
 
                     // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
                     auto& realInput = fastllmMoeDataManagerNumas.realInput;
@@ -440,10 +447,10 @@ auto st = std::chrono::system_clock::now();
                         reduceOutput.resize(reduceOutputSize);
                     }
 
-// printf"malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     // 0. input -> realInput
-                    RunMultiThreadConvertFromFloat32(realInput.data(), DataType::BFLOAT16, (float*)input.cpuData + o * inputDim, 1, inputDim, GetAlivePool());
-// printf"Float32ToBFloat16 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                    RunMultiThreadConvertFromFloat32(realInput.data(), startDataType, (float*)input.cpuData + o * inputDim, 1, inputDim, GetAlivePool());
+// printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                     // 1. gateUp
                     auto *numaConfig = GetNumaConfig();
@@ -463,13 +470,14 @@ auto st = std::chrono::system_clock::now();
                         
                         // 计算该NUMA节点上所有专家的总行数
                         int totalRows = kPer * totalExperts;
-                        int rowsPerThread = totalRows / threadNum;
-                        int remainingRows = totalRows % threadNum;
+                        int unitRows = 4;
+                        int rowsPerThread = (totalRows / unitRows) / threadNum;
+                        int remainingRows = (totalRows / unitRows) % threadNum;
                         
                         int currentRow = 0;
                         
                         for (int tid = 0; tid < threadNum; tid++) {
-                            int threadRows = rowsPerThread + (tid < remainingRows ? 1 : 0);
+                            int threadRows = (rowsPerThread + (tid < remainingRows ? 1 : 0)) * unitRows;
                             int endRow = currentRow + threadRows;
                             
                             // 处理当前线程负责的行范围
@@ -492,8 +500,8 @@ auto st = std::chrono::system_clock::now();
                                 // 添加GEMM操作
                                 ((MultiThreadMultiOps*)ops[numaConfig->numaToCpuDict[nid][tid].first])->ops.push_back(
                                     new MultiThreadGemmOp(
-                                        (uint8_t*)realInput.data(), DataType::BFLOAT16,
-                                        weights[e * 2]->numasData[nid], weights[e * 2]->dataType,
+                                        (uint8_t*)realInput.data(), startDataType,
+                                        weights[e * 2]->numasData[nid], weights[e * 2]->GetDataType(),
                                         (uint8_t*)gateUpOutput.data() + outputOffset, DataType::FLOAT32,
                                         1, inputDim, k, expertStartRow, expertEndRow
                                     )
@@ -510,7 +518,7 @@ auto st = std::chrono::system_clock::now();
                             currentRow = endRow;
                         }
                     }
-// printf"gateup prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("gateup prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     for (int i = 0; i < ops.size(); i++) {
                         pool->PushOp(i, ops[i]);
                     }
@@ -521,16 +529,16 @@ auto st = std::chrono::system_clock::now();
                     }
 
 
-// printf"gateup spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("gateup spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     // 3. swiglu
                     SwigluMultiThread((float *) gateUpOutput.data(), interDim, interDim, ((float *) swigluOutput.data()),
                                     v.size(), interDim * 2, interDim, GetAlivePool());
-// printf"swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                     // 4. swigluOutput -> downInput
-                    RunMultiThreadConvertFromFloat32(downInput.data(), DataType::BFLOAT16, (float*)swigluOutput.data(), v.size(), interDim, GetAlivePool());
+                    RunMultiThreadConvertFromFloat32(downInput.data(), downInputDataType, (float*)swigluOutput.data(), v.size(), interDim, GetAlivePool());
 
-// printf"Float32ToBFloat16 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     // 5. down
                     ops.resize(numaConfig->threads);
                     for (int i = 0; i < ops.size(); i++) {
@@ -545,12 +553,13 @@ auto st = std::chrono::system_clock::now();
                         
                         // 总共需要处理的行数：每个专家kPer行，共totalExperts个专家
                         int totalRows = kPer * totalExperts;
-                        int rowsPerThread = totalRows / threadNum;
-                        int extraRows = totalRows % threadNum;
+                        int unitRows = 4;
+                        int rowsPerThread = (totalRows / unitRows) / threadNum;
+                        int extraRows = (totalRows / unitRows) % threadNum;
                         
                         int currentRow = 0;
                         for (int tid = 0; tid < threadNum; tid++) {
-                            int threadRows = rowsPerThread + (tid < extraRows ? 1 : 0);
+                            int threadRows = (rowsPerThread + (tid < extraRows ? 1 : 0)) * unitRows;
                             int endRow = currentRow + threadRows;
                             
                             // 处理这个线程负责的行范围 [currentRow, endRow)
@@ -563,7 +572,6 @@ auto st = std::chrono::system_clock::now();
                                 
                                 // 计算当前专家中要处理的行范围
                                 int rowsToProcess = std::min(kPer - rowInExpert, endRow - row);
-                                
                                 if (expertIdx < totalExperts) {
                                     int e = v[expertIdx].first;
                                     size_t inputOffset = expertIdx * GetDataBytes(downInputDataType, 1, interDim);
@@ -572,8 +580,8 @@ auto st = std::chrono::system_clock::now();
                                     
                                     ((MultiThreadMultiOps*)ops[numaConfig->numaToCpuDict[nid][tid].first])->ops.push_back(
                                         new MultiThreadGemmOp(
-                                            (uint8_t*)downInput.data() + inputOffset, DataType::BFLOAT16,
-                                            weights[e * 2 + 1]->numasData[nid], weights[e * 2 + 1]->dataType,
+                                            (uint8_t*)downInput.data() + inputOffset, downInputDataType,
+                                            weights[e * 2 + 1]->numasData[nid], weights[e * 2 + 1]->GetDataType(),
                                             (uint8_t*)downOutput.data() + outputOffset, DataType::FLOAT32,
                                             1, interDim, k, rowInExpert, rowInExpert + rowsToProcess
                                         )
@@ -587,7 +595,7 @@ auto st = std::chrono::system_clock::now();
                         }
                     }
 
-// printf"down prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("down prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     for (int i = 0; i < ops.size(); i++) {
                         pool->PushOp(i, ops[i]);
                     }
@@ -596,7 +604,7 @@ auto st = std::chrono::system_clock::now();
                         delete ops[i];
                     }
 
-// printf"down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     float *fLastOutput = reduceOutput.data();
                     if (output.dataType == DataType::FLOAT32) {
                         fLastOutput = ((float*)output.cpuData) + o * outputDim;
@@ -617,14 +625,14 @@ auto st = std::chrono::system_clock::now();
                         }
                     }
 
-// printf"reduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("reduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     // 7. reduceOutput -> last Output
                     if (output.dataType != DataType::FLOAT32) {
                         if (output.dataType == DataType::FLOAT16) {
                             Float32ToFloat16(reduceOutput.data(), ((uint16_t*)output.cpuData) + o * outputDim, output.Count(0));
                         }
                     }
-// printf"last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 }
             }
         } else {
@@ -684,9 +692,9 @@ auto st = std::chrono::system_clock::now();
                         totalLines += expertTasks[e].size();
                     }
                 }
-// printf"prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-                DataType startDataType = DataType::BFLOAT16;
-                DataType downInputDataType = DataType::BFLOAT16;
+// printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                DataType startDataType = weights[2]->GetLinearActDataType();
+                DataType downInputDataType = weights[3]->GetLinearActDataType();
 
                 // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
                 auto& realInput = fastllmMoeDataManagerNumas.realInput;
@@ -729,10 +737,10 @@ auto st = std::chrono::system_clock::now();
                     reduceOutput.resize(reduceOutputSize);
                 }
 
-// printf"malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 0. input -> realInput
-                RunMultiThreadConvertFromFloat32(realInput.data(), DataType::BFLOAT16, (float*)input.cpuData, bs, inputDim, GetAlivePool());
-// printf"Float32ToBFloat16 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                RunMultiThreadConvertFromFloat32(realInput.data(), startDataType, (float*)input.cpuData, bs, inputDim, GetAlivePool());
+// printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                 // 1. realInput -> expandInput
                 std::vector <MultiThreadMemcpyMultiLinesTask> memcpyTasks;
@@ -759,7 +767,7 @@ auto st = std::chrono::system_clock::now();
                     }
                 }
                 RunMultiThreadMemcpyMultiLines(memcpyTasks, GetAlivePool());
-// printf"expand spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("expand spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 2. gateUp
                 
                 auto *numaConfig = GetNumaConfig();
@@ -784,15 +792,15 @@ auto st = std::chrono::system_clock::now();
                         int kPer = k / numaConfig->numaCnt;
                             
                         for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
-                            // Get weight data (assuming weights are stored as BFloat16)
+                            // Get weight data (assuming weights are stored as `startDataType`)
                             int base = kPer * nid;
                             size_t outputOffset = GetDataBytes(DataType::FLOAT32, 1, base);
 
                             for (int st = 0; st < kPer; st += stride) {
                                 int end = std::min(st + stride, kPer);
                                 ops[nid].push_back(new MultiThreadGemmOp(
-                                    (uint8_t*)expertInputPtr, DataType::BFLOAT16,
-                                    weights[e * 2]->numasData[nid], weights[e * 2]->dataType,
+                                    (uint8_t*)expertInputPtr, startDataType,
+                                    weights[e * 2]->numasData[nid], weights[e * 2]->GetDataType(),
                                     (uint8_t*)expertGateUpOutputPtr + outputOffset, DataType::FLOAT32,
                                     lines, inputDim, k, st, end
                                 ));
@@ -804,17 +812,17 @@ auto st = std::chrono::system_clock::now();
 
                 DynamicScheduleTasks(ops);
 
-// printf"gateup spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("gateup spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                 // 3. swiglu
                 SwigluMultiThread((float *) gateUpOutput.data(), interDim, interDim, ((float *) swigluOutput.data()),
                                     totalLines, interDim * 2, interDim, GetAlivePool());
-// printf"swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                 // 4. swigluOutput -> downInput
-                RunMultiThreadConvertFromFloat32(downInput.data(), DataType::BFLOAT16, (float*)swigluOutput.data(), totalLines, interDim, GetAlivePool());
+                RunMultiThreadConvertFromFloat32(downInput.data(), downInputDataType, (float*)swigluOutput.data(), totalLines, interDim, GetAlivePool());
 
-// printf"Float32ToBFloat16 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 5. down
                 offset = 0;
                 stride = 64;
@@ -837,15 +845,15 @@ auto st = std::chrono::system_clock::now();
                         int kPer = k / numaConfig->numaCnt;
                             
                         for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
-                            // Get weight data (assuming weights are stored as BFloat16)
+                            // Get weight data (assuming weights are stored as `downInputDataType`)
                             int base = kPer * nid;
                             size_t outputOffset = GetDataBytes(DataType::FLOAT32, 1, base);
 
                             for (int st = 0; st < kPer; st += stride) {
                                 int end = std::min(st + stride, kPer);
                                 ops[nid].push_back(new MultiThreadGemmOp(
-                                    (uint8_t*)expertDownInputPtr, DataType::BFLOAT16,
-                                    weights[e * 2 + 1]->numasData[nid], weights[e * 2 + 1]->dataType,
+                                    (uint8_t*)expertDownInputPtr, downInputDataType,
+                                    weights[e * 2 + 1]->numasData[nid], weights[e * 2 + 1]->GetDataType(),
                                     (uint8_t*)expertDownOutputPtr + outputOffset, DataType::FLOAT32,
                                     lines, interDim, k, st, end
                                 ));
@@ -857,7 +865,7 @@ auto st = std::chrono::system_clock::now();
 
                 DynamicScheduleTasks(ops);
 
-// printf"down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 6. reduce
                 {
                     // 准备数据结构
@@ -917,14 +925,14 @@ auto st = std::chrono::system_clock::now();
                     // 可以在MultiThreadReduceBatchOp::Run()中添加检查：
                     // if (curPos == -1) continue; // 跳过无效位置
                 }
-// printf"reduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("reduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 7. reduceOutput -> last Output
                 if (output.dataType != DataType::FLOAT32) {
                     if (output.dataType == DataType::FLOAT16) {
                         Float32ToFloat16(reduceOutput.data(), (uint16_t*)output.cpuData, output.Count(0));
                     }
                 }
-// printf"last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             }
         }
     }
