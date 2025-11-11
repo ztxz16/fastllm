@@ -431,6 +431,12 @@ namespace fastllm {
 
         // 从Fastllm格式中创建
         void CreateFromFastllmFormat(uint8_t *datas, uint64_t len);
+
+        // 普通类型：直接返回dataType, GGUF类型：返回dataType + ggmltype
+        DataType GetDataType();
+
+        // 当前权重作为linear的weight时，输入应该是什么类型
+        DataType GetLinearActDataType();
     };
 
     struct PartitionLinkNode {
