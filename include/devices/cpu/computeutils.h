@@ -17,7 +17,7 @@ namespace fastllm {
         void *C, long ldc, // C[n * k], ldc = bytes for 1 row in C
         int st, int end, // calc C[0 : n, st : end]
         DataType AType, DataType BType, DataType CType);
-
+    
     struct MultiThreadGemmOp : MultiThreadBaseOp {
         uint8_t *inputData;   // [n * m]
         uint8_t *weightData;  // [k * m]
@@ -59,6 +59,16 @@ namespace fastllm {
             batch_st(batch_st), batch_end(batch_end),
             hidden_st(hidden_st), hidden_end(hidden_end) {}
         
+        void Run();
+    };
+
+    struct MultiThreadRepackWeightsOp : MultiThreadBaseOp {
+        Data **weights;
+        int st, end;      
+
+        MultiThreadRepackWeightsOp (Data **weights, int st, int end) : 
+            weights(weights), st(st), end(end) {}
+
         void Run();
     };
 
@@ -329,6 +339,9 @@ namespace fastllm {
 
     bool LinearBFloat16_FP8E4M3BLOCK128_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end);
+    
+    bool LinearQ8K_GGUF_Kernel(uint8_t *q8kInputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end, DataType AType, DataType BType);
 }
 
 #endif // FASTLLM_COMPUTE_LINEAR_H

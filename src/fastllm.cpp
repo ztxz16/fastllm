@@ -156,6 +156,8 @@ namespace fastllm {
     std::string GetDataTypeName(DataType type) {
         if (dataTypeNames.find(type) != dataTypeNames.end()) {
             return dataTypeNames[type][0];
+        } else if (type >= DataType::DATA_GGUF_FORMAT && type < DataType::DATA_GGUF_FORMAT_END) {
+            return "GGML Type " + std::string(ggml_type_name((ggml_type)((int)type - (int)DataType::DATA_GGUF_FORMAT)));
         } else {
             return "Type " + std::to_string((int)type);
         }
@@ -174,6 +176,9 @@ namespace fastllm {
         } else if (type == DataType::AWQ_4BIT_128) {
             int groups = (columns - 1) / 128 + 1;
             size_t colBytes = columns / 2 + groups + groups * sizeof(float);
+            return rows * colBytes;
+        } else if (type >= DataType::DATA_GGUF_FORMAT && type < DataType::DATA_GGUF_FORMAT_END) {
+            size_t colBytes = ggml_row_size((ggml_type)(type - DataType::DATA_GGUF_FORMAT), columns);
             return rows * colBytes;
         } else {
             ErrorInFastLLM("GetDataBytes failed. " + GetDataTypeName(type) + "\n");
@@ -1752,6 +1757,27 @@ namespace fastllm {
             }
         } else {
             ErrorInFastLLM("CreateFromFastllmFormat error: unsupport version " + std::to_string(version));
+        }
+    }
+
+    DataType Data::GetDataType() {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            return (DataType)((int)DataType::DATA_GGUF_FORMAT + this->ggmlType);
+        } else {
+            return this->dataType;
+        }
+    }
+
+    DataType Data::GetLinearActDataType() {
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            return (DataType)((int)DataType::DATA_GGUF_FORMAT + ggml_type_vec_dot_type((ggml_type)this->ggmlType));
+        } else if (this->dataType == DataType::BFLOAT16 || 
+                    this->dataType == DataType::FP8_E4M3 ||
+                    this->dataType == DataType::FP8_E4M3_BLOCK_128) {
+            return DataType::BFLOAT16;
+        } else {
+            ErrorInFastLLM("GetLinearActDataType failed with type " + GetDataTypeName(this->dataType));
+            return DataType::FLOAT32;
         }
     }
 

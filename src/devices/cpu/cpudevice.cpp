@@ -871,22 +871,6 @@ namespace fastllm {
             std::vector <uint8_t, alignedAllocator<uint8_t, 64> > realInput, expandInput, downInput;
     } fastllmMoeDataManager;
 
-    struct MultiThreadRepackWeightsOp : MultiThreadBaseOp {
-        Data **weights;
-        int st, end;      
-
-        MultiThreadRepackWeightsOp (Data **weights, int st, int end) : 
-            weights(weights), st(st), end(end) {}
-
-        void Run() {
-            for (int i = st; i < end; i++) {
-                if (weights[i] != nullptr) {
-                    weights[i]->Repack();
-                }
-            }
-        }
-    };
-
     void FastllmGemm (int n, int m, int k, 
         const void *A, long lda, // A [n * m], lda = bytes for 1 row in A
         const void *B, long ldb, // B [k * m], ldb = bytes for 1 row in B
@@ -894,7 +878,12 @@ namespace fastllm {
         int st, int end, // calc C[0 : n, st : end]
         DataType AType, DataType BType, DataType CType
     ) {
-        if (AType == DataType::FLOAT32) {
+// printf("into fastllm gemm %s %s %s\n", GetDataTypeName(AType).c_str(), GetDataTypeName(BType).c_str(), GetDataTypeName(CType).c_str());
+        if (AType >= DataType::DATA_GGUF_FORMAT && AType < DataType::DATA_GGUF_FORMAT_END) {
+            if (CType == DataType::FLOAT32) {
+                LinearQ8K_GGUF_Kernel((uint8_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end, AType, BType);
+            }
+        } else if (AType == DataType::FLOAT32) {
             if (CType == DataType::FLOAT32) {
                 if (BType == DataType::FLOAT32) {
                     for (int i = 0; i < n; i++) {
@@ -1086,23 +1075,26 @@ namespace fastllm {
             Float32ToFloat16((float*)floatData, (uint16_t*)dstData, rows * columns);
         } else if (dstDataType == DataType::BFLOAT16) {
             Float32ToBFloat16((float*)floatData, (uint16_t*)dstData, rows * columns);
+        } else if (dstDataType >= DataType::DATA_GGUF_FORMAT && dstDataType < DataType::DATA_GGUF_FORMAT_END) {
+            auto ggmlType = (ggml_type)((int)dstDataType - (int)DataType::DATA_GGUF_FORMAT);
+            size_t rowCount = ggml_row_size(ggmlType, columns);
+            for (int i = 0; i < rows; i++) {
+                iqk_quantize_row_q8_K (
+                        (float*)floatData + i * columns, (uint8_t*)dstData + i * rowCount, columns, 
+                        ggmlType, ggmlType
+                );
+            }
         } else {
-            ErrorInFastLLM("ConvertFromFloat32 failed.\n");
+            ErrorInFastLLM("ConvertFromFloat32 failed with type" + GetDataTypeName(dstDataType));
         }
     }
 
     void MultiThreadConvertFromFloat32Op::Run() {
             // 计算每行的字节大小
-            size_t elementSize = 0;
-            switch (dstDataType) {
-                case DataType::FLOAT16: elementSize = 2; break;
-                case DataType::BFLOAT16: elementSize = 2; break;
-                // 根据实际的DataType枚举添加更多类型
-                default: ErrorInFastLLM("MultiThreadConvertFromFloat32Op error: unsupport dataType.\n");
-            }
+            size_t rowSize = GetDataBytes(dstDataType, 1, columns);
             
             // 调用原始函数处理指定行范围
-            void *dstStart = (char*)dstData + startRow * columns * elementSize;
+            void *dstStart = (char*)dstData + startRow * rowSize;
             const float *srcStart = floatData + startRow * columns;
             size_t rowsToProcess = endRow - startRow;
             
@@ -1269,6 +1261,14 @@ namespace fastllm {
         // 删除原始ops
         for (auto* op : ops) {
             delete op;
+        }
+    }
+
+    void MultiThreadRepackWeightsOp::Run() {
+        for (int i = st; i < end; i++) {
+            if (weights[i] != nullptr) {
+                weights[i]->Repack();
+            }
         }
     }
 
