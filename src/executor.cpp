@@ -27,6 +27,10 @@
 #include "devices/numa/numadevice.h"
 #endif
 
+#ifdef USE_NUMAS
+#include "devices/numas/numasdevice.h"
+#endif
+
 namespace fastllm {
     Executor::Executor() {
         this->devices.clear();
@@ -51,6 +55,10 @@ namespace fastllm {
             }
         } catch (...) {
         }
+#endif
+
+#ifdef USE_NUMAS
+        this->devices.push_back((BaseDevice*) new NumasDevice());
 #endif
         this->devices.push_back((BaseDevice*) new CpuDevice());
     }

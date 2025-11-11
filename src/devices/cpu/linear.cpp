@@ -25,6 +25,7 @@ namespace fastllm {
     extern CPUInstructInfo cpuInstructInfo;
     extern FP16ToFP32Manager fp16tofp32;
     extern BF16ToFP32Manager bf16tofp32;
+    extern FP8E4M3ToFP32Manager fp8e4m3tofp32;
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
     extern void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
@@ -36,6 +37,96 @@ namespace fastllm {
 #ifdef __AVX2__
     extern int DotU4U8(uint8_t *a, uint8_t *b, int n);
 #endif
+
+    CPUInstructInfo *GetCPUInstructInfo() {
+        return &cpuInstructInfo;
+    }
+
+    void AddBias(float *outputData, float *biasData, int n, int k, int st, int end) {
+        if (biasData) {
+            for (int i = 0; i < n; i++) {
+                for (int j = st; j < end; j++) {
+                    outputData[i * k + j] += biasData[j];
+                }
+            }
+        }
+    }
+
+    bool LinearBFloat16_FP8E4M3BLOCK128_Base_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+        static int block_size = 128;
+        size_t perRow = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, m);
+        
+        // 计算总共有多少个完整的block和最后一个不完整block的大小
+        int num_blocks = (m + block_size - 1) / block_size;
+        int last_block_size = (m % block_size == 0) ? block_size : (m % block_size);
+        
+        for (int i = 0; i < n; i++) {
+            uint16_t *bf16A = inputData + i * m;
+            float *floatC = outputData + i * k;
+                            
+            for (int j = st; j < end; j++) {
+                uint8_t *rowStart = (uint8_t*)weightData + j * perRow;
+                float sum = 0.0f;
+                
+                // 按block进行处理
+                for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
+                    // 计算当前block的大小（最后一个block可能不完整）
+                    int current_block_size = (block_idx == num_blocks - 1) ? last_block_size : block_size;
+                    
+                    // 计算当前block的起始位置
+                    // 每个block占用 128字节(fp8) + 4字节(float scale)
+                    uint8_t *block_start = rowStart + block_idx * (block_size + sizeof(float));
+                    uint8_t *fp8_ptr = block_start;
+                    float *scale_ptr = (float*)(block_start + block_size);
+                    
+                    // 先计算block内的点积，最后再乘以scale
+                    float block_sum = 0.0f;
+                    int base_idx = block_idx * block_size;
+                    
+                    for (int l = 0; l < current_block_size; l++) {
+                        // 将bf16的A转换为fp32
+                        float valA = bf16tofp32.dict[bf16A[base_idx + l]];
+                        
+                        // 将fp8的B转换为fp32
+                        float valB = fp8e4m3tofp32.dict[fp8_ptr[l]];
+                        
+                        block_sum += valA * valB;
+                    }
+                    
+                    // 整个block的结果乘以scale
+                    sum += block_sum * (*scale_ptr);
+                }
+                
+                floatC[j] = sum;
+            }
+        }
+        AddBias(outputData, biasData, n, k, st, end);
+        return true;
+    }
+    
+    extern bool LinearBFloat16_FP8E4M3BLOCK128_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+    bool LinearBFloat16_FP8E4M3BLOCK128_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+        if (GetCPUInstructInfo()->hasAVX512BF16) {
+            return LinearBFloat16_FP8E4M3BLOCK128_AVX512BF16_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        } else { 
+            return LinearBFloat16_FP8E4M3BLOCK128_Base_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        }
+
+        /*
+        if (GetCPUInstructInfo()->hasAVX512BF16) {
+            return LinearBFloat16_FP8E4M3BLOCK128_AVX512BF16_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        } else if (GetCPUInstructInfo()->hasAVX2) {
+            return LinearBFloat16_FP8E4M3BLOCK128_AVX2_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        } else {
+            return LinearBFloat16_FP8E4M3BLOCK128_Base_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        }
+        */
+
+        return false;
+    }
 
     void MultiThreadLinearFloat32Float32Op::Run() {
         for (int i = 0; i < n; i++) {
