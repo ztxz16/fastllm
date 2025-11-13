@@ -107,10 +107,14 @@ namespace fastllm {
     
     extern bool LinearBFloat16_FP8E4M3BLOCK128_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end);
+    extern bool LinearBFloat16_FP8E4M3BLOCK128_AVX2_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
     bool LinearBFloat16_FP8E4M3BLOCK128_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
         if (GetCPUInstructInfo()->hasAVX512BF16) {
             return LinearBFloat16_FP8E4M3BLOCK128_AVX512BF16_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        } if (GetCPUInstructInfo()->hasAVX2) {
+            return LinearBFloat16_FP8E4M3BLOCK128_AVX2_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
         } else { 
             return LinearBFloat16_FP8E4M3BLOCK128_Base_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
         }
@@ -126,6 +130,60 @@ namespace fastllm {
         */
 
         return false;
+    }
+
+    bool LinearINT8PERCHANNEL_INT4PERCHANNEL_Base_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+        size_t lda = GetDataBytes(DataType::INF_INT8_PERCHANNEL, 1, m);
+        size_t ldb = GetDataBytes(DataType::INT4_PERCHANNEL, 1, m);
+        size_t ldc = GetDataBytes(DataType::FLOAT32, 1, k);
+        
+        for (int i = 0; i < n; i++) {
+            // A矩阵的第i行，InfInt8PerChannel格式
+            uint8_t *infInt8A = (uint8_t*)inputData + i * lda;
+            int8_t *quantizedA = (int8_t*)infInt8A;
+            float scaleA = *(float*)(infInt8A + m);
+            int sumA = *(int*)(infInt8A + m + sizeof(float));
+            
+            float *floatC = (float*)((uint8_t*)outputData + i * ldc);
+            
+            for (int j = st; j < end; j++) {
+                // B矩阵的第j行，INT4_PERCHANNEL格式
+                uint8_t *int4B = (uint8_t*)weightData + j * ldb;
+                float minB = *(float*)(int4B + (m + 1) / 2);
+                float scaleB = *(float*)(int4B + (m + 1) / 2 + sizeof(float));
+                
+                int sum = 0;
+                // 一次处理两个int4值（假设m是偶数）
+                for (int l = 0; l < m; l += 2) {
+                    uint8_t packedValue = int4B[l / 2];
+                    // 提取高4位和低4位
+                    uint8_t int4Value0 = (packedValue >> 4) & 0x0F;  // 第一个int4
+                    uint8_t int4Value1 = packedValue & 0x0F;         // 第二个int4
+                    
+                    // 同时计算两个乘积并累加
+                    sum += quantizedA[l] * int4Value0 + quantizedA[l + 1] * int4Value1;
+                }
+                
+                floatC[j] = sum * scaleA * scaleB + minB * scaleA * sumA;
+            }
+        }
+        AddBias(outputData, biasData, n, k, st, end);
+        return true;
+    }
+    extern bool LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX512VNNI_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+    extern bool LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX2_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+    bool LinearINT8PERCHANNEL_INT4PERCHANNEL_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+        if (GetCPUInstructInfo()->hasAVX512VNNI) {
+            return LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX512VNNI_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        } else if (GetCPUInstructInfo()->hasAVX2) {
+            return LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX2_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        } else { 
+            return LinearINT8PERCHANNEL_INT4PERCHANNEL_Base_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        }
     }
 
     void MultiThreadLinearFloat32Float32Op::Run() {
@@ -289,10 +347,19 @@ namespace fastllm {
 
     extern bool LinearFloat32Float16_AVX512F_Kernel(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end);
+    extern bool LinearFloat32Float16_AVX2_Kernel(float *inputData, uint16_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
 
     void MultiThreadLinearFloat32Float16Op::Run() {
-        if (cpuInstructInfo.hasAVX512BF16) {
+        if (cpuInstructInfo.hasAVX512F) {
             if (LinearFloat32Float16_AVX512F_Kernel(
+                inputData, weightData, biasData, outputData, n, m, k, st, end
+                )) {
+                return;
+            }
+        }
+        if (cpuInstructInfo.hasAVX2 && n > 1) {
+            if (LinearFloat32Float16_AVX2_Kernel(
                 inputData, weightData, biasData, outputData, n, m, k, st, end
                 )) {
                 return;
@@ -341,10 +408,20 @@ namespace fastllm {
 
     extern bool LinearBFloat16BFloat16_AVX512BF16_Kernel(uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end);
+    extern bool LinearBFloat16BFloat16_AVX2_Kernel(uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
 
     void MultiThreadLinearBFloat16BFloat16Op::Run() {
         if (cpuInstructInfo.hasAVX512BF16) {
             if (LinearBFloat16BFloat16_AVX512BF16_Kernel(
+                inputData, weightData, biasData, outputData, n, m, k, st, end
+                )) {
+                return;
+            }
+        }
+
+        if (cpuInstructInfo.hasAVX2) {
+            if (LinearBFloat16BFloat16_AVX2_Kernel(
                 inputData, weightData, biasData, outputData, n, m, k, st, end
                 )) {
                 return;
