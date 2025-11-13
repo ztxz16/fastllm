@@ -492,6 +492,133 @@ namespace fastllm {
 #endif
     }
 
+    bool LinearBFloat16_FP8E4M3PERCHANNEL_AVX2_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+#ifdef __AVX2__
+        static int block_size = m;
+        size_t perRow = GetDataBytes(DataType::FP8_E4M3_PERCHANNEL, 1, m);
+        float magicScale = pow(2, 120);
+        
+        for (int i = 0; i < n; i++) {
+            uint16_t *bf16A = inputData + i * m;
+            float *floatC = outputData + i * k;
+            int j = st;
+            __m128i v_a_mask_byte = _mm_set1_epi8(0x80); 
+            __m128i v_b_mask_byte = _mm_set1_epi8(0x7F); 
+            
+            for (; j < end; j++) {
+                float now = 0.0f;
+                __m256 last_sum = _mm256_setzero_ps(); // Accumulator for 8 parallel sums
+                // 获取当前行的起始位置
+                uint8_t *rowData = (uint8_t*)weightData + j * perRow;
+                    
+                // 获取当前block的FP8数据和scale
+                uint8_t *fp8B = rowData;
+                    
+                // 计算当前block处理的元素范围
+                int blockStart = 0;
+                int blockEnd = m;
+                    
+                __m256 v_sum = _mm256_setzero_ps(); // Accumulator for 8 parallel sums
+                    
+                // 处理当前block内的数据
+                int l = blockStart;
+                for (; l + 15 < blockEnd; l += 16) {
+                    // 1. Load 16 BF16 inputs and convert to float
+                    __m256i v_input_bf16 = _mm256_loadu_si256((__m256i const*)(bf16A + l));
+                        
+                    // Convert BF16 to float32 (shift left by 16 bits)
+                    __m128i v_input_low = _mm256_extracti128_si256(v_input_bf16, 0);
+                    __m128i v_input_high = _mm256_extracti128_si256(v_input_bf16, 1);
+                        
+                    // Process low 8 BF16 values
+                    __m256i v_input_low_32 = _mm256_cvtepu16_epi32(v_input_low);
+                    __m256i v_input_low_shifted = _mm256_slli_epi32(v_input_low_32, 16);
+                    __m256 v_input_float_low = _mm256_castsi256_ps(v_input_low_shifted);
+                    
+                    // Process high 8 BF16 values
+                    __m256i v_input_high_32 = _mm256_cvtepu16_epi32(v_input_high);
+                    __m256i v_input_high_shifted = _mm256_slli_epi32(v_input_high_32, 16);
+                    __m256 v_input_float_high = _mm256_castsi256_ps(v_input_high_shifted);
+                        
+                    // 2. Load 16 FP8 weights from current block
+                    __m128i va_bytes = _mm_loadu_si128((__m128i*)(fp8B + (l - blockStart)));
+                        
+                    // Extract sign and mantissa for FP8 conversion
+                    __m128i va_masked_bytes = _mm_and_si128(va_bytes, v_a_mask_byte);
+                    __m128i vb_masked_bytes = _mm_and_si128(va_bytes, v_b_mask_byte);
+                        
+                    // Convert to 16-bit for BF16 format
+                    // Low 8 bytes
+                    __m128i va_low_bytes = _mm_unpacklo_epi8(va_masked_bytes, _mm_setzero_si128());
+                    __m128i vb_low_bytes = _mm_unpacklo_epi8(vb_masked_bytes, _mm_setzero_si128());
+                    __m128i v_a_term_low = _mm_slli_epi16(va_low_bytes, 8);
+                    __m128i v_b_term_low = _mm_slli_epi16(vb_low_bytes, 4);
+                    __m128i v_result_low = _mm_or_si128(v_a_term_low, v_b_term_low);
+                        
+                    // High 8 bytes
+                    __m128i va_high_bytes = _mm_unpackhi_epi8(va_masked_bytes, _mm_setzero_si128());
+                    __m128i vb_high_bytes = _mm_unpackhi_epi8(vb_masked_bytes, _mm_setzero_si128());
+                    __m128i v_a_term_high = _mm_slli_epi16(va_high_bytes, 8);
+                    __m128i v_b_term_high = _mm_slli_epi16(vb_high_bytes, 4);
+                    __m128i v_result_high = _mm_or_si128(v_a_term_high, v_b_term_high);
+                        
+                    // Convert BF16 weights to float32
+                    __m256i v_weight_low_32 = _mm256_cvtepu16_epi32(v_result_low);
+                    __m256i v_weight_low_shifted = _mm256_slli_epi32(v_weight_low_32, 16);
+                    __m256 v_weight_float_low = _mm256_castsi256_ps(v_weight_low_shifted);
+                    
+                    __m256i v_weight_high_32 = _mm256_cvtepu16_epi32(v_result_high);
+                    __m256i v_weight_high_shifted = _mm256_slli_epi32(v_weight_high_32, 16);
+                    __m256 v_weight_float_high = _mm256_castsi256_ps(v_weight_high_shifted);
+                    
+                    // 3. Compute dot product: multiply and accumulate
+                    __m256 v_mul_low = _mm256_mul_ps(v_input_float_low, v_weight_float_low);
+                    __m256 v_mul_high = _mm256_mul_ps(v_input_float_high, v_weight_float_high);
+                        
+                    v_sum = _mm256_add_ps(v_sum, v_mul_low);
+                    v_sum = _mm256_add_ps(v_sum, v_mul_high);
+            }
+                    
+            // 处理剩余的元素（标量处理）
+            for (; l < blockEnd; l++) {
+                    // Convert BF16 input to float
+                    uint32_t input_val = ((uint32_t)bf16A[l]) << 16;
+                    float input_float = *((float*)&input_val);
+                    
+                    // Convert FP8 weight to BF16 then to float
+                    uint8_t fp8_val = fp8B[l - blockStart];
+                    uint16_t sign_and_exp = (fp8_val & 0x80) << 8;
+                    uint16_t mantissa = (fp8_val & 0x7F) << 4;
+                    uint16_t bf16_val = sign_and_exp | mantissa;
+                    uint32_t weight_val = ((uint32_t)bf16_val) << 16;
+                    float weight_float = *((float*)&weight_val);
+                        
+                    // Accumulate
+                    now += input_float * weight_float;
+            }
+                    
+            float curScale = *(float*)(fp8B + m);  // scale在128个FP8之后
+            __m256 vScale = _mm256_set1_ps(curScale);
+            last_sum = _mm256_fmadd_ps(v_sum, vScale, last_sum);
+                
+            // Horizontal sum of last_sum
+            __m128 sum_low = _mm256_extractf128_ps(last_sum, 0);
+            __m128 sum_high = _mm256_extractf128_ps(last_sum, 1);
+            __m128 sum_128 = _mm_add_ps(sum_low, sum_high);
+            sum_128 = _mm_hadd_ps(sum_128, sum_128);
+            sum_128 = _mm_hadd_ps(sum_128, sum_128);
+                
+            now += _mm_cvtss_f32(sum_128) * magicScale;
+            floatC[j] = now;
+        }
+    }
+    return true;
+#else
+    return false;
+#endif
+    }
+
 #ifdef __AVX2__
     void print_m256i_epi16_v2(const char* name, __m256i vec) {
         int16_t values[16] __attribute__((aligned(32)));

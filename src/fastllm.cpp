@@ -171,6 +171,8 @@ namespace fastllm {
         } else if (type == DataType::FP8_E4M3_BLOCK_128) {
             // columns * [fp8] + ((columns - 1) / 128 + 1) * [float]
             return rows * (columns + ((columns - 1) / 128 + 1) * sizeof(float));
+        } else if (type == DataType::FP8_E4M3_PERCHANNEL) {
+            return rows * (columns + sizeof(float));
         } else if (type == DataType::FP8_E4M3) {
             return rows * columns * sizeof(uint8_t);
         } else if (type == DataType::INT4_PERCHANNEL) {
@@ -1782,7 +1784,8 @@ namespace fastllm {
             return DataType::INF_INT8_PERCHANNEL;
         } else if (this->dataType == DataType::BFLOAT16 || 
                     this->dataType == DataType::FP8_E4M3 ||
-                    this->dataType == DataType::FP8_E4M3_BLOCK_128) {
+                    this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                    this->dataType == DataType::FP8_E4M3_PERCHANNEL) {
             return DataType::BFLOAT16;
         } else {
             ErrorInFastLLM("GetLinearActDataType failed with type " + GetDataTypeName(this->dataType));

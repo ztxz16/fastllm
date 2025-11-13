@@ -118,17 +118,56 @@ namespace fastllm {
         } else { 
             return LinearBFloat16_FP8E4M3BLOCK128_Base_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
         }
+        return false;
+    }
 
-        /*
-        if (GetCPUInstructInfo()->hasAVX512BF16) {
-            return LinearBFloat16_FP8E4M3BLOCK128_AVX512BF16_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
-        } else if (GetCPUInstructInfo()->hasAVX2) {
-            return LinearBFloat16_FP8E4M3BLOCK128_AVX2_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
-        } else {
-            return LinearBFloat16_FP8E4M3BLOCK128_Base_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+    bool LinearBFloat16_FP8E4M3PERCHANNEL_Base_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+        size_t perRow = GetDataBytes(DataType::FP8_E4M3_PERCHANNEL, 1, m);
+        for (int i = 0; i < n; i++) {
+            uint16_t *bf16A = inputData + i * m;
+            float *floatC = outputData + i * k;
+                            
+            for (int j = st; j < end; j++) {
+                uint8_t *rowStart = (uint8_t*)weightData + j * perRow;
+                float sum = 0.0f;
+                
+                uint8_t *block_start = rowStart;
+                uint8_t *fp8_ptr = block_start;
+                float *scale_ptr = (float*)(block_start + m);
+                                
+                float block_sum = 0.0f;
+                for (int l = 0; l < m; l++) {
+                    // 将bf16的A转换为fp32
+                    float valA = bf16tofp32.dict[bf16A[l]];
+                        
+                    // 将fp8的B转换为fp32
+                    float valB = fp8e4m3tofp32.dict[fp8_ptr[l]];
+                        
+                    block_sum += valA * valB;
+                }
+                    
+                sum += block_sum * (*scale_ptr);
+                floatC[j] = sum;
+            }
         }
-        */
-
+        AddBias(outputData, biasData, n, k, st, end);
+        return true;
+    }
+    
+    extern bool LinearBFloat16_FP8E4M3PERCHANNEL_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+    extern bool LinearBFloat16_FP8E4M3PERCHANNEL_AVX2_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+    bool LinearBFloat16_FP8E4M3PERCHANNEL_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+        if (GetCPUInstructInfo()->hasAVX512BF16) {
+            return LinearBFloat16_FP8E4M3PERCHANNEL_AVX512BF16_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        } if (GetCPUInstructInfo()->hasAVX2) {
+            return LinearBFloat16_FP8E4M3PERCHANNEL_AVX2_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        } else { 
+            return LinearBFloat16_FP8E4M3PERCHANNEL_Base_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        }
         return false;
     }
 
