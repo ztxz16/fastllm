@@ -2,6 +2,10 @@
 
 | [快速开始](#快速开始) | [部署DeepSeek](docs/deepseek.md) | [部署Qwen3](docs/qwen3.md) | [版本日志](docs/version.md) | [English Document](README_EN.md)
 
+# 引用说明
+
+本项目参考了许多开源项目的代码和相关文章，具体请参考 [参考代码和文章](#参考代码和文章)
+
 ## 介绍
 
 fastllm是c++实现自有算子替代Pytorch的高性能全功能大模型推理库，可以推理Qwen, Llama, Phi等稠密模型，以及DeepSeek, Qwen-moe等moe模型
@@ -398,3 +402,39 @@ bash install.sh -DUSE_CUDA=ON -D CMAKE_CUDA_COMPILER=$(which nvcc) # 编译GPU�
 [ROCm平台](docs/rocm.md)
 
 编译中遇到问题可参考 [FAQ文档](docs/faq.md)
+
+## 参考代码和文章
+
+### 大量NN底层算子的实现思路
+
+[pytorch](https://github.com/pytorch/pytorch)
+
+### 大量LLM具体的模型实现
+
+[transfomers](https://github.com/huggingface/transformers)
+
+### GGML中的一些量化方法、以及计算Kernel
+
+[llama.cpp](https://github.com/ggml-org/llama.cpp)
+
+[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)
+
+### MOE算子线程不平衡时动态调度的思路
+
+[KTransformers 0.3 思路介绍](https://zhuanlan.zhihu.com/p/1900318746402329329)
+
+[KT中关于线程调度的相关代码](https://github.com/kvcache-ai/ktransformers/blob/main/csrc/ktransformers_ext/cpu_backend/backend.cpp)
+
+### 基于numa改进的MOE动态调度算子
+
+[lvllm中的实现](https://github.com/guqiong96/Lvllm/blob/main/csrc/lk/moe.cpp)
+
+### Function call解析相关的代码
+
+[vllm中的实现](https://github.com/vllm-project/vllm/tree/main/vllm/entrypoints/openai/tool_parsers)
+
+### json的构造和解析
+
+[json11](https://github.com/dropbox/json11)
+
+感谢大佬对开源社区的贡献！如发现未标明的引用代码可在issue中提出
