@@ -173,9 +173,14 @@ namespace fastllm {
             return rows * (columns + ((columns - 1) / 128 + 1) * sizeof(float));
         } else if (type == DataType::FP8_E4M3) {
             return rows * columns * sizeof(uint8_t);
+        } else if (type == DataType::INT4_PERCHANNEL) {
+            return rows * (columns / 2 + 2 * sizeof(float));
         } else if (type == DataType::AWQ_4BIT_128) {
             int groups = (columns - 1) / 128 + 1;
             size_t colBytes = columns / 2 + groups + groups * sizeof(float);
+            return rows * colBytes;
+        } else if (type == DataType::INF_INT8_PERCHANNEL) {
+            size_t colBytes = columns + sizeof(float) + sizeof(int); // [int8 values] + scale + sum
             return rows * colBytes;
         } else if (type >= DataType::DATA_GGUF_FORMAT && type < DataType::DATA_GGUF_FORMAT_END) {
             size_t colBytes = ggml_row_size((ggml_type)(type - DataType::DATA_GGUF_FORMAT), columns);
@@ -1773,6 +1778,8 @@ namespace fastllm {
             return (DataType)((int)DataType::DATA_GGUF_FORMAT + ggml_type_vec_dot_type((ggml_type)this->ggmlType));
         } else if (this->dataType == DataType::FLOAT16) {
             return DataType::FLOAT32;
+        } else if (this->dataType == DataType::INT4_PERCHANNEL) {
+            return DataType::INF_INT8_PERCHANNEL;
         } else if (this->dataType == DataType::BFLOAT16 || 
                     this->dataType == DataType::FP8_E4M3 ||
                     this->dataType == DataType::FP8_E4M3_BLOCK_128) {

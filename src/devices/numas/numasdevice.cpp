@@ -26,6 +26,8 @@
 #include "numas.h"
 
 namespace fastllm {
+    extern CPUInstructInfo *GetCPUInstructInfo();
+
     static MachineNumaInfo machineNumaInfo;
     NumaConfig *fastllmNumaConfig = nullptr;
     std::mutex numaConfigLocker;
@@ -116,6 +118,96 @@ namespace fastllm {
         }
     }
 
+    void Int4ToFastllmInt4PerchannelRow(uint8_t *newWeight, uint8_t *oldWeight, int m) {
+        if (GetCPUInstructInfo()->hasAVX512VNNI) {
+            uint8_t *temp = new uint8_t[64];
+            uint8_t *repack = new uint8_t[64];
+            for (int i = 0; i < m; i += 64) {
+                int len = std::min(m - i, 64);
+                if (len == 64) {
+                    for (int k = 0; k < 32; k++) {
+                        temp[k * 2] = oldWeight[i / 2 + k] >> 4;
+                        temp[k * 2 + 1] = oldWeight[i / 2 + k] & 0xF;
+                    }
+                            
+                    for (int k = 0; k < 32; k++) {
+                        repack[k * 2 + 1] = temp[k];
+                        repack[k * 2] = temp[k + 32];
+                    }
+
+                    for (int k = 0; k < 32; k++) {
+                        newWeight[i / 2 + k] = (repack[k * 2] << 4) + (repack[k * 2 + 1]);
+                    }
+                } else {
+                    memcpy(newWeight + i / 2, oldWeight + i / 2, len / 2);
+                }
+            }
+            delete[] temp;
+            delete[] repack;
+        } else if (GetCPUInstructInfo()->hasAVX2) {
+            uint8_t *temp = new uint8_t[32];
+            uint8_t *repack = new uint8_t[32];
+            for (int i = 0; i < m; i += 32) {
+                int len = std::min(m - i, 32);
+                if (len == 32) {
+                    for (int k = 0; k < 16; k++) {
+                        temp[k * 2] = oldWeight[i / 2 + k] >> 4;
+                        temp[k * 2 + 1] = oldWeight[i / 2 + k] & 0xF;
+                    }
+                            
+                    for (int k = 0; k < 16; k++) {
+                        repack[k * 2 + 1] = temp[k];
+                        repack[k * 2] = temp[k + 16];
+                    }
+
+                    for (int k = 0; k < 16; k++) {
+                        newWeight[i / 2 + k] = (repack[k * 2] << 4) + (repack[k * 2 + 1]);
+                    }
+                } else {
+                    memcpy(newWeight + i / 2, oldWeight + i / 2, len / 2);
+                }
+            }
+            delete[] temp;
+            delete[] repack;
+        } else {
+            memcpy(newWeight, oldWeight, m / 2);
+        }
+    }
+
+    void Int4ToFastllmInt4PerchannelPacked(int experts, int n, int m, uint8_t *qweight, float *mins, float *scales, std::vector <uint8_t> &int4Packed) {
+        // 每行需要的字节数：m个uint4需要m/2个uint8，加上一个min和一个scale
+        int int4BytesPerRow = m / 2;  // m是偶数，所以直接除以2
+        int rowSize = int4BytesPerRow + sizeof(float) * 2;  // m/2个uint8 + 1个min + 1个scale
+        
+        // 调整输出vector大小
+        int4Packed.resize((size_t)experts * n * rowSize);
+        
+        for (size_t i = 0; i < experts; i++) {
+            for (size_t j = 0; j < n; j++) {
+                size_t rowIdx = i * n + j;
+                size_t packedOffset = rowIdx * rowSize;
+                
+                size_t currentPos = packedOffset;
+                
+                // 直接使用当前行的int4数据
+                size_t srcOffset = i * n * int4BytesPerRow + j * int4BytesPerRow;
+                Int4ToFastllmInt4PerchannelRow(&int4Packed[currentPos], &qweight[srcOffset], m);
+                currentPos += int4BytesPerRow;
+                
+                // 添加当前行的min值
+                float* minPtr = (float*)(&int4Packed[currentPos]);
+                *minPtr = mins[rowIdx];
+                currentPos += sizeof(float);
+                
+                // 添加当前行的scale值
+                float* scalePtr = (float*)(&int4Packed[currentPos]);
+                *scalePtr = scales[rowIdx];
+                currentPos += sizeof(float);
+            }
+        }
+    }
+
+
     struct FastllmMoeDataManagerNumas {
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
             std::vector <uint8_t, alignedAllocator<uint8_t, 64> > realInput, expandInput, downInput;
@@ -155,6 +247,16 @@ namespace fastllm {
                 for (int i = 0; i < numaConfig->numaCnt; i++) {
                     data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
                     memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                }
+            } else if (data->dataType == DataType::INT4_NOZERO) {
+                std::vector <uint8_t> int4Packed;
+                Int4ToFastllmInt4PerchannelPacked(1, k, m, (uint8_t*)data->cpuData, data->mins.data(), data->scales.data(), int4Packed);
+                data->dataType = DataType::INT4_PERCHANNEL;
+
+                size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
+                for (int i = 0; i < numaConfig->numaCnt; i++) {
+                    data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
+                    memcpy(data->numasData[i], int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
                 }
             } else if (data->dataType == DataType::DATA_GGUF_FORMAT) {
                 size_t bytesPerRow = GetDataBytes((DataType)((int)data->dataType + data->ggmlType), 1, m);
