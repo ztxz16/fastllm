@@ -337,6 +337,8 @@ namespace fastllm {
 
     void MatMulInt8Int8(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k, int kstride);
 
+    bool LinearBFloat16_FP8E4M3PERCHANNEL_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
     bool LinearBFloat16_FP8E4M3BLOCK128_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end);
     bool LinearINT8PERCHANNEL_INT4PERCHANNEL_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,

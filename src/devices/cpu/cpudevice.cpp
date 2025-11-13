@@ -984,6 +984,52 @@ namespace fastllm {
                         LinearBFloat16_FP8E4M3BLOCK128_Kernel((uint16_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
                         finish = true;
                     }
+                } else if (BType == FP8_E4M3_PERCHANNEL) {
+                    // A是BFLOAT16, B是FP8_E4M3_PERCHANNEL格式（fp8数据+scale）, C是FLOAT32
+                    // 为需要计算的行分配临时bf16缓冲区
+                    if (n > 31) {
+                        std::vector<uint16_t> bf16B_temp((end - st) * m);
+                        // 转换fp8到bf16，仅转换需要计算的行[st:end]
+                        int block_size = m;
+                        int num_blocks = (m + block_size - 1) / block_size;
+                        int last_block_size = (m % block_size == 0) ? block_size : (m % block_size);
+                        for (int j = st; j < end; j++) {
+                            uint8_t *rowStart = (uint8_t*)B + j * ldb;  // ldb应该是每行的总字节数
+                            uint16_t *bf16B_row = bf16B_temp.data() + (j - st) * m;
+                            
+                            // 按block进行处理
+                            for (int block_idx = 0; block_idx < num_blocks; block_idx++) {
+                                // 计算当前block的大小（最后一个block可能不完整）
+                                int current_block_size = (block_idx == num_blocks - 1) ? last_block_size : block_size;
+                                
+                                // 计算当前block的起始位置
+                                // 每个block占用 128字节(fp8) + 4字节(float scale)
+                                uint8_t *block_start = rowStart + block_idx * (block_size + sizeof(float));
+                                uint8_t *fp8_ptr = block_start;
+                                float *scale_ptr = (float*)(block_start + block_size);
+                                
+                                // 转换当前block中的每个fp8到bf16
+                                int base_idx = block_idx * block_size;
+                                for (int l = 0; l < current_block_size; l++) {
+                                    // fp8转fp32并乘以scale
+                                    float fp32_val = fp8e4m3tofp32.dict[fp8_ptr[l]] * (*scale_ptr);
+                                    
+                                    // fp32转bf16
+                                    uint32_t val;
+                                    memcpy(&val, &fp32_val, sizeof(val));
+                                    bf16B_row[base_idx + l] = (uint16_t)(val >> 16);
+                                }
+                            }
+                        }
+
+                        MultiThreadLinearBFloat16BFloat16Op (
+                            (uint16_t*)A, bf16B_temp.data(), nullptr, ((float*)C) + st, n, m, ldc / sizeof(float), 0, end - st
+                        ).Run();
+                        finish = true;
+                    } else {
+                        LinearBFloat16_FP8E4M3PERCHANNEL_Kernel((uint16_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
+                        finish = true;
+                    }
                 } else if (BType == AWQ_4BIT_128) {
                     // A是BFLOAT16, B是AWQ_4BIT_128格式（uint4权重+zero+scale）, C是FLOAT32
                     // 为需要计算的行分配临时bf16缓冲区
