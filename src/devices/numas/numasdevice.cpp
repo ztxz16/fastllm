@@ -118,6 +118,48 @@ namespace fastllm {
         }
     }
 
+    void Fp8PerchannelToFastllmFP8_E4M3_BLOCK128(int experts, int k, int m, uint8_t *fp8, float *scales, int blockK, int blockM, std::vector <uint8_t> &fp8Packed) {
+        int ks = (k - 1) / blockK + 1;
+        int ms = (m - 1) / blockM + 1;
+        
+        // 计算每行需要的总字节数
+        // 每128个fp8需要1个float的scale，所以需要 (m + 127) / 128 个scale
+        int numScalesPerRow = (m + 127) / 128;
+        int rowSize = m + numScalesPerRow * sizeof(float);
+        fp8Packed.resize((size_t)experts * k * rowSize);
+        for (size_t i = 0; i < experts; i++) {
+            for (size_t j = 0; j < k; j++) {
+                size_t rowIdx = i * k + j;
+                size_t packedOffset = rowIdx * rowSize;
+                
+                // 按照每128个fp8后接一个scale的格式打包
+                size_t currentPos = packedOffset;
+                
+                for (int blockIdx = 0; blockIdx < numScalesPerRow; blockIdx++) {
+                    size_t blockStart = blockIdx * 128;
+                    size_t blockEnd = std::min(blockStart + 128, (size_t)m);
+                    size_t blockSize = blockEnd - blockStart;
+                    
+                    // 复制当前block的fp8数据
+                    for (size_t l = blockStart; l < blockEnd; l++) {
+                        size_t srcIdx = i * k * m + j * m + l;
+                        fp8Packed[currentPos++] = fp8[srcIdx];
+                    }
+                    
+                    // 在这个block后面添加对应的scale
+                    // scale的索引计算：需要根据当前block在整个矩阵中的位置
+                    size_t scaleRow = j / blockK;  // 当前行属于哪个scale行块
+                    size_t scaleCol = blockStart / blockM;  // 当前block属于哪个scale列块
+                    size_t scaleIdx = i * ks * ms + scaleRow * ms + scaleCol;
+                    
+                    float* scalePtr = (float*)(&fp8Packed[currentPos]);
+                    *scalePtr = scales[scaleIdx];
+                    currentPos += sizeof(float);
+                }
+            }
+        }
+    }
+
     void Int4ToFastllmInt4PerchannelRow(uint8_t *newWeight, uint8_t *oldWeight, int m) {
         if (GetCPUInstructInfo()->hasAVX512VNNI) {
             uint8_t *temp = new uint8_t[64];
@@ -239,6 +281,9 @@ namespace fastllm {
                 if (data->blockM == 128) {
                     data->dataType = DataType::FP8_E4M3_BLOCK_128;
                     Fp8ToFastllmFP8_E4M3_BLOCK128(1, k, m, (uint8_t*)data->cpuData, data->scales.data(), data->blockK, data->blockM, fp8Packed);
+                } else if (data->blockM == m) {
+                    data->dataType = DataType::FP8_E4M3_BLOCK_128;
+                    Fp8PerchannelToFastllmFP8_E4M3_BLOCK128(1, k, m, (uint8_t*)data->cpuData, data->scales.data(), data->blockK, data->blockM, fp8Packed);
                 } else {
                     ErrorInFastLLM("RegisterNumas can't support fp8 with blockM = " + std::to_string(data->blockM));    
                 }
