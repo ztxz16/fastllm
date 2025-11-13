@@ -109,10 +109,19 @@ namespace fastllm {
             vSum = _mm256_add_epi32(vSum, vQuantized);
             
             // 打包成int8并存储
-            // 需要将两个__m256i（每个包含8个int32）打包成16个int8
-            // 但这里我们只有8个值，所以需要特殊处理
-            __m128i vPacked = _mm256_cvtsepi32_epi8(vQuantized);
-            _mm_storel_epi64((__m128i*)&quantizedData[i], vPacked);
+            // AVX2方法：将8个int32打包成8个int8
+            // 首先提取低128位和高128位
+            __m128i vLow = _mm256_castsi256_si128(vQuantized);
+            __m128i vHigh = _mm256_extracti128_si256(vQuantized, 1);
+            
+            // 将两个__m128i（各含4个int32）打包成一个__m128i（含8个int16）
+            __m128i vPacked16 = _mm_packs_epi32(vLow, vHigh);
+            
+            // 将int16打包成int8（由于我们已经限制在[-127,127]范围内，所以不会溢出）
+            __m128i vPacked8 = _mm_packs_epi16(vPacked16, _mm_setzero_si128());
+            
+            // 存储8个int8
+            _mm_storel_epi64((__m128i*)&quantizedData[i], vPacked8);
         }
         
         // 水平求和
