@@ -878,11 +878,20 @@ namespace fastllm {
         int st, int end, // calc C[0 : n, st : end]
         DataType AType, DataType BType, DataType CType
     ) {
+        bool finish = false;
 // printf("into fastllm gemm %s %s %s\n", GetDataTypeName(AType).c_str(), GetDataTypeName(BType).c_str(), GetDataTypeName(CType).c_str());
         if (AType >= DataType::DATA_GGUF_FORMAT && AType < DataType::DATA_GGUF_FORMAT_END) {
             if (CType == DataType::FLOAT32) {
                 LinearQ8K_GGUF_Kernel((uint8_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end, AType, BType);
+                finish = true;
             }
+        } else if (AType == DataType::INF_INT8_PERCHANNEL) {
+        	if (CType == DataType::FLOAT32) {
+        		if (BType == DataType::INT4_PERCHANNEL) {
+                    LinearINT8PERCHANNEL_INT4PERCHANNEL_Kernel((uint8_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
+                    finish = true;
+        		}
+        	}
         } else if (AType == DataType::FLOAT32) {
             if (CType == DataType::FLOAT32) {
                 if (BType == DataType::FLOAT32) {
@@ -898,6 +907,7 @@ namespace fastllm {
                             floatC[j] = sum;
                         }
                     }
+                    finish = true;
                 } else if (BType == DataType::BFLOAT16) {
                     for (int i = 0; i < n; i++) {
                         float *floatA = (float*)((uint8_t*)A + i * lda);
@@ -911,10 +921,12 @@ namespace fastllm {
                             floatC[j] = sum;
                         }
                     }
+                    finish = true;
                 } else if (BType == DataType::FLOAT16) {
                     MultiThreadLinearFloat32Float16Op (
                         (float*)A, (uint16_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end
                     ).Run();
+                    finish = true;
                 }
             }
         } else if (AType == DataType::BFLOAT16) {
@@ -924,6 +936,7 @@ namespace fastllm {
                     MultiThreadLinearBFloat16BFloat16Op (
                         (uint16_t*)A, (uint16_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end
                     ).Run();
+                    finish = true;
                 } else if (BType == FP8_E4M3_BLOCK_128) {
                     // A是BFLOAT16, B是FP8_E4M3_BLOCK_128格式（fp8数据+scale）, C是FLOAT32
                     // 为需要计算的行分配临时bf16缓冲区
@@ -965,9 +978,11 @@ namespace fastllm {
                         MultiThreadLinearBFloat16BFloat16Op (
                             (uint16_t*)A, bf16B_temp.data(), nullptr, ((float*)C) + st, n, m, ldc / sizeof(float), 0, end - st
                         ).Run();
+                        finish = true;
                         // LinearBFloat16BFloat16_Kernel((uint16_t*)A, bf16B_temp.data(), nullptr, ((float*)C) + st, n, m, ldc / sizeof(float), 0, end - st);
                     } else {
                         LinearBFloat16_FP8E4M3BLOCK128_Kernel((uint16_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
+                        finish = true;
                     }
                 } else if (BType == AWQ_4BIT_128) {
                     // A是BFLOAT16, B是AWQ_4BIT_128格式（uint4权重+zero+scale）, C是FLOAT32
@@ -981,6 +996,10 @@ namespace fastllm {
                     } */ 
                 }
             }
+        }
+        
+        if (!finish) {
+            ErrorInFastLLM("FastllmGemm Error: \nAType = " + GetDataTypeName(AType) + "\nBType = " + GetDataTypeName(BType) + "\nCType = " + GetDataTypeName(CType));
         }
     }
 
@@ -1072,6 +1091,54 @@ namespace fastllm {
         }
     }
 
+    extern void Float32ToInfInt8PerChannelAVX2(const float* srcData, uint8_t* dstData, size_t columns);
+    void Float32ToInfInt8PerChannel(const float* srcData, uint8_t* dstData, size_t columns) {
+        if (cpuInstructInfo.hasAVX2) {
+            Float32ToInfInt8PerChannelAVX2(srcData, dstData, columns);
+            return;
+        }
+        // 目标内存布局：
+        // [int8 * columns] [float scale] [int sum]
+        int8_t* quantizedData = (int8_t*)dstData;
+        float* scalePtr = (float*)(dstData + columns);
+        int* sumPtr = (int*)(dstData + columns + sizeof(float));
+        
+        // 1. 找到这一行的最大绝对值
+        float maxAbs = 0.0f;
+        for (size_t i = 0; i < columns; i++) {
+            float absVal = std::abs(srcData[i]);
+            if (absVal > maxAbs) {
+                maxAbs = absVal;
+            }
+        }
+        
+        // 2. 计算scale（对称量化，范围是 -127 到 127）
+        float scale;
+        if (maxAbs > 0) {
+            scale = maxAbs / 127.0f;
+        } else {
+            scale = 1.0f;  // 避免除零
+        }
+        
+        // 3. 量化并计算sum
+        int sum = 0;
+        for (size_t i = 0; i < columns; i++) {
+            // 量化: q = round(x / scale)
+            int quantized = std::round(srcData[i] / scale);
+            
+            // 裁剪到int8范围 [-127, 127]（对称量化通常不使用-128）
+            if (quantized > 127) quantized = 127;
+            if (quantized < -127) quantized = -127;
+            
+            quantizedData[i] = (int8_t)quantized;
+            sum += quantized;
+        }
+        
+        // 4. 存储scale和sum
+        *scalePtr = scale;
+        *sumPtr = sum;
+    }
+
     void ConvertFromFloat32(void *dstData, DataType dstDataType, const float *floatData, size_t rows, size_t columns) {
         if (dstDataType == DataType::FLOAT32) {
             memcpy(dstData, floatData, rows * columns * sizeof(float));
@@ -1079,6 +1146,15 @@ namespace fastllm {
             Float32ToFloat16((float*)floatData, (uint16_t*)dstData, rows * columns);
         } else if (dstDataType == DataType::BFLOAT16) {
             Float32ToBFloat16((float*)floatData, (uint16_t*)dstData, rows * columns);
+        } else if (dstDataType == DataType::INF_INT8_PERCHANNEL) {
+            size_t rowCount = GetDataBytes(dstDataType, 1, columns);
+            for (int i = 0; i < rows; i++) {
+                Float32ToInfInt8PerChannel (
+                    (float*)floatData + i * columns, 
+                    (uint8_t*)dstData + i * rowCount, 
+                    columns
+                );
+            }
         } else if (dstDataType >= DataType::DATA_GGUF_FORMAT && dstDataType < DataType::DATA_GGUF_FORMAT_END) {
             auto ggmlType = (ggml_type)((int)dstDataType - (int)DataType::DATA_GGUF_FORMAT);
             size_t rowCount = ggml_row_size(ggmlType, columns);
