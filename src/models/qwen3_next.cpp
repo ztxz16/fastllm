@@ -144,9 +144,11 @@ namespace fastllm {
                     this->specialWeights[downWeightName] = "linearColumn";
                 }
                 
-                this->moeLinears.insert(w1WeightName);
-                this->moeLinears.insert(w3WeightName);
-                this->moeLinears.insert(downWeightName);
+                if (j != -1) {
+                    this->moeLinears.insert(w1WeightName);
+                    this->moeLinears.insert(w3WeightName);
+                    this->moeLinears.insert(downWeightName);
+                }
             }
         }
     }
@@ -546,12 +548,11 @@ namespace fastllm {
                     Mul(qtemp, scale, qq); // query = query * scale
 
                     bb.Resize({bb.dims[0], bb.dims[1], bb.dims[2], 1});
-                    Repeat(bb, -1, kk.dims.back(), b);
                     Data k_beta, v_beta;
                     Mul(kk, 1.0f, k_beta);
                     Mul(vv, 1.0f, v_beta);
-                    MulTo(k_beta, b);
-                    MulTo(v_beta, b);
+                    MulTo(k_beta, bb);
+                    MulTo(v_beta, bb);
 
                     qq.Reshape({qq.dims[0], qq.dims[1], -1, chunk_size, qq.dims.back()});
                     kk.Reshape({kk.dims[0], kk.dims[1], -1, chunk_size, kk.dims.back()});
@@ -571,12 +572,8 @@ namespace fastllm {
                     TransferAttn(attn);
                     MatMul(attn, v_beta, vv);
                     
-                    Data k_temp, k_cumdecay;
-
-                    gg.Reshape({gg.dims[0], gg.dims[1], gg.dims[2], gg.dims[3], 1});
-                    Repeat(gg, 4, k_beta.dims[4], g);
-                    Exp(g, g);
-                    gg.Reshape({gg.dims[0], gg.dims[1], gg.dims[2], gg.dims[3]});
+                    Data k_temp, k_cumdecay;                    
+                    Exp(gg, g);
 
                     Mul(k_beta, 1.0f, k_temp);
                     MulTo(k_temp, g);
@@ -612,13 +609,12 @@ namespace fastllm {
                         Mul(v_prime, -1.0f, v_new);
                         AddTo(v_new, v_i);
 
-                        Data attn_inter, g_i, g_i_exp, g_i_exp_repeat, q_i_temp;
+                        Data attn_inter, g_i, g_i_exp, q_i_temp;
                         Split(gg, 2, i, i + 1, g_i);
                         g_i.Resize({g_i.dims[0], g_i.dims[1], g_i.dims[3], 1});
                         Exp(g_i, g_i_exp);
                         Mul(q_i, 1.0f, q_i_temp);
-                        Repeat(g_i_exp, 3, q_i_temp.dims[3], g_i_exp_repeat);
-                        MulTo(q_i_temp, g_i_exp_repeat);
+                        MulTo(q_i_temp, g_i_exp);
 
                         MatMul(q_i_temp, last_recurrent_state, attn_inter);
                         Data atv;
@@ -640,24 +636,22 @@ namespace fastllm {
                         AddTo(g_i_l_temp, g_i_last_repeat);
                         Exp(g_i_l_temp, g_i_l_temp);
                         g_i_l_temp.Resize({g_i_l_temp.dims[0], g_i_l_temp.dims[1], g_i_l_temp.dims[2], 1});
-                        Repeat(g_i_l_temp, 3, k_i.dims[3], g);
-                        MulTo(k_i, g);
+                        MulTo(k_i, g_i_l_temp);
                         PermuteSelf(k_i, {0, 1, 3, 2});
 
                         Data k_i_v_new;
                         MatMul(k_i, v_new, k_i_v_new);
 
-                        Data g_i_exp_last, g_i_exp_temp;
+                        Data g_i_exp_last;
                         Split(g_i_exp, 2, g_i_exp.dims[2] - 1, g_i_exp.dims[2], g_i_exp_last);
-                        Repeat(g_i_exp_last, 2, last_recurrent_state.dims[2], g_i_exp_temp);
-                        Repeat(g_i_exp_temp, 3, last_recurrent_state.dims[3], g_i_exp);
-                        MulTo(last_recurrent_state, g_i_exp);
+                        MulTo(last_recurrent_state, g_i_exp_last);
                         AddTo(last_recurrent_state, k_i_v_new);
                     }
 
                     core_attn_out.Reshape({core_attn_out.dims[0], core_attn_out.dims[1], -1, core_attn_out.dims.back()});
                     Split(core_attn_out, 2, 0, seq, core_attn_out_temp);
-                    Permute(core_attn_out_temp, {0, 2, 1, 3}, core_attn_out);
+                    PermuteSelf(core_attn_out_temp, {0, 2, 1, 3});
+                    Mul(core_attn_out_temp, 1.0f, core_attn_out);
                 }
 
                 {
@@ -707,12 +701,11 @@ namespace fastllm {
                 Swiglu(w3, w1);
                 Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.shared_expert.down_proj.weight"], Data(), moeFinal2);
                 Sigmoid(sharedGate, sharedGate);
-            
+                
                 if (sharedGate.Count(0) == 1) {
                     MulTo(moeFinal2, sharedGate);
                 } else {
-                    Repeat(sharedGate, 1, moeFinal2.dims.back(), sharedGateRepeat);
-                    MulTo(moeFinal2, sharedGateRepeat);
+                    MulTo(moeFinal2, sharedGate);
                 }
                 
                 ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
