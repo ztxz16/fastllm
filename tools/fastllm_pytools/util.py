@@ -124,6 +124,11 @@ def make_normal_llm_model(args):
                         args.dtype = "fp8_e4m3"
                 except:
                     pass
+                try:
+                    if (args.path.lower().find("-fp8") != -1):
+                        args.dtype = "fp8_e4m3";
+                except:
+                    pass
         except:
             pass
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
