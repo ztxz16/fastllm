@@ -122,6 +122,14 @@ namespace fastllm {
         void Shutdown() {
             /// TODO: shutdown
         }
+
+        void ResizeThreads(int threadNum) {
+            for (int i = this->threads.size(); i < threadNum; i++) {
+                this->loops.push_back(new AliveThreadLoop(i));
+                this->threads.push_back(new std::thread(*(this->loops[i])));
+            }
+            curActivateThreadInterval = std::make_pair(0, threadNum);
+        }
     };
 
     struct MultiThreadMultiOps : MultiThreadBaseOp {
