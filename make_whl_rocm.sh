@@ -11,7 +11,7 @@ cd $folder
 
 # cpu
 rm -rf CMakeCache.txt CMakeFiles
-cmake .. -DMAKE_WHL_X86=ON -DUSE_ROCM=OFF -DUSE_NUMA=ON
+cmake .. -DMAKE_WHL_X86=ON -DUSE_ROCM=OFF -DUSE_NUMAS=ON
 make fastllm_tools -j$(nproc)
 if [ $? != 0 ]; then
     exit -1
@@ -20,7 +20,7 @@ cp tools/ftllm/libfastllm_tools.so tools/ftllm/libfastllm_tools-cpu.so
 
 # cuda-11
 rm -rf CMakeCache.txt CMakeFiles
-cmake .. -DMAKE_WHL_X86=ON -DUSE_ROCM=ON -DUSE_NUMA=ON -DROCM_ARCH="gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101"
+cmake .. -DMAKE_WHL_X86=ON -DUSE_ROCM=ON -DUSE_NUMAS=ON -DROCM_ARCH="gfx906;gfx908;gfx90a;gfx942;gfx1030;gfx1100;gfx1101"
 make fastllm_tools -j$(nproc)
 if [ $? != 0 ]; then
     exit -1
