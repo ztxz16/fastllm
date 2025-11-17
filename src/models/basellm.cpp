@@ -859,7 +859,7 @@ auto st = std::chrono::system_clock::now();
                                 }
                                 if (model->model_struct == "qwen3_next") {
                                     // TODO: qwen3_next支持更长的切片
-                                    first = 1024;
+                                    first = 2048;
                                     part = 1024;
                                 }
                                 if (seqLens[0] > first) {
