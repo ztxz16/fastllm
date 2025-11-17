@@ -357,58 +357,236 @@ namespace fastllm {
 
     extern void AddBiasAVX512(float *outputData, float *biasData, int n, int k, int st, int end);
 
-    bool LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX512VNNI_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
-                        int n, int m, int k, int st, int end) {
+    template <int BROW, int AROW>
+    void mul_mat_int8_int4_direct_avx512vnni(
+        int m,  // 内积维度
+        const uint8_t* A,  // INT8_PERCHANNEL format (输入数据)
+        size_t stride_a,
+        const uint8_t* B,  // INT4_PERCHANNEL format (权重数据)
+        size_t stride_b,
+        float* C,
+        size_t stride_c
+    ) {
 #ifdef __AVX512VNNI__
+        constexpr int SIMD_WIDTH = 64;  // AVX512 VNNI 一次处理 64 个 int8
+        
+        // 累加器 - 为每个输出元素准备一个累加器
+        __m512i acc[AROW * BROW];
+        
+        // 初始化累加器
+        for (int i = 0; i < AROW * BROW; ++i) {
+            acc[i] = _mm512_setzero_si512();
+        }
+        
+        const __m512i lowMask = _mm512_set1_epi8(0xf);
+        
+        // 主循环 - 处理SIMD_WIDTH的倍数部分
+        int nb = m / SIMD_WIDTH;
+        for (int block = 0; block < nb; ++block) {
+            for (int ia = 0; ia < AROW; ++ia) {
+                // A矩阵的第ia行 (输入数据)
+                const uint8_t* a_row = (const uint8_t*)((const char*)A + ia * stride_a);
+                const int8_t* quantizedA = (const int8_t*)a_row;
+                __m512i ay = _mm512_loadu_si512((const __m512i*)(quantizedA + block * SIMD_WIDTH));
+                
+                for (int ib = 0; ib < BROW; ++ib) {
+                    // B矩阵的第ib行 (权重数据，INT4格式)
+                    const uint8_t* b_row = (const uint8_t*)((const char*)B + ib * stride_b);
+                    __m256i orix = _mm256_loadu_si256((const __m256i*)(b_row + block * SIMD_WIDTH / 2));
+                    __m512i bytex = _mm512_inserti64x4(_mm512_castsi256_si512(orix), _mm256_srli_epi16(orix, 4), 1);
+                    __m512i bx = _mm512_and_si512(lowMask, bytex);
+                    
+                    int acc_idx = ia * BROW + ib;
+                    acc[acc_idx] = _mm512_dpbusd_epi32(acc[acc_idx], bx, ay);
+                }
+            }
+        }
+        
+        // 处理剩余部分
+        int remainder = m % SIMD_WIDTH;
+        int remainderSums[AROW * BROW] = {0};
+        if (remainder > 0) {
+            for (int ia = 0; ia < AROW; ++ia) {
+                const uint8_t* a_row = (const uint8_t*)((const char*)A + ia * stride_a);
+                const int8_t* quantizedA = (const int8_t*)a_row;
+                
+                for (int ib = 0; ib < BROW; ++ib) {
+                    const uint8_t* b_row = (const uint8_t*)((const char*)B + ib * stride_b);
+                    
+                    for (int i = nb * SIMD_WIDTH; i < m; i += 2) {
+                        uint8_t packedValue = b_row[i / 2];
+                        uint8_t int4Value0 = (packedValue >> 4) & 0x0F;
+                        uint8_t int4Value1 = packedValue & 0x0F;
+                        
+                        int acc_idx = ia * BROW + ib;
+                        remainderSums[acc_idx] += quantizedA[i] * int4Value0;
+                        if (i + 1 < m) {
+                            remainderSums[acc_idx] += quantizedA[i + 1] * int4Value1;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 水平求和，应用缩放因子，然后存储结果
+        for (int ia = 0; ia < AROW; ++ia) {
+            const uint8_t* a_row = (const uint8_t*)((const char*)A + ia * stride_a);
+            float scaleA = *(float*)(a_row + m);
+            int sumA = *(int*)(a_row + m + sizeof(float));
+            
+            for (int ib = 0; ib < BROW; ++ib) {
+                const uint8_t* b_row = (const uint8_t*)((const char*)B + ib * stride_b);
+                float minB = *(float*)(b_row + (m + 1) / 2);
+                float scaleB = *(float*)(b_row + (m + 1) / 2 + sizeof(float));
+                
+                int acc_idx = ia * BROW + ib;
+                int sum = _mm512_reduce_add_epi32(acc[acc_idx]) + remainderSums[acc_idx];
+                
+                // C[ia][ib] = sum * scaleA * scaleB + minB * scaleA * sumA
+                float* c_ptr = (float*)((char*)C + ia * stride_c);
+                c_ptr[ib] = sum * scaleA * scaleB + minB * scaleA * sumA;
+            }
+        }
+#endif
+    }
+
+    template <int BRow>
+    void LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX512VNNI_Row_Kernel(
+        uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+        int i, int m, int k, int st, int end) 
+    {
         size_t lda = GetDataBytes(DataType::INF_INT8_PERCHANNEL, 1, m);
         size_t ldb = GetDataBytes(DataType::INT4_PERCHANNEL, 1, m);
         size_t ldc = GetDataBytes(DataType::FLOAT32, 1, k);
         
-        for (int i = 0; i < n; i++) {
-            // A矩阵的第i行，InfInt8PerChannel格式
-            uint8_t *infInt8A = (uint8_t*)inputData + i * lda;
-            int8_t *quantizedA = (int8_t*)infInt8A;
-            float scaleA = *(float*)(infInt8A + m);
-            int sumA = *(int*)(infInt8A + m + sizeof(float));
-            
-            float *floatC = (float*)((uint8_t*)outputData + i * ldc);
-            
-            for (int j = st; j < end; j++) {
-                // B矩阵的第j行，INT4_PERCHANNEL格式
-                uint8_t *int4B = (uint8_t*)weightData + j * ldb;
-                float minB = *(float*)(int4B + (m + 1) / 2);
-                float scaleB = *(float*)(int4B + (m + 1) / 2 + sizeof(float));
-                
-                int sum = 0;
-
-                __m512i acc = _mm512_setzero_si512();
-                const __m512i lowMask = _mm512_set1_epi8(0xf);
-                const __m512i ones = _mm512_set1_epi16(1);
-
-                int i = 0;
-                for (; i + 63 < m; i += 64) {
-                    __m256i orix = _mm256_loadu_si256((const __m256i *) (int4B + i / 2));
-                    __m512i bytex = _mm512_inserti64x4(_mm512_castsi256_si512(orix), _mm256_srli_epi16(orix, 4), 1);
-                    __m512i bx = _mm512_and_si512(lowMask, bytex);
-                    __m512i by = _mm512_loadu_si512((const __m512i *) (quantizedA + i));
-                    acc = _mm512_dpbusd_epi32(acc, bx, by);
-                }
-                sum = _mm512_reduce_add_epi32(acc);
-
-                // 一次处理两个int4值（假设m是偶数）
-                for (; i < m; i += 2) {
-                    uint8_t packedValue = int4B[i / 2];
-                    // 提取高4位和低4位
-                    uint8_t int4Value0 = (packedValue >> 4) & 0x0F;  // 第一个int4
-                    uint8_t int4Value1 = packedValue & 0x0F;         // 第二个int4
-                    
-                    // 同时计算两个乘积并累加
-                    sum += quantizedA[i] * int4Value0 + quantizedA[i + 1] * int4Value1;
-                }
-
-                floatC[j] = sum * scaleA * scaleB + minB * scaleA * sumA;
-            }
+        int j = st;
+        // 一次处理5列
+        for (j = st; j + 4 < end; j += 5) {
+            mul_mat_int8_int4_direct_avx512vnni<5, BRow>(
+                m,
+                inputData + i * lda, lda,           // A: 输入数据的第i行开始的BRow行
+                weightData + j * ldb, ldb,          // B: 权重数据的第j行开始的5行
+                outputData + i * k + j, ldc         // C: 输出位置
+            );
         }
+        
+        // 处理剩余列
+        switch (end - j) {
+            case 0: break;
+            case 1: 
+                mul_mat_int8_int4_direct_avx512vnni<1, BRow>(
+                    m, inputData + i * lda, lda, weightData + j * ldb, ldb, 
+                    outputData + i * k + j, ldc); 
+                break;
+            case 2: 
+                mul_mat_int8_int4_direct_avx512vnni<2, BRow>(
+                    m, inputData + i * lda, lda, weightData + j * ldb, ldb, 
+                    outputData + i * k + j, ldc); 
+                break;
+            case 3: 
+                mul_mat_int8_int4_direct_avx512vnni<3, BRow>(
+                    m, inputData + i * lda, lda, weightData + j * ldb, ldb, 
+                    outputData + i * k + j, ldc); 
+                break;
+            case 4: 
+                mul_mat_int8_int4_direct_avx512vnni<4, BRow>(
+                    m, inputData + i * lda, lda, weightData + j * ldb, ldb, 
+                    outputData + i * k + j, ldc); 
+                break;
+        }
+    }
+
+    bool LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX512VNNI_Kernel(
+        uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+        int n, int m, int k, int st, int end) 
+    {
+        if (n == 1) {
+#ifdef __AVX512VNNI__
+            size_t lda = GetDataBytes(DataType::INF_INT8_PERCHANNEL, 1, m);
+            size_t ldb = GetDataBytes(DataType::INT4_PERCHANNEL, 1, m);
+            size_t ldc = GetDataBytes(DataType::FLOAT32, 1, k);
+            
+            for (int i = 0; i < n; i++) {
+                // A矩阵的第i行，InfInt8PerChannel格式
+                uint8_t *infInt8A = (uint8_t*)inputData + i * lda;
+                int8_t *quantizedA = (int8_t*)infInt8A;
+                float scaleA = *(float*)(infInt8A + m);
+                int sumA = *(int*)(infInt8A + m + sizeof(float));
+                
+                float *floatC = (float*)((uint8_t*)outputData + i * ldc);
+                
+                for (int j = st; j < end; j++) {
+                    // B矩阵的第j行，INT4_PERCHANNEL格式
+                    uint8_t *int4B = (uint8_t*)weightData + j * ldb;
+                    float minB = *(float*)(int4B + (m + 1) / 2);
+                    float scaleB = *(float*)(int4B + (m + 1) / 2 + sizeof(float));
+                    
+                    int sum = 0;
+
+                    __m512i acc = _mm512_setzero_si512();
+                    const __m512i lowMask = _mm512_set1_epi8(0xf);
+                    const __m512i ones = _mm512_set1_epi16(1);
+
+                    int i = 0;
+                    for (; i + 63 < m; i += 64) {
+                        __m256i orix = _mm256_loadu_si256((const __m256i *) (int4B + i / 2));
+                        __m512i bytex = _mm512_inserti64x4(_mm512_castsi256_si512(orix), _mm256_srli_epi16(orix, 4), 1);
+                        __m512i bx = _mm512_and_si512(lowMask, bytex);
+                        __m512i by = _mm512_loadu_si512((const __m512i *) (quantizedA + i));
+                        acc = _mm512_dpbusd_epi32(acc, bx, by);
+                    }
+                    sum = _mm512_reduce_add_epi32(acc);
+
+                    // 一次处理两个int4值（假设m是偶数）
+                    for (; i < m; i += 2) {
+                        uint8_t packedValue = int4B[i / 2];
+                        // 提取高4位和低4位
+                        uint8_t int4Value0 = (packedValue >> 4) & 0x0F;  // 第一个int4
+                        uint8_t int4Value1 = packedValue & 0x0F;         // 第二个int4
+                        
+                        // 同时计算两个乘积并累加
+                        sum += quantizedA[i] * int4Value0 + quantizedA[i + 1] * int4Value1;
+                    }
+
+                    floatC[j] = sum * scaleA * scaleB + minB * scaleA * sumA;
+                }
+            }
+            AddBiasAVX512(outputData, biasData, n, k, st, end);
+            return true;
+#else
+            return false;
+#endif
+        }
+#ifdef __AVX512VNNI__
+        int i = 0;
+        // 一次处理5行
+        for (; i + 4 < n; i += 5) {
+            LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX512VNNI_Row_Kernel<5>(
+                inputData, weightData, biasData, outputData, i, m, k, st, end
+            );
+        }
+        
+        // 处理剩余行
+        switch (n - i) {
+            case 0: break;
+            case 1: 
+                LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX512VNNI_Row_Kernel<1>(
+                    inputData, weightData, biasData, outputData, i, m, k, st, end); 
+                break;
+            case 2: 
+                LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX512VNNI_Row_Kernel<2>(
+                    inputData, weightData, biasData, outputData, i, m, k, st, end); 
+                break;
+            case 3: 
+                LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX512VNNI_Row_Kernel<3>(
+                    inputData, weightData, biasData, outputData, i, m, k, st, end); 
+                break;
+            case 4: 
+                LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX512VNNI_Row_Kernel<4>(
+                    inputData, weightData, biasData, outputData, i, m, k, st, end); 
+                break;
+        }
+        
         AddBiasAVX512(outputData, biasData, n, k, st, end);
         return true;
 #else

@@ -137,6 +137,8 @@ def make_normal_llm_model(args):
             args.threads = max(1, min(32, available_cores - 2))
         except:
             args.threads = max(1, min(32, os.cpu_count() - 2))
+    if ("FT_THREADS" not in os.environ and "FASTLLM_NUMA_THREADS" not in os.environ):
+        os.environ["FT_THREADS"] = args.threads
     if (args.atype == "auto"):
         if (args.device in ["cpu", "numa", "tfacc"]):
             args.atype = "float32"
