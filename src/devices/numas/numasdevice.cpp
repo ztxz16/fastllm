@@ -44,7 +44,7 @@ namespace fastllm {
     }
 
     NumasDevice::NumasDevice() {
-        this->deviceType = "numas";
+        this->deviceType = "numa";
         // this->ops["Linear"] = (BaseOperator *) (new NumasLinearOp());
         this->ops["MergeMOE"] = (BaseOperator*)(new NumasMergeMOE());
 
