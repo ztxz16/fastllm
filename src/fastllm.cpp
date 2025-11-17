@@ -110,18 +110,17 @@ namespace fastllm {
         py::gil_scoped_release release;
 #endif
         globalLocker.lock();
-        threads = t;
         if (fastllmAliveThreadPool != nullptr) {
-            fastllmAliveThreadPool->Shutdown();
-            delete fastllmAliveThreadPool;
+            fastllmAliveThreadPool->ResizeThreads(t);
+        } else {
+            fastllmAliveThreadPool = new AliveThreadPool(t);
         }
-        fastllmAliveThreadPool = new AliveThreadPool(t);
+        threads = fastllmAliveThreadPool->threads.size();
         globalLocker.unlock();
 #ifdef PY_API
         py::gil_scoped_acquire acquire;
 #endif
     }
-
     void SetThreads(int t) {
         SetAliveThreads(t);
     }
