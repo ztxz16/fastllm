@@ -901,6 +901,55 @@ namespace fastllm {
 #endif
     }
 
+    bool LinearINT8PERCHANNEL_INT8PERCHANNEL_AVX2_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+#ifdef __AVX2__
+        size_t lda = GetDataBytes(DataType::INF_INT8_PERCHANNEL, 1, m);
+        size_t ldb = GetDataBytes(DataType::INT8_PERCHANNEL, 1, m);
+        size_t ldc = GetDataBytes(DataType::FLOAT32, 1, k);
+        
+        for (int i = 0; i < n; i++) {
+            // A矩阵的第i行，InfInt8PerChannel格式
+            uint8_t *infInt8A = (uint8_t*)inputData + i * lda;
+            int8_t *quantizedA = (int8_t*)infInt8A;
+            float scaleA = *(float*)(infInt8A + m);
+            int sumA = *(int*)(infInt8A + m + sizeof(float));
+            
+            float *floatC = (float*)((uint8_t*)outputData + i * ldc);
+            
+            for (int j = st; j < end; j++) {
+                // B矩阵的第j行，INT8_PERCHANNEL格式
+                uint8_t *int8B = (uint8_t*)weightData + j * ldb;
+                float minB = *(float*)(int8B + m);
+                float scaleB = *(float*)(int8B + m + sizeof(float));
+                
+                int sum = 0;
+                int i = 0;
+
+                __m256i acc = _mm256_setzero_si256();
+                const __m256i ones = _mm256_set1_epi16(1);
+
+                for (; i + 31 < m; i += 32) {
+                    __m256i bx = _mm256_loadu_si256((const __m256i *) (int8B + i));
+                    __m256i by = _mm256_loadu_si256((const __m256i *) (quantizedA + i));
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, by), ones));
+                }
+                sum = I32sum(acc);
+                for (; i < m; i++) {
+                    sum += quantizedA[i] * int8B[i];
+                }
+
+                floatC[j] = sum * scaleA * scaleB + minB * scaleA * sumA;
+            }
+        }
+
+        AddBiasAVX2(outputData, biasData, n, k, st, end);
+        return true;
+#else
+        return false;
+#endif
+    }
+
     bool LinearINT8PERCHANNEL_INT4PERCHANNEL_AVX2_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
 #ifdef __AVX2__
