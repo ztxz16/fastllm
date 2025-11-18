@@ -219,7 +219,9 @@ namespace fastllm {
         AWQ_4BIT_128 = 1001, // awq, bits = 4, group = 128
         INT4_PERCHANNEL = 1002, // int4, per channel量化
         FP8_E4M3_PERCHANNEL = 1003, // fp8, per channel量化
+        INT4_GROUP128 = 1004, // int4, per group量化，group = 128
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
+        INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         DATA_GGUF_FORMAT = 9999, DATA_GGUF_FORMAT_END = 19999, // [DATA_GGUF_FORMAT, DATA_GGUF_FORMAT_END]之间为GGUF格式的数据，ggml_type = type - DATA_FFUF_FORMAT
         DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV
     };
