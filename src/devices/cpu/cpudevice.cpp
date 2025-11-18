@@ -892,6 +892,13 @@ namespace fastllm {
                     finish = true;
         		}
         	}
+        } else if (AType == DataType::INF_INT8_GROUP128) {
+        	if (CType == DataType::FLOAT32) {
+        		if (BType == DataType::INT4_GROUP128) {
+                    LinearINT8GROUP128_INT4GROUP128_Kernel((uint8_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
+                    finish = true;
+        		}
+        	}
         } else if (AType == DataType::FLOAT32) {
             if (CType == DataType::FLOAT32) {
                 if (BType == DataType::FLOAT32) {
@@ -1194,6 +1201,17 @@ namespace fastllm {
             Float32ToBFloat16((float*)floatData, (uint16_t*)dstData, rows * columns);
         } else if (dstDataType == DataType::INF_INT8_PERCHANNEL) {
             size_t rowCount = GetDataBytes(dstDataType, 1, columns);
+            for (int i = 0; i < rows; i++) {
+                Float32ToInfInt8PerChannel (
+                    (float*)floatData + i * columns, 
+                    (uint8_t*)dstData + i * rowCount, 
+                    columns
+                );
+            }
+        } else if (dstDataType == DataType::INF_INT8_GROUP128) {
+            rows *= (columns / 128);
+            columns = 128;
+            size_t rowCount = GetDataBytes(INF_INT8_PERCHANNEL, 1, columns);
             for (int i = 0; i < rows; i++) {
                 Float32ToInfInt8PerChannel (
                     (float*)floatData + i * columns, 

@@ -225,6 +225,68 @@ namespace fastllm {
         }
     }
 
+    bool LinearINT8GROUP128_INT4GROUP128_Base_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+        size_t lda = GetDataBytes(DataType::INF_INT8_GROUP128, 1, m);
+        size_t ldb = GetDataBytes(DataType::INT4_GROUP128, 1, m);
+        size_t ldc = GetDataBytes(DataType::FLOAT32, 1, k);
+        
+        int groupCnt = 128;
+        int groups = m / 128;
+        size_t astride = groupCnt + sizeof(float) + sizeof(int);
+        size_t bstride = (groupCnt / 2) + sizeof(float) * 2;
+        for (int i = 0; i < n; i++) {
+            // A矩阵的第i行，INF_INT8_GROUP128格式
+            float *floatC = (float*)((uint8_t*)outputData + i * ldc);
+            for (int j = st; j < end; j++) {
+                float fsum = 0.0f;
+                for (int g = 0; g < groups; g++) {
+                    uint8_t *infInt8A = (uint8_t*)inputData + i * lda + g * astride;
+                    int8_t *quantizedA = (int8_t*)infInt8A;
+                    
+                    float scaleA = *(float*)(infInt8A + groupCnt);
+                    int sumA = *(int*)(infInt8A + groupCnt + sizeof(float));
+
+                    uint8_t *int4B = (uint8_t*)weightData + j * ldb + g * bstride;
+                    float minB = *(float*)(int4B + (groupCnt + 1) / 2);
+                    float scaleB = *(float*)(int4B + (groupCnt + 1) / 2 + sizeof(float));
+
+                    int sum = 0;
+                    // 一次处理两个int4值（假设m是偶数）
+                    for (int l = 0; l < groupCnt; l += 2) {
+                        uint8_t packedValue = int4B[l / 2];
+                        // 提取高4位和低4位
+                        uint8_t int4Value0 = (packedValue >> 4) & 0x0F;  // 第一个int4
+                        uint8_t int4Value1 = packedValue & 0x0F;         // 第二个int4
+                        
+                        // 同时计算两个乘积并累加
+                        sum += quantizedA[l] * int4Value0 + quantizedA[l + 1] * int4Value1;
+                    }
+
+                    fsum += sum * scaleA * scaleB + minB * scaleA * sumA;
+                }
+                floatC[j] = fsum;
+            }
+        }
+        AddBias(outputData, biasData, n, k, st, end);
+        return true;
+    }
+
+    extern bool LinearINT8GROUP128_INT4GROUP128_AVX512VNNI_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+    extern bool LinearINT8GROUP128_INT4GROUP128_AVX2_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+    bool LinearINT8GROUP128_INT4GROUP128_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+        if (GetCPUInstructInfo()->hasAVX512VNNI) {
+            return LinearINT8GROUP128_INT4GROUP128_AVX512VNNI_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        } else if (GetCPUInstructInfo()->hasAVX2) {
+            return LinearINT8GROUP128_INT4GROUP128_AVX2_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        } else { 
+            return LinearINT8GROUP128_INT4GROUP128_Base_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        }
+    }
+
     void MultiThreadLinearFloat32Float32Op::Run() {
         for (int i = 0; i < n; i++) {
             for (int j = st; j < end; j++) {

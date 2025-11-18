@@ -291,6 +291,26 @@ namespace fastllm {
                     data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
                     memcpy(data->numasData[i], int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
                 }
+            } else if (data->dataType == DataType::INT4_GROUP) {
+                if (m % data->groupCnt > 0) {
+                    ErrorInFastLLM("RegisterNumas can't support data type int4g when m % groupCnt > 0.");
+                }
+
+                int groups = m / data->groupCnt;
+                std::vector <uint8_t> int4Packed;
+                Int4ToFastllmInt4PerchannelPacked(1, k * groups, data->groupCnt, (uint8_t*)data->cpuData, data->mins.data(), data->scales.data(), int4Packed);
+
+                if (data->groupCnt == 128) {                    
+                    data->dataType = DataType::INT4_GROUP128;
+                } else {
+                    ErrorInFastLLM("RegisterNumas can't support data type " + GetDataTypeName(data->dataType));
+                }
+
+                size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
+                for (int i = 0; i < numaConfig->numaCnt; i++) {
+                    data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
+                    memcpy(data->numasData[i], int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                }
             } else if (data->dataType == DataType::DATA_GGUF_FORMAT) {
                 size_t bytesPerRow = GetDataBytes((DataType)((int)data->dataType + data->ggmlType), 1, m);
                 for (int i = 0; i < numaConfig->numaCnt; i++) {

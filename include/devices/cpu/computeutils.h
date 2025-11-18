@@ -343,7 +343,8 @@ namespace fastllm {
                         int n, int m, int k, int st, int end);
     bool LinearINT8PERCHANNEL_INT4PERCHANNEL_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end);
-    
+    bool LinearINT8GROUP128_INT4GROUP128_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
     bool LinearQ8K_GGUF_Kernel(uint8_t *q8kInputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end, DataType AType, DataType BType);
 }
