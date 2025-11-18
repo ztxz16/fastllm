@@ -225,6 +225,53 @@ namespace fastllm {
         }
     }
 
+    bool LinearINT8PERCHANNEL_INT8PERCHANNEL_Base_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+        size_t lda = GetDataBytes(DataType::INF_INT8_PERCHANNEL, 1, m);
+        size_t ldb = GetDataBytes(DataType::INT8_PERCHANNEL, 1, m);
+        size_t ldc = GetDataBytes(DataType::FLOAT32, 1, k);
+        
+        for (int i = 0; i < n; i++) {
+            // A矩阵的第i行，InfInt8PerChannel格式
+            uint8_t *infInt8A = (uint8_t*)inputData + i * lda;
+            int8_t *quantizedA = (int8_t*)infInt8A;
+            float scaleA = *(float*)(infInt8A + m);
+            int sumA = *(int*)(infInt8A + m + sizeof(float));
+            
+            float *floatC = (float*)((uint8_t*)outputData + i * ldc);
+            
+            for (int j = st; j < end; j++) {
+                // B矩阵的第j行，INT8_PERCHANNEL格式
+                uint8_t *int8B = (uint8_t*)weightData + j * ldb;
+                float minB = *(float*)(int8B + m);
+                float scaleB = *(float*)(int8B + m + sizeof(float));
+                
+                int sum = 0;
+                for (int l = 0; l < m; l++) {
+                    sum += quantizedA[l] * int8B[l];
+                }
+                
+                floatC[j] = sum * scaleA * scaleB + minB * scaleA * sumA;
+            }
+        }
+        AddBias(outputData, biasData, n, k, st, end);
+        return true;
+    }
+    extern bool LinearINT8PERCHANNEL_INT8PERCHANNEL_AVX512VNNI_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+    extern bool LinearINT8PERCHANNEL_INT8PERCHANNEL_AVX2_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
+    bool LinearINT8PERCHANNEL_INT8PERCHANNEL_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+        if (GetCPUInstructInfo()->hasAVX512VNNI) {
+            return LinearINT8PERCHANNEL_INT8PERCHANNEL_AVX512VNNI_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        } else if (GetCPUInstructInfo()->hasAVX2) {
+            return LinearINT8PERCHANNEL_INT8PERCHANNEL_AVX2_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        } else { 
+            return LinearINT8PERCHANNEL_INT8PERCHANNEL_Base_Kernel(inputData, weightData, biasData, outputData, n, m, k, st, end);
+        }
+    }
+
     bool LinearINT8GROUP128_INT4GROUP128_Base_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
         size_t lda = GetDataBytes(DataType::INF_INT8_GROUP128, 1, m);

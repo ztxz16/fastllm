@@ -237,6 +237,37 @@ namespace fastllm {
         }
     }
 
+    void Int8ToFastllmInt8PerchannelPacked(int experts, int n, int m, uint8_t *qweight, int *zeros, float *scales, std::vector <uint8_t> &int8Packed) {
+        int int8BytesPerRow = m;
+        int rowSize = int8BytesPerRow + sizeof(float) * 2;  // m个uint8 + 1个min + 1个scale
+        
+        // 调整输出vector大小
+        int8Packed.resize((size_t)experts * n * rowSize);
+        
+        for (size_t i = 0; i < experts; i++) {
+            for (size_t j = 0; j < n; j++) {
+                size_t rowIdx = i * n + j;
+                size_t packedOffset = rowIdx * rowSize;
+                
+                size_t currentPos = packedOffset;
+                
+                // 直接使用当前行的int4数据
+                size_t srcOffset = i * n * int8BytesPerRow + j * int8BytesPerRow;
+                memcpy(&int8Packed[currentPos], &qweight[srcOffset], m);
+                currentPos += int8BytesPerRow;
+                
+                // 添加当前行的min值
+                float* minPtr = (float*)(&int8Packed[currentPos]);
+                *minPtr = ((float)0 - zeros[rowIdx]) * scales[rowIdx];
+                currentPos += sizeof(float);
+                
+                // 添加当前行的scale值
+                float* scalePtr = (float*)(&int8Packed[currentPos]);
+                *scalePtr = scales[rowIdx];
+                currentPos += sizeof(float);
+            }
+        }
+    }
 
     struct FastllmMoeDataManagerNumas {
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
@@ -280,6 +311,16 @@ namespace fastllm {
                 for (int i = 0; i < numaConfig->numaCnt; i++) {
                     data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
                     memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                }
+            } else if (data->dataType == DataType::INT8) {
+                std::vector <uint8_t> int8Packed;
+                Int8ToFastllmInt8PerchannelPacked(1, k, m, (uint8_t*)data->cpuData, data->zeros.data(), data->scales.data(), int8Packed);
+                data->dataType = DataType::INT8_PERCHANNEL;
+
+                size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
+                for (int i = 0; i < numaConfig->numaCnt; i++) {
+                    data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
+                    memcpy(data->numasData[i], int8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
                 }
             } else if (data->dataType == DataType::INT4_NOZERO) {
                 std::vector <uint8_t> int4Packed;
