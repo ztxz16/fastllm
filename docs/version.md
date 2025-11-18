@@ -1,3 +1,12 @@
+## V0.1.5.0
+
+- 提高moe_device为numa时的prefill速度
+- moe_device为numa时，可以不设置环境变量，通过`-t`参数设置总的线程数
+- 支持参数`--moe_dtype bfloat16`指定moe类型为bf16, 在一些情况下可以提高速度
+- 支持GLM系列的FP8模型，修复GLM模型长上下文的bug
+- 支持DeepSeek V3.2模型
+- 新增项目引用文件说明，详见[参考代码和文章](../README.md#参考代码和文章)
+
 ## V0.1.4.9
 
 - 修复Qwen3-Next长上下文中出现的bug
