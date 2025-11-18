@@ -232,7 +232,7 @@ namespace fastllm {
             model = (basellm*)(new Qwen3MOEModel());
         } else if (modelType == "qwen3_next") {
             model = (basellm*)(new Qwen3NextModel());
-        } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3" || modelType == "kimi_k2") {
+        } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3" || modelType == "kimi_k2" || modelType == "deepseek_v32") {
             model = (basellm*)(new DeepSeekV2Model());
             model->model_type = modelType;
         } else if (modelType == "qwen2") {
