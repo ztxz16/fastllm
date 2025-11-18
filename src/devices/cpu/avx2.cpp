@@ -960,6 +960,61 @@ namespace fastllm {
 #endif
     }
 
+    bool LinearINT8GROUP128_INT4GROUP128_AVX2_Kernel(uint8_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end) {
+#ifdef __AVX2__
+        size_t lda = GetDataBytes(DataType::INF_INT8_GROUP128, 1, m);
+        size_t ldb = GetDataBytes(DataType::INT4_GROUP128, 1, m);
+        size_t ldc = GetDataBytes(DataType::FLOAT32, 1, k);
+        
+        int groupCnt = 128;
+        int groups = m / 128;
+        size_t astride = groupCnt + sizeof(float) + sizeof(int);
+        size_t bstride = (groupCnt / 2) + sizeof(float) * 2;
+
+        for (int i = 0; i < n; i++) {
+            // A矩阵的第i行，InfInt8PerChannel格式
+            float *floatC = (float*)((uint8_t*)outputData + i * ldc);
+            
+            for (int j = st; j < end; j++) {
+                float fsum = 0.0f;
+                for (int g = 0; g < groups; g++) {
+                    uint8_t *infInt8A = (uint8_t*)inputData + i * lda + g * astride;
+                    int8_t *quantizedA = (int8_t*)infInt8A;
+                    float scaleA = *(float*)(infInt8A + groupCnt);
+                    int sumA = *(int*)(infInt8A + groupCnt + sizeof(float));
+
+                    uint8_t *int4B = (uint8_t*)weightData + j * ldb + g * bstride;
+                    float minB = *(float*)(int4B + (groupCnt + 1) / 2);
+                    float scaleB = *(float*)(int4B + (groupCnt + 1) / 2 + sizeof(float));
+
+                    int sum = 0;
+                    int i = 0;
+                    __m256i acc = _mm256_setzero_si256();
+                    const __m256i lowMask = _mm256_set1_epi8(0xf);
+                    const __m256i ones = _mm256_set1_epi16(1);
+                    for (; i + 31 < groupCnt; i += 32) {
+                        __m128i orix = _mm_loadu_si128((const __m128i *) (int4B + i / 2));
+                        __m256i bytex = _mm256_set_m128i(_mm_srli_epi16(orix, 4), orix);
+                        __m256i bx = _mm256_and_si256(lowMask, bytex);
+                        __m256i by = _mm256_loadu_si256((const __m256i *) (quantizedA + i));
+                        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(bx, by), ones));
+                    }
+                    sum = I32sum(acc);
+                    fsum += sum * scaleA * scaleB + minB * scaleA * sumA;
+                }
+
+                floatC[j] = fsum;
+            }
+        }
+
+        AddBiasAVX2(outputData, biasData, n, k, st, end);
+        return true;
+#else
+        return false;
+#endif
+    }
+
     template <int BROW, int AROW>
     void mul_mat_f16_f32_direct_avx2(
         int n,
