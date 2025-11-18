@@ -56,13 +56,32 @@ namespace fastllm {
         using value_type = T;
         
         T* allocate(std::size_t n) {
-            void* ptr = std::aligned_alloc(Alignment, n * sizeof(T));
-            if (!ptr) throw std::bad_alloc();
-            return static_cast<T*>(ptr);
+            std::size_t size = n * sizeof(T);
+            
+            // 分配额外的内存用于对齐和存储原始指针
+            std::size_t total_size = size + Alignment - 1 + sizeof(void*);
+            void* raw_ptr = std::malloc(total_size);
+            
+            if (!raw_ptr) throw std::bad_alloc();
+            
+            // 计算对齐后的地址
+            void* aligned_ptr = reinterpret_cast<void*>(
+                (reinterpret_cast<std::uintptr_t>(raw_ptr) + sizeof(void*) + Alignment - 1) 
+                & ~(Alignment - 1)
+            );
+            
+            // 在对齐地址前存储原始指针
+            *(reinterpret_cast<void**>(aligned_ptr) - 1) = raw_ptr;
+            
+            return static_cast<T*>(aligned_ptr);
         }
         
         void deallocate(T* p, std::size_t) noexcept {
-            std::free(p);
+            if (p) {
+                // 获取原始指针并释放
+                void* raw_ptr = *(reinterpret_cast<void**>(p) - 1);
+                std::free(raw_ptr);
+            }
         }
         
         template<typename U>
