@@ -4541,7 +4541,7 @@ __global__ void CumSumLastDimKernel(T* data, int dim, int outer) {
         
         // 对每一行进行累积和
         for (int j = 1; j < dim; j++) {
-            row[j] += row[j - 1];
+            row[j] = (T)((float)row[j] + (float)row[j - 1]);
         }
     }
 }
