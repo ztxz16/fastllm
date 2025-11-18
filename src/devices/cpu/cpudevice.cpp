@@ -890,7 +890,10 @@ namespace fastllm {
         		if (BType == DataType::INT4_PERCHANNEL) {
                     LinearINT8PERCHANNEL_INT4PERCHANNEL_Kernel((uint8_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
                     finish = true;
-        		}
+        		} else if (BType == DataType::INT8_PERCHANNEL) {
+                    LinearINT8PERCHANNEL_INT8PERCHANNEL_Kernel((uint8_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
+                    finish = true;
+                }
         	}
         } else if (AType == DataType::INF_INT8_GROUP128) {
         	if (CType == DataType::FLOAT32) {

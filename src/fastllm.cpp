@@ -176,6 +176,8 @@ namespace fastllm {
             return rows * columns * sizeof(uint8_t);
         } else if (type == DataType::INT4_PERCHANNEL) {
             return rows * (columns / 2 + 2 * sizeof(float));
+        } else if (type == DataType::INT8_PERCHANNEL) {
+            return rows * (columns + 2 * sizeof(float));
         } else if (type == DataType::INT4_GROUP128) {
             rows *= (columns / 128);
             columns = 128;
@@ -1786,7 +1788,8 @@ namespace fastllm {
             return (DataType)((int)DataType::DATA_GGUF_FORMAT + ggml_type_vec_dot_type((ggml_type)this->ggmlType));
         } else if (this->dataType == DataType::FLOAT16) {
             return DataType::FLOAT32;
-        } else if (this->dataType == DataType::INT4_PERCHANNEL) {
+        } else if (this->dataType == DataType::INT4_PERCHANNEL ||
+                    this->dataType == DataType::INT8_PERCHANNEL) {
             return DataType::INF_INT8_PERCHANNEL;
         } else if (this->dataType == DataType::INT4_GROUP128) {
             return DataType::INF_INT8_GROUP128;
