@@ -815,6 +815,14 @@ namespace fastllm {
         }
     }
 
+    static std::map <DataType, int> DefaultGroupCnts = {
+        {DataType::INT4_GROUP, 128},
+        {DataType::INT2_GROUP, 128}, 
+        {DataType::BASE3_GROUP, 128}
+    };
+
+    extern std::map <DataType, std::vector <std::string> > dataTypeNames;
+
     void ParseDataType(std::string weightName, std::vector <std::pair <std::string, std::string> > &dtypeRules, 
                         DataType &dataType, int &groupCnt, int &ggmlType) {
         std::string matchedType = "";
