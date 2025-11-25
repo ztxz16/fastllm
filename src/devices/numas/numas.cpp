@@ -98,6 +98,12 @@ namespace fastllm {
         void* raw_ptr = numa_alloc_onnode(total_size, node);
         if (!raw_ptr) {
             std::cerr << "Failed to allocate " << size << " bytes on NUMA node " << node << std::endl;
+
+            std::cerr << "Try increate max_map_count: " << std::endl;
+            std::cerr << "Temporary: `sudo sysctl -w vm.max_map_count=262144`" << std::endl;
+            std::cerr << "Permanent: `sudo echo \"vm.max_map_count=262144\" | sudo tee -a /etc/sysctl.conf && sudo sysctl -p`" << std::endl;
+            exit(0);
+
             return nullptr;
         }
         
