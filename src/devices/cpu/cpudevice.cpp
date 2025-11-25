@@ -5761,8 +5761,9 @@ ops += (long long)lines * inputDim * interDim * 2;
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input0 = *(datas.find("input0")->second);
         Data &input1 = *(datas.find("input1")->second);
+        int input0Len = input0.Count(0);
         int input1Len = input1.Count(0);
-        AssertInFastLLM(input0.dims == input1.dims || input1Len == 1, "MulTo error: input's shape should be same.\n");
+        AssertInFastLLM(input0.dims == input1.dims || input1Len == 1 || input0Len % input1Len == 0, "MulTo error: input's shape should be same.\n");
 
         int len = input0.Count(0);
         int inner = input1.Count(0);
@@ -5783,7 +5784,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                     input0Data[i] *= input1Data[0];
                 }
             }
-        } else {
+        } else if (input0Len == input1Len) {
             if (input0.dataType == DataType::FLOAT16) {
                 uint16_t *input0Data = (uint16_t*)input0.cpuData;
                 uint16_t *input1Data = (uint16_t*)input1.cpuData;
@@ -5795,6 +5796,21 @@ ops += (long long)lines * inputDim * interDim * 2;
                 float *input1Data = (float*)input1.cpuData;
                 for (int i = 0; i < len; i++) {
                     input0Data[i] *= input1Data[i];
+                }
+            }
+        } else {
+            int channelLen = input0Len / input1Len;
+            if (input0.dataType == DataType::FLOAT16) {
+                uint16_t *input0Data = (uint16_t*)input0.cpuData;
+                uint16_t *input1Data = (uint16_t*)input1.cpuData;
+                for (int i = 0; i < len; i++) {
+                    input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] * fp16tofp32.dict[input1Data[i / channelLen]]);
+                }
+            } else {
+                float *input0Data = (float*)input0.cpuData;
+                float *input1Data = (float*)input1.cpuData;
+                for (int i = 0; i < len; i++) {
+                    input0Data[i] *= input1Data[i / channelLen];
                 }
             }
         }
