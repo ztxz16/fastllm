@@ -165,7 +165,7 @@ namespace fastllm {
             return;
         }
         int threadNum = pool->threads.size();
-        threadNum = std::min(4, threadNum);
+        threadNum = std::min(8, threadNum);
 
         int per = len / threadNum;
         int cur = 0;

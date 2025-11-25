@@ -6485,6 +6485,8 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    static std::vector <uint8_t> vold;
+
     void CpuPermuteSelfOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -6535,8 +6537,9 @@ ops += (long long)lines * inputDim * interDim * 2;
             delete[] temp;
             input.Resize(new_dims);
         } else if (axis == std::vector<int> {0, 2, 1, 3}) {
-            std::vector <uint8_t> vold;
-            vold.resize(input.GetBytes());
+            if (vold.size() < input.GetBytes()) {
+                vold.resize(input.GetBytes());
+            }
             RunMultiThreadMemcpy(vold.data(), input.cpuData, input.GetBytes(), GetAlivePool());
             uint8_t *oldData = vold.data();
             uint8_t *newData = (uint8_t *) input.cpuData;
@@ -6552,8 +6555,9 @@ ops += (long long)lines * inputDim * interDim * 2;
             }
             input.Resize(new_dims);
         } else if (axis == std::vector <int> {1, 0, 2}) {
-            std::vector <uint8_t> vold;
-            vold.resize(input.GetBytes());
+            if (vold.size() < input.GetBytes()) {
+                vold.resize(input.GetBytes());
+            }
             RunMultiThreadMemcpy(vold.data(), input.cpuData, input.GetBytes(), GetAlivePool());
             uint8_t *oldData = vold.data();
             uint8_t *newData = (uint8_t *) input.cpuData;
