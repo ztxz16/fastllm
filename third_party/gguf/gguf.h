@@ -15,6 +15,10 @@
 #include "fastllm.h"
 #include "basellm.h"
 
+#ifdef __aarch64__
+#include "arm_neon.h"
+#endif
+
 #if defined(GGML_COMMON_IMPL_CUDA) || defined(GGML_COMMON_IMPL_HIP) || defined(GGML_COMMON_IMPL_MUSA)
 #define GGML_TABLE_BEGIN(type, name, size) static const __device__ type name[size] = {
 #define GGML_TABLE_END() };

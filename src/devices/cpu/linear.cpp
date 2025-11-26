@@ -519,12 +519,32 @@ namespace fastllm {
                 float now = biasData ? biasData[j] : 0.0f;
                 int l = 0;
 #ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
-                float16x8_t sum = {0, 0, 0, 0, 0, 0, 0, 0};
+                float16x8_t sum_vec = vdupq_n_f16(0.0f);
                 for (; l + 7 < m; l += 8) {
-                    sum = vfmaq_f16(sum, vld1q_f16((float16_t*)inputData + i * m + l),
-                                        vld1q_f16((float16_t*)weightData + j * m + l));
+                    // 加载 8 个 FP32 输入：分成低 4 和高 4
+                    float32x4_t vin_low = vld1q_f32(inputData + i * m + l);
+                    float32x4_t vin_high = vld1q_f32(inputData + i * m + l + 4);
+                    
+                    // 转换为 FP16
+                    float16x4_t vin16_low = vcvt_f16_f32(vin_low);
+                    float16x4_t vin16_high = vcvt_f16_f32(vin_high);
+                    
+                    // 合并为 FP16x8
+                    float16x8_t vin16 = vcombine_f16(vin16_low, vin16_high);
+                    
+                    // 加载 8 个 FP16 权重
+                    float16x8_t vweight = vld1q_f16((const float16_t*)(weightData + j * m + l));
+                    
+                    // FP16 FMA: sum += vin * vweight
+                    sum_vec = vfmaq_f16(sum_vec, vin16, vweight);
                 }
-                now += sum[0] + sum[1] + sum[2] + sum[3] + sum[4] + sum[5] + sum[6] + sum[7];
+                
+                // 将 sum_vec 转换为 FP32 并求和
+                float16x4_t slow = vget_low_f16(sum_vec);
+                float16x4_t shigh = vget_high_f16(sum_vec);
+                float32x4_t flow = vcvt_f32_f16(slow);
+                float32x4_t fhigh = vcvt_f32_f16(shigh);
+                now += vaddvq_f32(flow) + vaddvq_f32(fhigh);
 #else
 #ifdef __aarch64__
                 float32x4_t sum = {0, 0, 0, 0};
@@ -1170,13 +1190,6 @@ namespace fastllm {
     void RunLinearFloat32Float16(float *inputData, uint16_t *weightData, float *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum) {
-#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
-        uint16_t *temp = new uint16_t[n * m];
-        for (int i = 0; i < n * m; i++) {
-            temp[i] = float_to_half(inputData[i]);
-        }
-        inputData = (float*)temp;
-#endif
         int per = k / threadNum;
         int cur = 0;
         std::vector<fastllm::MultiThreadLinearFloat32Float16Op*> ops;
@@ -1196,9 +1209,6 @@ namespace fastllm {
             pool->Wait(startTid + i);
             delete ops[i];
         }
-#ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
-        delete[] temp;
-#endif
     }
 
     struct FastllmBF16Manager {
