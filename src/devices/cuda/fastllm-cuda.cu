@@ -1034,15 +1034,17 @@ __global__ void AttnBlockUpdate(half *data, int n, int m, float *lastMax, float 
     unsigned int bid = blockIdx.x;
 
     if (tid == 0) {
-        float oldSum = lastSum[bid] * exp(lastMax[bid] - curMax[bid]);
-        scale = oldSum / curSum[bid];
+        float diff = fminf(lastMax[bid] - curMax[bid], 0.f);
+        float oldSum = lastSum[bid] * expf(diff);
+        scale = (curSum[bid] > 1e-10f) ? (oldSum / curSum[bid]) : 0.0f;
+
         lastSum[bid] = curSum[bid];
         lastMax[bid] = curMax[bid];
     }
     __syncthreads();
 
     for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
-        data[bid * m + tid] = (half)((float)data[bid * m + tid] * scale);
+        data[bid * m + i] = (half)((float)data[bid * m + i] * scale);
     }
 }
 
