@@ -21,13 +21,6 @@
 // 一个 Tile B (权重) 占用的字节数: 16行(VNNI packing后) * 64字节(宽) = 1024字节
 #define TILE_B_SIZE_BYTES 1024 
 
-// ARCH_REQ_XCOMP_PERM 系统调用
-#define ARCH_GET_XCOMP_PERM     0x1022
-#define ARCH_REQ_XCOMP_PERM     0x1023
-#define XFEATURE_XTILECFG       17
-#define XFEATURE_XTILEDATA      18
-#include <sys/syscall.h>
-
 // BF16 类型定义
 typedef uint16_t bf16_t;
 
@@ -43,18 +36,6 @@ typedef struct __tile_config {
 #include "fastllm.h"
 
 namespace fastllm {
-    struct AMXIniter {
-        AMXIniter() {
-            if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) != 0) {
-                printf("init amx failed.\n");
-                exit(0);
-            } else {
-                printf("init amx.\n");
-            }
-        }
-    };
-    static AMXIniter amxIniter;
-
     extern void AddBiasAVX512(float *outputData, float *biasData, int n, int k, int st, int end);
 
     // -------------------------------------------------------------------------
