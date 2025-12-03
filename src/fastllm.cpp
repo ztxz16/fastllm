@@ -43,6 +43,13 @@ namespace py = pybind11;
 
 #include "gguf.h"
 
+// ARCH_REQ_XCOMP_PERM 系统调用
+#define ARCH_GET_XCOMP_PERM     0x1022
+#define ARCH_REQ_XCOMP_PERM     0x1023
+#define XFEATURE_XTILECFG       17
+#define XFEATURE_XTILEDATA      18
+#include <sys/syscall.h>
+
 namespace fastllm {
     std::map <std::string, int> defaultDeviceMap, defaultMoeDeviceMap;
     Executor defaultExecutor;
@@ -56,6 +63,7 @@ namespace fastllm {
     static bool historyCacheInCPU = false;
     static bool cudaEmbedding = false;
     static bool cudaSharedExpert = false;
+    static bool enableAMX = false;
 
     static std::map <DataType, int> DataTypeBits = {
         {DataType::FLOAT32, 32}, {DataType::BFLOAT16, 16}, {DataType::INT16, 16}, 
@@ -150,6 +158,22 @@ namespace fastllm {
 
     int GetThreads() {
         return threads;
+    }
+
+    void EnableAMX(bool enable) {
+        enableAMX = enable;
+        if (enable) {
+            if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) != 0) {
+                printf("init amx failed.\n");
+                exit(0);
+            } else {
+                printf("enable amx finish.\n");
+            }
+        }
+    }
+
+    bool GetEnableAMX() {
+        return enableAMX;
     }
 
     AliveThreadPool *GetAlivePool() {
@@ -1604,8 +1628,13 @@ namespace fastllm {
         this->dataDevice = device;
     }
 
+    extern CPUInstructInfo cpuInstructInfo;
+
     void Data::Repack() {
         if (this->IsRepacked || this->dataType != DATA_GGUF_FORMAT) {
+            return;
+        }
+        if (GetEnableAMX() && cpuInstructInfo.hasAMX) {
             return;
         }
         this->IsRepacked = true;
@@ -1797,9 +1826,13 @@ namespace fastllm {
         }
     }
 
-    DataType Data::GetLinearActDataType() {
+    DataType Data::GetLinearActDataType(int batchSize) {
         if (this->dataType == DataType::DATA_GGUF_FORMAT) {
-            return (DataType)((int)DataType::DATA_GGUF_FORMAT + ggml_type_vec_dot_type((ggml_type)this->ggmlType));
+            if (batchSize > 31 && GetEnableAMX() && cpuInstructInfo.hasAMX) {
+                return DataType::BFLOAT16;
+            } else {
+                return (DataType)((int)DataType::DATA_GGUF_FORMAT + ggml_type_vec_dot_type((ggml_type)this->ggmlType));
+            }
         } else if (this->dataType == DataType::FLOAT16) {
             return DataType::FLOAT32;
         } else if (this->dataType == DataType::INT4_PERCHANNEL ||

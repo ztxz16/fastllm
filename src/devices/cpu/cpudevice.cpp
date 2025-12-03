@@ -1050,6 +1050,19 @@ namespace fastllm {
                     } else {
                         LinearBFloat16_AWQ4BIT128_Kernel((uint16_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
                     } */ 
+                } else if (BType >= DataType::DATA_GGUF_FORMAT && BType < DataType::DATA_GGUF_FORMAT_END) {
+                    std::vector <float> fp32B_temp((end - st) * m);
+                    std::vector <uint16_t> bf16B_temp((end - st) * m);
+                    ggml_type weightType = (ggml_type)((int)BType - (int)DataType::DATA_GGUF_FORMAT);
+
+                    auto toFloat = ggml_type_to_float(weightType);
+                    AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight (type " + std::string(ggml_type_name(weightType)) + ") can't convert to fp32.");
+                    toFloat(((uint8_t*)B) + ldb * st, fp32B_temp.data(), (end - st) * m);
+                    Float32ToBFloat16(fp32B_temp.data(), bf16B_temp.data(), (end - st) * m);
+                    MultiThreadLinearBFloat16BFloat16Op (
+                            (uint16_t*)A, bf16B_temp.data(), nullptr, ((float*)C) + st, n, m, ldc / sizeof(float), 0, end - st
+                    ).Run();
+                    finish = true;
                 }
             }
         }

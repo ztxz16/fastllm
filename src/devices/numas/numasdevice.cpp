@@ -604,8 +604,8 @@ auto st = std::chrono::system_clock::now();
                         v.push_back(std::make_pair(0, sharedScale));
                     }
 
-                    DataType startDataType = weights[2]->GetLinearActDataType();
-                    DataType downInputDataType = weights[3]->GetLinearActDataType();
+                    DataType startDataType = weights[2]->GetLinearActDataType(1);
+                    DataType downInputDataType = weights[3]->GetLinearActDataType(1);
 
                     // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
                     auto& realInput = fastllmMoeDataManagerNumas.realInput;
@@ -889,8 +889,8 @@ auto st = std::chrono::system_clock::now();
                     }
                 }
 // printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-                DataType startDataType = weights[2]->GetLinearActDataType();
-                DataType downInputDataType = weights[3]->GetLinearActDataType();
+                DataType startDataType = weights[2]->GetLinearActDataType(bs);
+                DataType downInputDataType = weights[3]->GetLinearActDataType(bs);
 
                 // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
                 auto& realInput = fastllmMoeDataManagerNumas.realInput;
