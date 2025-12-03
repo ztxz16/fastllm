@@ -901,13 +901,14 @@ auto st = std::chrono::system_clock::now();
                 auto& downOutput = fastllmMoeDataManagerNumas.downOutput;
                 auto& reduceOutput = fastllmMoeDataManagerNumas.reduceOutput;
 
+                int alignTotalLines = ((totalLines - 1) / 64 + 1) * 64;
                 // 计算所需大小
                 size_t realInputSize = GetDataBytes(startDataType, bs, inputDim);
-                size_t expandInputSize = GetDataBytes(startDataType, totalLines, inputDim);
-                size_t gateUpOutputSize = totalLines * interDim * 2;
-                size_t swigluOutputSize = totalLines * interDim;
-                size_t downInputSize = GetDataBytes(downInputDataType, totalLines, interDim);
-                size_t downOutputSize = totalLines * outputDim;
+                size_t expandInputSize = GetDataBytes(startDataType, alignTotalLines, inputDim);
+                size_t gateUpOutputSize = alignTotalLines * interDim * 2;
+                size_t swigluOutputSize = alignTotalLines * interDim;
+                size_t downInputSize = GetDataBytes(downInputDataType, alignTotalLines, interDim);
+                size_t downOutputSize = alignTotalLines * outputDim;
                 size_t reduceOutputSize = bs * outputDim;
 
                 // 只在当前容量不足时才进行 resize
