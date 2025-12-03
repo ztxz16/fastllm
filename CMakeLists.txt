@@ -176,6 +176,11 @@ else()
             PROPERTIES
             COMPILE_OPTIONS "-mavx512vnni;-mavx512f"
         )
+        set_source_files_properties(
+            "src/devices/cpu/amx.cpp"
+            PROPERTIES
+            COMPILE_OPTIONS "-mavx512bf16;-mavx512f;-mavx512bw;-mavx512vl;-mamx-tile;-mamx-bf16"
+        )
     endif()
 endif()
 
