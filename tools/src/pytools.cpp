@@ -53,6 +53,10 @@ extern "C" {
         fastllm::SetCudaSharedExpert(cuda_shared_expert);
     }
 
+    DLL_EXPORT void set_enable_amx(bool enable_amx) {
+        fastllm::EnableAMX(enable_amx);
+    }
+
     DLL_EXPORT bool get_cpu_low_mem(bool low) {
         return fastllm::GetLowMemMode();
     }
