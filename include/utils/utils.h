@@ -139,41 +139,47 @@ namespace fastllm {
         bool hasAVX512F = false;
         bool hasAVX512BF16 = false;
         bool hasAVX512VNNI = false;
-        
+        bool hasAMX = false; // New flag for AMX
+
         CPUInstructInfo() {
 #ifndef __aarch64__
-            #if defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)
+#if defined(_MSC_VER) || defined(__GNUC__) || defined(__clang__)
             std::array<int, 4> regs; // For EAX, EBX, ECX, EDX
             
             // Step 1: Check OSXSAVE bit (CPUID EAX=1, ECX bit 27)
-            // This indicates if the OS supports XGETBV to query enabled AVX features
             bool os_supports_xsave = false;
             #if defined(_MSC_VER)
             __cpuid(regs.data(), 1);
-            #else // GCC/Clang
+            #else 
             __get_cpuid(1, (unsigned int*)&regs[0], (unsigned int*)&regs[1], (unsigned int*)&regs[2], (unsigned int*)&regs[3]);
             #endif
-            if (regs[2] & (1 << 27)) { // Check ECX bit 27 (OSXSAVE)
+            if (regs[2] & (1 << 27)) {
                 os_supports_xsave = true;
             }
             
             bool os_avx_enabled = false;
             bool os_avx512_enabled = false;
+            bool os_amx_enabled = false; // OS state support for AMX
+
             if (os_supports_xsave) {
-                // Step 2: Check if AVX states (and by extension AVX512 states) are enabled by OS
-                // XCR0 register:
-                // Bit 1 (SSE state) must be 1
-                // Bit 2 (AVX state - YMM registers) must be 1
-                // Bits 5,6,7 (AVX512 OPMASK, ZMM_Hi256, Hi16_ZMM states) must be 1 for AVX512
-                uint64_t xcr0 = _xgetbv(_XCR_XFEATURE_ENABLED_MASK); // _XCR_XFEATURE_ENABLED_MASK is typically 0
+                uint64_t xcr0 = _xgetbv(_XCR_XFEATURE_ENABLED_MASK);
                 
                 // Check for AVX support (bits 1 and 2)
                 if ((xcr0 & 0x6) == 0x6) {
                     os_avx_enabled = true;
                     
                     // Check for AVX512 support (bits 1,2,5,6,7)
+                    // OPMASK(5), ZMM_Hi256(6), Hi16_ZMM(7)
                     if ((xcr0 & 0xE6) == 0xE6) {
                         os_avx512_enabled = true;
+                    }
+
+                    // Check for AMX support (bits 17 and 18)
+                    // Bit 17: XTILECFG state
+                    // Bit 18: XTILEDATA state
+                    // Both must be 1 for AMX to be usable
+                    if ((xcr0 & ((1 << 17) | (1 << 18))) == ((1 << 17) | (1 << 18))) {
+                        os_amx_enabled = true;
                     }
                 }
             }
@@ -182,7 +188,7 @@ namespace fastllm {
                 // CPUID with EAX=7, ECX=0 for extended features
                 #if defined(_MSC_VER)
                 __cpuidex(regs.data(), 7, 0);
-                #else // GCC/Clang
+                #else 
                 __get_cpuid_count(7, 0, (unsigned int*)&regs[0], (unsigned int*)&regs[1], (unsigned int*)&regs[2], (unsigned int*)&regs[3]);
                 #endif
                 
@@ -197,33 +203,44 @@ namespace fastllm {
                     // AVX512VNNI: EAX=7, ECX=0, ECX bit 11
                     hasAVX512VNNI = (regs[2] & (1 << 11)) != 0;
                     
+                    // AMX-TILE is the base requirement (EAX=7, ECX=0, EDX bit 24)
+                    if(os_amx_enabled) {
+                        bool hasAMX_TILE = (regs[3] & (1 << 24)) != 0;
+                        // Usually we also check for specific AMX arithmetic capabilities:
+                        // AMX-INT8 (EDX bit 25) or AMX-BF16 (EDX bit 22)
+                        bool hasAMX_INT8 = (regs[3] & (1 << 25)) != 0;
+                        bool hasAMX_BF16 = (regs[3] & (1 << 22)) != 0;
+
+                        // We set hasAMX to true if we have the tile architecture AND at least one compute capability
+                        hasAMX = hasAMX_TILE && (hasAMX_INT8 || hasAMX_BF16);
+                    }
+
                     // AVX512_BF16: EAX=7, ECX=1, EAX bit 5
-                    // Need to make another CPUID call with ECX=1
                     #if defined(_MSC_VER)
                     __cpuidex(regs.data(), 7, 1);
-                    #else // GCC/Clang
+                    #else 
                     __get_cpuid_count(7, 1, (unsigned int*)&regs[0], (unsigned int*)&regs[1], (unsigned int*)&regs[2], (unsigned int*)&regs[3]);
                     #endif
                     hasAVX512BF16 = (regs[0] & (1 << 5)) != 0;
                     
-                    // Ensure AVX512_BF16 and AVX512VNNI depend on AVX512F
+                    // Dependencies
                     hasAVX512BF16 = hasAVX512BF16 && hasAVX512F;
                     hasAVX512VNNI = hasAVX512VNNI && hasAVX512F;
                 }
             }
-            // If os_avx_enabled is false, all 'has...' flags will remain false.
-            #endif // Compiler check
-            // Print the results
+#endif             
             std::string x[2] = {"OFF", "ON"};
             printf("CPU Instruction Info: ");
             printf("[AVX2: %s] ", x[hasAVX2].c_str());
             printf("[AVX512F: %s] ", x[hasAVX512F].c_str());
             printf("[AVX512_VNNI: %s] ", x[hasAVX512VNNI].c_str());
             printf("[AVX512_BF16: %s] ", x[hasAVX512BF16].c_str());
+            printf("[AMX: %s] ", x[hasAMX].c_str()); // Print AMX status
             printf("\n");
-#endif // ifndef __aarch64__
+#endif 
         }
     };
+
     // static CPUInstructInfo cpuInstructInfo;
 
     struct FP16ToFP32Manager {

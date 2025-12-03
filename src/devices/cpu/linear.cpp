@@ -578,8 +578,17 @@ namespace fastllm {
                         int n, int m, int k, int st, int end);
     extern bool LinearBFloat16BFloat16_AVX2_Kernel(uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end);
-
+    extern bool LinearBFloat16BFloat16_AMX_Kernel(uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end);
     void MultiThreadLinearBFloat16BFloat16Op::Run() {
+        if (cpuInstructInfo.hasAMX && GetEnableAMX() && n > 7) {
+            if (LinearBFloat16BFloat16_AMX_Kernel(
+                inputData, weightData, biasData, outputData, n, m, k, st, end
+                )) {
+                return;
+            }
+        }
+        
         if (cpuInstructInfo.hasAVX512BF16) {
             if (LinearBFloat16BFloat16_AVX512BF16_Kernel(
                 inputData, weightData, biasData, outputData, n, m, k, st, end

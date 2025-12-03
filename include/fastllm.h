@@ -48,6 +48,8 @@ namespace fastllm {
     int GetThreads();
     bool GetKVCacheInCPU();
     bool GetHistoryCacheInCPU();
+    void EnableAMX(bool enable);
+    bool GetEnableAMX();
     AliveThreadPool *GetAlivePool();
 
     template<typename T, std::size_t Alignment>
@@ -441,7 +443,7 @@ namespace fastllm {
         DataType GetDataType();
 
         // 当前权重作为linear的weight时，输入应该是什么类型
-        DataType GetLinearActDataType();
+        DataType GetLinearActDataType(int batchSize);
     };
 
     struct PartitionLinkNode {
