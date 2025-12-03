@@ -1,3 +1,12 @@
+## V0.1.5.1
+
+- 初步支持AMX加速，在支持AMX的机器上通过参数--amx true来开启
+- 修复纯CPU执行Next模型出错的bug
+- 修复部分没有AVX512的机器执行出错的bug
+- Numa分配出错时输出提示信息和解决命令
+- 修复Cuda计算长Attention的错误 (pr from loveheart)
+- 修复Arm上的编译
+
 ## V0.1.5.0
 
 - 提高moe_device为numa时的prefill速度
