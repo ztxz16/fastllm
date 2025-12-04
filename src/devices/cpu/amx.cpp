@@ -34,9 +34,28 @@ typedef struct __tile_config {
 } __tilecfg;
 
 #include "fastllm.h"
+// ARCH_REQ_XCOMP_PERM 系统调用
+#define ARCH_GET_XCOMP_PERM     0x1022
+#define ARCH_REQ_XCOMP_PERM     0x1023
+#define XFEATURE_XTILECFG       17
+#define XFEATURE_XTILEDATA      18
+#include <sys/syscall.h>
 
 namespace fastllm {
     extern void AddBiasAVX512(float *outputData, float *biasData, int n, int k, int st, int end);
+
+    void InitAMX() {
+#if defined(__AMX_TILE__)
+        if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) != 0) {
+            printf("init amx failed.\n");
+            exit(0);
+        } else {
+            printf("enable amx finish.\n");
+        }
+#else
+        printf("enable amx failed.\n");
+#endif
+    }
 
     // -------------------------------------------------------------------------
     // 辅助函数: 上取整除法
@@ -54,6 +73,7 @@ namespace fastllm {
                                int N, int M, int GlobalK, 
                                int st, int end,
                                int lda, int ldc) {
+#if defined(__AMX_TILE__)
         __tilecfg tile_cfg;
         memset(&tile_cfg, 0, sizeof(tile_cfg));
         tile_cfg.palette_id = 1;
@@ -132,8 +152,13 @@ namespace fastllm {
         _tile_release();
         free(A_block);
         free(C_block);
+#else
+        printf("Unsupport AMX.\n");
+        exit(0);
+#endif
     }
 
+#if defined(__AMX_TILE__)
     // This function copy from https://github.com/alibaba/MNN
     inline void transpose16x16F(
                     __m512& r0f, __m512& r1f, __m512& r2f, __m512& r3f,
@@ -244,6 +269,7 @@ namespace fastllm {
         ref = _mm512_castsi512_ps(re);
         rff = _mm512_castsi512_ps(rf);
     }
+#endif
 
     // 假设已经包含了 transpose16x16F 函数定义
     static inline void amx_transpose_pack_kernel_avx512(float *dst_tile, 
@@ -252,6 +278,7 @@ namespace fastllm {
                                                             int valid_cols, // k (width)
                                                             int valid_rows) // m (height) 
     {
+#if defined(__AMX_TILE__)
         // 1. 准备 K 维度的 Mask
         // 如果 valid_cols = 16，mask 为 0xFFFF；如果 < 16，高位为 0，防止非法读取并自动填充 0
         __mmask16 load_mask = (1 << valid_cols) - 1;
@@ -290,6 +317,10 @@ namespace fastllm {
         for (int i = 0; i < 16; ++i) {
             _mm512_storeu_ps(dst_tile + i * 16, regs[i]);
         }
+#else
+        printf("Unsupport AMX.\n");
+        exit(0);
+#endif
     }
 
     // -------------------------------------------------------------------------
@@ -356,6 +387,7 @@ namespace fastllm {
                                     int N, int M, int GlobalK, 
                                     int st, int end,
                                     int lda, int ldc) {
+#if defined(__AMX_TILE__)
         int width_k = end - st;
         int num_m_blocks = ceil_div(M, TILE_K); // M / 32
         // 1. 遍历 Batch (N)
@@ -431,6 +463,10 @@ namespace fastllm {
                 }
             }
         }
+#else
+        printf("Unsupport AMX.\n");
+        exit(0);
+#endif
     }
     // -------------------------------------------------------------------------
     // 3. 原始接口封装
@@ -439,7 +475,7 @@ namespace fastllm {
     // 而在此函数中直接复用已打包的内存。
     bool LinearBFloat16BFloat16_AMX_Kernel(uint16_t *inputData, uint16_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end) {
-// printf("into amx kernel\n");
+#if defined(__AMX_TILE__)
         // 1. 计算需要的 buffer 大小
         // M 维度按 32 对齐，K 维度 (end-st) 按 16 对齐
         int width_k = end - st;
@@ -472,5 +508,10 @@ namespace fastllm {
         free(packedB);
         
         return true;
+#else
+        printf("Unsupport AMX.\n");
+        exit(0);
+        return false;
+#endif
     }
 }

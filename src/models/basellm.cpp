@@ -856,6 +856,10 @@ auto st = std::chrono::system_clock::now();
                                     // TODO: ds_v2支持更长的切片
                                     first = 1024;
                                     part = 1024;
+                                    if (GetEnableAMX() && cpuInstructInfo.hasAMX) {
+                                        first = 2048;
+                                        part = 2048;
+                                    }
                                 }
                                 if (model->model_struct == "qwen3_next") {
                                     // TODO: qwen3_next支持更长的切片
