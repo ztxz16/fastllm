@@ -43,13 +43,6 @@ namespace py = pybind11;
 
 #include "gguf.h"
 
-// ARCH_REQ_XCOMP_PERM 系统调用
-#define ARCH_GET_XCOMP_PERM     0x1022
-#define ARCH_REQ_XCOMP_PERM     0x1023
-#define XFEATURE_XTILECFG       17
-#define XFEATURE_XTILEDATA      18
-#include <sys/syscall.h>
-
 namespace fastllm {
     std::map <std::string, int> defaultDeviceMap, defaultMoeDeviceMap;
     Executor defaultExecutor;
@@ -160,15 +153,11 @@ namespace fastllm {
         return threads;
     }
 
+    extern void InitAMX();
     void EnableAMX(bool enable) {
         enableAMX = enable;
         if (enable) {
-            if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) != 0) {
-                printf("init amx failed.\n");
-                exit(0);
-            } else {
-                printf("enable amx finish.\n");
-            }
+            InitAMX();
         }
     }
 
