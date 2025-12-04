@@ -176,10 +176,15 @@ else()
             PROPERTIES
             COMPILE_OPTIONS "-mavx512vnni;-mavx512f"
         )
+        set(AMX_COMPILE_OPTIONS "-mavx512bf16;-mavx512f;-mavx512bw;-mavx512vl")
+        if (CXX_MAJOR_VERSION GREATER_EQUAL 11)
+            list(APPEND AMX_COMPILE_OPTIONS "-mamx-tile" "-mamx-bf16")
+            message(STATUS "AMX support enabled (g++ >= 11)")
+        endif()
         set_source_files_properties(
             "src/devices/cpu/amx.cpp"
             PROPERTIES
-            COMPILE_OPTIONS "-mavx512bf16;-mavx512f;-mavx512bw;-mavx512vl;-mamx-tile;-mamx-bf16"
+            COMPILE_OPTIONS "${AMX_COMPILE_OPTIONS}"
         )
     endif()
 endif()
