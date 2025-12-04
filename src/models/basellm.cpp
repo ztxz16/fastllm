@@ -860,7 +860,7 @@ ClearProfiler();
                                     // TODO: ds_v2支持更长的切片
                                     first = 1024;
                                     part = 1024;
-                                    if (GetEnableAMX() && CPUInstructInfo.hasAMX) {
+                                    if (GetEnableAMX()) {
                                         first = 2048;
                                         part = 2048;
                                     }
