@@ -188,10 +188,6 @@ namespace fastllm {
             ret->flushTime = ++this->flushTime;
         }
         maxPrefixToken = std::min(maxPrefixToken, (int)inputToken.size() - 1);
-        printf("maxPrefixToken = %d\n", maxPrefixToken);
-        if (maxPrefixToken < 10) {
-            maxPrefixToken = 0;
-        }
         return std::make_pair(ret, maxPrefixToken);
     }
 
@@ -836,7 +832,7 @@ namespace fastllm {
                             Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                             std::vector<int> ret;
 auto st = std::chrono::system_clock::now();
-ClearProfiler();
+//ClearProfiler();
                             if (seqLens.size() > 1) {
                                 if (!model->canDoBatchForward) {
                                     dictLocker.lock();
@@ -906,12 +902,12 @@ ClearProfiler();
                                     }
                                 }
                             }
-PrintProfiler();
-int total = 0;
+//PrintProfiler();
+/*int total = 0;
 for (int i : seqLens) total += i;
 float spend = GetSpan(st, std::chrono::system_clock::now());
 printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)total / spend);
-
+*/
                             forwardLocker.unlock();
                             dictLocker.lock();
 
@@ -1011,7 +1007,6 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         context->tokens = LastTokensUnit(generationConfig.last_n);
 
         auto cache = pastKVCacheManager.Get(inputTokens);
-printf("len = %d\n", cache.second);
         if (cache.first != nullptr && cache.second > 0) {
             int len = cache.second;
             
