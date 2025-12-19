@@ -20,6 +20,9 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/cpu/computeutils.h"
 
+#include <cuda_runtime.h>
+#include <nccl.h>
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
 #include "mma.h"
 using namespace nvcuda;
@@ -454,6 +457,77 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
     return true;
 }
 
+bool SplitMultiCudaWeight1D(fastllm::Data &bias, std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme) {
+    int deviceNum = multiCudaCurrentDevices.size();
+    for (int i = 0; i < deviceNum; i++) {
+        if (specialDeviceIds.find(multiCudaCurrentDevices[i]) == specialDeviceIds.end()) {
+            cudaSetDevice(multiCudaCurrentDevices[i]);
+        } 
+        for (int j = 0; j < deviceNum; j++) {
+            if (i != j) {
+                if (specialDeviceIds.find(multiCudaCurrentDevices[j]) == specialDeviceIds.end()) {
+                    cudaDeviceEnablePeerAccess(multiCudaCurrentDevices[j], 0);
+                }
+            }
+        }
+    }
+    cudaSetDevice(0);
+
+    if (bias.multiDeviceData) {
+        return true;
+    }
+    bias.multiDeviceData = true;
+    int k = bias.dims[0];
+    cudaError_t state = cudaSuccess;
+    float *cudaBiasData = (float*)FastllmCudaMalloc(k * sizeof(float));
+    if (bias.dims.size() > 0) {
+        state = cudaMemcpy(cudaBiasData, (uint8_t *) bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+    } else {
+        state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
+    }
+        
+    for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
+        int deviceId = multiCudaCurrentDevices[i], mallocType = 0;
+        std::string specialId = "";
+        SwitchDeviceAndGetInfos(deviceId, specialId, mallocType);
+        fastllm::DataDevice dataDevice = (mallocType == 0 ? fastllm::DataDevice::CPU :fastllm::DataDevice::CUDA);
+
+        auto &div = divisionScheme[deviceId];
+        int len = 0;
+        for (auto &it : div) {
+            len += it.second - it.first;
+        }
+
+        void *deviceWeightData;
+        float *deviceBiasData;
+        cudaError_t state = cudaSuccess;
+        {
+            bias.multiDeviceDatas[deviceId] = new fastllm::Data(bias.dataType, {len});
+            bias.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
+            bias.multiDeviceDatas[deviceId]->Allocate();
+            deviceBiasData = (float*)(mallocType == 0 ? bias.multiDeviceDatas[deviceId]->cpuData : bias.multiDeviceDatas[deviceId]->cudaData);
+            int curLen = 0;
+            for (auto &it : div) {
+                state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first, (it.second - it.first) * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                curLen += (it.second - it.first);
+            }
+        }
+
+        if (cudaSuccess != state) {
+            checkCudaErrors("Error: CUDA error when split weight!", state);
+            return false;
+        }
+    }
+    if (cudaSuccess != state) {
+        checkCudaErrors("Error: CUDA error when split weight!", state);
+        return false;
+    }
+
+    cudaSetDevice(0);
+    FastllmCudaFree(cudaBiasData);
+    return true;
+}
+
 std::vector <bool> streamInits = std::vector <bool> (4, 0);
 cudaStream_t streams[4];
 
@@ -465,4 +539,110 @@ cudaStream_t *GetFastllmStream(int id) {
         cudaSetDevice(0);
     }
     return &streams[id];
+}
+
+// 全局变量存储通信器
+// Key: deviceId, Value: ncclComm_t
+static std::map<int, ncclComm_t> g_ncclComms;
+static bool g_ncclInitialized = false;
+
+void FastllmInitNccl(const std::vector<int>& devices) {
+    if (g_ncclInitialized) return; // 防止重复初始化
+    if (devices.empty()) return;
+
+    int numGPUs = devices.size();
+    std::vector<ncclComm_t> comms(numGPUs);
+
+    // ncclCommInitAll 会在这一组设备之间建立通信域
+    // 注意：这会阻塞，直到所有卡都就绪
+    ncclCommInitAll(comms.data(), numGPUs, devices.data());
+
+    // 将生成的 comms 存入 map，方便后续通过 deviceId 查找
+    for(int i = 0; i < numGPUs; ++i) {
+        g_ncclComms[devices[i]] = comms[i];
+    }
+        
+    g_ncclInitialized = true;
+    printf("NCCL Initialized for %d devices.\n", numGPUs);
+}
+
+ncclComm_t GetNcclComm(int deviceId) {
+    if (g_ncclComms.find(deviceId) != g_ncclComms.end()) {
+        return g_ncclComms[deviceId];
+    }
+    printf("Error: No NCCL comm found for device %d\n", deviceId);
+    return nullptr;
+}
+
+// 功能：将 root 设备上的 data 数据广播到所有卡 (In-place 操作)
+// data: 也就是发送/接收缓冲区的首地址
+// count: 元素个数
+// dataType: fastllm 数据类型
+// root: 源数据的 deviceId
+// deviceId: 当前调用线程所属的 deviceId
+void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int deviceId) {
+    // 1. 获取当前设备的通信器
+    ncclComm_t comm = GetNcclComm(deviceId);
+    if (comm == nullptr) {
+        printf("Error: FastllmNcclBroadcast failed, comm is null for device %d\n", deviceId);
+        return;
+    }
+
+    // 2. 映射数据类型
+    ncclDataType_t ncclType = ncclFloat; 
+    if (dataType == 7) { // float16
+        ncclType = ncclHalf;
+    } else if (dataType == 0) { // float32
+        ncclType = ncclFloat;
+    } else {
+        printf("Error: Unknown dataType %d for NCCL Broadcast\n", dataType);
+        return;
+    }
+
+    // 3. 执行 Broadcast
+    // ncclBroadcast(sendbuff, recvbuff, ...);
+    // 对于 In-place 操作，sendbuff 和 recvbuff 传同一个地址即可
+    cudaStream_t stream = 0; // 使用默认流
+    
+    ncclResult_t res = ncclBroadcast(data, data, count, ncclType, root, comm, stream);
+    
+    if (res != ncclSuccess) {
+        printf("Error: ncclBroadcast failed on device %d: %s\n", deviceId, ncclGetErrorString(res));
+    }
+}
+
+// 功能：将所有卡上的 data 数据进行 Sum 求和，结果保存在 dest 中 (支持 in-place，即 data == dest)
+void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId) {
+    // 1. 获取当前设备的通信器
+    ncclComm_t comm = GetNcclComm(deviceId);
+    if (comm == nullptr) {
+        printf("Error: FastllmNcclAllReduce failed, comm is null for device %d\n", deviceId);
+        return;
+    }
+
+    // 2. 映射数据类型 (Fastllm DataType -> NCCL type)
+    // 假设 dataType: 0 -> float32, 1 -> float16/half (具体需根据 fastllm 的 DataType 枚举调整)
+    ncclDataType_t ncclType = ncclFloat; 
+    if (dataType == 7) { // 假设 1 代表 float16
+        ncclType = ncclHalf;
+    } else if (dataType == 0) { // 假设 0 代表 float32
+        ncclType = ncclFloat;
+    } else {
+        // 如果有其他类型，需在此补充
+        printf("Error: Unknown dataType %d for NCCL\n", dataType);
+        return;
+    }
+
+    // 3. 执行 AllReduce
+    // op: ncclSum (求和)
+    // stream: 使用当前 CUDA流，通常 fastllm 默认使用 0 流。
+    // 如果 fastllm 使用了特定流，需通过 cudaStream_t 参数传入。
+    cudaStream_t stream = 0; 
+    
+    // 注意：NCCL调用是异步的
+    ncclResult_t res = ncclAllReduce(data, dest, count, ncclType, ncclSum, comm, stream);
+    
+    if (res != ncclSuccess) {
+        printf("Error: ncclAllReduce failed on device %d: %s\n", deviceId, ncclGetErrorString(res));
+    }
 }
