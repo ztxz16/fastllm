@@ -243,7 +243,11 @@ namespace fastllm {
                     attenInputTemp, 
                     weight[mergeQkvWeightName], weight[mergeQkvBiasName], 
                     weight[oWeightName], weight[oBiasName],
-                    qkv, q, k, v, curInput, curOutput,
+                    this->use_qk_norm, 
+                    this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"], 
+                    this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"], 
+                    rms_norm_eps, 
+                    qkv, q, k, v,
                     num_attention_heads, num_key_value_heads, head_dim, rotary_dim, 1.0 / sqrt(head_dim),
                     positionIds, *sinDataPtr, *cosDataPtr, 
                     keys, values, masks, w1

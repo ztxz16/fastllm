@@ -173,7 +173,7 @@ namespace fastllm {
 
             if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()
                 && CanRunMergeAttention()
-                && false) {
+                && true) {
                 // MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), k);
                 // printf("n_head = %d, %d\n", num_attention_heads, num_key_value_heads);
                 std::vector <Data*> keys, values, masks;
@@ -184,7 +184,11 @@ namespace fastllm {
                     attenInput, 
                     weight[mergeQkvWeightName], weight[mergeQkvBiasName], 
                     weight[oWeightName], weight[oBiasName],
-                    qkv, q, k, v, curInput, curOutput,
+                    true,
+                    this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"],
+                    this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"],
+                    rms_norm_eps,
+                    qkv, q, k, v,
                     num_attention_heads, num_key_value_heads, head_dim, rotary_dim, 1.0 / sqrt(head_dim),
                     positionIds, *sinDataPtr, *cosDataPtr, 
                     keys, values, masks, w1
@@ -492,193 +496,219 @@ namespace fastllm {
 
             // 1.1 Get q, k, v
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
-            if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
-                Linear(attenInput, weight[qkvWeightName], Data(), qkv);
-                int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
-                int qdim = per * (num_attention_heads / num_key_value_heads);
-                Split(qkv, -1, 0, qdim, q);
-                Split(qkv, -1, qdim, qdim + per, k);
-                Split(qkv, -1, qdim + per, qdim + per * 2, v);
+            if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()
+                && CanRunMergeAttention()
+                && true) {
+                std::vector <Data*> keys, values, masks;
+                for (int b = 0; b < batch; b++) {
+                    keys.push_back(pastKeyValues[b * block_cnt + i].first);
+                    values.push_back(pastKeyValues[b * block_cnt + i].second);
+                    masks.push_back(attentionMask[b]);
+                }
+                MergeAttention (
+                    attenInput, 
+                    weight[mergeQkvWeightName], weight[mergeQkvBiasName], 
+                    weight[oWeightName], weight[oBiasName],
+                    true,
+                    this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"],
+                    this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"],
+                    rms_norm_eps,
+                    qkv, q, k, v, 
+                    num_attention_heads, num_key_value_heads, head_dim, rotary_dim, 1.0 / sqrt(head_dim),
+                    allPositionIds, *sinDataPtr, *cosDataPtr, 
+                    keys, values, masks, w1
+                );
+                AddTo(hiddenStates, w1);
             } else {
-                if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
-                    Linear(attenInput, weight[mergeQkvWeightName], weight[mergeQkvBiasName], qkv);
+                if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
+                    Linear(attenInput, weight[qkvWeightName], Data(), qkv);
                     int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
                     int qdim = per * (num_attention_heads / num_key_value_heads);
-
                     Split(qkv, -1, 0, qdim, q);
                     Split(qkv, -1, qdim, qdim + per, k);
                     Split(qkv, -1, qdim + per, qdim + per * 2, v);
                 } else {
-                    Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
-                    Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
-                    Data vBias = (weight.weight.find(vBiasName) != weight.weight.end()) ? weight[vBiasName] : Data();
-                    Linear(attenInput, weight[qWeightName], qBias, q);
-                    Linear(attenInput, weight[kWeightName], kBias, k);
-                    Linear(attenInput, weight[vWeightName], vBias, v);
+                    if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
+                        Linear(attenInput, weight[mergeQkvWeightName], weight[mergeQkvBiasName], qkv);
+                        int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
+                        int qdim = per * (num_attention_heads / num_key_value_heads);
+
+                        Split(qkv, -1, 0, qdim, q);
+                        Split(qkv, -1, qdim, qdim + per, k);
+                        Split(qkv, -1, qdim + per, qdim + per * 2, v);
+                    } else {
+                        Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
+                        Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
+                        Data vBias = (weight.weight.find(vBiasName) != weight.weight.end()) ? weight[vBiasName] : Data();
+                        Linear(attenInput, weight[qWeightName], qBias, q);
+                        Linear(attenInput, weight[kWeightName], kBias, k);
+                        Linear(attenInput, weight[vWeightName], vBias, v);
+                    }
                 }
-            }
 
-            q.Reshape({q.dims[0], q.dims[1], -1, head_dim});
-            k.Reshape({k.dims[0], k.dims[1], -1, head_dim});
-            v.Reshape({v.dims[0], v.dims[1], -1, head_dim});
+                q.Reshape({q.dims[0], q.dims[1], -1, head_dim});
+                k.Reshape({k.dims[0], k.dims[1], -1, head_dim});
+                v.Reshape({v.dims[0], v.dims[1], -1, head_dim});
 
-            RMSNorm(q, this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"], rms_norm_eps, q);
-            RMSNorm(k, this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"], rms_norm_eps, k);
+                RMSNorm(q, this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"], rms_norm_eps, q);
+                RMSNorm(k, this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"], rms_norm_eps, k);
 
-            int cacheOuter = k.dims[2], cacheInner = k.dims[3];
-            int targetSeqLength = 0;
-            for (int b = 0; b < batch; b++) {
+                int cacheOuter = k.dims[2], cacheInner = k.dims[3];
+                int targetSeqLength = 0;
+                for (int b = 0; b < batch; b++) {
+                        Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
+                        if (GetKVCacheInCPU()) {
+                            pastKey.lockInCPU = true;
+                            pastValue.lockInCPU = true;
+                        } else {
+                            pastKey.ToDevice(k.dataDevice);
+                            pastValue.ToDevice(k.dataDevice);
+                        }
+                        targetSeqLength = std::max(targetSeqLength, (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqLens[b] : seqLens[b]);
+                }
+
+                if (targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
+                        float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+                        float newbase = rope_base * scale;
+                        std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(newbase, rope_factor, targetSeqLength);
+                        sinDataPtr = new Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, pair.first);
+                        cosDataPtr = new Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, pair.second);
+                }
+
+                for (int b = 0; b < batch; b++) {
                     Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
-                    if (GetKVCacheInCPU()) {
-                        pastKey.lockInCPU = true;
-                        pastValue.lockInCPU = true;
-                    } else {
-                        pastKey.ToDevice(k.dataDevice);
-                        pastValue.ToDevice(k.dataDevice);
+                    int curLen = seqLens[b];
+                    
+                    int unitLen = 64;
+    #ifdef USE_CUDA
+                    unitLen = 128;
+    #endif
+                    while ((pastKey.dims.size() == 0 &&
+                            (pastKey.expansionDims.size() == 0 || curLen > pastKey.expansionDims[1]))
+                        || (pastKey.dims.size() > 0 && pastKey.dims[1] + curLen > pastKey.expansionDims[1])) {
+                        std::vector<int> newDims;
+                        if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                            newDims = std::vector<int> {cacheOuter, ((curLen - 1) / unitLen + 1) * unitLen, cacheInner};
+                        } else {
+                            newDims = pastKey.dims;
+                            newDims[1] += ((curLen - 1) / unitLen + 1) * unitLen;
+                        }
+                        pastKey.Expansion(newDims);
                     }
-                    targetSeqLength = std::max(targetSeqLength, (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqLens[b] : seqLens[b]);
-            }
-
-            if (targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
-                    float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
-                    float newbase = rope_base * scale;
-                    std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(newbase, rope_factor, targetSeqLength);
-                    sinDataPtr = new Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, pair.first);
-                    cosDataPtr = new Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, pair.second);
-            }
-
-            for (int b = 0; b < batch; b++) {
-                Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
-                int curLen = seqLens[b];
-                
-                int unitLen = 64;
-#ifdef USE_CUDA
-                unitLen = 128;
-#endif
-                while ((pastKey.dims.size() == 0 &&
-                        (pastKey.expansionDims.size() == 0 || curLen > pastKey.expansionDims[1]))
-                       || (pastKey.dims.size() > 0 && pastKey.dims[1] + curLen > pastKey.expansionDims[1])) {
-                    std::vector<int> newDims;
-                    if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
-                        newDims = std::vector<int> {cacheOuter, ((curLen - 1) / unitLen + 1) * unitLen, cacheInner};
-                    } else {
-                        newDims = pastKey.dims;
-                        newDims[1] += ((curLen - 1) / unitLen + 1) * unitLen;
+                    while ((pastValue.dims.size() == 0 &&
+                            (pastValue.expansionDims.size() == 0 || curLen > pastValue.expansionDims[1]))
+                        || (pastValue.dims.size() > 0 && pastValue.dims[1] + curLen > pastValue.expansionDims[1])) {
+                        std::vector<int> newDims;
+                        if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                            newDims = std::vector<int>{cacheOuter, ((curLen - 1) / unitLen + 1) * unitLen, cacheInner};
+                        } else {
+                            newDims = pastValue.dims;
+                            newDims[1] += ((curLen - 1) / unitLen + 1) * unitLen;
+                        }
+                        pastValue.Expansion(newDims);
                     }
-                    pastKey.Expansion(newDims);
                 }
-                while ((pastValue.dims.size() == 0 &&
-                        (pastValue.expansionDims.size() == 0 || curLen > pastValue.expansionDims[1]))
-                       || (pastValue.dims.size() > 0 && pastValue.dims[1] + curLen > pastValue.expansionDims[1])) {
-                    std::vector<int> newDims;
-                    if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
-                        newDims = std::vector<int>{cacheOuter, ((curLen - 1) / unitLen + 1) * unitLen, cacheInner};
-                    } else {
-                        newDims = pastValue.dims;
-                        newDims[1] += ((curLen - 1) / unitLen + 1) * unitLen;
-                    }
-                    pastValue.Expansion(newDims);
-                }
-            }
 
-            fastllm::LlamaRotatePosition2D(q, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
-            fastllm::LlamaRotatePosition2D(k, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+                fastllm::LlamaRotatePosition2D(q, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+                fastllm::LlamaRotatePosition2D(k, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
 
-            Data attenOutput = Data(this->dataType);
-            int total = 0;
+                Data attenOutput = Data(this->dataType);
+                int total = 0;
 
-            if (false) {
-                
-            } else {
-                if (all1 && batch > 1) {
-                    q.Reshape({-1, q.dims[2], q.dims[3]});
-                    k.Reshape({-1, k.dims[2], k.dims[3]});
-                    v.Reshape({-1, v.dims[2], v.dims[3]});
-
-                    std::vector <int> qdims = {q.dims[1], 1, q.dims[2]};
-                    std::vector <uint64_t> qstrides = {(uint64_t)q.dims[2], (uint64_t)q.dims[2], 1};
-                    std::vector <int> kdims = {k.dims[1], 1, k.dims[2]};
-                    std::vector <uint64_t> kstrides = {(uint64_t)k.dims[2], (uint64_t)k.dims[2], 1};
-                    std::vector <int> vdims = {v.dims[1], 1, v.dims[2]};
-                    std::vector <uint64_t> vstrides = {(uint64_t)v.dims[2], (uint64_t)v.dims[2], 1};
-                    for (int b = 0; b < batch; b++) {
-                        curQs[b].dims = qdims;
-                        curQs[b].strides = qstrides;
-                        curQs[b].FakeFrom(q, b * q.strides[0] * q.unitSize);
-                        curKs[b].dims = kdims;
-                        curKs[b].strides = kstrides;
-                        curKs[b].FakeFrom(k, b * k.strides[0] * k.unitSize);
-                        curVs[b].dims = vdims;
-                        curVs[b].strides = vstrides;
-                        curVs[b].FakeFrom(v, b * v.strides[0] * v.unitSize);
-                    }
-
-                    total = batch;
+                if (false) {
+                    
                 } else {
-                    PermuteSelf(q, {0, 2, 1, 3});
-                    PermuteSelf(k, {0, 2, 1, 3});
-                    PermuteSelf(v, {0, 2, 1, 3});
+                    if (all1 && batch > 1) {
+                        q.Reshape({-1, q.dims[2], q.dims[3]});
+                        k.Reshape({-1, k.dims[2], k.dims[3]});
+                        v.Reshape({-1, v.dims[2], v.dims[3]});
 
-                    std::vector<int> qkvSize = {-1, seqlen, head_dim};
-                    q.Reshape(qkvSize);
-                    k.Reshape(qkvSize);
-                    v.Reshape(qkvSize);
+                        std::vector <int> qdims = {q.dims[1], 1, q.dims[2]};
+                        std::vector <uint64_t> qstrides = {(uint64_t)q.dims[2], (uint64_t)q.dims[2], 1};
+                        std::vector <int> kdims = {k.dims[1], 1, k.dims[2]};
+                        std::vector <uint64_t> kstrides = {(uint64_t)k.dims[2], (uint64_t)k.dims[2], 1};
+                        std::vector <int> vdims = {v.dims[1], 1, v.dims[2]};
+                        std::vector <uint64_t> vstrides = {(uint64_t)v.dims[2], (uint64_t)v.dims[2], 1};
+                        for (int b = 0; b < batch; b++) {
+                            curQs[b].dims = qdims;
+                            curQs[b].strides = qstrides;
+                            curQs[b].FakeFrom(q, b * q.strides[0] * q.unitSize);
+                            curKs[b].dims = kdims;
+                            curKs[b].strides = kstrides;
+                            curKs[b].FakeFrom(k, b * k.strides[0] * k.unitSize);
+                            curVs[b].dims = vdims;
+                            curVs[b].strides = vstrides;
+                            curVs[b].FakeFrom(v, b * v.strides[0] * v.unitSize);
+                        }
+
+                        total = batch;
+                    } else {
+                        PermuteSelf(q, {0, 2, 1, 3});
+                        PermuteSelf(k, {0, 2, 1, 3});
+                        PermuteSelf(v, {0, 2, 1, 3});
+
+                        std::vector<int> qkvSize = {-1, seqlen, head_dim};
+                        q.Reshape(qkvSize);
+                        k.Reshape(qkvSize);
+                        v.Reshape(qkvSize);
+
+                        for (int b = 0; b < batch; b++) {
+                            Split(k, 1, total, total + seqLens[b], curKs[b]);
+                            Split(v, 1, total, total + seqLens[b], curVs[b]);
+                            Split(q, 1, total, total + seqLens[b], curQs[b]);
+                            total += seqLens[b];
+                        }
+                    }
 
                     for (int b = 0; b < batch; b++) {
-                        Split(k, 1, total, total + seqLens[b], curKs[b]);
-                        Split(v, 1, total, total + seqLens[b], curVs[b]);
-                        Split(q, 1, total, total + seqLens[b], curQs[b]);
-                        total += seqLens[b];
+                        keys[b] = (pastKeyValues[b * block_cnt + i].first);
+                        values[b] = (pastKeyValues[b * block_cnt + i].second);
+                        pointersK[b] = (&curKs[b]);
+                        pointersV[b] = (&curVs[b]);
+                    }
+                    CatDirectBatch(keys, pointersK, 1);
+                    CatDirectBatch(values, pointersV, 1);
+                }
+
+                if (all1 && batch > 1) {
+                    attenOutput.ToDevice(q.dataDevice);
+                    attenOutput.Resize({1, batch, embed_dim});
+                    attenOutput.Allocate();
+                    for (int b = 0; b < batch; b++) {
+                        qs[b] = (&curQs[b]);
+                        keys[b] = (pastKeyValues[b * block_cnt + i].first);
+                        values[b] = (pastKeyValues[b * block_cnt + i].second);
+                        masks[b] = attentionMask[b];
+                        curContextLayer[b].FakeFrom(attenOutput, b * embed_dim * attenOutput.unitSize);
+                        contexts[b] = (&curContextLayer[b]);
+                    }
+                    AttentionBatch(qs, keys, values, masks, contexts, qs[0]->dims[0] / values[0]->dims[0], 1.0 / scale_attn, 1);
+                } else {
+                    attenOutput.ToDevice(curQs[0].dataDevice);
+                    attenOutput.Resize({1, total, embed_dim});
+                    attenOutput.Allocate();
+                    int curLen = 0;
+                    for (int b = 0; b < batch; b++) {
+                        auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
+                        Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
+                        curAttenOutput.FakeFrom(attenOutput, curLen * embed_dim * attenOutput.unitSize);
+                        curLen += seqLens[b];
+
+                        // 1.2 Attention
+                        if (attentionMask[b] == nullptr) {
+                            Attention(q, pastKey, pastValue, Data(), curAttenOutput, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
+                        } else {
+                            Attention(q, pastKey, pastValue, *attentionMask[b], curAttenOutput, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
+                        }
+                        PermuteSelf(curAttenOutput, {1, 0, 2});
                     }
                 }
 
-                for (int b = 0; b < batch; b++) {
-                    keys[b] = (pastKeyValues[b * block_cnt + i].first);
-                    values[b] = (pastKeyValues[b * block_cnt + i].second);
-                    pointersK[b] = (&curKs[b]);
-                    pointersV[b] = (&curVs[b]);
-                }
-                CatDirectBatch(keys, pointersK, 1);
-                CatDirectBatch(values, pointersV, 1);
+                Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
+                Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
+                AddTo(hiddenStates, attenLastOutput);
             }
 
-            if (all1 && batch > 1) {
-                attenOutput.ToDevice(q.dataDevice);
-                attenOutput.Resize({1, batch, embed_dim});
-                attenOutput.Allocate();
-                for (int b = 0; b < batch; b++) {
-                    qs[b] = (&curQs[b]);
-                    keys[b] = (pastKeyValues[b * block_cnt + i].first);
-                    values[b] = (pastKeyValues[b * block_cnt + i].second);
-                    masks[b] = attentionMask[b];
-                    curContextLayer[b].FakeFrom(attenOutput, b * embed_dim * attenOutput.unitSize);
-                    contexts[b] = (&curContextLayer[b]);
-                }
-                AttentionBatch(qs, keys, values, masks, contexts, qs[0]->dims[0] / values[0]->dims[0], 1.0 / scale_attn, 1);
-            } else {
-                attenOutput.ToDevice(curQs[0].dataDevice);
-                attenOutput.Resize({1, total, embed_dim});
-                attenOutput.Allocate();
-                int curLen = 0;
-                for (int b = 0; b < batch; b++) {
-                    auto &q = curQs[b], &k = curKs[b], &v = curVs[b];
-                    Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
-                    curAttenOutput.FakeFrom(attenOutput, curLen * embed_dim * attenOutput.unitSize);
-                    curLen += seqLens[b];
-
-                    // 1.2 Attention
-                    if (attentionMask[b] == nullptr) {
-                        Attention(q, pastKey, pastValue, Data(), curAttenOutput, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
-                    } else {
-                        Attention(q, pastKey, pastValue, *attentionMask[b], curAttenOutput, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
-                    }
-                    PermuteSelf(curAttenOutput, {1, 0, 2});
-                }
-            }
-
-            Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
-            Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
-            AddTo(hiddenStates, attenLastOutput);
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
 
