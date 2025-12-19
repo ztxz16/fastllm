@@ -71,3 +71,31 @@ RUN cd /tmp \
     && rm -rf binutils-2.38 binutils-2.38.tar.gz
 # 3. 验证 'as' 版本 (预期输出包含 2.38)
 RUN as --version
+
+# 添加 NVIDIA 仓库密钥和源
+RUN apt-get update && apt-get install -y gnupg2 \
+    && wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.0-1_all.deb \
+    && dpkg -i cuda-keyring_1.0-1_all.deb \
+    && rm cuda-keyring_1.0-1_all.deb \
+    && apt-get update
+# 安装 NCCL for CUDA 11.x (用于 CUDA 11.3)
+RUN apt-get install -y libnccl2=2.14.3-1+cuda11.7 libnccl-dev=2.14.3-1+cuda11.7 \
+    && rm -rf /var/lib/apt/lists/*
+# 为 CUDA 12.1 下载并安装对应的 NCCL
+RUN cd /tmp \
+    && wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/libnccl2_2.18.1-1+cuda12.1_amd64.deb \
+    && wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/libnccl-dev_2.18.1-1+cuda12.1_amd64.deb \
+    && dpkg -i --force-overwrite libnccl2_2.18.1-1+cuda12.1_amd64.deb \
+    && dpkg -i --force-overwrite libnccl-dev_2.18.1-1+cuda12.1_amd64.deb \
+    && rm -f libnccl*.deb
+# 创建 NCCL 符号链接以便两个 CUDA 版本都能找到
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libnccl* /usr/local/cuda-11.3/lib64/ 2>/dev/null || true \
+    && ln -sf /usr/lib/x86_64-linux-gnu/libnccl* /usr/local/cuda-12.1/lib64/ 2>/dev/null || true \
+    && ln -sf /usr/include/nccl.h /usr/local/cuda-11.3/include/ 2>/dev/null || true \
+    && ln -sf /usr/include/nccl.h /usr/local/cuda-12.1/include/ 2>/dev/null || true
+# 设置 NCCL 环境变量
+ENV NCCL_HOME=/usr
+ENV NCCL_INCLUDE_DIR=/usr/include
+ENV NCCL_LIB_DIR=/usr/lib/x86_64-linux-gnu
+# 验证 NCCL 安装
+RUN ls -la /usr/include/nccl.h && ls -la /usr/lib/x86_64-linux-gnu/libnccl*
