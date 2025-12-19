@@ -677,11 +677,12 @@ namespace fastllm {
     bool CanRunMergeAttention();
     
     void MergeAttention(Data &input, Data &weight0, Data &bias0, Data &weight1, Data &bias1, 
-                        Data &qkv, Data &q, Data &k, Data &v, Data &curInput, Data &curOutput,
-                        int qNum, int kvNum, int headDim, int rotDim, float attentionScale,
-                        const Data &positionIds, Data &sinData, Data &cosData,
-                        std::vector <Data*> &keys, std::vector <Data*> &values, std::vector <Data*> &masks, 
-                        Data &output);
+        bool doQKNorm, Data &qNorm, Data &kNorm, float eps,
+        Data &qkv, Data &q, Data &k, Data &v,
+        int qNum, int kvNum, int headDim, int rotDim, float attentionScale,
+        const Data &positionIds, Data &sinData, Data &cosData,
+        std::vector <Data*> &keys, std::vector <Data*> &values, std::vector <Data*> &masks, 
+        Data &output);
 
     bool CanRunMLP();
 
