@@ -2725,7 +2725,8 @@ namespace fastllm {
     }
 
     void MergeAttention(Data &input, Data &weight0, Data &bias0, Data &weight1, Data &bias1, 
-        Data &qkv, Data &q, Data &k, Data &v, Data &curInput, Data &curOutput,
+        bool doQKNorm, Data &qNorm, Data &kNorm, float eps,
+        Data &qkv, Data &q, Data &k, Data &v,
         int qNum, int kvNum, int headDim, int rotDim, float attentionScale,
         const Data &positionIds, Data &sinData, Data &cosData,
         std::vector <Data*> &keys, std::vector <Data*> &values, std::vector <Data*> &masks, 
@@ -2734,15 +2735,15 @@ namespace fastllm {
                 {"input", &input}, 
                 {"weight0", &weight0}, {"bias0", &bias0}, 
                 {"weight1", &weight1}, {"bias1", &bias1}, 
+                {"qNorm", &qNorm}, {"kNorm", &kNorm}, 
                 {"qkv", &qkv}, {"q", &q}, {"k", &k}, {"v", &v}, 
-                {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"positionIds", (Data*)&positionIds},
                 {"sinData", (Data*)&sinData},
                 {"cosData", (Data*)&cosData},
                 {"keys", (Data*)keys.data()}, {"values", (Data*)values.data()}, {"masks", (Data*)masks.data()},
                 {"output", &output}
-        }, {{"attentionScale", attentionScale}}, 
-        {{"qNum", qNum}, {"kvNum",kvNum}, {"headDim", headDim}, {"rotDim", rotDim},
+        }, {{"attentionScale", attentionScale}, {"eps", eps}}, 
+        {{"doQKNorm", doQKNorm}, {"qNum", qNum}, {"kvNum",kvNum}, {"headDim", headDim}, {"rotDim", rotDim},
         {"keys___batch", (int)keys.size()}, {"values___batch", (int)values.size()}, {"masks___batch", (int)masks.size()}});
     }
 

@@ -73,50 +73,68 @@ namespace fastllm {
     }
 
     struct MultiCudaDoMergeMLPOp : MultiThreadBaseOp {
-        uint8_t *oriCudaInput, *oriCpuInput, *partOutput;
+        uint8_t *oriCudaInput, *oriCpuInput; // 移除了 partOutput
         Data *input, *weight0, *bias0, *weight1, *bias1;
         Data *w1, *w2, *w3;
         Data *output;
         int deviceId;
 
-        MultiCudaDoMergeMLPOp(uint8_t *oriCudaInput, uint8_t *oriCpuInput, uint8_t *partOutput,
+        MultiCudaDoMergeMLPOp(uint8_t *oriCudaInput, uint8_t *oriCpuInput, 
                             Data *input, Data *weight0, Data *bias0, Data *weight1, Data *bias1, 
                             Data *w1, Data *w2, Data *w3,
                             Data *output, int deviceId) : 
-                oriCudaInput(oriCudaInput), oriCpuInput(oriCpuInput), partOutput(partOutput),
+                oriCudaInput(oriCudaInput), oriCpuInput(oriCpuInput), // 移除了 partOutput 初始化
                 input(input), weight0(weight0), bias0(bias0), weight1(weight1), bias1(bias1), 
                 w1(w1), w2(w2), w3(w3), 
                 output(output), deviceId(deviceId) {}
 
         void Run() {
             FastllmCudaSetDevice(deviceId);
+            
+            // 1. 输入数据拷贝 (保持原逻辑不变)
+            // 1. 准备 Input 内存
             if (deviceId == 0) {
+                // Device 0 直接指向源数据
                 input->cudaData = oriCudaInput;
             } else {
-                input->Allocate();
-                FastllmCudaCopyFromHostToDevice(input->cudaData, oriCpuInput, input->GetBytes());
+                // 其他 Device 必须先分配显存，作为接收 Broadcast 的缓冲区
+                // 注意：这里假设 input 的 shape 等信息已经在 CopyToMultiDevices 时元数据同步过了
+                if (input->cudaData == nullptr) {
+                    input->Allocate();
+                }
             }
 
-            int bsz = input->dims[0], seqlen = input->dims[1];            
+            // 2. [NEW] 使用 NCCL 广播 Input
+            // 将 Device 0 的 input->cudaData 广播到所有其他卡的 input->cudaData
+            // 假设 Root Device 是 0
+            FastllmNcclBroadcast(input->cudaData, input->Count(0), input->dataType, 0, deviceId);
 
+            // 2. MLP 计算 (Upsize -> Swiglu -> Downsize)
             DoCudaLinearReshape(*input, *weight0, *w3);
             DoCudaLinear(*input, *weight0, bias0 == nullptr ? Data() : *bias0, *w3);
 
             DoCudaSwigluReshape(*w3, *w1);
             DoCudaSwiglu(*w3, *w1);
 
+            // 计算最终输出形状
             DoCudaLinearReshape(*w1, *weight1, *output);
-            if (deviceId == 0) {
-                output->isFake = true;
-                output->UpdateUnitSize();
-                output->cudaData = partOutput;
-                output->expansionSize = output->Count(0);
-                output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
+            
+            // 分配输出空间 (注意：原代码 Device 0 使用了 partOutput 这里的逻辑要改回正常分配)
+            if (output->cudaData == nullptr) {
+                // output->Allocate(); 
             }
+
+            // 执行最后一步线性层计算
+            // 此时 output 中存储的是当前 GPU 计算的部分结果 (Partial Sum)
             DoCudaLinear(*w1, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
-            if (deviceId != 0) {
-                FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
-            }
+
+            // 3. 使用 NCCL 进行规约 (AllReduce)
+            // 将所有卡的 Partial Sum 相加，结果更新到所有卡的 output->cudaData 中
+            // 假设 output->dataType 对应 fastllm 的类型枚举
+            FastllmNcclAllReduce(output->cudaData, output->cudaData, output->Count(0), output->dataType, deviceId);
+            
+            // 可选：如果后续代码不是立即执行CUDA核函数，可能需要同步
+            // cudaDeviceSynchronize(); 
         }
     };
 
@@ -211,6 +229,8 @@ namespace fastllm {
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, false);
         std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, mid, unit);
 
+        FastllmInitNccl(devices);
+
         DivisionScheme divisionScheme, divisionSchemeO;
         for (int i = 0; i < devices.size(); i++) {
             int st = points[i], end = points[i + 1];
@@ -227,14 +247,63 @@ namespace fastllm {
         CopyToMultiDevices(w2, devices, false);
         CopyToMultiDevices(w3, devices, false);
         
-        Data curOutput;
+        // Data curOutput;
         CopyToMultiDevices(input, devices, false);
-        curOutput.dataDevice = input.dataDevice;
-        CopyToMultiDevices(curOutput, devices, false);
-        std::vector <uint8_t> cpuInput;
-        cpuInput.resize(input.GetBytes());
+        output.dataDevice = input.dataDevice;
+        CopyToMultiDevices(output, devices, false);
+        // std::vector <uint8_t> cpuInput;
+        // cpuInput.resize(input.GetBytes());
         FastllmCudaSetDevice(0);
-        FastllmCudaCopyFromDeviceToHost(cpuInput.data(), input.cudaData, input.GetBytes());
+        // FastllmCudaCopyFromDeviceToHost(cpuInput.data(), input.cudaData, input.GetBytes());
+
+        {
+            // 1. 移除 partOutput 的内存分配
+            // uint8_t *partOutput = ... (删除)
+            
+            // Launch cuda op
+            auto *pool = fastllm::GetAlivePool();
+
+            std::vector<fastllm::MultiThreadBaseOp*> ops;
+            for (int i = 0; i < devices.size(); i++) {
+                auto device = devices[i];
+                std::string specialId = "";
+                int mallocType;
+                DeviceGetInfos(device, specialId, mallocType);
+
+                if (specialId != "cpu") {
+                    // 构造函数参数已修改，移除了 partOutput 参数
+                    ops.push_back(new MultiCudaDoMergeMLPOp (
+                        (uint8_t*)input.cudaData, (uint8_t*)input.cudaData, 
+                        input.multiDeviceDatas[device], 
+                        weight0.multiDeviceDatas[device], bias0.multiDeviceDatas[device], 
+                        weight1.multiDeviceDatas[device], bias1.multiDeviceDatas[device], 
+                        w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device],
+                        output.multiDeviceDatas[device], device));
+                }
+            }
+            
+            // 提交任务到线程池
+            for (int i = 0; i < ops.size(); i++) {
+                pool->PushOp(i, ops[i]);
+            }
+            
+            // 等待所有线程完成 (包括 NCCL 操作的提交)
+            for (int i = 0; i < ops.size(); i++) {
+                pool->Wait(i);
+                delete ops[i];
+            }
+
+            // printf("inner...\n");
+            output.cudaData = output.multiDeviceDatas[0]->cudaData;
+
+            // 2. 移除原来的 FastllmReduce 和 Free
+            // FastllmReduce(...) (删除)
+            // FastllmCudaFree(partOutput) (删除)
+            
+            // 此时，curOutput.multiDeviceDatas[0] 以及其他卡的数据都已经是 Reduce 后的完整结果了。
+            // output.cudaData 通常指向 device 0 的数据，这里数据已经准备好了。
+        }
+/*
         uint8_t *partOutput = (uint8_t*)FastllmCudaMalloc(output.GetBytes() * devices.size());
         
         // Launch cuda op
@@ -291,6 +360,7 @@ namespace fastllm {
         FastllmReduce((uint8_t*)output.cudaData, partOutput, output.Count(0), devices.size(), output.dataType);
         FastllmCudaFree(partOutput);
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+*/
     }
 
     struct MultiCudaDoLinearOp : MultiThreadBaseOp {
@@ -415,26 +485,30 @@ namespace fastllm {
     }
 
     struct MultiCudaDoMergeAttentionOp : MultiThreadBaseOp {
-        uint8_t *oriCudaInput, *oriCpuInput, *partOutput;
+        uint8_t *oriCudaInput;
         Data *input, *weight0, *bias0, *weight1, *bias1;
+        Data *qNorm, *kNorm;
         Data *qkv, *q, *k, *v;
+        int doQKNorm;
         int qNum, kvNum, headDim, rotDim;
-        float attentionScale;
+        float attentionScale, eps;
         Data *positionIds, *sinData, *cosData;
         Data **keys, **values, **masks;
         Data *output;
         int batch;
         int deviceId;
 
-        MultiCudaDoMergeAttentionOp(uint8_t *oriCudaInput, uint8_t *oriCpuInput, uint8_t *partOutput,
+        MultiCudaDoMergeAttentionOp(uint8_t *oriCudaInput,
                             Data *input, Data *weight0, Data *bias0, Data *weight1, Data *bias1, 
+                            bool doQKNorm, Data *qNorm, Data *kNorm, float eps,
                             Data *qkv, Data *q, Data *k, Data *v,
                             int qNum, int kvNum, int headDim, int rotDim, float attentionScale,
                             Data *positionIds, Data *sinData, Data *cosData,
                             Data** keys, Data** values, Data** masks, 
                             Data *output, int batch, int deviceId) : 
-                oriCudaInput(oriCudaInput), oriCpuInput(oriCpuInput), partOutput(partOutput),
+                oriCudaInput(oriCudaInput),
                 input(input), weight0(weight0), bias0(bias0), weight1(weight1), bias1(bias1), 
+                doQKNorm(doQKNorm), qNorm(qNorm), kNorm(kNorm), eps(eps),
                 qkv(qkv), q(q), k(k), v(v), 
                 qNum(qNum), kvNum(kvNum), headDim(headDim), rotDim(rotDim), attentionScale(attentionScale),
                 positionIds(positionIds), sinData(sinData), cosData(cosData),
@@ -443,12 +517,24 @@ namespace fastllm {
 
         void Run() {
             FastllmCudaSetDevice(deviceId);
+
+            // 1. 输入数据拷贝 (保持原逻辑不变)
+            // 1. 准备 Input 内存
             if (deviceId == 0) {
+                // Device 0 直接指向源数据
                 input->cudaData = oriCudaInput;
             } else {
-                input->Allocate();
-                FastllmCudaCopyFromHostToDevice(input->cudaData, oriCpuInput, input->GetBytes());
+                // 其他 Device 必须先分配显存，作为接收 Broadcast 的缓冲区
+                // 注意：这里假设 input 的 shape 等信息已经在 CopyToMultiDevices 时元数据同步过了
+                if (input->cudaData == nullptr) {
+                    input->Allocate();
+                }
             }
+
+            // 2. [NEW] 使用 NCCL 广播 Input
+            // 将 Device 0 的 input->cudaData 广播到所有其他卡的 input->cudaData
+            // 假设 Root Device 是 0
+            FastllmNcclBroadcast(input->cudaData, input->Count(0), input->dataType, 0, deviceId);
 
             if (batch > 1) {
                 int bsz = batch, seqlen = input->dims[1];
@@ -492,6 +578,11 @@ namespace fastllm {
                 q->Reshape(qkvSize);
                 k->Reshape(qkvSize);
                 v->Reshape(qkvSize);
+
+                if (doQKNorm) {
+                    RMSNorm(*q, *qNorm, eps, *q);
+                    RMSNorm(*k, *kNorm, eps, *k);                    
+                }
 
                 FastllmCudaLlamaRotatePosition2D(*q, *positionIds, *sinData, *cosData, rotDim);
                 FastllmCudaLlamaRotatePosition2D(*k, *positionIds, *sinData, *cosData, rotDim);
@@ -543,17 +634,19 @@ namespace fastllm {
                                 qs[0]->dims[0] / values[0]->dims[0], attentionScale, bsz);                
 
                 DoCudaLinearReshape(*qkv, *weight1, *output);
-                if (deviceId == 0) {
+                /* if (deviceId == 0) {
                     output->isFake = true;
                     output->UpdateUnitSize();
                     output->cudaData = partOutput;
                     output->expansionSize = output->Count(0);
                     output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
-                }
+                } */
                 DoCudaLinear(*qkv, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
                 if (deviceId != 0) {
-                    FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
+                    // FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
                 }
+
+                FastllmNcclAllReduce(output->cudaData, output->cudaData, output->Count(0), output->dataType, deviceId);
             } else {
                 int bsz = input->dims[0], seqlen = input->dims[1];
 
@@ -572,7 +665,11 @@ namespace fastllm {
                 q->Reshape(qkvSize);
                 k->Reshape(qkvSize);
                 v->Reshape(qkvSize);
-
+                if (doQKNorm) {
+                    RMSNorm(*q, *qNorm, eps, *q);
+                    RMSNorm(*k, *kNorm, eps, *k);                    
+                }
+                
                 FastllmCudaLlamaRotatePosition2D(*q, *positionIds, *sinData, *cosData, rotDim);
                 FastllmCudaLlamaRotatePosition2D(*k, *positionIds, *sinData, *cosData, rotDim);
 
@@ -597,17 +694,20 @@ namespace fastllm {
                 DoCudaPermuteSelf(*qkv, {1, 0, 2});
                 DoCudaLinearReshape(*qkv, *weight1, *output);
 
-                if (deviceId == 0) {
+                /* if (deviceId == 0) {
                     output->isFake = true;
                     output->UpdateUnitSize();
                     output->cudaData = partOutput;
                     output->expansionSize = output->Count(0);
                     output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
-                }
+                } */
                 DoCudaLinear(*qkv, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
+
                 if (deviceId != 0) {
-                    FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
+                    // FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
                 }
+
+                FastllmNcclAllReduce(output->cudaData, output->cudaData, output->Count(0), output->dataType, deviceId);
             }
         }
     };
@@ -619,6 +719,8 @@ namespace fastllm {
         Data &bias0 = *(datas.find("bias0")->second);
         Data &weight1 = *(datas.find("weight1")->second);
         Data &bias1 = *(datas.find("bias1")->second);
+        Data &qNorm = *(datas.find("qNorm")->second);
+        Data &kNorm = *(datas.find("kNorm")->second);
         Data &positionIds = *(datas.find("positionIds")->second);
         Data &sinData = *(datas.find("sinData")->second);
         Data &cosData = *(datas.find("cosData")->second);
@@ -631,7 +733,9 @@ namespace fastllm {
         int kvNum = intParams.find("kvNum")->second;
         int headDim = intParams.find("headDim")->second;
         int rotDim = intParams.find("rotDim")->second;
+        int doQKNorm = intParams.find("doQKNorm")->second;
         float attentionScale = floatParams.find("attentionScale")->second;
+        float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-5;
         Data **keys = (Data**)(datas.find("keys")->second);
         Data **values = (Data**)(datas.find("values")->second);
         Data **masks = (Data**)(datas.find("masks")->second);
@@ -645,6 +749,9 @@ namespace fastllm {
         std::map <int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
         std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, kvNum, 1);
+
+        FastllmInitNccl(devices);
+        
         DivisionScheme divisionScheme, divisionSchemeO;
         for (int i = 0; i < devices.size(); i++) {
             int st = points[i], end = points[i + 1];
@@ -658,6 +765,11 @@ namespace fastllm {
         }
         SplitMultiCudaWeight(weight0, bias0, devices, divisionScheme, 0);
         SplitMultiCudaWeight(weight1, bias1, devices, divisionSchemeO, 1);
+        if (doQKNorm) {
+            CopyToMultiDevices(qNorm, devices, true);
+            CopyToMultiDevices(kNorm, devices, true);
+        }
+
         CopyToMultiDevices(qkv, devices, false);
         CopyToMultiDevices(q, devices, false);
         CopyToMultiDevices(k, devices, false);
@@ -681,17 +793,14 @@ namespace fastllm {
             }
         }
 
-        Data &curInput = *(datas.find("curInput")->second);
-        Data &curOutput = *(datas.find("curOutput")->second);
-
         CopyToMultiDevices(input, devices, false);
-        curOutput.dataDevice = input.dataDevice;
-        CopyToMultiDevices(curOutput, devices, false);
-        std::vector <uint8_t> cpuInput;
-        cpuInput.resize(input.GetBytes());
+        output.dataDevice = input.dataDevice;
+        CopyToMultiDevices(output, devices, false);
+        // std::vector <uint8_t> cpuInput;
+        // cpuInput.resize(input.GetBytes());
         FastllmCudaSetDevice(0);
-        FastllmCudaCopyFromDeviceToHost(cpuInput.data(), input.cudaData, input.GetBytes());
-        uint8_t *partOutput = (uint8_t*)FastllmCudaMalloc(output.GetBytes() * devices.size());
+        // FastllmCudaCopyFromDeviceToHost(cpuInput.data(), input.cudaData, input.GetBytes());
+        // uint8_t *partOutput = (uint8_t*)FastllmCudaMalloc(output.GetBytes() * devices.size());
         auto *pool = fastllm::GetAlivePool();
         std::vector<fastllm::MultiThreadBaseOp*> ops;
 
@@ -736,15 +845,16 @@ namespace fastllm {
         for (int i = 0; i < devices.size(); i++) {
             auto device = devices[i];
             ops.push_back(new MultiCudaDoMergeAttentionOp (
-                (uint8_t*)input.cudaData, (uint8_t*)cpuInput.data(), partOutput + output.GetBytes() * i,
+                (uint8_t*)input.cudaData,
                 input.multiDeviceDatas[device], 
                 weight0.multiDeviceDatas[device], bias0.multiDeviceDatas[device], 
                 weight1.multiDeviceDatas[device], bias1.multiDeviceDatas[device], 
+                doQKNorm, qNorm.multiDeviceDatas[device], kNorm.multiDeviceDatas[device], eps,
                 qkv.multiDeviceDatas[device], q.multiDeviceDatas[device], k.multiDeviceDatas[device], v.multiDeviceDatas[device], 
                 qNum, kvNum, headDim, rotDim, attentionScale, 
                 positionIds.multiDeviceDatas[device], sinData.multiDeviceDatas[device], cosData.multiDeviceDatas[device], 
                 curKeys[device].data(), curValues[device].data(), curMasks[device].data(), 
-                curOutput.multiDeviceDatas[device], batch, device));
+                output.multiDeviceDatas[device], batch, device));
         }
         for (int i = 0; i < devices.size(); i++) {
             pool->PushOp(i, ops[i]);
@@ -755,8 +865,10 @@ namespace fastllm {
             delete ops[i];
         }
 // printf("calc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-        FastllmReduce((uint8_t*)output.cudaData, partOutput, output.Count(0), devices.size(), output.dataType);
-        FastllmCudaFree(partOutput);
+        // FastllmReduce((uint8_t*)output.cudaData, partOutput, output.Count(0), devices.size(), output.dataType);
+        // FastllmCudaFree(partOutput);
+        output.cudaData = output.multiDeviceDatas[0]->cudaData;
+        
 // printf("FastllmReduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         for (int i = 0; i < batch; i++) {
             keys[i]->dims = keys[i]->multiDeviceDatas[devices[0]]->dims;

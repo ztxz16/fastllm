@@ -205,11 +205,13 @@ namespace fastllm {
                 keys.push_back(&pastKeyValues[i].first);
                 values.push_back(&pastKeyValues[i].second);
                 masks.push_back((Data*)&attentionMask);
+                Data empty;
                 MergeAttention (
                     attenInput, 
                     weight[mergeQkvWeightName], weight[mergeQkvBiasName], 
                     weight[oWeightName], weight[oBiasName],
-                    qkv, q, k, v, curInput, curOutput, 
+                    false, empty, empty, 1e-5, 
+                    qkv, q, k, v, 
                     num_attention_heads, num_key_value_heads, head_dim, rotary_dim, 1.0 / sqrt(head_dim),
                     positionIds, *sinDataPtr, *cosDataPtr, 
                     keys, values, masks, w1
@@ -513,11 +515,13 @@ namespace fastllm {
                     values.push_back(pastKeyValues[b * block_cnt + i].second);
                     masks.push_back(attentionMask[b]);
                 }
+                Data empty;
                 MergeAttention (
                     attenInput, 
                     weight[mergeQkvWeightName], weight[mergeQkvBiasName], 
                     weight[oWeightName], weight[oBiasName],
-                    qkv, q, k, v, curInput, curOutput, 
+                    false, empty, empty, 1e-5, 
+                    qkv, q, k, v, 
                     num_attention_heads, num_key_value_heads, head_dim, rotary_dim, 1.0 / sqrt(head_dim),
                     allPositionIds, *sinDataPtr, *cosDataPtr, 
                     keys, values, masks, w1
