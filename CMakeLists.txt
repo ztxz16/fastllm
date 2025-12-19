@@ -237,7 +237,7 @@ if (USE_CUDA)
     include_directories(include/devices/multicuda)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES} src/devices/multicuda/multicudadevice.cpp src/devices/multicuda/fastllm-multicuda.cu)
 
-    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas)
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublas nccl)
     set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
 endif()
 
