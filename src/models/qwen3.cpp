@@ -174,8 +174,6 @@ namespace fastllm {
             if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()
                 && CanRunMergeAttention()
                 && true) {
-                // MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), k);
-                // printf("n_head = %d, %d\n", num_attention_heads, num_key_value_heads);
                 std::vector <Data*> keys, values, masks;
                 keys.push_back(&pastKeyValues[i].first);
                 values.push_back(&pastKeyValues[i].second);
@@ -191,9 +189,9 @@ namespace fastllm {
                     qkv, q, k, v,
                     num_attention_heads, num_key_value_heads, head_dim, rotary_dim, 1.0 / sqrt(head_dim),
                     positionIds, *sinDataPtr, *cosDataPtr, 
-                    keys, values, masks, w1
+                    keys, values, masks, attenLastOutput
                 );
-                AddTo(hiddenStates, w1);
+                AddTo(hiddenStates, attenLastOutput);
             } else {
                 if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
                     Linear(attenInput, weight[qkvWeightName], Data(), qkv);
@@ -516,9 +514,9 @@ namespace fastllm {
                     qkv, q, k, v, 
                     num_attention_heads, num_key_value_heads, head_dim, rotary_dim, 1.0 / sqrt(head_dim),
                     allPositionIds, *sinDataPtr, *cosDataPtr, 
-                    keys, values, masks, w1
+                    keys, values, masks, attenLastOutput
                 );
-                AddTo(hiddenStates, w1);
+                AddTo(hiddenStates, attenLastOutput);
             } else {
                 if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
                     Linear(attenInput, weight[qkvWeightName], Data(), qkv);
