@@ -3974,6 +3974,7 @@ void FastllmCudaFree(void *ret) {
     }
     if (cudaBuffersMap.empty())
         return;
+    int oriId = FastllmCudaGetDevice();
     cudaError_t state = cudaSuccess;
     for (auto &it: cudaBuffersMap) {
         if (noBusyCnt[it.first] > 1024 * 1024 * 1024) {
@@ -4015,6 +4016,7 @@ void FastllmCudaFree(void *ret) {
         }
     }
     state = cudaFree(ret);
+    FastllmCudaSetDevice(oriId);
     checkCudaErrors("CUDA error when release memory!", state);
 }
 
