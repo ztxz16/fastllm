@@ -9,6 +9,8 @@ option(USE_ROCM "use ROCm" OFF)
 
 option(USE_TFACC "use tfacc" OFF)
 
+option(USE_ASCEND "use Ascend NPU" OFF)
+
 option(PY_API "python api" OFF)
 
 option(USE_MMAP "use mmap" OFF)
@@ -113,6 +115,8 @@ message(STATUS "USE_ROCM: ${USE_ROCM}")
 message(STATUS "CUDA_ARCH: ${CUDA_ARCH}")
 
 message(STATUS "USE_TFACC: ${USE_TFACC}")
+
+message(STATUS "USE_ASCEND: ${USE_ASCEND}")
 
 message(STATUS "For legacy CUDA GPUs: ${CUDA_NO_TENSOR_CORE}")
 
@@ -310,6 +314,27 @@ if (USE_TFACC)
     include_directories(include/devices/tfacc)
 endif()
 
+if (USE_ASCEND)
+    add_compile_definitions(USE_ASCEND)
+    set(FASTLLM_ASCEND_SOURCES src/devices/ascend/ascenddevice.cpp)
+    include_directories(include/devices/ascend)
+
+    # Ascend CANN toolkit paths
+    if (DEFINED $ENV{ASCEND_TOOLKIT_HOME})
+        set(ASCEND_TOOLKIT_HOME $ENV{ASCEND_TOOLKIT_HOME})
+    else()
+        set(ASCEND_TOOLKIT_HOME /usr/local/Ascend/ascend-toolkit/latest)
+    endif()
+
+    include_directories(${ASCEND_TOOLKIT_HOME}/include)
+    include_directories(${ASCEND_TOOLKIT_HOME}/include/acl)
+    include_directories(${ASCEND_TOOLKIT_HOME}/include/aclnn)
+
+    link_directories(${ASCEND_TOOLKIT_HOME}/lib64)
+
+    set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} ascendcl)
+endif()
+
 if (USE_NUMA)
     add_compile_definitions(USE_NUMA)
     set(FASTLLM_CXX_SOURCES ${FASTLLM_CXX_SOURCES} src/devices/numa/numadevice.cpp src/devices/numa/fastllm-numa.cpp src/devices/numa/computeserver.cpp src/devices/numa/kvcache.cpp)
@@ -353,7 +378,7 @@ if (PY_API)
 
     include_directories(third_party/pybind11/include)
     file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
-    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_ASCEND_SOURCES} ${FASTLLM_TOPS_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
@@ -361,6 +386,7 @@ add_library(fastllm OBJECT
             ${FASTLLM_CXX_SOURCES}
             ${FASTLLM_CUDA_SOURCES}
             ${FASTLLM_TFACC_SOURCES}
+            ${FASTLLM_ASCEND_SOURCES}
             ${FASTLLM_TOPS_SOURCES}
             )
 target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS})
@@ -399,7 +425,7 @@ if (BUILD_CLI)
     target_link_libraries(FastllmStudio_cli fastllm)
 endif()
 
-add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES} tools/src/pytools.cpp)
+add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_ASCEND_SOURCES} ${FASTLLM_TOPS_SOURCES} tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
 
 if (${CMAKE_HOST_WIN32})
