@@ -18,7 +18,7 @@ setup (
             'ftllm=ftllm.cli:main'
         ]
     },
-    packages = ['ftllm', 'ftllm/openai_server', 'ftllm/openai_server/protocal', 'ftllm/openai_server/tool_parsers'],
+    packages = ['ftllm', 'ftllm/openai_server', 'ftllm/openai_server/protocal', 'ftllm/openai_server/tool_parsers', 'ftllm/openai_server/reasoning'],
     package_data = {
         '': ['*.dll', '*.so', '*.dylib', '*.so.*']
     },

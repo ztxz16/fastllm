@@ -107,7 +107,8 @@ class ChatCompletionRequest(BaseModel):
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
+    reasoning_content: Optional[str] = None
 
 
 class ChatCompletionResponseChoice(BaseModel):

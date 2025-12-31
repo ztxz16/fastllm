@@ -36,7 +36,8 @@ class FastLLmCompletion:
                model_name,
                model,
                think, 
-               hide_input):
+               hide_input,
+               reasoning_parser: str = "auto"):
     self.model_name = model_name
     self.model = model
     self.init_fast_llm_model()
@@ -45,9 +46,48 @@ class FastLLmCompletion:
     # Store mapping between conversation IDs and handles
     self.conversation_handles = {}
     self.tool_parser = None
+    self.reasoning_parser = None
+    self.reasoning_parser_name = reasoning_parser
+    
+    # Initialize reasoning parser
+    self._init_reasoning_parser(reasoning_parser)
     
   def init_fast_llm_model(self):
     pass
+  
+  def _init_reasoning_parser(self, reasoning_parser_name: str):
+    """Initialize the reasoning parser based on the provided name or auto-detect."""
+    if reasoning_parser_name in ['none', '']:
+      self.reasoning_parser = None
+      return
+      
+    try:
+      from .reasoning import ReasoningParserManager
+      
+      if reasoning_parser_name == 'auto':
+        # Auto-detect based on model type
+        model_type = self.model.get_type() if hasattr(self.model, 'get_type') else ''
+        chat_template = ''
+        if hasattr(self.model, 'hf_tokenizer') and hasattr(self.model.hf_tokenizer, 'chat_template'):
+          chat_template = self.model.hf_tokenizer.chat_template or ''
+        
+        parser_cls = ReasoningParserManager.get_reasoning_parser_auto(
+          model_type=model_type,
+          chat_template=chat_template,
+          force_reasoning_parser=reasoning_parser_name
+        )
+        if parser_cls is not None:
+          self.reasoning_parser = parser_cls
+          logging.info(f"Auto-detected reasoning parser: {parser_cls.__name__}")
+        else:
+          logging.info("No reasoning parser detected for this model")
+      else:
+        # Use the specified parser
+        self.reasoning_parser = ReasoningParserManager.get_reasoning_parser(reasoning_parser_name)
+        logging.info(f"Using reasoning parser: {reasoning_parser_name}")
+    except Exception as e:
+      logging.warning(f"Failed to initialize reasoning parser: {e}")
+      self.reasoning_parser = None
   
   def create_error_response(
           self,
@@ -203,9 +243,23 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
+      # Use reasoning parser to separate reasoning from content
+      reasoning_content = None
+      final_content = result
+      
+      if self.reasoning_parser is not None:
+          try:
+              reasoning_parser_instance = self.reasoning_parser(self.model.hf_tokenizer)
+              reasoning_content, final_content = reasoning_parser_instance.extract_reasoning(result, request)
+              if final_content is None:
+                  final_content = ""
+          except Exception as e:
+              logging.warning(f"Failed to parse reasoning: {e}")
+              final_content = result
+
       choice_data = ChatCompletionResponseChoice(
               index=0,
-              message=ChatMessage(role="assistant", content=result),
+              message=ChatMessage(role="assistant", content=final_content, reasoning_content=reasoning_content),
               logprobs=None,
               finish_reason='stop',
           )
@@ -288,12 +342,23 @@ class FastLLmCompletion:
                 force_chat_template = self.model.force_chat_template, 
                 force_type = self.model.tool_call_parser) (self.model.hf_tokenizer)
         
+        # Initialize reasoning parser instance if available (works with or without tool_parser)
+        reasoning_parser_instance = None
+        if self.reasoning_parser is not None:
+            try:
+                reasoning_parser_instance = self.reasoning_parser(self.model.hf_tokenizer)
+            except Exception as e:
+                logging.warning(f"Failed to create reasoning parser instance: {e}")
+        
         completion_tokens = 0
 
         previous_token_ids = []
         current_token_ids = []
         previous_text = ""
         current_text = ""
+        
+        # Track reasoning end state for tool parsing
+        reasoning_ended = False
 
         async for res in result_generator:
             if (res == "[unused16]"):
@@ -303,30 +368,75 @@ class FastLLmCompletion:
             completion_tokens += 1
             delta_text = res
 
-            # print("delta_text", delta_text)
+            # Get token ids for the delta text
+            try:
+                delta_token_ids = self.model.hf_tokenizer.encode(delta_text, add_special_tokens=False)
+            except:
+                delta_token_ids = []
+            
+            current_text += delta_text
+            current_token_ids += delta_token_ids
 
-            # Send token-by-token response for each request.n
-            if self.tool_parser and request.tools: 
+            delta_message = None
+
+            # First, try reasoning parser to separate reasoning content
+            if reasoning_parser_instance is not None and not reasoning_ended:
+                try:
+                    delta_message = reasoning_parser_instance.extract_reasoning_streaming(
+                        previous_text=previous_text,
+                        current_text=current_text,
+                        delta_text=delta_text,
+                        previous_token_ids=previous_token_ids,
+                        current_token_ids=current_token_ids,
+                        delta_token_ids=delta_token_ids
+                    )
+                    
+                    # Check if reasoning has ended (content field is set)
+                    if delta_message and delta_message.content is not None:
+                        reasoning_ended = True
+                        
+                        # If we have tools, process the content part with tool_parser
+                        if self.tool_parser and request.tools and delta_message.content:
+                            tool_delta = self.tool_parser.extract_tool_calls_streaming(
+                                previous_text="",
+                                current_text=delta_message.content,
+                                delta_text=delta_message.content,
+                                previous_token_ids=[],
+                                current_token_ids=delta_token_ids,
+                                delta_token_ids=delta_token_ids,
+                                request=request
+                            )
+                            if tool_delta and tool_delta.tool_calls:
+                                # Merge reasoning_content with tool_calls
+                                delta_message = DeltaMessage(
+                                    reasoning_content=delta_message.reasoning_content,
+                                    content=tool_delta.content,
+                                    tool_calls=tool_delta.tool_calls
+                                )
+                except Exception as e:
+                    logging.debug(f"Reasoning parser error: {e}")
+                    delta_message = DeltaMessage(content=delta_text)
+            
+            # After reasoning ends, use tool_parser for remaining content
+            elif self.tool_parser and request.tools:
                 now_ids = self.tool_parser.get_token_ids(delta_text)
-                # print("delta_text", delta_text, "now_ids", now_ids)
-
-                current_text += delta_text
-                current_token_ids += now_ids
-
+                
                 delta_message = self.tool_parser.extract_tool_calls_streaming(
-                                previous_text = previous_text,
-                                current_text = current_text,
-                                delta_text = delta_text,
-                                previous_token_ids = previous_token_ids,
-                                current_token_ids = current_token_ids,
-                                delta_token_ids = [0],
-                                request = request)
+                    previous_text=previous_text,
+                    current_text=current_text,
+                    delta_text=delta_text,
+                    previous_token_ids=previous_token_ids,
+                    current_token_ids=current_token_ids,
+                    delta_token_ids=now_ids,
+                    request=request
+                )
+            
+            # Fallback: just content
+            elif delta_message is None:
+                delta_message = DeltaMessage(content=delta_text)
 
-                previous_text += delta_text
-                previous_token_ids += now_ids
-                # print("delta", delta_message)
-            else:
-                delta_message = DeltaMessage(content = delta_text)
+            previous_text = current_text
+            previous_token_ids = current_token_ids.copy()
 
             if (delta_message):
                 choice_data = ChatCompletionResponseStreamChoice(

@@ -164,7 +164,7 @@ def fastllm_server(args):
         args.model_name = args.path
         if (args.model_name is None or args.model_name == ''):
             args.model_name = args.model
-    fastllm_completion = FastLLmCompletion(model_name = args.model_name, model = model, think = (args.think.lower() != "false"), hide_input = args.hide_input)
+    fastllm_completion = FastLLmCompletion(model_name = args.model_name, model = model, think = (args.think.lower() != "false"), hide_input = args.hide_input, reasoning_parser = args.reasoning_parser)
     fastllm_embed = FastLLmEmbed(model_name = args.model_name, model = model)
     fastllm_reranker = FastLLmReranker(model_name = args.model_name, model = model)
     fastllm_model = FastLLmModel(model_name = args.model_name)

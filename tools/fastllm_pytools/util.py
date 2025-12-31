@@ -42,6 +42,8 @@ def add_server_args(parser):
     parser.add_argument("--think", type = str, default = "false", help="if <think> lost")
     parser.add_argument("--hide_input", action = 'store_true', help = "不显示请求信息")
     parser.add_argument("--dev_mode", action = 'store_true', help = "开发模式, 启用后能够获取对话列表并主动停止")
+    parser.add_argument("--reasoning_parser", type = str, default = "auto", 
+                        help = "使用的reasoning_parser类型 (auto, none, deepseek_r1, qwen3, glm45)")
 
 def make_normal_llm_model(args):
     if (args.model and args.model != ''):
