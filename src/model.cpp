@@ -99,13 +99,16 @@ namespace fastllm {
         }
         if (this->weight.dicts.find("eos_token_id") != this->weight.dicts.end()) {
             if (this->weight.dicts["eos_token_id"]!="None") {
-                if (this->weight.dicts["eos_token_id"][0] == '[' && this->eos_token_ids.empty()) {
+                if (this->weight.dicts["eos_token_id"][0] == '[') {
+                    // eos_token_id is array format - parse and add to eos_token_ids set
                     std::string error;
                     json11::Json ids = json11::Json::parse(this->weight.dicts["eos_token_id"], error);
                     for (auto &it : ids.array_items()) {
                         this->eos_token_ids.insert(it.int_value());
                     }
+                    // Don't set eos_token_id integer - leave it as -1
                 } else {
+                    // Single value - set eos_token_id
                     this->eos_token_id = atoi(this->weight.dicts["eos_token_id"].c_str());
                 }
             }
@@ -113,6 +116,7 @@ namespace fastllm {
             this->bos_token_id = atoi(this->weight.dicts["im_start_id"].c_str());
             this->eos_token_id = atoi(this->weight.dicts["im_end_id"].c_str());
         }
+
         if (this->weight.dicts.find("num_hidden_layers") != this->weight.dicts.end()) {
             block_cnt = atoi(this->weight.dicts["num_hidden_layers"].c_str());
         } else if (this->weight.dicts.find("num_layers") != this->weight.dicts.end()) {
