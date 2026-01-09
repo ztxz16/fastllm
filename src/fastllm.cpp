@@ -57,6 +57,7 @@ namespace fastllm {
     static bool cudaEmbedding = false;
     static bool cudaSharedExpert = false;
     static bool enableAMX = false;
+    static Data emptyData;
 
     static std::map <DataType, int> DataTypeBits = {
         {DataType::FLOAT32, 32}, {DataType::BFLOAT16, 16}, {DataType::INT16, 16}, 
@@ -87,6 +88,10 @@ namespace fastllm {
         printf("AARCH64: %s\n", aarch64.c_str());
         printf("Neon FP16: %s\n", neonFp16.c_str());
         printf("Neon DOT: %s\n", neonDot.c_str());
+    }
+
+    Data *GetEmptyData() {
+        return &emptyData;
     }
 
     void SetCudaEmbedding(bool v) {
@@ -1157,6 +1162,12 @@ namespace fastllm {
                 this->cudaData = FastllmCudaDirectMalloc(this->expansionBytes);
             } else {
                 this->cudaData = FastllmCudaMalloc(this->expansionBytes);
+            }
+            if (this->multiDeviceData) {
+                for (auto it : this->multiDeviceDatas) {
+                    delete it.second;
+                }
+                this->multiDeviceData = false;
             }
             FastllmCudaMemset0(this->cudaData, this->expansionBytes);
 #else
@@ -2422,11 +2433,13 @@ namespace fastllm {
     void WeightMap::AddEmptyWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType) {
         this->weight[key] = Data(dataType, dims);
         this->weight[key].name = std::string(key);
+        this->weight[key].isModelWeight = true;
     }
 
     void WeightMap::AddEmptyGGMLWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType, int ggmlType) {
         this->weight[key] = Data(dataType, ggmlType, dims);
         this->weight[key].name = std::string(key);
+        this->weight[key].isModelWeight = true;
     }
 
     void WeightMap::AddWeight(const std::string &key, const std::vector<int> &dims, fastllm::DataType dataType,

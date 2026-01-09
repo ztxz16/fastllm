@@ -1272,13 +1272,13 @@ namespace fastllm {
                     }
 
                     DoCudaLinearReshape(input, *weights[idx * 2], w3);
-                    DoCudaLinear(input, *weights[idx * 2], Data(), w3);
+                    DoCudaLinear(input, *weights[idx * 2], *GetEmptyData(), w3);
 
                     DoCudaSwigluReshape(w3, w1);
                     DoCudaSwiglu(w3, w1);
 
                     DoCudaLinearReshape(w1, *weights[idx * 2 + 1], w2);
-                    DoCudaLinear(w1, *weights[idx * 2 + 1], Data(), w2);
+                    DoCudaLinear(w1, *weights[idx * 2 + 1], *GetEmptyData(), w2);
                     if (j == 0) {
                         output.dataType = w2.dataType;
                         output.Resize(w2.dims);
@@ -1345,13 +1345,13 @@ namespace fastllm {
                         }
                         
                         DoCudaLinearReshape(*currentData, *weights[idx * 2], w3);
-                        DoCudaLinear(*currentData, *weights[idx * 2], Data(), w3);
+                        DoCudaLinear(*currentData, *weights[idx * 2], *GetEmptyData(), w3);
 
                         DoCudaSwigluReshape(w3, w1);
                         DoCudaSwiglu(w3, w1);
 
                         DoCudaLinearReshape(w1, *weights[idx * 2 + 1], w2);
-                        DoCudaLinear(w1, *weights[idx * 2 + 1], Data(), w2);
+                        DoCudaLinear(w1, *weights[idx * 2 + 1], *GetEmptyData(), w2);
 
                         FastllmCudaAddTo(moePart, w2, value);
                     }

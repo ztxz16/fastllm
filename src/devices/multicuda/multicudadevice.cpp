@@ -111,7 +111,11 @@ namespace fastllm {
 
             // 2. MLP 计算 (Upsize -> Swiglu -> Downsize)
             DoCudaLinearReshape(*input, *weight0, *w3);
-            DoCudaLinear(*input, *weight0, bias0 == nullptr ? Data() : *bias0, *w3);
+            if (bias0 == nullptr) {
+                DoCudaLinear(*input, *weight0, *GetEmptyData(), *w3);
+            } else {
+                DoCudaLinear(*input, *weight0, *bias0, *w3);
+            }
 
             DoCudaSwigluReshape(*w3, *w1);
             DoCudaSwiglu(*w3, *w1);
@@ -126,7 +130,11 @@ namespace fastllm {
 
             // 执行最后一步线性层计算
             // 此时 output 中存储的是当前 GPU 计算的部分结果 (Partial Sum)
-            DoCudaLinear(*w1, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
+            if (bias1 == nullptr) {
+                DoCudaLinear(*w1, *weight1, *GetEmptyData(), *output);
+            } else {
+                DoCudaLinear(*w1, *weight1, *bias1, *output);
+            }
 
             // 3. 使用 NCCL 进行规约 (AllReduce)
             // 将所有卡的 Partial Sum 相加，结果更新到所有卡的 output->cudaData 中
@@ -294,6 +302,9 @@ namespace fastllm {
             }
 
             // printf("inner...\n");
+            if (output.cudaData != output.multiDeviceDatas[0]->cudaData) {
+                FastllmCudaFree(output.cudaData);
+            }
             output.cudaData = output.multiDeviceDatas[0]->cudaData;
 
             // 2. 移除原来的 FastllmReduce 和 Free
@@ -396,7 +407,12 @@ namespace fastllm {
                 output->expansionSize = output->Count(0);
                 output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
             }
-            DoCudaLinear(*input, *weight, bias == nullptr ? Data() : *bias, *output);
+            if (bias == nullptr) {
+                DoCudaLinear(*input, *weight, *GetEmptyData(), *output);
+            } else {
+                DoCudaLinear(*input, *weight, *bias, *output);
+            }
+
             if (deviceId != 0 || n > 1) {
                 FastllmCudaMemcpy2DDeviceToDeviceAuto(lastOutput + start * output->unitSize, k * output->unitSize, output->cudaData, 
                     len * output->unitSize, len * output->unitSize, n, 0, deviceId);
@@ -564,7 +580,12 @@ namespace fastllm {
                     vMasks[i] = masks[i];
                 }
                 DoCudaLinearReshape(*input, *weight0, *qkv);
-                DoCudaLinear(*input, *weight0, bias0 == nullptr ? Data() : *bias0, *qkv);
+                if (bias0 == nullptr) {
+                    DoCudaLinear(*input, *weight0, *GetEmptyData(), *qkv);
+                } else {
+                    DoCudaLinear(*input, *weight0, *bias0, *qkv);
+                }
+
                 int per = qkv->dims.back() / (qNum / kvNum + 2);
                 int qdim = per * (qNum / kvNum);
                 DoCudaSplitReshape(*qkv, -1, 0, qdim, *q);
@@ -641,7 +662,11 @@ namespace fastllm {
                     output->expansionSize = output->Count(0);
                     output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
                 } */
-                DoCudaLinear(*qkv, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
+                if (bias1 == nullptr) {
+                    DoCudaLinear(*qkv, *weight1, *GetEmptyData(), *output);
+                } else {
+                    DoCudaLinear(*qkv, *weight1, *bias1, *output);
+                }
                 if (deviceId != 0) {
                     // FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
                 }
@@ -651,7 +676,11 @@ namespace fastllm {
                 int bsz = input->dims[0], seqlen = input->dims[1];
 
                 DoCudaLinearReshape(*input, *weight0, *qkv);
-                DoCudaLinear(*input, *weight0, bias0 == nullptr ? Data() : *bias0, *qkv);
+                if (bias0 == nullptr) {
+                    DoCudaLinear(*input, *weight0, *GetEmptyData(), *qkv);
+                } else {
+                    DoCudaLinear(*input, *weight0, *bias0, *qkv);
+                }
                 int per = qkv->dims.back() / (qNum / kvNum + 2);
                 int qdim = per * (qNum / kvNum);
                 DoCudaSplitReshape(*qkv, -1, 0, qdim, *q);
@@ -701,8 +730,12 @@ namespace fastllm {
                     output->expansionSize = output->Count(0);
                     output->expansionBytes = (output->Count(0) * output->unitSize - 1) / output->unitSizeDiv + 1;
                 } */
-                DoCudaLinear(*qkv, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
-
+                if (bias1 == nullptr) {
+                    DoCudaLinear(*qkv, *weight1, *GetEmptyData(), *output);
+                } else {
+                    DoCudaLinear(*qkv, *weight1, *bias1, *output);
+                }
+                
                 if (deviceId != 0) {
                     // FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
                 }
@@ -739,12 +772,11 @@ namespace fastllm {
         Data **keys = (Data**)(datas.find("keys")->second);
         Data **values = (Data**)(datas.find("values")->second);
         Data **masks = (Data**)(datas.find("masks")->second);
-
         int batch = intParams.find("keys___batch")->second;
         output.Allocate();
 // auto st = std::chrono::system_clock::now();
         int group = qNum / kvNum;
-        int vDim = weight1.dims[0] / qNum;
+        int vDim = weight1.dims[1] / qNum;
         std::vector <int> devices;
         std::map <int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
@@ -867,8 +899,10 @@ namespace fastllm {
 // printf("calc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         // FastllmReduce((uint8_t*)output.cudaData, partOutput, output.Count(0), devices.size(), output.dataType);
         // FastllmCudaFree(partOutput);
+        if (output.cudaData != output.multiDeviceDatas[0]->cudaData) {
+            FastllmCudaFree(output.cudaData);
+        }
         output.cudaData = output.multiDeviceDatas[0]->cudaData;
-        
 // printf("FastllmReduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         for (int i = 0; i < batch; i++) {
             keys[i]->dims = keys[i]->multiDeviceDatas[devices[0]]->dims;
