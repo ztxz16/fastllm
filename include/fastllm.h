@@ -29,12 +29,15 @@
 #endif
 
 namespace fastllm {
+    class Data;
+
     void SetDeviceMap(const std::map <std::string, int> &deviceMap);
     void SetMoeDeviceMap(const std::map <std::string, int> &moeDeviceMap);
 
     std::map <std::string, int> GetDeviceMap();
     std::map <std::string, int> GetMoeDeviceMap();
 
+    Data *GetEmptyData();
     void PrintInstructionInfo();
     void SetThreads(int t);
     void SetLowMemMode(bool m);
@@ -343,6 +346,7 @@ namespace fastllm {
 
         std::vector <uint16_t> halfScales; // 某些量化方式使用float16的scales
 
+        bool isModelWeight = false; // 是否是模型权重
         std::string name; // weightName
         std::string fileName;
         long long filePos;
