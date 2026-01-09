@@ -787,8 +787,125 @@ namespace fastllm {
                 }
             }
         }
+#elif defined(__aarch64__FOR_FP16_FP16)
+        // 定义常量 Mask，用于提取权重的位
+        const uint8x16_t mask_sign = vdupq_n_u8(0x80);
+        const uint8x16_t mask_body = vdupq_n_u8(0x7F);
+
+        for (int i = 0; i < n; i++) {
+            for (int j = st; j < end; j++) {
+                float now = biasData ? biasData[j] : 0.0f;
+                int currentBlockK = j / blockK;
+
+                for (int midx = 0; midx < ms; midx++) {
+                    // pow(2, 8) 是常量 256.0f
+                    float curScale = scales[currentBlockK * ms + midx] * 256.0f;
+                    
+                    int l = midx * blockM;
+                    int l_end = l + blockM;
+                    if (l_end > m) l_end = m;
+                    
+                    // 初始化 FP16 累加器向量为 0
+                    float16x8_t acc_vec = vdupq_n_f16(0.0f);
+                    
+                    // 指向当前 Input 和 Weight 的指针
+                    // 注意：这里假设 inputData 是以 uint16_t 存储的 fp16 数据，强制转换为 float16_t* 读取
+                    const float16_t* ptr_in = (const float16_t*)(inputData + i * m + l);
+                    const uint8_t* ptr_w = (const uint8_t*)(weightData + j * m + l);
+                    
+                    int count = l_end - l;
+                    int vec_step = 0;
+
+                    // 1. 向量化循环：每次处理 16 个元素 (2个 float16x8 块)
+                    for (; vec_step <= count - 16; vec_step += 16) {
+                        // --- 加载输入 (FP16) ---
+                        float16x8_t in0 = vld1q_f16(ptr_in + vec_step);
+                        float16x8_t in1 = vld1q_f16(ptr_in + vec_step + 8);
+                        
+                        // --- 加载并解压权重 (UINT8 -> FP16) ---
+                        // 加载 16 个 uint8 权重
+                        uint8x16_t w_raw = vld1q_u8(ptr_w + vec_step);
+                        
+                        // 将 128位的 u8x16 拆分为两个 64位的 u8x8 以便进行长移位(vshll)
+                        uint8x8_t w_low = vget_low_u8(w_raw);
+                        uint8x8_t w_high = vget_high_u8(w_raw);
+                        
+                        // [Low Part] 处理前 8 个权重
+                        // 逻辑: ((u8 & 0x80) << 8) | ((u8 & 0x7F) << 7)
+                        uint16x8_t w0_sign = vshll_n_u8(vand_u8(w_low, vget_low_u8(mask_sign)), 8);
+                        uint16x8_t w0_body = vshll_n_u8(vand_u8(w_low, vget_low_u8(mask_body)), 7);
+                        float16x8_t w0 = vreinterpretq_f16_u16(vorrq_u16(w0_sign, w0_body));
+                        
+                        // [High Part] 处理后 8 个权重
+                        uint16x8_t w1_sign = vshll_n_u8(vand_u8(w_high, vget_high_u8(mask_sign)), 8);
+                        uint16x8_t w1_body = vshll_n_u8(vand_u8(w_high, vget_high_u8(mask_body)), 7);
+                        float16x8_t w1 = vreinterpretq_f16_u16(vorrq_u16(w1_sign, w1_body));
+                        
+                        // --- FMA 计算 ---
+                        acc_vec = vfmaq_f16(acc_vec, in0, w0);
+                        acc_vec = vfmaq_f16(acc_vec, in1, w1);
+                    }
+                    
+                    // 将 sum_vec 转换为 FP32 并求和
+                    float16x4_t slow = vget_low_f16(acc_vec);
+                    float16x4_t shigh = vget_high_f16(acc_vec);
+                    float32x4_t flow = vcvt_f32_f16(slow);
+                    float32x4_t fhigh = vcvt_f32_f16(shigh);
+                    float blockSum = vaddvq_f32(flow) + vaddvq_f32(fhigh);
+                    
+                    // 2. 处理剩余的元素 (Scalar cleanup)
+                    for (int k = vec_step; k < count; k++) {
+                        int current_idx = i * m + l + k;
+                        // 使用 dict 保持与原始代码一致的转换行为，或者直接转换
+                        float inp = fp16tofp32.dict[inputData[current_idx]]; 
+                        
+                        uint8_t u8_val = weightData[j * m + l + k];
+                        uint16_t fp32_w_bits = ((uint16_t)(u8_val & 0x80) << 8) | ((uint16_t)(u8_val & 0x7F) << 7);
+                        float w = fp16tofp32.dict[fp32_w_bits];
+
+                        blockSum += inp * w;
+                    }
+
+                    now += blockSum * curScale;
+                }
+                outputData[i * k + j] = now;
+            }
+        }
 #else
-        ErrorInFastLLM("Unsupport MultiThreadLinearBFloat16FP8E4M3Op");
+        // ErrorInFastLLM("Unsupport MultiThreadLinearBFloat16FP8E4M3Op");
+        // 朴素 CPU 实现 (无 AVX2 支持时的回退路径)
+        for (int i = 0; i < n; i++) {
+            for (int j = st; j < end; j++) {
+                float now = biasData ? biasData[j] : 0.0f;
+                int currentBlockK = j / blockK;
+
+                for (int midx = 0; midx < ms; midx++) {
+                    // 计算当前 Block 的 Scale，同时乘上 magicScale (pow(2, 120))
+                    float curScale = scales[currentBlockK * ms + midx];
+                    
+                    int l = midx * blockM;
+                    int l_end = l + blockM;
+                    if (l_end > m) l_end = m;
+                    
+                    float blockSum = 0.0f;
+                    for (; l < l_end; l++) {
+                        // 1. 将 BFloat16 (uint16_t) 转换为 Float
+                        // 方法：左移16位填充到 float 的高位
+                        uint16_t bf16_val = (uint16_t)inputData[i * m + l];
+                        uint32_t fp32_bits = (uint32_t)bf16_val << 16;
+                        float inp = *reinterpret_cast<float*>(&fp32_bits);
+
+                        // 2. 将 FP8E4M3 (uint8_t) 转换为 Float
+                        // 方法：查表
+                        float w = fp8e4m3tofp32.dict[weightData[j * m + l]];
+
+                        blockSum += inp * w;
+                    }
+                    now += blockSum * curScale;
+                }
+                outputData[i * k + j] = now;
+            }
+        }
 #endif
     }
 
