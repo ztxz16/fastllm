@@ -194,7 +194,7 @@ namespace fastllm {
                 AddTo(hiddenStates, attenLastOutput);
             } else {
                 if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
-                    Linear(attenInput, weight[qkvWeightName], Data(), qkv);
+                    Linear(attenInput, weight[qkvWeightName], *GetEmptyData(), qkv);
                     int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
                     int qdim = per * (num_attention_heads / num_key_value_heads);
                     Split(qkv, -1, 0, qdim, q);
@@ -210,12 +210,9 @@ namespace fastllm {
                         Split(qkv, -1, qdim, qdim + per, k);
                         Split(qkv, -1, qdim + per, qdim + per * 2, v);
                     } else {
-                        Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
-                        Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
-                        Data vBias = (weight.weight.find(vBiasName) != weight.weight.end()) ? weight[vBiasName] : Data();
-                        Linear(attenInput, weight[qWeightName], qBias, q);
-                        Linear(attenInput, weight[kWeightName], kBias, k);
-                        Linear(attenInput, weight[vWeightName], vBias, v);
+                        Linear(attenInput, weight[qWeightName], weight[qBiasName], q);
+                        Linear(attenInput, weight[kWeightName], weight[kBiasName], k);
+                        Linear(attenInput, weight[vWeightName], weight[vBiasName], v);
                     }
                 }
 
@@ -293,8 +290,7 @@ namespace fastllm {
                 qkv.Reshape({seqlen, bsz, -1});
                 PermuteSelf(qkv, {1, 0, 2});
 
-                Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
-                Linear(qkv, weight[oWeightName], oBias, attenInput);
+                Linear(qkv, weight[oWeightName], weight[oBiasName], attenInput);
                 AddTo(hiddenStates, attenInput);
             }
 
@@ -304,27 +300,27 @@ namespace fastllm {
             std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
             if (weight.weight.find(swigluWeightName) != weight.weight.end() && CanRunMLP()) {
                 std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
-                MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), w1, w2, w3, k);
+                MLP(attenInput, weight[swigluWeightName], *GetEmptyData(), weight[downWeightName], *GetEmptyData(), w1, w2, w3, k);
                 AddTo(hiddenStates, k);
             } else {
                 if (weight.weight.find(swigluWeightName) != weight.weight.end()) {
                     if (CanRunLinearEx(LinearExType::ExSwiglu)) {
-                        LinearEx(attenInput, weight[swigluWeightName], Data(), q, LinearExType::ExSwiglu);
+                        LinearEx(attenInput, weight[swigluWeightName], *GetEmptyData(), q, LinearExType::ExSwiglu);
                     } else {
-                        Linear(attenInput, weight[swigluWeightName], Data(), v);
+                        Linear(attenInput, weight[swigluWeightName], *GetEmptyData(), v);
                         Swiglu(v, q);
                     }
                 } else {
                     if (CanRunLinearEx(LinearExType::ExSilu)) {
-                        LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), q, LinearExType::ExSilu);
+                        LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], *GetEmptyData(), q, LinearExType::ExSilu);
                     } else {
-                        Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), q);
+                        Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], *GetEmptyData(), q);
                         Silu(q, q);
                     }
-                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), v);
+                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], *GetEmptyData(), v);
                     MulTo(q, v);
                 }
-                Linear(q, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), k);
+                Linear(q, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], *GetEmptyData(), k);
                 AddTo(hiddenStates, k);
             }
         }
@@ -343,7 +339,7 @@ namespace fastllm {
         {
             auto &hiddenStates = *lastHiddenStates;
             RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
-            Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
+            Linear(hiddenStates, weight["lm_head.weight"], *GetEmptyData(), logits);
             ToDataType(logits, DataType::FLOAT32);
             if (generationConfig.output_logits && retLogits != nullptr) {
                 int size = logits.dims.back();
@@ -519,7 +515,7 @@ namespace fastllm {
                 AddTo(hiddenStates, attenLastOutput);
             } else {
                 if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
-                    Linear(attenInput, weight[qkvWeightName], Data(), qkv);
+                    Linear(attenInput, weight[qkvWeightName], *GetEmptyData(), qkv);
                     int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
                     int qdim = per * (num_attention_heads / num_key_value_heads);
                     Split(qkv, -1, 0, qdim, q);
@@ -535,12 +531,9 @@ namespace fastllm {
                         Split(qkv, -1, qdim, qdim + per, k);
                         Split(qkv, -1, qdim + per, qdim + per * 2, v);
                     } else {
-                        Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
-                        Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
-                        Data vBias = (weight.weight.find(vBiasName) != weight.weight.end()) ? weight[vBiasName] : Data();
-                        Linear(attenInput, weight[qWeightName], qBias, q);
-                        Linear(attenInput, weight[kWeightName], kBias, k);
-                        Linear(attenInput, weight[vWeightName], vBias, v);
+                        Linear(attenInput, weight[qWeightName], weight[qBiasName], q);
+                        Linear(attenInput, weight[kWeightName], weight[kBiasName], k);
+                        Linear(attenInput, weight[vWeightName], weight[vBiasName], v);
                     }
                 }
 
@@ -694,7 +687,7 @@ namespace fastllm {
 
                         // 1.2 Attention
                         if (attentionMask[b] == nullptr) {
-                            Attention(q, pastKey, pastValue, Data(), curAttenOutput, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
+                            Attention(q, pastKey, pastValue, *GetEmptyData(), curAttenOutput, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
                         } else {
                             Attention(q, pastKey, pastValue, *attentionMask[b], curAttenOutput, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
                         }
@@ -702,8 +695,7 @@ namespace fastllm {
                     }
                 }
 
-                Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
-                Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
+                Linear(attenOutput, weight[oWeightName], weight[oBiasName], attenLastOutput);
                 AddTo(hiddenStates, attenLastOutput);
             }
 
@@ -713,28 +705,28 @@ namespace fastllm {
             std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
             if (weight.weight.find(swigluWeightName) != weight.weight.end() && CanRunMLP()) {
                 std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
-                MLP(attenInput, weight[swigluWeightName], Data(), weight[downWeightName], Data(), w1, w2, w3, k);
+                MLP(attenInput, weight[swigluWeightName], *GetEmptyData(), weight[downWeightName], *GetEmptyData(), w1, w2, w3, k);
                 AddTo(hiddenStates, k);
             } else {
                 if (weight.weight.find(swigluWeightName) != weight.weight.end()) {
                     if (CanRunLinearEx(LinearExType::ExSwiglu)) {
-                        LinearEx(attenInput, weight[swigluWeightName], Data(), w1, LinearExType::ExSwiglu);
+                        LinearEx(attenInput, weight[swigluWeightName], *GetEmptyData(), w1, LinearExType::ExSwiglu);
                     } else {
-                        Linear(attenInput, weight[swigluWeightName], Data(), w3);
+                        Linear(attenInput, weight[swigluWeightName], *GetEmptyData(), w3);
                         Swiglu(w3, w1);
                     }
                 } else {
                     if (CanRunLinearEx(LinearExType::ExSilu)) {
-                        LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                        LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], *GetEmptyData(), w1, LinearExType::ExSilu);
                     } else {
-                        Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
+                        Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], *GetEmptyData(), w1);
                         Silu(w1, w1);
                     }
-                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
+                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], *GetEmptyData(), w3);
                     MulTo(w1, w3);
                 }
 
-                Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
+                Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], *GetEmptyData(), w2);
                 AddTo(hiddenStates, w2);
             }
         }
@@ -757,7 +749,7 @@ namespace fastllm {
         }
 
         RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
-        Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
+        Linear(hiddenStates, weight["lm_head.weight"], *GetEmptyData(), logits);
         ToDataType(logits, DataType::FLOAT32);
         std::vector <int> lastRet;
         int total = 0;
