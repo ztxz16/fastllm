@@ -6941,3 +6941,165 @@ void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm:
     // Synchronize if needed
     DeviceSync();
 }
+
+void FastllmCudaLinearFromCPU(uint8_t *input, fastllm::DataType inputType, 
+    uint8_t *weight, fastllm::DataType weightType, 
+    uint8_t *output, fastllm::DataType outputType, int n, int m, int k) {
+
+    size_t inputSize = fastllm::GetDataBytes(inputType, n, m);
+    size_t weightSize = fastllm::GetDataBytes(weightType, k, m);
+    size_t outputSize = fastllm::GetDataBytes(outputType, n, k);
+
+    uint8_t *cudaInput = (uint8_t*)FastllmCudaDirectMalloc(inputSize);
+    uint8_t *cudaWeight = (uint8_t*)FastllmCudaDirectMalloc(weightSize);
+    uint8_t *cudaOutput = (uint8_t*)FastllmCudaDirectMalloc(outputSize);
+
+    cudaMemcpy(cudaInput, input, inputSize, cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaWeight, weight, weightSize, cudaMemcpyHostToDevice);
+
+    if (inputType == fastllm::DataType::FLOAT32) {
+        if (outputType == fastllm::DataType::FLOAT32) {
+            if (weightType == fastllm::DataType::FLOAT16) {
+                // LaunchFastllmGemmFp32Fp16((float*)cudaInput, (half*)cudaWeight, (float*)cudaOutput, cudaBias, n, m, k);
+
+                auto fastllmCublasHandle = getFastllmCublasHandle();
+                half *cudaFp16Input, *cudaFp16Output;
+                cudaFp16Input = (half *) FastllmCudaDirectMalloc(n * m * sizeof(half));
+                cudaFp16Output = (half *) FastllmCudaDirectMalloc(n * k * sizeof(half));
+
+                __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
+                cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+                cublasStatus_t status;
+
+                int len = n * m;
+                int threadPerBlock = std::min(256, len);
+                FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((float*)cudaInput, cudaFp16Input, len);
+                status = cublasGemmEx(fastllmCublasHandle,
+                                    CUBLAS_OP_T, CUBLAS_OP_N,
+                                    k, n, m,
+                                    &h_alpha, (half *) cudaWeight, AType,
+                                    m, cudaFp16Input, BType,
+                                    m, &h_beta,
+                                    cudaFp16Output, CType,
+                                    k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    printf("Error: cublas error.\n");
+                    throw("cublas error");
+                    exit(0);
+                }
+
+                len = n * k;
+                FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, (float*)cudaOutput, len);
+                FastllmCudaDirectFree(cudaFp16Input);
+                FastllmCudaDirectFree(cudaFp16Output);
+            }
+        }
+    } else if (inputType == fastllm::DataType::FLOAT16) {
+        if (outputType == fastllm::DataType::FLOAT16) {
+            if (weightType == fastllm::DataType::FLOAT16) {
+                auto fastllmCublasHandle = getFastllmCublasHandle();
+                half *cudaFp16Input = (half*)cudaInput, *cudaFp16Output = (half*)cudaOutput;
+                __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
+                cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+                cublasStatus_t status;
+                status = cublasGemmEx(fastllmCublasHandle,
+                                    CUBLAS_OP_T, CUBLAS_OP_N,
+                                    k, n, m,
+                                    &h_alpha, (half *) cudaWeight, AType,
+                                    m, cudaFp16Input, BType,
+                                    m, &h_beta,
+                                    cudaFp16Output, CType,
+                                    k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+                if (status != CUBLAS_STATUS_SUCCESS) {
+                    printf("Error: cublas error.\n");
+                    throw("cublas error");
+                    exit(0);
+                }
+            }
+        }
+    }
+
+    cudaMemcpy(output, cudaOutput, outputSize, cudaMemcpyHostToDevice);
+
+    FastllmCudaDirectFree(cudaInput);
+    FastllmCudaDirectFree(cudaWeight);
+    FastllmCudaDirectFree(cudaOutput);
+    return;
+}
+
+void FastllmPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *cudaIndex) {
+    for (int i = 0; i < rows; i++) {
+        int index = cudaIndex[i];
+        for (int j = 0; j < cols; j++) {
+            partInput[i * cols + j] = input[index * cols + j];
+        }
+    }
+}
+
+// CUDA Kernel 函数
+// 每个线程负责搬运一个 uint8_t 元素
+__global__ void FastllmPickInputKernel(uint8_t *input, uint8_t *partInput, int rows, int cols, int *index) {
+    // blockIdx.y 对应行索引 i
+    int row = blockIdx.y;
+    // blockIdx.x * blockDim.x + threadIdx.x 对应列索引 j
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    // 边界检查：防止越界访问
+    if (row < rows && col < cols) {
+        // 读取该行在源数据中对应的真实行号
+        int srcRow = index[row];
+        
+        // 计算扁平化的内存偏移量
+        // 使用 long long 防止在大模型显存较大时 int32 溢出
+        long long dstOffset = (long long)row * cols + col;
+        long long srcOffset = (long long)srcRow * cols + col;
+        // 执行拷贝
+        partInput[dstOffset] = input[srcOffset];
+    }
+}
+
+// Host 调用函数
+void FastllmCudaPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *index) {
+    // 设定 Block 大小：256 是通过是一个比较通用的高性能值
+    dim3 block(256);
+    // 设定 Grid 大小：
+    // x 维度：覆盖所有列 (cols)，向上取整除以 256
+    // y 维度：覆盖所有行 (rows)
+    dim3 grid((cols + 255) / 256, rows);
+    // 启动 Kernel
+    FastllmPickInputKernel<<<grid, block>>>(input, partInput, rows, cols, index);
+}
+
+// CUDA Kernel 函数
+// 每个线程负责一个 float 元素的计算和累加
+__global__ void FastllmPickOutputKernel(float *partOutput, float *output, int rows, int cols, int *index, float *scales) {
+    // blockIdx.y 对应行索引 i (partOutput 中的行)
+    int i = blockIdx.y;
+    // blockIdx.x * blockDim.x + threadIdx.x 对应列索引 j
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    // 边界检查
+    if (i < rows && j < cols) {
+        // 获取目标行号 idx 和 缩放因子 sca
+        int idx = index[i];
+        float sca = scales[i];
+        // 计算扁平化的内存偏移量
+        // 使用 long long 防止大模型显存地址溢出
+        long long srcOffset = (long long)i * cols + j;
+        long long dstOffset = (long long)idx * cols + j;
+        // 执行 CPU 逻辑: output[idx * cols + j] += sca * partOutput[i * cols + j];
+        // 注意：这里假设 index 映射的目标行通常是唯一的（在 LLM Batch 推理中通常如此）。
+        // 如果多个 i 映射到同一个 idx，这里存在竞争冒险，但在 FastLLM 上下文中通常是 Scatter 操作。
+        output[dstOffset] += sca * partOutput[srcOffset];
+    }
+}
+// Host 调用函数
+void FastllmCudaPickOutput(float *partOutput, float *output, int rows, int cols, int *index, float *scales) {
+    // 设定 Block 大小：使用 256 作为通用高性能值
+    dim3 block(256);
+    
+    // 设定 Grid 大小：
+    // x 维度：覆盖所有列 (cols)，向上取整
+    // y 维度：覆盖所有行 (rows)
+    dim3 grid((cols + 255) / 256, rows);
+    // 启动 Kernel
+    FastllmPickOutputKernel<<<grid, block>>>(partOutput, output, rows, cols, index, scales);
+}

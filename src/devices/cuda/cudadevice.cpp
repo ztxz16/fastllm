@@ -1288,6 +1288,112 @@ namespace fastllm {
                     }
                 }
             } else {
+                FastllmCudaMemset0(output.cudaData, output.GetBytes());
+                std::vector <std::pair <float, int> > v; // (value, idx)
+                v.resize(m);
+                std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
+                expertTasks.resize(m + 1);
+                for (int b = 0; b < batch; b++) {
+                    expertTasks[0].push_back(std::make_pair(b, sharedScale));
+                    float *cur = cpuRouterLogits + b * m;
+                    for (int i = 0; i < m; i++) {
+                        v[i] = (std::make_pair(-cur[i], i));
+                    }
+                    if (gateBias.dims.size() > 0) {
+                        ToDataType(gateBias, DataType::FLOAT32);
+                        gateBias.ToDevice(DataDevice::CPU);
+                        float *cpuBias = (float*)gateBias.cpuData;
+                        for (int i = 0; i < m; i++) {
+                            v[i].first -= cpuBias[i];
+                        }
+                    }
+                    // sort(v.begin(), v.end());
+                    partial_sort(v.begin(), v.begin() + topk, v.end());
+                    float sum = 1.0;
+                    if (needNorm) {
+                        sum = 0.0;
+                        for (int j = 0; j < topk; j++) {
+                            sum += cur[v[j].second];
+                        }
+                    }
+                    
+                    for (int j = 0; j < topk; j++) {
+                        int idx = v[j].second;
+                        float value = cur[idx] / sum * routeScale;
+                        expertTasks[idx + 1].push_back(std::make_pair(b, value));
+                    }
+                }
+
+                std::vector <int> index;
+                std::vector <float> scales;
+                std::vector <int> startIdx;                
+                for (int i = 0; i < expertTasks.size(); i++) {
+                    startIdx.push_back(index.size());
+                    for (int j = 0; j < expertTasks[i].size(); j++) {
+                        index.push_back(expertTasks[i][j].first);
+                        scales.push_back(expertTasks[i][j].second);
+                    }
+                }
+
+                int *cudaIndex = (int*)FastllmCudaMalloc(index.size() * sizeof(int));
+                FastllmCudaCopyFromHostToDevice(cudaIndex, index.data(), index.size() * sizeof(int));
+
+                float *cudaScales = (float*)FastllmCudaMalloc(scales.size() * sizeof(float));
+                FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
+
+                Data tempInput, tempMiddle, tempSwiglu, tempOutput;
+                tempInput.Resize(input.dims);
+                tempInput.ToDevice(input.dataDevice);
+                tempInput.Allocate();
+
+                tempMiddle.Resize({input.dims[0], weights[2]->dims[0]});
+                tempMiddle.ToDevice(input.dataDevice);
+                tempMiddle.Allocate();
+
+                tempSwiglu.Resize({input.dims[0], weights[2]->dims[0] / 2});
+                tempSwiglu.ToDevice(input.dataDevice);
+                tempSwiglu.Allocate();
+
+                tempOutput.Resize(output.dims);
+                tempOutput.ToDevice(output.dataDevice);
+                tempOutput.Allocate();
+
+                for (int i = 0; i < expertTasks.size(); i++) {
+                    if (expertTasks[i].size() == 0 || weights[i * 2] == nullptr) {
+                        continue;
+                    }
+
+                    tempInput.Resize({(int)expertTasks[i].size(), tempInput.dims[1]});
+                    FastllmCudaPickInput (
+                        (uint8_t*)input.cudaData, 
+                        (uint8_t*)tempInput.cudaData, 
+                        expertTasks[i].size(), 
+                        GetDataBytes(input.dataType, 1, input.dims[1]), 
+                        cudaIndex + startIdx[i]
+                    );
+
+                    DoCudaLinearReshape(tempInput, *weights[i * 2], tempMiddle);
+                    DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
+
+                    DoCudaSwigluReshape(tempMiddle, tempSwiglu);
+                    DoCudaSwiglu(tempMiddle, tempSwiglu);
+
+                    DoCudaLinearReshape(tempSwiglu, *weights[i * 2 + 1], tempOutput);
+                    DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
+
+                    FastllmCudaPickOutput (
+                        (float*)tempOutput.cudaData, 
+                        (float*)output.cudaData, 
+                        expertTasks[i].size(), 
+                        output.dims[1], 
+                        cudaIndex + startIdx[i],
+                        cudaScales + startIdx[i]
+                    );
+                }
+
+                FastllmCudaFree(cudaIndex);
+                FastllmCudaFree(cudaScales);
+/*
                 Data attenPart, moePart;
                 Data moeFinal = Data();
                 moeFinal.Resize({0, input.dims[1]});
@@ -1295,7 +1401,7 @@ namespace fastllm {
                 attenPart.ToDevice(input.dataDevice);
                 moePart.ToDevice(input.dataDevice);
                 moeFinal.ToDevice(input.dataDevice);
-                
+
                 for (int b = 0; b < batch; b++) {
                     float *cur = cpuRouterLogits + b * m;
                     std::vector <std::pair <float, int> > oriV; // (value, idx)
@@ -1361,6 +1467,7 @@ namespace fastllm {
 
                     FastllmCudaMul(moeFinal, 1.0f, output);
                 }
+*/
             }
         }
     }
