@@ -6,6 +6,12 @@ std::vector <long long> FastllmCudaGetFreeSizes();
 extern "C" {
 #endif
 
+void FastllmCudaLinearFromCPU(uint8_t *input, fastllm::DataType inputType, 
+    uint8_t *weight, fastllm::DataType weightType, 
+    uint8_t *output, fastllm::DataType outputType, int n, int m, int k);
+void FastllmCudaPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *cudaIndex);
+void FastllmCudaPickOutput(float *partOutput, float *output, int rows, int cols, int *index, float *scales);
+
 void ForceDeviceSync();
 void FastllmInitCublas(void);
 
