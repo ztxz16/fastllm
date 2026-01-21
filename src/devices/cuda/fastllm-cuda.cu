@@ -366,6 +366,16 @@ __global__ void FastllmCudaInt82HalfKernel(uint8_t* a, float *scales, uint8_t *z
 #endif
 }
 
+__global__ void FastllmCudaFP8E4M3BLOCK1282HalfKernel(uint8_t* a, half *b) {
+    unsigned int tid = threadIdx.x;
+    unsigned int st = blockIdx.x;
+
+    a += st * (128 + sizeof(float));
+    b += st * 128;
+    b[tid] = __float2half((float)__ushort_as_half(((a[tid] & 0x80) << 8) | ((a[tid] & 0x7F) << 7)) * *(float*)(a + 128));
+}
+
+
 __global__ void FastllmCudaFP8E4M32HalfKernel(uint8_t* a, float *scales, half *b, int k, int m, int blockK, int blockM) {
     unsigned int tid = threadIdx.x;
     unsigned int st = blockIdx.x;
@@ -3384,6 +3394,73 @@ void LaunchFastllmGemmFp32Int4NoZero(float *input, uint8_t *weight, float *outpu
         }
         return;
     }
+}
+
+bool FastllmCudaMatMulFloatFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
+        cudaError_t state = cudaSuccess;
+        float *cudaBiasData;
+        state = cudaMalloc(&cudaBiasData, k * sizeof(float));
+        if (bias.dims.size() > 0) {
+            state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+        } else {
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
+        }
+        checkCudaErrors("Error: CUDA error when moving bias to device!", state);
+        weight.extraCudaData.push_back((void*)cudaBiasData);
+    }
+
+    float *cudaBiasData = (float*)weight.extraCudaData[0];
+
+    float *cudaInput = (float*)FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
+
+    if (n >= 0) {
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+        half *cudaFp16Input, *cudaFp16Output, *cudaFp16Weight;
+
+        cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
+        cudaFp16Output = (half *) FastllmCudaMalloc(n * k * sizeof(half));
+        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+
+        __half h_alpha = __float2half_rn(exp2f(8.0f)), h_beta = __float2half_rn(0.0);
+        cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+        cublasStatus_t status;
+
+        int len = n * m;
+        int threadPerBlock = std::min(256, len);
+        FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaFp16Input, len);
+        FastllmCudaFP8E4M3BLOCK1282HalfKernel <<< k * (m / 128), 128 >>>((uint8_t*)weight.cudaData, cudaFp16Weight);
+
+        status = cublasGemmEx(fastllmCublasHandle,
+                              CUBLAS_OP_T, CUBLAS_OP_N,
+                              k, n, m,
+                              &h_alpha, cudaFp16Weight, AType,
+                              m, cudaFp16Input, BType,
+                              m, &h_beta,
+                              cudaFp16Output, CType,
+                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: cublas error.\n");
+            throw("cublas error");
+            exit(0);
+        }
+
+        len = n * k;
+        FastllmCudaHalf2FloatKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaFp16Output, cudaOutput,
+                                                                                           len);
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, cudaBiasData, k);
+        }
+
+        FastllmCudaFree(cudaFp16Input);
+        FastllmCudaFree(cudaFp16Output);
+        FastllmCudaFree(cudaFp16Weight);
+    }
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
 }
 
 bool FastllmCudaMatMulFloatFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
@@ -7102,4 +7179,46 @@ void FastllmCudaPickOutput(float *partOutput, float *output, int rows, int cols,
     dim3 grid((cols + 255) / 256, rows);
     // 启动 Kernel
     FastllmPickOutputKernel<<<grid, block>>>(partOutput, output, rows, cols, index, scales);
+}
+
+// CUDA Kernel 函数
+// 每个线程负责一个 float 元素的计算和累加
+__global__ void FastllmPickOutputKernel(half *partOutput, half *output, int rows, int cols, int *index, float *scales) {
+    // blockIdx.y 对应行索引 i (partOutput 中的行)
+    int i = blockIdx.y;
+    // blockIdx.x * blockDim.x + threadIdx.x 对应列索引 j
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    // 边界检查
+    if (i < rows && j < cols) {
+        // 获取目标行号 idx 和 缩放因子 sca
+        int idx = index[i];
+        float sca = scales[i];
+        // 计算扁平化的内存偏移量
+        // 使用 long long 防止大模型显存地址溢出
+        long long srcOffset = (long long)i * cols + j;
+        long long dstOffset = (long long)idx * cols + j;
+        // 执行 CPU 逻辑: output[idx * cols + j] += sca * partOutput[i * cols + j];
+        // 注意：这里假设 index 映射的目标行通常是唯一的（在 LLM Batch 推理中通常如此）。
+        // 如果多个 i 映射到同一个 idx，这里存在竞争冒险，但在 FastLLM 上下文中通常是 Scatter 操作。
+        output[dstOffset] = (half)(sca * (float)partOutput[srcOffset]);
+    }
+}
+// Host 调用函数
+void FastllmCudaPickOutput(uint8_t *partOutput, uint8_t *output, int rows, int cols, int *index, float *scales, fastllm::DataType dataType) {
+    // 设定 Block 大小：使用 256 作为通用高性能值
+    dim3 block(256);
+    
+    // 设定 Grid 大小：
+    // x 维度：覆盖所有列 (cols)，向上取整
+    // y 维度：覆盖所有行 (rows)
+    dim3 grid((cols + 255) / 256, rows);
+    // 启动 Kernel
+    if (dataType == fastllm::DataType::FLOAT32) {
+        FastllmPickOutputKernel<<<grid, block>>>((float*)partOutput, (float*)output, rows, cols, index, scales);
+    } else if (dataType == fastllm::DataType::FLOAT16) {
+        FastllmPickOutputKernel<<<grid, block>>>((half*)partOutput, (half*)output, rows, cols, index, scales);
+    } else {
+        printf("FastllmCudaPickOutput Error: datatype error.\n");
+        exit(0);
+    }
 }
