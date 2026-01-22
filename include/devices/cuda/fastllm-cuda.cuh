@@ -2,9 +2,21 @@
 
 std::vector <long long> FastllmCudaGetFreeSizes();
 
+#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
+#define FETCH_FLOAT2(pointer) (reinterpret_cast<float2*>(&(pointer))[0])
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
+
+struct CudaInfos {
+    int cudaArch;
+    bool hasTensorCore;
+
+    CudaInfos ();
+};
+
+CudaInfos *getCudaInfos();
 
 void FastllmCudaLinearFromCPU(uint8_t *input, fastllm::DataType inputType, 
     uint8_t *weight, fastllm::DataType weightType, 
@@ -12,6 +24,7 @@ void FastllmCudaLinearFromCPU(uint8_t *input, fastllm::DataType inputType,
 void FastllmCudaPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *cudaIndex);
 void FastllmCudaPickOutput(uint8_t *partOutput, uint8_t *output, int rows, int cols, int *index, float *scales, fastllm::DataType dataType);
 
+void DeviceSync();
 void ForceDeviceSync();
 void FastllmInitCublas(void);
 

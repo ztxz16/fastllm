@@ -212,6 +212,7 @@ include_directories(include/models)
 include_directories(include/devices/cpu)
 include_directories(third_party/json11)
 include_directories(third_party/gguf)
+include_directories(third_party/flashinfer)
 
 if (USE_MMAP)
     add_compile_definitions(USE_MMAP)
