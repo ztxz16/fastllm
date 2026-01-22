@@ -18,6 +18,14 @@
 #include "fastllm-hip.h"
 #endif
 
+// FlashInfer includes
+#include "attention_impl.cuh"
+#include "attention/default_prefill_params.cuh"
+#include "attention/variants.cuh"
+#include "attention/mask.cuh"
+#include "pos_enc.cuh"
+#include "utils.cuh"
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
 #include "mma.h"
 using namespace nvcuda;
@@ -922,8 +930,12 @@ bool FastllmCudaSoftmaxBatch(fastllm::Data **inputs, fastllm::Data **outputs, in
     return true;
 }
 
+extern bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis);
+
 bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                               const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType) {
+    using namespace flashinfer;
+    
     int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
     half *qd = (half*)q.cudaData;
     half *kd = (half*)k.cudaData;
@@ -933,6 +945,183 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
     int batch = (mask.dims.size() == 3) ? mask.dims[0] : 1;
     int maskStride = (mask.dims.size() == 3 ? mask.strides[0] : mask.Count(0));
 
+    // 使用 FlashInfer 实现 attention
+    
+    uint32_t num_kv_heads = k0;          // KV heads 数（所有 batch 共享）
+
+    // 最可能的情况：group 就是 group_size（GQA 的 group size）
+    // 所以 num_qo_heads（每个 batch）= group * num_kv_heads
+    uint32_t num_qo_heads = group * num_kv_heads;  // 每个 batch 的 Q heads 数 = group_size * num_kv_heads
+    uint32_t actual_batch = q0 / num_qo_heads;     // batch 数 = q0 / (每个 batch 的 Q heads 数)
+    
+    // 验证参数有效性，避免除零错误
+    if (num_kv_heads == 0) {
+        printf("Error: num_kv_heads is 0 (k0=%d)\n", k0);
+        return false;
+    }
+    if (num_qo_heads == 0) {
+        printf("Error: num_qo_heads is 0 (group=%d, num_kv_heads=%u)\n", group, num_kv_heads);
+        return false;
+    }
+    if (num_qo_heads % num_kv_heads != 0) {
+        printf("Error: num_qo_heads (%u) is not divisible by num_kv_heads (%u), group=%d\n", 
+               num_qo_heads, num_kv_heads, group);
+        return false;
+    }
+    if (actual_batch == 0) {
+        printf("Error: actual_batch is 0 (q0=%d, num_qo_heads=%u)\n", q0, num_qo_heads);
+        return false;
+    }
+    if (q0 % num_qo_heads != 0) {
+        printf("Error: q0 (%d) is not divisible by num_qo_heads (%u)\n", q0, num_qo_heads);
+        return false;
+    }
+    uint32_t qo_len = q1;                // query 序列长度
+    uint32_t kv_len = k1;                // key/value 序列长度
+    uint32_t head_dim_qk = q2;           // QK head dimension
+    uint32_t head_dim_vo = v2;           // VO head dimension
+    
+    // 确定 mask mode - FlashInfer 的 custom mask 需要 bit-packed 格式，暂时不支持
+    MaskMode mask_mode = MaskMode::kNone;
+    bool use_custom_mask = (maskd != nullptr);
+// printf("maskType = %d, use_custom_mask = %d, batch = %d\n", maskType, use_custom_mask, batch);
+    if (maskType == 0 && !use_custom_mask && batch == 1) {
+        mask_mode = MaskMode::kCausal;
+    }
+mask_mode = MaskMode::kCausal;
+    // 注意：FlashInfer 的 custom mask 格式与 fastllm 不同，暂时禁用
+    if (use_custom_mask) {
+        // Fallback 到原始实现，因为 mask 格式不兼容
+        use_custom_mask = false;
+    }
+    
+    // FlashInfer 支持 HND 布局，使用 HND 布局实现
+    // fastllm 的数据布局是 HND: [num_heads, seq_len, head_dim]
+    // 对于 HND 布局：
+    // - stride_n (token 之间的 stride) = head_dim
+    // - stride_h (head 之间的 stride) = seq_len * head_dim
+    bool use_flashinfer = (head_dim_qk == 128 && head_dim_vo == 128 && !use_custom_mask);
+// use_flashinfer = false;
+    // 调试信息：打印参数值
+    if (use_flashinfer) {
+        // printf("FlashInfer params: q0=%d, q1=%d, q2=%d, k0=%d, k1=%d, v2=%d, group=%d, batch=%d\n", q0, q1, q2, k0, k1, v2, group, batch);
+        // printf("  num_kv_heads=%u, num_qo_heads=%u, actual_batch=%u, qo_len=%u, kv_len=%u\n", num_kv_heads, num_qo_heads, actual_batch, qo_len, kv_len);
+    }
+    
+    if (use_flashinfer) {
+        // 为每个 batch item 调用 FlashInfer
+        // q0 = batch * num_qo_heads，所以需要按 batch 循环
+        for (int batch_idx = 0; batch_idx < actual_batch; batch_idx++) {
+            // 准备参数
+            // q 的布局: [batch*num_qo_heads, seq_len, head_dim] (HND)
+            // 对于单个 batch，需要 group 个 heads 的数据
+            // cur_q 指向 batch_idx * group 个 heads 的起始位置
+            half *cur_q = qd + batch_idx * group * q.Count(1);
+            half *cur_k = kd + batch_idx * k.Count(1);
+            half *cur_v = vd + batch_idx * v.Count(1);
+            half *cur_o = od + batch_idx * group * output.Count(1);
+            
+            // 对于 HND 布局 [num_heads, seq_len, head_dim]:
+            // - stride_n (token 之间的 stride) = head_dim
+            // - stride_h (head 之间的 stride) = seq_len * head_dim
+            uint32_t q_stride_n = q.strides[1];    // head_dim (token 之间的 stride)
+            uint32_t q_stride_h = q.Count(1);      // seq_len * head_dim (head 之间的 stride)
+            
+            // k/v 也是 HND 布局: [num_kv_heads, kv_len, head_dim]
+            uint32_t kv_stride_n = k.strides[1];   // head_dim (token 之间的 stride)
+            uint32_t kv_stride_h = k.Count(1);     // kv_len * head_dim (head 之间的 stride)
+
+            // 验证 stride 值
+            if (q_stride_n == 0 || q_stride_h == 0 || kv_stride_n == 0 || kv_stride_h == 0) {
+                printf("Error: Invalid stride values: q_stride_n=%u, q_stride_h=%u, kv_stride_n=%u, kv_stride_h=%u\n",
+                       q_stride_n, q_stride_h, kv_stride_n, kv_stride_h);
+                use_flashinfer = false;
+                break;
+            }
+            
+            // 验证序列长度
+            if (qo_len == 0 || kv_len == 0) {
+                printf("Error: Invalid sequence lengths: qo_len=%u, kv_len=%u\n", qo_len, kv_len);
+                use_flashinfer = false;
+                break;
+            }
+            
+            // 创建 SinglePrefillParams (使用 HND 布局)
+            // 注意：FlashInfer 内部会计算 group_size = num_qo_heads / num_kv_heads
+            // 所以我们需要确保 num_qo_heads 是 num_kv_heads 的倍数
+            // 由于我们已经验证了 num_qo_heads % num_kv_heads == 0，这应该是安全的
+            
+            // 再次验证，避免运行时除零
+            uint32_t expected_group_size = num_qo_heads / num_kv_heads;
+            if (expected_group_size == 0) {
+                printf("Error: expected_group_size is 0 (num_qo_heads=%u, num_kv_heads=%u)\n",
+                       num_qo_heads, num_kv_heads);
+                use_flashinfer = false;
+                break;
+            }
+            
+            SinglePrefillParams<half, half, half> params(
+                cur_q, cur_k, cur_v, nullptr,  // q, k, v, custom_mask (暂时不支持)
+                cur_o, nullptr, nullptr,        // o, lse, alibi_slopes
+                num_qo_heads,                   // num_qo_heads (每个 batch 的 Q heads 数)
+                num_kv_heads,                   // num_kv_heads (KV heads 数)
+                qo_len,                         // qo_len
+                kv_len,                         // kv_len
+                q_stride_n,                     // q_stride_n (token stride for HND = head_dim)
+                q_stride_h,                     // q_stride_h (head stride for HND = seq_len * head_dim)
+                kv_stride_n,                    // k_stride_n (token stride for HND = head_dim)
+                kv_stride_h,                    // k_stride_h (head stride for HND = kv_len * head_dim)
+                head_dim_qk,                    // head_dim
+                -1,                             // window_left (-1 means no sliding window)
+                0.0f,                           // logits_soft_cap
+                scale,                          // sm_scale
+                1.0f,                           // rope_scale (不使用 RoPE)
+                10000.0f                        // rope_theta (不使用 RoPE)
+            );
+            
+            // 分配临时缓冲区（如果需要 partition-kv）
+            half *tmp = nullptr;
+            // 暂时不分配
+            /* if (kv_len > 8192) {
+                uint32_t num_chunks = (kv_len + 8191) / 8192;
+                size_t tmp_size = num_chunks * qo_len * num_qo_heads * head_dim_vo * sizeof(half) + 
+                                 num_chunks * qo_len * num_qo_heads * sizeof(float);
+                tmp = (half*)FastllmCudaMalloc(tmp_size);
+            } */ 
+            
+            // 调用 FlashInfer，根据 mask_mode 选择不同的 variant
+            cudaError_t status = cudaSuccess;
+            cudaStream_t stream = nullptr;
+            
+            if (mask_mode == MaskMode::kCausal) {
+                status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, DefaultAttention<false, false, false, false>>(
+                    params, tmp, stream);
+            } else {
+                status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kNone, DefaultAttention<false, false, false, false>>(
+                    params, tmp, stream);
+            }
+            
+            if (tmp != nullptr) {
+                FastllmCudaFree(tmp);
+            }
+            
+            if (status != cudaSuccess) {
+                printf("FlashInfer error: %s\n", cudaGetErrorString(status));
+                // Fallback 到原始实现
+                use_flashinfer = false;
+                break;
+            }
+((fastllm::Data*)&output)->Resize({output.dims[1], output.dims[0], output.dims[2]});
+FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
+        }
+        
+        if (use_flashinfer) {
+            DeviceSync();
+            return true;
+        }
+    }
+    
+    // Fallback 到原始实现
     half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
     if (q1 >= 1024 || (q1 > 1 && q1 != k1 && k1 >= 1024)) {
         int alignQ1 = q1, alignK1 = k1;
