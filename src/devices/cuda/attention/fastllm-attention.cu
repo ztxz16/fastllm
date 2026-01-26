@@ -1046,11 +1046,6 @@ mask_mode = MaskMode::kCausal;
                 break;
             }
             
-            // 创建 SinglePrefillParams (使用 HND 布局)
-            // 注意：FlashInfer 内部会计算 group_size = num_qo_heads / num_kv_heads
-            // 所以我们需要确保 num_qo_heads 是 num_kv_heads 的倍数
-            // 由于我们已经验证了 num_qo_heads % num_kv_heads == 0，这应该是安全的
-            
             // 再次验证，避免运行时除零
             uint32_t expected_group_size = num_qo_heads / num_kv_heads;
             if (expected_group_size == 0) {
@@ -1060,45 +1055,69 @@ mask_mode = MaskMode::kCausal;
                 break;
             }
             
-            SinglePrefillParams<half, half, half> params(
-                cur_q, cur_k, cur_v, nullptr,  // q, k, v, custom_mask (暂时不支持)
-                cur_o, nullptr, nullptr,        // o, lse, alibi_slopes
-                num_qo_heads,                   // num_qo_heads (每个 batch 的 Q heads 数)
-                num_kv_heads,                   // num_kv_heads (KV heads 数)
-                qo_len,                         // qo_len
-                kv_len,                         // kv_len
-                q_stride_n,                     // q_stride_n (token stride for HND = head_dim)
-                q_stride_h,                     // q_stride_h (head stride for HND = seq_len * head_dim)
-                kv_stride_n,                    // k_stride_n (token stride for HND = head_dim)
-                kv_stride_h,                    // k_stride_h (head stride for HND = kv_len * head_dim)
-                head_dim_qk,                    // head_dim
-                -1,                             // window_left (-1 means no sliding window)
-                0.0f,                           // logits_soft_cap
-                scale,                          // sm_scale
-                1.0f,                           // rope_scale (不使用 RoPE)
-                10000.0f                        // rope_theta (不使用 RoPE)
-            );
-            
             // 分配临时缓冲区（如果需要 partition-kv）
             half *tmp = nullptr;
-            // 暂时不分配
-            /* if (kv_len > 8192) {
-                uint32_t num_chunks = (kv_len + 8191) / 8192;
-                size_t tmp_size = num_chunks * qo_len * num_qo_heads * head_dim_vo * sizeof(half) + 
-                                 num_chunks * qo_len * num_qo_heads * sizeof(float);
-                tmp = (half*)FastllmCudaMalloc(tmp_size);
-            } */ 
-            
-            // 调用 FlashInfer，根据 mask_mode 选择不同的 variant
             cudaError_t status = cudaSuccess;
             cudaStream_t stream = nullptr;
             
-            if (mask_mode == MaskMode::kCausal) {
-                status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, DefaultAttention<false, false, false, false>>(
-                    params, tmp, stream);
+            // 当 q1 == 1 时（decode 阶段），使用 decode 接口
+            if (q1 == 1) {
+                // Decode 阶段：q 的形状是 [num_qo_heads, head_dim]（单个 token）
+                // 创建 SingleDecodeParams (使用 HND 布局)
+                SingleDecodeParams<half, half, half> decode_params(
+                    cur_q, cur_k, cur_v, cur_o,    // q, k, v, o
+                    nullptr,                        // maybe_alibi_slopes
+                    kv_len,                         // seq_len (kv_len)
+                    num_qo_heads,                   // num_qo_heads
+                    num_kv_heads,                   // num_kv_heads
+                    QKVLayout::kHND,                // kv_layout (HND)
+                    head_dim_qk,                    // head_dim
+                    -1,                             // window_left (-1 means no sliding window)
+                    0.0f,                           // logits_soft_cap
+                    scale,                          // sm_scale
+                    1.0f,                           // rope_scale (不使用 RoPE)
+                    10000.0f                        // rope_theta (不使用 RoPE)
+                );
+                
+                // 手动设置 stride（因为 decode 接口的构造函数可能不适用于我们的布局）
+                decode_params.q_stride_n = q_stride_n;
+                decode_params.q_stride_h = q_stride_h;
+                decode_params.kv_stride_n = kv_stride_n;
+                decode_params.kv_stride_h = kv_stride_h;
+                
+                // 调用 FlashInfer decode 接口（decode 阶段总是 causal）
+                status = SingleDecodeWithKVCacheDispatched<128, PosEncodingMode::kNone, DefaultAttention<false, false, false, false>>(
+                    decode_params, tmp, stream);
             } else {
-                status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kNone, DefaultAttention<false, false, false, false>>(
-                    params, tmp, stream);
+                // Prefill 阶段：q 的形状是 [num_qo_heads, qo_len, head_dim]
+                // 创建 SinglePrefillParams (使用 HND 布局)
+                SinglePrefillParams<half, half, half> params(
+                    cur_q, cur_k, cur_v, nullptr,  // q, k, v, custom_mask (暂时不支持)
+                    cur_o, nullptr, nullptr,        // o, lse, alibi_slopes
+                    num_qo_heads,                   // num_qo_heads (每个 batch 的 Q heads 数)
+                    num_kv_heads,                   // num_kv_heads (KV heads 数)
+                    qo_len,                         // qo_len
+                    kv_len,                         // kv_len
+                    q_stride_n,                     // q_stride_n (token stride for HND = head_dim)
+                    q_stride_h,                     // q_stride_h (head stride for HND = seq_len * head_dim)
+                    kv_stride_n,                    // k_stride_n (token stride for HND = head_dim)
+                    kv_stride_h,                    // k_stride_h (head stride for HND = kv_len * head_dim)
+                    head_dim_qk,                    // head_dim
+                    -1,                             // window_left (-1 means no sliding window)
+                    0.0f,                           // logits_soft_cap
+                    scale,                          // sm_scale
+                    1.0f,                           // rope_scale (不使用 RoPE)
+                    10000.0f                        // rope_theta (不使用 RoPE)
+                );
+                
+                // 调用 FlashInfer prefill 接口，根据 mask_mode 选择不同的 variant
+                if (mask_mode == MaskMode::kCausal) {
+                    status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, DefaultAttention<false, false, false, false>>(
+                        params, tmp, stream);
+                } else {
+                    status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kNone, DefaultAttention<false, false, false, false>>(
+                        params, tmp, stream);
+                }
             }
             
             if (tmp != nullptr) {
