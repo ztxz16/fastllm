@@ -92,6 +92,10 @@ namespace fastllm {
         this->ops["CatDirectBatch"] = (BaseOperator*)(new CpuCatDirectBatchOp());
         this->ops["AppendKVCachebatch"] = (BaseOperator*)(new CpuAppendKVCacheBatchOp());
         this->ops["AttentionBatch"] = (BaseOperator*)(new CpuAttentionBatchOp());
+
+        this->ops["AttentionPaged"] = (BaseOperator*)(new CpuAttentionPagedOp());
+        this->ops["AppendPagedCache"] = (BaseOperator*)(new CpuAppendPagedCacheOp());
+        this->ops["AppendPagedCacheBatch"] = (BaseOperator*)(new CpuAppendPagedCacheBatchOp());
     }
 
     bool CpuDevice::Malloc(void **ret, size_t size) {
@@ -7231,5 +7235,551 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
         delete[] qk;
         delete[] temp;
+    }
+
+    void CpuAppendPagedCacheOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &cache = *(datas.find("cache")->second);
+        Data &input = *(datas.find("input")->second);
+
+        AssertInFastLLM(cache.dataType == DataType::FLOAT32 ||
+                        cache.dataType == DataType::FLOAT16, 
+                        "CpuAppendPagedCacheOp's cache's type should be float32 or float16.\n");
+        
+        AssertInFastLLM(input.dims.size() == 3, 
+                        "CpuAppendPagedCacheOp's input should have 3 dimensions [numHeads, seqLen, headDim].\n");
+        
+        AssertInFastLLM(input.dataType == cache.dataType,
+                        "CpuAppendPagedCacheOp's input and cache should have the same data type.\n");
+        
+        cache.isPagedKVCache = true;
+        
+        // 获取输入的形状信息
+        int numHeads = input.dims[0];
+        int seqLen = input.dims[1];
+        int headDim = input.dims[2];
+        
+        if (cache.pagedKVCacheData == nullptr) {
+            cache.pagedKVCacheData = new Data();
+            cache.pagedKVCacheData->dataType = cache.dataType;
+            cache.pagedKVCacheData->UpdateUnitSize();
+            cache.pagedKVCacheData->Resize({100, cache.pageLen, numHeads, headDim});
+            cache.pagedKVCacheData->Allocate();
+        }
+
+        // 如果 pagedKVCacheData 还没有初始化，需要初始化它
+        AssertInFastLLM(cache.pagedKVCacheData != nullptr,
+                        "CpuAppendPagedCacheOp's pagedKVCacheData should be initialized.\n");
+            
+        // 检查 pagedKVCacheData 的形状是否匹配
+        AssertInFastLLM(cache.pagedKVCacheData->dims.size() == 4,
+                            "CpuAppendPagedCacheOp's pagedKVCacheData should have 4 dimensions.\n");
+        AssertInFastLLM(cache.pagedKVCacheData->dims[1] == cache.pageLen,
+                            "CpuAppendPagedCacheOp's pagedKVCacheData pageLen mismatch.\n");
+        AssertInFastLLM(cache.pagedKVCacheData->dims[2] == numHeads,
+                            "CpuAppendPagedCacheOp's pagedKVCacheData numHeads mismatch.\n");
+        AssertInFastLLM(cache.pagedKVCacheData->dims[3] == headDim,
+                            "CpuAppendPagedCacheOp's pagedKVCacheData headDim mismatch.\n");
+        
+        // 计算需要多少个新的 pages
+        int currentUsedTokens = 0;
+        if (cache.pageIndex.size() > 0) {
+            currentUsedTokens = (cache.pageIndex.size() - 1) * cache.pageLen + cache.lastPageLen;
+        }
+        int totalNeededTokens = currentUsedTokens + seqLen;
+        int totalNeededPages = (totalNeededTokens + cache.pageLen - 1) / cache.pageLen;
+        int currentPages = (int)cache.pageIndex.size();
+        int newPagesNeeded = totalNeededPages - currentPages;
+        
+        // 检查是否有足够的 pages
+        int maxPages = cache.pagedKVCacheData->dims[0];
+        if (totalNeededPages > maxPages) {
+            // 需要扩容 pagedKVCacheData
+            int newMaxPages = std::max(maxPages * 2, totalNeededPages);
+            Data *oldData = cache.pagedKVCacheData;
+            cache.pagedKVCacheData = new Data();
+            cache.pagedKVCacheData->dataType = cache.dataType;
+            cache.pagedKVCacheData->UpdateUnitSize();
+            cache.pagedKVCacheData->Resize({newMaxPages, cache.pageLen, numHeads, headDim});
+            cache.pagedKVCacheData->Allocate();
+            cache.pagedKVCacheData->ToDevice(DataDevice::CPU);
+            
+            // 复制旧数据
+            if (oldData != nullptr && oldData->cpuData != nullptr) {
+                int copySize = maxPages * cache.pageLen * numHeads * headDim * cache.unitSize;
+                memcpy(cache.pagedKVCacheData->cpuData, oldData->cpuData, copySize);
+                delete oldData;
+            }
+        }
+
+        if (cache.dims.size() == 0) {
+            cache.Resize(input.dims);
+        } else {
+            cache.Resize({cache.dims[0], cache.dims[1] + input.dims[1], cache.dims[2]});
+        }
+    }
+
+    void CpuAppendPagedCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &cache = *(datas.find("cache")->second);
+        Data &input = *(datas.find("input")->second);
+        
+        // 获取输入的形状信息
+        int numHeads = input.dims[0];
+        int seqLen = input.dims[1];
+        int headDim = input.dims[2];
+        
+        // 计算需要追加的 token 数量
+        int remainingInCurrentPage = cache.pageLen - cache.lastPageLen;
+        int tokensToAppend = seqLen;
+        int inputOffset = 0;
+        
+        // 获取 pagedKVCacheData 的数据指针
+        uint8_t *pagedData = cache.pagedKVCacheData->cpuData;
+        uint8_t *inputData = input.cpuData;
+        int unitSize = cache.unitSize;
+        
+        // 先填充当前 page 的剩余空间
+        if (cache.pageIndex.size() > 0 && remainingInCurrentPage > 0) {
+            int currentPageIdx = cache.pageIndex.back();
+            int copyLen = std::min(remainingInCurrentPage, tokensToAppend);
+            
+            // 复制数据：对于每个 token，每个 head，复制 headDim 个元素
+            // pagedKVCacheData shape: [maxPages, pageLen, numHeads, headDim]
+            // input shape: [numHeads, seqLen, headDim]
+            for (int t = 0; t < copyLen; t++) {
+                for (int h = 0; h < numHeads; h++) {
+                    uint8_t *dst = pagedData + 
+                        (currentPageIdx * cache.pageLen * numHeads * headDim +
+                         (cache.lastPageLen + t) * numHeads * headDim +
+                         h * headDim) * unitSize;
+                    uint8_t *src = inputData + 
+                        (h * seqLen * headDim + (inputOffset + t) * headDim) * unitSize;
+                    memcpy(dst, src, headDim * unitSize);
+                }
+            }
+            
+            cache.lastPageLen += copyLen;
+            tokensToAppend -= copyLen;
+            inputOffset += copyLen;
+        }
+        
+        // 如果还有剩余的数据，需要分配新的 pages
+        while (tokensToAppend > 0) {
+            // 分配新的 page
+            int newPageIdx = -1;
+            int maxPages = cache.pagedKVCacheData->dims[0];
+            
+            // 查找一个未使用的 page（简单实现：使用下一个可用的索引）
+            // 这里可以使用更复杂的分配策略，比如维护一个空闲 page 列表
+            if (cache.pageIndex.size() == 0) {
+                newPageIdx = 0;
+            } else {
+                // 简单策略：使用下一个连续的 page
+                newPageIdx = cache.pageIndex.size();
+                if (newPageIdx >= maxPages) {
+                    ErrorInFastLLM("CpuAppendPagedCacheOp: No more pages available. Need to resize pagedKVCacheData.\n");
+                }
+            }
+            
+            cache.pageIndex.push_back(newPageIdx);
+            
+            // 计算这个 page 可以存储多少 token
+            int copyLen = std::min(cache.pageLen, tokensToAppend);
+            
+            // 复制数据：对于每个 token，每个 head，复制 headDim 个元素
+            // pagedKVCacheData shape: [maxPages, pageLen, numHeads, headDim]
+            // input shape: [numHeads, seqLen, headDim]
+            for (int t = 0; t < copyLen; t++) {
+                for (int h = 0; h < numHeads; h++) {
+                    uint8_t *dst = pagedData + 
+                        (newPageIdx * cache.pageLen * numHeads * headDim +
+                         t * numHeads * headDim +
+                         h * headDim) * unitSize;
+                    uint8_t *src = inputData + 
+                        (h * seqLen * headDim + (inputOffset + t) * headDim) * unitSize;
+                    memcpy(dst, src, headDim * unitSize);
+                }
+            }
+            
+            cache.lastPageLen = copyLen;
+            tokensToAppend -= copyLen;
+            inputOffset += copyLen;
+        }
+    }
+
+    void CpuAttentionPagedOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
+    
+        std::vector <int> dims = {q.dims[0], q.dims[1], v.dims[2]};
+        output.dataType = q.dataType;
+        output.Resize(dims);
+    }
+
+    void CpuAttentionPagedOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+
+        if (k.isPagedKVCache && v.isPagedKVCache) {
+            int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
+            float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+            
+            int q0 = q.dims[0]; // numHeads
+            int q1 = q.dims[1]; // seqLen
+            int q2 = q.dims[2]; // headDim
+            int k0 = k.dims[0]; // numHeads (for k cache)
+            int v2 = v.dims[2]; // headDim (for v cache)
+            
+            // 计算总的 k/v 序列长度
+            int k1 = 0;
+            if (k.pageIndex.size() > 0) {
+                k1 = (k.pageIndex.size() - 1) * k.pageLen + k.lastPageLen;
+            }
+            
+            // 获取 pagedKVCacheData 的信息
+            int pageLen = k.pageLen;
+            int numHeads = k.pagedKVCacheData->dims[2];
+            int headDim = k.pagedKVCacheData->dims[3];
+            int unitSize = k.unitSize;
+            
+            if (q.dataType == DataType::FLOAT32) {
+                float *qd = (float*)q.cpuData;
+                float *od = (float*)output.cpuData;
+                Data *maskPtr = datas.find("mask") != datas.end() ? datas.find("mask")->second : nullptr;
+                float *maskd = (maskPtr != nullptr && maskPtr->dims.size() > 0) ? (float*)maskPtr->cpuData : nullptr;
+                uint8_t *kPagedData = k.pagedKVCacheData->cpuData;
+                uint8_t *vPagedData = v.pagedKVCacheData->cpuData;
+                
+                int batch = (maskd != nullptr && maskPtr != nullptr && maskPtr->dims.size() == 3) ? maskPtr->dims[0] : 1;
+                batch = intParams.find("mask___batch") != intParams.end() ? intParams.find("mask___batch")->second : batch;
+                int maskStride = (maskd != nullptr && maskPtr != nullptr) ? (maskPtr->dims.size() == 3 ? maskPtr->strides[0] : maskPtr->Count(0)) : 0;
+                
+                std::fill(od, od + output.Count(0), 0.0f);
+                
+                // 对于每个 query head
+                for (int o = 0; o < q0; o++) {
+                    float *qHead = qd + o * q.strides[0];
+                    float *oHead = od + o * output.strides[0];
+                    float *maskHead = maskd ? (maskd + (o / (q0 / batch)) * maskStride) : nullptr;
+                    
+                    // 对于每个 query token
+                    for (int i = 0; i < q1; i++) {
+                        float *qk = new float[k1];
+                        float *temp = new float[k1];
+                        float maxValue = -10000.0f;
+                        int base = k1 - q1;
+                        
+                        // 计算 q[i] 与所有 k[j] 的点积
+                        int kvTokenIdx = 0;
+                        for (size_t pageIdx = 0; pageIdx < k.pageIndex.size(); pageIdx++) {
+                            int currentPageIdx = k.pageIndex[pageIdx];
+                            int tokensInPage = (pageIdx == k.pageIndex.size() - 1) ? k.lastPageLen : pageLen;
+                            
+                            for (int t = 0; t < tokensInPage; t++) {
+                                int j = kvTokenIdx;
+                                
+                                // 检查 mask
+                                if (maskHead && maskHead[i * k1 + j] > 0.99) {
+                                    qk[j] = -10000.0f;
+                                    kvTokenIdx++;
+                                    continue;
+                                }
+                                if (!maskHead && (base + i) < j) {
+                                    qk[j] = -10000.0f;
+                                    kvTokenIdx++;
+                                    continue;
+                                }
+                                
+                                // 计算点积 q[i] · k[j]
+                                float dotProduct = 0.0f;
+                                int kHeadIdx = o / group;
+                                
+                                // 获取 k[j] 的数据指针
+                                uint8_t *kDataPtr = kPagedData + 
+                                    (currentPageIdx * pageLen * numHeads * headDim +
+                                     t * numHeads * headDim +
+                                     kHeadIdx * headDim) * unitSize;
+                                float *kToken = (float*)kDataPtr;
+                                
+                                // 向量点积计算
+                                int l = 0;
+#ifdef __aarch64__
+                                float32x4_t sum = {0, 0, 0, 0};
+                                for (; l + 3 < q2; l += 4) {
+                                    sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(qHead + i * q2 + l),
+                                                                vld1q_f32(kToken + l)));
+                                }
+                                dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
+#elif defined(__AVX__)
+                                __m256 vsum = _mm256_set1_ps(0.0f);
+                                for (; l + 7 < q2; l += 8) {
+                                    __m256 vx = _mm256_loadu_ps((const float *) (qHead + i * q2 + l));
+                                    __m256 vy = _mm256_loadu_ps((const float *) (kToken + l));
+                                    vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
+                                }
+                                dotProduct += Floatsum(vsum);
+#endif
+                                for (; l < q2; l++) {
+                                    dotProduct += qHead[i * q2 + l] * kToken[l];
+                                }
+                                
+                                qk[j] = dotProduct * scale;
+                                maxValue = std::max(maxValue, qk[j]);
+                                kvTokenIdx++;
+                            }
+                        }
+                        
+                        // Softmax
+                        int j = 0;
+#ifdef __aarch64__
+                        float32x4_t vmax = vdupq_n_f32(maxValue);
+                        for (; j + 3 < k1; j += 4) {
+                            vst1q_f32(temp + j, exp_ps(vsubq_f32(vld1q_f32(qk + j), vmax)));
+                        }
+#endif
+                        for (; j < k1; j++) {
+                            temp[j] = expf(qk[j] - maxValue);
+                        }
+                        
+                        float sum = 0.0f;
+                        for (int j = 0; j < k1; j++) {
+                            sum += temp[j];
+                        }
+                        sum = std::max(sum, 0.1f);
+                        for (int j = 0; j < k1; j++) {
+                            qk[j] = temp[j] / sum;
+                        }
+                        
+                        // 加权求和：output[i] = sum(softmax[j] * v[j])
+                        kvTokenIdx = 0;
+                        for (size_t pageIdx = 0; pageIdx < v.pageIndex.size(); pageIdx++) {
+                            int currentPageIdx = v.pageIndex[pageIdx];
+                            int tokensInPage = (pageIdx == v.pageIndex.size() - 1) ? v.lastPageLen : pageLen;
+                            
+                            for (int t = 0; t < tokensInPage; t++) {
+                                int j = kvTokenIdx;
+                                int vHeadIdx = o / group;
+                                
+                                // 获取 v[j] 的数据指针
+                                uint8_t *vDataPtr = vPagedData + 
+                                    (currentPageIdx * pageLen * numHeads * headDim +
+                                     t * numHeads * headDim +
+                                     vHeadIdx * headDim) * unitSize;
+                                float *vToken = (float*)vDataPtr;
+                                
+                                // 累加 softmax[j] * v[j]
+                                for (int l = 0; l < v2; l++) {
+                                    oHead[i * v2 + l] += qk[j] * vToken[l];
+                                }
+                                
+                                kvTokenIdx++;
+                            }
+                        }
+                        
+                        delete[] qk;
+                        delete[] temp;
+                    }
+                }
+            } else if (q.dataType == DataType::FLOAT16) {
+                uint16_t *qd = (uint16_t*)q.cpuData;
+                uint16_t *od = (uint16_t*)output.cpuData;
+                Data *maskPtr = datas.find("mask") != datas.end() ? datas.find("mask")->second : nullptr;
+                uint16_t *maskd = (maskPtr != nullptr && maskPtr->dims.size() > 0) ? (uint16_t*)maskPtr->cpuData : nullptr;
+                uint8_t *kPagedData = k.pagedKVCacheData->cpuData;
+                uint8_t *vPagedData = v.pagedKVCacheData->cpuData;
+                
+                int batch = (maskd != nullptr && maskPtr != nullptr && maskPtr->dims.size() == 3) ? maskPtr->dims[0] : 1;
+                batch = intParams.find("mask___batch") != intParams.end() ? intParams.find("mask___batch")->second : batch;
+                int maskStride = (maskd != nullptr && maskPtr != nullptr) ? (maskPtr->dims.size() == 3 ? maskPtr->strides[0] : maskPtr->Count(0)) : 0;
+                
+                std::fill(od, od + output.Count(0), float_to_half(0.0f));
+                
+                // 对于每个 query head
+                for (int o = 0; o < q0; o++) {
+                    uint16_t *qHead = qd + o * q.strides[0];
+                    uint16_t *oHead = od + o * output.strides[0];
+                    uint16_t *maskHead = maskd ? (maskd + (o / (q0 / batch)) * maskStride) : nullptr;
+                    
+                    // 转换 q 为 float32
+                    std::vector<float> fqHead;
+                    fqHead.resize(q1 * q2);
+                    Float16ToFloat32(qHead, fqHead.data(), q1 * q2);
+                    
+                    // 对于每个 query token
+                    for (int i = 0; i < q1; i++) {
+                        float *qk = new float[k1];
+                        float *temp = new float[k1];
+                        float maxValue = -10000.0f;
+                        int base = k1 - q1;
+                        
+                        // 计算 q[i] 与所有 k[j] 的点积
+                        int kvTokenIdx = 0;
+                        for (size_t pageIdx = 0; pageIdx < k.pageIndex.size(); pageIdx++) {
+                            int currentPageIdx = k.pageIndex[pageIdx];
+                            int tokensInPage = (pageIdx == k.pageIndex.size() - 1) ? k.lastPageLen : pageLen;
+                            
+                            for (int t = 0; t < tokensInPage; t++) {
+                                int j = kvTokenIdx;
+                                
+                                // 检查 mask
+                                if (maskHead) {
+                                    float maskVal = half_to_float(maskHead[i * k1 + j]);
+                                    if (maskVal > 0.99) {
+                                        qk[j] = -10000.0f;
+                                        kvTokenIdx++;
+                                        continue;
+                                    }
+                                }
+                                if (!maskHead && (base + i) < j) {
+                                    qk[j] = -10000.0f;
+                                    kvTokenIdx++;
+                                    continue;
+                                }
+                                
+                                // 计算点积 q[i] · k[j]
+                                float dotProduct = 0.0f;
+                                int kHeadIdx = o / group;
+                                
+                                // 获取 k[j] 的数据指针
+                                uint8_t *kDataPtr = kPagedData + 
+                                    (currentPageIdx * pageLen * numHeads * headDim +
+                                     t * numHeads * headDim +
+                                     kHeadIdx * headDim) * unitSize;
+                                
+                                // 转换 k[j] 为 float32
+                                std::vector<float> fkToken;
+                                fkToken.resize(headDim);
+                                if (k.dataType == DataType::FLOAT32) {
+                                    float *kToken = (float*)kDataPtr;
+                                    memcpy(fkToken.data(), kToken, headDim * sizeof(float));
+                                } else {
+                                    uint16_t *kToken = (uint16_t*)kDataPtr;
+                                    Float16ToFloat32(kToken, fkToken.data(), headDim);
+                                }
+                                
+                                // 向量点积计算
+                                int l = 0;
+#ifdef __aarch64__
+                                float32x4_t sum = {0, 0, 0, 0};
+                                for (; l + 3 < q2; l += 4) {
+                                    sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(fqHead.data() + i * q2 + l),
+                                                                vld1q_f32(fkToken.data() + l)));
+                                }
+                                dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
+#elif defined(__AVX__)
+                                __m256 vsum = _mm256_set1_ps(0.0f);
+                                for (; l + 7 < q2; l += 8) {
+                                    __m256 vx = _mm256_loadu_ps((const float *) (fqHead.data() + i * q2 + l));
+                                    __m256 vy = _mm256_loadu_ps((const float *) (fkToken.data() + l));
+                                    vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
+                                }
+                                dotProduct += Floatsum(vsum);
+#endif
+                                for (; l < q2; l++) {
+                                    dotProduct += fqHead[i * q2 + l] * fkToken[l];
+                                }
+                                
+                                qk[j] = dotProduct * scale;
+                                maxValue = std::max(maxValue, qk[j]);
+                                kvTokenIdx++;
+                            }
+                        }
+                        
+                        // Softmax
+                        int j = 0;
+#ifdef __aarch64__
+                        float32x4_t vmax = vdupq_n_f32(maxValue);
+                        for (; j + 3 < k1; j += 4) {
+                            vst1q_f32(temp + j, exp_ps(vsubq_f32(vld1q_f32(qk + j), vmax)));
+                        }
+#endif
+                        for (; j < k1; j++) {
+                            temp[j] = expf(qk[j] - maxValue);
+                        }
+                        
+                        float sum = 0.0f;
+                        for (int j = 0; j < k1; j++) {
+                            sum += temp[j];
+                        }
+                        sum = std::max(sum, 0.1f);
+                        for (int j = 0; j < k1; j++) {
+                            qk[j] = temp[j] / sum;
+                        }
+                        
+                        // 加权求和：output[i] = sum(softmax[j] * v[j])
+                        std::vector<float> foHead;
+                        foHead.resize(v2, 0.0f);
+                        
+                        kvTokenIdx = 0;
+                        for (size_t pageIdx = 0; pageIdx < v.pageIndex.size(); pageIdx++) {
+                            int currentPageIdx = v.pageIndex[pageIdx];
+                            int tokensInPage = (pageIdx == v.pageIndex.size() - 1) ? v.lastPageLen : pageLen;
+                            
+                            for (int t = 0; t < tokensInPage; t++) {
+                                int j = kvTokenIdx;
+                                int vHeadIdx = o / group;
+                                
+                                // 获取 v[j] 的数据指针
+                                uint8_t *vDataPtr = vPagedData + 
+                                    (currentPageIdx * pageLen * numHeads * headDim +
+                                     t * numHeads * headDim +
+                                     vHeadIdx * headDim) * unitSize;
+                                
+                                // 转换 v[j] 为 float32
+                                std::vector<float> fvToken;
+                                fvToken.resize(headDim);
+                                if (v.dataType == DataType::FLOAT32) {
+                                    float *vToken = (float*)vDataPtr;
+                                    memcpy(fvToken.data(), vToken, headDim * sizeof(float));
+                                } else {
+                                    uint16_t *vToken = (uint16_t*)vDataPtr;
+                                    Float16ToFloat32(vToken, fvToken.data(), headDim);
+                                }
+                                
+                                // 累加 softmax[j] * v[j]
+                                for (int l = 0; l < v2; l++) {
+                                    foHead[l] += qk[j] * fvToken[l];
+                                }
+                                
+                                kvTokenIdx++;
+                            }
+                        }
+                        
+                        // 转换回 float16
+                        Float32ToFloat16(foHead.data(), oHead + i * v2, v2);
+                        
+                        delete[] qk;
+                        delete[] temp;
+                    }
+                }
+            } else {
+                ErrorInFastLLM("CpuAttentionPagedOp error: unsupport dataType.\n");
+            }
+        }
+    }
+
+    void CpuAppendPagedCacheBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &cache = *(datas.find("cache")->second);
+        Data &input = *(datas.find("input")->second);
+
+        AssertInFastLLM(cache.dataType == DataType::FLOAT32 ||
+                        cache.dataType == DataType::FLOAT16, 
+                        "CpuAppendPagedCacheBatchOp's cache's type should be float32 or float16.\n");
+    }
+
+    void CpuAppendPagedCacheBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &cache = *(datas.find("cache")->second);
+        Data &input = *(datas.find("input")->second);
     }
 }
