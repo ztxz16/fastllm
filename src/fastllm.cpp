@@ -1147,6 +1147,10 @@ namespace fastllm {
         if (this->dataType == DataType::DATA_GGUF_FORMAT) {
             return ggml_nbytes((ggml_tensor*)this->ggmlTensor);
         }
+        if (this->dataType >= 1000 && this->dataType < DataType::DATA_GGUF_FORMAT 
+            && this->dims.size() == 2) {
+            return GetDataBytes(this->dataType, this->dims[0], this->dims[1]);
+        }
         return (this->strides[0] * this->dims[0] * this->unitSize - 1) / this->unitSizeDiv + 1;
     }
 
@@ -3067,6 +3071,25 @@ namespace fastllm {
             {"q___batch", (int)q.size()}, {"k___batch", (int)k.size()}, {"v___batch", (int)v.size()},
             {"mask___batch", (int)mask.size()}, {"output___batch", (int)output.size()}
         });
+    }
+
+    void AppendPagedCache(Data &cache, const Data &input) {
+        curExecutor->Run("AppendPagedCache", {
+                {"cache", &cache}, {"input", (Data*)&input}
+        }, {}, {});
+    }
+    
+    void AppendPagedCacheBatch(std::vector <Data*> &cache, const Data &input) {
+        curExecutor->Run("AppendPagedCacheBatch", {
+                {"cache", (Data*)cache.data()}, {"input", (Data*)&input}
+        }, {}, {{"cache___batch", (int)cache.size()}});
+    }
+
+    void AttentionPaged(const Data &q, const Data &k, const Data &v, Data &output,
+        int group, float scale, int attentionType) {
+        curExecutor->Run("AttentionPaged", {
+                {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v}, {"output", &output}
+        }, {{"scale", scale}}, {{"group", group}, {"attentionType", attentionType}});
     }
 
     void LoraLayer(Data &input, Data &weight, Data &loraA, Data &loraB, const Data &bias, Data &output, 

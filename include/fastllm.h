@@ -304,6 +304,14 @@ namespace fastllm {
         bool isKVCache = false; // 是否是KV Cache TODO: 做一些KVCache的管理
         bool isLinearAttention = false; // 是否是线性attention的缓存（永远保持同样的形状）
 
+        // Paged KV Cache的相关信息
+        // 当isKVCache = true且isPagedKVCache = true时，下面这些信息才有意义
+        bool isPagedKVCache = false; // 是否是分片的KV Cache
+        int pageLen = 128; // 每个page的长度（token数）
+        Data *pagedKVCacheData = nullptr; // 存储kv cached的数据，shape为 [maxPages, pageLen, numHeads, headDim]
+        std::vector <int> pageIndex; // 目前使用的Index编号
+        int lastPageLen; // 最后一个Page中使用了多少长度
+
         bool lockInCPU = false; // 如果lock在CPU上，那么不允许移动到其余设备
         WeightType weightType = WeightType::NONE; // 权重类型，NONE代表非权重（或未知权重）
 
@@ -794,6 +802,13 @@ namespace fastllm {
 
     void IA3Layer(Data &input, Data &weight, Data &ia3_l, Data &bias, Data &output,
                   std::map <std::string, std::string> ia3Config);
+
+    void AppendPagedCache(Data &cache, const Data &input);
+    
+    void AppendPagedCacheBatch(std::vector <Data*> &cache, const Data &input);
+
+    void AttentionPaged(const Data &q, const Data &k, const Data &v, Data &output,
+        int group, float scale, int attentionType);
 }
 
 #endif //TEST_FASTLLM_H
