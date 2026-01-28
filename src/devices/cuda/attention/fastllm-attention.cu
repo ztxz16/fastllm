@@ -23,6 +23,7 @@
 #include "attention/default_prefill_params.cuh"
 #include "attention/variants.cuh"
 #include "attention/mask.cuh"
+#include "attention/scheduler.cuh"
 #include "pos_enc.cuh"
 #include "utils.cuh"
 
@@ -1801,3 +1802,499 @@ bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
     DeviceSync();
     return true;
 }
+
+// CUDA kernel for copying data from input to paged KV cache
+// input: [numHeads, seqLen, headDim], pagedData: [maxPages, pageLen, numHeads, headDim]
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmPagedCacheCopyKernel(
+    uint8_t *pagedData,      // dst: [maxPages, pageLen, numHeads, headDim]
+    int pageIdx,              // target page index
+    int pageLen,              // page length
+    int numHeads,             // number of heads
+    int headDim,              // head dimension
+    int unitSize,             // size of each element in bytes
+    uint8_t *inputData,       // src: [numHeads, seqLen, headDim]
+    int seqLen,               // input sequence length
+    int inputOffset,          // offset in input sequence
+    int copyLen,              // number of tokens to copy
+    int pageOffset            // offset in target page (where to start writing)
+) {
+    // Calculate the linear index for this thread
+    // Each thread handles one element: (head, token, dim)
+    int totalElements = numHeads * copyLen * headDim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= totalElements) {
+        return;
+    }
+    
+    // Decompose linear index into (head, token, dim)
+    int head = idx / (copyLen * headDim);
+    int remainder = idx % (copyLen * headDim);
+    int token = remainder / headDim;
+    int dim = remainder % headDim;
+    
+    // Calculate source address: input[head, inputOffset + token, dim]
+    // input layout: [numHeads, seqLen, headDim]
+    // For input[head, token_idx, dim] where token_idx = inputOffset + token:
+    // srcOffset = head * (seqLen * headDim * unitSize) + token_idx * (headDim * unitSize) + dim * unitSize
+    int srcOffset = head * seqLen * headDim * unitSize + (inputOffset + token) * headDim * unitSize + dim * unitSize;
+    
+    // Calculate destination address: pagedData[pageIdx, pageOffset + token, head, dim]
+    // pagedData layout: [maxPages, pageLen, numHeads, headDim]
+    int pageStride = pageLen * numHeads * headDim * unitSize;
+    int tokenStride = numHeads * headDim * unitSize;
+    int headStride = headDim * unitSize;
+    int dstOffset = pageIdx * pageStride + (pageOffset + token) * tokenStride + head * headStride + dim * unitSize;
+    
+    // Perform the copy
+    for (int i = 0; i < unitSize; i++) {
+        pagedData[dstOffset + i] = inputData[srcOffset + i];
+    }
+}
+
+// Host function to launch the kernel
+void FastllmCudaPagedCacheCopy(
+    uint8_t *pagedData,       // dst: pagedKVCache->cudaData
+    int pageIdx,              // page index
+    int pageLen,              // page length
+    int numHeads,             // number of heads
+    int headDim,              // head dimension
+    int unitSize,             // unit size in bytes
+    uint8_t *inputData,       // src: input.cudaData
+    int seqLen,               // input sequence length
+    int inputOffset,          // input offset
+    int copyLen,              // copy length
+    int pageOffset            // offset in target page (where to start writing)
+) {
+    int totalElements = numHeads * copyLen * headDim;
+    if (totalElements == 0) {
+        return;
+    }
+    
+    const int THREAD_PER_BLOCK = 256;
+    int numBlocks = (totalElements + THREAD_PER_BLOCK - 1) / THREAD_PER_BLOCK;
+    
+    FastllmPagedCacheCopyKernel<THREAD_PER_BLOCK><<<numBlocks, THREAD_PER_BLOCK>>>(
+        pagedData, pageIdx, pageLen, numHeads, headDim, unitSize,
+        inputData, seqLen, inputOffset, copyLen, pageOffset
+    );
+    
+    DeviceSync();
+}
+
+static double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
+    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds> (time2 - time1);
+    return double(duration.count()) * std::chrono::nanoseconds::period::num / std::chrono::nanoseconds::period::den;
+};
+
+bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale) {
+    using namespace flashinfer;
+// ForceDeviceSync(); auto st = std::chrono::system_clock::now();
+    // 检查是否是 paged KV cache
+    if (!k.isPagedKVCache || !v.isPagedKVCache) {
+        printf("DoCudaAttentionPaged: k and v must be paged KV cache.\n");
+        exit(0);
+    }
+    
+    // 获取基本参数
+    int q0 = q.dims[0];  // num_qo_heads
+    int q1 = q.dims[1];  // seq_len (query length)
+    int q2 = q.dims[2];  // head_dim_qk
+    int k0 = k.dims[0];  // num_kv_heads
+    int v2 = v.dims[2];  // head_dim_vo
+    // 计算 batch size: q0 = batch * num_qo_heads_per_batch
+    uint32_t num_qo_heads_per_batch = group * k0;
+    if (q0 % num_qo_heads_per_batch != 0) {
+        printf("DoCudaAttentionPaged: q0 (%d) is not divisible by num_qo_heads_per_batch (%u)\n", 
+                       q0, num_qo_heads_per_batch);
+        exit(0);
+    }
+    uint32_t batch_size = q0 / num_qo_heads_per_batch;
+    
+    // 获取 paged KV cache 信息（k 和 v 各自有独立的 cache）
+    fastllm::Data *pagedKVCacheK = k.pagedKVCacheData;
+    fastllm::Data *pagedKVCacheV = v.pagedKVCacheData;
+    if (pagedKVCacheK == nullptr || pagedKVCacheV == nullptr) {
+        printf("DoCudaAttentionPaged: pagedKVCacheData is nullptr\n");
+        exit(0);
+    }
+    
+    int pageLen = k.pageLen;
+    int numHeads = pagedKVCacheK->dims[2];  // [maxPages, pageLen, numHeads, headDim]
+    int headDim = pagedKVCacheK->dims[3];
+
+    // 检查数据类型
+    if (q.dataType != fastllm::DataType::FLOAT16 || k.dataType != fastllm::DataType::FLOAT16 || 
+        v.dataType != fastllm::DataType::FLOAT16 || output.dataType != fastllm::DataType::FLOAT16) {
+        printf("DoCudaAttentionPaged: Only FLOAT16 is supported for paged attention\n");
+        return true;
+        // exit(0);
+    }
+    
+    if (q2 != 128 || v2 != 128 || headDim != 128) {
+        printf("DoCudaAttentionPaged: head_dim must be 128, got q2=%d, v2=%d, headDim=%d\n", 
+                       q2, v2, headDim);
+        exit(0);
+    }
+    
+    // 检查指针有效性
+    if (q.cudaData == nullptr || output.cudaData == nullptr) {
+        printf("DoCudaAttentionPaged: q or output cudaData is nullptr\n");
+        exit(0);
+    }
+    
+    if (pagedKVCacheK->cudaData == nullptr || pagedKVCacheV->cudaData == nullptr) {
+        printf("DoCudaAttentionPaged: pagedKVCacheData cudaData is nullptr\n");
+        exit(0);
+    }
+    
+    half *qd = (half*)q.cudaData;
+    half *od = (half*)output.cudaData;
+    
+    // 获取 paged KV cache 数据
+    // pagedKVCacheData shape: [maxPages, pageLen, numHeads, headDim] (NHD layout)
+    half *pagedKVCacheDataK = (half*)pagedKVCacheK->cudaData;
+    half *pagedKVCacheDataV = (half*)pagedKVCacheV->cudaData;
+    
+    // 为每个 batch 构造 indptr、indices 和 last_page_len
+    // 目前假设所有 batch 共享相同的 page 索引（单 batch 场景）
+    std::vector<uint32_t> indptr_host(batch_size + 1);
+    std::vector<uint32_t> indices_host;
+    std::vector<uint32_t> last_page_len_host(batch_size);
+    
+    // 从 k 的 pageIndex 获取信息
+    int numPages = k.pageIndex.size();
+    if (numPages == 0) {
+        printf("DoCudaAttentionPaged: No pages in cache (pageIndex is empty)\n");
+        exit(0);
+    }
+
+    indptr_host[0] = 0;
+    for (int b = 0; b < batch_size; b++) {
+        // 假设每个 batch 使用相同的 pages（单 batch 场景）
+        int pagesPerBatch = numPages;
+        indptr_host[b + 1] = indptr_host[b] + pagesPerBatch;
+        
+        // 复制 page indices
+        for (int i = 0; i < pagesPerBatch; i++) {
+            if (k.pageIndex[i] < 0 || k.pageIndex[i] >= pagedKVCacheK->dims[0]) {
+                printf("DoCudaAttentionPaged: Invalid page index %d (maxPages=%d)\n", 
+                       k.pageIndex[i], (int)pagedKVCacheK->dims[0]);
+                exit(0);
+            }
+            indices_host.push_back((uint32_t)k.pageIndex[i]);
+        }
+        
+        // 设置最后一个 page 的长度
+        last_page_len_host[b] = (uint32_t)k.lastPageLen;
+    }
+    
+    // 分配 GPU 内存并拷贝数据
+    uint32_t *indptr_gpu = nullptr;
+    uint32_t *indices_gpu = nullptr;
+    uint32_t *last_page_len_gpu = nullptr;
+    
+    indptr_gpu = (uint32_t*)FastllmCudaMalloc((batch_size + 1) * sizeof(uint32_t));
+    indices_gpu = (uint32_t*)FastllmCudaMalloc(indices_host.size() * sizeof(uint32_t));
+    last_page_len_gpu = (uint32_t*)FastllmCudaMalloc(batch_size * sizeof(uint32_t));
+
+    cudaMemcpy(indptr_gpu, indptr_host.data(), (batch_size + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(indices_gpu, indices_host.data(), indices_host.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(last_page_len_gpu, last_page_len_host.data(), batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    
+    // 构造 paged_kv_t 结构
+    // fastllm 的布局是 [maxPages, pageLen, numHeads, headDim]，这是 NHD 布局
+    // NHD 布局：[page, token, head, dim]
+    paged_kv_t<half, uint32_t> paged_kv(
+        numHeads,           // num_heads
+        pageLen,            // page_size
+        headDim,            // head_dim
+        batch_size,         // batch_size
+        QKVLayout::kNHD,    // layout (NHD: [page, token, head, dim])
+        pagedKVCacheDataK,  // k_data
+        pagedKVCacheDataV,  // v_data
+        indices_gpu,        // indices
+        indptr_gpu,         // indptr
+        last_page_len_gpu,  // last_page_len
+        nullptr             // rope_pos_offset
+    );
+    
+    // 根据 q1 判断是 prefill 还是 decode
+    cudaStream_t stream = nullptr;
+    half *tmp_v = nullptr;
+    float *tmp_s = nullptr;
+    cudaError_t status = cudaSuccess;
+    
+    // Decode 阶段需要的临时内存（在函数末尾统一释放）
+    uint32_t *request_indices_gpu = nullptr;
+    uint32_t *kv_tile_indices_gpu = nullptr;
+    uint32_t *kv_chunk_size_ptr_gpu = nullptr;
+    
+    if (q1 == 1 && false) {
+        // Decode 阶段
+        // q 的布局可能是: [num_qo_heads, 1, head_dim] 或 [num_qo_heads, head_dim]
+        // 对于 decode，每个 batch 有 num_qo_heads_per_batch 个 heads
+        // 计算 stride: 
+        // - q_stride_n: token 之间的 stride (对于单个 token，通常是 head_dim)
+        // - q_stride_h: head 之间的 stride
+        uint32_t q_stride_n, q_stride_h;
+        if (q.dims.size() == 3) {
+            // [num_qo_heads, 1, head_dim]
+            q_stride_n = (q.strides.size() >= 2) ? q.strides[1] : q2;
+            q_stride_h = (q.strides.size() >= 1) ? q.strides[0] : (q1 * q2);
+        } else if (q.dims.size() == 2) {
+            // [num_qo_heads, head_dim]
+            q_stride_n = q2;  // token 之间的 stride (只有一个 token)
+            q_stride_h = (q.strides.size() >= 1) ? q.strides[0] : q2;
+        } else {
+            printf("DoCudaAttentionPaged: Unexpected q dimensions: %zu\n", q.dims.size());
+            exit(0);
+        }
+        
+        BatchDecodeParams<half, half, half, uint32_t> decode_params(
+            qd,                    // q
+            nullptr,               // q_rope_offset
+            paged_kv,             // paged_kv
+            od,                    // o
+            nullptr,               // lse
+            nullptr,               // maybe_alibi_slopes
+            num_qo_heads_per_batch, // num_qo_heads
+            q_stride_n,            // q_stride_n (使用实际 stride)
+            q_stride_h,            // q_stride_h (使用实际 stride)
+            -1,                    // window_left
+            0.0f,                  // logits_soft_cap
+            scale,                 // sm_scale
+            1.0f,                  // rope_scale
+            10000.0f               // rope_theta
+        );
+        decode_params.padded_batch_size = batch_size;
+        
+        // 初始化必需的索引数组（即使不使用 partition-kv 也需要）
+        // request_indices: identity mapping [0, 1, 2, ..., batch_size-1]
+        std::vector<uint32_t> request_indices_host(batch_size);
+        for (int i = 0; i < batch_size; i++) {
+            request_indices_host[i] = i;
+        }
+        request_indices_gpu = (uint32_t*)FastllmCudaMalloc(batch_size * sizeof(uint32_t));
+        cudaMemcpy(request_indices_gpu, request_indices_host.data(), batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice);
+        decode_params.request_indices = request_indices_gpu;
+        
+        // kv_tile_indices: 全部设为 0（不使用 partition-kv，只有一个 tile）
+        std::vector<uint32_t> kv_tile_indices_host(batch_size, 0);
+        kv_tile_indices_gpu = (uint32_t*)FastllmCudaMalloc(batch_size * sizeof(uint32_t));
+        cudaMemcpy(kv_tile_indices_gpu, kv_tile_indices_host.data(), batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice);
+        decode_params.kv_tile_indices = kv_tile_indices_gpu;
+        
+        // kv_chunk_size_ptr: 指向一个有效的 uint32_t（即使不使用 partition-kv 也需要）
+        uint32_t kv_chunk_size_host = 0;  // 不使用 partition-kv，设为 0
+        kv_chunk_size_ptr_gpu = (uint32_t*)FastllmCudaMalloc(sizeof(uint32_t));
+        cudaMemcpy(kv_chunk_size_ptr_gpu, &kv_chunk_size_host, sizeof(uint32_t), cudaMemcpyHostToDevice);
+        decode_params.kv_chunk_size_ptr = kv_chunk_size_ptr_gpu;
+        
+        // 调用 FlashInfer decode 接口
+        status = BatchDecodeWithPagedKVCacheDispatched<128, PosEncodingMode::kNone, DefaultAttention<false, false, false, false>>(
+            decode_params, tmp_v, tmp_s, false, stream);
+    } else {
+// ForceDeviceSync(); printf("start_time = %f\n", GetSpan(st, std::chrono::system_clock::now()));
+        // Prefill 阶段
+        // q 的布局: [num_qo_heads, q1, head_dim] (HND layout)
+        // 构造 q_indptr: [0, q1, 2*q1, ..., batch_size*q1]
+        uint32_t *q_indptr_gpu = nullptr;
+        std::vector<uint32_t> q_indptr_host(batch_size + 1);
+        for (int i = 0; i <= batch_size; i++) {
+            q_indptr_host[i] = i * q1;
+        }
+
+        q_indptr_gpu = (uint32_t*)FastllmCudaMalloc((batch_size + 1) * sizeof(uint32_t));
+        cudaMemcpy(q_indptr_gpu, q_indptr_host.data(), (batch_size + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
+// ForceDeviceSync(); printf("q_indptr_gpu = %f\n", GetSpan(st, std::chrono::system_clock::now()));
+        // 计算 total_num_rows (总 query token 数)
+        uint32_t total_num_rows = q_indptr_host[batch_size];
+        
+        // 分配 workspace 内存用于 plan（使用静态变量缓存，避免每次重新分配）
+        const size_t float_workspace_size = 256 * 1024 * 1024;  // 256 MB
+        const size_t int_workspace_size = 256 * 1024 * 1024;     // 256 MB
+        
+        // 使用静态变量缓存 workspace 内存，避免每次 prefill 都重新分配
+        static void* d_float_workspace = nullptr;
+        static void* d_int_workspace = nullptr;
+        static void* h_page_locked_int_workspace = nullptr;
+        static size_t cached_float_workspace_size = 0;
+        static size_t cached_int_workspace_size = 0;
+        
+        // 只在第一次调用或大小不足时分配
+        if (d_float_workspace == nullptr || cached_float_workspace_size < float_workspace_size) {
+            if (d_float_workspace != nullptr) {
+                FastllmCudaFree(d_float_workspace);
+                d_float_workspace = nullptr;
+            }
+            d_float_workspace = FastllmCudaMalloc(float_workspace_size);
+            if (d_float_workspace == nullptr) {
+                printf("DoCudaAttentionPaged: Failed to allocate d_float_workspace\n");
+                FastllmCudaFree(q_indptr_gpu);
+                exit(0);
+            }
+            cached_float_workspace_size = float_workspace_size;
+        }
+// ForceDeviceSync(); printf("malloc = %f\n", GetSpan(st, std::chrono::system_clock::now()));
+        
+        if (d_int_workspace == nullptr || cached_int_workspace_size < int_workspace_size) {
+            if (d_int_workspace != nullptr) {
+                FastllmCudaFree(d_int_workspace);
+                d_int_workspace = nullptr;
+            }
+            d_int_workspace = FastllmCudaMalloc(int_workspace_size);
+            if (d_int_workspace == nullptr) {
+                printf("DoCudaAttentionPaged: Failed to allocate d_int_workspace\n");
+                FastllmCudaFree(q_indptr_gpu);
+                exit(0);
+            }
+            cached_int_workspace_size = int_workspace_size;
+        }
+// ForceDeviceSync(); printf("malloc = %f\n", GetSpan(st, std::chrono::system_clock::now()));
+        
+        if (h_page_locked_int_workspace == nullptr || cached_int_workspace_size < int_workspace_size) {
+            if (h_page_locked_int_workspace != nullptr) {
+                cudaFreeHost(h_page_locked_int_workspace);
+                h_page_locked_int_workspace = nullptr;
+            }
+            cudaError_t err = cudaMallocHost(&h_page_locked_int_workspace, int_workspace_size);
+            if (err != cudaSuccess || h_page_locked_int_workspace == nullptr) {
+                printf("DoCudaAttentionPaged: Failed to allocate h_page_locked_int_workspace: %s\n", cudaGetErrorString(err));
+                FastllmCudaFree(q_indptr_gpu);
+                exit(0);
+            }
+        }
+// ForceDeviceSync(); printf("malloc = %f\n", GetSpan(st, std::chrono::system_clock::now()));
+        // 进行 plan
+        PrefillPlanInfo plan_info;
+        cudaError_t plan_status = PrefillPlan<uint32_t>(
+            d_float_workspace, float_workspace_size, d_int_workspace, h_page_locked_int_workspace,
+            int_workspace_size, plan_info, q_indptr_host.data(), indptr_host.data(), 
+            total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
+            pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(half), 
+            /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
+            /*num_colocated_ctas=*/0, stream);
+// ForceDeviceSync(); printf("plan_time = %f\n", GetSpan(st, std::chrono::system_clock::now()));
+
+        if (plan_status != cudaSuccess) {
+            printf("DoCudaAttentionPaged: PrefillPlan failed: %s\n", cudaGetErrorString(plan_status));
+            cudaStreamSynchronize(stream);
+            FastllmCudaFree(q_indptr_gpu);
+            // 注意：不释放静态缓存的 workspace 内存，供下次调用使用
+            exit(0);
+        }
+        
+        // 构造 BatchPrefillPagedParams
+        // 使用实际的 stride 值
+        uint32_t q_stride_n = (q.dims.size() >= 2 && q.strides.size() >= 2) ? q.strides[1] : q2;
+        uint32_t q_stride_h = (q.dims.size() >= 3 && q.strides.size() >= 1) ? q.strides[0] : (q1 * q2);
+        
+        BatchPrefillPagedParams<half, half, half, uint32_t> prefill_params(
+            qd,                    // q
+            paged_kv,             // paged_kv
+            nullptr,               // maybe_custom_mask
+            q_indptr_gpu,         // q_indptr
+            nullptr,               // maybe_mask_indptr
+            nullptr,               // maybe_q_rope_offset
+            od,                    // o
+            nullptr,               // lse
+            nullptr,               // maybe_alibi_slopes
+            num_qo_heads_per_batch, // num_qo_heads
+            q_stride_n,            // q_stride_n (使用实际 stride)
+            q_stride_h,            // q_stride_h (使用实际 stride)
+            -1,                    // window_left
+            0.0f,                  // logits_soft_cap
+            scale,                 // sm_scale
+            1.0f,                  // rope_scale
+            10000.0f               // rope_theta
+        );
+        
+        // 从 plan_info 设置参数
+        prefill_params.request_indices = reinterpret_cast<uint32_t*>(
+            static_cast<uint8_t*>(d_int_workspace) + plan_info.request_indices_offset);
+        prefill_params.qo_tile_indices = reinterpret_cast<uint32_t*>(
+            static_cast<uint8_t*>(d_int_workspace) + plan_info.qo_tile_indices_offset);
+        prefill_params.kv_tile_indices = reinterpret_cast<uint32_t*>(
+            static_cast<uint8_t*>(d_int_workspace) + plan_info.kv_tile_indices_offset);
+        prefill_params.o_indptr = reinterpret_cast<uint32_t*>(
+            static_cast<uint8_t*>(d_int_workspace) + plan_info.o_indptr_offset);
+        prefill_params.kv_chunk_size_ptr = reinterpret_cast<uint32_t*>(
+            static_cast<uint8_t*>(d_int_workspace) + plan_info.kv_chunk_size_ptr_offset);
+        prefill_params.padded_batch_size = plan_info.padded_batch_size;
+        prefill_params.max_total_num_rows = plan_info.total_num_rows;
+        
+        if (plan_info.split_kv) {
+            prefill_params.merge_indptr = reinterpret_cast<uint32_t*>(
+                static_cast<uint8_t*>(d_int_workspace) + plan_info.merge_indptr_offset);
+            tmp_v = reinterpret_cast<half*>(
+                static_cast<uint8_t*>(d_float_workspace) + plan_info.v_offset);
+            tmp_s = reinterpret_cast<float*>(
+                static_cast<uint8_t*>(d_float_workspace) + plan_info.s_offset);
+        }
+        
+        // 根据 plan_info.cta_tile_q 来 dispatch 不同的 kernel
+        // 注意：HEAD_DIM_QK 和 HEAD_DIM_VO 必须是编译时常量，所以使用 128（代码中已检查 headDim == 128）
+        bool enable_pdl = false;
+        if (plan_info.cta_tile_q == 16) {
+            status = BatchPrefillWithPagedKVCacheDispatched<
+                /*CTA_TILE_Q=*/16, /*HEAD_DIM_QK=*/128, /*HEAD_DIM_VO=*/128,
+                PosEncodingMode::kNone, /*USE_FP16_QK_REDUCTION=*/false,
+                MaskMode::kCausal, DefaultAttention<false, false, false, false>,
+                BatchPrefillPagedParams<half, half, half, uint32_t>>(
+                prefill_params, tmp_v, tmp_s, enable_pdl, stream);
+        } else if (plan_info.cta_tile_q == 64) {
+            status = BatchPrefillWithPagedKVCacheDispatched<
+                /*CTA_TILE_Q=*/64, /*HEAD_DIM_QK=*/128, /*HEAD_DIM_VO=*/128,
+                PosEncodingMode::kNone, /*USE_FP16_QK_REDUCTION=*/false,
+                MaskMode::kCausal, DefaultAttention<false, false, false, false>,
+                BatchPrefillPagedParams<half, half, half, uint32_t>>(
+                prefill_params, tmp_v, tmp_s, enable_pdl, stream);
+        } else if (plan_info.cta_tile_q == 128) {
+            status = BatchPrefillWithPagedKVCacheDispatched<
+                /*CTA_TILE_Q=*/128, /*HEAD_DIM_QK=*/128, /*HEAD_DIM_VO=*/128,
+                PosEncodingMode::kNone, /*USE_FP16_QK_REDUCTION=*/false,
+                MaskMode::kCausal, DefaultAttention<false, false, false, false>,
+                BatchPrefillPagedParams<half, half, half, uint32_t>>(
+                prefill_params, tmp_v, tmp_s, enable_pdl, stream);
+        } else {
+            printf("DoCudaAttentionPaged: Unsupported cta_tile_q: %ld\n", plan_info.cta_tile_q);
+            cudaStreamSynchronize(stream);
+            FastllmCudaFree(q_indptr_gpu);
+            // 注意：不释放静态缓存的 workspace 内存，供下次调用使用
+            exit(0);
+        }
+        
+        // 清理临时分配的内存（q_indptr_gpu）
+        // 注意：不释放静态缓存的 workspace 内存（d_float_workspace, d_int_workspace, h_page_locked_int_workspace），供下次调用使用
+        FastllmCudaFree(q_indptr_gpu);
+((fastllm::Data*)&output)->Resize({output.dims[1], output.dims[0], output.dims[2]});
+FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
+    }
+    
+    // 清理 GPU 内存
+    FastllmCudaFree(indptr_gpu);
+    FastllmCudaFree(indices_gpu);
+    FastllmCudaFree(last_page_len_gpu);
+    
+    // 清理 decode 阶段临时分配的内存
+    if (request_indices_gpu != nullptr) {
+        FastllmCudaFree(request_indices_gpu);
+    }
+    if (kv_tile_indices_gpu != nullptr) {
+        FastllmCudaFree(kv_tile_indices_gpu);
+    }
+    if (kv_chunk_size_ptr_gpu != nullptr) {
+        FastllmCudaFree(kv_chunk_size_ptr_gpu);
+    }
+    
+    if (status != cudaSuccess) {
+        printf("DoCudaAttentionPaged: FlashInfer error: %s\n", cudaGetErrorString(status));
+        exit(0);
+    }
+    
+    DeviceSync();
+    return true;
+}
+

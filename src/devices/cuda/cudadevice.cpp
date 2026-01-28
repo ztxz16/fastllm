@@ -72,6 +72,10 @@ namespace fastllm {
         this->ops["CatDirectBatch"] = (BaseOperator*)(new CudaCatDirectBatchOp());
         this->ops["AppendKVCachebatch"] = (BaseOperator*)(new CudaAppendKVCacheBatchOp());
         this->ops["AttentionBatch"] = (BaseOperator*)(new CudaAttentionBatchOp());
+
+        this->ops["AttentionPaged"] = (BaseOperator*)(new CudaAttentionPagedOp());
+        this->ops["AppendPagedCache"] = (BaseOperator*)(new CudaAppendPagedCacheOp());
+        this->ops["AppendPagedCacheBatch"] = (BaseOperator*)(new CudaAppendPagedCacheBatchOp());
     }
 
     bool CudaDevice::Malloc(void **ret, size_t size) {
@@ -1599,5 +1603,115 @@ namespace fastllm {
 
         DoCudaLinearReshape(qkv, weight1, output);
         DoCudaLinear(qkv, weight1, bias1, output);
+    }
+
+    void CudaAppendPagedCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &cache = *(datas.find("cache")->second);
+        Data &input = *(datas.find("input")->second);
+
+        // CUDA实现分页缓存追加
+        int numHeads = input.dims[0];
+        int seqLen = input.dims[1];
+        int headDim = input.dims[2];
+        int unitSize = input.unitSize;
+        int tokensToAppend = seqLen;
+        int inputOffset = 0;
+
+        // pagedKVCacheData shape: [maxPages, pageLen, numHeads, headDim]
+        Data *pagedKVCache = cache.pagedKVCacheData;
+        int maxPages = pagedKVCache->dims[0];
+        int pageLen = cache.pageLen;
+        uint8_t *pagedData = (uint8_t*)pagedKVCache->cudaData;
+        uint8_t *inputData = (uint8_t*)input.cudaData;
+        
+        // 计算当前page的剩余空间
+        int remainingInCurrentPage = 0;
+        if (cache.pageIndex.size() > 0) {
+            remainingInCurrentPage = pageLen - cache.lastPageLen;
+        }
+        
+        // 先填充当前page的剩余空间
+        if (remainingInCurrentPage > 0 && tokensToAppend > 0) {
+            int currentPageIdx = cache.pageIndex.back();
+            int copyLen = std::min(remainingInCurrentPage, tokensToAppend);
+            
+            // kernel复制 input 到 pagedKVCacheData 的当前 page 的剩余空间
+            // input: [numHeads, seqLen, headDim], pagedKVCacheData: [maxPages, pageLen, numHeads, headDim]
+            FastllmCudaPagedCacheCopy(
+                pagedData, // dst: pagedKVCache->cudaData
+                currentPageIdx, // page idx
+                pageLen,
+                numHeads,
+                headDim,
+                unitSize,
+                inputData, // src: input.cudaData
+                seqLen,    // input sequence length
+                inputOffset,
+                copyLen,
+                cache.lastPageLen // page offset: 从当前page的lastPageLen位置开始写入
+            );
+            
+            cache.lastPageLen += copyLen;
+            tokensToAppend -= copyLen;
+            inputOffset += copyLen;
+        }
+        
+        // 如果还有剩余的数据，需要分配新的 pages
+        while (tokensToAppend > 0) {
+            int newPageIdx = 0;
+            if (cache.pageIndex.size() == 0) {
+                newPageIdx = 0;
+            } else {
+                newPageIdx = cache.pageIndex.size();
+                if (newPageIdx >= maxPages) {
+                    ErrorInFastLLM("CudaAppendPagedCacheOp: No more pages available. Need to resize pagedKVCacheData.\n");
+                }
+            }
+            cache.pageIndex.push_back(newPageIdx);
+
+            int copyLen = std::min(pageLen, tokensToAppend);
+
+            // kernel复制 input 的一个 page 到 pagedKVCacheData 的新 page
+            // input: [numHeads, seqLen, headDim], pagedKVCacheData: [maxPages, pageLen, numHeads, headDim]
+            FastllmCudaPagedCacheCopy(
+                pagedData, // dst: pagedKVCache->cudaData
+                newPageIdx, // page idx
+                pageLen,
+                numHeads,
+                headDim,
+                unitSize,
+                inputData, // src: input.cudaData
+                seqLen,    // input sequence length
+                inputOffset,
+                copyLen,
+                0 // page offset: 新page从0开始写入
+            );
+
+            cache.lastPageLen = copyLen;
+            tokensToAppend -= copyLen;
+            inputOffset += copyLen;
+        }
+    }
+
+    void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale) {
+        FastllmCudaHalfPagedAttention(q, k, v, output, group, scale);
+    }
+
+    void CudaAttentionPagedOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
+        float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+        DoCudaAttentionPaged(q, k, v, output, group, scale);
+    }
+
+    void CudaAppendPagedCacheBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &cache = *(datas.find("cache")->second);
+        Data &input = *(datas.find("input")->second);
     }
 }
