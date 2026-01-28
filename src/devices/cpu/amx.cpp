@@ -39,7 +39,9 @@ typedef struct __tile_config {
 #define ARCH_REQ_XCOMP_PERM     0x1023
 #define XFEATURE_XTILECFG       17
 #define XFEATURE_XTILEDATA      18
+#if defined(__AMX_TILE__)
 #include <sys/syscall.h>
+#endif
 
 namespace fastllm {
     extern void AddBiasAVX512(float *outputData, float *biasData, int n, int k, int st, int end);

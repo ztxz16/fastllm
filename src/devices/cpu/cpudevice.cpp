@@ -25,6 +25,33 @@
 #include "utils.h"
 #include "gguf.h"
 
+#ifndef __cpp_aligned_new
+inline void* MallocAligned(std::size_t size, std::size_t alignment) {
+#if defined(_MSC_VER)
+    void* ptr = _aligned_malloc(size, alignment);
+    if (!ptr) throw std::bad_alloc{};
+    return ptr;
+#elif defined(__GNUC__) || defined(__clang__)
+    void* ptr = nullptr;
+    int ret = ::posix_memalign(&ptr, alignment, size);
+    if (ret != 0 || !ptr) throw std::bad_alloc{};
+    return ptr;
+#else
+    void* ptr = std::malloc(alignment);
+    return ptr;
+#endif
+}
+
+inline void FreeAligned(void* ptr, std::size_t size) noexcept {
+    if (!ptr) return;
+#if defined(_MSC_VER)
+    _aligned_free(ptr);
+#else
+    std::free(ptr);  // both aligned_alloc and posix_memalign use free()
+#endif
+}
+#endif
+
 namespace fastllm {
     CpuDevice::CpuDevice() {
         this->deviceType = "cpu";
@@ -1356,7 +1383,12 @@ namespace fastllm {
         
         // 为每个线程分配任务状态
         for (int i = 0; i < numThreads; i++) {
-            taskStates[i] = new (std::align_val_t{64}) TaskState();
+#if __cpp_aligned_new >= 201606
+            void *p = operator new(sizeof(TaskState), std::align_val_t{64});
+#else
+            void *p = MallocAligned(sizeof(TaskState), 64);
+#endif
+            taskStates[i] = new (p) TaskState();
             taskStates[i]->curr.store(0, std::memory_order_relaxed);
             taskStates[i]->end = 0;
             taskStates[i]->completed.store(false, std::memory_order_relaxed);
@@ -1410,11 +1442,11 @@ namespace fastllm {
             delete wsOps[i];
             if (taskStates[i] != nullptr) {
                 taskStates[i]->~TaskState();
-                #if __cpp_aligned_new >= 201606
-                    operator delete(taskStates[i], std::align_val_t{64});
-                #else
-                    free_aligned(taskStates[i], sizeof(TaskState));
-                #endif
+#if __cpp_aligned_new >= 201606
+                operator delete(taskStates[i], std::align_val_t{64});
+#else
+                FreeAligned(taskStates[i], sizeof(TaskState));
+#endif
             }
         }
         
@@ -7126,7 +7158,7 @@ ops += (long long)lines * inputDim * interDim * 2;
 
     void MultiThreadSoftmaxOp::Run() {
         for (int i = 0; i < n; i++) {
-            float maxValue = -1e100;
+            float maxValue = -FLT_MAX;
             for (int j = 0; j < m; j++) {
                 if (lastlen + i < j) {
                     value[i * m + j] = -10000;
