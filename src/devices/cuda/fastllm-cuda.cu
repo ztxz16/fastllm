@@ -42,6 +42,13 @@ void showError(cudaError_t result, char const* const message, const char* const 
     }  
 }
 
+#pragma once
+#ifdef __INTELLISENSE__
+void __syncthreads();
+extern const dim3 blockIdx, blockDim, gridDim;
+extern const uint3 threadIdx;
+#endif
+
 /*
 size_t totalMalloc = 0;
 std::map <void*, size_t> mallocMap;
@@ -768,7 +775,7 @@ __global__ void FastllmChannelMulToKernel(half* a, half *b, float alpha, int len
 #ifdef CUDA_NO_TENSOR_CORE
         a[idx] = __float2half(__half2float(b[idx / channelLen]) * alpha * __half2float(a[idx]));
 #else
-        a[idx] *= (half)((float)b[idx / channelLen] * alpha);
+        a[idx] = __hmul(a[idx], (half)(__half2float(b[idx / channelLen]) * alpha));
 #endif
     }
 }
@@ -4432,11 +4439,11 @@ __global__ void TransferAttnKernel(float *data, int n, int m, int outer, int row
     if (o >= outer) return;
     
     int j = threadIdx.x + blockIdx.x * blockDim.x;  // column index
-    if (j >= row_idx) return;  // 只处理前row_idx个元素
+    if (j >= row_idx) return;  // 只处理前row_idx个元素  
     
     float *batchData = data + o * n * m;
     
-    // 保存原始的第row_idx行的值
+    // 保存原始的第row_idx行的值  
     float original_val = batchData[row_idx * m + j];
     
     // 计算新值: original_val + sum(row[k] * matrix[k][j] for k in [0, row_idx))
@@ -4445,11 +4452,11 @@ __global__ void TransferAttnKernel(float *data, int n, int m, int outer, int row
         sum += batchData[row_idx * m + k] * batchData[k * m + j];
     }
     
-    // 更新值
+    // 更新值  
     batchData[row_idx * m + j] = sum;
 }
 
-// 使用共享内存的优化版本
+// 使用共享内存的优化版本  
 __global__ void TransferAttnKernelShared(float *data, int n, int m, int outer, int row_idx) {
     extern __shared__ float shared[];
     
@@ -4460,24 +4467,24 @@ __global__ void TransferAttnKernelShared(float *data, int n, int m, int outer, i
     int j = tid + blockIdx.x * blockDim.x;
     
     float *batchData = data + o * n * m;
-    float *row_i = shared;  // 存储第row_idx行的前row_idx个元素
+    float *row_i = shared;  // 存储第row_idx行的前row_idx个元素  
     
-    // 协作加载第row_idx行的前row_idx个元素到共享内存
+    // 协作加载第row_idx行的前row_idx个元素到共享内存  
     for (int idx = tid; idx < row_idx; idx += blockDim.x) {
         row_i[idx] = batchData[row_idx * m + idx];
     }
     __syncthreads();
     
     if (j < row_idx) {
-        // 使用共享内存中的原始值计算
+        // 使用共享内存中的原始值计算  
         float sum = row_i[j];
         
-        // 累加：注意这里row_i[k]是原始值，batchData[k * m + j]是可能已更新的值
+        // 累加：注意这里row_i[k]是原始值，batchData[k * m + j]是可能已更新的值  
         for (int k = 0; k < row_idx; k++) {
             sum += row_i[k] * batchData[k * m + j];
         }
         
-        // 写回结果
+        // 写回结果  
         batchData[row_idx * m + j] = sum;
     }
 }
@@ -4502,11 +4509,11 @@ bool FastllmCudaTransferAttn(fastllm::Data &input) {
     int m = input.dims[dimsLen - 1]; 
     int outer = input.Count(0) / input.Count(dimsLen - 2);
 
-    // 逐行处理，从第1行开始（第0行不需要处理）
+    // 逐行处理，从第1行开始（第0行不需要处理）  
     for (int i = 1; i < n; i++) {
-        // 每行只需要处理前i个元素
+        // 每行只需要处理前i个元素  
         int elementsToProcess = i;
-        int threadsPerBlock = min(256, elementsToProcess);
+        int threadsPerBlock = std::min(256, elementsToProcess);
         int blocksPerGrid = (elementsToProcess + threadsPerBlock - 1) / threadsPerBlock;
         
         dim3 blocks(blocksPerGrid, 1, outer);
@@ -4541,7 +4548,7 @@ __global__ void CumSumLastDimKernel(T* data, int dim, int outer) {
     if (tid < outer) {
         T* row = data + tid * dim;
         
-        // 对每一行进行累积和
+        // 对每一行进行累积和  
         for (int j = 1; j < dim; j++) {
             row[j] = (T)((float)row[j] + (float)row[j - 1]);
         }
@@ -4570,7 +4577,7 @@ bool FastllmCudaCumSumLastDim(fastllm::Data &input) {
     DeviceSync();
     FastllmCudaFinishOutput(input, inputData);
     
-    return true; // 添加返回值
+    return true; // 添加返回值  
 }
 
 // CUDA核函数模板，支持float和half
@@ -4610,14 +4617,14 @@ bool FastllmCudaCausalMask(fastllm::Data &input, int base, float maskValue) {
         CausalMaskKernel<__half><<<gridSize, blockSize>>>(halfData, n, m, outer, base, halfMaskValue);
     }
     
-    // 等待核函数执行完成
+    // 等待核函数执行完成  
     DeviceSync();
     
     FastllmCudaFinishOutput(input, inputData);
     return true;
 }
 
-// CUDA核函数定义
+// CUDA核函数定义  
 template<typename T>
 __global__ void MakeDecayMaskKernel(const T* input, T* output, int dim, int outer) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4684,7 +4691,7 @@ bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output) {
             (half*)inputData, (half*)outputData, dim, outer);
     }
 
-    // 等待核函数执行完成
+    // 等待核函数执行完成  
     DeviceSync();
     
     FastllmCudaFinishInput(input, inputData);
@@ -6608,7 +6615,7 @@ __global__ void Conv1DPerChannelKernel(
     int padding,
     int groups) {
     
-    // 计算当前线程处理的位置
+    // 计算当前线程处理的位置  
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int totalElements = batchSize * outputChannels * outputLength;
     
@@ -6619,36 +6626,36 @@ __global__ void Conv1DPerChannelKernel(
     int oc = (tid / outputLength) % outputChannels;
     int b = tid / (outputChannels * outputLength);
     
-    // 对于逐通道卷积，每个输出通道对应一个输入通道
+    // 对于逐通道卷积，每个输出通道对应一个输入通道  
     int g = oc;  // group index (因为 groups = inputChannels)
-    int ic = g;  // 对应的输入通道
+    int ic = g;  // 对应的输入通道  
     
-    // 计算输入起始位置
+    // 计算输入起始位置  
     int il_start = ol * stride - padding;
     
-    // 初始化输出值（加上bias）
+    // 初始化输出值（加上bias）  
     float value = bias ? bias[oc] : 0.0f;
     
-    // 获取权重和输入的指针
+    // 获取权重和输入的指针  
     const float* curWeight = weight + oc * kernelSize;
     const T* curInput = input + b * inputChannels * inputLength + ic * inputLength;
     
-    // 执行卷积
+    // 执行卷积  
     #pragma unroll
     for (int k = 0; k < kernelSize; k++) {
         int inputPos = il_start + k;
         
-        // 边界检查
+        // 边界检查  
         if (inputPos >= 0 && inputPos < inputLength) {
             value += (float)curInput[inputPos] * curWeight[k];
         }
     }
     
-    // 写入输出
+    // 写入输出  
     output[tid] = (T)value;
 }
 
-// 主函数
+// 主函数  
 bool FastllmCudaConv1DPerChannelFloat32(
     const fastllm::Data &input, 
     fastllm::Data &weight, 
@@ -6666,16 +6673,16 @@ bool FastllmCudaConv1DPerChannelFloat32(
     int inputLength = dims[2];
     int outputLength = (inputLength + 2 * padding - kernelSize) / stride + 1;
     
-    // 准备输出维度
+    // 准备输出维度  
     output.Resize({batchSize, outputChannels, outputLength});
     
-    // 获取设备指针
+    // 获取设备指针  
     float *d_input = (float*)input.cudaData;
     float *d_weight = (float*)weight.cudaData;
     float *d_bias = bias.dims.size() > 0 ? (float*)bias.cudaData : nullptr;
     float *d_output = (float*)output.cudaData;
     
-    // 配置kernel参数
+    // 配置kernel参数  
     int totalElements = batchSize * outputChannels * outputLength;
     int threadsPerBlock = 256;
     int blocksPerGrid = (totalElements + threadsPerBlock - 1) / threadsPerBlock;

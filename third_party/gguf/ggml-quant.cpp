@@ -2536,7 +2536,7 @@ void iqk_quantize_row_q8_K_T(const float * x, void * vy, int64_t k) {
             __m256i i1 = _mm256_cvtps_epi32(v1);
             __m256i i2 = _mm256_cvtps_epi32(v2);
             __m256i i3 = _mm256_cvtps_epi32(v3);
-            if constexpr (q8_type == 1) {
+            if CONSTEXPR (q8_type == 1) {
                 int bsum = hsum_i32_8(_mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3)));
                 auto bs = (float *)y[i].bsums;
                 bs[ib] = d*bsum;
@@ -2553,7 +2553,7 @@ void iqk_quantize_row_q8_K_T(const float * x, void * vy, int64_t k) {
             _mm256_storeu_si256((__m256i *)q8, i0);
             q8 += 32;
         }
-        if constexpr (q8_type == 1) {
+        if CONSTEXPR (q8_type == 1) {
             y[i].sum = block_sum_f32;
         } else {
             y[i].sum = d*block_sum_i32;

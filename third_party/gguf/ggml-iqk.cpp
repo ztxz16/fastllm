@@ -944,6 +944,10 @@ template <int nrc, typename block_q8 = block_q8_K> struct Q8 {
     const block_q8 * y[nrc_y];
 };
 
+#if (defined(_MSC_VER) && _MSC_VER <= 1900)  // VS 2015
+#define constexpr 
+#endif
+
 template <int nrc_y>
 static void mul_mat_iq2_xxs_r4_q8_k(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
     assert(nrc_x%4 == 0);

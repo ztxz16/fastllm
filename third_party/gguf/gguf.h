@@ -19,6 +19,12 @@
 #include "arm_neon.h"
 #endif
 
+#if (defined(_MSC_VER) && _MSC_VER <= 1900)  // VS 2015) 
+#define CONSTEXPR
+#else
+#define CONSTEXPR constexpr
+#endif
+
 #if defined(GGML_COMMON_IMPL_CUDA) || defined(GGML_COMMON_IMPL_HIP) || defined(GGML_COMMON_IMPL_MUSA)
 #define GGML_TABLE_BEGIN(type, name, size) static const __device__ type name[size] = {
 #define GGML_TABLE_END() };
@@ -1783,6 +1789,23 @@ struct ggml_type_traits {
     ggml_gemv_t              gemv;
     ggml_gemm_t              gemm;
     int64_t                  row_meta_size;
+#if (defined(_MSC_VER) && _MSC_VER <= 1900) 
+    ggml_type_traits() {}
+    ggml_type_traits(const char* name, int64_t blck_size, size_t type_size, bool is_quantized)
+        : type_name(name), blck_size(blck_size), type_size(type_size), is_quantized(is_quantized) {}
+    ggml_type_traits(const char* name, int64_t blck_size, size_t type_size, bool is_quantized,
+                     ggml_vec_dot_t vec_dot, ggml_type vd_type)
+        : type_name(name), blck_size(blck_size), type_size(type_size), is_quantized(is_quantized),
+          vec_dot(vec_dot), vec_dot_type(vd_type) {}
+    ggml_type_traits(const char* name, int64_t blck_size, size_t type_size, bool is_quantized,
+                     ggml_vec_dot_t vec_dot, ggml_type vd_type, ggml_to_float_t to_float)
+        : type_name(name), blck_size(blck_size), type_size(type_size), is_quantized(is_quantized),
+          vec_dot(vec_dot), vec_dot_type(vd_type), to_float(to_float) {}
+    ggml_type_traits(const char* name, int64_t blck_size, size_t type_size, bool is_quantized,
+                     ggml_vec_dot_t vec_dot, ggml_type vd_type, ggml_to_float_t to_float, ggml_from_float_t from_float)
+        : type_name(name), blck_size(blck_size), type_size(type_size), is_quantized(is_quantized),
+          vec_dot(vec_dot), vec_dot_type(vd_type), to_float(to_float), from_float_ref(from_float) {}
+#endif
 };
 
 
@@ -1893,6 +1916,12 @@ struct DataInfo {
         int           ne11;
         const mmid_row_mapping * row_mapping = nullptr;
         size_t        bs2 = 0;
+
+#if (defined(_MSC_VER) && _MSC_VER <= 1900) 
+        DataInfo(float* dst, const char* src, size_t dst_stride, size_t src_stride, int dim_ne11, int current_y = 0,
+                 const mmid_row_mapping* mapping = nullptr,size_t dst_stride2 = 0)
+        : s(dst), cy(src), bs(dst_stride), by(src_stride), cur_y(current_y), ne11(dim_ne11), row_mapping(mapping), bs2(dst_stride2) {}
+#endif
 
         inline const char * src1_row(int iy) const {
             if (!row_mapping) return cy + (cur_y + iy)*by;

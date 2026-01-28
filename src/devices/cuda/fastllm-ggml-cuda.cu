@@ -340,7 +340,7 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, con
 #endif
 }
 
-static constexpr __device__ int8_t kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+static CONSTEXPR __device__ int8_t kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4) {
     return get_int_from_table_16(q4, kvalues_iq4nl);
@@ -756,8 +756,8 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
-static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
-    switch (type) {        
+static CONSTEXPR __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
+switch (type) {
         case GGML_TYPE_Q3_K   : return vec_dot_q3_K_q8_1;
         case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
         case GGML_TYPE_IQ3_S  : return vec_dot_iq3_s_q8_1;
@@ -776,7 +776,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
 #define VDR_Q4_K_Q8_1_MMVQ 2
 #define VDR_Q4_K_Q8_1_MMQ  8
 
-static constexpr __device__ int get_vdr_mmvq(ggml_type type) {
+static CONSTEXPR __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q3_K    : return VDR_Q3_K_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_XXS : return VDR_IQ3_XXS_Q8_1_MMVQ;
@@ -879,9 +879,9 @@ static __device__ void mul_mat_vec_q(
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
+    CONSTEXPR int vdr = get_vdr_mmvq(type);
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+	CONSTEXPR vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     //int64_t rows_per_cuda_block = ggml_cuda_info().devices[id].cc < CC_RDNA2 ?
     //    ncols_y < 4 ? 1 : 2 : 1;
@@ -896,7 +896,7 @@ static __device__ void mul_mat_vec_q(
     const     int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
     const     int blocks_per_col_y = nrows_y / QK8_1;
-    constexpr int blocks_per_iter = vdr * nwarps*WARP_SIZE / qi;
+    CONSTEXPR int blocks_per_iter = vdr * nwarps*WARP_SIZE / qi;
 
 // partial sum for each thread
     float tmp[ncols_y][rows_per_cuda_block] = {0.0f};
@@ -1154,7 +1154,7 @@ __global__ void dequantize_q4_K_cuda_simple(const block_q4_K * __restrict__ x,
                                             int64_t k) {
     const int nb = k / QK_K;
     
-    // 每个block处理一个q4_K块
+    // 每个block处理一个q4_K块 
     const int block_id = blockIdx.x;
     if (block_id >= nb) return;
     
@@ -1164,12 +1164,12 @@ __global__ void dequantize_q4_K_cuda_simple(const block_q4_K * __restrict__ x,
     const float d   = __half2float(xi->data.d);
     const float min = __half2float(xi->data.dmin);
     
-    // 每个线程处理一个或多个元素
+    // 每个线程处理一个或多个元素 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
     
     for (int idx = tid; idx < QK_K; idx += stride) {
-        // 确定这个元素属于哪个32元素的子块
+        // 确定这个元素属于哪个32元素的子块 
         const int sub_block = idx / 32;
         // const int elem_in_block = idx % 32;
         
@@ -1186,15 +1186,15 @@ __global__ void dequantize_q4_K_cuda_simple(const block_q4_K * __restrict__ x,
         const int elem_in_64 = idx % 64;
         const int qs_idx = group_of_64 * 32 + elem_in_64 % 32;
         
-        if (qs_idx < QK_K/2) {  // 边界检查
+        if (qs_idx < QK_K/2) {  // 边界检查 
             uint8_t q_val = xi->qs[qs_idx];
             
             float result;
             if (elem_in_64 < 32) {
-                // 前32个元素使用低4位
+                // 前32个元素使用低4位 
                 result = d_scaled * (q_val & 0xF) - min_scaled;
             } else {
-                // 后32个元素使用高4位
+                // 后32个元素使用高4位 
                 result = d_scaled * (q_val >> 4) - min_scaled;
             }
             
@@ -1209,15 +1209,15 @@ void dequantize_row_q4_K_cuda(const block_q4_K* d_x, half* d_y, int64_t k,
     assert(k % QK_K == 0);
     const int nb = k / QK_K;
     
-    // 使用简单版本或共享内存版本
+    // 使用简单版本或共享内存版本 
     const int threads_per_block = 128;
-    const int blocks = nb;  // 每个block处理一个q4_K块
+    const int blocks = nb;  // 每个block处理一个q4_K块 
     
     // 选择一个kernel
     dequantize_q4_K_cuda_simple<<<blocks, threads_per_block, 0, stream>>>(d_x, d_y, k);
     // dequantize_q4_K_cuda_shared<<<blocks, threads_per_block, 0, stream>>>(d_x, d_y, k);
     
-    // 检查错误
+    // 检查错误 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("Kernel launch error: %s\n", cudaGetErrorString(err));
@@ -1338,17 +1338,17 @@ __global__ void dequantize_q8_0_cuda_simple(const block_q8_0 * __restrict__ x,
                                             int64_t k) {
     const int nb = k / QK8_0;
     
-    // 每个block处理一个q8_0块
+    // 每个block处理一个q8_0块 
     const int block_id = blockIdx.x;
     if (block_id >= nb) return;
     
     const block_q8_0 * xi = &x[block_id];
     half * yi = y + block_id * QK8_0;
     
-    // 获取scale因子
+    // 获取scale因子 
     const float d = __half2float(xi->d);
     
-    // 每个线程处理一个或多个元素
+    // 每个线程处理一个或多个元素 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
     
@@ -1366,11 +1366,11 @@ void dequantize_row_q8_0_cuda(const block_q8_0* d_x, half* d_y, int64_t k,
     
     // 选择合适的kernel配置
     // 方案1: 简单版本 - 每个CUDA block处理一个q8_0 block
-    const int threads_per_block = 32;  // QK8_0 = 32，使用32个线程正好
+    const int threads_per_block = 32;  // QK8_0 = 32，使用32个线程正好  
     const int blocks = nb;
     dequantize_q8_0_cuda_simple<<<blocks, threads_per_block, 0, stream>>>(d_x, d_y, k);
 
-    // 检查错误
+    // 检查错误 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("Kernel launch error: %s\n", cudaGetErrorString(err));
