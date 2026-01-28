@@ -23,6 +23,7 @@ namespace fastllm {
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis);
     void DoCudaMergeMOE(Data &input, Data &output, Data &gateBias, Data &logits, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, int topk, int needNorm, float sharedScale, float routeScale);
+    void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale);
     
     class CudaDevice : BaseDevice {
     public:
@@ -287,6 +288,21 @@ namespace fastllm {
 
     class CudaAttentionBatchOp : BaseBatchOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    // 分页注意力
+    class CudaAttentionPagedOp : CpuAttentionPagedOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    // 分页缓存追加
+    class CudaAppendPagedCacheOp : CpuAppendPagedCacheOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    // 分页缓存批量追加
+    class CudaAppendPagedCacheBatchOp : CpuAppendPagedCacheBatchOp {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 }
