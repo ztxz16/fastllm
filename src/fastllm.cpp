@@ -1312,6 +1312,11 @@ namespace fastllm {
     }
 
     Data::~Data() {
+        if (this->isPagedKVCache) {
+            for (auto index : this->pageIndex) {
+                this->pagedKVCacheData->ReleasePageIndex(index);
+            }
+        }
         if (this->multiDeviceData) {
             for (auto it : this->multiDeviceDatas) {
                 delete it.second;
@@ -3073,16 +3078,100 @@ namespace fastllm {
         });
     }
 
-    void AppendPagedCache(Data &cache, const Data &input) {
+    PagedCacheManager* AllocatePagedCacheManager(int layerIndex, 
+        PagedCacheManager::PagedCacheManagerType type, 
+        const Data &cacheData, 
+        int pageLen, 
+        int maxPages) {
+        // 静态缓存：按层号复用 PagedCacheManager
+        static std::unordered_map<int, PagedCacheManager*> layerPagedCacheManagers;
+
+        auto it = layerPagedCacheManagers.find(layerIndex);
+        if (it != layerPagedCacheManagers.end()) {
+            return it->second;
+        }
+
+        // 创建新的 PagedCacheManager
+        PagedCacheManager *manager = new PagedCacheManager();
+
+        // 设置基本属性
+        manager->type = type;
+
+        // 从 cacheData 中提取信息
+        // cacheData 的尺寸应该是 [numHeads, seqLen, headDim] 或类似的形状
+        AssertInFastLLM(cacheData.dims.size() >= 2, 
+            "AllocatePagedCacheManager: cacheData should have at least 2 dimensions.\n");
+        int numHeads = cacheData.dims[0];
+        int headDim = cacheData.dims.back();
+        DataType dataType = cacheData.dataType;
+
+        // 设置 Data 的基本属性（PagedCacheManager 继承自 Data）
+        ((Data*)manager)->dataType = dataType;
+        ((Data*)manager)->UpdateUnitSize();
+
+        // 根据设备类型设置默认 maxPages
+        if (maxPages <= 0) {
+            if (cacheData.dataDevice == DataDevice::CUDA) {
+                maxPages = 300;  // CUDA 默认 300 页
+            } else {
+                maxPages = 100;  // CPU 默认 100 页
+            }
+        }
+
+        // 初始化 pagedKVCacheData
+
+        ((Data*)manager)->ToDevice(cacheData.dataDevice);
+
+        // Resize manager: [maxPages, pageLen, numHeads, headDim]
+        ((Data*)manager)->Resize({maxPages, pageLen, numHeads, headDim});
+        ((Data*)manager)->Allocate();
+
+        // 初始化 unusedPageIndex
+        manager->SetMaxPages(maxPages);
+
+        // 记录到静态 map 中
+        layerPagedCacheManagers[layerIndex] = manager;
+
+        return manager;
+    }
+
+    void AppendPagedCache(PagedCacheManager &pagedCacheManager, Data &cache, const Data &input) {
         curExecutor->Run("AppendPagedCache", {
-                {"cache", &cache}, {"input", (Data*)&input}
+                {"pagedCacheManager", (Data*)&pagedCacheManager}, {"cache", &cache}, {"input", (Data*)&input}
         }, {}, {});
     }
-    
-    void AppendPagedCacheBatch(std::vector <Data*> &cache, const Data &input) {
+
+    void GenerateAppendPagedCacheBatchParams(PagedCacheManager &pagedCacheManager,
+        const std::vector<Data*> &pastKeys, int batch,
+        Data &insertIndexs, Data &insertPositions) {
+        curExecutor->Run("GenerateAppendPagedCacheBatchParams", {
+            {"pagedCacheManager", (Data*)&pagedCacheManager},
+            {"pastKeys", (Data*)pastKeys.data()},
+            {"insertIndexs", &insertIndexs},
+            {"insertPositions", &insertPositions}
+        }, {}, {
+            {"batch", batch},
+            {"pastKeys___batch", (int)pastKeys.size()},
+        });
+    }
+
+    // 将input中的数据插入到pagedCacheManager中, 用于decode，每个batch的seqlen都是1
+    // pagedCacheManager: PagedCacheManager
+    // currentCaches: batch个caches的列表，每个元素是一个Data*
+    // input: 输入数据，维度为[batch, num_heads, head_dim]
+    // insertIndexs: 是INT32PARAM，长度为(batch), 第i个询问的插入的page id为insertIndexs[i]
+    // insertPositions: 是INT32PARAM，长度为(batch), 第i个询问的插入位置为insertPositions[i]
+    void AppendPagedCacheBatch(PagedCacheManager &pagedCacheManager, const std::vector<Data*> &currentCaches, const Data &input, 
+        Data &insertIndexs, Data &insertPositions) {
         curExecutor->Run("AppendPagedCacheBatch", {
-                {"cache", (Data*)cache.data()}, {"input", (Data*)&input}
-        }, {}, {{"cache___batch", (int)cache.size()}});
+            {"pagedCacheManager", (Data*)&pagedCacheManager},
+            {"currentCaches", (Data*)currentCaches.data()},
+            {"input", (Data*)&input},
+            {"insertIndexs", &insertIndexs},
+            {"insertPositions", &insertPositions}
+        }, {}, {
+            {"currentCaches___batch", (int)currentCaches.size()}
+        });
     }
 
     void AttentionPaged(const Data &q, const Data &k, const Data &v, Data &output,
@@ -3090,6 +3179,40 @@ namespace fastllm {
         curExecutor->Run("AttentionPaged", {
                 {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v}, {"output", &output}
         }, {{"scale", scale}}, {{"group", group}, {"attentionType", attentionType}});
+    }
+
+    // 这里一般都是Decode部分，q中所有batch的seqlen都是1
+    // kCaches, vCaches: 总的PagedKVCache
+    // qSizes: 是INT32PARAM，长度为(batch + 1), 第i个询问位于q的[qSizes[i], qSizes[i+1])范围内
+    // pageSizes: 是INT32PARAM，长度为(batch + 1), 第i个询问缓存于pageIndexs[pageSizes[i] : pageSizes[i + 1]]
+    // pageIndexs: 是INT32PARAM，长度为所有询问使用的pages数目之和
+    // lastPageLens: 是INT32PARAM，长度为(batch), 第i个询问的最后一个page的长度为lastPageLens[i]
+    void AttentionPagedBatch(const Data &q, const Data &kCaches, const Data &vCaches, 
+        const Data &qSizes, const Data &pageSizes, const Data &pageIndexs, const Data &lastPageLens, 
+        Data &output, int group, float scale, int attentionType) {
+        curExecutor->Run("AttentionPagedBatch", {
+            {"q", (Data*)&q}, {"kCaches", (Data*)&kCaches}, {"vCaches", (Data*)&vCaches}, {"output", &output},
+            {"qSizes", (Data*)&qSizes}, {"pageSizes", (Data*)&pageSizes}, {"pageIndexs", (Data*)&pageIndexs}, {"lastPageLens", (Data*)&lastPageLens}
+        }, {{"scale", scale}, {"group", group}, {"attentionType", attentionType}}, {});
+    }
+
+    // 从batch个pastKey中生成AttentionPagedBatch所需要的qSizes, pageSizes, pageIndexs, lastPageLens
+    // pastKeys: batch个pastKey的列表，每个元素是一个Data*
+    // q: query数据，维度为[num_heads, batch, head_dim]
+    // batch: 批量大小
+    // qSizes, pageSizes, pageIndexs, lastPageLens: 输出的参数
+    void GeneratePagedBatchParams(const Data &q, const std::vector<Data*> &pastKeys, 
+        int batch, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens) {
+        curExecutor->Run("GeneratePagedBatchParams", {
+            {"q", (Data*)&q}, 
+            {"pastKeys", (Data*)pastKeys.data()}, 
+            {"qSizes", &qSizes}, 
+            {"pageSizes", &pageSizes}, 
+            {"pageIndexs", &pageIndexs}, 
+            {"lastPageLens", &lastPageLens}
+        }, {}, 
+        {{"batch", batch}, 
+        {"pastKeys___batch", (int)pastKeys.size()}});
     }
 
     void LoraLayer(Data &input, Data &weight, Data &loraA, Data &loraB, const Data &bias, Data &output, 
@@ -3204,5 +3327,28 @@ namespace fastllm {
 
     std::map <std::string, int> GetMoeDeviceMap() {
         return defaultMoeDeviceMap;
+    }
+
+    void PagedCacheManager::SetMaxPages(int maxPages) {
+        this->maxPages = maxPages;
+        this->unusedPageIndex.clear();
+        for (int i = 0; i < maxPages; i++) {
+            this->unusedPageIndex.insert(i);
+        }
+    }
+
+    int PagedCacheManager::GetUnusedPageIndex(bool pick) {
+        if (this->unusedPageIndex.empty()) {
+            ErrorInFastLLM("PagedCacheManager::GetUnusedPageIndex: no page can be use.\n");
+        }
+        int pageIndex = *this->unusedPageIndex.begin();
+        if (pick) {
+            this->unusedPageIndex.erase(pageIndex);
+        }
+        return pageIndex;
+    }
+
+    void PagedCacheManager::ReleasePageIndex(int pageIndex) {
+        this->unusedPageIndex.insert(pageIndex);
     }
 }

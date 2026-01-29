@@ -296,6 +296,8 @@ namespace fastllm {
         const char *ptr;
     };
 
+    class PagedCacheManager;
+
     class Data {
     public:
         bool isFake = false; // 没有创建空间，指向别的data（无需销毁）
@@ -308,7 +310,7 @@ namespace fastllm {
         // 当isKVCache = true且isPagedKVCache = true时，下面这些信息才有意义
         bool isPagedKVCache = false; // 是否是分片的KV Cache
         int pageLen = 128; // 每个page的长度（token数）
-        Data *pagedKVCacheData = nullptr; // 存储kv cached的数据，shape为 [maxPages, pageLen, numHeads, headDim]
+        PagedCacheManager *pagedKVCacheData = nullptr; // 存储kv cached的数据，shape为 [maxPages, pageLen, numHeads, headDim]
         std::vector <int> pageIndex; // 目前使用的Index编号
         int lastPageLen; // 最后一个Page中使用了多少长度
 
@@ -374,6 +376,8 @@ namespace fastllm {
         bool IsRepacked = false;
 
         std::vector <uint8_t*> numasData; // numa数据
+
+        std::vector <int> cpuIntDatas; // 锁定在cpu上的int数据
         
         Data () {};
 
@@ -456,6 +460,31 @@ namespace fastllm {
 
         // 当前权重作为linear的weight时，输入应该是什么类型
         DataType GetLinearActDataType(int batchSize);
+    };
+
+    // 一个带PageCache功能的Data，可以管理多个PageCache
+    class PagedCacheManager : public Data {
+        public:
+            enum PagedCacheManagerType {
+                PAGED_CACHE_MANAGER_TYPE_KV_CACHE = 0,
+                PAGED_CACHE_MANAGER_TYPE_MLP_CACHE = 1
+            };
+
+            // 类型
+            PagedCacheManagerType type;
+
+            // 页长
+            int pageLen;
+
+            // 最大页数
+            int maxPages;
+
+            // 目前可以使用的页索引
+            std::set <int> unusedPageIndex;
+
+            void SetMaxPages(int maxPages);
+            int GetUnusedPageIndex(bool pick);
+            void ReleasePageIndex(int pageIndex);
     };
 
     struct PartitionLinkNode {
@@ -803,12 +832,52 @@ namespace fastllm {
     void IA3Layer(Data &input, Data &weight, Data &ia3_l, Data &bias, Data &output,
                   std::map <std::string, std::string> ia3Config);
 
-    void AppendPagedCache(Data &cache, const Data &input);
+    PagedCacheManager* AllocatePagedCacheManager(int layerIndex, 
+        PagedCacheManager::PagedCacheManagerType type, 
+        const Data &cacheData, 
+        int pageLen = 128, 
+        int maxPages = -1);
+
+    void AppendPagedCache(PagedCacheManager &pagedCacheManager, Data &cache, const Data &input);
     
-    void AppendPagedCacheBatch(std::vector <Data*> &cache, const Data &input);
+    // 从batch个pastKey中生成AppendPagedCacheBatch所需要的insertIndexs和insertPositions
+    // pastKeys: batch个pastKey的列表，每个元素是一个Data*
+    // batch: 批量大小
+    // insertIndexs: 是INT32PARAM，长度为(batch), 第i个询问的插入的page id为insertIndexs[i]
+    // insertPositions: 是INT32PARAM，长度为(batch), 第i个询问的插入位置为insertPositions[i]
+    void GenerateAppendPagedCacheBatchParams(PagedCacheManager &pagedCacheManager, 
+        const std::vector<Data*> &pastKeys, int batch, 
+        Data &insertIndexs, Data &insertPositions);
+
+    // 将input中的数据插入到pagedCacheManager中, 用于decode，每个batch的seqlen都是1
+    // pagedCacheManager: PagedCacheManager
+    // currentCaches: batch个caches的列表，每个元素是一个Data*
+    // input: 输入数据，维度为[batch, num_heads, head_dim]
+    // insertIndexs: 是INT32PARAM，长度为(batch), 第i个询问的插入的page id为insertIndexs[i]
+    // insertPositions: 是INT32PARAM，长度为(batch), 第i个询问的插入位置为insertPositions[i]
+    void AppendPagedCacheBatch(PagedCacheManager &pagedCacheManager, const std::vector<Data*> &currentCaches, const Data &input, 
+        Data &insertIndexs, Data &insertPositions);
 
     void AttentionPaged(const Data &q, const Data &k, const Data &v, Data &output,
         int group, float scale, int attentionType);
+
+    // 这里一般都是Decode部分，q中所有batch的seqlen都是1
+    // kCaches, vCaches: 总的PagedKVCache
+    // qSizes: 是INT32PARAM，长度为(batch + 1), 第i个询问位于q的[qSizes[i], qSizes[i+1])范围内
+    // pageSizes: 是INT32PARAM，长度为(batch + 1), 第i个询问缓存于pageIndexs[pageSizes[i] : pageSizes[i + 1]]
+    // pageIndexs: 是INT32PARAM，长度为所有询问使用的pages数目之和
+    // lastPageLens: 是INT32PARAM，长度为(batch), 第i个询问的最后一个page的长度为lastPageLens[i]
+    void AttentionPagedBatch(const Data &q, const Data &kCaches, const Data &vCaches, 
+        const Data &qSizes, const Data &pageSizes, const Data &pageIndexs, const Data &lastPageLens, 
+        Data &output, int group, float scale, int attentionType);
+
+    // 从batch个pastKey中生成AttentionPagedBatch所需要的qSizes, pageSizes, pageIndexs, lastPageLens
+    // pastKeys: batch个pastKey的列表，每个元素是一个Data*
+    // q: query数据，维度为[num_heads, batch, head_dim]
+    // batch: 批量大小
+    // qSizes, pageSizes, pageIndexs, lastPageLens: 输出的参数
+    void GeneratePagedBatchParams(const Data &q, const std::vector<Data*> &pastKeys, 
+        int batch, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens);
 }
 
 #endif //TEST_FASTLLM_H

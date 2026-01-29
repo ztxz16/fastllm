@@ -76,6 +76,9 @@ namespace fastllm {
         this->ops["AttentionPaged"] = (BaseOperator*)(new CudaAttentionPagedOp());
         this->ops["AppendPagedCache"] = (BaseOperator*)(new CudaAppendPagedCacheOp());
         this->ops["AppendPagedCacheBatch"] = (BaseOperator*)(new CudaAppendPagedCacheBatchOp());
+        this->ops["AttentionPagedBatch"] = (BaseOperator*)(new CudaAttentionPagedBatchOp());
+        this->ops["GeneratePagedBatchParams"] = (BaseOperator*)(new CudaGeneratePagedBatchParamsOp());
+        this->ops["GenerateAppendPagedCacheBatchParams"] = (BaseOperator*)(new CudaGenerateAppendPagedCacheBatchParamsOp());
     }
 
     bool CudaDevice::Malloc(void **ret, size_t size) {
@@ -467,6 +470,8 @@ namespace fastllm {
                 FastllmCudaMatMulFloatFP8E4M3(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
                 FastllmCudaMatMulFloatGGUF(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128) {
+                FastllmCudaMatMulFloatFP8E4M3Block128(input, weight, bias, output, n, m, k);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
@@ -1386,12 +1391,13 @@ namespace fastllm {
                     DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
 
                     FastllmCudaPickOutput (
-                        (float*)tempOutput.cudaData, 
-                        (float*)output.cudaData, 
+                        (uint8_t*)tempOutput.cudaData, 
+                        (uint8_t*)output.cudaData, 
                         expertTasks[i].size(), 
                         output.dims[1], 
                         cudaIndex + startIdx[i],
-                        cudaScales + startIdx[i]
+                        cudaScales + startIdx[i], 
+                        output.dataType
                     );
                 }
 
@@ -1659,17 +1665,8 @@ namespace fastllm {
         
         // 如果还有剩余的数据，需要分配新的 pages
         while (tokensToAppend > 0) {
-            int newPageIdx = 0;
-            if (cache.pageIndex.size() == 0) {
-                newPageIdx = 0;
-            } else {
-                newPageIdx = cache.pageIndex.size();
-                if (newPageIdx >= maxPages) {
-                    ErrorInFastLLM("CudaAppendPagedCacheOp: No more pages available. Need to resize pagedKVCacheData.\n");
-                }
-            }
+            int newPageIdx = cache.pagedKVCacheData->GetUnusedPageIndex(true);
             cache.pageIndex.push_back(newPageIdx);
-
             int copyLen = std::min(pageLen, tokensToAppend);
 
             // kernel复制 input 的一个 page 到 pagedKVCacheData 的新 page
@@ -1706,12 +1703,166 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+        output.Allocate();
         DoCudaAttentionPaged(q, k, v, output, group, scale);
     }
 
     void CudaAppendPagedCacheBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data &cache = *(datas.find("cache")->second);
-        Data &input = *(datas.find("input")->second);
+        Data &input = *(datas.find("input")->second); // batch, num_heads, head_dim
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        PagedCacheManager &manager = *(PagedCacheManager*)datas.find("pagedCacheManager")->second;
+
+        int batch = input.dims[0], numHeads = input.dims[1], headDim = input.dims[2];
+        int pageLen = ((Data*)&manager)->dims[1];
+        int unitSize = input.unitSize;
+        uint8_t *pagedData = (uint8_t*)((Data*)&manager)->cudaData;
+        uint8_t *inputData = (uint8_t*)input.cudaData;
+        int32_t *idxDataCuda = (int32_t*)insertIndexs.cudaData;
+        int32_t *posDataCuda = (int32_t*)insertPositions.cudaData;
+        // 使用batch函数一次性处理所有batch
+        FastllmCudaPagedCacheCopyBatch(
+            pagedData,
+            idxDataCuda,
+            posDataCuda,
+            pageLen,
+            batch,
+            numHeads,
+            headDim,
+            unitSize,
+            inputData
+        );
+    }
+
+    void CudaGenerateAppendPagedCacheBatchParamsOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        PagedCacheManager &manager = *(PagedCacheManager*)datas.find("pagedCacheManager")->second;
+        Data **pastKeys = (Data**)(datas.find("pastKeys")->second);
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        int batch = intParams.find("pastKeys___batch") != intParams.end() ? intParams.find("pastKeys___batch")->second : 1;
+        if (batch <= 0 && intParams.find("batch") != intParams.end()) {
+            batch = intParams.find("batch")->second;
+        }
+        AssertInFastLLM(batch > 0, "CudaGenerateAppendPagedCacheBatchParamsOp: batch must be positive.\n");
+
+        insertIndexs.Allocate();
+        insertPositions.Allocate();
+        
+        // 先在CPU上准备数据
+        auto &idxDataHost = insertIndexs.cpuIntDatas;
+        auto &posDataHost = insertPositions.cpuIntDatas;
+        idxDataHost.resize(batch);
+        posDataHost.resize(batch);
+
+        for (int b = 0; b < batch; b++) {
+            Data *pk = pastKeys[b];
+            int pageLen = pk->pageLen;
+            int insertIdx, insertPos;
+            if (pk->pageIndex.empty()) {
+                insertIdx = manager.GetUnusedPageIndex(false);
+                insertPos = 0;
+            } else if (pk->lastPageLen < pageLen) {
+                insertIdx = pk->pageIndex.back();
+                insertPos = pk->lastPageLen;
+            } else {
+                insertIdx = manager.GetUnusedPageIndex(false);
+                insertPos = 0;
+            }
+            idxDataHost[b] = insertIdx;
+            posDataHost[b] = insertPos;
+        }
+        
+        // 拷贝到CUDA设备
+        FastllmCudaCopyFromHostToDevice(insertIndexs.cudaData, idxDataHost.data(), batch * sizeof(int32_t));
+        FastllmCudaCopyFromHostToDevice(insertPositions.cudaData, posDataHost.data(), batch * sizeof(int32_t));
+    }
+
+    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens, Data &output, int group, float scale, int attentionType) {
+        FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType);
+    }
+
+    void CudaAttentionPagedBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &kCaches = *(datas.find("kCaches")->second);
+        Data &vCaches = *(datas.find("vCaches")->second);
+        Data &qSizes = *(datas.find("qSizes")->second);
+        Data &pageSizes = *(datas.find("pageSizes")->second);
+        Data &pageIndexs = *(datas.find("pageIndexs")->second);
+        Data &lastPageLens = *(datas.find("lastPageLens")->second);
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / kCaches.dims[0];
+        float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+        int attentionType = intParams.find("attentionType") != intParams.end() ? intParams.find("attentionType")->second : 0;
+        output.Allocate();
+        DoCudaAttentionPagedBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType);  
+    }
+
+    void CudaGeneratePagedBatchParamsOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data **pastKeys = (Data**)(datas.find("pastKeys")->second);
+        Data &qSizes = *(datas.find("qSizes")->second);
+        Data &pageSizes = *(datas.find("pageSizes")->second);
+        Data &pageIndexs = *(datas.find("pageIndexs")->second);
+        Data &lastPageLens = *(datas.find("lastPageLens")->second);
+        
+        int batch = intParams.find("pastKeys___batch") != intParams.end() ? intParams.find("pastKeys___batch")->second : 1;
+        
+        // 分配输出内存
+        qSizes.Allocate();
+        pageSizes.Allocate();
+        lastPageLens.Allocate();
+        pageIndexs.Allocate();
+        
+        // 先在CPU上计算，然后拷贝到GPU
+        auto &qSizesHost = qSizes.cpuIntDatas;
+        qSizesHost.resize(batch + 1);
+
+        auto &pageSizesHost = pageSizes.cpuIntDatas;
+        pageSizesHost.resize(batch + 1);
+
+        auto &lastPageLensHost = lastPageLens.cpuIntDatas;
+        lastPageLensHost.resize(batch);
+
+        auto &pageIndexsHost = pageIndexs.cpuIntDatas;
+        
+        // 计算总的page数量
+        int totalPages = 0;
+        for (int b = 0; b < batch; b++) {
+            totalPages += pastKeys[b]->pageIndex.size();
+        }
+        pageIndexsHost.resize(totalPages);
+        
+        // 生成qSizes: [0, 1, 2, ... batch]
+        qSizesHost[0] = 0;
+        for (int b = 0; b < batch; b++) {
+            qSizesHost[b + 1] = b + 1;
+        }
+        
+        // 生成pageSizes, pageIndexs, lastPageLens
+        int pageOffset = 0;
+        pageSizesHost[0] = 0;
+        for (int b = 0; b < batch; b++) {
+            int numPages = pastKeys[b]->pageIndex.size();
+            pageSizesHost[b + 1] = pageSizesHost[b] + numPages;
+            
+            // 复制pageIndex
+            for (int i = 0; i < numPages; i++) {
+                pageIndexsHost[pageOffset + i] = pastKeys[b]->pageIndex[i];
+            }
+            pageOffset += numPages;
+            
+            // 设置lastPageLen
+            lastPageLensHost[b] = pastKeys[b]->lastPageLen;
+        }
+        
+        // 拷贝到对应设备
+        FastllmCudaCopyFromHostToDevice(qSizes.cudaData, qSizesHost.data(), (batch + 1) * sizeof(int32_t));
+        FastllmCudaCopyFromHostToDevice(pageSizes.cudaData, pageSizesHost.data(), (batch + 1) * sizeof(int32_t));
+        FastllmCudaCopyFromHostToDevice(lastPageLens.cudaData, lastPageLensHost.data(), batch * sizeof(int32_t));
+        FastllmCudaCopyFromHostToDevice(pageIndexs.cudaData, pageIndexsHost.data(), totalPages * sizeof(int32_t));
     }
 }
