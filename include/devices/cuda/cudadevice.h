@@ -305,6 +305,21 @@ namespace fastllm {
     class CudaAppendPagedCacheBatchOp : CpuAppendPagedCacheBatchOp {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
+
+    // 分页注意力批量
+    class CudaAttentionPagedBatchOp : CpuAttentionPagedBatchOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    // 生成分页批量参数
+    class CudaGeneratePagedBatchParamsOp : CpuGeneratePagedBatchParamsOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    // 生成 AppendPagedCacheBatch 所需的 insertIndexs、insertPositions
+    class CudaGenerateAppendPagedCacheBatchParamsOp : CpuGenerateAppendPagedCacheBatchParamsOp {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
 }
 
 #endif //FASTLLM_CUDADEVICE_H

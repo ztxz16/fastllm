@@ -94,6 +94,8 @@ namespace fastllm {
         this->ops["AttentionBatch"] = (BaseOperator*)(new CpuAttentionBatchOp());
 
         this->ops["AttentionPaged"] = (BaseOperator*)(new CpuAttentionPagedOp());
+        this->ops["GeneratePagedBatchParams"] = (BaseOperator*)(new CpuGeneratePagedBatchParamsOp());
+        this->ops["GenerateAppendPagedCacheBatchParams"] = (BaseOperator*)(new CpuGenerateAppendPagedCacheBatchParamsOp());
         this->ops["AppendPagedCache"] = (BaseOperator*)(new CpuAppendPagedCacheOp());
         this->ops["AppendPagedCacheBatch"] = (BaseOperator*)(new CpuAppendPagedCacheBatchOp());
     }
@@ -7241,6 +7243,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &cache = *(datas.find("cache")->second);
         Data &input = *(datas.find("input")->second);
+        PagedCacheManager &pagedCacheManager = *((PagedCacheManager*)datas.find("pagedCacheManager")->second);
 
         AssertInFastLLM(cache.dataType == DataType::FLOAT32 ||
                         cache.dataType == DataType::FLOAT16, 
@@ -7260,16 +7263,8 @@ ops += (long long)lines * inputDim * interDim * 2;
         int headDim = input.dims[2];
         
         if (cache.pagedKVCacheData == nullptr) {
-            cache.pagedKVCacheData = new Data();
-            cache.pagedKVCacheData->dataType = cache.dataType;
-            cache.pagedKVCacheData->UpdateUnitSize();
-            cache.pagedKVCacheData->Resize({100, cache.pageLen, numHeads, headDim});
-            cache.pagedKVCacheData->Allocate();
+            cache.pagedKVCacheData = &pagedCacheManager;
         }
-
-        // 如果 pagedKVCacheData 还没有初始化，需要初始化它
-        AssertInFastLLM(cache.pagedKVCacheData != nullptr,
-                        "CpuAppendPagedCacheOp's pagedKVCacheData should be initialized.\n");
             
         // 检查 pagedKVCacheData 的形状是否匹配
         AssertInFastLLM(cache.pagedKVCacheData->dims.size() == 4,
@@ -7294,22 +7289,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         // 检查是否有足够的 pages
         int maxPages = cache.pagedKVCacheData->dims[0];
         if (totalNeededPages > maxPages) {
-            // 需要扩容 pagedKVCacheData
-            int newMaxPages = std::max(maxPages * 2, totalNeededPages);
-            Data *oldData = cache.pagedKVCacheData;
-            cache.pagedKVCacheData = new Data();
-            cache.pagedKVCacheData->dataType = cache.dataType;
-            cache.pagedKVCacheData->UpdateUnitSize();
-            cache.pagedKVCacheData->Resize({newMaxPages, cache.pageLen, numHeads, headDim});
-            cache.pagedKVCacheData->Allocate();
-            cache.pagedKVCacheData->ToDevice(DataDevice::CPU);
-            
-            // 复制旧数据
-            if (oldData != nullptr && oldData->cpuData != nullptr) {
-                int copySize = maxPages * cache.pageLen * numHeads * headDim * cache.unitSize;
-                memcpy(cache.pagedKVCacheData->cpuData, oldData->cpuData, copySize);
-                delete oldData;
-            }
+            ErrorInFastLLM("CpuAppendPagedCacheOp: No more pages available. Need to resize pagedKVCacheData.\n");
         }
 
         if (cache.dims.size() == 0) {
@@ -7363,25 +7343,12 @@ ops += (long long)lines * inputDim * interDim * 2;
             tokensToAppend -= copyLen;
             inputOffset += copyLen;
         }
-        
+
         // 如果还有剩余的数据，需要分配新的 pages
         while (tokensToAppend > 0) {
             // 分配新的 page
-            int newPageIdx = -1;
-            int maxPages = cache.pagedKVCacheData->dims[0];
-            
-            // 查找一个未使用的 page（简单实现：使用下一个可用的索引）
-            // 这里可以使用更复杂的分配策略，比如维护一个空闲 page 列表
-            if (cache.pageIndex.size() == 0) {
-                newPageIdx = 0;
-            } else {
-                // 简单策略：使用下一个连续的 page
-                newPageIdx = cache.pageIndex.size();
-                if (newPageIdx >= maxPages) {
-                    ErrorInFastLLM("CpuAppendPagedCacheOp: No more pages available. Need to resize pagedKVCacheData.\n");
-                }
-            }
-            
+            int newPageIdx = cache.pagedKVCacheData->GetUnusedPageIndex(true);
+
             cache.pageIndex.push_back(newPageIdx);
             
             // 计算这个 page 可以存储多少 token
@@ -7769,17 +7736,204 @@ ops += (long long)lines * inputDim * interDim * 2;
 
     void CpuAppendPagedCacheBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data &cache = *(datas.find("cache")->second);
         Data &input = *(datas.find("input")->second);
-
-        AssertInFastLLM(cache.dataType == DataType::FLOAT32 ||
-                        cache.dataType == DataType::FLOAT16, 
-                        "CpuAppendPagedCacheBatchOp's cache's type should be float32 or float16.\n");
+        Data **currentCaches = (Data**)(datas.find("currentCaches")->second);
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        PagedCacheManager &manager = *(PagedCacheManager*)datas.find("pagedCacheManager")->second;
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "CpuAppendPagedCacheBatchOp's input type should be float32 or float16.\n");
+        AssertInFastLLM(input.dims.size() == 3,
+                        "CpuAppendPagedCacheBatchOp's input should have 3 dimensions [numHeads, batch, headDim].\n");
+        AssertInFastLLM(insertIndexs.dims.size() == 1 && insertIndexs.dims[0] == input.dims[0],
+                        "CpuAppendPagedCacheBatchOp's insertIndexs length should match batch.\n");
+        AssertInFastLLM(insertPositions.dims.size() == 1 && insertPositions.dims[0] == input.dims[0],
+                        "CpuAppendPagedCacheBatchOp's insertPositions length should match batch.\n");
+        AssertInFastLLM(((Data*)&manager)->dims.size() == 4,
+                        "CpuAppendPagedCacheBatchOp's pagedCacheManager storage should have 4 dimensions.\n");
+        int batch = input.dims[0];
+        for (int i = 0; i < batch; i++) {
+            Data *currentCache = currentCaches[i];
+            int pageLen = currentCache->pageLen;
+            if (currentCache->lastPageLen < pageLen) {
+                currentCache->lastPageLen++;
+            } else {
+                currentCache->lastPageLen = 0;
+                currentCache->pageIndex.push_back(manager.GetUnusedPageIndex(true));
+            }
+        }
     }
 
     void CpuAppendPagedCacheBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data &cache = *(datas.find("cache")->second);
-        Data &input = *(datas.find("input")->second);
+        Data &input = *(datas.find("input")->second); // batch, num_heads, head_dim
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        PagedCacheManager &manager = *(PagedCacheManager*)datas.find("pagedCacheManager")->second;
+
+        int batch = input.dims[0], numHeads = input.dims[1], headDim = input.dims[2];
+        int pageLen = manager.pageLen;
+        int unitSize = input.unitSize;
+        uint8_t *pagedData = (uint8_t*)((Data*)&manager)->cpuData;
+        uint8_t *inputData = (uint8_t*)input.cpuData;
+        int32_t *idxData = (int32_t*)insertIndexs.cpuData;
+        int32_t *posData = (int32_t*)insertPositions.cpuData;
+
+        for (int b = 0; b < batch; b++) {
+            int pageIdx = idxData[b];
+            int pageOffset = posData[b];
+            for (int h = 0; h < numHeads; h++) {
+                uint8_t *dst = pagedData +
+                    (pageIdx * pageLen * numHeads * headDim + pageOffset * numHeads * headDim + h * headDim) * unitSize;
+                uint8_t *src = inputData + (b * numHeads * headDim + h * headDim) * unitSize;
+                memcpy(dst, src, headDim * unitSize);
+            }
+        }
+    }
+
+    void CpuGenerateAppendPagedCacheBatchParamsOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        int batch = intParams.find("pastKeys___batch") != intParams.end() ? intParams.find("pastKeys___batch")->second : 1;
+        if (batch <= 0 && intParams.find("batch") != intParams.end()) {
+            batch = intParams.find("batch")->second;
+        }
+        insertIndexs.dataType = DataType::INT32PARAM;
+        insertIndexs.Resize({batch});
+        insertPositions.dataType = DataType::INT32PARAM;
+        insertPositions.Resize({batch});
+    }
+
+    void CpuGenerateAppendPagedCacheBatchParamsOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        PagedCacheManager &manager = *(PagedCacheManager*)datas.find("pagedCacheManager")->second;
+        Data **pastKeys = (Data**)(datas.find("pastKeys")->second);
+        Data **pastValues = (Data**)(datas.find("pastValues")->second);
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        int batch = intParams.find("pastKeys___batch") != intParams.end() ? intParams.find("pastKeys___batch")->second : 1;
+        if (batch <= 0 && intParams.find("batch") != intParams.end()) {
+            batch = intParams.find("batch")->second;
+        }
+        AssertInFastLLM(batch > 0, "CpuGenerateAppendPagedCacheBatchParamsOp: batch must be positive.\n");
+
+        insertIndexs.Allocate();
+        insertPositions.Allocate();
+        int32_t *idxData = (int32_t*)insertIndexs.cpuData;
+        int32_t *posData = (int32_t*)insertPositions.cpuData;
+
+        for (int b = 0; b < batch; b++) {
+            Data *pk = pastKeys[b];
+            int pageLen = pk->pageLen;
+            int insertIdx, insertPos;
+            if (pk->pageIndex.empty()) {
+                insertIdx = manager.GetUnusedPageIndex(false);
+                insertPos = 0;
+            } else if (pk->lastPageLen < pageLen) {
+                insertIdx = pk->pageIndex.back();
+                insertPos = pk->lastPageLen;
+            } else {
+                insertIdx = manager.GetUnusedPageIndex(false);
+                insertPos = 0;
+            }
+            idxData[b] = insertIdx;
+            posData[b] = insertPos;
+        }
+    }
+
+    void CpuAttentionPagedBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &vCaches = *(datas.find("vCaches")->second);
+        Data &output = *(datas.find("output")->second);
+
+        std::vector <int> dims = {q.dims[0], q.dims[1], vCaches.dims[2]};
+        output.dataType = q.dataType;
+        output.Resize(dims);
+    }
+
+    void CpuAttentionPagedBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+
+    }
+
+    void CpuGeneratePagedBatchParamsOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data **pastKeys = (Data**)(datas.find("pastKeys")->second);
+        Data &qSizes = *(datas.find("qSizes")->second);
+        Data &pageSizes = *(datas.find("pageSizes")->second);
+        Data &pageIndexs = *(datas.find("pageIndexs")->second);
+        Data &lastPageLens = *(datas.find("lastPageLens")->second);
+
+        int batch = intParams.find("pastKeys___batch") != intParams.end() ? intParams.find("pastKeys___batch")->second : 1;
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
+        
+        // qSizes: [batch + 1]
+        qSizes.dataType = DataType::INT32PARAM;
+        qSizes.Resize({batch + 1});
+        
+        // pageSizes: [batch + 1]
+        pageSizes.dataType = DataType::INT32PARAM;
+        pageSizes.Resize({batch + 1});
+        
+        // lastPageLens: [batch]
+        lastPageLens.dataType = DataType::INT32PARAM;
+        lastPageLens.Resize({batch});
+        
+        // 计算总的page数量
+        int totalPages = 0;
+        for (int b = 0; b < batch; b++) {
+            totalPages += pastKeys[b]->pageIndex.size();
+        }
+        pageIndexs.dataType = DataType::INT32PARAM;
+        pageIndexs.Resize({totalPages});
+    }
+
+    void CpuGeneratePagedBatchParamsOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data **pastKeys = (Data**)(datas.find("pastKeys")->second);
+        Data &qSizes = *(datas.find("qSizes")->second);
+        Data &pageSizes = *(datas.find("pageSizes")->second);
+        Data &pageIndexs = *(datas.find("pageIndexs")->second);
+        Data &lastPageLens = *(datas.find("lastPageLens")->second);
+        
+        int batch = intParams.find("pastKeys___batch") != intParams.end() ? intParams.find("pastKeys___batch")->second : 1;
+        
+        // 分配输出内存
+        qSizes.Allocate();
+        pageSizes.Allocate();
+        lastPageLens.Allocate();
+        pageIndexs.Allocate();
+        
+        int32_t *qSizesData = (int32_t*)qSizes.cpuData;
+        int32_t *pageSizesData = (int32_t*)pageSizes.cpuData;
+        int32_t *lastPageLensData = (int32_t*)lastPageLens.cpuData;
+        int32_t *pageIndexsData = (int32_t*)pageIndexs.cpuData;
+        
+        // 生成qSizes: [0, 1, 2, 3, ..., batch]
+        qSizesData[0] = 0;
+        for (int b = 0; b < batch; b++) {
+            qSizesData[b + 1] = b + 1;
+        }
+        
+        // 生成pageSizes, pageIndexs, lastPageLens
+        int pageOffset = 0;
+        pageSizesData[0] = 0;
+        for (int b = 0; b < batch; b++) {
+            int numPages = pastKeys[b]->pageIndex.size();
+            pageSizesData[b + 1] = pageSizesData[b] + numPages;
+            
+            // 复制pageIndex
+            for (int i = 0; i < numPages; i++) {
+                pageIndexsData[pageOffset + i] = pastKeys[b]->pageIndex[i];
+            }
+            pageOffset += numPages;
+            
+            // 设置lastPageLen
+            lastPageLensData[b] = pastKeys[b]->lastPageLen;
+        }
     }
 }
