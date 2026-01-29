@@ -736,16 +736,30 @@ namespace fastllm {
                                 }
 
                                 if (!isPrompt) {
-                                    if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1] == it.second->pastKeyValues[0].first.dims[1]) {
-                                        int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;                                        
-                                        int predictLen = 256;
-                                        if (sur > 0) {
-                                            predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
+                                    if (it.second->pastKeyValues[model->kvCacheId].first.isPagedKVCache) {
+                                        if (it.second->pastKeyValues[model->kvCacheId].first.pageLen == it.second->pastKeyValues[model->kvCacheId].first.lastPageLen) {
+                                            int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;                                        
+                                            int predictLen = 256;
+                                            if (sur > 0) {
+                                                predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
+                                            }
+                                            if (lenSum + predictLen > limit) {
+                                                continue;
+                                            }
+                                            lenSum += predictLen;
                                         }
-                                        if (lenSum + predictLen > limit) {
-                                            continue;
+                                    } else {
+                                        if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1] == it.second->pastKeyValues[0].first.dims[1]) {
+                                            int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;                                        
+                                            int predictLen = 256;
+                                            if (sur > 0) {
+                                                predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
+                                            }
+                                            if (lenSum + predictLen > limit) {
+                                                continue;
+                                            }
+                                            lenSum += predictLen;
                                         }
-                                        lenSum += predictLen;
                                     }
                                 } else {
                                     if (it.second->currentTokens.size() * 2 < currentMaxLen) {

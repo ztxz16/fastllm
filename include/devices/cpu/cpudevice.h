@@ -504,6 +504,24 @@ namespace fastllm {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
+
+    // 分页注意力批量
+    class CpuAttentionPagedBatchOp : BaseBatchOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    // 生成分页批量参数
+    class CpuGeneratePagedBatchParamsOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    // 生成 AppendPagedCacheBatch 所需的 insertIndexs、insertPositions
+    class CpuGenerateAppendPagedCacheBatchParamsOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
 }
 
 #endif //FASTLLM_CPUDEVICE_H
