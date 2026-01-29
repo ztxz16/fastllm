@@ -87,6 +87,12 @@
     <ClInclude Include="..\..\include\models\glm.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\glm4_moe.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\include\models\gpt_oss.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\graphllm.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
@@ -129,6 +135,9 @@
     <ClInclude Include="..\..\include\models\qwen3_moe.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\include\models\qwen3_next.h">
+      <Filter>头文件\models</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\include\models\xlmroberta.h">
       <Filter>头文件\models</Filter>
     </ClInclude>
@@ -149,6 +158,9 @@
     </ClInclude>
     <ClInclude Include="..\..\include\utils\utils.h">
       <Filter>头文件\utils</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\third_party\gguf\gguf.h">
+      <Filter>头文件\third_party</Filter>
     </ClInclude>
     <ClInclude Include="..\..\third_party\json11\json11.hpp">
       <Filter>头文件\third_party</Filter>
@@ -197,6 +209,12 @@
     <ClCompile Include="..\..\src\models\glm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\glm4_moe.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\models\gpt_oss.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\graphllm.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
@@ -239,6 +257,9 @@
     <ClCompile Include="..\..\src\models\qwen3_moe.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\models\qwen3_next.cpp">
+      <Filter>源文件\models</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\models\xlmroberta.cpp">
       <Filter>源文件\models</Filter>
     </ClCompile>
@@ -254,10 +275,19 @@
     <ClCompile Include="..\..\src\models\graph\telechat.cpp">
       <Filter>源文件\models\graph</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\src\devices\cpu\amx.cpp">
+      <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\devices\cpu\avx2.cpp">
+      <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\avx512bf16.cpp">
       <Filter>源文件\devices\cpu</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\avx512vnni.cpp">
+      <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\src\devices\cpu\avx512f.cpp">
       <Filter>源文件\devices\cpu</Filter>
     </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\cpudevice.cpp">
@@ -268,6 +298,21 @@
     </ClCompile>
     <ClCompile Include="..\..\src\devices\cpu\linear.cpp">
       <Filter>源文件\devices\cpu</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\third_party\gguf\ggml-dequantize.cpp">
+      <Filter>源文件\third_party</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\third_party\gguf\ggml-iqk.cpp">
+      <Filter>源文件\third_party</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\third_party\gguf\ggml-quant.cpp">
+      <Filter>源文件\third_party</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\third_party\gguf\gguf.cpp">
+      <Filter>源文件\third_party</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\third_party\gguf\gguf-adapter.cpp">
+      <Filter>源文件\third_party</Filter>
     </ClCompile>
     <ClCompile Include="..\..\third_party\json11\json11.cpp">
       <Filter>源文件\third_party</Filter>

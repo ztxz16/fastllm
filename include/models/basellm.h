@@ -120,9 +120,9 @@ namespace fastllm {
     };
 
     struct WeightMergeRule {
-        // 权重合并的规则
+        // 权重合并的规则 
         std::vector <WeightMergeRuleSingle> rules; 
-        // 当rules涉及到的所有权重都被读取后，依此遍历rules中的每条规则，如果都满足合并条件，那么执行合并
+        // 当rules涉及到的所有权重都被读取后，依此遍历rules中的每条规则，如果都满足合并条件，那么执行合并 
 
         std::set <std::string> allInputs; // 所有涉及到的合并前的name
 
@@ -172,11 +172,11 @@ namespace fastllm {
 
         virtual ~basellm();
 
-        virtual void LoadFromFile(const std::string &fileName); // 从文件读取 
+        virtual void LoadFromFile(const std::string &fileName); // 从文件读取   
 
-        virtual void InitParams(); // 初始化参数信息 
+        virtual void InitParams(); // 初始化参数信息  
 
-        // 根据原始的tensorNames获得映射表
+        // 根据原始的tensorNames获得映射表  
         virtual std::map <std::string, std::vector <std::pair <std::string, DataType> > >
                 GetTensorMap(const std::vector <std::string> &tensorNames);
 

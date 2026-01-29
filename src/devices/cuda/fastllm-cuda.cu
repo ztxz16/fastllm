@@ -863,7 +863,7 @@ __global__ void FastllmChannelMulToKernel(half* a, half *b, float alpha, int len
 #ifdef CUDA_NO_TENSOR_CORE
         a[idx] = __float2half(__half2float(b[idx / channelLen]) * alpha * __half2float(a[idx]));
 #else
-        a[idx] *= (half)((float)b[idx / channelLen] * alpha);
+        a[idx] = __hmul(a[idx], (half)(__half2float(b[idx / channelLen]) * alpha));
 #endif
     }
 }
