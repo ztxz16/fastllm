@@ -10,7 +10,15 @@
 #include <fcntl.h>
 #include <mutex>
 #include <set>
+#ifdef _MSC_VER
+#include <io.h>
+#include <windows.h>
+#define ssize_t intptr_t
+#define open _open
+#define close _close
+#else
 #include <unistd.h>
+#endif
 #include <unordered_map>
 #include <unordered_set>
 
@@ -26,6 +34,32 @@ namespace fastllm {
                                       bool setZero, const std::unordered_set<int> &experts,
                                       bool isCrossSwiglu, MoeGateType gateType);
 #endif
+
+    inline ssize_t cross_pread(int fd, void* buf, size_t count, int64_t offset) {
+#ifdef _MSC_VER
+        HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            return -1;
+        }
+
+        // 配置 OVERLAPPED 结构体以实现无锁偏移读取
+        OVERLAPPED overlapped = {0};
+        overlapped.Offset = static_cast<DWORD>(offset & 0xFFFFFFFF);
+        overlapped.OffsetHigh = static_cast<DWORD>((offset >> 32) & 0xFFFFFFFF);
+
+        DWORD bytesRead = 0;
+        if (ReadFile(hFile, buf, static_cast<DWORD>(count), &bytesRead, &overlapped)) {
+            return static_cast<ssize_t>(bytesRead);
+        }
+
+        if (GetLastError() == ERROR_HANDLE_EOF) {
+            return 0; // 读到文件末尾
+        }
+        return -1;
+#else
+        return pread(fd, buf, count, offset);
+#endif
+}
 
     DiskDevice::DiskDevice() {
         this->deviceType = "disk";
@@ -141,7 +175,7 @@ namespace fastllm {
         int fd = GetDiskFileCache().Get(part.fileName);
         uint64_t done = 0;
         while (done < part.bytes) {
-            ssize_t ret = pread(fd, dst + done, part.bytes - done, part.fileOffset + done);
+            ssize_t ret = cross_pread(fd, dst + done, part.bytes - done, part.fileOffset + done);
             if (ret < 0) {
                 ErrorInFastLLM("Disk MoE read weight failed: " + part.fileName + "\n");
             }

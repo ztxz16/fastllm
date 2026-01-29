@@ -31,6 +31,14 @@
 #include <unistd.h>
 #endif
 
+#ifdef _MSC_VER
+#define forceinline __forceinline
+#elif defined(__GNUC__)
+#define forceinline __attribute__((always_inline))
+#else
+#define forceinline
+#endif
+
 #ifdef __AVX__
 #include "immintrin.h"
 #ifdef __GNUC__
