@@ -1219,6 +1219,7 @@ if (false) {
 
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
+                                        mergeData.isModelWeight = true;
                                         mergeData.Allocate();
                                         uint64_t offset = 0;
                                         for (auto input : it.inputs) {
@@ -1237,6 +1238,7 @@ if (false) {
                                         }
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
+                                        mergeData.isModelWeight = true;
                                         mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
                                         mergeData.group = model->weight[input0].group;
                                         mergeData.groupCnt = model->weight[input0].groupCnt;
@@ -1873,6 +1875,7 @@ if (false) {
                                         }
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
+                                        mergeData.isModelWeight = true;
                                         mergeData.Allocate();
                                         uint64_t offset = 0;
                                         for (auto input : it.inputs) {
@@ -1891,6 +1894,7 @@ if (false) {
                                         }
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
+                                        mergeData.isModelWeight = true;
                                         mergeData.perChannelAxis = model->weight[input0].perChannelAxis;
                                         mergeData.group = model->weight[input0].group;
                                         mergeData.groupCnt = model->weight[input0].groupCnt;

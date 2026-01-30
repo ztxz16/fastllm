@@ -1598,21 +1598,31 @@ namespace fastllm {
                     memcpy(cpuData, this->cpuData, expansionBytes);
 #endif
                     // FastllmCudaSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
-                    this->cudaData = FastllmCudaMalloc(expansionBytes);
+                    if (this->cudaData == nullptr) {
+                        this->cudaData = FastllmCudaMalloc(expansionBytes);
+                    }
+
                     FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
 #ifdef USE_MMAP
                     delete[] cpuData;
 #else
-                    delete[] this->cpuData;
-                    this->cpuData = nullptr;
+                    if (this->isModelWeight || this->isKVCache) {
+                        delete[] this->cpuData;
+                        this->cpuData = nullptr;
+                    }
 #endif
                 }
             } else if (this->dataDevice == DataDevice::CUDA) {
                 if (device == DataDevice::CPU) {
-                    this->cpuData = new uint8_t[expansionBytes];
+                    if (this->cpuData == nullptr) {
+                        this->cpuData = new uint8_t[expansionBytes];
+                    } 
                     FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
-                    FastllmCudaFree(this->cudaData);
-                    this->cudaData = nullptr;
+
+                    if (this->isModelWeight || this->isKVCache) {
+                        FastllmCudaFree(this->cudaData);
+                        this->cudaData = nullptr;
+                    }
                 } else if (device == DataDevice::CUDA) {
                     int sourceDevice = this->dataDeviceIds.size() == 0 ? 0 : this->dataDeviceIds[0];
                     int destDevice = deviceIds.size() == 0 ? 0 : deviceIds[0];
@@ -1635,6 +1645,56 @@ namespace fastllm {
             this->dataDeviceIds = deviceIds;
         };
         this->dataDevice = device;
+    }
+
+    // 临时移动到cuda 
+    void Data::ToCudaTemporary(const std::vector <int> &deviceIds, bool copyData) { 
+#ifdef USE_CUDA
+        AssertInFastLLM(deviceIds.size() <= 0, "ToCudaTemporary Error: can't set deviceids\n");
+        this->dataDevice = DataDevice::CUDA;
+        size_t bytes = this->GetBytes();
+
+        if (this->cudaData == nullptr) {
+            this->cudaData = (uint8_t*)FastllmCudaMalloc(bytes);
+        }
+
+        if (copyData) {
+            if (this->cpuData != nullptr) {
+                FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, bytes);
+            } else {
+                int numaCnt = this->numasData.size();
+                int k = this->dims[0], m = this->dims[1];
+                int kPerNuma = k / numaCnt;
+                size_t bytesPerRow = GetDataBytes(this->dataType, 1, m);
+                for (int i = 0; i < numaCnt; i++) {
+                    FastllmCudaCopyFromHostToDevice((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
+                        this->numasData[i], (size_t)kPerNuma * bytesPerRow);
+                }
+            }
+        }
+#else
+        ErrorInFastLLM("ToCudaTemporary Error: don't support.");
+#endif
+    }
+
+    // 销毁临时移动到cuda的数据
+    void Data::FreeCudaTemporary(const std::vector <int> &deviceIds, bool copyData) {
+#ifdef USE_CUDA
+        AssertInFastLLM(deviceIds.size() <= 0, "ToCudaTemporary Error: can't set deviceids\n");
+        this->dataDevice = DataDevice::CPU;
+        size_t bytes = this->GetBytes();
+
+        if (copyData) {
+            FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, bytes);
+        }
+
+        if (this->isModelWeight) {
+            FastllmCudaFree(this->cudaData);
+            this->cudaData = nullptr;
+        }
+#else
+        ErrorInFastLLM("FreeCudaTemporary Error: don't support.");
+#endif
     }
 
     extern CPUInstructInfo cpuInstructInfo;
