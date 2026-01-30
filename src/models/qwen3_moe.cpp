@@ -444,11 +444,8 @@ namespace fastllm {
                 }
 
                 moeFinal.Reshape(hiddenStates.dims);
-
-                Data tempMoeFinal;
-                tempMoeFinal.CopyFrom(moeFinal);
                 ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
-                AddTo(hiddenStates, tempMoeFinal);
+                AddTo(hiddenStates, moeFinal);
             }
         }
 
@@ -986,11 +983,8 @@ namespace fastllm {
                 }
 
                 moeFinal.Reshape(hiddenStates.dims);
-
-                Data tempMoeFinal;
-                tempMoeFinal.CopyFrom(moeFinal);
                 ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
-                AddTo(hiddenStates, tempMoeFinal);
+                AddTo(hiddenStates, moeFinal);
             }
         }
 

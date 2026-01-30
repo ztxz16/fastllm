@@ -438,6 +438,10 @@ namespace fastllm {
 
         void ToDevice(void *device);
 
+        void ToCudaTemporary(const std::vector <int> &deviceIds, bool copyData); // 临时移动到cuda
+
+        void FreeCudaTemporary(const std::vector <int> &deviceIds, bool copyData); // 销毁临时移动到cuda的数据
+
         void Repack(); // 重新打包数据，便于计算
 
         void SetMapFile(std::shared_ptr<FileMmap> file) {
