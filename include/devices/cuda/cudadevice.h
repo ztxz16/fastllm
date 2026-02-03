@@ -21,8 +21,8 @@ namespace fastllm {
     void DoCudaCatDirect(Data &input0, Data &input1, int axis);
     void DoCudaCatDirectBatch(Data **input0s, Data **input1s, int batch, int axis);
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis);
-    void DoCudaMergeMOE(Data &input, Data &output, Data &gateBias, Data &logits, Data &w1, Data &w2, Data &w3, 
-        Data **weights, Data **biass, int topk, int needNorm, float sharedScale, float routeScale);
+    void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
+        Data **weights, Data **biass, float sharedScale);
     void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale);
     
     class CudaDevice : BaseDevice {
@@ -208,6 +208,12 @@ namespace fastllm {
     };
 
     class CudaTopKOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaSelectExpertOp : BaseOperator {
         void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);

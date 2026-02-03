@@ -357,16 +357,21 @@ namespace fastllm {
                 bool needNorm = true;
                 Softmax(routerLogits, routerLogits, -1);
 
+                Data expertIndex, expertScore;
+                if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
+                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, needNorm, 
+                                this->routed_scaling_factor, weight.weight.find(gateBiasName) != weight.weight.end() ? &weight[gateBiasName] : nullptr);
+                }
                 ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
                     && CanRunMergeMOE(attenInput, biass[i])) {
                     MergeMOE (
-                        attenInput, routerLogits, weight[gateBiasName],
+                        attenInput, expertIndex, expertScore,
                         weights[i], biass[i],
                         w1, w2, w3, tempInput, tempOutput,
-                        this->routed_scaling_factor, 1.0f,
-                        this->num_experts_per_tok, needNorm,
-                        moeFinal
+                        1.0f,
+                        moeFinal, i
                     );
                 } else {
                     Data &bias = weight[gateBiasName];                  
@@ -896,16 +901,21 @@ namespace fastllm {
                 bool needNorm = true;
                 Softmax(routerLogits, routerLogits, -1);
 
+                Data expertIndex, expertScore;
+                if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
+                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, needNorm, 
+                                this->routed_scaling_factor, weight.weight.find(gateBiasName) != weight.weight.end() ? &weight[gateBiasName] : nullptr);
+                }
                 ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
                     && CanRunMergeMOE(attenInput, biass[i])) {
                     MergeMOE (
-                        attenInput, routerLogits, weight[gateBiasName],
+                        attenInput, expertIndex, expertScore,
                         weights[i], biass[i],
                         w1, w2, w3, tempInput, tempOutput,
-                        this->routed_scaling_factor, 1.0f,
-                        this->num_experts_per_tok, needNorm,
-                        moeFinal
+                        1.0f,
+                        moeFinal, i
                     );
                 } else {
                     Data &bias = weight[gateBiasName];                  

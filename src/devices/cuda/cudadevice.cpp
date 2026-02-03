@@ -50,6 +50,7 @@ namespace fastllm {
         this->ops["TransferAttn"] = (BaseOperator*)(new CudaTransferAttnOp());
         this->ops["CumSumLastDim"] = (BaseOperator*)(new CudaCumSumLastDimOp());
         this->ops["TopK"] = (BaseOperator*)(new CudaTopKOp());
+        this->ops["SelectExpert"] = (BaseOperator*)(new CudaSelectExpertOp());
         this->ops["PermuteSelf"] = (BaseOperator*)(new CudaPermuteSelfOp());
         this->ops["RotatePosition2D"] = (BaseOperator*)(new CudaRotatePosition2DOp());
         this->ops["NearlyRotatePosition2D"] = (BaseOperator*)(new CudaNearlyRotatePosition2DOp());
@@ -1013,6 +1014,57 @@ namespace fastllm {
         FastllmCudaTopK(input, output, topk);
     }
 
+    void CudaSelectExpertOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                      const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+
+        AssertInFastLLM(logits.dataType == DataType::FLOAT32, "SelectExpert error: logits's type should be float32.\n");
+        
+        int dimsLen = logits.dims.size();
+        int n = logits.Count(0) / logits.dims[dimsLen - 1]; // number of tokens
+        int numExperts = logits.dims[dimsLen - 1]; // number of experts
+
+        // Index output: [n, topk]
+        index.dataType = DataType::INT32;
+        index.Resize({n, topk});
+        
+        // Score output: [n, topk]
+        score.dataType = DataType::FLOAT32;
+        score.Resize({n, topk});
+    }
+
+    bool CudaSelectExpertOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        if (topk > 50) {
+            return false; // 回退到 CPU 实现
+        }
+        return true;
+    }
+
+    void CudaSelectExpertOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        Data *gateBias = datas.find("gateBias") != datas.end() ? datas.find("gateBias")->second : nullptr;
+        
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        bool needNorm = intParams.find("needNorm") != intParams.end() ? (intParams.find("needNorm")->second != 0) : false;
+        float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;
+        
+        index.Allocate();
+        score.Allocate();
+        
+        bool success = FastllmCudaSelectExpert(logits, gateBias, index, score, topk, needNorm, routeScale);
+        if (!success) {
+            ErrorInFastLLM("CudaSelectExpert failed, topk may be too large (> 50).\n");
+        }
+    }
+
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis) {
         bool same = false;
         same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
@@ -1233,46 +1285,187 @@ namespace fastllm {
         }
     }
 
-    void DoCudaMergeMOE(Data &input, Data &output, Data &gateBias, Data &logits, Data &w1, Data &w2, Data &w3, 
-                        Data **weights, Data **biass, int topk, int needNorm, float sharedScale, float routeScale) {
+    void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
+                        Data **weights, Data **biass, float sharedScale, bool setZero, int expertLimit) {
+// static std::map <std::string, float> timeCnt;
+// auto st = std::chrono::system_clock::now();
+        if (setZero) {
+            output.Allocate();
+            output.ToCudaTemporary({}, false);
+            FastllmCudaMemset0(output.cudaData, output.GetBytes());
+        } else {
+            output.ToCudaTemporary({}, true);
+        }
+        input.ToCudaTemporary({}, true);
+// ForceDeviceSync(); timeCnt["io"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+        int batch = input.dims[0];
+        
+        int32_t *indexData = (int32_t*)index.cpuData;
+        float *scoreData = (float*)score.cpuData;
+        int n = index.dims[0];
+        int topk = index.dims[1];
+        
+        // 计算最大专家数量
+        int maxExpert = 0;
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < topk; j++) {
+                int expertIdx = indexData[i * topk + j];
+                if (expertIdx > maxExpert) {
+                    maxExpert = expertIdx;
+                }
+            }
+        }
+        int m = maxExpert + 1; // 专家数量
+        
+        std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
+        expertTasks.resize(m + 1);
+        for (int b = 0; b < batch; b++) {
+            expertTasks[0].push_back(std::make_pair(b, sharedScale));
+            for (int j = 0; j < topk; j++) {
+                int expertIdx = indexData[b * topk + j];
+                float value = scoreData[b * topk + j];
+                expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
+            }
+        }
+
+        std::vector <int> indexVec;
+        std::vector <float> scales;
+        std::vector <int> startIdx;                
+        for (int i = 0; i < expertTasks.size(); i++) {
+            startIdx.push_back(indexVec.size());
+            for (int j = 0; j < expertTasks[i].size(); j++) {
+                indexVec.push_back(expertTasks[i][j].first);
+                scales.push_back(expertTasks[i][j].second);
+            }
+        }
+
+// ForceDeviceSync(); timeCnt["get experts"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+        int *cudaIndex = (int*)FastllmCudaMalloc(indexVec.size() * sizeof(int));
+        float *cudaScales = (float*)FastllmCudaMalloc(scales.size() * sizeof(float));
+// ForceDeviceSync(); timeCnt["malloc index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+        FastllmCudaCopyFromHostToDevice(cudaIndex, indexVec.data(), indexVec.size() * sizeof(int));
+        FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
+// ForceDeviceSync(); timeCnt["copy index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+        static Data tempInput, tempMiddle, tempSwiglu, tempOutput;
+        tempInput.Resize(input.dims);
+        tempInput.dataType = input.dataType;
+        tempInput.ToDevice(input.dataDevice);
+        tempInput.Allocate();
+
+        tempMiddle.Resize({input.dims[0], weights[2]->dims[0]});
+        tempMiddle.dataType = input.dataType;
+        tempMiddle.ToDevice(input.dataDevice);
+        tempMiddle.Allocate();
+
+        tempSwiglu.Resize({input.dims[0], weights[2]->dims[0] / 2});
+        tempSwiglu.dataType = input.dataType;
+        tempSwiglu.ToDevice(input.dataDevice);
+        tempSwiglu.Allocate();
+
+        tempOutput.Resize(output.dims);
+        tempOutput.dataType = input.dataType;
+        tempOutput.ToDevice(output.dataDevice);
+        tempOutput.Allocate();
+// ForceDeviceSync(); timeCnt["alloc data"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+static float total = 0.0f;
+std::map <int, int> eeCnt;
+for (int e = 0; e < expertTasks.size(); e++) {
+    if (weights[e * 2] != nullptr) {
+        eeCnt[expertTasks[e].size()]++;
+    }
+}
+for (auto &it : eeCnt) {
+    // printf("%d: %d\n", it.first, it.second);
+}
+        for (int i = 0; i < expertTasks.size(); i++) {
+            if (expertTasks[i].size() == 0 || expertTasks[i].size() < expertLimit || weights[i * 2] == nullptr) {
+                continue;
+            }
+// ForceDeviceSync(); timeCnt["expert start"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+            weights[i * 2]->ToCudaTemporary({}, true);
+            weights[i * 2 + 1]->ToCudaTemporary({}, true);
+total += weights[i * 2]->GetBytes();
+total += weights[i * 2 + 1]->GetBytes();
+// ForceDeviceSync(); timeCnt["copy weight"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+            tempInput.Resize({(int)expertTasks[i].size(), tempInput.dims[1]});
+            FastllmCudaPickInput (
+                (uint8_t*)input.cudaData, 
+                (uint8_t*)tempInput.cudaData, 
+                expertTasks[i].size(), 
+                GetDataBytes(input.dataType, 1, input.dims[1]), 
+                cudaIndex + startIdx[i]
+            );
+// ForceDeviceSync(); timeCnt["pick input"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+            DoCudaLinearReshape(tempInput, *weights[i * 2], tempMiddle);
+            DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
+// ForceDeviceSync(); timeCnt["linear"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+            DoCudaSwigluReshape(tempMiddle, tempSwiglu);
+            DoCudaSwiglu(tempMiddle, tempSwiglu);
+// ForceDeviceSync(); timeCnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+            DoCudaLinearReshape(tempSwiglu, *weights[i * 2 + 1], tempOutput);
+            DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
+// ForceDeviceSync(); timeCnt["linear"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+            FastllmCudaPickOutput (
+                (uint8_t*)tempOutput.cudaData, 
+                (uint8_t*)output.cudaData, 
+                expertTasks[i].size(), 
+                output.dims[1], 
+                cudaIndex + startIdx[i],
+                cudaScales + startIdx[i], 
+                tempOutput.dataType
+            );
+// ForceDeviceSync(); timeCnt["pick output"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+            weights[i * 2]->FreeCudaTemporary({}, false);
+            weights[i * 2 + 1]->FreeCudaTemporary({}, false);
+// ForceDeviceSync(); timeCnt["FreeCudaTemporary"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+        }
+
+        FastllmCudaFree(cudaIndex);
+        FastllmCudaFree(cudaScales);
+// printf("copy weight %f G.\n", total / 1e9);
+
+        input.FreeCudaTemporary({}, false);
+        output.FreeCudaTemporary({}, true);
+// ForceDeviceSync(); timeCnt["last free"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+float totalTime = 0.0f;
+// for (auto &it : timeCnt) {
+    // printf("%s: %f s.\n", it.first.c_str(), it.second);
+    // totalTime += it.second;
+// }
+// printf("total time = %f\n", totalTime);
+    }
+
+    void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
+                        Data **weights, Data **biass, float sharedScale) {
+// static std::map<std::string, float> mergeMoeTimeCnt;
+// auto st = std::chrono::system_clock::now();
         output.Allocate();
+// ForceDeviceSync(); mergeMoeTimeCnt["allocate"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
         {
             int batch = input.dims[0];
-            Data &bias = gateBias;                  
-            ToDataType(logits, DataType::FLOAT32);
-            logits.ToDevice(DataDevice::CPU);
-            float *cpuRouterLogits = (float*)logits.cpuData;
-            int m = logits.dims.back();
+            
+            // 确保 index 和 score 在 CPU 上
+            index.ToDevice(DataDevice::CPU);
+            score.ToDevice(DataDevice::CPU);
+            ToDataType(index, DataType::INT32);
+            ToDataType(score, DataType::FLOAT32);
+            
+            int32_t *indexData = (int32_t*)index.cpuData;
+            float *scoreData = (float*)score.cpuData;
+            int n = index.dims[0];
+            int topk = index.dims[1];
+            
             if (batch == 1) {
-                float *cur = cpuRouterLogits;
-                std::vector <std::pair <float, int> > oriV; // (value, idx)
-                for (int i = 0; i < m; i++) {
-                    oriV.push_back(std::make_pair(-cur[i], i));
-                }
-                if (bias.dims.size() > 0) {
-                    ToDataType(bias, DataType::FLOAT32);
-                    bias.ToDevice(DataDevice::CPU);
-                    float *cpuBias = (float*)bias.cpuData;
-                    for (int i = 0; i < m; i++) {
-                        oriV[i].first -= cpuBias[i];
-                    }
-                }
-                // sort(oriV.begin(), oriV.end());
-                std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
-                float sum = 0.0;
-                for (int j = 0; j < topk; j++) {
-                    float value = cur[oriV[j].second];
-                    sum += value;
-                }
-                if (!needNorm) {
-                    sum = 1.0;
-                }
                 std::vector <std::pair <int, float> > v;
                 v.resize(topk + 1);
                 for (int j = 0; j < topk; j++) {
-                    v[j] = std::make_pair(oriV[j].second + 1, cur[oriV[j].second] / sum * routeScale);
+                    // index 存储的是专家索引（从0开始），需要+1因为0表示shared expert
+                    int expertIdx = indexData[j];
+                    float expertScore = scoreData[j];
+                    v[j] = std::make_pair(expertIdx + 1, expertScore);
                 }
                 v.back() = (std::make_pair(0, sharedScale));
+// ForceDeviceSync(); mergeMoeTimeCnt["get_experts"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 for (int j = 0; j < v.size(); j++) {
                     int idx = v[j].first;
                     float value = v[j].second;
@@ -1282,12 +1475,15 @@ namespace fastllm {
 
                     DoCudaLinearReshape(input, *weights[idx * 2], w3);
                     DoCudaLinear(input, *weights[idx * 2], *GetEmptyData(), w3);
+// ForceDeviceSync(); mergeMoeTimeCnt["linear1"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                     DoCudaSwigluReshape(w3, w1);
                     DoCudaSwiglu(w3, w1);
+// ForceDeviceSync(); mergeMoeTimeCnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                     DoCudaLinearReshape(w1, *weights[idx * 2 + 1], w2);
                     DoCudaLinear(w1, *weights[idx * 2 + 1], *GetEmptyData(), w2);
+// ForceDeviceSync(); mergeMoeTimeCnt["linear2"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                     if (j == 0) {
                         output.dataType = w2.dataType;
                         output.Resize(w2.dims);
@@ -1295,60 +1491,53 @@ namespace fastllm {
                     } else {
                         FastllmCudaAddTo(output, w2, value);
                     }
+// ForceDeviceSync(); mergeMoeTimeCnt["mul_add"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 }
             } else {
                 FastllmCudaMemset0(output.cudaData, output.GetBytes());
-                std::vector <std::pair <float, int> > v; // (value, idx)
-                v.resize(m);
+                
+                // 计算最大专家数量
+                int maxExpert = 0;
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j < topk; j++) {
+                        int expertIdx = indexData[i * topk + j];
+                        if (expertIdx > maxExpert) {
+                            maxExpert = expertIdx;
+                        }
+                    }
+                }
+                int m = maxExpert + 1; // 专家数量
+                
                 std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
                 expertTasks.resize(m + 1);
                 for (int b = 0; b < batch; b++) {
                     expertTasks[0].push_back(std::make_pair(b, sharedScale));
-                    float *cur = cpuRouterLogits + b * m;
-                    for (int i = 0; i < m; i++) {
-                        v[i] = (std::make_pair(-cur[i], i));
-                    }
-                    if (gateBias.dims.size() > 0) {
-                        ToDataType(gateBias, DataType::FLOAT32);
-                        gateBias.ToDevice(DataDevice::CPU);
-                        float *cpuBias = (float*)gateBias.cpuData;
-                        for (int i = 0; i < m; i++) {
-                            v[i].first -= cpuBias[i];
-                        }
-                    }
-                    // sort(v.begin(), v.end());
-                    partial_sort(v.begin(), v.begin() + topk, v.end());
-                    float sum = 1.0;
-                    if (needNorm) {
-                        sum = 0.0;
-                        for (int j = 0; j < topk; j++) {
-                            sum += cur[v[j].second];
-                        }
-                    }
-                    
                     for (int j = 0; j < topk; j++) {
-                        int idx = v[j].second;
-                        float value = cur[idx] / sum * routeScale;
-                        expertTasks[idx + 1].push_back(std::make_pair(b, value));
+                        int expertIdx = indexData[b * topk + j];
+                        float value = scoreData[b * topk + j];
+                        expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
                     }
                 }
 
-                std::vector <int> index;
+                std::vector <int> indexVec2;
                 std::vector <float> scales;
                 std::vector <int> startIdx;                
                 for (int i = 0; i < expertTasks.size(); i++) {
-                    startIdx.push_back(index.size());
+                    startIdx.push_back(indexVec2.size());
                     for (int j = 0; j < expertTasks[i].size(); j++) {
-                        index.push_back(expertTasks[i][j].first);
+                        indexVec2.push_back(expertTasks[i][j].first);
                         scales.push_back(expertTasks[i][j].second);
                     }
                 }
+// ForceDeviceSync(); mergeMoeTimeCnt["get_experts"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
-                int *cudaIndex = (int*)FastllmCudaMalloc(index.size() * sizeof(int));
-                FastllmCudaCopyFromHostToDevice(cudaIndex, index.data(), index.size() * sizeof(int));
+                int *cudaIndex = (int*)FastllmCudaMalloc(indexVec2.size() * sizeof(int));
+// ForceDeviceSync(); mergeMoeTimeCnt["malloc_index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                FastllmCudaCopyFromHostToDevice(cudaIndex, indexVec2.data(), indexVec2.size() * sizeof(int));
 
                 float *cudaScales = (float*)FastllmCudaMalloc(scales.size() * sizeof(float));
                 FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
+// ForceDeviceSync(); mergeMoeTimeCnt["copy_index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                 Data tempInput, tempMiddle, tempSwiglu, tempOutput;
                 tempInput.Resize(input.dims);
@@ -1366,11 +1555,13 @@ namespace fastllm {
                 tempOutput.Resize(output.dims);
                 tempOutput.ToDevice(output.dataDevice);
                 tempOutput.Allocate();
+// ForceDeviceSync(); mergeMoeTimeCnt["alloc_data"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                 for (int i = 0; i < expertTasks.size(); i++) {
                     if (expertTasks[i].size() == 0 || weights[i * 2] == nullptr) {
                         continue;
                     }
+// ForceDeviceSync(); mergeMoeTimeCnt["expert_start"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                     tempInput.Resize({(int)expertTasks[i].size(), tempInput.dims[1]});
                     FastllmCudaPickInput (
@@ -1380,15 +1571,19 @@ namespace fastllm {
                         GetDataBytes(input.dataType, 1, input.dims[1]), 
                         cudaIndex + startIdx[i]
                     );
+// ForceDeviceSync(); mergeMoeTimeCnt["pick_input"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                     DoCudaLinearReshape(tempInput, *weights[i * 2], tempMiddle);
                     DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
+// ForceDeviceSync(); mergeMoeTimeCnt["linear1"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                     DoCudaSwigluReshape(tempMiddle, tempSwiglu);
                     DoCudaSwiglu(tempMiddle, tempSwiglu);
+// ForceDeviceSync(); mergeMoeTimeCnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                     DoCudaLinearReshape(tempSwiglu, *weights[i * 2 + 1], tempOutput);
                     DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
+// ForceDeviceSync(); mergeMoeTimeCnt["linear2"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
                     FastllmCudaPickOutput (
                         (uint8_t*)tempOutput.cudaData, 
@@ -1399,108 +1594,37 @@ namespace fastllm {
                         cudaScales + startIdx[i], 
                         output.dataType
                     );
+// ForceDeviceSync(); mergeMoeTimeCnt["pick_output"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 }
 
                 FastllmCudaFree(cudaIndex);
                 FastllmCudaFree(cudaScales);
-/*
-                Data attenPart, moePart;
-                Data moeFinal = Data();
-                moeFinal.Resize({0, input.dims[1]});
-                moeFinal.Expansion(input.dims);
-                attenPart.ToDevice(input.dataDevice);
-                moePart.ToDevice(input.dataDevice);
-                moeFinal.ToDevice(input.dataDevice);
-
-                for (int b = 0; b < batch; b++) {
-                    float *cur = cpuRouterLogits + b * m;
-                    std::vector <std::pair <float, int> > oriV; // (value, idx)
-                    for (int i = 0; i < m; i++) {
-                        oriV.push_back(std::make_pair(-cur[i], i));
-                    }
-                    if (bias.dims.size() > 0) {
-                        ToDataType(bias, DataType::FLOAT32);
-                        bias.ToDevice(DataDevice::CPU);
-                        float *cpuBias = (float*)bias.cpuData;
-                        for (int i = 0; i < m; i++) {
-                            oriV[i].first -= cpuBias[i];
-                        }
-                    }
-
-                    sort(oriV.begin(), oriV.end());
-                    Data *currentData = &input;
-                    if (batch != 1) {
-                        DoCudaSplitReshape(input, 0, b, b + 1, attenPart);
-                        DoCudaSplit(input, 0, b, b + 1, attenPart);
-                        currentData = &attenPart;
-                    }
-                        
-                    moePart.Resize(currentData->dims);
-                    moePart.Allocate(0.0f);
-
-                    float sum = 0.0;
-                    for (int j = 0; j < topk; j++) {
-                        float value = cur[oriV[j].second];
-                        sum += value;
-                    }
-                    if (!needNorm) {
-                        sum = 1.0;
-                    }
-
-                    std::vector <std::pair <int, float> > v;
-                    for (int j = 0; j < topk; j++) {
-                        v.push_back(std::make_pair(oriV[j].second + 1, cur[oriV[j].second] / sum * routeScale));
-                    }
-                    v.push_back(std::make_pair(0, sharedScale));
-
-                    for (int j = 0; j < v.size(); j++) {
-                        int idx = v[j].first;
-                        float value = v[j].second;
-                        if (weights[idx * 2] == nullptr) {
-                            continue;
-                        }
-                        
-                        DoCudaLinearReshape(*currentData, *weights[idx * 2], w3);
-                        DoCudaLinear(*currentData, *weights[idx * 2], *GetEmptyData(), w3);
-
-                        DoCudaSwigluReshape(w3, w1);
-                        DoCudaSwiglu(w3, w1);
-
-                        DoCudaLinearReshape(w1, *weights[idx * 2 + 1], w2);
-                        DoCudaLinear(w1, *weights[idx * 2 + 1], *GetEmptyData(), w2);
-
-                        FastllmCudaAddTo(moePart, w2, value);
-                    }
-
-                    DoCudaCatDirect(moeFinal, moePart, 0);
-                    moeFinal.expansionDims.clear();
-
-                    FastllmCudaMul(moeFinal, 1.0f, output);
-                }
-*/
+// ForceDeviceSync(); mergeMoeTimeCnt["free"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
             }
         }
+// float totalTime = 0.0f;
+// for (auto &it : mergeMoeTimeCnt) {
+    // printf("[DoCudaMergeMOE] %s: %f s.\n", it.first.c_str(), it.second);
+    // totalTime += it.second;
+// }
+// printf("[DoCudaMergeMOE] total: %f s.\n", totalTime);
     }
 
     void CudaMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        Data &gateBias = *(datas.find("gateBias")->second);
-        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
         Data &w1 = *(datas.find("w1")->second);
         Data &w2 = *(datas.find("w2")->second);
         Data &w3 = *(datas.find("w3")->second);
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
-        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
-        int needNorm = intParams.find("needNorm") != intParams.end() ? intParams.find("needNorm")->second : 0;
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
-        float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
-    
+
         DoCudaMergeMOE (
-            input, output, gateBias, logits, w1, w2, w3, weights, biass, 
-            topk, needNorm, sharedScale, routeScale
+            input, output, index, score, w1, w2, w3, weights, biass, sharedScale
         );
     }
 
