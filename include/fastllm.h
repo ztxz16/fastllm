@@ -238,6 +238,7 @@ namespace fastllm {
         FP8_E4M3 = 10,
         INT2_GROUP = 11, // 不用zeroPoint的int2, floatValue = min + uint2Value * scale, 且使用分组量化
         BASE3_GROUP = 12, // 三元量化，-1 0 1
+        INT32 = 13, // int32
         INT32PARAM = 100, // int32的参数，这种类型的数据永远存在CPU上
         FP8_E4M3_BLOCK_128 = 1000, // fp8e4m3, block = 128
         AWQ_4BIT_128 = 1001, // awq, bits = 4, group = 128
@@ -684,9 +685,9 @@ namespace fastllm {
     void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset);
 
     bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass);
-    void MergeMOE(const Data &input, const Data &logits, Data &gateBias, std::vector <Data*> &weights, std::vector <Data*> &biass, 
+    void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
-                float routeScale, float sharedScale, int topk, bool needNorm, Data &output);
+                float sharedScale, Data &output, int layer = 0);
     
     void MergeMLA(Data &qNope, Data &qPe, Data &kvCache, Data &peCache, const Data &mask, Data &output, float softmaxScale);
 
@@ -797,6 +798,8 @@ namespace fastllm {
     void PermuteSelf(const Data &input, const std::vector<int> &axis); // 转置
 
     void TopK(const Data &input, Data &output, int topK); // 求topk
+
+    void SelectExpert(const Data &logits, Data &index, Data &score, int topk, bool needNorm = false, float routeScale = 1.0f, const Data *gateBias = nullptr); // MOE专家选择
 
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim); // 2D position
 

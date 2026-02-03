@@ -72,6 +72,7 @@ namespace fastllm {
         this->ops["RecurrentGatedDeltaRule"] = (BaseOperator*)(new CpuRecurrentGatedDeltaRuleOp());
         this->ops["CausalMask"] = (BaseOperator*)(new CpuCausalMaskOp());
         this->ops["TopK"] = (BaseOperator*)(new CpuTopKOp());
+        this->ops["SelectExpert"] = (BaseOperator*)(new CpuSelectExpertOp());
         this->ops["Permute"] = (BaseOperator*)(new CpuPermuteOp());
         this->ops["PermuteSelf"] = (BaseOperator*)(new CpuPermuteSelfOp());
         this->ops["RotatePosition2D"] = (BaseOperator*)(new CpuRotatePosition2DOp());
@@ -1445,24 +1446,28 @@ namespace fastllm {
  // std::vector <std::pair <std::string, float> > record;
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        Data &gateBias = *(datas.find("gateBias")->second);
-        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
         Data &w1 = *(datas.find("w1")->second);
         Data &w2 = *(datas.find("w2")->second);
         Data &w3 = *(datas.find("w3")->second);
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
-        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
-        int needNorm = intParams.find("needNorm") != intParams.end() ? intParams.find("needNorm")->second : 0;
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
-        float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
         output.Allocate();
+
+        // index: [n, topk], score: [n, topk]
+        int n = index.dims[0];
+        int topk = index.dims[1];
+        int weightsBatch = intParams.find("weights___batch") != intParams.end() ? intParams.find("weights___batch")->second : (topk + 1) * 2;
+        
+        ToDataType(score, DataType::FLOAT32);
+        int32_t *indexData = (int32_t*)index.cpuData;
+        float *scoreData = (float*)score.cpuData;
 
         if (weights[2]->dataType == DataType::DATA_GGUF_FORMAT && 
             !weights[2]->IsRepacked) {
-            int dimsLen = logits.dims.size();
-            int outer = logits.Count(0) / logits.Count(dimsLen - 1);
-            int channels = logits.dims[dimsLen - 1];
+            int channels = n > 0 ? (weightsBatch / 2 - 1) : 0; // 专家数量
             int len = channels * 2;
             
             auto *pool = GetAlivePool();
@@ -1497,13 +1502,12 @@ namespace fastllm {
                 permuteType = 0;
             }
             
-            int dimsLen = logits.dims.size();
-            int outer = logits.Count(0) / logits.Count(dimsLen - 1);
-            int channels = logits.dims[dimsLen - 1];
-
-            std::vector <float> vLogits, vInputs;
-            float *floatLogits = ((float*)logits.cpuData);
+            int32_t *indexData = (int32_t*)index.cpuData;
+            float *scoreData = (float*)score.cpuData;
+            
+            int outer = n;
             float *floatInput = (float*)input.cpuData;
+            std::vector <float> vInputs;
             output.Allocate(0.0f);
 
             if (input.dataType == DataType::FLOAT16) {
@@ -1514,46 +1518,14 @@ namespace fastllm {
                 }
                 floatInput = vInputs.data();
             }
-            if (logits.dataType == DataType::FLOAT16) {
-                int len = logits.Count(0);
-                vLogits.resize(len);
-                for (int i = 0; i < len; i++) {
-                    vLogits[i] = fp16tofp32.dict[((uint16_t*)logits.cpuData)[i]];
-                }
-                floatLogits = vLogits.data();
-            }
+            
             for (int o = 0; o < outer; o++) {
-                std::vector <std::pair <float, int> > oriV;
-                oriV.resize(channels);
-                for (int j = 0; j < channels; j++) {
-                    oriV[j].first = -floatLogits[o * channels + j];
-                    oriV[j].second = j;
-                }
-                if (gateBias.dims.size() > 0) {
-                    if (gateBias.dataType != DataType::FLOAT32) {
-                        ToDataType(gateBias, DataType::FLOAT32);
-                    }
-                    float *cpuBias = (float*)gateBias.cpuData;
-                    for (int i = 0; i < channels; i++) {
-                        oriV[i].first -= cpuBias[i];
-                    }
-                }
-// record.push_back(std::make_pair("very first", GetSpan(ttt, std::chrono::system_clock::now())));
-                // sort(oriV.begin(), oriV.end());
-                std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
-                // std::nth_element(oriV.begin(), oriV.begin() + topk, oriV.end());
-// record.push_back(std::make_pair("sort", GetSpan(ttt, std::chrono::system_clock::now())));
-                float sum = 1.0;
-                if (needNorm) {
-                    sum = 0.0;
-                    for (int j = 0; j < topk; j++) {
-                        sum += floatLogits[o * channels + oriV[j].second];
-                    }
-                }
-
                 std::vector <std::pair <int, float> > v;
                 for (int j = 0; j < topk; j++) {
-                    v.push_back(std::make_pair(oriV[j].second + 1, floatLogits[o * channels + oriV[j].second] / sum * routeScale));
+                    // index 存储的是专家索引（从0开始），需要+1因为0表示shared expert
+                    int expertIdx = indexData[o * topk + j];
+                    float expertScore = scoreData[o * topk + j];
+                    v.push_back(std::make_pair(expertIdx + 1, expertScore));
                 }
                 if (weights[0] != nullptr) {
                     v.push_back(std::make_pair(0, sharedScale));
@@ -1790,13 +1762,9 @@ namespace fastllm {
         } else if ((input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16) && 
                 (weights[2]->dataType == DataType::DATA_GGUF_FORMAT) &&
             input.dims[0] < 32) {
-            int dimsLen = logits.dims.size();
-            int outer = logits.Count(0) / logits.Count(dimsLen - 1);
-            int channels = logits.dims[dimsLen - 1];
-
-            std::vector <float> vLogits, vInputs;
-            float *floatLogits = ((float*)logits.cpuData);
+            int outer = n;
             float *floatInput = (float*)input.cpuData;
+            std::vector <float> vInputs;
             output.Allocate(0.0f);
 
             if (input.dataType == DataType::FLOAT16) {
@@ -1807,51 +1775,17 @@ namespace fastllm {
                 }
                 floatInput = vInputs.data();
             }
-            if (logits.dataType == DataType::FLOAT16) {
-                int len = logits.Count(0);
-                vLogits.resize(len);
-                for (int i = 0; i < len; i++) {
-                    vLogits[i] = fp16tofp32.dict[((uint16_t*)logits.cpuData)[i]];
-                }
-                floatLogits = vLogits.data();
-            }
             for (int o = 0; o < outer; o++) {
-                std::vector <std::pair <float, int> > oriV;
-                oriV.resize(channels);
-                for (int j = 0; j < channels; j++) {
-                    oriV[j].first = -floatLogits[o * channels + j];
-                    oriV[j].second = j;
-                }
-                if (gateBias.dims.size() > 0) {
-                    if (gateBias.dataType != DataType::FLOAT32) {
-                        ToDataType(gateBias, DataType::FLOAT32);
-                    }
-                    float *cpuBias = (float*)gateBias.cpuData;
-                    for (int i = 0; i < channels; i++) {
-                        oriV[i].first -= cpuBias[i];
-                    }
-                }
-// record.push_back(std::make_pair("very first", GetSpan(ttt, std::chrono::system_clock::now())));
-                // sort(oriV.begin(), oriV.end());
-                std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
-                // std::nth_element(oriV.begin(), oriV.begin() + topk, oriV.end());
-// record.push_back(std::make_pair("sort", GetSpan(ttt, std::chrono::system_clock::now())));
-                float sum = 1.0;
-                if (needNorm) {
-                    sum = 0.0;
-                    for (int j = 0; j < topk; j++) {
-                        sum += floatLogits[o * channels + oriV[j].second];
-                    }
-                }
-
                 std::vector <std::pair <int, float> > v;
                 for (int j = 0; j < topk; j++) {
-                    v.push_back(std::make_pair(oriV[j].second + 1, floatLogits[o * channels + oriV[j].second] / sum * routeScale));
+                    int expertIdx = indexData[o * topk + j];
+                    float expertScore = scoreData[o * topk + j];
+                    v.push_back(std::make_pair(expertIdx + 1, expertScore));
                 }
                 if (weights[0] != nullptr) {
                     v.push_back(std::make_pair(0, sharedScale));
                 }
-                int n = input.dims[0], m = input.dims[1];
+                int nRow = input.dims[0], m = input.dims[1];
                 float *inputData = floatInput + o * m;
 
                 std::vector <uint8_t> &q8kInputs = moeIntSingleVarManager.uinput;
@@ -2027,13 +1961,9 @@ namespace fastllm {
         } else if ((input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16) && 
                 (weights[2]->dataType == DataType::FLOAT16) &&
                 input.dims[0] < 32) {
-            int dimsLen = logits.dims.size();
-            int outer = logits.Count(0) / logits.Count(dimsLen - 1);
-            int channels = logits.dims[dimsLen - 1];
-
-            std::vector <float> vLogits, vInputs;
-            float *floatLogits = ((float*)logits.cpuData);
+            int outer = n;
             float *floatInput = (float*)input.cpuData;
+            std::vector <float> vInputs;
             output.Allocate(0.0f);
 
             if (input.dataType == DataType::FLOAT16) {
@@ -2044,47 +1974,17 @@ namespace fastllm {
                 }
                 floatInput = vInputs.data();
             }
-            if (logits.dataType == DataType::FLOAT16) {
-                int len = logits.Count(0);
-                vLogits.resize(len);
-                for (int i = 0; i < len; i++) {
-                    vLogits[i] = fp16tofp32.dict[((uint16_t*)logits.cpuData)[i]];
-                }
-                floatLogits = vLogits.data();
-            }
             for (int o = 0; o < outer; o++) {
-                std::vector <std::pair <float, int> > oriV;
-                oriV.resize(channels);
-                for (int j = 0; j < channels; j++) {
-                    oriV[j].first = -floatLogits[o * channels + j];
-                    oriV[j].second = j;
-                }
-                if (gateBias.dims.size() > 0) {
-                    if (gateBias.dataType != DataType::FLOAT32) {
-                        ToDataType(gateBias, DataType::FLOAT32);
-                    }
-                    float *cpuBias = (float*)gateBias.cpuData;
-                    for (int i = 0; i < channels; i++) {
-                        oriV[i].first -= cpuBias[i];
-                    }
-                }
-                std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
-                float sum = 1.0;
-                if (needNorm) {
-                    sum = 0.0;
-                    for (int j = 0; j < topk; j++) {
-                        sum += floatLogits[o * channels + oriV[j].second];
-                    }
-                }
-
                 std::vector <std::pair <int, float> > v;
                 for (int j = 0; j < topk; j++) {
-                    v.push_back(std::make_pair(oriV[j].second + 1, floatLogits[o * channels + oriV[j].second] / sum * routeScale));
+                    int expertIdx = indexData[o * topk + j];
+                    float expertScore = scoreData[o * topk + j];
+                    v.push_back(std::make_pair(expertIdx + 1, expertScore));
                 }
                 if (weights[0] != nullptr) {
                     v.push_back(std::make_pair(0, sharedScale));
                 }
-                int n = input.dims[0], m = input.dims[1];
+                int m = input.dims[1];
                 float *inputData = floatInput + o * m;
             
                 auto &middles = moeFloatSingleVarManager.middles;
@@ -2211,64 +2111,21 @@ namespace fastllm {
                 (weights[2]->dataType == DataType::FP8_E4M3 ||
                  weights[2]->dataType == DataType::BFLOAT16) &&
                 input.dims[0] < 32) {
-            int dimsLen = logits.dims.size();
-            int outer = logits.Count(0) / logits.Count(dimsLen - 1);
-            int channels = logits.dims[dimsLen - 1];
-
-            std::vector <float> vLogits, vInputs;
-            float *floatLogits = ((float*)logits.cpuData);
+            int outer = n;
             float *floatInput = (float*)input.cpuData;
             output.Allocate(0.0f);
 
-            if (input.dataType == DataType::FLOAT16) {
-                int len = input.Count(0);
-                vInputs.resize(len);
-                for (int i = 0; i < len; i++) {
-                    vInputs[i] = fp16tofp32.dict[((uint16_t*)input.cpuData)[i]];
-                }
-                floatInput = vInputs.data();
-            }
-            if (logits.dataType == DataType::FLOAT16) {
-                int len = logits.Count(0);
-                vLogits.resize(len);
-                for (int i = 0; i < len; i++) {
-                    vLogits[i] = fp16tofp32.dict[((uint16_t*)logits.cpuData)[i]];
-                }
-                floatLogits = vLogits.data();
-            }
             for (int o = 0; o < outer; o++) {
-                std::vector <std::pair <float, int> > oriV;
-                oriV.resize(channels);
-                for (int j = 0; j < channels; j++) {
-                    oriV[j].first = -floatLogits[o * channels + j];
-                    oriV[j].second = j;
-                }
-                if (gateBias.dims.size() > 0) {
-                    if (gateBias.dataType != DataType::FLOAT32) {
-                        ToDataType(gateBias, DataType::FLOAT32);
-                    }
-                    float *cpuBias = (float*)gateBias.cpuData;
-                    for (int i = 0; i < channels; i++) {
-                        oriV[i].first -= cpuBias[i];
-                    }
-                }
-                std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
-                float sum = 1.0;
-                if (needNorm) {
-                    sum = 0.0;
-                    for (int j = 0; j < topk; j++) {
-                        sum += floatLogits[o * channels + oriV[j].second];
-                    }
-                }
-
                 std::vector <std::pair <int, float> > v;
                 for (int j = 0; j < topk; j++) {
-                    v.push_back(std::make_pair(oriV[j].second + 1, floatLogits[o * channels + oriV[j].second] / sum * routeScale));
+                    int expertIdx = indexData[o * topk + j];
+                    float expertScore = scoreData[o * topk + j];
+                    v.push_back(std::make_pair(expertIdx + 1, expertScore));
                 }
                 if (weights[0] != nullptr) {
                     v.push_back(std::make_pair(0, sharedScale));
                 }
-                int n = input.dims[0], m = input.dims[1];
+                int m = input.dims[1];
                 float *inputData = floatInput + o * m;
                 auto &bf16Input = moeFloatSingleVarManager.bf16Input;
                 bf16Input.resize(m);
@@ -2411,51 +2268,25 @@ namespace fastllm {
                 && weights[2]->dataType == DataType::BFLOAT16) {
  auto st = std::chrono::system_clock::now();
             Data gate, attenPart, moePart;
-            ToDataType(logits, DataType::FLOAT32);
-            logits.ToDevice(DataDevice::CPU);
-            float *cpuRouterLogits = (float*)logits.cpuData;
-            int m = logits.dims.back();
+            int bs = input.dims[0];
+            int m = weightsBatch / 2 - 1; // num experts
 
             {
                 auto *pool = GetAlivePool();
 
-                int bs = input.dims[0], dim = output.dims[1];
+                int dim = output.dims[1];
                 int inputDim = input.dims[1];
                 int interDim = weights[2]->dims[0] / 2;
                 int outputDim = output.dims[1];
-                std::vector <std::pair <float, int> > v; // (value, idx)
-                v.resize(m);
 
                 std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
                 expertTasks.resize(m + 1);
                 for (int b = 0; b < bs; b++) {
                     expertTasks[0].push_back(std::make_pair(b, sharedScale));
-                    float *cur = cpuRouterLogits + b * m;
-                    for (int i = 0; i < m; i++) {
-                        v[i] = (std::make_pair(-cur[i], i));
-                    }
-                    if (gateBias.dims.size() > 0) {
-                        ToDataType(gateBias, DataType::FLOAT32);
-                        gateBias.ToDevice(DataDevice::CPU);
-                        float *cpuBias = (float*)gateBias.cpuData;
-                        for (int i = 0; i < m; i++) {
-                            v[i].first -= cpuBias[i];
-                        }
-                    }
-                    // sort(v.begin(), v.end());
-                    partial_sort(v.begin(), v.begin() + topk, v.end());
-                    float sum = 1.0;
-                    if (needNorm) {
-                        sum = 0.0;
-                        for (int j = 0; j < topk; j++) {
-                            sum += cur[v[j].second];
-                        }
-                    }
-                    
                     for (int j = 0; j < topk; j++) {
-                        int idx = v[j].second;
-                        float value = cur[idx] / sum * routeScale;
-                        expertTasks[idx + 1].push_back(std::make_pair(b, value));
+                        int expertIdx = indexData[b * topk + j];
+                        float value = scoreData[b * topk + j];
+                        expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
                     }
                 }
 
@@ -2695,41 +2526,17 @@ ops += (long long)lines * inputDim * interDim * 2;
   // std::map <std::string, float> cnt;
             // normal
             Data gate, attenPart, moePart;
-            ToDataType(logits, DataType::FLOAT32);
-            logits.ToDevice(DataDevice::CPU);
-            float *cpuRouterLogits = (float*)logits.cpuData;
-            int m = logits.dims.back();
+            int m = weightsBatch / 2 - 1; // num experts
 
             if (input.dims[0] == 1) {
-                std::vector <std::pair <float, int> > v; // (value, idx)
-                for (int i = 0; i < m; i++) {
-                    v.push_back(std::make_pair(-cpuRouterLogits[i], i));
-                }
-                if (gateBias.dims.size() > 0) {
-                    ToDataType(gateBias, DataType::FLOAT32);
-                    gateBias.ToDevice(DataDevice::CPU);
-                    float *cpuBias = (float*)gateBias.cpuData;
-                    for (int i = 0; i < m; i++) {
-                        v[i].first -= cpuBias[i];
-                    }
-                }
-                sort(v.begin(), v.end());
-                float sum = 1.0;
-                if (needNorm) {
-                    sum = 0.0;
-                    for (int j = 0; j < topk; j++) {
-                        sum += cpuRouterLogits[v[j].second];
-                    }
-                }
-
                 output.Allocate(0.0f);
                 for (int j = 0; j < topk; j++) {
-                    int idx = v[j].second;
-                    float value = cpuRouterLogits[idx] / sum * routeScale;
+                    int expertIdx = indexData[j];
+                    float value = scoreData[j];
 
-                    Linear(input, *weights[(idx + 1) * 2], Data(), w3);
+                    Linear(input, *weights[(expertIdx + 1) * 2], Data(), w3);
                     Swiglu(w3, w1);
-                    Linear(w1, *weights[(idx + 1) * 2 + 1], Data(), w2);
+                    Linear(w1, *weights[(expertIdx + 1) * 2 + 1], Data(), w2);
                     AddTo(output, w2, value);
                 }
 
@@ -2753,36 +2560,12 @@ ops += (long long)lines * inputDim * interDim * 2;
   // cnt["prepare 0"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                 tempInput.Allocate();
   // cnt["allocate"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-                std::vector <std::pair <float, int> > v; // (value, idx)
-                v.resize(m);
                 for (int b = 0; b < bs; b++) {
                     expertTasks[0].push_back(std::make_pair(b, sharedScale));
-                    float *cur = cpuRouterLogits + b * m;
-                    for (int i = 0; i < m; i++) {
-                        v[i] = (std::make_pair(-cur[i], i));
-                    }
-                    if (gateBias.dims.size() > 0) {
-                        ToDataType(gateBias, DataType::FLOAT32);
-                        gateBias.ToDevice(DataDevice::CPU);
-                        float *cpuBias = (float*)gateBias.cpuData;
-                        for (int i = 0; i < m; i++) {
-                            v[i].first -= cpuBias[i];
-                        }
-                    }
-                    // sort(v.begin(), v.end());
-                    partial_sort(v.begin(), v.begin() + topk, v.end());
-                    float sum = 1.0;
-                    if (needNorm) {
-                        sum = 0.0;
-                        for (int j = 0; j < topk; j++) {
-                            sum += cur[v[j].second];
-                        }
-                    }
-                    
                     for (int j = 0; j < topk; j++) {
-                        int idx = v[j].second;
-                        float value = cur[idx] / sum * routeScale;
-                        expertTasks[idx + 1].push_back(std::make_pair(b, value));
+                        int expertIdx = indexData[b * topk + j];
+                        float value = scoreData[b * topk + j];
+                        expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
                     }
                 }
   // cnt["prepare"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
@@ -6314,6 +6097,100 @@ ops += (long long)lines * inputDim * interDim * 2;
                 outputData += 2 * topk;
             }
 */
+        }
+    }
+
+    void CpuSelectExpertOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+
+        AssertInFastLLM(logits.dataType == DataType::FLOAT32, "SelectExpert error: logits's type should be float32.\n");
+        
+        int dimsLen = logits.dims.size();
+        int n = logits.Count(0) / logits.dims[dimsLen - 1]; // number of tokens
+        int numExperts = logits.dims[dimsLen - 1]; // number of experts
+
+        // Index output: [n, topk]
+        index.dataType = DataType::INT32;
+        index.Resize({n, topk});
+        
+        // Score output: [n, topk]
+        score.dataType = DataType::FLOAT32;
+        score.Resize({n, topk});
+    }
+
+    void CpuSelectExpertOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        Data *gateBias = datas.find("gateBias") != datas.end() ? datas.find("gateBias")->second : nullptr;
+        
+        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
+        bool needNorm = intParams.find("needNorm") != intParams.end() ? (intParams.find("needNorm")->second != 0) : false;
+        float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;
+        
+        index.Allocate();
+        score.Allocate();
+        
+        // 确保logits在CPU上且为FLOAT32
+        ToDataType(logits, DataType::FLOAT32);
+        logits.ToDevice(DataDevice::CPU);
+        
+        int dimsLen = logits.dims.size();
+        int n = logits.Count(0) / logits.dims[dimsLen - 1]; // number of tokens
+        int numExperts = logits.dims[dimsLen - 1]; // number of experts
+        
+        float *logitsData = (float*)logits.cpuData;
+        int32_t *indexData = (int32_t*)index.cpuData;
+        float *scoreData = (float*)score.cpuData;
+        
+        float *biasData = nullptr;
+        if (gateBias != nullptr && gateBias->dims.size() > 0) {
+            ToDataType(*gateBias, DataType::FLOAT32);
+            gateBias->ToDevice(DataDevice::CPU);
+            biasData = (float*)gateBias->cpuData;
+        }
+        
+        for (int i = 0; i < n; i++) {
+            float *curLogits = logitsData + i * numExperts;
+            
+            // 创建pair数组用于排序: (负值, 索引)
+            std::vector<std::pair<float, int>> v;
+            v.resize(numExperts);
+            for (int j = 0; j < numExperts; j++) {
+                v[j].first = -curLogits[j];
+                v[j].second = j;
+            }
+            
+            // 如果有bias，减去bias
+            if (biasData != nullptr) {
+                for (int j = 0; j < numExperts; j++) {
+                    v[j].first -= biasData[j];
+                }
+            }
+            
+            // 使用partial_sort找到topk
+            std::partial_sort(v.begin(), v.begin() + topk, v.end());
+            
+            // 计算归一化sum
+            float sum = 1.0f;
+            if (needNorm) {
+                sum = 0.0f;
+                for (int j = 0; j < topk; j++) {
+                    sum += curLogits[v[j].second];
+                }
+            }
+            
+            // 填充输出
+            for (int j = 0; j < topk; j++) {
+                int expertIdx = v[j].second;
+                indexData[i * topk + j] = expertIdx;
+                scoreData[i * topk + j] = curLogits[expertIdx] / sum * routeScale;
+            }
         }
     }
 
