@@ -917,22 +917,22 @@ namespace fastllm {
         uint8_t *oriCudaInput, *oriCpuInput, *partOutput;
         Data *input;
         Data **weights;
-        Data *logits, *gateBias;
+        Data *index, *score;
         Data *w1, *w2, *w3;
-        int wBatch, topk, needNorm;
-        float routeScale, sharedScale;
+        int wBatch;
+        float sharedScale;
         Data *output;
         int deviceId;
 
         MultiCudaDoMergeMOEOp(uint8_t *oriCudaInput, uint8_t *oriCpuInput, uint8_t *partOutput, 
-                Data *input, Data **weights, Data *logits, Data *gateBias, 
+                Data *input, Data **weights, Data *index, Data *score, 
                 Data *w1, Data *w2, Data *w3, 
-                int wBatch, int topk, int needNorm, float routeScale, float sharedScale,
+                int wBatch, float sharedScale,
                 Data *output, int deviceId) : 
                 oriCudaInput(oriCudaInput), oriCpuInput(oriCpuInput), partOutput(partOutput),
-                input(input), weights(weights), logits(logits), gateBias(gateBias), 
+                input(input), weights(weights), index(index), score(score), 
                 w1(w1), w2(w2), w3(w3),
-                wBatch(wBatch), topk(topk), needNorm(needNorm), routeScale(routeScale), sharedScale(sharedScale),
+                wBatch(wBatch), sharedScale(sharedScale),
                 output(output), deviceId(deviceId) {}
 
         void Run() {
@@ -962,7 +962,7 @@ namespace fastllm {
             }
 
             output->Resize(input->dims);
-            DoCudaMergeMOE(*input, *output, *gateBias, *logits, *w1, *w2, *w3, curWeights.data(), nullptr, topk, needNorm, sharedScale, routeScale);
+            DoCudaMergeMOE(*input, *output, *index, *score, *w1, *w2, *w3, curWeights.data(), nullptr, sharedScale);
 
             if (deviceId != 0) {
                 FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
@@ -974,22 +974,22 @@ namespace fastllm {
         uint8_t *oriCpuInput, *partOutput;
         Data *input;
         Data **weights;
-        Data *logits, *gateBias;
+        Data *index, *score;
         Data *w1, *w2, *w3;
-        int wBatch, topk, needNorm;
-        float routeScale, sharedScale;
+        int wBatch;
+        float sharedScale;
         Data *output;
         int deviceId;
 
         MultiCudaCpuDoMergeMOEOp(uint8_t *oriCpuInput, uint8_t *partOutput, 
-                Data *input, Data **weights, Data *logits, Data *gateBias, 
+                Data *input, Data **weights, Data *index, Data *score, 
                 Data *w1, Data *w2, Data *w3, 
-                int wBatch, int topk, int needNorm, float routeScale, float sharedScale,
+                int wBatch, float sharedScale,
                 Data *output, int deviceId) : 
                 oriCpuInput(oriCpuInput), partOutput(partOutput),
-                input(input), weights(weights), logits(logits), gateBias(gateBias), 
+                input(input), weights(weights), index(index), score(score), 
                 w1(w1), w2(w2), w3(w3),
-                wBatch(wBatch), topk(topk), needNorm(needNorm), routeScale(routeScale), sharedScale(sharedScale),
+                wBatch(wBatch), sharedScale(sharedScale),
                 output(output), deviceId(deviceId) {}
 
         void Run() {
@@ -998,36 +998,23 @@ namespace fastllm {
             memcpy(input->cpuData, oriCpuInput, input->GetBytes());
 
             int batch = input->dims[0];
-            Data &bias = *gateBias;                  
-            float *cpuRouterLogits = (float*)logits->cpuData;
-            int m = logits->dims.back();
+            int n = index->dims[0];
+            int topk = index->dims[1];
+            
+            index->ToDevice(DataDevice::CPU);
+            score->ToDevice(DataDevice::CPU);
+            ToDataType(*index, DataType::INT32PARAM);
+            ToDataType(*score, DataType::FLOAT32);
+            int32_t *indexData = (int32_t*)index->cpuData;
+            float *scoreData = (float*)score->cpuData;
 
             if (batch == 1) {
-                float *cur = cpuRouterLogits;
-                std::vector <std::pair <float, int> > oriV; // (value, idx)
-                for (int i = 0; i < m; i++) {
-                    oriV.push_back(std::make_pair(-cur[i], i));
-                }
-                if (bias.dims.size() > 0) {
-                    float *cpuBias = (float*)bias.cpuData;
-                    for (int i = 0; i < m; i++) {
-                        oriV[i].first -= cpuBias[i];
-                    }
-                }
-                // sort(oriV.begin(), oriV.end());
-                std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
-                float sum = 0.0;
-                for (int j = 0; j < topk; j++) {
-                    float value = cur[oriV[j].second];
-                    sum += value;
-                }
-                if (!needNorm) {
-                    sum = 1.0;
-                }
                 std::vector <std::pair <int, float> > v;
                 v.resize(topk + 1);
                 for (int j = 0; j < topk; j++) {
-                    v[j] = std::make_pair(oriV[j].second + 1, cur[oriV[j].second] / sum * routeScale);
+                    int expertIdx = indexData[j];
+                    float expertScore = scoreData[j];
+                    v[j] = std::make_pair(expertIdx + 1, expertScore);
                 }
                 v.back() = (std::make_pair(0, sharedScale));
                 for (int j = 0; j < v.size(); j++) {
@@ -1068,19 +1055,6 @@ namespace fastllm {
                 moeFinal.ToDevice(input->dataDevice);
                 
                 for (int b = 0; b < batch; b++) {
-                    float *cur = cpuRouterLogits + b * m;
-                    std::vector <std::pair <float, int> > oriV; // (value, idx)
-                    for (int i = 0; i < m; i++) {
-                        oriV.push_back(std::make_pair(-cur[i], i));
-                    }
-                    if (bias.dims.size() > 0) {
-                        float *cpuBias = (float*)bias.cpuData;
-                        for (int i = 0; i < m; i++) {
-                            oriV[i].first -= cpuBias[i];
-                        }
-                    }
-
-                    sort(oriV.begin(), oriV.end());
                     Data *currentData = input;
                     if (batch != 1) {
                         attenPart.Resize({1, input->dims.back()});
@@ -1098,18 +1072,11 @@ namespace fastllm {
                     moePart.Resize(currentData->dims);
                     moePart.Allocate(0.0f);
 
-                    float sum = 0.0;
-                    for (int j = 0; j < topk; j++) {
-                        float value = cur[oriV[j].second];
-                        sum += value;
-                    }
-                    if (!needNorm) {
-                        sum = 1.0;
-                    }
-
                     std::vector <std::pair <int, float> > v;
                     for (int j = 0; j < topk; j++) {
-                        v.push_back(std::make_pair(oriV[j].second + 1, cur[oriV[j].second] / sum * routeScale));
+                        int expertIdx = indexData[b * topk + j];
+                        float expertScore = scoreData[b * topk + j];
+                        v.push_back(std::make_pair(expertIdx + 1, expertScore));
                     }
                     v.push_back(std::make_pair(0, sharedScale));
 
@@ -1151,17 +1118,17 @@ namespace fastllm {
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        Data &gateBias = *(datas.find("gateBias")->second);
-        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
         Data &w1 = *(datas.find("w1")->second);
         Data &w2 = *(datas.find("w2")->second);
         Data &w3 = *(datas.find("w3")->second);
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
-        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
-        int needNorm = intParams.find("needNorm") != intParams.end() ? intParams.find("needNorm")->second : 0;
-        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
-        float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
+        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;
+        
+        int n = index.dims[0];
+        int topk = index.dims[1];        
         output.Allocate();
         std::vector <int> devices;
         std::map <int, int> ratios;
@@ -1191,12 +1158,10 @@ namespace fastllm {
             }
         }
 
-        ToDataType(logits, DataType::FLOAT32);
-        logits.ToDevice(DataDevice::CPU);
-        if (gateBias.dims.size() > 0) {
-            ToDataType(gateBias, DataType::FLOAT32);
-            gateBias.ToDevice(DataDevice::CPU);
-        }
+        index.ToDevice(DataDevice::CPU);
+        score.ToDevice(DataDevice::CPU);
+        ToDataType(index, DataType::INT32);
+        ToDataType(score, DataType::FLOAT32);
         
         CopyToMultiDevices(w1, devices, false);
         CopyToMultiDevices(w2, devices, false);
@@ -1225,9 +1190,9 @@ namespace fastllm {
             if (specialId != "cpu") {
                 ops.push_back(new MultiCudaDoMergeMOEOp(
                     (uint8_t*)input.cudaData, (uint8_t*)cpuInput.data(), partOutput + output.GetBytes() * i,
-                    input.multiDeviceDatas[device], weights, &logits, &gateBias, 
+                    input.multiDeviceDatas[device], weights, &index, &score, 
                     w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device], 
-                    wBatch, topk, needNorm, routeScale, sharedScale, 
+                    wBatch, sharedScale, 
                     curOutput.multiDeviceDatas[device], device
                 ));
             }
@@ -1247,9 +1212,9 @@ namespace fastllm {
             if (specialId == "cpu") {
                 MultiCudaCpuDoMergeMOEOp (
                     (uint8_t*)cpuInput.data(), partOutput + output.GetBytes() * i,
-                    input.multiDeviceDatas[device], weights, &logits, &gateBias, 
+                    input.multiDeviceDatas[device], weights, &index, &score, 
                     w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device], 
-                    wBatch, topk, needNorm, routeScale, sharedScale, 
+                    wBatch, sharedScale, 
                     curOutput.multiDeviceDatas[device], device).Run();
             }
         }
