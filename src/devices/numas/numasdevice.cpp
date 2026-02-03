@@ -272,7 +272,9 @@ namespace fastllm {
     struct FastllmMoeDataManagerNumas {
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
             std::vector <uint8_t, alignedAllocator<uint8_t, 64> > realInput, expandInput, downInput;
-    } fastllmMoeDataManagerNumas;
+    };
+    // 每层一个 MoE 缓存，避免层间共享导致的数据竞争
+    std::unordered_map<int, FastllmMoeDataManagerNumas> fastllmMoeDataManagerNumasPerLayer;
 
     void RegisterNumas(fastllm::Data *data) {
         data->Repack();
@@ -536,6 +538,9 @@ namespace fastllm {
         }
     }
 
+    extern void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
+        Data **weights, Data **biass, float sharedScale, bool setZero, int expertLimit);
+
     void NumasMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuLinearOp());
@@ -543,25 +548,30 @@ namespace fastllm {
  // std::vector <std::pair <std::string, float> > record;
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        Data &gateBias = *(datas.find("gateBias")->second);
-        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
         Data &w1 = *(datas.find("w1")->second);
         Data &w2 = *(datas.find("w2")->second);
         Data &w3 = *(datas.find("w3")->second);
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
-        int topk = intParams.find("topk") != intParams.end() ? intParams.find("topk")->second : 1;
-        int needNorm = intParams.find("needNorm") != intParams.end() ? intParams.find("needNorm")->second : 0;
-        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
-        float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;        
+        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;
+        
+        // index: [n, topk], score: [n, topk]
+        int n = index.dims[0];
+        int topk = index.dims[1];
+        int weightsBatch = intParams.find("weights___batch") != intParams.end() ? intParams.find("weights___batch")->second : (topk + 1) * 2;
+        int layer = intParams.find("layer") != intParams.end() ? intParams.find("layer")->second : 0;
+        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas = fastllmMoeDataManagerNumasPerLayer[0];
         output.Allocate();
+        
+        int32_t *indexData = (int32_t*)index.cpuData;
+        float *scoreData = (float*)score.cpuData;
 
         if (input.dims[0] < 32) {
 auto st = std::chrono::system_clock::now();
-            ToDataType(logits, DataType::FLOAT32);
-            logits.ToDevice(DataDevice::CPU);
-            float *cpuRouterLogits = (float*)logits.cpuData;
-            int m = logits.dims.back();
+            int32_t *indexData = (int32_t*)index.cpuData;
+            float *scoreData = (float*)score.cpuData;
 
             {
                 auto *pool = GetAlivePool();
@@ -570,35 +580,14 @@ auto st = std::chrono::system_clock::now();
                 int inputDim = input.dims[1];
                 int interDim = weights[2]->dims[0] / 2;
                 int outputDim = output.dims[1];
-                float *floatLogits = ((float*)logits.cpuData);
 
                 for (int o = 0; o < bs; o++) {
-                    std::vector <std::pair <float, int> > oriV;
-                    oriV.resize(m);
-                    for (int j = 0; j < m; j++) {
-                        oriV[j].first = -floatLogits[o * m + j];
-                        oriV[j].second = j;
-                    }
-                    if (gateBias.dims.size() > 0) {
-                        if (gateBias.dataType != DataType::FLOAT32) {
-                            ToDataType(gateBias, DataType::FLOAT32);
-                        }
-                        float *cpuBias = (float*)gateBias.cpuData;
-                        for (int i = 0; i < m; i++) {
-                            oriV[i].first -= cpuBias[i];
-                        }
-                    }
-                    std::partial_sort(oriV.begin(), oriV.begin() + topk, oriV.end());
-                    float sum = 1.0;
-                    if (needNorm) {
-                        sum = 0.0;
-                        for (int j = 0; j < topk; j++) {
-                            sum += floatLogits[o * m + oriV[j].second];
-                        }
-                    }
                     std::vector <std::pair <int, float> > v;
                     for (int j = 0; j < topk; j++) {
-                        v.push_back(std::make_pair(oriV[j].second + 1, floatLogits[o * m + oriV[j].second] / sum * routeScale));
+                        // index 存储的是专家索引（从0开始），需要+1因为0表示shared expert
+                        int expertIdx = indexData[o * topk + j];
+                        float expertScore = scoreData[o * topk + j];
+                        v.push_back(std::make_pair(expertIdx + 1, expertScore));
                     }
                     if (weights[0] != nullptr) {
                         v.push_back(std::make_pair(0, sharedScale));
@@ -832,53 +821,32 @@ auto st = std::chrono::system_clock::now();
                 }
             }
         } else {
-            auto st = std::chrono::system_clock::now();
-            Data gate, attenPart, moePart;
-            ToDataType(logits, DataType::FLOAT32);
-            logits.ToDevice(DataDevice::CPU);
-            float *cpuRouterLogits = (float*)logits.cpuData;
-            int m = logits.dims.back();
+            /*DoCudaMergeMOEFromCPU (
+                input, output, gateBias, logits, w1, w2, w3, weights, biass, topk, needNorm, sharedScale, routeScale, true, 0
+            );
+            return;*/
 
+// auto st = std::chrono::system_clock::now();
+            Data gate, attenPart, moePart;
+            int bs = input.dims[0];
+            int m = weightsBatch / 2 - 1; // num experts
+            int expertLimit = 1e9;
             {
                 auto *pool = GetAlivePool();
 
-                int bs = input.dims[0], dim = output.dims[1];
+                int dim = output.dims[1];
                 int inputDim = input.dims[1];
                 int interDim = weights[2]->dims[0] / 2;
                 int outputDim = output.dims[1];
-                std::vector <std::pair <float, int> > v; // (value, idx)
-                v.resize(m);
 
                 std::vector <std::vector <std::pair <int, float> > > expertTasks; // expertTasks[i]代表专家i的task, expertTasks[i][j] = (第j个任务对应的行数， 权重)
                 expertTasks.resize(m + 1);
                 for (int b = 0; b < bs; b++) {
                     expertTasks[0].push_back(std::make_pair(b, sharedScale));
-                    float *cur = cpuRouterLogits + b * m;
-                    for (int i = 0; i < m; i++) {
-                        v[i] = (std::make_pair(-cur[i], i));
-                    }
-                    if (gateBias.dims.size() > 0) {
-                        ToDataType(gateBias, DataType::FLOAT32);
-                        gateBias.ToDevice(DataDevice::CPU);
-                        float *cpuBias = (float*)gateBias.cpuData;
-                        for (int i = 0; i < m; i++) {
-                            v[i].first -= cpuBias[i];
-                        }
-                    }
-                    // sort(v.begin(), v.end());
-                    partial_sort(v.begin(), v.begin() + topk, v.end());
-                    float sum = 1.0;
-                    if (needNorm) {
-                        sum = 0.0;
-                        for (int j = 0; j < topk; j++) {
-                            sum += cur[v[j].second];
-                        }
-                    }
-                    
                     for (int j = 0; j < topk; j++) {
-                        int idx = v[j].second;
-                        float value = cur[idx] / sum * routeScale;
-                        expertTasks[idx + 1].push_back(std::make_pair(b, value));
+                        int expertIdx = indexData[b * topk + j];
+                        float value = scoreData[b * topk + j];
+                        expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
                     }
                 }
 
@@ -888,7 +856,7 @@ auto st = std::chrono::system_clock::now();
                         totalLines += expertTasks[e].size();
                     }
                 }
-// printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+ // printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 DataType startDataType = weights[2]->GetLinearActDataType(bs);
                 DataType downInputDataType = weights[3]->GetLinearActDataType(bs);
 
@@ -930,6 +898,7 @@ auto st = std::chrono::system_clock::now();
                 if (downOutput.size() < downOutputSize) {
                     downOutput.resize(downOutputSize);
                 }
+                //std::fill(downOutput.begin(), downOutput.end(), 0.0f);
                 if (reduceOutput.size() < reduceOutputSize) {
                     reduceOutput.resize(reduceOutputSize);
                 }
@@ -978,7 +947,10 @@ auto st = std::chrono::system_clock::now();
                 for (int e = 0; e < expertTasks.size(); e++) {
                     if (weights[e * 2] != nullptr && expertTasks[e].size() > 0) {
                         int lines = expertTasks[e].size();
-
+if (lines >= expertLimit) {
+    offset += lines;
+    continue;
+}
                         // Prepare input pointer for this expert's batch
                         uint16_t* expertInputPtr = (uint16_t*)(expandInput.data() + offset * GetDataBytes(startDataType, 1, inputDim));
                             
@@ -1031,7 +1003,10 @@ auto st = std::chrono::system_clock::now();
                 for (int e = 0; e < expertTasks.size(); e++) {
                     if (weights[e * 2 + 1] != nullptr && expertTasks[e].size() > 0) {
                         int lines = expertTasks[e].size();
-
+if (lines >= expertLimit) {
+    offset += lines;
+    continue;
+}
                         // Prepare input pointer for this expert's batch
                         uint16_t* expertDownInputPtr = (uint16_t*)(downInput.data() + offset * GetDataBytes(downInputDataType, 1, interDim));
                             
@@ -1131,6 +1106,14 @@ auto st = std::chrono::system_clock::now();
                 }
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             }
+/*
+            DoCudaMergeMOEFromCPU (
+                input, output, gateBias, logits, w1, w2, w3, weights, biass, topk, needNorm, sharedScale, routeScale, false, expertLimit
+            );
+
+printf("DoCudaMergeMOEFromCPU spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+*/
+            return;
         }
     }
 }

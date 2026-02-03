@@ -4136,6 +4136,137 @@ bool FastllmCudaTopK(const fastllm::Data &input, fastllm::Data &output, int topk
     return true;
 }
 
+// CUDA kernel for SelectExpert
+template <int THREAD_PER_BLOCK, int MAXK>
+__global__ void FastllmSelectExpertKernel(float *logits, float *bias, int32_t *index, float *score, 
+    int n, int numExperts, int topk, int hasBias, bool needNorm, float routeScale) {
+    __shared__ float idData[THREAD_PER_BLOCK][MAXK];
+    __shared__ float maxData[THREAD_PER_BLOCK][MAXK];
+    
+    int tokenIdx = blockIdx.x;
+    float *inputData = logits + tokenIdx * numExperts;
+    int32_t *outputIndex = index + tokenIdx * topk;
+    float *outputScore = score + tokenIdx * topk;
+    
+    int tid = threadIdx.x;
+    
+    // Initialize
+    for (int i = 0; i < topk; i++) {
+        maxData[tid][i] = -1e100;
+        idData[tid][i] = -1;
+    }
+    
+    // Find topk experts
+    for (int j = tid; j < numExperts; j += THREAD_PER_BLOCK) {
+        float cur = inputData[j];
+        if (hasBias) {
+            cur -= bias[j];
+        }
+        
+        for (int l = 0; l < topk; l++) {
+            if (cur > maxData[tid][l]) {
+                for (int x = topk - 1; x > l; x--) {
+                    maxData[tid][x] = maxData[tid][x - 1];
+                    idData[tid][x] = idData[tid][x - 1];
+                }
+                maxData[tid][l] = cur;
+                idData[tid][l] = j;
+                break;
+            }
+        }
+    }
+    __syncthreads();
+    
+    // Merge results from all threads
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            int pos0 = 0, pos1 = 0;
+            while (pos0 + pos1 < topk) {
+                if (maxData[tid][pos0] > maxData[tid + s][pos1]) {
+                    pos0++;
+                } else {
+                    pos1++;
+                }
+            }
+            pos0--;
+            pos1--;
+            int pos = topk - 1;
+            while (pos >= 0) {
+                if (pos1 < 0 || (pos0 >= 0 && maxData[tid][pos0] < maxData[tid + s][pos1])) {
+                    maxData[tid][pos] = maxData[tid][pos0];
+                    idData[tid][pos] = idData[tid][pos0];
+                    pos0--;
+                } else {
+                    maxData[tid][pos] = maxData[tid + s][pos1];
+                    idData[tid][pos] = idData[tid + s][pos1];
+                    pos1--;
+                }
+                pos--;
+            }
+        }
+        __syncthreads();
+    }
+    
+    // Write output
+    if (tid == 0) {
+        // Calculate sum for normalization
+        float sum = 1.0f;
+        if (needNorm) {
+            sum = 0.0f;
+            for (int i = 0; i < topk; i++) {
+                int expertIdx = idData[0][i];
+                sum += inputData[expertIdx];
+            }
+        }
+        
+        // Write index and score
+        for (int i = 0; i < topk; i++) {
+            int expertIdx = idData[0][i];
+            outputIndex[i] = expertIdx;
+            outputScore[i] = inputData[expertIdx] / sum * routeScale;
+        }
+    }
+}
+
+bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *gateBias, 
+    fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale) {
+    if (topk > 50) {
+        printf("SelectExpert: unsupport topk > 50, falling back to CPU implementation.\n");
+        return false; // 返回 false 表示不支持，应该回退到 CPU
+    }
+    
+    float *cudaLogits = (float *) FastllmCudaPrepareInput(logits);
+    float *cudaBias = nullptr;
+    int hasBias = 0;
+    if (gateBias != nullptr && gateBias->dims.size() > 0) {
+        cudaBias = (float *) FastllmCudaPrepareInput(*gateBias);
+        hasBias = 1;
+    }
+    int32_t *cudaIndex = (int32_t *) FastllmCudaPrepareInput(index);
+    float *cudaScore = (float *) FastllmCudaPrepareInput(score);
+    
+    int dimsLen = logits.dims.size();
+    int n = logits.Count(0) / logits.dims[dimsLen - 1]; // number of tokens
+    int numExperts = logits.dims[dimsLen - 1]; // number of experts
+    
+    // Use 64 threads to stay within shared memory limit (64*50*4*2 = 25KB < 48KB)
+#ifdef USE_ROCM
+    FastllmSelectExpertKernel<64, 50> <<< n, 64 >>> 
+        (cudaLogits, cudaBias, cudaIndex, cudaScore, n, numExperts, topk, hasBias, needNorm, routeScale);
+#else
+    FastllmSelectExpertKernel<64, 50> <<< n, 64 >>> 
+        (cudaLogits, cudaBias, cudaIndex, cudaScore, n, numExperts, topk, hasBias, needNorm, routeScale);
+#endif
+    
+    FastllmCudaFinishInput(logits, cudaLogits);
+    if (gateBias != nullptr && gateBias->dims.size() > 0) {
+        FastllmCudaFinishInput(*gateBias, cudaBias);
+    }
+    FastllmCudaFinishOutput(index, cudaIndex);
+    FastllmCudaFinishOutput(score, cudaScore);
+    return true;
+}
+
 bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axis) {
     if (input.dataDevice != fastllm::DataDevice::CUDA) {
         printf("permute: data should in cuda.\n");

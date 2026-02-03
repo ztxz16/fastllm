@@ -1057,7 +1057,7 @@ namespace fastllm {
         } else if (this->dataType == DataType::BIT) {
             this->unitSize = 1;
             this->unitSizeDiv = 8;
-        } else if (this->dataType == DataType::INT32PARAM) {
+        } else if (this->dataType == DataType::INT32PARAM || this->dataType == DataType::INT32) {
             this->unitSize = 4;
             this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::DATA_GGUF_FORMAT) {
@@ -2702,17 +2702,17 @@ namespace fastllm {
         return curExecutor->CanRunOnFirstDevice("MergeMOE", {{"input", (Data*)&input}, {"biass", (Data*)biass.data()}}, {}, {});
     }
 
-    void MergeMOE(const Data &input, const Data &logits, Data &gateBias, std::vector <Data*> &weights, std::vector <Data*> &biass, 
+    void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
-                float routeScale, float sharedScale, int topk, bool needNorm, Data &output) {
+                float sharedScale, Data &output, int layer) {
         curExecutor->Run("MergeMOE", {
-                {"input", (Data*)&input}, {"logits", (Data*)&logits}, {"gateBias", (Data*)&gateBias},
+                {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
                 {"w1", (Data*)&w1}, {"w2", (Data*)&w2}, {"w3", (Data*)&w3},
                 {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"output", (Data*)&output}
-        }, {{"sharedScale", sharedScale}, {"routeScale", routeScale}}, {{"topk", topk}, {"needNorm", needNorm}, 
-                                        {"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()}});
+        }, {{"sharedScale", sharedScale}}, 
+                                        {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()}, {"layer", layer}});
     }
 
     void MergeMLA(Data &qNope, Data &qPe, Data &kvCache, Data &peCache, const Data &mask, Data &output, float softmaxScale) {
@@ -3019,6 +3019,16 @@ namespace fastllm {
         curExecutor->Run("TopK", {
                 {"input", (Data*)&input}, {"output", &output}
         }, {}, {{"topk", topk}});
+    };
+
+    void SelectExpert(const Data &logits, Data &index, Data &score, int topk, bool needNorm, float routeScale, const Data *gateBias) {
+        DataDict datas = {{"logits", (Data*)&logits}, {"index", &index}, {"score", &score}};
+        if (gateBias != nullptr) {
+            datas["gateBias"] = (Data*)gateBias;
+        }
+        curExecutor->Run("SelectExpert", datas, 
+            {{"routeScale", routeScale}}, 
+            {{"topk", topk}, {"needNorm", needNorm ? 1 : 0}});
     };
 
     void RotatePosition2D(Data &input, const Data &positionIds, Data &sinData, Data &cosData, int rotaryDim) {
