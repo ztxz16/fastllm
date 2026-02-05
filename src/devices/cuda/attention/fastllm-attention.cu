@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <vector>
 #include <chrono>
+#include <map>
+#include <memory>
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
@@ -1995,10 +1997,26 @@ struct FlashInferWorkSpaceManager {
         FastllmCudaFree(d_int_workspace);
         cudaFreeHost(h_page_locked_int_workspace);
     }
-} flashInferWorkSpaceManager;
+};
+
+static std::map<int, std::unique_ptr<FlashInferWorkSpaceManager>> s_fastllmFlashInferWorkSpaceMap;
+
+FlashInferWorkSpaceManager& getFastllmFlashInferWorkSpace() {
+    int id = -1;
+    cudaGetDevice(&id);
+    auto it = s_fastllmFlashInferWorkSpaceMap.find(id);
+    if (it != s_fastllmFlashInferWorkSpaceMap.end()) {
+        return *it->second;
+    }
+    auto manager = std::make_unique<FlashInferWorkSpaceManager>();
+    FlashInferWorkSpaceManager* ptr = manager.get();
+    s_fastllmFlashInferWorkSpaceMap[id] = std::move(manager);
+    return *ptr;
+}
 
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale) {
     using namespace flashinfer;
+    FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
 // ForceDeviceSync(); auto st = std::chrono::system_clock::now();
     // 检查是否是 paged KV cache
     if (!k.isPagedKVCache || !v.isPagedKVCache) {
@@ -2223,8 +2241,8 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         // 进行 plan
         PrefillPlanInfo plan_info;
         cudaError_t plan_status = PrefillPlan<uint32_t>(
-            flashInferWorkSpaceManager.d_float_workspace, flashInferWorkSpaceManager.float_workspace_size, flashInferWorkSpaceManager.d_int_workspace, flashInferWorkSpaceManager.h_page_locked_int_workspace,
-            flashInferWorkSpaceManager.int_workspace_size, plan_info, q_indptr_host.data(), indptr_host.data(), 
+            workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
+            workspace.int_workspace_size, plan_info, q_indptr_host.data(), indptr_host.data(), 
             total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
             pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(half), 
             /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
@@ -2266,25 +2284,25 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         
         // 从 plan_info 设置参数
         prefill_params.request_indices = reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(flashInferWorkSpaceManager.d_int_workspace) + plan_info.request_indices_offset);
+            static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.request_indices_offset);
         prefill_params.qo_tile_indices = reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(flashInferWorkSpaceManager.d_int_workspace) + plan_info.qo_tile_indices_offset);
+            static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.qo_tile_indices_offset);
         prefill_params.kv_tile_indices = reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(flashInferWorkSpaceManager.d_int_workspace) + plan_info.kv_tile_indices_offset);
+            static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.kv_tile_indices_offset);
         prefill_params.o_indptr = reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(flashInferWorkSpaceManager.d_int_workspace) + plan_info.o_indptr_offset);
+            static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.o_indptr_offset);
         prefill_params.kv_chunk_size_ptr = reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(flashInferWorkSpaceManager.d_int_workspace) + plan_info.kv_chunk_size_ptr_offset);
+            static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.kv_chunk_size_ptr_offset);
         prefill_params.padded_batch_size = plan_info.padded_batch_size;
         prefill_params.max_total_num_rows = plan_info.total_num_rows;
         
         if (plan_info.split_kv) {
             prefill_params.merge_indptr = reinterpret_cast<uint32_t*>(
-                static_cast<uint8_t*>(flashInferWorkSpaceManager.d_int_workspace) + plan_info.merge_indptr_offset);
+                static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.merge_indptr_offset);
             tmp_v = reinterpret_cast<half*>(
-                static_cast<uint8_t*>(flashInferWorkSpaceManager.d_float_workspace) + plan_info.v_offset);
+                static_cast<uint8_t*>(workspace.d_float_workspace) + plan_info.v_offset);
             tmp_s = reinterpret_cast<float*>(
-                static_cast<uint8_t*>(flashInferWorkSpaceManager.d_float_workspace) + plan_info.s_offset);
+                static_cast<uint8_t*>(workspace.d_float_workspace) + plan_info.s_offset);
         }
         
         // 根据 plan_info.cta_tile_q 来 dispatch 不同的 kernel
@@ -2353,6 +2371,7 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
 
 bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType) {
     using namespace flashinfer;
+    FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
     
     // 获取基本参数
     int q0 = q.dims[0];  // total num_qo_heads across all batches
@@ -2460,8 +2479,8 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
     PrefillPlanInfo plan_info;
 
     cudaError_t plan_status = PrefillPlan<uint32_t>(
-        flashInferWorkSpaceManager.d_float_workspace, flashInferWorkSpaceManager.float_workspace_size, flashInferWorkSpaceManager.d_int_workspace, flashInferWorkSpaceManager.h_page_locked_int_workspace,
-        flashInferWorkSpaceManager.int_workspace_size, plan_info, 
+        workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
+        workspace.int_workspace_size, plan_info, 
         (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(), 
         total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
         pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(half), 
@@ -2500,15 +2519,15 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
     
     // 从 plan_info 设置参数
     prefill_params.request_indices = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(flashInferWorkSpaceManager.d_int_workspace) + plan_info.request_indices_offset);
+        static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.request_indices_offset);
     prefill_params.qo_tile_indices = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(flashInferWorkSpaceManager.d_int_workspace) + plan_info.qo_tile_indices_offset);
+        static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.qo_tile_indices_offset);
     prefill_params.kv_tile_indices = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(flashInferWorkSpaceManager.d_int_workspace) + plan_info.kv_tile_indices_offset);
+        static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.kv_tile_indices_offset);
     prefill_params.o_indptr = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(flashInferWorkSpaceManager.d_int_workspace) + plan_info.o_indptr_offset);
+        static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.o_indptr_offset);
     prefill_params.kv_chunk_size_ptr = reinterpret_cast<uint32_t*>(
-        static_cast<uint8_t*>(flashInferWorkSpaceManager.d_int_workspace) + plan_info.kv_chunk_size_ptr_offset);
+        static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.kv_chunk_size_ptr_offset);
     prefill_params.padded_batch_size = plan_info.padded_batch_size;
     prefill_params.max_total_num_rows = plan_info.total_num_rows;
     
@@ -2516,11 +2535,11 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
     float *tmp_s = nullptr;
     if (plan_info.split_kv) {
         prefill_params.merge_indptr = reinterpret_cast<uint32_t*>(
-            static_cast<uint8_t*>(flashInferWorkSpaceManager.d_int_workspace) + plan_info.merge_indptr_offset);
+            static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.merge_indptr_offset);
         tmp_v = reinterpret_cast<half*>(
-            static_cast<uint8_t*>(flashInferWorkSpaceManager.d_float_workspace) + plan_info.v_offset);
+            static_cast<uint8_t*>(workspace.d_float_workspace) + plan_info.v_offset);
         tmp_s = reinterpret_cast<float*>(
-            static_cast<uint8_t*>(flashInferWorkSpaceManager.d_float_workspace) + plan_info.s_offset);
+            static_cast<uint8_t*>(workspace.d_float_workspace) + plan_info.s_offset);
     }
     
     // 根据 plan_info.cta_tile_q 来 dispatch 不同的 kernel
@@ -2569,6 +2588,7 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
 bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCachePaged, const fastllm::Data &peCachePaged,
                          fastllm::Data &output, float softmaxScale) {
     using namespace flashinfer;
+    FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
     if (!kvCachePaged.isPagedKVCache || !peCachePaged.isPagedKVCache) return false;
     if (qNope.dataType != fastllm::DataType::FLOAT16) return false;
 
@@ -2592,8 +2612,8 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
 
     MLAPlanInfo plan_info;
     cudaError_t plan_status = MLAPlan<int32_t>(
-        flashInferWorkSpaceManager.d_float_workspace, flashInferWorkSpaceManager.float_workspace_size, flashInferWorkSpaceManager.d_int_workspace, flashInferWorkSpaceManager.h_page_locked_int_workspace,
-        flashInferWorkSpaceManager.int_workspace_size, plan_info, q_indptr_h.data(), kv_indptr_h.data(), kv_len_arr_h.data(),
+        workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
+        workspace.int_workspace_size, plan_info, q_indptr_h.data(), kv_indptr_h.data(), kv_len_arr_h.data(),
         batch_size, (uint32_t)h, (uint32_t)head_dim_ckv, causal, 0);
 
     int32_t *d_kv_indices = (int32_t*)FastllmCudaMalloc(numPages * sizeof(int32_t));
@@ -2609,23 +2629,23 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
     params.kpe = d_kpe;
     params.final_o = d_o;
     params.final_lse = nullptr;
-    params.q_indptr = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.q_indptr_offset);
-    params.kv_indptr = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.kv_indptr_offset);
-    params.partial_indptr = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.partial_indptr_offset);
+    params.q_indptr = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.q_indptr_offset);
+    params.kv_indptr = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.kv_indptr_offset);
+    params.partial_indptr = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.partial_indptr_offset);
     params.kv_indices = d_kv_indices;
-    params.q_len = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.q_len_offset);
-    params.kv_len = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.kv_len_offset);
-    params.q_start = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.q_start_offset);
-    params.kv_start = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.kv_start_offset);
-    params.kv_end = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.kv_end_offset);
-    params.work_indptr = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.work_indptr_offset);
-    params.merge_packed_offset_start = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.merge_packed_offset_start_offset);
-    params.merge_packed_offset_end = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.merge_packed_offset_end_offset);
-    params.merge_partial_packed_offset_start = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.merge_partial_packed_offset_start_offset);
-    params.merge_partial_packed_offset_end = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.merge_partial_packed_offset_end_offset);
-    params.merge_partial_stride = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.merge_partial_stride_offset);
-    params.partial_o = (half*)((uint8_t*)flashInferWorkSpaceManager.d_float_workspace + plan_info.partial_o_offset);
-    params.partial_lse = (float*)((uint8_t*)flashInferWorkSpaceManager.d_float_workspace + plan_info.partial_lse_offset);
+    params.q_len = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.q_len_offset);
+    params.kv_len = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.kv_len_offset);
+    params.q_start = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.q_start_offset);
+    params.kv_start = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.kv_start_offset);
+    params.kv_end = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.kv_end_offset);
+    params.work_indptr = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.work_indptr_offset);
+    params.merge_packed_offset_start = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.merge_packed_offset_start_offset);
+    params.merge_packed_offset_end = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.merge_packed_offset_end_offset);
+    params.merge_partial_packed_offset_start = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.merge_partial_packed_offset_start_offset);
+    params.merge_partial_packed_offset_end = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.merge_partial_packed_offset_end_offset);
+    params.merge_partial_stride = (int32_t*)((uint8_t*)workspace.d_int_workspace + plan_info.merge_partial_stride_offset);
+    params.partial_o = (half*)((uint8_t*)workspace.d_float_workspace + plan_info.partial_o_offset);
+    params.partial_lse = (float*)((uint8_t*)workspace.d_float_workspace + plan_info.partial_lse_offset);
     params.num_heads = num_heads_div;
     params.block_size = block_size_div;
     // qNope / output 布局 [h, b*s, c]：按 token 步进 stride_n，按 head 步进 stride_h
