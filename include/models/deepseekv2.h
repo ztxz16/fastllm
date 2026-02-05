@@ -38,6 +38,11 @@ namespace fastllm {
                 const GenerationConfig &generationConfig = GenerationConfig(),
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
+        
+        std::vector <int> ForwardBatchV2(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+                const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *retLogits);
 
         std::vector <int> ForwardBatch(
                 int batch,
