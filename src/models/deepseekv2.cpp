@@ -279,6 +279,422 @@ namespace fastllm {
         return ret;
     }
 
+    std::vector <int> DeepSeekV2Model::ForwardBatchV2(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+        const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+        const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+        std::vector <std::vector <float>*> *retLogits) {
+            Executor &excutor = *((Executor*)GetExecutor());
+
+        std::string scoring_func = "softmax";
+        if (this->weight.dicts.find("scoring_func") != this->weight.dicts.end()) {
+            scoring_func = this->weight.dicts["scoring_func"];
+        }
+
+        int maxLen = inputIds.dims[1];
+        Data hiddenStates;
+        Data attenInput;
+        Data qa, q, q_nope, q_pe, compressed_kv_ori, compressed_kv, k_pe, k_pe_repeat, kv_ln, kv, k_nope, k, v, qkv;
+        Data attenWeights;
+        Data attenLastOutput;
+        Data w1, w2, w3, routerLogits, gate, attenPart, moePart, moeFinal, sharedGate;
+        Data curInput, curOutput;
+        Data* sinDataPtr = &sinData;
+        Data* cosDataPtr = &cosData;
+        Data ww1, ww2, ww3, moeFinal2;
+        Data &attenOutput = q_nope;
+
+        Data resultTemp, qpeTemp, qnopeTemp, kTemp, vTemp;
+        Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
+        // ToDataType(hiddenStates, this->dataType);
+
+        int seqlen = hiddenStates.dims[1];
+
+        if (weights.size() == 0) {
+            weights.resize(block_cnt);
+            biass.resize(block_cnt);
+            for (int i = 0; i < block_cnt; i++) {
+                weights[i].push_back(&weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gateup_proj.weight"]);
+                weights[i].push_back(&weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.down_proj.weight"]);
+                biass[i].push_back(nullptr);
+                biass[i].push_back(nullptr);
+                for (int j = 0; j < this->num_experts; j++) {
+                    weights[i].push_back(&weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".gateup_proj.weight"]);
+                    weights[i].push_back(&weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".down_proj.weight"]);
+                    biass[i].push_back(nullptr);
+                    biass[i].push_back(nullptr);
+                }
+            }
+        }
+
+        float softmax_scale = 1.0 / sqrt(q_head_dim);
+        float mscale = 0.1 * rope_scaling_mscale * log(rope_factor) + 1.0;
+        softmax_scale = softmax_scale * mscale * mscale;
+        
+        Data attenInputTemp, x, result, score0, score1;
+        bool cudaSe = GetCudaSharedExpert();
+        for (int i = 0; i < block_cnt; i++) {
+            ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+            UpdateRotaryPtr(&sinDataPtr, &cosDataPtr, excutor.firstDevice);
+
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
+                    rms_norm_eps, attenInput);
+            
+            ToDataType(attenInput, attenInputTemp, this->dataType);
+
+            std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+            std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
+            std::string qaWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_a_proj.weight";
+            std::string qaBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_a_proj.bias";
+            std::string qRmsNormName = "model.layers." + std::to_string(i) + ".self_attn.q_a_layernorm.weight";
+            std::string qbWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_b_proj.weight";
+            std::string qbBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_b_proj.bias";
+            std::string compressedKvWeightName = "model.layers." + std::to_string(i) + ".self_attn.kv_a_proj_with_mqa.weight";
+            std::string compressedKvBiasName = "model.layers." + std::to_string(i) + ".self_attn.kv_a_proj_with_mqa.bias";
+
+            std::string kvRmsNormName = "model.layers." + std::to_string(i) + ".self_attn.kv_a_layernorm.weight";
+            std::string kvWeightName = "model.layers." + std::to_string(i) + ".self_attn.kv_b_proj.weight";
+            std::string kvBiasName = "model.layers." + std::to_string(i) + ".self_attn.kv_b_proj.bias";
+
+            std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
+            std::string kBiasName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.bias";
+            std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string vBiasName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.bias";
+            std::string qkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.W_pack.weight";
+            std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
+            std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
+            std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+            std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
+
+            // 1.1 Get q, k, v
+            int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
+
+            if (this->weight.weight.find(qaWeightName) != this->weight.weight.end()) { 
+                Linear(attenInputTemp, this->weight[qaWeightName], this->weight[qaBiasName], qa);
+                RMSNorm(qa, this->weight[qRmsNormName], this->rms_norm_eps, qa);
+                Linear(qa, this->weight[qbWeightName], this->weight[qbBiasName], q);
+            } else {
+                Linear(attenInputTemp, this->weight[qWeightName], this->weight[qBiasName], q);
+            }
+
+            q.Reshape({bsz, seqlen, -1, q_head_dim});
+            PermuteSelf(q, {0, 2, 1, 3});
+            Split(q, -1, 0, qk_nope_head_dim, q_nope);
+            Split(q, -1, qk_nope_head_dim, q_head_dim, q_pe);
+
+            Linear(attenInputTemp, this->weight[compressedKvWeightName], this->weight[compressedKvBiasName], compressed_kv_ori);
+            Split(compressed_kv_ori, -1, 0, kv_lora_rank, compressed_kv);
+            Split(compressed_kv_ori, -1, kv_lora_rank, kv_lora_rank + qk_rope_head_dim, k_pe);
+            RMSNorm(compressed_kv, this->weight[kvRmsNormName], this->rms_norm_eps, kv_ln);
+
+            PermuteSelf(q_pe, {0, 2, 1, 3});
+            PermuteSelf(q_pe, {1, 0, 2, 3});
+            fastllm::NearlyRotatePosition2D(q_pe, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+            PermuteSelf(q_pe, {1, 0, 2, 3});
+            PermuteSelf(q_pe, {0, 2, 1, 3});
+
+            k_pe.Reshape({bsz, seqlen, 1, qk_rope_head_dim});
+            PermuteSelf(k_pe, {1, 0, 2, 3});
+            fastllm::NearlyRotatePosition2D(k_pe, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+            PermuteSelf(k_pe, {1, 0, 2, 3});
+            PermuteSelf(k_pe, {0, 2, 1, 3});
+
+            if (true) {
+                const int pageLen = 128;
+                k_pe.Reshape({k_pe.dims[0], k_pe.dims[2], k_pe.dims[3]});
+                Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
+                PagedCacheManager *pagedKpeManager = AllocatePagedCacheManager(i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE, k_pe, pageLen, -1);
+                PagedCacheManager *pagedCkvManager = AllocatePagedCacheManager(i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE, kv_ln, pageLen, -1);
+                if (GetKVCacheInCPU()) {
+                    pastKey.lockInCPU = true;
+                    pastValue.lockInCPU = true;
+                } else {
+                    pastKey.ToDevice(k_pe.dataDevice);
+                    pastValue.ToDevice(kv_ln.dataDevice);
+                }
+                AppendPagedCache(*pagedKpeManager, pastKey, k_pe);
+                AppendPagedCache(*pagedCkvManager, pastValue, kv_ln);
+
+                PermuteSelf(q_pe, {0, 2, 1, 3});
+                PermuteSelf(q_nope, {0, 2, 1, 3});
+                int b = q_nope.dims[0], s = q_nope.dims[1], h = q_nope.dims[2], d = q_nope.dims[3];
+                PermuteSelf(q_nope, {2, 0, 1, 3});
+                q_nope.Reshape({q_nope.dims[0], -1, q_nope.dims[3]});
+
+                std::string kv0Name = kvWeightName + "__0", kv1Name = kvWeightName + "__1";
+                if (this->weight.weight.find(kvWeightName) != this->weight.weight.end()) {
+                    this->weight[kvWeightName].Reshape({num_attention_heads, -1, kv_lora_rank});
+                    Split(this->weight[kvWeightName], 1, 0, qk_nope_head_dim, this->weight[kv0Name]);
+                    Split(this->weight[kvWeightName], 1, qk_nope_head_dim, qk_nope_head_dim + v_head_dim, this->weight[kv1Name]);
+                    this->weight.weight.erase(kvWeightName);
+                }
+
+                Data &kv0 = this->weight[kv0Name];
+                Data &kv1 = this->weight[kv1Name];
+
+                if (kv0.dims != kv1.dims) {
+                    PermuteSelf(kv0, {0, 2, 1});
+                }
+
+                MatMul(q_nope, kv0, result);
+                int c = result.dims.back();
+                MergeMLAPaged(result, q_pe, pastKey, pastValue, x, softmax_scale);
+                // x 已是 [h, b*s, c]，直接用于 MatMulTransB
+                MatMulTransB(x, kv1, attenOutput);
+                attenOutput.Reshape({h, b, s, -1});
+                PermuteSelf(attenOutput, {1, 2, 0, 3});
+                attenOutput.Reshape({seqlen, bsz, -1});
+                PermuteSelf(attenOutput, {1, 0, 2});
+                ToDataType(attenOutput, DataType::FLOAT32);
+            }
+
+            Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
+            Linear(attenOutput, weight[oWeightName], oBias, attenLastOutput);
+
+            AddTo(hiddenStates, attenLastOutput);
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);            
+            // 2. moe mlp
+            if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.gate_proj.weight") != weight.weight.end()) {
+                if (CanRunLinearEx(LinearExType::ExSilu)) {
+                    LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                } else {
+                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
+                    Silu(w1, w1);
+                }
+                Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
+                MulTo(w1, w3);
+                Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
+                AddTo(hiddenStates, w2);
+            } else {
+                // 这里是moe mlp
+                std::string gateWeightName = "model.layers." + std::to_string(i) + ".mlp.gate.weight";
+                std::string gateBiasName = "model.layers." + std::to_string(i) + ".mlp.gate.e_score_correction_bias";
+
+                int batch = attenInput.dims[0], len = attenInput.dims[1];
+                attenInput.Reshape({batch * len, attenInput.dims[2]});
+
+                if (cudaSe) {
+                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gateup_proj.weight"], Data(), ww3);
+                    Swiglu(ww3, ww1);
+                    Linear(ww1, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.down_proj.weight"], Data(), moeFinal2);
+                    weights[i][0] = weights[i][1] = nullptr;
+                }
+
+                Linear(attenInput, weight[gateWeightName], Data(), routerLogits);
+
+                bool needNorm = false;
+                if (scoring_func == "sigmoid") {
+                    Sigmoid(routerLogits, routerLogits);
+                    needNorm = true;
+                } else {
+                    Softmax(routerLogits, routerLogits, -1);
+                }
+
+                Data expertIndex, expertScore;
+                if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
+                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, needNorm, 
+                                this->routed_scaling_factor, weight.weight.find(gateBiasName) != weight.weight.end() ? &weight[gateBiasName] : nullptr);
+                }
+                ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
+                if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
+                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    MergeMOE (
+                        attenInput, expertIndex, expertScore,
+                        weights[i], biass[i],
+                        w1, w2, w3, curInput, curOutput, 
+                        1.0f,
+                        moeFinal, i
+                    );
+                } else {
+                    Data &bias = weight[gateBiasName];                  
+                    ToDataType(routerLogits, DataType::FLOAT32);
+                    routerLogits.ToDevice(DataDevice::CPU);
+                    float *cpuRouterLogits = (float*)routerLogits.cpuData;
+                    int m = routerLogits.dims.back();
+
+                    moeFinal = Data();
+                    moeFinal.Resize({0, attenInput.dims[1]});
+                    moeFinal.Expansion(attenInput.dims);
+
+                    for (int b = 0; b < batch * len; b++) {
+                        float *cur = cpuRouterLogits + b * m;
+                        std::vector <std::pair <float, int> > v; // (value, idx)
+                        for (int i = 0; i < m; i++) {
+                            v.push_back(std::make_pair(-cur[i], i));
+                        }
+                        if (bias.dims.size() > 0) {
+                            ToDataType(bias, DataType::FLOAT32);
+                            bias.ToDevice(DataDevice::CPU);
+                            float *cpuBias = (float*)bias.cpuData;
+                            for (int i = 0; i < m; i++) {
+                                v[i].first -= cpuBias[i];
+                            }
+                        }
+
+                        sort(v.begin(), v.end());
+                        Data *currentData = &attenInput;
+                        if (batch * len != 1) {
+                            Split(attenInput, 0, b, b + 1, attenPart);
+                            currentData = &attenPart;
+                        }
+                        moePart.Resize(currentData->dims);
+                        moePart.Allocate(0.0f);
+
+                        float sum = 0.0;
+                        for (int j = 0; j < this->num_experts_per_tok; j++) {
+                            float value = cur[v[j].second];
+                            sum += value;
+                        }
+                        if (!needNorm) {
+                            sum = 1.0;
+                        }
+
+                        for (int j = 0; j < this->num_experts_per_tok; j++) {
+                            int idx = v[j].second;
+                            float value = cur[idx];
+
+                            value /= sum;
+                            value *= routed_scaling_factor;
+                            if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gateup_proj.weight") != weight.weight.end()) {
+                                if (CanRunLinearEx(LinearExType::ExSwiglu)) {
+                                    LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gateup_proj.weight"], Data(), w1, LinearExType::ExSwiglu);
+                                } else {
+                                    Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gateup_proj.weight"], Data(), w3);
+                                    Swiglu(w3, w1);
+                                }
+                            } else {
+                                if (CanRunLinearEx(LinearExType::ExSilu)) {
+                                    LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                                } else {
+                                    Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gate_proj.weight"], Data(), w1);
+                                    Silu(w1, w1);
+                                }
+                                Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".up_proj.weight"], Data(), w3);
+                                MulTo(w1, w3);
+                            }
+                            Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".down_proj.weight"], Data(), w2);
+                            AddTo(moePart, w2, value);
+                        }
+
+                        if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.shared_experts.gateup_proj.weight") != weight.weight.end()) {
+                            if (CanRunLinearEx(LinearExType::ExSwiglu)) {
+                                LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gateup_proj.weight"], Data(), w1, LinearExType::ExSwiglu);
+                            } else {
+                                Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gateup_proj.weight"], Data(), w3);
+                                Swiglu(w3, w1);
+                            }
+                        } else {
+                            if (CanRunLinearEx(LinearExType::ExSilu)) {
+                                LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                            } else {
+                                Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.gate_proj.weight"], Data(), w1);
+                                Silu(w1, w1);
+                            }
+                            Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.up_proj.weight"], Data(), w3);
+                            MulTo(w1, w3);
+                        }
+                        Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.shared_experts.down_proj.weight"], Data(), w2);
+                        AddTo(moePart, w2);
+
+                        CatDirect(moeFinal, moePart, 0);
+                    }
+                    moeFinal.expansionDims.clear();
+                }
+
+                moeFinal.Reshape(hiddenStates.dims);
+
+                Data tempMoeFinal;
+                tempMoeFinal.CopyFrom(moeFinal);
+                ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+                AddTo(hiddenStates, tempMoeFinal);
+
+                if (cudaSe) {
+                    moeFinal2.Reshape(hiddenStates.dims);
+                    AddTo(hiddenStates, moeFinal2);
+                }
+            }
+        }
+
+        Data logits, topk;
+        Data tempHiddenStates;
+        Data *lastHiddenStates;
+        if (maxLen > 1) {
+            Split(hiddenStates, 1, maxLen - 1, maxLen, tempHiddenStates);
+            lastHiddenStates = &tempHiddenStates;
+        } else {
+            lastHiddenStates = &hiddenStates;
+        }
+
+        std::vector <int> lastRet;
+        {
+            auto &hiddenStates = *lastHiddenStates;
+            RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
+            Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
+            ToDataType(logits, DataType::FLOAT32);
+            ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfig);
+            if (this->weight.dicts["model_type"] != "deepseek_v2") {
+                if (((GenerationConfig*)&generationConfig)->top_k <= 1) { 
+                    ((GenerationConfig*)&generationConfig)->top_k = 10;
+                }
+
+                ((GenerationConfig*)&generationConfig)->top_p = 0.95;
+                if (fabs(generationConfig.temperature - 1.0f) < 1e-6) {
+                    ((GenerationConfig*)&generationConfig)->temperature = 0.6;
+                } 
+            }
+            if (generationConfig.output_logits && retLogits != nullptr) {
+                int size = logits.dims.back();
+                logits.ToDevice(DataDevice::CPU);
+                for (int b = 0; b < batch; b++) {
+                    (*retLogits)[b]->resize(size);
+                    memcpy((float*)(*retLogits)[b]->data(), 
+                        ((float*)logits.cpuData) + ((b + 1) * logits.dims[1] - 1) * size, 
+                        size * logits.unitSize);
+                }
+            }
+
+            if (generationConfig.IsSimpleGreedy()) {
+                TopK(logits, topk, 1);
+                topk.ToDevice(DataDevice::CPU);
+                for (int b = 0; b < batch; b++) {
+                    int base = b;
+                    lastRet.push_back((int) (((float *) topk.cpuData)[base * 2] + 1e-3));
+                }
+            } else if (generationConfig.top_k <= 50 && fabs(generationConfig.repeat_penalty - 1.0f) < 1e-5) {
+                /*int maxTokenSetSize = 0;
+                for (int b = 0; b < batch; b++) {
+                    maxTokenSetSize = std::max(maxTokenSetSize, (int)lastTokens.units[b].tokenSet.size());
+                }
+                std::vector <float> penaltyData = std::vector <float> (batch * maxTokenSetSize, -100.0f);
+                std::vector <float> penaltyScaleData = std::vector <float> (batch, 1.0f);
+                for (int b = 0; b < batch; b++) {
+                    int curId = 0;
+                    for (int i : lastTokens.units[b].tokenSet) {
+                        penaltyData[b * maxTokenSetSize + curId] = i;
+                        curId++;
+                    }
+                    penaltyScaleData[b] = generationConfigs[b].repeat_penalty;
+                }
+                Data penalty, penaltyScale;
+                penalty.CopyFrom(Data(DataType::FLOAT32, {batch, maxTokenSetSize}, penaltyData));
+                penaltyScale.CopyFrom(Data(DataType::FLOAT32, {batch}, penaltyScaleData));
+                RepeatPenalty(logits, penalty, penaltyScale);*/
+                Data topk;
+                TopK(logits, topk, generationConfig.top_k);
+                topk.ToDevice(DataDevice::CPU);
+                for (int b = 0; b < batch; b++) {
+                    lastRet.push_back(LLMSamplingOnly(topk, b, generationConfig));
+                }
+            } else {
+                for (int b = 0; b < batch; b++) {
+                    int base = b * logits.dims[1] + logits.dims[1] - 1;
+                    lastRet.push_back(LLMSampling(logits, base, generationConfig, lastTokens.units[b]));
+                }
+            }
+        }
+        return lastRet;
+    }
+
     std::vector <int> DeepSeekV2Model::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
@@ -1464,6 +1880,7 @@ namespace fastllm {
     }
 
     bool DeepSeekV2Model::NeedAttentionMask(int qlen, int klen) {
+        return false;
         if (((qlen == 1) || (qlen >= 8192))) {
             return false;
         }

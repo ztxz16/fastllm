@@ -24,6 +24,8 @@
 #include "attention/variants.cuh"
 #include "attention/mask.cuh"
 #include "attention/scheduler.cuh"
+#include "attention/mla.cuh"
+#include "fastdiv.cuh"
 #include "pos_enc.cuh"
 #include "utils.cuh"
 
@@ -2560,6 +2562,107 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
 ((fastllm::Data*)&output)->Resize({output.dims[1], output.dims[0], output.dims[2]});
 FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
     
+    DeviceSync();
+    return true;
+}
+
+bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCachePaged, const fastllm::Data &peCachePaged,
+                         fastllm::Data &output, float softmaxScale) {
+    using namespace flashinfer;
+    if (!kvCachePaged.isPagedKVCache || !peCachePaged.isPagedKVCache) return false;
+    if (qNope.dataType != fastllm::DataType::FLOAT16) return false;
+
+    const bool causal = true;
+    int b = qPe.dims[0], s = qPe.dims[1], h = qPe.dims[2], head_dim_ckv = (int)qNope.dims.back(), head_dim_kpe = (int)qPe.dims[3];
+    int numPages = (int)kvCachePaged.pageIndex.size();
+    int pageLen = kvCachePaged.pageLen;
+    int kvLen = (numPages > 0) ? (numPages - 1) * pageLen + kvCachePaged.lastPageLen : 0;
+    int qoLen = b * s;
+
+    half *d_q_nope = (half*)qNope.cudaData;
+    half *d_q_pe = (half*)qPe.cudaData;
+    half *d_ckv = (half*)peCachePaged.pagedKVCacheData->cudaData;
+    half *d_kpe = (half*)kvCachePaged.pagedKVCacheData->cudaData;
+    half *d_o = (half*)output.cudaData;
+
+    std::vector<int32_t> q_indptr_h = {0, qoLen};
+    std::vector<int32_t> kv_indptr_h = {0, numPages};
+    std::vector<int32_t> kv_len_arr_h = {kvLen};
+    const uint32_t batch_size = 1;
+
+    MLAPlanInfo plan_info;
+    cudaError_t plan_status = MLAPlan<int32_t>(
+        flashInferWorkSpaceManager.d_float_workspace, flashInferWorkSpaceManager.float_workspace_size, flashInferWorkSpaceManager.d_int_workspace, flashInferWorkSpaceManager.h_page_locked_int_workspace,
+        flashInferWorkSpaceManager.int_workspace_size, plan_info, q_indptr_h.data(), kv_indptr_h.data(), kv_len_arr_h.data(),
+        batch_size, (uint32_t)h, (uint32_t)head_dim_ckv, causal, 0);
+
+    int32_t *d_kv_indices = (int32_t*)FastllmCudaMalloc(numPages * sizeof(int32_t));
+    cudaMemcpy(d_kv_indices, kvCachePaged.pageIndex.data(), numPages * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+    uint_fastdiv num_heads_div((uint32_t)h);
+    uint_fastdiv block_size_div((uint32_t)pageLen);
+
+    MLAParams<half, half, half, int32_t> params = {};
+    params.q_nope = d_q_nope;
+    params.q_pe = d_q_pe;
+    params.ckv = d_ckv;
+    params.kpe = d_kpe;
+    params.final_o = d_o;
+    params.final_lse = nullptr;
+    params.q_indptr = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.q_indptr_offset);
+    params.kv_indptr = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.kv_indptr_offset);
+    params.partial_indptr = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.partial_indptr_offset);
+    params.kv_indices = d_kv_indices;
+    params.q_len = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.q_len_offset);
+    params.kv_len = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.kv_len_offset);
+    params.q_start = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.q_start_offset);
+    params.kv_start = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.kv_start_offset);
+    params.kv_end = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.kv_end_offset);
+    params.work_indptr = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.work_indptr_offset);
+    params.merge_packed_offset_start = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.merge_packed_offset_start_offset);
+    params.merge_packed_offset_end = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.merge_packed_offset_end_offset);
+    params.merge_partial_packed_offset_start = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.merge_partial_packed_offset_start_offset);
+    params.merge_partial_packed_offset_end = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.merge_partial_packed_offset_end_offset);
+    params.merge_partial_stride = (int32_t*)((uint8_t*)flashInferWorkSpaceManager.d_int_workspace + plan_info.merge_partial_stride_offset);
+    params.partial_o = (half*)((uint8_t*)flashInferWorkSpaceManager.d_float_workspace + plan_info.partial_o_offset);
+    params.partial_lse = (float*)((uint8_t*)flashInferWorkSpaceManager.d_float_workspace + plan_info.partial_lse_offset);
+    params.num_heads = num_heads_div;
+    params.block_size = block_size_div;
+    // qNope / output 布局 [h, b*s, c]：按 token 步进 stride_n，按 head 步进 stride_h
+    params.q_nope_stride_n = head_dim_ckv;
+    params.q_nope_stride_h = (uint32_t)qoLen * head_dim_ckv;
+    params.q_pe_stride_n = h * head_dim_kpe;
+    params.q_pe_stride_h = head_dim_kpe;
+    params.ckv_stride_page = (uint32_t)(pageLen * head_dim_ckv);
+    params.ckv_stride_n = (uint32_t)(head_dim_ckv);
+    params.kpe_stride_page = (uint32_t)(pageLen * head_dim_kpe);
+    params.kpe_stride_n = (uint32_t)(head_dim_kpe);
+    params.o_stride_n = head_dim_ckv;
+    params.o_stride_h = (uint32_t)qoLen * head_dim_ckv;
+    params.sm_scale = softmaxScale;
+    params.return_lse_base_on_e = false;
+
+    cudaError_t status;
+    if (head_dim_ckv == 128 && head_dim_kpe == 64) {
+        if (causal) {
+            status = mla::BatchMLAPagedAttention<MaskMode::kCausal, 128, 64>(params, (uint32_t)plan_info.num_blks_x, (uint32_t)plan_info.num_blks_y, 0);
+        } else {
+            status = mla::BatchMLAPagedAttention<MaskMode::kNone, 128, 64>(params, (uint32_t)plan_info.num_blks_x, (uint32_t)plan_info.num_blks_y, 0);
+        }
+    } else if (head_dim_ckv == 512 && head_dim_kpe == 64) {
+        if (causal) {
+            status = mla::BatchMLAPagedAttention<MaskMode::kCausal, 512, 64>(params, (uint32_t)plan_info.num_blks_x, (uint32_t)plan_info.num_blks_y, 0);
+        } else {
+            status = mla::BatchMLAPagedAttention<MaskMode::kNone, 512, 64>(params, (uint32_t)plan_info.num_blks_x, (uint32_t)plan_info.num_blks_y, 0);
+        }
+    } else {
+        FastllmCudaFree(d_kv_indices);
+        return false;
+    }
+
+    FastllmCudaFree(d_kv_indices);
+
+    if (status != cudaSuccess) return false;
     DeviceSync();
     return true;
 }

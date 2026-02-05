@@ -2722,6 +2722,13 @@ namespace fastllm {
         }, {{"softmaxScale", softmaxScale}}, {});
     }
 
+    void MergeMLAPaged(Data &qNope, Data &qPe, Data &kvCachePaged, Data &peCachePaged, Data &output, float softmaxScale) {
+        curExecutor->Run("MergeMLAPaged", {
+            {"qNope", (Data*)&qNope}, {"qPe", (Data*)&qPe}, {"kvCachePaged", (Data*)&kvCachePaged}, {"peCachePaged", (Data*)&peCachePaged},
+            {"output", (Data*)&output}
+        }, {{"softmaxScale", softmaxScale}}, {});
+    }
+
     // attentionType
     // 1: normal
     // 2: 不做mask
@@ -3181,11 +3188,7 @@ namespace fastllm {
 
         // 根据设备类型设置默认 maxPages
         if (maxPages <= 0) {
-            if (cacheData.dataDevice == DataDevice::CUDA) {
-                maxPages = 300;  // CUDA 默认 300 页
-            } else {
-                maxPages = 100;  // CPU 默认 100 页
-            }
+            maxPages = 300;
         }
 
         // 初始化 pagedKVCacheData
