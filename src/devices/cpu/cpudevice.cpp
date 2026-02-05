@@ -36,6 +36,7 @@ namespace fastllm {
         this->ops["Attention"] = (BaseOperator*)(new CpuAttention());
         this->ops["MergeMOE"] = (BaseOperator*)(new CpuMergeMOE());
         this->ops["MergeMLA"] = (BaseOperator*)(new CpuMergeMLA());
+        this->ops["MergeMLAPaged"] = (BaseOperator*)(new CpuMergeMLAPaged());
         this->ops["CopyKVCache"] = (BaseOperator*)(new CpuCopyKVCacheOp());
         this->ops["Embedding"] = (BaseOperator*)(new CpuEmbedding());
         this->ops["LayerNorm"] = (BaseOperator*)(new CpuLayerNormOp());
@@ -309,6 +310,7 @@ namespace fastllm {
         Data *output = (datas.find("output")->second);
         output->dataType = DataType::FLOAT16;
         output->Resize(input->dims);
+        output->UpdateUnitSize();
         if (input->expansionDims.size() != 0)
             output->Expansion(input->expansionDims);
     }
@@ -335,6 +337,7 @@ namespace fastllm {
         Data *output = (datas.find("output")->second);
         output->dataType = DataType::FLOAT32;
         output->Resize(input->dims);
+        output->UpdateUnitSize();
         if (input->expansionDims.size() != 0)
             output->Expansion(input->expansionDims);
     }
@@ -2722,6 +2725,223 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    void CpuMergeMLAPaged::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qNope = *(datas.find("qNope")->second);
+        Data &output = *(datas.find("output")->second);
+        output.dataType = qNope.dataType;
+        output.Resize(qNope.dims);
+    }
+
+    void CpuMergeMLAPaged::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qNope = *(datas.find("qNope")->second);
+        Data &qPe = *(datas.find("qPe")->second);
+        Data &kvCachePaged = *(datas.find("kvCachePaged")->second);
+        Data &peCachePaged = *(datas.find("peCachePaged")->second);
+        Data &output = *(datas.find("output")->second);
+        float softmaxScale = floatParams.find("softmaxScale") != floatParams.end() ? floatParams.find("softmaxScale")->second : 1.0f;
+
+        AssertInFastLLM(kvCachePaged.isPagedKVCache && peCachePaged.isPagedKVCache,
+            "CpuMergeMLAPaged: kvCachePaged and peCachePaged must be paged KV cache (isPagedKVCache=true).\n");
+        AssertInFastLLM(kvCachePaged.pageIndex.size() == peCachePaged.pageIndex.size() &&
+            kvCachePaged.lastPageLen == peCachePaged.lastPageLen && kvCachePaged.pageLen == peCachePaged.pageLen,
+            "CpuMergeMLAPaged: kvCachePaged and peCachePaged must share same page layout.\n");
+
+        // qNope 布局固定为 [h, b*s, c]；qPe 可能为 [b, h, s, r] 或 [b, s, h, r]，按 qNope 推断并兼容两种
+        int hNope = qNope.dims[0], bsNope = qNope.dims[1], c = qNope.dims[2];
+        int b, s, h, r = qPe.dims[3];
+        bool qPeLayoutBhs = (qPe.dims[1] == hNope && (int)qPe.dims[0] * (int)qPe.dims[2] == bsNope);
+        bool qPeLayoutBsh = (qPe.dims[2] == hNope && (int)qPe.dims[0] * (int)qPe.dims[1] == bsNope);
+        AssertInFastLLM(qPeLayoutBhs || qPeLayoutBsh, "CpuMergeMLAPaged: qNope shape must be [h, b*s, c] and qPe [b,h,s,r] or [b,s,h,r].\n");
+        if (qPeLayoutBhs) {
+            b = qPe.dims[0]; h = qPe.dims[1]; s = qPe.dims[2];
+        } else {
+            b = qPe.dims[0]; s = qPe.dims[1]; h = qPe.dims[2];
+        }
+        int numPages = (int)kvCachePaged.pageIndex.size();
+        int pageLen = kvCachePaged.pageLen;
+        int kvLen = (numPages > 0) ? (numPages - 1) * pageLen + kvCachePaged.lastPageLen : 0;
+
+        output.Allocate();
+
+        // pagedKVCacheData 为整体数据，形状 [maxPages, pageLen, 1, r] 或 [maxPages, pageLen, 1, c]；真实 kv/pe 由 pageIndex 指向的页拼成
+        AssertInFastLLM(peCachePaged.pagedKVCacheData->dims.size() >= 4 && kvCachePaged.pagedKVCacheData->dims.size() >= 4,
+            "CpuMergeMLAPaged: pagedKVCacheData shape must be [maxPages, pageLen, 1, feat].\n");
+        int ckvDim2 = peCachePaged.pagedKVCacheData->dims[2];
+        int ckvDim3 = peCachePaged.pagedKVCacheData->dims[3];
+        int kpeDim2 = kvCachePaged.pagedKVCacheData->dims[2];
+        int kpeDim3 = kvCachePaged.pagedKVCacheData->dims[3];
+        AssertInFastLLM(ckvDim3 == c && kpeDim3 == r, "CpuMergeMLAPaged: cache feature dim mismatch (pastValue last dim=c, pastKey last dim=r).\n");
+        int unitSizeCkv = peCachePaged.unitSize;
+        int unitSizeKpe = kvCachePaged.unitSize;
+        uint8_t *ckvData = peCachePaged.pagedKVCacheData->cpuData;
+        uint8_t *kpeData = kvCachePaged.pagedKVCacheData->cpuData;
+        size_t ckvPosStride = (size_t)ckvDim2 * ckvDim3 * unitSizeCkv;
+        size_t ckvPageStride = (size_t)pageLen * ckvPosStride;
+        size_t kpePosStride = (size_t)kpeDim2 * kpeDim3 * unitSizeKpe;
+        size_t kpePageStride = (size_t)pageLen * kpePosStride;
+
+        auto getCkvAt = [&](int kvPos) -> const uint8_t* {
+            if (kvPos >= kvLen) return nullptr;
+            int pi = kvPos / pageLen;
+            int posInPage = kvPos % pageLen;
+            if (pi >= numPages) return nullptr;
+            int actualPage = peCachePaged.pageIndex[pi];
+            if (pi == numPages - 1 && posInPage >= peCachePaged.lastPageLen) return nullptr;
+            return ckvData + (size_t)actualPage * ckvPageStride + (size_t)posInPage * ckvPosStride;
+        };
+        auto getKpeAt = [&](int kvPos) -> const uint8_t* {
+            if (kvPos >= kvLen) return nullptr;
+            int pi = kvPos / pageLen;
+            int posInPage = kvPos % pageLen;
+            if (pi >= numPages) return nullptr;
+            int actualPage = kvCachePaged.pageIndex[pi];
+            if (pi == numPages - 1 && posInPage >= kvCachePaged.lastPageLen) return nullptr;
+            return kpeData + (size_t)actualPage * kpePageStride + (size_t)posInPage * kpePosStride;
+        };
+
+        auto dotF32 = [](const float* a, const float* b, int n) {
+            float sum = 0.f;
+#ifdef __AVX__
+            __m256 vsum = _mm256_setzero_ps();
+            int i = 0;
+            for (; i + 7 < n; i += 8) {
+                vsum = _mm256_add_ps(vsum, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+            }
+            sum = Floatsum(vsum);
+            for (; i < n; i++) sum += a[i] * b[i];
+#else
+            for (int i = 0; i < n; i++) sum += a[i] * b[i];
+#endif
+            return sum;
+        };
+
+        auto dotF16 = [](const uint16_t* a, const uint16_t* b, int n) {
+            float sum = 0.f;
+            for (int i = 0; i < n; i++) sum += half_to_float(a[i]) * half_to_float(b[i]);
+            return sum;
+        };
+
+        const bool causal = true;
+        int base = kvLen - s;
+
+        if (qNope.dataType == DataType::FLOAT32) {
+            float *qNopePtr = (float*)qNope.cpuData;
+            float *qPePtr = (float*)qPe.cpuData;
+            float *outPtr = (float*)output.cpuData;
+            std::fill(outPtr, outPtr + output.Count(0), 0.f);
+
+            for (int bi = 0; bi < b; bi++) {
+                for (int ti = 0; ti < s; ti++) {
+                    for (int hi = 0; hi < h; hi++) {
+                        int ni = bi * s + ti;
+                        int qFlat = hi * (b * s) + ni;
+                        const float *qn = qNopePtr + qFlat * c;
+                        int qPeOff = qPeLayoutBhs ? (bi * h * s + hi * s + ti) * r : (ni * h + hi) * r;
+                        const float *qp = qPePtr + qPeOff;
+                        float *oHead = outPtr + qFlat * c;
+
+                        int sMin = 0, sMax = kvLen - 1;
+                        if (causal && base >= 0) {
+                            sMax = std::min(ti + base, kvLen - 1);
+                        } else if (causal) {
+                            sMax = std::min(ti, kvLen - 1);
+                        }
+
+                        std::vector<float> logits(kvLen, -1e9f);
+                        float m = -1e9f;
+                        for (int j = sMin; j <= sMax; j++) {
+                            const uint8_t *ckvJ = getCkvAt(j);
+                            const uint8_t *kpeJ = getKpeAt(j);
+                            if (!ckvJ || !kpeJ) continue;
+                            float acc = dotF32(qn, (const float*)ckvJ, c) + dotF32(qp, (const float*)kpeJ, r);
+                            logits[j] = acc * softmaxScale;
+                            m = std::max(m, logits[j]);
+                        }
+
+                        float denom = 0.f;
+                        for (int j = sMin; j <= sMax; j++) {
+                            logits[j] = expf(logits[j] - m);
+                            denom += logits[j];
+                        }
+                        if (denom < 1e-9f) denom = 1e-9f;
+                        for (int j = sMin; j <= sMax; j++) logits[j] /= denom;
+
+                        for (int j = sMin; j <= sMax; j++) {
+                            const uint8_t *ckvJ = getCkvAt(j);
+                            if (!ckvJ) continue;
+                            const float *vj = (const float*)ckvJ;
+                            float p = logits[j];
+                            for (int d = 0; d < c; d++) oHead[d] += p * vj[d];
+                        }
+                    }
+                }
+            }
+        } else {
+            uint16_t *qNopePtr = (uint16_t*)qNope.cpuData;
+            uint16_t *qPePtr = (uint16_t*)qPe.cpuData;
+            uint16_t *outPtr = (uint16_t*)output.cpuData;
+            std::fill(outPtr, outPtr + output.Count(0), float_to_half(0.f));
+
+            std::vector<float> fqn(c), fqp(r), fo(c);
+            for (int bi = 0; bi < b; bi++) {
+                for (int ti = 0; ti < s; ti++) {
+                    for (int hi = 0; hi < h; hi++) {
+                        int ni = bi * s + ti;
+                        int qFlat = hi * (b * s) + ni;
+                        int qPeOff = qPeLayoutBhs ? (bi * h * s + hi * s + ti) * r : (ni * h + hi) * r;
+                        Float16ToFloat32(qNopePtr + qFlat * c, fqn.data(), c);
+                        Float16ToFloat32(qPePtr + qPeOff, fqp.data(), r);
+
+                        int sMin = 0, sMax = kvLen - 1;
+                        if (causal && base >= 0) {
+                            sMax = std::min(ti + base, kvLen - 1);
+                        } else if (causal) {
+                            sMax = std::min(ti, kvLen - 1);
+                        }
+
+                        std::vector<float> logits(kvLen, -1e9f);
+                        float m = -1e9f;
+                        for (int j = sMin; j <= sMax; j++) {
+                            const uint8_t *ckvJ = getCkvAt(j);
+                            const uint8_t *kpeJ = getKpeAt(j);
+                            if (!ckvJ || !kpeJ) continue;
+                            float accNope = (unitSizeCkv == 2) ? dotF16(qNopePtr + qFlat * c, (const uint16_t*)ckvJ, c) : dotF32(fqn.data(), (const float*)ckvJ, c);
+                            float accPe = (unitSizeKpe == 2) ? dotF16(qPePtr + qPeOff, (const uint16_t*)kpeJ, r) : dotF32(fqp.data(), (const float*)kpeJ, r);
+                            float acc = accNope + accPe;
+                            logits[j] = acc * softmaxScale;
+                            m = std::max(m, logits[j]);
+                        }
+
+                        float denom = 0.f;
+                        for (int j = sMin; j <= sMax; j++) {
+                            logits[j] = expf(logits[j] - m);
+                            denom += logits[j];
+                        }
+                        if (denom < 1e-9f) denom = 1e-9f;
+                        for (int j = sMin; j <= sMax; j++) logits[j] /= denom;
+
+                        std::fill(fo.begin(), fo.end(), 0.f);
+                        for (int j = sMin; j <= sMax; j++) {
+                            const uint8_t *ckvJ = getCkvAt(j);
+                            if (!ckvJ) continue;
+                            float p = logits[j];
+                            if (unitSizeCkv == 2) {
+                                const uint16_t *vj = (const uint16_t*)ckvJ;
+                                for (int d = 0; d < c; d++) fo[d] += p * half_to_float(vj[d]);
+                            } else {
+                                const float *vj = (const float*)ckvJ;
+                                for (int d = 0; d < c; d++) fo[d] += p * vj[d];
+                            }
+                        }
+                        Float32ToFloat16(fo.data(), outPtr + qFlat * c, c);
+                    }
+                }
+            }
+        }
+    }
+
     void CpuCopyKVCacheOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         return;
@@ -4635,7 +4855,6 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &input0 = *(datas.find("input0")->second);
         Data &input1 = *(datas.find("input1")->second);
         Data &output = *(datas.find("output")->second);
-
         output.Allocate();
 
         float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0f;
@@ -4683,7 +4902,9 @@ ops += (long long)lines * inputDim * interDim * 2;
             }
         } else if (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT16) {
             std::vector <uint16_t> fp16InputData;
+            std::vector <uint16_t> fp16OutputData;
             fp16InputData.resize(input0.Count(0));
+            fp16OutputData.resize(output.Count(0));
             Float32ToFloat16((float*)input0.cpuData, fp16InputData.data(), input0.Count(0));
 
             auto *pool = GetAlivePool();
@@ -4691,7 +4912,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             std::vector<fastllm::MultiThreadMatMulFloat16SingleOp*> ops;
             for (int o = 0; o < batch0; o++) {
                 ops.push_back(new MultiThreadMatMulFloat16SingleOp(
-                    (uint16_t *) fp16InputData.data(), (uint16_t *) input1.cpuData, (uint16_t *) output.cpuData,
+                    (uint16_t *) fp16InputData.data(), (uint16_t *) input1.cpuData, (uint16_t *) fp16OutputData.data(),
                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                     n, m, k, alpha, o, o + 1
                 ));
@@ -4704,6 +4925,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                     pool->Wait(i - st);
                 }
             }
+            Float16ToFloat32(fp16OutputData.data(), (float *) output.cpuData, output.Count(0));
         } else if (input0.dataType == DataType::FLOAT16) {
             auto *pool = GetAlivePool();
             int threads = pool->threads.size();
@@ -4820,8 +5042,9 @@ ops += (long long)lines * inputDim * interDim * 2;
                 }
             }
         } else if (input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT16) {
-            std::vector <uint16_t> fp16InputData;
+            std::vector <uint16_t> fp16InputData, fp16OutputData;
             fp16InputData.resize(input0.Count(0));
+            fp16OutputData.resize(output.Count(0));
             Float32ToFloat16((float*)input0.cpuData, fp16InputData.data(), input0.Count(0));
 
             auto *pool = GetAlivePool();
@@ -4829,7 +5052,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             std::vector<fastllm::MultiThreadMatMulTransBFloat16SingleOp*> ops;
             for (int o = 0; o < batch0; o++) {
                 ops.push_back(new MultiThreadMatMulTransBFloat16SingleOp(
-                    (uint16_t *) fp16InputData.data(), (uint16_t *) input1.cpuData, (uint16_t *) output.cpuData,
+                    (uint16_t *) fp16InputData.data(), (uint16_t *) input1.cpuData, (uint16_t *) fp16OutputData.data(),
                     input0Spatial, input1Spatial, outputSpatial, input0Stride, input1Stride,
                     n, m, k, alpha, o, o + 1
                 ));
@@ -4842,6 +5065,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                     pool->Wait(i - st);
                 }
             }
+            Float16ToFloat32(fp16OutputData.data(), (float *) output.cpuData, output.Count(0));
         } else {
             auto *pool = GetAlivePool();
             int threads = pool->threads.size();
