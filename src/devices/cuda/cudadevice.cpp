@@ -60,6 +60,7 @@ namespace fastllm {
         this->ops["ApplyLognAttn"] = (BaseOperator*)(new CudaApplyLognAttnOp());
         this->ops["MergeMOE"] = (BaseOperator*)(new CudaMergeMOE());
         this->ops["MergeMLA"] = (BaseOperator*)(new CudaMergeMLA());
+        this->ops["MergeMLAPaged"] = (BaseOperator*)(new CudaMergeMLAPaged());
         this->ops["RecurrentGatedDeltaRule"] = (BaseOperator*)(new CudaRecurrentGatedDeltaRuleOp());
         this->ops["CausalMask"] = (BaseOperator*)(new CudaCausalMaskOp());
         this->ops["MakeDecayMask"] = (BaseOperator*)(new CudaMakeDecayMaskOp());
@@ -156,6 +157,7 @@ namespace fastllm {
         Data *output = (datas.find("output")->second);
         output->dataType = DataType::FLOAT16;
         output->Resize(input->dims);
+        output->UpdateUnitSize();
         if (input->expansionDims.size() != 0)
             output->Expansion(input->expansionDims);
     }
@@ -182,6 +184,7 @@ namespace fastllm {
         Data *output = (datas.find("output")->second);
         output->dataType = DataType::FLOAT32;
         output->Resize(input->dims);
+        output->UpdateUnitSize();
         if (input->expansionDims.size() != 0)
             output->Expansion(input->expansionDims);
     }
@@ -1283,6 +1286,36 @@ namespace fastllm {
                 MatMul(score0, peCache, output);
             }
         }
+    }
+
+    void CudaMergeMLAPaged::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qNope = *(datas.find("qNope")->second);
+        Data &output = *(datas.find("output")->second);
+        output.dataType = qNope.dataType;
+        output.Resize(qNope.dims);
+    }
+
+    void CudaMergeMLAPaged::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qNope = *(datas.find("qNope")->second);
+        Data &qPe = *(datas.find("qPe")->second);
+        Data &kvCachePaged = *(datas.find("kvCachePaged")->second);
+        Data &peCachePaged = *(datas.find("peCachePaged")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+
+        float softmaxScale = floatParams.find("softmaxScale") != floatParams.end() ? floatParams.find("softmaxScale")->second : 1.0f;
+
+        AssertInFastLLM(kvCachePaged.isPagedKVCache && peCachePaged.isPagedKVCache,
+            "CudaMergeMLAPaged: kvCachePaged and peCachePaged must be paged KV cache (isPagedKVCache=true).\n");
+        if (qNope.dataType != DataType::FLOAT16) {
+            printf("CudaMergeMLAPaged: qNope must be FLOAT16 to use FastllmCudaMLAPaged.\n");
+            return;
+        }
+
+        bool ok = FastllmCudaMLAPaged(qNope, qPe, kvCachePaged, peCachePaged, output, softmaxScale);
+        AssertInFastLLM(ok, "CudaMergeMLAPaged: FastllmCudaMLAPaged failed.\n");
     }
 
     void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
