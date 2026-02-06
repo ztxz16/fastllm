@@ -202,6 +202,7 @@ def make_normal_llm_model(args):
     if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
         model.enable_thinking = False
     model.set_atype(args.atype)
+    model.warmup()
     if (args.cache_history.lower() not in ["", "false", "0", "off"]):
         model.set_save_history(True)
         if (args.cache_fast in ["", "false", "0", "off"]):

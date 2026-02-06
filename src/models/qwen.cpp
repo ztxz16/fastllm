@@ -532,14 +532,14 @@ namespace fastllm {
 
     void QWenModel::WarmUp() {
         printf("Warmup...\n");
-        Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
-        Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});
-        Data positionIds = Data(DataType::FLOAT32, {1, 1}, {0, 0});
+        Data inputIds = Data(this->dataType, {1, 1}, {1});
+        Data attentionMask = Data(this->dataType, {1, 1}, {0});
+        Data positionIds = Data(this->dataType, {1, 1}, {0, 0});
 
         std::vector <std::pair <Data, Data> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
-                                                   Data(DataType::FLOAT32)));
+            pastKeyValues.push_back(std::make_pair(Data(this->dataType),
+                                                   Data(this->dataType)));
         }
         Forward(inputIds, attentionMask, positionIds, pastKeyValues);
         elementsInKVCachePerToken = (long long)block_cnt * 

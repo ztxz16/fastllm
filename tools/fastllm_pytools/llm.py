@@ -130,6 +130,8 @@ fastllm_lib.set_max_batch_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 
 fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
 
+fastllm_lib.warmup_llm_model.argtypes = [ctypes.c_int]
+
 fastllm_lib.get_max_input_len_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_max_input_len_llm_model.restype = ctypes.c_int
 
@@ -1463,6 +1465,9 @@ class model:
 
     def set_atype(self, atype: str):
         fastllm_lib.set_model_atype(self.model, str(atype).encode())
+
+    def warmup(self):
+        fastllm_lib.warmup_llm_model(self.model)
 
     def set_moe_experts(self, experts: int):
         fastllm_lib.set_moe_experts(self.model, experts)
