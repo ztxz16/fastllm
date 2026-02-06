@@ -1345,7 +1345,7 @@ namespace fastllm {
         int oldTopk = this->num_experts_per_tok;
         this->num_experts_per_tok = this->num_experts;
 
-        Data inputIds = Data(this->dataType, {1, 4}, {0, 1, 2, 3});
+        Data inputIds = Data(DataType::FLOAT32, {1, 4}, {0, 1, 2, 3});
         Data attentionMask = Data(this->dataType, {4, 4});
         Data positionIds = Data(this->dataType, {1, 4}, {0, 1, 2, 3});
 
