@@ -281,7 +281,6 @@ namespace fastllm {
         BertModel *model = new BertModel();
         model->weight.tokenizer.type = Tokenizer::BERT;
         model->LoadFromFile(fileName);
-        model->WarmUp();
         return std::unique_ptr<fastllm::BertModel> (model);
     }
 
@@ -1338,7 +1337,6 @@ if (false) {
         printf("\n");
         fflush(stdout);
 
-        model->WarmUp();
         return std::unique_ptr<fastllm::basellm> (model);
     }
 
@@ -1349,10 +1347,8 @@ if (false) {
             BertModel *bertModel = (BertModel*)model;
             bertModel->weight.tokenizer.type = Tokenizer::BERT;
             bertModel->LoadFromFile(fileName);
-            bertModel->WarmUp();
         }else{
             model->LoadFromFile(fileName);
-            model->WarmUp();
         }
         return std::unique_ptr<fastllm::basellm> (model);
     }
@@ -1995,8 +1991,6 @@ if (false) {
 
         delete loraTensors;
 
-        if (!weightOnly)
-            model->WarmUp();
         return std::unique_ptr<fastllm::basellm> (model);
     }
 
