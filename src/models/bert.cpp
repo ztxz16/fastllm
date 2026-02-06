@@ -226,7 +226,7 @@ namespace fastllm {
         std::vector <float> token_type_ids = std::vector <float> (batch * len, 0.0f);
         std::vector <float> attention_mask = std::vector <float> (batch * len, -1e10f);
         std::vector <float> position_ids = std::vector <float> (batch * len, 0.0f);
-        fastllm::Data inputIds = fastllm::Data(this->dataType, {batch, len}, ids);
+        fastllm::Data inputIds = fastllm::Data(fastllm::DataType::FLOAT32, {batch, len}, ids);
         fastllm::Data attentionMask = fastllm::Data(this->dataType, {batch, len}, attention_mask);
         fastllm::Data tokenTypeIds = fastllm::Data(this->dataType, {batch, len}, token_type_ids);
         fastllm::Data positionIds = fastllm::Data(this->dataType, {batch, len}, position_ids);

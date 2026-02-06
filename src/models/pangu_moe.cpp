@@ -1013,7 +1013,7 @@ namespace fastllm {
         int old = this->moe_num_groups;
         this->moe_num_groups = 1;
 
-        Data inputIds = Data(this->dataType, {1, 1}, {1});
+        Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
         Data attentionMask = Data(this->dataType, {1, 1}, {0});
         Data positionIds = Data(this->dataType, {1, 1}, {0, 0});
 
