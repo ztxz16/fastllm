@@ -1,5 +1,66 @@
 #include "fastllm.h"
 
+#ifdef __CUDACC__
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include <cuda_profiler_api.h>
+#include <cuda.h>
+#include <stdio.h>
+#include <vector>
+#include <chrono>
+#include <map>
+#include <memory>
+
+#define checkCudaErrors(message, val) showError(val, message, __FILE__, __LINE__)
+void showError(cudaError_t result, char const* const message, const char* const file, int const line);
+
+#ifdef USE_ROCM
+#include "fastllm-hip.h"
+#endif
+
+#define CUDA_MAX(a, b) ((a) > (b) ? (a) : (b))
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
+#include "mma.h"
+using namespace nvcuda;
+#endif
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 530
+#define CUDA_NO_TENSOR_CORE
+#endif
+
+typedef union __align__(16) {
+    uint2 in;
+    uint8_t out[8];
+} union_char8;
+
+typedef union __align__(16) {
+    uint32_t in;
+    uint8_t out[4];
+} union_char4;
+
+typedef union __align__(16) _union_half_4 {
+    uint2 in;
+    half out[4];
+    half2 out2[2];
+    __device__ _union_half_4() {
+      // Do nothing
+    }
+} union_half4;
+
+typedef union __align__(16) _union_half_8 {
+    uint4 in;
+    half out[8];
+    half2 out2[4];
+    __device__ _union_half_8() {
+      // Do nothing
+    }
+} union_half8;
+#else
+typedef void* cublasHandle_t;
+#endif
+
 std::vector <long long> FastllmCudaGetFreeSizes();
 
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
@@ -16,11 +77,16 @@ struct CudaInfos {
     CudaInfos ();
 };
 
+const size_t ST128_FP16_COUNT = 8;
+
 CudaInfos *getCudaInfos();
 
-void FastllmCudaLinearFromCPU(uint8_t *input, fastllm::DataType inputType, 
-    uint8_t *weight, fastllm::DataType weightType, 
-    uint8_t *output, fastllm::DataType outputType, int n, int m, int k);
+void *FastllmCudaPrepareInput(const fastllm::Data &input);
+void *FastllmCudaPrepareOutput(fastllm::Data &output);
+void FastllmCudaFinishInput(const fastllm::Data &input, void *data);
+void FastllmCudaFinishOutput(fastllm::Data &output, void *data);
+cublasHandle_t getFastllmCublasHandle();
+
 void FastllmCudaPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *cudaIndex);
 void FastllmCudaPickOutput(uint8_t *partOutput, uint8_t *output, int rows, int cols, int *index, float *scales, fastllm::DataType dataType);
 
@@ -165,4 +231,12 @@ int GetPointerDeviceId(void *ptr);
 int FastllmCudaGetDeviceCount();
 #ifdef  __cplusplus
 }
+#endif
+
+#ifdef __CUDACC__
+/* CUDA kernel declarations (shared by linear/ggml/attention .cu files) */
+extern __global__ void FastllmCudaFloat2HalfKernel(float* a, half *b, int len);
+extern __global__ void FastllmCudaHalf2FloatKernel(half* a, float *b, int len);
+extern __global__ void FastllmCudaBiasKernel(float *a, float *bias, int k);
+extern __global__ void FastllmCudaBiasKernel(half *a, half *bias, int k);
 #endif
