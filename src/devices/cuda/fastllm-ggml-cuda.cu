@@ -6,15 +6,6 @@
 // https://github.com/ggml-org/llama.cpp
 // https://github.com/ikawrakow/ik_llama.cpp
 
-#include <cuda_profiler_api.h>
-#include <cublas_v2.h>
-#include <cuda.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-#include <stdio.h>
-#include <vector>
-#include <chrono>
-
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
 #include <thrust/sequence.h>
@@ -28,24 +19,6 @@
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
 #include "gguf.h"
-
-#ifdef USE_ROCM
-#include "fastllm-hip.h"
-#endif
-
-#define checkCudaErrors(message, val) showError(val, message, __FILE__, __LINE__)
-extern void showError(cudaError_t result, char const* const message, const char* const file, int const line);
-
-extern void *FastllmCudaPrepareInput(const fastllm::Data &input);
-extern void *FastllmCudaPrepareOutput(fastllm::Data &output);
-extern void FastllmCudaFinishInput(const fastllm::Data &input, void *data);
-extern void FastllmCudaFinishOutput(fastllm::Data &output, void *data);
-extern __global__ void FastllmCudaBiasKernel(float *a, float *bias, int k);
-extern __global__ void FastllmCudaBiasKernel(half *a, half *bias, int k);
-extern __global__ void FastllmCudaFloat2HalfKernel(float* a, half *b, int len);
-extern __global__ void FastllmCudaHalf2FloatKernel(half* a, float *b, int len);
-
-extern cublasHandle_t getFastllmCublasHandle();
 
 static __device__ __forceinline__ float warp_reduce_max(float x) {
 #pragma unroll
