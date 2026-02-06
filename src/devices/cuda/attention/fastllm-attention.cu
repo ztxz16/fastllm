@@ -1,25 +1,6 @@
 //
 // Created by huangyuyang on 1/21/26.
 //
-
-#include <cuda_profiler_api.h>
-#include <cublas_v2.h>
-#include <cuda.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-#include <stdio.h>
-#include <vector>
-#include <chrono>
-#include <map>
-#include <memory>
-
-#include "fastllm-cuda.cuh"
-#include "fastllm.h"
-
-#ifdef USE_ROCM
-#include "fastllm-hip.h"
-#endif
-
 // FlashInfer includes
 #include "attention_impl.cuh"
 #include "attention/default_prefill_params.cuh"
@@ -31,23 +12,8 @@
 #include "pos_enc.cuh"
 #include "utils.cuh"
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 // support tensor core
-#include "mma.h"
-using namespace nvcuda;
-#endif
-
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 530
-#define CUDA_NO_TENSOR_CORE
-#endif
-
-#define checkCudaErrors(message, val) showError(val, message, __FILE__, __LINE__)
-extern void showError(cudaError_t result, char const* const message, const char* const file, int const line);
-
-extern void *FastllmCudaPrepareInput(const fastllm::Data &input);
-extern void *FastllmCudaPrepareOutput(fastllm::Data &output);
-extern void FastllmCudaFinishInput(const fastllm::Data &input, void *data);
-extern void FastllmCudaFinishOutput(fastllm::Data &output, void *data);
-extern cublasHandle_t getFastllmCublasHandle();
+#include "fastllm-cuda.cuh"
+#include "fastllm.h"
 
 template <int BN, int BM, int BK>
 __global__ void HalfFC(
@@ -1065,35 +1031,7 @@ mask_mode = MaskMode::kCausal;
             cudaError_t status = cudaSuccess;
             cudaStream_t stream = nullptr;
             
-            // 当 q1 == 1 时（decode 阶段），使用 decode 接口
-            if (q1 == 1) {
-                // Decode 阶段：q 的形状是 [num_qo_heads, head_dim]（单个 token）
-                // 创建 SingleDecodeParams (使用 HND 布局)
-                SingleDecodeParams<half, half, half> decode_params(
-                    cur_q, cur_k, cur_v, cur_o,    // q, k, v, o
-                    nullptr,                        // maybe_alibi_slopes
-                    kv_len,                         // seq_len (kv_len)
-                    num_qo_heads,                   // num_qo_heads
-                    num_kv_heads,                   // num_kv_heads
-                    QKVLayout::kHND,                // kv_layout (HND)
-                    head_dim_qk,                    // head_dim
-                    -1,                             // window_left (-1 means no sliding window)
-                    0.0f,                           // logits_soft_cap
-                    scale,                          // sm_scale
-                    1.0f,                           // rope_scale (不使用 RoPE)
-                    10000.0f                        // rope_theta (不使用 RoPE)
-                );
-                
-                // 手动设置 stride（因为 decode 接口的构造函数可能不适用于我们的布局）
-                decode_params.q_stride_n = q_stride_n;
-                decode_params.q_stride_h = q_stride_h;
-                decode_params.kv_stride_n = kv_stride_n;
-                decode_params.kv_stride_h = kv_stride_h;
-                
-                // 调用 FlashInfer decode 接口（decode 阶段总是 causal）
-                status = SingleDecodeWithKVCacheDispatched<128, PosEncodingMode::kNone, DefaultAttention<false, false, false, false>>(
-                    decode_params, tmp, stream);
-            } else {
+            {
                 // Prefill 阶段：q 的形状是 [num_qo_heads, qo_len, head_dim]
                 // 创建 SinglePrefillParams (使用 HND 布局)
                 SinglePrefillParams<half, half, half> params(
