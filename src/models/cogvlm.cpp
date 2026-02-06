@@ -619,13 +619,13 @@ namespace fastllm {
         std::map <std::string, std::vector <fastllm::Data*> > multimodalInput;
         std::vector <float> imageInput = std::vector <float> (1 * this->vision_in_channels * this->vision_image_size * this->vision_image_size, 0);
         fastllm::Data imageInputData;
-        imageInputData.CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {1, this->vision_in_channels, this->vision_image_size, this->vision_image_size}, imageInput));
+        imageInputData.CopyFrom(fastllm::Data(this->dataType, {1, this->vision_in_channels, this->vision_image_size, this->vision_image_size}, imageInput));
         multimodalInput["images"].push_back(&imageInputData);
 
         std::vector <std::pair <Data, Data> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
-                                                   Data(DataType::FLOAT32)));
+            pastKeyValues.push_back(std::make_pair(Data(this->dataType),
+                                                   Data(this->dataType)));
         }
         ForwardMultimodal(inputIds, attentionMask, positionIds, pastKeyValues, multimodalInput, generationConfig);
         elementsInKVCachePerToken = (long long)block_cnt * 

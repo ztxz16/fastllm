@@ -272,7 +272,6 @@ def create(model,
 
     print("");
     llm.fastllm_lib.init_params_llm_model(model_handle);
-    llm.fastllm_lib.warmup_llm_model(model_handle);
     ret = llm.model("", id = model_handle);
     return ret;
 
