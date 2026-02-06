@@ -865,20 +865,17 @@ auto st = std::chrono::system_clock::now();
                                                             tokensManager, &logits);
                                 }
                             } else {
-                                int first = 8192, part = 2048;
-                                if (model->model_struct == "deepseek_v2") {
-                                    // TODO: ds_v2支持更长的切片
-                                    first = 1024;
-                                    part = 1024;
-                                    if (GetEnableAMX()) {
-                                        first = 2048;
-                                        part = 2048;
+                                int first, part;
+                                if (model->chunkedPrefillSize >= 0) {
+                                    first = part = model->chunkedPrefillSize;
+                                } else {
+                                    first = part = 8192;
+                                    if (model->model_struct == "deepseek_v2") {
+                                        first = part = 2048;
                                     }
-                                }
-                                if (model->model_struct == "qwen3_next") {
-                                    // TODO: qwen3_next支持更长的切片
-                                    first = 2048;
-                                    part = 1024;
+                                    if (model->model_struct == "qwen3_next") {
+                                        first = part = 2048;
+                                    }
                                 }
                                 if (seqLens[0] > first) {
                                     int len = seqLens[0];
@@ -1300,6 +1297,10 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
     void basellm::SetMoeExperts(int experts) {
         this->num_experts_per_tok = std::max(1, experts - this->n_shared_experts);
         return;
+    }
+
+    void basellm::SetChunkedPrefillSize(int size) {
+        this->chunkedPrefillSize = size;
     }
 
     void basellm::SetDataType(DataType dataType) {

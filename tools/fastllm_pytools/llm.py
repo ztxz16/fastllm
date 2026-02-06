@@ -128,6 +128,8 @@ fastllm_lib.set_kv_cache_limit_llm_model.argtypes = [ctypes.c_int, ctypes.c_int6
 
 fastllm_lib.set_max_batch_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 
+fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+
 fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
 
 fastllm_lib.warmup_llm_model.argtypes = [ctypes.c_int]
@@ -1494,6 +1496,10 @@ class model:
     
     def set_max_batch(self, batch: int):
         fastllm_lib.set_max_batch_llm_model(self.model, batch)
+
+    def set_chunked_prefill_size(self, size: int):
+        """设置分块 prefill 的切片大小（首块与后续块使用相同 token 数）。"""
+        fastllm_lib.set_chunked_prefill_size_llm_model(self.model, size)
     
     def set_verbose(self, verbose: int):
         fastllm_lib.set_verbose_llm_model(self.model, verbose)
