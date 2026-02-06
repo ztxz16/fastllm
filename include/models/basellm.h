@@ -239,6 +239,8 @@ namespace fastllm {
 
         virtual void SetMoeExperts(int experts);
 
+        virtual void SetChunkedPrefillSize(int size);
+
         virtual void SetDataType(DataType dataType);
 
         virtual void UpdateRotaryPtr(Data **sinDataPtr, Data **cosDataPtr, const std::string &device);
@@ -329,6 +331,9 @@ namespace fastllm {
 
         int kvCacheId = 0; // 最早使用kv_cache的层编号 （因为有一些混合架构的模型，其中一些block是线性attention）
         bool canDoBatchForward = true; // 是否支持batch推理
+
+        // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
+        int chunkedPrefillSize = -1;
     };
 }
 

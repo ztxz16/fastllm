@@ -14,6 +14,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
+    parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
     parser.add_argument('--device', type = str, help = '使用的设备')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
@@ -202,7 +203,6 @@ def make_normal_llm_model(args):
     if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
         model.enable_thinking = False
     model.set_atype(args.atype)
-    model.warmup()
     if (args.cache_history.lower() not in ["", "false", "0", "off"]):
         model.set_save_history(True)
         if (args.cache_fast in ["", "false", "0", "off"]):
@@ -213,6 +213,9 @@ def make_normal_llm_model(args):
         model.set_max_batch(args.max_batch)
     if (args.kv_cache_limit != "" and args.kv_cache_limit != "auto"):
         model.set_kv_cache_limit(args.kv_cache_limit)
+    if (args.chunked_prefill_size > 0):
+        model.set_chunked_prefill_size(args.chunked_prefill_size)
+    model.warmup()
     return model
 
 def make_download_parser(add_help = True):
