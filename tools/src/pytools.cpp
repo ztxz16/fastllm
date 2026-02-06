@@ -544,6 +544,11 @@ extern "C" {
         model->maxBatch = batch;
     }
 
+    DLL_EXPORT void set_chunked_prefill_size_llm_model(int modelId, int size) {
+        auto model = models.GetModel(modelId);
+        model->SetChunkedPrefillSize(size);
+    }
+
     DLL_EXPORT void set_verbose_llm_model(int modelId, bool verbose) {
         auto model = models.GetModel(modelId);
         model->verbose = verbose;
