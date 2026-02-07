@@ -238,6 +238,7 @@ if (USE_CUDA)
         src/devices/cuda/attention/fastllm-attention.cu
         src/devices/cuda/linear/fastllm-linear-fp32.cu
         src/devices/cuda/linear/fastllm-linear-fp16.cu
+        src/devices/cuda/linear/fastllm-linear-bf16.cu
         src/devices/cuda/linear/fastllm-linear-fp8.cu
         src/devices/cuda/linear/fastllm-linear-int8.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu

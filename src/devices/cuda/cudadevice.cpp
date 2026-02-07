@@ -444,6 +444,8 @@ namespace fastllm {
                 FastllmCudaHalfMatMulFloat32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaHalfMatMulFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::BFLOAT16) {
+                FastllmCudaHalfMatMulBFloat16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT8) {
                 FastllmCudaHalfMatMulFloatInt8(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_GROUP) {
@@ -462,6 +464,8 @@ namespace fastllm {
                 FastllmCudaMatMulFloat32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaMatMulFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::BFLOAT16) {
+                FastllmCudaMatMulBFloat16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT8) {
                 FastllmCudaMatMulFloatInt8(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4) {
@@ -478,6 +482,12 @@ namespace fastllm {
                 FastllmCudaMatMulFloatFP8E4M3Block128(input, weight, bias, output, n, m, k);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
+            }
+        } else if (input.dataType == DataType::BFLOAT16) {
+            if (weight.dataType == DataType::BFLOAT16) {
+                FastllmCudaBFloat16MatMulBFloat16(input, weight, bias, output, n, m, k);
+            } else {
+                ErrorInFastLLM("Linear error: unsupport weight's dataType for BFLOAT16 input.\n");
             }
         } else {
             ErrorInFastLLM("Linear error: unsupport input's dataType.\n");
