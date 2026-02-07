@@ -184,6 +184,21 @@ __global__ void FastllmCudaBF162FloatKernel(uint16_t* a, float *b, int len) {
     }
 }
 
+__global__ void FastllmCudaFloat2Bf16Kernel(float* a, __nv_bfloat16* b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        b[idx] = __float2bfloat16_rn(a[idx]);
+    }
+}
+
+__global__ void FastllmCudaBiasKernel(__nv_bfloat16* a, __nv_bfloat16* bias, int k) {
+    __nv_bfloat16* now = a + blockIdx.x * k;
+    int stride = blockDim.x;
+    for (int i = threadIdx.x; i < k; i += stride) {
+        now[i] = __float2bfloat16_rn(__bfloat162float(now[i]) + __bfloat162float(bias[i]));
+    }
+}
+
 __global__ void FastllmCudaBiasKernel(float *a, float *bias, int k) {
     float *now = a + blockIdx.x * k;
     int stride = blockDim.x;
