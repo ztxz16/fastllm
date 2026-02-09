@@ -1468,6 +1468,9 @@ class model:
     def set_atype(self, atype: str):
         fastllm_lib.set_model_atype(self.model, str(atype).encode())
 
+    def set_moe_atype(self, moe_atype: str):
+        fastllm_lib.set_model_moe_atype(self.model, str(moe_atype).encode())
+
     def warmup(self):
         fastllm_lib.warmup_llm_model(self.model)
 
