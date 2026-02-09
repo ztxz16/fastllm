@@ -433,11 +433,11 @@ namespace fastllm {
 
         void CalcWeightSum(); // 计算WeightSum
 
-        void ToDevice(DataDevice device); // 移动到指定device
+        void ToDevice(DataDevice device, bool copyData = true); // 移动到指定device
 
-        void ToDevice(DataDevice device, const std::vector <int> &deviceIds); // 移动到指定device
+        void ToDevice(DataDevice device, const std::vector <int> &deviceIds, bool copyData = true); // 移动到指定device
 
-        void ToDevice(void *device);
+        void ToDevice(void *device, bool copyData = true);
 
         void ToCudaTemporary(const std::vector <int> &deviceIds, bool copyData); // 临时移动到cuda
 
