@@ -171,7 +171,11 @@ namespace fastllm {
                         }
                     } else {
                         if (it.second) {
-                            it.second->ToDevice((void *) device);
+                            if (it.first == "output") {
+                                it.second->ToDevice((void *) device, false);
+                            } else {
+                                it.second->ToDevice((void *) device);
+                            }
                         }
                     }
                 }
