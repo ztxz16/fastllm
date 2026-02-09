@@ -3089,7 +3089,7 @@ __global__ void FastllmPickOutputKernel(half *partOutput, half *output, int rows
         // 执行 CPU 逻辑: output[idx * cols + j] += sca * partOutput[i * cols + j];
         // 注意：这里假设 index 映射的目标行通常是唯一的（在 LLM Batch 推理中通常如此）。
         // 如果多个 i 映射到同一个 idx，这里存在竞争冒险，但在 FastLLM 上下文中通常是 Scatter 操作。
-        output[dstOffset] = (half)(sca * (float)partOutput[srcOffset]);
+        output[dstOffset] = (half)((float)output[dstOffset] + sca * (float)partOutput[srcOffset]);
     }
 }
 // Host 调用函数

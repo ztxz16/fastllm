@@ -1325,6 +1325,14 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         this->dataType = dataType;
     }
 
+    void basellm::SetMoeAtype(DataType type) {
+        if (type == DataType::FLOAT32 || type == DataType::FLOAT16) {
+            this->moeAtype = type;
+        } else {
+            ErrorInFastLLM("SetMoeAtype Error: moe_atype should be float32 or float16");
+        }
+    }
+
     void basellm::UpdateRotaryPtr(Data **sinDataPtr, Data **cosDataPtr, const std::string &device) {
         if (this->deviceSinDatas.find(device) == this->deviceSinDatas.end()) {
             this->deviceSinDatas[device] = new Data();
