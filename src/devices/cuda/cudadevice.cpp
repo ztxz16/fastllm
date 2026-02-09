@@ -1584,18 +1584,22 @@ float totalTime = 0.0f;
 
                 Data tempInput, tempMiddle, tempSwiglu, tempOutput;
                 tempInput.Resize(input.dims);
+                tempInput.dataType = input.dataType;
                 tempInput.ToDevice(input.dataDevice);
                 tempInput.Allocate();
 
                 tempMiddle.Resize({input.dims[0], weights[2]->dims[0]});
+                tempMiddle.dataType = input.dataType;
                 tempMiddle.ToDevice(input.dataDevice);
                 tempMiddle.Allocate();
 
                 tempSwiglu.Resize({input.dims[0], weights[2]->dims[0] / 2});
+                tempSwiglu.dataType = input.dataType;
                 tempSwiglu.ToDevice(input.dataDevice);
                 tempSwiglu.Allocate();
 
                 tempOutput.Resize(output.dims);
+                tempOutput.dataType = output.dataType;
                 tempOutput.ToDevice(output.dataDevice);
                 tempOutput.Allocate();
 // ForceDeviceSync(); mergeMoeTimeCnt["alloc_data"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();

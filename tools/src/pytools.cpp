@@ -297,6 +297,19 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT void set_model_moe_atype(int modelId, char *moe_atype) {
+        auto model = models.GetModel(modelId);
+        std::string atypeStr = moe_atype;
+        if (atypeStr == "float16" || atypeStr == "half") {
+            model->SetMoeAtype(fastllm::DataType::FLOAT16);
+        } else if (atypeStr == "float" || atypeStr == "float32" || atypeStr == "" || atypeStr == "auto") {
+            model->SetMoeAtype(fastllm::DataType::FLOAT32);
+        } else {
+            fastllm::ErrorInFastLLM("set_model_moe_atype error: moe_atype should be float32 or float16.");
+        }
+        return;
+    }
+
     DLL_EXPORT void set_model_atype(int modelId, char *atype) {
         auto model = models.GetModel(modelId);
         std::string atypeStr = atype;
