@@ -243,6 +243,8 @@ namespace fastllm {
 
         virtual void SetDataType(DataType dataType);
 
+        virtual void SetMoeAtype(DataType type);
+
         virtual void UpdateRotaryPtr(Data **sinDataPtr, Data **cosDataPtr, const std::string &device);
 
         // messages: [ (role, content) ... ]
@@ -327,6 +329,7 @@ namespace fastllm {
         bool verbose = false;
 
         DataType dataType = DataType::FLOAT32;
+        DataType moeAtype = DataType::FLOAT32; // MOE 层激活类型，可由 --moe_atype 设定
         bool isFree = false; // 是否释放
 
         int kvCacheId = 0; // 最早使用kv_cache的层编号 （因为有一些混合架构的模型，其中一些block是线性attention）
