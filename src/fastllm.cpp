@@ -1555,24 +1555,24 @@ namespace fastllm {
         } 
     }
 
-    void Data::ToDevice(void *device) {
+    void Data::ToDevice(void *device, bool copyData) {
         BaseDevice *dev = (BaseDevice*)device;
         if (dev->deviceType == "cuda" || dev->deviceType == "multicuda") {
-            this->ToDevice(DataDevice::CUDA, dev->deviceIds);
+            this->ToDevice(DataDevice::CUDA, dev->deviceIds, copyData);
         } else {
-            this->ToDevice(DataDevice::CPU, dev->deviceIds);
+            this->ToDevice(DataDevice::CPU, dev->deviceIds, copyData);
         }
     }
 
-    void Data::ToDevice(fastllm::DataDevice device) {
+    void Data::ToDevice(fastllm::DataDevice device, bool copyData) {
         if (device == DataDevice::CUDA) {
-            ToDevice(device, curExecutor->GetDeviceIds("cuda"));
+            ToDevice(device, curExecutor->GetDeviceIds("cuda"), copyData);
         } else {
-            ToDevice(device, {0});
+            ToDevice(device, {0}, copyData);
         }
     }
 
-    void Data::ToDevice(fastllm::DataDevice device, const std::vector <int> &deviceIds) {
+    void Data::ToDevice(fastllm::DataDevice device, const std::vector <int> &deviceIds, bool copyData) {
         // TODO: 同一个Weight切分到不同 Device 上
         // NOTICE: 目前还不支持，暂时只切到deviceIds[0]上
 
@@ -1592,32 +1592,39 @@ namespace fastllm {
 #ifdef USE_CUDA
             if (this->dataDevice == DataDevice::CPU) {
                 if (device == DataDevice::CUDA) {
-                    uint8_t *cpuData = this->cpuData;
+                    if (copyData) {
+                        uint8_t *cpuData = this->cpuData;
 #ifdef USE_MMAP
-                    cpuData = new uint8_t[expansionBytes];
-                    memcpy(cpuData, this->cpuData, expansionBytes);
+                        cpuData = new uint8_t[expansionBytes];
+                        memcpy(cpuData, this->cpuData, expansionBytes);
 #endif
-                    // FastllmCudaSetDevice(deviceIds.size() == 0 ? 0 : deviceIds[0]);
-                    if (this->cudaData == nullptr) {
-                        this->cudaData = FastllmCudaMalloc(expansionBytes);
-                    }
+                        if (this->cudaData == nullptr) {
+                            this->cudaData = FastllmCudaMalloc(expansionBytes);
+                        }
 
-                    FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
+                        FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
 #ifdef USE_MMAP
-                    delete[] cpuData;
+                        delete[] cpuData;
 #else
-                    if (this->isModelWeight || this->isKVCache) {
-                        delete[] this->cpuData;
-                        this->cpuData = nullptr;
-                    }
+                        if (this->isModelWeight || this->isKVCache) {
+                            delete[] this->cpuData;
+                            this->cpuData = nullptr;
+                        }
 #endif
+                    } else {
+                        if (this->cudaData == nullptr) {
+                            this->cudaData = FastllmCudaMalloc(expansionBytes);
+                        }
+                    }
                 }
             } else if (this->dataDevice == DataDevice::CUDA) {
                 if (device == DataDevice::CPU) {
                     if (this->cpuData == nullptr) {
                         this->cpuData = new uint8_t[expansionBytes];
-                    } 
-                    FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
+                    }
+                    if (copyData) {
+                        FastllmCudaCopyFromDeviceToHost(this->cpuData, this->cudaData, expansionBytes);
+                    }
 
                     if (this->isModelWeight || this->isKVCache) {
                         FastllmCudaFree(this->cudaData);
@@ -1629,7 +1636,9 @@ namespace fastllm {
                     if (sourceDevice != destDevice) {
                                         FastllmCudaSetDevice(destDevice);
                                         void *newCudaData = FastllmCudaMalloc(expansionBytes);
-                                        FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
+                                        if (copyData) {
+                                            FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
+                                        }
                                         FastllmCudaSetDevice(sourceDevice);
                                         FastllmCudaFree(this->cudaData);
                                         this->cudaData = newCudaData;
