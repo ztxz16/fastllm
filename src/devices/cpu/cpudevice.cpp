@@ -154,6 +154,8 @@ namespace fastllm {
     FP16ToFP32Manager fp16tofp32;
     BF16ToFP32Manager bf16tofp32;
     FP8E4M3ToFP32Manager fp8e4m3tofp32;
+    extern BF16ToFP16Manager bf16tofp16;
+    FP16ToBF16Manager fp16tobf16;
 
     void Float16ToFloat32(uint16_t *float16, float *float32, int len) {
         int i = 0;
@@ -233,22 +235,14 @@ namespace fastllm {
     }
 
     void Float16ToBFloat16(uint16_t *float16, uint16_t *bfloat16, int len) {
-        int i = 0;
-#ifdef __AVX__
-        for (; i + 7 < len; i += 8) {
-            __m256 _float_vec = _mm256_cvtph_ps(_mm_loadu_si128((__m128i *) (float16 + i)));
-            __m256i float_vec = *((__m256i *)&_float_vec);
-            __m256i shifted = _mm256_srli_epi32(float_vec, 16);
-            __m128i lo = _mm256_castsi256_si128(shifted);
-            __m128i hi = _mm256_extracti128_si256(shifted, 1);
-            __m128i packed = _mm_packus_epi32(lo, hi);
-            _mm_storeu_si128((__m128i*)&bfloat16[i], packed);
+        for (int i = 0; i < len; i++) {
+            bfloat16[i] = fp16tobf16.dict[float16[i]];
         }
-#endif
-        for (; i < len; i++) {
-            uint32_t val;
-            memcpy(&val, &fp16tofp32.dict[float16[i]], sizeof(val));
-            bfloat16[i] = (uint16_t)(val >> 16);
+    }
+
+    void BFloat16ToFloat16(uint16_t *bfloat16, uint16_t *float16, int len) {
+        for (int i = 0; i < len; i++) {
+            float16[i] = bf16tofp16.dict[bfloat16[i]];
         }
     }
 
@@ -274,6 +268,11 @@ namespace fastllm {
                 cur[i] = float_to_half(old[i]);
             }
             delete[] old;
+        } else if (data.dataType == DataType::BFLOAT16) {
+            data.dataType = DataType::FLOAT16;
+            data.UpdateUnitSize();
+            int len = data.Count(0);
+            BFloat16ToFloat16((uint16_t*)data.cpuData, (uint16_t*)data.cpuData, len);
         } else {
             ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
         }
@@ -340,6 +339,8 @@ namespace fastllm {
         }
         if (input.dataType == DataType::FLOAT32) {
             Float32ToFloat16((float*)input.cpuData, (uint16_t*)output.cpuData, input.Count(0));
+        } else if (input.dataType == DataType::BFLOAT16) {
+            BFloat16ToFloat16((uint16_t*)input.cpuData, (uint16_t*)output.cpuData, input.Count(0));
         } else {
             ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
         }
@@ -400,6 +401,11 @@ namespace fastllm {
             int len = data.Count(0);
             Float32ToBFloat16(old, cur, len);
             delete[] old;
+        } else if (data.dataType == DataType::FLOAT16) {
+            data.dataType = DataType::BFLOAT16;
+            data.UpdateUnitSize();
+            int len = data.Count(0);
+            Float16ToBFloat16((uint16_t*)data.cpuData, (uint16_t*)data.cpuData, len);
         } else {
             ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
         }
@@ -427,6 +433,8 @@ namespace fastllm {
         }
         if (input.dataType == DataType::FLOAT32) {
             Float32ToBFloat16((float*)input.cpuData, (uint16_t*)output.cpuData, input.Count(0));
+        } else if (input.dataType == DataType::FLOAT16) {
+            Float16ToBFloat16((uint16_t*)input.cpuData, (uint16_t*)output.cpuData, input.Count(0));
         } else {
             ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
         }
@@ -1169,19 +1177,28 @@ namespace fastllm {
             
     void MultiThreadReduceBatchOp::Run() {
             for (int i = batch_st; i < batch_end; i++) {
-                // 处理第一个专家（初始化输出）
-                int curPos = pos[i * k];
-                float weight = weights[curPos];
-                for (int h = hidden_st; h < hidden_end; h++) {
-                    lastOutput[i * hidden_size + h] = weight * ((float*)downOutData)[curPos * hidden_size + h];
+                bool initialized = false;
+                for (int expert_idx = 0; expert_idx < k; expert_idx++) {
+                    int curPos = pos[i * k + expert_idx];
+                    if (curPos == -1) continue; // 跳过无效位置
+                    float weight = weights[curPos];
+                    if (!initialized) {
+                        // 第一个有效专家：初始化输出
+                        for (int h = hidden_st; h < hidden_end; h++) {
+                            lastOutput[i * hidden_size + h] = weight * ((float*)downOutData)[curPos * hidden_size + h];
+                        }
+                        initialized = true;
+                    } else {
+                        // 累加其余专家的贡献
+                        for (int h = hidden_st; h < hidden_end; h++) {
+                            lastOutput[i * hidden_size + h] += weight * ((float*)downOutData)[curPos * hidden_size + h];
+                        }
+                    }
                 }
-                
-                // 累加其余专家的贡献
-                for (int expert_idx = 1; expert_idx < k; expert_idx++) {
-                    curPos = pos[i * k + expert_idx];
-                    weight = weights[curPos];
+                if (!initialized) {
+                    // 如果没有有效专家，初始化为0
                     for (int h = hidden_st; h < hidden_end; h++) {
-                        lastOutput[i * hidden_size + h] += weight * ((float*)downOutData)[curPos * hidden_size + h];
+                        lastOutput[i * hidden_size + h] = 0.0f;
                     }
                 }
             }
@@ -2593,6 +2610,8 @@ ops += (long long)lines * inputDim * interDim * 2;
                 if (output.dataType != DataType::FLOAT32) {
                     if (output.dataType == DataType::FLOAT16) {
                         Float32ToFloat16(reduceOutput.data(), (uint16_t*)output.cpuData, output.Count(0));
+                    } else if (output.dataType == DataType::BFLOAT16) {
+                        Float32ToBFloat16(reduceOutput.data(), (uint16_t*)output.cpuData, output.Count(0));
                     }
                 }
 //printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
@@ -2690,6 +2709,14 @@ ops += (long long)lines * inputDim * interDim * 2;
                     } else if (w3.dataType == DataType::FLOAT16) {
                         Float16ToFloat32((uint16_t*)w3.cpuData, middleResult.data(), w3.Count(0));
                         curOutput = middleResult.data();
+                    } else if (w3.dataType == DataType::BFLOAT16) {
+                        uint16_t *src = (uint16_t*)w3.cpuData;
+                        int len = w3.Count(0);
+                        for (int idx = 0; idx < len; idx++) {
+                            uint32_t x = (uint32_t)src[idx] << 16;
+                            middleResult[idx] = *(float*)&x;
+                        }
+                        curOutput = middleResult.data();
                     }
 
                     RunMultiThreadMoeReduce(&task, &tempResult, curOutput, dim, GetAlivePool());
@@ -2699,6 +2726,8 @@ ops += (long long)lines * inputDim * interDim * 2;
                     memcpy(output.cpuData, tempResult.data(), output.GetBytes());
                 } else if (output.dataType == DataType::FLOAT16) {
                     Float32ToFloat16(tempResult.data(), (uint16_t*)output.cpuData, output.Count(0));
+                } else if (output.dataType == DataType::BFLOAT16) {
+                    Float32ToBFloat16(tempResult.data(), (uint16_t*)output.cpuData, output.Count(0));
                 }
   // cnt["output memcpy"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
             }
@@ -3389,6 +3418,30 @@ ops += (long long)lines * inputDim * interDim * 2;
                 j = 0;
                 for (; j < channels; j++) {
                     outputData[j] = float_to_half(fp16tofp32.dict[inputData[j]] * scale * weightData[j]);
+                }
+
+                inputData += channels;
+                outputData += channels;
+            }
+        } else if (input.dataType == DataType::BFLOAT16) {
+            uint16_t *inputData = (uint16_t *) input.cpuData;
+            uint16_t *outputData = (uint16_t *) output.cpuData;
+            float *weightData = (float *) weight.cpuData;
+
+            for (int i = 0; i < outer; i++) {
+                float mean = 0.f;
+                int j = 0;
+                for (; j < channels; j++) {
+                    float x = bf16tofp32.dict[inputData[j]];
+                    mean += x * x;
+                }
+                float scale = 1.0 / sqrt(mean / channels + eps);
+                j = 0;
+                for (; j < channels; j++) {
+                    float val = bf16tofp32.dict[inputData[j]] * scale * weightData[j];
+                    uint32_t tmp;
+                    memcpy(&tmp, &val, sizeof(tmp));
+                    outputData[j] = (uint16_t)(tmp >> 16);
                 }
 
                 inputData += channels;
@@ -4600,8 +4653,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
 
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
-                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
-                        "Cat's input's type should be float32 or float16.\n");
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+                        (input0.dataType == DataType::BFLOAT16 && input1.dataType == DataType::BFLOAT16),
+                        "Cat's input's type should be float32, float16 or bfloat16.\n");
         AssertInFastLLM(input0.dims.size() == input1.dims.size(), "Cat Error: input's shape's size should be same.");
 
         int dimsLen = input0.dims.size();
@@ -4660,8 +4714,9 @@ ops += (long long)lines * inputDim * interDim * 2;
 
     void DoCpuCatDirect(Data &input0, Data &input1, int axis) {
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
-                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
-                        "CatDirect's input's type should be float32 or float16.\n");
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+                        (input0.dataType == DataType::BFLOAT16 && input1.dataType == DataType::BFLOAT16),
+                        "CatDirect's input's type should be float32, float16 or bfloat16.\n");
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "CatDirect error: inputs should use same device.\n");
 
         if (input0.dims.size() == 0) {
@@ -5959,8 +6014,8 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &input1 = *(datas.find("input1")->second);
         float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0;
 
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 || input0.dataType == DataType::FLOAT16,
-                        "AddTo error: Data's type should be float32 or float16.\n");
+        AssertInFastLLM(input0.dataType == DataType::FLOAT32 || input0.dataType == DataType::FLOAT16 || input0.dataType == DataType::BFLOAT16,
+                        "AddTo error: Data's type should be float32, float16 or bfloat16.\n");
         AssertInFastLLM(input0.dims == input1.dims, "AddTo error: input's shape should be same.\n");
 
         int len = input0.Count(0);
@@ -5974,6 +6029,15 @@ ops += (long long)lines * inputDim * interDim * 2;
             uint16_t *input1Data = (uint16_t *) input1.cpuData;
             for (int i = 0; i < len; i++) {
                 input0Data[i] = float_to_half(fp16tofp32.dict[input0Data[i]] + fp16tofp32.dict[input1Data[i]] * alpha);
+            }
+        } else if (input0.dataType == DataType::BFLOAT16) {
+            uint16_t *input0Data = (uint16_t *) input0.cpuData;
+            uint16_t *input1Data = (uint16_t *) input1.cpuData;
+            for (int i = 0; i < len; i++) {
+                float val = bf16tofp32.dict[input0Data[i]] + bf16tofp32.dict[input1Data[i]] * alpha;
+                uint32_t tmp;
+                memcpy(&tmp, &val, sizeof(tmp));
+                input0Data[i] = (uint16_t)(tmp >> 16);
             }
         }
     }
@@ -6503,7 +6567,8 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
 
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16, "Permute error: datatype should be float32 or float16.");
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16, "Permute error: datatype should be float32, float16 or bfloat16.");
         AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
         std::vector<int> new_dims;
         for (int i = 0; i < axis.size(); i++) {
@@ -6691,7 +6756,8 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
 
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16, "Permute error: datatype should be float32 or float16.");
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16, "Permute error: datatype should be float32, float16 or bfloat16.");
         AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
 
         std::vector<int> new_dims;

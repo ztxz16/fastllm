@@ -337,10 +337,12 @@ extern "C" {
 #endif
         } else if (atypeStr == "float16" || atypeStr == "half") {
             model->SetDataType(fastllm::DataType::FLOAT16);
+        } else if (atypeStr == "bfloat16" || atypeStr == "bf16") {
+            model->SetDataType(fastllm::DataType::BFLOAT16);
         } else if (atypeStr == "float" || atypeStr == "float32") {
             model->SetDataType(fastllm::DataType::FLOAT32);
         } else {
-            fastllm::ErrorInFastLLM("set_model_atype error: atype should be float32 or float16.");
+            fastllm::ErrorInFastLLM("set_model_atype error: atype should be float32, float16 or bfloat16.");
         }
         return;
     }
