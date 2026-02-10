@@ -16,6 +16,8 @@ namespace fastllm {
         this->ops["ToFloat32"] = (BaseOperator*)(new CudaToFloat32());
         this->ops["ConvertToFloat16"] = (BaseOperator*)(new CudaConvertToFloat16());
         this->ops["ConvertToFloat32"] = (BaseOperator*)(new CudaConvertToFloat32());
+        this->ops["ToBFloat16"] = (BaseOperator*)(new CudaToBFloat16());
+        this->ops["ConvertToBFloat16"] = (BaseOperator*)(new CudaConvertToBFloat16());
 
         this->ops["Attention"] = (BaseOperator*)(new CudaAttention());
         // this->ops["MergeAttention"] = (BaseOperator*)(new CudaMergeAttention());
@@ -146,6 +148,14 @@ namespace fastllm {
             int len = data.Count(0);
             FastllmHalfToFloat(old, data.cudaData, len);
             FastllmCudaFree(old);
+        } else if (data.dataType == DataType::BFLOAT16) {
+            uint16_t *old = (uint16_t*)data.cudaData;
+            data.dataType = DataType::FLOAT32;
+            data.UpdateUnitSize();
+            data.cudaData = FastllmCudaMalloc(data.GetBytes());
+            int len = data.Count(0);
+            FastllmBF16ToFloat(old, data.cudaData, len);
+            FastllmCudaFree(old);
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
         }
@@ -200,8 +210,61 @@ namespace fastllm {
         }
         if (input.dataType == DataType::FLOAT16) {
             FastllmHalfToFloat(input.cudaData, output.cudaData, input.Count(0));
+        } else if (input.dataType == DataType::BFLOAT16) {
+            FastllmBF16ToFloat(input.cudaData, output.cudaData, input.Count(0));
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
+        }
+    }
+
+    void CudaToBFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        if (data.dataType == DataType::BFLOAT16) {
+            return;
+        }
+        if (data.dims.size() == 0) {
+            data.dataType = DataType::BFLOAT16;
+            data.UpdateUnitSize();
+            return;
+        }
+        if (data.dataType == DataType::FLOAT32) {
+            float *old = (float*)data.cudaData;
+            data.dataType = DataType::BFLOAT16;
+            data.UpdateUnitSize();
+            data.cudaData = FastllmCudaMalloc(data.GetBytes());
+            int len = data.Count(0);
+            FastllmFloatToBF16(old, data.cudaData, len);
+            FastllmCudaFree(old);
+        } else {
+            ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
+        }
+    }
+
+    void CudaConvertToBFloat16::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = (datas.find("input")->second);
+        Data *output = (datas.find("output")->second);
+        output->dataType = DataType::BFLOAT16;
+        output->Resize(input->dims);
+        output->UpdateUnitSize();
+        if (input->expansionDims.size() != 0)
+            output->Expansion(input->expansionDims);
+    }
+
+    void CudaConvertToBFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        if (input.dataType == DataType::BFLOAT16) {
+            FastllmCudaCopyFromDeviceToDevice(output.cudaData, input.cudaData, input.GetBytes());
+            return;
+        }
+        if (input.dataType == DataType::FLOAT32) {
+            FastllmFloatToBF16(input.cudaData, output.cudaData, input.Count(0));
+        } else {
+            ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
         }
     }
 
@@ -1668,7 +1731,7 @@ float totalTime = 0.0f;
         Data &w3 = *(datas.find("w3")->second);
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
-        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
+        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;
 
         DoCudaMergeMOE (
             input, output, index, score, w1, w2, w3, weights, biass, sharedScale

@@ -75,6 +75,14 @@ namespace fastllm {
 
     extern void Float16ToFloat32(uint16_t *float16, float *float32, int len);
     extern void Float32ToFloat16(float *float32, uint16_t *float16, int len);
+    extern void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
+
+    static void BFloat16ToFloat32(uint16_t *bfloat16, float *float32, int len) {
+        for (int i = 0; i < len; i++) {
+            uint32_t x = (uint32_t)bfloat16[i] << 16;
+            float32[i] = *(float*)&x;
+        }
+    }
 
     void Fp8ToFastllmFP8_E4M3_BLOCK128(int experts, int k, int m, uint8_t *fp8, float *scales, int blockK, int blockM, std::vector <uint8_t> &fp8Packed) {
         int ks = (k - 1) / blockK + 1;
@@ -271,6 +279,7 @@ namespace fastllm {
 
     struct FastllmMoeDataManagerNumas {
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
+            std::vector <float, alignedAllocator<float, 64> > inputFloat32;  // 当 input 非 FLOAT32 时暂存转成 float32 的数据
             std::vector <uint8_t, alignedAllocator<uint8_t, 64> > realInput, expandInput, downInput;
     };
     // 每层一个 MoE 缓存，避免层间共享导致的数据竞争
@@ -598,6 +607,7 @@ auto st = std::chrono::system_clock::now();
 
                     // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
                     auto& realInput = fastllmMoeDataManagerNumas.realInput;
+                    auto& inputFloat32 = fastllmMoeDataManagerNumas.inputFloat32;
                     auto& gateUpOutput = fastllmMoeDataManagerNumas.gateUpOutput;
                     auto& swigluOutput = fastllmMoeDataManagerNumas.swigluOutput;
                     auto& downInput = fastllmMoeDataManagerNumas.downInput;
@@ -606,6 +616,7 @@ auto st = std::chrono::system_clock::now();
 
                     // 计算所需大小
                     size_t realInputSize = GetDataBytes(startDataType, 1, inputDim);
+                    size_t inputFloat32Size = 1 * inputDim;
                     size_t gateUpOutputSize = v.size() * interDim * 2;
                     size_t swigluOutputSize = v.size() * interDim;
                     size_t downInputSize = GetDataBytes(downInputDataType, v.size(), interDim);
@@ -615,6 +626,9 @@ auto st = std::chrono::system_clock::now();
                     // 只在当前容量不足时才进行 resize
                     if (realInput.size() < realInputSize) {
                         realInput.resize(realInputSize);
+                    }
+                    if (input.dataType != DataType::FLOAT32 && inputFloat32.size() < inputFloat32Size) {
+                        inputFloat32.resize(inputFloat32Size);
                     }
                     if (gateUpOutput.size() < gateUpOutputSize) {
                         gateUpOutput.resize(gateUpOutputSize);
@@ -633,8 +647,26 @@ auto st = std::chrono::system_clock::now();
                     }
 
 // printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-                    // 0. input -> realInput
-                    RunMultiThreadConvertFromFloat32(realInput.data(), startDataType, (float*)input.cpuData + o * inputDim, 1, inputDim, GetAlivePool());
+                    // 0. input -> realInput（若 input 非 FLOAT32 则先转为 float32）
+                    if (input.dataType == startDataType && input.dataType != DataType::FLOAT32) {
+                        size_t bytes = GetDataBytes(startDataType, 1, inputDim);
+                        memcpy(realInput.data(), (uint8_t*)input.cpuData + o * bytes, bytes);
+                    } else {
+                        const float *inputF32Ptr = nullptr;
+                        if (input.dataType == DataType::FLOAT32) {
+                            inputF32Ptr = (const float*)input.cpuData + o * inputDim;
+                        } else {
+                            if (input.dataType == DataType::FLOAT16) {
+                                Float16ToFloat32((uint16_t*)input.cpuData + o * inputDim, inputFloat32.data(), inputDim);
+                            } else if (input.dataType == DataType::BFLOAT16) {
+                                BFloat16ToFloat32((uint16_t*)input.cpuData + o * inputDim, inputFloat32.data(), inputDim);
+                            } else {
+                                ErrorInFastLLM("NumasMergeMOE: unsupported input dataType.\n");
+                            }
+                            inputF32Ptr = inputFloat32.data();
+                        }
+                        RunMultiThreadConvertFromFloat32(realInput.data(), startDataType, inputF32Ptr, 1, inputDim, GetAlivePool());
+                    }
 // printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                     // 1. gateUp
@@ -814,17 +846,19 @@ auto st = std::chrono::system_clock::now();
                     // 7. reduceOutput -> last Output
                     if (output.dataType != DataType::FLOAT32) {
                         if (output.dataType == DataType::FLOAT16) {
-                            Float32ToFloat16(reduceOutput.data(), ((uint16_t*)output.cpuData) + o * outputDim, output.Count(0));
+                            Float32ToFloat16(reduceOutput.data(), ((uint16_t*)output.cpuData) + o * outputDim, outputDim);
+                        } else if (output.dataType == DataType::BFLOAT16) {
+                            Float32ToBFloat16(reduceOutput.data(), (uint16_t*)output.cpuData + o * outputDim, outputDim);
                         }
                     }
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 }
             }
         } else {
-            /*DoCudaMergeMOEFromCPU (
-                input, output, gateBias, logits, w1, w2, w3, weights, biass, topk, needNorm, sharedScale, routeScale, true, 0
+            /* DoCudaMergeMOEFromCPU (
+                input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, 0
             );
-            return;*/
+            return; */
 
 // auto st = std::chrono::system_clock::now();
             Data gate, attenPart, moePart;
@@ -862,6 +896,7 @@ auto st = std::chrono::system_clock::now();
 
                 // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
                 auto& realInput = fastllmMoeDataManagerNumas.realInput;
+                auto& inputFloat32 = fastllmMoeDataManagerNumas.inputFloat32;
                 auto& expandInput = fastllmMoeDataManagerNumas.expandInput;
                 auto& gateUpOutput = fastllmMoeDataManagerNumas.gateUpOutput;
                 auto& swigluOutput = fastllmMoeDataManagerNumas.swigluOutput;
@@ -872,6 +907,7 @@ auto st = std::chrono::system_clock::now();
                 int alignTotalLines = ((totalLines - 1) / 64 + 1) * 64;
                 // 计算所需大小
                 size_t realInputSize = GetDataBytes(startDataType, bs, inputDim);
+                size_t inputFloat32Size = (size_t)bs * inputDim;
                 size_t expandInputSize = GetDataBytes(startDataType, alignTotalLines, inputDim);
                 size_t gateUpOutputSize = alignTotalLines * interDim * 2;
                 size_t swigluOutputSize = alignTotalLines * interDim;
@@ -882,6 +918,9 @@ auto st = std::chrono::system_clock::now();
                 // 只在当前容量不足时才进行 resize
                 if (realInput.size() < realInputSize) {
                     realInput.resize(realInputSize);
+                }
+                if (input.dataType != DataType::FLOAT32 && inputFloat32.size() < inputFloat32Size) {
+                    inputFloat32.resize(inputFloat32Size);
                 }
                 if (expandInput.size() < expandInputSize) {
                     expandInput.resize(expandInputSize);
@@ -903,10 +942,29 @@ auto st = std::chrono::system_clock::now();
                     reduceOutput.resize(reduceOutputSize);
                 }
 
-// printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-                // 0. input -> realInput
-                RunMultiThreadConvertFromFloat32(realInput.data(), startDataType, (float*)input.cpuData, bs, inputDim, GetAlivePool());
-// printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+ // printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                // 0. input -> realInput（若 input 非 FLOAT32 则先转为 float32）
+                if (input.dataType == startDataType && input.dataType != DataType::FLOAT32) {
+                    size_t bytes = GetDataBytes(startDataType, bs, inputDim);
+                    memcpy(realInput.data(), (uint8_t*)input.cpuData, bytes);
+                } else {
+                    const float *inputF32Ptr = nullptr;
+                    if (input.dataType == DataType::FLOAT32) {
+                        inputF32Ptr = (const float*)input.cpuData;
+                    } else {
+                        int inputCount = bs * inputDim;
+                        if (input.dataType == DataType::FLOAT16) {
+                            Float16ToFloat32((uint16_t*)input.cpuData, inputFloat32.data(), inputCount);
+                        } else if (input.dataType == DataType::BFLOAT16) {
+                            BFloat16ToFloat32((uint16_t*)input.cpuData, inputFloat32.data(), inputCount);
+                        } else {
+                            ErrorInFastLLM("NumasMergeMOE: unsupported input dataType.\n");
+                        }
+                        inputF32Ptr = inputFloat32.data();
+                    }
+                    RunMultiThreadConvertFromFloat32(realInput.data(), startDataType, inputF32Ptr, bs, inputDim, GetAlivePool());
+                }
+ // printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                 // 1. realInput -> expandInput
                 std::vector <MultiThreadMemcpyMultiLinesTask> memcpyTasks;
@@ -1101,16 +1159,19 @@ if (lines >= expertLimit) {
                 // 7. reduceOutput -> last Output
                 if (output.dataType != DataType::FLOAT32) {
                     if (output.dataType == DataType::FLOAT16) {
-                        Float32ToFloat16(reduceOutput.data(), (uint16_t*)output.cpuData, output.Count(0));
+                        Float32ToFloat16(reduceOutput.data(), (uint16_t*)output.cpuData, bs * dim);
+                    } else if (output.dataType == DataType::BFLOAT16) {
+                        Float32ToBFloat16(reduceOutput.data(), (uint16_t*)output.cpuData, bs * dim);
                     }
                 }
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             }
 /*
             DoCudaMergeMOEFromCPU (
-                input, output, gateBias, logits, w1, w2, w3, weights, biass, topk, needNorm, sharedScale, routeScale, false, expertLimit
+                input, output, index, score, w1, w2, w3, weights, biass, sharedScale, false, expertLimit
             );
-
+*/
+/*
 printf("DoCudaMergeMOEFromCPU spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 */
             return;
