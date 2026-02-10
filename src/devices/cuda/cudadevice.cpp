@@ -124,6 +124,11 @@ namespace fastllm {
             int len = data.Count(0);
             FastllmFloatToHalf(old, data.cudaData, len);
             FastllmCudaFree(old);
+        } else if (data.dataType == DataType::BFLOAT16) {
+            data.dataType = DataType::FLOAT16;
+            data.UpdateUnitSize();
+            int len = data.Count(0);
+            FastllmBF16ToHalf(data.cudaData, data.cudaData, len);
         } else {
             ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
         }
@@ -183,6 +188,8 @@ namespace fastllm {
         }
         if (input.dataType == DataType::FLOAT32) {
             FastllmFloatToHalf(input.cudaData, output.cudaData, input.Count(0));
+        } else if (input.dataType == DataType::BFLOAT16) {
+            FastllmBF16ToHalf(input.cudaData, output.cudaData, input.Count(0));
         } else {
             ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
         }
@@ -236,6 +243,11 @@ namespace fastllm {
             int len = data.Count(0);
             FastllmFloatToBF16(old, data.cudaData, len);
             FastllmCudaFree(old);
+        } else if (data.dataType == DataType::FLOAT16) {
+            data.dataType = DataType::BFLOAT16;
+            data.UpdateUnitSize();
+            int len = data.Count(0);
+            FastllmHalfToBF16(data.cudaData, data.cudaData, len);
         } else {
             ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
         }
@@ -263,6 +275,8 @@ namespace fastllm {
         }
         if (input.dataType == DataType::FLOAT32) {
             FastllmFloatToBF16(input.cudaData, output.cudaData, input.Count(0));
+        } else if (input.dataType == DataType::FLOAT16) {
+            FastllmHalfToBF16(input.cudaData, output.cudaData, input.Count(0));
         } else {
             ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
         }
@@ -370,8 +384,9 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
 
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16,
-                        "RMSNorm error: datatype should be float32 or float16.");
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "RMSNorm error: datatype should be float32 or float16 or bfloat16.");
 
         output.Allocate();
 
@@ -677,8 +692,9 @@ namespace fastllm {
 
     void DoCudaCatDirect(Data &input0, Data &input1, int axis) {
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
-                                (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
-                        "Cat's input's type should be float32 or float16.\n");
+                                (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+                                (input0.dataType == DataType::BFLOAT16 && input1.dataType == DataType::BFLOAT16),
+                        "Cat's input's type should be float32, float16 or bfloat16.\n");
         AssertInFastLLM(input0.dataDevice == input1.dataDevice, "CatDirect error: inputs should use same device.\n");
 
         if (input0.dims.size() == 0) {
@@ -1009,8 +1025,9 @@ namespace fastllm {
         float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0;
 
         AssertInFastLLM((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
-                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16),
-                        "AddTo error: Data's type should be float32 or float16.\n");
+                        (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+                        (input0.dataType == DataType::BFLOAT16 && input1.dataType == DataType::BFLOAT16),
+                        "AddTo error: Data's type should be float32, float16 or bfloat16.\n");
         AssertInFastLLM(input0.dims == input1.dims, "AddTo error: input's shape should be same.\n");
         FastllmCudaAddTo(input0, input1, alpha);
     }
@@ -1171,8 +1188,9 @@ namespace fastllm {
         }
 
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                                input.dataType == DataType::FLOAT16,
-                                "Permute error: datatype should be float32 or float16.");
+                                input.dataType == DataType::FLOAT16 ||
+                                input.dataType == DataType::BFLOAT16,
+                                "Permute error: datatype should be float32, float16 or bfloat16.");
         AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
         DoCudaPermuteSelf(input, axis);
     }
