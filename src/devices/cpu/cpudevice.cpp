@@ -32,6 +32,8 @@ namespace fastllm {
         this->ops["ToFloat32"] = (BaseOperator*)(new CpuToFloat32());
         this->ops["ConvertToFloat16"] = (BaseOperator*)(new CpuConvertToFloat16());
         this->ops["ConvertToFloat32"] = (BaseOperator*)(new CpuConvertToFloat32());
+        this->ops["ToBFloat16"] = (BaseOperator*)(new CpuToBFloat16());
+        this->ops["ConvertToBFloat16"] = (BaseOperator*)(new CpuConvertToBFloat16());
 
         this->ops["Attention"] = (BaseOperator*)(new CpuAttention());
         this->ops["MergeMOE"] = (BaseOperator*)(new CpuMergeMOE());
@@ -299,6 +301,18 @@ namespace fastllm {
                 cur[i] = fp16tofp32.dict[old[i]];
             }
             delete[] old;
+        } else if (data.dataType == DataType::BFLOAT16) {
+            uint16_t *old = (uint16_t*)data.cpuData;
+            data.dataType = DataType::FLOAT32;
+            data.UpdateUnitSize();
+            data.cpuData = new uint8_t[data.GetBytes()];
+            float *cur = (float*)data.cpuData;
+            int len = data.Count(0);
+            for (int i = 0; i < len; i++) {
+                uint32_t x = (uint32_t)old[i] << 16;
+                cur[i] = *(float*)&x;
+            }
+            delete[] old;
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
         }
@@ -353,8 +367,68 @@ namespace fastllm {
         }
         if (input.dataType == DataType::FLOAT16) {
             Float16ToFloat32((uint16_t*)input.cpuData, (float*)output.cpuData, input.Count(0));
+        } else if (input.dataType == DataType::BFLOAT16) {
+            uint16_t *src = (uint16_t*)input.cpuData;
+            float *dst = (float*)output.cpuData;
+            int len = input.Count(0);
+            for (int i = 0; i < len; i++) {
+                uint32_t x = (uint32_t)src[i] << 16;
+                dst[i] = *(float*)&x;
+            }
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
+        }
+    }
+
+    void CpuToBFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        if (data.dataType == DataType::BFLOAT16) {
+            return;
+        }
+        if (data.dims.size() == 0) {
+            data.dataType = DataType::BFLOAT16;
+            data.UpdateUnitSize();
+            return;
+        }
+        if (data.dataType == DataType::FLOAT32) {
+            float *old = (float*)data.cpuData;
+            data.dataType = DataType::BFLOAT16;
+            data.UpdateUnitSize();
+            data.cpuData = new uint8_t[data.GetBytes()];
+            uint16_t *cur = (uint16_t*)data.cpuData;
+            int len = data.Count(0);
+            Float32ToBFloat16(old, cur, len);
+            delete[] old;
+        } else {
+            ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
+        }
+    }
+
+    void CpuConvertToBFloat16::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data *input = (datas.find("input")->second);
+        Data *output = (datas.find("output")->second);
+        output->dataType = DataType::BFLOAT16;
+        output->Resize(input->dims);
+        output->UpdateUnitSize();
+        if (input->expansionDims.size() != 0)
+            output->Expansion(input->expansionDims);
+    }
+
+    void CpuConvertToBFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        if (input.dataType == DataType::BFLOAT16) {
+            memcpy(output.cpuData, input.cpuData, input.GetBytes());
+            return;
+        }
+        if (input.dataType == DataType::FLOAT32) {
+            Float32ToBFloat16((float*)input.cpuData, (uint16_t*)output.cpuData, input.Count(0));
+        } else {
+            ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
         }
     }
 
