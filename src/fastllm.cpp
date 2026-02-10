@@ -540,16 +540,7 @@ namespace fastllm {
         }
     }
 
-    struct BF16ToFP16Manager {
-        float dict[65536];
-
-        BF16ToFP16Manager() {
-            for (uint16_t i = 0; i < 65535; i++) {
-                uint32_t x = (i << 16);
-                dict[i] = float_to_half(*((float*)&x));
-            }
-        }
-    } bf16tofp16;
+    BF16ToFP16Manager bf16tofp16;
 
     extern BF16ToFP32Manager bf16tofp32;
 
@@ -1216,7 +1207,8 @@ namespace fastllm {
 
     void Data::Allocate(float v) {
         AssertInFastLLM(this->dataType == DataType::FLOAT32
-                        || this->dataType == DataType::FLOAT16, "Allocate error: Data's type should be float32 or float16.\n");
+                        || this->dataType == DataType::FLOAT16
+                        || this->dataType == DataType::BFLOAT16, "Allocate error: Data's type should be float32, float16 or bfloat16.\n");
         this->Allocate();
         if (this->dataDevice == DataDevice::CPU) {
             if (this->dataType == DataType::FLOAT32) {
@@ -1225,6 +1217,10 @@ namespace fastllm {
             } else if (this->dataType == DataType::FLOAT16) {
                 uint16_t *h = (uint16_t*)cpuData;
                 std::fill(h, h + Count(0), float_to_half(v));
+            } else if (this->dataType == DataType::BFLOAT16) {
+                uint16_t *h = (uint16_t*)cpuData;
+                uint16_t bf16v = (uint16_t)(*((uint32_t*)&v) >> 16);
+                std::fill(h, h + Count(0), bf16v);
             }
         } if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
@@ -1233,6 +1229,10 @@ namespace fastllm {
                 FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(float));
             } else if (this->dataType == DataType::FLOAT16) {
                 std::vector <uint16_t> f = std::vector <uint16_t> (Count(0), float_to_half(v));
+                FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(uint16_t));
+            } else if (this->dataType == DataType::BFLOAT16) {
+                uint16_t bf16v = (uint16_t)(*((uint32_t*)&v) >> 16);
+                std::vector <uint16_t> f = std::vector <uint16_t> (Count(0), bf16v);
                 FastllmCudaCopyFromHostToDevice(cudaData, f.data(), Count(0) * sizeof(uint16_t));
             }
 #endif
@@ -1388,6 +1388,10 @@ namespace fastllm {
         } else if (this->dataType == DataType::FLOAT16) {
             for (int i = 0; i < floatData.size(); i++) {
                 floatData[i] = half_to_float(((uint16_t*)cpuData)[i]);
+            }
+        } else if (this->dataType == DataType::BFLOAT16) {
+            for (int i = 0; i < floatData.size(); i++) {
+                floatData[i] = bf16tofp32.dict[(((uint16_t*)cpuData)[i])];
             }
         }
 

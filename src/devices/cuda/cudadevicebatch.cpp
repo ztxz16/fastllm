@@ -304,8 +304,9 @@ namespace fastllm {
         int batch = intParams.find("input0___batch")->second;
         int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
         AssertInFastLLM((input0s[0]->dataType == DataType::FLOAT32 && input1s[0]->dataType == DataType::FLOAT32) ||
-                        (input0s[0]->dataType == DataType::FLOAT16 && input1s[0]->dataType == DataType::FLOAT16),
-                        "Cat's input's type should be float32 or float16.\n");
+                        (input0s[0]->dataType == DataType::FLOAT16 && input1s[0]->dataType == DataType::FLOAT16) ||
+                        (input0s[0]->dataType == DataType::BFLOAT16 && input1s[0]->dataType == DataType::BFLOAT16),
+                        "Cat's input's type should be float32, float16 or bfloat16.\n");
         AssertInFastLLM(input0s[0]->dataDevice == input1s[0]->dataDevice,
                             "CatDirect error: inputs should use same device.\n");
         AssertInFastLLM(input0s[0]->dims.size() == 0 || input0s[0]->dims.size() == input1s[0]->dims.size(),

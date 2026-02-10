@@ -123,6 +123,8 @@ bool FastllmFloatToHalf(void *a, void *b, int len);
 bool FastllmHalfToFloat(void *a, void *b, int len);
 bool FastllmBF16ToFloat(void *a, void *b, int len);
 bool FastllmFloatToBF16(void *a, void *b, int len);
+bool FastllmBF16ToHalf(void *a, void *b, int len);
+bool FastllmHalfToBF16(void *a, void *b, int len);
 
 void FastllmReduce(uint8_t *output, uint8_t* partOutput, int len, int threadNum, fastllm::DataType dataType);
 
@@ -245,5 +247,7 @@ extern __global__ void FastllmCudaBF162FloatKernel(uint16_t* a, float *b, int le
 extern __global__ void FastllmCudaBiasKernel(float *a, float *bias, int k);
 extern __global__ void FastllmCudaBiasKernel(half *a, half *bias, int k);
 extern __global__ void FastllmCudaFloat2Bf16Kernel(float* a, __nv_bfloat16* b, int len);
+extern __global__ void FastllmCudaBF162HalfKernel(uint16_t* a, half *b, int len);
+extern __global__ void FastllmCudaHalf2BF16Kernel(half* a, __nv_bfloat16 *b, int len);
 extern __global__ void FastllmCudaBiasKernel(__nv_bfloat16* a, __nv_bfloat16* bias, int k);
 #endif

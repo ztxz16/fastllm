@@ -191,6 +191,22 @@ __global__ void FastllmCudaFloat2Bf16Kernel(float* a, __nv_bfloat16* b, int len)
     }
 }
 
+__global__ void FastllmCudaBF162HalfKernel(uint16_t* a, half *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        uint32_t val = (uint32_t)a[idx] << 16;
+        float f = __uint_as_float(val);
+        b[idx] = __float2half_rz(f);
+    }
+}
+
+__global__ void FastllmCudaHalf2BF16Kernel(half* a, __nv_bfloat16 *b, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        b[idx] = __float2bfloat16_rn(__half2float(a[idx]));
+    }
+}
+
 __global__ void FastllmCudaBiasKernel(__nv_bfloat16* a, __nv_bfloat16* bias, int k) {
     __nv_bfloat16* now = a + blockIdx.x * k;
     int stride = blockDim.x;
@@ -432,6 +448,13 @@ __global__ void FastllmAddToKernel(half* a, half *b, half alpha, int len) {
 #else
         a[idx] = __hadd(a[idx], __hmul(b[idx], alpha));
 #endif
+    }
+}
+
+__global__ void FastllmAddToKernel(__nv_bfloat16* a, __nv_bfloat16 *b, __nv_bfloat16 alpha, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        a[idx] = __float2bfloat16_rn(__bfloat162float(a[idx]) + __bfloat162float(b[idx]) * __bfloat162float(alpha));
     }
 }
 
@@ -765,6 +788,55 @@ __global__ void FastllmRMSNormKernelInner1(half *input, float *weight, half *out
 
     for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
         output[i] = __float2half(__half2float(input[i]) * scale * weight[i]);
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmRMSNormKernelInner1(__nv_bfloat16 *input, float *weight, __nv_bfloat16 *output, int outer, int channels, float eps) {
+    int o = blockIdx.x;
+    input = input + o * channels;
+    output = output + o * channels;
+
+    __shared__ float sdata2[THREAD_PER_BLOCK];
+    __shared__ float scale;
+
+    // 1. 每个线程计算一部分
+    unsigned int tid = threadIdx.x;
+    float sum2 = 0.0;
+    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
+        float x = __bfloat162float(input[i]);
+        sum2 += x * x;
+    }
+    sdata2[tid] = sum2;
+    __syncthreads();
+
+    // 2. 求和
+    for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
+        if (tid < s) {
+            sdata2[tid] += sdata2[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid < 32) {
+        volatile float *now = sdata2;
+        now[tid] += now[tid + 32];
+        now[tid] += now[tid + 16];
+        now[tid] += now[tid + 8];
+        now[tid] += now[tid + 4];
+        now[tid] += now[tid + 2];
+        now[tid] += now[tid + 1];
+    }
+    __syncthreads();
+
+    // 3. 计算参数
+    if (tid == 0) {
+        scale = 1.0 / sqrt(sdata2[0] / channels + eps);
+    }
+    __syncthreads();
+
+    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
+        output[i] = __float2bfloat16_rn(__bfloat162float(input[i]) * scale * weight[i]);
     }
 }
 
@@ -1498,6 +1570,8 @@ bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float 
         FastllmAddToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaData, input1Data, alpha, len);
     } else if (input0.dataType == fastllm::DataType::FLOAT16) {
         FastllmAddToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaData, (half*)input1Data, __float2half_rn(alpha), len);
+    } else if (input0.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmAddToKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((__nv_bfloat16*)cudaData, (__nv_bfloat16*)input1Data, __float2bfloat16_rn(alpha), len);
     }
 
     FastllmCudaFinishInput(input1, input1Data);
@@ -1844,6 +1918,14 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
         } else {
             FastllmRMSNormKernelInner1<512> <<< outer, 512 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer,
                                                                channels, eps);
+        }
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        if (channels < 512) {
+            FastllmRMSNormKernelInner1<64> <<< outer, 64 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
+                                                              channels, eps);
+        } else {
+            FastllmRMSNormKernelInner1<512> <<< outer, 512 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
+                                                                channels, eps);
         }
     }
 
@@ -2237,6 +2319,20 @@ bool FastllmBF16ToFloat(void *a, void *b, int len) {
 bool FastllmFloatToBF16(void *a, void *b, int len) {
     int threadPerBlock = std::min(256, len);
     FastllmCudaFloat2Bf16Kernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((float*)a, (__nv_bfloat16*)b, len);
+    DeviceSync();
+    return true;
+}
+
+bool FastllmBF16ToHalf(void *a, void *b, int len) {
+    int threadPerBlock = std::min(256, len);
+    FastllmCudaBF162HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((uint16_t*)a, (half*)b, len);
+    DeviceSync();
+    return true;
+}
+
+bool FastllmHalfToBF16(void *a, void *b, int len) {
+    int threadPerBlock = std::min(256, len);
+    FastllmCudaHalf2BF16Kernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)a, (__nv_bfloat16*)b, len);
     DeviceSync();
     return true;
 }
