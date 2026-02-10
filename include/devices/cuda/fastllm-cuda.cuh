@@ -122,6 +122,7 @@ void FastllmCudaPagedCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray, i
 bool FastllmFloatToHalf(void *a, void *b, int len);
 bool FastllmHalfToFloat(void *a, void *b, int len);
 bool FastllmBF16ToFloat(void *a, void *b, int len);
+bool FastllmFloatToBF16(void *a, void *b, int len);
 
 void FastllmReduce(uint8_t *output, uint8_t* partOutput, int len, int threadNum, fastllm::DataType dataType);
 

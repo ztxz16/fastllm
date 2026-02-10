@@ -2680,6 +2680,10 @@ namespace fastllm {
             curExecutor->Run("ToFloat16", {
                     {"input", (Data*)&input}
             }, {}, {});
+        } else if (dataType == DataType::BFLOAT16) {
+            curExecutor->Run("ToBFloat16", {
+                    {"input", (Data*)&input}
+            }, {}, {});
         } else {
             ErrorInFastLLM("ToDataType: Unsupport data type.\n");
         }
@@ -2692,6 +2696,10 @@ namespace fastllm {
             }, {}, {});
         } else if (dataType == DataType::FLOAT16) {
             curExecutor->Run("ConvertToFloat16", {
+                {"input", (Data*)&input}, {"output", (Data*)&output}
+            }, {}, {});
+        } else if (dataType == DataType::BFLOAT16) {
+            curExecutor->Run("ConvertToBFloat16", {
                 {"input", (Data*)&input}, {"output", (Data*)&output}
             }, {}, {});
         } else {

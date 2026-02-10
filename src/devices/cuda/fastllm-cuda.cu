@@ -2234,6 +2234,13 @@ bool FastllmBF16ToFloat(void *a, void *b, int len) {
     return true;
 }
 
+bool FastllmFloatToBF16(void *a, void *b, int len) {
+    int threadPerBlock = std::min(256, len);
+    FastllmCudaFloat2Bf16Kernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((float*)a, (__nv_bfloat16*)b, len);
+    DeviceSync();
+    return true;
+}
+
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight,fastllm::Data &output) {
     int vocabSize = weight.dims[0], embSize = weight.dims[1];
     uint64_t inputLen = input.Count(0);

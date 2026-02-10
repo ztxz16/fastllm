@@ -1326,10 +1326,10 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
     }
 
     void basellm::SetMoeAtype(DataType type) {
-        if (type == DataType::FLOAT32 || type == DataType::FLOAT16) {
+        if (type == DataType::FLOAT32 || type == DataType::FLOAT16 || type == DataType::BFLOAT16) {
             this->moeAtype = type;
         } else {
-            ErrorInFastLLM("SetMoeAtype Error: moe_atype should be float32 or float16");
+            ErrorInFastLLM("SetMoeAtype Error: moe_atype should be float32, float16 or bfloat16");
         }
     }
 
