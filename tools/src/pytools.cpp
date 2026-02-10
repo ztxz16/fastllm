@@ -302,10 +302,12 @@ extern "C" {
         std::string atypeStr = moe_atype;
         if (atypeStr == "float16" || atypeStr == "half") {
             model->SetMoeAtype(fastllm::DataType::FLOAT16);
+        } else if (atypeStr == "bfloat16" || atypeStr == "bf16") {
+            model->SetMoeAtype(fastllm::DataType::BFLOAT16);
         } else if (atypeStr == "float" || atypeStr == "float32" || atypeStr == "" || atypeStr == "auto") {
             model->SetMoeAtype(fastllm::DataType::FLOAT32);
         } else {
-            fastllm::ErrorInFastLLM("set_model_moe_atype error: moe_atype should be float32 or float16.");
+            fastllm::ErrorInFastLLM("set_model_moe_atype error: moe_atype should be float32, float16 or bfloat16.");
         }
         return;
     }
