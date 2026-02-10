@@ -946,7 +946,7 @@ auto st = std::chrono::system_clock::now();
                 // 0. input -> realInput（若 input 非 FLOAT32 则先转为 float32）
                 if (input.dataType == startDataType && input.dataType != DataType::FLOAT32) {
                     size_t bytes = GetDataBytes(startDataType, bs, inputDim);
-                    memcpy(realInput.data(), (uint8_t*)input.cpuData, bytes);
+                    RunMultiThreadMemcpy(realInput.data(), (uint8_t*)input.cpuData, bytes, GetAlivePool());
                 } else {
                     const float *inputF32Ptr = nullptr;
                     if (input.dataType == DataType::FLOAT32) {
@@ -1159,9 +1159,13 @@ if (lines >= expertLimit) {
                 // 7. reduceOutput -> last Output
                 if (output.dataType != DataType::FLOAT32) {
                     if (output.dataType == DataType::FLOAT16) {
-                        Float32ToFloat16(reduceOutput.data(), (uint16_t*)output.cpuData, bs * dim);
+                        // Float32ToFloat16(reduceOutput.data(), (uint16_t*)output.cpuData, bs * dim);
+                        RunMultiThreadConvertFromFloat32((uint16_t*)output.cpuData, DataType::FLOAT16, 
+                            reduceOutput.data(), bs, dim, GetAlivePool());
                     } else if (output.dataType == DataType::BFLOAT16) {
-                        Float32ToBFloat16(reduceOutput.data(), (uint16_t*)output.cpuData, bs * dim);
+                        // Float32ToBFloat16(reduceOutput.data(), (uint16_t*)output.cpuData, bs * dim);
+                        RunMultiThreadConvertFromFloat32((uint16_t*)output.cpuData, DataType::BFLOAT16, 
+                            reduceOutput.data(), bs, dim, GetAlivePool());
                     }
                 }
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
