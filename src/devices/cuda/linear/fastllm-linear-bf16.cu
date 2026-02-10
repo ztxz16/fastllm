@@ -560,7 +560,7 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
     } else {
         auto fastllmCublasHandle = getFastllmCublasHandle();
         cublasStatus_t status;
-        __nv_bfloat16 h_alpha = __float2bfloat16_rn(1.0f), h_beta = __float2bfloat16_rn(0.0f);
+        float h_alpha = 1.0f, h_beta = 0.0f;
         cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
 
         status = cublasGemmEx(fastllmCublasHandle,

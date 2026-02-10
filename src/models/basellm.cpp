@@ -1319,8 +1319,21 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             this->model_struct == "glm4_moe" ||
                             this->model_struct == "qwen3_next",  
                             this->model_struct + " doesn't support float16");
+        } else if (dataType == DataType::BFLOAT16) {
+            AssertInFastLLM(this->model_struct == "chatglm" || 
+                            this->model_struct == "llama" ||
+                            this->model_struct == "graph" ||
+                            this->model_struct == "cogvlm" ||
+                            this->model_struct == "deepseek_v2" ||
+                            this->model_struct == "qwen3_moe" ||
+                            this->model_struct == "hunyuan" || 
+                            this->model_struct == "ernie4_5" || 
+                            this->model_struct == "pangu_moe" ||
+                            this->model_struct == "glm4_moe" ||
+                            this->model_struct == "qwen3_next",  
+                            this->model_struct + " doesn't support bfloat16");
         } else {
-            ErrorInFastLLM("SetDataType Error: datatype should be float32 or float16");
+            ErrorInFastLLM("SetDataType Error: datatype should be float32, float16 or bfloat16");
         }
         this->dataType = dataType;
     }
