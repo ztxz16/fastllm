@@ -5,6 +5,85 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#ifdef __CUDACC__
+#include <cuda_bf16.h>
+#endif
+
+typedef union __align__(16) _union_bf16_4_fp16 {
+    uint2 in;
+    __nv_bfloat16 out[4];
+    __nv_bfloat162 out2[2];
+} union_bf16_4_fp16;
+
+template <int THREAD_PER_BLOCK, int PART>
+__global__ void FastllmGemvBf16Fp16Kernel2MultiRow(__nv_bfloat16 *A, half *B, __nv_bfloat16 *C, __nv_bfloat16 *bias, int m, int k) {
+    __shared__ float sdata[PART][THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    union_bf16_4_fp16 regA;
+    union_half4 regB;
+
+    int st = blockIdx.x;
+    int p = st;
+#pragma unroll
+    for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
+
+    const half *baseB = B + p * m;
+    if (m % 4 == 0) {
+#pragma unroll
+        for (int i = tid * 4; i + 3 < m; i += THREAD_PER_BLOCK * 4) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                regA.in = *reinterpret_cast<const uint2 *>(A + i + x * m);
+                regB.in = *reinterpret_cast<const uint2 *>(baseB + i);
+                float sum = 0.0f;
+                if (i < m)
+                    sum += __bfloat162float(regA.out2[0].x) * __low2float(regB.out2[0]);
+                if (i + 1 < m)
+                    sum += __bfloat162float(regA.out2[0].y) * __high2float(regB.out2[0]);
+                if (i + 2 < m)
+                    sum += __bfloat162float(regA.out2[1].x) * __low2float(regB.out2[1]);
+                if (i + 3 < m)
+                    sum += __bfloat162float(regA.out2[1].y) * __high2float(regB.out2[1]);
+                sdata[x][tid] += sum;
+            }
+        }
+    } else {
+        for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                sdata[x][tid] += __bfloat162float(A[i + x * m]) * __half2float(baseB[i]);
+            }
+        }
+    }
+    __syncthreads();
+    float diff = 0.0f;
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                float other = sdata[x][tid + s] - diff;
+                float sumTmp = sdata[x][tid] + other;
+                diff = (sumTmp - sdata[x][tid]) - other;
+                sdata[x][tid] = sumTmp;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        if (bias != nullptr) {
+#pragma unroll
+            for (int x = 0; x < PART; x++)
+                C[p + k * x] = __float2bfloat16_rn(sdata[x][0] + __bfloat162float(__ldg(bias + p)));
+        } else {
+#pragma unroll
+            for (int x = 0; x < PART; x++)
+                C[p + k * x] = __float2bfloat16_rn(sdata[x][0]);
+        }
+    }
+    __syncthreads();
+}
+
 template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(half *A, half *B, half *C, half *bias, int m, int k) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
@@ -367,6 +446,143 @@ bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &wei
         if (bias.dims.size() > 0) {
             FastllmCudaBiasKernel <<< n, 256 >>>(cudaOutput, (half *) weight.extraCudaHalfData[0], k);
         }
+    }
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+// ============ BF16 input × FP16 weight -> BF16 output ============
+
+static void FastllmCudaFP16EnsureBiasBf16OnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
+    // Store BF16 bias in extraCudaData[1] (extraCudaData[0] is float bias)
+    if (weight.cudaData == nullptr || weight.extraCudaData.size() < 2) {
+        __nv_bfloat16 *cudaBiasData;
+        cudaError_t state = cudaSuccess;
+        state = cudaMalloc(&cudaBiasData, k * sizeof(__nv_bfloat16));
+        if (bias.dims.size() > 0) {
+            float *tempBiasData;
+            state = cudaMalloc(&tempBiasData, k * sizeof(float));
+            state = cudaMemcpy(tempBiasData, (uint8_t *)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            int threadPerBlock = std::min(256, k);
+            FastllmCudaFloat2Bf16Kernel <<<(k - 1) / threadPerBlock + 1, threadPerBlock>>>(tempBiasData, cudaBiasData, k);
+            state = cudaFree(tempBiasData);
+        } else {
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(__nv_bfloat16));
+        }
+        checkCudaErrors("Error: CUDA error when moving bias (bf16 for BF16×FP16) to device!", state);
+        if (weight.extraCudaData.size() < 2)
+            weight.extraCudaData.push_back((void *)cudaBiasData);
+        else
+            weight.extraCudaData[1] = (void *)cudaBiasData;
+    }
+}
+
+// BF16 -> FP16 逐元素转换
+__global__ void FastllmCudaBf16ToHalfKernelFP16(const __nv_bfloat16 *src, half *dst, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len)
+        dst[idx] = __float2half_rn(__bfloat162float(src[idx]));
+}
+
+void LaunchFastllmGemmBf16Fp16(__nv_bfloat16 *input, half *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
+    if (n == 1) {
+        FastllmGemvBf16Fp16Kernel2MultiRow<256, 1> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (n == 2) {
+        FastllmGemvBf16Fp16Kernel2MultiRow<256, 2> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (n == 3) {
+        FastllmGemvBf16Fp16Kernel2MultiRow<256, 3> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (n == 4) {
+        FastllmGemvBf16Fp16Kernel2MultiRow<256, 4> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (n == 5) {
+        FastllmGemvBf16Fp16Kernel2MultiRow<256, 5> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (n == 6) {
+        FastllmGemvBf16Fp16Kernel2MultiRow<256, 6> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (n == 7) {
+        FastllmGemvBf16Fp16Kernel2MultiRow<256, 7> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else {
+        for (int i = 0; i < n; i++) {
+            FastllmGemvBf16Fp16Kernel2MultiRow<256, 1> <<< k, 256 >>>(input + i * m, weight, output + i * k, bias, m, k);
+        }
+    }
+}
+
+// BF16 input × FP16 weight -> BF16 output
+bool FastllmCudaBFloat16MatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    FastllmCudaFP16EnsureBiasOnDevice(weight, bias, k);
+    FastllmCudaFP16EnsureBiasBf16OnDevice(weight, bias, k);
+
+    __nv_bfloat16 *cudaInput = (__nv_bfloat16 *)FastllmCudaPrepareInput(input);
+    __nv_bfloat16 *cudaOutput = (__nv_bfloat16 *)FastllmCudaPrepareOutput(output);
+    __nv_bfloat16 *cudaBiasData = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *)weight.extraCudaData[1];
+    half *weightPtr = (half *)weight.cudaData;
+
+    if (n < 8) {
+        LaunchFastllmGemmBf16Fp16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);
+    } else {
+        // 大 batch：将 BF16 input 转为 FP16，使用 cublas FP16 gemm，再将输出转为 BF16
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+        half *cudaFp16Input = (half *)FastllmCudaMalloc(n * m * sizeof(half));
+
+        int len = n * m;
+        int threadPerBlock = std::min(256, len);
+        FastllmCudaBf16ToHalfKernelFP16 <<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaFp16Input, len);
+
+        cublasStatus_t status;
+#ifdef CUDA_NO_TENSOR_CORE
+        float *cudaFp32Output = (float *)FastllmCudaMalloc(n * k * sizeof(float));
+        float h_alpha = 1.0f, h_beta = 0.0f;
+        cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_32F, ComputeType = CUDA_R_32F;
+
+        status = cublasGemmEx(fastllmCublasHandle,
+                              CUBLAS_OP_T, CUBLAS_OP_N,
+                              k, n, m,
+                              &h_alpha, weightPtr, AType,
+                              m, cudaFp16Input, BType,
+                              m, &h_beta,
+                              cudaFp32Output, CType,
+                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+#else
+        half *cudaFp16Output = (half *)FastllmCudaMalloc(n * k * sizeof(half));
+        __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
+        cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
+
+        status = cublasGemmEx(fastllmCublasHandle,
+                              CUBLAS_OP_T, CUBLAS_OP_N,
+                              k, n, m,
+                              &h_alpha, weightPtr, AType,
+                              m, cudaFp16Input, BType,
+                              m, &h_beta,
+                              cudaFp16Output, CType,
+                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+#endif
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: cublas error (BFloat16MatMulFloat16).\n");
+            throw("cublas error");
+            exit(0);
+        }
+
+#ifdef CUDA_NO_TENSOR_CORE
+        // FP32 output -> BF16 output
+        len = n * k;
+        threadPerBlock = std::min(256, len);
+        FastllmCudaFloat2Bf16Kernel <<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaFp32Output, cudaOutput, len);
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<<n, 256>>>(cudaOutput, (__nv_bfloat16 *)weight.extraCudaData[1], k);
+        }
+        FastllmCudaFree(cudaFp32Output);
+#else
+        // FP16 output -> BF16 output
+        len = n * k;
+        threadPerBlock = std::min(256, len);
+        FastllmCudaHalf2BF16Kernel <<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaFp16Output, cudaOutput, len);
+        if (bias.dims.size() > 0) {
+            FastllmCudaBiasKernel <<<n, 256>>>(cudaOutput, (__nv_bfloat16 *)weight.extraCudaData[1], k);
+        }
+        FastllmCudaFree(cudaFp16Output);
+#endif
+        FastllmCudaFree(cudaFp16Input);
     }
 
     FastllmCudaFinishInput(input, cudaInput);
