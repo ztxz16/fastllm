@@ -43,6 +43,7 @@ namespace fastllm {
         this->ops["Sigmoid"] = (BaseOperator*)(new CudaSigmoidOp());
         this->ops["MambaSoftplus"] = (BaseOperator*)(new CudaMambaSoftplusOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CudaSwigluOp());
+        this->ops["CrossSwiglu"] = (BaseOperator*)(new CudaCrossSwigluOp());
         this->ops["Add"] = (BaseOperator*)(new CudaAddOp());
         this->ops["Mul"] = (BaseOperator*)(new CudaMulOp());
         this->ops["AddTo"] = (BaseOperator*)(new CudaAddToOp());
@@ -564,6 +565,8 @@ namespace fastllm {
         } else if (input.dataType == DataType::BFLOAT16) {
             if (weight.dataType == DataType::BFLOAT16) {
                 FastllmCudaBFloat16MatMulBFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FLOAT16) {
+                FastllmCudaBFloat16MatMulFloat16(input, weight, bias, output, n, m, k);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType for BFLOAT16 input.\n");
             }
@@ -953,6 +956,24 @@ namespace fastllm {
                         input.dataType == DataType::FLOAT16, 
                         "Swiglu error: Data's type should be float32 or float16.\n");
         DoCudaSwiglu(input, output);
+    }
+
+    void CudaCrossSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        DoCudaSwigluReshape(input, output);
+    }
+
+    void CudaCrossSwigluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16, 
+                        "CrossSwiglu error: Data's type should be float32 or float16.\n");
+        output.Allocate();
+        FastllmCudaCrossSwiglu(input, output);
     }
 
     void CudaSiluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
