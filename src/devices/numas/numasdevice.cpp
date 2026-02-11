@@ -285,8 +285,21 @@ namespace fastllm {
     // 每层一个 MoE 缓存，避免层间共享导致的数据竞争
     std::unordered_map<int, FastllmMoeDataManagerNumas> fastllmMoeDataManagerNumasPerLayer;
 
-    void RegisterNumas(fastllm::Data *data) {
-        data->Repack();
+    // CrossSwiglu 重排：将 a[n, m] 重排为 b[n, m]
+    // b[0] = a[0], b[1] = a[n/2], b[2] = a[1], b[3] = a[n/2+1], ...
+    // 即前半部分和后半部分行交错排列
+    void CrossSwigluReorder(uint8_t *src, int k, size_t bytesPerRow, std::vector<uint8_t> &dst) {
+        dst.resize((size_t)k * bytesPerRow);
+        int half = k / 2;
+        for (int i = 0; i < half; i++) {
+            memcpy(dst.data() + (size_t)(2 * i) * bytesPerRow, 
+                   src + (size_t)i * bytesPerRow, bytesPerRow);
+            memcpy(dst.data() + (size_t)(2 * i + 1) * bytesPerRow, 
+                   src + (size_t)(half + i) * bytesPerRow, bytesPerRow);
+        }
+    }
+
+    void RegisterNumas(fastllm::Data *data, std::string weightType) {
         auto *numaConfig = GetNumaConfig();
         if (data == nullptr) {
             return;
@@ -300,77 +313,121 @@ namespace fastllm {
             }
             int kPerNuma = k / numaConfig->numaCnt;
 
-            if (data->dataType == DataType::FLOAT32 || data->dataType == DataType::BFLOAT16 || data->dataType == DataType::FLOAT16) {
-                size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
+            bool isCrossSwiglu = (weightType == "linearSwiglu");
+
+            if (data->dataType == DataType::DATA_GGUF_FORMAT) {
+                // GGUF格式需要先交错存储，然后再repack
+                // 因为repack会将多行打包在一起，打包后行之间的数据互相依赖，无法再做行交错
+                size_t bytesPerRow = GetDataBytes((DataType)((int)data->dataType + data->ggmlType), 1, m);
+                if (isCrossSwiglu) {
+                    std::vector<uint8_t> reordered;
+                    CrossSwigluReorder(data->cpuData, k, bytesPerRow, reordered);
+                    memcpy(data->cpuData, reordered.data(), (size_t)k * bytesPerRow);
+                }
+                // 交错存储完成后再repack
+                data->Repack();
+                // repack后bytesPerRow可能变化，重新获取
+                bytesPerRow = GetDataBytes((DataType)((int)data->dataType + data->ggmlType), 1, m);
+                uint8_t *srcData = data->cpuData;
                 for (int i = 0; i < numaConfig->numaCnt; i++) {
                     data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
-                    memcpy(data->numasData[i], data->cpuData + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    memcpy(data->numasData[i], srcData + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
                 }
-            } else if (data->dataType == DataType::FP8_E4M3) {
-                std::vector <uint8_t> fp8Packed;
-                if (data->blockM == 128) {
-                    data->dataType = DataType::FP8_E4M3_BLOCK_128;
-                    Fp8ToFastllmFP8_E4M3_BLOCK128(1, k, m, (uint8_t*)data->cpuData, data->scales.data(), data->blockK, data->blockM, fp8Packed);
-                } else if (data->blockM == m) {
-                    data->dataType = DataType::FP8_E4M3_PERCHANNEL;
-                    Fp8PerchannelToFastllmFP8_E4M3_PERCHANNEL(1, k, m, (uint8_t*)data->cpuData, data->scales.data(), data->blockK, data->blockM, fp8Packed);
-                } else {
-                    ErrorInFastLLM("RegisterNumas can't support fp8 with blockM = " + std::to_string(data->blockM));    
-                }
+            } else {
+                data->Repack();
 
-                size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
-                for (int i = 0; i < numaConfig->numaCnt; i++) {
-                    data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
-                    memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                }
-            } else if (data->dataType == DataType::INT8) {
-                std::vector <uint8_t> int8Packed;
-                Int8ToFastllmInt8PerchannelPacked(1, k, m, (uint8_t*)data->cpuData, data->zeros.data(), data->scales.data(), int8Packed);
-                data->dataType = DataType::INT8_PERCHANNEL;
+                if (data->dataType == DataType::FLOAT32 || data->dataType == DataType::BFLOAT16 || data->dataType == DataType::FLOAT16) {
+                    size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
+                    uint8_t *srcData = data->cpuData;
+                    std::vector<uint8_t> reordered;
+                    if (isCrossSwiglu) {
+                        CrossSwigluReorder(data->cpuData, k, bytesPerRow, reordered);
+                        srcData = reordered.data();
+                    }
+                    for (int i = 0; i < numaConfig->numaCnt; i++) {
+                        data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
+                        memcpy(data->numasData[i], srcData + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    }
+                } else if (data->dataType == DataType::FP8_E4M3) {
+                    std::vector <uint8_t> fp8Packed;
+                    if (data->blockM == 128) {
+                        data->dataType = DataType::FP8_E4M3_BLOCK_128;
+                        Fp8ToFastllmFP8_E4M3_BLOCK128(1, k, m, (uint8_t*)data->cpuData, data->scales.data(), data->blockK, data->blockM, fp8Packed);
+                    } else if (data->blockM == m) {
+                        data->dataType = DataType::FP8_E4M3_PERCHANNEL;
+                        Fp8PerchannelToFastllmFP8_E4M3_PERCHANNEL(1, k, m, (uint8_t*)data->cpuData, data->scales.data(), data->blockK, data->blockM, fp8Packed);
+                    } else {
+                        ErrorInFastLLM("RegisterNumas can't support fp8 with blockM = " + std::to_string(data->blockM));    
+                    }
 
-                size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
-                for (int i = 0; i < numaConfig->numaCnt; i++) {
-                    data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
-                    memcpy(data->numasData[i], int8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                }
-            } else if (data->dataType == DataType::INT4_NOZERO) {
-                std::vector <uint8_t> int4Packed;
-                Int4ToFastllmInt4PerchannelPacked(1, k, m, (uint8_t*)data->cpuData, data->mins.data(), data->scales.data(), int4Packed);
-                data->dataType = DataType::INT4_PERCHANNEL;
+                    size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
+                    if (isCrossSwiglu) {
+                        std::vector<uint8_t> reordered;
+                        CrossSwigluReorder(fp8Packed.data(), k, bytesPerRow, reordered);
+                        fp8Packed.swap(reordered);
+                    }
+                    for (int i = 0; i < numaConfig->numaCnt; i++) {
+                        data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
+                        memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    }
+                } else if (data->dataType == DataType::INT8) {
+                    std::vector <uint8_t> int8Packed;
+                    Int8ToFastllmInt8PerchannelPacked(1, k, m, (uint8_t*)data->cpuData, data->zeros.data(), data->scales.data(), int8Packed);
+                    data->dataType = DataType::INT8_PERCHANNEL;
 
-                size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
-                for (int i = 0; i < numaConfig->numaCnt; i++) {
-                    data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
-                    memcpy(data->numasData[i], int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                }
-            } else if (data->dataType == DataType::INT4_GROUP) {
-                if (m % data->groupCnt > 0) {
-                    ErrorInFastLLM("RegisterNumas can't support data type int4g when m % groupCnt > 0.");
-                }
+                    size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
+                    if (isCrossSwiglu) {
+                        std::vector<uint8_t> reordered;
+                        CrossSwigluReorder(int8Packed.data(), k, bytesPerRow, reordered);
+                        int8Packed.swap(reordered);
+                    }
+                    for (int i = 0; i < numaConfig->numaCnt; i++) {
+                        data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
+                        memcpy(data->numasData[i], int8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    }
+                } else if (data->dataType == DataType::INT4_NOZERO) {
+                    std::vector <uint8_t> int4Packed;
+                    Int4ToFastllmInt4PerchannelPacked(1, k, m, (uint8_t*)data->cpuData, data->mins.data(), data->scales.data(), int4Packed);
+                    data->dataType = DataType::INT4_PERCHANNEL;
 
-                int groups = m / data->groupCnt;
-                std::vector <uint8_t> int4Packed;
-                Int4ToFastllmInt4PerchannelPacked(1, k * groups, data->groupCnt, (uint8_t*)data->cpuData, data->mins.data(), data->scales.data(), int4Packed);
+                    size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
+                    if (isCrossSwiglu) {
+                        std::vector<uint8_t> reordered;
+                        CrossSwigluReorder(int4Packed.data(), k, bytesPerRow, reordered);
+                        int4Packed.swap(reordered);
+                    }
+                    for (int i = 0; i < numaConfig->numaCnt; i++) {
+                        data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
+                        memcpy(data->numasData[i], int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    }
+                } else if (data->dataType == DataType::INT4_GROUP) {
+                    if (m % data->groupCnt > 0) {
+                        ErrorInFastLLM("RegisterNumas can't support data type int4g when m % groupCnt > 0.");
+                    }
 
-                if (data->groupCnt == 128) {                    
-                    data->dataType = DataType::INT4_GROUP128;
+                    int groups = m / data->groupCnt;
+                    std::vector <uint8_t> int4Packed;
+                    Int4ToFastllmInt4PerchannelPacked(1, k * groups, data->groupCnt, (uint8_t*)data->cpuData, data->mins.data(), data->scales.data(), int4Packed);
+
+                    if (data->groupCnt == 128) {                    
+                        data->dataType = DataType::INT4_GROUP128;
+                    } else {
+                        ErrorInFastLLM("RegisterNumas can't support data type " + GetDataTypeName(data->dataType));
+                    }
+
+                    size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
+                    if (isCrossSwiglu) {
+                        std::vector<uint8_t> reordered;
+                        CrossSwigluReorder(int4Packed.data(), k, bytesPerRow, reordered);
+                        int4Packed.swap(reordered);
+                    }
+                    for (int i = 0; i < numaConfig->numaCnt; i++) {
+                        data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
+                        memcpy(data->numasData[i], int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    }
                 } else {
                     ErrorInFastLLM("RegisterNumas can't support data type " + GetDataTypeName(data->dataType));
                 }
-
-                size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
-                for (int i = 0; i < numaConfig->numaCnt; i++) {
-                    data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
-                    memcpy(data->numasData[i], int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                }
-            } else if (data->dataType == DataType::DATA_GGUF_FORMAT) {
-                size_t bytesPerRow = GetDataBytes((DataType)((int)data->dataType + data->ggmlType), 1, m);
-                for (int i = 0; i < numaConfig->numaCnt; i++) {
-                    data->numasData[i] = (uint8_t*)allocate_aligned_numa(kPerNuma * bytesPerRow, i);
-                    memcpy(data->numasData[i], data->cpuData + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                }
-            } else {
-                ErrorInFastLLM("RegisterNumas can't support data type " + GetDataTypeName(data->dataType));
             }
         }
 
@@ -555,6 +612,7 @@ namespace fastllm {
         fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuLinearOp());
  // auto ttt = std::chrono::system_clock::now();
  // std::vector <std::pair <std::string, float> > record;
+ // auto st = std::chrono::system_clock::now();
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &index = *(datas.find("index")->second);
@@ -571,14 +629,14 @@ namespace fastllm {
         int topk = index.dims[1];
         int weightsBatch = intParams.find("weights___batch") != intParams.end() ? intParams.find("weights___batch")->second : (topk + 1) * 2;
         int layer = intParams.find("layer") != intParams.end() ? intParams.find("layer")->second : 0;
-        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas = fastllmMoeDataManagerNumasPerLayer[0];
+        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas = fastllmMoeDataManagerNumasPerLayer[layer % 2];
         output.Allocate();
-        
+// printf("allocate spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         int32_t *indexData = (int32_t*)index.cpuData;
         float *scoreData = (float*)score.cpuData;
 
         if (input.dims[0] < 32) {
-auto st = std::chrono::system_clock::now();
+// auto st = std::chrono::system_clock::now();
             int32_t *indexData = (int32_t*)index.cpuData;
             float *scoreData = (float*)score.cpuData;
 
@@ -669,8 +727,14 @@ auto st = std::chrono::system_clock::now();
                     }
 // printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
-                    // 1. gateUp
+                    // 1. gateUp + swiglu (融合算子)
                     auto *numaConfig = GetNumaConfig();
+
+                    // 判断 downInputDataType 是否支持算子内直接转换
+                    bool canFuseDstConvert = (downInputDataType == DataType::FLOAT32 ||
+                                              downInputDataType == DataType::FLOAT16 ||
+                                              downInputDataType == DataType::BFLOAT16);
+
                     std::vector<MultiThreadBaseOp*> ops;
                     ops.resize(numaConfig->threads);
                     for (int i = 0; i < ops.size(); i++) {
@@ -714,13 +778,18 @@ auto st = std::chrono::system_clock::now();
                                 size_t outputOffset = GetDataBytes(DataType::FLOAT32, expertIdx, k) + 
                                                     GetDataBytes(DataType::FLOAT32, 1, base);
                                 
-                                // 添加GEMM操作
+                                // 添加 GateUp GEMM + CrossSwiglu 融合操作
+                                // 仅当 downInputDataType 支持直接转换时，才传 dstOutputData
+                                uint8_t *dstPtr = canFuseDstConvert ?
+                                    (uint8_t*)downInput.data() + expertIdx * GetDataBytes(downInputDataType, 1, interDim) : nullptr;
                                 ((MultiThreadMultiOps*)ops[numaConfig->numaToCpuDict[nid][tid].first])->ops.push_back(
-                                    new MultiThreadGemmOp(
+                                    new MultiThreadGemmAndCrossSwigluOp(
                                         (uint8_t*)realInput.data(), startDataType,
                                         weights[e * 2]->numasData[nid], weights[e * 2]->GetDataType(),
                                         (uint8_t*)gateUpOutput.data() + outputOffset, DataType::FLOAT32,
-                                        1, inputDim, k, expertStartRow, expertEndRow
+                                        swigluOutput.data() + expertIdx * interDim,
+                                        1, inputDim, k, expertStartRow, expertEndRow, base,
+                                        dstPtr, downInputDataType
                                     )
                                 );
                                 
@@ -735,7 +804,7 @@ auto st = std::chrono::system_clock::now();
                             currentRow = endRow;
                         }
                     }
-// printf("gateup prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("gateup+swiglu prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     for (int i = 0; i < ops.size(); i++) {
                         pool->PushOp(i, ops[i]);
                     }
@@ -745,17 +814,21 @@ auto st = std::chrono::system_clock::now();
                         delete ops[i];
                     }
 
-
-// printf("gateup spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-                    // 3. swiglu
-                    SwigluMultiThread((float *) gateUpOutput.data(), interDim, interDim, ((float *) swigluOutput.data()),
-                                    v.size(), interDim * 2, interDim, GetAlivePool());
-// printf("swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("gateup+swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                     // 4. swigluOutput -> downInput
-                    RunMultiThreadConvertFromFloat32(downInput.data(), downInputDataType, (float*)swigluOutput.data(), v.size(), interDim, GetAlivePool());
+                    //    如果 downInputDataType 支持算子内直接转换，则已在融合算子中完成；
+                    //    否则需要在这里将 swigluOutput 转换为 downInput
+                    if (!canFuseDstConvert) {
+                        for (int expertIdx = 0; expertIdx < totalExperts; expertIdx++) {
+                            RunMultiThreadConvertFromFloat32(
+                                (uint8_t*)downInput.data() + expertIdx * GetDataBytes(downInputDataType, 1, interDim),
+                                downInputDataType,
+                                swigluOutput.data() + expertIdx * interDim,
+                                1, interDim, GetAlivePool());
+                        }
+                    }
 
-// printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     // 5. down
                     ops.resize(numaConfig->threads);
                     for (int i = 0; i < ops.size(); i++) {
@@ -860,7 +933,6 @@ auto st = std::chrono::system_clock::now();
             );
             return; */
 
-// auto st = std::chrono::system_clock::now();
             Data gate, attenPart, moePart;
             int bs = input.dims[0];
             int m = weightsBatch / 2 - 1; // num experts
@@ -890,7 +962,7 @@ auto st = std::chrono::system_clock::now();
                         totalLines += expertTasks[e].size();
                     }
                 }
- // printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+  // printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 DataType startDataType = weights[2]->GetLinearActDataType(bs);
                 DataType downInputDataType = weights[3]->GetLinearActDataType(bs);
 
@@ -942,7 +1014,7 @@ auto st = std::chrono::system_clock::now();
                     reduceOutput.resize(reduceOutputSize);
                 }
 
- // printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+  // printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 0. input -> realInput（若 input 非 FLOAT32 则先转为 float32）
                 if (input.dataType == startDataType && input.dataType != DataType::FLOAT32) {
                     size_t bytes = GetDataBytes(startDataType, bs, inputDim);
@@ -964,40 +1036,68 @@ auto st = std::chrono::system_clock::now();
                     }
                     RunMultiThreadConvertFromFloat32(realInput.data(), startDataType, inputF32Ptr, bs, inputDim, GetAlivePool());
                 }
- // printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+  // printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                 // 1. realInput -> expandInput
                 std::vector <MultiThreadMemcpyMultiLinesTask> memcpyTasks;
                 memcpyTasks.resize(totalLines);
                 {
-                    int offset = 0;
                     uint8_t* realInputPtr = realInput.data();
                     uint8_t* expandInputPtr = expandInput.data();
                     int bytesPerLine = GetDataBytes(startDataType, 1, inputDim);
-                    
-                    for (int e = 0; e < expertTasks.size(); e++) {
-                        if (weights[e * 2] != nullptr) {
-                            for (auto& task : expertTasks[e]) {
-                                int rowIdx = task.first;
 
-                                memcpyTasks[offset] = MultiThreadMemcpyMultiLinesTask(
-                                    expandInputPtr + offset * bytesPerLine, 
-                                    realInputPtr + rowIdx * bytesPerLine, 
+                    // 预计算每个 expert 在 expandInput 中的起始偏移
+                    std::vector<int> curPos(expertTasks.size(), 0);
+                    {
+                        int base = 0;
+                        for (int e = 0; e < expertTasks.size(); e++) {
+                            if (weights[e * 2] != nullptr) {
+                                curPos[e] = base;
+                                base += expertTasks[e].size();
+                            }
+                        }
+                    }
+
+                    // 按 token 顺序枚举：先 shared expert (expert 0)，再按 b * topk + j 顺序
+                    int idx = 0;
+                    for (int b = 0; b < bs; b++) {
+                        // shared expert (expert 0)
+                        if (weights[0] != nullptr) {
+                            int pos = curPos[0]++;
+                            memcpyTasks[idx++] = MultiThreadMemcpyMultiLinesTask(
+                                expandInputPtr + pos * bytesPerLine,
+                                realInputPtr + b * bytesPerLine,
+                                bytesPerLine
+                            );
+                        }
+                        // routed experts
+                        for (int j = 0; j < topk; j++) {
+                            int expertIdx = indexData[b * topk + j] + 1;
+                            if (weights[expertIdx * 2] != nullptr) {
+                                int pos = curPos[expertIdx]++;
+                                memcpyTasks[idx++] = MultiThreadMemcpyMultiLinesTask(
+                                    expandInputPtr + pos * bytesPerLine,
+                                    realInputPtr + b * bytesPerLine,
                                     bytesPerLine
                                 );
-                                offset++;
                             }
                         }
                     }
                 }
+ // printf("prepare expand spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 RunMultiThreadMemcpyMultiLines(memcpyTasks, GetAlivePool());
-// printf("expand spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+  // printf("expand spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 2. gateUp
                 
                 auto *numaConfig = GetNumaConfig();
 
                 int offset = 0;
                 int stride = 64;
+
+                // 判断 downInputDataType 是否支持算子内直接转换
+                bool canFuseDstConvert = (downInputDataType == DataType::FLOAT32 ||
+                                          downInputDataType == DataType::FLOAT16 ||
+                                          downInputDataType == DataType::BFLOAT16);
 
                 std::vector<std::vector <fastllm::MultiThreadBaseOp*> > ops;
                 ops.resize(numaConfig->numaCnt);
@@ -1014,6 +1114,9 @@ if (lines >= expertLimit) {
                             
                         // Prepare output pointer for this expert's batch
                         float* expertGateUpOutputPtr = gateUpOutput.data() + offset * interDim * 2;
+                        float* expertSwigluOutputPtr = swigluOutput.data() + offset * interDim;
+                        uint8_t* expertDstOutputPtr = canFuseDstConvert ?
+                            (uint8_t*)downInput.data() + offset * GetDataBytes(downInputDataType, 1, interDim) : nullptr;
 
                         int k = interDim * 2;
                         int kPer = k / numaConfig->numaCnt;
@@ -1025,11 +1128,13 @@ if (lines >= expertLimit) {
 
                             for (int st = 0; st < kPer; st += stride) {
                                 int end = std::min(st + stride, kPer);
-                                ops[nid].push_back(new MultiThreadGemmOp(
+                                ops[nid].push_back(new MultiThreadGemmAndCrossSwigluOp(
                                     (uint8_t*)expertInputPtr, startDataType,
                                     weights[e * 2]->numasData[nid], weights[e * 2]->GetDataType(),
                                     (uint8_t*)expertGateUpOutputPtr + outputOffset, DataType::FLOAT32,
-                                    lines, inputDim, k, st, end
+                                    expertSwigluOutputPtr,
+                                    lines, inputDim, k, st, end, base,
+                                    expertDstOutputPtr, downInputDataType
                                 ));
                             }
                         }
@@ -1039,17 +1144,29 @@ if (lines >= expertLimit) {
 
                 DynamicScheduleTasks(ops);
 
-// printf("gateup spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-
-                // 3. swiglu
-                SwigluMultiThread((float *) gateUpOutput.data(), interDim, interDim, ((float *) swigluOutput.data()),
-                                    totalLines, interDim * 2, interDim, GetAlivePool());
-// printf("swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+ // printf("gateup+swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                 // 4. swigluOutput -> downInput
-                RunMultiThreadConvertFromFloat32(downInput.data(), downInputDataType, (float*)swigluOutput.data(), totalLines, interDim, GetAlivePool());
+                //    如果 downInputDataType 支持算子内直接转换，则已在融合算子中完成；
+                //    否则需要在这里将 swigluOutput 转换为 downInput
+                if (!canFuseDstConvert) {
+                    offset = 0;
+                    for (int e = 0; e < expertTasks.size(); e++) {
+                        if (weights[e * 2] != nullptr && expertTasks[e].size() > 0) {
+                            int lines = expertTasks[e].size();
+                            if (lines >= expertLimit) {
+                                offset += lines;
+                                continue;
+                            }
+                            float* expertSwigluOutputPtr = swigluOutput.data() + offset * interDim;
+                            uint8_t* expertDstOutputPtr = (uint8_t*)downInput.data() + offset * GetDataBytes(downInputDataType, 1, interDim);
+                            RunMultiThreadConvertFromFloat32(expertDstOutputPtr, downInputDataType,
+                                                            expertSwigluOutputPtr, lines, interDim, GetAlivePool());
+                            offset += lines;
+                        }
+                    }
+                }
 
-// printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 5. down
                 offset = 0;
                 stride = 64;
@@ -1095,55 +1212,51 @@ if (lines >= expertLimit) {
 
                 DynamicScheduleTasks(ops);
 
-// printf("down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+ // printf("down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 6. reduce
                 {
-                    // 准备数据结构
-                    int total_tasks = 0;
-                    for (int e = 0; e < expertTasks.size(); e++) {
-                        if (weights[e * 2] != nullptr) {
-                            total_tasks += expertTasks[e].size();
-                        }
-                    }
-                    // 假设每个样本最多选择k个专家
-                    int k = 0; // 需要确定每个样本选择的专家数量
-                    std::vector<int> samples_expert_count(bs, 0);
-                    // 第一遍：统计每个样本的专家数量
-                    for (int e = 0; e < expertTasks.size(); e++) {
-                        if (weights[e * 2] != nullptr) {
-                            for (auto& task : expertTasks[e]) {
-                                int rowIdx = task.first;
-                                samples_expert_count[rowIdx]++;
-                                k = std::max(k, samples_expert_count[rowIdx]);
+                    // 计算每个样本选择的专家数 k（shared expert + routed experts）
+                    int k = (weights[0] != nullptr ? 1 : 0) + topk;
+
+                    // 预计算每个 expert 在 downOutput 中的起始偏移（与 expand 一致）
+                    std::vector<int> curPos(expertTasks.size(), 0);
+                    {
+                        int base = 0;
+                        for (int e = 0; e < expertTasks.size(); e++) {
+                            if (weights[e * 2] != nullptr) {
+                                curPos[e] = base;
+                                base += expertTasks[e].size();
                             }
                         }
                     }
-                    // 分配内存
-                    std::vector<int> pos(bs * k, -1);  // 初始化为-1表示无效位置
-                    std::vector<float> task_weights(total_tasks, 0.0f);
-                    std::vector<int> sample_expert_idx(bs, 0);  // 记录每个样本当前填充到第几个专家
-                    // 第二遍：填充pos和weights数组
-                    int offset = 0;
-                    for (int e = 0; e < expertTasks.size(); e++) {
-                        if (weights[e * 2] != nullptr) {
-                            for (auto& task : expertTasks[e]) {
-                                int rowIdx = task.first;
-                                float weight = task.second;
-                                
-                                // 在pos数组中记录这个任务的位置
-                                int expert_idx = sample_expert_idx[rowIdx]++;
-                                pos[rowIdx * k + expert_idx] = offset;
-                                task_weights[offset] = weight;
-                                
-                                offset++;
+
+                    // 按 token 顺序枚举填充 pos 和 task_weights（与 expand 顺序一致）
+                    std::vector<int> pos(bs * k, -1);
+                    std::vector<float> task_weights(bs * k, 0.0f);
+
+                    for (int b = 0; b < bs; b++) {
+                        int expert_idx = 0;
+                        // shared expert (expert 0)
+                        if (weights[0] != nullptr) {
+                            pos[b * k + expert_idx] = curPos[0]++;
+                            task_weights[b * k + expert_idx] = sharedScale;
+                            expert_idx++;
+                        }
+                        // routed experts
+                        for (int j = 0; j < topk; j++) {
+                            int expertId = indexData[b * topk + j] + 1;
+                            if (weights[expertId * 2] != nullptr) {
+                                pos[b * k + expert_idx] = curPos[expertId]++;
+                                task_weights[b * k + expert_idx] = scoreData[b * topk + j];
                             }
+                            expert_idx++;
                         }
                     }
 
                     // 调用多线程函数
                     MultiThreadReduceBatch(
                         (uint8_t*)downOutput.data(),  // downOutData
-                        DataType::FLOAT32,             // downOutDataType (假设是float32)
+                        DataType::FLOAT32,             // downOutDataType
                         task_weights.data(),           // weights
                         output.dataType == DataType::FLOAT32 ? (float*)output.cpuData : reduceOutput.data(),           // lastOutput
                         pos.data(),                    // pos
@@ -1151,11 +1264,8 @@ if (lines >= expertLimit) {
                         k,                            // k (每个样本的专家数)
                         dim                           // hidden_size
                     );
-                    // 注意：如果某些样本的专家数少于k，需要特殊处理
-                    // 可以在MultiThreadReduceBatchOp::Run()中添加检查：
-                    // if (curPos == -1) continue; // 跳过无效位置
                 }
-// printf("reduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+ // printf("reduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 7. reduceOutput -> last Output
                 if (output.dataType != DataType::FLOAT32) {
                     if (output.dataType == DataType::FLOAT16) {
@@ -1168,7 +1278,7 @@ if (lines >= expertLimit) {
                             reduceOutput.data(), bs, dim, GetAlivePool());
                     }
                 }
-// printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+ // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             }
 /*
             DoCudaMergeMOEFromCPU (
