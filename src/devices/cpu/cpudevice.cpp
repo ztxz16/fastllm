@@ -62,6 +62,7 @@ namespace fastllm {
         this->ops["Gelu"] = (BaseOperator*)(new CpuGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CpuGeluNewOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CpuSwigluOp());
+        this->ops["CrossSwiglu"] = (BaseOperator*)(new CpuCrossSwigluOp());
         this->ops["SwigluGptOss"] = (BaseOperator*)(new CpuSwigluGptOssOp());
         this->ops["MambaSoftplus"] = (BaseOperator*)(new CpuMambaSoftplusOp());
         this->ops["Mul"] = (BaseOperator*)(new CpuMulOp());
@@ -769,6 +770,54 @@ namespace fastllm {
         }
     }
 
+    void MultiThreadCrossSwigluOp::Run() {
+        // CrossSwiglu: y[i] = x[i*2+1] * silu(x[i*2])  (即 x[1::2] * silu(x[0::2]))
+        for (int o = 0; o < n; o++) {
+                float *cur = (float*)input + o * inputStride;
+                float *out = (float*)output + o * outputStride;
+                int i = 0;
+    #ifdef __aarch64__
+                float32x4_t c1 = vdupq_n_f32(1.0f);
+                for (; i + 3 < len; i += 4) {
+                    // 交错加载：x[0::2] 和 x[1::2]
+                    float32x4x2_t xy = vld2q_f32(cur + i * 2);
+                    float32x4_t vx = xy.val[0]; // 偶数位 (gate)
+                    float32x4_t vy = xy.val[1]; // 奇数位 (up)
+                    vx = vdivq_f32(vx, vaddq_f32(c1, exp_ps(vnegq_f32(vx))));
+                    vy = vmulq_f32(vx, vy);
+                    vst1q_f32(out + i, vy);
+                }
+    #endif
+    #ifdef __AVX2__
+                __m256i deinterleave_idx = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+                for (; i + 7 < len; i += 8) {
+                    // 加载16个连续交错的float: [g0,u0,g1,u1,...,g7,u7]
+                    __m256 lo = _mm256_loadu_ps(&cur[i * 2]);       // [g0,u0,g1,u1, g2,u2,g3,u3]
+                    __m256 hi = _mm256_loadu_ps(&cur[i * 2 + 8]);   // [g4,u4,g5,u5, g6,u6,g7,u7]
+                    // shuffle_ps 0x88 在每个128位lane内提取偶数位
+                    __m256 x = _mm256_shuffle_ps(lo, hi, 0x88); // [g0,g1,g4,g5, g2,g3,g6,g7]
+                    __m256 y = _mm256_shuffle_ps(lo, hi, 0xDD); // [u0,u1,u4,u5, u2,u3,u6,u7]
+                    // 跨lane重排以恢复正确顺序
+                    x = _mm256_permutevar8x32_ps(x, deinterleave_idx); // [g0,g1,g2,g3,g4,g5,g6,g7]
+                    y = _mm256_permutevar8x32_ps(y, deinterleave_idx); // [u0,u1,u2,u3,u4,u5,u6,u7]
+
+                    // Compute silu: x / (1.0 + exp(-x))
+                    __m256 neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
+                    __m256 exp_neg_x = exp256_ps(neg_x);
+                    __m256 denom = _mm256_add_ps(_mm256_set1_ps(1.0f), exp_neg_x);
+                    __m256 sigmoid = _mm256_div_ps(x, denom);
+
+                    __m256 result = _mm256_mul_ps(sigmoid, y);
+                    _mm256_storeu_ps(&out[i], result);
+                }
+    #endif
+                for (; i < len; i++) {
+                    float x = cur[i * 2], y = cur[i * 2 + 1];
+                    out[i] = (x / (1.0 + expf(-x))) * y;
+                }
+        }
+    }
+
     void MultiThreadSwigluFloat16Op::Run() {
         for (int o = 0; o < n; o++) {
             uint16_t *cur = (uint16_t*)input + o * inputStride;
@@ -1173,6 +1222,92 @@ namespace fastllm {
                 st, end,
                 inputDataType, weightDataType, outputDataType
             );
+    }
+
+    void MultiThreadGemmAndCrossSwigluOp::Run() {
+            // 1. 先执行 GEMM，结果写到 gateUpOutputData
+            //    gateUpOutputData 已经偏移到了当前 NUMA 分片的起始列 (base)
+            //    GEMM 写入列范围 [st, end)，ldc = k * sizeof(float) (整行步长)
+            FastllmGemm(
+                n, m, k,
+                inputData, GetDataBytes(inputDataType, 1, m),
+                weightData, GetDataBytes(weightDataType, 1, m),
+                gateUpOutputData, GetDataBytes(gateUpOutputDataType, 1, k),
+                st, end,
+                inputDataType, weightDataType, gateUpOutputDataType
+            );
+
+            // 2. 对 GEMM 刚写出的列做 CrossSwiglu
+            //    gateUpOutputData 指向 gateUpOutput[..., globalColOffset]
+            //    GEMM 写了 [st, end) 列，在全局坐标下是 [globalColOffset + st, globalColOffset + end)
+            //    gateUpOutput 交错布局: gate[0], up[0], gate[1], up[1], ...
+            //    swigluOutput 布局: [n, interDim], interDim = k / 2
+            int interDim = k / 2;
+            int localCols = end - st;         // 本次 GEMM 写出的列数
+            int swigluCols = localCols / 2;   // 做完 swiglu 后的列数
+            int globalSt = globalColOffset + st;
+            int swigluColSt = globalSt / 2;   // swiglu 输出的列起始位置
+            long ldc = GetDataBytes(gateUpOutputDataType, 1, k);
+
+            for (int row = 0; row < n; row++) {
+                // gateUpOutputData 已经偏移了 base 列，所以这里从 st 开始读
+                float *gateUpRow = (float*)(gateUpOutputData + ldc * row);
+                float *cur = gateUpRow + st;  // 指向 GEMM 写出的 [st] 位置
+                float *out = swigluOutputData + (size_t)row * interDim + swigluColSt;
+
+                int i = 0;
+#ifdef __aarch64__
+                float32x4_t c1 = vdupq_n_f32(1.0f);
+                for (; i + 3 < swigluCols; i += 4) {
+                    float32x4x2_t xy = vld2q_f32(cur + i * 2);
+                    float32x4_t vx = xy.val[0]; // gate
+                    float32x4_t vy = xy.val[1]; // up
+                    vx = vdivq_f32(vx, vaddq_f32(c1, exp_ps(vnegq_f32(vx))));
+                    vy = vmulq_f32(vx, vy);
+                    vst1q_f32(out + i, vy);
+                }
+#endif
+#ifdef __AVX2__
+                __m256i deinterleave_idx = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+                for (; i + 7 < swigluCols; i += 8) {
+                    __m256 lo = _mm256_loadu_ps(&cur[i * 2]);
+                    __m256 hi = _mm256_loadu_ps(&cur[i * 2 + 8]);
+                    __m256 x = _mm256_shuffle_ps(lo, hi, 0x88);
+                    __m256 y = _mm256_shuffle_ps(lo, hi, 0xDD);
+                    x = _mm256_permutevar8x32_ps(x, deinterleave_idx);
+                    y = _mm256_permutevar8x32_ps(y, deinterleave_idx);
+
+                    __m256 neg_x = _mm256_sub_ps(_mm256_setzero_ps(), x);
+                    __m256 exp_neg_x = exp256_ps(neg_x);
+                    __m256 denom = _mm256_add_ps(_mm256_set1_ps(1.0f), exp_neg_x);
+                    __m256 sigmoid = _mm256_div_ps(x, denom);
+
+                    __m256 result = _mm256_mul_ps(sigmoid, y);
+                    _mm256_storeu_ps(&out[i], result);
+                }
+#endif
+                for (; i < swigluCols; i++) {
+                    float x = cur[i * 2], y = cur[i * 2 + 1];
+                    out[i] = (x / (1.0f + expf(-x))) * y;
+                }
+
+                // 3. 如果指定了目标类型，立即将 swiglu 输出的列范围转换写入 dstOutputData
+                if (dstOutputData != nullptr) {
+                    size_t dstRowBytes = GetDataBytes(dstOutputDataType, 1, interDim);
+                    if (dstOutputDataType == DataType::FLOAT32) {
+                        memcpy((uint8_t*)dstOutputData + dstRowBytes * row + swigluColSt * sizeof(float),
+                               out, swigluCols * sizeof(float));
+                    } else if (dstOutputDataType == DataType::FLOAT16) {
+                        Float32ToFloat16(out, (uint16_t*)((uint8_t*)dstOutputData + dstRowBytes * row) + swigluColSt, swigluCols);
+                    } else if (dstOutputDataType == DataType::BFLOAT16) {
+                        Float32ToBFloat16(out, (uint16_t*)((uint8_t*)dstOutputData + dstRowBytes * row) + swigluColSt, swigluCols);
+                    } else {
+                        // 对于需要整行量化的类型（INF_INT8 等），逐列分块无法处理，
+                        // 需要外部在所有列写完后单独调用 ConvertFromFloat32
+                        ErrorInFastLLM("MultiThreadGemmAndCrossSwigluOp: Unsupported destination type " + GetDataTypeName(dstOutputDataType));
+                    }
+                }
+            }
     }
             
     void MultiThreadReduceBatchOp::Run() {
@@ -5776,6 +5911,38 @@ ops += (long long)lines * inputDim * interDim * 2;
         return;
     }
 
+    void CpuCrossSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+
+        std::vector <int> dims = input.dims;
+        dims[dims.size() - 1] /= 2;
+        output.dataType = input.dataType;
+        output.Resize(dims);
+    }
+
+    void CpuCrossSwigluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32,
+                        "CrossSwiglu error: Data's type should be float32.\n");
+
+        float *inputData = (float*)input.cpuData;
+        float *outputData = (float*)output.cpuData;
+
+        int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
+        int outer = input.Count(0) / spatial;
+
+        // CrossSwiglu: 交替存储格式, y[i] = x[i*2+1] * silu(x[i*2])
+        CrossSwigluMultiThread((float*)inputData, mid, mid, (float*)outputData, outer, spatial, mid, GetAlivePool());
+
+        return;
+    }
+
     void CpuSwigluGptOssOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -7315,6 +7482,27 @@ ops += (long long)lines * inputDim * interDim * 2;
         for (int i = 0; i < threadNum; i++) {
             int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
             ops.push_back(new fastllm::MultiThreadSwigluOp(input + cur, mid, end - cur, output + cur,
+                                                           n, inputStride, outputStride));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
+    void CrossSwigluMultiThread(float *input, int mid, int len, float *output,
+                           int n, int inputStride, int outputStride, AliveThreadPool *pool) {
+        int threadNum = pool->threads.size();
+        int per = len / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadCrossSwigluOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
+            ops.push_back(new fastllm::MultiThreadCrossSwigluOp(input + cur * 2, mid, end - cur, output + cur,
                                                            n, inputStride, outputStride));
             cur = end;
         }

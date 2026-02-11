@@ -925,7 +925,7 @@ namespace fastllm {
         }
     }
 
-    extern void RegisterNumas(fastllm::Data *data);
+    extern void RegisterNumas(fastllm::Data *data, std::string weightType);
 
     std::unique_ptr<basellm> CreateLLMModelFromGGUFFile(const std::string &fileName, const std::string &originalPath) {
         std::vector <ReadGGUFTask> readGGUFTasks;
@@ -1276,7 +1276,7 @@ if (false) {
                                             if (s != "" && s != "OFF") {
                                                 if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
                                                     mergeData.weightSum.resize(1);
-                                                    RegisterNumas(&mergeData);       
+                                                    RegisterNumas(&mergeData, it.type);       
                                                 }
                                             }
                                         } catch (...) {
@@ -1311,7 +1311,7 @@ if (false) {
                                 if (s != "" && s != "OFF") {
                                     if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
                                         model->weight.weight[weightName].weightSum.resize(1);
-                                        RegisterNumas(&model->weight.weight[weightName]);       
+                                        RegisterNumas(&model->weight.weight[weightName], model->specialWeights[weightName]);       
                                     }
                                 }
                             } catch (...) {
@@ -1930,7 +1930,7 @@ if (false) {
                                             if (s != "" && s != "OFF") {
                                                 if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
                                                     mergeData.weightSum.resize(1);
-                                                    RegisterNumas(&mergeData);       
+                                                    RegisterNumas(&mergeData, it.type);       
                                                 }
                                             }
                                         } catch (...) {
@@ -1965,7 +1965,7 @@ if (false) {
                                 if (s != "" && s != "OFF") {
                                     if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
                                         model->weight.weight[weightName].weightSum.resize(1);
-                                        RegisterNumas(&model->weight.weight[weightName]);       
+                                        RegisterNumas(&model->weight.weight[weightName], model->specialWeights[weightName]);       
                                     }
                                 }
                             } catch (...) {

@@ -181,7 +181,8 @@ namespace fastllm {
         {DataType::FLOAT32, {"float32", "fp32"}}, {DataType::BFLOAT16, {"bfloat16", "bf16"}}, {DataType::INT16, {"int16"}}, 
         {DataType::INT8, {"int8"}}, {DataType::INT4, {"int4o"}}, {DataType::INT2, {"int2"}}, {DataType::BIT, {"bit"}}, 
         {DataType::FLOAT16, {"float16", "fp16", "half"}}, {DataType::INT4_NOZERO, {"int4"}}, {DataType::INT4_GROUP, {"int4g"}},
-        {DataType::FP8_E4M3, {"float8", "fp8", "fp8_e4m3"}}, {DataType::INT2_GROUP, {"int2g"}}, {DataType::BASE3_GROUP, {"base3g"}}
+        {DataType::FP8_E4M3, {"float8", "fp8", "fp8_e4m3"}}, {DataType::INT2_GROUP, {"int2g"}}, {DataType::BASE3_GROUP, {"base3g"}},
+        {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}}
     };
 
     std::string GetDataTypeName(DataType type) {
@@ -199,6 +200,10 @@ namespace fastllm {
             return rows * columns * sizeof(float);
         } else if (type == DataType::BFLOAT16 || type == DataType::FLOAT16) {
             return rows * columns * sizeof(uint16_t);
+        } else if (type == DataType::INT4_NOZERO || type == DataType::INT4 || type == DataType::INT4_GROUP) {
+            return rows * (columns / 2);
+        } else if (type == DataType::INT8) {
+            return rows * columns;
         } else if (type == DataType::FP8_E4M3_BLOCK_128) {
             // columns * [fp8] + ((columns - 1) / 128 + 1) * [float]
             return rows * (columns + ((columns - 1) / 128 + 1) * sizeof(float));
