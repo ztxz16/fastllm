@@ -35,6 +35,36 @@ namespace fastllm {
         void Run();
     };
 
+    // GateUp GEMM + CrossSwiglu 融合算子
+    // GEMM 输出是交错的 [gate, up] 布局 (k = interDim * 2)
+    // 在 GEMM 写出 [st, end) 列后，立即做 CrossSwiglu，并转换为 dstOutputDataType 写出到 dstOutputData
+    struct MultiThreadGemmAndCrossSwigluOp : MultiThreadBaseOp {
+        uint8_t *inputData;       // [n * m]
+        uint8_t *weightData;      // [k * m], k = interDim * 2
+        uint8_t *gateUpOutputData; // [n * k], 用于暂存 GEMM 结果
+        float *swigluOutputData;  // [n * interDim], Swiglu 中间结果（仅当 dstOutputData 非 nullptr 时用作临时缓冲）
+        uint8_t *dstOutputData;   // [n * interDim] 目标类型缓冲区，swiglu 后直接转换写出；nullptr 时行为同旧版
+        DataType inputDataType, weightDataType, gateUpOutputDataType, dstOutputDataType;
+        int n, m, k;              // k = interDim * 2
+        int st, end;              // GEMM 列范围 [st, end), 在当前 NUMA 分片内的局部偏移
+        int globalColOffset;      // 当前 NUMA 分片在全局 k 维度的起始列
+
+        MultiThreadGemmAndCrossSwigluOp(
+            uint8_t *inputData, DataType inputDataType,
+            uint8_t *weightData, DataType weightDataType,
+            uint8_t *gateUpOutputData, DataType gateUpOutputDataType,
+            float *swigluOutputData,
+            int n, int m, int k, int st, int end, int globalColOffset,
+            uint8_t *dstOutputData = nullptr, DataType dstOutputDataType = DataType::FLOAT32) :
+            inputData(inputData), inputDataType(inputDataType),
+            weightData(weightData), weightDataType(weightDataType),
+            gateUpOutputData(gateUpOutputData), gateUpOutputDataType(gateUpOutputDataType),
+            swigluOutputData(swigluOutputData),
+            dstOutputData(dstOutputData), dstOutputDataType(dstOutputDataType),
+            n(n), m(m), k(k), st(st), end(end), globalColOffset(globalColOffset) {}
+        void Run();
+    };
+
     struct MultiThreadReduceBatchOp : MultiThreadBaseOp {
         uint8_t *downOutData;
         DataType downOutDataType;
