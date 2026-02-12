@@ -5,6 +5,19 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#ifdef __CUDACC__
+#include <cuda_bf16.h>
+#endif
+
+typedef union __align__(16) _union_bf16_4_fp8 {
+    uint2 in;
+    __nv_bfloat16 out[4];
+    __nv_bfloat162 out2[2];
+    __device__ _union_bf16_4_fp8() {
+      // Do nothing
+    }
+} union_bf16_4_fp8;
+
 __global__ void FastllmCudaFP8E4M3BLOCK1282HalfKernel(uint8_t* a, half *b) {
     unsigned int tid = threadIdx.x;
     unsigned int st = blockIdx.x;
@@ -405,6 +418,27 @@ static void FastllmCudaFP8E4M3Block128EnsureHalfBiasOnDevice(fastllm::Data &weig
     }
 }
 
+static void FastllmCudaFP8E4M3Block128EnsureBFloat16BiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
+    if (weight.cudaData == nullptr ||
+        (weight.extraCudaHalfData.size() == 0 && bias.dims.size() > 0)) {
+        __nv_bfloat16 *cudaBiasData;
+        cudaError_t state = cudaSuccess;
+        state = cudaMalloc(&cudaBiasData, k * sizeof(__nv_bfloat16));
+        if (bias.dims.size() > 0) {
+            float *tempBiasData;
+            state = cudaMalloc(&tempBiasData, k * sizeof(float));
+            state = cudaMemcpy(tempBiasData, (uint8_t *) bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            int threadPerBlock = std::min(256, k);
+            FastllmCudaFloat2Bf16Kernel <<< (k - 1) / threadPerBlock + 1, threadPerBlock>>>(tempBiasData, cudaBiasData, k);
+            state = cudaFree(tempBiasData);
+        } else {
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(__nv_bfloat16));
+        }
+        checkCudaErrors("Error: CUDA error when moving bf16 bias to device!", state);
+        weight.extraCudaHalfData.push_back((void *) cudaBiasData);
+    }
+}
+
 static void FastllmCudaFP8E4M3Block128EnsureBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         cudaError_t state = cudaSuccess;
@@ -678,6 +712,208 @@ bool FastllmCudaHalfMatMulFloatFP8E4M3Block128(const fastllm::Data &input, fastl
         FastllmCudaFree(cudaFp16Weight);
     } else {
         LaunchFastllmGemmFp16FP8E4M3Block128(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBiasData, n, m, k, perRow);
+    }
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+// ==================== BFloat16 x FP8_E4M3_BLOCK_128 ====================
+
+// FP8 BLOCK_128 -> BF16 转换 kernel
+// 数据布局: 每个block = 128字节fp8 + 4字节float scale
+// FP8 -> BF16 位操作: sign: (byte & 0x80) << 8, mantissa: (byte & 0x7F) << 4
+__global__ void FastllmCudaFP8E4M3BLOCK1282BF16Kernel(uint8_t* a, __nv_bfloat16 *b) {
+    unsigned int tid = threadIdx.x;
+    unsigned int st = blockIdx.x;
+
+    a += st * (128 + sizeof(float));
+    b += st * 128;
+    uint16_t bf16_bits = ((a[tid] & 0x80) << 8) | ((a[tid] & 0x7F) << 4);
+    float val = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&bf16_bits)) * *(float*)(a + 128);
+    b[tid] = __float2bfloat16_rn(val);
+}
+
+template <int THREAD_PER_BLOCK, int PART>
+__global__ void FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow(__nv_bfloat16 *A, uint8_t *B, __nv_bfloat16 *C,
+                                                    __nv_bfloat16 *bias,
+                                                    int m, int k, int perRow) {
+    __shared__ float sdata[PART][THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+
+    int st = blockIdx.x;
+#pragma unroll
+    for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
+    const int block_size = 128;
+    const float magicScaleConstant = exp2f(120.0f);
+
+    const uint8_t *baseB = B + st * perRow;
+    int numBlocks = (m - 1) / block_size + 1;
+    union_bf16_4_fp8 regA;
+
+    for (int blk = 0; blk < numBlocks; blk++) {
+        int blkStart = blk * block_size;
+        int blkEnd = min(blkStart + block_size, m);
+        // 数据布局: [fp8_0..fp8_127][float_scale_0][fp8_128..fp8_255][float_scale_1]...
+        const uint8_t *blkData = baseB + blk * (block_size + sizeof(float));
+        float blkScale = *(float*)(blkData + block_size);
+
+        for (int i = blkStart + tid * 4; i < blkEnd; i += THREAD_PER_BLOCK * 4) {
+            int localIdx = i - blkStart;
+            int remaining = blkEnd - i;
+
+            if (remaining >= 4) {
+                uint32_t bb = *(uint32_t*)(blkData + localIdx);
+                // FP8 -> BF16 位操作: sign << 8, mantissa << 4
+                uint16_t b0_bits = (((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 4);
+                uint16_t b1_bits = (((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 4);
+                uint16_t b2_bits = (((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 4);
+                uint16_t b3_bits = (((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 4);
+                float bf0 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b0_bits));
+                float bf1 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b1_bits));
+                float bf2 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b2_bits));
+                float bf3 = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&b3_bits));
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    regA.in = *reinterpret_cast<const uint2 *>(A + x * m + i);
+                    sdata[x][tid] += (__bfloat162float(regA.out[0]) * bf0 +
+                                      __bfloat162float(regA.out[1]) * bf1 +
+                                      __bfloat162float(regA.out[2]) * bf2 +
+                                      __bfloat162float(regA.out[3]) * bf3) * blkScale;
+                }
+            } else {
+                for (int j = 0; j < remaining; j++) {
+                    uint16_t bj_bits = ((blkData[localIdx + j] & 0x80) << 8) | ((blkData[localIdx + j] & 0x7F) << 4);
+                    float bVal = __bfloat162float(*reinterpret_cast<__nv_bfloat16*>(&bj_bits)) * blkScale;
+#pragma unroll
+                    for (int x = 0; x < PART; x++) {
+                        sdata[x][tid] += __bfloat162float(A[x * m + i + j]) * bVal;
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    float diff = 0.0f;
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            #pragma unroll
+            for (int x = 0; x < PART; x++) {
+                float other = sdata[x][tid + s] - diff;
+                float sumTmp = sdata[x][tid] + other;
+                diff = (sumTmp - sdata[x][tid]) - other;
+                sdata[x][tid] = sumTmp;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        if (bias == nullptr) {
+            for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sdata[x][0] * magicScaleConstant);
+        } else {
+#pragma unroll
+            for (int x = 0; x < PART; x++) C[st + k * x] = __float2bfloat16_rn(sdata[x][0] * magicScaleConstant + __bfloat162float(bias[st]));
+        }
+    }
+    __syncthreads();
+}
+
+void LaunchFastllmGemmBF16FP8E4M3Block128(__nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k, int perRow) {
+    if (n == 1) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 1> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 2) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 2> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 3) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 3> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 4) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 4> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 5) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 5> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 6) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 6> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 7) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 7> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 8) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 8> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 9) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 9> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 10) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 10> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 11) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 11> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 12) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 12> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 13) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 13> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 14) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 14> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else if (n == 15) {
+        FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 15> <<< k, 64 >>>(input, weight, output, bias, m, k, perRow);
+    } else {
+        int i = 0;
+        for (; i + 15 < n; i += 16) {
+            FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 16> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, m, k, perRow);
+        }
+        for (; i + 7 < n; i += 8) {
+            FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 8> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, m, k, perRow);
+        }
+        for (; i + 3 < n; i += 4) {
+            FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 4> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, m, k, perRow);
+        }
+        for (; i < n; i++) {
+            FastllmGemvBF16FP8E4M3Block128Kernel1MultiRow<64, 1> <<< k, 64 >>>(input + i * m, weight, output + i * k, bias, m, k, perRow);
+        }
+        return;
+    }
+}
+
+bool FastllmCudaBFloat16MatMulFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    FastllmCudaFP8E4M3Block128EnsureBFloat16BiasOnDevice(weight, bias, k);
+
+    __nv_bfloat16 *cudaBF16Bias = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *) weight.extraCudaHalfData[0];
+
+    __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
+    __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
+
+    size_t perRow = m + ((m - 1) / 128 + 1) * sizeof(float);
+
+    if (n >= 32) {
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+        __nv_bfloat16 *cudaBF16Weight;
+
+        cudaBF16Weight = (__nv_bfloat16 *) FastllmCudaMalloc(k * m * sizeof(__nv_bfloat16));
+
+        float h_alpha = exp2f(120.0), h_beta = 0.0f;
+        cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
+        cublasStatus_t status;
+
+        FastllmCudaFP8E4M3BLOCK1282BF16Kernel <<< k * (m / 128), 128 >>>((uint8_t*)weight.cudaData, cudaBF16Weight);
+
+        status = cublasGemmEx(fastllmCublasHandle,
+                                CUBLAS_OP_T, CUBLAS_OP_N,
+                                k, n, m,
+                                &h_alpha, cudaBF16Weight, AType,
+                                m, cudaInput, BType,
+                                m, &h_beta,
+                                cudaOutput, CType,
+                                k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: cublas error (BFloat16MatMulFP8E4M3Block128).\n");
+            throw("cublas error");
+            exit(0);
+        }
+
+        if (cudaBF16Bias != nullptr) {
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBF16Bias, k);
+        }
+
+        FastllmCudaFree(cudaBF16Weight);
+    } else {
+        LaunchFastllmGemmBF16FP8E4M3Block128(cudaInput, (uint8_t*)weight.cudaData, cudaOutput, cudaBF16Bias, n, m, k, perRow);
     }
 
     FastllmCudaFinishInput(input, cudaInput);

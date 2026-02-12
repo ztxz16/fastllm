@@ -569,6 +569,8 @@ namespace fastllm {
                 FastllmCudaBFloat16MatMulBFloat16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaBFloat16MatMulFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FP8_E4M3_BLOCK_128) {
+                FastllmCudaBFloat16MatMulFP8E4M3Block128(input, weight, bias, output, n, m, k);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType for BFLOAT16 input.\n");
             }
