@@ -1684,6 +1684,9 @@ namespace fastllm {
                 int k = this->dims[0], m = this->dims[1];
                 int kPerNuma = k / numaCnt;
                 size_t bytesPerRow = GetDataBytes(this->dataType, 1, m);
+                if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+                    bytesPerRow = GetDataBytes((DataType)((int)this->dataType + this->ggmlType), 1, m);
+                }
                 for (int i = 0; i < numaCnt; i++) {
                     FastllmCudaCopyFromHostToDevice((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
                         this->numasData[i], (size_t)kPerNuma * bytesPerRow);
