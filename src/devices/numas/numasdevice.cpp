@@ -11,10 +11,13 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <algorithm>
 #include <thread>
 #include <mutex>
 
 #include <cfloat>
+#include <climits>
 #include <cmath>
 
 #ifdef __aarch64__
@@ -32,6 +35,49 @@
 
 namespace fastllm {
     extern CPUInstructInfo *GetCPUInstructInfo();
+
+    class MoeEnvConfig {
+    public:
+        static MoeEnvConfig& GetInstance() {
+            static MoeEnvConfig instance;
+            return instance;
+        }
+
+        int GetExpertLimit() const { return expertLimit; }
+        bool GetGpuPrefill() const { return gpuPrefill; }
+
+    private:
+        MoeEnvConfig() {
+            expertLimit = 256;
+            gpuPrefill = true;
+
+            const char *expertLimitEnv = std::getenv("FT_EXPERT_LIMIT");
+            if (expertLimitEnv != nullptr) {
+                expertLimit = std::atoi(expertLimitEnv);
+            }
+
+            const char *gpuPrefillEnv = std::getenv("FT_GPU_PREFILL");
+            if (gpuPrefillEnv != nullptr) {
+                std::string val(gpuPrefillEnv);
+                std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+                if (val == "0" || val == "false" || val == "off") {
+                    gpuPrefill = false;
+                }
+            }
+
+            if (gpuPrefill) {
+                printf("Activate GPU Prefill\n");
+            } else {
+                printf("Disable GPU Prefill\n");
+            }
+        }
+
+        MoeEnvConfig(const MoeEnvConfig&) = delete;
+        MoeEnvConfig& operator=(const MoeEnvConfig&) = delete;
+
+        int expertLimit;
+        bool gpuPrefill;
+    };
 
     static MachineNumaInfo machineNumaInfo;
     NumaConfig *fastllmNumaConfig = nullptr;
@@ -937,13 +983,18 @@ namespace fastllm {
             Data gate, attenPart, moePart;
             int bs = input.dims[0];
             int m = weightsBatch / 2 - 1; // num experts
-            int expertLimit = 256;
-            const char *expertLimitEnv = std::getenv("EXPERTLIMIT");
-            if (expertLimitEnv != nullptr) {
-                expertLimit = std::atoi(expertLimitEnv);
+            auto &moeConfig = MoeEnvConfig::GetInstance();
+            int expertLimit = moeConfig.GetExpertLimit();
+            bool gpuPrefill = moeConfig.GetGpuPrefill();
+            if (output.cudaData == nullptr) {
+                gpuPrefill = false;
             }
 
-            if (expertLimit == 0) {
+            if (!gpuPrefill) {
+                expertLimit = INT_MAX; // 不使用GPU时，所有专家都由CPU处理
+            }
+
+            if (gpuPrefill && expertLimit == 0) {
                 DoCudaMergeMOEFromCPU (
                     input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, 0, true
                 );
@@ -951,12 +1002,15 @@ namespace fastllm {
             }
 
             int gpuId = FastllmCudaGetDevice();
-            std::thread gpuThread([&, gpuId]() {
-                FastllmCudaSetDevice(gpuId);
-                DoCudaMergeMOEFromCPU (
-                    input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, expertLimit, true
-                );
-            });
+            std::thread gpuThread;
+            if (gpuPrefill) {
+                gpuThread = std::thread([&, gpuId]() {
+                    FastllmCudaSetDevice(gpuId);
+                    DoCudaMergeMOEFromCPU (
+                        input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, expertLimit, true
+                    );
+                });
+            }
 // printf("gpuThread create spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
             {
@@ -1300,10 +1354,12 @@ namespace fastllm {
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             }
 
-            gpuThread.join();
+            if (gpuPrefill) {
+                gpuThread.join();
 // printf("gpuThread join spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-            ReduceSumFromCPU(output);
+                ReduceSumFromCPU(output);
 // printf("last sum spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            }
             return;
         }
     }
