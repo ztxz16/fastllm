@@ -1430,10 +1430,23 @@ namespace fastllm {
         AssertInFastLLM(ok, "CudaMergeMLAPaged: FastllmCudaMLAPaged failed.\n");
     }
 
+    // 将 output.cpuData 中的值拷入 GPU，按数据类型加到 output.cudaData 中，然后将结果拷回 CPU
+    void ReduceSumFromCPU(Data &output) {
+        int len = output.Count(0);
+        FastllmCudaAddHostToDevice(output.cudaData, output.cpuData, len, output.dataType);
+    }
+
     void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
-                        Data **weights, Data **biass, float sharedScale, bool setZero, int expertLimit) {
+                        Data **weights, Data **biass, float sharedScale, bool setZero, int expertLimit, bool isCrossSwiglu) {
 // static std::map <std::string, float> timeCnt;
+// static std::chrono::steady_clock::time_point lastMergeMoeCallTime;
+// auto now = std::chrono::steady_clock::now();
+// if (!timeCnt.empty() && std::chrono::duration_cast<std::chrono::seconds>(now - lastMergeMoeCallTime).count() >= 2) {
+   // timeCnt.clear();
+// }
+// lastMergeMoeCallTime = now;
 // auto st = std::chrono::system_clock::now();
+// auto xxx = std::chrono::system_clock::now();
         if (setZero) {
             output.Allocate();
             output.ToCudaTemporary({}, false);
@@ -1441,7 +1454,7 @@ namespace fastllm {
         } else {
             output.ToCudaTemporary({}, true);
         }
-        input.ToCudaTemporary({}, true);
+        input.ToCudaTemporary({}, false);
 // ForceDeviceSync(); timeCnt["io"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
         int batch = input.dims[0];
         
@@ -1545,7 +1558,11 @@ total += weights[i * 2 + 1]->GetBytes();
             DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
 // ForceDeviceSync(); timeCnt["linear"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
             DoCudaSwigluReshape(tempMiddle, tempSwiglu);
-            DoCudaSwiglu(tempMiddle, tempSwiglu);
+            if (isCrossSwiglu) {
+                FastllmCudaCrossSwiglu(tempMiddle, tempSwiglu);
+            } else {
+                DoCudaSwiglu(tempMiddle, tempSwiglu);
+            }
 // ForceDeviceSync(); timeCnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
             DoCudaLinearReshape(tempSwiglu, *weights[i * 2 + 1], tempOutput);
             DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
@@ -1570,14 +1587,14 @@ total += weights[i * 2 + 1]->GetBytes();
 // printf("copy weight %f G.\n", total / 1e9);
 
         input.FreeCudaTemporary({}, false);
-        output.FreeCudaTemporary({}, true);
 // ForceDeviceSync(); timeCnt["last free"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-float totalTime = 0.0f;
+// float totalTime = 0.0f;
 // for (auto &it : timeCnt) {
-    // printf("%s: %f s.\n", it.first.c_str(), it.second);
-    // totalTime += it.second;
+//     // printf("%s: %f s.\n", it.first.c_str(), it.second);
+//     totalTime += it.second;
 // }
-// printf("total time = %f\n", totalTime);
+// // printf("total time = %f\n", totalTime);
+//printf("DoCudaMergeMOEFromCPU spend %f s.\n", GetSpan(xxx, std::chrono::system_clock::now()));
     }
 
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
