@@ -394,6 +394,17 @@ __global__ void FastllmCrossSwigluKernel(half* __restrict__ a, half* __restrict_
     }
 }
 
+__global__ void FastllmCrossSwigluKernel(__nv_bfloat16* __restrict__ a, __nv_bfloat16* __restrict__ b, int len, int spatial, int mid) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        int outer = idx / mid;
+        int inner = idx % mid;
+        int id = outer * spatial + inner * 2;
+        float x = __bfloat162float(a[id]), y = __bfloat162float(a[id + 1]);
+        b[idx] = __float2bfloat16((x / (1.0f + expf(-x))) * y);
+    }
+}
+
 __global__ void FastllmAddKernel(float* a, float *b, float v, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -1565,6 +1576,8 @@ bool FastllmCudaCrossSwiglu(const fastllm::Data &input, fastllm::Data &output) {
         FastllmCrossSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len, spatial, mid);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmCrossSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, len, spatial, mid);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmCrossSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((__nv_bfloat16*)cudaInput, (__nv_bfloat16*)cudaOutput, len, spatial, mid);
     }
 
     FastllmCudaFinishInput(input, cudaInput);
@@ -3241,6 +3254,30 @@ __global__ void FastllmPickOutputKernel(half *partOutput, half *output, int rows
         output[dstOffset] = (half)((float)output[dstOffset] + sca * (float)partOutput[srcOffset]);
     }
 }
+
+// CUDA Kernel 函数
+// 每个线程负责一个 bfloat16 元素的计算和累加
+__global__ void FastllmPickOutputKernel(__nv_bfloat16 *partOutput, __nv_bfloat16 *output, int rows, int cols, int *index, float *scales) {
+    // blockIdx.y 对应行索引 i (partOutput 中的行)
+    int i = blockIdx.y;
+    // blockIdx.x * blockDim.x + threadIdx.x 对应列索引 j
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    // 边界检查
+    if (i < rows && j < cols) {
+        // 获取目标行号 idx 和 缩放因子 sca
+        int idx = index[i];
+        float sca = scales[i];
+        // 计算扁平化的内存偏移量
+        // 使用 long long 防止大模型显存地址溢出
+        long long srcOffset = (long long)i * cols + j;
+        long long dstOffset = (long long)idx * cols + j;
+        // 执行逻辑: output[idx * cols + j] += sca * partOutput[i * cols + j];
+        // 注意：这里假设 index 映射的目标行通常是唯一的（在 LLM Batch 推理中通常如此）。
+        // 如果多个 i 映射到同一个 idx，这里存在竞争冒险，但在 FastLLM 上下文中通常是 Scatter 操作。
+        output[dstOffset] = (__nv_bfloat16)((float)output[dstOffset] + sca * (float)partOutput[srcOffset]);
+    }
+}
+
 // Host 调用函数
 void FastllmCudaPickOutput(uint8_t *partOutput, uint8_t *output, int rows, int cols, int *index, float *scales, fastllm::DataType dataType) {
     // 设定 Block 大小：使用 256 作为通用高性能值
@@ -3255,6 +3292,8 @@ void FastllmCudaPickOutput(uint8_t *partOutput, uint8_t *output, int rows, int c
         FastllmPickOutputKernel<<<grid, block>>>((float*)partOutput, (float*)output, rows, cols, index, scales);
     } else if (dataType == fastllm::DataType::FLOAT16) {
         FastllmPickOutputKernel<<<grid, block>>>((half*)partOutput, (half*)output, rows, cols, index, scales);
+    } else if (dataType == fastllm::DataType::BFLOAT16) {
+        FastllmPickOutputKernel<<<grid, block>>>((__nv_bfloat16*)partOutput, (__nv_bfloat16*)output, rows, cols, index, scales);
     } else {
         printf("FastllmCudaPickOutput Error: datatype error.\n");
         exit(0);
