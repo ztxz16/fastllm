@@ -26,6 +26,10 @@
 #include "computeutils.h"
 #include "numas.h"
 
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
+
 namespace fastllm {
     extern CPUInstructInfo *GetCPUInstructInfo();
 
@@ -946,7 +950,9 @@ namespace fastllm {
                 return;
             }
 
-            std::thread gpuThread([&]() {
+            int gpuId = FastllmCudaGetDevice();
+            std::thread gpuThread([&, gpuId]() {
+                FastllmCudaSetDevice(gpuId);
                 DoCudaMergeMOEFromCPU (
                     input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, expertLimit, true
                 );
