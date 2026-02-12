@@ -1577,7 +1577,11 @@ namespace fastllm {
         if (device == DataDevice::CUDA) {
             ToDevice(device, curExecutor->GetDeviceIds("cuda"), copyData);
         } else {
+#ifdef USE_CUDA
+            ToDevice(device, {FastllmCudaGetDevice()}, copyData);
+#else
             ToDevice(device, {0}, copyData);
+#endif
         }
     }
 
@@ -1658,7 +1662,11 @@ namespace fastllm {
 #endif
         }
         if (deviceIds.size() == 0) {
+#ifdef USE_CUDA
+            this->dataDeviceIds = {FastllmCudaGetDevice()};
+#else
             this->dataDeviceIds = {0};
+#endif
         } else {
             this->dataDeviceIds = deviceIds;
         };
