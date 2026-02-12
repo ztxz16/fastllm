@@ -6,6 +6,7 @@
 // https://github.com/ggml-org/llama.cpp
 // https://github.com/ikawrakow/ik_llama.cpp
 
+#include <set>
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
 #include <thrust/sequence.h>
@@ -729,6 +730,23 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
+bool get_has_vec_dot_q_cuda(ggml_type type) {
+    switch (type) {        
+        case GGML_TYPE_Q3_K   : return true;
+        case GGML_TYPE_IQ3_XXS: return true;
+        case GGML_TYPE_IQ3_S  : return true;
+        case GGML_TYPE_Q4_K   : return true;
+        case GGML_TYPE_IQ4_NL : return true;
+        case GGML_TYPE_IQ4_XS : return true;
+        case GGML_TYPE_Q5_0   : return true;
+        case GGML_TYPE_Q5_1   : return true;
+        case GGML_TYPE_Q5_K   : return true;
+        case GGML_TYPE_Q6_K   : return true;
+        case GGML_TYPE_Q8_0   : return true;
+        default               : return false;
+    }
+}
+
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {        
         case GGML_TYPE_Q3_K   : return vec_dot_q3_K_q8_1;
@@ -1350,17 +1368,501 @@ void dequantize_row_q8_0_cuda(const block_q8_0* d_x, half* d_y, int64_t k,
     }
 }
 
-using ggml_cuda_dequant_func = void (*) (const char *d_x, half *d_y, int64_t k, cudaStream_t stream);
+#define CUDA_DEQUANTIZE_BLOCK_SIZE 256
+#define CUDA_Q8_0_NE_ALIGN 2048
 
-ggml_cuda_dequant_func GetGGMLDequantFunc(ggml_type type) {
-    if (type == GGML_TYPE_Q4_K) {
-        return (ggml_cuda_dequant_func)dequantize_row_q4_K_cuda;
-    } else if (type == GGML_TYPE_Q6_K) {
-        return (ggml_cuda_dequant_func)dequantize_row_q6_K_cuda;
-    } else if (type == GGML_TYPE_Q8_0) {
-        return (ggml_cuda_dequant_func)dequantize_row_q8_0_cuda;
+typedef half dfloat; // dequantize float
+typedef half2 dfloat2;
+
+typedef void (*dequantize_kernel_t)(const void * vx, const int64_t ib, const int iqs, dfloat2 & v);
+
+template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
+static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
+    const int64_t i = (int64_t)2*(blockDim.x*blockIdx.x + threadIdx.x);
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t ib = i/qk; // block index
+    const int64_t iqs = (i%qk)/qr; // quant index
+    const int64_t iybs = i - i%qk; // y block start index
+    const int64_t y_offset = qr == 1 ? 1 : qk/2;
+
+    // dequantize
+    dfloat2 v;
+    dequantize_kernel(vx, ib, iqs, v);
+
+    y[iybs + iqs + 0]        = v.x;
+    y[iybs + iqs + y_offset] = v.y;
+}
+
+template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
+static void dequantize_block_cuda(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    const int num_blocks = (k + 2*CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / (2*CUDA_DEQUANTIZE_BLOCK_SIZE);
+    dequantize_block<qk, qr, dequantize_kernel><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
+}
+
+static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const int64_t ib, const int iqs, dfloat2 & v){
+    const block_q8_0 * x = (const block_q8_0 *) vx;
+
+    const dfloat d = x[ib].d;
+
+    v.x = x[ib].qs[iqs + 0];
+    v.y = x[ib].qs[iqs + 1];
+
+    v = __hmul2(v, {d, d});
+}
+
+
+static inline __device__ void get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+    if (j < 4) {
+        d = q[j] & 63; m = q[j + 4] & 63;
     } else {
-        return nullptr;
+        d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
+    }
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const block_q4_K * x = (const block_q4_K *) vx;
+
+    const int64_t i = blockIdx.x;
+
+    // assume 32 threads
+    const int64_t tid = threadIdx.x;
+    const int64_t il  = tid/8;
+    const int64_t ir  = tid%8;
+    const int64_t is  = 2*il;
+    const int64_t n   = 4;
+
+    dst_t * y = yy + i*QK_K + 64*il + n*ir;
+
+    const float dall = __low2half(x[i].dm);
+    const float dmin = __high2half(x[i].dm);
+
+    const uint8_t * q = x[i].qs + 32*il + n*ir;
+
+    uint8_t sc, m;
+    get_scale_min_k4(is + 0, x[i].scales, sc, m);
+    const float d1 = dall * sc; const float m1 = dmin * m;
+    get_scale_min_k4(is + 1, x[i].scales, sc, m);
+    const float d2 = dall * sc; const float m2 = dmin * m;
+    for (int l = 0; l < n; ++l) {
+        y[l + 0] = d1 * (q[l] & 0xF) - m1;
+        y[l +32] = d2 * (q[l] >>  4) - m2;
+    }
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const block_q5_K * x = (const block_q5_K *) vx;
+
+    const int64_t i = blockIdx.x;
+
+    // assume 64 threads - this is very slightly better than the one below
+    const int64_t tid = threadIdx.x;
+    const int64_t il  = tid/16;   // il is in 0...3
+    const int64_t ir  = tid%16;   // ir is in 0...15
+    const int64_t is  = 2*il;     // is is in 0...6
+
+    dst_t * y = yy + i*QK_K + 64*il + 2*ir;
+
+    const float dall = __low2half(x[i].dm);
+    const float dmin = __high2half(x[i].dm);
+
+    const uint8_t * ql = x[i].qs + 32*il + 2*ir;
+    const uint8_t * qh = x[i].qh + 2*ir;
+
+    uint8_t sc, m;
+    get_scale_min_k4(is + 0, x[i].scales, sc, m);
+    const float d1 = dall * sc; const float m1 = dmin * m;
+    get_scale_min_k4(is + 1, x[i].scales, sc, m);
+    const float d2 = dall * sc; const float m2 = dmin * m;
+
+    uint8_t   hm  = 1 << (2*il);
+    y[ 0] = d1 * ((ql[ 0] & 0xF) + (qh[ 0] & hm ? 16 : 0)) - m1;
+    y[ 1] = d1 * ((ql[ 1] & 0xF) + (qh[ 1] & hm ? 16 : 0)) - m1;
+    hm <<= 1;
+    y[32] = d2 * ((ql[ 0] >>  4) + (qh[ 0] & hm ? 16 : 0)) - m2;
+    y[33] = d2 * ((ql[ 1] >>  4) + (qh[ 1] & hm ? 16 : 0)) - m2;
+}
+
+template<typename dst_t>
+static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const block_q6_K * x = (const block_q6_K *) vx;
+
+    const int64_t i = blockIdx.x;
+
+    // assume 64 threads - this is very slightly better than the one below
+    const int64_t tid = threadIdx.x;
+    const int64_t ip  = tid/32;   // ip is 0 or 1
+    const int64_t il  = tid - 32*ip; // 0...32
+    const int64_t is  = 8*ip + il/16;
+
+    dst_t * y = yy + i*QK_K + 128*ip + il;
+
+    const float d = x[i].d;
+
+    const uint8_t * ql = x[i].ql + 64*ip + il;
+    const uint8_t   qh = x[i].qh[32*ip + il];
+    const int8_t  * sc = x[i].scales + is;
+
+    y[ 0] = d * sc[0] * ((int8_t)((ql[ 0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32);
+    y[32] = d * sc[2] * ((int8_t)((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32);
+    y[64] = d * sc[4] * ((int8_t)((ql[ 0]  >> 4) | (((qh >> 4) & 3) << 4)) - 32);
+    y[96] = d * sc[6] * ((int8_t)((ql[32]  >> 4) | (((qh >> 6) & 3) << 4)) - 32);
+}
+
+template<typename dst_t>
+static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    const int nb = k / QK_K;
+    dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+// Dequantize block_q4_k_r4: each block packs 4 rows of QK_K(=256) elements.
+// 128 threads per CUDA block (32 threads per row x 4 rows), each thread decodes 8 elements.
+template<typename dst_t>
+static __global__ void dequantize_block_q4_K_r4(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                                 const int64_t n_per_row) {
+    const block_q4_k_r4 * x = (const block_q4_k_r4 *) vx;
+    const int64_t i = blockIdx.x; // block index
+
+    // tid = 0..127; k = tid/32 (row 0..3), ltid = tid%32 (position within row)
+    const int64_t tid  = threadIdx.x;
+    const int64_t k    = tid / 32;  // row 0..3
+    const int64_t ltid = tid % 32;  // 0..31
+
+    const int nblock = n_per_row / QK_K;
+    const int64_t group = i / nblock;
+    const int64_t ibl   = i % nblock;
+    dst_t * y = yy + group * 4 * n_per_row + k * n_per_row + ibl * QK_K;
+
+    const float dall = __half2float(x[i].d[k]);
+    const float dmin = __half2float(x[i].d[k + 4]);
+
+    // ltid = 0..31 maps to: ib = ltid/4 (sub-block 0..7), j = ltid%4 (0..3)
+    const int ib = ltid / 4;
+    const int j  = ltid % 4;
+
+    // Decode scale and min for this sub-block
+    const uint8_t sl = x[i].scales_l[4 * ib + k];
+    const uint8_t Ld_low = sl & 0xf;
+    const uint8_t Lm_low = sl >> 4;
+
+    const int sh_idx = (4 * ib + k) % 16;
+    const int sh_shift = 4 * ((4 * ib + k) / 16);
+    const uint8_t sh = (x[i].scales_h[sh_idx] >> sh_shift) & 0xf;
+    const uint8_t Ld_high = sh & 0x3;
+    const uint8_t Lm_high = (sh >> 2) & 0x3;
+
+    const uint8_t Ld = Ld_low | (Ld_high << 4);
+    const uint8_t Lm = Lm_low | (Lm_high << 4);
+
+    const float d_sc = dall * Ld;
+    const float m_sc = dmin * Lm;
+
+    // Each thread decodes 8 elements: L[32*ib + j + offset] for 8 offsets
+    const uint8_t * qs_base = x[i].qs + 64 * ib + 4 * k;
+
+    const uint8_t q0 = qs_base[j + 0];   // L[j+0]  | (L[j+8] << 4)
+    const uint8_t q1 = qs_base[j + 32];  // L[j+4]  | (L[j+12] << 4)
+    const uint8_t q2 = qs_base[j + 16];  // L[j+16] | (L[j+24] << 4)
+    const uint8_t q3 = qs_base[j + 48];  // L[j+20] | (L[j+28] << 4)
+
+    y[32 * ib + j + 0]  = d_sc * (q0 & 0xf) - m_sc;
+    y[32 * ib + j + 8]  = d_sc * (q0 >> 4)   - m_sc;
+    y[32 * ib + j + 4]  = d_sc * (q1 & 0xf) - m_sc;
+    y[32 * ib + j + 12] = d_sc * (q1 >> 4)   - m_sc;
+    y[32 * ib + j + 16] = d_sc * (q2 & 0xf) - m_sc;
+    y[32 * ib + j + 24] = d_sc * (q2 >> 4)   - m_sc;
+    y[32 * ib + j + 20] = d_sc * (q3 & 0xf) - m_sc;
+    y[32 * ib + j + 28] = d_sc * (q3 >> 4)   - m_sc;
+}
+
+template<typename dst_t>
+static void dequantize_row_q4_K_r4_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    // nrows must be a multiple of 4
+    const int64_t nblocks = (nrows / 4) * (n_per_row / QK_K);
+    dequantize_block_q4_K_r4<<<nblocks, 128, 0, stream>>>(vx, y, n_per_row);
+}
+
+template<typename dst_t>
+static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    const int nb = k / QK_K;
+    dequantize_block_q5_K<<<nb, 64, 0, stream>>>(vx, y);
+}
+
+// Dequantize q5_K_r4 (4-row interleaved) format back to float/half
+// Each block_q5_k_r4 encodes 4 rows × QK_K elements.
+// Launch with 128 threads per block: tid/32 selects row (0..3), tid%32 selects position.
+// Each thread decodes 8 elements (one 32-element sub-block).
+// Q5_K formula: x = dall * Ld * (low4 | (high1 << 4)) - dmin * Lm
+template<typename dst_t>
+static __global__ void dequantize_block_q5_K_r4(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                                 const int64_t n_per_row) {
+    const block_q5_k_r4 * x = (const block_q5_k_r4 *) vx;
+    const int64_t i = blockIdx.x; // r4 block index
+
+    const int64_t tid  = threadIdx.x;  // 0..127
+    const int64_t k    = tid / 32;     // row 0..3
+    const int64_t ltid = tid % 32;     // 0..31
+
+    const int nblock = n_per_row / QK_K;
+    const int64_t group = i / nblock;
+    const int64_t ibl   = i % nblock;
+
+    // Output pointer for this thread's row
+    dst_t * y = yy + group * 4 * n_per_row + k * n_per_row + ibl * QK_K;
+
+    const float dall = __half2float(x[i].d[k]);
+    const float dmin = __half2float(x[i].d[k + 4]);
+
+    // ltid = 0..31 -> ib = ltid/4 (sub-block 0..7), j = ltid%4 (0..3)
+    const int ib = ltid / 4;
+    const int j  = ltid % 4;
+
+    // Decode scale (Ld) and min (Lm) for this sub-block
+    // repack stored: scales_l[4*ib+k] = (Ld[ib] & 0xf) | ((Lm[ib] & 0xf) << 4)
+    const uint8_t sl = x[i].scales_l[4 * ib + k];
+    const uint8_t Ld_low = sl & 0xf;
+    const uint8_t Lm_low = sl >> 4;
+
+    // scales_h packing: h = (Ld[ib] >> 4) | ((Lm[ib] >> 4) << 2), stored at scales_h[(4*ib+k)%16] shifted by 4*((4*ib+k)/16)
+    const int sh_idx = (4 * ib + k) % 16;
+    const int sh_shift = 4 * ((4 * ib + k) / 16);
+    const uint8_t sh = (x[i].scales_h[sh_idx] >> sh_shift) & 0xf;
+    const uint8_t Ld_high = sh & 0x3;
+    const uint8_t Lm_high = (sh >> 2) & 0x3;
+
+    const uint8_t Ld = Ld_low | (Ld_high << 4);
+    const uint8_t Lm = Lm_low | (Lm_high << 4);
+
+    const float d_sc = dall * Ld;
+    const float m_sc = dmin * Lm;
+
+    // Read packed low 4-bit quants (same layout as q4_K_r4)
+    // qs layout from repack: qs[64*ib + 4*k + i + offset]
+    const uint8_t * qs_base = x[i].qs + 64 * ib + 4 * k;
+    const uint8_t q0 = qs_base[j +  0];  // (L[j+0] & 0xf) | ((L[j+8] & 0xf) << 4)
+    const uint8_t q1 = qs_base[j + 16];  // (L[j+16] & 0xf) | ((L[j+24] & 0xf) << 4)
+    const uint8_t q2 = qs_base[j + 32];  // (L[j+4] & 0xf) | ((L[j+12] & 0xf) << 4)
+    const uint8_t q3 = qs_base[j + 48];  // (L[j+20] & 0xf) | ((L[j+28] & 0xf) << 4)
+
+    // Read packed high 1-bit quants (the 5th bit)
+    // qh layout from repack: qh[16*ib + 4*k + i] packs 8 elements' bit4:
+    //   bit0 = L[j+0]>>4, bit1 = L[j+8]>>4, bit2 = L[j+4]>>4, bit3 = L[j+12]>>4,
+    //   bit4 = L[j+16]>>4, bit5 = L[j+24]>>4, bit6 = L[j+20]>>4, bit7 = L[j+28]>>4
+    const uint8_t qh = x[i].qh[16 * ib + 4 * k + j];
+
+    // Reconstruct 5-bit values and dequantize: x = d_sc * q5val - m_sc
+    y[32 * ib + j +  0] = d_sc * ((q0 & 0xf) | (((qh >> 0) & 1) << 4)) - m_sc;
+    y[32 * ib + j +  8] = d_sc * ((q0 >>  4) | (((qh >> 1) & 1) << 4)) - m_sc;
+    y[32 * ib + j +  4] = d_sc * ((q2 & 0xf) | (((qh >> 2) & 1) << 4)) - m_sc;
+    y[32 * ib + j + 12] = d_sc * ((q2 >>  4) | (((qh >> 3) & 1) << 4)) - m_sc;
+    y[32 * ib + j + 16] = d_sc * ((q1 & 0xf) | (((qh >> 4) & 1) << 4)) - m_sc;
+    y[32 * ib + j + 24] = d_sc * ((q1 >>  4) | (((qh >> 5) & 1) << 4)) - m_sc;
+    y[32 * ib + j + 20] = d_sc * ((q3 & 0xf) | (((qh >> 6) & 1) << 4)) - m_sc;
+    y[32 * ib + j + 28] = d_sc * ((q3 >>  4) | (((qh >> 7) & 1) << 4)) - m_sc;
+}
+
+template<typename dst_t>
+static void dequantize_row_q5_K_r4_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    // nrows must be a multiple of 4
+    const int64_t nblocks = (nrows / 4) * (n_per_row / QK_K);
+    dequantize_block_q5_K_r4<<<nblocks, 128, 0, stream>>>(vx, y, n_per_row);
+}
+
+template<typename dst_t>
+static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    const int nb = k / QK_K;
+    dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
+}
+
+// Dequantize q6_K_r4 (4-row interleaved) format back to float/half
+// Each block_q6_k_r4 encodes 4 rows × QK_K elements.
+// Launch with 128 threads per block: tid/32 selects row (0..3), tid%32 selects position.
+// Each thread decodes 8 elements (one 32-element sub-block, 4 positions × 2 scale groups).
+template<typename dst_t>
+static __global__ void dequantize_block_q6_K_r4(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                                 const int64_t n_per_row) {
+    const block_q6_k_r4 * x = (const block_q6_k_r4 *) vx;
+    const int64_t i = blockIdx.x; // r4 block index
+
+    const int64_t tid  = threadIdx.x;  // 0..127
+    const int64_t k    = tid / 32;     // row 0..3
+    const int64_t ltid = tid % 32;     // 0..31
+
+    const int nblock = n_per_row / QK_K;
+    const int64_t group = i / nblock;
+    const int64_t ibl   = i % nblock;
+
+    // Output pointer for this thread's row
+    dst_t * y = yy + group * 4 * n_per_row + k * n_per_row + ibl * QK_K;
+
+    const float d = __half2float(x[i].d[k]);
+
+    // ltid = 0..31 -> ib = ltid/4 (sub-block 0..7), j = ltid%4 (0..3)
+    const int ib = ltid / 4;
+    const int j  = ltid % 4;
+
+    // Scales: scales[8*ib + k + 0] for first 16 elements, scales[8*ib + k + 4] for last 16
+    const int8_t sc0 = x[i].scales[8 * ib + k + 0];  // original scales[2*ib+0]
+    const int8_t sc1 = x[i].scales[8 * ib + k + 4];  // original scales[2*ib+1]
+
+    // Read packed low 4-bit quants
+    // ql layout from repack: ql[64*ib + 4*k + j + offset]
+    const uint8_t * ql_base = x[i].ql + 64 * ib + 4 * k;
+    const uint8_t ql0 = ql_base[j +  0];  // (L[j+0] & 0xf) | ((L[j+8] & 0xf) << 4)
+    const uint8_t ql1 = ql_base[j + 16];  // (L[j+16] & 0xf) | ((L[j+24] & 0xf) << 4)
+    const uint8_t ql2 = ql_base[j + 32];  // (L[j+4] & 0xf) | ((L[j+12] & 0xf) << 4)
+    const uint8_t ql3 = ql_base[j + 48];  // (L[j+20] & 0xf) | ((L[j+28] & 0xf) << 4)
+
+    // Read packed high 2-bit quants
+    // qh layout from repack: qh[32*ib + 4*k + j + offset]
+    const uint8_t * qh_base = x[i].qh + 32 * ib + 4 * k;
+    const uint8_t qh0 = qh_base[j +  0]; // (L[j+0]>>4) | ((L[j+8]>>4)<<2) | ((L[j+4]>>4)<<4) | ((L[j+12]>>4)<<6)
+    const uint8_t qh1 = qh_base[j + 16]; // (L[j+16]>>4) | ((L[j+24]>>4)<<2) | ((L[j+20]>>4)<<4) | ((L[j+28]>>4)<<6)
+
+    // Reconstruct 6-bit values L[offset] = (ql_low_4bits) | (qh_2bits << 4), then dequant = d * scale * (L - 32)
+    // From ql0: L[j+0] low4 = ql0 & 0xf,  L[j+8] low4 = ql0 >> 4
+    // From qh0: L[j+0] high2 = qh0 & 3,   L[j+8] high2 = (qh0>>2)&3, L[j+4] high2 = (qh0>>4)&3, L[j+12] high2 = (qh0>>6)&3
+    // From ql2: L[j+4] low4 = ql2 & 0xf,  L[j+12] low4 = ql2 >> 4
+    // From ql1: L[j+16] low4 = ql1 & 0xf, L[j+24] low4 = ql1 >> 4
+    // From qh1: L[j+16] high2 = qh1 & 3,  L[j+24] high2 = (qh1>>2)&3, L[j+20] high2 = (qh1>>4)&3, L[j+28] high2 = (qh1>>6)&3
+    // From ql3: L[j+20] low4 = ql3 & 0xf, L[j+28] low4 = ql3 >> 4
+
+    // First 16 elements of sub-block (scale = sc0): positions j+0, j+8, j+4, j+12
+    y[32 * ib + j +  0] = d * sc0 * ((int8_t)(( ql0       & 0xf) | (((qh0 >> 0) & 3) << 4)) - 32);
+    y[32 * ib + j +  8] = d * sc0 * ((int8_t)(( ql0       >>  4) | (((qh0 >> 2) & 3) << 4)) - 32);
+    y[32 * ib + j +  4] = d * sc0 * ((int8_t)(( ql2       & 0xf) | (((qh0 >> 4) & 3) << 4)) - 32);
+    y[32 * ib + j + 12] = d * sc0 * ((int8_t)(( ql2       >>  4) | (((qh0 >> 6) & 3) << 4)) - 32);
+
+    // Last 16 elements of sub-block (scale = sc1): positions j+16, j+24, j+20, j+28
+    y[32 * ib + j + 16] = d * sc1 * ((int8_t)(( ql1       & 0xf) | (((qh1 >> 0) & 3) << 4)) - 32);
+    y[32 * ib + j + 24] = d * sc1 * ((int8_t)(( ql1       >>  4) | (((qh1 >> 2) & 3) << 4)) - 32);
+    y[32 * ib + j + 20] = d * sc1 * ((int8_t)(( ql3       & 0xf) | (((qh1 >> 4) & 3) << 4)) - 32);
+    y[32 * ib + j + 28] = d * sc1 * ((int8_t)(( ql3       >>  4) | (((qh1 >> 6) & 3) << 4)) - 32);
+}
+
+template<typename dst_t>
+static void dequantize_row_q6_K_r4_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    // nrows must be a multiple of 4
+    const int64_t nblocks = (nrows / 4) * (n_per_row / QK_K);
+    dequantize_block_q6_K_r4<<<nblocks, 128, 0, stream>>>(vx, y, n_per_row);
+}
+
+template<typename T>
+using to_t_cuda_t = void (*)(const void * __restrict__ x, T * __restrict__ y, int64_t nrows, int64_t n_per_row, cudaStream_t stream);
+
+typedef to_t_cuda_t<float> to_fp32_cuda_t;
+typedef to_t_cuda_t<half> to_fp16_cuda_t;
+typedef to_t_cuda_t<nv_bfloat16> to_bf16_cuda_t;
+
+to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+    switch (type) {
+        // case GGML_TYPE_Q4_0:
+        //     return dequantize_row_q4_0_cuda;
+        // case GGML_TYPE_Q4_1:
+        //     return dequantize_row_q4_1_cuda;
+        // case GGML_TYPE_Q5_0:
+        //     return dequantize_block_cuda<QK5_0, QR5_0, dequantize_q5_0>;
+        // case GGML_TYPE_Q5_1:
+        //     return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
+        // case GGML_TYPE_Q6_0:
+        //     return dequantize_row_q6_0_cuda;
+        case GGML_TYPE_Q8_0:
+            // if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= CC_PASCAL) {
+               // return dequantize_block_q8_0_f16_cuda;
+            //}
+            return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+        // case GGML_TYPE_Q2_K:
+        //    return dequantize_row_q2_K_cuda;
+        //case GGML_TYPE_Q3_K:
+        //    return dequantize_row_q3_K_cuda;
+        case GGML_TYPE_Q4_K:
+            return dequantize_row_q4_K_cuda;
+        case GGML_TYPE_Q4_K_R4:
+            return dequantize_row_q4_K_r4_cuda;
+        case GGML_TYPE_Q5_K:
+            return dequantize_row_q5_K_cuda;
+        case GGML_TYPE_Q5_K_R4:
+            return dequantize_row_q5_K_r4_cuda;
+        case GGML_TYPE_Q6_K:
+            return dequantize_row_q6_K_cuda;
+        case GGML_TYPE_Q6_K_R4:
+            return dequantize_row_q6_K_r4_cuda;
+        // case GGML_TYPE_IQ2_XXS:
+        //    return dequantize_row_iq2_xxs_cuda;
+        // case GGML_TYPE_IQ1_KT:
+        //    return dequantize_row_iq1_kt_cuda;
+        // case GGML_TYPE_IQ2_KT:
+        //    return dequantize_row_iq2_kt_cuda;
+        // case GGML_TYPE_IQ3_KT:
+        //    return dequantize_row_iq3_kt_cuda;
+        // case GGML_TYPE_IQ4_KT:
+        //    return dequantize_row_iq4_kt_cuda;
+        // case GGML_TYPE_IQ2_XS:
+        //    return dequantize_row_iq2_xs_cuda;
+        // case GGML_TYPE_IQ2_S: // TODO: 这个类型需要支持吗？
+        //    return dequantize_row_iq2_s_cuda;
+        // case GGML_TYPE_IQ3_XXS:
+        //    return dequantize_row_iq3_xxs_cuda;
+        // case GGML_TYPE_IQ1_S:
+        //    return dequantize_row_iq1_s_cuda;
+        // case GGML_TYPE_IQ1_S_R4:
+        //    return dequantize_row_iq1_s_r4_cuda;
+        // case GGML_TYPE_IQ1_M_R4:
+        //    return dequantize_row_iq1_m_r4_cuda;
+        // case GGML_TYPE_IQ1_M:
+        //    return dequantize_row_iq1_m_cuda;
+        // case GGML_TYPE_IQ1_BN:
+        //    return dequantize_row_iq1_bn_cuda;
+        // case GGML_TYPE_IQ2_BN:
+        //    return dequantize_row_iq2_bn_cuda;
+        // case GGML_TYPE_IQ4_NL:
+        //    return dequantize_row_iq4_nl_cuda;
+        // case GGML_TYPE_MXFP4:
+        //    return dequantize_row_mxfp4_cuda;
+        // case GGML_TYPE_IQ4_XS:
+        //    return dequantize_row_iq4_xs_cuda;
+        // case GGML_TYPE_IQ4_KS:
+        //    return dequantize_row_iq4_ks_cuda;
+        // case GGML_TYPE_IQ2_K:
+        //    return dequantize_row_iq2_k_cuda;
+        // case GGML_TYPE_IQ3_K:
+        //    return dequantize_row_iq3_k_cuda;
+        // case GGML_TYPE_IQ2_KL:
+        //    return dequantize_row_iq2_kl_cuda;
+        // case GGML_TYPE_IQ3_S:
+        //    return dequantize_row_iq3_s_cuda;
+        // case GGML_TYPE_F32:
+        //    return convert_unary_cuda<float>;
+        // case GGML_TYPE_BF16:
+        //    return convert_from_bf16_cuda;
+        // case GGML_TYPE_IQ2_K_R4:
+        //    return dequantize_row_iq2_k_r4_cuda;
+        // case GGML_TYPE_IQ3_K_R4:
+        //    return dequantize_row_iq3_k_r4_cuda;
+        // case GGML_TYPE_IQ4_K_R4:
+        //    return dequantize_row_iq4_k_r4_cuda;
+        // case GGML_TYPE_IQ4_KS_R4:
+        //    return dequantize_row_iq4_ks_r4_cuda;
+        // case GGML_TYPE_IQ5_K_R4:
+        //    return dequantize_row_iq5_k_r4_cuda;
+        default: {
+            static std::set<ggml_type> warned_types;
+            if (warned_types.find(type) == warned_types.end()) {
+                warned_types.insert(type);
+                printf("Warning: Type %s doesn't has dequant func. Prefill may be very slow...\n", ggml_type_name(type));
+            }
+            return nullptr;
+        }
     }
 }
 
@@ -1389,10 +1891,11 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
 
     ggml_backend_cuda_context ctx;
 
-    auto dequant = GetGGMLDequantFunc((ggml_type)weight.ggmlType);
-    dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
+    auto dequant = ggml_get_to_fp16_cuda((ggml_type)weight.ggmlType);
+    auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
+    // dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
 
-    if (n > 32 && dequant != nullptr) {
+    if ((n > 32 || !has_vec_dot) && dequant != nullptr) {
         half *cudaFp16Input, *cudaFp16Output;
         cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
         cudaFp16Output = (half *) FastllmCudaMalloc(n * k * sizeof(half));
@@ -1413,7 +1916,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
 
         int len = k * m;
         int threadPerBlock = std::min(256, len);
-        dequant((const char *)weight.cudaData, cudaFp16Weight, len, nullptr);
+        dequant((const char *)weight.cudaData, cudaFp16Weight, k, m, nullptr);
 
         status = cublasGemmEx(fastllmCublasHandle,
                                 CUBLAS_OP_T, CUBLAS_OP_N,
@@ -1512,10 +2015,11 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
 
     ggml_backend_cuda_context ctx;
 
-    auto dequant = GetGGMLDequantFunc((ggml_type)weight.ggmlType);
-    dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
+    auto dequant = ggml_get_to_fp16_cuda((ggml_type)weight.ggmlType);
+    auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
+    // dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
 
-    if (n > 32 && dequant != nullptr) {
+    if ((n > 32 || !has_vec_dot) && dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         half *cudaFp16Weight;
@@ -1527,7 +2031,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
 
         int len = k * m;
         int threadPerBlock = std::min(256, len);
-        dequant((const char *)weight.cudaData, cudaFp16Weight, len, nullptr);
+        dequant((const char *)weight.cudaData, cudaFp16Weight, k, m, nullptr);
 
         status = cublasGemmEx(fastllmCublasHandle,
                                 CUBLAS_OP_T, CUBLAS_OP_N,
