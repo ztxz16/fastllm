@@ -1638,6 +1638,34 @@ bool FastllmCudaAddTo(fastllm::Data &input0, const fastllm::Data &input1, float 
     return true;
 }
 
+void FastllmCudaAddHostToDevice(void *dst, void *hostSrc, int len, fastllm::DataType dataType) {
+    size_t bytes;
+    if (dataType == fastllm::DataType::FLOAT32) {
+        bytes = (size_t)len * sizeof(float);
+    } else if (dataType == fastllm::DataType::FLOAT16 || dataType == fastllm::DataType::BFLOAT16) {
+        bytes = (size_t)len * sizeof(uint16_t);
+    } else {
+        printf("FastllmCudaAddHostToDevice: unsupported dataType.\n");
+        return;
+    }
+
+    void *tmpGpu = FastllmCudaMalloc(bytes);
+    FastllmCudaCopyFromHostToDevice(tmpGpu, hostSrc, bytes);
+
+    int threadPerBlock = std::min(1024, len);
+    int blocks = (len - 1) / threadPerBlock + 1;
+    if (dataType == fastllm::DataType::FLOAT32) {
+        FastllmAddToKernel<<<blocks, threadPerBlock>>>((float*)dst, (float*)tmpGpu, 1.0f, len);
+    } else if (dataType == fastllm::DataType::FLOAT16) {
+        FastllmAddToKernel<<<blocks, threadPerBlock>>>((half*)dst, (half*)tmpGpu, __float2half_rn(1.0f), len);
+    } else if (dataType == fastllm::DataType::BFLOAT16) {
+        FastllmAddToKernel<<<blocks, threadPerBlock>>>((__nv_bfloat16*)dst, (__nv_bfloat16*)tmpGpu, __float2bfloat16_rn(1.0f), len);
+    }
+
+    FastllmCudaFree(tmpGpu);
+    DeviceSync();
+}
+
 bool FastllmCudaMulTo(fastllm::Data &input0, const fastllm::Data &input1, float alpha) {
     int len = input0.Count(0);
     float *cudaData = (float *) FastllmCudaPrepareInput(input0);

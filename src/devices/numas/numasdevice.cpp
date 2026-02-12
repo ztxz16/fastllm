@@ -9,6 +9,7 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/cpu/alivethreadpool.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <mutex>
@@ -605,7 +606,8 @@ namespace fastllm {
     }
 
     extern void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
-        Data **weights, Data **biass, float sharedScale, bool setZero, int expertLimit);
+        Data **weights, Data **biass, float sharedScale, bool setZero, int expertLimit, bool isCrossSwiglu);
+    extern void ReduceSumFromCPU(Data &output);
 
     void NumasMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
@@ -928,15 +930,29 @@ namespace fastllm {
                 }
             }
         } else {
-            /* DoCudaMergeMOEFromCPU (
-                input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, 0
-            );
-            return; */
-
             Data gate, attenPart, moePart;
             int bs = input.dims[0];
             int m = weightsBatch / 2 - 1; // num experts
-            int expertLimit = 1e9;
+            int expertLimit = 256;
+            const char *expertLimitEnv = std::getenv("EXPERTLIMIT");
+            if (expertLimitEnv != nullptr) {
+                expertLimit = std::atoi(expertLimitEnv);
+            }
+
+            if (expertLimit == 0) {
+                DoCudaMergeMOEFromCPU (
+                    input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, 0, true
+                );
+                return;
+            }
+
+            std::thread gpuThread([&]() {
+                DoCudaMergeMOEFromCPU (
+                    input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, expertLimit, true
+                );
+            });
+// printf("gpuThread create spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+
             {
                 auto *pool = GetAlivePool();
 
@@ -958,11 +974,11 @@ namespace fastllm {
 
                 int totalLines = 0;
                 for (int e = 0; e < expertTasks.size(); e++) {
-                    if (weights[e * 2] != nullptr) {
+                    if (weights[e * 2] != nullptr && (int)expertTasks[e].size() < expertLimit) {
                         totalLines += expertTasks[e].size();
                     }
                 }
-  // printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 DataType startDataType = weights[2]->GetLinearActDataType(bs);
                 DataType downInputDataType = weights[3]->GetLinearActDataType(bs);
 
@@ -1009,12 +1025,12 @@ namespace fastllm {
                 if (downOutput.size() < downOutputSize) {
                     downOutput.resize(downOutputSize);
                 }
-                //std::fill(downOutput.begin(), downOutput.end(), 0.0f);
+                // downOutput 不需要 fill 0：所有有效行都会被 down 阶段完整写入；
                 if (reduceOutput.size() < reduceOutputSize) {
                     reduceOutput.resize(reduceOutputSize);
                 }
 
-  // printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 0. input -> realInput（若 input 非 FLOAT32 则先转为 float32）
                 if (input.dataType == startDataType && input.dataType != DataType::FLOAT32) {
                     size_t bytes = GetDataBytes(startDataType, bs, inputDim);
@@ -1036,7 +1052,7 @@ namespace fastllm {
                     }
                     RunMultiThreadConvertFromFloat32(realInput.data(), startDataType, inputF32Ptr, bs, inputDim, GetAlivePool());
                 }
-  // printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                 // 1. realInput -> expandInput
                 std::vector <MultiThreadMemcpyMultiLinesTask> memcpyTasks;
@@ -1046,12 +1062,12 @@ namespace fastllm {
                     uint8_t* expandInputPtr = expandInput.data();
                     int bytesPerLine = GetDataBytes(startDataType, 1, inputDim);
 
-                    // 预计算每个 expert 在 expandInput 中的起始偏移
-                    std::vector<int> curPos(expertTasks.size(), 0);
+                    // 预计算每个 expert 在 expandInput 中的起始偏移（跳过 expertLimit 筛掉的专家）
+                    std::vector<int> curPos(expertTasks.size(), -1);
                     {
                         int base = 0;
                         for (int e = 0; e < expertTasks.size(); e++) {
-                            if (weights[e * 2] != nullptr) {
+                            if (weights[e * 2] != nullptr && (int)expertTasks[e].size() < expertLimit) {
                                 curPos[e] = base;
                                 base += expertTasks[e].size();
                             }
@@ -1059,10 +1075,11 @@ namespace fastllm {
                     }
 
                     // 按 token 顺序枚举：先 shared expert (expert 0)，再按 b * topk + j 顺序
+                    // 跳过被 expertLimit 筛掉的专家
                     int idx = 0;
                     for (int b = 0; b < bs; b++) {
                         // shared expert (expert 0)
-                        if (weights[0] != nullptr) {
+                        if (weights[0] != nullptr && curPos[0] >= 0) {
                             int pos = curPos[0]++;
                             memcpyTasks[idx++] = MultiThreadMemcpyMultiLinesTask(
                                 expandInputPtr + pos * bytesPerLine,
@@ -1073,7 +1090,7 @@ namespace fastllm {
                         // routed experts
                         for (int j = 0; j < topk; j++) {
                             int expertIdx = indexData[b * topk + j] + 1;
-                            if (weights[expertIdx * 2] != nullptr) {
+                            if (weights[expertIdx * 2] != nullptr && curPos[expertIdx] >= 0) {
                                 int pos = curPos[expertIdx]++;
                                 memcpyTasks[idx++] = MultiThreadMemcpyMultiLinesTask(
                                     expandInputPtr + pos * bytesPerLine,
@@ -1083,10 +1100,11 @@ namespace fastllm {
                             }
                         }
                     }
+                    memcpyTasks.resize(idx);
                 }
- // printf("prepare expand spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("prepare expand spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 RunMultiThreadMemcpyMultiLines(memcpyTasks, GetAlivePool());
-  // printf("expand spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("expand spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 2. gateUp
                 
                 auto *numaConfig = GetNumaConfig();
@@ -1105,10 +1123,9 @@ namespace fastllm {
                 for (int e = 0; e < expertTasks.size(); e++) {
                     if (weights[e * 2] != nullptr && expertTasks[e].size() > 0) {
                         int lines = expertTasks[e].size();
-if (lines >= expertLimit) {
-    offset += lines;
-    continue;
-}
+                        if (lines >= expertLimit) {
+                            continue;
+                        }
                         // Prepare input pointer for this expert's batch
                         uint16_t* expertInputPtr = (uint16_t*)(expandInput.data() + offset * GetDataBytes(startDataType, 1, inputDim));
                             
@@ -1144,7 +1161,7 @@ if (lines >= expertLimit) {
 
                 DynamicScheduleTasks(ops);
 
- // printf("gateup+swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("gateup+swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                 // 4. swigluOutput -> downInput
                 //    如果 downInputDataType 支持算子内直接转换，则已在融合算子中完成；
@@ -1155,7 +1172,6 @@ if (lines >= expertLimit) {
                         if (weights[e * 2] != nullptr && expertTasks[e].size() > 0) {
                             int lines = expertTasks[e].size();
                             if (lines >= expertLimit) {
-                                offset += lines;
                                 continue;
                             }
                             float* expertSwigluOutputPtr = swigluOutput.data() + offset * interDim;
@@ -1178,10 +1194,9 @@ if (lines >= expertLimit) {
                 for (int e = 0; e < expertTasks.size(); e++) {
                     if (weights[e * 2 + 1] != nullptr && expertTasks[e].size() > 0) {
                         int lines = expertTasks[e].size();
-if (lines >= expertLimit) {
-    offset += lines;
-    continue;
-}
+                        if (lines >= expertLimit) {
+                            continue;
+                        }
                         // Prepare input pointer for this expert's batch
                         uint16_t* expertDownInputPtr = (uint16_t*)(downInput.data() + offset * GetDataBytes(downInputDataType, 1, interDim));
                             
@@ -1215,50 +1230,48 @@ if (lines >= expertLimit) {
  // printf("down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 // 6. reduce
                 {
-                    // 计算每个样本选择的专家数 k（shared expert + routed experts）
-                    int k = (weights[0] != nullptr ? 1 : 0) + topk;
-
-                    // 预计算每个 expert 在 downOutput 中的起始偏移（与 expand 一致）
-                    std::vector<int> curPos(expertTasks.size(), 0);
-                    {
-                        int base = 0;
-                        for (int e = 0; e < expertTasks.size(); e++) {
-                            if (weights[e * 2] != nullptr) {
-                                curPos[e] = base;
-                                base += expertTasks[e].size();
+                    // 计算每个样本选择的专家数 k
+                    int k = 0;
+                    std::vector<int> samples_expert_count(bs, 0);
+                    for (int e = 0; e < expertTasks.size(); e++) {
+                        if (weights[e * 2] != nullptr && (int)expertTasks[e].size() < expertLimit) {
+                            for (auto& task : expertTasks[e]) {
+                                int rowIdx = task.first;
+                                samples_expert_count[rowIdx]++;
+                                k = std::max(k, samples_expert_count[rowIdx]);
                             }
                         }
                     }
 
-                    // 按 token 顺序枚举填充 pos 和 task_weights（与 expand 顺序一致）
+                    // 分配内存: task_weights 按 totalLines 大小，以 downOutput 行号索引
                     std::vector<int> pos(bs * k, -1);
-                    std::vector<float> task_weights(bs * k, 0.0f);
+                    std::vector<float> task_weights(totalLines, 0.0f);
+                    std::vector<int> sample_expert_idx(bs, 0);
 
-                    for (int b = 0; b < bs; b++) {
-                        int expert_idx = 0;
-                        // shared expert (expert 0)
-                        if (weights[0] != nullptr) {
-                            pos[b * k + expert_idx] = curPos[0]++;
-                            task_weights[b * k + expert_idx] = sharedScale;
-                            expert_idx++;
-                        }
-                        // routed experts
-                        for (int j = 0; j < topk; j++) {
-                            int expertId = indexData[b * topk + j] + 1;
-                            if (weights[expertId * 2] != nullptr) {
-                                pos[b * k + expert_idx] = curPos[expertId]++;
-                                task_weights[b * k + expert_idx] = scoreData[b * topk + j];
+                    int reduceOffset = 0;
+                    for (int e = 0; e < expertTasks.size(); e++) {
+                        if (weights[e * 2] != nullptr && (int)expertTasks[e].size() < expertLimit) {
+                            for (auto& task : expertTasks[e]) {
+                                int rowIdx = task.first;
+                                float weight = task.second;
+                                int idx = sample_expert_idx[rowIdx]++;
+                                pos[rowIdx * k + idx] = reduceOffset;
+                                task_weights[reduceOffset] = weight;
+                                reduceOffset++;
                             }
-                            expert_idx++;
                         }
                     }
+
+                    // 有一些token不会被关联到任何专家，也需要先清零
+                    float *lastOutput = output.dataType == DataType::FLOAT32 ? (float*)output.cpuData : reduceOutput.data();
+                    memset(lastOutput, 0, bs * dim * sizeof(float));
 
                     // 调用多线程函数
                     MultiThreadReduceBatch(
                         (uint8_t*)downOutput.data(),  // downOutData
                         DataType::FLOAT32,             // downOutDataType
                         task_weights.data(),           // weights
-                        output.dataType == DataType::FLOAT32 ? (float*)output.cpuData : reduceOutput.data(),           // lastOutput
+                        lastOutput,                    // lastOutput
                         pos.data(),                    // pos
                         bs,                           // bsz
                         k,                            // k (每个样本的专家数)
@@ -1278,16 +1291,13 @@ if (lines >= expertLimit) {
                             reduceOutput.data(), bs, dim, GetAlivePool());
                     }
                 }
- // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             }
-/*
-            DoCudaMergeMOEFromCPU (
-                input, output, index, score, w1, w2, w3, weights, biass, sharedScale, false, expertLimit
-            );
-*/
-/*
-printf("DoCudaMergeMOEFromCPU spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-*/
+
+            gpuThread.join();
+// printf("gpuThread join spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            ReduceSumFromCPU(output);
+// printf("last sum spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             return;
         }
     }
