@@ -247,6 +247,13 @@ namespace fastllm {
         }
     }
 
+    void BFloat16ToFloat32(uint16_t *bfloat16, float *float32, int len) {
+        for (int i = 0; i < len; i++) {
+            uint32_t x = (uint32_t)bfloat16[i] << 16;
+            memcpy(&float32[i], &x, sizeof(float));
+        }
+    }
+
     void CpuToFloat16::Run(const std::string &opType, const fastllm::DataDict &datas,
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &data = *(datas.find("input")->second);
@@ -849,6 +856,21 @@ namespace fastllm {
             for (; i < len; i++) {
                 float x = fp16tofp32.dict[cur[i]], y = fp16tofp32.dict[cur[i + mid]];
                 out[i] = float_to_half((x / (1.0 + expf(-x))) * y);
+            }
+        }
+    }
+
+    void MultiThreadSwigluBFloat16Op::Run() {
+        for (int o = 0; o < n; o++) {
+            uint16_t *cur = (uint16_t*)input + o * inputStride;
+            uint16_t *out = (uint16_t*)output + o * outputStride;
+            int i = 0;
+            for (; i < len; i++) {
+                float x = bf16tofp32.dict[cur[i]], y = bf16tofp32.dict[cur[i + mid]];
+                float val = (x / (1.0f + expf(-x))) * y;
+                uint32_t tmp;
+                memcpy(&tmp, &val, sizeof(tmp));
+                out[i] = (uint16_t)(tmp >> 16);
             }
         }
     }
@@ -5868,8 +5890,9 @@ ops += (long long)lines * inputDim * interDim * 2;
 
     void DoCpuSwiglu(Data &input, Data &output) {
         output.Allocate();
-        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
-                        "Swiglu error: Data's type should be float32 or float16.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Swiglu error: Data's type should be float32, float16 or bfloat16.\n");
 
         float *inputData = (float*)input.cpuData;
         float *outputData = (float*)output.cpuData;
@@ -5881,6 +5904,8 @@ ops += (long long)lines * inputDim * interDim * 2;
             (MultiThreadSwigluOp((float*)inputData, spatial / 2, spatial / 2, (float*)outputData, outer, spatial, spatial / 2)).Run();
         } else if (input.dataType == DataType::FLOAT16) {
             (MultiThreadSwigluFloat16Op((uint16_t*)inputData, spatial / 2, spatial / 2, (uint16_t*)outputData, outer, spatial, spatial / 2)).Run();
+        } else if (input.dataType == DataType::BFLOAT16) {
+            (MultiThreadSwigluBFloat16Op((uint16_t*)inputData, spatial / 2, spatial / 2, (uint16_t*)outputData, outer, spatial, spatial / 2)).Run();
         } else {
             printf("Unsupport swiglu type.");
         }
@@ -5892,8 +5917,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &output = *(datas.find("output")->second);
         
         output.Allocate();
-        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
-                        "Swiglu error: Data's type should be float32 or float16.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Swiglu error: Data's type should be float32, float16 or bfloat16.\n");
 
         float *inputData = (float*)input.cpuData;
         float *outputData = (float*)output.cpuData;
@@ -5905,6 +5931,8 @@ ops += (long long)lines * inputDim * interDim * 2;
             (SwigluMultiThread((float*)inputData, spatial / 2, spatial / 2, (float*)outputData, outer, spatial, spatial / 2, GetAlivePool()));
         } else if (input.dataType == DataType::FLOAT16) {
             (SwigluMultiThreadFloat16((uint16_t*)inputData, spatial / 2, spatial / 2, (uint16_t*)outputData, outer, spatial, spatial / 2, GetAlivePool()));
+        } else if (input.dataType == DataType::BFLOAT16) {
+            (SwigluMultiThreadBFloat16((uint16_t*)inputData, spatial / 2, spatial / 2, (uint16_t*)outputData, outer, spatial, spatial / 2, GetAlivePool()));
         } else {
             printf("Unsupport swiglu type.");
         }
@@ -5960,8 +5988,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &output = *(datas.find("output")->second);
         
         output.Allocate();
-        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
-                        "Swiglu error: Data's type should be float32 or float16.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Swiglu error: Data's type should be float32, float16 or bfloat16.\n");
 
         float *inputData = (float*)input.cpuData;
         float *outputData = (float*)output.cpuData;
@@ -7536,6 +7565,27 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    void SwigluMultiThreadBFloat16(uint16_t *input, int mid, int len, uint16_t *output,
+                           int n, int inputStride, int outputStride, AliveThreadPool *pool) {
+        int threadNum = pool->threads.size();
+        int per = len / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadSwigluBFloat16Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
+            ops.push_back(new fastllm::MultiThreadSwigluBFloat16Op(input + cur, mid, end - cur, output + cur,
+                                                           n, inputStride, outputStride));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
     void SoftmaxMultiThread(float *input, int n, int m, int lastlen, AliveThreadPool *pool) {
         if (n == 1) {
             (MultiThreadSoftmaxOp(input, n, m, lastlen)).Run();
@@ -7675,8 +7725,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         PagedCacheManager &pagedCacheManager = *((PagedCacheManager*)datas.find("pagedCacheManager")->second);
 
         AssertInFastLLM(cache.dataType == DataType::FLOAT32 ||
-                        cache.dataType == DataType::FLOAT16, 
-                        "CpuAppendPagedCacheOp's cache's type should be float32 or float16.\n");
+                        cache.dataType == DataType::FLOAT16 ||
+                        cache.dataType == DataType::BFLOAT16, 
+                        "CpuAppendPagedCacheOp's cache's type should be float32, float16 or bfloat16.\n");
         
         AssertInFastLLM(input.dims.size() == 3, 
                         "CpuAppendPagedCacheOp's input should have 3 dimensions [numHeads, seqLen, headDim].\n");
@@ -8157,6 +8208,184 @@ ops += (long long)lines * inputDim * interDim * 2;
                         delete[] temp;
                     }
                 }
+            } else if (q.dataType == DataType::BFLOAT16) {
+                uint16_t *qd = (uint16_t*)q.cpuData;
+                uint16_t *od = (uint16_t*)output.cpuData;
+                Data *maskPtr = datas.find("mask") != datas.end() ? datas.find("mask")->second : nullptr;
+                uint16_t *maskd = (maskPtr != nullptr && maskPtr->dims.size() > 0) ? (uint16_t*)maskPtr->cpuData : nullptr;
+                uint8_t *kPagedData = k.pagedKVCacheData->cpuData;
+                uint8_t *vPagedData = v.pagedKVCacheData->cpuData;
+                
+                int batch = (maskd != nullptr && maskPtr != nullptr && maskPtr->dims.size() == 3) ? maskPtr->dims[0] : 1;
+                batch = intParams.find("mask___batch") != intParams.end() ? intParams.find("mask___batch")->second : batch;
+                int maskStride = (maskd != nullptr && maskPtr != nullptr) ? (maskPtr->dims.size() == 3 ? maskPtr->strides[0] : maskPtr->Count(0)) : 0;
+                
+                // 初始化 output 为 0
+                {
+                    uint16_t zero_bf16 = 0;
+                    std::fill(od, od + output.Count(0), zero_bf16);
+                }
+                
+                // 对于每个 query head
+                for (int o = 0; o < q0; o++) {
+                    uint16_t *qHead = qd + o * q.strides[0];
+                    uint16_t *oHead = od + o * output.strides[0];
+                    uint16_t *maskHead = maskd ? (maskd + (o / (q0 / batch)) * maskStride) : nullptr;
+                    
+                    // 转换 q 为 float32
+                    std::vector<float> fqHead;
+                    fqHead.resize(q1 * q2);
+                    BFloat16ToFloat32(qHead, fqHead.data(), q1 * q2);
+                    
+                    // 对于每个 query token
+                    for (int i = 0; i < q1; i++) {
+                        float *qk = new float[k1];
+                        float *temp = new float[k1];
+                        float maxValue = -10000.0f;
+                        int base = k1 - q1;
+                        
+                        // 计算 q[i] 与所有 k[j] 的点积
+                        int kvTokenIdx = 0;
+                        for (size_t pageIdx = 0; pageIdx < k.pageIndex.size(); pageIdx++) {
+                            int currentPageIdx = k.pageIndex[pageIdx];
+                            int tokensInPage = (pageIdx == k.pageIndex.size() - 1) ? k.lastPageLen : pageLen;
+                            
+                            for (int t = 0; t < tokensInPage; t++) {
+                                int j = kvTokenIdx;
+                                
+                                // 检查 mask
+                                if (maskHead) {
+                                    float maskVal;
+                                    uint32_t mx = (uint32_t)maskHead[i * k1 + j] << 16;
+                                    memcpy(&maskVal, &mx, sizeof(float));
+                                    if (maskVal > 0.99) {
+                                        qk[j] = -10000.0f;
+                                        kvTokenIdx++;
+                                        continue;
+                                    }
+                                }
+                                if (!maskHead && (base + i) < j) {
+                                    qk[j] = -10000.0f;
+                                    kvTokenIdx++;
+                                    continue;
+                                }
+                                
+                                // 计算点积 q[i] · k[j]
+                                float dotProduct = 0.0f;
+                                int kHeadIdx = o / group;
+                                
+                                // 获取 k[j] 的数据指针
+                                uint8_t *kDataPtr = kPagedData + 
+                                    (currentPageIdx * pageLen * numHeads * headDim +
+                                     t * numHeads * headDim +
+                                     kHeadIdx * headDim) * unitSize;
+                                
+                                // 转换 k[j] 为 float32
+                                std::vector<float> fkToken;
+                                fkToken.resize(headDim);
+                                if (k.dataType == DataType::FLOAT32) {
+                                    float *kToken = (float*)kDataPtr;
+                                    memcpy(fkToken.data(), kToken, headDim * sizeof(float));
+                                } else {
+                                    uint16_t *kToken = (uint16_t*)kDataPtr;
+                                    BFloat16ToFloat32(kToken, fkToken.data(), headDim);
+                                }
+                                
+                                // 向量点积计算
+                                int l = 0;
+#ifdef __aarch64__
+                                float32x4_t sum = {0, 0, 0, 0};
+                                for (; l + 3 < q2; l += 4) {
+                                    sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(fqHead.data() + i * q2 + l),
+                                                                vld1q_f32(fkToken.data() + l)));
+                                }
+                                dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
+#elif defined(__AVX__)
+                                __m256 vsum = _mm256_set1_ps(0.0f);
+                                for (; l + 7 < q2; l += 8) {
+                                    __m256 vx = _mm256_loadu_ps((const float *) (fqHead.data() + i * q2 + l));
+                                    __m256 vy = _mm256_loadu_ps((const float *) (fkToken.data() + l));
+                                    vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
+                                }
+                                dotProduct += Floatsum(vsum);
+#endif
+                                for (; l < q2; l++) {
+                                    dotProduct += fqHead[i * q2 + l] * fkToken[l];
+                                }
+                                
+                                qk[j] = dotProduct * scale;
+                                maxValue = std::max(maxValue, qk[j]);
+                                kvTokenIdx++;
+                            }
+                        }
+                        
+                        // Softmax
+                        int j = 0;
+#ifdef __aarch64__
+                        float32x4_t vmax = vdupq_n_f32(maxValue);
+                        for (; j + 3 < k1; j += 4) {
+                            vst1q_f32(temp + j, exp_ps(vsubq_f32(vld1q_f32(qk + j), vmax)));
+                        }
+#endif
+                        for (; j < k1; j++) {
+                            temp[j] = expf(qk[j] - maxValue);
+                        }
+                        
+                        float sum = 0.0f;
+                        for (int j = 0; j < k1; j++) {
+                            sum += temp[j];
+                        }
+                        sum = std::max(sum, 0.1f);
+                        for (int j = 0; j < k1; j++) {
+                            qk[j] = temp[j] / sum;
+                        }
+                        
+                        // 加权求和：output[i] = sum(softmax[j] * v[j])
+                        std::vector<float> foHead;
+                        foHead.resize(v2, 0.0f);
+                        
+                        kvTokenIdx = 0;
+                        for (size_t pageIdx = 0; pageIdx < v.pageIndex.size(); pageIdx++) {
+                            int currentPageIdx = v.pageIndex[pageIdx];
+                            int tokensInPage = (pageIdx == v.pageIndex.size() - 1) ? v.lastPageLen : pageLen;
+                            
+                            for (int t = 0; t < tokensInPage; t++) {
+                                int j = kvTokenIdx;
+                                int vHeadIdx = o / group;
+                                
+                                // 获取 v[j] 的数据指针
+                                uint8_t *vDataPtr = vPagedData + 
+                                    (currentPageIdx * pageLen * numHeads * headDim +
+                                     t * numHeads * headDim +
+                                     vHeadIdx * headDim) * unitSize;
+                                
+                                // 转换 v[j] 为 float32
+                                std::vector<float> fvToken;
+                                fvToken.resize(headDim);
+                                if (v.dataType == DataType::FLOAT32) {
+                                    float *vToken = (float*)vDataPtr;
+                                    memcpy(fvToken.data(), vToken, headDim * sizeof(float));
+                                } else {
+                                    uint16_t *vToken = (uint16_t*)vDataPtr;
+                                    BFloat16ToFloat32(vToken, fvToken.data(), headDim);
+                                }
+                                
+                                // 累加 softmax[j] * v[j]
+                                for (int l = 0; l < v2; l++) {
+                                    foHead[l] += qk[j] * fvToken[l];
+                                }
+                                
+                                kvTokenIdx++;
+                            }
+                        }
+                        
+                        // 转换回 bfloat16
+                        Float32ToBFloat16(foHead.data(), oHead + i * v2, v2);
+                        
+                        delete[] qk;
+                        delete[] temp;
+                    }
+                }
             } else {
                 ErrorInFastLLM("CpuAttentionPagedOp error: unsupport dataType.\n");
             }
@@ -8170,8 +8399,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &insertIndexs = *(datas.find("insertIndexs")->second);
         Data &insertPositions = *(datas.find("insertPositions")->second);
         PagedCacheManager &manager = *(PagedCacheManager*)datas.find("pagedCacheManager")->second;
-        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
-                        "CpuAppendPagedCacheBatchOp's input type should be float32 or float16.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "CpuAppendPagedCacheBatchOp's input type should be float32, float16 or bfloat16.\n");
         AssertInFastLLM(input.dims.size() == 3,
                         "CpuAppendPagedCacheBatchOp's input should have 3 dimensions [numHeads, batch, headDim].\n");
         AssertInFastLLM(insertIndexs.dims.size() == 1 && insertIndexs.dims[0] == input.dims[0],
