@@ -3105,6 +3105,35 @@ namespace fastllm {
         }, {{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}}, {{"rotaryDim", rotaryDim}});
     }
 
+    void QKVRMSNormRope(Data &qkv, Data &qNormWeight, Data &kNormWeight,
+                        const Data &positionIds, int q_heads, int k_heads, int head_dim,
+                        int rotaryDim, float eps, float ropeTheta, float ropeScale) {
+        curExecutor->Run("QKVRMSNormRope", {
+                {"qkv", &qkv}, {"qNormWeight", &qNormWeight}, {"kNormWeight", &kNormWeight},
+                {"positionIds", (Data*)&positionIds}
+        }, {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
+           {{"q_heads", q_heads}, {"k_heads", k_heads}, {"head_dim", head_dim}, {"rotaryDim", rotaryDim}});
+    }
+
+    void QKVRMSNormRopeSplitAppendPagedCache(
+        Data &qkv, Data &qNormWeight, Data &kNormWeight,
+        const Data &positionIds,
+        Data &qOutput,
+        Data &pagedKCacheData, Data &pagedVCacheData,
+        Data &insertIndexs, Data &insertPositions,
+        int q_heads, int k_heads, int head_dim,
+        int rotaryDim, float eps, float ropeTheta, float ropeScale,
+        int pageLen, int batch) {
+        curExecutor->Run("QKVRMSNormRopeSplitAppendPagedCache", {
+                {"qkv", &qkv}, {"qNormWeight", &qNormWeight}, {"kNormWeight", &kNormWeight},
+                {"positionIds", (Data*)&positionIds},
+                {"qOutput", &qOutput},
+                {"pagedKCacheData", &pagedKCacheData}, {"pagedVCacheData", &pagedVCacheData},
+                {"insertIndexs", &insertIndexs}, {"insertPositions", &insertPositions}
+        }, {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
+           {{"q_heads", q_heads}, {"k_heads", k_heads}, {"head_dim", head_dim}, {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch}});
+    }
+
     void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale) {
         curExecutor->Run("RepeatPenalty", {
                 {"input", &input}, {"penalty", (Data*)&penalty}, {"penaltyScale", (Data*)&penaltyScale}
