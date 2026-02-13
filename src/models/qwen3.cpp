@@ -182,7 +182,7 @@ namespace fastllm {
 
             // 1.1 Get q, k, v
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
-            if (true) {
+            if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
                 Linear(attenInput, weight[mergeQkvWeightName], weight[mergeQkvBiasName], qkv);
                 int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
                 int qdim = per * (num_attention_heads / num_key_value_heads);
