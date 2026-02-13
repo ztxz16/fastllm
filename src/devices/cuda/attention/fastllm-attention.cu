@@ -1952,7 +1952,7 @@ FlashInferWorkSpaceManager& getFastllmFlashInferWorkSpace() {
     return *ptr;
 }
 
-bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale) {
+bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited) {
     using namespace flashinfer;
     FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
 // ForceDeviceSync(); auto st = std::chrono::system_clock::now();
@@ -2176,23 +2176,25 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
 // ForceDeviceSync(); printf("q_indptr_gpu = %f\n", GetSpan(st, std::chrono::system_clock::now()));
         // 计算 total_num_rows (总 query token 数)
         uint32_t total_num_rows = q_indptr_host[batch_size];
-        // 进行 plan
-        PrefillPlanInfo plan_info;
-        cudaError_t plan_status = PrefillPlan<uint32_t>(
-            workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
-            workspace.int_workspace_size, plan_info, q_indptr_host.data(), indptr_host.data(), 
-            total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
-            pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(half), 
-            /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
-            /*num_colocated_ctas=*/0, stream);
+        // 进行 plan（使用 static 缓存，仅在当前推理的第一次 attention 时执行 plan）
+        static PrefillPlanInfo plan_info;
+        if (!inited) {
+            cudaError_t plan_status = PrefillPlan<uint32_t>(
+                workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
+                workspace.int_workspace_size, plan_info, q_indptr_host.data(), indptr_host.data(), 
+                total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
+                pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(half), 
+                /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
+                /*num_colocated_ctas=*/0, stream);
 // ForceDeviceSync(); printf("plan_time = %f\n", GetSpan(st, std::chrono::system_clock::now()));
 
-        if (plan_status != cudaSuccess) {
-            printf("DoCudaAttentionPaged: PrefillPlan failed: %s\n", cudaGetErrorString(plan_status));
-            cudaStreamSynchronize(stream);
-            FastllmCudaFree(q_indptr_gpu);
-            // 注意：不释放静态缓存的 workspace 内存，供下次调用使用
-            exit(0);
+            if (plan_status != cudaSuccess) {
+                printf("DoCudaAttentionPaged: PrefillPlan failed: %s\n", cudaGetErrorString(plan_status));
+                cudaStreamSynchronize(stream);
+                FastllmCudaFree(q_indptr_gpu);
+                // 注意：不释放静态缓存的 workspace 内存，供下次调用使用
+                exit(0);
+            }
         }
         
         // 构造 BatchPrefillPagedParams
@@ -2307,7 +2309,7 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
     return true;
 }
 
-bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType) {
+bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited) {
     using namespace flashinfer;
     FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
     
@@ -2412,23 +2414,24 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
     // 计算 total_num_rows (总 query token 数)
     uint32_t total_num_rows = qSizes.cpuIntDatas[batch_size];
 
-    // 进行 plan
+    // 进行 plan（使用 static 缓存，仅在当前推理的第一次 attention 时执行 plan）
     cudaStream_t stream = nullptr;
-    PrefillPlanInfo plan_info;
-
-    cudaError_t plan_status = PrefillPlan<uint32_t>(
-        workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
-        workspace.int_workspace_size, plan_info, 
-        (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(), 
-        total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
-        pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(half), 
-        /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
-        /*num_colocated_ctas=*/0, stream);
-    
-    if (plan_status != cudaSuccess) {
-        printf("FastllmCudaHalfPagedAttentionBatch: PrefillPlan failed: %s\n", cudaGetErrorString(plan_status));
-        cudaStreamSynchronize(stream);
-        exit(0);
+    static PrefillPlanInfo plan_info;
+    if (!inited) {
+        cudaError_t plan_status = PrefillPlan<uint32_t>(
+            workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
+            workspace.int_workspace_size, plan_info, 
+            (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(), 
+            total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
+            pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(half), 
+            /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
+            /*num_colocated_ctas=*/0, stream);
+        
+        if (plan_status != cudaSuccess) {
+            printf("FastllmCudaHalfPagedAttentionBatch: PrefillPlan failed: %s\n", cudaGetErrorString(plan_status));
+            cudaStreamSynchronize(stream);
+            exit(0);
+        }
     }
     
     // 构造 BatchPrefillPagedParams
@@ -2515,9 +2518,9 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         exit(0);
     }
     
-// 调整 output 的维度顺序（与 FastllmCudaHalfPagedAttention 保持一致）
+// 仅更新 output 的 shape 为 [seqlen, num_heads_total, head_dim]，与 FlashInfer 输出布局一致，
+// 避免在 CUDA 侧再做 Permute，由调用方按需做一次 Reshape + Permute 即可得到 [bsz, seqlen, embed_dim]
 ((fastllm::Data*)&output)->Resize({output.dims[1], output.dims[0], output.dims[2]});
-FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
     
     DeviceSync();
     return true;

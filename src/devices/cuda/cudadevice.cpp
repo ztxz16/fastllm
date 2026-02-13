@@ -1985,8 +1985,8 @@ total += weights[i * 2 + 1]->GetBytes();
         }
     }
 
-    void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale) {
-        FastllmCudaHalfPagedAttention(q, k, v, output, group, scale);
+    void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale, bool inited) {
+        FastllmCudaHalfPagedAttention(q, k, v, output, group, scale, inited);
     }
 
     void CudaAttentionPagedOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -1997,8 +1997,9 @@ total += weights[i * 2 + 1]->GetBytes();
         Data &output = *(datas.find("output")->second);
         int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+        bool inited = intParams.find("inited") != intParams.end() ? (intParams.find("inited")->second != 0) : false;
         output.Allocate();
-        DoCudaAttentionPaged(q, k, v, output, group, scale);
+        DoCudaAttentionPaged(q, k, v, output, group, scale, inited);
     }
 
     void CudaAppendPagedCacheBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -2073,8 +2074,8 @@ total += weights[i * 2 + 1]->GetBytes();
         FastllmCudaCopyFromHostToDevice(insertPositions.cudaData, posDataHost.data(), batch * sizeof(int32_t));
     }
 
-    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens, Data &output, int group, float scale, int attentionType) {
-        FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType);
+    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens, Data &output, int group, float scale, int attentionType, bool inited) {
+        FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited);
     }
 
     void CudaAttentionPagedBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -2090,8 +2091,9 @@ total += weights[i * 2 + 1]->GetBytes();
         int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / kCaches.dims[0];
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
         int attentionType = intParams.find("attentionType") != intParams.end() ? intParams.find("attentionType")->second : 0;
+        bool inited = intParams.find("inited") != intParams.end() ? (intParams.find("inited")->second != 0) : false;
         output.Allocate();
-        DoCudaAttentionPagedBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType);  
+        DoCudaAttentionPagedBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited);  
     }
 
     void CudaGeneratePagedBatchParamsOp::Run(const std::string &opType, const fastllm::DataDict &datas,

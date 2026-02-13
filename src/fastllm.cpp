@@ -3285,10 +3285,10 @@ namespace fastllm {
     }
 
     void AttentionPaged(const Data &q, const Data &k, const Data &v, Data &output,
-        int group, float scale, int attentionType) {
+        int group, float scale, int attentionType, bool inited) {
         curExecutor->Run("AttentionPaged", {
                 {"q", (Data*)&q}, {"k", (Data*)&k}, {"v", (Data*)&v}, {"output", &output}
-        }, {{"scale", scale}}, {{"group", group}, {"attentionType", attentionType}});
+        }, {{"scale", scale}}, {{"group", group}, {"attentionType", attentionType}, {"inited", (int)inited}});
     }
 
     // 这里一般都是Decode部分，q中所有batch的seqlen都是1
@@ -3299,11 +3299,11 @@ namespace fastllm {
     // lastPageLens: 是INT32PARAM，长度为(batch), 第i个询问的最后一个page的长度为lastPageLens[i]
     void AttentionPagedBatch(const Data &q, const Data &kCaches, const Data &vCaches, 
         const Data &qSizes, const Data &pageSizes, const Data &pageIndexs, const Data &lastPageLens, 
-        Data &output, int group, float scale, int attentionType) {
+        Data &output, int group, float scale, int attentionType, bool inited) {
         curExecutor->Run("AttentionPagedBatch", {
             {"q", (Data*)&q}, {"kCaches", (Data*)&kCaches}, {"vCaches", (Data*)&vCaches}, {"output", &output},
             {"qSizes", (Data*)&qSizes}, {"pageSizes", (Data*)&pageSizes}, {"pageIndexs", (Data*)&pageIndexs}, {"lastPageLens", (Data*)&lastPageLens}
-        }, {{"scale", scale}, {"group", group}, {"attentionType", attentionType}}, {});
+        }, {{"scale", scale}}, {{"group", group}, {"attentionType", attentionType}, {"inited", (int)inited}});
     }
 
     // 从batch个pastKey中生成AttentionPagedBatch所需要的qSizes, pageSizes, pageIndexs, lastPageLens
