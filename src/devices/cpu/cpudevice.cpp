@@ -83,6 +83,7 @@ namespace fastllm {
         this->ops["NearlyRotatePosition2D"] = (BaseOperator*)(new CpuNearlyRotatePosition2DOp());
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CpuLlamaRotatePosition2DOp());
         this->ops["LlamaRotatePosition2DPart"] = (BaseOperator*)(new CpuLlamaRotatePosition2DPartOp());
+        this->ops["RopeEncoding"] = (BaseOperator*)(new CpuRopeEncodingOp());
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CpuRepeatPenaltyOp());
         this->ops["ApplyLognAttn"] = (BaseOperator*)(new CpuApplyLognAttnOp());
         this->ops["CumSumLastDim"] = (BaseOperator*)(new CpuCumSumLastDimOp());
@@ -7308,6 +7309,109 @@ ops += (long long)lines * inputDim * interDim * 2;
         RunMultiThreadLlamaRotatePosition2DPartFloat(data.dataType, (float*)data.cpuData, (float*)positionIds.cpuData, 
             (float*)sinData.cpuData, (float*)cosData.cpuData, bs, len, n, m, stride, spatial, 
             positionIds.dims.back(), rotaryDim, part, GetAlivePool());
+    }
+
+    struct MultiThreadRopeEncodingFloatOp : MultiThreadBaseOp {
+        DataType dataType;
+        float *data, *positionIds;
+        int bs, len, n, m, spatial, posDim, rotaryDim;
+        float ropeTheta, ropeScale;
+        int st, end;
+
+        MultiThreadRopeEncodingFloatOp
+            (DataType dataType, float *data, float *positionIds,
+            int bs, int len, int n, int m, int spatial, int posDim, int rotaryDim,
+            float ropeTheta, float ropeScale,
+            int st, int end) :
+            dataType(dataType), data(data), positionIds(positionIds),
+            bs(bs), len(len), n(n), m(m), spatial(spatial), posDim(posDim), rotaryDim(rotaryDim),
+            ropeTheta(ropeTheta), ropeScale(ropeScale),
+            st(st), end(end) {}
+
+        void Run() {
+            if (dataType == DataType::FLOAT32) {
+                for (int idx = st; idx < end; idx++) {
+                    int b = idx / len;
+                    int l = idx % len;
+                    int index = (int) ((float *) positionIds)[b * posDim + l];
+                    float position = (float)index / ropeScale;
+                    float *d = (float *) data + (b * len + l) * spatial;
+                    for (int i = 0; i < n; i++) {
+                        for (int j = 0; j < rotaryDim && j < m / 2; j++) {
+                            float freq = position / pow(ropeTheta, (float)(2 * j) / rotaryDim);
+                            float curSin = sin(freq);
+                            float curCos = cos(freq);
+                            float a = d[j], b = d[j + m / 2];
+                            d[j] = a * curCos - b * curSin;
+                            d[j + m / 2] = a * curSin + b * curCos;
+                        }
+                        d += m;
+                    }
+                }
+            } else {
+                for (int idx = st; idx < end; idx++) {
+                    int b = idx / len;
+                    int l = idx % len;
+                    int index = (int) ((float *) positionIds)[b * posDim + l];
+                    float position = (float)index / ropeScale;
+                    uint16_t *d = (uint16_t *) data + (b * len + l) * spatial;
+                    for (int i = 0; i < n; i++) {
+                        for (int j = 0; j < rotaryDim && j < m / 2; j++) {
+                            float freq = position / pow(ropeTheta, (float)(2 * j) / rotaryDim);
+                            float curSin = sin(freq);
+                            float curCos = cos(freq);
+                            float a = fp16tofp32.dict[d[j]], b = fp16tofp32.dict[d[j + m / 2]];
+                            d[j] = float_to_half(a * curCos - b * curSin);
+                            d[j + m / 2] = float_to_half(a * curSin + b * curCos);
+                        }
+                        d += m;
+                    }
+                }
+            }
+        }
+    };
+
+    static void RunMultiThreadRopeEncodingFloat(DataType dataType, float *data, float *positionIds,
+            int bs, int len, int n, int m, int spatial, int posDim, int rotaryDim,
+            float ropeTheta, float ropeScale, AliveThreadPool *pool) {
+        if (bs * len == 1) {
+            (MultiThreadRopeEncodingFloatOp(dataType, data, positionIds, bs, len, n, m, spatial, posDim, rotaryDim, ropeTheta, ropeScale, 0, bs * len)).Run();
+            return;
+        }
+
+        int threadNum = pool->threads.size();
+        int per = (bs * len) / pool->threads.size();
+        int cur = 0;
+        std::vector<fastllm::MultiThreadRopeEncodingFloatOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? (bs * len) : cur + per + (cur + per * (threadNum - i) < (bs * len)));
+            ops.push_back(new MultiThreadRopeEncodingFloatOp(
+                dataType, data, positionIds, bs, len, n, m, spatial, posDim, rotaryDim, ropeTheta, ropeScale, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
+    void CpuRopeEncodingOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+
+        int bs = data.dims[0], len = data.dims[1];
+        int spatial = data.Count(2);
+        int n = data.dims[2], m = data.dims[3];
+        RunMultiThreadRopeEncodingFloat(data.dataType, (float*)data.cpuData, (float*)positionIds.cpuData,
+            bs, len, n, m, spatial,
+            positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale, GetAlivePool());
     }
 
     void CpuRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,

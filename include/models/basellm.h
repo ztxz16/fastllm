@@ -130,6 +130,37 @@ namespace fastllm {
         }
     };
 
+    // ForwardDataManager: 管理前向推理中的持久化Data对象，避免每次forward都重新创建
+    class ForwardDataManager {
+    public:
+        // 通过名称获取持久化的Data引用，若不存在则自动创建
+        Data& GetData(const std::string &name) {
+            return dataMap[name];
+        }
+
+        // 通过名称获取持久化的Data vector，若不存在则自动创建
+        std::vector<Data>& GetDataVector(const std::string &name) {
+            return dataVectorMap[name];
+        }
+
+        // 通过名称获取持久化的Data* vector，若不存在则自动创建
+        std::vector<Data*>& GetDataPtrVector(const std::string &name) {
+            return dataPtrVectorMap[name];
+        }
+
+        // 清空所有持久化数据
+        void Clear() {
+            dataMap.clear();
+            dataVectorMap.clear();
+            dataPtrVectorMap.clear();
+        }
+
+    private:
+        std::map<std::string, Data> dataMap;
+        std::map<std::string, std::vector<Data>> dataVectorMap;
+        std::map<std::string, std::vector<Data*>> dataPtrVectorMap;
+    };
+
     class basellm {
     public:
         basellm() {};
@@ -317,6 +348,7 @@ namespace fastllm {
         int promptLimit = -1;
 
         PastKVCacheManager pastKVCacheManager;
+        ForwardDataManager forwardDataManager; // 前向推理中持久化Data管理器
         bool saveHistoryChat = false;
 
         std::string lastPrompt = "";
