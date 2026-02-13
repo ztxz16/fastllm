@@ -59,6 +59,7 @@ namespace fastllm {
         this->ops["NearlyRotatePosition2D"] = (BaseOperator*)(new CudaNearlyRotatePosition2DOp());
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CudaLlamaRotatePosition2DOp());
         this->ops["LlamaRotatePosition2DPart"] = (BaseOperator*)(new CudaLlamaRotatePosition2DPartOp());
+        this->ops["RopeEncoding"] = (BaseOperator*)(new CudaRopeEncodingOp());
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CudaRepeatPenaltyOp());
         this->ops["ApplyLognAttn"] = (BaseOperator*)(new CudaApplyLognAttnOp());
         this->ops["MergeMOE"] = (BaseOperator*)(new CudaMergeMOE());
@@ -1265,6 +1266,17 @@ namespace fastllm {
         int part = intParams.find("part") != intParams.end() ? intParams.find("part")->second : 128;
 
         FastllmCudaLlamaRotatePosition2DPart(data, positionIds, sinData, cosData, rotaryDim, part);
+    }
+
+    void CudaRopeEncodingOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+
+        FastllmCudaRopeEncoding(data, positionIds, rotaryDim, ropeTheta, ropeScale);
     }
 
     void CudaRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
