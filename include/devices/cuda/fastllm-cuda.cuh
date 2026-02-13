@@ -201,6 +201,22 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
 bool FastllmCudaLlamaRotatePosition2DPart(fastllm::Data &data, const fastllm::Data &positionIds,
                                  const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim, int part);
 bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale);
+bool FastllmCudaQKVRMSNormRope(fastllm::Data &qkv, fastllm::Data &qNormWeight, fastllm::Data &kNormWeight,
+                                const fastllm::Data &positionIds,
+                                int q_heads, int k_heads, int head_dim,
+                                int rotateDim, float eps, float ropeTheta, float ropeScale);
+// 融合 QKVRMSNormRope + Split KV + AppendPagedCacheBatch
+// qkv: [bs, seqlen, total_dim], qOutput: [bs*q_heads, seqlen, head_dim] (permuted)
+// K/V 直接写入 paged cache
+bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
+    fastllm::Data &qkv, fastllm::Data &qNormWeight, fastllm::Data &kNormWeight,
+    const fastllm::Data &positionIds,
+    fastllm::Data &qOutput,
+    uint8_t *pagedKData, uint8_t *pagedVData,
+    int32_t *insertIndexs, int32_t *insertPositions,
+    int q_heads, int k_heads, int head_dim,
+    int rotateDim, float eps, float ropeTheta, float ropeScale,
+    int pageLen, int unitSize, int batch);
 bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fastllm::Data &penaltyScale);
 bool FastllmCudaApplyLognAttn (fastllm::Data &input, fastllm::Data &lognAttn, fastllm::Data &positionIds);
 

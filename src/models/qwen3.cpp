@@ -202,9 +202,6 @@ namespace fastllm {
                 k.Reshape(qkvSize);
                 v.Reshape(qkvSize);
 
-                RMSNorm(q, this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"], rms_norm_eps, q);
-                RMSNorm(k, this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"], rms_norm_eps, k);
-
                 Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
                 if (GetKVCacheInCPU()) {
                     pastKey.lockInCPU = true;
@@ -221,7 +218,10 @@ namespace fastllm {
                 }
                 float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
 
+                RMSNorm(q, this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"], rms_norm_eps, q);
                 fastllm::RopeEncoding(q, positionIds, rotary_dim, curRopeTheta, ropeScale);
+
+                RMSNorm(k, this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"], rms_norm_eps, k);
                 fastllm::RopeEncoding(k, positionIds, rotary_dim, curRopeTheta, ropeScale);
 
                 PermuteSelf(q, {0, 2, 1, 3});
@@ -364,111 +364,81 @@ namespace fastllm {
             if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()
                 && CanRunMergeAttention()
                 && true) {
-                std::vector <Data*> keys, values, masks;
-                for (int b = 0; b < batch; b++) {
-                    keys.push_back(pastKeyValues[b * block_cnt + i].first);
-                    values.push_back(pastKeyValues[b * block_cnt + i].second);
-                    masks.push_back(attentionMask[b]);
-                }
-                MergeAttention (
-                    attenInput, 
-                    weight[mergeQkvWeightName], weight[mergeQkvBiasName], 
-                    weight[oWeightName], weight[oBiasName],
-                    true,
-                    this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"],
-                    this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"],
-                    rms_norm_eps,
-                    qkv, q, k, v, 
-                    num_attention_heads, num_key_value_heads, head_dim, rotary_dim, 1.0 / sqrt(head_dim),
-                    allPositionIds, *sinDataPtr, *cosDataPtr, 
-                    keys, values, masks, attenLastOutput
-                );
-                AddTo(hiddenStates, attenLastOutput);
             } else {
-                if (weight.weight.find(qkvWeightName) != weight.weight.end()) {
-                    Linear(attenInput, weight[qkvWeightName], *GetEmptyData(), qkv);
-                    int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
-                    int qdim = per * (num_attention_heads / num_key_value_heads);
-                    Split(qkv, -1, 0, qdim, q);
-                    Split(qkv, -1, qdim, qdim + per, k);
-                    Split(qkv, -1, qdim + per, qdim + per * 2, v);
-                } else {
-                    if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
-                        Linear(attenInput, weight[mergeQkvWeightName], weight[mergeQkvBiasName], qkv);
-                        int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
-                        int qdim = per * (num_attention_heads / num_key_value_heads);
+                Linear(attenInput, weight[mergeQkvWeightName], weight[mergeQkvBiasName], qkv);
 
-                        Split(qkv, -1, 0, qdim, q);
-                        Split(qkv, -1, qdim, qdim + per, k);
-                        Split(qkv, -1, qdim + per, qdim + per * 2, v);
-                    } else {
-                        Linear(attenInput, weight[qWeightName], weight[qBiasName], q);
-                        Linear(attenInput, weight[kWeightName], weight[kBiasName], k);
-                        Linear(attenInput, weight[vWeightName], weight[vBiasName], v);
-                    }
-                }
-
-                q.Reshape({q.dims[0], q.dims[1], -1, head_dim});
-                k.Reshape({k.dims[0], k.dims[1], -1, head_dim});
-                v.Reshape({v.dims[0], v.dims[1], -1, head_dim});
-
-                RMSNorm(q, this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"], rms_norm_eps, q);
-                RMSNorm(k, this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"], rms_norm_eps, k);
-
-                int cacheOuter = k.dims[2], cacheInner = k.dims[3];
+                // 先计算 targetSeqLength 和 rope 参数
                 int targetSeqLength = 0;
                 for (int b = 0; b < batch; b++) {
-                        Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
-                        if (GetKVCacheInCPU()) {
-                            pastKey.lockInCPU = true;
-                            pastValue.lockInCPU = true;
-                        } else {
-                            pastKey.ToDevice(k.dataDevice);
-                            pastValue.ToDevice(k.dataDevice);
-                        }
-                        targetSeqLength = std::max(targetSeqLength, (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqLens[b] : seqLens[b]);
+                    Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
+                    if (GetKVCacheInCPU()) {
+                        pastKey.lockInCPU = true;
+                        pastValue.lockInCPU = true;
+                    } else {
+                        pastKey.ToDevice(qkv.dataDevice);
+                        pastValue.ToDevice(qkv.dataDevice);
+                    }
+                    targetSeqLength = std::max(targetSeqLength, (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqLens[b] : seqLens[b]);
                 }
 
                 float curRopeTheta = rope_base;
                 if (targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
-                        float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
-                        curRopeTheta = rope_base * scale;
+                    float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
+                    curRopeTheta = rope_base * scale;
                 }
                 float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
 
-                fastllm::RopeEncoding(q, allPositionIds, rotary_dim, curRopeTheta, ropeScale);
-                fastllm::RopeEncoding(k, allPositionIds, rotary_dim, curRopeTheta, ropeScale);
+                // 准备batch的pastKeyValues列表
+                for (int b = 0; b < batch; b++) {
+                    batchPastKeys[b] = pastKeyValues[b * block_cnt + i].first;
+                    batchPastValues[b] = pastKeyValues[b * block_cnt + i].second;
+                }
 
-                int total = 0;
+                // 获取第一个batch的pastKey和pastValue（所有batch共享同一个PagedCacheManager）
+                Data &kCaches = *batchPastKeys[0];
+                Data &vCaches = *batchPastValues[0];
+                PagedCacheManager *pagedCacheKManager = kCaches.pagedKVCacheData;
+                PagedCacheManager *pagedCacheVManager = vCaches.pagedKVCacheData;
+
+                // 生成分页批量参数（insertIndexs/insertPositions 在所有层共享）
+                if (!generatedAppendPagedCacheBatchParams) {
+                    GenerateAppendPagedCacheBatchParams(*pagedCacheKManager, batchPastKeys, batch, 
+                       insertIndexs, insertPositions);
+                    generatedAppendPagedCacheBatchParams = true;
+                }
+
+                // 融合操作：QKVRMSNormRope + Split Q/K/V + AppendPagedCacheBatch(K,V)
+                // q 输出为 [bsz * q_heads, seqlen, head_dim]（已做Permute）
+                // K/V 直接写入 paged cache
+                q.dataType = qkv.dataType;
+                q.Resize({bsz * num_attention_heads, seqlen, head_dim});
+                int curPageLen = kCaches.pageLen;
+                fastllm::QKVRMSNormRopeSplitAppendPagedCache(qkv,
+                    this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"],
+                    this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"],
+                    allPositionIds,
+                    q,
+                    *(Data*)pagedCacheKManager, *(Data*)pagedCacheVManager,
+                    insertIndexs, insertPositions,
+                    num_attention_heads, num_key_value_heads, head_dim,
+                    rotary_dim, rms_norm_eps, curRopeTheta, ropeScale,
+                    curPageLen, batch);
+
+                // 更新 pastKey/pastValue 的 pageIndex 和 lastPageLen（原来在 AppendPagedCacheBatch 的 Reshape 中完成）
+                for (int b = 0; b < batch; b++) {
+                    auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
+                        if (cache->lastPageLen < cache->pageLen) {
+                            cache->lastPageLen++;
+                        } else {
+                            cache->lastPageLen = 0;
+                            cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
+                        }
+                    };
+                    updatePageMeta(batchPastKeys[b], pagedCacheKManager);
+                    updatePageMeta(batchPastValues[b], pagedCacheVManager);
+                }
 
                 {
-                    PermuteSelf(q, {0, 2, 1, 3});
-                    q.Reshape({-1, seqlen, head_dim});
-
-                    // 准备batch的pastKeyValues列表
-                    for (int b = 0; b < batch; b++) {
-                        batchPastKeys[b] = pastKeyValues[b * block_cnt + i].first;
-                        batchPastValues[b] = pastKeyValues[b * block_cnt + i].second;
-                    }
-                    
-                    k.Reshape({-1, k.dims[2], k.dims[3]});
-                    v.Reshape({-1, v.dims[2], v.dims[3]});
-                    // 获取第一个batch的pastKey和pastValue（所有batch共享同一个PagedCacheManager）
-                    Data &kCaches = *batchPastKeys[0];
-                    Data &vCaches = *batchPastValues[0];
-                    PagedCacheManager *pagedCacheKManager = kCaches.pagedKVCacheData;
-                    PagedCacheManager *pagedCacheVManager = vCaches.pagedKVCacheData;
-
-                    // 生成分页批量参数
-                    if (!generatedAppendPagedCacheBatchParams) {
-                        GenerateAppendPagedCacheBatchParams(*pagedCacheKManager, batchPastKeys, batch, 
-                           insertIndexs, insertPositions);
-                        generatedAppendPagedCacheBatchParams = true;
-                    }
-
-                    AppendPagedCacheBatch(*pagedCacheKManager, batchPastKeys, k, insertIndexs, insertPositions);
-                    AppendPagedCacheBatch(*pagedCacheVManager, batchPastValues, v, insertIndexs, insertPositions);
-
                     // 生成分页批量参数
                     if (!generatedBatchDecodeParams) {
                         GeneratePagedBatchParams(q, batchPastKeys, batch, 
@@ -616,6 +586,7 @@ namespace fastllm {
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
                             std::vector <std::vector <float>*> *retLogits) {
+return ForwardBatchV2(batch, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, retLogits);
         int maxLen = inputIds.dims[1];
         Data hiddenStates;
         Data attenInput;
@@ -899,6 +870,7 @@ namespace fastllm {
                                                const std::vector <GenerationConfig> &generationConfigs,
                                                const LastTokensManager &lastTokens,
                                                std::vector <std::vector <float>*> *retLogits) {
+return ForwardBatchV2(batch, inputIds, attentionMask, positionIds, seqLens, pastKeyValues, generationConfigs, lastTokens, retLogits);
         int seqLen = inputIds.dims[1];
 
         Data hiddenStates;

@@ -814,6 +814,27 @@ namespace fastllm {
 
     void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale); // RoPE encoding，直接用rope_theta和rope_scale计算，无需sin/cos缓存
 
+    // 在 qkv 拼接张量上融合执行 RMSNorm + RoPE（仅对 q 和 k 部分），v 不处理
+    void QKVRMSNormRope(Data &qkv, Data &qNormWeight, Data &kNormWeight,
+                        const Data &positionIds, int q_heads, int k_heads, int head_dim,
+                        int rotaryDim, float eps, float ropeTheta, float ropeScale);
+
+    // 融合 QKVRMSNormRope + Split KV + AppendPagedCacheBatch（K/V直接写入paged cache，Q单独输出）
+    // qkv: [bs, seqlen, (q_heads + k_heads + v_heads) * head_dim]
+    // qOutput: 输出Q，布局为 [bs * q_heads, seqlen, head_dim]（已做Permute）
+    // pagedKCacheData / pagedVCacheData: paged cache manager (作为Data传入)
+    // insertIndexs / insertPositions: 每个batch对应的page idx和page offset
+    // batch: 逻辑batch数（= insertIndexs长度，decode时每个token对应一个batch）
+    void QKVRMSNormRopeSplitAppendPagedCache(
+        Data &qkv, Data &qNormWeight, Data &kNormWeight,
+        const Data &positionIds, 
+        Data &qOutput,
+        Data &pagedKCacheData, Data &pagedVCacheData,
+        Data &insertIndexs, Data &insertPositions,
+        int q_heads, int k_heads, int head_dim,
+        int rotaryDim, float eps, float ropeTheta, float ropeScale,
+        int pageLen, int batch);
+
     void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale); // 重复惩罚
 
     void ApplyLognAttn(Data &input, const Data &lognAttn, const Data &positionIds);
