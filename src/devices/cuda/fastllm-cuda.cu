@@ -366,6 +366,15 @@ __global__ void FastllmSwigluKernel(half* __restrict__ a, half* __restrict__ b, 
     }
 }
 
+__global__ void FastllmSwigluKernel(__nv_bfloat16* __restrict__ a, __nv_bfloat16* __restrict__ b, int len, int spatial, int mid) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        int id = idx / mid * spatial + idx % mid;
+        float x = __bfloat162float(a[id]), y = __bfloat162float(a[id + mid]);
+        b[idx] = __float2bfloat16((x / (1.0f + expf(-x))) * y);
+    }
+}
+
 // CrossSwiglu: 交替存储格式, y[i] = x[i*2+1] * silu(x[i*2])
 __global__ void FastllmCrossSwigluKernel(float* __restrict__ a, float* __restrict__ b, int len, int spatial, int mid) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -654,6 +663,23 @@ __global__ void FastllmLlamaRotatePosition2DKernel(half *data, float *positionId
     float va = __half2float(d[i * m]), vb = __half2float(d[i * m + m / 2]);
     d[i * m] = __float2half(va * curCos - vb * curSin);
     d[i * m + m / 2] = __float2half(va * curSin + vb * curCos);
+}
+
+__global__ void FastllmLlamaRotatePosition2DKernel(__nv_bfloat16 *data, float *positionIds, float *sin, float *cos,
+                                                   int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int rotateDim) {
+    int o = (blockIdx.x / n);
+    int l = o % len;
+    int b = o / len;
+    int j = threadIdx.x;
+    int index = (int) (positionIds[b * partStride + l]);
+
+    float curSin = sin[index * sinCosStride + j];
+    float curCos = cos[index * sinCosStride + j];
+    __nv_bfloat16 *d = (__nv_bfloat16 *) data + o * spatial + j;
+    int i = blockIdx.x % n;
+    float va = __bfloat162float(d[i * m]), vb = __bfloat162float(d[i * m + m / 2]);
+    d[i * m] = __float2bfloat16(va * curCos - vb * curSin);
+    d[i * m + m / 2] = __float2bfloat16(va * curSin + vb * curCos);
 }
 
 __global__ void FastllmLlamaRotatePosition2DPartKernel(float *data, float *positionIds, float *sin, float *cos,
@@ -1558,6 +1584,8 @@ bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output) {
         FastllmSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len, spatial, mid);
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
         FastllmSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, len, spatial, mid);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmSwigluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((__nv_bfloat16*)cudaInput, (__nv_bfloat16*)cudaOutput, len, spatial, mid);
     }
 
     FastllmCudaFinishInput(input, cudaInput);
@@ -2649,6 +2677,10 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
                                                                                  (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
     } else if (data.dataType == fastllm::DataType::FLOAT16) {
         FastllmLlamaRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> ((half*)cudaData, cudaPositionIds, cudaSin, cudaCos,
+                                                                                 len, bs, spatial, n, m,
+                                                                                 (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
+    } else if (data.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmLlamaRotatePosition2DKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> ((__nv_bfloat16*)cudaData, cudaPositionIds, cudaSin, cudaCos,
                                                                                  len, bs, spatial, n, m,
                                                                                  (int)positionIds.dims.back(), (int)sinData.dims[1], rotaryDim);
     }
