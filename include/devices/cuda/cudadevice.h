@@ -23,7 +23,7 @@ namespace fastllm {
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis);
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, float sharedScale);
-    void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale);
+    void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale, bool inited = false);
     
     class CudaDevice : BaseDevice {
     public:
