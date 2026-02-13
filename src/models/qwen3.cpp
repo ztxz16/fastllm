@@ -214,16 +214,15 @@ namespace fastllm {
                     pastValue.ToDevice(k.dataDevice);
                 }
                 int targetSeqLength = (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqlen : seqlen;
+                float curRopeTheta = rope_base;
                 if (i == 0 && targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
                     float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
-                    float newbase = rope_base * scale;
-                    std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(newbase, rope_factor, targetSeqLength);
-                    sinDataPtr = new Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, pair.first);
-                    cosDataPtr = new Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, pair.second);
+                    curRopeTheta = rope_base * scale;
                 }
+                float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
 
-                fastllm::LlamaRotatePosition2D(q, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
-                fastllm::LlamaRotatePosition2D(k, positionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+                fastllm::RopeEncoding(q, positionIds, rotary_dim, curRopeTheta, ropeScale);
+                fastllm::RopeEncoding(k, positionIds, rotary_dim, curRopeTheta, ropeScale);
 
                 PermuteSelf(q, {0, 2, 1, 3});
                 PermuteSelf(k, {0, 2, 1, 3});
@@ -299,6 +298,7 @@ namespace fastllm {
         std::vector <std::vector <float>*> *retLogits) {
         int seqLen = inputIds.dims[1];
 
+        Data embeddingResult;
         Data hiddenStates;
         Data attenInput;
         Data q, k, v, qkv;
@@ -307,23 +307,8 @@ namespace fastllm {
         Data w1, w2, w3;
         Data* sinDataPtr = &sinData;
         Data* cosDataPtr = &cosData;
-        std::vector <Data> curContextLayer;
-        curContextLayer.resize(batch);
-        std::vector <Data> curKs, curVs, curQs;
-        curKs.resize(batch);
-        curVs.resize(batch);
-        curQs.resize(batch);
-        std::vector <Data*> pointersK, pointersV, pointersQ;
+        std::vector <Data*> pointersK;
         pointersK.resize(batch);
-        pointersV.resize(batch);
-        pointersQ.resize(batch);
-        std::vector <Data*> keys, values, qs, attns, masks, contexts;
-        keys.resize(batch);
-        values.resize(batch);
-        qs.resize(batch);
-        attns.resize(batch);
-        masks.resize(batch);
-        contexts.resize(batch);
 
 
         std::vector<Data*> batchPastKeys;
@@ -355,8 +340,8 @@ namespace fastllm {
             }
         }
 
-        Embedding(inputIds, this->weight["model.embed_tokens.weight"], hiddenStates);
-        ToDataType(hiddenStates, this->dataType);
+        Embedding(inputIds, this->weight["model.embed_tokens.weight"], embeddingResult);
+        ToDataType(embeddingResult, hiddenStates, this->dataType);
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
@@ -444,16 +429,15 @@ namespace fastllm {
                         targetSeqLength = std::max(targetSeqLength, (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqLens[b] : seqLens[b]);
                 }
 
+                float curRopeTheta = rope_base;
                 if (targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
                         float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
-                        float newbase = rope_base * scale;
-                        std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(newbase, rope_factor, targetSeqLength);
-                        sinDataPtr = new Data(DataType::FLOAT32, {(int)this->sin.size(), (int)this->sin[0].size()}, pair.first);
-                        cosDataPtr = new Data(DataType::FLOAT32, {(int)this->cos.size(), (int)this->cos[0].size()}, pair.second);
+                        curRopeTheta = rope_base * scale;
                 }
+                float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
 
-                fastllm::LlamaRotatePosition2D(q, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
-                fastllm::LlamaRotatePosition2D(k, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim);
+                fastllm::RopeEncoding(q, allPositionIds, rotary_dim, curRopeTheta, ropeScale);
+                fastllm::RopeEncoding(k, allPositionIds, rotary_dim, curRopeTheta, ropeScale);
 
                 int total = 0;
 

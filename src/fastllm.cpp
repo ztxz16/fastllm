@@ -3099,6 +3099,12 @@ namespace fastllm {
         }, {}, {{"rotaryDim", rotaryDim}, {"part", part}});
     }
 
+    void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale) {
+        curExecutor->Run("RopeEncoding", {
+                {"input", &input}, {"positionIds", (Data*)&positionIds}
+        }, {{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}}, {{"rotaryDim", rotaryDim}});
+    }
+
     void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale) {
         curExecutor->Run("RepeatPenalty", {
                 {"input", &input}, {"penalty", (Data*)&penalty}, {"penaltyScale", (Data*)&penaltyScale}
