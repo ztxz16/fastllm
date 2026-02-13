@@ -84,6 +84,7 @@ namespace fastllm {
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CpuLlamaRotatePosition2DOp());
         this->ops["LlamaRotatePosition2DPart"] = (BaseOperator*)(new CpuLlamaRotatePosition2DPartOp());
         this->ops["RopeEncoding"] = (BaseOperator*)(new CpuRopeEncodingOp());
+        this->ops["QKVRMSNormRope"] = (BaseOperator*)(new CpuQKVRMSNormRopeOp());
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CpuRepeatPenaltyOp());
         this->ops["ApplyLognAttn"] = (BaseOperator*)(new CpuApplyLognAttnOp());
         this->ops["CumSumLastDim"] = (BaseOperator*)(new CpuCumSumLastDimOp());
@@ -7412,6 +7413,57 @@ ops += (long long)lines * inputDim * interDim * 2;
         RunMultiThreadRopeEncodingFloat(data.dataType, (float*)data.cpuData, (float*)positionIds.cpuData,
             bs, len, n, m, spatial,
             positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale, GetAlivePool());
+    }
+
+    void CpuQKVRMSNormRopeOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        // CPU fallback: 使用原有的 RMSNorm + RopeEncoding 分步实现
+        Data &qkv = *(datas.find("qkv")->second);
+        Data &qNormWeight = *(datas.find("qNormWeight")->second);
+        Data &kNormWeight = *(datas.find("kNormWeight")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int q_heads = intParams.find("q_heads")->second;
+        int k_heads = intParams.find("k_heads")->second;
+        int head_dim = intParams.find("head_dim")->second;
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float eps = floatParams.find("eps")->second;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+
+        int qdim = q_heads * head_dim;
+        int per = k_heads * head_dim;
+
+        // 拆出 q, k，做 RMSNorm + RoPE，然后写回
+        Data q, k;
+        Split(qkv, -1, 0, qdim, q);
+        Split(qkv, -1, qdim, qdim + per, k);
+
+        q.Reshape({q.dims[0], q.dims[1], q_heads, head_dim});
+        k.Reshape({k.dims[0], k.dims[1], k_heads, head_dim});
+
+        RMSNorm(q, qNormWeight, eps, q);
+        RopeEncoding(q, positionIds, rotaryDim, ropeTheta, ropeScale);
+
+        RMSNorm(k, kNormWeight, eps, k);
+        RopeEncoding(k, positionIds, rotaryDim, ropeTheta, ropeScale);
+
+        // 将结果写回 qkv
+        q.Reshape({q.dims[0], q.dims[1], qdim});
+        k.Reshape({k.dims[0], k.dims[1], per});
+
+        int bs = qkv.dims[0], seqlen = qkv.dims[1], total_dim = qkv.dims[2];
+        int unitSize = qkv.unitSize;
+        for (int b = 0; b < bs; b++) {
+            for (int s = 0; s < seqlen; s++) {
+                int offset = (b * seqlen + s) * total_dim;
+                memcpy((uint8_t*)qkv.cpuData + offset * unitSize,
+                       (uint8_t*)q.cpuData + (b * seqlen + s) * qdim * unitSize,
+                       qdim * unitSize);
+                memcpy((uint8_t*)qkv.cpuData + (offset + qdim) * unitSize,
+                       (uint8_t*)k.cpuData + (b * seqlen + s) * per * unitSize,
+                       per * unitSize);
+            }
+        }
     }
 
     void CpuRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,

@@ -253,6 +253,15 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    class CudaQKVRMSNormRopeOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    // 融合 QKVRMSNormRope + Split KV + AppendPagedCacheBatch
+    class CudaQKVRMSNormRopeSplitAppendPagedCacheOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class CudaNearlyRotatePosition2DOp : BaseOperator {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
