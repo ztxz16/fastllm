@@ -60,6 +60,8 @@ namespace fastllm {
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CudaLlamaRotatePosition2DOp());
         this->ops["LlamaRotatePosition2DPart"] = (BaseOperator*)(new CudaLlamaRotatePosition2DPartOp());
         this->ops["RopeEncoding"] = (BaseOperator*)(new CudaRopeEncodingOp());
+        this->ops["QKVRMSNormRope"] = (BaseOperator*)(new CudaQKVRMSNormRopeOp());
+        this->ops["QKVRMSNormRopeSplitAppendPagedCache"] = (BaseOperator*)(new CudaQKVRMSNormRopeSplitAppendPagedCacheOp());
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CudaRepeatPenaltyOp());
         this->ops["ApplyLognAttn"] = (BaseOperator*)(new CudaApplyLognAttnOp());
         this->ops["MergeMOE"] = (BaseOperator*)(new CudaMergeMOE());
@@ -1277,6 +1279,60 @@ namespace fastllm {
         float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
 
         FastllmCudaRopeEncoding(data, positionIds, rotaryDim, ropeTheta, ropeScale);
+    }
+
+    void CudaQKVRMSNormRopeOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qkv = *(datas.find("qkv")->second);
+        Data &qNormWeight = *(datas.find("qNormWeight")->second);
+        Data &kNormWeight = *(datas.find("kNormWeight")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int q_heads = intParams.find("q_heads")->second;
+        int k_heads = intParams.find("k_heads")->second;
+        int head_dim = intParams.find("head_dim")->second;
+        int rotateDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float eps = floatParams.find("eps")->second;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+
+        FastllmCudaQKVRMSNormRope(qkv, qNormWeight, kNormWeight, positionIds,
+                                   q_heads, k_heads, head_dim, rotateDim, eps, ropeTheta, ropeScale);
+    }
+
+    void CudaQKVRMSNormRopeSplitAppendPagedCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qkv = *(datas.find("qkv")->second);
+        Data &qNormWeight = *(datas.find("qNormWeight")->second);
+        Data &kNormWeight = *(datas.find("kNormWeight")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &qOutput = *(datas.find("qOutput")->second);
+        Data &pagedKCacheData = *(datas.find("pagedKCacheData")->second);
+        Data &pagedVCacheData = *(datas.find("pagedVCacheData")->second);
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+
+        int q_heads = intParams.find("q_heads")->second;
+        int k_heads = intParams.find("k_heads")->second;
+        int head_dim = intParams.find("head_dim")->second;
+        int rotateDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        int pageLen = intParams.find("pageLen")->second;
+        int batch = intParams.find("batch")->second;
+        float eps = floatParams.find("eps")->second;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+
+        int unitSize = qkv.unitSize;
+
+        // 分配 qOutput 内存
+        qOutput.Allocate();
+
+        FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
+            qkv, qNormWeight, kNormWeight, positionIds,
+            qOutput,
+            (uint8_t*)pagedKCacheData.cudaData, (uint8_t*)pagedVCacheData.cudaData,
+            (int32_t*)insertIndexs.cudaData, (int32_t*)insertPositions.cudaData,
+            q_heads, k_heads, head_dim, rotateDim, eps, ropeTheta, ropeScale,
+            pageLen, unitSize, batch);
     }
 
     void CudaRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
