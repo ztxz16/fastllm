@@ -689,6 +689,7 @@ __global__ void FastllmRopeEncodingKernel(float *data, float *positionIds,
     int l = o % len;
     int b = o / len;
     int j = threadIdx.x;
+    int half = rotateDim / 2;
     int index = (int) (positionIds[b * partStride + l]);
     float position = (float)index / ropeScale;
     float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
@@ -696,9 +697,9 @@ __global__ void FastllmRopeEncodingKernel(float *data, float *positionIds,
     float curCos = cosf(freq);
     float *d = (float *) data + o * spatial + j;
     int i = blockIdx.x % n;
-    float va = d[i * m], vb = d[i * m + m / 2];
+    float va = d[i * m], vb = d[i * m + half];
     d[i * m] = va * curCos - vb * curSin;
-    d[i * m + m / 2] = va * curSin + vb * curCos;
+    d[i * m + half] = va * curSin + vb * curCos;
 }
 
 __global__ void FastllmRopeEncodingKernel(half *data, float *positionIds,
@@ -708,6 +709,7 @@ __global__ void FastllmRopeEncodingKernel(half *data, float *positionIds,
     int l = o % len;
     int b = o / len;
     int j = threadIdx.x;
+    int half_dim = rotateDim / 2;
     int index = (int) (positionIds[b * partStride + l]);
     float position = (float)index / ropeScale;
     float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
@@ -715,9 +717,9 @@ __global__ void FastllmRopeEncodingKernel(half *data, float *positionIds,
     float curCos = cosf(freq);
     half *d = (half *) data + o * spatial + j;
     int i = blockIdx.x % n;
-    float va = __half2float(d[i * m]), vb = __half2float(d[i * m + m / 2]);
+    float va = __half2float(d[i * m]), vb = __half2float(d[i * m + half_dim]);
     d[i * m] = __float2half(va * curCos - vb * curSin);
-    d[i * m + m / 2] = __float2half(va * curSin + vb * curCos);
+    d[i * m + half_dim] = __float2half(va * curSin + vb * curCos);
 }
 
 __global__ void FastllmRopeEncodingKernel(__nv_bfloat16 *data, float *positionIds,
@@ -727,6 +729,7 @@ __global__ void FastllmRopeEncodingKernel(__nv_bfloat16 *data, float *positionId
     int l = o % len;
     int b = o / len;
     int j = threadIdx.x;
+    int half_dim = rotateDim / 2;
     int index = (int) (positionIds[b * partStride + l]);
     float position = (float)index / ropeScale;
     float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
@@ -734,9 +737,9 @@ __global__ void FastllmRopeEncodingKernel(__nv_bfloat16 *data, float *positionId
     float curCos = cosf(freq);
     __nv_bfloat16 *d = (__nv_bfloat16 *) data + o * spatial + j;
     int i = blockIdx.x % n;
-    float va = __bfloat162float(d[i * m]), vb = __bfloat162float(d[i * m + m / 2]);
+    float va = __bfloat162float(d[i * m]), vb = __bfloat162float(d[i * m + half_dim]);
     d[i * m] = __float2bfloat16(va * curCos - vb * curSin);
-    d[i * m + m / 2] = __float2bfloat16(va * curSin + vb * curCos);
+    d[i * m + half_dim] = __float2bfloat16(va * curSin + vb * curCos);
 }
 
 __global__ void FastllmLlamaRotatePosition2DPartKernel(float *data, float *positionIds, float *sin, float *cos,
@@ -2381,7 +2384,7 @@ __global__ void FastllmSelectExpertKernel(float *logits, float *bias, int32_t *i
     for (int j = tid; j < numExperts; j += THREAD_PER_BLOCK) {
         float cur = inputData[j];
         if (hasBias) {
-            cur -= bias[j];
+            cur += bias[j];
         }
         
         for (int l = 0; l < topk; l++) {
@@ -2967,7 +2970,7 @@ __global__ void FastllmQKVRMSNormRopeKernel(
 
     // ======== Step 2: RoPE Encoding ========
     // RoPE 只处理前 rotateDim 个维度 (每次处理一对)
-    int half_rotate = rotateDim / 2;  // == min(rotateDim, head_dim) / 2
+    int half_rotate = rotateDim / 2;
     if ((int)tid < half_rotate) {
         int j = tid;
         int index = (int)(positionIds[b * partStride + l]);
@@ -2977,9 +2980,9 @@ __global__ void FastllmQKVRMSNormRopeKernel(
         float curCos = cosf(freq);
 
         float va = base[j];
-        float vb = base[j + head_dim / 2];
+        float vb = base[j + half_rotate];
         base[j]               = va * curCos - vb * curSin;
-        base[j + head_dim / 2] = va * curSin + vb * curCos;
+        base[j + half_rotate] = va * curSin + vb * curCos;
     }
 }
 
@@ -3073,9 +3076,9 @@ __global__ void FastllmQKVRMSNormRopeKernel(
         float curCos = cosf(freq);
 
         float va = __half2float(base[j]);
-        float vb = __half2float(base[j + head_dim / 2]);
+        float vb = __half2float(base[j + half_rotate]);
         base[j]               = __float2half(va * curCos - vb * curSin);
-        base[j + head_dim / 2] = __float2half(va * curSin + vb * curCos);
+        base[j + half_rotate] = __float2half(va * curSin + vb * curCos);
     }
 }
 
@@ -3169,9 +3172,9 @@ __global__ void FastllmQKVRMSNormRopeKernel(
         float curCos = cosf(freq);
 
         float va = __bfloat162float(base[j]);
-        float vb = __bfloat162float(base[j + head_dim / 2]);
+        float vb = __bfloat162float(base[j + half_rotate]);
         base[j]               = __float2bfloat16(va * curCos - vb * curSin);
-        base[j + head_dim / 2] = __float2bfloat16(va * curSin + vb * curCos);
+        base[j + half_rotate] = __float2bfloat16(va * curSin + vb * curCos);
     }
 }
 
@@ -3370,9 +3373,9 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
             float curCos = cosf(freq);
 
             float va = (float)base[j];
-            float vb = (float)base[j + head_dim / 2];
+            float vb = (float)base[j + half_rotate];
             base[j]               = (T)(va * curCos - vb * curSin);
-            base[j + head_dim / 2] = (T)(va * curSin + vb * curCos);
+            base[j + half_rotate] = (T)(va * curSin + vb * curCos);
         }
         __syncthreads();
 
@@ -3497,16 +3500,17 @@ bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionI
     int bs = data.dims[0], len = data.dims[1];
     int n = data.dims[2], m = data.dims[3];
 
+    int halfDim = rotaryDim / 2;
     if (data.dataType == fastllm::DataType::FLOAT32) {
-        FastllmRopeEncodingKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> (cudaData, cudaPositionIds,
+        FastllmRopeEncodingKernel <<< outer * n, halfDim >>> (cudaData, cudaPositionIds,
                                                                                  len, bs, spatial, n, m,
                                                                                  (int)positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale);
     } else if (data.dataType == fastllm::DataType::FLOAT16) {
-        FastllmRopeEncodingKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> ((half*)cudaData, cudaPositionIds,
+        FastllmRopeEncodingKernel <<< outer * n, halfDim >>> ((half*)cudaData, cudaPositionIds,
                                                                                  len, bs, spatial, n, m,
                                                                                  (int)positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale);
     } else if (data.dataType == fastllm::DataType::BFLOAT16) {
-        FastllmRopeEncodingKernel <<< outer * n, std::min(rotaryDim, m / 2) >>> ((__nv_bfloat16*)cudaData, cudaPositionIds,
+        FastllmRopeEncodingKernel <<< outer * n, halfDim >>> ((__nv_bfloat16*)cudaData, cudaPositionIds,
                                                                                  len, bs, spatial, n, m,
                                                                                  (int)positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale);
     }

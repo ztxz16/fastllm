@@ -107,7 +107,8 @@ def make_normal_llm_model(args):
                 config["architectures"][0] == 'Ernie4_5_MoeForCausalLM' or 
                 config["architectures"][0] == 'PanguProMoEForCausalLM' or
                 config["architectures"][0] == 'Glm4MoeForCausalLM' or 
-                config["architectures"][0] == 'Qwen3NextForCausalLM'):
+                config["architectures"][0] == 'Qwen3NextForCausalLM' or
+                config["architectures"][0] == 'MinimaxM2ForCausalLM'):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
                 if ((not(args.device and args.device != ""))):
@@ -123,7 +124,8 @@ def make_normal_llm_model(args):
                 except:
                     pass
                 try:
-                    if (args.dtype == "auto" and quantization_config['quant_method'] == "fp8" and quantization_config['fmt'] == "e4m3"):
+                    if (args.dtype == "auto" and quantization_config['quant_method'] == "fp8" and 
+                        (quantization_config['fmt'] == "e4m3" or quantization_config['fmt'] == "float8_e4m3fn")):
                         args.dtype = "fp8_e4m3"
                 except:
                     pass

@@ -1398,6 +1398,10 @@ namespace fastllm {
             for (int i = 0; i < floatData.size(); i++) {
                 floatData[i] = bf16tofp32.dict[(((uint16_t*)cpuData)[i])];
             }
+        } else if (this->dataType == DataType::INT32) {
+            for (int i = 0; i < floatData.size(); i++) {
+                floatData[i] = ((int32_t*)cpuData)[i];
+            }
         }
 
         for (int i = 0; i < n; i++) {
