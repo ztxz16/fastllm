@@ -15,6 +15,7 @@
 #include "qwen3.h"
 #include "qwen3_moe.h"
 #include "qwen3_next.h"
+#include "minimax_m2.h"
 #include "hunyuan.h"
 #include "deepseekv2.h"
 #include "qwen.h"
@@ -230,6 +231,8 @@ namespace fastllm {
             model = (basellm*)(new MoeModel());
         } else if (modelType == "qwen3_moe") {
             model = (basellm*)(new Qwen3MOEModel());
+        } else if (modelType == "minimax_m2") {
+            model = (basellm*)(new MinimaxM2Model());
         } else if (modelType == "qwen3_next") {
             model = (basellm*)(new Qwen3NextModel());
         } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3" || modelType == "kimi_k2" || modelType == "deepseek_v32") {
@@ -259,6 +262,8 @@ namespace fastllm {
             model = (basellm*)(new CogvlmModel());
         } else if (modelType == "minimax_m1" || modelType == "minimax_text_01") {
             model = (basellm*)(new MinimaxModel());
+        } else if (modelType == "minimax_m2") {
+            model = (basellm*)(new MinimaxM2Model());
         } else if (modelType == "hunyuan" || modelType == "hunyuan_v1_dense" || modelType == "hunyuan_v1_moe") {
             model = (basellm*)(new HunyuanModel());
         } else if (modelType == "ernie4_5_moe" || modelType == "ernie4_5") {
@@ -971,7 +976,7 @@ namespace fastllm {
                     std::string tokenizerConfigFile = path + "tokenizer_config.json";
                     auto tokenizerConfig = json11::Json::parse(ReadAllFile(tokenizerConfigFile), error);
                     std::string eos_token = tokenizerConfig["eos_token"].string_value();
-                    printf("eos_token = %s\n", eos_token.c_str());
+// printf("eos_token = %s\n", eos_token.c_str());
                     for (auto added_token : tokenizer["added_tokens"].array_items()) {
                         if (added_token["content"] == eos_token) {
                             model->eos_token_ids.insert(added_token["id"].int_value());
@@ -1457,7 +1462,7 @@ if (false) {
                 std::string tokenizerConfigFile = path + "tokenizer_config.json";
                 auto tokenizerConfig = json11::Json::parse(ReadAllFile(tokenizerConfigFile), error);
                 std::string eos_token = tokenizerConfig["eos_token"].string_value();
-                printf("eos_token = %s\n", eos_token.c_str());
+// printf("eos_token = %s\n", eos_token.c_str());
                 for (auto added_token : tokenizer["added_tokens"].array_items()) {
                     if (added_token["content"] == eos_token) {
                         model->eos_token_ids.insert(added_token["id"].int_value());
