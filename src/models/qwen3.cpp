@@ -134,19 +134,6 @@ namespace fastllm {
         return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, &batchLogits)[0];
     }
 
-    extern void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output);
-    extern void DoCudaLinearReshape(Data &input, Data &weight, Data &output);
-
-    void MyLinear(Data &input, Data &weight, const Data &bias, Data &output) {
-        if (input.dataDevice == 1 && weight.dataDevice == 1 && output.dataDevice == 1 &&
-            (bias.dims.size() == 0 || bias.dataDevice == 1)) {
-            DoCudaLinearReshape(input, weight, output);
-            DoCudaLinear(input, weight, bias, output);
-        } else {
-            Linear(input, weight, bias, output);
-        }
-    }
-
     std::vector <int> Qwen3Model::ForwardBatchV2(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
