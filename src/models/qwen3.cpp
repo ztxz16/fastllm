@@ -154,8 +154,8 @@ namespace fastllm {
         int maxLen = inputIds.dims[1];
         Data hiddenStates;
         Data attenInput;
-        Data q, k, v, qkv, curInput, curOutput;
-        Data attenWeights, attenOutput;
+        Data qkv;
+        Data q, k, v, curInput, curOutput;
         Data attenLastOutput;
         Data w1, w2, w3;
         Data* sinDataPtr = &sinData;
@@ -298,15 +298,22 @@ namespace fastllm {
         std::vector <std::vector <float>*> *retLogits) {
         int seqLen = inputIds.dims[1];
 
+        Data qkv;
+        // Data &qkv = this->forwardDataManager.GetData("qkv");
+        Data q;
+        // Data &q = this->forwardDataManager.GetData("q");
+        Data k;
+        // Data &k = this->forwardDataManager.GetData("k");
+        Data v;
+        // Data &v = this->forwardDataManager.GetData("v");
         Data embeddingResult;
+        // Data &embeddingResult = this->forwardDataManager.GetData("embeddingResult");
         Data hiddenStates;
+        // Data &hiddenStates = this->forwardDataManager.GetData("hiddenStates");
         Data attenInput;
-        Data q, k, v, qkv;
-        Data attenWeights, curAttenOutput;
+        // Data &attenInput = this->forwardDataManager.GetData("attenInput");
         Data attenLastOutput;
-        Data w1, w2, w3;
-        Data* sinDataPtr = &sinData;
-        Data* cosDataPtr = &cosData;
+        // Data &attenLastOutput = this->forwardDataManager.GetData("attenLastOutput");
         std::vector <Data*> pointersK;
         pointersK.resize(batch);
 
@@ -315,10 +322,23 @@ namespace fastllm {
         std::vector<Data*> batchPastValues;
         batchPastKeys.resize(batch);
         batchPastValues.resize(batch);
+
         Data allPositionIds;
-        Data qSizes, pageSizes, pageIndexs, lastPageLens;
-        Data insertIndexs, insertPositions;
+        // Data &allPositionIds = this->forwardDataManager.GetData("allPositionIds");
+        Data qSizes;
+        // Data &qSizes = this->forwardDataManager.GetData("qSizes");
+        Data pageSizes;
+        // Data &pageSizes = this->forwardDataManager.GetData("pageSizes");
+        Data pageIndexs;
+        // Data &pageIndexs = this->forwardDataManager.GetData("pageIndexs");
+        Data lastPageLens;
+        // Data &lastPageLens = this->forwardDataManager.GetData("lastPageLens");
+        Data insertIndexs;
+        // Data &insertIndexs = this->forwardDataManager.GetData("insertIndexs");
+        Data insertPositions;
+        // Data &insertPositions = this->forwardDataManager.GetData("insertPositions");
         Data attenOutput;
+        // Data &attenOutput = this->forwardDataManager.GetData("attenOutput");
         bool generatedBatchDecodeParams = false;
         bool generatedAppendPagedCacheBatchParams = false;
 
@@ -363,7 +383,7 @@ namespace fastllm {
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()
                 && CanRunMergeAttention()
-                && true) {
+                && false) {
             } else {
                 Linear(attenInput, weight[mergeQkvWeightName], weight[mergeQkvBiasName], qkv);
 
@@ -575,10 +595,6 @@ namespace fastllm {
                 }
             }
         }
-        if (sinDataPtr != &sinData)
-            delete sinDataPtr;
-        if (cosDataPtr != &cosData)
-            delete cosDataPtr;
         return lastRet;
     }
 
