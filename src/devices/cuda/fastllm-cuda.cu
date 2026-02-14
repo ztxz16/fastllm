@@ -832,35 +832,74 @@ __global__ void FastllmRMSNormKernelInner1(float *input, float *weight, float *o
     input = input + o * channels;
     output = output + o * channels;
 
-    __shared__ float sdata2[THREAD_PER_BLOCK];
+    constexpr int WARP_SIZE = 32;
+    constexpr int NUM_WARPS = THREAD_PER_BLOCK / WARP_SIZE;
+    __shared__ float warp_sums[NUM_WARPS > 0 ? NUM_WARPS : 1];
     __shared__ float scale;
 
-    // 1. 每个线程计算一部分
     unsigned int tid = threadIdx.x;
-    float sum2 = 0.0;
-    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+
+    // 1. 向量化加载 (float4)，每个线程累加平方和
+    int f4_channels = channels / 4;
+    const float4 *input_f4 = reinterpret_cast<const float4 *>(input);
+    float sum2 = 0.0f;
+    for (int i = tid; i < f4_channels; i += THREAD_PER_BLOCK) {
+        float4 v = input_f4[i];
+        sum2 += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    // 处理尾部元素
+    int tail_start = f4_channels * 4;
+    for (int i = tail_start + tid; i < channels; i += THREAD_PER_BLOCK) {
         float x = input[i];
         sum2 += x * x;
     }
-    sdata2[tid] = sum2;
-    __syncthreads();
 
-    // 2. 求和
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sdata2[tid] += sdata2[tid + s];
+    // 2. Warp shuffle reduction
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+    }
+    if (THREAD_PER_BLOCK > WARP_SIZE) {
+        if (lane_id == 0) {
+            warp_sums[warp_id] = sum2;
+        }
+        __syncthreads();
+
+        if (warp_id == 0) {
+            float val = (lane_id < NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                val += __shfl_down_sync(0xffffffff, val, offset);
+            }
+            if (lane_id == 0) {
+                scale = rsqrtf(val / channels + eps);
+            }
+        }
+        __syncthreads();
+    } else {
+        // 只有一个 warp 的情况
+        if (tid == 0) {
+            scale = rsqrtf(sum2 / channels + eps);
         }
         __syncthreads();
     }
 
-    // 3. 计算参数
-    if (tid == 0) {
-        scale = 1.0 / sqrt(sdata2[0] / channels + eps);
+    // 3. 向量化写出
+    float s = scale;
+    float4 *output_f4 = reinterpret_cast<float4 *>(output);
+    const float4 *weight_f4 = reinterpret_cast<const float4 *>(weight);
+    for (int i = tid; i < f4_channels; i += THREAD_PER_BLOCK) {
+        float4 v = input_f4[i];
+        float4 w = weight_f4[i];
+        float4 out_v;
+        out_v.x = v.x * s * w.x;
+        out_v.y = v.y * s * w.y;
+        out_v.z = v.z * s * w.z;
+        out_v.w = v.w * s * w.w;
+        output_f4[i] = out_v;
     }
-    __syncthreads();
-
-    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
-        output[i] = (input[i] * scale * weight[i]);
+    for (int i = tail_start + tid; i < channels; i += THREAD_PER_BLOCK) {
+        output[i] = input[i] * s * __ldg(&weight[i]);
     }
 }
 
@@ -870,46 +909,72 @@ __global__ void FastllmRMSNormKernelInner1(half *input, float *weight, half *out
     input = input + o * channels;
     output = output + o * channels;
 
-    __shared__ float sdata2[THREAD_PER_BLOCK];
+    // 使用 warp shuffle reduction，仅需少量 shared memory 给跨 warp 汇总
+    constexpr int WARP_SIZE = 32;
+    constexpr int NUM_WARPS = THREAD_PER_BLOCK / WARP_SIZE;
+    __shared__ float warp_sums[NUM_WARPS];
     __shared__ float scale;
 
-    // 1. 每个线程计算一部分
     unsigned int tid = threadIdx.x;
-    float sum2 = 0.0;
-    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
-        float x = __half2float(input[i]);
-        sum2 += x * x;
-    }
-    sdata2[tid] = sum2;
-    __syncthreads();
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
 
-    // 2. 求和
-    for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
-        if (tid < s) {
-            sdata2[tid] += sdata2[tid + s];
+    // 1. 向量化加载 (half2)，每个线程累加平方和
+    int half2_channels = channels / 2;
+    const half2 *input_h2 = reinterpret_cast<const half2 *>(input);
+    float sum2 = 0.0f;
+    for (int i = tid; i < half2_channels; i += THREAD_PER_BLOCK) {
+        half2 v = input_h2[i];
+        float2 fv = __half22float2(v);
+        sum2 += fv.x * fv.x + fv.y * fv.y;
+    }
+    // 处理 channels 为奇数的尾部元素
+    if (channels & 1) {
+        int last = channels - 1;
+        if (tid == 0) {
+            float x = __half2float(input[last]);
+            sum2 += x * x;
         }
-        __syncthreads();
     }
 
-    if (tid < 32) {
-        volatile float *now = sdata2;
-        now[tid] += now[tid + 32];
-        now[tid] += now[tid + 16];
-        now[tid] += now[tid + 8];
-        now[tid] += now[tid + 4];
-        now[tid] += now[tid + 2];
-        now[tid] += now[tid + 1];
+    // 2. Warp shuffle reduction
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+    }
+    if (lane_id == 0) {
+        warp_sums[warp_id] = sum2;
     }
     __syncthreads();
 
-    // 3. 计算参数
-    if (tid == 0) {
-        scale = 1.0 / sqrt(sdata2[0] / channels + eps);
+    // 跨 warp 汇总（由第一个 warp 完成）
+    if (warp_id == 0) {
+        float val = (lane_id < NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (lane_id == 0) {
+            scale = rsqrtf(val / channels + eps);
+        }
     }
     __syncthreads();
 
-    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
-        output[i] = __float2half(__half2float(input[i]) * scale * weight[i]);
+    // 3. 向量化写出
+    float s = scale;
+    half2 *output_h2 = reinterpret_cast<half2 *>(output);
+    for (int i = tid; i < half2_channels; i += THREAD_PER_BLOCK) {
+        half2 v = input_h2[i];
+        float2 fv = __half22float2(v);
+        float w0 = __ldg(&weight[i * 2]);
+        float w1 = __ldg(&weight[i * 2 + 1]);
+        float2 out_f;
+        out_f.x = fv.x * s * w0;
+        out_f.y = fv.y * s * w1;
+        output_h2[i] = __float22half2_rn(out_f);
+    }
+    // 处理 channels 为奇数的尾部元素
+    if ((channels & 1) && tid == 0) {
+        int last = channels - 1;
+        output[last] = __float2half(__half2float(input[last]) * s * __ldg(&weight[last]));
     }
 }
 
@@ -919,46 +984,70 @@ __global__ void FastllmRMSNormKernelInner1(__nv_bfloat16 *input, float *weight, 
     input = input + o * channels;
     output = output + o * channels;
 
-    __shared__ float sdata2[THREAD_PER_BLOCK];
+    constexpr int WARP_SIZE = 32;
+    constexpr int NUM_WARPS = THREAD_PER_BLOCK / WARP_SIZE;
+    __shared__ float warp_sums[NUM_WARPS];
     __shared__ float scale;
 
-    // 1. 每个线程计算一部分
     unsigned int tid = threadIdx.x;
-    float sum2 = 0.0;
-    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
-        float x = __bfloat162float(input[i]);
-        sum2 += x * x;
-    }
-    sdata2[tid] = sum2;
-    __syncthreads();
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
 
-    // 2. 求和
-    for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
-        if (tid < s) {
-            sdata2[tid] += sdata2[tid + s];
+    // 1. 向量化加载 (nv_bfloat162)，每个线程累加平方和
+    int bf2_channels = channels / 2;
+    const __nv_bfloat162 *input_bf2 = reinterpret_cast<const __nv_bfloat162 *>(input);
+    float sum2 = 0.0f;
+    for (int i = tid; i < bf2_channels; i += THREAD_PER_BLOCK) {
+        __nv_bfloat162 v = input_bf2[i];
+        float lo = __bfloat162float(v.x);
+        float hi = __bfloat162float(v.y);
+        sum2 += lo * lo + hi * hi;
+    }
+    if (channels & 1) {
+        int last = channels - 1;
+        if (tid == 0) {
+            float x = __bfloat162float(input[last]);
+            sum2 += x * x;
         }
-        __syncthreads();
     }
 
-    if (tid < 32) {
-        volatile float *now = sdata2;
-        now[tid] += now[tid + 32];
-        now[tid] += now[tid + 16];
-        now[tid] += now[tid + 8];
-        now[tid] += now[tid + 4];
-        now[tid] += now[tid + 2];
-        now[tid] += now[tid + 1];
+    // 2. Warp shuffle reduction
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+    }
+    if (lane_id == 0) {
+        warp_sums[warp_id] = sum2;
     }
     __syncthreads();
 
-    // 3. 计算参数
-    if (tid == 0) {
-        scale = 1.0 / sqrt(sdata2[0] / channels + eps);
+    if (warp_id == 0) {
+        float val = (lane_id < NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (lane_id == 0) {
+            scale = rsqrtf(val / channels + eps);
+        }
     }
     __syncthreads();
 
-    for (int i = tid; i < channels; i += THREAD_PER_BLOCK) {
-        output[i] = __float2bfloat16_rn(__bfloat162float(input[i]) * scale * weight[i]);
+    // 3. 向量化写出
+    float s = scale;
+    __nv_bfloat162 *output_bf2 = reinterpret_cast<__nv_bfloat162 *>(output);
+    for (int i = tid; i < bf2_channels; i += THREAD_PER_BLOCK) {
+        __nv_bfloat162 v = input_bf2[i];
+        float lo = __bfloat162float(v.x);
+        float hi = __bfloat162float(v.y);
+        float w0 = __ldg(&weight[i * 2]);
+        float w1 = __ldg(&weight[i * 2 + 1]);
+        __nv_bfloat162 out_val;
+        out_val.x = __float2bfloat16_rn(lo * s * w0);
+        out_val.y = __float2bfloat16_rn(hi * s * w1);
+        output_bf2[i] = out_val;
+    }
+    if ((channels & 1) && tid == 0) {
+        int last = channels - 1;
+        output[last] = __float2bfloat16_rn(__bfloat162float(input[last]) * s * __ldg(&weight[last]));
     }
 }
 
@@ -2079,25 +2168,34 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
         } else if (channels < 512) {
             FastllmRMSNormKernelInner1<64> <<< outer, 64 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, outer,
                                                              channels, eps);
-        } else {
+        } else if (channels < 4096) {
             FastllmRMSNormKernelInner1<512> <<< outer, 512 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, outer,
                                                                channels, eps);
+        } else {
+            FastllmRMSNormKernelInner1<1024> <<< outer, 1024 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, outer,
+                                                                 channels, eps);
         }
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
         if (channels < 512) {
             FastllmRMSNormKernelInner1<64> <<< outer, 64 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer,
                                                              channels, eps);
-        } else {
+        } else if (channels < 4096) {
             FastllmRMSNormKernelInner1<512> <<< outer, 512 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer,
                                                                channels, eps);
+        } else {
+            FastllmRMSNormKernelInner1<1024> <<< outer, 1024 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer,
+                                                                 channels, eps);
         }
     } else if (input.dataType == fastllm::DataType::BFLOAT16) {
         if (channels < 512) {
             FastllmRMSNormKernelInner1<64> <<< outer, 64 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
                                                               channels, eps);
-        } else {
+        } else if (channels < 4096) {
             FastllmRMSNormKernelInner1<512> <<< outer, 512 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
                                                                 channels, eps);
+        } else {
+            FastllmRMSNormKernelInner1<1024> <<< outer, 1024 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer,
+                                                                  channels, eps);
         }
     }
 
