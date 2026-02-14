@@ -894,7 +894,7 @@ class model:
             return ctypes.c_int(len(stop_token_ids)), (ctypes.c_int * len(stop_token_ids))(*stop_token_ids)
     
     def trans_conversation(self, conversation: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        if (self.get_struct() in ["minimax"]):
+        if (self.get_struct() in ["minimax", "minimax_m2"]):
             for i in range(len(conversation)):
                 if ("content" in conversation[i] and isinstance(conversation[i]["content"], str)):
                     conversation[i]["content"] = [{"type": "text", "text": conversation[i]["content"]}]

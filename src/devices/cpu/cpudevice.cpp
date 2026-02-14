@@ -7330,6 +7330,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             st(st), end(end) {}
 
         void Run() {
+            int half = rotaryDim / 2;
             if (dataType == DataType::FLOAT32) {
                 for (int idx = st; idx < end; idx++) {
                     int b = idx / len;
@@ -7338,13 +7339,13 @@ ops += (long long)lines * inputDim * interDim * 2;
                     float position = (float)index / ropeScale;
                     float *d = (float *) data + (b * len + l) * spatial;
                     for (int i = 0; i < n; i++) {
-                        for (int j = 0; j < rotaryDim && j < m / 2; j++) {
+                        for (int j = 0; j < half; j++) {
                             float freq = position / pow(ropeTheta, (float)(2 * j) / rotaryDim);
                             float curSin = sin(freq);
                             float curCos = cos(freq);
-                            float a = d[j], b = d[j + m / 2];
+                            float a = d[j], b = d[j + half];
                             d[j] = a * curCos - b * curSin;
-                            d[j + m / 2] = a * curSin + b * curCos;
+                            d[j + half] = a * curSin + b * curCos;
                         }
                         d += m;
                     }
@@ -7357,13 +7358,13 @@ ops += (long long)lines * inputDim * interDim * 2;
                     float position = (float)index / ropeScale;
                     uint16_t *d = (uint16_t *) data + (b * len + l) * spatial;
                     for (int i = 0; i < n; i++) {
-                        for (int j = 0; j < rotaryDim && j < m / 2; j++) {
+                        for (int j = 0; j < half; j++) {
                             float freq = position / pow(ropeTheta, (float)(2 * j) / rotaryDim);
                             float curSin = sin(freq);
                             float curCos = cos(freq);
-                            float a = fp16tofp32.dict[d[j]], b = fp16tofp32.dict[d[j + m / 2]];
+                            float a = fp16tofp32.dict[d[j]], b = fp16tofp32.dict[d[j + half]];
                             d[j] = float_to_half(a * curCos - b * curSin);
-                            d[j + m / 2] = float_to_half(a * curSin + b * curCos);
+                            d[j + half] = float_to_half(a * curSin + b * curCos);
                         }
                         d += m;
                     }
