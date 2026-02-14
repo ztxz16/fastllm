@@ -63,7 +63,7 @@ namespace fastllm {
             return;
         }
         // 获取所有可用NUMA节点
-        struct bitmask* validNodes = numa_get_mems_allowed();
+        struct bitmask* validNodes = numa_get_membind();
         std::vector<int> nodes;
         
         // 遍历所有可能的节点
