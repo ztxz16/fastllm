@@ -349,124 +349,40 @@ namespace fastllm {
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
-            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
-                    rms_norm_eps, attenInput);
-            std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
-            std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
-            std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
-            std::string kBiasName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.bias";
-            std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
-            std::string vBiasName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.bias";
-            std::string qkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.W_pack.weight";
-            std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
-            std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
+            std::string inputRmsName = "model.layers." + std::to_string(i) + ".input_layernorm.weight";
             std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
             std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
-
-            // 1.1 Get q, k, v
-            int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
-            if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()
-                && CanRunMergeAttention()
-                && false) {
-            } else {
-                Linear(attenInput, weight[mergeQkvWeightName], weight[mergeQkvBiasName], qkv);
-
-                // 先计算 targetSeqLength 和 rope 参数
-                int targetSeqLength = 0;
-                for (int b = 0; b < batch; b++) {
-                    Data &pastKey = *pastKeyValues[b * block_cnt + i].first, &pastValue = *pastKeyValues[b * block_cnt + i].second;
-                    if (GetKVCacheInCPU()) {
-                        pastKey.lockInCPU = true;
-                        pastValue.lockInCPU = true;
-                    } else {
-                        pastKey.ToDevice(qkv.dataDevice);
-                        pastValue.ToDevice(qkv.dataDevice);
-                    }
-                    targetSeqLength = std::max(targetSeqLength, (pastKey.dims.size() > 2) ? pastKey.dims[1] + seqLens[b] : seqLens[b]);
-                }
-
-                float curRopeTheta = rope_base;
-                if (targetSeqLength >= max_positions && RoPEType::DYMAMIC_NTK == rope_type) {
-                    float scale = pow((rope_factor * targetSeqLength / max_positions) - (rope_factor - 1), rotary_dim / (rotary_dim - 2));
-                    curRopeTheta = rope_base * scale;
-                }
-                float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
-
-                // 准备batch的pastKeyValues列表
-                for (int b = 0; b < batch; b++) {
-                    batchPastKeys[b] = pastKeyValues[b * block_cnt + i].first;
-                    batchPastValues[b] = pastKeyValues[b * block_cnt + i].second;
-                }
-
-                // 获取第一个batch的pastKey和pastValue（所有batch共享同一个PagedCacheManager）
-                Data &kCaches = *batchPastKeys[0];
-                Data &vCaches = *batchPastValues[0];
-                PagedCacheManager *pagedCacheKManager = kCaches.pagedKVCacheData;
-                PagedCacheManager *pagedCacheVManager = vCaches.pagedKVCacheData;
-
-                // 生成分页批量参数（insertIndexs/insertPositions 在所有层共享）
-                if (!generatedAppendPagedCacheBatchParams) {
-                    GenerateAppendPagedCacheBatchParams(*pagedCacheKManager, batchPastKeys, batch, 
-                       insertIndexs, insertPositions);
-                    generatedAppendPagedCacheBatchParams = true;
-                }
-
-                // 融合操作：QKVRMSNormRope + Split Q/K/V + AppendPagedCacheBatch(K,V)
-                // q 输出为 [bsz * q_heads, seqlen, head_dim]（已做Permute）
-                // K/V 直接写入 paged cache
-                q.dataType = qkv.dataType;
-                q.Resize({bsz * num_attention_heads, seqlen, head_dim});
-                int curPageLen = kCaches.pageLen;
-                fastllm::QKVRMSNormRopeSplitAppendPagedCache(qkv,
-                    this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"],
-                    this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"],
-                    allPositionIds,
-                    q,
-                    *(Data*)pagedCacheKManager, *(Data*)pagedCacheVManager,
-                    insertIndexs, insertPositions,
-                    num_attention_heads, num_key_value_heads, head_dim,
-                    rotary_dim, rms_norm_eps, curRopeTheta, ropeScale,
-                    curPageLen, batch);
-
-                // 更新 pastKey/pastValue 的 pageIndex 和 lastPageLen（原来在 AppendPagedCacheBatch 的 Reshape 中完成）
-                for (int b = 0; b < batch; b++) {
-                    auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
-                        if (cache->lastPageLen < cache->pageLen) {
-                            cache->lastPageLen++;
-                        } else {
-                            cache->lastPageLen = 0;
-                            cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
-                        }
-                    };
-                    updatePageMeta(batchPastKeys[b], pagedCacheKManager);
-                    updatePageMeta(batchPastValues[b], pagedCacheVManager);
-                }
-
-                {
-                    // 生成分页批量参数
-                    if (!generatedBatchDecodeParams) {
-                        GeneratePagedBatchParams(q, batchPastKeys, batch, 
-                            qSizes, pageSizes, pageIndexs, lastPageLens);
-                        generatedBatchDecodeParams = true;
-                    }
-                    AttentionPagedBatch(q, 
-                        kCaches, 
-                        vCaches, 
-                        qSizes, pageSizes, pageIndexs, lastPageLens,
-                        attenOutput, q.dims[0] / kCaches.dims[0], 1.0 / sqrt(head_dim), 1, i > 0);
-                    // attenOutput 已是 [seqlen, num_heads_total, head_dim]，仅需 Reshape + 一次 Permute 得到 [bsz, seqlen, embed_dim]
-                    attenOutput.Reshape({seqlen, bsz, -1});
-                    PermuteSelf(attenOutput, {1, 0, 2});
-                }
-
-                LinearAddBlock(&attenOutput, &weight[oWeightName], &weight[oBiasName], &attenLastOutput, &hiddenStates);
-            }
-
-            // 2. mlp
-            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
-
+            std::string qNormName = "model.layers." + std::to_string(i) + ".self_attn.q_norm.weight";
+            std::string kNormName = "model.layers." + std::to_string(i) + ".self_attn.k_norm.weight";
+            std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
+            std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
+            std::string postRmsName = "model.layers." + std::to_string(i) + ".post_attention_layernorm.weight";
             std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
             std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
+
+            RMSNorm(hiddenStates, this->weight[inputRmsName], rms_norm_eps, attenInput);
+            AttentionPagedBlock(
+                &attenInput,
+                &weight[mergeQkvWeightName], &weight[mergeQkvBiasName],
+                &weight[qNormName], &weight[kNormName],
+                &weight[oWeightName], &weight[oBiasName],
+                &allPositionIds,
+                &pastKeyValues, &batchPastKeys, &batchPastValues,
+                &qkv, &q, &attenOutput, &attenLastOutput,
+                &insertIndexs, &insertPositions,
+                &qSizes, &pageSizes, &pageIndexs, &lastPageLens,
+                &generatedAppendPagedCacheBatchParams, &generatedBatchDecodeParams,
+                batch, block_cnt, i,
+                seqLens,
+                num_attention_heads, num_key_value_heads, head_dim,
+                rotary_dim, rms_norm_eps,
+                rope_base, rope_factor, max_positions,
+                rope_type,
+                GetKVCacheInCPU(),
+                &hiddenStates
+            );
+                
+            RMSNorm(hiddenStates, this->weight[postRmsName], rms_norm_eps, attenInput);
             MLPBlock(&attenInput, &weight[swigluWeightName], &weight[downWeightName], &v, &q, &hiddenStates);
         }
 
