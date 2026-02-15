@@ -34,6 +34,51 @@ namespace fastllm {
         Data *swigluResult,
         Data *output
     );
+
+    /*
+    Paged Attention Block:
+    1. Linear QKV projection
+    2. QKVRMSNormRope + Split Q/K/V + AppendPagedCache(K,V)
+    3. AttentionPagedBatch
+    4. Reshape + Permute
+    5. output += Linear(attenOutput, oWeight, oBias)
+
+    参数说明:
+    - attenInput: attention的输入 [bsz, seqlen, hidden]
+    - mergeQkvWeight/Bias: 合并的QKV投影权重/偏置
+    - qNormWeight/kNormWeight: Q/K的RMSNorm权重
+    - oWeight/oBias: output projection权重/偏置
+    - allPositionIds: 位置编码
+    - pastKeyValues: batch * block_cnt 个 (pastKey, pastValue) 对
+    - batchPastKeys/Values: batch个pastKey/Value指针的列表
+    - qkv/q/attenOutput/attenLastOutput: 中间变量
+    - insertIndexs/insertPositions: append paged cache 批量参数（跨层共享）
+    - qSizes/pageSizes/pageIndexs/lastPageLens: paged batch decode 参数（跨层共享）
+    - generatedAppendParams/generatedDecodeParams: 是否已生成跨层共享参数
+    - hiddenStates: 残差连接的输出
+    */
+    void AttentionPagedBlock (
+        Data *attenInput,
+        Data *mergeQkvWeight, Data *mergeQkvBias,
+        Data *qNormWeight, Data *kNormWeight,
+        Data *oWeight, Data *oBias,
+        Data *allPositionIds,
+        std::vector<std::pair<Data*, Data*>> *pastKeyValues,
+        std::vector<Data*> *batchPastKeys,
+        std::vector<Data*> *batchPastValues,
+        Data *qkv, Data *q, Data *attenOutput, Data *attenLastOutput,
+        Data *insertIndexs, Data *insertPositions,
+        Data *qSizes, Data *pageSizes, Data *pageIndexs, Data *lastPageLens,
+        bool *generatedAppendParams, bool *generatedDecodeParams,
+        int batch, int block_cnt, int layerIdx,
+        const std::vector<int> &seqLens,
+        int num_attention_heads, int num_key_value_heads, int head_dim,
+        int rotary_dim, float rms_norm_eps,
+        float rope_base, float rope_factor, int max_positions,
+        int rope_type, // RoPEType enum value
+        bool kvCacheInCPU,
+        Data *hiddenStates
+    );
 }
 
 #endif //FASTLLM_BASEBLOCK_H
