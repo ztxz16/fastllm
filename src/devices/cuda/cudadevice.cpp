@@ -26,6 +26,7 @@ namespace fastllm {
         this->ops["LayerNorm"] = (BaseOperator*)(new CudaLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
+        this->ops["LinearAdd"] = (BaseOperator*)(new CudaLinearAddOp());
         this->ops["Conv1DPerChannel"] = (BaseOperator*)(new CudaConv1DPerChannel());
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
@@ -582,6 +583,32 @@ namespace fastllm {
         }
     }
 
+    bool DoCudaLinearAdd(Data &input, Data &weight, const Data &bias, Data &output) {
+        int n = input.Count(0) / input.dims.back();
+        int m = input.dims.back();
+        int k = output.dims.back();
+        if (bias.dataType != DataType::FLOAT32) {
+            return false;
+        } else if (input.dataType == DataType::FLOAT16) {
+            if (weight.dataType == DataType::FLOAT16) {
+                FastllmCudaHalfMatMulFloat16(input, weight, bias, output, n, m, k, true);
+            } else {
+                return false;
+            }
+        } else if (input.dataType == DataType::FLOAT32) {
+            {
+                return false;
+            }
+        } else if (input.dataType == DataType::BFLOAT16) {
+            {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        return true;
+    }
+
     void CudaLinearOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -589,6 +616,46 @@ namespace fastllm {
         Data &weight = *(datas.find("weight")->second);
         Data &bias = *(datas.find("bias")->second);
         DoCudaLinear(input, weight, bias, output);
+    }
+
+    void CudaLinearAddOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+
+        AssertInFastLLM(weight.dims.size() == 2, "LinearAdd's weight's shape's size should be 2.\n");
+        AssertInFastLLM(input.dims.back() == weight.dims[1], "LinearAdd's weight's shape error.\n");
+
+        // output 已经存在且形状正确，不需要 resize
+        // 但需要验证 output 的最后一维与 weight.dims[0] 一致
+        AssertInFastLLM(output.dims.back() == weight.dims[0], "LinearAdd's output's shape doesn't match weight.\n");
+
+        weight.weightType = WeightType::LINEAR;
+    }
+
+    bool CudaLinearAddOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        return true;
+    }
+
+    void CudaLinearAddOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &middle = *(datas.find("middle")->second);
+        Data &bias = *(datas.find("bias")->second);
+
+        if (DoCudaLinearAdd(input, weight, bias, output)) { 
+            return;
+        } else {
+            DoCudaLinearReshape(input, weight, middle);
+            DoCudaLinear(input, weight, bias, middle);
+
+            // output += middle
+            FastllmCudaAddTo(output, middle, 1.0f);
+        }
     }
 
     void DoCudaSplitReshape(Data &input, int axis, int start, int end, Data &output) {

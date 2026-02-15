@@ -461,9 +461,8 @@ namespace fastllm {
                     attenOutput.Reshape({seqlen, bsz, -1});
                     PermuteSelf(attenOutput, {1, 0, 2});
                 }
-                
-                Linear(attenOutput, weight[oWeightName], weight[oBiasName], attenLastOutput);
-                AddTo(hiddenStates, attenLastOutput);
+
+                LinearAddBlock(&attenOutput, &weight[oWeightName], &weight[oBiasName], &attenLastOutput, &hiddenStates);
             }
 
             // 2. mlp
@@ -472,8 +471,8 @@ namespace fastllm {
             std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
             Linear(attenInput, weight[swigluWeightName], *GetEmptyData(), v);
             Swiglu(v, q);
-            Linear(q, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], *GetEmptyData(), k);
-            AddTo(hiddenStates, k);
+
+            LinearAddBlock(&q, &weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], GetEmptyData(), &k, &hiddenStates);
         }
 
         Data logits;
