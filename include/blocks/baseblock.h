@@ -13,10 +13,26 @@ namespace fastllm {
         Data *middle, Data *output
     );
 
+    /*
+    output = Swiglu(Linear(input, weight, bias))
+    */
     void LinearSwigluBlock (
         Data *input, 
         Data *weight, Data *bias,
         Data *middle, Data *output
+    );
+
+    /*
+    gateUpResult = Linear(input, gateUp)
+    swigluResult = Swiglu(gateUpResult)
+    output += Linear(swigluResult, down)
+    */
+    void MLPBlock (
+        Data *input, 
+        Data *gateUp, Data *down, 
+        Data *gateUpResult, 
+        Data *swigluResult,
+        Data *output
     );
 }
 
