@@ -27,6 +27,7 @@ namespace fastllm {
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
         this->ops["LinearAdd"] = (BaseOperator*)(new CudaLinearAddOp());
+        this->ops["LinearSwiglu"] = (BaseOperator*)(new CudaLinearSwigluOp());
         this->ops["Conv1DPerChannel"] = (BaseOperator*)(new CudaConv1DPerChannel());
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
@@ -655,6 +656,70 @@ namespace fastllm {
 
             // output += middle
             FastllmCudaAddTo(output, middle, 1.0f);
+        }
+    }
+
+    void CudaLinearSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &middle = *(datas.find("middle")->second);
+
+        AssertInFastLLM(weight.dims.size() == 2, "LinearSwiglu's weight's shape's size should be 2.\n");
+        AssertInFastLLM(input.dims.back() == weight.dims[1], "LinearSwiglu's weight's shape error.\n");
+
+        // middle = Linear(input, weight, bias), shape: [..., weight.dims[0]]
+        DoCudaLinearReshape(input, weight, middle);
+
+        // output = Swiglu(middle), shape: [..., weight.dims[0] / 2]
+        DoCudaSwigluReshape(middle, output);
+    }
+
+    bool CudaLinearSwigluOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        return true;
+    }
+
+    bool DoCudaLinearSwiglu(Data &input, Data &weight, const Data &bias, Data &middle, Data &output) {
+        int n = input.Count(0) / input.dims.back();
+        int m = input.dims.back();
+        int k = output.dims.back();
+        if (bias.dataType != DataType::FLOAT32) {
+            return false;
+        } else if (input.dataType == DataType::FLOAT16) {
+            if (weight.dataType == DataType::FLOAT16) {
+                return FastllmCudaHalfMatMulFloat16Swiglu(input, weight, bias, output, n, m, k);
+            } else {
+                return false;
+            }
+        } else if (input.dataType == DataType::FLOAT32) {
+            {
+                return false;
+            }
+        } else if (input.dataType == DataType::BFLOAT16) {
+            {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    void CudaLinearSwigluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &middle = *(datas.find("middle")->second);
+        Data &bias = *(datas.find("bias")->second);
+
+        if (DoCudaLinearSwiglu(input, weight, bias, middle, output)) {
+            return;
+        } else {
+            DoCudaLinear(input, weight, bias, middle);
+            DoCudaSwiglu(middle, output);
         }
     }
 
