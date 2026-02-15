@@ -466,6 +466,149 @@ bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &wei
     return true;
 }
 
+// Fused Linear + Swiglu kernel for FP16
+// Each block computes one output element p (0 <= p < k).
+// It reads two rows of the weight matrix: row p (gate) and row p+k (up),
+// computes dot(input[x], weight_gate[p]) and dot(input[x], weight_up[p+k]),
+// adds bias, then applies swiglu: output = silu(gate) * up = gate / (1 + exp(-gate)) * up
+template <int THREAD_PER_BLOCK, int PART>
+__global__ void FastllmGemvFp16Fp16SwigluKernel(half *A, half *B, half *C, half *bias, int m, int k) {
+    // A: input,  shape [PART, m]
+    // B: weight, shape [2*k, m], row-major. Row p is the gate row, row p+k is the up row.
+    // C: output, shape [PART, k]
+    // bias: [2*k] or nullptr
+    // m: input dim,  k: output dim (after swiglu)
+    __shared__ float sdata_gate[PART][THREAD_PER_BLOCK];
+    __shared__ float sdata_up[PART][THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    union_half8 regA;
+    union_half8 regB_gate;
+    union_half8 regB_up;
+
+    int p = blockIdx.x; // output index, 0 <= p < k
+
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+        sdata_gate[x][tid] = 0;
+        sdata_up[x][tid] = 0;
+    }
+
+    const half *baseB_gate = B + p * m;        // gate row
+    const half *baseB_up   = B + (p + k) * m;  // up row
+
+    if (m % 8 == 0) {
+#pragma unroll
+        for (int i = tid * 8; i < m; i += THREAD_PER_BLOCK * 8) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                regA.in = *reinterpret_cast<const uint4 *>(A + x * m + i);
+                regB_gate.in = *reinterpret_cast<const uint4 *>(baseB_gate + i);
+                regB_up.in = *reinterpret_cast<const uint4 *>(baseB_up + i);
+                float sum_gate = 0.0f;
+                float sum_up = 0.0f;
+                sum_gate += __low2float(regA.out2[0]) * __low2float(regB_gate.out2[0]);
+                sum_up   += __low2float(regA.out2[0]) * __low2float(regB_up.out2[0]);
+                sum_gate += __high2float(regA.out2[0]) * __high2float(regB_gate.out2[0]);
+                sum_up   += __high2float(regA.out2[0]) * __high2float(regB_up.out2[0]);
+                sum_gate += __low2float(regA.out2[1]) * __low2float(regB_gate.out2[1]);
+                sum_up   += __low2float(regA.out2[1]) * __low2float(regB_up.out2[1]);
+                sum_gate += __high2float(regA.out2[1]) * __high2float(regB_gate.out2[1]);
+                sum_up   += __high2float(regA.out2[1]) * __high2float(regB_up.out2[1]);
+                sum_gate += __low2float(regA.out2[2]) * __low2float(regB_gate.out2[2]);
+                sum_up   += __low2float(regA.out2[2]) * __low2float(regB_up.out2[2]);
+                sum_gate += __high2float(regA.out2[2]) * __high2float(regB_gate.out2[2]);
+                sum_up   += __high2float(regA.out2[2]) * __high2float(regB_up.out2[2]);
+                sum_gate += __low2float(regA.out2[3]) * __low2float(regB_gate.out2[3]);
+                sum_up   += __low2float(regA.out2[3]) * __low2float(regB_up.out2[3]);
+                sum_gate += __high2float(regA.out2[3]) * __high2float(regB_gate.out2[3]);
+                sum_up   += __high2float(regA.out2[3]) * __high2float(regB_up.out2[3]);
+                sdata_gate[x][tid] += sum_gate;
+                sdata_up[x][tid] += sum_up;
+            }
+        }
+    } else {
+        for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                float a_val = (float)A[i + x * m];
+                sdata_gate[x][tid] += a_val * (float)baseB_gate[i];
+                sdata_up[x][tid] += a_val * (float)baseB_up[i];
+            }
+        }
+    }
+    __syncthreads();
+
+    // Reduction
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                sdata_gate[x][tid] += sdata_gate[x][tid + s];
+                sdata_up[x][tid] += sdata_up[x][tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            float gate_val = sdata_gate[x][0];
+            float up_val = sdata_up[x][0];
+            if (bias != nullptr) {
+                gate_val += (float)(__ldg(bias + p));
+                up_val += (float)(__ldg(bias + p + k));
+            }
+            // swiglu: silu(gate) * up = gate / (1 + exp(-gate)) * up
+            float silu_gate = gate_val / (1.0f + expf(-gate_val));
+            C[p + k * x] = (half)(silu_gate * up_val);
+        }
+    }
+    __syncthreads();
+}
+
+void LaunchFastllmGemmFp16Fp16Swiglu(half *input, half *weight, half *output, half *bias, int n, int m, int k) {
+    // k is the output dim (after swiglu), weight has 2*k rows
+    if (n == 1) {
+        FastllmGemvFp16Fp16SwigluKernel<256, 1> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (n == 2) {
+        FastllmGemvFp16Fp16SwigluKernel<256, 2> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (n == 3) {
+        FastllmGemvFp16Fp16SwigluKernel<256, 3> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (n == 4) {
+        FastllmGemvFp16Fp16SwigluKernel<256, 4> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (n == 5) {
+        FastllmGemvFp16Fp16SwigluKernel<256, 5> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (n == 6) {
+        FastllmGemvFp16Fp16SwigluKernel<256, 6> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else if (n == 7) {
+        FastllmGemvFp16Fp16SwigluKernel<256, 7> <<< k, 256 >>>(input, weight, output, bias, m, k);
+    } else {
+        printf("Error: LaunchFastllmGemmFp16Fp16Swiglu: n > 7.\n");
+        exit(0);
+    }
+}
+
+bool FastllmCudaHalfMatMulFloat16Swiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    if (n >= 8) {
+        return false;
+    }
+
+    output.Allocate();
+
+    int biasK = k * 2; // weight has 2*k rows, bias has 2*k elements
+    FastllmCudaFP16EnsureBiasOnDevice(weight, bias, biasK);
+    FastllmCudaFP16EnsureBiasHalfOnDevice(weight, bias, biasK);
+
+    half *cudaInput = (half *) FastllmCudaPrepareInput(input);
+    half *cudaOutput = (half *) FastllmCudaPrepareOutput(output);
+    half *cudaBiasData = bias.dims.size() == 0 ? nullptr : (half *) weight.extraCudaHalfData[0];
+    LaunchFastllmGemmFp16Fp16Swiglu(cudaInput, (half*)weight.cudaData, cudaOutput, cudaBiasData, n, m, k);
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
 // ============ BF16 input × FP16 weight -> BF16 output ============
 
 static void FastllmCudaFP16EnsureBiasBf16OnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {

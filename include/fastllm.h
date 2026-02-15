@@ -716,6 +716,12 @@ namespace fastllm {
 
     void LinearAdd(const Data &input, const Data &weight, const Data &bias, Data &middle, Data &output);
 
+    bool CanRunLinearAdd(const Data &input, const Data &weight, const Data &bias, const Data &output);
+
+    void LinearSwiglu(const Data &input, const Data &weight, const Data &bias, Data &middle, Data &output);
+
+    bool CanRunLinearSwiglu(const Data &input, const Data &weight);
+
     enum LinearExType {
         ExTypeNone = 0,
         ExSwiglu = 1,
@@ -724,8 +730,6 @@ namespace fastllm {
     };
     
     bool CanRunLinearEx(LinearExType exType);
-
-    bool CanRunLinearAdd(const Data &input, const Data &weight, const Data &bias, const Data &output);
 
     bool CanRunMergeAttention();
     
