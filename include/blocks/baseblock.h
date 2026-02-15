@@ -12,6 +12,12 @@ namespace fastllm {
         Data *weight, Data *bias,
         Data *middle, Data *output
     );
+
+    void LinearSwigluBlock (
+        Data *input, 
+        Data *weight, Data *bias,
+        Data *middle, Data *output
+    );
 }
 
 #endif //FASTLLM_BASEBLOCK_H

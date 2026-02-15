@@ -233,17 +233,14 @@ namespace fastllm {
                 }
             }
 
-            Linear(qkv, weight[oWeightName], weight[oBiasName], attenInput);
-            AddTo(hiddenStates, attenInput);
+            LinearAddBlock(&qkv, &weight[oWeightName], &weight[oBiasName], &attenInput, &hiddenStates);
 
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
 
             std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
-            Linear(attenInput, weight[swigluWeightName], *GetEmptyData(), v);
-            Swiglu(v, q);
-            Linear(q, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], *GetEmptyData(), k);
-            AddTo(hiddenStates, k);
+            LinearSwigluBlock(&attenInput, &weight[swigluWeightName], GetEmptyData(), &v, &q);
+            LinearAddBlock(&q, &weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], GetEmptyData(), &k, &hiddenStates);
         }
 
         Data logits, topk;
@@ -469,9 +466,7 @@ namespace fastllm {
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
 
             std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
-            Linear(attenInput, weight[swigluWeightName], *GetEmptyData(), v);
-            Swiglu(v, q);
-
+            LinearSwigluBlock(&attenInput, &weight[swigluWeightName], GetEmptyData(), &v, &q);
             LinearAddBlock(&q, &weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], GetEmptyData(), &k, &hiddenStates);
         }
 
