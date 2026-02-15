@@ -3,6 +3,7 @@
 #define FASTLLM_BASELLM_H
 
 #include "fastllm.h"
+#include "baseblock.h"
 #include "template.h"
 
 #include <thread>

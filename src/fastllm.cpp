@@ -2825,6 +2825,16 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void LinearAdd(const Data &input, const Data &weight, const Data &bias, Data &middle, Data &output) {
+        curExecutor->Run("LinearAdd", 
+            {{"input", (Data*)&input}, {"weight", (Data*)&weight}, {"bias", (Data*)&bias}, {"middle", (Data*)&middle}, {"output", (Data*)&output}}, 
+        {}, {});
+    }
+
+    bool CanRunLinearAdd(const Data &input, const Data &weight, const Data &bias, const Data &output) {
+        return curExecutor->CanRunOnFirstDevice("LinearAdd", {{"input", (Data*)&input}, {"weight", (Data*)&weight}, {"bias", (Data*)&bias}, {"output", (Data*)&output}}, {}, {});
+    }
+
     bool CanRunLinearEx(LinearExType exType) {
         return curExecutor->CanRunOnFirstDevice("Linear", {}, {}, {{"exType", (int)exType}});
     }
