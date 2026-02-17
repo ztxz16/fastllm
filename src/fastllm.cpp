@@ -3371,7 +3371,17 @@ namespace fastllm {
     // batch: 批量大小
     // qSizes, pageSizes, pageIndexs, lastPageLens: 输出的参数
     void GeneratePagedBatchParams(const Data &q, const std::vector<Data*> &pastKeys, 
-        int batch, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens) {
+        int batch, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens,
+        const std::vector<int> &seqLens) {
+        std::map<std::string, int> intParams = {
+            {"batch", batch}, 
+            {"pastKeys___batch", (int)pastKeys.size()}
+        };
+        // 将 seqLens 编码到 intParams 中，供设备端实现使用
+        intParams["seqLens___size"] = (int)seqLens.size();
+        for (int i = 0; i < (int)seqLens.size(); i++) {
+            intParams["seqLens___" + std::to_string(i)] = seqLens[i];
+        }
         curExecutor->Run("GeneratePagedBatchParams", {
             {"q", (Data*)&q}, 
             {"pastKeys", (Data*)pastKeys.data()}, 
@@ -3379,9 +3389,7 @@ namespace fastllm {
             {"pageSizes", &pageSizes}, 
             {"pageIndexs", &pageIndexs}, 
             {"lastPageLens", &lastPageLens}
-        }, {}, 
-        {{"batch", batch}, 
-        {"pastKeys___batch", (int)pastKeys.size()}});
+        }, {}, intParams);
     }
 
     void LoraLayer(Data &input, Data &weight, Data &loraA, Data &loraB, const Data &bias, Data &output, 
