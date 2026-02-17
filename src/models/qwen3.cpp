@@ -204,7 +204,6 @@ namespace fastllm {
                     curRopeTheta = rope_base * scale;
                 }
                 float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
-
                 RMSNorm(q, this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"], rms_norm_eps, q);
                 fastllm::RopeEncoding(q, positionIds, rotary_dim, curRopeTheta, ropeScale);
 
@@ -232,9 +231,7 @@ namespace fastllm {
                     PermuteSelf(qkv, {1, 0, 2});
                 }
             }
-
             LinearAddBlock(&qkv, &weight[oWeightName], &weight[oBiasName], &attenInput, &hiddenStates);
-
             // 2. mlp
             RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
 
@@ -330,6 +327,7 @@ namespace fastllm {
         for (int i = 0; i < batch; i++) {
             all1 &= (seqLens[i] == 1);
         }
+        bool isPrefill = !all1;
         if (all1 && positionIds[0]->dataType == DataType::FLOAT32) {
             std::vector <float> vPositionIds;            
             for (int b = 0; b < batch; b++) {
@@ -337,11 +335,13 @@ namespace fastllm {
             }
             allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vPositionIds));
         } else {
-            allPositionIds.CopyFrom(*(Data*)positionIds[0]);
-            allPositionIds.Expansion({1, seqLen});
-            for (int i = 1; i < batch; i++) {
-                CatDirect(allPositionIds, *(Data*)positionIds[i], 1);
+            std::vector <float> vPositionIds;            
+            for (int b = 0; b < batch; b++) {
+                for (int i = 0; i < seqLens[b]; i++) {
+                    vPositionIds.push_back(((float*)positionIds[b]->cpuData)[i]);
+                }
             }
+            allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, vPositionIds.size()}, vPositionIds));
         }
 
         Embedding(inputIds, this->weight["model.embed_tokens.weight"], embeddingResult);
@@ -379,9 +379,10 @@ namespace fastllm {
                 rope_base, rope_factor, max_positions,
                 rope_type,
                 GetKVCacheInCPU(),
+                isPrefill,
                 &hiddenStates
             );
-                
+
             RMSNorm(hiddenStates, this->weight[postRmsName], rms_norm_eps, attenInput);
             MLPBlock(&attenInput, &weight[swigluWeightName], &weight[downWeightName], &v, &q, &hiddenStates);
         }
@@ -390,7 +391,7 @@ namespace fastllm {
         std::vector <Data> curLogits;
         curLogits.resize(batch);
 
-        if (batch > 1 && !all1) {
+        if (!all1) {
             int total = 0;
             std::vector <Data> lastTokens;
             std::vector <Data*> lastTokenPointers;
@@ -432,9 +433,9 @@ namespace fastllm {
             needLogits |= generationConfigs[b].output_logits;
             maxTopK = std::max(maxTopK, generationConfigs[b].top_k);
         }
-
+        
         ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfigs);
-        // if (batch > 1 && allSimple) {
+        // if (all1) {
         if (true) {
             Data topk;
             TopK(logits, topk, 1);
