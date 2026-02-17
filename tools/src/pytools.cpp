@@ -57,6 +57,10 @@ extern "C" {
         fastllm::EnableAMX(enable_amx);
     }
 
+    DLL_EXPORT void set_max_tokens(int max_tokens) {
+        fastllm::SetMaxTokens(max_tokens);
+    }
+
     DLL_EXPORT bool get_cpu_low_mem(bool low) {
         return fastllm::GetLowMemMode();
     }

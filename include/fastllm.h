@@ -53,6 +53,8 @@ namespace fastllm {
     bool GetHistoryCacheInCPU();
     void EnableAMX(bool enable);
     bool GetEnableAMX();
+    void SetMaxTokens(int maxTokens);
+    int GetMaxTokens();
     AliveThreadPool *GetAlivePool();
 
     template<typename T, std::size_t Alignment>
