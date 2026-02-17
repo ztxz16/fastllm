@@ -257,6 +257,9 @@ def set_cuda_embedding(cuda_embedding):
 def set_enable_amx(enable_amx):
     fastllm_lib.set_enable_amx(ctypes.c_bool(enable_amx));
 
+def set_max_tokens(max_tokens):
+    fastllm_lib.set_max_tokens(ctypes.c_int(max_tokens));
+
 def set_cuda_shared_expert(cuda_shared_expert):
     fastllm_lib.set_cuda_shared_expert(ctypes.c_bool(cuda_shared_expert));
 
