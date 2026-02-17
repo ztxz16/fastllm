@@ -8729,10 +8729,18 @@ ops += (long long)lines * inputDim * interDim * 2;
         int32_t *lastPageLensData = (int32_t*)lastPageLens.cpuData;
         int32_t *pageIndexsData = (int32_t*)pageIndexs.cpuData;
         
-        // 生成qSizes: [0, 1, 2, 3, ..., batch]
+        // 生成qSizes: 如果有 seqLens 则按 seqLens 的前缀和，否则按 [0, 1, 2, ..., batch]
+        int seqLensSize = intParams.find("seqLens___size") != intParams.end() ? intParams.find("seqLens___size")->second : 0;
         qSizesData[0] = 0;
-        for (int b = 0; b < batch; b++) {
-            qSizesData[b + 1] = b + 1;
+        if (seqLensSize > 0) {
+            for (int b = 0; b < batch; b++) {
+                int seqLen = intParams.find("seqLens___" + std::to_string(b))->second;
+                qSizesData[b + 1] = qSizesData[b] + seqLen;
+            }
+        } else {
+            for (int b = 0; b < batch; b++) {
+                qSizesData[b + 1] = b + 1;
+            }
         }
         
         // 生成pageSizes, pageIndexs, lastPageLens

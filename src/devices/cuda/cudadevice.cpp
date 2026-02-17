@@ -2333,10 +2333,18 @@ total += weights[i * 2 + 1]->GetBytes();
         }
         pageIndexsHost.resize(totalPages);
         
-        // 生成qSizes: [0, 1, 2, ... batch]
+        // 生成qSizes: 如果有 seqLens 则按 seqLens 的前缀和，否则按 [0, 1, 2, ..., batch]
+        int seqLensSize = intParams.find("seqLens___size") != intParams.end() ? intParams.find("seqLens___size")->second : 0;
         qSizesHost[0] = 0;
-        for (int b = 0; b < batch; b++) {
-            qSizesHost[b + 1] = b + 1;
+        if (seqLensSize > 0) {
+            for (int b = 0; b < batch; b++) {
+                int seqLen = intParams.find("seqLens___" + std::to_string(b))->second;
+                qSizesHost[b + 1] = qSizesHost[b] + seqLen;
+            }
+        } else {
+            for (int b = 0; b < batch; b++) {
+                qSizesHost[b + 1] = b + 1;
+            }
         }
         
         // 生成pageSizes, pageIndexs, lastPageLens

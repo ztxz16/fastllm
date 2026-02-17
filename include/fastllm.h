@@ -917,8 +917,10 @@ namespace fastllm {
     // q: query数据，维度为[num_heads, batch, head_dim]
     // batch: 批量大小
     // qSizes, pageSizes, pageIndexs, lastPageLens: 输出的参数
+    // seqLens: 可选，每个batch的seqLen（prefill时使用）。为空时每个batch的seqLen默认为1（decode）
     void GeneratePagedBatchParams(const Data &q, const std::vector<Data*> &pastKeys, 
-        int batch, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens);
+        int batch, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens,
+        const std::vector<int> &seqLens = {});
 }
 
 #endif //TEST_FASTLLM_H
