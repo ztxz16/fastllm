@@ -806,17 +806,10 @@ namespace fastllm {
                     dictLocker.lock();
                     pastKeyValue1 = &model->responseContextDict.dicts[handles[0]]->pastKeyValues;
                     dictLocker.unlock();
+                    auto prefillStartTime = std::chrono::system_clock::now();
                     for (int st = 0; st < len; ) {
-                        if (model->verbose) {
-                            genTokens += 1;
-                            auto nowTime = std::chrono::system_clock::now();
-                            float spend = GetSpan(lastRecordTime, nowTime);
-                            if (spend > 1) {
-                                printf("Long Prefill ... (%d%%)\n", st * 100 / len);
-                                lastRecordTime = nowTime;
-                            }
-                        }
                         int curLen = std::min(prefillChunkSize, len - st);
+                        auto chunkStartTime = std::chrono::system_clock::now();
                         Data curInput, curPositionIds;
                         Split(inputIds, 1, st, st + curLen, curInput);
                         Split(*positionIds[0], 1, st, st + curLen, curPositionIds);
@@ -834,12 +827,36 @@ namespace fastllm {
                                                   curPositionIdsVec, curSeqLens, curPastKeyValues, generationConfigs,
                                                   tokensManager, &logits);
                         st += curLen;
+                        if (model->verbose) {
+                            auto chunkEndTime = std::chrono::system_clock::now();
+                            float chunkSpend = GetSpan(chunkStartTime, chunkEndTime);
+                            float totalSpend = GetSpan(prefillStartTime, chunkEndTime);
+                            float chunkSpeed = chunkSpend > 0 ? curLen / chunkSpend : 0;
+                            float avgSpeed = totalSpend > 0 ? st / totalSpend : 0;
+                            printf("[Prefill] Long Prefill ... (%d/%d, %d%%). Speed: %f tokens / s.\n",
+                                   st, len, st * 100 / len, chunkSpeed);
+                        }
                     }
                 } else {
                     // 多个prefill请求混合 或 decode请求，统一调用ForwardBatch
+                    auto batchStartTime = std::chrono::system_clock::now();
                     ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
                                               positionIds, seqLens, pastKeyValues, generationConfigs,
                                               tokensManager, &logits);
+                    if (model->verbose) {
+                        int prefillTokens = 0;
+                        for (int i = 0; i < seqLens.size(); i++) {
+                            if (seqLens[i] > 1) {
+                                prefillTokens += seqLens[i];
+                            }
+                        }
+                        if (prefillTokens > 0) {
+                            auto batchEndTime = std::chrono::system_clock::now();
+                            float batchSpend = GetSpan(batchStartTime, batchEndTime);
+                            float prefillSpeed = batchSpend > 0 ? prefillTokens / batchSpend : 0;
+                            printf("[Prefill] %d Tokens. Speed: %f tokens / s.\n", prefillTokens, prefillSpeed);
+                        }
+                    }
                 }
 
                 forwardLocker.unlock();
@@ -855,7 +872,6 @@ namespace fastllm {
                         model->tokensLimit = maxTotalLens;
                         model->promptLimit = maxTotalLens * 3 / 4;
                         if (model->verbose) {
-                            printf("9into here\n");
                             printf("Fastllm KV Cache Token limit: %d tokens (maxPages=%d, pageLen=%d).\n", maxTotalLens, maxPages, pageLen);
                             printf("Fastllm Prompt Token limit: %d tokens.\n", std::min(model->max_positions, model->promptLimit));
                             printf("Fastllm Batch limit: %d.\n", maxBatch);
@@ -881,7 +897,7 @@ namespace fastllm {
                                 pending++;
                             }
                         }
-                        printf("alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n", alive, pending, aliveLen, (float)genTokens / spend);
+                        printf("[Decode]  alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n", alive, pending, aliveLen, (float)genTokens / spend);
                         lastRecordTime = nowTime;
                         genTokens = 0;
                     }
@@ -1329,7 +1345,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                                             pending++;
                                         }
                                     }
-                                    printf("alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n", alive, pending, aliveLen, (float)genTokens / spend);
+                                    printf("[Decode]  alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n", alive, pending, aliveLen, (float)genTokens / spend);
                                     lastRecordTime = nowTime;
                                     genTokens = 0;
                                 }
