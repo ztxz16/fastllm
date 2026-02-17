@@ -23,6 +23,7 @@ namespace fastllm {
     Qwen3Model::Qwen3Model() {
         this->model_struct = "llama";
         this->model_type = "qwen3";
+        this->use_new_engine = true;
 
         // 默认使用 llama3 的提示词和instruction
         this->pre_prompt="<|begin_of_text|><|start_header_id|>system<|end_header_id|>\nYou are a helpful assistant.<|eot_id|>";

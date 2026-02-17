@@ -562,12 +562,429 @@ namespace fastllm {
         exit(0);
     }
 
+    void basellm::NewMainLoop() {
+        basellm *model = this;
+        long long kvCacheLimit = 16LL << 30;
+#ifdef USE_CUDA
+        auto freeSizes = FastllmCudaGetFreeSizes();
+        auto dmap = GetDeviceMap();
+        std::set <int> deviceIds;
+        std::map <int, int> ratios;
+        for (auto &it : dmap) {
+            if (StartWith(it.first, "cuda")) {
+                for (int id : ParseDeviceIds(it.first, "cuda", ratios)) {
+                    deviceIds.insert(id);
+                }
+            }
+        }
+        if (deviceIds.size() == 0) {
+            deviceIds.insert(0);
+        }
+        kvCacheLimit = 0;
+        for (int id : deviceIds) {
+            if (id < freeSizes.size()) {
+                kvCacheLimit += std::max(freeSizes[id] * 3 / 4, freeSizes[id] - (2LL << 30));
+            } 
+        }
+        if (kvCacheLimit == 0) {
+            kvCacheLimit = 16LL << 30;
+        }
+#endif
+        if (model->kvCacheLimit > 0) {
+            kvCacheLimit = model->kvCacheLimit;
+        }
+
+        int unitSize = (model->dataType == DataType::FLOAT32 ? 4 : 2);
+        int maxTotalLens = kvCacheLimit / (model->elementsInKVCachePerToken * unitSize);
+        if (model->elementsInKVCachePerToken <= 0) {
+            maxTotalLens = kvCacheLimit / 1024 / 1024;
+        }
+        if (model->tokensLimit > 0) {
+            maxTotalLens = model->tokensLimit;
+        }
+
+        int maxBatch = std::max(1, std::min(512, maxTotalLens / 128));
+        if (model->maxBatch > 0) {
+            maxBatch = model->maxBatch;
+        }
+        
+        model->tokensLimit = maxTotalLens;
+        int limit = maxTotalLens;
+        model->promptLimit = limit * 3 / 4;
+
+        int prefillChunkSize;
+        if (model->chunkedPrefillSize >= 0) {
+            prefillChunkSize = model->chunkedPrefillSize;
+        } else {
+            prefillChunkSize = 8192;
+            if (model->model_struct == "deepseek_v2") {
+                prefillChunkSize = 2048;
+            }
+            if (model->model_struct == "qwen3_next") {
+                prefillChunkSize = 2048;
+            }
+        }
+
+        if (model->verbose) {
+            printf("Fastllm KV Cache Limit: %f MB.\n", (double)kvCacheLimit / 1e6);
+            printf("Fastllm KV Cache Token limit: %d tokens.\n", maxTotalLens);
+            printf("Fastllm Prompt Token limit: %d tokens.\n", std::min(model->max_positions, model->promptLimit));
+            printf("Fastllm Batch limit: %d.\n", maxBatch);
+        }
+
+        auto lastRecordTime = std::chrono::system_clock::now();
+        long long genTokens = 0;
+        while (true) {
+            if (model->isFree) {
+                break;
+            }
+            std::vector <Data*> attentionMasks;
+            std::vector <Data*> positionIds;
+            std::vector <std::pair <Data*, Data*> > pastKeyValues;
+            std::vector <float> ids;
+            std::vector <int> seqLens;
+            std::vector <int> handles;
+            std::vector <GenerationConfig> generationConfigs;
+            LastTokensManager tokensManager;
+            std::vector <std::vector <float>* > logits;
+            
+            std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+            auto &forwardLocker = model->forwardLocker;
+            
+            // 首先把已经abort的请求删除掉
+            std::set <int> abortHandles;
+            for (auto &it: model->responseContextDict.dicts) {
+                if (it.second->isAbort) {
+                    it.second->TryRecord(model);
+                    abortHandles.insert(it.first);
+                }
+            }
+            for (auto &it : abortHandles) {
+                model->responseContextDict.RemoveHandle(it);
+            }
+
+            int limit = maxTotalLens;
+
+            int lenSum = 0, currentActivate = 0;
+            for (auto &it: model->responseContextDict.dicts) {
+                if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
+                    lenSum += it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
+                    currentActivate++;
+                }
+            }
+            std::vector <std::pair <int, int> > orders;
+            for (auto &it : model->responseContextDict.dicts) {
+                orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
+            }
+            sort(orders.begin(), orders.end());
+
+            // 判断是否有可以做prefill的请求
+            bool hasPrefill = false;
+            for (auto &ii : orders) {
+                auto &it = *model->responseContextDict.dicts.find(ii.second);
+                if (!it.second->isEnding && it.second->preTokens == 0) {
+                    hasPrefill = true;
+                    break;
+                }
+            }
+
+            // isPrompt=1: Prefill阶段; isPrompt=0: Decode阶段; Prefill和Decode不混合
+            for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
+                if (isPrompt == 0 && seqLens.size() > 0) {
+                    continue;
+                }
+                // 如果有pending的prefill请求，优先做prefill，跳过decode
+                if (isPrompt == 0 && hasPrefill) {
+                    continue;
+                }
+
+                int prefillTokenCount = 0; // 当前已收集的prefill总token数
+
+                for (auto &ii : orders) {
+                    auto &it = *model->responseContextDict.dicts.find(ii.second);
+
+                    if (it.second->isEnding) {
+                        continue;
+                    }
+                    if (isPrompt && it.second->preTokens != 0) {
+                        continue;
+                    }
+                    if (!isPrompt && it.second->preTokens == 0) {
+                        continue;
+                    }
+
+                    if (it.second->cacheLen + it.second->currentTokens.size() > maxTotalLens ||
+                        it.second->cacheLen + it.second->currentTokens.size() > model->max_positions) {
+                        it.second->isEnding = true;
+                        it.second->error = ResponseContextErrorPromptTooLong;
+                        continue;
+                    }
+
+                    if (isPrompt) {
+                        int alive = 0;
+                        for (auto &jt: model->responseContextDict.dicts) {
+                            if (jt.second->isEnding) {
+                                continue;
+                            }
+                            if (jt.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
+                                alive++;
+                            }
+                        }
+                        if (alive + (int)seqLens.size() >= maxBatch) {
+                            continue;
+                        }
+                        if (lenSum + it.second->currentTokens.size() + (currentActivate + 1) * 256 > maxTotalLens) {
+                            continue;
+                        }
+
+                        // Prefill: 多个请求混合，总token数不超过prefillChunkSize
+                        int thisLen = (int)it.second->currentTokens.size();
+                        if (thisLen > prefillChunkSize) {
+                            // 单个请求超长，这一轮只处理这一个请求（后面会切分）
+                            if (seqLens.size() > 0) {
+                                continue;
+                            }
+                        } else {
+                            if (prefillTokenCount + thisLen > prefillChunkSize && seqLens.size() > 0) {
+                                continue;
+                            }
+                        }
+                        prefillTokenCount += thisLen;
+                        lenSum += thisLen;
+                        currentActivate++;
+                    } else {
+                        // Decode阶段: KV Cache空间检查
+                        if (it.second->pastKeyValues[model->kvCacheId].first.isPagedKVCache) {
+                            if (it.second->pastKeyValues[model->kvCacheId].first.pageLen == it.second->pastKeyValues[model->kvCacheId].first.lastPageLen) {
+                                int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;                                        
+                                int predictLen = 256;
+                                if (sur > 0) {
+                                    predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
+                                }
+                                if (lenSum + predictLen > limit) {
+                                    continue;
+                                }
+                                lenSum += predictLen;
+                            }
+                        } else {
+                            if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1] == it.second->pastKeyValues[0].first.dims[1]) {
+                                int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;                                        
+                                int predictLen = 256;
+                                if (sur > 0) {
+                                    predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
+                                }
+                                if (lenSum + predictLen > limit) {
+                                    continue;
+                                }
+                                lenSum += predictLen;
+                            }
+                        }
+                    }
+
+                    generationConfigs.push_back(it.second->generationConfig);
+                    if (it.second->generationConfig.output_logits) {
+                        it.second->resultLogits.push(new std::vector<float>());
+                        logits.push_back(it.second->resultLogits.back());
+                    } else {
+                        logits.push_back(nullptr);
+                    }
+
+                    tokensManager.units.push_back(it.second->tokens);
+                    handles.push_back(it.first);
+
+                    if (it.second->preTokens == 0) {
+                        it.second->intParams["add_special_tokens"] = it.second->cacheLen > 0 ? false : it.second->generationConfig.add_special_tokens;
+                        it.second->intParams["promptLen"] = it.second->cacheLen + it.second->currentTokens.size();
+                        it.second->intParams["index"] = 0;
+                    } else {
+                        it.second->intParams["index"]++;
+                    }
+                    Data inputIds, attentionMask, curPositionIds;
+                    std::vector<std::vector<float> > tokens;
+                    tokens.resize(1);
+                    for (int i: it.second->currentTokens) {
+                        tokens[0].push_back(i);
+                    }
+                    model->FillLLMInputs(tokens, it.second->intParams, inputIds, attentionMask, curPositionIds);
+                    ToDataType(attentionMask, model->dataType);
+
+                    seqLens.push_back(inputIds.Count(0));
+                    for (int i = 0; i < inputIds.Count(0); i++) {
+                        ids.push_back(((float *) inputIds.cpuData)[i]);
+                    }
+                    if (attentionMask.dims.size() == 0) {
+                        attentionMasks.push_back(nullptr);
+                    } else {
+                        attentionMasks.push_back(new Data());
+                        attentionMask.ToDevice(DataDevice::CPU);
+                        attentionMasks.back()->CopyFrom(attentionMask);
+                    }
+                    if (curPositionIds.dims.size() == 0) {
+                        positionIds.push_back(nullptr);
+                    } else {
+                        positionIds.push_back(new Data());
+                        positionIds.back()->CopyFrom(curPositionIds);
+                    }
+                    it.second->preTokens += seqLens.back();
+                    for (int i = 0; i < model->block_cnt; i++) {
+                        pastKeyValues.push_back(std::make_pair(&it.second->pastKeyValues[i].first,
+                                                               &it.second->pastKeyValues[i].second));
+                    }
+
+                    if (seqLens.size() >= maxBatch || lenSum + seqLens.size() * 128 > limit) {
+                        break;
+                    }
+                }
+            }
+
+            if (seqLens.size() > 0) {
+                dictLocker.unlock();
+                forwardLocker.lock();
+#ifdef USE_CUDA
+                FastllmCudaClearBigBuffer();
+#endif
+                Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
+                std::vector<int> ret;
+
+                // 如果是单个超长prefill请求，切分成多个小块
+                if (seqLens.size() == 1 && seqLens[0] > prefillChunkSize) {
+                    int len = seqLens[0];
+                    std::vector <std::pair <Data, Data> > *pastKeyValue1;
+                    dictLocker.lock();
+                    pastKeyValue1 = &model->responseContextDict.dicts[handles[0]]->pastKeyValues;
+                    dictLocker.unlock();
+                    for (int st = 0; st < len; ) {
+                        if (model->verbose) {
+                            genTokens += 1;
+                            auto nowTime = std::chrono::system_clock::now();
+                            float spend = GetSpan(lastRecordTime, nowTime);
+                            if (spend > 1) {
+                                printf("Long Prefill ... (%d%%)\n", st * 100 / len);
+                                lastRecordTime = nowTime;
+                            }
+                        }
+                        int curLen = std::min(prefillChunkSize, len - st);
+                        Data curInput, curPositionIds;
+                        Split(inputIds, 1, st, st + curLen, curInput);
+                        Split(*positionIds[0], 1, st, st + curLen, curPositionIds);
+
+                        // 切分后的块也通过ForwardBatch接口调用
+                        std::vector <int> curSeqLens = {curLen};
+                        std::vector <Data*> curAttentionMasks = {nullptr};
+                        std::vector <Data*> curPositionIdsVec = {&curPositionIds};
+                        std::vector <std::pair <Data*, Data*> > curPastKeyValues;
+                        for (int i = 0; i < model->block_cnt; i++) {
+                            curPastKeyValues.push_back(std::make_pair(&(*pastKeyValue1)[i].first,
+                                                                      &(*pastKeyValue1)[i].second));
+                        }
+                        ret = model->ForwardBatch(1, curInput, curAttentionMasks,
+                                                  curPositionIdsVec, curSeqLens, curPastKeyValues, generationConfigs,
+                                                  tokensManager, &logits);
+                        st += curLen;
+                    }
+                } else {
+                    // 多个prefill请求混合 或 decode请求，统一调用ForwardBatch
+                    ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
+                                              positionIds, seqLens, pastKeyValues, generationConfigs,
+                                              tokensManager, &logits);
+                }
+
+                forwardLocker.unlock();
+                dictLocker.lock();
+
+                if (model->verbose) {
+                    genTokens += seqLens.size();
+                    auto nowTime = std::chrono::system_clock::now();
+                    float spend = GetSpan(lastRecordTime, nowTime);
+                    if (spend > 1) {
+                        int total = 0, alive = 0, aliveLen = 0, pending = 0;
+                        for (auto &it: model->responseContextDict.dicts) {
+                            if (it.second->isEnding) {
+                                continue;
+                            }
+                            if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
+                                alive++;
+                                aliveLen += it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
+                            } else {
+                                pending++;
+                            }
+                        }
+                        printf("alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n", alive, pending, aliveLen, (float)genTokens / spend);
+                        lastRecordTime = nowTime;
+                        genTokens = 0;
+                    }
+                }
+
+                for (int i = 0; i < handles.size(); i++) {
+                    auto &it = *model->responseContextDict.dicts.find(handles[i]);
+                    int curRet = ret[i];
+                    if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
+                        it.second->isEnding = true;
+                        it.second->TryRecord(model);
+                    } else {
+                        auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
+                        if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
+                            it.second->isEnding = true;
+                            it.second->TryRecord(model);
+                        }
+                    }
+                    if (it.second->isEnding == false) {
+                        it.second->currentTokens = std::vector<int>{curRet};
+                        it.second->resultTokenQueue.push(curRet);
+                        it.second->allTokens.push_back(curRet);
+                        it.second->tokens.Push(curRet);
+                        it.second->curTokens++;
+                        if (it.second->curTokens == it.second->generationConfig.output_token_limit
+                            || it.second->allTokens.size() >= model->max_positions) {
+                            it.second->isEnding = true;
+                            it.second->TryRecord(model);
+                        }
+                    }
+                }
+            } else {
+                int maxLen = -1, select = -1;
+                for (auto &it: model->responseContextDict.dicts) {
+                    if (it.second->isEnding) {
+                        continue;
+                    }
+                    if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
+                        int curLen = it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
+                        if (curLen > maxLen) {
+                            maxLen = curLen;
+                            select = it.first;
+                        }
+                    }
+                }
+                if (select != -1) {
+                    model->responseContextDict.dicts[select]->isEnding = true;
+                    continue;
+                }
+            }
+
+            for (int i = 0; i < attentionMasks.size(); i++) {
+                delete attentionMasks[i];
+            }
+            for (int i = 0; i < positionIds.size(); i++) {
+                delete positionIds[i];
+            }
+
+            if (seqLens.size() == 0) {
+                model->dictCV.wait(dictLocker);
+            }
+        }
+    }
+
     int basellm::LaunchResponseTokens(const std::vector<int> &inputTokens,
                                       const fastllm::GenerationConfig &generationConfig,
                                       const std::map <std::string, std::vector <Data*> > &multimodalInput) {
         mainLoopLocker.lock();
         if (mainLoop == nullptr) {
             if (mainLoop == nullptr) {
+                if (this->use_new_engine) {
+                    mainLoop = new std::thread([](basellm *model) {
+                        model->NewMainLoop();
+                    }, this);
+                } else {
                 mainLoop = new std::thread([](basellm *model) {
                     long long kvCacheLimit = 16LL << 30;
 #ifdef USE_CUDA
@@ -1003,6 +1420,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                         }
                     }
                 }, this);
+                } // end of else (old engine)
             }
         }
         mainLoopLocker.unlock();

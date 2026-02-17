@@ -24,6 +24,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--enable_thinking", type = str, default = "", help = "是否开启硬思考开关（需要模型支持）")
     parser.add_argument("--cuda_shared_expert", "--cuda_se", type = str, default = "true", help = "是否使用cuda来执行共享专家")
     parser.add_argument("--enable_amx", "--amx", type = str, default = "false", help = "是否开启amx加速")
+    parser.add_argument("--tokens", type = int, default = -1, help = "设置总的token数量（用于计算paged cache的最大页数）")
     
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
@@ -185,6 +186,8 @@ def make_normal_llm_model(args):
         llm.set_cuda_shared_expert(True)
     if (args.enable_amx.lower() not in ["", "false", "0", "off"]):
         llm.set_enable_amx(True)
+    if (args.tokens > 0):
+        llm.set_max_tokens(args.tokens)
     graph = None
     if (args.custom != ""):
         import importlib.util

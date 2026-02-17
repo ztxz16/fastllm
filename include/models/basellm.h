@@ -293,10 +293,12 @@ namespace fastllm {
             const GenerationConfig &generationConfig);
         virtual void ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data*, Data*> > &pastKeyValues, 
             const std::vector <GenerationConfig> &generationConfigs); 
-
+        
         std::string model_type;
         std::string model_struct;
         bool is_multi_modal = false; // 是否是多模态模型
+
+        bool use_new_engine = false; // 是否使用新的推理引擎，这是一个过渡变量，未来会删除
 
         std::string pre_prompt; // 最初对话的提示语
         std::string user_role, bot_role, history_sep; // 用于生成每一轮的prompt
@@ -370,6 +372,9 @@ namespace fastllm {
 
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
+
+        // 新推理引擎的主循环
+        void NewMainLoop();
     };
 }
 

@@ -57,6 +57,7 @@ namespace fastllm {
     static bool cudaEmbedding = false;
     static bool cudaSharedExpert = false;
     static bool enableAMX = false;
+    static int maxTokens = -1;
     static Data emptyData;
 
     static std::map <DataType, int> DataTypeBits = {
@@ -168,6 +169,14 @@ namespace fastllm {
 
     bool GetEnableAMX() {
         return enableAMX;
+    }
+
+    void SetMaxTokens(int tokens) {
+        maxTokens = tokens;
+    }
+
+    int GetMaxTokens() {
+        return maxTokens;
     }
 
     AliveThreadPool *GetAlivePool() {
@@ -3284,7 +3293,12 @@ namespace fastllm {
 
         // 根据设备类型设置默认 maxPages
         if (maxPages <= 0) {
-            maxPages = 300;
+            int globalMaxTokens = GetMaxTokens();
+            if (globalMaxTokens > 0 && pageLen > 0) {
+                maxPages = globalMaxTokens / pageLen + 1;
+            } else {
+                maxPages = 300;
+            }
         }
 
         // 初始化 pagedKVCacheData
