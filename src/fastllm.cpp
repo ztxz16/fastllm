@@ -3309,7 +3309,8 @@ namespace fastllm {
         ((Data*)manager)->Resize({maxPages, pageLen, numHeads, headDim});
         ((Data*)manager)->Allocate();
 
-        // 初始化 unusedPageIndex
+        // 初始化 pageLen 和 unusedPageIndex
+        manager->pageLen = pageLen;
         manager->SetMaxPages(maxPages);
 
         // 记录到静态 map 中

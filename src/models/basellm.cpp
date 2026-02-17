@@ -564,53 +564,12 @@ namespace fastllm {
 
     void basellm::NewMainLoop() {
         basellm *model = this;
-        long long kvCacheLimit = 16LL << 30;
-#ifdef USE_CUDA
-        auto freeSizes = FastllmCudaGetFreeSizes();
-        auto dmap = GetDeviceMap();
-        std::set <int> deviceIds;
-        std::map <int, int> ratios;
-        for (auto &it : dmap) {
-            if (StartWith(it.first, "cuda")) {
-                for (int id : ParseDeviceIds(it.first, "cuda", ratios)) {
-                    deviceIds.insert(id);
-                }
-            }
-        }
-        if (deviceIds.size() == 0) {
-            deviceIds.insert(0);
-        }
-        kvCacheLimit = 0;
-        for (int id : deviceIds) {
-            if (id < freeSizes.size()) {
-                kvCacheLimit += std::max(freeSizes[id] * 3 / 4, freeSizes[id] - (2LL << 30));
-            } 
-        }
-        if (kvCacheLimit == 0) {
-            kvCacheLimit = 16LL << 30;
-        }
-#endif
-        if (model->kvCacheLimit > 0) {
-            kvCacheLimit = model->kvCacheLimit;
-        }
+        int maxTotalLens = 0;
 
-        int unitSize = (model->dataType == DataType::FLOAT32 ? 4 : 2);
-        int maxTotalLens = kvCacheLimit / (model->elementsInKVCachePerToken * unitSize);
-        if (model->elementsInKVCachePerToken <= 0) {
-            maxTotalLens = kvCacheLimit / 1024 / 1024;
-        }
-        if (model->tokensLimit > 0) {
-            maxTotalLens = model->tokensLimit;
-        }
-
-        int maxBatch = std::max(1, std::min(512, maxTotalLens / 128));
+        int maxBatch = 512;
         if (model->maxBatch > 0) {
             maxBatch = model->maxBatch;
         }
-        
-        model->tokensLimit = maxTotalLens;
-        int limit = maxTotalLens;
-        model->promptLimit = limit * 3 / 4;
 
         int prefillChunkSize;
         if (model->chunkedPrefillSize >= 0) {
@@ -623,13 +582,6 @@ namespace fastllm {
             if (model->model_struct == "qwen3_next") {
                 prefillChunkSize = 2048;
             }
-        }
-
-        if (model->verbose) {
-            printf("Fastllm KV Cache Limit: %f MB.\n", (double)kvCacheLimit / 1e6);
-            printf("Fastllm KV Cache Token limit: %d tokens.\n", maxTotalLens);
-            printf("Fastllm Prompt Token limit: %d tokens.\n", std::min(model->max_positions, model->promptLimit));
-            printf("Fastllm Batch limit: %d.\n", maxBatch);
         }
 
         auto lastRecordTime = std::chrono::system_clock::now();
@@ -663,12 +615,13 @@ namespace fastllm {
                 model->responseContextDict.RemoveHandle(it);
             }
 
-            int limit = maxTotalLens;
+            int limit = (maxTotalLens > 0) ? maxTotalLens : 999999999;
 
             int lenSum = 0, currentActivate = 0;
             for (auto &it: model->responseContextDict.dicts) {
-                if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
-                    lenSum += it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
+                auto &kvFirst = it.second->pastKeyValues[model->kvCacheId].first;
+                if (kvFirst.pageIndex.size() > 0) {
+                    lenSum += (kvFirst.pageIndex.size() - 1) * kvFirst.pageLen + kvFirst.lastPageLen;
                     currentActivate++;
                 }
             }
@@ -713,7 +666,7 @@ namespace fastllm {
                         continue;
                     }
 
-                    if (it.second->cacheLen + it.second->currentTokens.size() > maxTotalLens ||
+                    if ((maxTotalLens > 0 && it.second->cacheLen + it.second->currentTokens.size() > maxTotalLens) ||
                         it.second->cacheLen + it.second->currentTokens.size() > model->max_positions) {
                         it.second->isEnding = true;
                         it.second->error = ResponseContextErrorPromptTooLong;
@@ -726,14 +679,14 @@ namespace fastllm {
                             if (jt.second->isEnding) {
                                 continue;
                             }
-                            if (jt.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
+                            if (jt.second->pastKeyValues[model->kvCacheId].first.pageIndex.size() > 0) {
                                 alive++;
                             }
                         }
                         if (alive + (int)seqLens.size() >= maxBatch) {
                             continue;
                         }
-                        if (lenSum + it.second->currentTokens.size() + (currentActivate + 1) * 256 > maxTotalLens) {
+                        if (maxTotalLens > 0 && lenSum + it.second->currentTokens.size() + (currentActivate + 1) * 256 > maxTotalLens) {
                             continue;
                         }
 
@@ -892,6 +845,24 @@ namespace fastllm {
                 forwardLocker.unlock();
                 dictLocker.lock();
 
+                if (maxTotalLens == 0 && pastKeyValues.size() > (size_t)model->kvCacheId) {
+                    auto &kv = *pastKeyValues[model->kvCacheId].first;
+                    if (kv.pagedKVCacheData != nullptr) {
+                        int maxPages = kv.pagedKVCacheData->maxPages;
+                        int pageLen = kv.pagedKVCacheData->pageLen;
+                        maxTotalLens = maxPages * pageLen;
+                        maxBatch = std::max(1, std::min(maxBatch, maxTotalLens / 128));
+                        model->tokensLimit = maxTotalLens;
+                        model->promptLimit = maxTotalLens * 3 / 4;
+                        if (model->verbose) {
+                            printf("9into here\n");
+                            printf("Fastllm KV Cache Token limit: %d tokens (maxPages=%d, pageLen=%d).\n", maxTotalLens, maxPages, pageLen);
+                            printf("Fastllm Prompt Token limit: %d tokens.\n", std::min(model->max_positions, model->promptLimit));
+                            printf("Fastllm Batch limit: %d.\n", maxBatch);
+                        }
+                    }
+                }
+
                 if (model->verbose) {
                     genTokens += seqLens.size();
                     auto nowTime = std::chrono::system_clock::now();
@@ -902,9 +873,10 @@ namespace fastllm {
                             if (it.second->isEnding) {
                                 continue;
                             }
-                            if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
+                            auto &kvFirst = it.second->pastKeyValues[model->kvCacheId].first;
+                            if (kvFirst.pageIndex.size() > 0) {
                                 alive++;
-                                aliveLen += it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
+                                aliveLen += (kvFirst.pageIndex.size() - 1) * kvFirst.pageLen + kvFirst.lastPageLen;
                             } else {
                                 pending++;
                             }
@@ -947,8 +919,9 @@ namespace fastllm {
                     if (it.second->isEnding) {
                         continue;
                     }
-                    if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
-                        int curLen = it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
+                    auto &kvFirst = it.second->pastKeyValues[model->kvCacheId].first;
+                    if (kvFirst.pageIndex.size() > 0) {
+                        int curLen = (kvFirst.pageIndex.size() - 1) * kvFirst.pageLen + kvFirst.lastPageLen;
                         if (curLen > maxLen) {
                             maxLen = curLen;
                             select = it.first;
