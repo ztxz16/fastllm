@@ -37,11 +37,19 @@ namespace fastllm {
 
     /*
     Paged Attention Block:
-    1. Linear QKV projection
-    2. QKVRMSNormRope + Split Q/K/V + AppendPagedCache(K,V)
-    3. AttentionPagedBatch
-    4. Reshape + Permute
-    5. output += Linear(attenOutput, oWeight, oBias)
+    Decode 路径 (isPrefill=false):
+        1. Linear QKV projection
+        2. QKVRMSNormRope + Split Q/K/V + AppendPagedCacheBatch(K,V)（融合算子）
+        3. AttentionPagedBatch
+        4. Reshape + Permute
+        5. output += Linear(attenOutput, oWeight, oBias)
+    Prefill 路径 (isPrefill=true):
+        1. Linear QKV projection
+        2. Split Q/K/V + Reshape + RMSNorm + RopeEncoding + Permute + Reshape
+        3. 逐 batch: AppendPagedCache(K,V)
+        4. AttentionPagedBatch（批量 attention）
+        5. Reshape
+        6. output += Linear(attenOutput, oWeight, oBias)
 
     参数说明:
     - attenInput: attention的输入 [bsz, seqlen, hidden]
@@ -77,6 +85,7 @@ namespace fastllm {
         float rope_base, float rope_factor, int max_positions,
         int rope_type, // RoPEType enum value
         bool kvCacheInCPU,
+        bool isPrefill,
         Data *hiddenStates
     );
 }
