@@ -6,6 +6,8 @@
 #include "utils.h"
 #include <sstream>
 #include <cstring>
+#include <cstdlib>
+#include <algorithm>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -670,6 +672,8 @@ namespace fastllm {
                         it.second->cacheLen + it.second->currentTokens.size() > model->max_positions) {
                         it.second->isEnding = true;
                         it.second->error = ResponseContextErrorPromptTooLong;
+                        printf("[Handle %d] Finished. Reason: prompt too long (cacheLen=%d, currentTokens=%d, maxTotalLens=%d, max_positions=%d).\n",
+                               it.first, it.second->cacheLen, (int)it.second->currentTokens.size(), maxTotalLens, model->max_positions);
                         continue;
                     }
 
@@ -833,7 +837,7 @@ namespace fastllm {
                             float totalSpend = GetSpan(prefillStartTime, chunkEndTime);
                             float chunkSpeed = chunkSpend > 0 ? curLen / chunkSpend : 0;
                             float avgSpeed = totalSpend > 0 ? st / totalSpend : 0;
-                            printf("[Prefill] Long Prefill ... (%d/%d, %d%%). Speed: %f tokens / s.\n",
+                            printf("[Prompt] Long Prefill ... (%d/%d, %d%%). Speed: %f tokens / s.\n",
                                    st, len, st * 100 / len, chunkSpeed);
                         }
                     }
@@ -854,7 +858,7 @@ namespace fastllm {
                             auto batchEndTime = std::chrono::system_clock::now();
                             float batchSpend = GetSpan(batchStartTime, batchEndTime);
                             float prefillSpeed = batchSpend > 0 ? prefillTokens / batchSpend : 0;
-                            printf("[Prefill] %d Tokens. Speed: %f tokens / s.\n", prefillTokens, prefillSpeed);
+                            printf("[Prompt] %d Tokens. Speed: %f tokens / s.\n", prefillTokens, prefillSpeed);
                         }
                     }
                 }
@@ -870,7 +874,8 @@ namespace fastllm {
                         maxTotalLens = maxPages * pageLen;
                         maxBatch = std::max(1, std::min(maxBatch, maxTotalLens / 128));
                         model->tokensLimit = maxTotalLens;
-                        model->promptLimit = maxTotalLens * 3 / 4;
+                        model->promptLimit = maxTotalLens;
+                        // model->promptLimit = maxTotalLens * 3 / 4;
                         if (model->verbose) {
                             printf("Fastllm KV Cache Token limit: %d tokens (maxPages=%d, pageLen=%d).\n", maxTotalLens, maxPages, pageLen);
                             printf("Fastllm Prompt Token limit: %d tokens.\n", std::min(model->max_positions, model->promptLimit));
@@ -884,7 +889,8 @@ namespace fastllm {
                     auto nowTime = std::chrono::system_clock::now();
                     float spend = GetSpan(lastRecordTime, nowTime);
                     if (spend > 1) {
-                        int total = 0, alive = 0, aliveLen = 0, pending = 0;
+                        int alive = 0, pending = 0;
+                        int busyPages = 0, totalPages = 0;
                         for (auto &it: model->responseContextDict.dicts) {
                             if (it.second->isEnding) {
                                 continue;
@@ -892,12 +898,16 @@ namespace fastllm {
                             auto &kvFirst = it.second->pastKeyValues[model->kvCacheId].first;
                             if (kvFirst.pageIndex.size() > 0) {
                                 alive++;
-                                aliveLen += (kvFirst.pageIndex.size() - 1) * kvFirst.pageLen + kvFirst.lastPageLen;
+                                busyPages += kvFirst.pageIndex.size();
+                                if (totalPages == 0 && kvFirst.pagedKVCacheData != nullptr) {
+                                    totalPages = kvFirst.pagedKVCacheData->maxPages;
+                                }
                             } else {
                                 pending++;
                             }
                         }
-                        printf("[Decode]  alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n", alive, pending, aliveLen, (float)genTokens / spend);
+                        float kvUsage = totalPages > 0 ? busyPages * 100.0f / totalPages : 0;
+                        printf("[Decode] alive = %d, pending = %d, context usage: %.1f%%, Speed: %f tokens / s.\n", alive, pending, kvUsage, (float)genTokens / spend);
                         lastRecordTime = nowTime;
                         genTokens = 0;
                     }
@@ -909,11 +919,13 @@ namespace fastllm {
                     if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                         it.second->isEnding = true;
                         it.second->TryRecord(model);
+                        printf("[Handle %d] Finished. Reason: eos token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
                     } else {
                         auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
                         if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
                             it.second->isEnding = true;
                             it.second->TryRecord(model);
+                            printf("[Handle %d] Finished. Reason: stop token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
                         }
                     }
                     if (it.second->isEnding == false) {
@@ -922,10 +934,16 @@ namespace fastllm {
                         it.second->allTokens.push_back(curRet);
                         it.second->tokens.Push(curRet);
                         it.second->curTokens++;
-                        if (it.second->curTokens == it.second->generationConfig.output_token_limit
-                            || it.second->allTokens.size() >= model->max_positions) {
+                        if (it.second->curTokens == it.second->generationConfig.output_token_limit) {
                             it.second->isEnding = true;
                             it.second->TryRecord(model);
+                            printf("[Handle %d] Finished. Reason: output token limit reached (curTokens=%d, limit=%d).\n",
+                                   handles[i], it.second->curTokens, it.second->generationConfig.output_token_limit);
+                        } else if (it.second->allTokens.size() >= model->max_positions) {
+                            it.second->isEnding = true;
+                            it.second->TryRecord(model);
+                            printf("[Handle %d] Finished. Reason: max positions reached (allTokens=%d, max_positions=%d).\n",
+                                   handles[i], (int)it.second->allTokens.size(), model->max_positions);
                         }
                     }
                 }
@@ -946,6 +964,7 @@ namespace fastllm {
                 }
                 if (select != -1) {
                     model->responseContextDict.dicts[select]->isEnding = true;
+                    printf("[Handle %d] Finished. Reason: KV cache eviction (maxLen=%d).\n", select, maxLen);
                     continue;
                 }
             }
@@ -969,7 +988,16 @@ namespace fastllm {
         mainLoopLocker.lock();
         if (mainLoop == nullptr) {
             if (mainLoop == nullptr) {
-                if (this->use_new_engine) {
+                bool useNewEngine = this->use_new_engine;
+                const char *envVal = std::getenv("USE_OLD_ENGINE");
+                if (envVal != nullptr) {
+                    std::string val(envVal);
+                    std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+                    if (val == "on" || val == "1") {
+                        useNewEngine = false;
+                    }
+                }
+                if (useNewEngine) {
                     mainLoop = new std::thread([](basellm *model) {
                         model->NewMainLoop();
                     }, this);
