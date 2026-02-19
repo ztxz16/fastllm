@@ -3522,6 +3522,7 @@ namespace fastllm {
     }
 
     void PagedCacheManager::SetMaxPages(int maxPages) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         this->maxPages = maxPages;
         this->unusedPageIndex.clear();
         for (int i = 0; i < maxPages; i++) {
@@ -3530,6 +3531,7 @@ namespace fastllm {
     }
 
     int PagedCacheManager::GetUnusedPageIndex(bool pick) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         if (this->unusedPageIndex.empty()) {
             ErrorInFastLLM("PagedCacheManager::GetUnusedPageIndex: no page can be use.\n");
         }
@@ -3541,6 +3543,7 @@ namespace fastllm {
     }
 
     void PagedCacheManager::ReleasePageIndex(int pageIndex) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         this->unusedPageIndex.insert(pageIndex);
     }
 }
