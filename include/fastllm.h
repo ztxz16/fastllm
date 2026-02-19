@@ -19,6 +19,7 @@
 #include <iostream>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <locale>
 #include <codecvt>
 #include "devices/cpu/alivethreadpool.h"
@@ -488,6 +489,7 @@ namespace fastllm {
 
             // 目前可以使用的页索引
             std::set <int> unusedPageIndex;
+            std::mutex pageIndexLocker;
 
             void SetMaxPages(int maxPages);
             int GetUnusedPageIndex(bool pick);
