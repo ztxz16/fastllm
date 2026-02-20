@@ -7,6 +7,7 @@
 #include <sstream>
 #include <cstring>
 #include <cstdlib>
+#include <climits>
 #include <algorithm>
 
 #ifdef USE_CUDA
@@ -62,6 +63,21 @@ namespace fastllm {
     void ResponseContext::TryRecord(basellm *model) {
         if (model->saveHistoryChat) {
             model->pastKVCacheManager.Record(this->allTokens, this->allTokens.size(), &this->pastKeyValues);
+        }
+    }
+
+    void ResponseContext::TryRecordPagedCache() {
+        for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
+            auto &kvFirst = this->pastKeyValues[i].first;
+            auto &kvSecond = this->pastKeyValues[i].second;
+            PagedCacheManager *kManager = GetPagedCacheManager(i * 2);
+            PagedCacheManager *vManager = GetPagedCacheManager(i * 2 + 1);
+            if (kManager != nullptr && !kvFirst.pageIndex.empty()) {
+                kManager->Record(this->allTokens, kvFirst.pageIndex);
+            }
+            if (vManager != nullptr && !kvSecond.pageIndex.empty()) {
+                vManager->Record(this->allTokens, kvSecond.pageIndex);
+            }
         }
     }
 
@@ -661,7 +677,7 @@ namespace fastllm {
             std::set <int> abortHandles;
             for (auto &it: model->responseContextDict.dicts) {
                 if (it.second->isAbort) {
-                    it.second->TryRecord(model);
+                    it.second->TryRecordPagedCache();
                     abortHandles.insert(it.first);
                 }
             }
@@ -765,6 +781,92 @@ namespace fastllm {
                     }
 
                     if (isPrompt) {
+                        if (it.second->cacheLen == 0) {
+                            PagedCacheManager *probeManager = GetPagedCacheManager(model->kvCacheId * 2);
+                            if (probeManager != nullptr) {
+                                int minCachedPages = INT_MAX;
+                                for (int li = 0; li < model->block_cnt; li++) {
+                                    PagedCacheManager *kMgr = GetPagedCacheManager(li * 2);
+                                    PagedCacheManager *vMgr = GetPagedCacheManager(li * 2 + 1);
+                                    if (kMgr != nullptr) {
+                                        std::vector<int> kPages;
+                                        kMgr->Query(it.second->currentTokens, kPages);
+                                        minCachedPages = std::min(minCachedPages, (int)kPages.size());
+                                    } else {
+                                        minCachedPages = 0;
+                                    }
+                                    if (vMgr != nullptr) {
+                                        std::vector<int> vPages;
+                                        vMgr->Query(it.second->currentTokens, vPages);
+                                        minCachedPages = std::min(minCachedPages, (int)vPages.size());
+                                    } else {
+                                        minCachedPages = 0;
+                                    }
+                                    if (minCachedPages == 0) break;
+                                }
+                                if (minCachedPages > 0 && minCachedPages < INT_MAX) {
+                                    int cachedLen = minCachedPages * probeManager->pageLen;
+                                    if (cachedLen >= (int)it.second->currentTokens.size()) {
+                                        minCachedPages--;
+                                        cachedLen = minCachedPages * probeManager->pageLen;
+                                    }
+                                }
+                                if (minCachedPages > 0 && minCachedPages < INT_MAX) {
+                                    int cachedLen = minCachedPages * probeManager->pageLen;
+                                    for (int li = 0; li < model->block_cnt; li++) {
+                                        auto &kvFirst = it.second->pastKeyValues[li].first;
+                                        auto &kvSecond = it.second->pastKeyValues[li].second;
+                                        PagedCacheManager *kMgr = GetPagedCacheManager(li * 2);
+                                        PagedCacheManager *vMgr = GetPagedCacheManager(li * 2 + 1);
+                                        if (kMgr != nullptr) {
+                                            std::vector<int> kPages;
+                                            kMgr->Query(it.second->currentTokens, kPages);
+                                            kvFirst.isPagedKVCache = true;
+                                            kvFirst.pagedKVCacheData = kMgr;
+                                            kvFirst.pageLen = kMgr->pageLen;
+                                            kvFirst.pageIndex.clear();
+                                            {
+                                                std::lock_guard<std::mutex> guard(kMgr->pageIndexLocker);
+                                                for (int pi = 0; pi < minCachedPages; pi++) {
+                                                    kvFirst.pageIndex.push_back(kPages[pi]);
+                                                    kMgr->unusedPageIndex.erase(kPages[pi]);
+                                                }
+                                            }
+                                            kvFirst.lastPageLen = kMgr->pageLen;
+                                            int numHeads = ((Data*)kMgr)->dims[2];
+                                            int headDim = ((Data*)kMgr)->dims[3];
+                                            kvFirst.Resize({numHeads, cachedLen, headDim});
+                                        }
+                                        if (vMgr != nullptr) {
+                                            std::vector<int> vPages;
+                                            vMgr->Query(it.second->currentTokens, vPages);
+                                            kvSecond.isPagedKVCache = true;
+                                            kvSecond.pagedKVCacheData = vMgr;
+                                            kvSecond.pageLen = vMgr->pageLen;
+                                            kvSecond.pageIndex.clear();
+                                            {
+                                                std::lock_guard<std::mutex> guard(vMgr->pageIndexLocker);
+                                                for (int pi = 0; pi < minCachedPages; pi++) {
+                                                    kvSecond.pageIndex.push_back(vPages[pi]);
+                                                    vMgr->unusedPageIndex.erase(vPages[pi]);
+                                                }
+                                            }
+                                            kvSecond.lastPageLen = vMgr->pageLen;
+                                            int numHeads = ((Data*)vMgr)->dims[2];
+                                            int headDim = ((Data*)vMgr)->dims[3];
+                                            kvSecond.Resize({numHeads, cachedLen, headDim});
+                                        }
+                                    }
+                                    it.second->currentTokens.erase(it.second->currentTokens.begin(), it.second->currentTokens.begin() + cachedLen);
+                                    it.second->cacheLen = cachedLen;
+                                    curBusyPages += minCachedPages;
+                                    if (model->verbose) {
+                                        printf("[Handle %d] Prefix cache hit: %d pages (%d tokens).\n", it.first, minCachedPages, cachedLen);
+                                    }
+                                }
+                            }
+                        }
+
                         int alive = 0;
                         for (auto &jt: model->responseContextDict.dicts) {
                             if (jt.second->isEnding) {
@@ -1083,13 +1185,13 @@ namespace fastllm {
                     int curRet = ret[i];
                     if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                         it.second->isEnding = true;
-                        it.second->TryRecord(model);
+                        it.second->TryRecordPagedCache();
                         printf("[Handle %d] Finished. Reason: eos token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
                     } else {
                         auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
                         if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
                             it.second->isEnding = true;
-                            it.second->TryRecord(model);
+                            it.second->TryRecordPagedCache();
                             printf("[Handle %d] Finished. Reason: stop token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
                         }
                     }
@@ -1101,12 +1203,12 @@ namespace fastllm {
                         it.second->curTokens++;
                         if (it.second->curTokens == it.second->generationConfig.output_token_limit) {
                             it.second->isEnding = true;
-                            it.second->TryRecord(model);
+                            it.second->TryRecordPagedCache();
                             printf("[Handle %d] Finished. Reason: output token limit reached (curTokens=%d, limit=%d).\n",
                                    handles[i], it.second->curTokens, it.second->generationConfig.output_token_limit);
                         } else if (it.second->allTokens.size() >= model->max_positions) {
                             it.second->isEnding = true;
-                            it.second->TryRecord(model);
+                            it.second->TryRecordPagedCache();
                             printf("[Handle %d] Finished. Reason: max positions reached (allTokens=%d, max_positions=%d).\n",
                                    handles[i], (int)it.second->allTokens.size(), model->max_positions);
                         }

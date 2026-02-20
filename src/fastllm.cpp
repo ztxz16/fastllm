@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cmath>
 #include <cfloat>
+#include <climits>
 #include <thread>
 #include <algorithm>
 
@@ -3260,14 +3261,21 @@ namespace fastllm {
         });
     }
 
+    static std::unordered_map<int, PagedCacheManager*> layerPagedCacheManagers;
+
+    PagedCacheManager* GetPagedCacheManager(int layerIndex) {
+        auto it = layerPagedCacheManagers.find(layerIndex);
+        if (it == layerPagedCacheManagers.end()) {
+            return nullptr;
+        }
+        return it->second;
+    }
+
     PagedCacheManager* AllocatePagedCacheManager(int layerIndex, 
         PagedCacheManager::PagedCacheManagerType type, 
         const Data &cacheData, 
         int pageLen, 
         int maxPages) {
-        // 静态缓存：按层号复用 PagedCacheManager
-        static std::unordered_map<int, PagedCacheManager*> layerPagedCacheManagers;
-
         auto it = layerPagedCacheManagers.find(layerIndex);
         if (it != layerPagedCacheManagers.end()) {
             return it->second;
@@ -3528,6 +3536,13 @@ namespace fastllm {
         for (int i = 0; i < maxPages; i++) {
             this->unusedPageIndex.insert(i);
         }
+        this->pageTimestamp.assign(maxPages, 0);
+        this->currentTimestamp = 0;
+        this->pageToTrieNode.clear();
+        if (this->trieRoot) {
+            // 简单起见，不递归删除旧树节点（在生命周期内 SetMaxPages 通常只调用一次）
+        }
+        this->trieRoot = new CacheTrieNode();
     }
 
     int PagedCacheManager::GetUnusedPageIndex(bool pick) {
@@ -3535,7 +3550,46 @@ namespace fastllm {
         if (this->unusedPageIndex.empty()) {
             ErrorInFastLLM("PagedCacheManager::GetUnusedPageIndex: no page can be use.\n");
         }
-        int pageIndex = *this->unusedPageIndex.begin();
+
+        // 优先选不在 Trie 中的空闲页
+        int pageIndex = -1;
+        for (int idx : this->unusedPageIndex) {
+            if (this->pageToTrieNode.find(idx) == this->pageToTrieNode.end()) {
+                pageIndex = idx;
+                break;
+            }
+        }
+
+        if (pageIndex == -1) {
+            // 所有空闲页都在 Trie 中，选时间戳最旧的叶子节点
+            long long oldestTs = LLONG_MAX;
+            int oldestPage = -1;
+            for (int idx : this->unusedPageIndex) {
+                auto it = this->pageToTrieNode.find(idx);
+                if (it != this->pageToTrieNode.end()) {
+                    CacheTrieNode *node = it->second;
+                    if (node->children.empty() && node->timestamp < oldestTs) {
+                        oldestTs = node->timestamp;
+                        oldestPage = idx;
+                    }
+                }
+            }
+
+            if (oldestPage == -1) {
+                // 回退：选任意空闲页
+                pageIndex = *this->unusedPageIndex.begin();
+            } else {
+                pageIndex = oldestPage;
+                // 从 Trie 中移除该叶子节点
+                CacheTrieNode *node = this->pageToTrieNode[pageIndex];
+                if (node->parent) {
+                    node->parent->children.erase(node->edgeHash);
+                }
+                this->pageToTrieNode.erase(pageIndex);
+                delete node;
+            }
+        }
+
         if (pick) {
             this->unusedPageIndex.erase(pageIndex);
         }
@@ -3545,5 +3599,88 @@ namespace fastllm {
     void PagedCacheManager::ReleasePageIndex(int pageIndex) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         this->unusedPageIndex.insert(pageIndex);
+    }
+
+    uint64_t PagedCacheManager::HashTokenPage(const int *tokens, int len) {
+        uint64_t hash = 0;
+        const uint64_t P = 1000000007ULL;
+        for (int i = 0; i < len; i++) {
+            hash = hash * P + (uint64_t)tokens[i];
+        }
+        return hash;
+    }
+
+    void PagedCacheManager::Record(const std::vector<int> &tokens, const std::vector<int> &pages) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        this->currentTimestamp++;
+        long long ts = this->currentTimestamp;
+
+        int numPages = (int)tokens.size() / this->pageLen;
+        if ((int)pages.size() < numPages) {
+            numPages = (int)pages.size();
+        }
+
+        CacheTrieNode *cur = this->trieRoot;
+        for (int i = 0; i < numPages; i++) {
+            uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
+            int pid = pages[i];
+
+            auto it = cur->children.find(h);
+            CacheTrieNode *child;
+            if (it == cur->children.end()) {
+                child = new CacheTrieNode();
+                child->parent = cur;
+                child->edgeHash = h;
+                cur->children[h] = child;
+            } else {
+                child = it->second;
+                // 如果旧节点绑定了不同的 page，解除旧映射
+                if (child->pageId != -1 && child->pageId != pid) {
+                    this->pageToTrieNode.erase(child->pageId);
+                }
+            }
+
+            child->pageId = pid;
+            child->timestamp = ts;
+            this->pageTimestamp[pid] = ts;
+            this->pageToTrieNode[pid] = child;
+
+            cur = child;
+        }
+    }
+
+    void PagedCacheManager::Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        cachedPageIds.clear();
+
+        int numPages = (int)tokens.size() / this->pageLen;
+        CacheTrieNode *cur = this->trieRoot;
+
+        for (int i = 0; i < numPages; i++) {
+            uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
+
+            auto it = cur->children.find(h);
+            if (it == cur->children.end()) {
+                break;
+            }
+
+            CacheTrieNode *child = it->second;
+            if (child->pageId == -1) {
+                break;
+            }
+
+            // 验证时间戳：页面未被覆盖
+            if (this->pageTimestamp[child->pageId] != child->timestamp) {
+                break;
+            }
+
+            // 验证页面当前处于空闲状态（即未被其他请求占用）
+            if (this->unusedPageIndex.find(child->pageId) == this->unusedPageIndex.end()) {
+                break;
+            }
+
+            cachedPageIds.push_back(child->pageId);
+            cur = child;
+        }
     }
 }
