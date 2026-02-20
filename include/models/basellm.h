@@ -51,6 +51,7 @@ namespace fastllm {
 
         void Init(int blocks, DataType dataType);
         void TryRecord(basellm *model);
+        void TryRecordPagedCache();
     };
 
     struct ResponseContextDict {
