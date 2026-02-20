@@ -365,6 +365,7 @@ namespace fastllm {
             AttentionPagedBlock(
                 &attenInput,
                 &weight[mergeQkvWeightName], &weight[mergeQkvBiasName],
+                GetEmptyData(), GetEmptyData(),
                 &weight[qNormName], &weight[kNormName],
                 &weight[oWeightName], &weight[oBiasName],
                 &allPositionIds,
@@ -382,7 +383,8 @@ namespace fastllm {
                 GetKVCacheInCPU(),
                 isPrefill,
                 &hiddenStates,
-                true
+                true,
+                false
             );
 
             RMSNorm(hiddenStates, this->weight[postRmsName], rms_norm_eps, attenInput);

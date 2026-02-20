@@ -22,6 +22,7 @@ namespace fastllm {
     void AttentionPagedBlock (
         Data *attenInput,
         Data *mergeQkvWeight, Data *mergeQkvBias,
+        Data *preQNormWeight, Data *preKNormWeight,
         Data *qNormWeight, Data *kNormWeight,
         Data *oWeight, Data *oBias,
         Data *allPositionIds,
@@ -41,10 +42,18 @@ namespace fastllm {
         bool kvCacheInCPU,
         bool isPrefill,
         Data *hiddenStates,
-        bool doQKNorm
+        bool doQKNorm,
+        bool doPostQKNorm
     ) {
         // 1. Linear QKV projection
         Linear(*attenInput, *mergeQkvWeight, *mergeQkvBias, *qkv);
+
+        if (doPostQKNorm) {
+            int per = qkv->dims.back() / (num_attention_heads / num_key_value_heads + 2);
+            int qdim = per * (num_attention_heads / num_key_value_heads);
+            RMSNormPart(*qkv, *preQNormWeight, rms_norm_eps, 0, qdim, *qkv);
+            RMSNormPart(*qkv, *preKNormWeight, rms_norm_eps, qdim, qdim + per, *qkv);
+        }
 
         // 2. 计算 targetSeqLength 和 rope 参数
         int targetSeqLength = 0;
