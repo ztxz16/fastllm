@@ -3156,7 +3156,7 @@ namespace fastllm {
         Data &insertIndexs, Data &insertPositions,
         int q_heads, int k_heads, int head_dim,
         int rotaryDim, float eps, float ropeTheta, float ropeScale,
-        int pageLen, int batch) {
+        int pageLen, int batch, bool doQKNorm) {
         curExecutor->Run("QKVRMSNormRopeSplitAppendPagedCache", {
                 {"qkv", &qkv}, {"qNormWeight", &qNormWeight}, {"kNormWeight", &kNormWeight},
                 {"positionIds", (Data*)&positionIds},
@@ -3164,7 +3164,7 @@ namespace fastllm {
                 {"pagedKCacheData", &pagedKCacheData}, {"pagedVCacheData", &pagedVCacheData},
                 {"insertIndexs", &insertIndexs}, {"insertPositions", &insertPositions}
         }, {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
-           {{"q_heads", q_heads}, {"k_heads", k_heads}, {"head_dim", head_dim}, {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch}});
+           {{"q_heads", q_heads}, {"k_heads", k_heads}, {"head_dim", head_dim}, {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch}, {"doQKNorm", (int)doQKNorm}});
     }
 
     void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale) {
