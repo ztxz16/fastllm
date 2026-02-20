@@ -3289,7 +3289,8 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
     float ropeTheta,
     float ropeScale,
     int pageLen,             // page length for paged cache
-    int batch                // 逻辑 batch 数（= insertIndexs 长度）
+    int batch,               // 逻辑 batch 数（= insertIndexs 长度）
+    int doQKNorm             // 是否做 QK RMSNorm（0 = 跳过）
 ) {
     int total_heads = q_heads + k_heads + v_heads;
     int block_id = blockIdx.x;
@@ -3320,46 +3321,48 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
     T *base = qkvData + token_id * total_dim + offset_in_total;
 
     if (head_id < q_heads + k_heads) {
-        // ======== Q or K head: RMSNorm + RoPE ========
-        float *normWeight = (head_id < q_heads) ? qNormWeight : kNormWeight;
+        // ======== Q or K head: (optional) RMSNorm + RoPE ========
+        if (doQKNorm) {
+            float *normWeight = (head_id < q_heads) ? qNormWeight : kNormWeight;
 
-        // Step 1: RMSNorm
-        __shared__ float sdata[THREAD_PER_BLOCK];
-        __shared__ float scale;
+            // Step 1: RMSNorm
+            __shared__ float sdata[THREAD_PER_BLOCK];
+            __shared__ float scale;
 
-        float local_sum2 = 0.0f;
-        for (int i = tid; i < head_dim; i += THREAD_PER_BLOCK) {
-            float x = (float)base[i];
-            local_sum2 += x * x;
-        }
-        sdata[tid] = local_sum2;
-        __syncthreads();
+            float local_sum2 = 0.0f;
+            for (int i = tid; i < head_dim; i += THREAD_PER_BLOCK) {
+                float x = (float)base[i];
+                local_sum2 += x * x;
+            }
+            sdata[tid] = local_sum2;
+            __syncthreads();
 
-        for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
-            if (tid < s) sdata[tid] += sdata[tid + s];
+            for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
+                if (tid < s) sdata[tid] += sdata[tid + s];
+                __syncthreads();
+            }
+            if (tid < 32) {
+                volatile float *now = sdata;
+                now[tid] += now[tid + 32];
+                now[tid] += now[tid + 16];
+                now[tid] += now[tid + 8];
+                now[tid] += now[tid + 4];
+                now[tid] += now[tid + 2];
+                now[tid] += now[tid + 1];
+            }
+            __syncthreads();
+
+            if (tid == 0) {
+                scale = 1.0f / sqrtf(sdata[0] / head_dim + eps);
+            }
+            __syncthreads();
+
+            // Apply RMSNorm in-place
+            for (int i = tid; i < head_dim; i += THREAD_PER_BLOCK) {
+                base[i] = (T)((float)base[i] * scale * normWeight[i]);
+            }
             __syncthreads();
         }
-        if (tid < 32) {
-            volatile float *now = sdata;
-            now[tid] += now[tid + 32];
-            now[tid] += now[tid + 16];
-            now[tid] += now[tid + 8];
-            now[tid] += now[tid + 4];
-            now[tid] += now[tid + 2];
-            now[tid] += now[tid + 1];
-        }
-        __syncthreads();
-
-        if (tid == 0) {
-            scale = 1.0f / sqrtf(sdata[0] / head_dim + eps);
-        }
-        __syncthreads();
-
-        // Apply RMSNorm in-place
-        for (int i = tid; i < head_dim; i += THREAD_PER_BLOCK) {
-            base[i] = (T)((float)base[i] * scale * normWeight[i]);
-        }
-        __syncthreads();
 
         // Step 2: RoPE Encoding
         // positionIds 用物理索引 [phys_b * partStride + phys_l]
@@ -3431,7 +3434,8 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int32_t *insertPositions,
     int q_heads, int k_heads, int head_dim,
     int rotateDim, float eps, float ropeTheta, float ropeScale,
-    int pageLen, int unitSize, int batch
+    int pageLen, int unitSize, int batch,
+    int doQKNorm
 ) {
     float *cudaQKV = (float *) FastllmCudaPrepareInput(qkv);
     float *cudaPositionIds = (float *) FastllmCudaPrepareInput(positionIds);
@@ -3455,7 +3459,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
                 cudaPositionIds, cudaQOutput,
                 pagedKData, pagedVData, insertIndexs, insertPositions,
                 outer, total_dim, q_heads, k_heads, v_heads, head_dim,
-                bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch);
+                bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
         };
         if (head_dim <= 64) launch(std::integral_constant<int, 64>{});
         else if (head_dim <= 128) launch(std::integral_constant<int, 128>{});
@@ -3467,7 +3471,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
                 cudaPositionIds, (half*)cudaQOutput,
                 pagedKData, pagedVData, insertIndexs, insertPositions,
                 outer, total_dim, q_heads, k_heads, v_heads, head_dim,
-                bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch);
+                bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
         };
         if (head_dim <= 64) launch(std::integral_constant<int, 64>{});
         else if (head_dim <= 128) launch(std::integral_constant<int, 128>{});
@@ -3479,7 +3483,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
                 cudaPositionIds, (__nv_bfloat16*)cudaQOutput,
                 pagedKData, pagedVData, insertIndexs, insertPositions,
                 outer, total_dim, q_heads, k_heads, v_heads, head_dim,
-                bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch);
+                bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
         };
         if (head_dim <= 64) launch(std::integral_constant<int, 64>{});
         else if (head_dim <= 128) launch(std::integral_constant<int, 128>{});
