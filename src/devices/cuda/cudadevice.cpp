@@ -25,6 +25,7 @@ namespace fastllm {
         this->ops["Embedding"] = (BaseOperator*)(new CudaEmbedding());
         this->ops["LayerNorm"] = (BaseOperator*)(new CudaLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
+        this->ops["RMSNormPart"] = (BaseOperator*)(new CudaRMSNormPartOp());
         this->ops["Linear"] = (BaseOperator*)(new CudaLinearOp());
         this->ops["LinearAdd"] = (BaseOperator*)(new CudaLinearAddOp());
         this->ops["LinearSwiglu"] = (BaseOperator*)(new CudaLinearSwigluOp());
@@ -398,6 +399,30 @@ namespace fastllm {
 
         float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-5;
         FastllmCudaRMSNorm(input, weight, output, eps);
+    }
+
+    bool CudaRMSNormPartOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        return true;
+    }
+
+    void CudaRMSNormPartOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &output = *(datas.find("output")->second);
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "RMSNormPart error: datatype should be float32 or float16 or bfloat16.");
+
+        output.Allocate();
+
+        float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-5;
+        int start = intParams.find("start")->second;
+        int end = intParams.find("end")->second;
+        FastllmCudaRMSNormPart(input, weight, output, eps, start, end);
     }
 
     bool CudaLayerNormOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
