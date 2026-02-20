@@ -734,6 +734,8 @@ namespace fastllm {
 
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output);
 
+    void RMSNormPart(const Data &input, const Data &weight, float eps, int start, int end, Data &output);
+
     void LayerNorm(Data &input, Data &gamma, Data &beta, int axis, Data &output);
 
     void Linear(Data &input, Data &weight, const Data &bias, Data &output);
