@@ -588,6 +588,9 @@ namespace fastllm {
     void basellm::NewMainLoop() {
         basellm *model = this;
         int maxTotalLens = 0;
+        int totalPages = 0;
+        int pagesLimit = 0; // 默认为totalPages的80%，Prefill不会让已用分页超过此限制
+        int pageLen = 128;
 
         int maxBatch = 512;
         if (model->maxBatch > 0) {
@@ -606,6 +609,34 @@ namespace fastllm {
                 prefillChunkSize = 2048;
             }
         }
+
+        // 辅助lambda：释放一个请求占用的所有KV Cache分页，并以allTokens重新初始化为pending prefill状态
+        auto releaseAndReinitRequest = [&](ResponseContext *ctx) {
+            for (int i = 0; i < model->block_cnt; i++) {
+                auto &kvFirst = ctx->pastKeyValues[i].first;
+                auto &kvSecond = ctx->pastKeyValues[i].second;
+                if (kvFirst.isPagedKVCache && kvFirst.pagedKVCacheData != nullptr) {
+                    for (auto idx : kvFirst.pageIndex) {
+                        kvFirst.pagedKVCacheData->ReleasePageIndex(idx);
+                    }
+                    kvFirst.pageIndex.clear();
+                    kvFirst.lastPageLen = 0;
+                    kvFirst.dims.clear();
+                }
+                if (kvSecond.isPagedKVCache && kvSecond.pagedKVCacheData != nullptr) {
+                    for (auto idx : kvSecond.pageIndex) {
+                        kvSecond.pagedKVCacheData->ReleasePageIndex(idx);
+                    }
+                    kvSecond.pageIndex.clear();
+                    kvSecond.lastPageLen = 0;
+                    kvSecond.dims.clear();
+                }
+            }
+            ctx->currentTokens = ctx->allTokens;
+            ctx->preTokens = 0;
+            ctx->cacheLen = 0;
+            ctx->intParams.clear();
+        };
 
         auto lastRecordTime = std::chrono::system_clock::now();
         long long genTokens = 0;
@@ -638,13 +669,41 @@ namespace fastllm {
                 model->responseContextDict.RemoveHandle(it);
             }
 
+            // 已完成的请求（isEnding=true）主动释放KV cache页面，避免占用分页资源
+            for (auto &it : model->responseContextDict.dicts) {
+                if (it.second->isEnding) {
+                    for (int i = 0; i < model->block_cnt; i++) {
+                        auto &kvFirst = it.second->pastKeyValues[i].first;
+                        auto &kvSecond = it.second->pastKeyValues[i].second;
+                        if (kvFirst.isPagedKVCache && kvFirst.pagedKVCacheData != nullptr && !kvFirst.pageIndex.empty()) {
+                            for (auto idx : kvFirst.pageIndex) {
+                                kvFirst.pagedKVCacheData->ReleasePageIndex(idx);
+                            }
+                            kvFirst.pageIndex.clear();
+                            kvFirst.lastPageLen = 0;
+                        }
+                        if (kvSecond.isPagedKVCache && kvSecond.pagedKVCacheData != nullptr && !kvSecond.pageIndex.empty()) {
+                            for (auto idx : kvSecond.pageIndex) {
+                                kvSecond.pagedKVCacheData->ReleasePageIndex(idx);
+                            }
+                            kvSecond.pageIndex.clear();
+                            kvSecond.lastPageLen = 0;
+                        }
+                    }
+                }
+            }
+
             int limit = (maxTotalLens > 0) ? maxTotalLens : 999999999;
 
-            int lenSum = 0, currentActivate = 0;
+            // 统计当前已占用的分页数和活跃请求数（不包含已完成的请求）
+            int busyPages = 0, currentActivate = 0;
             for (auto &it: model->responseContextDict.dicts) {
+                if (it.second->isEnding) {
+                    continue;
+                }
                 auto &kvFirst = it.second->pastKeyValues[model->kvCacheId].first;
                 if (kvFirst.pageIndex.size() > 0) {
-                    lenSum += (kvFirst.pageIndex.size() - 1) * kvFirst.pageLen + kvFirst.lastPageLen;
+                    busyPages += (int)kvFirst.pageIndex.size();
                     currentActivate++;
                 }
             }
@@ -664,17 +723,24 @@ namespace fastllm {
                 }
             }
 
-            // isPrompt=1: Prefill阶段; isPrompt=0: Decode阶段; Prefill和Decode不混合
+            // 当busyPages未超过pagesLimit时可以开启新的Prefill；超过时只做Decode
+            bool canAddPrefill = (pagesLimit > 0) ? (busyPages < pagesLimit) : true;
+
             for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
                 if (isPrompt == 0 && seqLens.size() > 0) {
                     continue;
                 }
-                // 如果有pending的prefill请求，优先做prefill，跳过decode
-                if (isPrompt == 0 && hasPrefill) {
+                // 超过阈值时跳过Prefill
+                if (isPrompt == 1 && !canAddPrefill) {
+                    continue;
+                }
+                // 未超过阈值且有pending的prefill请求时，优先尝试prefill；但如果prefill阶段没收集到任何请求，回退做decode
+                if (isPrompt == 0 && hasPrefill && canAddPrefill && seqLens.size() > 0) {
                     continue;
                 }
 
-                int prefillTokenCount = 0; // 当前已收集的prefill总token数
+                int prefillTokenCount = 0;
+                int curBusyPages = busyPages;
 
                 for (auto &ii : orders) {
                     auto &it = *model->responseContextDict.dicts.find(ii.second);
@@ -711,14 +777,21 @@ namespace fastllm {
                         if (alive + (int)seqLens.size() >= maxBatch) {
                             continue;
                         }
-                        if (maxTotalLens > 0 && lenSum + it.second->currentTokens.size() + (currentActivate + 1) * 256 > maxTotalLens) {
-                            continue;
+
+                        int thisLen = (int)it.second->currentTokens.size();
+                        int thisPages = (thisLen + pageLen - 1) / pageLen;
+
+                        // Prefill后已用分页不能超过pagesLimit（除非单个请求就超过了）
+                        if (pagesLimit > 0 && curBusyPages + thisPages > pagesLimit) {
+                            if (seqLens.size() > 0 || thisPages <= pagesLimit) {
+                                continue;
+                            }
+                            if (currentActivate > 0) {
+                                continue;
+                            }
                         }
 
-                        // Prefill: 多个请求混合，总token数不超过prefillChunkSize
-                        int thisLen = (int)it.second->currentTokens.size();
                         if (thisLen > prefillChunkSize) {
-                            // 单个请求超长，这一轮只处理这一个请求（后面会切分）
                             if (seqLens.size() > 0) {
                                 continue;
                             }
@@ -728,35 +801,10 @@ namespace fastllm {
                             }
                         }
                         prefillTokenCount += thisLen;
-                        lenSum += thisLen;
+                        curBusyPages += thisPages;
                         currentActivate++;
                     } else {
-                        // Decode阶段: KV Cache空间检查
-                        if (it.second->pastKeyValues[model->kvCacheId].first.isPagedKVCache) {
-                            if (it.second->pastKeyValues[model->kvCacheId].first.pageLen == it.second->pastKeyValues[model->kvCacheId].first.lastPageLen) {
-                                int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;                                        
-                                int predictLen = 256;
-                                if (sur > 0) {
-                                    predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
-                                }
-                                if (lenSum + predictLen > limit) {
-                                    continue;
-                                }
-                                lenSum += predictLen;
-                            }
-                        } else {
-                            if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1] == it.second->pastKeyValues[0].first.dims[1]) {
-                                int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;                                        
-                                int predictLen = 256;
-                                if (sur > 0) {
-                                    predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
-                                }
-                                if (lenSum + predictLen > limit) {
-                                    continue;
-                                }
-                                lenSum += predictLen;
-                            }
-                        }
+                        // Decode阶段：不在这里限制分页，由后续驱逐逻辑统一处理
                     }
 
                     generationConfigs.push_back(it.second->generationConfig);
@@ -809,9 +857,108 @@ namespace fastllm {
                                                                &it.second->pastKeyValues[i].second));
                     }
 
-                    if (seqLens.size() >= maxBatch || lenSum + seqLens.size() * 128 > limit) {
+                    if (seqLens.size() >= maxBatch || (totalPages > 0 && curBusyPages >= totalPages)) {
                         break;
                     }
+                }
+            }
+
+            // Decode阶段：检查空闲分页是否足够，不够时释放资源
+            if (seqLens.size() > 0 && seqLens[0] == 1) {
+                PagedCacheManager *pagedManager = nullptr;
+                int newPagesNeeded = 0;
+                for (int i = 0; i < (int)handles.size(); i++) {
+                    auto &ctx = *model->responseContextDict.dicts[handles[i]];
+                    auto &kvFirst = ctx.pastKeyValues[model->kvCacheId].first;
+                    if (kvFirst.isPagedKVCache) {
+                        if (pagedManager == nullptr) {
+                            pagedManager = kvFirst.pagedKVCacheData;
+                        }
+                        if (kvFirst.pageLen == kvFirst.lastPageLen) {
+                            newPagesNeeded++;
+                        }
+                    }
+                }
+                if (pagedManager != nullptr && newPagesNeeded > 0) {
+                    int freePages;
+                    {
+                        std::lock_guard<std::mutex> guard(pagedManager->pageIndexLocker);
+                        freePages = (int)pagedManager->unusedPageIndex.size();
+                    }
+                    // if (freePages < newPagesNeeded) {
+                    //    printf("[Decode] Page shortage: newPagesNeeded=%d, freePages=%d, maxPages=%d, batchSize=%d\n",
+                    //           newPagesNeeded, freePages, pagedManager->maxPages, (int)handles.size());
+                    // }
+                    while (freePages < newPagesNeeded) {
+                        // 空闲分页不够，从本轮decode批次中选择上下文最长的请求驱逐
+                        int maxLen = -1, evictIdx = -1;
+                        for (int i = 0; i < (int)handles.size(); i++) {
+                            auto &ctx = *model->responseContextDict.dicts[handles[i]];
+                            auto &kvFirst = ctx.pastKeyValues[model->kvCacheId].first;
+                            if (kvFirst.pageIndex.size() > 0) {
+                                int curLen = (kvFirst.pageIndex.size() - 1) * kvFirst.pageLen + kvFirst.lastPageLen;
+                                if (curLen > maxLen) {
+                                    maxLen = curLen;
+                                    evictIdx = i;
+                                }
+                            }
+                        }
+                        if (evictIdx == -1) {
+                            break;
+                        }
+                        int evictHandle = handles[evictIdx];
+                        auto *evictCtx = model->responseContextDict.dicts[evictHandle];
+                        int evictedPages = (int)evictCtx->pastKeyValues[model->kvCacheId].first.pageIndex.size();
+                        // printf("[Handle %d] Evicting for recompute: releasing %d pages (contextLen=%d).\n", evictHandle, evictedPages, maxLen);
+                        releaseAndReinitRequest(evictCtx);
+
+                        // 从本轮decode批次中移除被驱逐的请求
+                        handles.erase(handles.begin() + evictIdx);
+                        seqLens.erase(seqLens.begin() + evictIdx);
+                        generationConfigs.erase(generationConfigs.begin() + evictIdx);
+                        tokensManager.units.erase(tokensManager.units.begin() + evictIdx);
+                        if (logits[evictIdx] != nullptr) {
+                            delete logits[evictIdx];
+                        }
+                        logits.erase(logits.begin() + evictIdx);
+                        if (attentionMasks[evictIdx] != nullptr) {
+                            delete attentionMasks[evictIdx];
+                        }
+                        attentionMasks.erase(attentionMasks.begin() + evictIdx);
+                        if (positionIds[evictIdx] != nullptr) {
+                            delete positionIds[evictIdx];
+                        }
+                        positionIds.erase(positionIds.begin() + evictIdx);
+                        pastKeyValues.erase(pastKeyValues.begin() + evictIdx * model->block_cnt,
+                                            pastKeyValues.begin() + (evictIdx + 1) * model->block_cnt);
+
+                        // 重新统计newPagesNeeded和freePages
+                        newPagesNeeded = 0;
+                        for (int i = 0; i < (int)handles.size(); i++) {
+                            auto &ctx = *model->responseContextDict.dicts[handles[i]];
+                            auto &kvFirst = ctx.pastKeyValues[model->kvCacheId].first;
+                            if (kvFirst.isPagedKVCache && kvFirst.pageLen == kvFirst.lastPageLen) {
+                                newPagesNeeded++;
+                            }
+                        }
+                        {
+                            std::lock_guard<std::mutex> guard(pagedManager->pageIndexLocker);
+                            freePages = (int)pagedManager->unusedPageIndex.size();
+                        }
+                    }
+                    if (freePages >= newPagesNeeded && newPagesNeeded > 0) {
+                        // 重新计算ids
+                        ids.clear();
+                        for (int i = 0; i < (int)handles.size(); i++) {
+                            auto &ctx = *model->responseContextDict.dicts[handles[i]];
+                            for (int t : ctx.currentTokens) {
+                                ids.push_back((float)t);
+                            }
+                        }
+                    }
+                }
+                if (handles.empty()) {
+                    seqLens.clear();
                 }
             }
 
@@ -824,7 +971,6 @@ namespace fastllm {
                 Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                 std::vector<int> ret;
 
-                // 如果是单个超长prefill请求，切分成多个小块
                 if (seqLens.size() == 1 && seqLens[0] > prefillChunkSize) {
                     int len = seqLens[0];
                     std::vector <std::pair <Data, Data> > *pastKeyValue1;
@@ -839,7 +985,6 @@ namespace fastllm {
                         Split(inputIds, 1, st, st + curLen, curInput);
                         Split(*positionIds[0], 1, st, st + curLen, curPositionIds);
 
-                        // 切分后的块也通过ForwardV2接口调用
                         std::vector <int> curSeqLens = {curLen};
                         std::vector <Data*> curAttentionMasks = {nullptr};
                         std::vector <Data*> curPositionIdsVec = {&curPositionIds};
@@ -863,7 +1008,6 @@ namespace fastllm {
                         }
                     }
                 } else {
-                    // 多个prefill请求混合 或 decode请求，统一调用ForwardV2
                     auto batchStartTime = std::chrono::system_clock::now();
                     ret = model->ForwardV2(seqLens.size(), inputIds, attentionMasks,
                                               positionIds, seqLens, pastKeyValues, generationConfigs,
@@ -890,16 +1034,16 @@ namespace fastllm {
                 if (maxTotalLens == 0 && pastKeyValues.size() > (size_t)model->kvCacheId) {
                     auto &kv = *pastKeyValues[model->kvCacheId].first;
                     if (kv.pagedKVCacheData != nullptr) {
-                        int maxPages = kv.pagedKVCacheData->maxPages;
-                        int pageLen = kv.pagedKVCacheData->pageLen;
-                        maxTotalLens = maxPages * pageLen;
+                        totalPages = kv.pagedKVCacheData->maxPages;
+                        pageLen = kv.pagedKVCacheData->pageLen;
+                        maxTotalLens = totalPages * pageLen;
+                        pagesLimit = totalPages * 4 / 5;
                         maxBatch = std::max(1, std::min(maxBatch, maxTotalLens / 128));
                         model->tokensLimit = maxTotalLens;
-                        model->promptLimit = maxTotalLens;
-                        // model->promptLimit = maxTotalLens * 3 / 4;
+                        model->promptLimit = pagesLimit * pageLen;
                         if (model->verbose) {
-                            printf("Fastllm KV Cache Token limit: %d tokens (maxPages=%d, pageLen=%d).\n", maxTotalLens, maxPages, pageLen);
-                            printf("Fastllm Prompt Token limit: %d tokens.\n", std::min(model->max_positions, model->promptLimit));
+                            printf("Fastllm KV Cache Token limit: %d tokens (totalPages=%d, pageLen=%d).\n", maxTotalLens, totalPages, pageLen);
+                            printf("Fastllm AddPrefill Pages limit: %d pages (80%% of %d).\n", pagesLimit, totalPages);
                             printf("Fastllm Batch limit: %d.\n", maxBatch);
                         }
                     }
@@ -911,7 +1055,7 @@ namespace fastllm {
                     float spend = GetSpan(lastRecordTime, nowTime);
                     if (spend > 1) {
                         int alive = 0, pending = 0;
-                        int busyPages = 0, totalPages = 0;
+                        int logBusyPages = 0, logTotalPages = 0;
                         for (auto &it: model->responseContextDict.dicts) {
                             if (it.second->isEnding) {
                                 continue;
@@ -919,16 +1063,16 @@ namespace fastllm {
                             auto &kvFirst = it.second->pastKeyValues[model->kvCacheId].first;
                             if (kvFirst.pageIndex.size() > 0) {
                                 alive++;
-                                busyPages += kvFirst.pageIndex.size();
-                                if (totalPages == 0 && kvFirst.pagedKVCacheData != nullptr) {
-                                    totalPages = kvFirst.pagedKVCacheData->maxPages;
+                                logBusyPages += kvFirst.pageIndex.size();
+                                if (logTotalPages == 0 && kvFirst.pagedKVCacheData != nullptr) {
+                                    logTotalPages = kvFirst.pagedKVCacheData->maxPages;
                                 }
                             } else {
                                 pending++;
                             }
                         }
-                        float kvUsage = totalPages > 0 ? busyPages * 100.0f / totalPages : 0;
-                        printf("[Decode] alive = %d, pending = %d, context usage: %.1f%%, Speed: %f tokens / s.\n", alive, pending, kvUsage, (float)genTokens / spend);
+                        float kvUsage = logTotalPages > 0 ? logBusyPages * 100.0f / logTotalPages : 0;
+                        printf("[Decode] alive = %d, pending = %d, context usages: %.1f%%, Speed: %f tokens / s.\n", alive, pending, kvUsage, (float)genTokens / spend);
                         lastRecordTime = nowTime;
                         genTokens = 0;
                     }
@@ -969,25 +1113,7 @@ namespace fastllm {
                     }
                 }
             } else {
-                int maxLen = -1, select = -1;
-                for (auto &it: model->responseContextDict.dicts) {
-                    if (it.second->isEnding) {
-                        continue;
-                    }
-                    auto &kvFirst = it.second->pastKeyValues[model->kvCacheId].first;
-                    if (kvFirst.pageIndex.size() > 0) {
-                        int curLen = (kvFirst.pageIndex.size() - 1) * kvFirst.pageLen + kvFirst.lastPageLen;
-                        if (curLen > maxLen) {
-                            maxLen = curLen;
-                            select = it.first;
-                        }
-                    }
-                }
-                if (select != -1) {
-                    model->responseContextDict.dicts[select]->isEnding = true;
-                    printf("[Handle %d] Finished. Reason: KV cache eviction (maxLen=%d).\n", select, maxLen);
-                    continue;
-                }
+                // 没有任何请求可以调度时，等待新请求
             }
 
             for (int i = 0; i < attentionMasks.size(); i++) {
@@ -998,7 +1124,18 @@ namespace fastllm {
             }
 
             if (seqLens.size() == 0) {
-                model->dictCV.wait(dictLocker);
+                bool hasPending = false;
+                for (auto &it : model->responseContextDict.dicts) {
+                    if (!it.second->isEnding) {
+                        hasPending = true;
+                        break;
+                    }
+                }
+                if (hasPending) {
+                    model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
+                } else {
+                    model->dictCV.wait(dictLocker);
+                }
             }
         }
     }
@@ -1538,16 +1675,14 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                     return ret;
                 } else {
                     if (context->isEnding) {
+                        ResponseContextError err = context->error;
                         responseContextDict.RemoveHandle(handleId);
                         dictLocker.unlock();
                         dictCV.notify_one();
-                        if (context->error == ResponseContextErrorNone) {
-                            return -1;
-                        } else if (context->error == ResponseContextErrorPromptTooLong) {
+                        if (err == ResponseContextErrorPromptTooLong) {
                             return -2;
-                        } else {
-                            return -1;
                         }
+                        return -1;
                     }
                 }
                 dictLocker.unlock();
