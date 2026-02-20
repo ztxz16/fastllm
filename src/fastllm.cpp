@@ -2823,6 +2823,12 @@ namespace fastllm {
         }, {{"eps", eps}}, {});
     }
 
+    void RMSNormPart(const Data &input, const Data &weight, float eps, int start, int end, Data &output) {
+        curExecutor->Run("RMSNormPart", {
+                {"input", (Data*)&input}, {"weight", (Data*)&weight}, {"output", &output}
+        }, {{"eps", eps}}, {{"start", start}, {"end", end}});
+    }
+
     void LayerNorm(Data &input, Data &gamma, Data &beta, int axis, Data &output) {
         curExecutor->Run("LayerNorm", {
             {"input", &input}, {"gamma", &gamma}, {"beta", &beta}, {"output", &output}

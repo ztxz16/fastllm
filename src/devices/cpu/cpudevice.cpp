@@ -43,6 +43,7 @@ namespace fastllm {
         this->ops["Embedding"] = (BaseOperator*)(new CpuEmbedding());
         this->ops["LayerNorm"] = (BaseOperator*)(new CpuLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CpuRMSNormOp());
+        this->ops["RMSNormPart"] = (BaseOperator*)(new CpuRMSNormPartOp());
         this->ops["Linear"] = (BaseOperator*)(new CpuLinearOp());
         this->ops["Conv1DPerChannel"] = (BaseOperator*)(new CpuConv1DPerChannel());
         this->ops["Conv2D"] = (BaseOperator*)(new CpuConv2DOp());
@@ -3608,6 +3609,101 @@ ops += (long long)lines * inputDim * interDim * 2;
             }
         } else {
             ErrorInFastLLM("RMSNorm error: unsupport dataType.\n");
+        }
+    }
+
+    void CpuRMSNormPartOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                      const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+
+        float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-5;
+        int start = intParams.find("start")->second;
+        int end = intParams.find("end")->second;
+        int dimsLen = input.dims.size();
+        int axis = dimsLen - 1;
+        int outer = input.Count(0) / input.Count(axis);
+        int channels = input.dims[axis];
+        int partChannels = end - start;
+
+        if (input.dataType == DataType::FLOAT32) {
+            float *inputData = (float *) input.cpuData;
+            float *outputData = (float *) output.cpuData;
+            float *weightData = (float *) weight.cpuData;
+
+            for (int i = 0; i < outer; i++) {
+                for (int j = 0; j < start; j++) {
+                    outputData[j] = inputData[j];
+                }
+                float mean = 0.f;
+                for (int j = start; j < end; j++) {
+                    mean += inputData[j] * inputData[j];
+                }
+                float scale = 1.0 / sqrt(mean / partChannels + eps);
+                for (int j = start; j < end; j++) {
+                    outputData[j] = inputData[j] * scale * weightData[j - start];
+                }
+                for (int j = end; j < channels; j++) {
+                    outputData[j] = inputData[j];
+                }
+                inputData += channels;
+                outputData += channels;
+            }
+        } else if (input.dataType == DataType::FLOAT16) {
+            uint16_t *inputData = (uint16_t *) input.cpuData;
+            uint16_t *outputData = (uint16_t *) output.cpuData;
+            float *weightData = (float *) weight.cpuData;
+
+            for (int i = 0; i < outer; i++) {
+                for (int j = 0; j < start; j++) {
+                    outputData[j] = inputData[j];
+                }
+                float mean = 0.f;
+                for (int j = start; j < end; j++) {
+                    float x = fp16tofp32.dict[inputData[j]];
+                    mean += x * x;
+                }
+                float scale = 1.0 / sqrt(mean / partChannels + eps);
+                for (int j = start; j < end; j++) {
+                    outputData[j] = float_to_half(fp16tofp32.dict[inputData[j]] * scale * weightData[j - start]);
+                }
+                for (int j = end; j < channels; j++) {
+                    outputData[j] = inputData[j];
+                }
+                inputData += channels;
+                outputData += channels;
+            }
+        } else if (input.dataType == DataType::BFLOAT16) {
+            uint16_t *inputData = (uint16_t *) input.cpuData;
+            uint16_t *outputData = (uint16_t *) output.cpuData;
+            float *weightData = (float *) weight.cpuData;
+
+            for (int i = 0; i < outer; i++) {
+                for (int j = 0; j < start; j++) {
+                    outputData[j] = inputData[j];
+                }
+                float mean = 0.f;
+                for (int j = start; j < end; j++) {
+                    float x = bf16tofp32.dict[inputData[j]];
+                    mean += x * x;
+                }
+                float scale = 1.0 / sqrt(mean / partChannels + eps);
+                for (int j = start; j < end; j++) {
+                    float val = bf16tofp32.dict[inputData[j]] * scale * weightData[j - start];
+                    uint32_t tmp;
+                    memcpy(&tmp, &val, sizeof(tmp));
+                    outputData[j] = (uint16_t)(tmp >> 16);
+                }
+                for (int j = end; j < channels; j++) {
+                    outputData[j] = inputData[j];
+                }
+                inputData += channels;
+                outputData += channels;
+            }
+        } else {
+            ErrorInFastLLM("RMSNormPart error: unsupport dataType.\n");
         }
     }
 
