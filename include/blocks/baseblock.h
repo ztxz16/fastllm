@@ -86,7 +86,8 @@ namespace fastllm {
         int rope_type, // RoPEType enum value
         bool kvCacheInCPU,
         bool isPrefill,
-        Data *hiddenStates
+        Data *hiddenStates,
+        bool doQKNorm
     );
 }
 

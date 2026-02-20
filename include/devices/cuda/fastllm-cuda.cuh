@@ -216,7 +216,8 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int32_t *insertIndexs, int32_t *insertPositions,
     int q_heads, int k_heads, int head_dim,
     int rotateDim, float eps, float ropeTheta, float ropeScale,
-    int pageLen, int unitSize, int batch);
+    int pageLen, int unitSize, int batch,
+    int doQKNorm);
 bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fastllm::Data &penaltyScale);
 bool FastllmCudaApplyLognAttn (fastllm::Data &input, fastllm::Data &lognAttn, fastllm::Data &positionIds);
 
