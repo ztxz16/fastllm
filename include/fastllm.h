@@ -470,6 +470,14 @@ namespace fastllm {
         DataType GetLinearActDataType(int batchSize);
     };
 
+    struct CacheTrieNode {
+        int pageId = -1;
+        long long timestamp = 0;
+        std::unordered_map<uint64_t, CacheTrieNode*> children;
+        CacheTrieNode *parent = nullptr;
+        uint64_t edgeHash = 0;
+    };
+
     // 一个带PageCache功能的Data，可以管理多个PageCache
     class PagedCacheManager : public Data {
         public:
@@ -491,9 +499,21 @@ namespace fastllm {
             std::set <int> unusedPageIndex;
             std::mutex pageIndexLocker;
 
+            // 每个页面的使用时间戳
+            std::vector<long long> pageTimestamp;
+            long long currentTimestamp = 0;
+
+            // Trie树缓存管理
+            CacheTrieNode *trieRoot = nullptr;
+            std::unordered_map<int, CacheTrieNode*> pageToTrieNode;
+
             void SetMaxPages(int maxPages);
             int GetUnusedPageIndex(bool pick);
             void ReleasePageIndex(int pageIndex);
+
+            static uint64_t HashTokenPage(const int *tokens, int len);
+            void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
+            void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds);
     };
 
     struct PartitionLinkNode {
@@ -882,6 +902,8 @@ namespace fastllm {
         const Data &cacheData, 
         int pageLen = 128, 
         int maxPages = -1);
+
+    PagedCacheManager* GetPagedCacheManager(int layerIndex);
 
     void AppendPagedCache(PagedCacheManager &pagedCacheManager, Data &cache, const Data &input);
     
