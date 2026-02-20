@@ -1454,6 +1454,7 @@ namespace fastllm {
         float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
 
         int unitSize = qkv.unitSize;
+        int doQKNorm = intParams.find("doQKNorm") != intParams.end() ? intParams.find("doQKNorm")->second : 1;
 
         // 分配 qOutput 内存
         qOutput.Allocate();
@@ -1464,7 +1465,7 @@ namespace fastllm {
             (uint8_t*)pagedKCacheData.cudaData, (uint8_t*)pagedVCacheData.cudaData,
             (int32_t*)insertIndexs.cudaData, (int32_t*)insertPositions.cudaData,
             q_heads, k_heads, head_dim, rotateDim, eps, ropeTheta, ropeScale,
-            pageLen, unitSize, batch);
+            pageLen, unitSize, batch, doQKNorm);
     }
 
     void CudaRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,

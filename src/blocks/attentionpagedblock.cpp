@@ -40,7 +40,8 @@ namespace fastllm {
         int rope_type,
         bool kvCacheInCPU,
         bool isPrefill,
-        Data *hiddenStates
+        Data *hiddenStates,
+        bool doQKNorm
     ) {
         // 1. Linear QKV projection
         Linear(*attenInput, *mergeQkvWeight, *mergeQkvBias, *qkv);
@@ -77,6 +78,10 @@ namespace fastllm {
 
         int bsz = attenInput->dims[0], seqlen = attenInput->dims[1];
 
+        if (!isPrefill && (*batchPastKeys)[0]->pagedKVCacheData == nullptr) {
+            isPrefill = true;
+        }
+
         if (isPrefill) {
             // ===== Prefill 路径：逐 batch AppendPagedCache + 批量 AttentionPagedBatch =====
             Data k, v;
@@ -95,10 +100,11 @@ namespace fastllm {
             v.Reshape(qkvSize);
 
             // 2.3 RMSNorm + RopeEncoding（对 q 和 k）
-            RMSNorm(*q, *qNormWeight, rms_norm_eps, *q);
+            if (doQKNorm) {
+                RMSNorm(*q, *qNormWeight, rms_norm_eps, *q);
+                RMSNorm(k, *kNormWeight, rms_norm_eps, k);
+            }
             RopeEncoding(*q, *allPositionIds, rotary_dim, curRopeTheta, ropeScale);
-
-            RMSNorm(k, *kNormWeight, rms_norm_eps, k);
             RopeEncoding(k, *allPositionIds, rotary_dim, curRopeTheta, ropeScale);
 
             // 2.4 Permute [bsz, seqlen, num_heads, head_dim] -> [bsz, num_heads, seqlen, head_dim]
@@ -185,7 +191,7 @@ namespace fastllm {
                 *insertIndexs, *insertPositions,
                 num_attention_heads, num_key_value_heads, head_dim,
                 rotary_dim, rms_norm_eps, curRopeTheta, ropeScale,
-                curPageLen, batch);
+                curPageLen, batch, doQKNorm);
 
             // 7. 更新 pastKey/pastValue 的 pageIndex 和 lastPageLen
             for (int b = 0; b < batch; b++) {

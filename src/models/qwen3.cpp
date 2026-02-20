@@ -134,7 +134,7 @@ namespace fastllm {
         batchLogits.push_back(retLogits);
         return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, &batchLogits)[0];
     }
-
+/*
     std::vector <int> Qwen3Model::ForwardBatchV2(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
@@ -267,8 +267,8 @@ namespace fastllm {
             return lastRet;
         }
     }
-
-    std::vector <int> Qwen3Model::ForwardBatchV2(
+*/
+    std::vector <int> Qwen3Model::ForwardV2(
         int batch,
         const Data &inputIds,
         const std::vector <Data*> &attentionMask,
@@ -381,7 +381,8 @@ namespace fastllm {
                 rope_type,
                 GetKVCacheInCPU(),
                 isPrefill,
-                &hiddenStates
+                &hiddenStates,
+                true
             );
 
             RMSNorm(hiddenStates, this->weight[postRmsName], rms_norm_eps, attenInput);
@@ -501,7 +502,6 @@ namespace fastllm {
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
                             std::vector <std::vector <float>*> *retLogits) {
-return ForwardBatchV2(batch, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, retLogits);
         int maxLen = inputIds.dims[1];
         Data hiddenStates;
         Data attenInput;
@@ -785,7 +785,6 @@ return ForwardBatchV2(batch, inputIds, attentionMask, positionIds, pastKeyValues
                                                const std::vector <GenerationConfig> &generationConfigs,
                                                const LastTokensManager &lastTokens,
                                                std::vector <std::vector <float>*> *retLogits) {
-return ForwardBatchV2(batch, inputIds, attentionMask, positionIds, seqLens, pastKeyValues, generationConfigs, lastTokens, retLogits);
         int seqLen = inputIds.dims[1];
 
         Data hiddenStates;

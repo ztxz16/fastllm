@@ -184,7 +184,7 @@ namespace fastllm {
                 std::vector<std::pair<Data, Data> > &pastKeyValues,
                 const GenerationConfig &generationConfig = GenerationConfig(),
                 const LastTokensManager &lastTokens = LastTokensManager(),
-                std::vector <float> *logits = nullptr) = 0;
+                std::vector <float> *logits = nullptr);
 
         virtual std::vector <int> ForwardBatch(
                 int batch,
@@ -197,6 +197,17 @@ namespace fastllm {
                 std::vector <std::vector <float>*> *logits = nullptr);
 
         virtual std::vector <int> ForwardBatch(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr);
+
+        virtual std::vector <int> ForwardV2(
                 int batch,
                 const Data &inputIds,
                 const std::vector <Data*> &attentionMask,

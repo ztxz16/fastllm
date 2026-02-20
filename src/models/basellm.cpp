@@ -512,6 +512,16 @@ namespace fastllm {
 #endif
     }
 
+    int basellm::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+                         const fastllm::Data &positionIds,
+                         std::vector<std::pair<Data, Data>> &pastKeyValues,
+                         const fastllm::GenerationConfig &generationConfig,
+                         const fastllm::LastTokensManager &lastTokens,
+                         std::vector <float> *logits) {
+        printf("Unsupport forward.\n");
+        exit(0);
+    }
+
     std::vector<int> basellm::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                                            const fastllm::Data &positionIds,
                                            std::vector<std::pair<Data, Data>> &pastKeyValues,
@@ -549,6 +559,17 @@ namespace fastllm {
             }
         }
         return ret;
+    }
+
+    std::vector<int> basellm::ForwardV2(int batch, const fastllm::Data &inputIds,
+                                           const std::vector<Data *> &attentionMask,
+                          const std::vector<Data *> &positionIds, const std::vector<int> &seqLens,
+                          std::vector<std::pair<Data *, Data *>> &pastKeyValues,
+                          const std::vector<GenerationConfig> &generationConfigs,
+                          const fastllm::LastTokensManager &lastTokens,
+                          std::vector <std::vector <float>*> *logits) {
+        printf("Unsupport ForwardV2.\n");
+        exit(0);
     }
 
     std::vector <int> basellm::ForwardMultimodal(
@@ -818,7 +839,7 @@ namespace fastllm {
                         Split(inputIds, 1, st, st + curLen, curInput);
                         Split(*positionIds[0], 1, st, st + curLen, curPositionIds);
 
-                        // 切分后的块也通过ForwardBatch接口调用
+                        // 切分后的块也通过ForwardV2接口调用
                         std::vector <int> curSeqLens = {curLen};
                         std::vector <Data*> curAttentionMasks = {nullptr};
                         std::vector <Data*> curPositionIdsVec = {&curPositionIds};
@@ -827,7 +848,7 @@ namespace fastllm {
                             curPastKeyValues.push_back(std::make_pair(&(*pastKeyValue1)[i].first,
                                                                       &(*pastKeyValue1)[i].second));
                         }
-                        ret = model->ForwardBatch(1, curInput, curAttentionMasks,
+                        ret = model->ForwardV2(1, curInput, curAttentionMasks,
                                                   curPositionIdsVec, curSeqLens, curPastKeyValues, generationConfigs,
                                                   tokensManager, &logits);
                         st += curLen;
@@ -842,9 +863,9 @@ namespace fastllm {
                         }
                     }
                 } else {
-                    // 多个prefill请求混合 或 decode请求，统一调用ForwardBatch
+                    // 多个prefill请求混合 或 decode请求，统一调用ForwardV2
                     auto batchStartTime = std::chrono::system_clock::now();
-                    ret = model->ForwardBatch(seqLens.size(), inputIds, attentionMasks,
+                    ret = model->ForwardV2(seqLens.size(), inputIds, attentionMasks,
                                               positionIds, seqLens, pastKeyValues, generationConfigs,
                                               tokensManager, &logits);
                     if (model->verbose) {
@@ -1373,7 +1394,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                                             pending++;
                                         }
                                     }
-                                    printf("[Decode]  alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n", alive, pending, aliveLen, (float)genTokens / spend);
+                                    printf("[Decode] alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n", alive, pending, aliveLen, (float)genTokens / spend);
                                     lastRecordTime = nowTime;
                                     genTokens = 0;
                                 }
@@ -1742,7 +1763,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         if (dataType == DataType::FLOAT32) {
 
         } else if (dataType == DataType::FLOAT16) {
-            AssertInFastLLM(this->model_struct == "chatglm" || 
+            AssertInFastLLM(this->use_new_engine ||
+                            this->model_struct == "chatglm" || 
                             this->model_struct == "llama" ||
                             this->model_struct == "graph" ||
                             this->model_struct == "cogvlm" ||
@@ -1756,7 +1778,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             this->model_struct == "qwen3_next",  
                             this->model_struct + " doesn't support float16");
         } else if (dataType == DataType::BFLOAT16) {
-            AssertInFastLLM(this->model_struct == "chatglm" || 
+            AssertInFastLLM(this->use_new_engine ||
+                            this->model_struct == "chatglm" || 
                             this->model_struct == "llama" ||
                             this->model_struct == "graph" ||
                             this->model_struct == "cogvlm" ||
