@@ -68,6 +68,7 @@ namespace fastllm {
     void AttentionPagedBlock (
         Data *attenInput,
         Data *mergeQkvWeight, Data *mergeQkvBias,
+        Data *preQNormWeight, Data *preKNormWeight,
         Data *qNormWeight, Data *kNormWeight,
         Data *oWeight, Data *oBias,
         Data *allPositionIds,
@@ -87,7 +88,8 @@ namespace fastllm {
         bool kvCacheInCPU,
         bool isPrefill,
         Data *hiddenStates,
-        bool doQKNorm
+        bool doQKNorm,
+        bool doPostQKNorm
     );
 }
 
