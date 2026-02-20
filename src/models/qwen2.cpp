@@ -198,6 +198,7 @@ namespace fastllm {
                 &attenInput,
                 &weight[mergeQkvWeightName], &weight[mergeQkvBiasName],
                 GetEmptyData(), GetEmptyData(),
+                GetEmptyData(), GetEmptyData(),
                 &weight[oWeightName], &weight[oBiasName],
                 &allPositionIds,
                 &pastKeyValues, &batchPastKeys, &batchPastValues,
@@ -214,6 +215,7 @@ namespace fastllm {
                 GetKVCacheInCPU(),
                 isPrefill,
                 &hiddenStates,
+                false,
                 false
             );
 
