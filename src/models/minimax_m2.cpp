@@ -233,27 +233,18 @@ namespace fastllm {
                 ToDataType(attenLastOutput, this->moeAtype);
                 AddTo(hiddenStates, attenLastOutput);
             } else {
-                if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
-                    Linear(attenInputTemp, weight[mergeQkvWeightName], weight[mergeQkvBiasName], qkv);
-                    int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
-                    int qdim = per * (num_attention_heads / num_key_value_heads);
+                Linear(attenInputTemp, weight[mergeQkvWeightName], weight[mergeQkvBiasName], qkv);
+                int per = qkv.dims.back() / (num_attention_heads / num_key_value_heads + 2);
+                int qdim = per * (num_attention_heads / num_key_value_heads);
 
-                    Split(qkv, -1, 0, qdim, q);
-                    Split(qkv, -1, qdim, qdim + per, k);
-                    Split(qkv, -1, qdim + per, qdim + per * 2, v);
-                } else {
-                    Data qBias = (weight.weight.find(qBiasName) != weight.weight.end()) ? weight[qBiasName] : Data();
-                    Data kBias = (weight.weight.find(kBiasName) != weight.weight.end()) ? weight[kBiasName] : Data();
-                    Data vBias = (weight.weight.find(vBiasName) != weight.weight.end()) ? weight[vBiasName] : Data();
-                    Linear(attenInputTemp, weight[qWeightName], qBias, q);
-                    Linear(attenInputTemp, weight[kWeightName], kBias, k);
-                    Linear(attenInputTemp, weight[vWeightName], vBias, v);
-                }
+                RMSNormPart(qkv, this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"], rms_norm_eps, 0, qdim, qkv);
+                RMSNormPart(qkv, this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"], rms_norm_eps, qdim, qdim + per, qkv);
+
+                Split(qkv, -1, 0, qdim, q);
+                Split(qkv, -1, qdim, qdim + per, k);
+                Split(qkv, -1, qdim + per, qdim + per * 2, v);
 
                 std::vector <int> qkvSize = {bsz, seqlen, -1, head_dim};
-
-                RMSNorm(q, this->weight["model.layers." + std::to_string(i) + ".self_attn.q_norm.weight"], rms_norm_eps, q);
-                RMSNorm(k, this->weight["model.layers." + std::to_string(i) + ".self_attn.k_norm.weight"], rms_norm_eps, k);
 
                 q.Reshape(qkvSize);
                 k.Reshape(qkvSize);

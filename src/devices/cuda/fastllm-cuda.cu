@@ -2207,6 +2207,220 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
     return true;
 }
 
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmRMSNormPartKernel(float *input, float *weight, float *output,
+                                          int outer, int channels, int start, int end, float eps) {
+    int o = blockIdx.x;
+    input = input + o * channels;
+    output = output + o * channels;
+    int partChannels = end - start;
+
+    constexpr int WARP_SIZE = 32;
+    constexpr int NUM_WARPS = THREAD_PER_BLOCK / WARP_SIZE;
+    __shared__ float warp_sums[NUM_WARPS > 0 ? NUM_WARPS : 1];
+    __shared__ float scale;
+
+    unsigned int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+
+    // Copy [0, start) and [end, channels)
+    for (int i = tid; i < start; i += THREAD_PER_BLOCK) {
+        output[i] = input[i];
+    }
+    for (int i = end + tid; i < channels; i += THREAD_PER_BLOCK) {
+        output[i] = input[i];
+    }
+
+    // Compute sum of squares over [start, end)
+    float sum2 = 0.0f;
+    for (int i = tid; i < partChannels; i += THREAD_PER_BLOCK) {
+        float x = input[start + i];
+        sum2 += x * x;
+    }
+
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+    }
+    if (THREAD_PER_BLOCK > WARP_SIZE) {
+        if (lane_id == 0) {
+            warp_sums[warp_id] = sum2;
+        }
+        __syncthreads();
+        if (warp_id == 0) {
+            float val = (lane_id < NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                val += __shfl_down_sync(0xffffffff, val, offset);
+            }
+            if (lane_id == 0) {
+                scale = rsqrtf(val / partChannels + eps);
+            }
+        }
+        __syncthreads();
+    } else {
+        if (tid == 0) {
+            scale = rsqrtf(sum2 / partChannels + eps);
+        }
+        __syncthreads();
+    }
+
+    float s = scale;
+    for (int i = tid; i < partChannels; i += THREAD_PER_BLOCK) {
+        output[start + i] = input[start + i] * s * __ldg(&weight[i]);
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmRMSNormPartKernel(half *input, float *weight, half *output,
+                                          int outer, int channels, int start, int end, float eps) {
+    int o = blockIdx.x;
+    input = input + o * channels;
+    output = output + o * channels;
+    int partChannels = end - start;
+
+    constexpr int WARP_SIZE = 32;
+    constexpr int NUM_WARPS = THREAD_PER_BLOCK / WARP_SIZE;
+    __shared__ float warp_sums[NUM_WARPS];
+    __shared__ float scale;
+
+    unsigned int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+
+    for (int i = tid; i < start; i += THREAD_PER_BLOCK) {
+        output[i] = input[i];
+    }
+    for (int i = end + tid; i < channels; i += THREAD_PER_BLOCK) {
+        output[i] = input[i];
+    }
+
+    float sum2 = 0.0f;
+    for (int i = tid; i < partChannels; i += THREAD_PER_BLOCK) {
+        float x = __half2float(input[start + i]);
+        sum2 += x * x;
+    }
+
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+    }
+    if (lane_id == 0) {
+        warp_sums[warp_id] = sum2;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float val = (lane_id < NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (lane_id == 0) {
+            scale = rsqrtf(val / partChannels + eps);
+        }
+    }
+    __syncthreads();
+
+    float s = scale;
+    for (int i = tid; i < partChannels; i += THREAD_PER_BLOCK) {
+        output[start + i] = __float2half(__half2float(input[start + i]) * s * __ldg(&weight[i]));
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmRMSNormPartKernel(__nv_bfloat16 *input, float *weight, __nv_bfloat16 *output,
+                                          int outer, int channels, int start, int end, float eps) {
+    int o = blockIdx.x;
+    input = input + o * channels;
+    output = output + o * channels;
+    int partChannels = end - start;
+
+    constexpr int WARP_SIZE = 32;
+    constexpr int NUM_WARPS = THREAD_PER_BLOCK / WARP_SIZE;
+    __shared__ float warp_sums[NUM_WARPS];
+    __shared__ float scale;
+
+    unsigned int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+
+    for (int i = tid; i < start; i += THREAD_PER_BLOCK) {
+        output[i] = input[i];
+    }
+    for (int i = end + tid; i < channels; i += THREAD_PER_BLOCK) {
+        output[i] = input[i];
+    }
+
+    float sum2 = 0.0f;
+    for (int i = tid; i < partChannels; i += THREAD_PER_BLOCK) {
+        float x = __bfloat162float(input[start + i]);
+        sum2 += x * x;
+    }
+
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+    }
+    if (lane_id == 0) {
+        warp_sums[warp_id] = sum2;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float val = (lane_id < NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (lane_id == 0) {
+            scale = rsqrtf(val / partChannels + eps);
+        }
+    }
+    __syncthreads();
+
+    float s = scale;
+    for (int i = tid; i < partChannels; i += THREAD_PER_BLOCK) {
+        output[start + i] = __float2bfloat16_rn(__bfloat162float(input[start + i]) * s * __ldg(&weight[i]));
+    }
+}
+
+bool FastllmCudaRMSNormPart(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps, int start, int end) {
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareInput(output);
+
+    int dimsLen = input.dims.size();
+    int axis = dimsLen - 1;
+    int outer = input.Count(0) / input.Count(axis);
+    int channels = input.dims[axis];
+    int partChannels = end - start;
+
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        if (partChannels < 64) {
+            FastllmRMSNormPartKernel<1> <<< outer, 1 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, outer, channels, start, end, eps);
+        } else if (partChannels < 512) {
+            FastllmRMSNormPartKernel<64> <<< outer, 64 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, outer, channels, start, end, eps);
+        } else if (partChannels < 4096) {
+            FastllmRMSNormPartKernel<512> <<< outer, 512 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, outer, channels, start, end, eps);
+        } else {
+            FastllmRMSNormPartKernel<1024> <<< outer, 1024 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, outer, channels, start, end, eps);
+        }
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        if (partChannels < 512) {
+            FastllmRMSNormPartKernel<64> <<< outer, 64 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer, channels, start, end, eps);
+        } else if (partChannels < 4096) {
+            FastllmRMSNormPartKernel<512> <<< outer, 512 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer, channels, start, end, eps);
+        } else {
+            FastllmRMSNormPartKernel<1024> <<< outer, 1024 >>>((half*)cudaInput, (float*) weight.cudaData, (half*)cudaOutput, outer, channels, start, end, eps);
+        }
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        if (partChannels < 512) {
+            FastllmRMSNormPartKernel<64> <<< outer, 64 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer, channels, start, end, eps);
+        } else if (partChannels < 4096) {
+            FastllmRMSNormPartKernel<512> <<< outer, 512 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer, channels, start, end, eps);
+        } else {
+            FastllmRMSNormPartKernel<1024> <<< outer, 1024 >>>((__nv_bfloat16*)cudaInput, (float*) weight.cudaData, (__nv_bfloat16*)cudaOutput, outer, channels, start, end, eps);
+        }
+    }
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
 bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fastllm::Data &beta, fastllm::Data &output, int axis) {
     float *cudaInput = (float *) FastllmCudaPrepareInput(input);
     float *cudaOutput = (float *) FastllmCudaPrepareInput(output);
