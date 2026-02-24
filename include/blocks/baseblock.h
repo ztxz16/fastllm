@@ -23,6 +23,18 @@ namespace fastllm {
     );
 
     /*
+    Embedding with optional type conversion:
+    if weight->dataType != outputType: Embedding -> ToDataType
+    else: Embedding directly into output
+    */
+    void EmbeddingBlock (
+        Data *input,
+        Data *weight,
+        Data *output,
+        DataType outputType
+    );
+
+    /*
     gateUpResult = Linear(input, gateUp)
     swigluResult = Swiglu(gateUpResult)
     output += Linear(swigluResult, down)

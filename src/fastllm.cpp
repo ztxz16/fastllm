@@ -2817,6 +2817,12 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void EmbeddingDirect(const Data &input, Data &weight, Data &output) {
+        curExecutor->Run("EmbeddingDirect", {
+                {"input", (Data*)&input}, {"weight", &weight}, {"output", &output}
+        }, {}, {});
+    }
+
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output) {
         curExecutor->Run("RMSNorm", {
                 {"input", (Data*)&input}, {"weight", (Data*)&weight}, {"output", &output}

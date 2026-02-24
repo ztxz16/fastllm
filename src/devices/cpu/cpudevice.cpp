@@ -41,6 +41,7 @@ namespace fastllm {
         this->ops["MergeMLAPaged"] = (BaseOperator*)(new CpuMergeMLAPaged());
         this->ops["CopyKVCache"] = (BaseOperator*)(new CpuCopyKVCacheOp());
         this->ops["Embedding"] = (BaseOperator*)(new CpuEmbedding());
+        this->ops["EmbeddingDirect"] = (BaseOperator*)(new CpuEmbeddingDirect());
         this->ops["LayerNorm"] = (BaseOperator*)(new CpuLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CpuRMSNormOp());
         this->ops["RMSNormPart"] = (BaseOperator*)(new CpuRMSNormPartOp());
@@ -3345,6 +3346,78 @@ ops += (long long)lines * inputDim * interDim * 2;
                 }
             } else {
                 ErrorInFastLLM("Embedding error: unsupport dataType.\n");
+            }
+        }
+    }
+
+    void CpuEmbeddingDirect::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);
+
+        AssertInFastLLM(weight.dims.size() == 2, "EmbeddingDirect's weight's dim should be 2.\n");
+        AssertInFastLLM(weight.dataType == DataType::FLOAT32 ||
+                        weight.dataType == DataType::FLOAT16 ||
+                        weight.dataType == DataType::BFLOAT16, "EmbeddingDirect's weight's type should be float32 or float16 or bfloat16.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16, 
+                        "EmbeddingDirect's input's type should be float32 or float16.\n");
+
+        weight.weightType = WeightType::EMBEDDING;
+        int vocabSize = weight.dims[0], embSize = weight.dims[1];
+        std::vector <int> dims = input.dims;
+        dims.push_back(embSize);
+
+        output.dataType = weight.dataType;
+        output.Resize(dims);
+    }
+
+    void CpuEmbeddingDirect::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);;
+
+        output.Allocate();
+
+        int vocabSize = weight.dims[0], embSize = weight.dims[1];
+        uint64_t inputLen = input.Count(0);
+
+        float *inputData = (float*)input.cpuData;
+        std::vector <float> tempInputData;
+        if (input.dataType != DataType::FLOAT32) {
+            tempInputData.resize(inputLen);
+            inputData = tempInputData.data();
+            if (input.dataType == DataType::FLOAT16) {
+                for (int i = 0; i < inputLen; i++) {
+                    inputData[i] = half_to_float(((uint16_t*)input.cpuData)[i]);
+                }
+            } else {
+                ErrorInFastLLM("EmbeddingDirect error: unsupport input dataType.\n");
+            }
+        }
+
+        int unitSize = weight.unitSize;
+        if (GetLowMemMode()) {
+            FILE *fi = fopen(weight.fileName.c_str(), "rb");
+            uint8_t *outputData = (uint8_t *) output.cpuData;
+            for (int i = 0; i < inputLen; i++) {
+                int token = (int) (inputData[i] + 1e-9);
+#if defined(_WIN32) or defined(_WIN64)
+                _fseeki64(fi, (long long)token * embSize * unitSize + weight.filePos, 0);
+#else
+                fseek(fi, (long long)token * embSize * unitSize + weight.filePos, 0);
+#endif
+                int ret = fread(outputData + i * embSize * unitSize, unitSize, embSize, fi);
+            }
+            fclose(fi);
+        } else {
+            uint8_t *outputData = (uint8_t *) output.cpuData;
+            uint8_t *weightData = (uint8_t *) weight.cpuData;
+            for (int i = 0; i < inputLen; i++) {
+                int token = (int) (inputData[i] + 1e-9);
+                memcpy(outputData + i * embSize * unitSize, weightData + token * embSize * unitSize, embSize * unitSize);
             }
         }
     }

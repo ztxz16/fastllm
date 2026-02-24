@@ -2858,6 +2858,30 @@ bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weigh
     return true;
 }
 
+bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output) {
+    int vocabSize = weight.dims[0], embSize = weight.dims[1];
+    uint64_t inputLen = input.Count(0);
+
+    float *inputData = (float*)input.cudaData;
+
+    if (weight.dataType == fastllm::DataType::FLOAT32) {
+        float *outputData = (float *) output.cudaData;
+        float *weightData = (float *) weight.cudaData;
+        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+    } else if (weight.dataType == fastllm::DataType::FLOAT16) {
+        half *outputData = (half *) output.cudaData;
+        half *weightData = (half *) weight.cudaData;
+        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+    } else if (weight.dataType == fastllm::DataType::BFLOAT16) {
+        __nv_bfloat16 *outputData = (__nv_bfloat16 *) output.cudaData;
+        __nv_bfloat16 *weightData = (__nv_bfloat16 *) weight.cudaData;
+        FastllmCudaFloatEmbeddingKernel <128> <<<inputLen, 128>>> (inputData, weightData, outputData, embSize);
+    }
+
+    DeviceSync();
+    return true;
+}
+
 bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &input1, fastllm::Data &output,
                             int input0Spatial, int input1Spatial, int outputSpatial,
                             int input0Stride, int input1Stride,

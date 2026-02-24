@@ -732,6 +732,8 @@ namespace fastllm {
 
     void Embedding(const Data &input, Data &weight, Data &output);
 
+    void EmbeddingDirect(const Data &input, Data &weight, Data &output);
+
     void RMSNorm(const Data &input, const Data &weight, float eps, Data &output);
 
     void RMSNormPart(const Data &input, const Data &weight, float eps, int start, int end, Data &output);
