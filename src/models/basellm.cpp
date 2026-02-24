@@ -1085,7 +1085,15 @@ namespace fastllm {
                         auto chunkStartTime = std::chrono::system_clock::now();
                         Data curInput, curPositionIds;
                         Split(inputIds, 1, st, st + curLen, curInput);
-                        Split(*positionIds[0], 1, st, st + curLen, curPositionIds);
+                        {
+                            curPositionIds.dataType = positionIds[0]->dataType;
+                            curPositionIds.Resize({1, curLen});
+                            curPositionIds.Allocate();
+                            int unitSize = curPositionIds.unitSize;
+                            memcpy(curPositionIds.cpuData,
+                                   positionIds[0]->cpuData + st * unitSize,
+                                   curLen * unitSize);
+                        }
 
                         std::vector <int> curSeqLens = {curLen};
                         std::vector <Data*> curAttentionMasks = {nullptr};
