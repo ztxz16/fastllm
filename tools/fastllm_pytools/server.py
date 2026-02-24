@@ -20,6 +20,37 @@ global fastllm_reranker
 global fastllm_model
 global dev_mode_enabled
 
+# Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L630
+def set_ulimit(target_soft_limit: int = 65535):
+    if sys.platform.startswith("win"):
+        print("Windows detected, skipping ulimit adjustment.")
+        return
+
+    import resource
+
+    resource_type = resource.RLIMIT_NOFILE
+    current_soft, current_hard = resource.getrlimit(resource_type)
+
+    if current_soft < target_soft_limit:
+        new_soft = min(target_soft_limit, current_hard)
+        if new_soft > current_soft:
+            try:
+                resource.setrlimit(resource_type, (new_soft, current_hard))
+                print(f"Increased ulimit from {current_soft} to {new_soft}.")
+            except ValueError as e:
+                print(
+                    f"Found ulimit of {current_soft} and failed to automatically increase "
+                    f"with error {e}. This can cause fd limit errors like "
+                    "`OSError: [Errno 24] Too many open files`. Consider "
+                    "increasing with ulimit -n"
+                )
+        else:
+            print(
+                f"Current ulimit soft={current_soft}, hard={current_hard}. "
+                f"Cannot increase to {target_soft_limit}. Consider running "
+                "`ulimit -n 65535` as root or updating /etc/security/limits.conf."
+            )
+
 def parse_args():
     parser = make_normal_parser("OpenAI-compatible API server")
     add_server_args(parser)
@@ -168,6 +199,7 @@ def fastllm_server(args):
     fastllm_embed = FastLLmEmbed(model_name = args.model_name, model = model)
     fastllm_reranker = FastLLmReranker(model_name = args.model_name, model = model)
     fastllm_model = FastLLmModel(model_name = args.model_name)
+    set_ulimit()
     uvicorn.run(app, host = args.host, port = args.port)
 
 if __name__ == "__main__":
