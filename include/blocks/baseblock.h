@@ -103,6 +103,19 @@ namespace fastllm {
         bool doQKNorm,
         bool doPostQKNorm
     );
+    /*
+    MergeMOE with optional activation type conversion:
+    if dataType != moeAtype: ToDataType(input) -> MergeMOE -> ToDataType(output)
+    else: MergeMOE directly
+    */
+    void MergeMOEBlock (
+        Data *input, Data *expertIndex, Data *expertScore,
+        std::vector <Data*> *weights, std::vector <Data*> *biass,
+        Data *w1, Data *w2, Data *w3, Data *tempInput, Data *tempOutput,
+        float sharedScale, Data *output, int layer,
+        DataType dataType, DataType moeAtype,
+        Data *moeInputTemp, Data *moeOutputTemp
+    );
 }
 
 #endif //FASTLLM_BASEBLOCK_H
