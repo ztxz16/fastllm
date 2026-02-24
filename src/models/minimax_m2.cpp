@@ -306,110 +306,14 @@ namespace fastllm {
             }
         }
 
-        Data logits;
-        std::vector <Data> curLogits;
-        curLogits.resize(batch);
-
-        if (!all1) {
-            int total = 0;
-            std::vector <Data> lastTokensData;
-            std::vector <Data*> lastTokenPointers;
-            lastTokensData.resize(seqLens.size());
-            for (int b = 0; b < seqLens.size(); b++) {
-                Split(hiddenStates, 1, total + seqLens[b] - 1, total + seqLens[b], lastTokensData[b]);
-                total += seqLens[b];
-                lastTokenPointers.push_back(&lastTokensData[b]);
-            }
-            CatBatch(lastTokenPointers, 1, hiddenStates);
-        }
-
-        RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
-        Linear(hiddenStates, weight["lm_head.weight"], *GetEmptyData(), logits);
-        ToDataType(logits, DataType::FLOAT32);
         std::vector <int> lastRet;
-        int total = 0;
-
-        for (int b = 0; b < batch; b++) {
-            if (generationConfigs[b].top_k <= 1) {
-                ((GenerationConfig*)&generationConfigs[b])->top_k = 5;
-                ((GenerationConfig*)&generationConfigs[b])->top_p = 0.95;
-                if (fabs(generationConfigs[b].temperature - 1.0f) < 1e-9) {
-                    ((GenerationConfig*)&generationConfigs[b])->temperature = 0.6;
-                }
-            }
-        }
-
-        bool allSimple = true, needLogits = false;
-        int maxTopK = 1;
-        for (int b = 0; b < batch; b++) {
-            if (!generationConfigs[b].IsSimpleGreedy()) {
-                allSimple = false;
-                break;
-            }
-        }
-        for (int b = 0; b < batch; b++) {
-            needLogits |= generationConfigs[b].output_logits;
-            maxTopK = std::max(maxTopK, generationConfigs[b].top_k);
-        }
-
-        ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfigs);
-        if (true) {
-            Data topk;
-            TopK(logits, topk, 1);
-            topk.ToDevice(DataDevice::CPU);
-            float *topkData = (float*)topk.cpuData;
-            for (int b = 0; b < batch; b++) {
-                lastRet.push_back((int) (topkData[0] + 1e-3));
-                topkData += topk.Count(2);
-            }
-        } else if (batch > 1 && maxTopK <= 50 && !needLogits) {
-            int maxTokenSetSize = 0;
-            for (int b = 0; b < batch; b++) {
-                maxTokenSetSize = std::max(maxTokenSetSize, (int)lastTokens.units[b].tokenSet.size());
-            }
-            std::vector <float> penaltyData = std::vector <float> (batch * maxTokenSetSize, -100.0f);
-            std::vector <float> penaltyScaleData = std::vector <float> (batch, 1.0f);
-            for (int b = 0; b < batch; b++) {
-                int curId = 0;
-                for (int i : lastTokens.units[b].tokenSet) {
-                    penaltyData[b * maxTokenSetSize + curId] = i;
-                    curId++;
-                }
-                penaltyScaleData[b] = generationConfigs[b].repeat_penalty;
-            }
-            Data penalty, penaltyScale;
-            penalty.CopyFrom(Data(DataType::FLOAT32, {batch, maxTokenSetSize}, penaltyData));
-            penaltyScale.CopyFrom(Data(DataType::FLOAT32, {batch}, penaltyScaleData));
-            RepeatPenalty(logits, penalty, penaltyScale);
-            Data topk;
-            TopK(logits, topk, maxTopK);
-            topk.ToDevice(DataDevice::CPU);
-            for (int b = 0; b < batch; b++) {
-                lastRet.push_back(LLMSamplingOnly(topk, b, generationConfigs[b]));
-            }
-        } else {
-            for (int b = 0; b < batch; b++) {
-                pointersK[b] = (&curLogits[b]);
-            }
-            SplitBatch(logits, 1, batch, pointersK);
-
-            for (int b = 0; b < batch; b++) {
-                Data &curLogit = curLogits[b];
-                if (generationConfigs[b].output_logits && retLogits != nullptr && (*retLogits)[b] != nullptr) {
-                    curLogit.ToDevice(DataDevice::CPU);
-                    (*retLogits)[b]->resize(curLogit.Count(0));
-                    memcpy((float*)(*retLogits)[b]->data(), (float*)curLogit.cpuData, curLogit.GetBytes());
-                }
-                if (generationConfigs[b].IsSimpleGreedy()) {
-                    Data topk;
-                    TopK(curLogit, topk, 1);
-                    topk.ToDevice(DataDevice::CPU);
-                    lastRet.push_back((int) (((float *) topk.cpuData)[0] + 1e-3));
-                } else {
-                    lastRet.push_back(LLMSampling(curLogit, 0, generationConfigs[b], lastTokens.units[b]));
-                }
-            }
-        }
+        LLMSamplingBlock(
+            this, &hiddenStates,
+            &weight["model.norm.weight"], &weight["lm_head.weight"],
+            rms_norm_eps, batch, all1, seqLens,
+            pastKeyValues, generationConfigs, lastTokens,
+            retLogits, lastRet
+        );
         return lastRet;
     }
 
