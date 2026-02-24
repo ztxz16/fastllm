@@ -345,8 +345,11 @@ namespace fastllm {
             allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, vPositionIds.size()}, vPositionIds));
         }
 
-        Embedding(inputIds, this->weight["model.embed_tokens.weight"], embeddingResult);
-        ToDataType(embeddingResult, hiddenStates, this->dataType);
+        EmbeddingBlock((Data*)&inputIds, 
+            &this->weight["model.embed_tokens.weight"], &hiddenStates, this->dataType);
+        // Embedding(inputIds, this->weight["model.embed_tokens.weight"], embeddingResult);
+        // ToDataType(embeddingResult, hiddenStates, this->dataType);
+
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
