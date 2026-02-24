@@ -3829,14 +3829,21 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *output,
                                   int batch, int vocabSize) {
     float *cudaProbs = (float *)FastllmCudaMalloc((long long)batch * vocabSize * sizeof(float));
-    float *cudaTemperatures = (float *)FastllmCudaMalloc(batch * sizeof(float));
-    int *cudaTopKArr = (int *)FastllmCudaMalloc(batch * sizeof(int));
-    float *cudaTopPArr = (float *)FastllmCudaMalloc(batch * sizeof(float));
-    int *cudaOutput = (int *)FastllmCudaMalloc(batch * sizeof(int));
 
-    FastllmCudaCopyFromHostToDevice(cudaTemperatures, temperatures, batch * sizeof(float));
-    FastllmCudaCopyFromHostToDevice(cudaTopKArr, topKArr, batch * sizeof(int));
-    FastllmCudaCopyFromHostToDevice(cudaTopPArr, topPArr, batch * sizeof(float));
+    // temperatures (float * batch) | topKArr (int * batch) | topPArr (float * batch) | output (int * batch)
+    size_t paramBytes = batch * (sizeof(float) + sizeof(int) + sizeof(float) + sizeof(int));
+    uint8_t *cudaParamBuf = (uint8_t *)FastllmCudaMalloc(paramBytes);
+    float *cudaTemperatures = (float *)(cudaParamBuf);
+    int   *cudaTopKArr      = (int   *)(cudaParamBuf + batch * sizeof(float));
+    float *cudaTopPArr      = (float *)(cudaParamBuf + batch * (sizeof(float) + sizeof(int)));
+    int   *cudaOutput       = (int   *)(cudaParamBuf + batch * (sizeof(float) + sizeof(int) + sizeof(float)));
+
+    uint8_t *hostParamBuf = new uint8_t[batch * (sizeof(float) + sizeof(int) + sizeof(float))];
+    memcpy(hostParamBuf, temperatures, batch * sizeof(float));
+    memcpy(hostParamBuf + batch * sizeof(float), topKArr, batch * sizeof(int));
+    memcpy(hostParamBuf + batch * (sizeof(float) + sizeof(int)), topPArr, batch * sizeof(float));
+    FastllmCudaCopyFromHostToDevice(cudaParamBuf, hostParamBuf, batch * (sizeof(float) + sizeof(int) + sizeof(float)));
+    delete[] hostParamBuf;
 
     FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(logits, cudaProbs, cudaTemperatures, vocabSize);
 
@@ -3853,10 +3860,7 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
     DeviceSync();
 
     FastllmCudaFree(cudaProbs);
-    FastllmCudaFree(cudaTemperatures);
-    FastllmCudaFree(cudaTopKArr);
-    FastllmCudaFree(cudaTopPArr);
-    FastllmCudaFree(cudaOutput);
+    FastllmCudaFree(cudaParamBuf);
     return true;
 }
 
