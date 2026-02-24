@@ -176,10 +176,11 @@ namespace fastllm {
         Data embeddingResult, hiddenStates, attenInput, attenLastOutput;
         Data w1, w2, w3, routerLogits, routerLogitsTemp, attenPart, moePart, moeFinal;
         Data tempInput, tempOutput;
+        Data moeInputTemp, moeOutputTemp;
         std::vector <Data*> pointersK;
         pointersK.resize(batch);
 
-        Data moeInputTemp, moeOutputTemp;
+
 
         std::vector<Data*> batchPastKeys;
         std::vector<Data*> batchPastValues;
@@ -293,102 +294,12 @@ namespace fastllm {
                                 this->routed_scaling_factor, weight.weight.find(gateBiasName) != weight.weight.end() ? &weight[gateBiasName] : nullptr);
                 }
                 ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
-                if (weight.weight.find("model.layers." + std::to_string(i) + ".block_sparse_moe.experts.0.w1w3.weight") != weight.weight.end()
-                    && CanRunMergeMOE(attenInput, biass[i])) {
-                    if (this->dataType == this->moeAtype) {
-                        MergeMOE (
-                            attenInput, expertIndex, expertScore,
-                            weights[i], biass[i],
-                            w1, w2, w3, tempInput, tempOutput,
-                            1.0f,
-                            moeFinal, i
-                        );
-                    } else {
-                        ToDataType(attenInput, moeInputTemp, this->moeAtype);
-                        MergeMOE (
-                            attenInput, expertIndex, expertScore,
-                            weights[i], biass[i],
-                            w1, w2, w3, tempInput, tempOutput,
-                            1.0f,
-                            moeOutputTemp, i
-                        );
-                        ToDataType(moeOutputTemp, moeFinal, this->dataType);
-                    }
-                } else {
-                    Data &bias = weight[gateBiasName];
-                    ToDataType(routerLogits, DataType::FLOAT32);
-                    routerLogits.ToDevice(DataDevice::CPU);
-                    float *cpuRouterLogits = (float*)routerLogits.cpuData;
-                    int m = routerLogits.dims.back();
-
-                    moeFinal = Data();
-                    moeFinal.Resize({0, attenInput.dims[1]});
-                    moeFinal.Expansion(attenInput.dims);
-
-                    for (int b = 0; b < curBatch * len; b++) {
-                        float *cur = cpuRouterLogits + b * m;
-                        std::vector <std::pair <float, int> > v;
-                        for (int ei = 0; ei < m; ei++) {
-                            v.push_back(std::make_pair(-cur[ei], ei));
-                        }
-                        if (bias.dims.size() > 0) {
-                            ToDataType(bias, DataType::FLOAT32);
-                            bias.ToDevice(DataDevice::CPU);
-                            float *cpuBias = (float*)bias.cpuData;
-                            for (int ei = 0; ei < m; ei++) {
-                                v[ei].first -= cpuBias[ei];
-                            }
-                        }
-
-                        sort(v.begin(), v.end());
-                        Data *currentData = &attenInput;
-                        if (curBatch * len != 1) {
-                            Split(attenInput, 0, b, b + 1, attenPart);
-                            currentData = &attenPart;
-                        }
-                        moePart.Resize(currentData->dims);
-                        moePart.Allocate(0.0f);
-
-                        float sum = 0.0;
-                        for (int j = 0; j < this->num_experts_per_tok; j++) {
-                            float value = cur[v[j].second];
-                            sum += value;
-                        }
-                        if (!needNorm) {
-                            sum = 1.0;
-                        }
-
-                        for (int j = 0; j < this->num_experts_per_tok; j++) {
-                            int idx = v[j].second;
-                            float value = cur[idx];
-
-                            value /= sum;
-                            value *= routed_scaling_factor;
-                            if (weight.weight.find("model.layers." + std::to_string(i) + ".block_sparse_moe.experts." + std::to_string(idx) + ".w1w3.weight") != weight.weight.end()) {
-                                if (CanRunLinearEx(LinearExType::ExSwiglu)) {
-                                    LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".block_sparse_moe.experts." + std::to_string(idx) + ".w1w3.weight"], Data(), w1, LinearExType::ExSwiglu);
-                                } else {
-                                    Linear(*currentData, weight["model.layers." + std::to_string(i) + ".block_sparse_moe.experts." + std::to_string(idx) + ".w1w3.weight"], Data(), w3);
-                                    Swiglu(w3, w1);
-                                }
-                            } else {
-                                if (CanRunLinearEx(LinearExType::ExSilu)) {
-                                    LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".block_sparse_moe.experts." + std::to_string(idx) + ".w1.weight"], Data(), w1, LinearExType::ExSilu);
-                                } else {
-                                    Linear(*currentData, weight["model.layers." + std::to_string(i) + ".block_sparse_moe.experts." + std::to_string(idx) + ".w1.weight"], Data(), w1);
-                                    Silu(w1, w1);
-                                }
-                                Linear(*currentData, weight["model.layers." + std::to_string(i) + ".block_sparse_moe.experts." + std::to_string(idx) + ".w3.weight"], Data(), w3);
-                                MulTo(w1, w3);
-                            }
-                            Linear(w1, weight["model.layers." + std::to_string(i) + ".block_sparse_moe.experts." + std::to_string(idx) + ".w2.weight"], Data(), w2);
-                            AddTo(moePart, w2, value);
-                        }
-                        CatDirect(moeFinal, moePart, 0);
-                    }
-                    moeFinal.expansionDims.clear();
-                }
-
+                MergeMOEBlock(&attenInput, &expertIndex, &expertScore,
+                                  &weights[i], &biass[i],
+                                  &w1, &w2, &w3, &tempInput, &tempOutput,
+                                  1.0f, &moeFinal, i,
+                                  this->dataType, this->moeAtype,
+                                  &moeInputTemp, &moeOutputTemp);
                 moeFinal.Reshape(hiddenStates.dims);
                 ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
                 AddTo(hiddenStates, moeFinal);
