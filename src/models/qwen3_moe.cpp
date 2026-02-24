@@ -1036,6 +1036,300 @@ namespace fastllm {
         return lastRet;
     }
 
+    std::vector <int> Qwen3MOEModel::ForwardV2(int batch,
+        const Data &inputIds,
+        const std::vector <Data*> &attentionMask,
+        const std::vector <Data*> &positionIds,
+        const std::vector <int> &seqLens,
+        std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+        const std::vector <GenerationConfig> &generationConfigs,
+        const LastTokensManager &lastTokens,
+        std::vector <std::vector <float>*> *retLogits) {
+        int seqLen = inputIds.dims[1];
+
+        Data hiddenStates;
+        Data attenInput;
+        Data q, qkv;
+        Data attenLastOutput;
+        Data w1, w2, w3, routerLogits, gate, attenPart, moePart, moeFinal, sharedGate;
+        Data tempInput, tempOutput;
+        Data routerLogitsTemp;
+
+        std::vector<Data*> batchPastKeys;
+        std::vector<Data*> batchPastValues;
+        batchPastKeys.resize(batch);
+        batchPastValues.resize(batch);
+
+        Data allPositionIds;
+        Data qSizes, pageSizes, pageIndexs, lastPageLens;
+        Data insertIndexs, insertPositions;
+        Data attenOutput;
+        bool generatedBatchDecodeParams = false;
+        bool generatedAppendPagedCacheBatchParams = false;
+
+        if (weights.size() == 0) {
+            weights.resize(block_cnt);
+            biass.resize(block_cnt);
+            for (int i = 0; i < block_cnt; i++) {
+                weights[i].push_back(nullptr);
+                weights[i].push_back(nullptr);
+                biass[i].push_back(nullptr);
+                biass[i].push_back(nullptr);
+                for (int j = 0; j < this->num_experts; j++) {
+                    weights[i].push_back(&weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".gateup_proj.weight"]);
+                    weights[i].push_back(&weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".down_proj.weight"]);
+                    biass[i].push_back(nullptr);
+                    biass[i].push_back(nullptr);
+                }
+            }
+        }
+
+        bool all1 = true;
+        for (int i = 0; i < batch; i++) {
+            all1 &= (seqLens[i] == 1);
+        }
+        bool isPrefill = !all1;
+        if (all1 && positionIds[0]->dataType == DataType::FLOAT32) {
+            std::vector <float> vPositionIds;            
+            for (int b = 0; b < batch; b++) {
+                vPositionIds.push_back(((float*)positionIds[b]->cpuData)[0]);
+            }
+            allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vPositionIds));
+        } else {
+            std::vector <float> vPositionIds;            
+            for (int b = 0; b < batch; b++) {
+                for (int i = 0; i < seqLens[b]; i++) {
+                    vPositionIds.push_back(((float*)positionIds[b]->cpuData)[i]);
+                }
+            }
+            allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, vPositionIds.size()}, vPositionIds));
+        }
+
+        EmbeddingBlock((Data*)&inputIds, 
+            &this->weight["model.embed_tokens.weight"], &hiddenStates, this->dataType);
+
+        for (int i = 0; i < block_cnt; i++) {
+            ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+            std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+            std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
+            std::string qNormName = "model.layers." + std::to_string(i) + ".self_attn.q_norm.weight";
+            std::string kNormName = "model.layers." + std::to_string(i) + ".self_attn.k_norm.weight";
+            std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
+            std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
+
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".input_layernorm.weight"],
+                    rms_norm_eps, attenInput);
+            AttentionPagedBlock(
+                &attenInput,
+                &weight[mergeQkvWeightName], &weight[mergeQkvBiasName],
+                GetEmptyData(), GetEmptyData(),
+                &weight[qNormName], &weight[kNormName],
+                &weight[oWeightName], &weight[oBiasName],
+                &allPositionIds,
+                &pastKeyValues, &batchPastKeys, &batchPastValues,
+                &qkv, &q, &attenOutput, &attenLastOutput,
+                &insertIndexs, &insertPositions,
+                &qSizes, &pageSizes, &pageIndexs, &lastPageLens,
+                &generatedAppendPagedCacheBatchParams, &generatedBatchDecodeParams,
+                batch, block_cnt, i,
+                seqLens,
+                num_attention_heads, num_key_value_heads, head_dim,
+                rotary_dim, rms_norm_eps,
+                rope_base, rope_factor, max_positions,
+                rope_type,
+                GetKVCacheInCPU(),
+                isPrefill,
+                &hiddenStates,
+                true,
+                false
+            );
+
+            RMSNorm(hiddenStates, this->weight["model.layers." + std::to_string(i) + ".post_attention_layernorm.weight"], rms_norm_eps, attenInput);
+            
+            // 2. moe mlp
+            if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.gate_proj.weight") != weight.weight.end()) {
+                if (CanRunLinearEx(LinearExType::ExSilu)) {
+                    LinearEx(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                } else {
+                    Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.gate_proj.weight"], Data(), w1);
+                    Silu(w1, w1);
+                }
+                Linear(attenInput, weight["model.layers." + std::to_string(i) + ".mlp.up_proj.weight"], Data(), w3);
+                MulTo(w1, w3);
+                Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.down_proj.weight"], Data(), w2);
+                AddTo(hiddenStates, w2);
+            } else {
+                // 这里是moe mlp
+                std::string gateWeightName = "model.layers." + std::to_string(i) + ".mlp.gate.weight";
+                std::string gateBiasName = "model.layers." + std::to_string(i) + ".mlp.gate.e_score_correction_bias";
+
+                int batch = attenInput.dims[0], len = attenInput.dims[1];
+                attenInput.Reshape({batch * len, attenInput.dims[2]});
+                Linear(attenInput, weight[gateWeightName], Data(), routerLogits);
+
+                ToDataType(routerLogits, routerLogitsTemp, DataType::FLOAT32);
+                bool needNorm = true;
+                Softmax(routerLogitsTemp, routerLogitsTemp, -1);
+
+                Data expertIndex, expertScore;
+                if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
+                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    SelectExpert(routerLogitsTemp, expertIndex, expertScore, this->num_experts_per_tok, needNorm, 
+                                this->routed_scaling_factor, weight.weight.find(gateBiasName) != weight.weight.end() ? &weight[gateBiasName] : nullptr);
+                }
+                ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
+                if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
+                    && CanRunMergeMOE(attenInput, biass[i])) {
+                    MergeMOE (
+                        attenInput, expertIndex, expertScore,
+                        weights[i], biass[i],
+                        w1, w2, w3, tempInput, tempOutput,
+                        1.0f,
+                        moeFinal, i
+                    );
+                } else {
+                    Data &bias = weight[gateBiasName];                  
+                    ToDataType(routerLogits, DataType::FLOAT32);
+                    routerLogits.ToDevice(DataDevice::CPU);
+                    float *cpuRouterLogits = (float*)routerLogits.cpuData;
+                    int m = routerLogits.dims.back();
+
+                    moeFinal = Data();
+                    moeFinal.Resize({0, attenInput.dims[1]});
+                    moeFinal.Expansion(attenInput.dims);
+
+                    for (int b = 0; b < batch * len; b++) {
+                        float *cur = cpuRouterLogits + b * m;
+                        std::vector <std::pair <float, int> > v; // (value, idx)
+                        for (int i = 0; i < m; i++) {
+                            v.push_back(std::make_pair(-cur[i], i));
+                        }
+                        if (bias.dims.size() > 0) {
+                            ToDataType(bias, DataType::FLOAT32);
+                            bias.ToDevice(DataDevice::CPU);
+                            float *cpuBias = (float*)bias.cpuData;
+                            for (int i = 0; i < m; i++) {
+                                v[i].first -= cpuBias[i];
+                            }
+                        }
+
+                        sort(v.begin(), v.end());
+                        Data *currentData = &attenInput;
+                        if (batch * len != 1) {
+                            Split(attenInput, 0, b, b + 1, attenPart);
+                            currentData = &attenPart;
+                        }
+                        moePart.Resize(currentData->dims);
+                        moePart.Allocate(0.0f);
+
+                        float sum = 0.0;
+                        for (int j = 0; j < this->num_experts_per_tok; j++) {
+                            float value = cur[v[j].second];
+                            sum += value;
+                        }
+                        if (!needNorm) {
+                            sum = 1.0;
+                        }
+
+                        for (int j = 0; j < this->num_experts_per_tok; j++) {
+                            int idx = v[j].second;
+                            float value = cur[idx];
+
+                            value /= sum;
+                            value *= routed_scaling_factor;
+                            if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gateup_proj.weight") != weight.weight.end()) {
+                                if (CanRunLinearEx(LinearExType::ExSwiglu)) {
+                                    LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gateup_proj.weight"], Data(), w1, LinearExType::ExSwiglu);
+                                } else {
+                                    Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gateup_proj.weight"], Data(), w3);
+                                    Swiglu(w3, w1);
+                                }
+                            } else {
+                                if (CanRunLinearEx(LinearExType::ExSilu)) {
+                                    LinearEx(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gate_proj.weight"], Data(), w1, LinearExType::ExSilu);
+                                } else {
+                                    Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gate_proj.weight"], Data(), w1);
+                                    Silu(w1, w1);
+                                }
+                                Linear(*currentData, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".up_proj.weight"], Data(), w3);
+                                MulTo(w1, w3);
+                            }
+                            Linear(w1, weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".down_proj.weight"], Data(), w2);
+                            AddTo(moePart, w2, value);
+                        }
+                        CatDirect(moeFinal, moePart, 0);
+                    }
+                    moeFinal.expansionDims.clear();
+                }
+
+                moeFinal.Reshape(hiddenStates.dims);
+                ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+                AddTo(hiddenStates, moeFinal);
+            }
+        }
+
+        Data logits;
+        std::vector <Data> curLogits;
+        curLogits.resize(batch);
+
+        if (!all1) {
+            int total = 0;
+            std::vector <Data> lastTokens;
+            std::vector <Data*> lastTokenPointers;
+            lastTokens.resize(seqLens.size());
+            for (int b = 0; b < seqLens.size(); b++) {
+                Split(hiddenStates, 1, total + seqLens[b] - 1, total + seqLens[b], lastTokens[b]);
+                total += seqLens[b];
+                lastTokenPointers.push_back(&lastTokens[b]);
+            }
+            CatBatch(lastTokenPointers, 1, hiddenStates);
+        }
+
+        RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
+        Linear(hiddenStates, weight["lm_head.weight"], *GetEmptyData(), logits);
+        ToDataType(logits, DataType::FLOAT32);
+        std::vector <int> lastRet;
+        int total = 0;
+
+        for (int b = 0; b < batch; b++) {
+            if (generationConfigs[b].top_k <= 1) {
+                // 禁用simple greedy
+                ((GenerationConfig*)&generationConfigs[b])->top_k = 5;
+                ((GenerationConfig*)&generationConfigs[b])->top_p = 0.95;
+                if (fabs(generationConfigs[b].temperature - 1.0f) < 1e-9) {
+                    ((GenerationConfig*)&generationConfigs[b])->temperature = 0.6;
+                }
+            }
+        }
+
+        bool allSimple = true, needLogits = false;
+        int maxTopK = 1;
+        for (int b = 0; b < batch; b++) {
+            if (!generationConfigs[b].IsSimpleGreedy()) {
+                allSimple = false;
+                break;
+            }
+        }
+        for (int b = 0; b < batch; b++) {
+            needLogits |= generationConfigs[b].output_logits;
+            maxTopK = std::max(maxTopK, generationConfigs[b].top_k);
+        }
+        
+        ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfigs);
+        // if (all1) {
+        if (true) {
+            Data topk;
+            TopK(logits, topk, 1);
+            topk.ToDevice(DataDevice::CPU);
+            float *topkData = (float*)topk.cpuData;
+            for (int b = 0; b < batch; b++) {
+                lastRet.push_back((int) (topkData[0] + 1e-3));
+                topkData += topk.Count(2);
+            }
+        } 
+        return lastRet;
+    }
+
     bool Qwen3MOEModel::NeedAttentionMask(int qlen, int klen) {
         if (((qlen == 1) || (qlen >= 1024))) {
             return false;
