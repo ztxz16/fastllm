@@ -134,7 +134,11 @@ class FastLLmCompletion:
 
       request_id = f"fastllm-{self.model_name}-{random_uuid()}"
       
-      frequency_penalty = 1.0
+      default_gen = self.model.default_generation_config
+      top_p = request.top_p if request.top_p is not None else default_gen['top_p']
+      top_k = request.top_k if request.top_k is not None else default_gen['top_k']
+      temperature = request.temperature if request.temperature is not None else default_gen['temperature']
+      frequency_penalty = default_gen['repetition_penalty']
       if request.frequency_penalty and request.frequency_penalty != 0.0:
         frequency_penalty = request.frequency_penalty
 
@@ -148,12 +152,10 @@ class FastLLmCompletion:
       input_token_len = self.model.get_input_token_len(messages)
 
       tools = [tool.model_dump(exclude_none=True) for tool in request.tools] if request.tools is not None else None
-      # print("tools", tools)
 
-      # from request.tools
       handle = self.model.launch_stream_response(messages,
                         max_length = max_length, min_length = min_length, do_sample = True,
-                        top_p = request.top_p, top_k = request.top_k, temperature = request.temperature,
+                        top_p = top_p, top_k = top_k, temperature = temperature,
                         repeat_penalty = frequency_penalty, tools = tools, one_by_one = True)
       # Store the mapping between conversation ID and handle
       self.conversation_handles[request_id] = handle

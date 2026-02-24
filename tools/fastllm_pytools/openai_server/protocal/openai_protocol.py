@@ -85,9 +85,9 @@ class ChatCompletionRequest(BaseModel):
         List[Dict[str, Union[str, List[Dict[str, Union[str, Dict[str, str]]]]]]],
     ]] = []
     prompt: Optional[str] = ""
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 1.0
-    top_k: Optional[int] = -1
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
     n: Optional[int] = 1
     max_tokens: Optional[int] = None
     min_tokens: Optional[int] = 0
