@@ -727,6 +727,22 @@ class model:
         # 由于token数量有限且不太多，所以缓存该结果来减少调用较为适合。
         # 不做成自动缓存是为了避免在多线程调用的时候对缓存dict加锁，同时也为不同场景提供选择空间
         self.tokenizer_decode_token_cache = None
+
+        self.default_generation_config = {
+            'repetition_penalty': 1.0,
+            'top_p': 0.8,
+            'top_k': 1,
+            'temperature': 1.0
+        }
+        generation_config_path = os.path.join(path, "generation_config.json") if os.path.isdir(path) else None
+        if generation_config_path and os.path.isfile(generation_config_path):
+            with open(generation_config_path, "r", encoding="utf-8") as f:
+                gen_cfg = json.load(f)
+                if gen_cfg.get('do_sample', False):
+                    for key in ["repetition_penalty", "top_p", "top_k", "temperature"]:
+                        if key in gen_cfg:
+                            self.default_generation_config[key] = gen_cfg[key]
+        print(f"[fastllm] default generation config: {self.default_generation_config}")
     
     def apply_chat_template(
         self,
