@@ -128,7 +128,14 @@ namespace fastllm {
 
             // 2.6 逐 batch 做 AppendPagedCache
             // k/v 形状为 [num_kv_heads, totalSeqLen, head_dim]
-            {
+            if (batch == 1) {
+                PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
+                    layerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
+                PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
+                    layerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
+                AppendPagedCache(*pagedCacheKManager, *(*batchPastKeys)[0], k);
+                AppendPagedCache(*pagedCacheVManager, *(*batchPastValues)[0], v);
+            } else  {
                 int total = 0;
                 Data curK, curV;
 
