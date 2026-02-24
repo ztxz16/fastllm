@@ -144,19 +144,25 @@ class FastLLmCompletion:
 
       max_length = request.max_tokens if request.max_tokens else 32768
       min_length = request.min_tokens if request.min_tokens else 0
+
+      enable_thinking = None
+      if request.chat_template_kwargs and "enable_thinking" in request.chat_template_kwargs:
+          enable_thinking = bool(request.chat_template_kwargs["enable_thinking"])
+
       #logging.info(request)
       if (not(self.hide_input)):
          logging.info(f"fastllm input message: {messages}")
       #logging.info(f"input tokens: {input_token_len}")
       
-      input_token_len = self.model.get_input_token_len(messages)
+      input_token_len = self.model.get_input_token_len(messages, enable_thinking = enable_thinking)
 
       tools = [tool.model_dump(exclude_none=True) for tool in request.tools] if request.tools is not None else None
 
       handle = self.model.launch_stream_response(messages,
                         max_length = max_length, min_length = min_length, do_sample = True,
                         top_p = top_p, top_k = top_k, temperature = temperature,
-                        repeat_penalty = frequency_penalty, tools = tools, one_by_one = True)
+                        repeat_penalty = frequency_penalty, tools = tools, one_by_one = True,
+                        enable_thinking = enable_thinking)
       # Store the mapping between conversation ID and handle
       self.conversation_handles[request_id] = handle
       logging.info(f"Created conversation: {request_id}, handle: {handle}")

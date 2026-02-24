@@ -103,6 +103,7 @@ class ChatCompletionRequest(BaseModel):
         Literal["required"],
         ChatCompletionNamedToolChoiceParam,
     ]] = "none"
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
 
 
 class ChatMessage(BaseModel):

@@ -919,9 +919,11 @@ class model:
                     conversation[i]["content"] = [{"type": "text", "text": conversation[i]["content"]}]
         return conversation
 
-    def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True) -> int:
+    def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True, enable_thinking = None) -> int:
+        if enable_thinking is None:
+            enable_thinking = self.enable_thinking
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
-            prompt = self.hf_tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
+            prompt = self.hf_tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = enable_thinking)
             return len(self.hf_tokenizer.encode(prompt, add_special_tokens = True))
         else:
             prompt = self.apply_chat_template(conversation)
@@ -1150,7 +1152,9 @@ class model:
                         max_length: int = 8192, min_length: int = 0, do_sample = True, 
                         top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                         one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True, 
-                        images: List = None, tools: List = None):
+                        images: List = None, tools: List = None, enable_thinking = None):
+        if enable_thinking is None:
+            enable_thinking = self.enable_thinking
         conversation = None
         if (isinstance(query, List)):
             conversation = query
@@ -1195,7 +1199,7 @@ class model:
             tokenizer = self.hf_tokenizer
             prompt = ""
             if (conversation != None and len(conversation) != 0):
-                prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = self.enable_thinking)
+                prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = enable_thinking)
             else:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
             input = tokenizer.encode(prompt, add_special_tokens = True)
@@ -1221,7 +1225,7 @@ class model:
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
                     prompt = tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, 
-                        enable_thinking = self.enable_thinking, thinking = self.enable_thinking, tools = tools)
+                        enable_thinking = enable_thinking, thinking = enable_thinking, tools = tools)
                 else:
                     prompt = query if self.direct_query else self.get_prompt(query, history)
                 if (self.save_history):
