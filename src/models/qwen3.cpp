@@ -394,16 +394,6 @@ namespace fastllm {
             MLPBlock(&attenInput, &weight[swigluWeightName], &weight[downWeightName], &v, &q, &hiddenStates);
         }
 
-        for (int b = 0; b < batch; b++) {
-            if (generationConfigs[b].top_k <= 1) {
-                ((GenerationConfig*)&generationConfigs[b])->top_k = 5;
-                ((GenerationConfig*)&generationConfigs[b])->top_p = 0.95;
-                if (fabs(generationConfigs[b].temperature - 1.0f) < 1e-9) {
-                    ((GenerationConfig*)&generationConfigs[b])->temperature = 0.6;
-                }
-            }
-        }
-
         std::vector <int> lastRet;
         LLMSamplingBlock(
             this, &hiddenStates,
