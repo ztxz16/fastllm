@@ -221,6 +221,10 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int pageLen, int unitSize, int batch,
     int doQKNorm);
 bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fastllm::Data &penaltyScale);
+bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
+                                  int *topKArr, float *topPArr,
+                                  int *output,
+                                  int batch, int vocabSize);
 bool FastllmCudaApplyLognAttn (fastllm::Data &input, fastllm::Data &lognAttn, fastllm::Data &positionIds);
 
 bool FastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::Data **v,
