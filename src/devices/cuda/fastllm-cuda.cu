@@ -8,6 +8,9 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#include <random>
+#include "sampling.cuh"
+
 void showError(cudaError_t result, char const* const message, const char* const file,
            int const line) {
     if (cudaSuccess != result) {
@@ -3781,6 +3784,79 @@ bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fas
     int vocabs = input.dims.back();
 
     FastllmRepeatPenaltyKernel <64> <<<batch, 64>>> (inputData, penaltyData, penaltyScaleData, tokens, vocabs);
+    return true;
+}
+
+template <int BLOCK_THREADS>
+__global__ void FastllmTemperatureSoftmaxKernel(float *logits, float *probs, float *temperatures, int vocabSize) {
+    int bid = blockIdx.x;
+    float invTemp = 1.0f / temperatures[bid];
+    float *input = logits + (long long)bid * vocabSize;
+    float *output = probs + (long long)bid * vocabSize;
+
+    __shared__ float sMaxVal;
+    __shared__ float sSumExp;
+
+    float localMax = -1e30f;
+    for (int i = threadIdx.x; i < vocabSize; i += BLOCK_THREADS) {
+        localMax = fmaxf(localMax, input[i] * invTemp);
+    }
+    typedef cub::BlockReduce<float, BLOCK_THREADS> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage tempStorage;
+    float blockMax = BlockReduce(tempStorage).Reduce(localMax, cub::Max());
+    if (threadIdx.x == 0) sMaxVal = blockMax;
+    __syncthreads();
+    float maxVal = sMaxVal;
+
+    float localSum = 0.0f;
+    for (int i = threadIdx.x; i < vocabSize; i += BLOCK_THREADS) {
+        localSum += expf(input[i] * invTemp - maxVal);
+    }
+    __syncthreads();
+    float blockSum = BlockReduce(tempStorage).Sum(localSum);
+    if (threadIdx.x == 0) sSumExp = blockSum;
+    __syncthreads();
+    float sumExp = sSumExp;
+
+    float invSum = 1.0f / sumExp;
+    for (int i = threadIdx.x; i < vocabSize; i += BLOCK_THREADS) {
+        output[i] = expf(input[i] * invTemp - maxVal) * invSum;
+    }
+}
+
+bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
+                                  int *topKArr, float *topPArr,
+                                  int *output,
+                                  int batch, int vocabSize) {
+    float *cudaProbs = (float *)FastllmCudaMalloc((long long)batch * vocabSize * sizeof(float));
+    float *cudaTemperatures = (float *)FastllmCudaMalloc(batch * sizeof(float));
+    int *cudaTopKArr = (int *)FastllmCudaMalloc(batch * sizeof(int));
+    float *cudaTopPArr = (float *)FastllmCudaMalloc(batch * sizeof(float));
+    int *cudaOutput = (int *)FastllmCudaMalloc(batch * sizeof(int));
+
+    FastllmCudaCopyFromHostToDevice(cudaTemperatures, temperatures, batch * sizeof(float));
+    FastllmCudaCopyFromHostToDevice(cudaTopKArr, topKArr, batch * sizeof(int));
+    FastllmCudaCopyFromHostToDevice(cudaTopPArr, topPArr, batch * sizeof(float));
+
+    FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(logits, cudaProbs, cudaTemperatures, vocabSize);
+
+    static std::mt19937 rng(std::random_device{}());
+    uint64_t seed = rng();
+
+    flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
+        cudaProbs, cudaTopKArr, cudaTopPArr, cudaOutput,
+        (int *)nullptr,
+        (uint32_t)batch, (int)0, 0.0f,
+        (uint32_t)vocabSize, false, seed, 0, 0);
+
+    FastllmCudaCopyFromDeviceToHost(output, cudaOutput, batch * sizeof(int));
+    DeviceSync();
+
+    FastllmCudaFree(cudaProbs);
+    FastllmCudaFree(cudaTemperatures);
+    FastllmCudaFree(cudaTopKArr);
+    FastllmCudaFree(cudaTopPArr);
+    FastllmCudaFree(cudaOutput);
     return true;
 }
 

@@ -116,6 +116,34 @@ namespace fastllm {
         DataType dataType, DataType moeAtype,
         Data *moeInputTemp, Data *moeOutputTemp
     );
+
+    class basellm;
+
+    /*
+    LLM Sampling Block:
+    1. (可选) 提取 last token (当 all1=false 时)
+    2. RMSNorm(hiddenStates, normWeight)
+    3. Linear(hiddenStates, lmHeadWeight) -> logits
+    4. ResetLogitsOfEOS
+    5. Sampling (allSimple / batch CUDA sampling / per-sample fallback)
+    输入: hiddenStates
+    输出: lastRet (采样得到的 token id)
+    */
+    void LLMSamplingBlock (
+        basellm *model,
+        Data *hiddenStates,
+        Data *normWeight,
+        Data *lmHeadWeight,
+        float rms_norm_eps,
+        int batch,
+        bool all1,
+        const std::vector<int> &seqLens,
+        std::vector<std::pair<Data*, Data*>> &pastKeyValues,
+        const std::vector<GenerationConfig> &generationConfigs,
+        const LastTokensManager &lastTokens,
+        std::vector<std::vector<float>*> *retLogits,
+        std::vector<int> &lastRet
+    );
 }
 
 #endif //FASTLLM_BASEBLOCK_H
