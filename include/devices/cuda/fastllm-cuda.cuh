@@ -138,6 +138,7 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
                          fastllm::Data &output, float softmaxScale);
 
 bool FastllmCudaEmbedding(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
+bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                           const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType);
 bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output);

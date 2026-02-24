@@ -23,6 +23,7 @@ namespace fastllm {
         // this->ops["MergeAttention"] = (BaseOperator*)(new CudaMergeAttention());
         this->ops["CopyKVCache"] = (BaseOperator*)(new CudaCopyKVCacheOp());
         this->ops["Embedding"] = (BaseOperator*)(new CudaEmbedding());
+        this->ops["EmbeddingDirect"] = (BaseOperator*)(new CudaEmbeddingDirect());
         this->ops["LayerNorm"] = (BaseOperator*)(new CudaLayerNormOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new CudaRMSNormOp());
         this->ops["RMSNormPart"] = (BaseOperator*)(new CudaRMSNormPartOp());
@@ -468,6 +469,27 @@ namespace fastllm {
         output.Allocate();
 
         FastllmCudaEmbedding(input, weight, output);
+    }
+
+    bool CudaEmbeddingDirect::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
+        if (GetLowMemMode() || !GetCudaEmbedding()) {
+            return false;
+        }
+        Data &input = *(datas.find("input")->second);
+        if (input.dataType != DataType::FLOAT32) {
+            return false;
+        }
+        return true;
+    }
+
+    void CudaEmbeddingDirect::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &weight = *(datas.find("weight")->second);;
+        output.Allocate();
+
+        FastllmCudaEmbeddingDirect(input, weight, output);
     }
 
     void CudaConv1DPerChannel::Run(const std::string &opType, const fastllm::DataDict &datas,
