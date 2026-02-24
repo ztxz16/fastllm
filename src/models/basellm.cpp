@@ -673,20 +673,19 @@ namespace fastllm {
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
             auto &forwardLocker = model->forwardLocker;
             
-            // 首先把已经abort的请求删除掉
-            std::set <int> abortHandles;
+            // 单次遍历：处理abort、释放isEnding的KV cache、统计busyPages/alive、构建orders、检测hasPrefill
+            std::vector <int> abortHandles;
+            int busyPages = 0, currentActivate = 0;
+            bool hasPrefill = false;
+            std::vector <std::pair <int, int> > orders;
+            int limit = (maxTotalLens > 0) ? maxTotalLens : 999999999;
+
             for (auto &it: model->responseContextDict.dicts) {
                 if (it.second->isAbort) {
                     it.second->TryRecordPagedCache();
-                    abortHandles.insert(it.first);
+                    abortHandles.push_back(it.first);
+                    continue;
                 }
-            }
-            for (auto &it : abortHandles) {
-                model->responseContextDict.RemoveHandle(it);
-            }
-
-            // 已完成的请求（isEnding=true）主动释放KV cache页面，避免占用分页资源
-            for (auto &it : model->responseContextDict.dicts) {
                 if (it.second->isEnding) {
                     for (int i = 0; i < model->block_cnt; i++) {
                         auto &kvFirst = it.second->pastKeyValues[i].first;
@@ -706,15 +705,6 @@ namespace fastllm {
                             kvSecond.lastPageLen = 0;
                         }
                     }
-                }
-            }
-
-            int limit = (maxTotalLens > 0) ? maxTotalLens : 999999999;
-
-            // 统计当前已占用的分页数和活跃请求数（不包含已完成的请求）
-            int busyPages = 0, currentActivate = 0;
-            for (auto &it: model->responseContextDict.dicts) {
-                if (it.second->isEnding) {
                     continue;
                 }
                 auto &kvFirst = it.second->pastKeyValues[model->kvCacheId].first;
@@ -722,22 +712,15 @@ namespace fastllm {
                     busyPages += (int)kvFirst.pageIndex.size();
                     currentActivate++;
                 }
-            }
-            std::vector <std::pair <int, int> > orders;
-            for (auto &it : model->responseContextDict.dicts) {
+                if (it.second->preTokens == 0) {
+                    hasPrefill = true;
+                }
                 orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
             }
-            sort(orders.begin(), orders.end());
-
-            // 判断是否有可以做prefill的请求
-            bool hasPrefill = false;
-            for (auto &ii : orders) {
-                auto &it = *model->responseContextDict.dicts.find(ii.second);
-                if (!it.second->isEnding && it.second->preTokens == 0) {
-                    hasPrefill = true;
-                    break;
-                }
+            for (auto &it : abortHandles) {
+                model->responseContextDict.RemoveHandle(it);
             }
+            sort(orders.begin(), orders.end());
 
             // 当busyPages未超过pagesLimit时可以开启新的Prefill；超过时只做Decode
             bool canAddPrefill = (pagesLimit > 0) ? (busyPages < pagesLimit) : true;
@@ -867,16 +850,7 @@ namespace fastllm {
                             }
                         }
 
-                        int alive = 0;
-                        for (auto &jt: model->responseContextDict.dicts) {
-                            if (jt.second->isEnding) {
-                                continue;
-                            }
-                            if (jt.second->pastKeyValues[model->kvCacheId].first.pageIndex.size() > 0) {
-                                alive++;
-                            }
-                        }
-                        if (alive + (int)seqLens.size() >= maxBatch) {
+                        if (currentActivate + (int)seqLens.size() >= maxBatch) {
                             continue;
                         }
 
@@ -1164,25 +1138,9 @@ namespace fastllm {
                     auto nowTime = std::chrono::system_clock::now();
                     float spend = GetSpan(lastRecordTime, nowTime);
                     if (spend > 1) {
-                        int alive = 0, pending = 0;
-                        int logBusyPages = 0, logTotalPages = 0;
-                        for (auto &it: model->responseContextDict.dicts) {
-                            if (it.second->isEnding) {
-                                continue;
-                            }
-                            auto &kvFirst = it.second->pastKeyValues[model->kvCacheId].first;
-                            if (kvFirst.pageIndex.size() > 0) {
-                                alive++;
-                                logBusyPages += kvFirst.pageIndex.size();
-                                if (logTotalPages == 0 && kvFirst.pagedKVCacheData != nullptr) {
-                                    logTotalPages = kvFirst.pagedKVCacheData->maxPages;
-                                }
-                            } else {
-                                pending++;
-                            }
-                        }
-                        float kvUsage = logTotalPages > 0 ? logBusyPages * 100.0f / logTotalPages : 0;
-                        printf("[Decode] alive = %d, pending = %d, context usages: %.1f%%, Speed: %f tokens / s.\n", alive, pending, kvUsage, (float)genTokens / spend);
+                        int logPending = (int)orders.size() - currentActivate;
+                        float kvUsage = totalPages > 0 ? busyPages * 100.0f / totalPages : 0;
+                        printf("[Decode] alive = %d, pending = %d, context usages: %.1f%%, Speed: %f tokens / s.\n", currentActivate, logPending, kvUsage, (float)genTokens / spend);
                         lastRecordTime = nowTime;
                         genTokens = 0;
                     }
@@ -1234,14 +1192,7 @@ namespace fastllm {
             }
 
             if (seqLens.size() == 0) {
-                bool hasPending = false;
-                for (auto &it : model->responseContextDict.dicts) {
-                    if (!it.second->isEnding) {
-                        hasPending = true;
-                        break;
-                    }
-                }
-                if (hasPending) {
+                if (!orders.empty()) {
                     model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
                 } else {
                     model->dictCV.wait(dictLocker);
