@@ -1327,10 +1327,8 @@ namespace fastllm {
     }
 
     Data::~Data() {
-        if (this->isPagedKVCache) {
-            for (auto index : this->pageIndex) {
-                this->pagedKVCacheData->ReleasePageIndex(index);
-            }
+        if (this->isPagedKVCache && !this->pageIndex.empty()) {
+            this->pagedKVCacheData->ReleasePageIndices(this->pageIndex);
         }
         if (this->multiDeviceData) {
             for (auto it : this->multiDeviceDatas) {
@@ -3544,9 +3542,15 @@ namespace fastllm {
     void PagedCacheManager::SetMaxPages(int maxPages) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         this->maxPages = maxPages;
-        this->unusedPageIndex.clear();
+        this->freePages.clear();
+        this->triePages.clear();
+        this->freePagesSet.clear();
+        this->triePagesSet.clear();
+        this->freePages.reserve(maxPages);
+        this->freePagesSet.reserve(maxPages);
         for (int i = 0; i < maxPages; i++) {
-            this->unusedPageIndex.insert(i);
+            this->freePages.push_back(i);
+            this->freePagesSet.insert(i);
         }
         this->pageTimestamp.assign(maxPages, 0);
         this->pageRefCount.assign(maxPages, 0);
@@ -3558,53 +3562,122 @@ namespace fastllm {
         this->trieRoot = new CacheTrieNode();
     }
 
+    // 从 Trie 中移除一个叶子节点，断开父子关系并清理映射
+    static void RemoveTrieLeaf(CacheTrieNode *node, int pageIndex,
+                               std::unordered_map<int, CacheTrieNode*> &pageToTrieNode) {
+        if (node->parent) {
+            node->parent->children.erase(node->edgeHash);
+        }
+        pageToTrieNode.erase(pageIndex);
+        delete node;
+    }
+
+    // 递归删除 Trie 子树中所有节点，将其关联的页面迁移回 freePages
+    void PagedCacheManager::EvictTrieSubtree(CacheTrieNode *node) {
+        // 先递归处理所有子节点
+        for (auto &kv : node->children) {
+            EvictTrieSubtree(kv.second);
+        }
+        int pid = node->pageId;
+        if (pid >= 0) {
+            this->pageToTrieNode.erase(pid);
+            // 如果页面空闲（在 triePagesSet 中），迁移到 freePages
+            if (this->triePagesSet.erase(pid)) {
+                this->freePagesSet.insert(pid);
+                this->freePages.push_back(pid);
+            }
+        }
+        delete node;
+    }
+
     int PagedCacheManager::GetUnusedPageIndex(bool pick) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
-        if (this->unusedPageIndex.empty()) {
-            ErrorInFastLLM("PagedCacheManager::GetUnusedPageIndex: no page can be use.\n");
-        }
 
-        // 优先选不在 Trie 中的空闲页
-        int pageIndex = -1;
-        for (int idx : this->unusedPageIndex) {
-            if (this->pageToTrieNode.find(idx) == this->pageToTrieNode.end()) {
-                pageIndex = idx;
+        // 尝试将 triePages 中已不在 Trie 中的 stale 条目迁移到 freePages
+        while (this->freePages.empty() && !this->triePages.empty()) {
+            int candidate = this->triePages.back();
+            auto it = this->pageToTrieNode.find(candidate);
+            if (it == this->pageToTrieNode.end()) {
+                // 页面已不在 Trie 中，迁移到 freePages
+                this->triePages.pop_back();
+                this->triePagesSet.erase(candidate);
+                this->freePages.push_back(candidate);
+                this->freePagesSet.insert(candidate);
+            } else {
                 break;
             }
         }
 
-        if (pageIndex == -1) {
-            // 所有空闲页都在 Trie 中，选时间戳最旧的叶子节点
-            long long oldestTs = LLONG_MAX;
-            int oldestPage = -1;
-            for (int idx : this->unusedPageIndex) {
-                auto it = this->pageToTrieNode.find(idx);
-                if (it != this->pageToTrieNode.end()) {
-                    CacheTrieNode *node = it->second;
-                    if (node->children.empty() && node->timestamp < oldestTs) {
-                        oldestTs = node->timestamp;
-                        oldestPage = idx;
-                    }
-                }
-            }
-
-            if (oldestPage == -1) {
-                // 回退：选任意空闲页
-                pageIndex = *this->unusedPageIndex.begin();
-            } else {
-                pageIndex = oldestPage;
-                // 从 Trie 中移除该叶子节点
-                CacheTrieNode *node = this->pageToTrieNode[pageIndex];
-                if (node->parent) {
-                    node->parent->children.erase(node->edgeHash);
-                }
-                this->pageToTrieNode.erase(pageIndex);
-                delete node;
-            }
+        if (this->freePages.empty() && this->triePages.empty()) {
+            ErrorInFastLLM("PagedCacheManager::GetUnusedPageIndex: no page can be use.\n");
         }
 
-        if (pick) {
-            this->unusedPageIndex.erase(pageIndex);
+        int pageIndex;
+        if (!this->freePages.empty()) {
+            pageIndex = this->freePages.back();
+            if (pick) {
+                this->freePages.pop_back();
+                this->freePagesSet.erase(pageIndex);
+                this->pageRefCount[pageIndex] = 1;
+            }
+        } else {
+            if (!pick) {
+                pageIndex = this->triePages.back();
+                return pageIndex;
+            }
+
+            // pick 模式：从 triePages 中淘汰，优先选叶子节点
+            pageIndex = -1;
+            for (int i = (int)this->triePages.size() - 1; i >= 0; i--) {
+                int candidate = this->triePages[i];
+                auto it = this->pageToTrieNode.find(candidate);
+                if (it == this->pageToTrieNode.end()) {
+                    // stale 条目：页面已不在 Trie 中，直接用
+                    pageIndex = candidate;
+                    this->triePages[i] = this->triePages.back();
+                    this->triePages.pop_back();
+                    this->triePagesSet.erase(pageIndex);
+                    break;
+                }
+                if (it->second->children.empty()) {
+                    pageIndex = candidate;
+                    this->triePages[i] = this->triePages.back();
+                    this->triePages.pop_back();
+                    this->triePagesSet.erase(pageIndex);
+                    RemoveTrieLeaf(it->second, pageIndex, this->pageToTrieNode);
+                    break;
+                }
+            }
+
+            if (pageIndex == -1) {
+                // 没有叶子可淘汰，选一个非叶子，递归清理其整个子树
+                pageIndex = this->triePages.back();
+                this->triePages.pop_back();
+                this->triePagesSet.erase(pageIndex);
+                auto it = this->pageToTrieNode.find(pageIndex);
+                if (it != this->pageToTrieNode.end()) {
+                    CacheTrieNode *node = it->second;
+                    for (auto &childKv : node->children) {
+                        EvictTrieSubtree(childKv.second);
+                    }
+                    node->children.clear();
+                    if (node->parent) {
+                        node->parent->children.erase(node->edgeHash);
+                    }
+                    this->pageToTrieNode.erase(it);
+                    delete node;
+                }
+                // EvictTrieSubtree 可能将子树页面从 triePages 迁移到 freePages，
+                // 过滤 triePages 中已不在 triePagesSet 的脏条目
+                int w = 0;
+                for (int i = 0; i < (int)this->triePages.size(); i++) {
+                    if (this->triePagesSet.count(this->triePages[i])) {
+                        this->triePages[w++] = this->triePages[i];
+                    }
+                }
+                this->triePages.resize(w);
+            }
+
             this->pageRefCount[pageIndex] = 1;
         }
         return pageIndex;
@@ -3615,15 +3688,69 @@ namespace fastllm {
         this->pageRefCount[pageIndex]--;
         if (this->pageRefCount[pageIndex] <= 0) {
             this->pageRefCount[pageIndex] = 0;
-            this->unusedPageIndex.insert(pageIndex);
+            if (this->pageToTrieNode.find(pageIndex) != this->pageToTrieNode.end()) {
+                if (this->triePagesSet.find(pageIndex) == this->triePagesSet.end()) {
+                    this->triePages.push_back(pageIndex);
+                    this->triePagesSet.insert(pageIndex);
+                }
+            } else {
+                if (this->freePagesSet.find(pageIndex) == this->freePagesSet.end()) {
+                    this->freePages.push_back(pageIndex);
+                    this->freePagesSet.insert(pageIndex);
+                }
+            }
+        }
+    }
+
+    void PagedCacheManager::ReleasePageIndices(const std::vector<int> &pageIndices) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        for (int pageIndex : pageIndices) {
+            this->pageRefCount[pageIndex]--;
+            if (this->pageRefCount[pageIndex] <= 0) {
+                this->pageRefCount[pageIndex] = 0;
+                if (this->pageToTrieNode.find(pageIndex) != this->pageToTrieNode.end()) {
+                    if (this->triePagesSet.find(pageIndex) == this->triePagesSet.end()) {
+                        this->triePages.push_back(pageIndex);
+                        this->triePagesSet.insert(pageIndex);
+                    }
+                } else {
+                    if (this->freePagesSet.find(pageIndex) == this->freePagesSet.end()) {
+                        this->freePages.push_back(pageIndex);
+                        this->freePagesSet.insert(pageIndex);
+                    }
+                }
+            }
         }
     }
 
     void PagedCacheManager::Pick(std::vector<int> &pageIds) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        bool needRebuildFree = false, needRebuildTrie = false;
         for (int pageIndex : pageIds) {
             this->pageRefCount[pageIndex]++;
-            this->unusedPageIndex.erase(pageIndex);
+            if (this->freePagesSet.erase(pageIndex)) {
+                needRebuildFree = true;
+            } else if (this->triePagesSet.erase(pageIndex)) {
+                needRebuildTrie = true;
+            }
+        }
+        if (needRebuildFree) {
+            int w = 0;
+            for (int i = 0; i < (int)this->freePages.size(); i++) {
+                if (this->freePagesSet.count(this->freePages[i])) {
+                    this->freePages[w++] = this->freePages[i];
+                }
+            }
+            this->freePages.resize(w);
+        }
+        if (needRebuildTrie) {
+            int w = 0;
+            for (int i = 0; i < (int)this->triePages.size(); i++) {
+                if (this->triePagesSet.count(this->triePages[i])) {
+                    this->triePages[w++] = this->triePages[i];
+                }
+            }
+            this->triePages.resize(w);
         }
     }
 
@@ -3660,9 +3787,38 @@ namespace fastllm {
                 cur->children[h] = child;
             } else {
                 child = it->second;
-                // 如果旧节点绑定了不同的 page，解除旧映射
                 if (child->pageId != -1 && child->pageId != pid) {
-                    this->pageToTrieNode.erase(child->pageId);
+                    int oldPid = child->pageId;
+                    this->pageToTrieNode.erase(oldPid);
+                    // 旧页面如果空闲，从 triePages 迁移到 freePages
+                    if (this->triePagesSet.erase(oldPid)) {
+                        for (int j = (int)this->triePages.size() - 1; j >= 0; j--) {
+                            if (this->triePages[j] == oldPid) {
+                                this->triePages[j] = this->triePages.back();
+                                this->triePages.pop_back();
+                                break;
+                            }
+                        }
+                        this->freePages.push_back(oldPid);
+                        this->freePagesSet.insert(oldPid);
+                    }
+                }
+            }
+
+            // 新页面加入 Trie：如果它在 freePages 中（空闲且不在 Trie 中），迁移到 triePages
+            if (this->pageToTrieNode.find(pid) == this->pageToTrieNode.end()) {
+                if (this->freePagesSet.erase(pid)) {
+                    for (int j = (int)this->freePages.size() - 1; j >= 0; j--) {
+                        if (this->freePages[j] == pid) {
+                            this->freePages[j] = this->freePages.back();
+                            this->freePages.pop_back();
+                            break;
+                        }
+                    }
+                    if (this->pageRefCount[pid] <= 0) {
+                        this->triePages.push_back(pid);
+                        this->triePagesSet.insert(pid);
+                    }
                 }
             }
 

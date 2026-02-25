@@ -495,9 +495,14 @@ namespace fastllm {
             // 最大页数
             int maxPages;
 
-            // 目前可以使用的页索引
-            std::set <int> unusedPageIndex;
+            // 空闲页双池：freePages 不在 Trie 中，triePages 在 Trie 中但未被引用
+            std::vector<int> freePages;
+            std::vector<int> triePages;
+            std::unordered_set<int> freePagesSet;
+            std::unordered_set<int> triePagesSet;
             std::mutex pageIndexLocker;
+
+            int FreePageCount() const { return (int)freePages.size() + (int)triePages.size(); }
 
             // 每个页面的使用时间戳
             std::vector<long long> pageTimestamp;
@@ -512,7 +517,9 @@ namespace fastllm {
 
             void SetMaxPages(int maxPages);
             int GetUnusedPageIndex(bool pick);
+            void EvictTrieSubtree(CacheTrieNode *node);
             void ReleasePageIndex(int pageIndex);
+            void ReleasePageIndices(const std::vector<int> &pageIndices);
             void Pick(std::vector<int> &pageIds);
 
             static uint64_t HashTokenPage(const int *tokens, int len);
@@ -908,7 +915,7 @@ namespace fastllm {
     PagedCacheManager* AllocatePagedCacheManager(int layerIndex, 
         PagedCacheManager::PagedCacheManagerType type, 
         const Data &cacheData, 
-        int pageLen = 128, 
+        int pageLen =  128, 
         int maxPages = -1);
 
     PagedCacheManager* GetPagedCacheManager(int layerIndex);
