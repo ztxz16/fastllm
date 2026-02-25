@@ -807,14 +807,8 @@ namespace fastllm {
                                             kvFirst.isPagedKVCache = true;
                                             kvFirst.pagedKVCacheData = kMgr;
                                             kvFirst.pageLen = kMgr->pageLen;
-                                            kvFirst.pageIndex.clear();
-                                            {
-                                                std::lock_guard<std::mutex> guard(kMgr->pageIndexLocker);
-                                                for (int pi = 0; pi < minCachedPages; pi++) {
-                                                    kvFirst.pageIndex.push_back(kPages[pi]);
-                                                    kMgr->unusedPageIndex.erase(kPages[pi]);
-                                                }
-                                            }
+                                            kvFirst.pageIndex.assign(kPages.begin(), kPages.begin() + minCachedPages);
+                                            kMgr->Pick(kvFirst.pageIndex);
                                             kvFirst.lastPageLen = kMgr->pageLen;
                                             int numHeads = ((Data*)kMgr)->dims[2];
                                             int headDim = ((Data*)kMgr)->dims[3];
@@ -826,14 +820,8 @@ namespace fastllm {
                                             kvSecond.isPagedKVCache = true;
                                             kvSecond.pagedKVCacheData = vMgr;
                                             kvSecond.pageLen = vMgr->pageLen;
-                                            kvSecond.pageIndex.clear();
-                                            {
-                                                std::lock_guard<std::mutex> guard(vMgr->pageIndexLocker);
-                                                for (int pi = 0; pi < minCachedPages; pi++) {
-                                                    kvSecond.pageIndex.push_back(vPages[pi]);
-                                                    vMgr->unusedPageIndex.erase(vPages[pi]);
-                                                }
-                                            }
+                                            kvSecond.pageIndex.assign(vPages.begin(), vPages.begin() + minCachedPages);
+                                            vMgr->Pick(kvSecond.pageIndex);
                                             kvSecond.lastPageLen = vMgr->pageLen;
                                             int numHeads = ((Data*)vMgr)->dims[2];
                                             int headDim = ((Data*)vMgr)->dims[3];
