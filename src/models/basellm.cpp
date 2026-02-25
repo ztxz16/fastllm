@@ -631,18 +631,14 @@ namespace fastllm {
             for (int i = 0; i < model->block_cnt; i++) {
                 auto &kvFirst = ctx->pastKeyValues[i].first;
                 auto &kvSecond = ctx->pastKeyValues[i].second;
-                if (kvFirst.isPagedKVCache && kvFirst.pagedKVCacheData != nullptr) {
-                    for (auto idx : kvFirst.pageIndex) {
-                        kvFirst.pagedKVCacheData->ReleasePageIndex(idx);
-                    }
+                if (kvFirst.isPagedKVCache && kvFirst.pagedKVCacheData != nullptr && !kvFirst.pageIndex.empty()) {
+                    kvFirst.pagedKVCacheData->ReleasePageIndices(kvFirst.pageIndex);
                     kvFirst.pageIndex.clear();
                     kvFirst.lastPageLen = 0;
                     kvFirst.dims.clear();
                 }
-                if (kvSecond.isPagedKVCache && kvSecond.pagedKVCacheData != nullptr) {
-                    for (auto idx : kvSecond.pageIndex) {
-                        kvSecond.pagedKVCacheData->ReleasePageIndex(idx);
-                    }
+                if (kvSecond.isPagedKVCache && kvSecond.pagedKVCacheData != nullptr && !kvSecond.pageIndex.empty()) {
+                    kvSecond.pagedKVCacheData->ReleasePageIndices(kvSecond.pageIndex);
                     kvSecond.pageIndex.clear();
                     kvSecond.lastPageLen = 0;
                     kvSecond.dims.clear();
@@ -691,16 +687,12 @@ namespace fastllm {
                         auto &kvFirst = it.second->pastKeyValues[i].first;
                         auto &kvSecond = it.second->pastKeyValues[i].second;
                         if (kvFirst.isPagedKVCache && kvFirst.pagedKVCacheData != nullptr && !kvFirst.pageIndex.empty()) {
-                            for (auto idx : kvFirst.pageIndex) {
-                                kvFirst.pagedKVCacheData->ReleasePageIndex(idx);
-                            }
+                            kvFirst.pagedKVCacheData->ReleasePageIndices(kvFirst.pageIndex);
                             kvFirst.pageIndex.clear();
                             kvFirst.lastPageLen = 0;
                         }
                         if (kvSecond.isPagedKVCache && kvSecond.pagedKVCacheData != nullptr && !kvSecond.pageIndex.empty()) {
-                            for (auto idx : kvSecond.pageIndex) {
-                                kvSecond.pagedKVCacheData->ReleasePageIndex(idx);
-                            }
+                            kvSecond.pagedKVCacheData->ReleasePageIndices(kvSecond.pageIndex);
                             kvSecond.pageIndex.clear();
                             kvSecond.lastPageLen = 0;
                         }
@@ -725,7 +717,7 @@ namespace fastllm {
                 PagedCacheManager *probeManager = GetPagedCacheManager(model->kvCacheId * 2);
                 if (probeManager != nullptr) {
                     std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
-                    busyPages = probeManager->maxPages - (int)probeManager->unusedPageIndex.size();
+                    busyPages = probeManager->maxPages - probeManager->FreePageCount();
                 }
             }
 
@@ -774,34 +766,19 @@ namespace fastllm {
                         if (it.second->cacheLen == 0) {
                             PagedCacheManager *probeManager = GetPagedCacheManager(model->kvCacheId * 2);
                             if (probeManager != nullptr) {
-                                int minCachedPages = INT_MAX;
-                                for (int li = 0; li < model->block_cnt; li++) {
-                                    PagedCacheManager *kMgr = GetPagedCacheManager(li * 2);
-                                    PagedCacheManager *vMgr = GetPagedCacheManager(li * 2 + 1);
-                                    if (kMgr != nullptr) {
-                                        std::vector<int> kPages;
-                                        kMgr->Query(it.second->currentTokens, kPages);
-                                        minCachedPages = std::min(minCachedPages, (int)kPages.size());
-                                    } else {
-                                        minCachedPages = 0;
-                                    }
-                                    if (vMgr != nullptr) {
-                                        std::vector<int> vPages;
-                                        vMgr->Query(it.second->currentTokens, vPages);
-                                        minCachedPages = std::min(minCachedPages, (int)vPages.size());
-                                    } else {
-                                        minCachedPages = 0;
-                                    }
-                                    if (minCachedPages == 0) break;
-                                }
-                                if (minCachedPages > 0 && minCachedPages < INT_MAX) {
+                                // 只在代表 layer 上做 Query 确定可命中页数
+                                std::vector<int> probePages;
+                                probeManager->Query(it.second->currentTokens, probePages);
+                                int minCachedPages = (int)probePages.size();
+
+                                if (minCachedPages > 0) {
                                     int cachedLen = minCachedPages * probeManager->pageLen;
                                     if (cachedLen >= (int)it.second->currentTokens.size()) {
                                         minCachedPages--;
                                         cachedLen = minCachedPages * probeManager->pageLen;
                                     }
                                 }
-                                if (minCachedPages > 0 && minCachedPages < INT_MAX) {
+                                if (minCachedPages > 0) {
                                     int cachedLen = minCachedPages * probeManager->pageLen;
                                     for (int li = 0; li < model->block_cnt; li++) {
                                         auto &kvFirst = it.second->pastKeyValues[li].first;
@@ -811,35 +788,37 @@ namespace fastllm {
                                         if (kMgr != nullptr) {
                                             std::vector<int> kPages;
                                             kMgr->Query(it.second->currentTokens, kPages);
+                                            int actualPages = std::min(minCachedPages, (int)kPages.size());
                                             kvFirst.isPagedKVCache = true;
                                             kvFirst.pagedKVCacheData = kMgr;
                                             kvFirst.pageLen = kMgr->pageLen;
-                                            kvFirst.pageIndex.assign(kPages.begin(), kPages.begin() + minCachedPages);
+                                            kvFirst.pageIndex.assign(kPages.begin(), kPages.begin() + actualPages);
                                             kMgr->Pick(kvFirst.pageIndex);
                                             kvFirst.lastPageLen = kMgr->pageLen;
                                             int numHeads = ((Data*)kMgr)->dims[2];
                                             int headDim = ((Data*)kMgr)->dims[3];
-                                            kvFirst.Resize({numHeads, cachedLen, headDim});
+                                            kvFirst.Resize({numHeads, actualPages * kMgr->pageLen, headDim});
                                         }
                                         if (vMgr != nullptr) {
                                             std::vector<int> vPages;
                                             vMgr->Query(it.second->currentTokens, vPages);
+                                            int actualPages = std::min(minCachedPages, (int)vPages.size());
                                             kvSecond.isPagedKVCache = true;
                                             kvSecond.pagedKVCacheData = vMgr;
                                             kvSecond.pageLen = vMgr->pageLen;
-                                            kvSecond.pageIndex.assign(vPages.begin(), vPages.begin() + minCachedPages);
+                                            kvSecond.pageIndex.assign(vPages.begin(), vPages.begin() + actualPages);
                                             vMgr->Pick(kvSecond.pageIndex);
                                             kvSecond.lastPageLen = vMgr->pageLen;
                                             int numHeads = ((Data*)vMgr)->dims[2];
                                             int headDim = ((Data*)vMgr)->dims[3];
-                                            kvSecond.Resize({numHeads, cachedLen, headDim});
+                                            kvSecond.Resize({numHeads, actualPages * vMgr->pageLen, headDim});
                                         }
                                     }
                                     it.second->currentTokens.erase(it.second->currentTokens.begin(), it.second->currentTokens.begin() + cachedLen);
                                     it.second->cacheLen = cachedLen;
                                     {
                                         std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
-                                        curBusyPages = probeManager->maxPages - (int)probeManager->unusedPageIndex.size();
+                                        curBusyPages = probeManager->maxPages - probeManager->FreePageCount();
                                     }
                                     if (model->verbose) {
                                         printf("[Handle %d] Prefix cache hit: %d pages (%d tokens).\n", it.first, minCachedPages, cachedLen);
@@ -957,7 +936,7 @@ namespace fastllm {
                     int freePages;
                     {
                         std::lock_guard<std::mutex> guard(pagedManager->pageIndexLocker);
-                        freePages = (int)pagedManager->unusedPageIndex.size();
+                        freePages = pagedManager->FreePageCount();
                     }
                     // if (freePages < newPagesNeeded) {
                     //    printf("[Decode] Page shortage: newPagesNeeded=%d, freePages=%d, maxPages=%d, batchSize=%d\n",
@@ -1017,7 +996,7 @@ namespace fastllm {
                         }
                         {
                             std::lock_guard<std::mutex> guard(pagedManager->pageIndexLocker);
-                            freePages = (int)pagedManager->unusedPageIndex.size();
+                            freePages = pagedManager->FreePageCount();
                         }
                     }
                     if (freePages >= newPagesNeeded && newPagesNeeded > 0) {
