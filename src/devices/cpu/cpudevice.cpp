@@ -7646,6 +7646,96 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    void CpuQKVRMSNormRopeSplitAppendPagedCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &qkv = *(datas.find("qkv")->second);
+        Data &qNormWeight = *(datas.find("qNormWeight")->second);
+        Data &kNormWeight = *(datas.find("kNormWeight")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &qOutput = *(datas.find("qOutput")->second);
+        Data &pagedKCacheData = *(datas.find("pagedKCacheData")->second);
+        Data &pagedVCacheData = *(datas.find("pagedVCacheData")->second);
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+
+        int q_heads = intParams.find("q_heads")->second;
+        int k_heads = intParams.find("k_heads")->second;
+        int v_heads = k_heads;
+        int head_dim = intParams.find("head_dim")->second;
+        int rotateDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        int pageLen = intParams.find("pageLen")->second;
+        int batch = intParams.find("batch")->second;
+        float eps = floatParams.find("eps")->second;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+        int doQKNorm = intParams.find("doQKNorm") != intParams.end() ? intParams.find("doQKNorm")->second : 1;
+
+        int qdim = q_heads * head_dim;
+        int kdim = k_heads * head_dim;
+        int vdim = v_heads * head_dim;
+
+        Data q, k, v;
+        Split(qkv, -1, 0, qdim, q);
+        Split(qkv, -1, qdim, qdim + kdim, k);
+        Split(qkv, -1, qdim + kdim, qdim + kdim + vdim, v);
+
+        q.Reshape({q.dims[0], q.dims[1], q_heads, head_dim});
+        k.Reshape({k.dims[0], k.dims[1], k_heads, head_dim});
+
+        if (doQKNorm) {
+            RMSNorm(q, qNormWeight, eps, q);
+            RMSNorm(k, kNormWeight, eps, k);
+        }
+
+        RopeEncoding(q, positionIds, rotateDim, ropeTheta, ropeScale);
+        RopeEncoding(k, positionIds, rotateDim, ropeTheta, ropeScale);
+
+        int bs = qkv.dims[0];
+        int seqlen = qkv.dims[1];
+        int unitSize = qkv.unitSize;
+
+        qOutput.Allocate();
+
+        for (int b = 0; b < bs; b++) {
+            for (int s = 0; s < seqlen; s++) {
+                for (int h = 0; h < q_heads; h++) {
+                    uint8_t *dst = (uint8_t*)qOutput.cpuData +
+                        ((b * q_heads + h) * seqlen + s) * head_dim * unitSize;
+                    uint8_t *src = (uint8_t*)q.cpuData +
+                        ((b * seqlen + s) * q_heads + h) * head_dim * unitSize;
+                    memcpy(dst, src, head_dim * unitSize);
+                }
+            }
+        }
+
+        uint8_t *pagedKData = (uint8_t*)pagedKCacheData.cpuData;
+        uint8_t *pagedVData = (uint8_t*)pagedVCacheData.cpuData;
+        int32_t *idxData = (int32_t*)insertIndexs.cpuData;
+        int32_t *posData = (int32_t*)insertPositions.cpuData;
+
+        k.Reshape({k.dims[0] * k.dims[1], k_heads, head_dim});
+        v.Reshape({v.dims[0] * v.dims[1], v_heads, head_dim});
+
+        for (int b = 0; b < batch; b++) {
+            int pageIdx = idxData[b];
+            int pageOffset = posData[b];
+            for (int h = 0; h < k_heads; h++) {
+                uint8_t *dst = pagedKData +
+                    ((size_t)pageIdx * pageLen * k_heads * head_dim + pageOffset * k_heads * head_dim + h * head_dim) * unitSize;
+                uint8_t *src = (uint8_t*)k.cpuData +
+                    (b * k_heads * head_dim + h * head_dim) * unitSize;
+                memcpy(dst, src, head_dim * unitSize);
+            }
+            for (int h = 0; h < v_heads; h++) {
+                uint8_t *dst = pagedVData +
+                    ((size_t)pageIdx * pageLen * v_heads * head_dim + pageOffset * v_heads * head_dim + h * head_dim) * unitSize;
+                uint8_t *src = (uint8_t*)v.cpuData +
+                    (b * v_heads * head_dim + h * head_dim) * unitSize;
+                memcpy(dst, src, head_dim * unitSize);
+            }
+        }
+    }
+
     void CpuRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
