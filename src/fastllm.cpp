@@ -3549,6 +3549,7 @@ namespace fastllm {
             this->unusedPageIndex.insert(i);
         }
         this->pageTimestamp.assign(maxPages, 0);
+        this->pageRefCount.assign(maxPages, 0);
         this->currentTimestamp = 0;
         this->pageToTrieNode.clear();
         if (this->trieRoot) {
@@ -3604,13 +3605,26 @@ namespace fastllm {
 
         if (pick) {
             this->unusedPageIndex.erase(pageIndex);
+            this->pageRefCount[pageIndex] = 1;
         }
         return pageIndex;
     }
 
     void PagedCacheManager::ReleasePageIndex(int pageIndex) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
-        this->unusedPageIndex.insert(pageIndex);
+        this->pageRefCount[pageIndex]--;
+        if (this->pageRefCount[pageIndex] <= 0) {
+            this->pageRefCount[pageIndex] = 0;
+            this->unusedPageIndex.insert(pageIndex);
+        }
+    }
+
+    void PagedCacheManager::Pick(std::vector<int> &pageIds) {
+        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        for (int pageIndex : pageIds) {
+            this->pageRefCount[pageIndex]++;
+            this->unusedPageIndex.erase(pageIndex);
+        }
     }
 
     uint64_t PagedCacheManager::HashTokenPage(const int *tokens, int len) {

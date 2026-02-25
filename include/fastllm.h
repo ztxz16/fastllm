@@ -503,6 +503,9 @@ namespace fastllm {
             std::vector<long long> pageTimestamp;
             long long currentTimestamp = 0;
 
+            // 每个页面的引用计数
+            std::vector<int> pageRefCount;
+
             // Trie树缓存管理
             CacheTrieNode *trieRoot = nullptr;
             std::unordered_map<int, CacheTrieNode*> pageToTrieNode;
@@ -510,6 +513,7 @@ namespace fastllm {
             void SetMaxPages(int maxPages);
             int GetUnusedPageIndex(bool pick);
             void ReleasePageIndex(int pageIndex);
+            void Pick(std::vector<int> &pageIds);
 
             static uint64_t HashTokenPage(const int *tokens, int len);
             void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
