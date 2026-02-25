@@ -757,8 +757,8 @@ namespace fastllm {
                         it.second->cacheLen + it.second->currentTokens.size() > model->max_positions) {
                         it.second->isEnding = true;
                         it.second->error = ResponseContextErrorPromptTooLong;
-                        printf("[Handle %d] Finished. Reason: prompt too long (cacheLen=%d, currentTokens=%d, maxTotalLens=%d, max_positions=%d).\n",
-                               it.first, it.second->cacheLen, (int)it.second->currentTokens.size(), maxTotalLens, model->max_positions);
+                        // printf("[Handle %d] Finished. Reason: prompt too long (cacheLen=%d, currentTokens=%d, maxTotalLens=%d, max_positions=%d).\n",
+                               // it.first, it.second->cacheLen, (int)it.second->currentTokens.size(), maxTotalLens, model->max_positions);
                         continue;
                     }
 
@@ -821,7 +821,7 @@ namespace fastllm {
                                         curBusyPages = probeManager->maxPages - probeManager->FreePageCount();
                                     }
                                     if (model->verbose) {
-                                        printf("[Handle %d] Prefix cache hit: %d pages (%d tokens).\n", it.first, minCachedPages, cachedLen);
+                                        // printf("[Handle %d] Prefix cache hit: %d pages (%d tokens).\n", it.first, minCachedPages, cachedLen);
                                     }
                                 }
                             }
@@ -1139,13 +1139,13 @@ namespace fastllm {
                     if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
                         it.second->isEnding = true;
                         it.second->TryRecordPagedCache();
-                        printf("[Handle %d] Finished. Reason: eos token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
+                        // printf("[Handle %d] Finished. Reason: eos token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
                     } else {
                         auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
                         if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
                             it.second->isEnding = true;
                             it.second->TryRecordPagedCache();
-                            printf("[Handle %d] Finished. Reason: stop token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
+                            // printf("[Handle %d] Finished. Reason: stop token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
                         }
                     }
                     if (it.second->isEnding == false) {
@@ -1157,13 +1157,13 @@ namespace fastllm {
                         if (it.second->curTokens == it.second->generationConfig.output_token_limit) {
                             it.second->isEnding = true;
                             it.second->TryRecordPagedCache();
-                            printf("[Handle %d] Finished. Reason: output token limit reached (curTokens=%d, limit=%d).\n",
-                                   handles[i], it.second->curTokens, it.second->generationConfig.output_token_limit);
+                            // printf("[Handle %d] Finished. Reason: output token limit reached (curTokens=%d, limit=%d).\n",
+                                   // handles[i], it.second->curTokens, it.second->generationConfig.output_token_limit);
                         } else if (it.second->allTokens.size() >= model->max_positions) {
                             it.second->isEnding = true;
                             it.second->TryRecordPagedCache();
-                            printf("[Handle %d] Finished. Reason: max positions reached (allTokens=%d, max_positions=%d).\n",
-                                   handles[i], (int)it.second->allTokens.size(), model->max_positions);
+                            // printf("[Handle %d] Finished. Reason: max positions reached (allTokens=%d, max_positions=%d).\n",
+                                   //handles[i], (int)it.second->allTokens.size(), model->max_positions);
                         }
                     }
                 }
