@@ -837,7 +837,10 @@ namespace fastllm {
                                     }
                                     it.second->currentTokens.erase(it.second->currentTokens.begin(), it.second->currentTokens.begin() + cachedLen);
                                     it.second->cacheLen = cachedLen;
-                                    curBusyPages += minCachedPages;
+                                    {
+                                        std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
+                                        curBusyPages = probeManager->maxPages - (int)probeManager->unusedPageIndex.size();
+                                    }
                                     if (model->verbose) {
                                         printf("[Handle %d] Prefix cache hit: %d pages (%d tokens).\n", it.first, minCachedPages, cachedLen);
                                     }
