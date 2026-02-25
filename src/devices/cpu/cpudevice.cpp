@@ -103,6 +103,7 @@ namespace fastllm {
         this->ops["AttentionBatch"] = (BaseOperator*)(new CpuAttentionBatchOp());
 
         this->ops["AttentionPaged"] = (BaseOperator*)(new CpuAttentionPagedOp());
+        this->ops["AttentionPagedBatch"] = (BaseOperator*)(new CpuAttentionPagedBatchOp());
         this->ops["GeneratePagedBatchParams"] = (BaseOperator*)(new CpuGeneratePagedBatchParamsOp());
         this->ops["GenerateAppendPagedCacheBatchParams"] = (BaseOperator*)(new CpuGenerateAppendPagedCacheBatchParamsOp());
         this->ops["AppendPagedCache"] = (BaseOperator*)(new CpuAppendPagedCacheOp());
@@ -7113,25 +7114,7 @@ ops += (long long)lines * inputDim * interDim * 2;
 
     static std::vector <uint8_t> vold;
 
-    void CpuPermuteSelfOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        Data &input = *(datas.find("input")->second);
-        Data &axisData = *(datas.find("axis")->second);
-        std::vector <int> axis;
-        for (int i = 0; i < axisData.Count(0); i++) {
-            axis.push_back(((int32_t *) axisData.cpuData)[i]);
-        }
-
-        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
-                        input.dataType == DataType::FLOAT16 ||
-                        input.dataType == DataType::BFLOAT16, "Permute error: datatype should be float32, float16 or bfloat16.");
-        AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
-
-        std::vector<int> new_dims;
-        for (int i = 0; i < axis.size(); i++) {
-            new_dims.push_back(input.dims[axis[i]]);
-        }
-
+    void DoCpuPermuteSelf(Data &input, const std::vector <int> &axis) {
         bool same = false;
         same |= ((axis == std::vector <int>{1, 2, 0} || axis == std::vector <int>{1, 0, 2}) && (input.dims[0] == 1 || input.dims[1] == 1));
         same |= ((axis == std::vector <int>{2, 0, 1, 3}) && input.dims[2] == 1);
@@ -7139,9 +7122,19 @@ ops += (long long)lines * inputDim * interDim * 2;
         same |= ((axis == std::vector <int>{0, 2, 1, 3}) && (input.dims[1] == 1 || input.dims[2] == 1));
         same |= ((axis == std::vector <int>{1, 0, 2, 3}) && (input.dims[0] == 1 || input.dims[1] == 1));
         same |= ((axis == std::vector <int>{1, 2, 0, 3}) && input.dims[1] == 1 && input.dims[2] == 1);
+        same |= ((axis == std::vector <int>{0, 2, 1}) && (input.dims[1] == 1 || input.dims[2] == 1));
         if (same) {
+            std::vector<int> new_dims;
+            for (int i = 0; i < axis.size(); i++) {
+                new_dims.push_back(input.dims[axis[i]]);
+            }
             input.Resize(new_dims);
             return;
+        }
+
+        std::vector<int> new_dims;
+        for (int i = 0; i < axis.size(); i++) {
+            new_dims.push_back(input.dims[axis[i]]);
         }
 
         bool swapLastTwoDims = false;
@@ -7202,6 +7195,23 @@ ops += (long long)lines * inputDim * interDim * 2;
             input.Resize(tmp->dims);
             delete tmp;
         }
+    }
+
+    void CpuPermuteSelfOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &axisData = *(datas.find("axis")->second);
+        std::vector <int> axis;
+        for (int i = 0; i < axisData.Count(0); i++) {
+            axis.push_back(((int32_t *) axisData.cpuData)[i]);
+        }
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Permute error: datatype should be float32, float16 or bfloat16.");
+        AssertInFastLLM(axis.size() == input.dims.size(), "Permute error: axis's size should be equal to data's shape's size.");
+        DoCpuPermuteSelf(input, axis);
     }
 
     void CpuRotatePosition2DOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -8201,7 +8211,6 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &v = *(datas.find("v")->second);
         Data &output = *(datas.find("output")->second);
         output.Allocate();
-
         if (k.isPagedKVCache && v.isPagedKVCache) {
             int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
             float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
@@ -8218,11 +8227,17 @@ ops += (long long)lines * inputDim * interDim * 2;
                 k1 = (k.pageIndex.size() - 1) * k.pageLen + k.lastPageLen;
             }
             
-            // 获取 pagedKVCacheData 的信息
+            // 获取 K pagedKVCacheData 的信息
             int pageLen = k.pageLen;
-            int numHeads = k.pagedKVCacheData->dims[2];
-            int headDim = k.pagedKVCacheData->dims[3];
-            int unitSize = k.unitSize;
+            int kNumHeads = k.pagedKVCacheData->dims[2];
+            int kHeadDim = k.pagedKVCacheData->dims[3];
+            int kUnitSize = k.unitSize;
+            
+            // 获取 V pagedKVCacheData 的信息
+            int vPageLen = v.pageLen;
+            int vNumHeads = v.pagedKVCacheData->dims[2];
+            int vHeadDim = v.pagedKVCacheData->dims[3];
+            int vUnitSize = v.unitSize;
             
             if (q.dataType == DataType::FLOAT32) {
                 float *qd = (float*)q.cpuData;
@@ -8278,9 +8293,9 @@ ops += (long long)lines * inputDim * interDim * 2;
                                 
                                 // 获取 k[j] 的数据指针
                                 uint8_t *kDataPtr = kPagedData + 
-                                    (currentPageIdx * pageLen * numHeads * headDim +
-                                     t * numHeads * headDim +
-                                     kHeadIdx * headDim) * unitSize;
+                                    (currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                                     t * kNumHeads * kHeadDim +
+                                     kHeadIdx * kHeadDim) * kUnitSize;
                                 float *kToken = (float*)kDataPtr;
                                 
                                 // 向量点积计算
@@ -8336,7 +8351,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         kvTokenIdx = 0;
                         for (size_t pageIdx = 0; pageIdx < v.pageIndex.size(); pageIdx++) {
                             int currentPageIdx = v.pageIndex[pageIdx];
-                            int tokensInPage = (pageIdx == v.pageIndex.size() - 1) ? v.lastPageLen : pageLen;
+                            int tokensInPage = (pageIdx == v.pageIndex.size() - 1) ? v.lastPageLen : vPageLen;
                             
                             for (int t = 0; t < tokensInPage; t++) {
                                 int j = kvTokenIdx;
@@ -8344,9 +8359,9 @@ ops += (long long)lines * inputDim * interDim * 2;
                                 
                                 // 获取 v[j] 的数据指针
                                 uint8_t *vDataPtr = vPagedData + 
-                                    (currentPageIdx * pageLen * numHeads * headDim +
-                                     t * numHeads * headDim +
-                                     vHeadIdx * headDim) * unitSize;
+                                    (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                                     t * vNumHeads * vHeadDim +
+                                     vHeadIdx * vHeadDim) * vUnitSize;
                                 float *vToken = (float*)vDataPtr;
                                 
                                 // 累加 softmax[j] * v[j]
@@ -8424,19 +8439,19 @@ ops += (long long)lines * inputDim * interDim * 2;
                                 
                                 // 获取 k[j] 的数据指针
                                 uint8_t *kDataPtr = kPagedData + 
-                                    (currentPageIdx * pageLen * numHeads * headDim +
-                                     t * numHeads * headDim +
-                                     kHeadIdx * headDim) * unitSize;
+                                    (currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                                     t * kNumHeads * kHeadDim +
+                                     kHeadIdx * kHeadDim) * kUnitSize;
                                 
                                 // 转换 k[j] 为 float32
                                 std::vector<float> fkToken;
-                                fkToken.resize(headDim);
-                                if (k.dataType == DataType::FLOAT32) {
+                                fkToken.resize(kHeadDim);
+                                if (k.pagedKVCacheData->dataType == DataType::FLOAT32) {
                                     float *kToken = (float*)kDataPtr;
-                                    memcpy(fkToken.data(), kToken, headDim * sizeof(float));
+                                    memcpy(fkToken.data(), kToken, kHeadDim * sizeof(float));
                                 } else {
                                     uint16_t *kToken = (uint16_t*)kDataPtr;
-                                    Float16ToFloat32(kToken, fkToken.data(), headDim);
+                                    Float16ToFloat32(kToken, fkToken.data(), kHeadDim);
                                 }
                                 
                                 // 向量点积计算
@@ -8495,7 +8510,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         kvTokenIdx = 0;
                         for (size_t pageIdx = 0; pageIdx < v.pageIndex.size(); pageIdx++) {
                             int currentPageIdx = v.pageIndex[pageIdx];
-                            int tokensInPage = (pageIdx == v.pageIndex.size() - 1) ? v.lastPageLen : pageLen;
+                            int tokensInPage = (pageIdx == v.pageIndex.size() - 1) ? v.lastPageLen : vPageLen;
                             
                             for (int t = 0; t < tokensInPage; t++) {
                                 int j = kvTokenIdx;
@@ -8503,19 +8518,19 @@ ops += (long long)lines * inputDim * interDim * 2;
                                 
                                 // 获取 v[j] 的数据指针
                                 uint8_t *vDataPtr = vPagedData + 
-                                    (currentPageIdx * pageLen * numHeads * headDim +
-                                     t * numHeads * headDim +
-                                     vHeadIdx * headDim) * unitSize;
+                                    (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                                     t * vNumHeads * vHeadDim +
+                                     vHeadIdx * vHeadDim) * vUnitSize;
                                 
                                 // 转换 v[j] 为 float32
                                 std::vector<float> fvToken;
-                                fvToken.resize(headDim);
-                                if (v.dataType == DataType::FLOAT32) {
+                                fvToken.resize(vHeadDim);
+                                if (v.pagedKVCacheData->dataType == DataType::FLOAT32) {
                                     float *vToken = (float*)vDataPtr;
-                                    memcpy(fvToken.data(), vToken, headDim * sizeof(float));
+                                    memcpy(fvToken.data(), vToken, vHeadDim * sizeof(float));
                                 } else {
                                     uint16_t *vToken = (uint16_t*)vDataPtr;
-                                    Float16ToFloat32(vToken, fvToken.data(), headDim);
+                                    Float16ToFloat32(vToken, fvToken.data(), vHeadDim);
                                 }
                                 
                                 // 累加 softmax[j] * v[j]
@@ -8602,19 +8617,19 @@ ops += (long long)lines * inputDim * interDim * 2;
                                 
                                 // 获取 k[j] 的数据指针
                                 uint8_t *kDataPtr = kPagedData + 
-                                    (currentPageIdx * pageLen * numHeads * headDim +
-                                     t * numHeads * headDim +
-                                     kHeadIdx * headDim) * unitSize;
+                                    (currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                                     t * kNumHeads * kHeadDim +
+                                     kHeadIdx * kHeadDim) * kUnitSize;
                                 
                                 // 转换 k[j] 为 float32
                                 std::vector<float> fkToken;
-                                fkToken.resize(headDim);
-                                if (k.dataType == DataType::FLOAT32) {
+                                fkToken.resize(kHeadDim);
+                                if (k.pagedKVCacheData->dataType == DataType::FLOAT32) {
                                     float *kToken = (float*)kDataPtr;
-                                    memcpy(fkToken.data(), kToken, headDim * sizeof(float));
+                                    memcpy(fkToken.data(), kToken, kHeadDim * sizeof(float));
                                 } else {
                                     uint16_t *kToken = (uint16_t*)kDataPtr;
-                                    BFloat16ToFloat32(kToken, fkToken.data(), headDim);
+                                    BFloat16ToFloat32(kToken, fkToken.data(), kHeadDim);
                                 }
                                 
                                 // 向量点积计算
@@ -8673,7 +8688,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                         kvTokenIdx = 0;
                         for (size_t pageIdx = 0; pageIdx < v.pageIndex.size(); pageIdx++) {
                             int currentPageIdx = v.pageIndex[pageIdx];
-                            int tokensInPage = (pageIdx == v.pageIndex.size() - 1) ? v.lastPageLen : pageLen;
+                            int tokensInPage = (pageIdx == v.pageIndex.size() - 1) ? v.lastPageLen : vPageLen;
                             
                             for (int t = 0; t < tokensInPage; t++) {
                                 int j = kvTokenIdx;
@@ -8681,19 +8696,19 @@ ops += (long long)lines * inputDim * interDim * 2;
                                 
                                 // 获取 v[j] 的数据指针
                                 uint8_t *vDataPtr = vPagedData + 
-                                    (currentPageIdx * pageLen * numHeads * headDim +
-                                     t * numHeads * headDim +
-                                     vHeadIdx * headDim) * unitSize;
+                                    (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                                     t * vNumHeads * vHeadDim +
+                                     vHeadIdx * vHeadDim) * vUnitSize;
                                 
                                 // 转换 v[j] 为 float32
                                 std::vector<float> fvToken;
-                                fvToken.resize(headDim);
-                                if (v.dataType == DataType::FLOAT32) {
+                                fvToken.resize(vHeadDim);
+                                if (v.pagedKVCacheData->dataType == DataType::FLOAT32) {
                                     float *vToken = (float*)vDataPtr;
-                                    memcpy(fvToken.data(), vToken, headDim * sizeof(float));
+                                    memcpy(fvToken.data(), vToken, vHeadDim * sizeof(float));
                                 } else {
                                     uint16_t *vToken = (uint16_t*)vDataPtr;
-                                    BFloat16ToFloat32(vToken, fvToken.data(), headDim);
+                                    BFloat16ToFloat32(vToken, fvToken.data(), vHeadDim);
                                 }
                                 
                                 // 累加 softmax[j] * v[j]
@@ -8833,14 +8848,101 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &vCaches = *(datas.find("vCaches")->second);
         Data &output = *(datas.find("output")->second);
 
-        std::vector <int> dims = {q.dims[0], q.dims[1], vCaches.dims[2]};
+        std::vector <int> dims = {q.dims[0], q.dims[1], vCaches.pagedKVCacheData->dims[3]};
         output.dataType = q.dataType;
         output.Resize(dims);
     }
 
     void CpuAttentionPagedBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &kCaches = *(datas.find("kCaches")->second);
+        Data &vCaches = *(datas.find("vCaches")->second);
+        Data &qSizes = *(datas.find("qSizes")->second);
+        Data &pageSizes = *(datas.find("pageSizes")->second);
+        Data &pageIndexs = *(datas.find("pageIndexs")->second);
+        Data &lastPageLens = *(datas.find("lastPageLens")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / kCaches.dims[0];
+        float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
+        int attentionType = intParams.find("attentionType") != intParams.end() ? intParams.find("attentionType")->second : 0;
 
+        int32_t *qSizesData = (int32_t*)qSizes.cpuData;
+        int32_t *pageSizesData = (int32_t*)pageSizes.cpuData;
+        int32_t *pageIndexsData = (int32_t*)pageIndexs.cpuData;
+        int32_t *lastPageLensData = (int32_t*)lastPageLens.cpuData;
+        int batch = lastPageLens.dims[0];
+
+        int numHeads = q.dims[0];
+        int headDim = q.dims[2];
+        int vHeadDim = vCaches.pagedKVCacheData->dims[3];
+        int pageLen = kCaches.pageLen;
+
+        int totalSeqLen = q.dims[1];
+        CpuAttentionPagedOp pagedOp;
+        for (int b = 0; b < batch; b++) {
+            int qStart = qSizesData[b];
+            int qEnd = qSizesData[b + 1];
+            int qLen = qEnd - qStart;
+            int pageStart = pageSizesData[b];
+            int pageEnd = pageSizesData[b + 1];
+
+            Data batchQ, batchK, batchV, batchOutput;
+
+            batchQ.dataType = q.dataType;
+            batchQ.Resize({numHeads, qLen, headDim});
+            batchQ.Allocate();
+            for (int h = 0; h < numHeads; h++) {
+                memcpy(batchQ.cpuData + (size_t)h * qLen * headDim * q.unitSize,
+                       q.cpuData + ((size_t)h * totalSeqLen + qStart) * headDim * q.unitSize,
+                       (size_t)qLen * headDim * q.unitSize);
+            }
+
+            batchK.isFake = true;
+            batchK.isPagedKVCache = true;
+            batchK.dataType = kCaches.dataType;
+            batchK.pagedKVCacheData = kCaches.pagedKVCacheData;
+            batchK.pageLen = pageLen;
+            batchK.unitSize = kCaches.unitSize;
+            batchK.dims = kCaches.dims;
+            batchK.pageIndex.assign(pageIndexsData + pageStart, pageIndexsData + pageEnd);
+            batchK.lastPageLen = lastPageLensData[b];
+
+            batchV.isFake = true;
+            batchV.isPagedKVCache = true;
+            batchV.dataType = vCaches.dataType;
+            batchV.pagedKVCacheData = vCaches.pagedKVCacheData;
+            batchV.pageLen = pageLen;
+            batchV.unitSize = vCaches.unitSize;
+            batchV.dims = vCaches.dims;
+            batchV.pageIndex.assign(pageIndexsData + pageStart, pageIndexsData + pageEnd);
+            batchV.lastPageLen = lastPageLensData[b];
+
+            batchOutput.dataType = output.dataType;
+            batchOutput.Resize({numHeads, qLen, vHeadDim});
+
+            fastllm::DataDict tempDatas = {
+                {"q", &batchQ}, {"k", &batchK}, {"v", &batchV}, {"output", &batchOutput}
+            };
+            fastllm::FloatDict tempFloatParams = {{"scale", scale}};
+            fastllm::IntDict tempIntParams = {{"group", group}, {"attentionType", attentionType}};
+
+            pagedOp.Reshape("AttentionPaged", tempDatas, tempFloatParams, tempIntParams);
+            pagedOp.Run("AttentionPaged", tempDatas, tempFloatParams, tempIntParams);
+
+            for (int h = 0; h < numHeads; h++) {
+                memcpy(output.cpuData + ((size_t)h * totalSeqLen + qStart) * vHeadDim * output.unitSize,
+                       batchOutput.cpuData + (size_t)h * qLen * vHeadDim * output.unitSize,
+                       (size_t)qLen * vHeadDim * output.unitSize);
+            }
+        }
+
+
+// ((fastllm::Data*)&output)->Resize({output.dims[1], output.dims[0], output.dims[2]});
+DoCpuPermuteSelf(*((fastllm::Data*)&output), {1, 0, 2});
+((fastllm::Data*)&output)->Resize({1, output.dims[0], output.dims[1] * output.dims[2]});
     }
 
     void CpuGeneratePagedBatchParamsOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
