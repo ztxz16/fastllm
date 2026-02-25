@@ -61,6 +61,10 @@ extern "C" {
         fastllm::SetMaxTokens(max_tokens);
     }
 
+    DLL_EXPORT void set_page_size(int page_size) {
+        fastllm::SetPageLen(page_size);
+    }
+
     DLL_EXPORT bool get_cpu_low_mem(bool low) {
         return fastllm::GetLowMemMode();
     }
