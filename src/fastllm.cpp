@@ -59,6 +59,7 @@ namespace fastllm {
     static bool cudaSharedExpert = false;
     static bool enableAMX = false;
     static int maxTokens = -1;
+    static int defaultPageLen = 16;
     static Data emptyData;
 
     static std::map <DataType, int> DataTypeBits = {
@@ -178,6 +179,14 @@ namespace fastllm {
 
     int GetMaxTokens() {
         return maxTokens;
+    }
+
+    void SetPageLen(int pageLen) {
+        defaultPageLen = pageLen;
+    }
+
+    int GetPageLen() {
+        return defaultPageLen;
     }
 
     AliveThreadPool *GetAlivePool() {
@@ -3286,6 +3295,9 @@ namespace fastllm {
         const Data &cacheData, 
         int pageLen, 
         int maxPages) {
+        if (pageLen <= 0) {
+            pageLen = GetPageLen();
+        }
         auto it = layerPagedCacheManagers.find(layerIndex);
         if (it != layerPagedCacheManagers.end()) {
             return it->second;
