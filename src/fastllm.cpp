@@ -3700,11 +3700,6 @@ namespace fastllm {
                 break;
             }
 
-            // 验证页面当前处于空闲状态（即未被其他请求占用）
-            if (this->unusedPageIndex.find(child->pageId) == this->unusedPageIndex.end()) {
-                break;
-            }
-
             cachedPageIds.push_back(child->pageId);
             cur = child;
         }
