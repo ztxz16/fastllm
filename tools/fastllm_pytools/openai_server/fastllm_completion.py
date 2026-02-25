@@ -165,7 +165,7 @@ class FastLLmCompletion:
                         enable_thinking = enable_thinking)
       # Store the mapping between conversation ID and handle
       self.conversation_handles[request_id] = handle
-      logging.info(f"Created conversation: {request_id}, handle: {handle}")
+      # logging.info(f"Created conversation: {request_id}, handle: {handle}")
       result_generator = self.model.stream_response_handle_async(handle)
       # Streaming response
       if request.stream:
@@ -232,7 +232,7 @@ class FastLLmCompletion:
       # After completion, remove the conversation from tracking dictionary
       if request_id in self.conversation_handles:
           del self.conversation_handles[request_id]
-          logging.info(f"Removed completed conversation from tracking: {request_id}")
+          # logging.info(f"Removed completed conversation from tracking: {request_id}")
 
       return response
       
@@ -379,7 +379,7 @@ class FastLLmCompletion:
       # After completion, remove the conversation from tracking dictionary
       if request_id in self.conversation_handles:
           del self.conversation_handles[request_id]
-          logging.info(f"Removed completed stream conversation from tracking: {request_id}")
+          # logging.info(f"Removed completed stream conversation from tracking: {request_id}")
       
       yield "data: [DONE]\n\n"
       await asyncio.sleep(0)
