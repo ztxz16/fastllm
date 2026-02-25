@@ -606,7 +606,7 @@ namespace fastllm {
         int maxTotalLens = 0;
         int totalPages = 0;
         int pagesLimit = 0; // 默认为totalPages的80%，Prefill不会让已用分页超过此限制
-        int pageLen = 128;
+        int pageLen = fastllm::GetPageLen();
 
         int maxBatch = 512;
         if (model->maxBatch > 0) {

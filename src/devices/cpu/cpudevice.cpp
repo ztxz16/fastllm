@@ -8172,6 +8172,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         if (cache.pagedKVCacheData == nullptr) {
             cache.pagedKVCacheData = &pagedCacheManager;
         }
+        cache.pageLen = pagedCacheManager.pageLen;
             
         // 检查 pagedKVCacheData 的形状是否匹配
         AssertInFastLLM(cache.pagedKVCacheData->dims.size() == 4,
