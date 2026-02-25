@@ -399,7 +399,7 @@ namespace fastllm {
             PermuteSelf(k_pe, {0, 2, 1, 3});
 
             if (true) {
-                const int pageLen = 128;
+                const int pageLen = fastllm::GetPageLen();
                 k_pe.Reshape({k_pe.dims[0], k_pe.dims[2], k_pe.dims[3]});
                 Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
                 PagedCacheManager *pagedKpeManager = AllocatePagedCacheManager(i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_MLP_CACHE, k_pe, pageLen, -1);
