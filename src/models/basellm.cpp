@@ -673,7 +673,7 @@ namespace fastllm {
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
             auto &forwardLocker = model->forwardLocker;
             
-            // 单次遍历：处理abort、释放isEnding的KV cache、统计busyPages/alive、构建orders、检测hasPrefill
+            // 单次遍历：处理abort、释放isEnding的KV cache、统计alive、构建orders、检测hasPrefill
             std::vector <int> abortHandles;
             int busyPages = 0, currentActivate = 0;
             bool hasPrefill = false;
@@ -707,9 +707,7 @@ namespace fastllm {
                     }
                     continue;
                 }
-                auto &kvFirst = it.second->pastKeyValues[model->kvCacheId].first;
-                if (kvFirst.pageIndex.size() > 0) {
-                    busyPages += (int)kvFirst.pageIndex.size();
+                if (it.second->preTokens > 0) {
                     currentActivate++;
                 }
                 if (it.second->preTokens == 0) {
@@ -721,6 +719,15 @@ namespace fastllm {
                 model->responseContextDict.RemoveHandle(it);
             }
             sort(orders.begin(), orders.end());
+
+            // 通过PagedCacheManager获取实际使用的物理页数（复用的页只算一次）
+            if (totalPages > 0) {
+                PagedCacheManager *probeManager = GetPagedCacheManager(model->kvCacheId * 2);
+                if (probeManager != nullptr) {
+                    std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
+                    busyPages = probeManager->maxPages - (int)probeManager->unusedPageIndex.size();
+                }
+            }
 
             // 当busyPages未超过pagesLimit时可以开启新的Prefill；超过时只做Decode
             bool canAddPrefill = (pagesLimit > 0) ? (busyPages < pagesLimit) : true;
