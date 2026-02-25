@@ -342,7 +342,7 @@ namespace fastllm {
                     vPositionIds.push_back(((float*)positionIds[b]->cpuData)[i]);
                 }
             }
-            allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, vPositionIds.size()}, vPositionIds));
+            allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, (int)vPositionIds.size()}, vPositionIds));
         }
 
         EmbeddingBlock((Data*)&inputIds, 
