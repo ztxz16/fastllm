@@ -1131,6 +1131,16 @@ namespace fastllm {
                     }
                 }
 
+                // Prefill完成后立即Record，使其他请求可以尽早命中Prefix Cache
+                for (int i = 0; i < (int)handles.size(); i++) {
+                    if (seqLens[i] > 1) {
+                        auto &ctx = *model->responseContextDict.dicts[handles[i]];
+                        if ((int)ctx.allTokens.size() >= pageLen) {
+                            ctx.TryRecordPagedCache();
+                        }
+                    }
+                }
+
                 if (model->verbose) {
                     genTokens += seqLens.size();
                     auto nowTime = std::chrono::system_clock::now();
