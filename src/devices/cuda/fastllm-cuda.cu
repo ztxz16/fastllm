@@ -107,6 +107,28 @@ std::vector <long long> FastllmCudaGetFreeSizes() {
     return ret;
 }
 
+std::vector <long long> FastllmCudaGetTotalSizes() {
+    int deviceCount;
+    auto error = cudaGetDeviceCount(&deviceCount);
+    if (error != cudaSuccess) {
+        printf("cudaGetDeviceCount returned %d\n-> %s\n", (int)error, cudaGetErrorString(error));
+        return {};
+    }
+    std::vector <long long> ret;
+
+    int id = -1;
+    cudaGetDevice(&id);
+
+    for (int i = 0; i < deviceCount; ++i) {
+        cudaSetDevice(i);
+        size_t free = 0, total = 0;
+        cudaMemGetInfo(&free, &total);
+        ret.push_back(total);
+    }
+    cudaSetDevice(id);
+    return ret;
+}
+
 __global__ void GetCudaInfoKernel(int *infos) {
 #if defined(__CUDA_ARCH__)
     infos[0] = __CUDA_ARCH__;
