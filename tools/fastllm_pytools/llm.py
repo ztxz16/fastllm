@@ -748,7 +748,7 @@ class model:
                     for key in ["repetition_penalty", "top_p", "top_k", "temperature"]:
                         if key in gen_cfg:
                             self.default_generation_config[key] = gen_cfg[key]
-        print(f"[fastllm] default generation config: {self.default_generation_config}")
+        print(f"[Fastllm] default generation config: {self.default_generation_config}")
     
     def apply_chat_template(
         self,
