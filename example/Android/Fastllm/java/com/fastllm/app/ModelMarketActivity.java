@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -11,7 +12,7 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.Button;
+import android.view.Window;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -96,22 +97,31 @@ public class ModelMarketActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
+        if (Build.VERSION.SDK_INT >= 21) {
+            Window window = getWindow();
+            window.setStatusBarColor(0xFF4834DF);
+        }
+
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(0xFFF5F5F5);
+        root.setBackgroundColor(0xFFF8F9FD);
 
-        // Top bar
         LinearLayout topBar = new LinearLayout(this);
         topBar.setOrientation(LinearLayout.HORIZONTAL);
-        topBar.setBackgroundColor(0xFF1976D2);
-        topBar.setPadding(dp(8), dp(10), dp(16), dp(10));
+        topBar.setPadding(dp(6), dp(12), dp(20), dp(12));
         topBar.setGravity(Gravity.CENTER_VERTICAL);
 
+        GradientDrawable topBarBg = new GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                new int[]{0xFF6C63FF, 0xFF4834DF});
+        topBar.setBackground(topBarBg);
+        topBar.setElevation(dp(4));
+
         TextView backBtn = new TextView(this);
-        backBtn.setText("← 返回");
+        backBtn.setText("←");
         backBtn.setTextColor(Color.WHITE);
-        backBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-        backBtn.setPadding(dp(8), dp(4), dp(12), dp(4));
+        backBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        backBtn.setPadding(dp(12), dp(4), dp(12), dp(4));
         backBtn.setOnClickListener(v -> {
             if (downloading) {
                 toast("请等待下载完成或取消下载");
@@ -122,31 +132,62 @@ public class ModelMarketActivity extends Activity {
         topBar.addView(backBtn, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
+        LinearLayout titleGroup = new LinearLayout(this);
+        titleGroup.setOrientation(LinearLayout.VERTICAL);
+
         TextView title = new TextView(this);
-        title.setText("模型市场");
+        title.setText("🛒 模型市场");
         title.setTextColor(Color.WHITE);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
         title.setTypeface(null, android.graphics.Typeface.BOLD);
-        topBar.addView(title, new LinearLayout.LayoutParams(
+        title.setLetterSpacing(0.02f);
+        titleGroup.addView(title);
+
+        TextView titleSub = new TextView(this);
+        titleSub.setText("来自 ModelScope 的精选模型");
+        titleSub.setTextColor(0xBBFFFFFF);
+        titleSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        titleGroup.addView(titleSub);
+
+        topBar.addView(titleGroup, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         root.addView(topBar, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // Subtitle
-        TextView subtitle = new TextView(this);
-        subtitle.setText("以下模型来自 ModelScope，选择后将下载到本地");
-        subtitle.setTextColor(0xFF666666);
-        subtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        subtitle.setPadding(dp(16), dp(10), dp(16), dp(6));
-        root.addView(subtitle, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout infoBanner = new LinearLayout(this);
+        infoBanner.setOrientation(LinearLayout.HORIZONTAL);
+        infoBanner.setGravity(Gravity.CENTER_VERTICAL);
+        infoBanner.setPadding(dp(16), dp(12), dp(16), dp(12));
 
-        // Model list
+        GradientDrawable bannerBg = new GradientDrawable();
+        bannerBg.setCornerRadius(dp(12));
+        bannerBg.setColor(0xFFF0EFFF);
+        infoBanner.setBackground(bannerBg);
+
+        TextView infoIcon = new TextView(this);
+        infoIcon.setText("ℹ️");
+        infoIcon.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        infoBanner.addView(infoIcon);
+
+        TextView infoText = new TextView(this);
+        infoText.setText("选择模型后将自动下载到本地存储");
+        infoText.setTextColor(0xFF6C63FF);
+        infoText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        LinearLayout.LayoutParams infoTextLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        infoTextLp.leftMargin = dp(8);
+        infoBanner.addView(infoText, infoTextLp);
+
+        LinearLayout.LayoutParams bannerLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        bannerLp.setMargins(dp(16), dp(12), dp(16), dp(4));
+        root.addView(infoBanner, bannerLp);
+
         ScrollView scrollView = new ScrollView(this);
         LinearLayout listContainer = new LinearLayout(this);
         listContainer.setOrientation(LinearLayout.VERTICAL);
-        listContainer.setPadding(dp(12), dp(6), dp(12), dp(12));
+        listContainer.setPadding(dp(16), dp(8), dp(16), dp(16));
 
         for (MarketModel model : MODELS) {
             listContainer.addView(createModelCard(model));
@@ -162,63 +203,89 @@ public class ModelMarketActivity extends Activity {
 
     private View createModelCard(MarketModel model) {
         LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(14), dp(12), dp(14), dp(12));
+        card.setOrientation(LinearLayout.HORIZONTAL);
+        card.setPadding(dp(14), dp(14), dp(14), dp(14));
 
         GradientDrawable cardBg = new GradientDrawable();
-        cardBg.setCornerRadius(dp(8));
+        cardBg.setCornerRadius(dp(14));
         cardBg.setColor(Color.WHITE);
         card.setBackground(cardBg);
         card.setElevation(dp(2));
 
         LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        cardLp.bottomMargin = dp(8);
+        cardLp.bottomMargin = dp(10);
         card.setLayoutParams(cardLp);
 
-        // Name
+        TextView modelIcon = new TextView(this);
+        modelIcon.setText("🧠");
+        modelIcon.setTextSize(TypedValue.COMPLEX_UNIT_SP, 26);
+        modelIcon.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(48), dp(48));
+        iconLp.gravity = Gravity.TOP;
+
+        GradientDrawable iconBg = new GradientDrawable();
+        iconBg.setCornerRadius(dp(12));
+        iconBg.setColor(0xFFF0EFFF);
+        modelIcon.setBackground(iconBg);
+
+        card.addView(modelIcon, iconLp);
+
+        LinearLayout infoCol = new LinearLayout(this);
+        infoCol.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams infoLp = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        infoLp.leftMargin = dp(12);
+
         TextView nameView = new TextView(this);
         nameView.setText(model.name);
-        nameView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-        nameView.setTextColor(0xFF333333);
+        nameView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        nameView.setTextColor(0xFF1A1A2E);
         nameView.setTypeface(null, android.graphics.Typeface.BOLD);
-        card.addView(nameView);
+        infoCol.addView(nameView);
 
-        // Description
         TextView descView = new TextView(this);
         descView.setText(model.description);
         descView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        descView.setTextColor(0xFF666666);
+        descView.setTextColor(0xFF6E7191);
         LinearLayout.LayoutParams descLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         descLp.topMargin = dp(4);
-        card.addView(descView, descLp);
+        infoCol.addView(descView, descLp);
 
-        // Bottom row: size + download button
         LinearLayout bottomRow = new LinearLayout(this);
         bottomRow.setOrientation(LinearLayout.HORIZONTAL);
         bottomRow.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams bottomLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        bottomLp.topMargin = dp(8);
+        bottomLp.topMargin = dp(10);
 
-        TextView sizeView = new TextView(this);
-        sizeView.setText("大小: " + model.sizeText);
-        sizeView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        sizeView.setTextColor(0xFF888888);
-        bottomRow.addView(sizeView, new LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        TextView sizeBadge = new TextView(this);
+        sizeBadge.setText("💾 " + model.sizeText);
+        sizeBadge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        sizeBadge.setTextColor(0xFF6C63FF);
+        GradientDrawable sizeBadgeBg = new GradientDrawable();
+        sizeBadgeBg.setCornerRadius(dp(8));
+        sizeBadgeBg.setColor(0xFFF0EFFF);
+        sizeBadge.setBackground(sizeBadgeBg);
+        sizeBadge.setPadding(dp(8), dp(3), dp(8), dp(3));
+        bottomRow.addView(sizeBadge);
 
-        Button dlBtn = new Button(this);
-        dlBtn.setText("下载");
+        View spacer = new View(this);
+        bottomRow.addView(spacer, new LinearLayout.LayoutParams(0, 0, 1));
+
+        TextView dlBtn = new TextView(this);
+        dlBtn.setText("⬇ 下载");
         dlBtn.setTextColor(Color.WHITE);
         dlBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        dlBtn.setAllCaps(false);
-        dlBtn.setPadding(dp(16), dp(4), dp(16), dp(4));
+        dlBtn.setTypeface(null, android.graphics.Typeface.BOLD);
+        dlBtn.setGravity(Gravity.CENTER);
+        dlBtn.setPadding(dp(18), dp(8), dp(18), dp(8));
 
-        GradientDrawable btnBg = new GradientDrawable();
-        btnBg.setCornerRadius(dp(6));
-        btnBg.setColor(0xFF43A047);
+        GradientDrawable btnBg = new GradientDrawable(
+                GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[]{0xFF00BFA5, 0xFF009688});
+        btnBg.setCornerRadius(dp(10));
         dlBtn.setBackground(btnBg);
 
         dlBtn.setOnClickListener(v -> {
@@ -230,9 +297,10 @@ public class ModelMarketActivity extends Activity {
         });
 
         bottomRow.addView(dlBtn, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, dp(36)));
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        card.addView(bottomRow, bottomLp);
+        infoCol.addView(bottomRow, bottomLp);
+        card.addView(infoCol, infoLp);
 
         return card;
     }
@@ -265,30 +333,60 @@ public class ModelMarketActivity extends Activity {
         cancelDownload = false;
 
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
-        builder.setTitle("下载: " + model.name);
         builder.setCancelable(false);
 
         LinearLayout dlLayout = new LinearLayout(this);
         dlLayout.setOrientation(LinearLayout.VERTICAL);
-        dlLayout.setPadding(dp(20), dp(16), dp(20), dp(8));
+        dlLayout.setPadding(dp(24), dp(20), dp(24), dp(12));
+
+        TextView dlTitle = new TextView(this);
+        dlTitle.setText("⬇ 下载中");
+        dlTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        dlTitle.setTextColor(0xFF1A1A2E);
+        dlTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+        dlLayout.addView(dlTitle);
+
+        TextView dlModel = new TextView(this);
+        dlModel.setText(model.name);
+        dlModel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        dlModel.setTextColor(0xFF6E7191);
+        LinearLayout.LayoutParams dlModelLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        dlModelLp.topMargin = dp(4);
+        dlLayout.addView(dlModel, dlModelLp);
 
         ProgressBar progressBar = new ProgressBar(this, null,
                 android.R.attr.progressBarStyleHorizontal);
         progressBar.setMax(100);
         progressBar.setProgress(0);
-        dlLayout.addView(progressBar, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams pbLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pbLp.topMargin = dp(16);
+        dlLayout.addView(progressBar, pbLp);
 
         TextView progressText = new TextView(this);
         progressText.setText("准备下载...");
         progressText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        progressText.setTextColor(0xFF666666);
-        progressText.setPadding(0, dp(8), 0, 0);
-        dlLayout.addView(progressText, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        progressText.setTextColor(0xFF6E7191);
+        progressText.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams ptLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        ptLp.topMargin = dp(8);
+        dlLayout.addView(progressText, ptLp);
+
+        TextView percentText = new TextView(this);
+        percentText.setText("0%");
+        percentText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
+        percentText.setTextColor(0xFF6C63FF);
+        percentText.setTypeface(null, android.graphics.Typeface.BOLD);
+        percentText.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams pctLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        pctLp.topMargin = dp(8);
+        dlLayout.addView(percentText, pctLp);
 
         builder.setView(dlLayout);
-        builder.setNegativeButton("取消", (d, w) -> cancelDownload = true);
+        builder.setNegativeButton("取消下载", (d, w) -> cancelDownload = true);
 
         AlertDialog dlg = builder.create();
         dlg.show();
@@ -339,7 +437,8 @@ public class ModelMarketActivity extends Activity {
                             progressBar.setProgress(pct);
                             String dlText = formatSize(dl);
                             String totalText = total > 0 ? formatSize(total) : "未知";
-                            progressText.setText(dlText + " / " + totalText + "  (" + pct + "%)");
+                            progressText.setText(dlText + " / " + totalText);
+                            percentText.setText(pct + "%");
                         });
                     }
                 }
@@ -369,12 +468,12 @@ public class ModelMarketActivity extends Activity {
                 dlg.dismiss();
                 if (ok) {
                     addToStorage(model, target);
-                    toast("下载完成: " + model.name);
+                    toast("✅ 下载完成: " + model.name);
                     setResult(RESULT_OK);
                 } else if (cancelDownload) {
                     toast("下载已取消");
                 } else {
-                    toast("下载失败，请检查网络后重试");
+                    toast("❌ 下载失败，请检查网络后重试");
                 }
             });
         }).start();

@@ -11,7 +11,6 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -32,23 +31,47 @@ public class ModelRepoPage {
 
         LinearLayout root = new LinearLayout(activity);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(0xFFF5F5F5);
+        root.setBackgroundColor(MainActivity.COLOR_BG);
 
         ScrollView scrollView = new ScrollView(activity);
         scrollView.setFillViewport(true);
 
         LinearLayout inner = new LinearLayout(activity);
         inner.setOrientation(LinearLayout.VERTICAL);
-        inner.setPadding(dp(12), dp(12), dp(12), dp(12));
+        inner.setPadding(dp(16), dp(16), dp(16), dp(16));
 
-        // Header
+        LinearLayout headerRow = new LinearLayout(activity);
+        headerRow.setOrientation(LinearLayout.HORIZONTAL);
+        headerRow.setGravity(Gravity.CENTER_VERTICAL);
+        headerRow.setPadding(dp(2), 0, 0, dp(12));
+
+        TextView headerIcon = new TextView(activity);
+        headerIcon.setText("📦");
+        headerIcon.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        headerRow.addView(headerIcon, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout headerTextGroup = new LinearLayout(activity);
+        headerTextGroup.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams htgLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        htgLp.leftMargin = dp(10);
+
         TextView header = new TextView(activity);
         header.setText("模型仓库");
-        header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
-        header.setTextColor(0xFF333333);
+        header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        header.setTextColor(MainActivity.COLOR_TEXT_PRIMARY);
         header.setTypeface(null, android.graphics.Typeface.BOLD);
-        header.setPadding(dp(4), 0, 0, dp(8));
-        inner.addView(header, new LinearLayout.LayoutParams(
+        headerTextGroup.addView(header);
+
+        TextView headerSub = new TextView(activity);
+        headerSub.setText("管理你的本地模型");
+        headerSub.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        headerSub.setTextColor(MainActivity.COLOR_TEXT_SECONDARY);
+        headerTextGroup.addView(headerSub);
+
+        headerRow.addView(headerTextGroup, htgLp);
+        inner.addView(headerRow, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         modelListContainer = new LinearLayout(activity);
@@ -62,24 +85,32 @@ public class ModelRepoPage {
         root.addView(scrollView, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
-        // Add model button
-        Button addBtn = new Button(activity);
-        addBtn.setText("+ 添加模型");
+        LinearLayout btnContainer = new LinearLayout(activity);
+        btnContainer.setOrientation(LinearLayout.VERTICAL);
+        btnContainer.setBackgroundColor(MainActivity.COLOR_BG);
+        btnContainer.setPadding(dp(16), dp(8), dp(16), dp(16));
+
+        TextView addBtn = new TextView(activity);
+        addBtn.setText("＋  添加模型");
         addBtn.setTextColor(Color.WHITE);
         addBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-        addBtn.setAllCaps(false);
+        addBtn.setTypeface(null, android.graphics.Typeface.BOLD);
+        addBtn.setGravity(Gravity.CENTER);
+        addBtn.setPadding(0, dp(14), 0, dp(14));
 
-        GradientDrawable btnBg = new GradientDrawable();
-        btnBg.setCornerRadius(dp(8));
-        btnBg.setColor(0xFF1976D2);
+        GradientDrawable btnBg = new GradientDrawable(
+                GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[]{MainActivity.COLOR_GRADIENT_START, MainActivity.COLOR_GRADIENT_END});
+        btnBg.setCornerRadius(dp(14));
         addBtn.setBackground(btnBg);
-
-        LinearLayout.LayoutParams btnLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
-        btnLp.setMargins(dp(12), dp(8), dp(12), dp(12));
-        root.addView(addBtn, btnLp);
+        addBtn.setElevation(dp(4));
 
         addBtn.setOnClickListener(v -> showAddModelDialog());
+        btnContainer.addView(addBtn, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        root.addView(btnContainer, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         this.rootView = root;
         refreshList();
@@ -94,13 +125,39 @@ public class ModelRepoPage {
         List<ModelStorage.ModelInfo> models = storage.getModels();
 
         if (models.isEmpty()) {
-            TextView empty = new TextView(activity);
-            empty.setText("暂无模型，请点击下方按钮添加");
-            empty.setTextColor(0xFF999999);
-            empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-            empty.setGravity(Gravity.CENTER);
-            empty.setPadding(0, dp(60), 0, dp(60));
-            modelListContainer.addView(empty, new LinearLayout.LayoutParams(
+            LinearLayout emptyLayout = new LinearLayout(activity);
+            emptyLayout.setOrientation(LinearLayout.VERTICAL);
+            emptyLayout.setGravity(Gravity.CENTER);
+            emptyLayout.setPadding(0, dp(60), 0, dp(60));
+
+            TextView emptyIcon = new TextView(activity);
+            emptyIcon.setText("📭");
+            emptyIcon.setTextSize(TypedValue.COMPLEX_UNIT_SP, 48);
+            emptyIcon.setGravity(Gravity.CENTER);
+            emptyLayout.addView(emptyIcon);
+
+            TextView emptyTitle = new TextView(activity);
+            emptyTitle.setText("暂无模型");
+            emptyTitle.setTextColor(MainActivity.COLOR_TEXT_PRIMARY);
+            emptyTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+            emptyTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+            emptyTitle.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams etLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            etLp.topMargin = dp(12);
+            emptyLayout.addView(emptyTitle, etLp);
+
+            TextView emptyDesc = new TextView(activity);
+            emptyDesc.setText("点击下方按钮添加本地模型或从模型市场下载");
+            emptyDesc.setTextColor(MainActivity.COLOR_TEXT_SECONDARY);
+            emptyDesc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            emptyDesc.setGravity(Gravity.CENTER);
+            LinearLayout.LayoutParams edLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            edLp.topMargin = dp(6);
+            emptyLayout.addView(emptyDesc, edLp);
+
+            modelListContainer.addView(emptyLayout, new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
             return;
         }
@@ -112,59 +169,93 @@ public class ModelRepoPage {
 
     private View createModelCard(ModelStorage.ModelInfo model) {
         LinearLayout card = new LinearLayout(activity);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(14), dp(12), dp(14), dp(12));
+        card.setOrientation(LinearLayout.HORIZONTAL);
+        card.setPadding(dp(14), dp(14), dp(14), dp(14));
 
         GradientDrawable cardBg = new GradientDrawable();
-        cardBg.setCornerRadius(dp(8));
-        cardBg.setColor(Color.WHITE);
+        cardBg.setCornerRadius(dp(14));
+        cardBg.setColor(MainActivity.COLOR_SURFACE);
         card.setBackground(cardBg);
         card.setElevation(dp(2));
 
         LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        cardLp.bottomMargin = dp(8);
+        cardLp.bottomMargin = dp(10);
         card.setLayoutParams(cardLp);
 
-        // Model name
+        TextView modelIcon = new TextView(activity);
+        modelIcon.setText("🤖");
+        modelIcon.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
+        modelIcon.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(44), dp(44));
+        iconLp.gravity = Gravity.CENTER_VERTICAL;
+
+        GradientDrawable iconBg = new GradientDrawable();
+        iconBg.setCornerRadius(dp(12));
+        iconBg.setColor(0xFFF0EFFF);
+        modelIcon.setBackground(iconBg);
+
+        card.addView(modelIcon, iconLp);
+
+        LinearLayout infoCol = new LinearLayout(activity);
+        infoCol.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams infoLp = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
+        infoLp.leftMargin = dp(12);
+        infoLp.gravity = Gravity.CENTER_VERTICAL;
+
         TextView nameView = new TextView(activity);
         nameView.setText(model.name);
-        nameView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-        nameView.setTextColor(0xFF333333);
+        nameView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        nameView.setTextColor(MainActivity.COLOR_TEXT_PRIMARY);
         nameView.setTypeface(null, android.graphics.Typeface.BOLD);
-        card.addView(nameView, new LinearLayout.LayoutParams(
+        nameView.setSingleLine(true);
+        infoCol.addView(nameView, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // Model path
         TextView pathView = new TextView(activity);
         pathView.setText(model.path);
-        pathView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        pathView.setTextColor(0xFF888888);
+        pathView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        pathView.setTextColor(MainActivity.COLOR_TEXT_SECONDARY);
         pathView.setSingleLine(true);
         LinearLayout.LayoutParams pathLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        pathLp.topMargin = dp(4);
-        card.addView(pathView, pathLp);
+        pathLp.topMargin = dp(2);
+        infoCol.addView(pathView, pathLp);
 
-        // Bottom row: size + delete
-        LinearLayout bottomRow = new LinearLayout(activity);
-        bottomRow.setOrientation(LinearLayout.HORIZONTAL);
-        bottomRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams bottomLp = new LinearLayout.LayoutParams(
+        LinearLayout metaRow = new LinearLayout(activity);
+        metaRow.setOrientation(LinearLayout.HORIZONTAL);
+        metaRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams metaLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        bottomLp.topMargin = dp(6);
+        metaLp.topMargin = dp(6);
 
-        TextView sizeView = new TextView(activity);
-        sizeView.setText(model.getSizeText());
-        sizeView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        sizeView.setTextColor(0xFF666666);
-        bottomRow.addView(sizeView, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        TextView sizeBadge = new TextView(activity);
+        sizeBadge.setText("💾 " + model.getSizeText());
+        sizeBadge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        sizeBadge.setTextColor(MainActivity.COLOR_PRIMARY);
+        GradientDrawable sizeBadgeBg = new GradientDrawable();
+        sizeBadgeBg.setCornerRadius(dp(8));
+        sizeBadgeBg.setColor(0xFFF0EFFF);
+        sizeBadge.setBackground(sizeBadgeBg);
+        sizeBadge.setPadding(dp(8), dp(3), dp(8), dp(3));
+        metaRow.addView(sizeBadge);
+
+        infoCol.addView(metaRow, metaLp);
+        card.addView(infoCol, infoLp);
 
         TextView deleteBtn = new TextView(activity);
-        deleteBtn.setText("删除");
-        deleteBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        deleteBtn.setTextColor(0xFFE53935);
-        deleteBtn.setPadding(dp(12), dp(4), dp(12), dp(4));
+        deleteBtn.setText("🗑");
+        deleteBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        deleteBtn.setGravity(Gravity.CENTER);
+        LinearLayout.LayoutParams delLp = new LinearLayout.LayoutParams(dp(38), dp(38));
+        delLp.gravity = Gravity.CENTER_VERTICAL;
+
+        GradientDrawable delBg = new GradientDrawable();
+        delBg.setCornerRadius(dp(10));
+        delBg.setColor(0xFFFFF0F0);
+        deleteBtn.setBackground(delBg);
+
         deleteBtn.setOnClickListener(v -> {
             new AlertDialog.Builder(activity)
                     .setTitle("确认删除")
@@ -177,10 +268,7 @@ public class ModelRepoPage {
                     .setNegativeButton("取消", null)
                     .show();
         });
-        bottomRow.addView(deleteBtn, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        card.addView(bottomRow, bottomLp);
+        card.addView(deleteBtn, delLp);
 
         return card;
     }
@@ -188,7 +276,7 @@ public class ModelRepoPage {
     private void showAddModelDialog() {
         new AlertDialog.Builder(activity)
                 .setTitle("添加模型")
-                .setItems(new String[]{"添加本地模型", "从模型市场下载"}, (dialog, which) -> {
+                .setItems(new String[]{"📁 添加本地模型", "🛒 从模型市场下载"}, (dialog, which) -> {
                     if (which == 0) {
                         startFolderPicker();
                     } else {

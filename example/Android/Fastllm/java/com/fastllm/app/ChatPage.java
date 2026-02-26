@@ -33,7 +33,7 @@ public class ChatPage {
     private LinearLayout chatContainer;
     private ScrollView scrollView;
     private EditText inputBox;
-    private Button sendBtn;
+    private TextView sendBtn;
     private TextView statusText;
     private LinearLayout inputArea;
 
@@ -47,9 +47,8 @@ public class ChatPage {
     private TextView currentBotBubble = null;
     private String currentModelPath = null;
 
-    // Sampling params
     private float topP = 0.9f;
-    private int topK = 50;
+    private int topK = 5;
     private float temperature = 0.7f;
     private float repeatPenalty = 1.0f;
 
@@ -67,16 +66,15 @@ public class ChatPage {
     private View buildUI() {
         LinearLayout root = new LinearLayout(activity);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(0xFFF5F5F5);
+        root.setBackgroundColor(MainActivity.COLOR_BG);
 
-        // Top area: model selector + settings
         LinearLayout topArea = new LinearLayout(activity);
         topArea.setOrientation(LinearLayout.HORIZONTAL);
-        topArea.setBackgroundColor(Color.WHITE);
-        topArea.setPadding(dp(12), dp(8), dp(8), dp(8));
+        topArea.setBackgroundColor(MainActivity.COLOR_SURFACE);
+        topArea.setPadding(dp(16), dp(10), dp(10), dp(10));
         topArea.setGravity(Gravity.CENTER_VERTICAL);
+        topArea.setElevation(dp(2));
 
-        // Model spinner
         modelSpinner = new Spinner(activity);
         spinnerAdapter = new ArrayAdapter<>(activity,
                 android.R.layout.simple_spinner_item, spinnerItems);
@@ -99,108 +97,123 @@ public class ChatPage {
         topArea.addView(modelSpinner, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
 
-        // Settings button
-        Button settingsBtn = new Button(activity);
-        settingsBtn.setText("⚙");
-        settingsBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
-        settingsBtn.setBackgroundColor(Color.TRANSPARENT);
-        settingsBtn.setPadding(dp(8), 0, dp(8), 0);
+        TextView settingsBtn = createIconButton("⚙️");
         settingsBtn.setOnClickListener(v -> showSettings());
-        topArea.addView(settingsBtn, new LinearLayout.LayoutParams(
-                dp(44), dp(44)));
+        topArea.addView(settingsBtn, new LinearLayout.LayoutParams(dp(42), dp(42)));
 
-        // Reset button
-        Button resetBtn = new Button(activity);
-        resetBtn.setText("🔄");
-        resetBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
-        resetBtn.setBackgroundColor(Color.TRANSPARENT);
-        resetBtn.setPadding(dp(8), 0, dp(8), 0);
+        View spacer = new View(activity);
+        topArea.addView(spacer, new LinearLayout.LayoutParams(dp(4), 0));
+
+        TextView resetBtn = createIconButton("🔄");
         resetBtn.setOnClickListener(v -> {
             if (generating) return;
             FastllmJNI.resetChat();
             chatContainer.removeAllViews();
         });
-        topArea.addView(resetBtn, new LinearLayout.LayoutParams(
-                dp(44), dp(44)));
+        topArea.addView(resetBtn, new LinearLayout.LayoutParams(dp(42), dp(42)));
 
         root.addView(topArea, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        View divider = new View(activity);
-        divider.setBackgroundColor(0xFFEEEEEE);
-        root.addView(divider, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 1));
-
-        // Status
         statusText = new TextView(activity);
         statusText.setText("请选择一个模型开始对话");
-        statusText.setTextColor(0xFF666666);
+        statusText.setTextColor(MainActivity.COLOR_TEXT_SECONDARY);
         statusText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         statusText.setGravity(Gravity.CENTER);
-        statusText.setPadding(dp(16), dp(12), dp(16), dp(12));
-        root.addView(statusText, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        statusText.setPadding(dp(16), dp(14), dp(16), dp(14));
 
-        // Chat area
+        GradientDrawable statusBg = new GradientDrawable();
+        statusBg.setColor(0xFFF0EFFF);
+        statusBg.setCornerRadius(dp(12));
+        statusText.setBackground(statusBg);
+
+        LinearLayout.LayoutParams statusLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        statusLp.setMargins(dp(16), dp(12), dp(16), dp(4));
+        root.addView(statusText, statusLp);
+
         scrollView = new ScrollView(activity);
         scrollView.setFillViewport(true);
         chatContainer = new LinearLayout(activity);
         chatContainer.setOrientation(LinearLayout.VERTICAL);
-        chatContainer.setPadding(dp(10), dp(8), dp(10), dp(8));
+        chatContainer.setPadding(dp(12), dp(8), dp(12), dp(8));
         scrollView.addView(chatContainer, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         root.addView(scrollView, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
 
-        // Input area
-        inputArea = new LinearLayout(activity);
-        inputArea.setOrientation(LinearLayout.HORIZONTAL);
-        inputArea.setBackgroundColor(Color.WHITE);
-        inputArea.setPadding(dp(10), dp(8), dp(10), dp(8));
-        inputArea.setGravity(Gravity.CENTER_VERTICAL);
-        inputArea.setVisibility(View.GONE);
+        LinearLayout inputWrapper = new LinearLayout(activity);
+        inputWrapper.setOrientation(LinearLayout.VERTICAL);
+        inputWrapper.setBackgroundColor(MainActivity.COLOR_SURFACE);
+        inputWrapper.setElevation(dp(6));
 
         View inputDivider = new View(activity);
-        inputDivider.setBackgroundColor(0xFFEEEEEE);
-        root.addView(inputDivider, new LinearLayout.LayoutParams(
+        inputDivider.setBackgroundColor(MainActivity.COLOR_DIVIDER);
+        inputWrapper.addView(inputDivider, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 1));
+
+        inputArea = new LinearLayout(activity);
+        inputArea.setOrientation(LinearLayout.HORIZONTAL);
+        inputArea.setPadding(dp(12), dp(10), dp(12), dp(10));
+        inputArea.setGravity(Gravity.CENTER_VERTICAL);
+        inputArea.setVisibility(View.GONE);
 
         inputBox = new EditText(activity);
         inputBox.setHint("输入消息...");
         inputBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        inputBox.setTextColor(MainActivity.COLOR_TEXT_PRIMARY);
+        inputBox.setHintTextColor(0xFFB0B3C5);
         inputBox.setMaxLines(4);
 
         GradientDrawable inputBg = new GradientDrawable();
-        inputBg.setCornerRadius(dp(20));
-        inputBg.setColor(0xFFF0F0F0);
+        inputBg.setCornerRadius(dp(24));
+        inputBg.setColor(0xFFF3F4F8);
+        inputBg.setStroke(1, 0xFFE0E3EE);
         inputBox.setBackground(inputBg);
-        inputBox.setPadding(dp(16), dp(10), dp(16), dp(10));
+        inputBox.setPadding(dp(18), dp(12), dp(18), dp(12));
 
         inputArea.addView(inputBox, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
 
-        sendBtn = new Button(activity);
-        sendBtn.setText("发送");
+        sendBtn = new TextView(activity);
+        sendBtn.setText("➤");
+        sendBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
         sendBtn.setTextColor(Color.WHITE);
-        sendBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        sendBtn.setAllCaps(false);
+        sendBtn.setGravity(Gravity.CENTER);
 
-        GradientDrawable sendBg = new GradientDrawable();
-        sendBg.setCornerRadius(dp(20));
-        sendBg.setColor(0xFF1976D2);
+        GradientDrawable sendBg = new GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                new int[]{MainActivity.COLOR_GRADIENT_START, MainActivity.COLOR_GRADIENT_END});
+        sendBg.setCornerRadius(dp(22));
         sendBtn.setBackground(sendBg);
 
-        LinearLayout.LayoutParams sendLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
-        sendLp.leftMargin = dp(8);
+        LinearLayout.LayoutParams sendLp = new LinearLayout.LayoutParams(dp(44), dp(44));
+        sendLp.leftMargin = dp(10);
         inputArea.addView(sendBtn, sendLp);
 
         sendBtn.setOnClickListener(v -> sendMessage());
 
-        root.addView(inputArea, new LinearLayout.LayoutParams(
+        inputWrapper.addView(inputArea, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        root.addView(inputWrapper, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         return root;
+    }
+
+    private TextView createIconButton(String icon) {
+        TextView btn = new TextView(activity);
+        btn.setText(icon);
+        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        btn.setGravity(Gravity.CENTER);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(12));
+        bg.setColor(0xFFF3F4F8);
+        btn.setBackground(bg);
+
+        return btn;
     }
 
     void refreshModelList() {
@@ -225,8 +238,12 @@ public class ChatPage {
             return;
         }
 
-        statusText.setText("正在加载模型: " + model.name + "...");
+        statusText.setText("⏳ 正在加载模型: " + model.name + "...");
         statusText.setVisibility(View.VISIBLE);
+        GradientDrawable loadingBg = new GradientDrawable();
+        loadingBg.setColor(0xFFFFF8E1);
+        loadingBg.setCornerRadius(dp(12));
+        statusText.setBackground(loadingBg);
         inputArea.setVisibility(View.GONE);
 
         new Thread(() -> {
@@ -237,17 +254,31 @@ public class ChatPage {
                     if (modelType != null && !modelType.isEmpty()) {
                         modelLoaded = true;
                         currentModelPath = model.path;
-                        statusText.setText("模型已加载: " + modelType);
+                        statusText.setText("✅ 模型已加载: " + modelType);
+                        GradientDrawable successBg = new GradientDrawable();
+                        successBg.setColor(0xFFE8F5E9);
+                        successBg.setCornerRadius(dp(12));
+                        statusText.setBackground(successBg);
                         inputArea.setVisibility(View.VISIBLE);
                         chatContainer.removeAllViews();
                         FastllmJNI.resetChat();
                     } else {
-                        statusText.setText("模型加载失败");
+                        statusText.setText("❌ 模型加载失败");
+                        GradientDrawable errBg = new GradientDrawable();
+                        errBg.setColor(0xFFFFEBEE);
+                        errBg.setCornerRadius(dp(12));
+                        statusText.setBackground(errBg);
                     }
                 });
             } catch (Throwable t) {
                 Log.e(TAG, "Model load error", t);
-                handler.post(() -> statusText.setText("模型加载异常: " + t.getMessage()));
+                handler.post(() -> {
+                    statusText.setText("❌ 模型加载异常: " + t.getMessage());
+                    GradientDrawable errBg = new GradientDrawable();
+                    errBg.setColor(0xFFFFEBEE);
+                    errBg.setCornerRadius(dp(12));
+                    statusText.setBackground(errBg);
+                });
             }
         }).start();
     }
@@ -259,6 +290,7 @@ public class ChatPage {
         inputBox.setText("");
         generating = true;
         sendBtn.setEnabled(false);
+        sendBtn.setAlpha(0.5f);
 
         addBubble(text, true);
 
@@ -273,6 +305,7 @@ public class ChatPage {
                         generating = false;
                         currentBotBubble = null;
                         sendBtn.setEnabled(true);
+                        sendBtn.setAlpha(1f);
                     }
                 })
         )).start();
@@ -285,64 +318,82 @@ public class ChatPage {
 
         LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rowLp.bottomMargin = dp(6);
+        rowLp.bottomMargin = dp(10);
 
-        // Avatar
         TextView avatar = new TextView(activity);
-        avatar.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        avatar.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         avatar.setGravity(Gravity.CENTER);
         avatar.setTextColor(Color.WHITE);
+        avatar.setTypeface(null, android.graphics.Typeface.BOLD);
 
         GradientDrawable avatarBg = new GradientDrawable();
-        avatarBg.setCornerRadius(dp(18));
+        avatarBg.setCornerRadius(dp(20));
 
         LinearLayout.LayoutParams avatarLp = new LinearLayout.LayoutParams(dp(36), dp(36));
+        avatarLp.gravity = Gravity.TOP;
 
         if (isUser) {
             avatar.setText("我");
-            avatarBg.setColor(0xFF1976D2);
+            avatarBg = new GradientDrawable(
+                    GradientDrawable.Orientation.TL_BR,
+                    new int[]{MainActivity.COLOR_GRADIENT_START, MainActivity.COLOR_GRADIENT_END});
+            avatarBg.setCornerRadius(dp(20));
             avatarLp.leftMargin = dp(8);
         } else {
             avatar.setText("AI");
-            avatarBg.setColor(0xFF43A047);
+            avatarBg = new GradientDrawable(
+                    GradientDrawable.Orientation.TL_BR,
+                    new int[]{MainActivity.COLOR_ACCENT, 0xFF009688});
+            avatarBg.setCornerRadius(dp(20));
             avatarLp.rightMargin = dp(8);
         }
         avatar.setBackground(avatarBg);
 
-        // Bubble
+        LinearLayout bubbleWrapper = new LinearLayout(activity);
+        bubbleWrapper.setOrientation(LinearLayout.VERTICAL);
+
         TextView tv = new TextView(activity);
         tv.setText(text);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-        tv.setTextColor(isUser ? 0xFF333333 : 0xFF333333);
-        tv.setPadding(dp(12), dp(8), dp(12), dp(8));
+        tv.setLineSpacing(dp(2), 1f);
+        tv.setTextColor(isUser ? Color.WHITE : MainActivity.COLOR_TEXT_PRIMARY);
+        tv.setPadding(dp(14), dp(10), dp(14), dp(10));
         tv.setTextIsSelectable(true);
 
-        GradientDrawable bubbleBg = new GradientDrawable();
+        GradientDrawable bubbleBg;
         if (isUser) {
+            bubbleBg = new GradientDrawable(
+                    GradientDrawable.Orientation.TL_BR,
+                    new int[]{MainActivity.COLOR_GRADIENT_START, MainActivity.COLOR_GRADIENT_END});
             bubbleBg.setCornerRadii(new float[]{
-                    dp(12), dp(12), dp(4), dp(4),
-                    dp(12), dp(12), dp(12), dp(12)});
-            bubbleBg.setColor(0xFF95EC69);
+                    dp(16), dp(16), dp(4), dp(4),
+                    dp(16), dp(16), dp(16), dp(16)});
         } else {
+            bubbleBg = new GradientDrawable();
+            bubbleBg.setColor(MainActivity.COLOR_SURFACE);
             bubbleBg.setCornerRadii(new float[]{
-                    dp(4), dp(4), dp(12), dp(12),
-                    dp(12), dp(12), dp(12), dp(12)});
-            bubbleBg.setColor(Color.WHITE);
+                    dp(4), dp(4), dp(16), dp(16),
+                    dp(16), dp(16), dp(16), dp(16)});
+            bubbleBg.setStroke(1, 0xFFE8EAF0);
         }
         tv.setBackground(bubbleBg);
+        tv.setElevation(dp(1));
 
         LinearLayout.LayoutParams tvLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        tvLp.gravity = Gravity.TOP;
-        int maxWidth = (int) (activity.getResources().getDisplayMetrics().widthPixels * 0.65);
+        int maxWidth = (int) (activity.getResources().getDisplayMetrics().widthPixels * 0.7);
         tv.setMaxWidth(maxWidth);
+        bubbleWrapper.addView(tv, tvLp);
+
+        LinearLayout.LayoutParams wrapperLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
 
         if (isUser) {
-            row.addView(tv, tvLp);
+            row.addView(bubbleWrapper, wrapperLp);
             row.addView(avatar, avatarLp);
         } else {
             row.addView(avatar, avatarLp);
-            row.addView(tv, tvLp);
+            row.addView(bubbleWrapper, wrapperLp);
         }
 
         chatContainer.addView(row, rowLp);
