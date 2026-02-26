@@ -29,6 +29,7 @@ namespace fastllm {
     DeepSeekV2Model::DeepSeekV2Model() {
         this->model_type = "deepseek_v2";
         this->model_struct = "deepseek_v2";
+        this->defaultChunkedPrefillSize = 2048;
 
         // 默认使用alpaca的提示词和instruction
         this->pre_prompt = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n";
