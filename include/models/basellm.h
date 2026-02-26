@@ -267,7 +267,11 @@ namespace fastllm {
 
         virtual void SaveModel(const std::string &fileName); // 直接导出
 
+        virtual void Prepare() {}; // 预处理（如补全缺失权重等），在 WarmUp/AutoWarmup 之前调用
+
         virtual void WarmUp() {}; // 预热
+
+        void AutoWarmup(); // 自动预热：use_new_engine 时使用新引擎预热，否则调用 WarmUp
 
         virtual void AddPromptCache(const std::vector <int> &inputTokens);
 
