@@ -65,6 +65,10 @@ extern "C" {
         fastllm::SetPageLen(page_size);
     }
 
+    DLL_EXPORT void set_gpu_mem_ratio(float ratio) {
+        fastllm::SetGpuMemRatio(ratio);
+    }
+
     DLL_EXPORT bool get_cpu_low_mem(bool low) {
         return fastllm::GetLowMemMode();
     }

@@ -263,6 +263,9 @@ def set_max_tokens(max_tokens):
 def set_page_size(page_size):
     fastllm_lib.set_page_size(ctypes.c_int(page_size));
 
+def set_gpu_mem_ratio(ratio):
+    fastllm_lib.set_gpu_mem_ratio(ctypes.c_float(ratio));
+
 def set_cuda_shared_expert(cuda_shared_expert):
     fastllm_lib.set_cuda_shared_expert(ctypes.c_bool(cuda_shared_expert));
 
