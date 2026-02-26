@@ -9,6 +9,7 @@
 
     <application
         android:label="Fastllm"
+        android:theme="@android:style/Theme.NoTitleBar"
         android:requestLegacyExternalStorage="true"
         android:largeHeap="true"
         android:usesCleartextTraffic="true">
