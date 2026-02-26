@@ -2129,4 +2129,115 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         }
         return;
     }
+
+    void basellm::AutoWarmup() {
+        if (!this->use_new_engine) {
+            WarmUp();
+            return;
+        }
+
+        printf("Warmup...\n");
+        Prepare();
+
+        int pageLen = fastllm::GetPageLen();
+        int len = this->GetChunkedPrefillSize();
+        bool autoCalcPages = (fastllm::GetMaxTokens() <= 0);
+
+        if (autoCalcPages) {
+            int minPages = len / pageLen + 2;
+            fastllm::SetMaxTokens(minPages * pageLen);
+        }
+
+        std::vector <float> ids(len, 1.0f);
+        Data inputIds = Data(DataType::FLOAT32, {1, len}, ids);
+        std::vector <float> posData(len);
+        for (int i = 0; i < len; i++) posData[i] = i;
+        Data positionIds = Data(this->dataType, {1, len}, posData);
+        std::vector <Data*> attentionMasks = {nullptr};
+        std::vector <Data*> positionIdsVec = {&positionIds};
+        std::vector <int> seqLens = {len};
+        std::vector <std::pair <Data, Data> > pastKeyValuesStorage;
+        std::vector <std::pair <Data*, Data*> > pastKeyValues;
+        for (int i = 0; i < block_cnt; i++) {
+            pastKeyValuesStorage.push_back(std::make_pair(Data(this->dataType), Data(this->dataType)));
+        }
+        for (int i = 0; i < block_cnt; i++) {
+            pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage[i].first, &pastKeyValuesStorage[i].second));
+        }
+        GenerationConfig generationConfig;
+        std::vector <GenerationConfig> generationConfigs = {generationConfig};
+        LastTokensManager lastTokens;
+        ForwardV2(1, inputIds, attentionMasks, positionIdsVec, seqLens, pastKeyValues, generationConfigs, lastTokens, nullptr);
+        elementsInKVCachePerToken = (long long)block_cnt * 
+            (pastKeyValuesStorage[0].first.dims[0] * pastKeyValuesStorage[0].first.dims[2] + 
+             pastKeyValuesStorage[0].second.dims[0] * pastKeyValuesStorage[0].second.dims[2]);
+
+        if (autoCalcPages) {
+#ifdef USE_CUDA
+            int numHeads = pastKeyValuesStorage[0].first.dims[0];
+            int headDim = pastKeyValuesStorage[0].first.dims[2];
+            int unitSize = (this->dataType == DataType::FLOAT32) ? 4 : 2;
+            long long bytesPerPage = (long long)block_cnt * 2 * pageLen * numHeads * headDim * unitSize;
+
+            for (auto &kv : pastKeyValuesStorage) {
+                kv.first.pageIndex.clear();
+                kv.first.pagedKVCacheData = nullptr;
+                kv.first.isPagedKVCache = false;
+                kv.second.pageIndex.clear();
+                kv.second.pagedKVCacheData = nullptr;
+                kv.second.isPagedKVCache = false;
+            }
+            ClearAllPagedCacheManagers();
+
+            auto freeSizes = FastllmCudaGetFreeSizes();
+            auto totalSizes = FastllmCudaGetTotalSizes();
+            auto dmap = GetDeviceMap();
+            std::set <int> deviceIds;
+            std::map <int, int> ratios;
+            for (auto &it : dmap) {
+                if (StartWith(it.first, "cuda")) {
+                    for (int id : ParseDeviceIds(it.first, "cuda", ratios)) {
+                        deviceIds.insert(id);
+                    }
+                }
+            }
+            if (deviceIds.empty()) {
+                deviceIds.insert(0);
+            }
+            long long cacheAvail = 0;
+            for (int id : deviceIds) {
+                if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
+                    cacheAvail += freeSizes[id] - (long long)(totalSizes[id] * 0.1);
+                }
+            }
+            if (cacheAvail > 0 && bytesPerPage > 0) {
+                int maxPages = (int)(cacheAvail / bytesPerPage);
+                if (maxPages > 0) {
+                    fastllm::SetMaxTokens(maxPages * pageLen);
+                    printf("Auto set cache pages: %d (tokens: %d, avail: %.2f GB).\n",
+                           maxPages, maxPages * pageLen, cacheAvail / 1e9);
+                }
+            }
+
+            pastKeyValuesStorage.clear();
+            pastKeyValues.clear();
+            for (int i = 0; i < block_cnt; i++) {
+                pastKeyValuesStorage.push_back(std::make_pair(Data(this->dataType), Data(this->dataType)));
+            }
+            for (int i = 0; i < block_cnt; i++) {
+                pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage[i].first, &pastKeyValuesStorage[i].second));
+            }
+            ForwardV2(1, inputIds, attentionMasks, positionIdsVec, seqLens, pastKeyValues, generationConfigs, lastTokens, nullptr);
+            for (auto &kv : pastKeyValuesStorage) {
+                kv.first.pageIndex.clear();
+                kv.first.pagedKVCacheData = nullptr;
+                kv.first.isPagedKVCache = false;
+                kv.second.pageIndex.clear();
+                kv.second.pagedKVCacheData = nullptr;
+                kv.second.isPagedKVCache = false;
+            }
+#endif
+        }
+        printf("finish.\n");
+    }
 }
