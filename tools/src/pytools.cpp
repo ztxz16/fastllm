@@ -65,6 +65,10 @@ extern "C" {
         fastllm::SetPageLen(page_size);
     }
 
+    DLL_EXPORT void set_gpu_mem_ratio(float ratio) {
+        fastllm::SetGpuMemRatio(ratio);
+    }
+
     DLL_EXPORT bool get_cpu_low_mem(bool low) {
         return fastllm::GetLowMemMode();
     }
@@ -365,7 +369,7 @@ extern "C" {
 
     DLL_EXPORT void warmup_llm_model(int modelId) {
         auto model = models.GetModel(modelId);
-        model->WarmUp();
+        model->AutoWarmup();
         return;
     }
 
