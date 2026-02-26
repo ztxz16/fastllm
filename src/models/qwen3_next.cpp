@@ -24,6 +24,7 @@ namespace fastllm {
         this->canDoBatchForward = false;
         this->model_type = "qwen3_next";
         this->model_struct = "qwen3_next";
+        this->defaultChunkedPrefillSize = 2048;
 
         // 默认使用alpaca的提示词和instruction
         this->pre_prompt = "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n";

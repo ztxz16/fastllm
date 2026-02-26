@@ -613,18 +613,7 @@ namespace fastllm {
             maxBatch = model->maxBatch;
         }
 
-        int prefillChunkSize;
-        if (model->chunkedPrefillSize >= 0) {
-            prefillChunkSize = model->chunkedPrefillSize;
-        } else {
-            prefillChunkSize = 8192;
-            if (model->model_struct == "deepseek_v2") {
-                prefillChunkSize = 2048;
-            }
-            if (model->model_struct == "qwen3_next") {
-                prefillChunkSize = 2048;
-            }
-        }
+        int prefillChunkSize = model->GetChunkedPrefillSize();
 
         // 辅助lambda：释放一个请求占用的所有KV Cache分页，并以allTokens重新初始化为pending prefill状态
         auto releaseAndReinitRequest = [&](ResponseContext *ctx) {
@@ -1506,17 +1495,7 @@ auto st = std::chrono::system_clock::now();
                                 }
                             } else {
                                 int first, part;
-                                if (model->chunkedPrefillSize >= 0) {
-                                    first = part = model->chunkedPrefillSize;
-                                } else {
-                                    first = part = 8192;
-                                    if (model->model_struct == "deepseek_v2") {
-                                        first = part = 2048;
-                                    }
-                                    if (model->model_struct == "qwen3_next") {
-                                        first = part = 2048;
-                                    }
-                                }
+                                first = part = model->GetChunkedPrefillSize();
                                 if (seqLens[0] > first) {
                                     int len = seqLens[0];
                                     for (int st = 0; st < len; ) {
@@ -1940,6 +1919,13 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 
     void basellm::SetChunkedPrefillSize(int size) {
         this->chunkedPrefillSize = size;
+    }
+
+    int basellm::GetChunkedPrefillSize() {
+        if (this->chunkedPrefillSize >= 0) {
+            return this->chunkedPrefillSize;
+        }
+        return this->defaultChunkedPrefillSize;
     }
 
     void basellm::SetDataType(DataType dataType) {
