@@ -639,6 +639,22 @@ namespace fastllm {
             ctx->intParams.clear();
         };
 
+        auto *pcm = GetPagedCacheManager(model->kvCacheId);
+        if (pcm != nullptr) {
+            totalPages = pcm->maxPages;
+            pageLen = pcm->pageLen;
+            maxTotalLens = totalPages * pageLen;
+            pagesLimit = totalPages * 4 / 5;
+            maxBatch = std::max(1, std::min(maxBatch, maxTotalLens / 128));
+            model->tokensLimit = maxTotalLens;
+            model->promptLimit = pagesLimit * pageLen;
+            if (model->verbose) {
+                printf("Fastllm KV Cache Token limit: %d tokens (totalPages=%d, pageLen=%d).\n", maxTotalLens, totalPages, pageLen);
+                printf("Fastllm AddPrefill Pages limit: %d pages (80%% of %d).\n", pagesLimit, totalPages);
+                printf("Fastllm Batch limit: %d.\n", maxBatch);
+            }
+        }
+
         auto lastRecordTime = std::chrono::system_clock::now();
         long long genTokens = 0;
         while (true) {
@@ -1080,24 +1096,6 @@ namespace fastllm {
 
                 forwardLocker.unlock();
                 dictLocker.lock();
-
-                if (maxTotalLens == 0 && pastKeyValues.size() > (size_t)model->kvCacheId) {
-                    auto &kv = *pastKeyValues[model->kvCacheId].first;
-                    if (kv.pagedKVCacheData != nullptr) {
-                        totalPages = kv.pagedKVCacheData->maxPages;
-                        pageLen = kv.pagedKVCacheData->pageLen;
-                        maxTotalLens = totalPages * pageLen;
-                        pagesLimit = totalPages * 4 / 5;
-                        maxBatch = std::max(1, std::min(maxBatch, maxTotalLens / 128));
-                        model->tokensLimit = maxTotalLens;
-                        model->promptLimit = pagesLimit * pageLen;
-                        if (model->verbose) {
-                            printf("Fastllm KV Cache Token limit: %d tokens (totalPages=%d, pageLen=%d).\n", maxTotalLens, totalPages, pageLen);
-                            printf("Fastllm AddPrefill Pages limit: %d pages (80%% of %d).\n", pagesLimit, totalPages);
-                            printf("Fastllm Batch limit: %d.\n", maxBatch);
-                        }
-                    }
-                }
 
                 // Prefill完成后立即Record，使其他请求可以尽早命中Prefix Cache
                 for (int i = 0; i < (int)handles.size(); i++) {
@@ -2239,5 +2237,23 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 #endif
         }
         printf("finish.\n");
+
+        auto *pcm = GetPagedCacheManager(this->kvCacheId);
+        if (pcm != nullptr) {
+            int totalPages = pcm->maxPages;
+            int cachePageLen = pcm->pageLen;
+            this->tokensLimit = totalPages * cachePageLen;
+            this->promptLimit = (totalPages * 4 / 5) * cachePageLen;
+            {
+                int mBatch = 512;
+                if (this->maxBatch > 0) {
+                    mBatch = this->maxBatch;
+                }
+                mBatch = std::max(1, std::min(mBatch, this->tokensLimit / 128));
+                printf("[Fastllm] KV Cache Token limit: %d tokens (totalPages=%d, pageLen=%d).\n", this->tokensLimit, totalPages, cachePageLen);
+                printf("[Fastllm] AddPrefill Pages limit: %d pages (80%% of %d).\n", totalPages * 4 / 5, totalPages);
+                printf("[Fastllm] Batch limit: %d.\n", mBatch);
+            }
+        }
     }
 }
