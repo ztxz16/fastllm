@@ -285,6 +285,8 @@ namespace fastllm {
 
         virtual void SetChunkedPrefillSize(int size);
 
+        virtual int GetChunkedPrefillSize();
+
         virtual void SetDataType(DataType dataType);
 
         virtual void SetMoeAtype(DataType type);
@@ -384,6 +386,8 @@ namespace fastllm {
 
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
+
+        int defaultChunkedPrefillSize = 8192;
 
         // 新推理引擎的主循环
         void NewMainLoop();
