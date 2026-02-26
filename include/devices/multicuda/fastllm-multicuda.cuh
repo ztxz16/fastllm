@@ -5,6 +5,7 @@
 #include "fastllm.h"
 
 std::vector <long long> FastllmCudaGetFreeSizes();
+std::vector <long long> FastllmCudaGetTotalSizes();
 
 #ifdef  __cplusplus
 extern "C" {
