@@ -2207,7 +2207,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             long long cacheAvail = 0;
             for (int id : deviceIds) {
                 if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
-                    cacheAvail += freeSizes[id] - (long long)(totalSizes[id] * 0.1);
+                    cacheAvail += freeSizes[id] - (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
                 }
             }
             if (cacheAvail > 0 && bytesPerPage > 0) {

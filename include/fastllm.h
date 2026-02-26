@@ -58,6 +58,8 @@ namespace fastllm {
     int GetMaxTokens();
     void SetPageLen(int pageLen);
     int GetPageLen();
+    void SetGpuMemRatio(float ratio);
+    float GetGpuMemRatio();
     AliveThreadPool *GetAlivePool();
 
     template<typename T, std::size_t Alignment>

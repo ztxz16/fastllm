@@ -60,6 +60,7 @@ namespace fastllm {
     static bool enableAMX = false;
     static int maxTokens = -1;
     static int defaultPageLen = 16;
+    static float gpuMemRatio = 0.9f;
     static Data emptyData;
 
     static std::map <DataType, int> DataTypeBits = {
@@ -187,6 +188,14 @@ namespace fastllm {
 
     int GetPageLen() {
         return defaultPageLen;
+    }
+
+    void SetGpuMemRatio(float ratio) {
+        gpuMemRatio = ratio;
+    }
+
+    float GetGpuMemRatio() {
+        return gpuMemRatio;
     }
 
     AliveThreadPool *GetAlivePool() {
