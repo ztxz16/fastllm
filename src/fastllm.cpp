@@ -1356,12 +1356,11 @@ namespace fastllm {
 #endif
 #ifdef USE_CUDA
         if (this->cudaData != nullptr) {
-            FastllmCudaFree(this->cudaData);
-            /*if (this->directMemory) {
+            if (this->directMemory) {
                 FastllmCudaDirectFree(this->cudaData);
             } else {
                 FastllmCudaFree(this->cudaData);
-            }*/
+            }
         }
 #endif
     }
@@ -3332,7 +3331,7 @@ namespace fastllm {
         }
 
         // 初始化 pagedKVCacheData
-
+        ((Data*)manager)->directMemory = true;
         ((Data*)manager)->ToDevice(cacheData.dataDevice);
 
         // Resize manager: [maxPages, pageLen, numHeads, headDim]
@@ -3347,6 +3346,14 @@ namespace fastllm {
         layerPagedCacheManagers[layerIndex] = manager;
 
         return manager;
+    }
+
+    void ClearAllPagedCacheManagers() {
+        for (auto &it : layerPagedCacheManagers) {
+            it.second->FreeSpace();
+            delete it.second;
+        }
+        layerPagedCacheManagers.clear();
     }
 
     void AppendPagedCache(PagedCacheManager &pagedCacheManager, Data &cache, const Data &input) {

@@ -922,6 +922,8 @@ namespace fastllm {
 
     PagedCacheManager* GetPagedCacheManager(int layerIndex);
 
+    void ClearAllPagedCacheManagers();
+
     void AppendPagedCache(PagedCacheManager &pagedCacheManager, Data &cache, const Data &input);
     
     // 从batch个pastKey中生成AppendPagedCacheBatch所需要的insertIndexs和insertPositions

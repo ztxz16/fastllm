@@ -62,6 +62,7 @@ typedef void* cublasHandle_t;
 #endif
 
 std::vector <long long> FastllmCudaGetFreeSizes();
+std::vector <long long> FastllmCudaGetTotalSizes();
 
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 #define FETCH_FLOAT2(pointer) (reinterpret_cast<float2*>(&(pointer))[0])
