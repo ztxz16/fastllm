@@ -384,6 +384,7 @@ namespace fastllm {
         bool IsRepacked = false;
 
         std::vector <uint8_t*> numasData; // numa数据
+        bool isPinned = false; // 是否使用pinned memory (page-locked)
 
         std::vector <int> cpuIntDatas; // 锁定在cpu上的int数据
         
