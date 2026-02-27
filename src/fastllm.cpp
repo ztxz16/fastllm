@@ -1715,7 +1715,11 @@ namespace fastllm {
 
         if (copyData) {
             if (this->cpuData != nullptr) {
-                FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, bytes);
+                if (this->isPinned) {
+                    FastllmCudaCopyFromPinnedHostToDevice(this->cudaData, this->cpuData, bytes);
+                } else {
+                    FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, bytes);
+                }
             } else {
                 int numaCnt = this->numasData.size();
                 int k = this->dims[0], m = this->dims[1];
@@ -1724,9 +1728,16 @@ namespace fastllm {
                 if (this->dataType == DataType::DATA_GGUF_FORMAT) {
                     bytesPerRow = GetDataBytes((DataType)((int)this->dataType + this->ggmlType), 1, m);
                 }
-                for (int i = 0; i < numaCnt; i++) {
-                    FastllmCudaCopyFromHostToDevice((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
-                        this->numasData[i], (size_t)kPerNuma * bytesPerRow);
+                if (this->isPinned) {
+                    for (int i = 0; i < numaCnt; i++) {
+                        FastllmCudaCopyFromPinnedHostToDevice((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
+                            this->numasData[i], (size_t)kPerNuma * bytesPerRow);
+                    }
+                } else {
+                    for (int i = 0; i < numaCnt; i++) {
+                        FastllmCudaCopyFromHostToDevice((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
+                            this->numasData[i], (size_t)kPerNuma * bytesPerRow);
+                    }
                 }
             }
         }

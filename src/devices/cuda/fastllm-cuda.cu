@@ -1532,10 +1532,45 @@ void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size) {
     //cudaDeviceSynchronize();
 }
 
+void FastllmCudaCopyFromPinnedHostToDevice(void *dst, void *src, size_t size) {
+    cudaError_t state = cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, 0);
+    checkCudaErrors("Error: CUDA error when async copy from pinned memory to GPU!", state);
+}
+
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size) {
     cudaError_t state = cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost);
     checkCudaErrors("Error: CUDA error when copy from GPU to memory!", state);
     //cudaDeviceSynchronize();
+}
+
+void *FastllmCudaHostMalloc(size_t size) {
+    void *ptr = nullptr;
+    cudaError_t state = cudaHostAlloc(&ptr, size, cudaHostAllocDefault);
+    checkCudaErrors("Error: CUDA error when allocating pinned memory!", state);
+    return ptr;
+}
+
+void FastllmCudaHostFree(void *ptr) {
+    if (ptr != nullptr) {
+        cudaError_t state = cudaFreeHost(ptr);
+        checkCudaErrors("Error: CUDA error when freeing pinned memory!", state);
+    }
+}
+
+bool FastllmCudaHostRegister(void *ptr, size_t size) {
+    cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterDefault);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Warning: cudaHostRegister failed (%s), falling back to unpinned memory\n",
+                cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+void FastllmCudaHostUnregister(void *ptr) {
+    if (ptr != nullptr) {
+        cudaHostUnregister(ptr);
+    }
 }
 
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {

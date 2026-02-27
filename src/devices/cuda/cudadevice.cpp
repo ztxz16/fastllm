@@ -1690,7 +1690,7 @@ namespace fastllm {
     }
 
     void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
-                        Data **weights, Data **biass, float sharedScale, bool setZero, int expertLimit, bool isCrossSwiglu) {
+        Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu) {
 // static std::map <std::string, float> timeCnt;
 // static std::chrono::steady_clock::time_point lastMergeMoeCallTime;
 // auto now = std::chrono::steady_clock::now();
@@ -1789,7 +1789,7 @@ for (auto &it : eeCnt) {
     // printf("%d: %d\n", it.first, it.second);
 }
         for (int i = 0; i < expertTasks.size(); i++) {
-            if (expertTasks[i].size() == 0 || expertTasks[i].size() < expertLimit || weights[i * 2] == nullptr) {
+            if (expertTasks[i].size() == 0 || experts.find(i) == experts.end() || weights[i * 2] == nullptr) {
                 continue;
             }
 // ForceDeviceSync(); timeCnt["expert start"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();

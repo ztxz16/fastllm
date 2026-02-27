@@ -104,8 +104,14 @@ void FastllmCudaDirectFree(void *ret);
 void FastllmCudaMemset0(void *ret, size_t size);
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size);
+void FastllmCudaCopyFromPinnedHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size);
+
+void *FastllmCudaHostMalloc(size_t size);
+void FastllmCudaHostFree(void *ptr);
+bool FastllmCudaHostRegister(void *ptr, size_t size);
+void FastllmCudaHostUnregister(void *ptr);
 
 // 将 host 端数据拷到 GPU 临时缓冲区，按数据类型加到 dst（GPU）上，len 为元素个数
 void FastllmCudaAddHostToDevice(void *dst, void *hostSrc, int len, fastllm::DataType dataType);
