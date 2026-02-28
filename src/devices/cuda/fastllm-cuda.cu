@@ -172,6 +172,24 @@ void ForceDeviceSync() {
     cudaDeviceSynchronize();
 }
 
+void *FastllmCudaStreamCreate(bool nonBlocking) {
+    cudaStream_t stream;
+    unsigned int flags = nonBlocking ? cudaStreamNonBlocking : cudaStreamDefault;
+    cudaError_t state = cudaStreamCreateWithFlags(&stream, flags);
+    checkCudaErrors("Error: CUDA error when creating stream!", state);
+    return (void*)stream;
+}
+
+void FastllmCudaStreamDestroy(void *stream) {
+    cudaError_t state = cudaStreamDestroy((cudaStream_t)stream);
+    checkCudaErrors("Error: CUDA error when destroying stream!", state);
+}
+
+void FastllmCudaStreamSynchronize(void *stream) {
+    cudaError_t state = cudaStreamSynchronize((cudaStream_t)stream);
+    checkCudaErrors("Error: CUDA error when synchronizing stream!", state);
+}
+
 double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
     auto duration = std::chrono::duration_cast<std::chrono::nanoseconds> (time2 - time1);
     return double(duration.count()) * std::chrono::nanoseconds::period::num / std::chrono::nanoseconds::period::den;
@@ -1534,6 +1552,16 @@ void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size) {
 
 void FastllmCudaCopyFromPinnedHostToDevice(void *dst, void *src, size_t size) {
     cudaError_t state = cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, 0);
+    checkCudaErrors("Error: CUDA error when async copy from pinned memory to GPU!", state);
+}
+
+void FastllmCudaCopyFromHostToDeviceAsync(void *dst, void *src, size_t size, void *stream) {
+    cudaError_t state = cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, (cudaStream_t)stream);
+    checkCudaErrors("Error: CUDA error when async copy from memory to GPU!", state);
+}
+
+void FastllmCudaCopyFromPinnedHostToDeviceAsync(void *dst, void *src, size_t size, void *stream) {
+    cudaError_t state = cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, (cudaStream_t)stream);
     checkCudaErrors("Error: CUDA error when async copy from pinned memory to GPU!", state);
 }
 
