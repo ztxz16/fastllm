@@ -193,6 +193,7 @@ namespace fastllm {
         Data attenOutput;
         bool generatedBatchDecodeParams = false;
         bool generatedAppendPagedCacheBatchParams = false;
+        Data expertIndex, expertScore;
 
         bool all1 = true;
         for (int i = 0; i < batch; i++) {
@@ -287,7 +288,6 @@ namespace fastllm {
                 bool needNorm = true;
                 Sigmoid(routerLogitsTemp, routerLogitsTemp);
 
-                Data expertIndex, expertScore;
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".block_sparse_moe.experts.0.w1w3.weight") != weight.weight.end()
                     && CanRunMergeMOE(attenInput, biass[i])) {
                     SelectExpert(routerLogitsTemp, expertIndex, expertScore, this->num_experts_per_tok, needNorm,
