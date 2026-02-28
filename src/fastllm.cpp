@@ -1703,7 +1703,7 @@ namespace fastllm {
     }
 
     // 临时移动到cuda 
-    void Data::ToCudaTemporary(const std::vector <int> &deviceIds, bool copyData) { 
+    void Data::ToCudaTemporary(const std::vector <int> &deviceIds, bool copyData, void *stream) { 
 #ifdef USE_CUDA
         AssertInFastLLM(deviceIds.size() <= 0, "ToCudaTemporary Error: can't set deviceids\n");
         this->dataDevice = DataDevice::CUDA;
@@ -1715,10 +1715,18 @@ namespace fastllm {
 
         if (copyData) {
             if (this->cpuData != nullptr) {
-                if (this->isPinned) {
-                    FastllmCudaCopyFromPinnedHostToDevice(this->cudaData, this->cpuData, bytes);
+                if (stream) {
+                    if (this->isPinned) {
+                        FastllmCudaCopyFromPinnedHostToDeviceAsync(this->cudaData, this->cpuData, bytes, stream);
+                    } else {
+                        FastllmCudaCopyFromHostToDeviceAsync(this->cudaData, this->cpuData, bytes, stream);
+                    }
                 } else {
-                    FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, bytes);
+                    if (this->isPinned) {
+                        FastllmCudaCopyFromPinnedHostToDevice(this->cudaData, this->cpuData, bytes);
+                    } else {
+                        FastllmCudaCopyFromHostToDevice(this->cudaData, this->cpuData, bytes);
+                    }
                 }
             } else {
                 int numaCnt = this->numasData.size();
@@ -1728,15 +1736,29 @@ namespace fastllm {
                 if (this->dataType == DataType::DATA_GGUF_FORMAT) {
                     bytesPerRow = GetDataBytes((DataType)((int)this->dataType + this->ggmlType), 1, m);
                 }
-                if (this->isPinned) {
-                    for (int i = 0; i < numaCnt; i++) {
-                        FastllmCudaCopyFromPinnedHostToDevice((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
-                            this->numasData[i], (size_t)kPerNuma * bytesPerRow);
+                if (stream) {
+                    if (this->isPinned) {
+                        for (int i = 0; i < numaCnt; i++) {
+                            FastllmCudaCopyFromPinnedHostToDeviceAsync((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
+                                this->numasData[i], (size_t)kPerNuma * bytesPerRow, stream);
+                        }
+                    } else {
+                        for (int i = 0; i < numaCnt; i++) {
+                            FastllmCudaCopyFromHostToDeviceAsync((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
+                                this->numasData[i], (size_t)kPerNuma * bytesPerRow, stream);
+                        }
                     }
                 } else {
-                    for (int i = 0; i < numaCnt; i++) {
-                        FastllmCudaCopyFromHostToDevice((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
-                            this->numasData[i], (size_t)kPerNuma * bytesPerRow);
+                    if (this->isPinned) {
+                        for (int i = 0; i < numaCnt; i++) {
+                            FastllmCudaCopyFromPinnedHostToDevice((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
+                                this->numasData[i], (size_t)kPerNuma * bytesPerRow);
+                        }
+                    } else {
+                        for (int i = 0; i < numaCnt; i++) {
+                            FastllmCudaCopyFromHostToDevice((uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow, 
+                                this->numasData[i], (size_t)kPerNuma * bytesPerRow);
+                        }
                     }
                 }
             }

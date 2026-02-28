@@ -95,6 +95,10 @@ void DeviceSync();
 void ForceDeviceSync();
 void FastllmInitCublas(void);
 
+void *FastllmCudaStreamCreate(bool nonBlocking = true);
+void FastllmCudaStreamDestroy(void *stream);
+void FastllmCudaStreamSynchronize(void *stream);
+
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
 void *FastllmCudaMalloc(size_t size);
@@ -105,6 +109,8 @@ void FastllmCudaMemset0(void *ret, size_t size);
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromPinnedHostToDevice(void *dst, void *src, size_t size);
+void FastllmCudaCopyFromHostToDeviceAsync(void *dst, void *src, size_t size, void *stream);
+void FastllmCudaCopyFromPinnedHostToDeviceAsync(void *dst, void *src, size_t size, void *stream);
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size);
 

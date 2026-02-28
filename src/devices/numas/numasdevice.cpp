@@ -1023,7 +1023,7 @@ namespace fastllm {
         fastllm::BaseOperator *op = (fastllm::BaseOperator*)(new CpuLinearOp());
  // auto ttt = std::chrono::system_clock::now();
  // std::vector <std::pair <std::string, float> > record;
- // auto st = std::chrono::system_clock::now();
+  auto st = std::chrono::system_clock::now();
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &index = *(datas.find("index")->second);
@@ -1345,8 +1345,12 @@ namespace fastllm {
             auto &moeConfig = MoeEnvConfig::GetInstance();
             int expertLimit = moeConfig.GetExpertLimit();
             bool gpuPrefill = moeConfig.GetGpuPrefill();
-            if (output.cudaData == nullptr) {
+            if (input.cudaData == nullptr) {
                 gpuPrefill = false;
+            }
+            if (input.cudaData != nullptr && output.cudaData == nullptr) {
+                output.ToDevice(DataDevice::CUDA);
+                output.ToDevice(DataDevice::CPU);
             }
 
             if (!gpuPrefill) {
@@ -1377,7 +1381,7 @@ namespace fastllm {
                     gpuExperts.insert(e);
                 }
             }
-
+ // printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             // 若 gpuPrefill 且所有专家都归 GPU（cpuExperts 为空），直接调用 GPU 处理并返回
             if (gpuPrefill && cpuExperts.empty()) {
                 DoCudaMergeMOEFromCPU (
@@ -1396,18 +1400,19 @@ namespace fastllm {
                     );
                 });
             }
-
+ //printf("gpu prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             if (!cpuExperts.empty()) {
                 DoNumasMergeMOEOnCPU(
                     input, output, index, score, weights, biass,
                     sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas
                 );
             }
-
+ //printf("cpu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             if (gpuPrefill && !gpuExperts.empty()) {
                 gpuThread.join();
                 ReduceSumFromCPU(output);
             }
+ //printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             return;
         }
     }
