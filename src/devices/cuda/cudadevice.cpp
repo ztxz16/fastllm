@@ -1790,16 +1790,40 @@ for (int e = 0; e < expertTasks.size(); e++) {
 for (auto &it : eeCnt) {
     // printf("%d: %d\n", it.first, it.second);
 }
-        for (int i = 0; i < expertTasks.size(); i++) {
-            if (expertTasks[i].size() == 0 || experts.find(i) == experts.end() || weights[i * 2] == nullptr) {
-                continue;
+        auto isValidExpert = [&](int idx) {
+            return idx >= 0 && idx < (int)expertTasks.size() &&
+                   expertTasks[idx].size() > 0 &&
+                   experts.find(idx) != experts.end() &&
+                   weights[idx * 2] != nullptr;
+        };
+        auto findNextValidExpert = [&](int after) {
+            for (int j = after + 1; j < (int)expertTasks.size(); j++) {
+                if (isValidExpert(j)) return j;
             }
-// ForceDeviceSync(); timeCnt["expert start"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-            weights[i * 2]->ToCudaTemporary({}, true);
-            weights[i * 2 + 1]->ToCudaTemporary({}, true);
-total += weights[i * 2]->GetBytes();
-total += weights[i * 2 + 1]->GetBytes();
-// ForceDeviceSync(); timeCnt["copy weight"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+            return -1;
+        };
+
+        void *copyStream = FastllmCudaStreamCreate(true);
+        int curExpert = findNextValidExpert(-1);
+
+        if (curExpert >= 0) {
+            weights[curExpert * 2]->ToCudaTemporary({}, true);
+            weights[curExpert * 2 + 1]->ToCudaTemporary({}, true);
+total += weights[curExpert * 2]->GetBytes();
+total += weights[curExpert * 2 + 1]->GetBytes();
+        }
+
+        while (curExpert >= 0) {
+            int nextExpert = findNextValidExpert(curExpert);
+
+            if (nextExpert >= 0) {
+                weights[nextExpert * 2]->ToCudaTemporary({}, true, copyStream);
+                weights[nextExpert * 2 + 1]->ToCudaTemporary({}, true, copyStream);
+total += weights[nextExpert * 2]->GetBytes();
+total += weights[nextExpert * 2 + 1]->GetBytes();
+            }
+
+            int i = curExpert;
             tempInput.Resize({(int)expertTasks[i].size(), tempInput.dims[1]});
             FastllmCudaPickInput (
                 (uint8_t*)input.cudaData, 
@@ -1808,20 +1832,16 @@ total += weights[i * 2 + 1]->GetBytes();
                 GetDataBytes(input.dataType, 1, input.dims[1]), 
                 cudaIndex + startIdx[i]
             );
-// ForceDeviceSync(); timeCnt["pick input"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
             DoCudaLinearReshape(tempInput, *weights[i * 2], tempMiddle);
             DoCudaLinear(tempInput, *weights[i * 2], *GetEmptyData(), tempMiddle);
-// ForceDeviceSync(); timeCnt["linear"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
             DoCudaSwigluReshape(tempMiddle, tempSwiglu);
             if (isCrossSwiglu) {
                 FastllmCudaCrossSwiglu(tempMiddle, tempSwiglu);
             } else {
                 DoCudaSwiglu(tempMiddle, tempSwiglu);
             }
-// ForceDeviceSync(); timeCnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
             DoCudaLinearReshape(tempSwiglu, *weights[i * 2 + 1], tempOutput);
             DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
-// ForceDeviceSync(); timeCnt["linear"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
             FastllmCudaPickOutput (
                 (uint8_t*)tempOutput.cudaData, 
                 (uint8_t*)output.cudaData, 
@@ -1831,11 +1851,18 @@ total += weights[i * 2 + 1]->GetBytes();
                 cudaScales + startIdx[i], 
                 tempOutput.dataType
             );
-// ForceDeviceSync(); timeCnt["pick output"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+
+            if (nextExpert >= 0) {
+                FastllmCudaStreamSynchronize(copyStream);
+            }
+
             weights[i * 2]->FreeCudaTemporary({}, false);
             weights[i * 2 + 1]->FreeCudaTemporary({}, false);
-// ForceDeviceSync(); timeCnt["FreeCudaTemporary"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+
+            curExpert = nextExpert;
         }
+
+        FastllmCudaStreamDestroy(copyStream);
 
         FastllmCudaFree(cudaIndex);
         FastllmCudaFree(cudaScales);
