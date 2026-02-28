@@ -2226,7 +2226,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                            maxPages, maxPages * pageLen, cacheAvail / 1e9);
                 }
             }
-
+            
             pastKeyValuesStorage.clear();
             pastKeyValues.clear();
             for (int i = 0; i < block_cnt; i++) {
@@ -2235,7 +2235,12 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             for (int i = 0; i < block_cnt; i++) {
                 pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage[i].first, &pastKeyValuesStorage[i].second));
             }
-            ForwardV2(1, inputIds, attentionMasks, positionIdsVec, seqLens, pastKeyValues, generationConfigs, lastTokens, nullptr);
+            Data shortInputIds = Data(DataType::FLOAT32, {1, 1}, {1.0f});
+            Data shortPositionIds = Data(this->dataType, {1, 1}, {0.0f});
+            std::vector <Data*> shortAttentionMasks = {nullptr};
+            std::vector <Data*> shortPositionIdsVec = {&shortPositionIds};
+            std::vector <int> shortSeqLens = {1};
+            ForwardV2(1, shortInputIds, shortAttentionMasks, shortPositionIdsVec, shortSeqLens, pastKeyValues, generationConfigs, lastTokens, nullptr);
             for (auto &kv : pastKeyValuesStorage) {
                 kv.first.pageIndex.clear();
                 kv.first.pagedKVCacheData = nullptr;
