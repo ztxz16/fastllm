@@ -744,6 +744,7 @@ namespace fastllm {
 
                 int prefillTokenCount = 0;
                 int curBusyPages = busyPages;
+                int pendingNewPages = 0;
 
                 for (auto &ii : orders) {
                     auto &it = *model->responseContextDict.dicts.find(ii.second);
@@ -823,7 +824,7 @@ namespace fastllm {
                                     it.second->cacheLen = cachedLen;
                                     {
                                         std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
-                                        curBusyPages = probeManager->maxPages - probeManager->FreePageCount();
+                                        curBusyPages = probeManager->maxPages - probeManager->FreePageCount() + pendingNewPages;
                                     }
                                     if (model->verbose) {
                                         // printf("[Handle %d] Prefix cache hit: %d pages (%d tokens).\n", it.first, minCachedPages, cachedLen);
@@ -860,6 +861,7 @@ namespace fastllm {
                         }
                         prefillTokenCount += thisLen;
                         curBusyPages += thisPages;
+                        pendingNewPages += thisPages;
                         currentActivate++;
                     } else {
                         // Decode阶段：不在这里限制分页，由后续驱逐逻辑统一处理
