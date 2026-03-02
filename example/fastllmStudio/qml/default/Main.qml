@@ -91,50 +91,7 @@ ApplicationWindow {
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: langPopup.open()
-                    }
-
-                    Popup {
-                        id: langPopup
-                        x: parent.width + 4
-                        y: 0
-                        width: 150
-                        padding: 4
-                        background: Rectangle {
-                            color: Styles.Theme.bgPopup
-                            border.color: Styles.Theme.border
-                            radius: Styles.Theme.borderRadius
-                        }
-                        contentItem: Column {
-                            spacing: 2
-                            Repeater {
-                                model: langManager ? langManager.availableLanguages() : []
-                                delegate: Rectangle {
-                                    width: 142
-                                    height: 28
-                                    radius: 3
-                                    color: langItemMa.containsMouse ? Styles.Theme.sidebarItemHover : "transparent"
-                                    Text {
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        anchors.left: parent.left
-                                        anchors.leftMargin: 8
-                                        text: langManager ? langManager.languageDisplayName(modelData) : modelData
-                                        font.pixelSize: Styles.Theme.fontSizeMedium
-                                        color: Styles.Theme.textPrimary
-                                    }
-                                    MouseArea {
-                                        id: langItemMa
-                                        anchors.fill: parent
-                                        hoverEnabled: true
-                                        cursorShape: Qt.PointingHandCursor
-                                        onClicked: {
-                                            if (langManager) langManager.load_language(modelData)
-                                            langPopup.close()
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        onClicked: langDialog.open()
                     }
                 }
             }
@@ -152,6 +109,95 @@ ApplicationWindow {
 
             ModelRepoPage { id: modelRepoPage }
             ChatPage { id: chatPage }
+        }
+    }
+
+    Dialog {
+        id: langDialog
+        modal: true
+        title: ""
+        standardButtons: Dialog.NoButton
+        anchors.centerIn: parent
+        width: 300
+        dim: true
+
+        Overlay.modal: Rectangle { color: "#80000000" }
+
+        background: Rectangle {
+            color: Styles.Theme.bgPopup
+            border.color: Styles.Theme.border
+            radius: Styles.Theme.borderRadiusLarge
+        }
+
+        contentItem: ColumnLayout {
+            spacing: 0
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 44
+                color: "transparent"
+
+                Text {
+                    anchors.centerIn: parent
+                    text: qsTr("Language")
+                    font.pixelSize: Styles.Theme.fontSizeLarge
+                    font.weight: Font.DemiBold
+                    color: Styles.Theme.textBright
+                }
+                Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Styles.Theme.border }
+            }
+
+            Item { Layout.preferredHeight: Styles.Theme.paddingSmall }
+
+            Repeater {
+                model: [
+                    { code: "zh_CN", label: "简体中文" },
+                    { code: "en_US", label: "English" }
+                ]
+
+                delegate: Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 44
+                    Layout.leftMargin: Styles.Theme.paddingMedium
+                    Layout.rightMargin: Styles.Theme.paddingMedium
+                    radius: Styles.Theme.borderRadius
+                    color: langItemMa.containsMouse ? Styles.Theme.bgCardHover : "transparent"
+
+                    property bool isCurrent: langManager && langManager.currentLanguage === modelData.code
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: Styles.Theme.paddingMedium
+                        anchors.rightMargin: Styles.Theme.paddingMedium
+                        spacing: Styles.Theme.spacing
+
+                        Text {
+                            text: modelData.label
+                            font.pixelSize: Styles.Theme.fontSizeMedium
+                            color: isCurrent ? Styles.Theme.accentColor : Styles.Theme.textBright
+                            Layout.fillWidth: true
+                        }
+                        Text {
+                            text: isCurrent ? "✓" : ""
+                            font.pixelSize: 14
+                            color: Styles.Theme.accentColor
+                        }
+                    }
+
+                    MouseArea {
+                        id: langItemMa
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (langManager) langManager.load_language(modelData.code)
+                            langDialog.close()
+                        }
+                    }
+                }
+            }
+
+            Item { Layout.preferredHeight: Styles.Theme.paddingSmall }
         }
     }
 }

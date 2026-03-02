@@ -15,6 +15,10 @@
         <source>Local Chat</source>
         <translation>本地对话</translation>
     </message>
+    <message>
+        <source>Language</source>
+        <translation>语言</translation>
+    </message>
 </context>
 <context>
     <name>ModelRepoPage</name>

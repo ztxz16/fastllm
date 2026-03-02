@@ -23,10 +23,12 @@ def create_app(argv=None, style: str = "default"):
     app.setApplicationName("Fastllm Studio")
 
     lang_mgr = LangManager(app)
-    system_locale = QLocale.system().name()
-    lang_mgr.load_language(system_locale)
 
     engine = QQmlApplicationEngine()
+    lang_mgr.set_engine(engine)
+
+    system_locale = QLocale.system().name()
+    lang_mgr.load_language(system_locale)
 
     from app.viewmodels.model_repo_vm import ModelRepoViewModel
     from app.viewmodels.model_market_vm import ModelMarketViewModel
