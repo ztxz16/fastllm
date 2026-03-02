@@ -384,6 +384,7 @@ namespace fastllm {
         bool IsRepacked = false;
 
         std::vector <uint8_t*> numasData; // numa数据
+        bool isPinned = false; // 是否使用pinned memory (page-locked)
 
         std::vector <int> cpuIntDatas; // 锁定在cpu上的int数据
         
@@ -446,7 +447,7 @@ namespace fastllm {
 
         void ToDevice(void *device, bool copyData = true);
 
-        void ToCudaTemporary(const std::vector <int> &deviceIds, bool copyData); // 临时移动到cuda
+        void ToCudaTemporary(const std::vector <int> &deviceIds, bool copyData, void *stream = nullptr); // 临时移动到cuda
 
         void FreeCudaTemporary(const std::vector <int> &deviceIds, bool copyData); // 销毁临时移动到cuda的数据
 

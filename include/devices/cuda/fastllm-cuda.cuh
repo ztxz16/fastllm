@@ -95,6 +95,10 @@ void DeviceSync();
 void ForceDeviceSync();
 void FastllmInitCublas(void);
 
+void *FastllmCudaStreamCreate(bool nonBlocking = true);
+void FastllmCudaStreamDestroy(void *stream);
+void FastllmCudaStreamSynchronize(void *stream);
+
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
 void *FastllmCudaMalloc(size_t size);
@@ -104,8 +108,16 @@ void FastllmCudaDirectFree(void *ret);
 void FastllmCudaMemset0(void *ret, size_t size);
 
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size);
+void FastllmCudaCopyFromPinnedHostToDevice(void *dst, void *src, size_t size);
+void FastllmCudaCopyFromHostToDeviceAsync(void *dst, void *src, size_t size, void *stream);
+void FastllmCudaCopyFromPinnedHostToDeviceAsync(void *dst, void *src, size_t size, void *stream);
 void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size);
+
+void *FastllmCudaHostMalloc(size_t size);
+void FastllmCudaHostFree(void *ptr);
+bool FastllmCudaHostRegister(void *ptr, size_t size);
+void FastllmCudaHostUnregister(void *ptr);
 
 // 将 host 端数据拷到 GPU 临时缓冲区，按数据类型加到 dst（GPU）上，len 为元素个数
 void FastllmCudaAddHostToDevice(void *dst, void *hostSrc, int len, fastllm::DataType dataType);
@@ -256,6 +268,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
 
 bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
+bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 
 bool FastllmCudaHalfMatMulFloat16Swiglu(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
