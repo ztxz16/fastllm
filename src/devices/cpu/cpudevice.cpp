@@ -8891,9 +8891,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         if (batch <= 0 && intParams.find("batch") != intParams.end()) {
             batch = intParams.find("batch")->second;
         }
-        insertIndexs.dataType = DataType::INT32PARAM;
+        insertIndexs.dataType = DataType::INT32;
         insertIndexs.Resize({batch});
-        insertPositions.dataType = DataType::INT32PARAM;
+        insertPositions.dataType = DataType::INT32;
         insertPositions.Resize({batch});
     }
 
@@ -9050,15 +9050,15 @@ DoCpuPermuteSelf(*((fastllm::Data*)&output), {1, 0, 2});
         int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : 1;
         
         // qSizes: [batch + 1]
-        qSizes.dataType = DataType::INT32PARAM;
+        qSizes.dataType = DataType::INT32;
         qSizes.Resize({batch + 1});
         
         // pageSizes: [batch + 1]
-        pageSizes.dataType = DataType::INT32PARAM;
+        pageSizes.dataType = DataType::INT32;
         pageSizes.Resize({batch + 1});
         
         // lastPageLens: [batch]
-        lastPageLens.dataType = DataType::INT32PARAM;
+        lastPageLens.dataType = DataType::INT32;
         lastPageLens.Resize({batch});
         
         // 计算总的page数量
@@ -9066,7 +9066,7 @@ DoCpuPermuteSelf(*((fastllm::Data*)&output), {1, 0, 2});
         for (int b = 0; b < batch; b++) {
             totalPages += pastKeys[b]->pageIndex.size();
         }
-        pageIndexs.dataType = DataType::INT32PARAM;
+        pageIndexs.dataType = DataType::INT32;
         pageIndexs.Resize({totalPages});
     }
 
