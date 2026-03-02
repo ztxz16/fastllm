@@ -1316,25 +1316,14 @@ namespace fastllm {
     void RunLinearFloat32Float16(float *inputData, uint16_t *weightData, float *outputData, float *biasData, 
                                 int n, int m, int k, 
                                 AliveThreadPool *pool, int startTid, int threadNum) {
-        int per = k / threadNum;
-        int cur = 0;
-        std::vector<fastllm::MultiThreadLinearFloat32Float16Op*> ops;
-        for (int i = 0; i < threadNum; i++) {
-            int end = cur + per + (cur + per * (threadNum - i) < k);
-            if (i == threadNum - 1) {
-                end = k;
-            }
+        int stride = 64;
+        std::vector<MultiThreadBaseOp*> ops;
+        for (int st = 0; st < k; st += stride) {
+            int end = std::min(st + stride, k);
             ops.push_back(new MultiThreadLinearFloat32Float16Op(inputData, weightData, biasData, outputData,
-                                                n, m, k, cur, end));
-            cur = end;
+                                                n, m, k, st, end));
         }
-        for (int i = 0; i < threadNum; i++) {
-            pool->PushOp(startTid + i, ops[i]);
-        }
-        for (int i = 0; i < threadNum; i++) {
-            pool->Wait(startTid + i);
-            delete ops[i];
-        }
+        DynamicScheduleTasks(ops);
     }
 
     struct FastllmBF16Manager {
