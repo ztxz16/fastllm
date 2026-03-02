@@ -152,6 +152,7 @@ namespace fastllm {
         Data tempInput, tempOutput;
         Data routerLogitsTemp;
         Data moeInputTemp, moeOutputTemp;
+        Data expertIndex, expertScore;
 
         std::vector<Data*> batchPastKeys;
         std::vector<Data*> batchPastValues;
@@ -258,7 +259,6 @@ namespace fastllm {
                 bool needNorm = true;
                 Softmax(routerLogitsTemp, routerLogitsTemp, -1);
 
-                Data expertIndex, expertScore;
                 if (weight.weight.find("model.layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight") != weight.weight.end() 
                     && CanRunMergeMOE(attenInput, biass[i])) {
                     SelectExpert(routerLogitsTemp, expertIndex, expertScore, this->num_experts_per_tok, needNorm, 
