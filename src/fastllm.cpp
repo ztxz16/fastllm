@@ -59,7 +59,7 @@ namespace fastllm {
     static bool cudaSharedExpert = false;
     static bool enableAMX = false;
     static int maxTokens = -1;
-    static int defaultPageLen = 16;
+    static int defaultPageLen = 128;
     static float gpuMemRatio = 0.9f;
     static Data emptyData;
 

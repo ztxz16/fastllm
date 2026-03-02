@@ -317,7 +317,7 @@ namespace fastllm {
         // Paged KV Cache的相关信息
         // 当isKVCache = true且isPagedKVCache = true时，下面这些信息才有意义
         bool isPagedKVCache = false; // 是否是分片的KV Cache
-        int pageLen = 16; // 每个page的长度（token数）
+        int pageLen = 128; // 每个page的长度（token数）
         PagedCacheManager *pagedKVCacheData = nullptr; // 存储kv cached的数据，shape为 [maxPages, pageLen, numHeads, headDim]
         std::vector <int> pageIndex; // 目前使用的Index编号
         int lastPageLen; // 最后一个Page中使用了多少长度
