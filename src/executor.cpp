@@ -171,11 +171,13 @@ namespace fastllm {
                         }
                     } else {
                         if (it.second) {
+                            bool copyData = true;
                             if (it.first == "output") {
-                                it.second->ToDevice((void *) device, false);
-                            } else {
-                                it.second->ToDevice((void *) device);
+                                copyData = false;
+                            } else if (opType == "SelectExpert" && (it.first == "index" || it.first == "score")) {
+                                copyData = false;
                             }
+                            it.second->ToDevice((void *) device, copyData);
                         }
                     }
                 }
