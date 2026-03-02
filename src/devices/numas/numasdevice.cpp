@@ -49,9 +49,9 @@ namespace fastllm {
 
     private:
         MoeEnvConfig() {
-            expertLimit = 256;
+            expertLimit = 128;
             gpuPrefill = true;
-            pinnedWeight = false;
+            pinnedWeight = true;
 
             const char *expertLimitEnv = std::getenv("FT_EXPERT_LIMIT");
             if (expertLimitEnv != nullptr) {
@@ -71,8 +71,8 @@ namespace fastllm {
             if (pinnedWeightEnv != nullptr) {
                 std::string val(pinnedWeightEnv);
                 std::transform(val.begin(), val.end(), val.begin(), ::tolower);
-                if (val == "1" || val == "true" || val == "on") {
-                    pinnedWeight = true;
+                if (val == "0" || val == "false" || val == "off") {
+                    pinnedWeight = false;
                 }
             }
 
@@ -82,7 +82,7 @@ namespace fastllm {
                 printf("Disable GPU Prefill\n");
             }
             if (pinnedWeight) {
-                printf("Activate Pinned Weight (page-locked memory for faster H2D transfer)\n");
+                printf("Activate Pinned Weight\n");
             }
         }
 
