@@ -46,6 +46,7 @@ public class ChatPage {
     private volatile boolean generating = false;
     private TextView currentBotBubble = null;
     private String currentModelPath = null;
+    private boolean scrollPending = false;
 
     private float topP = 0.9f;
     private int topK = 5;
@@ -402,7 +403,16 @@ public class ChatPage {
     }
 
     private void scrollToBottom() {
-        scrollView.post(() -> scrollView.fullScroll(View.FOCUS_DOWN));
+        if (scrollPending) return;
+        scrollPending = true;
+        scrollView.post(() -> {
+            scrollPending = false;
+            int contentHeight = chatContainer.getHeight();
+            int scrollHeight = scrollView.getHeight();
+            if (contentHeight > scrollHeight) {
+                scrollView.scrollTo(0, contentHeight - scrollHeight);
+            }
+        });
     }
 
     private void showSettings() {
