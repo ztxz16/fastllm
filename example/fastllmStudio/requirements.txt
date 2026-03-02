@@ -1,0 +1,3 @@
+PySide6>=6.5
+requests
+openai
