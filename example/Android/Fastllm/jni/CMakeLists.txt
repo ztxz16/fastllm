@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.18.1)
 project("fastllm_jni")
 
 set(FASTLLM_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../../../..)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --std=c++17 -O2")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --std=c++17 -O2 -march=armv8.2-a+fp16")
 
 file(GLOB CPU_DEVICE_FILES "${FASTLLM_ROOT}/src/devices/cpu/*.cpp")
 file(GLOB BLOCK_FILES "${FASTLLM_ROOT}/src/blocks/*.cpp")
