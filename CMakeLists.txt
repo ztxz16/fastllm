@@ -417,6 +417,37 @@ endif()
 add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES} tools/src/pytools.cpp)
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
 
+set(BUILD_INFO_USE_CUDA "false")
+set(BUILD_INFO_USE_ROCM "false")
+set(BUILD_INFO_USE_NUMA "false")
+set(BUILD_INFO_USE_NUMAS "false")
+set(BUILD_INFO_USE_TFACC "false")
+set(BUILD_INFO_USE_TOPS "false")
+set(BUILD_INFO_USE_IVCOREX "false")
+if (USE_CUDA)
+    set(BUILD_INFO_USE_CUDA "true")
+endif()
+if (USE_ROCM)
+    set(BUILD_INFO_USE_ROCM "true")
+endif()
+if (USE_NUMA)
+    set(BUILD_INFO_USE_NUMA "true")
+endif()
+if (USE_NUMAS)
+    set(BUILD_INFO_USE_NUMAS "true")
+endif()
+if (USE_TFACC)
+    set(BUILD_INFO_USE_TFACC "true")
+endif()
+if (USE_TOPS)
+    set(BUILD_INFO_USE_TOPS "true")
+endif()
+if (USE_IVCOREX)
+    set(BUILD_INFO_USE_IVCOREX "true")
+endif()
+file(WRITE ${CMAKE_BINARY_DIR}/build_info.json
+"{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMA\": ${BUILD_INFO_USE_NUMA},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX}\n}\n")
+
 if (${CMAKE_HOST_WIN32})
     add_custom_command(
             TARGET fastllm_tools
@@ -427,6 +458,7 @@ if (${CMAKE_HOST_WIN32})
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts ${CMAKE_BINARY_DIR}/tools/.
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/$(Configuration)/fastllm_tools.dll ${CMAKE_BINARY_DIR}/tools/ftllm/.
             COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_BINARY_DIR}/$(Configuration)/fastllm_tools.dll
+            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
     )
 else()
     add_custom_command(
@@ -438,6 +470,7 @@ else()
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts ${CMAKE_BINARY_DIR}/tools/.
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/libfastllm_tools.* ${CMAKE_BINARY_DIR}/tools/ftllm/.
             COMMAND ${CMAKE_COMMAND} -E remove ${CMAKE_BINARY_DIR}/libfastllm_tools.*
+            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
     )
 endif()
 
