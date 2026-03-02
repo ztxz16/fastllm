@@ -61,9 +61,8 @@ def make_normal_llm_model(args):
                 
     usenuma = False
     try:
-        from ftllm import llm
-        if llm.has_device("numa"):
-            usenuma = True
+        from ftllm.env import env
+        usenuma = env.use_numas
     except:
         pass
     if (args.path == '' or args.path is None):
@@ -119,8 +118,6 @@ def make_normal_llm_model(args):
                     args.moe_device = "cpu"
                     if (usenuma):
                         args.moe_device = "numa"
-            print("args", args)
-
             if ("quantization_config" in config):
                 quantization_config = config["quantization_config"]
                 try:
@@ -150,10 +147,14 @@ def make_normal_llm_model(args):
                 numa_nodes = sorted(glob.glob("/sys/devices/system/node/node[0-9]*"))
                 numa_count = len(numa_nodes)
                 if numa_count > 0:
-                    cpus_per_numa = 0
+                    physical_cores_per_numa = set()
                     for entry in os.listdir(numa_nodes[0]):
                         if entry.startswith("cpu") and entry[3:].isdigit():
-                            cpus_per_numa += 1
+                            siblings_path = os.path.join(numa_nodes[0], entry, "topology", "thread_siblings_list")
+                            if os.path.exists(siblings_path):
+                                with open(siblings_path, "r") as f:
+                                    physical_cores_per_numa.add(f.read().strip())
+                    cpus_per_numa = len(physical_cores_per_numa) if physical_cores_per_numa else 1
                     args.threads = max(1, numa_count * (cpus_per_numa - 4))
                 else:
                     args.threads = 4

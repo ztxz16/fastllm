@@ -20,7 +20,7 @@ setup (
     },
     packages = ['ftllm', 'ftllm/openai_server', 'ftllm/openai_server/protocal', 'ftllm/openai_server/tool_parsers'],
     package_data = {
-        '': ['*.dll', '*.so', '*.dylib', '*.so.*']
+        '': ['*.dll', '*.so', '*.dylib', '*.so.*', 'build_info.json']
     },
     install_requires=[
         'pyreadline3',
