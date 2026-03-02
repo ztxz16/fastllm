@@ -29,4 +29,6 @@ namespace fastllm {
     void free_aligned_numa(void* aligned_ptr, size_t size);
     void* allocate_aligned(size_t size);
     void free_aligned(void* aligned_ptr, size_t size);
+    void* allocate_pinned_numa(size_t size, int node);
+    void free_pinned_numa(void* ptr, size_t size);
 }

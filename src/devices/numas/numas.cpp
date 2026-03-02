@@ -1,4 +1,7 @@
 #include "numas.h"
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
 
 namespace fastllm {
     struct NumaDetector {
@@ -120,6 +123,27 @@ namespace fastllm {
         uintptr_t addr = reinterpret_cast<uintptr_t>(aligned_ptr);
         void* raw_ptr = reinterpret_cast<void*>(addr & ~(63));
         numa_free(raw_ptr, size);
+    }
+
+    void* allocate_pinned_numa(size_t size, int node) {
+#ifdef USE_CUDA
+        void *ptr = allocate_aligned_numa(size, node);
+        if (ptr) {
+            FastllmCudaHostRegister(ptr, size);
+        }
+        return ptr;
+#else
+        return allocate_aligned_numa(size, node);
+#endif
+    }
+
+    void free_pinned_numa(void *ptr, size_t size) {
+#ifdef USE_CUDA
+        FastllmCudaHostUnregister(ptr);
+        free_aligned_numa(ptr, size);
+#else
+        free_aligned_numa(ptr, size);
+#endif
     }
 
     struct BindCPUOp : MultiThreadBaseOp {
