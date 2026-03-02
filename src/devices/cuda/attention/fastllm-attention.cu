@@ -2102,7 +2102,11 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
 
         uint32_t total_num_rows = q_indptr_host[batch_size];
         static PrefillPlanInfo plan_info;
-        if (!inited) {
+        static int last_plan_device_id = -1;
+        int current_device_id = -1;
+        cudaGetDevice(&current_device_id);
+        bool device_changed = (current_device_id != last_plan_device_id);
+        if (!inited || device_changed) {
             cudaError_t plan_status = PrefillPlan<uint32_t>(
                 workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
                 workspace.int_workspace_size, plan_info, q_indptr_host.data(), indptr_host.data(), 
@@ -2117,6 +2121,7 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
                 FastllmCudaFree(q_indptr_gpu);
                 exit(0);
             }
+            last_plan_device_id = current_device_id;
         }
         
         uint32_t q_stride_n = (q.dims.size() >= 2 && q.strides.size() >= 2) ? q.strides[1] : q2;
@@ -2320,7 +2325,11 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
 
         cudaStream_t stream = nullptr;
         static PrefillPlanInfo plan_info;
-        if (!inited) {
+        static int last_plan_device_id = -1;
+        int current_device_id = -1;
+        cudaGetDevice(&current_device_id);
+        bool device_changed = (current_device_id != last_plan_device_id);
+        if (!inited || device_changed) {
             cudaError_t plan_status = PrefillPlan<uint32_t>(
                 workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
                 workspace.int_workspace_size, plan_info, 
@@ -2335,6 +2344,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
                 cudaStreamSynchronize(stream);
                 exit(0);
             }
+            last_plan_device_id = current_device_id;
         }
         
         uint32_t q_stride_n = (q.dims.size() >= 2 && q.strides.size() >= 2) ? q.strides[1] : q2;
