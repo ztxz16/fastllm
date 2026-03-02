@@ -1,5 +1,7 @@
 *.log
 *.pyc
+*.o
+__pycache__/
 token
 /cmake-build-debug/
 /build*
@@ -19,6 +21,9 @@ token
 /example/Android_test/build/
 /example/Android_test/*.apk
 /example/Android_test/*.idsig
+/example/fastllmStudio/build/
+/example/fastllmStudio/i18n/*.qm
+CLAUDE.md
 /test/cmmlu/results/
 /models/
 /localtest/
@@ -28,4 +33,3 @@ token
 /src/devices/hip
 /src/devices/multihip
 /test/mmlu
-*.o
