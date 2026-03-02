@@ -8,6 +8,10 @@
 
 #include "devices/cpu/cpudevice.h"
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 #ifdef USE_CUDA
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -205,5 +209,13 @@ namespace fastllm {
             sum += it.second;
         }
         printf("total spend %f\n", sum);
+#ifdef __ANDROID__
+        __android_log_print(ANDROID_LOG_INFO, "FastllmProfiler", "===== Profiler Results =====");
+        for (auto &it : profiler) {
+            __android_log_print(ANDROID_LOG_INFO, "FastllmProfiler",
+                "%s spend %.4f s (%.1f%%)", it.first.c_str(), it.second, sum > 0 ? it.second * 100.0f / sum : 0);
+        }
+        __android_log_print(ANDROID_LOG_INFO, "FastllmProfiler", "total spend %.4f s", sum);
+#endif
     }
 }
