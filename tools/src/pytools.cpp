@@ -33,6 +33,10 @@ extern "C" {
         fastllm::PrintInstructionInfo();
     }
 
+    DLL_EXPORT bool has_device(char *deviceType) {
+        return fastllm::HasDeviceType(std::string(deviceType));
+    }
+
     DLL_EXPORT void set_cpu_threads(int threads) {
         fastllm::SetThreads(threads);
     }
