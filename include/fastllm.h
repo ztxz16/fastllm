@@ -708,6 +708,8 @@ namespace fastllm {
 
     void *GetExecutor();
 
+    bool HasDeviceType(const std::string &deviceType);
+
     void ClearProfiler();
 
     void PrintProfiler();

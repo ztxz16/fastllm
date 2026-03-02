@@ -103,6 +103,15 @@ namespace fastllm {
         this->firstDevice = device;
     }
 
+    bool Executor::HasDevice(const std::string &deviceType) {
+        for (int i = 0; i < devices.size(); i++) {
+            if (devices[i]->deviceType == deviceType) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     std::vector <int> Executor::GetDeviceIds(const std::string &device) {
         for (int i = 0; i < devices.size(); i++) {
             if (StartWith(devices[i]->deviceType, device)) {

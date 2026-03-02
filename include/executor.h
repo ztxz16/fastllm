@@ -28,6 +28,8 @@ namespace fastllm {
 
         std::vector <int> GetDeviceIds(const std::string &device); // 获取指定device的deviceIds
 
+        bool HasDevice(const std::string &deviceType); // 判断devices中是否包含指定类型的device
+
         bool CanRunOnFirstDevice(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                        const fastllm::IntDict &intParams);
                        

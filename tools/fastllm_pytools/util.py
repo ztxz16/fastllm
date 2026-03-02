@@ -61,8 +61,8 @@ def make_normal_llm_model(args):
                 
     usenuma = False
     try:
-        env_FASTLLM_USE_NUMA = os.getenv("FASTLLM_USE_NUMA")
-        if (env_FASTLLM_USE_NUMA and env_FASTLLM_USE_NUMA != '' and env_FASTLLM_USE_NUMA != "OFF" and env_FASTLLM_USE_NUMA != "0"):
+        from ftllm import llm
+        if llm.has_device("numa"):
             usenuma = True
     except:
         pass
@@ -111,7 +111,7 @@ def make_normal_llm_model(args):
                 config["architectures"][0] == 'PanguProMoEForCausalLM' or
                 config["architectures"][0] == 'Glm4MoeForCausalLM' or 
                 config["architectures"][0] == 'Qwen3NextForCausalLM' or
-                config["architectures"][0] == 'MinimaxM2ForCausalLM'):
+                config["architectures"][0] == 'MiniMaxM2ForCausalLM'):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
                 if ((not(args.device and args.device != ""))):
@@ -119,6 +119,8 @@ def make_normal_llm_model(args):
                     args.moe_device = "cpu"
                     if (usenuma):
                         args.moe_device = "numa"
+            print("args", args)
+
             if ("quantization_config" in config):
                 quantization_config = config["quantization_config"]
                 try:
@@ -143,7 +145,20 @@ def make_normal_llm_model(args):
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"
         if (args.threads == -1):
-            args.threads = 4
+            try:
+                import glob
+                numa_nodes = sorted(glob.glob("/sys/devices/system/node/node[0-9]*"))
+                numa_count = len(numa_nodes)
+                if numa_count > 0:
+                    cpus_per_numa = 0
+                    for entry in os.listdir(numa_nodes[0]):
+                        if entry.startswith("cpu") and entry[3:].isdigit():
+                            cpus_per_numa += 1
+                    args.threads = max(1, numa_count * (cpus_per_numa - 4))
+                else:
+                    args.threads = 4
+            except:
+                args.threads = 4
     if (args.threads == -1):
         try:
             available_cores = len(os.sched_getaffinity(0))  # 参数 0 表示当前进程

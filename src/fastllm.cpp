@@ -3556,6 +3556,10 @@ namespace fastllm {
         return (void*)curExecutor;
     }
 
+    bool HasDeviceType(const std::string &deviceType) {
+        return curExecutor->HasDevice(deviceType);
+    }
+
     void ClearProfiler() {
         curExecutor->ClearProfiler();
     }
