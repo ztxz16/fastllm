@@ -49,7 +49,7 @@ namespace fastllm {
 
     private:
         MoeEnvConfig() {
-            expertLimit = 256;
+            expertLimit = 128;
             gpuPrefill = true;
             pinnedWeight = false;
 
