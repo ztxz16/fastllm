@@ -59,7 +59,7 @@ namespace fastllm {
     static bool cudaSharedExpert = false;
     static bool enableAMX = false;
     static int maxTokens = -1;
-    static int defaultPageLen = 16;
+    static int defaultPageLen = 128;
     static float gpuMemRatio = 0.9f;
     static Data emptyData;
 
@@ -3554,6 +3554,10 @@ namespace fastllm {
 
     void *GetExecutor() {
         return (void*)curExecutor;
+    }
+
+    bool HasDeviceType(const std::string &deviceType) {
+        return curExecutor->HasDevice(deviceType);
     }
 
     void ClearProfiler() {

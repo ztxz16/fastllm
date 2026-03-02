@@ -42,6 +42,9 @@ else:
         print("Load fastllm failed. (Try update glibc)")
         exit(0)
 
+fastllm_lib.has_device.argtypes = [ctypes.c_char_p]
+fastllm_lib.has_device.restype = ctypes.c_bool
+
 fastllm_lib.export_llm_model_fromhf.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
 
 fastllm_lib.create_llm_model.argtypes = [ctypes.c_char_p]
@@ -229,6 +232,9 @@ def softmax(a):
         sum += a[i]
     for i in range(len(a)):
         a[i] /= sum
+
+def has_device(device_type: str) -> bool:
+    return fastllm_lib.has_device(device_type.encode())
 
 def set_cpu_threads(threads: int):
     fastllm_lib.set_cpu_threads(threads);
