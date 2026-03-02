@@ -19,6 +19,8 @@
 #include <cfloat>
 #include <climits>
 #include <cmath>
+#include <map>
+#include <set>
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -44,18 +46,21 @@ namespace fastllm {
         }
 
         int GetExpertLimit() const { return expertLimit; }
+        bool HasExpertLimitOverride() const { return hasExpertLimitOverride; }
         bool GetGpuPrefill() const { return gpuPrefill; }
         bool GetPinnedWeight() const { return pinnedWeight; }
 
     private:
         MoeEnvConfig() {
-            expertLimit = 256;
+            expertLimit = 128;
+            hasExpertLimitOverride = false;
             gpuPrefill = true;
-            pinnedWeight = false;
+            pinnedWeight = true;
 
             const char *expertLimitEnv = std::getenv("FT_EXPERT_LIMIT");
             if (expertLimitEnv != nullptr) {
                 expertLimit = std::atoi(expertLimitEnv);
+                hasExpertLimitOverride = true;
             }
 
             const char *gpuPrefillEnv = std::getenv("FT_GPU_PREFILL");
@@ -71,8 +76,8 @@ namespace fastllm {
             if (pinnedWeightEnv != nullptr) {
                 std::string val(pinnedWeightEnv);
                 std::transform(val.begin(), val.end(), val.begin(), ::tolower);
-                if (val == "1" || val == "true" || val == "on") {
-                    pinnedWeight = true;
+                if (val == "0" || val == "false" || val == "off") {
+                    pinnedWeight = false;
                 }
             }
 
@@ -82,7 +87,7 @@ namespace fastllm {
                 printf("Disable GPU Prefill\n");
             }
             if (pinnedWeight) {
-                printf("Activate Pinned Weight (page-locked memory for faster H2D transfer)\n");
+                printf("Activate Pinned Weight\n");
             }
         }
 
@@ -90,6 +95,7 @@ namespace fastllm {
         MoeEnvConfig& operator=(const MoeEnvConfig&) = delete;
 
         int expertLimit;
+        bool hasExpertLimitOverride;
         bool gpuPrefill;
         bool pinnedWeight;
     };
@@ -682,6 +688,337 @@ namespace fastllm {
     extern void DoCudaMergeMOEFromCPU (Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
         Data **weights, Data **biass, float sharedScale, bool setZero, const std::unordered_set<int> &experts, bool isCrossSwiglu);
     extern void ReduceSumFromCPU(Data &output);
+    void DoNumasMergeMOEOnCPU(
+        Data &input, Data &output,
+        Data &index, Data &score,
+        Data **weights, Data **biass,
+        float sharedScale,
+        int weightsBatch, int topk,
+        const std::unordered_set<int> &cpuExperts,
+        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas
+    );
+
+    struct MoeBenchmarkShapeKey {
+        int inputDim = 0;
+        int interDim = 0;
+        int outputDim = 0;
+        int topk = 0;
+        int inputType = 0;
+        int outputType = 0;
+        int gpuId = 0;
+
+        bool operator==(const MoeBenchmarkShapeKey &other) const {
+            return inputDim == other.inputDim &&
+                   interDim == other.interDim &&
+                   outputDim == other.outputDim &&
+                   topk == other.topk &&
+                   inputType == other.inputType &&
+                   outputType == other.outputType &&
+                   gpuId == other.gpuId;
+        }
+    };
+
+    struct MoeBenchmarkShapeKeyHasher {
+        size_t operator()(const MoeBenchmarkShapeKey &key) const {
+            size_t h = std::hash<int>()(key.inputDim);
+            h = h * 131 + std::hash<int>()(key.interDim);
+            h = h * 131 + std::hash<int>()(key.outputDim);
+            h = h * 131 + std::hash<int>()(key.topk);
+            h = h * 131 + std::hash<int>()(key.inputType);
+            h = h * 131 + std::hash<int>()(key.outputType);
+            h = h * 131 + std::hash<int>()(key.gpuId);
+            return h;
+        }
+    };
+
+    class MoeExpertSpeedEstimator {
+    public:
+        static MoeExpertSpeedEstimator& GetInstance() {
+            static MoeExpertSpeedEstimator instance;
+            return instance;
+        }
+
+        int GetDynamicExpertLimit(
+            Data &input, Data &output, Data &w1, Data &w2, Data &w3,
+            Data **weights, Data **biass, int weightsBatch, int topk, float sharedScale,
+            const std::vector<std::vector<std::pair<int, float> > > &expertTasks,
+            int defaultExpertLimit
+        ) {
+            if (input.cudaData == nullptr || input.cpuData == nullptr) {
+                return defaultExpertLimit;
+            }
+
+            int m = weightsBatch / 2 - 1;
+            int maxTaskSize = 0;
+            for (int e = 0; e < (int)expertTasks.size(); e++) {
+                if (e * 2 >= weightsBatch || weights[e * 2] == nullptr) {
+                    continue;
+                }
+                maxTaskSize = std::max(maxTaskSize, (int)expertTasks[e].size());
+            }
+            if (maxTaskSize <= 0) {
+                return defaultExpertLimit;
+            }
+
+            int adaptiveN = std::min(maxTaskSize, hardMaxBenchmarkN);
+            adaptiveN = std::min(adaptiveN, input.dims[0]);
+            if (adaptiveN <= 0) {
+                return defaultExpertLimit;
+            }
+
+            MoeBenchmarkShapeKey key;
+            key.inputDim = input.dims[1];
+            key.interDim = weights[2]->dims[0] / 2;
+            key.outputDim = output.dims[1];
+            key.topk = topk;
+            key.inputType = (int)input.dataType;
+            key.outputType = (int)output.dataType;
+            key.gpuId = FastllmCudaGetDevice();
+
+            std::lock_guard<std::mutex> lock(profileLocker);
+            auto &profile = profiles[key];
+            if (!profile.initialized || profile.maxN < adaptiveN) {
+                if (!BuildProfile(profile, input, output, w1, w2, w3, weights, biass,
+                                  weightsBatch, sharedScale, adaptiveN, m)) {
+                    return defaultExpertLimit;
+                }
+                printf("MoE dynamic expertLimit benchmark initialized: N=%d, bs=%d, topk=%d\n",
+                       profile.maxN, input.dims[0], topk);
+            }
+
+            int bestLimit = defaultExpertLimit;
+            double bestGap = DBL_MAX;
+            double bestCpuTime = 0.0;
+            double bestGpuTime = 0.0;
+            for (int t = 1; t <= maxTaskSize + 1; t++) {
+                double cpuTime = 0.0;
+                double gpuTime = 0.0;
+                for (int e = 0; e < (int)expertTasks.size(); e++) {
+                    if (e * 2 >= weightsBatch || weights[e * 2] == nullptr) {
+                        continue;
+                    }
+                    int sz = (int)expertTasks[e].size();
+                    if (sz < t) {
+                        cpuTime += InterpolateFromMap(profile.cpuTimeUs, sz);
+                    } else {
+                        gpuTime += InterpolateFromMap(profile.gpuTimeUs, sz);
+                    }
+                }
+                double gap = std::fabs(cpuTime - gpuTime);
+                if (gap < bestGap) {
+                    bestGap = gap;
+                    bestLimit = t;
+                    bestCpuTime = cpuTime;
+                    bestGpuTime = gpuTime;
+                }
+            }
+
+            if (profile.lastPrintedLimit != bestLimit) {
+                printf("MoE dynamic expertLimit=%d, predict cpu=%.2fus gpu=%.2fus\n",
+                       bestLimit, bestCpuTime, bestGpuTime);
+                profile.lastPrintedLimit = bestLimit;
+            }
+
+            return bestLimit;
+        }
+
+    private:
+        struct BenchmarkProfile {
+            int maxN = 0;
+            bool initialized = false;
+            int lastPrintedLimit = -1;
+            std::map<int, double> cpuTimeUs;
+            std::map<int, double> gpuTimeUs;
+        };
+
+        std::unordered_map<MoeBenchmarkShapeKey, BenchmarkProfile, MoeBenchmarkShapeKeyHasher> profiles;
+        std::mutex profileLocker;
+        const int warmupRounds = 2;
+        const int measureRounds = 8;
+        const int hardMaxBenchmarkN = 2048;
+
+        static int GetStepForN(int n, bool isCpu) {
+            int baseStep;
+            if (n <= 16) {
+                baseStep = 1;
+            } else if (n <= 64) {
+                baseStep = 4;
+            } else if (n <= 256) {
+                baseStep = 16;
+            } else if (n <= 1024) {
+                baseStep = 64;
+            } else {
+                baseStep = 128;
+            }
+            return isCpu ? std::max(baseStep * 2, 2) : baseStep;
+        }
+
+        static std::vector<int> GenerateSamplePoints(int maxN, bool isCpu) {
+            std::vector<int> points;
+            int n = 1;
+            while (n <= maxN) {
+                points.push_back(n);
+                int step = GetStepForN(n, isCpu);
+                n += step;
+            }
+            if (points.empty() || points.back() != maxN) {
+                points.push_back(maxN);
+            }
+            return points;
+        }
+
+        static double InterpolateFromMap(const std::map<int, double> &curve, int size) {
+            if (size <= 0 || curve.empty()) {
+                return 0.0;
+            }
+            auto it = curve.find(size);
+            if (it != curve.end()) {
+                return it->second;
+            }
+            auto upper = curve.upper_bound(size);
+            if (upper == curve.begin()) {
+                return upper->second;
+            }
+            if (upper == curve.end()) {
+                auto last = std::prev(upper);
+                if (last == curve.begin()) {
+                    return last->second;
+                }
+                auto prev2 = std::prev(last);
+                double slope = (last->second - prev2->second) / (last->first - prev2->first);
+                double ret = last->second + slope * (size - last->first);
+                return std::max(ret, 0.0);
+            }
+            auto lower = std::prev(upper);
+            double t = (double)(size - lower->first) / (upper->first - lower->first);
+            return lower->second + t * (upper->second - lower->second);
+        }
+
+        static int PickBenchmarkExpert(Data **weights, int weightsBatch, int m) {
+            for (int e = 1; e <= m; e++) {
+                if (e * 2 < weightsBatch && weights[e * 2] != nullptr) {
+                    return e;
+                }
+            }
+            return -1;
+        }
+
+        bool BuildProfile(
+            BenchmarkProfile &profile,
+            Data &input, Data &output, Data &w1, Data &w2, Data &w3,
+            Data **weights, Data **biass, int weightsBatch, float sharedScale,
+            int adaptiveN, int m
+        ) {
+            if (input.dims.size() < 2 || output.dims.size() < 2 || input.cpuData == nullptr) {
+                return false;
+            }
+            if (adaptiveN <= 0 || adaptiveN > input.dims[0]) {
+                return false;
+            }
+
+            int benchExpert = PickBenchmarkExpert(weights, weightsBatch, m);
+            if (benchExpert < 1) {
+                return false;
+            }
+
+            int inputDim = input.dims[1];
+            int outputDim = output.dims[1];
+            std::unordered_set<int> cpuExperts = {benchExpert};
+            std::unordered_set<int> gpuExperts = {benchExpert};
+            FastllmMoeDataManagerNumas cpuBenchDataManager;
+
+            Data benchIndex(DataType::INT32, {adaptiveN, 1});
+            benchIndex.Allocate();
+            Data benchScore(DataType::FLOAT32, {adaptiveN, 1});
+            benchScore.Allocate();
+            int32_t *benchIndexData = (int32_t*)benchIndex.cpuData;
+            float *benchScoreData = (float*)benchScore.cpuData;
+            for (int i = 0; i < adaptiveN; i++) {
+                benchIndexData[i] = benchExpert - 1;
+                benchScoreData[i] = 1.0f;
+            }
+
+            profile.maxN = adaptiveN;
+            profile.cpuTimeUs.clear();
+            profile.gpuTimeUs.clear();
+            profile.cpuTimeUs[0] = 0.0;
+            profile.gpuTimeUs[0] = 0.0;
+
+            std::vector<int> cpuSamples = GenerateSamplePoints(adaptiveN, true);
+            std::vector<int> gpuSamples = GenerateSamplePoints(adaptiveN, false);
+            std::set<int> allSamples(cpuSamples.begin(), cpuSamples.end());
+            allSamples.insert(gpuSamples.begin(), gpuSamples.end());
+            std::set<int> cpuSampleSet(cpuSamples.begin(), cpuSamples.end());
+            std::set<int> gpuSampleSet(gpuSamples.begin(), gpuSamples.end());
+
+            for (auto it = allSamples.rbegin(); it != allSamples.rend(); ++it) {
+                int k = *it;
+                Data benchInput(input.dataType, {k, inputDim}, DataDevice::CPU, input.cpuData);
+                Data benchIndexK(DataType::INT32, {k, 1}, DataDevice::CPU, benchIndex.cpuData);
+                Data benchScoreK(DataType::FLOAT32, {k, 1}, DataDevice::CPU, benchScore.cpuData);
+
+                if (cpuSampleSet.count(k)) {
+                    Data cpuOutput(output.dataType, {k, outputDim});
+                    cpuOutput.Allocate();
+                    for (int i = 0; i < warmupRounds; i++) {
+                        DoNumasMergeMOEOnCPU(
+                            benchInput, cpuOutput, benchIndexK, benchScoreK, weights, biass,
+                            sharedScale, weightsBatch, 1, cpuExperts, cpuBenchDataManager
+                        );
+                    }
+                    double cpuElapsed = 0.0;
+                    for (int i = 0; i < measureRounds; i++) {
+                        auto st = std::chrono::steady_clock::now();
+                        DoNumasMergeMOEOnCPU(
+                            benchInput, cpuOutput, benchIndexK, benchScoreK, weights, biass,
+                            sharedScale, weightsBatch, 1, cpuExperts, cpuBenchDataManager
+                        );
+                        auto ed = std::chrono::steady_clock::now();
+                        cpuElapsed += std::chrono::duration<double, std::micro>(ed - st).count();
+                    }
+                    profile.cpuTimeUs[k] = cpuElapsed / measureRounds;
+                }
+
+                if (gpuSampleSet.count(k)) {
+                    Data gpuOutput(output.dataType, {k, outputDim});
+                    gpuOutput.Allocate();
+                    if (gpuOutput.cudaData == nullptr) {
+                        gpuOutput.ToDevice(DataDevice::CUDA);
+                        gpuOutput.ToDevice(DataDevice::CPU);
+                    }
+                    for (int i = 0; i < warmupRounds; i++) {
+                        DoCudaMergeMOEFromCPU(
+                            benchInput, gpuOutput, benchIndexK, benchScoreK, w1, w2, w3, weights, biass,
+                            sharedScale, true, gpuExperts, true
+                        );
+#ifdef USE_CUDA
+                        FastllmCudaStreamSynchronize(nullptr);
+#endif
+                    }
+                    double gpuElapsed = 0.0;
+                    for (int i = 0; i < measureRounds; i++) {
+                        auto st = std::chrono::steady_clock::now();
+                        DoCudaMergeMOEFromCPU(
+                            benchInput, gpuOutput, benchIndexK, benchScoreK, w1, w2, w3, weights, biass,
+                            sharedScale, true, gpuExperts, true
+                        );
+#ifdef USE_CUDA
+                        FastllmCudaStreamSynchronize(nullptr);
+#endif
+                        auto ed = std::chrono::steady_clock::now();
+                        gpuElapsed += std::chrono::duration<double, std::micro>(ed - st).count();
+                    }
+                    profile.gpuTimeUs[k] = gpuElapsed / measureRounds;
+                }
+            }
+
+            printf("MoE benchmark: cpu samples=%d, gpu samples=%d\n",
+                   (int)profile.cpuTimeUs.size(), (int)profile.gpuTimeUs.size());
+            profile.initialized = true;
+            profile.lastPrintedLimit = -1;
+            return true;
+        }
+    };
 
     void DoNumasMergeMOEOnCPU(
         Data &input, Data &output,
@@ -1368,6 +1705,15 @@ namespace fastllm {
                     expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
                 }
             }
+/*
+            if (gpuPrefill && !hasExpertLimitOverride) {
+                expertLimit = MoeExpertSpeedEstimator::GetInstance().GetDynamicExpertLimit(
+                    input, output, w1, w2, w3,
+                    weights, biass, weightsBatch, topk, sharedScale,
+                    expertTasks, expertLimit
+                );
+            }
+*/
 
             // 根据 expertLimit 阈值生成 cpuExperts / gpuExperts 集合
             std::unordered_set<int> cpuExperts, gpuExperts;
@@ -1381,7 +1727,8 @@ namespace fastllm {
                     gpuExperts.insert(e);
                 }
             }
- // printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("MoE expertLimit=%d, cpuExperts=%d, gpuExperts=%d\n", expertLimit, (int)cpuExperts.size(), (int)gpuExperts.size());
+// printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             // 若 gpuPrefill 且所有专家都归 GPU（cpuExperts 为空），直接调用 GPU 处理并返回
             if (gpuPrefill && cpuExperts.empty()) {
                 DoCudaMergeMOEFromCPU (
