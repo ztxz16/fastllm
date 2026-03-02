@@ -321,8 +321,8 @@ namespace fastllm {
         std::string pre_prompt; // 最初对话的提示语
         std::string user_role, bot_role, history_sep; // 用于生成每一轮的prompt
 
-        int bos_token_id;
-        int eos_token_id;
+        int bos_token_id = -1;
+        int eos_token_id = -1;
         std::set <int> eos_token_ids;
         int embed_dim = 4096;
         int num_attention_heads = 32;
