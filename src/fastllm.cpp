@@ -1191,6 +1191,9 @@ namespace fastllm {
             } else {
                 this->cudaData = FastllmCudaMalloc(this->expansionBytes);
             }
+            if (this->cudaData == nullptr) {
+                ErrorInFastLLM("Error: cuda malloc failed in Data::MallocSpace, maybe no enough GPU memory.\n");
+            }
             if (this->multiDeviceData) {
                 for (auto it : this->multiDeviceDatas) {
                     delete it.second;
@@ -1634,6 +1637,19 @@ namespace fastllm {
 #ifdef USE_CUDA
             if (this->dataDevice == DataDevice::CPU) {
                 if (device == DataDevice::CUDA) {
+                    int destDevice = deviceIds.size() == 0 ? FastllmCudaGetDevice() : deviceIds[0];
+                    FastllmCudaSetDevice(destDevice);
+                    if (this->cudaData != nullptr) {
+                        bool needRealloc = true;
+                        int ptrDevice = GetPointerDeviceId(this->cudaData);
+                        if (ptrDevice >= 0) {
+                            needRealloc = (ptrDevice != destDevice);
+                        }
+                        if (needRealloc) {
+                            FastllmCudaFree(this->cudaData);
+                            this->cudaData = nullptr;
+                        }
+                    }
                     if (copyData) {
                         uint8_t *cpuData = this->cpuData;
 #ifdef USE_MMAP
@@ -1674,6 +1690,12 @@ namespace fastllm {
                     }
                 } else if (device == DataDevice::CUDA) {
                     int sourceDevice = this->dataDeviceIds.size() == 0 ? 0 : this->dataDeviceIds[0];
+                    if (this->cudaData != nullptr) {
+                        int realSourceDevice = GetPointerDeviceId(this->cudaData);
+                        if (realSourceDevice >= 0) {
+                            sourceDevice = realSourceDevice;
+                        }
+                    }
                     int destDevice = deviceIds.size() == 0 ? 0 : deviceIds[0];
                     if (sourceDevice != destDevice) {
                                         FastllmCudaSetDevice(destDevice);

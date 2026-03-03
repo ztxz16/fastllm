@@ -1702,6 +1702,16 @@ namespace fastllm {
 // lastMergeMoeCallTime = now;
 // auto st = std::chrono::system_clock::now();
 // auto xxx = std::chrono::system_clock::now();
+        int curDeviceId = FastllmCudaGetDevice();
+        if (output.cudaData != nullptr) {
+            int outputPtrDevice = GetPointerDeviceId(output.cudaData);
+            if (outputPtrDevice >= 0 && outputPtrDevice != curDeviceId) {
+                FastllmCudaSetDevice(outputPtrDevice);
+                FastllmCudaFree(output.cudaData);
+                FastllmCudaSetDevice(curDeviceId);
+                output.cudaData = FastllmCudaMalloc(output.expansionBytes);
+            }
+        }
         if (setZero) {
             output.Allocate();
             output.ToCudaTemporary({}, false);
@@ -1883,6 +1893,16 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                         Data **weights, Data **biass, float sharedScale) {
 // static std::map<std::string, float> mergeMoeTimeCnt;
 // auto st = std::chrono::system_clock::now();
+        int curDeviceId = FastllmCudaGetDevice();
+        if (output.cudaData != nullptr) {
+            int outputPtrDevice = GetPointerDeviceId(output.cudaData);
+            if (outputPtrDevice >= 0 && outputPtrDevice != curDeviceId) {
+                FastllmCudaSetDevice(outputPtrDevice);
+                FastllmCudaFree(output.cudaData);
+                FastllmCudaSetDevice(curDeviceId);
+                output.cudaData = FastllmCudaMalloc(output.expansionBytes);
+            }
+        }
         output.Allocate();
 // ForceDeviceSync(); mergeMoeTimeCnt["allocate"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
         {
