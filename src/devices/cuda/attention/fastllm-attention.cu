@@ -15,6 +15,8 @@
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
+#include <cstdlib>
+
 template <int BN, int BM, int BK>
 __global__ void HalfFC(
     half * __restrict__ a, half * __restrict__ b, half * __restrict__ c,
@@ -1908,8 +1910,24 @@ static double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::
     return double(duration.count()) * std::chrono::nanoseconds::period::num / std::chrono::nanoseconds::period::den;
 };
 
+static size_t ParseSizeFromEnv(const char* env_name, size_t default_size) {
+    const char* val = std::getenv(env_name);
+    if (!val || val[0] == '\0') return default_size;
+    char* end = nullptr;
+    double num = std::strtod(val, &end);
+    if (end == val) return default_size;
+    size_t result = default_size;
+    if (*end == 'G' || *end == 'g') result = (size_t)(num * 1024 * 1024 * 1024);
+    else if (*end == 'M' || *end == 'm') result = (size_t)(num * 1024 * 1024);
+    else if (*end == 'K' || *end == 'k') result = (size_t)(num * 1024);
+    else if (*end == '\0') result = (size_t)num;
+    else return default_size;
+    printf("[Info] %s = %s (%.2f MB)\n", env_name, val, result / (1024.0 * 1024.0));
+    return result;
+}
+
 struct FlashInferWorkSpaceManager {
-    const size_t float_workspace_size = 256 * 1024 * 1024;  // 256 MB
+    const size_t float_workspace_size = ParseSizeFromEnv("FT_FLOAT_WORKSPACE_SIZE", 256 * 1024 * 1024);
     const size_t int_workspace_size = 64 * 1024 * 1024;     // 64 MB
 
     void* d_float_workspace = nullptr;
