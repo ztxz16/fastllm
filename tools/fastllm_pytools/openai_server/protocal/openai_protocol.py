@@ -106,15 +106,26 @@ class ChatCompletionRequest(BaseModel):
     chat_template_kwargs: Optional[Dict[str, Any]] = None
 
 
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str
+
+class ToolCall(BaseModel):
+    id: str = Field(default_factory=lambda: "fastllm-tool-" + str(uuid.uuid4().hex))
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
+    tool_calls: Optional[list[ToolCall]] = None
 
 
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
-    finish_reason: Optional[Literal["stop", "length"]] = None
+    finish_reason: Optional[Literal["stop", "length", "tool_calls"]] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -141,15 +152,6 @@ class DeltaMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
-
-class FunctionCall(BaseModel):
-    name: str
-    arguments: str
-
-class ToolCall(BaseModel):
-    id: str = Field(default_factory=lambda: "fastllm-tool-" + str(uuid.uuid4().hex))
-    type: Literal["function"] = "function"
-    function: FunctionCall
 
 class ExtractedToolCallInformation(BaseModel):
     # indicate if tools were called
