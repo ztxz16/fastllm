@@ -16,9 +16,12 @@ from starlette.background import BackgroundTask
 from .protocal.openai_protocol import *
 
 class ConversationMessage:
-    def __init__(self, role:str, content:str):
+    def __init__(self, role:str, content:str, tool_calls=None, tool_call_id=None, name=None):
       self.role = role
       self.content = content
+      self.tool_calls = tool_calls
+      self.tool_call_id = tool_call_id
+      self.name = name
 
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
@@ -72,11 +75,17 @@ class FastLLmCompletion:
       role: ChatCompletionRole,
       content: Optional[Union[str,
                               Iterable[ChatCompletionContentPartParam]]],
+      tool_calls=None,
+      tool_call_id=None,
+      name=None,
   ) -> Tuple[List[ConversationMessage], List[Awaitable[object]]]:
-      if content is None:
+      if content is None and tool_calls is None and tool_call_id is None:
           return [], []
-      if isinstance(content, str):
-          return [ConversationMessage(role=role, content=content)], []
+      if content is None or isinstance(content, str):
+          return [ConversationMessage(role=role, content=content or "",
+                                      tool_calls=tool_calls,
+                                      tool_call_id=tool_call_id,
+                                      name=name)], []
       if isinstance(content, list):
           content_str = ""
           for it in content:
@@ -87,8 +96,10 @@ class FastLLmCompletion:
                     content_str += it['text']
               else:
                  raise NotImplementedError("Complex input not supported yet")
-          return [ConversationMessage(role=role, content=content_str)], []
-      # 暂时不支持图像输入
+          return [ConversationMessage(role=role, content=content_str,
+                                      tool_calls=tool_calls,
+                                      tool_call_id=tool_call_id,
+                                      name=name)], []
       raise NotImplementedError("Complex input not supported yet")
 
   async def create_chat_completion(
@@ -117,7 +128,10 @@ class FastLLmCompletion:
           conversation: List[ConversationMessage] = []
           for m in request.messages:
               messages, _ = self._parse_chat_message_content(
-                  m["role"], m["content"])
+                  m["role"], m.get("content"),
+                  tool_calls=m.get("tool_calls"),
+                  tool_call_id=m.get("tool_call_id"),
+                  name=m.get("name"))
 
               conversation.extend(messages)
 
@@ -125,7 +139,28 @@ class FastLLmCompletion:
             raise Exception("Empty msg")
           messages = []
           for msg in conversation:
-            messages.append({"role": msg.role, "content": msg.content})
+            msg_dict = {"role": msg.role, "content": msg.content}
+            if msg.tool_calls is not None:
+                parsed_tool_calls = []
+                for tc in msg.tool_calls:
+                    tc_copy = dict(tc) if isinstance(tc, dict) else tc
+                    if isinstance(tc_copy, dict) and "function" in tc_copy:
+                        func = tc_copy["function"]
+                        if isinstance(func, dict) and isinstance(func.get("arguments"), str):
+                            func = dict(func)
+                            try:
+                                func["arguments"] = json.loads(func["arguments"])
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                            tc_copy = dict(tc_copy)
+                            tc_copy["function"] = func
+                    parsed_tool_calls.append(tc_copy)
+                msg_dict["tool_calls"] = parsed_tool_calls
+            if msg.tool_call_id is not None:
+                msg_dict["tool_call_id"] = msg.tool_call_id
+            if msg.name is not None:
+                msg_dict["name"] = msg.name
+            messages.append(msg_dict)
 
       except Exception as e:
           logging.error("Error in applying chat template from request: %s", e)
@@ -211,14 +246,34 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
-      choice_data = ChatCompletionResponseChoice(
+      if self.tool_parser is None:
+          from .tool_parsers import ToolParser, ToolParserManager
+          self.tool_parser = ToolParserManager.get_tool_parser_auto(
+              self.model.get_type(), self.model.hf_tokenizer.chat_template,
+              force_chat_template=self.model.force_chat_template,
+              force_type=self.model.tool_call_parser)(self.model.hf_tokenizer)
+
+      tool_call_info = self.tool_parser.extract_tool_calls(result, request)
+
+      if tool_call_info.tools_called:
+          choice_data = ChatCompletionResponseChoice(
+              index=0,
+              message=ChatMessage(
+                  role="assistant",
+                  content=tool_call_info.content or None,
+                  tool_calls=tool_call_info.tool_calls,
+              ),
+              logprobs=None,
+              finish_reason='tool_calls',
+          )
+      else:
+          choice_data = ChatCompletionResponseChoice(
               index=0,
               message=ChatMessage(role="assistant", content=result),
               logprobs=None,
               finish_reason='stop',
           )
 
-      # TODO: 补充usage信息, 包括prompt token数, 生成的tokens数量
       response = ChatCompletionResponse(
           id = request_id,
           created = created_time,
