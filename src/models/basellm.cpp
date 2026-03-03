@@ -2202,8 +2202,31 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             auto freeSizes = FastllmCudaGetFreeSizes();
             auto totalSizes = FastllmCudaGetTotalSizes();
             auto dmap = GetDeviceMap();
-            std::set <int> deviceIds;
             std::map <int, int> ratios;
+
+            // 计算每个设备上分配的层数
+            std::map <int, int> deviceLayerCount;
+            if (dmap.size() > 1) {
+                // 多卡模式：按照 deviceMap 的比例分配层数
+                int sum = 0;
+                for (auto &it : dmap) {
+                    sum += it.second;
+                }
+                int cur = 0, prevLayer = 0;
+                for (auto &it : dmap) {
+                    cur += it.second;
+                    int endLayer = (int)((long long)cur * block_cnt / sum);
+                    int layersOnDevice = endLayer - prevLayer;
+                    if (StartWith(it.first, "cuda")) {
+                        for (int id : ParseDeviceIds(it.first, "cuda", ratios)) {
+                            deviceLayerCount[id] += layersOnDevice;
+                        }
+                    }
+                    prevLayer = endLayer;
+                }
+            }
+
+            std::set <int> deviceIds;
             for (auto &it : dmap) {
                 if (StartWith(it.first, "cuda")) {
                     for (int id : ParseDeviceIds(it.first, "cuda", ratios)) {
@@ -2214,18 +2237,49 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             if (deviceIds.empty()) {
                 deviceIds.insert(0);
             }
-            long long cacheAvail = 0;
-            for (int id : deviceIds) {
-                if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
-                    cacheAvail += freeSizes[id] - (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
+
+            if (deviceIds.size() > 1 && !deviceLayerCount.empty()) {
+                // 多卡模式：计算每张卡上的 (剩余显存 / 单页显存)，取最小值
+                long long bytesPerLayerPerPage = (long long)2 * pageLen * numHeads * headDim * unitSize;
+                int maxPages = INT_MAX;
+                for (int id : deviceIds) {
+                    if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
+                        long long avail = freeSizes[id] - (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
+                        int layers = deviceLayerCount.count(id) ? deviceLayerCount[id] : 0;
+                        if (layers > 0 && avail > 0) {
+                            long long perPageOnDevice = layers * bytesPerLayerPerPage;
+                            int pages = (int)(avail / perPageOnDevice);
+                            maxPages = std::min(maxPages, pages);
+                        }
+                    }
                 }
-            }
-            if (cacheAvail > 0 && bytesPerPage > 0) {
-                int maxPages = (int)(cacheAvail / bytesPerPage);
-                if (maxPages > 0) {
+                if (maxPages > 0 && maxPages < INT_MAX) {
                     fastllm::SetMaxTokens(maxPages * pageLen);
-                    printf("Auto set cache pages: %d (tokens: %d, avail: %.2f GB).\n",
-                           maxPages, maxPages * pageLen, cacheAvail / 1e9);
+                    printf("Auto set cache pages (multi-gpu): %d (tokens: %d).\n",
+                           maxPages, maxPages * pageLen);
+                    for (int id : deviceIds) {
+                        if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
+                            long long avail = freeSizes[id] - (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
+                            int layers = deviceLayerCount.count(id) ? deviceLayerCount[id] : 0;
+                            printf("  GPU %d: layers=%d, avail=%.2f GB.\n", id, layers, avail / 1e9);
+                        }
+                    }
+                }
+            } else {
+                // 单卡模式：原有逻辑
+                long long cacheAvail = 0;
+                for (int id : deviceIds) {
+                    if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
+                        cacheAvail += freeSizes[id] - (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
+                    }
+                }
+                if (cacheAvail > 0 && bytesPerPage > 0) {
+                    int maxPages = (int)(cacheAvail / bytesPerPage);
+                    if (maxPages > 0) {
+                        fastllm::SetMaxTokens(maxPages * pageLen);
+                        printf("Auto set cache pages: %d (tokens: %d, avail: %.2f GB).\n",
+                               maxPages, maxPages * pageLen, cacheAvail / 1e9);
+                    }
                 }
             }
             
