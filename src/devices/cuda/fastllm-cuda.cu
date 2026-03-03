@@ -4255,7 +4255,7 @@ int GetPointerDeviceId(void *ptr) {
         if (attributes.type == cudaMemoryTypeDevice) {
 #endif
             int device = attributes.device;
-            printf("Pointer belongs to device %d\n", device);
+            // printf("Pointer belongs to device %d\n", device);
             return device;
         } else {
             printf("Pointer is not device memory\n");
