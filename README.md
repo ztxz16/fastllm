@@ -218,6 +218,8 @@ ftllm server deepseek-ai/DeepSeek-V3-0324 --dtype fp8 --moe_dtype int4
   - **串行计算**: 一些场景下可以指定不同的device串行执行。例如
     - `--device "{'cuda:0':3,'cuda:1':2}"`: 这样`3/5`的层会运行在`cuda:0`上，`2/5`的层会运行在`cuda:1`上
     - `--device "{'multicuda:0,1':3,'cuda:1':2}"`: 这样`3/5`的层会使用`cuda:0`,`cuda:1`张量并行，`2/5`的层仅仅运行在`cuda:1`上
+    - **简写**: `--device cudapp=N` 表示N卡均匀串行，例如 `--device cudapp=4` 等价于 `--device "{'cuda:0':1,'cuda:1':1,'cuda:2':1,'cuda:3':1}"`
+    - **简写**: `--device cudapp=1:2:3` 表示三卡按1:2:3比例串行，等价于 `--device "{'cuda:0':1,'cuda:1':2,'cuda:2':3}"`
 
 - `--moe_device`:
   - **描述**: 指定 MOE（Mixture of Experts）层的计算设备。

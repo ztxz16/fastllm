@@ -48,6 +48,17 @@ def add_server_args(parser):
     parser.add_argument("--hide_input", action = 'store_true', help = "不显示请求信息")
     parser.add_argument("--dev_mode", action = 'store_true', help = "开发模式, 启用后能够获取对话列表并主动停止")
 
+def expand_cudapp_device(device_str):
+    if not device_str or not device_str.startswith("cudapp="):
+        return device_str
+    spec = device_str[len("cudapp="):]
+    if ':' in spec:
+        weights = [int(w) for w in spec.split(':')]
+    else:
+        n = int(spec)
+        weights = [1] * n
+    return str({f'cuda:{i}': w for i, w in enumerate(weights)})
+
 def make_normal_llm_model(args):
     if (args.model and args.model != ''):
         if (args.model.endswith(".json") and os.path.exists(args.model)):
@@ -175,6 +186,11 @@ def make_normal_llm_model(args):
         args.dtype = "float16"
     if (args.moe_device == ""):
         args.moe_device = args.device
+    if (args.device and args.device != ""):
+        expanded = expand_cudapp_device(args.device)
+        if expanded != args.device:
+            print(f"[device] cudapp expand: {args.device} => {expanded}")
+            args.device = expanded
     from ftllm import llm
     if (args.device and args.device != ""):
         try:
