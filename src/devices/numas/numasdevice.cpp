@@ -782,26 +782,40 @@ namespace fastllm {
                                   weightsBatch, sharedScale, adaptiveN, m)) {
                     return defaultExpertLimit;
                 }
-                printf("MoE dynamic expertLimit benchmark initialized: N=%d, bs=%d, topk=%d\n",
-                       profile.maxN, input.dims[0], topk);
+                // printf("MoE dynamic expertLimit benchmark initialized: N=%d, bs=%d, topk=%d\n", profile.maxN, input.dims[0], topk);
+            }
+            // Precompute per-expert interpolated times to avoid repeated map lookups
+            int numExperts = (int)expertTasks.size();
+            std::vector<int> expertSz(numExperts);
+            std::vector<double> expertCpu(numExperts, 0.0);
+            std::vector<double> expertGpu(numExperts, 0.0);
+            std::vector<bool> expertValid(numExperts, false);
+            for (int e = 0; e < numExperts; e++) {
+                if (e * 2 >= weightsBatch || weights[e * 2] == nullptr) {
+                    continue;
+                }
+                expertValid[e] = true;
+                expertSz[e] = (int)expertTasks[e].size();
+                expertCpu[e] = InterpolateFromMap(profile.cpuTimeUs, expertSz[e]);
+                expertGpu[e] = InterpolateFromMap(profile.gpuTimeUs, expertSz[e]);
             }
 
             int bestLimit = defaultExpertLimit;
             double bestGap = DBL_MAX;
             double bestCpuTime = 0.0;
             double bestGpuTime = 0.0;
+            maxTaskSize = std::min(maxTaskSize, defaultExpertLimit);
             for (int t = 1; t <= maxTaskSize + 1; t++) {
                 double cpuTime = 0.0;
                 double gpuTime = 0.0;
-                for (int e = 0; e < (int)expertTasks.size(); e++) {
-                    if (e * 2 >= weightsBatch || weights[e * 2] == nullptr) {
+                for (int e = 0; e < numExperts; e++) {
+                    if (!expertValid[e]) {
                         continue;
                     }
-                    int sz = (int)expertTasks[e].size();
-                    if (sz < t) {
-                        cpuTime += InterpolateFromMap(profile.cpuTimeUs, sz);
+                    if (expertSz[e] < t) {
+                        cpuTime += expertCpu[e];
                     } else {
-                        gpuTime += InterpolateFromMap(profile.gpuTimeUs, sz);
+                        gpuTime += expertGpu[e];
                     }
                 }
                 double gap = std::fabs(cpuTime - gpuTime);
@@ -812,13 +826,10 @@ namespace fastllm {
                     bestGpuTime = gpuTime;
                 }
             }
-
             if (profile.lastPrintedLimit != bestLimit) {
-                printf("MoE dynamic expertLimit=%d, predict cpu=%.2fus gpu=%.2fus\n",
-                       bestLimit, bestCpuTime, bestGpuTime);
+                // printf("MoE dynamic expertLimit=%d, predict cpu=%.2fus gpu=%.2fus\n", bestLimit, bestCpuTime, bestGpuTime);
                 profile.lastPrintedLimit = bestLimit;
             }
-
             return bestLimit;
         }
 
@@ -835,7 +846,7 @@ namespace fastllm {
         std::mutex profileLocker;
         const int warmupRounds = 2;
         const int measureRounds = 8;
-        const int hardMaxBenchmarkN = 2048;
+        const int hardMaxBenchmarkN = 512;
 
         static int GetStepForN(int n, bool isCpu) {
             int baseStep;
@@ -1012,8 +1023,7 @@ namespace fastllm {
                 }
             }
 
-            printf("MoE benchmark: cpu samples=%d, gpu samples=%d\n",
-                   (int)profile.cpuTimeUs.size(), (int)profile.gpuTimeUs.size());
+            // printf("MoE benchmark: cpu samples=%d, gpu samples=%d\n", (int)profile.cpuTimeUs.size(), (int)profile.gpuTimeUs.size());
             profile.initialized = true;
             profile.lastPrintedLimit = -1;
             return true;
@@ -1681,6 +1691,7 @@ namespace fastllm {
             int m = weightsBatch / 2 - 1; // num experts
             auto &moeConfig = MoeEnvConfig::GetInstance();
             int expertLimit = moeConfig.GetExpertLimit();
+            bool hasExpertLimitOverride = moeConfig.HasExpertLimitOverride();
             bool gpuPrefill = moeConfig.GetGpuPrefill();
             if (input.cudaData == nullptr) {
                 gpuPrefill = false;
@@ -1705,16 +1716,17 @@ namespace fastllm {
                     expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
                 }
             }
-/*
-            if (gpuPrefill && !hasExpertLimitOverride) {
-                expertLimit = MoeExpertSpeedEstimator::GetInstance().GetDynamicExpertLimit(
-                    input, output, w1, w2, w3,
-                    weights, biass, weightsBatch, topk, sharedScale,
-                    expertTasks, expertLimit
+// printf("prepare 0 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+            if (gpuPrefill) {
+                expertLimit = std::min(expertLimit, 
+                    MoeExpertSpeedEstimator::GetInstance().GetDynamicExpertLimit(
+                        input, output, w1, w2, w3,
+                        weights, biass, weightsBatch, topk, sharedScale,
+                        expertTasks, expertLimit
+                    )
                 );
             }
-*/
-
+// printf("get expertLimit spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             // 根据 expertLimit 阈值生成 cpuExperts / gpuExperts 集合
             std::unordered_set<int> cpuExperts, gpuExperts;
             for (int e = 0; e < (int)expertTasks.size(); e++) {
@@ -1728,7 +1740,7 @@ namespace fastllm {
                 }
             }
 // printf("MoE expertLimit=%d, cpuExperts=%d, gpuExperts=%d\n", expertLimit, (int)cpuExperts.size(), (int)gpuExperts.size());
-// printf("prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("prepare 1 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             // 若 gpuPrefill 且所有专家都归 GPU（cpuExperts 为空），直接调用 GPU 处理并返回
             if (gpuPrefill && cpuExperts.empty()) {
                 DoCudaMergeMOEFromCPU (
@@ -1747,19 +1759,19 @@ namespace fastllm {
                     );
                 });
             }
- //printf("gpu prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("gpu prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             if (!cpuExperts.empty()) {
                 DoNumasMergeMOEOnCPU(
                     input, output, index, score, weights, biass,
                     sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas
                 );
             }
- //printf("cpu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("cpu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             if (gpuPrefill && !gpuExperts.empty()) {
                 gpuThread.join();
                 ReduceSumFromCPU(output);
             }
- //printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+// printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             return;
         }
     }
