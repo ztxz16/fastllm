@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.5)
 
 project(fastllm LANGUAGES CXX)
 
+option(USE_NUMAS "use numas" ON)
+
 option(USE_CUDA "use CUDA" OFF)
 option(CUDA_NO_TENSOR_CORE "Optimize for legacy CUDA GPUs which has Tensor Core." OFF)
 
@@ -105,6 +107,8 @@ if(USE_ROCM)
         message(STATUS "MI50 device detected (gfx906)")
     endif()
 endif()
+
+message(STATUS "USE_NUMAS: ${USE_NUMAS}")
 
 message(STATUS "USE_CUDA: ${USE_CUDA}")
 
