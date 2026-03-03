@@ -211,6 +211,8 @@ class ToolParserManager:
             target = ""
             if ("<｜tool▁calls▁begin｜>" in chat_template):
                 target = "deepseek_v31"
+            elif ("<minimax:tool_call>" in chat_template):
+                target = "minimax_m2"
             if (target == ""):
                 print("Warning: can't detect tool parse, use default tool parser")
                 target = "hermes"
@@ -227,6 +229,8 @@ class ToolParserManager:
                 target = 'hermes'
         elif model_type == 'glm4_moe':
             target = 'glm45'
+        elif model_type == 'minimax_m2':
+            target = 'minimax_m2'
         elif model_type == 'kimi_k2':
             target = 'kimi_k2'
         elif model_type == 'deepseek_v3' or model_type == 'deepseek_v2':
