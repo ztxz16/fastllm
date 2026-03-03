@@ -15,6 +15,7 @@ from .kimi_k2_tool_parser import KimiK2ToolParser
 #from .llama4_pythonic_tool_parser import Llama4PythonicToolParser
 #from .llama_tool_parser import Llama3JsonToolParser
 #from .minimax_tool_parser import MinimaxToolParser
+from .minimax_m2_tool_parser import MinimaxM2ToolParser
 #from .mistral_tool_parser import MistralToolParser
 #from .phi4mini_tool_parser import Phi4MiniJsonToolParser
 #from .pythonic_tool_parser import PythonicToolParser
@@ -39,6 +40,7 @@ __all__ = [
     "DeepSeekV31ToolParser",
     #"xLAMToolParser",
     #"MinimaxToolParser",
+    "MinimaxM2ToolParser",
     "KimiK2ToolParser",
     #"HunyuanA13BToolParser",
     "Glm4MoeModelToolParser",
