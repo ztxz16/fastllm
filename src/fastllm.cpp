@@ -210,7 +210,13 @@ namespace fastllm {
         {DataType::INT8, {"int8"}}, {DataType::INT4, {"int4o"}}, {DataType::INT2, {"int2"}}, {DataType::BIT, {"bit"}}, 
         {DataType::FLOAT16, {"float16", "fp16", "half"}}, {DataType::INT4_NOZERO, {"int4"}}, {DataType::INT4_GROUP, {"int4g"}},
         {DataType::FP8_E4M3, {"float8", "fp8", "fp8_e4m3"}}, {DataType::INT2_GROUP, {"int2g"}}, {DataType::BASE3_GROUP, {"base3g"}},
-        {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}}
+        {DataType::INT32, {"int32"}}, {DataType::INT32PARAM, {"int32param"}},
+        {DataType::FP8_E4M3_BLOCK_128, {"fp8_e4m3_block_128"}}, {DataType::AWQ_4BIT_128, {"awq_4bit_128"}},
+        {DataType::INT4_PERCHANNEL, {"int4_perchannel"}}, {DataType::FP8_E4M3_PERCHANNEL, {"fp8_e4m3_perchannel"}},
+        {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
+        {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
+        {DataType::DATA_AUTO_NONE, {"data_auto_none"}}, {DataType::DATA_AUTO_LINEAR, {"data_auto_linear"}},
+        {DataType::DATA_AUTO_EMBEDDING, {"data_auto_embedding"}}, {DataType::DATA_AUTO_CONV, {"data_auto_conv"}}
     };
 
     std::string GetDataTypeName(DataType type) {
