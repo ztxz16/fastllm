@@ -9,7 +9,7 @@ cd $folder
 # cpu
 rm -rf CMakeCache.txt CMakeFiles
 cmake .. -DMAKE_WHL_X86=ON -DUSE_CUDA=OFF -DUSE_NUMAS=ON
-make fastllm_tools -j$(nproc)
+make fastllm_tools -j30
 if [ $? != 0 ]; then
     exit -1
 fi
@@ -18,25 +18,36 @@ cp tools/ftllm/libfastllm_tools.so tools/ftllm/libfastllm_tools-cpu.so
 # cuda-10
 #rm -rf CMakeCache.txt CMakeFiles
 #cmake .. -DMAKE_WHL_X86=ON -DUSE_CUDA=ON -DCUDA_ARCH=70 -D CMAKE_CUDA_COMPILER=/usr/local/cuda-10.1/bin/nvcc
-#make fastllm_tools -j$(nproc)
+#make fastllm_tools -j30
 #if [ $? != 0 ]; then
 #    exit -1
 #fi
 #cp tools/ftllm/libfastllm_tools.so tools/ftllm/libfastllm_tools-cu10.so
 
-# cuda-11
-rm -rf CMakeCache.txt CMakeFiles
-cmake .. -DMAKE_WHL_X86=ON -DUSE_CUDA=ON -DUSE_NUMAS=ON -DCUDA_ARCH="52;53;70" -D CMAKE_CXX_COMPILER=g++-10 -D CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-10 -D CMAKE_CUDA_COMPILER=/usr/local/cuda-11.3/bin/nvcc
-make fastllm_tools -j$(nproc)
-if [ $? != 0 ]; then
-    exit -1
-fi
-cp tools/ftllm/libfastllm_tools.so tools/ftllm/libfastllm_tools-cu11.so
-
 # cuda-12
 rm -rf CMakeCache.txt CMakeFiles
-cmake .. -DMAKE_WHL_X86=ON -DUSE_CUDA=ON -DUSE_NUMAS=ON -DCUDA_ARCH="52;53;70;89" -D CMAKE_CXX_COMPILER=g++-11 -D CMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-11 -D CMAKE_CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc
-make fastllm_tools -j$(nproc)
+CUDA_ARCH_LIST="70;75;89;90;100;120"
+if [ -x /usr/local/cuda/bin/nvcc ]; then
+    CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+elif [ -x /usr/local/cuda-12.9/bin/nvcc ]; then
+    CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc
+elif [ -x /usr/local/cuda-12.1/bin/nvcc ]; then
+    CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc
+else
+    echo "nvcc not found in /usr/local/cuda*/bin"
+    exit -1
+fi
+
+cmake .. \
+    -DMAKE_WHL_X86=ON \
+    -DUSE_CUDA=ON \
+    -DUSE_NUMAS=ON \
+    -DCUDA_ARCH="${CUDA_ARCH_LIST}" \
+    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH_LIST}" \
+    -DCMAKE_CXX_COMPILER=/usr/bin/g++-11 \
+    -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-11 \
+    -DCMAKE_CUDA_COMPILER="${CUDA_COMPILER}"
+make fastllm_tools -j30
 if [ $? != 0 ]; then
     exit -1
 fi

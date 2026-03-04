@@ -1,11 +1,16 @@
 import ctypes
 import math
 import os
+import glob
 import threading
 import asyncio
 import copy
 import json
 import math
+import importlib.util
+import importlib.metadata as importlib_metadata
+import site
+import sys
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
 try:
@@ -14,6 +19,138 @@ except:
     pass
 
 import platform
+def _load_library(path: str):
+    mode = getattr(ctypes, "RTLD_GLOBAL", 0)
+    if mode:
+        return ctypes.CDLL(path, mode=mode)
+    return ctypes.CDLL(path)
+
+def _discover_nvidia_lib_dirs() -> List[str]:
+    dirs = []
+    # 1) Try python module specs (works when namespace packages are visible)
+    candidates = [
+        "nvidia.cuda_runtime.lib",
+        "nvidia.cublas.lib",
+        "nvidia.nccl.lib",
+        "nvidia.curand.lib",
+        "nvidia.cuda_nvrtc.lib",
+    ]
+    for module_name in candidates:
+        try:
+            spec = importlib.util.find_spec(module_name)
+            if spec is not None and spec.submodule_search_locations is not None:
+                for path in spec.submodule_search_locations:
+                    if os.path.isdir(path):
+                        dirs.append(path)
+        except Exception:
+            continue
+    # 2) Fallback: scan site-packages directly (more robust across envs)
+    search_roots = []
+    try:
+        search_roots.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        user_site = site.getusersitepackages()
+        if isinstance(user_site, str):
+            search_roots.append(user_site)
+    except Exception:
+        pass
+    for path in sys.path:
+        if isinstance(path, str) and ("site-packages" in path or "dist-packages" in path):
+            search_roots.append(path)
+
+    for root in list(dict.fromkeys(search_roots)):
+        if not isinstance(root, str) or not os.path.isdir(root):
+            continue
+        for libdir in glob.glob(os.path.join(root, "nvidia", "*", "lib")):
+            if os.path.isdir(libdir):
+                dirs.append(libdir)
+        for libdir in glob.glob(os.path.join(root, "nvidia", "**", "lib"), recursive=True):
+            if os.path.isdir(libdir):
+                dirs.append(libdir)
+    # 3) Fallback: locate by installed distributions metadata
+    for dist_name in ["nvidia-cuda-runtime-cu12", "nvidia-cublas-cu12", "nvidia-nccl-cu12"]:
+        try:
+            dist = importlib_metadata.distribution(dist_name)
+            dist_root = str(dist.locate_file(""))
+            for libdir in glob.glob(os.path.join(dist_root, "nvidia", "*", "lib")):
+                if os.path.isdir(libdir):
+                    dirs.append(libdir)
+        except Exception:
+            continue
+    # De-duplicate while preserving order
+    return list(dict.fromkeys(dirs))
+
+def _preload_cuda_runtime_dependencies() -> Dict[str, Any]:
+    # Try system runtime first. If a machine only has pip nvidia-* packages,
+    # the fallback search below will preload those shared libraries.
+    diagnostics = {
+        "lib_dirs": [],
+        "loaded": [],
+        "failed": [],
+        "unresolved": [],
+    }
+    base_names = [
+        "libcudart.so.12",
+        "libcublas.so.12",
+        "libcublasLt.so.12",
+        "libnccl.so.2",
+    ]
+    unresolved = set(base_names)
+    for libname in [
+        "libcuda.so.1",
+        "libcudart.so.12", "libcudart.so",
+        "libcublasLt.so.12", "libcublasLt.so",
+        "libcublas.so.12", "libcublas.so",
+        "libnccl.so.2", "libnccl.so",
+    ]:
+        try:
+            _load_library(libname)
+            diagnostics["loaded"].append(libname)
+            if libname.startswith("libcudart.so.12"):
+                unresolved.discard("libcudart.so.12")
+            elif libname.startswith("libcublasLt.so.12"):
+                unresolved.discard("libcublasLt.so.12")
+            elif libname.startswith("libcublas.so.12"):
+                unresolved.discard("libcublas.so.12")
+            elif libname.startswith("libnccl.so.2"):
+                unresolved.discard("libnccl.so.2")
+        except Exception as e:
+            diagnostics["failed"].append(f"{libname}: {e}")
+            continue
+
+    if not unresolved:
+        diagnostics["unresolved"] = sorted(unresolved)
+        return diagnostics
+
+    lib_dirs = _discover_nvidia_lib_dirs()
+    diagnostics["lib_dirs"] = lib_dirs
+    attempted_failures = set()
+    # Dependency chain may require multiple passes (e.g. load libcublasLt first,
+    # then libcublas can be loaded in a later pass).
+    while unresolved:
+        progressed = False
+        for libdir in lib_dirs:
+            for base in list(unresolved):
+                for libpath in sorted(glob.glob(os.path.join(libdir, f"{base}*")), reverse=True):
+                    try:
+                        _load_library(libpath)
+                        diagnostics["loaded"].append(libpath)
+                        unresolved.discard(base)
+                        progressed = True
+                        break
+                    except Exception as e:
+                        fail_key = f"{libpath}: {e}"
+                        if fail_key not in attempted_failures:
+                            diagnostics["failed"].append(fail_key)
+                            attempted_failures.add(fail_key)
+                        continue
+        if not progressed:
+            break
+    diagnostics["unresolved"] = sorted(unresolved)
+    return diagnostics
+
 if platform.system() == 'Windows':
     fastllm_lib = ctypes.CDLL(os.path.join(os.path.split(os.path.realpath(__file__))[0], "fastllm_tools.dll"), winmode=0)
 elif platform.system() == 'Darwin':
@@ -22,23 +159,55 @@ else:
     succ = False
     for extraLibName in ["libnuma.so.1"]:
         try:
-            ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], extraLibName))
+            _load_library(os.path.join(os.path.split(os.path.realpath(__file__))[0], extraLibName))
             print("Load", extraLibName)
         except:
             continue
+    preload_diagnostics = _preload_cuda_runtime_dependencies()
+    load_errors = []
     for libname in ["libfastllm_tools.so", "libfastllm_tools-cu11.so", "libfastllm_tools-cpu.so"]:
         try:
-            fastllm_lib = ctypes.cdll.LoadLibrary(os.path.join(os.path.split(os.path.realpath(__file__))[0], libname))
+            fastllm_lib = _load_library(os.path.join(os.path.split(os.path.realpath(__file__))[0], libname))
             print("Load", libname)
             succ = True
             break
-        except OSError:
+        except OSError as e:
+            load_errors.append(f"{libname}: {e}")
             continue
         except Exception as e:
             # e.g. Error loading libfastllm_tools.so: /root/anaconda3/envs/ftllm/bin/../lib/libstdc++.so.6: version `GLIBCXX_3.4.32' not found (required by /root/anaconda3/envs/ftllm/lib/python3.12/site-packages/ftllm/libfastllm_tools.so)
             print(f"Error loading {libname}: {e}")
+            load_errors.append(f"{libname}: {e}")
             continue
     if (not(succ)):
+        if len(load_errors) > 0:
+            print("FastLLM load errors:")
+            for err in load_errors:
+                print(" -", err)
+            # Debug logs for CUDA/NCCL runtime probing (enable when troubleshooting).
+            # print("FastLLM loader debug:")
+            # lib_dirs = preload_diagnostics.get("lib_dirs", [])
+            # if len(lib_dirs) > 0:
+            #     print(" - discovered nvidia lib dirs:")
+            #     for p in lib_dirs:
+            #         print("   *", p)
+            # else:
+            #     print(" - discovered nvidia lib dirs: (none)")
+            # unresolved = preload_diagnostics.get("unresolved", [])
+            # if len(unresolved) > 0:
+            #     print(" - unresolved runtime libs:", ", ".join(unresolved))
+            # loaded_libs = preload_diagnostics.get("loaded", [])
+            # if len(loaded_libs) > 0:
+            #     print(" - loaded runtime libs:")
+            #     for p in loaded_libs:
+            #         print("   *", p)
+            # failed_libs = preload_diagnostics.get("failed", [])
+            # if len(failed_libs) > 0:
+            #     print(" - runtime load failures (first 10):")
+            #     for err in failed_libs[:10]:
+            #         print("   *", err)
+            print("If CUDA/NCCL runtime is missing, try:")
+            print("pip install -U nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-nccl-cu12")
         print("Load fastllm failed. (Try update glibc)")
         exit(0)
 

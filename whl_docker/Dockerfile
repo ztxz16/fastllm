@@ -22,24 +22,22 @@ RUN update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-10 50 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-11 60 \
     && update-alternatives --set g++ /usr/bin/g++-11
 
-# 安装CUDA 11.3
-RUN wget https://developer.download.nvidia.com/compute/cuda/11.3.0/local_installers/cuda_11.3.0_465.19.01_linux.run \
-    && sh cuda_11.3.0_465.19.01_linux.run --silent --toolkit --override \
-    --no-drm --no-man-page --no-opengl-libs --installpath=/usr/local/cuda-11.3 \
-    && rm cuda_11.3.0_465.19.01_linux.run
+# 添加 NVIDIA 仓库密钥和源（用于安装 CUDA 12.9）
+RUN apt-get update && apt-get install -y gnupg2 \
+    && wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.0-1_all.deb \
+    && dpkg -i cuda-keyring_1.0-1_all.deb \
+    && rm cuda-keyring_1.0-1_all.deb \
+    && apt-get update
 
-# 安装CUDA 12.1
-RUN wget https://developer.download.nvidia.com/compute/cuda/12.1.0/local_installers/cuda_12.1.0_530.30.02_linux.run \
-    && sh cuda_12.1.0_530.30.02_linux.run --silent --toolkit --override \
-    --no-drm --no-man-page --no-opengl-libs --installpath=/usr/local/cuda-12.1 \
-    && rm cuda_12.1.0_530.30.02_linux.run
+# 安装 CUDA 12.9 toolkit（包含 nvcc）
+RUN apt-get install -y cuda-toolkit-12-9
 
-# 配置CUDA环境变量（默认使用11.3）
-ENV PATH=/usr/local/cuda-11.3/bin:${PATH}
-ENV LD_LIBRARY_PATH=/usr/local/cuda-11.3/lib64:${LD_LIBRARY_PATH}
+# 配置 CUDA 环境变量（默认使用 12.9）
+ENV PATH=/usr/local/cuda-12.9/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64:${LD_LIBRARY_PATH}
 
-# 创建版本切换符号链接
-RUN ln -sf /usr/local/cuda-11.3 /usr/local/cuda
+# 创建默认 CUDA 软链接
+RUN ln -sf /usr/local/cuda-12.9 /usr/local/cuda
 
 # 验证安装
 RUN g++ --version
@@ -72,27 +70,12 @@ RUN cd /tmp \
 # 3. 验证 'as' 版本 (预期输出包含 2.38)
 RUN as --version
 
-# 添加 NVIDIA 仓库密钥和源
-RUN apt-get update && apt-get install -y gnupg2 \
-    && wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.0-1_all.deb \
-    && dpkg -i cuda-keyring_1.0-1_all.deb \
-    && rm cuda-keyring_1.0-1_all.deb \
-    && apt-get update
-# 安装 NCCL for CUDA 11.x (用于 CUDA 11.3)
-RUN apt-get install -y libnccl2=2.14.3-1+cuda11.7 libnccl-dev=2.14.3-1+cuda11.7 \
+# 安装最新 CUDA 12.9 对应 NCCL
+RUN apt-get update && apt-get install -y "libnccl2=*+cuda12.9" "libnccl-dev=*+cuda12.9" \
     && rm -rf /var/lib/apt/lists/*
-# 为 CUDA 12.1 下载并安装对应的 NCCL
-RUN cd /tmp \
-    && wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/libnccl2_2.18.1-1+cuda12.1_amd64.deb \
-    && wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/libnccl-dev_2.18.1-1+cuda12.1_amd64.deb \
-    && dpkg -i --force-overwrite libnccl2_2.18.1-1+cuda12.1_amd64.deb \
-    && dpkg -i --force-overwrite libnccl-dev_2.18.1-1+cuda12.1_amd64.deb \
-    && rm -f libnccl*.deb
-# 创建 NCCL 符号链接以便两个 CUDA 版本都能找到
-RUN ln -sf /usr/lib/x86_64-linux-gnu/libnccl* /usr/local/cuda-11.3/lib64/ 2>/dev/null || true \
-    && ln -sf /usr/lib/x86_64-linux-gnu/libnccl* /usr/local/cuda-12.1/lib64/ 2>/dev/null || true \
-    && ln -sf /usr/include/nccl.h /usr/local/cuda-11.3/include/ 2>/dev/null || true \
-    && ln -sf /usr/include/nccl.h /usr/local/cuda-12.1/include/ 2>/dev/null || true
+# 创建 NCCL 符号链接以便 CUDA 12.9 找到
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libnccl* /usr/local/cuda-12.9/lib64/ 2>/dev/null || true \
+    && ln -sf /usr/include/nccl.h /usr/local/cuda-12.9/include/ 2>/dev/null || true
 # 设置 NCCL 环境变量
 ENV NCCL_HOME=/usr
 ENV NCCL_INCLUDE_DIR=/usr/include
