@@ -584,8 +584,6 @@ namespace fastllm {
                 FastllmCudaHalfMatMulFloatInt8(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_GROUP) {
                 FastllmCudaHalfMatMulFloatInt4Group(input, weight, bias, output, n, m, k);
-            } else if (weight.dataType == DataType::INT4_GROUP128) {
-                FastllmCudaHalfMatMulFloatInt4Group128(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::INT4_NOZERO) {
                 FastllmCudaHalfMatMulFloatInt4NoZero(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
