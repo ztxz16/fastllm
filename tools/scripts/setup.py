@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 server_require = ['fastapi', 'pydantic', 'openai', 'shortuuid', 'uvicorn']
 webui_require = ['streamlit-chat']
 download_require = ['aria2']
-tokenizer_require = ['tiktoken', 'blobfile']
+tokenizer_require = ['tiktoken', 'blobfile', 'partial_json_parser']
 all_require = server_require + webui_require + download_require + tokenizer_require
 
 setup (
