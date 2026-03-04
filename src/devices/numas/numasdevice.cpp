@@ -744,6 +744,7 @@ namespace fastllm {
             const std::vector<std::vector<std::pair<int, float> > > &expertTasks,
             int defaultExpertLimit
         ) {
+#ifdef USE_CUDA
             if (input.cudaData == nullptr || input.cpuData == nullptr) {
                 return defaultExpertLimit;
             }
@@ -831,6 +832,20 @@ namespace fastllm {
                 profile.lastPrintedLimit = bestLimit;
             }
             return bestLimit;
+#else
+            (void)input;
+            (void)output;
+            (void)w1;
+            (void)w2;
+            (void)w3;
+            (void)weights;
+            (void)biass;
+            (void)weightsBatch;
+            (void)topk;
+            (void)sharedScale;
+            (void)expertTasks;
+            return defaultExpertLimit;
+#endif
         }
 
     private:
@@ -991,6 +1006,7 @@ namespace fastllm {
                 }
 
                 if (gpuSampleSet.count(k)) {
+#ifdef USE_CUDA
                     Data gpuOutput(output.dataType, {k, outputDim});
                     gpuOutput.Allocate();
                     if (gpuOutput.cudaData == nullptr) {
@@ -1020,6 +1036,9 @@ namespace fastllm {
                         gpuElapsed += std::chrono::duration<double, std::micro>(ed - st).count();
                     }
                     profile.gpuTimeUs[k] = gpuElapsed / measureRounds;
+#else
+                    profile.gpuTimeUs[k] = profile.cpuTimeUs.count(k) ? profile.cpuTimeUs[k] : 0.0;
+#endif
                 }
             }
 
@@ -1693,10 +1712,13 @@ namespace fastllm {
             int expertLimit = moeConfig.GetExpertLimit();
             bool hasExpertLimitOverride = moeConfig.HasExpertLimitOverride();
             bool gpuPrefill = moeConfig.GetGpuPrefill();
+#ifndef USE_CUDA
+            gpuPrefill = false;
+#endif
             if (input.cudaData == nullptr) {
                 gpuPrefill = false;
             }
-            if (input.cudaData != nullptr && output.cudaData == nullptr) {
+            if (gpuPrefill && input.cudaData != nullptr && output.cudaData == nullptr) {
                 output.ToDevice(DataDevice::CUDA);
                 output.ToDevice(DataDevice::CPU);
             }
@@ -1742,6 +1764,7 @@ namespace fastllm {
 // printf("MoE expertLimit=%d, cpuExperts=%d, gpuExperts=%d\n", expertLimit, (int)cpuExperts.size(), (int)gpuExperts.size());
 // printf("prepare 1 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             // 若 gpuPrefill 且所有专家都归 GPU（cpuExperts 为空），直接调用 GPU 处理并返回
+#ifdef USE_CUDA
             if (gpuPrefill && cpuExperts.empty()) {
                 DoCudaMergeMOEFromCPU (
                     input, output, index, score, w1, w2, w3, weights, biass, sharedScale, true, gpuExperts, true
@@ -1760,6 +1783,7 @@ namespace fastllm {
                 });
             }
 // printf("gpu prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+#endif
             if (!cpuExperts.empty()) {
                 DoNumasMergeMOEOnCPU(
                     input, output, index, score, weights, biass,
@@ -1767,10 +1791,12 @@ namespace fastllm {
                 );
             }
 // printf("cpu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+#ifdef USE_CUDA
             if (gpuPrefill && !gpuExperts.empty()) {
                 gpuThread.join();
                 ReduceSumFromCPU(output);
             }
+#endif
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             return;
         }
