@@ -26,6 +26,11 @@ jobs:
     #    make -j -B
     #    cp main fastllm-main-android
         
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libnuma-dev
+
     - name: Build with x86
       run: |
         mkdir build-x86
