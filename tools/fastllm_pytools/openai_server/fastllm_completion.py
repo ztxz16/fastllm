@@ -246,14 +246,18 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
-      if self.tool_parser is None:
+      if (request.tools and self.tool_parser is None):
           from .tool_parsers import ToolParser, ToolParserManager
           self.tool_parser = ToolParserManager.get_tool_parser_auto(
               self.model.get_type(), self.model.hf_tokenizer.chat_template,
               force_chat_template=self.model.force_chat_template,
               force_type=self.model.tool_call_parser)(self.model.hf_tokenizer)
 
-      tool_call_info = self.tool_parser.extract_tool_calls(result, request)
+      if request.tools:
+          tool_call_info = self.tool_parser.extract_tool_calls(result, request)
+      else:
+          tool_call_info = ExtractedToolCallInformation(
+              tools_called=False, tool_calls=[], content=result)
 
       if tool_call_info.tools_called:
           choice_data = ChatCompletionResponseChoice(
