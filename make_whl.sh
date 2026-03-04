@@ -1,4 +1,17 @@
 #!/bin/bash
+
+NIGHTLY=0
+for arg in "$@"; do
+    case $arg in
+        --nightly)
+            NIGHTLY=1
+            shift
+            ;;
+    esac
+done
+
+export FASTLLM_NIGHTLY=$NIGHTLY
+
 folder="build-fastllm"
 
 # 创建工作文件夹
