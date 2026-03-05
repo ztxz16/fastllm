@@ -1363,6 +1363,209 @@ std::map<int, int> cudaBuffersMinId; // 最小的空闲id
 std::map<int, size_t> noBusyCnt;
 std::map<int, std::vector <CudaMemoryBuffer>> bigBuffersMap;
 
+static size_t fastllmCudaMemPoolAllocated = 0;
+static size_t fastllmCudaMemPoolPeak = 0;
+
+#ifdef CUDA_MEM_DEBUG
+#include <execinfo.h>
+#include <cxxabi.h>
+#include <mutex>
+#include <thread>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <sys/stat.h>
+#include <algorithm>
+
+struct CudaMemDebugInfo {
+    size_t size;
+    std::string callstack;
+};
+
+static std::mutex cudaMemDebugMutex;
+static std::map<void*, CudaMemDebugInfo> cudaMemDebugMap;
+static bool cudaMemDebugThreadStarted = false;
+static size_t cudaMemDebugPeakUsed = 0;
+
+static std::string CudaMemDebugGetCallStack() {
+    const int maxFrames = 128;
+    void *frames[maxFrames];
+    int numFrames = backtrace(frames, maxFrames);
+    char **symbols = backtrace_symbols(frames, numFrames);
+    std::string result;
+    if (symbols) {
+        int skip = 0;
+        int end = std::min(numFrames, skip + 16);
+        for (int i = skip; i < end; i++) {
+            result += "  #" + std::to_string(i - skip) + " " + symbols[i] + "\n";
+        }
+        free(symbols);
+    }
+    return result;
+}
+
+// caller must hold cudaMemDebugMutex; suffix is appended to filename (e.g. "" or "_peak_12345MB")
+static void CudaMemDebugWriteReport(const std::string &suffix) {
+    mkdir("Debug", 0755);
+
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    std::tm tm_buf;
+    localtime_r(&t, &tm_buf);
+
+    std::ostringstream fnss;
+    fnss << "Debug/"
+         << std::put_time(&tm_buf, "%Y%m%d_%H%M%S")
+         << "_" << std::setfill('0') << std::setw(3) << ms.count()
+         << suffix << ".txt";
+    std::string filename = fnss.str();
+
+    size_t totalSize = 0;
+    size_t totalCount = cudaMemDebugMap.size();
+    std::map<size_t, size_t> sizeDistribution;
+    for (auto &it : cudaMemDebugMap) {
+        totalSize += it.second.size;
+        sizeDistribution[it.second.size]++;
+    }
+
+    size_t bigPoolTotal = 0, bigPoolBusy = 0, bigPoolFreeCount = 0, bigPoolBusyCount = 0;
+    size_t smallPoolTotal = 0, smallPoolBusy = 0, smallPoolFreeCount = 0, smallPoolBusyCount = 0;
+    for (auto &dev : bigBuffersMap) {
+        for (auto &b : dev.second) {
+            bigPoolTotal += b.size;
+            if (b.busy) { bigPoolBusy += b.size; bigPoolBusyCount++; }
+            else { bigPoolFreeCount++; }
+        }
+    }
+    for (auto &dev : cudaBuffersMap) {
+        for (auto &b : dev.second) {
+            smallPoolTotal += b.size;
+            if (b.busy) { smallPoolBusy += b.size; smallPoolBusyCount++; }
+            else { smallPoolFreeCount++; }
+        }
+    }
+
+    size_t freeMem = 0, totalMem = 0;
+    cudaMemGetInfo(&freeMem, &totalMem);
+    size_t usedMem = totalMem - freeMem;
+
+    std::ofstream ofs(filename);
+    if (!ofs.is_open()) return;
+
+    ofs << "========== CUDA Memory Debug Report ==========\n";
+    ofs << "Time: " << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S") << "." << std::setfill('0') << std::setw(3) << ms.count() << "\n";
+    if (!suffix.empty()) ofs << "Trigger: PEAK memory\n";
+    ofs << "\n";
+
+    ofs << "--- Summary ---\n";
+    ofs << "GPU Memory: used " << (usedMem >> 20) << " MB, free " << (freeMem >> 20) << " MB / total " << (totalMem >> 20) << " MB\n";
+    ofs << "Tracked allocations: " << totalCount << " pointers, total " << std::fixed << std::setprecision(2) << (double)totalSize / (1024.0 * 1024.0) << " MB\n\n";
+
+    ofs << "Big buffer pool:   total " << (bigPoolTotal >> 20) << " MB, busy " << (bigPoolBusy >> 20) << " MB"
+        << " (busy " << bigPoolBusyCount << ", free " << bigPoolFreeCount << ")\n";
+    ofs << "Small buffer pool: total " << (smallPoolTotal >> 20) << " MB, busy " << (smallPoolBusy >> 20) << " MB"
+        << " (busy " << smallPoolBusyCount << ", free " << smallPoolFreeCount << ")\n";
+    ofs << "Pool allocated total: " << (fastllmCudaMemPoolAllocated >> 20) << " MB, peak: " << (fastllmCudaMemPoolPeak >> 20) << " MB\n\n";
+
+    ofs << "--- Size Distribution (tracked) ---\n";
+    std::vector<std::pair<size_t, size_t>> sortedDist(sizeDistribution.begin(), sizeDistribution.end());
+    std::sort(sortedDist.begin(), sortedDist.end(), [](const auto &a, const auto &b) {
+        return a.first > b.first;
+    });
+    for (auto &p : sortedDist) {
+        double sizeMB = (double)p.first / (1024.0 * 1024.0);
+        if (sizeMB >= 1.0)
+            ofs << "  " << std::fixed << std::setprecision(2) << sizeMB << " MB : " << p.second << " blocks\n";
+        else
+            ofs << "  " << (p.first / 1024) << " KB : " << p.second << " blocks\n";
+    }
+
+    ofs << "\n--- Free Buffers in Pool ---\n";
+    for (auto &dev : bigBuffersMap) {
+        size_t devFreeSize = 0, devFreeCount = 0;
+        for (auto &b : dev.second) {
+            if (!b.busy) { devFreeSize += b.size; devFreeCount++; }
+        }
+        if (devFreeCount == 0) continue;
+        ofs << "  [Big Pool] Device " << dev.first << ": " << devFreeCount << " free blocks, "
+            << std::fixed << std::setprecision(2) << (double)devFreeSize / (1024.0 * 1024.0) << " MB\n";
+        for (auto &b : dev.second) {
+            if (!b.busy) {
+                ofs << "    ptr=" << b.data << ", size=" << std::fixed << std::setprecision(2)
+                    << (double)b.size / (1024.0 * 1024.0) << " MB (" << b.size << " bytes)\n";
+            }
+        }
+    }
+    for (auto &dev : cudaBuffersMap) {
+        size_t devFreeSize = 0, devFreeCount = 0;
+        for (auto &b : dev.second) {
+            if (!b.busy) { devFreeSize += b.size; devFreeCount++; }
+        }
+        if (devFreeCount == 0) continue;
+        ofs << "  [Small Pool] Device " << dev.first << ": " << devFreeCount << " free blocks, "
+            << std::fixed << std::setprecision(2) << (double)devFreeSize / (1024.0 * 1024.0) << " MB\n";
+        for (auto &b : dev.second) {
+            if (!b.busy) {
+                ofs << "    ptr=" << b.data << ", size=" << std::fixed << std::setprecision(2)
+                    << (double)b.size / (1024.0 * 1024.0) << " MB (" << b.size << " bytes)\n";
+            }
+        }
+    }
+
+    ofs << "\n--- Unreleased Blocks Detail (" << totalCount << " blocks) ---\n";
+    for (auto &it : cudaMemDebugMap) {
+        double sizeMB = (double)it.second.size / (1024.0 * 1024.0);
+        ofs << "ptr=" << it.first << ", size=" << std::fixed << std::setprecision(2) << sizeMB << " MB (" << it.second.size << " bytes)\n";
+        ofs << "  callstack:\n" << it.second.callstack << "\n";
+    }
+
+    ofs << "========== End of Report ==========\n";
+    ofs.close();
+
+    printf("[CUDA_MEM_DEBUG] Report saved to %s (%zu pointers, %.2f MB tracked, GPU used %zu MB)\n",
+           filename.c_str(), totalCount, (double)totalSize / (1024.0 * 1024.0), usedMem >> 20);
+    fflush(stdout);
+}
+
+static void CudaMemDebugReportThread() {
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(20));
+        std::lock_guard<std::mutex> lock(cudaMemDebugMutex);
+        CudaMemDebugWriteReport("");
+    }
+}
+
+static void CudaMemDebugEnsureThread() {
+    if (!cudaMemDebugThreadStarted) {
+        cudaMemDebugThreadStarted = true;
+        std::thread(CudaMemDebugReportThread).detach();
+    }
+}
+
+static void CudaMemDebugRecord(void *ptr, size_t size) {
+    std::lock_guard<std::mutex> lock(cudaMemDebugMutex);
+    CudaMemDebugEnsureThread();
+    cudaMemDebugMap[ptr] = {size, CudaMemDebugGetCallStack()};
+
+    size_t freeMem = 0, totalMem = 0;
+    cudaMemGetInfo(&freeMem, &totalMem);
+    size_t usedMem = totalMem - freeMem;
+    if (usedMem > cudaMemDebugPeakUsed) {
+        cudaMemDebugPeakUsed = usedMem;
+        std::string suffix = "_peak_" + std::to_string(usedMem >> 20) + "MB";
+        CudaMemDebugWriteReport(suffix);
+    }
+}
+
+static void CudaMemDebugRemove(void *ptr) {
+    std::lock_guard<std::mutex> lock(cudaMemDebugMutex);
+    cudaMemDebugMap.erase(ptr);
+}
+#endif // CUDA_MEM_DEBUG
+
 void * FastllmCudaDirectMalloc(size_t size) {
     void * ret;
     cudaError_t state = cudaMalloc(&ret, size);
@@ -1371,10 +1574,16 @@ void * FastllmCudaDirectMalloc(size_t size) {
         checkCudaErrors("", state);
         return nullptr;
     }
+#ifdef CUDA_MEM_DEBUG
+    CudaMemDebugRecord(ret, size);
+#endif
     return ret;
 }
 
 void FastllmCudaDirectFree(void *ret) {
+#ifdef CUDA_MEM_DEBUG
+    CudaMemDebugRemove(ret);
+#endif
     cudaError_t state = cudaFree(ret);
     //checkCudaErrors("Error: CUDA error when release memory!", state);
 }
@@ -1382,9 +1591,6 @@ void FastllmCudaDirectFree(void *ret) {
 void FastllmCudaMemset0(void *ret, size_t size) {
     cudaMemset(ret, 0, size);
 }
-
-static size_t fastllmCudaMemPoolAllocated = 0;
-static size_t fastllmCudaMemPoolPeak = 0;
 
 void FastllmCudaMemPoolStats() {
     int id = -1;
@@ -1430,6 +1636,9 @@ void * FastllmCudaMalloc(size_t size) {
         }
         if (selId != -1) {
             bigBuffers[selId].busy = true;
+#ifdef CUDA_MEM_DEBUG
+            CudaMemDebugRecord(bigBuffers[selId].data, size);
+#endif
             return bigBuffers[selId].data;
         }
 
@@ -1441,6 +1650,9 @@ void * FastllmCudaMalloc(size_t size) {
             return nullptr;
         }
         bigBuffers.push_back(CudaMemoryBuffer(ret, size, true));
+#ifdef CUDA_MEM_DEBUG
+        CudaMemDebugRecord(ret, size);
+#endif
         return ret;
     }
     auto &cudaBuffers = cudaBuffersMap[id];
@@ -1451,6 +1663,9 @@ void * FastllmCudaMalloc(size_t size) {
             while (cudaBuffersMinId[id] < cudaBuffers.size() && cudaBuffers[cudaBuffersMinId[id]].busy) {
                 cudaBuffersMinId[id]++;
             }
+#ifdef CUDA_MEM_DEBUG
+            CudaMemDebugRecord(cudaBuffers[i].data, size);
+#endif
             return cudaBuffers[i].data;
         }
     }
@@ -1462,6 +1677,9 @@ void * FastllmCudaMalloc(size_t size) {
         return nullptr;
     }
     cudaBuffers.push_back(CudaMemoryBuffer(ret, size, true));
+#ifdef CUDA_MEM_DEBUG
+    CudaMemDebugRecord(ret, size);
+#endif
     return ret;
 }
 
@@ -1501,6 +1719,9 @@ void FastllmCudaFree(void *ret) {
                 noBusyCnt[it.first] += cudaBuffers[i].size;
                 cudaBuffers[i].busy = false;
                 cudaBuffersMinId[it.first] = std::min(cudaBuffersMinId[it.first], i);
+#ifdef CUDA_MEM_DEBUG
+                CudaMemDebugRemove(ret);
+#endif
                 return;
             }
         }
@@ -1508,10 +1729,16 @@ void FastllmCudaFree(void *ret) {
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (bigBuffers[i].data == ret) {
                 bigBuffers[i].busy = false;
+#ifdef CUDA_MEM_DEBUG
+                CudaMemDebugRemove(ret);
+#endif
                 return;
             }
         }
     }
+#ifdef CUDA_MEM_DEBUG
+    CudaMemDebugRemove(ret);
+#endif
     state = cudaFree(ret);
     FastllmCudaSetDevice(oriId);
     checkCudaErrors("CUDA error when release memory!", state);

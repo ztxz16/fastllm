@@ -6,6 +6,7 @@ option(USE_NUMAS "use numas" ON)
 
 option(USE_CUDA "use CUDA" OFF)
 option(CUDA_NO_TENSOR_CORE "Optimize for legacy CUDA GPUs which has Tensor Core." OFF)
+option(CUDA_MEM_DEBUG "Enable CUDA memory pool debug logging" OFF)
 
 option(USE_ROCM "use ROCm" OFF)
 
@@ -119,6 +120,8 @@ message(STATUS "CUDA_ARCH: ${CUDA_ARCH}")
 message(STATUS "USE_TFACC: ${USE_TFACC}")
 
 message(STATUS "For legacy CUDA GPUs: ${CUDA_NO_TENSOR_CORE}")
+
+message(STATUS "CUDA_MEM_DEBUG: ${CUDA_MEM_DEBUG}")
 
 message(STATUS "PYTHON_API: ${PY_API}")
 
@@ -237,6 +240,9 @@ if (USE_CUDA)
     add_compile_definitions(USE_CUDA)
     if (CUDA_NO_TENSOR_CORE)
         add_compile_definitions(CUDA_NO_TENSOR_CORE)
+    endif()
+    if (CUDA_MEM_DEBUG)
+        add_compile_definitions(CUDA_MEM_DEBUG)
     endif()
     include_directories(include/devices/cuda)
     #message(${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
