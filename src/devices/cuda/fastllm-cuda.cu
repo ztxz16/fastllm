@@ -4440,9 +4440,8 @@ bool FastllmCudaConv1DPerChannelFloat32(
 
 bool FastllmCudaConv2DFloat32(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, fastllm::Data &output) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
-        float *cudaBiasData;
         cudaError_t state = cudaSuccess;
-        state = cudaMalloc(&cudaBiasData, outputChannels * sizeof(float));
+        float *cudaBiasData = (float *)FastllmCudaMalloc(outputChannels * sizeof(float));
         if (bias.dims.size() > 0) {
             state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, outputChannels * sizeof(float), cudaMemcpyDeviceToDevice);
         } else {
