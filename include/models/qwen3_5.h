@@ -48,6 +48,9 @@ namespace fastllm {
 
         std::pair<std::vector<float>, std::vector<float>> UpdateRotaryPosEmb(float base, float factor, int seqLen = 0); // 更新位置编码
 
+        static const std::string language_prefix;
+        static const std::string visual_prefix;
+
     protected:
         RoPEType rope_type = RoPEType::BASE;
 
@@ -61,6 +64,8 @@ namespace fastllm {
 
         bool mergeQKV = false;
         bool mergeSwiglu = false;
+
+        bool initialized_add1 = false;
     };
 }
 

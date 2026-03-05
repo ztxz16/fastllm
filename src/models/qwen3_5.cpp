@@ -17,6 +17,20 @@
 #endif
 
 namespace fastllm {
+    static void Add1(Data &input) {
+        if (input.dims.size() == 0) {
+            return;
+        }
+        float *v = (float*)input.cpuData;
+        int len = input.Count(0);
+        for (int i = 0; i < len; i++) {
+            v[i] += 1.0f;
+        }
+    }
+
+    const std::string Qwen3_5Model::language_prefix = "model.language_model.";
+    const std::string Qwen3_5Model::visual_prefix = "model.visual.";
+
     int Qwen3_5Model::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
                             const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
@@ -41,12 +55,16 @@ namespace fastllm {
         this->model_type = "qwen3_5";
         this->use_new_engine = true;
 
-        weight.embeddingNames.insert("model.embed_tokens.weight");
+        weight.embeddingNames.insert(language_prefix + "embed_tokens.weight");
         weight.linearNames = {
-            "lm_head.weight", "model.layers.*.mlp.down_proj.weight", "model.layers.*.mlp.up_proj.weight",
-            "model.layers.*.mlp.gate_proj.weight",  "model.layers.*.mlp.gate_proj.weight", "model.layers.*.mlp.gateup_proj.weight",
-            "model.layers.*.self_attn.o_proj.weight", "model.layers.*.self_attn.q_proj.weight", "model.layers.*.self_attn.k_proj.weight",
-            "model.layers.*.self_attn.v_proj.weight", "model.layers.*.self_attn.mergeqkv.weight", "model.layers.*.self_attn.W_pack.weight"
+            "lm_head.weight",
+            language_prefix + "layers.*.mlp.down_proj.weight", language_prefix + "layers.*.mlp.up_proj.weight",
+            language_prefix + "layers.*.mlp.gate_proj.weight", language_prefix + "layers.*.mlp.gate_proj.weight",
+            language_prefix + "layers.*.mlp.gateup_proj.weight",
+            language_prefix + "layers.*.self_attn.o_proj.weight", language_prefix + "layers.*.self_attn.q_proj.weight",
+            language_prefix + "layers.*.self_attn.k_proj.weight",
+            language_prefix + "layers.*.self_attn.v_proj.weight", language_prefix + "layers.*.self_attn.mergeqkv.weight",
+            language_prefix + "layers.*.self_attn.W_pack.weight"
         };
     }
 
@@ -78,21 +96,21 @@ namespace fastllm {
             rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
         }
         for (int i = 0; i < block_cnt; i++) {
-            std::string w1WeightName = "model.layers." + std::to_string(i) + ".mlp.gate_proj.weight";
-            std::string w3WeightName = "model.layers." + std::to_string(i) + ".mlp.up_proj.weight";
-            std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+            std::string w1WeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate_proj.weight";
+            std::string w3WeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.up_proj.weight";
+            std::string swigluWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
             this->weightMergeRules.push_back(
                 WeightMergeRule({WeightMergeRuleSingle({w1WeightName, w3WeightName}, swigluWeightName, std::string("linearSwiglu"))})
             );
 
-            std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
-            std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
-            std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
-            std::string kBiasName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.bias";
-            std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
-            std::string vBiasName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.bias";
-            std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
-            std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
+            std::string qWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+            std::string qBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.bias";
+            std::string kWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.k_proj.weight";
+            std::string kBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.k_proj.bias";
+            std::string vWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string vBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.v_proj.bias";
+            std::string mergeQkvWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+            std::string mergeQkvBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
             this->weightMergeRules.push_back(
                 WeightMergeRule({WeightMergeRuleSingle({qWeightName, kWeightName, vWeightName}, mergeQkvWeightName, std::string("linear")),
                                  WeightMergeRuleSingle({qBiasName, kBiasName, vBiasName}, mergeQkvBiasName, std::string("bias"))})
@@ -177,23 +195,42 @@ namespace fastllm {
             allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, (int)vPositionIds.size()}, vPositionIds));
         }
 
-        Embedding(inputIds, this->weight["model.embed_tokens.weight"], embeddingResult);
+
+
+        if (!initialized_add1) {
+            for (int i = 0; i < block_cnt; i++) {
+                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".input_layernorm.weight"]);
+                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.q_norm.weight"]);
+                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.k_norm.weight"]);
+                Add1(this->weight[language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight"]);
+            }
+            Add1(this->weight[language_prefix + "norm.weight"]);
+            initialized_add1 = true;
+        }
+
+        Embedding(inputIds, this->weight[language_prefix + "embed_tokens.weight"], embeddingResult);
         ToDataType(embeddingResult, hiddenStates, this->dataType);
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
-            std::string inputRmsName = "model.layers." + std::to_string(i) + ".input_layernorm.weight";
-            std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
-            std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
-            std::string qNormName = "model.layers." + std::to_string(i) + ".self_attn.q_norm.weight";
-            std::string kNormName = "model.layers." + std::to_string(i) + ".self_attn.k_norm.weight";
-            std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
-            std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
-            std::string postRmsName = "model.layers." + std::to_string(i) + ".post_attention_layernorm.weight";
-            std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
-            std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
+            std::string inputRmsName = language_prefix + "layers." + std::to_string(i) + ".input_layernorm.weight";
+            std::string mergeQkvWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+            std::string mergeQkvBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
+            std::string qNormName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_norm.weight";
+            std::string kNormName = language_prefix + "layers." + std::to_string(i) + ".self_attn.k_norm.weight";
+            std::string oWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.o_proj.weight";
+            std::string oBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.o_proj.bias";
+            std::string postRmsName = language_prefix + "layers." + std::to_string(i) + ".post_attention_layernorm.weight";
+            std::string swigluWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+            std::string downWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.down_proj.weight";
+
+            hiddenStates.Print();
 
             RMSNorm(hiddenStates, this->weight[inputRmsName], rms_norm_eps, attenInput);
+
+            attenInput.Print();
+            exit(0);
+
             AttentionPagedBlock(
                 &attenInput,
                 &weight[mergeQkvWeightName], &weight[mergeQkvBiasName],
@@ -226,7 +263,7 @@ namespace fastllm {
         std::vector <int> lastRet;
         LLMSamplingBlock(
             this, &hiddenStates,
-            &weight["model.norm.weight"], &weight["lm_head.weight"],
+            &weight[language_prefix + "norm.weight"], &weight["lm_head.weight"],
             rms_norm_eps, batch, all1, seqLens,
             pastKeyValues, generationConfigs, lastTokens,
             retLogits, lastRet
@@ -259,7 +296,7 @@ namespace fastllm {
         }
         if (this->weight.weight.find("lm_head.weight") == this->weight.weight.end()) {
             this->weight["lm_head.weight"] = Data();
-            this->weight["lm_head.weight"].CopyFrom(this->weight["model.embed_tokens.weight"]);
+            this->weight["lm_head.weight"].CopyFrom(this->weight[language_prefix + "embed_tokens.weight"]);
             ToDataType(this->weight["lm_head.weight"], this->dataType);
         }
         Forward(inputIds, attentionMask, positionIds, pastKeyValues);
