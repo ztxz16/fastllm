@@ -190,6 +190,67 @@ namespace fastllm {
                 }
             },
             {
+                "minimax_m2", 
+                {
+                    GGUFWeightReplaceRule ( 
+                        std::regex(R"(blk\.(\d+)\.attn_(q|k|v)\.(weight|bias))"),
+                        "model.layers.$1.self_attn.$2_proj.$3"
+                    ), // qkv
+                    GGUFWeightReplaceRule ( 
+                        std::regex(R"(blk\.(\d+)\.attn_(q|k)_norm\.weight)"),
+                        "model.layers.$1.self_attn.$2_norm.weight"
+                    ), // qk norm
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_output\.(weight|bias))"),
+                        "model.layers.$1.self_attn.o_proj.$2"
+                    ), // o 
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.attn_norm\.weight)"),
+                        "model.layers.$1.input_layernorm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_norm\.weight)"),
+                        "model.layers.$1.post_attention_layernorm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(token_embd.weight)"),
+                        "model.embed_tokens.weight", 
+                        GGUFWeightReplaceRule::GGUFWeightReplaceForceFP32
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(output.weight)"),
+                        "lm_head.weight"
+                    ), 
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(output_norm.weight)"),
+                        "model.norm.weight"
+                    ),
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.ffn_gate_inp\.weight)"),
+                        "model.layers.$1.block_sparse_moe.gate.weight"
+                    ), // gate weight
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk\.(\d+)\.exp_probs_b\.bias)"),
+                        "model.layers.$1.block_sparse_moe.e_score_correction_bias"
+                    ), // gate bias
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk.(\d+).ffn_gate_exps.weight)"),
+                        std::vector <std::string> ({"model.layers.$1.block_sparse_moe.experts.", ".w1.weight"}),
+                        GGUFWeightReplaceRule::GGUFWeightReplacePacked
+                    ), // experts gate -> w1
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk.(\d+).ffn_up_exps.weight)"),
+                        std::vector <std::string> ({"model.layers.$1.block_sparse_moe.experts.", ".w3.weight"}),
+                        GGUFWeightReplaceRule::GGUFWeightReplacePacked
+                    ), // experts up -> w3
+                    GGUFWeightReplaceRule (
+                        std::regex(R"(blk.(\d+).ffn_down_exps.weight)"),
+                        std::vector <std::string> ({"model.layers.$1.block_sparse_moe.experts.", ".w2.weight"}),
+                        GGUFWeightReplaceRule::GGUFWeightReplacePacked
+                    ), // experts down -> w2
+                }
+            },
+            {
                 "glm4_moe", 
                 {
                     GGUFWeightReplaceRule ( 
