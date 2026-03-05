@@ -225,9 +225,9 @@ double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_
 template <int THREAD_PER_BLOCK, typename T>
 __global__ void FastllmCudaFloatEmbeddingKernel(float *input, T *weight, T *output, int embSize) {
     input += blockIdx.x;
-    output += blockIdx.x * embSize;
+    output += (int64_t)blockIdx.x * embSize;
     int token = (int)(input[0] + 1e-5);
-    weight += token * embSize;
+    weight += (int64_t)token * embSize;
     for (int i = threadIdx.x; i < embSize; i+= THREAD_PER_BLOCK) {
         output[i] = weight[i];
     }

@@ -3271,7 +3271,6 @@ ops += (long long)lines * inputDim * interDim * 2;
 
         float *inputData = (float*)input.cpuData;
         float *dstOutputData = (float*)output.cpuData;
-
         std::vector <float> tempInputData, tempOutputData;
         if (input.dataType != DataType::FLOAT32) {
             tempInputData.resize(inputLen);
@@ -3299,7 +3298,7 @@ ops += (long long)lines * inputDim * interDim * 2;
 #else
                     fseek(fi, (long long)token * embSize * sizeof(float) + weight.filePos, 0);
 #endif
-                    int ret = fread(outputData + i * embSize, sizeof(float), embSize, fi);
+                    int ret = fread(outputData + (uint64_t)i * embSize, sizeof(float), embSize, fi);
                 }
             } else {
                 uint16_t *outputData = (uint16_t *) dstOutputData;
@@ -3313,8 +3312,8 @@ ops += (long long)lines * inputDim * interDim * 2;
 #endif
                     int ret = fread(weightData, sizeof(uint16_t), embSize, fi);
                     for (int j = 0; j < embSize; j++) {
-                        outputData[i * embSize * 2 + j * 2] = 0;
-                        outputData[i * embSize * 2 + j * 2 + 1] = weightData[j];
+                        outputData[(uint64_t)i * embSize * 2 + j * 2] = 0;
+                        outputData[(uint64_t)i * embSize * 2 + j * 2 + 1] = weightData[j];
                     }
                 }
                 delete[] weightData;
@@ -3326,7 +3325,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                 float *weightData = (float *) weight.cpuData;
                 for (int i = 0; i < inputLen; i++) {
                     int token = (int) (inputData[i] + 1e-9);
-                    memcpy(outputData + i * embSize, weightData + token * embSize, embSize * sizeof(float));
+                    memcpy(outputData + (uint64_t)i * embSize, weightData + (uint64_t)token * embSize, embSize * sizeof(float));
                 }
             } else {
                 uint16_t *outputData = (uint16_t *) dstOutputData;
@@ -3334,8 +3333,8 @@ ops += (long long)lines * inputDim * interDim * 2;
                 for (int i = 0; i < inputLen; i++) {
                     int token = (int) (inputData[i] + 1e-9);
                     for (int j = 0; j < embSize; j++) {
-                        outputData[i * embSize * 2 + j * 2] = 0;
-                        outputData[i * embSize * 2 + j * 2 + 1] = weightData[token * embSize + j];
+                        outputData[(uint64_t)i * embSize * 2 + j * 2] = 0;
+                        outputData[(uint64_t)i * embSize * 2 + j * 2 + 1] = weightData[(uint64_t)token * embSize + j];
                     }
                 }
             }
@@ -3411,7 +3410,7 @@ ops += (long long)lines * inputDim * interDim * 2;
 #else
                 fseek(fi, (long long)token * embSize * unitSize + weight.filePos, 0);
 #endif
-                int ret = fread(outputData + i * embSize * unitSize, unitSize, embSize, fi);
+                int ret = fread(outputData + (uint64_t)i * embSize * unitSize, unitSize, embSize, fi);
             }
             fclose(fi);
         } else {
@@ -3419,7 +3418,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             uint8_t *weightData = (uint8_t *) weight.cpuData;
             for (int i = 0; i < inputLen; i++) {
                 int token = (int) (inputData[i] + 1e-9);
-                memcpy(outputData + i * embSize * unitSize, weightData + token * embSize * unitSize, embSize * unitSize);
+                memcpy(outputData + (uint64_t)i * embSize * unitSize, weightData + (uint64_t)token * embSize * unitSize, (uint64_t)embSize * unitSize);
             }
         }
     }
