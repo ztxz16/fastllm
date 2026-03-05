@@ -8282,6 +8282,450 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    struct MultiThreadPagedAttentionFloat32Op : MultiThreadBaseOp {
+        float *qHead, *oHead, *maskHead;
+        float scale;
+        int q1, q2, k1, v2, group, o;
+        int pageLen, kNumHeads, kHeadDim, kUnitSize;
+        int vPageLen, vNumHeads, vHeadDim, vUnitSize;
+        uint8_t *kPagedData, *vPagedData;
+        const std::vector<int> *kPageIndex, *vPageIndex;
+        int kLastPageLen, vLastPageLen;
+
+        MultiThreadPagedAttentionFloat32Op(
+            float *qHead, float *oHead, float *maskHead, float scale,
+            int q1, int q2, int k1, int v2, int group, int o,
+            int pageLen, int kNumHeads, int kHeadDim, int kUnitSize,
+            int vPageLen, int vNumHeads, int vHeadDim, int vUnitSize,
+            uint8_t *kPagedData, uint8_t *vPagedData,
+            const std::vector<int> *kPageIndex, const std::vector<int> *vPageIndex,
+            int kLastPageLen, int vLastPageLen) :
+            qHead(qHead), oHead(oHead), maskHead(maskHead), scale(scale),
+            q1(q1), q2(q2), k1(k1), v2(v2), group(group), o(o),
+            pageLen(pageLen), kNumHeads(kNumHeads), kHeadDim(kHeadDim), kUnitSize(kUnitSize),
+            vPageLen(vPageLen), vNumHeads(vNumHeads), vHeadDim(vHeadDim), vUnitSize(vUnitSize),
+            kPagedData(kPagedData), vPagedData(vPagedData),
+            kPageIndex(kPageIndex), vPageIndex(vPageIndex),
+            kLastPageLen(kLastPageLen), vLastPageLen(vLastPageLen) {}
+
+        void Run() {
+            for (int i = 0; i < q1; i++) {
+                float *qk = new float[k1];
+                float *temp = new float[k1];
+                float maxValue = -10000.0f;
+                int base = k1 - q1;
+
+                int kvTokenIdx = 0;
+                for (size_t pageIdx = 0; pageIdx < kPageIndex->size(); pageIdx++) {
+                    int currentPageIdx = (*kPageIndex)[pageIdx];
+                    int tokensInPage = (pageIdx == kPageIndex->size() - 1) ? kLastPageLen : pageLen;
+
+                    for (int t = 0; t < tokensInPage; t++) {
+                        int j = kvTokenIdx;
+                        if (maskHead && maskHead[i * k1 + j] > 0.99) {
+                            qk[j] = -10000.0f;
+                            kvTokenIdx++;
+                            continue;
+                        }
+                        if (!maskHead && (base + i) < j) {
+                            qk[j] = -10000.0f;
+                            kvTokenIdx++;
+                            continue;
+                        }
+
+                        float dotProduct = 0.0f;
+                        int kHeadIdx = o / group;
+                        uint8_t *kDataPtr = kPagedData +
+                            (currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                             t * kNumHeads * kHeadDim +
+                             kHeadIdx * kHeadDim) * kUnitSize;
+                        float *kToken = (float*)kDataPtr;
+
+                        int l = 0;
+#ifdef __aarch64__
+                        float32x4_t sum = {0, 0, 0, 0};
+                        for (; l + 3 < q2; l += 4) {
+                            sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(qHead + i * q2 + l),
+                                                        vld1q_f32(kToken + l)));
+                        }
+                        dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
+#elif defined(__AVX__)
+                        __m256 vsum = _mm256_set1_ps(0.0f);
+                        for (; l + 7 < q2; l += 8) {
+                            __m256 vx = _mm256_loadu_ps((const float *) (qHead + i * q2 + l));
+                            __m256 vy = _mm256_loadu_ps((const float *) (kToken + l));
+                            vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
+                        }
+                        dotProduct += Floatsum(vsum);
+#endif
+                        for (; l < q2; l++) {
+                            dotProduct += qHead[i * q2 + l] * kToken[l];
+                        }
+                        qk[j] = dotProduct * scale;
+                        maxValue = std::max(maxValue, qk[j]);
+                        kvTokenIdx++;
+                    }
+                }
+
+                int j = 0;
+#ifdef __aarch64__
+                float32x4_t vmax = vdupq_n_f32(maxValue);
+                for (; j + 3 < k1; j += 4) {
+                    vst1q_f32(temp + j, exp_ps(vsubq_f32(vld1q_f32(qk + j), vmax)));
+                }
+#endif
+                for (; j < k1; j++) {
+                    temp[j] = expf(qk[j] - maxValue);
+                }
+
+                float sum = 0.0f;
+                for (int j = 0; j < k1; j++) {
+                    sum += temp[j];
+                }
+                sum = std::max(sum, 0.1f);
+                for (int j = 0; j < k1; j++) {
+                    qk[j] = temp[j] / sum;
+                }
+
+                kvTokenIdx = 0;
+                for (size_t pageIdx = 0; pageIdx < vPageIndex->size(); pageIdx++) {
+                    int currentPageIdx = (*vPageIndex)[pageIdx];
+                    int tokensInPage = (pageIdx == vPageIndex->size() - 1) ? vLastPageLen : vPageLen;
+
+                    for (int t = 0; t < tokensInPage; t++) {
+                        int j = kvTokenIdx;
+                        int vHeadIdx = o / group;
+                        uint8_t *vDataPtr = vPagedData +
+                            (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                             t * vNumHeads * vHeadDim +
+                             vHeadIdx * vHeadDim) * vUnitSize;
+                        float *vToken = (float*)vDataPtr;
+
+                        for (int l = 0; l < v2; l++) {
+                            oHead[i * v2 + l] += qk[j] * vToken[l];
+                        }
+                        kvTokenIdx++;
+                    }
+                }
+
+                delete[] qk;
+                delete[] temp;
+            }
+        }
+    };
+
+    struct MultiThreadPagedAttentionFloat16Op : MultiThreadBaseOp {
+        uint16_t *qHead, *oHead, *maskHead;
+        float scale;
+        int q1, q2, k1, v2, group, o;
+        int pageLen, kNumHeads, kHeadDim, kUnitSize;
+        int vPageLen, vNumHeads, vHeadDim, vUnitSize;
+        uint8_t *kPagedData, *vPagedData;
+        const std::vector<int> *kPageIndex, *vPageIndex;
+        int kLastPageLen, vLastPageLen;
+        DataType kCacheDataType, vCacheDataType;
+
+        MultiThreadPagedAttentionFloat16Op(
+            uint16_t *qHead, uint16_t *oHead, uint16_t *maskHead, float scale,
+            int q1, int q2, int k1, int v2, int group, int o,
+            int pageLen, int kNumHeads, int kHeadDim, int kUnitSize,
+            int vPageLen, int vNumHeads, int vHeadDim, int vUnitSize,
+            uint8_t *kPagedData, uint8_t *vPagedData,
+            const std::vector<int> *kPageIndex, const std::vector<int> *vPageIndex,
+            int kLastPageLen, int vLastPageLen,
+            DataType kCacheDataType, DataType vCacheDataType) :
+            qHead(qHead), oHead(oHead), maskHead(maskHead), scale(scale),
+            q1(q1), q2(q2), k1(k1), v2(v2), group(group), o(o),
+            pageLen(pageLen), kNumHeads(kNumHeads), kHeadDim(kHeadDim), kUnitSize(kUnitSize),
+            vPageLen(vPageLen), vNumHeads(vNumHeads), vHeadDim(vHeadDim), vUnitSize(vUnitSize),
+            kPagedData(kPagedData), vPagedData(vPagedData),
+            kPageIndex(kPageIndex), vPageIndex(vPageIndex),
+            kLastPageLen(kLastPageLen), vLastPageLen(vLastPageLen),
+            kCacheDataType(kCacheDataType), vCacheDataType(vCacheDataType) {}
+
+        void Run() {
+            std::vector<float> fqHead(q1 * q2);
+            Float16ToFloat32(qHead, fqHead.data(), q1 * q2);
+
+            for (int i = 0; i < q1; i++) {
+                float *qk = new float[k1];
+                float *temp = new float[k1];
+                float maxValue = -10000.0f;
+                int base = k1 - q1;
+
+                int kvTokenIdx = 0;
+                for (size_t pageIdx = 0; pageIdx < kPageIndex->size(); pageIdx++) {
+                    int currentPageIdx = (*kPageIndex)[pageIdx];
+                    int tokensInPage = (pageIdx == kPageIndex->size() - 1) ? kLastPageLen : pageLen;
+
+                    for (int t = 0; t < tokensInPage; t++) {
+                        int j = kvTokenIdx;
+                        if (maskHead) {
+                            float maskVal = half_to_float(maskHead[i * k1 + j]);
+                            if (maskVal > 0.99) {
+                                qk[j] = -10000.0f;
+                                kvTokenIdx++;
+                                continue;
+                            }
+                        }
+                        if (!maskHead && (base + i) < j) {
+                            qk[j] = -10000.0f;
+                            kvTokenIdx++;
+                            continue;
+                        }
+
+                        float dotProduct = 0.0f;
+                        int kHeadIdx = o / group;
+                        uint8_t *kDataPtr = kPagedData +
+                            (currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                             t * kNumHeads * kHeadDim +
+                             kHeadIdx * kHeadDim) * kUnitSize;
+
+                        std::vector<float> fkToken(kHeadDim);
+                        if (kCacheDataType == DataType::FLOAT32) {
+                            memcpy(fkToken.data(), (float*)kDataPtr, kHeadDim * sizeof(float));
+                        } else {
+                            Float16ToFloat32((uint16_t*)kDataPtr, fkToken.data(), kHeadDim);
+                        }
+
+                        int l = 0;
+#ifdef __aarch64__
+                        float32x4_t sum = {0, 0, 0, 0};
+                        for (; l + 3 < q2; l += 4) {
+                            sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(fqHead.data() + i * q2 + l),
+                                                        vld1q_f32(fkToken.data() + l)));
+                        }
+                        dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
+#elif defined(__AVX__)
+                        __m256 vsum = _mm256_set1_ps(0.0f);
+                        for (; l + 7 < q2; l += 8) {
+                            __m256 vx = _mm256_loadu_ps((const float *) (fqHead.data() + i * q2 + l));
+                            __m256 vy = _mm256_loadu_ps((const float *) (fkToken.data() + l));
+                            vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
+                        }
+                        dotProduct += Floatsum(vsum);
+#endif
+                        for (; l < q2; l++) {
+                            dotProduct += fqHead[i * q2 + l] * fkToken[l];
+                        }
+                        qk[j] = dotProduct * scale;
+                        maxValue = std::max(maxValue, qk[j]);
+                        kvTokenIdx++;
+                    }
+                }
+
+                int j = 0;
+#ifdef __aarch64__
+                float32x4_t vmax = vdupq_n_f32(maxValue);
+                for (; j + 3 < k1; j += 4) {
+                    vst1q_f32(temp + j, exp_ps(vsubq_f32(vld1q_f32(qk + j), vmax)));
+                }
+#endif
+                for (; j < k1; j++) {
+                    temp[j] = expf(qk[j] - maxValue);
+                }
+
+                float sum = 0.0f;
+                for (int j = 0; j < k1; j++) {
+                    sum += temp[j];
+                }
+                sum = std::max(sum, 0.1f);
+                for (int j = 0; j < k1; j++) {
+                    qk[j] = temp[j] / sum;
+                }
+
+                std::vector<float> foHead(v2, 0.0f);
+                kvTokenIdx = 0;
+                for (size_t pageIdx = 0; pageIdx < vPageIndex->size(); pageIdx++) {
+                    int currentPageIdx = (*vPageIndex)[pageIdx];
+                    int tokensInPage = (pageIdx == vPageIndex->size() - 1) ? vLastPageLen : vPageLen;
+
+                    for (int t = 0; t < tokensInPage; t++) {
+                        int j = kvTokenIdx;
+                        int vHeadIdx = o / group;
+                        uint8_t *vDataPtr = vPagedData +
+                            (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                             t * vNumHeads * vHeadDim +
+                             vHeadIdx * vHeadDim) * vUnitSize;
+
+                        std::vector<float> fvToken(vHeadDim);
+                        if (vCacheDataType == DataType::FLOAT32) {
+                            memcpy(fvToken.data(), (float*)vDataPtr, vHeadDim * sizeof(float));
+                        } else {
+                            Float16ToFloat32((uint16_t*)vDataPtr, fvToken.data(), vHeadDim);
+                        }
+
+                        for (int l = 0; l < v2; l++) {
+                            foHead[l] += qk[j] * fvToken[l];
+                        }
+                        kvTokenIdx++;
+                    }
+                }
+
+                Float32ToFloat16(foHead.data(), oHead + i * v2, v2);
+                delete[] qk;
+                delete[] temp;
+            }
+        }
+    };
+
+    struct MultiThreadPagedAttentionBFloat16Op : MultiThreadBaseOp {
+        uint16_t *qHead, *oHead, *maskHead;
+        float scale;
+        int q1, q2, k1, v2, group, o;
+        int pageLen, kNumHeads, kHeadDim, kUnitSize;
+        int vPageLen, vNumHeads, vHeadDim, vUnitSize;
+        uint8_t *kPagedData, *vPagedData;
+        const std::vector<int> *kPageIndex, *vPageIndex;
+        int kLastPageLen, vLastPageLen;
+        DataType kCacheDataType, vCacheDataType;
+
+        MultiThreadPagedAttentionBFloat16Op(
+            uint16_t *qHead, uint16_t *oHead, uint16_t *maskHead, float scale,
+            int q1, int q2, int k1, int v2, int group, int o,
+            int pageLen, int kNumHeads, int kHeadDim, int kUnitSize,
+            int vPageLen, int vNumHeads, int vHeadDim, int vUnitSize,
+            uint8_t *kPagedData, uint8_t *vPagedData,
+            const std::vector<int> *kPageIndex, const std::vector<int> *vPageIndex,
+            int kLastPageLen, int vLastPageLen,
+            DataType kCacheDataType, DataType vCacheDataType) :
+            qHead(qHead), oHead(oHead), maskHead(maskHead), scale(scale),
+            q1(q1), q2(q2), k1(k1), v2(v2), group(group), o(o),
+            pageLen(pageLen), kNumHeads(kNumHeads), kHeadDim(kHeadDim), kUnitSize(kUnitSize),
+            vPageLen(vPageLen), vNumHeads(vNumHeads), vHeadDim(vHeadDim), vUnitSize(vUnitSize),
+            kPagedData(kPagedData), vPagedData(vPagedData),
+            kPageIndex(kPageIndex), vPageIndex(vPageIndex),
+            kLastPageLen(kLastPageLen), vLastPageLen(vLastPageLen),
+            kCacheDataType(kCacheDataType), vCacheDataType(vCacheDataType) {}
+
+        void Run() {
+            std::vector<float> fqHead(q1 * q2);
+            BFloat16ToFloat32(qHead, fqHead.data(), q1 * q2);
+
+            for (int i = 0; i < q1; i++) {
+                float *qk = new float[k1];
+                float *temp = new float[k1];
+                float maxValue = -10000.0f;
+                int base = k1 - q1;
+
+                int kvTokenIdx = 0;
+                for (size_t pageIdx = 0; pageIdx < kPageIndex->size(); pageIdx++) {
+                    int currentPageIdx = (*kPageIndex)[pageIdx];
+                    int tokensInPage = (pageIdx == kPageIndex->size() - 1) ? kLastPageLen : pageLen;
+
+                    for (int t = 0; t < tokensInPage; t++) {
+                        int j = kvTokenIdx;
+                        if (maskHead) {
+                            float maskVal;
+                            uint32_t mx = (uint32_t)maskHead[i * k1 + j] << 16;
+                            memcpy(&maskVal, &mx, sizeof(float));
+                            if (maskVal > 0.99) {
+                                qk[j] = -10000.0f;
+                                kvTokenIdx++;
+                                continue;
+                            }
+                        }
+                        if (!maskHead && (base + i) < j) {
+                            qk[j] = -10000.0f;
+                            kvTokenIdx++;
+                            continue;
+                        }
+
+                        float dotProduct = 0.0f;
+                        int kHeadIdx = o / group;
+                        uint8_t *kDataPtr = kPagedData +
+                            (currentPageIdx * pageLen * kNumHeads * kHeadDim +
+                             t * kNumHeads * kHeadDim +
+                             kHeadIdx * kHeadDim) * kUnitSize;
+
+                        std::vector<float> fkToken(kHeadDim);
+                        if (kCacheDataType == DataType::FLOAT32) {
+                            memcpy(fkToken.data(), (float*)kDataPtr, kHeadDim * sizeof(float));
+                        } else {
+                            BFloat16ToFloat32((uint16_t*)kDataPtr, fkToken.data(), kHeadDim);
+                        }
+
+                        int l = 0;
+#ifdef __aarch64__
+                        float32x4_t sum = {0, 0, 0, 0};
+                        for (; l + 3 < q2; l += 4) {
+                            sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(fqHead.data() + i * q2 + l),
+                                                        vld1q_f32(fkToken.data() + l)));
+                        }
+                        dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
+#elif defined(__AVX__)
+                        __m256 vsum = _mm256_set1_ps(0.0f);
+                        for (; l + 7 < q2; l += 8) {
+                            __m256 vx = _mm256_loadu_ps((const float *) (fqHead.data() + i * q2 + l));
+                            __m256 vy = _mm256_loadu_ps((const float *) (fkToken.data() + l));
+                            vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
+                        }
+                        dotProduct += Floatsum(vsum);
+#endif
+                        for (; l < q2; l++) {
+                            dotProduct += fqHead[i * q2 + l] * fkToken[l];
+                        }
+                        qk[j] = dotProduct * scale;
+                        maxValue = std::max(maxValue, qk[j]);
+                        kvTokenIdx++;
+                    }
+                }
+
+                int j = 0;
+#ifdef __aarch64__
+                float32x4_t vmax = vdupq_n_f32(maxValue);
+                for (; j + 3 < k1; j += 4) {
+                    vst1q_f32(temp + j, exp_ps(vsubq_f32(vld1q_f32(qk + j), vmax)));
+                }
+#endif
+                for (; j < k1; j++) {
+                    temp[j] = expf(qk[j] - maxValue);
+                }
+
+                float sum = 0.0f;
+                for (int j = 0; j < k1; j++) {
+                    sum += temp[j];
+                }
+                sum = std::max(sum, 0.1f);
+                for (int j = 0; j < k1; j++) {
+                    qk[j] = temp[j] / sum;
+                }
+
+                std::vector<float> foHead(v2, 0.0f);
+                kvTokenIdx = 0;
+                for (size_t pageIdx = 0; pageIdx < vPageIndex->size(); pageIdx++) {
+                    int currentPageIdx = (*vPageIndex)[pageIdx];
+                    int tokensInPage = (pageIdx == vPageIndex->size() - 1) ? vLastPageLen : vPageLen;
+
+                    for (int t = 0; t < tokensInPage; t++) {
+                        int j = kvTokenIdx;
+                        int vHeadIdx = o / group;
+                        uint8_t *vDataPtr = vPagedData +
+                            (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
+                             t * vNumHeads * vHeadDim +
+                             vHeadIdx * vHeadDim) * vUnitSize;
+
+                        std::vector<float> fvToken(vHeadDim);
+                        if (vCacheDataType == DataType::FLOAT32) {
+                            memcpy(fvToken.data(), (float*)vDataPtr, vHeadDim * sizeof(float));
+                        } else {
+                            BFloat16ToFloat32((uint16_t*)vDataPtr, fvToken.data(), vHeadDim);
+                        }
+
+                        for (int l = 0; l < v2; l++) {
+                            foHead[l] += qk[j] * fvToken[l];
+                        }
+                        kvTokenIdx++;
+                    }
+                }
+
+                Float32ToBFloat16(foHead.data(), oHead + i * v2, v2);
+                delete[] qk;
+                delete[] temp;
+            }
+        }
+    };
+
     void CpuAttentionPagedOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &q = *(datas.find("q")->second);
@@ -8344,130 +8788,32 @@ ops += (long long)lines * inputDim * interDim * 2;
                 
                 std::fill(od, od + output.Count(0), 0.0f);
                 
-                // 对于每个 query head
+                auto *pool = GetAlivePool();
+                int threads = pool->threads.size();
+                std::vector<MultiThreadPagedAttentionFloat32Op*> ops;
                 for (int o = 0; o < q0; o++) {
                     float *qHead = qd + o * q.strides[0];
                     float *oHead = od + o * output.strides[0];
                     float *maskHead = maskd ? (maskd + (o / (q0 / batch)) * maskStride) : nullptr;
-                    
-                    // 对于每个 query token
-                    for (int i = 0; i < q1; i++) {
-                        float *qk = new float[k1];
-                        float *temp = new float[k1];
-                        float maxValue = -10000.0f;
-                        int base = k1 - q1;
-                        
-                        // 计算 q[i] 与所有 k[j] 的点积
-                        int kvTokenIdx = 0;
-                        for (size_t pageIdx = 0; pageIdx < k.pageIndex.size(); pageIdx++) {
-                            int currentPageIdx = k.pageIndex[pageIdx];
-                            int tokensInPage = (pageIdx == k.pageIndex.size() - 1) ? k.lastPageLen : pageLen;
-                            
-                            for (int t = 0; t < tokensInPage; t++) {
-                                int j = kvTokenIdx;
-                                
-                                // 检查 mask
-                                if (maskHead && maskHead[i * k1 + j] > 0.99) {
-                                    qk[j] = -10000.0f;
-                                    kvTokenIdx++;
-                                    continue;
-                                }
-                                if (!maskHead && (base + i) < j) {
-                                    qk[j] = -10000.0f;
-                                    kvTokenIdx++;
-                                    continue;
-                                }
-                                
-                                // 计算点积 q[i] · k[j]
-                                float dotProduct = 0.0f;
-                                int kHeadIdx = o / group;
-                                
-                                // 获取 k[j] 的数据指针
-                                uint8_t *kDataPtr = kPagedData + 
-                                    (currentPageIdx * pageLen * kNumHeads * kHeadDim +
-                                     t * kNumHeads * kHeadDim +
-                                     kHeadIdx * kHeadDim) * kUnitSize;
-                                float *kToken = (float*)kDataPtr;
-                                
-                                // 向量点积计算
-                                int l = 0;
-#ifdef __aarch64__
-                                float32x4_t sum = {0, 0, 0, 0};
-                                for (; l + 3 < q2; l += 4) {
-                                    sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(qHead + i * q2 + l),
-                                                                vld1q_f32(kToken + l)));
-                                }
-                                dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
-#elif defined(__AVX__)
-                                __m256 vsum = _mm256_set1_ps(0.0f);
-                                for (; l + 7 < q2; l += 8) {
-                                    __m256 vx = _mm256_loadu_ps((const float *) (qHead + i * q2 + l));
-                                    __m256 vy = _mm256_loadu_ps((const float *) (kToken + l));
-                                    vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
-                                }
-                                dotProduct += Floatsum(vsum);
-#endif
-                                for (; l < q2; l++) {
-                                    dotProduct += qHead[i * q2 + l] * kToken[l];
-                                }
-                                
-                                qk[j] = dotProduct * scale;
-                                maxValue = std::max(maxValue, qk[j]);
-                                kvTokenIdx++;
-                            }
-                        }
-                        
-                        // Softmax
-                        int j = 0;
-#ifdef __aarch64__
-                        float32x4_t vmax = vdupq_n_f32(maxValue);
-                        for (; j + 3 < k1; j += 4) {
-                            vst1q_f32(temp + j, exp_ps(vsubq_f32(vld1q_f32(qk + j), vmax)));
-                        }
-#endif
-                        for (; j < k1; j++) {
-                            temp[j] = expf(qk[j] - maxValue);
-                        }
-                        
-                        float sum = 0.0f;
-                        for (int j = 0; j < k1; j++) {
-                            sum += temp[j];
-                        }
-                        sum = std::max(sum, 0.1f);
-                        for (int j = 0; j < k1; j++) {
-                            qk[j] = temp[j] / sum;
-                        }
-                        
-                        // 加权求和：output[i] = sum(softmax[j] * v[j])
-                        kvTokenIdx = 0;
-                        for (size_t pageIdx = 0; pageIdx < v.pageIndex.size(); pageIdx++) {
-                            int currentPageIdx = v.pageIndex[pageIdx];
-                            int tokensInPage = (pageIdx == v.pageIndex.size() - 1) ? v.lastPageLen : vPageLen;
-                            
-                            for (int t = 0; t < tokensInPage; t++) {
-                                int j = kvTokenIdx;
-                                int vHeadIdx = o / group;
-                                
-                                // 获取 v[j] 的数据指针
-                                uint8_t *vDataPtr = vPagedData + 
-                                    (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
-                                     t * vNumHeads * vHeadDim +
-                                     vHeadIdx * vHeadDim) * vUnitSize;
-                                float *vToken = (float*)vDataPtr;
-                                
-                                // 累加 softmax[j] * v[j]
-                                for (int l = 0; l < v2; l++) {
-                                    oHead[i * v2 + l] += qk[j] * vToken[l];
-                                }
-                                
-                                kvTokenIdx++;
-                            }
-                        }
-                        
-                        delete[] qk;
-                        delete[] temp;
+                    ops.push_back(new MultiThreadPagedAttentionFloat32Op(
+                        qHead, oHead, maskHead, scale,
+                        q1, q2, k1, v2, group, o,
+                        pageLen, kNumHeads, kHeadDim, kUnitSize,
+                        vPageLen, vNumHeads, vHeadDim, vUnitSize,
+                        kPagedData, vPagedData,
+                        &k.pageIndex, &v.pageIndex,
+                        k.lastPageLen, v.lastPageLen));
+                }
+                for (int st = 0; st < (int)ops.size(); st += threads) {
+                    int end = std::min(st + threads, (int)ops.size());
+                    for (int i = st; i < end; i++) {
+                        pool->PushOp(i - st, ops[i]);
+                    }
+                    for (int i = st; i < end; i++) {
+                        pool->Wait(i - st);
                     }
                 }
+                for (auto *op : ops) delete op;
             } else if (q.dataType == DataType::FLOAT16) {
                 uint16_t *qd = (uint16_t*)q.cpuData;
                 uint16_t *od = (uint16_t*)output.cpuData;
@@ -8482,164 +8828,33 @@ ops += (long long)lines * inputDim * interDim * 2;
                 
                 std::fill(od, od + output.Count(0), float_to_half(0.0f));
                 
-                // 对于每个 query head
+                auto *pool = GetAlivePool();
+                int threads = pool->threads.size();
+                std::vector<MultiThreadPagedAttentionFloat16Op*> ops;
                 for (int o = 0; o < q0; o++) {
                     uint16_t *qHead = qd + o * q.strides[0];
                     uint16_t *oHead = od + o * output.strides[0];
                     uint16_t *maskHead = maskd ? (maskd + (o / (q0 / batch)) * maskStride) : nullptr;
-                    
-                    // 转换 q 为 float32
-                    std::vector<float> fqHead;
-                    fqHead.resize(q1 * q2);
-                    Float16ToFloat32(qHead, fqHead.data(), q1 * q2);
-                    
-                    // 对于每个 query token
-                    for (int i = 0; i < q1; i++) {
-                        float *qk = new float[k1];
-                        float *temp = new float[k1];
-                        float maxValue = -10000.0f;
-                        int base = k1 - q1;
-                        
-                        // 计算 q[i] 与所有 k[j] 的点积
-                        int kvTokenIdx = 0;
-                        for (size_t pageIdx = 0; pageIdx < k.pageIndex.size(); pageIdx++) {
-                            int currentPageIdx = k.pageIndex[pageIdx];
-                            int tokensInPage = (pageIdx == k.pageIndex.size() - 1) ? k.lastPageLen : pageLen;
-                            
-                            for (int t = 0; t < tokensInPage; t++) {
-                                int j = kvTokenIdx;
-                                
-                                // 检查 mask
-                                if (maskHead) {
-                                    float maskVal = half_to_float(maskHead[i * k1 + j]);
-                                    if (maskVal > 0.99) {
-                                        qk[j] = -10000.0f;
-                                        kvTokenIdx++;
-                                        continue;
-                                    }
-                                }
-                                if (!maskHead && (base + i) < j) {
-                                    qk[j] = -10000.0f;
-                                    kvTokenIdx++;
-                                    continue;
-                                }
-                                
-                                // 计算点积 q[i] · k[j]
-                                float dotProduct = 0.0f;
-                                int kHeadIdx = o / group;
-                                
-                                // 获取 k[j] 的数据指针
-                                uint8_t *kDataPtr = kPagedData + 
-                                    (currentPageIdx * pageLen * kNumHeads * kHeadDim +
-                                     t * kNumHeads * kHeadDim +
-                                     kHeadIdx * kHeadDim) * kUnitSize;
-                                
-                                // 转换 k[j] 为 float32
-                                std::vector<float> fkToken;
-                                fkToken.resize(kHeadDim);
-                                if (k.pagedKVCacheData->dataType == DataType::FLOAT32) {
-                                    float *kToken = (float*)kDataPtr;
-                                    memcpy(fkToken.data(), kToken, kHeadDim * sizeof(float));
-                                } else {
-                                    uint16_t *kToken = (uint16_t*)kDataPtr;
-                                    Float16ToFloat32(kToken, fkToken.data(), kHeadDim);
-                                }
-                                
-                                // 向量点积计算
-                                int l = 0;
-#ifdef __aarch64__
-                                float32x4_t sum = {0, 0, 0, 0};
-                                for (; l + 3 < q2; l += 4) {
-                                    sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(fqHead.data() + i * q2 + l),
-                                                                vld1q_f32(fkToken.data() + l)));
-                                }
-                                dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
-#elif defined(__AVX__)
-                                __m256 vsum = _mm256_set1_ps(0.0f);
-                                for (; l + 7 < q2; l += 8) {
-                                    __m256 vx = _mm256_loadu_ps((const float *) (fqHead.data() + i * q2 + l));
-                                    __m256 vy = _mm256_loadu_ps((const float *) (fkToken.data() + l));
-                                    vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
-                                }
-                                dotProduct += Floatsum(vsum);
-#endif
-                                for (; l < q2; l++) {
-                                    dotProduct += fqHead[i * q2 + l] * fkToken[l];
-                                }
-                                
-                                qk[j] = dotProduct * scale;
-                                maxValue = std::max(maxValue, qk[j]);
-                                kvTokenIdx++;
-                            }
-                        }
-                        
-                        // Softmax
-                        int j = 0;
-#ifdef __aarch64__
-                        float32x4_t vmax = vdupq_n_f32(maxValue);
-                        for (; j + 3 < k1; j += 4) {
-                            vst1q_f32(temp + j, exp_ps(vsubq_f32(vld1q_f32(qk + j), vmax)));
-                        }
-#endif
-                        for (; j < k1; j++) {
-                            temp[j] = expf(qk[j] - maxValue);
-                        }
-                        
-                        float sum = 0.0f;
-                        for (int j = 0; j < k1; j++) {
-                            sum += temp[j];
-                        }
-                        sum = std::max(sum, 0.1f);
-                        for (int j = 0; j < k1; j++) {
-                            qk[j] = temp[j] / sum;
-                        }
-                        
-                        // 加权求和：output[i] = sum(softmax[j] * v[j])
-                        std::vector<float> foHead;
-                        foHead.resize(v2, 0.0f);
-                        
-                        kvTokenIdx = 0;
-                        for (size_t pageIdx = 0; pageIdx < v.pageIndex.size(); pageIdx++) {
-                            int currentPageIdx = v.pageIndex[pageIdx];
-                            int tokensInPage = (pageIdx == v.pageIndex.size() - 1) ? v.lastPageLen : vPageLen;
-                            
-                            for (int t = 0; t < tokensInPage; t++) {
-                                int j = kvTokenIdx;
-                                int vHeadIdx = o / group;
-                                
-                                // 获取 v[j] 的数据指针
-                                uint8_t *vDataPtr = vPagedData + 
-                                    (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
-                                     t * vNumHeads * vHeadDim +
-                                     vHeadIdx * vHeadDim) * vUnitSize;
-                                
-                                // 转换 v[j] 为 float32
-                                std::vector<float> fvToken;
-                                fvToken.resize(vHeadDim);
-                                if (v.pagedKVCacheData->dataType == DataType::FLOAT32) {
-                                    float *vToken = (float*)vDataPtr;
-                                    memcpy(fvToken.data(), vToken, vHeadDim * sizeof(float));
-                                } else {
-                                    uint16_t *vToken = (uint16_t*)vDataPtr;
-                                    Float16ToFloat32(vToken, fvToken.data(), vHeadDim);
-                                }
-                                
-                                // 累加 softmax[j] * v[j]
-                                for (int l = 0; l < v2; l++) {
-                                    foHead[l] += qk[j] * fvToken[l];
-                                }
-                                
-                                kvTokenIdx++;
-                            }
-                        }
-                        
-                        // 转换回 float16
-                        Float32ToFloat16(foHead.data(), oHead + i * v2, v2);
-                        
-                        delete[] qk;
-                        delete[] temp;
+                    ops.push_back(new MultiThreadPagedAttentionFloat16Op(
+                        qHead, oHead, maskHead, scale,
+                        q1, q2, k1, v2, group, o,
+                        pageLen, kNumHeads, kHeadDim, kUnitSize,
+                        vPageLen, vNumHeads, vHeadDim, vUnitSize,
+                        kPagedData, vPagedData,
+                        &k.pageIndex, &v.pageIndex,
+                        k.lastPageLen, v.lastPageLen,
+                        k.pagedKVCacheData->dataType, v.pagedKVCacheData->dataType));
+                }
+                for (int st = 0; st < (int)ops.size(); st += threads) {
+                    int end = std::min(st + threads, (int)ops.size());
+                    for (int i = st; i < end; i++) {
+                        pool->PushOp(i - st, ops[i]);
+                    }
+                    for (int i = st; i < end; i++) {
+                        pool->Wait(i - st);
                     }
                 }
+                for (auto *op : ops) delete op;
             } else if (q.dataType == DataType::BFLOAT16) {
                 uint16_t *qd = (uint16_t*)q.cpuData;
                 uint16_t *od = (uint16_t*)output.cpuData;
@@ -8652,172 +8867,38 @@ ops += (long long)lines * inputDim * interDim * 2;
                 batch = intParams.find("mask___batch") != intParams.end() ? intParams.find("mask___batch")->second : batch;
                 int maskStride = (maskd != nullptr && maskPtr != nullptr) ? (maskPtr->dims.size() == 3 ? maskPtr->strides[0] : maskPtr->Count(0)) : 0;
                 
-                // 初始化 output 为 0
                 {
                     uint16_t zero_bf16 = 0;
                     std::fill(od, od + output.Count(0), zero_bf16);
                 }
                 
-                // 对于每个 query head
+                auto *pool = GetAlivePool();
+                int threads = pool->threads.size();
+                std::vector<MultiThreadPagedAttentionBFloat16Op*> ops;
                 for (int o = 0; o < q0; o++) {
                     uint16_t *qHead = qd + o * q.strides[0];
                     uint16_t *oHead = od + o * output.strides[0];
                     uint16_t *maskHead = maskd ? (maskd + (o / (q0 / batch)) * maskStride) : nullptr;
-                    
-                    // 转换 q 为 float32
-                    std::vector<float> fqHead;
-                    fqHead.resize(q1 * q2);
-                    BFloat16ToFloat32(qHead, fqHead.data(), q1 * q2);
-                    
-                    // 对于每个 query token
-                    for (int i = 0; i < q1; i++) {
-                        float *qk = new float[k1];
-                        float *temp = new float[k1];
-                        float maxValue = -10000.0f;
-                        int base = k1 - q1;
-                        
-                        // 计算 q[i] 与所有 k[j] 的点积
-                        int kvTokenIdx = 0;
-                        for (size_t pageIdx = 0; pageIdx < k.pageIndex.size(); pageIdx++) {
-                            int currentPageIdx = k.pageIndex[pageIdx];
-                            int tokensInPage = (pageIdx == k.pageIndex.size() - 1) ? k.lastPageLen : pageLen;
-                            
-                            for (int t = 0; t < tokensInPage; t++) {
-                                int j = kvTokenIdx;
-                                
-                                // 检查 mask
-                                if (maskHead) {
-                                    float maskVal;
-                                    uint32_t mx = (uint32_t)maskHead[i * k1 + j] << 16;
-                                    memcpy(&maskVal, &mx, sizeof(float));
-                                    if (maskVal > 0.99) {
-                                        qk[j] = -10000.0f;
-                                        kvTokenIdx++;
-                                        continue;
-                                    }
-                                }
-                                if (!maskHead && (base + i) < j) {
-                                    qk[j] = -10000.0f;
-                                    kvTokenIdx++;
-                                    continue;
-                                }
-                                
-                                // 计算点积 q[i] · k[j]
-                                float dotProduct = 0.0f;
-                                int kHeadIdx = o / group;
-                                
-                                // 获取 k[j] 的数据指针
-                                uint8_t *kDataPtr = kPagedData + 
-                                    (currentPageIdx * pageLen * kNumHeads * kHeadDim +
-                                     t * kNumHeads * kHeadDim +
-                                     kHeadIdx * kHeadDim) * kUnitSize;
-                                
-                                // 转换 k[j] 为 float32
-                                std::vector<float> fkToken;
-                                fkToken.resize(kHeadDim);
-                                if (k.pagedKVCacheData->dataType == DataType::FLOAT32) {
-                                    float *kToken = (float*)kDataPtr;
-                                    memcpy(fkToken.data(), kToken, kHeadDim * sizeof(float));
-                                } else {
-                                    uint16_t *kToken = (uint16_t*)kDataPtr;
-                                    BFloat16ToFloat32(kToken, fkToken.data(), kHeadDim);
-                                }
-                                
-                                // 向量点积计算
-                                int l = 0;
-#ifdef __aarch64__
-                                float32x4_t sum = {0, 0, 0, 0};
-                                for (; l + 3 < q2; l += 4) {
-                                    sum = vaddq_f32(sum, vmulq_f32(vld1q_f32(fqHead.data() + i * q2 + l),
-                                                                vld1q_f32(fkToken.data() + l)));
-                                }
-                                dotProduct += sum[0] + sum[1] + sum[2] + sum[3];
-#elif defined(__AVX__)
-                                __m256 vsum = _mm256_set1_ps(0.0f);
-                                for (; l + 7 < q2; l += 8) {
-                                    __m256 vx = _mm256_loadu_ps((const float *) (fqHead.data() + i * q2 + l));
-                                    __m256 vy = _mm256_loadu_ps((const float *) (fkToken.data() + l));
-                                    vsum = _mm256_add_ps(vsum, _mm256_mul_ps(vx, vy));
-                                }
-                                dotProduct += Floatsum(vsum);
-#endif
-                                for (; l < q2; l++) {
-                                    dotProduct += fqHead[i * q2 + l] * fkToken[l];
-                                }
-                                
-                                qk[j] = dotProduct * scale;
-                                maxValue = std::max(maxValue, qk[j]);
-                                kvTokenIdx++;
-                            }
-                        }
-                        
-                        // Softmax
-                        int j = 0;
-#ifdef __aarch64__
-                        float32x4_t vmax = vdupq_n_f32(maxValue);
-                        for (; j + 3 < k1; j += 4) {
-                            vst1q_f32(temp + j, exp_ps(vsubq_f32(vld1q_f32(qk + j), vmax)));
-                        }
-#endif
-                        for (; j < k1; j++) {
-                            temp[j] = expf(qk[j] - maxValue);
-                        }
-                        
-                        float sum = 0.0f;
-                        for (int j = 0; j < k1; j++) {
-                            sum += temp[j];
-                        }
-                        sum = std::max(sum, 0.1f);
-                        for (int j = 0; j < k1; j++) {
-                            qk[j] = temp[j] / sum;
-                        }
-                        
-                        // 加权求和：output[i] = sum(softmax[j] * v[j])
-                        std::vector<float> foHead;
-                        foHead.resize(v2, 0.0f);
-                        
-                        kvTokenIdx = 0;
-                        for (size_t pageIdx = 0; pageIdx < v.pageIndex.size(); pageIdx++) {
-                            int currentPageIdx = v.pageIndex[pageIdx];
-                            int tokensInPage = (pageIdx == v.pageIndex.size() - 1) ? v.lastPageLen : vPageLen;
-                            
-                            for (int t = 0; t < tokensInPage; t++) {
-                                int j = kvTokenIdx;
-                                int vHeadIdx = o / group;
-                                
-                                // 获取 v[j] 的数据指针
-                                uint8_t *vDataPtr = vPagedData + 
-                                    (currentPageIdx * vPageLen * vNumHeads * vHeadDim +
-                                     t * vNumHeads * vHeadDim +
-                                     vHeadIdx * vHeadDim) * vUnitSize;
-                                
-                                // 转换 v[j] 为 float32
-                                std::vector<float> fvToken;
-                                fvToken.resize(vHeadDim);
-                                if (v.pagedKVCacheData->dataType == DataType::FLOAT32) {
-                                    float *vToken = (float*)vDataPtr;
-                                    memcpy(fvToken.data(), vToken, vHeadDim * sizeof(float));
-                                } else {
-                                    uint16_t *vToken = (uint16_t*)vDataPtr;
-                                    BFloat16ToFloat32(vToken, fvToken.data(), vHeadDim);
-                                }
-                                
-                                // 累加 softmax[j] * v[j]
-                                for (int l = 0; l < v2; l++) {
-                                    foHead[l] += qk[j] * fvToken[l];
-                                }
-                                
-                                kvTokenIdx++;
-                            }
-                        }
-                        
-                        // 转换回 bfloat16
-                        Float32ToBFloat16(foHead.data(), oHead + i * v2, v2);
-                        
-                        delete[] qk;
-                        delete[] temp;
+                    ops.push_back(new MultiThreadPagedAttentionBFloat16Op(
+                        qHead, oHead, maskHead, scale,
+                        q1, q2, k1, v2, group, o,
+                        pageLen, kNumHeads, kHeadDim, kUnitSize,
+                        vPageLen, vNumHeads, vHeadDim, vUnitSize,
+                        kPagedData, vPagedData,
+                        &k.pageIndex, &v.pageIndex,
+                        k.lastPageLen, v.lastPageLen,
+                        k.pagedKVCacheData->dataType, v.pagedKVCacheData->dataType));
+                }
+                for (int st = 0; st < (int)ops.size(); st += threads) {
+                    int end = std::min(st + threads, (int)ops.size());
+                    for (int i = st; i < end; i++) {
+                        pool->PushOp(i - st, ops[i]);
+                    }
+                    for (int i = st; i < end; i++) {
+                        pool->Wait(i - st);
                     }
                 }
+                for (auto *op : ops) delete op;
             } else {
                 ErrorInFastLLM("CpuAttentionPagedOp error: unsupport dataType.\n");
             }
