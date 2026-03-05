@@ -16,6 +16,7 @@
 #include "qwen3.h"
 #include "qwen3_moe.h"
 #include "qwen3_next.h"
+#include "qwen3_5.h"
 #include "minimax_m2.h"
 #include "hunyuan.h"
 #include "deepseekv2.h"
@@ -245,6 +246,9 @@ namespace fastllm {
         } else if (modelType == "qwen3") {
             model = new Qwen3Model();
             model->model_type = "qwen3";
+        } else if (modelType == "qwen3_5") {
+            model = new Qwen3_5Model();
+            model->model_type = "qwen3_5";
         } else if (modelType == "phi3") {
             model = new Phi3Model();
             model->model_type = "phi3";
