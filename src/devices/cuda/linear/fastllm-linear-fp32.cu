@@ -133,6 +133,8 @@ bool FastllmCudaHalfMatMulFloat32(const fastllm::Data &input, fastllm::Data &wei
     
     int outputLen = output.Count(0);
     FastllmCudaFloat2HalfKernel <<< (outputLen - 1) / 256 + 1, 256>>>(cudaOutput, (half*)output.cudaData, outputLen);
+    FastllmCudaFree(cudaInput);
+    FastllmCudaFree(cudaOutput);
     DeviceSync();
     return true;
 }
