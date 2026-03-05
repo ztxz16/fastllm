@@ -103,6 +103,7 @@ void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
 void *FastllmCudaMalloc(size_t size);
 void FastllmCudaFree(void *ret);
+void FastllmCudaMemPoolStats();
 void * FastllmCudaDirectMalloc(size_t size);
 void FastllmCudaDirectFree(void *ret);
 void FastllmCudaMemset0(void *ret, size_t size);

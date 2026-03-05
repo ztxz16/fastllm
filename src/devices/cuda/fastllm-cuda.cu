@@ -1383,6 +1383,35 @@ void FastllmCudaMemset0(void *ret, size_t size) {
     cudaMemset(ret, 0, size);
 }
 
+static size_t fastllmCudaMemPoolAllocated = 0;
+static size_t fastllmCudaMemPoolPeak = 0;
+
+void FastllmCudaMemPoolStats() {
+    int id = -1;
+    cudaGetDevice(&id);
+    size_t bigTotal = 0, bigBusy = 0;
+    size_t smallTotal = 0, smallBusy = 0;
+    auto &bigBuffers = bigBuffersMap[id];
+    for (auto &b : bigBuffers) {
+        bigTotal += b.size;
+        if (b.busy) bigBusy += b.size;
+    }
+    auto &cudaBuffers = cudaBuffersMap[id];
+    for (auto &b : cudaBuffers) {
+        smallTotal += b.size;
+        if (b.busy) smallBusy += b.size;
+    }
+    size_t freeMem = 0, totalMem = 0;
+    cudaMemGetInfo(&freeMem, &totalMem);
+    printf("[CUDA_MEM_POOL] dev=%d bigPool: %zu/%zu MB (%zu bufs), smallPool: %zu/%zu MB (%zu bufs), "
+           "poolTotal: %zu MB, peak: %zu MB, gpuFree: %zu MB / %zu MB\n",
+           id,
+           bigBusy >> 20, bigTotal >> 20, bigBuffers.size(),
+           smallBusy >> 20, smallTotal >> 20, cudaBuffers.size(),
+           fastllmCudaMemPoolAllocated >> 20, fastllmCudaMemPoolPeak >> 20,
+           freeMem >> 20, totalMem >> 20);
+}
+
 void * FastllmCudaMalloc(size_t size) {
     int id = -1;
     cudaError_t state = cudaSuccess;
