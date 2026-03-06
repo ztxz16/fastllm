@@ -66,6 +66,8 @@ namespace fastllm {
         bool mergeSwiglu = false;
 
         bool initialized_add1 = false;
+
+        int num_k_heads, num_v_heads, head_k_dim, head_v_dim;
     };
 }
 
