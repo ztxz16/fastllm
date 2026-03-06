@@ -2259,31 +2259,64 @@ bool FastllmCudaAlibiMask(fastllm::Data &input, const fastllm::Data &mask, float
     return true;
 }
 
+__device__ __forceinline__ float FastllmCudaValueToFloat(float value) {
+    return value;
+}
+
+__device__ __forceinline__ float FastllmCudaValueToFloat(half value) {
+    return __half2float(value);
+}
+
+__device__ __forceinline__ float FastllmCudaValueToFloat(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template<typename T>
+__device__ __forceinline__ T FastllmCudaFloatToValue(float value);
+
+template<>
+__device__ __forceinline__ float FastllmCudaFloatToValue<float>(float value) {
+    return value;
+}
+
+template<>
+__device__ __forceinline__ half FastllmCudaFloatToValue<half>(float value) {
+    return __float2half(value);
+}
+
+template<>
+__device__ __forceinline__ __nv_bfloat16 FastllmCudaFloatToValue<__nv_bfloat16>(float value) {
+    return __float2bfloat16_rn(value);
+}
+
 // CUDA kernel for the main transformation
-__global__ void TransferAttnKernel(float *data, int n, int m, int outer, int row_idx) {
+template<typename T>
+__global__ void TransferAttnKernel(T *data, int n, int m, int outer, int row_idx) {
     int o = blockIdx.z;  // batch index
     if (o >= outer) return;
     
     int j = threadIdx.x + blockIdx.x * blockDim.x;  // column index
     if (j >= row_idx) return;  // 只处理前row_idx个元素
     
-    float *batchData = data + o * n * m;
+    T *batchData = data + o * n * m;
     
     // 保存原始的第row_idx行的值
-    float original_val = batchData[row_idx * m + j];
+    float original_val = FastllmCudaValueToFloat(batchData[row_idx * m + j]);
     
     // 计算新值: original_val + sum(row[k] * matrix[k][j] for k in [0, row_idx))
     float sum = original_val;
     for (int k = 0; k < row_idx; k++) {
-        sum += batchData[row_idx * m + k] * batchData[k * m + j];
+        sum += FastllmCudaValueToFloat(batchData[row_idx * m + k]) *
+               FastllmCudaValueToFloat(batchData[k * m + j]);
     }
     
     // 更新值
-    batchData[row_idx * m + j] = sum;
+    batchData[row_idx * m + j] = FastllmCudaFloatToValue<T>(sum);
 }
 
 // 使用共享内存的优化版本
-__global__ void TransferAttnKernelShared(float *data, int n, int m, int outer, int row_idx) {
+template<typename T>
+__global__ void TransferAttnKernelShared(T *data, int n, int m, int outer, int row_idx) {
     extern __shared__ float shared[];
     
     int o = blockIdx.z;
@@ -2292,12 +2325,12 @@ __global__ void TransferAttnKernelShared(float *data, int n, int m, int outer, i
     int tid = threadIdx.x;
     int j = tid + blockIdx.x * blockDim.x;
     
-    float *batchData = data + o * n * m;
+    T *batchData = data + o * n * m;
     float *row_i = shared;  // 存储第row_idx行的前row_idx个元素
     
     // 协作加载第row_idx行的前row_idx个元素到共享内存
     for (int idx = tid; idx < row_idx; idx += blockDim.x) {
-        row_i[idx] = batchData[row_idx * m + idx];
+        row_i[idx] = FastllmCudaValueToFloat(batchData[row_idx * m + idx]);
     }
     __syncthreads();
     
@@ -2307,28 +2340,31 @@ __global__ void TransferAttnKernelShared(float *data, int n, int m, int outer, i
         
         // 累加：注意这里row_i[k]是原始值，batchData[k * m + j]是可能已更新的值
         for (int k = 0; k < row_idx; k++) {
-            sum += row_i[k] * batchData[k * m + j];
+            sum += row_i[k] * FastllmCudaValueToFloat(batchData[k * m + j]);
         }
         
         // 写回结果
-        batchData[row_idx * m + j] = sum;
+        batchData[row_idx * m + j] = FastllmCudaFloatToValue<T>(sum);
     }
 }
 
 // CUDA kernel for adding identity matrix
-__global__ void AddIdentityKernel(float *data, int n, int m, int outer) {
+template<typename T>
+__global__ void AddIdentityKernel(T *data, int n, int m, int outer) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = outer * n;
     
     if (idx < total) {
         int o = idx / n;
         int i = idx % n;
-        data[o * n * m + i * m + i] += 1.0f;
+        int offset = o * n * m + i * m + i;
+        float cur = FastllmCudaValueToFloat(data[offset]);
+        data[offset] = FastllmCudaFloatToValue<T>(cur + 1.0f);
     }
 }
 
 bool FastllmCudaTransferAttn(fastllm::Data &input) {
-    float *inputData = (float *) FastllmCudaPrepareInput(input);
+    void *inputData = FastllmCudaPrepareInput(input);
 
     int dimsLen = input.dims.size();
     int n = input.dims[dimsLen - 2];
@@ -2347,8 +2383,16 @@ bool FastllmCudaTransferAttn(fastllm::Data &input) {
         
         // 使用共享内存版本
         int sharedMemSize = elementsToProcess * sizeof(float);
-        TransferAttnKernelShared<<<blocks, threads, sharedMemSize>>>(
-            inputData, n, m, outer, i);
+        if (input.dataType == fastllm::DataType::FLOAT32) {
+            TransferAttnKernelShared<<<blocks, threads, sharedMemSize>>>(
+                (float*)inputData, n, m, outer, i);
+        } else if (input.dataType == fastllm::DataType::FLOAT16) {
+            TransferAttnKernelShared<<<blocks, threads, sharedMemSize>>>(
+                (half*)inputData, n, m, outer, i);
+        } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+            TransferAttnKernelShared<<<blocks, threads, sharedMemSize>>>(
+                (__nv_bfloat16*)inputData, n, m, outer, i);
+        }
         
         // 必须同步，因为下一行的计算依赖于当前行的结果
         cudaDeviceSynchronize();
@@ -2359,14 +2403,20 @@ bool FastllmCudaTransferAttn(fastllm::Data &input) {
     int threadsPerBlock = 256;
     int blocksPerGrid = (totalDiag + threadsPerBlock - 1) / threadsPerBlock;
     
-    AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>(inputData, n, m, outer);
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((float*)inputData, n, m, outer);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((half*)inputData, n, m, outer);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((__nv_bfloat16*)inputData, n, m, outer);
+    }
 
     DeviceSync();
     FastllmCudaFinishOutput(input, inputData);
     return true;
 }
 
-// CUDA核函数模板，支持float和half类型
+// CUDA核函数模板，支持float / half / bfloat16
 template<typename T>
 __global__ void CumSumLastDimKernel(T* data, int dim, int outer) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2376,7 +2426,8 @@ __global__ void CumSumLastDimKernel(T* data, int dim, int outer) {
         
         // 对每一行进行累积和
         for (int j = 1; j < dim; j++) {
-            row[j] = (T)((float)row[j] + (float)row[j - 1]);
+            float sum = FastllmCudaValueToFloat(row[j]) + FastllmCudaValueToFloat(row[j - 1]);
+            row[j] = FastllmCudaFloatToValue<T>(sum);
         }
     }
 }
@@ -2398,6 +2449,9 @@ bool FastllmCudaCumSumLastDim(fastllm::Data &input) {
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
         CumSumLastDimKernel<<<blocksPerGrid, threadsPerBlock>>>(
             (half*)inputData, dim, outer);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        CumSumLastDimKernel<<<blocksPerGrid, threadsPerBlock>>>(
+            (__nv_bfloat16*)inputData, dim, outer);
     }
 
     DeviceSync();
@@ -2441,6 +2495,10 @@ bool FastllmCudaCausalMask(fastllm::Data &input, int base, float maskValue) {
         __half *halfData = (__half *)inputData;
         __half halfMaskValue = __float2half(maskValue);
         CausalMaskKernel<__half><<<gridSize, blockSize>>>(halfData, n, m, outer, base, halfMaskValue);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        __nv_bfloat16 *bf16Data = (__nv_bfloat16 *)inputData;
+        __nv_bfloat16 bf16MaskValue = __float2bfloat16_rn(maskValue);
+        CausalMaskKernel<__nv_bfloat16><<<gridSize, blockSize>>>(bf16Data, n, m, outer, base, bf16MaskValue);
     }
     
     // 等待核函数执行完成
@@ -2463,35 +2521,11 @@ __global__ void MakeDecayMaskKernel(const T* input, T* output, int dim, int oute
         int j = remainder % dim;
         
         if (j <= i) {
-            // 计算 exp(input[o * dim + i] - input[o * dim + j])
-            T val_i = input[o * dim + i];
-            T val_j = input[o * dim + j];
-            output[idx] = exp(val_i - val_j);
+            float val_i = FastllmCudaValueToFloat(input[o * dim + i]);
+            float val_j = FastllmCudaValueToFloat(input[o * dim + j]);
+            output[idx] = FastllmCudaFloatToValue<T>(expf(val_i - val_j));
         } else {
-            output[idx] = T(0);
-        }
-    }
-}
-
-// 特化版本处理half类型
-template<>
-__global__ void MakeDecayMaskKernel<half>(const half* input, half* output, int dim, int outer) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = outer * dim * dim;
-    
-    if (idx < total_elements) {
-        int o = idx / (dim * dim);
-        int remainder = idx % (dim * dim);
-        int i = remainder / dim;
-        int j = remainder % dim;
-        
-        if (j <= i) {
-            // 对于half类型，需要转换为float进行计算
-            float val_i = __half2float(input[o * dim + i]);
-            float val_j = __half2float(input[o * dim + j]);
-            output[idx] = __float2half(expf(val_i - val_j));
-        } else {
-            output[idx] = __float2half(0.0f);
+            output[idx] = FastllmCudaFloatToValue<T>(0.0f);
         }
     }
 }
@@ -2515,6 +2549,9 @@ bool FastllmCudaMakeDecayMask(fastllm::Data &input, fastllm::Data &output) {
     } else if (input.dataType == fastllm::DataType::FLOAT16) {
         MakeDecayMaskKernel<half><<<gridSize, blockSize>>>(
             (half*)inputData, (half*)outputData, dim, outer);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        MakeDecayMaskKernel<__nv_bfloat16><<<gridSize, blockSize>>>(
+            (__nv_bfloat16*)inputData, (__nv_bfloat16*)outputData, dim, outer);
     }
 
     // 等待核函数执行完成
