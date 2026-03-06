@@ -117,6 +117,9 @@ namespace fastllm {
             head_v_dim = atoi(this->weight.dicts["linear_value_head_dim"].c_str());
         }
         head_dim = embed_dim / num_attention_heads;
+        if (this->weight.dicts.find("head_dim") != this->weight.dicts.end()) {
+            head_dim = atoi(this->weight.dicts["head_dim"].c_str());
+        }
         rotary_dim = head_dim;
         if (this->weight.dicts.find("max_position_embeddings") != this->weight.dicts.end()) {
             max_positions = atoi(this->weight.dicts["max_position_embeddings"].c_str());
@@ -137,6 +140,13 @@ namespace fastllm {
         if (this->weight.dicts.find("rope_scaling.factor") != this->weight.dicts.end()) {
             rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
         }
+
+        std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
+        sinData.ToDevice(DataDevice::CPU);
+        cosData.ToDevice(DataDevice::CPU);
+        sinData.CopyFrom(Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first));
+        cosData.CopyFrom(Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second));
+
         for (int i = 0; i < block_cnt; i++) {
             std::string w1WeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate_proj.weight";
             std::string w3WeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.up_proj.weight";
@@ -144,7 +154,7 @@ namespace fastllm {
             this->weightMergeRules.push_back(
                 WeightMergeRule({WeightMergeRuleSingle({w1WeightName, w3WeightName}, swigluWeightName, std::string("linearSwiglu"))})
             );
-
+/*
             std::string qWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string qBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.bias";
             std::string kWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.k_proj.weight";
@@ -157,7 +167,34 @@ namespace fastllm {
                 WeightMergeRule({WeightMergeRuleSingle({qWeightName, kWeightName, vWeightName}, mergeQkvWeightName, std::string("linear")),
                                  WeightMergeRuleSingle({qBiasName, kBiasName, vBiasName}, mergeQkvBiasName, std::string("bias"))})
             );
+*/
         }
+    }
+
+    std::pair<std::vector<float>, std::vector<float>> Qwen3_5Model::UpdateRotaryPosEmb(float base, float factor, int seqLen) {
+        int positions = std::max(max_positions, seqLen);
+        sin.resize(positions);
+        cos.resize(positions);
+        std::vector <float> invFreq;
+        for (int i = 0; i < rotary_dim; i += 2) {
+            invFreq.push_back(1.0 / pow(base, (float)i / rotary_dim));
+        }
+
+        float scale = rope_type == RoPEType::LINEAR_SCALE ? factor : 1.0;
+        for (int i = 0; i < positions; i++) {
+            sin[i].resize(rotary_dim);
+            cos[i].resize(rotary_dim);
+            for (int j = 0; j < invFreq.size(); j++) {
+                sin[i][j] = ::sin((float)i / scale * invFreq[j]);
+                cos[i][j] = ::cos((float)i / scale * invFreq[j]);
+            }
+        }
+        std::vector <float> fsin, fcos;
+        for (int i = 0; i < sin.size(); i++) {
+            fsin.insert(fsin.end(), sin[i].begin(), sin[i].end());
+            fcos.insert(fcos.end(), cos[i].begin(), cos[i].end());
+        }
+        return std::make_pair(fsin, fcos);
     }
 
     std::vector <int> Qwen3_5Model::ForwardV2(
@@ -285,7 +322,7 @@ namespace fastllm {
                 std::string oBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.o_proj.bias";
                 std::string mergeQkvWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
                 std::string mergeQkvBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
-                
+
                 Data qgate, q, gate, k, v;
                 Linear(attenInput, weight[qWeightName], weight[qBiasName], qgate);
                 qgate.Reshape({bsz, seqlen, -1, this->head_dim * 2});
@@ -294,7 +331,7 @@ namespace fastllm {
                 gate.Reshape({bsz, seqlen, -1});
 
                 Linear(attenInput, weight[kWeightName], weight[kBiasName], k);
-                Linear(attenInput, weight[vWeightName], weight[vBiasName], v);
+                Linear(attenInput, weight[vWeightName], weight[vBiasName], v);                
 
                 k.Reshape({bsz, seqlen, -1, this->head_dim});
                 v.Reshape({bsz, seqlen, -1, this->head_dim});
@@ -635,10 +672,14 @@ namespace fastllm {
             MLPBlock(&attenInput, &weight[swigluWeightName], &weight[downWeightName], &v, &q, &hiddenStates);
         }
 
+        std::string lmHeadWeightName = "lm_head.weight";
+        if (this->weight.weight.find(lmHeadWeightName) == this->weight.weight.end()) {
+            lmHeadWeightName = language_prefix + "embed_tokens.weight";
+        }
         std::vector <int> lastRet;
         LLMSamplingBlock(
             this, &hiddenStates,
-            &weight[language_prefix + "norm.weight"], &weight["lm_head.weight"],
+            &weight[language_prefix + "norm.weight"], &weight[lmHeadWeightName],
             rms_norm_eps, batch, all1, seqLens,
             pastKeyValues, generationConfigs, lastTokens,
             retLogits, lastRet
