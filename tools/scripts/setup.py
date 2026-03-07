@@ -9,7 +9,7 @@ all_require = server_require + webui_require + download_require + tokenizer_requ
 
 PACKAGE_INFO = {
     "release": {"name": "ftllm", "version": "0.1.5.1"},
-    "nightly": {"name": "ftllm-nightly", "version": "0.0.0.2"},
+    "nightly": {"name": "ftllm-nightly", "version": "0.0.0.3"},
 }
 variant = "nightly" if os.environ.get("FASTLLM_NIGHTLY", "0") == "1" else "release"
 package_name = PACKAGE_INFO[variant]["name"]
