@@ -624,6 +624,8 @@ namespace fastllm {
         } else if (input.dataType == DataType::BFLOAT16) {
             if (weight.dataType == DataType::BFLOAT16) {
                 FastllmCudaBFloat16MatMulBFloat16(input, weight, bias, output, n, m, k);
+            } else if (weight.dataType == DataType::FLOAT32) {
+                FastllmCudaBFloat16MatMulFloat32(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FLOAT16) {
                 FastllmCudaBFloat16MatMulFloat16(input, weight, bias, output, n, m, k);
             } else if (weight.dataType == DataType::FP8_E4M3) {
