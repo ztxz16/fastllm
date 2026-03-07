@@ -1321,6 +1321,53 @@ namespace fastllm {
 
         DynamicScheduleTasks(ops);
 
+        // debug: 输出指定token关联的所有专家计算结果（通过环境变量 FASTLLM_DEBUG_TOKEN_ID 指定token id，逗号分隔）
+        /* {
+            static std::set<int> debugTokenIds;
+            static bool debugTokenIdInited = false;
+            if (!debugTokenIdInited) {
+                const char *env = getenv("FASTLLM_DEBUG_TOKEN_ID");
+                if (env) {
+                    std::string s(env);
+                    size_t pos = 0;
+                    while (pos < s.size()) {
+                        size_t next = s.find(',', pos);
+                        if (next == std::string::npos) next = s.size();
+                        debugTokenIds.insert(atoi(s.substr(pos, next - pos).c_str()));
+                        pos = next + 1;
+                    }
+                }
+                debugTokenIdInited = true;
+            }
+            if (!debugTokenIds.empty()) {
+                int debugOffset = 0;
+                for (int e = 0; e < (int)expertTasks.size(); e++) {
+                    if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && cpuExperts.count(e)) {
+                        float* debugDownOutput = downOutput.data() + debugOffset * dim;
+                        for (int i = 0; i < (int)expertTasks[e].size(); i++) {
+                            int rowIdx = expertTasks[e][i].first;
+                            if (debugTokenIds.count(rowIdx)) {
+                                float score = expertTasks[e][i].second;
+                                float sumAbs = 0.0f;
+                                for (int d = 0; d < dim; d++) {
+                                    sumAbs += std::abs(debugDownOutput[i * dim + d]);
+                                }
+                                printf("[DEBUG origToken=%d] expert=%d, score=%.6f, output_l1norm=%.6f, first5=[%.6f, %.6f, %.6f, %.6f, %.6f]\n",
+                                       rowIdx, e, score, sumAbs,
+                                       debugDownOutput[i * dim + 0],
+                                       debugDownOutput[i * dim + 1],
+                                       debugDownOutput[i * dim + 2],
+                                       debugDownOutput[i * dim + 3],
+                                       debugDownOutput[i * dim + 4]);
+                            }
+                        }
+                        debugOffset += expertTasks[e].size();
+                    }
+                }
+                fflush(stdout);
+            }
+        } */
+
         // 6. reduce
         {
             // 计算每个样本选择的专家数 k

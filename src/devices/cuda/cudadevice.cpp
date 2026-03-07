@@ -1863,6 +1863,80 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             }
             DoCudaLinearReshape(tempSwiglu, *weights[i * 2 + 1], tempOutput);
             DoCudaLinear(tempSwiglu, *weights[i * 2 + 1], *GetEmptyData(), tempOutput);
+
+            // debug: 输出指定token关联的所有专家计算结果（通过环境变量 FASTLLM_DEBUG_TOKEN_ID 指定token id，逗号分隔）
+            /* {
+                static std::set<int> debugTokenIds;
+                static bool debugTokenIdInited = false;
+                if (!debugTokenIdInited) {
+                    const char *env = getenv("FASTLLM_DEBUG_TOKEN_ID");
+                    if (env) {
+                        std::string s(env);
+                        size_t pos = 0;
+                        while (pos < s.size()) {
+                            size_t next = s.find(',', pos);
+                            if (next == std::string::npos) next = s.size();
+                            debugTokenIds.insert(atoi(s.substr(pos, next - pos).c_str()));
+                            pos = next + 1;
+                        }
+                    }
+                    debugTokenIdInited = true;
+                }
+                if (!debugTokenIds.empty()) {
+                    bool needCopy = false;
+                    for (int t = 0; t < (int)expertTasks[i].size(); t++) {
+                        if (debugTokenIds.count(expertTasks[i][t].first)) { needCopy = true; break; }
+                    }
+                    if (needCopy) {
+                        int lines = expertTasks[i].size();
+                        int dim = output.dims[1];
+                        size_t rawBytes = GetDataBytes(tempOutput.dataType, lines, dim);
+                        std::vector<uint8_t> rawBuf(rawBytes);
+                        FastllmCudaCopyFromDeviceToHost(rawBuf.data(), tempOutput.cudaData, rawBytes);
+                        std::vector<float> f32Buf(lines * dim);
+                        if (tempOutput.dataType == DataType::FLOAT32) {
+                            memcpy(f32Buf.data(), rawBuf.data(), lines * dim * sizeof(float));
+                        } else if (tempOutput.dataType == DataType::FLOAT16) {
+                            for (int idx = 0; idx < lines * dim; idx++) {
+                                uint16_t h = ((uint16_t*)rawBuf.data())[idx];
+                                uint32_t sign = (h >> 15) & 0x1;
+                                uint32_t exp = (h >> 10) & 0x1F;
+                                uint32_t mant = h & 0x3FF;
+                                uint32_t f;
+                                if (exp == 0) f = (sign << 31);
+                                else if (exp == 0x1F) f = (sign << 31) | 0x7F800000 | (mant << 13);
+                                else f = (sign << 31) | ((exp - 15 + 127) << 23) | (mant << 13);
+                                memcpy(&f32Buf[idx], &f, 4);
+                            }
+                        } else if (tempOutput.dataType == DataType::BFLOAT16) {
+                            for (int idx = 0; idx < lines * dim; idx++) {
+                                uint16_t bf = ((uint16_t*)rawBuf.data())[idx];
+                                uint32_t f = (uint32_t)bf << 16;
+                                memcpy(&f32Buf[idx], &f, 4);
+                            }
+                        }
+                        for (int t = 0; t < lines; t++) {
+                            int rowIdx = expertTasks[i][t].first;
+                            if (debugTokenIds.count(rowIdx)) {
+                                float score = expertTasks[i][t].second;
+                                float sumAbs = 0.0f;
+                                for (int d = 0; d < dim; d++) {
+                                    sumAbs += std::abs(f32Buf[t * dim + d]);
+                                }
+                                printf("[DEBUG CUDA origToken=%d] expert=%d, score=%.6f, output_l1norm=%.6f, first5=[%.6f, %.6f, %.6f, %.6f, %.6f]\n",
+                                       rowIdx, i, score, sumAbs,
+                                       f32Buf[t * dim + 0],
+                                       f32Buf[t * dim + 1],
+                                       f32Buf[t * dim + 2],
+                                       f32Buf[t * dim + 3],
+                                       f32Buf[t * dim + 4]);
+                            }
+                        }
+                        fflush(stdout);
+                    }
+                }
+            } */
+
             FastllmCudaPickOutput (
                 (uint8_t*)tempOutput.cudaData, 
                 (uint8_t*)output.cudaData, 
