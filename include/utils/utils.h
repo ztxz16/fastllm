@@ -96,6 +96,8 @@ namespace fastllm {
 
     static void ErrorInFastLLM(const std::string &error) {
         printf("FastLLM Error: %s\n", error.c_str());
+        printf("Press any key to exit...\n");
+        getchar();
         exit(0);
     }
 
