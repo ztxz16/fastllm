@@ -259,6 +259,10 @@ namespace fastllm {
             initialized_add1 = true;
         }
 
+        if (this->weight.weight.find("lm_head.weight") == this->weight.weight.end()) {
+            // 如果tie weight，那么embedding在cuda上处理
+            SetCudaEmbedding(true);
+        }
         Embedding(inputIds, this->weight[language_prefix + "embed_tokens.weight"], embeddingResult);
         ToDataType(embeddingResult, hiddenStates, this->dataType);
         int seqlen = hiddenStates.dims[1];
