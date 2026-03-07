@@ -190,6 +190,33 @@ void FastllmCudaStreamSynchronize(void *stream) {
     checkCudaErrors("Error: CUDA error when synchronizing stream!", state);
 }
 
+void *FastllmCudaEventCreate() {
+    cudaEvent_t event;
+    cudaError_t state = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+    checkCudaErrors("Error: CUDA error when creating event!", state);
+    return (void*)event;
+}
+
+void FastllmCudaEventDestroy(void *event) {
+    cudaError_t state = cudaEventDestroy((cudaEvent_t)event);
+    checkCudaErrors("Error: CUDA error when destroying event!", state);
+}
+
+void FastllmCudaEventRecord(void *event, void *stream) {
+    cudaError_t state = cudaEventRecord((cudaEvent_t)event, (cudaStream_t)stream);
+    checkCudaErrors("Error: CUDA error when recording event!", state);
+}
+
+void FastllmCudaEventSynchronize(void *event) {
+    cudaError_t state = cudaEventSynchronize((cudaEvent_t)event);
+    checkCudaErrors("Error: CUDA error when synchronizing event!", state);
+}
+
+void FastllmCudaStreamWaitEvent(void *stream, void *event) {
+    cudaError_t state = cudaStreamWaitEvent((cudaStream_t)stream, (cudaEvent_t)event, 0);
+    checkCudaErrors("Error: CUDA error when stream waiting event!", state);
+}
+
 double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
     auto duration = std::chrono::duration_cast<std::chrono::nanoseconds> (time2 - time1);
     return double(duration.count()) * std::chrono::nanoseconds::period::num / std::chrono::nanoseconds::period::den;

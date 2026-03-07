@@ -99,6 +99,12 @@ void *FastllmCudaStreamCreate(bool nonBlocking = true);
 void FastllmCudaStreamDestroy(void *stream);
 void FastllmCudaStreamSynchronize(void *stream);
 
+void *FastllmCudaEventCreate();
+void FastllmCudaEventDestroy(void *event);
+void FastllmCudaEventRecord(void *event, void *stream = nullptr);
+void FastllmCudaEventSynchronize(void *event);
+void FastllmCudaStreamWaitEvent(void *stream, void *event);
+
 void FastllmCudaMallocBigBuffer(size_t size);
 void FastllmCudaClearBigBuffer();
 void *FastllmCudaMalloc(size_t size);

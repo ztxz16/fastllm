@@ -1823,6 +1823,7 @@ for (auto &it : eeCnt) {
         };
 
         void *copyStream = FastllmCudaStreamCreate(true);
+        void *computeDoneEvent = FastllmCudaEventCreate();
         int curExpert = findNextValidExpert(-1);
 
         if (curExpert >= 0) {
@@ -1832,6 +1833,7 @@ total += weights[curExpert * 2]->GetBytes();
 total += weights[curExpert * 2 + 1]->GetBytes();
         }
 
+        int prevExpert = -1;
         while (curExpert >= 0) {
             int nextExpert = findNextValidExpert(curExpert);
 
@@ -1871,16 +1873,29 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 tempOutput.dataType
             );
 
+            FastllmCudaEventRecord(computeDoneEvent);
+            FastllmCudaStreamWaitEvent(copyStream, computeDoneEvent);
+
             if (nextExpert >= 0) {
                 FastllmCudaStreamSynchronize(copyStream);
             }
 
-            weights[i * 2]->FreeCudaTemporary({}, false);
-            weights[i * 2 + 1]->FreeCudaTemporary({}, false);
+            if (prevExpert >= 0) {
+                weights[prevExpert * 2]->FreeCudaTemporary({}, false);
+                weights[prevExpert * 2 + 1]->FreeCudaTemporary({}, false);
+            }
 
+            prevExpert = curExpert;
             curExpert = nextExpert;
         }
 
+        if (prevExpert >= 0) {
+            FastllmCudaEventSynchronize(computeDoneEvent);
+            weights[prevExpert * 2]->FreeCudaTemporary({}, false);
+            weights[prevExpert * 2 + 1]->FreeCudaTemporary({}, false);
+        }
+
+        FastllmCudaEventDestroy(computeDoneEvent);
         FastllmCudaStreamDestroy(copyStream);
 
         FastllmCudaFree(cudaIndex);
