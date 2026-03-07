@@ -264,6 +264,7 @@ namespace fastllm {
             SetCudaEmbedding(true);
         }
         Embedding(inputIds, this->weight[language_prefix + "embed_tokens.weight"], embeddingResult);
+
         ToDataType(embeddingResult, hiddenStates, this->dataType);
         int seqlen = hiddenStates.dims[1];
         for (int i = 0; i < block_cnt; i++) {
@@ -325,42 +326,17 @@ namespace fastllm {
                 k.Reshape(qkvSize);
                 v.Reshape(qkvSize);
 
-                int unitLen = 64;
-    #ifdef USE_CUDA
-                unitLen = 128;
-    #endif
-                while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
-                    || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
-                    std::vector <int> newDims;
-                    if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
-                        newDims = std::vector <int> {k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
-                    } else {
-                        newDims = pastKey.dims;
-                        newDims[1] += ((k.dims[1] - 1) / unitLen + 1) * unitLen;
-                    }
-                    pastKey.Expansion(newDims);
-                }
-                while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[1] > pastValue.expansionDims[1]))
-                    || (pastValue.dims.size() > 0 && pastValue.dims[1] + v.dims[1] > pastValue.expansionDims[1])) {
-                    std::vector <int> newDims;
-                    if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
-                        newDims = std::vector <int> {v.dims[0], ((v.dims[1] - 1) / unitLen + 1) * unitLen, v.dims[2]};
-                    } else {
-                        newDims = pastValue.dims;
-                        newDims[1] += ((v.dims[1] - 1) / unitLen + 1) * unitLen;
-                    }
-                    pastValue.Expansion(newDims);
+                {
+                    // Paged Attention
+                    PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
+                        i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
+                    PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
+                        i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
+                    AppendPagedCache(*pagedCacheKManager, pastKey, k);
+                    AppendPagedCache(*pagedCacheVManager, pastValue, v);
+                    AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, i > 0);
                 }
 
-                CatDirect(pastKey, k, 1);
-                CatDirect(pastValue, v, 1);
-
-                // 1.2 Attention
-                if (attentionMask[0] == nullptr) {
-                    Attention(q, pastKey, pastValue, Data(), qkv, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
-                } else {
-                    Attention(q, pastKey, pastValue, *attentionMask[0], qkv, q.dims[0] / pastKey.dims[0], 1.0 / sqrt(head_dim), 1);
-                }
                 PermuteSelf(qkv, {1, 0, 2});
                 qkv.Reshape({seqlen, bsz, -1});
                 PermuteSelf(qkv, {1, 0, 2});
@@ -635,10 +611,9 @@ namespace fastllm {
                     Linear(core_attn_out, 
                         this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"], 
                         Data(), attenInput);
-                    AddTo(hiddenStates, attenInput);
                 }
             }
-
+            AddTo(hiddenStates, attenInput);
             RMSNorm(hiddenStates, this->weight[postRmsName], rms_norm_eps, attenInput);
             MLPBlock(&attenInput, &weight[swigluWeightName], &weight[downWeightName], &v, &q, &hiddenStates);
         }
