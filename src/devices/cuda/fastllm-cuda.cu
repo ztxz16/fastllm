@@ -1,9 +1,9 @@
-#include <thrust/device_vector.h>
+/* #include <thrust/device_vector.h>
 #include <thrust/sort.h>
 #include <thrust/sequence.h>
 #include <thrust/gather.h>
 #include <thrust/copy.h>
-#include <thrust/functional.h>
+#include <thrust/functional.h> */
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
@@ -2848,7 +2848,7 @@ bool FastllmCudaLayerNorm(const fastllm::Data &input, fastllm::Data &gamma, fast
     return true;
 }
 
-#ifndef USE_ROCM
+/*#ifndef USE_ROCM
 // 自定义函子，用于处理每一行的 TopK 操作  
 struct TopKFunctor {
     float* cudaInput;        // 指向原始输入数据的设备指针  
@@ -2905,7 +2905,7 @@ void topk_parallel_thrust(float* d_input, float* d_output, int outer, int channe
         functor                                 // 应用于每个元素的函子  
     );
 }
-#endif
+#endif */
 
 bool FastllmCudaTopK(const fastllm::Data &input, fastllm::Data &output, int topk) {
     if (topk > 50) {
@@ -2920,12 +2920,13 @@ bool FastllmCudaTopK(const fastllm::Data &input, fastllm::Data &output, int topk
     int outer = input.Count(0) / input.Count(dimsLen - 1);
     int channels = input.dims[dimsLen - 1];
 
-#ifdef USE_ROCM
+// #ifdef USE_ROCM
     if (topk == 1) {
         FastllmLayerNormKernelTop1 <256> <<< outer, 256 >>> (cudaInput, cudaOutput, channels);
     } else {
         FastllmLayerNormKernelTopK <64, 50> <<< outer, 64 >>> (cudaInput, cudaOutput, topk, channels);
     }
+/*
 #else
     if (outer > 4 || topk == 1) {
         if (topk == 1) {
@@ -2939,7 +2940,7 @@ bool FastllmCudaTopK(const fastllm::Data &input, fastllm::Data &output, int topk
             functor(i);
         }
     }
-#endif
+#endif */
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;
