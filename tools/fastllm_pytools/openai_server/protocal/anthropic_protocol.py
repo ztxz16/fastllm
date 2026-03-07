@@ -10,9 +10,29 @@ class AnthropicTextContentBlock(BaseModel):
     text: str
 
 
+class AnthropicToolUseContentBlock(BaseModel):
+    type: Literal["tool_use"] = "tool_use"
+    id: str
+    name: str
+    input: Dict[str, Any]
+
+
+class AnthropicToolResultContentBlock(BaseModel):
+    type: Literal["tool_result"] = "tool_result"
+    tool_use_id: str
+    content: Union[str, List[Dict[str, Any]]]
+    is_error: Optional[bool] = None
+
+
 class AnthropicInputMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: Union[str, List[Dict[str, Any]]]
+
+
+class AnthropicToolParam(BaseModel):
+    name: str
+    description: Optional[str] = None
+    input_schema: Optional[Dict[str, Any]] = None
 
 
 class AnthropicMessageRequest(BaseModel):
@@ -26,6 +46,7 @@ class AnthropicMessageRequest(BaseModel):
     top_k: Optional[int] = None
     stop_sequences: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
+    tools: Optional[List[AnthropicToolParam]] = None
 
 
 class AnthropicUsage(BaseModel):
@@ -37,7 +58,7 @@ class AnthropicMessageResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"msg_{shortuuid.random()}")
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
-    content: List[AnthropicTextContentBlock]
+    content: List[Union[AnthropicTextContentBlock, AnthropicToolUseContentBlock]]
     model: str
     stop_reason: Optional[str] = None
     stop_sequence: Optional[str] = None
@@ -49,6 +70,11 @@ class AnthropicTextDelta(BaseModel):
     text: str
 
 
+class AnthropicInputJsonDelta(BaseModel):
+    type: Literal["input_json_delta"] = "input_json_delta"
+    partial_json: str
+
+
 class MessageStartEvent(BaseModel):
     type: Literal["message_start"] = "message_start"
     message: AnthropicMessageResponse
@@ -57,13 +83,13 @@ class MessageStartEvent(BaseModel):
 class ContentBlockStartEvent(BaseModel):
     type: Literal["content_block_start"] = "content_block_start"
     index: int
-    content_block: AnthropicTextContentBlock
+    content_block: Union[AnthropicTextContentBlock, AnthropicToolUseContentBlock]
 
 
 class ContentBlockDeltaEvent(BaseModel):
     type: Literal["content_block_delta"] = "content_block_delta"
     index: int
-    delta: AnthropicTextDelta
+    delta: Union[AnthropicTextDelta, AnthropicInputJsonDelta]
 
 
 class ContentBlockStopEvent(BaseModel):

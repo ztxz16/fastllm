@@ -103,6 +103,208 @@ class FastLLmCompletion:
                                       name=name)], []
       raise NotImplementedError("Complex input not supported yet")
 
+  def _stringify_anthropic_block_content(self, content: Any) -> str:
+      if content is None:
+          return ""
+      if isinstance(content, str):
+          return content
+      if isinstance(content, list):
+          parts = []
+          for block in content:
+              if isinstance(block, dict) and block.get("type") == "text":
+                  parts.append(block.get("text", ""))
+              else:
+                  parts.append(json.dumps(block, ensure_ascii = False))
+          return "\n".join([part for part in parts if part != ""])
+      if isinstance(content, dict):
+          return json.dumps(content, ensure_ascii = False)
+      return str(content)
+
+  def _serialize_tool_arguments(self, arguments: Any) -> str:
+      if isinstance(arguments, str):
+          return arguments
+      return json.dumps(arguments, ensure_ascii = False)
+
+  def _deserialize_tool_arguments(self, arguments: Any) -> Dict[str, Any]:
+      if isinstance(arguments, dict):
+          return arguments
+      if isinstance(arguments, str):
+          try:
+              parsed = json.loads(arguments)
+              if isinstance(parsed, dict):
+                  return parsed
+              return {"value": parsed}
+          except (json.JSONDecodeError, TypeError):
+              return {"raw": arguments}
+      return {"value": arguments}
+
+  def _convert_anthropic_tools(
+      self, tools: Optional[List[AnthropicToolParam]]
+  ) -> Tuple[Optional[List[ChatCompletionToolsParam]], Optional[List[Dict[str, Any]]]]:
+      if not tools:
+          return None, None
+
+      parser_tools: List[ChatCompletionToolsParam] = []
+      model_tools: List[Dict[str, Any]] = []
+      for tool in tools:
+          parser_tools.append(ChatCompletionToolsParam(
+              function = FunctionDefinition(
+                  name = tool.name,
+                  description = tool.description,
+                  parameters = tool.input_schema,
+              )))
+          model_tools.append({
+              "type": "function",
+              "function": {
+                  "name": tool.name,
+                  "description": tool.description,
+                  "parameters": tool.input_schema,
+              }
+          })
+      return parser_tools, model_tools
+
+  def _build_anthropic_parser_request(
+      self,
+      request: AnthropicMessageRequest,
+      messages: List[Dict[str, Any]],
+      parser_tools: Optional[List[ChatCompletionToolsParam]],
+  ) -> Optional[ChatCompletionRequest]:
+      if not parser_tools:
+          return None
+
+      parser_messages = []
+      for message in messages:
+          parser_messages.append({
+              "role": str(message.get("role", "user")),
+              "content": self._stringify_anthropic_block_content(
+                  message.get("content", "")),
+          })
+
+      return ChatCompletionRequest(
+          model = request.model,
+          messages = parser_messages,
+          max_tokens = request.max_tokens,
+          temperature = request.temperature,
+          top_p = request.top_p,
+          top_k = request.top_k,
+          stop = request.stop_sequences,
+          stream = request.stream,
+          tools = parser_tools,
+          tool_choice = "auto",
+      )
+
+  def _ensure_tool_parser(self):
+      if self.tool_parser is None:
+          from .tool_parsers import ToolParserManager
+          self.tool_parser = ToolParserManager.get_tool_parser_auto(
+              self.model.get_type(), self.model.hf_tokenizer.chat_template,
+              force_chat_template = self.model.force_chat_template,
+              force_type = self.model.tool_call_parser)(self.model.hf_tokenizer)
+
+  def _parse_anthropic_message_content(
+      self,
+      role: str,
+      content: Optional[Union[str, Iterable[Dict[str, Any]]]],
+  ) -> List[ConversationMessage]:
+      if content is None or isinstance(content, str):
+          messages, _ = self._parse_chat_message_content(role, content)
+          return messages
+
+      if not isinstance(content, list):
+          raise NotImplementedError("Complex input not supported yet")
+
+      if role == "assistant":
+          text_blocks: List[str] = []
+          tool_calls: List[Dict[str, Any]] = []
+          for block in content:
+              block_type = block.get("type")
+              if block_type == "text":
+                  text_blocks.append(block.get("text", ""))
+              elif block_type == "tool_use":
+                  tool_calls.append({
+                      "id": block.get("id") or f"toolu_{shortuuid.random()}",
+                      "type": "function",
+                      "function": {
+                          "name": block.get("name", ""),
+                          "arguments": self._serialize_tool_arguments(
+                              block.get("input", {})),
+                      },
+                  })
+              else:
+                  raise NotImplementedError("Complex input not supported yet")
+          text_content = "\n".join([text for text in text_blocks if text != ""])
+          return [ConversationMessage(
+              role = role,
+              content = text_content,
+              tool_calls = tool_calls or None,
+          )]
+
+      if role == "user":
+          messages: List[ConversationMessage] = []
+          text_blocks: List[str] = []
+
+          def flush_text_blocks():
+              if text_blocks:
+                  messages.append(ConversationMessage(
+                      role = "user",
+                      content = "\n".join([text for text in text_blocks if text != ""]),
+                  ))
+                  text_blocks.clear()
+
+          for block in content:
+              block_type = block.get("type")
+              if block_type == "text":
+                  text_blocks.append(block.get("text", ""))
+              elif block_type == "tool_result":
+                  flush_text_blocks()
+                  messages.append(ConversationMessage(
+                      role = "tool",
+                      content = self._stringify_anthropic_block_content(
+                          block.get("content")),
+                      tool_call_id = block.get("tool_use_id"),
+                  ))
+              else:
+                  raise NotImplementedError("Complex input not supported yet")
+          flush_text_blocks()
+          return messages
+
+      messages, _ = self._parse_chat_message_content(role, content)
+      return messages
+
+  def _build_anthropic_response_blocks(
+      self,
+      text_content: Optional[str],
+      tool_calls: List[ToolCall],
+  ) -> List[Union[AnthropicTextContentBlock, AnthropicToolUseContentBlock]]:
+      blocks: List[Union[AnthropicTextContentBlock, AnthropicToolUseContentBlock]] = []
+      if text_content:
+          blocks.append(AnthropicTextContentBlock(text = text_content))
+      for tool_call in tool_calls:
+          blocks.append(AnthropicToolUseContentBlock(
+              id = tool_call.id,
+              name = tool_call.function.name,
+              input = self._deserialize_tool_arguments(
+                  tool_call.function.arguments),
+          ))
+      return blocks
+
+  def _normalize_internal_tool_calls(self, tool_calls: Any) -> List[Any]:
+      parsed_tool_calls = []
+      for tc in tool_calls:
+          tc_copy = dict(tc) if isinstance(tc, dict) else tc
+          if isinstance(tc_copy, dict) and "function" in tc_copy:
+              func = tc_copy["function"]
+              if isinstance(func, dict) and isinstance(func.get("arguments"), str):
+                  func = dict(func)
+                  try:
+                      func["arguments"] = json.loads(func["arguments"])
+                  except (json.JSONDecodeError, TypeError):
+                      pass
+                  tc_copy = dict(tc_copy)
+                  tc_copy["function"] = func
+          parsed_tool_calls.append(tc_copy)
+      return parsed_tool_calls
+
   def _get_anthropic_stop_reason(self, completion_tokens: int,
                                  max_tokens: Optional[int]) -> str:
       if max_tokens is not None and completion_tokens >= max_tokens:
@@ -125,12 +327,12 @@ class FastLLmCompletion:
       try:
           conversation: List[ConversationMessage] = []
           if request.system is not None:
-              system_messages, _ = self._parse_chat_message_content(
+              system_messages = self._parse_anthropic_message_content(
                   "system", request.system)
               conversation.extend(system_messages)
 
           for m in request.messages:
-              messages, _ = self._parse_chat_message_content(
+              messages = self._parse_anthropic_message_content(
                   m.role, m.content)
               conversation.extend(messages)
 
@@ -139,16 +341,27 @@ class FastLLmCompletion:
 
           messages = []
           for msg in conversation:
-              messages.append({
+              msg_dict = {
                   "role": msg.role,
                   "content": msg.content,
-              })
+              }
+              if msg.tool_calls is not None:
+                  msg_dict["tool_calls"] = self._normalize_internal_tool_calls(
+                      msg.tool_calls)
+              if msg.tool_call_id is not None:
+                  msg_dict["tool_call_id"] = msg.tool_call_id
+              if msg.name is not None:
+                  msg_dict["name"] = msg.name
+              messages.append(msg_dict)
       except Exception as e:
           logging.error("Error in applying anthropic request: %s", e)
           traceback.print_exc()
           return self.create_error_response(str(e))
 
       request_id = f"msg_{shortuuid.random()}"
+      parser_tools, model_tools = self._convert_anthropic_tools(request.tools)
+      parser_request = self._build_anthropic_parser_request(
+          request, messages, parser_tools)
       default_gen = self.model.default_generation_config
       top_p = request.top_p if request.top_p is not None else default_gen['top_p']
       top_k = request.top_k if request.top_k is not None else default_gen['top_k']
@@ -166,18 +379,21 @@ class FastLLmCompletion:
       handle = self.model.launch_stream_response(messages,
                         max_length = max_length, min_length = 0, do_sample = True,
                         top_p = top_p, top_k = top_k, temperature = temperature,
-                        repeat_penalty = frequency_penalty, one_by_one = True)
+                        repeat_penalty = frequency_penalty, tools = model_tools,
+                        one_by_one = True)
       self.conversation_handles[request_id] = handle
       result_generator = self.model.stream_response_handle_async(handle)
 
       if request.stream:
           return (self.anthropic_message_stream_generator(
-              request, raw_request, result_generator, request_id, input_token_len),
+              request, raw_request, result_generator, request_id, input_token_len,
+              parser_request),
               BackgroundTask(self.check_disconnect, raw_request, request_id, handle))
       else:
           try:
               return await self.anthropic_message_full_generator(
-                  request, raw_request, handle, result_generator, request_id, input_token_len)
+                  request, raw_request, handle, result_generator, request_id,
+                  input_token_len, parser_request)
           except ValueError as e:
               return self.create_error_response(str(e))
 
@@ -527,7 +743,8 @@ class FastLLmCompletion:
               handle: int,
               result_generator: AsyncIterator,
               request_id: str,
-              input_token_len: int) -> Union[ErrorResponse, AnthropicMessageResponse]:
+              input_token_len: int,
+              parser_request: Optional[ChatCompletionRequest]) -> Union[ErrorResponse, AnthropicMessageResponse]:
       model_name = self.model_name
       result = ""
       completion_tokens = 0
@@ -544,12 +761,21 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
+      if request.tools and parser_request is not None:
+          self._ensure_tool_parser()
+          tool_call_info = self.tool_parser.extract_tool_calls(result, parser_request)
+      else:
+          tool_call_info = ExtractedToolCallInformation(
+              tools_called = False, tool_calls = [], content = result)
+
       response = AnthropicMessageResponse(
           id = request_id,
-          content = [AnthropicTextContentBlock(text = result)],
+          content = self._build_anthropic_response_blocks(
+              tool_call_info.content, tool_call_info.tool_calls),
           model = model_name,
-          stop_reason = self._get_anthropic_stop_reason(
-              completion_tokens, request.max_tokens),
+          stop_reason = ("tool_use" if tool_call_info.tools_called
+                         else self._get_anthropic_stop_reason(
+                             completion_tokens, request.max_tokens)),
           usage = AnthropicUsage(input_tokens = input_token_len,
                                  output_tokens = completion_tokens)
       )
@@ -563,9 +789,19 @@ class FastLLmCompletion:
           self, request: AnthropicMessageRequest, raw_request: Request,
           result_generator: AsyncIterator,
           request_id: str,
-          input_token_len: int) -> AsyncGenerator[str, None]:
+          input_token_len: int,
+          parser_request: Optional[ChatCompletionRequest]) -> AsyncGenerator[str, None]:
       model_name = self.model_name
       completion_tokens = 0
+      next_content_index = 0
+      text_block_index = None
+      tool_blocks: Dict[int, Dict[str, Any]] = {}
+      emitted_tool_use = False
+
+      previous_token_ids = []
+      current_token_ids = []
+      previous_text = ""
+      current_text = ""
 
       try:
           message = AnthropicMessageResponse(
@@ -579,12 +815,9 @@ class FastLLmCompletion:
           )
           yield self._create_anthropic_sse_event(
               "message_start", MessageStartEvent(message = message))
-          yield self._create_anthropic_sse_event(
-              "content_block_start",
-              ContentBlockStartEvent(
-                  index = 0,
-                  content_block = AnthropicTextContentBlock(text = ""),
-              ))
+
+          if request.tools and parser_request is not None:
+              self._ensure_tool_parser()
 
           async for res in result_generator:
               if (res == "[unused16]"):
@@ -592,22 +825,119 @@ class FastLLmCompletion:
               elif (res == "[unused17]"):
                   res = "</think>"
               completion_tokens += 1
-              yield self._create_anthropic_sse_event(
-                  "content_block_delta",
-                  ContentBlockDeltaEvent(
-                      index = 0,
-                      delta = AnthropicTextDelta(text = res),
-                  ))
+              delta_text = res
 
-          yield self._create_anthropic_sse_event(
-              "content_block_stop",
-              ContentBlockStopEvent(index = 0))
+              if request.tools and parser_request is not None and self.tool_parser:
+                  now_ids = self.tool_parser.get_token_ids(delta_text)
+                  current_text += delta_text
+                  current_token_ids += now_ids
+
+                  delta_message = self.tool_parser.extract_tool_calls_streaming(
+                                  previous_text = previous_text,
+                                  current_text = current_text,
+                                  delta_text = delta_text,
+                                  previous_token_ids = previous_token_ids,
+                                  current_token_ids = current_token_ids,
+                                  delta_token_ids = [0],
+                                  request = parser_request)
+
+                  previous_text += delta_text
+                  previous_token_ids += now_ids
+              else:
+                  delta_message = DeltaMessage(content = delta_text)
+
+              if not delta_message:
+                  continue
+
+              if delta_message.content:
+                  if tool_blocks:
+                      for tool_state in sorted(
+                              tool_blocks.values(),
+                              key = lambda item: item["content_index"]):
+                          yield self._create_anthropic_sse_event(
+                              "content_block_stop",
+                              ContentBlockStopEvent(index = tool_state["content_index"]))
+                      tool_blocks = {}
+
+                  if text_block_index is None:
+                      text_block_index = next_content_index
+                      next_content_index += 1
+                      yield self._create_anthropic_sse_event(
+                          "content_block_start",
+                          ContentBlockStartEvent(
+                              index = text_block_index,
+                              content_block = AnthropicTextContentBlock(text = ""),
+                          ))
+                  yield self._create_anthropic_sse_event(
+                      "content_block_delta",
+                      ContentBlockDeltaEvent(
+                          index = text_block_index,
+                          delta = AnthropicTextDelta(text = delta_message.content),
+                      ))
+
+              for tool_delta in delta_message.tool_calls:
+                  emitted_tool_use = True
+                  if text_block_index is not None:
+                      yield self._create_anthropic_sse_event(
+                          "content_block_stop",
+                          ContentBlockStopEvent(index = text_block_index))
+                      text_block_index = None
+
+                  tool_state = tool_blocks.get(tool_delta.index)
+                  if tool_state is None:
+                      content_index = next_content_index
+                      next_content_index += 1
+                      tool_state = {
+                          "content_index": content_index,
+                          "id": tool_delta.id or f"toolu_{shortuuid.random()}",
+                          "name": "",
+                      }
+                      if (tool_delta.function is not None
+                              and tool_delta.function.name is not None):
+                          tool_state["name"] = tool_delta.function.name
+                      tool_blocks[tool_delta.index] = tool_state
+                      yield self._create_anthropic_sse_event(
+                          "content_block_start",
+                          ContentBlockStartEvent(
+                              index = content_index,
+                              content_block = AnthropicToolUseContentBlock(
+                                  id = tool_state["id"],
+                                  name = tool_state["name"],
+                                  input = {},
+                              ),
+                          ))
+
+                  if (tool_delta.function is not None
+                          and tool_delta.function.name is not None
+                          and tool_state["name"] == ""):
+                      tool_state["name"] = tool_delta.function.name
+
+                  if (tool_delta.function is not None
+                          and tool_delta.function.arguments is not None):
+                      yield self._create_anthropic_sse_event(
+                          "content_block_delta",
+                          ContentBlockDeltaEvent(
+                              index = tool_state["content_index"],
+                              delta = AnthropicInputJsonDelta(
+                                  partial_json = tool_delta.function.arguments),
+                          ))
+
+          if text_block_index is not None:
+              yield self._create_anthropic_sse_event(
+                  "content_block_stop",
+                  ContentBlockStopEvent(index = text_block_index))
+          for tool_state in sorted(
+                  tool_blocks.values(), key = lambda item: item["content_index"]):
+              yield self._create_anthropic_sse_event(
+                  "content_block_stop",
+                  ContentBlockStopEvent(index = tool_state["content_index"]))
           yield self._create_anthropic_sse_event(
               "message_delta",
               MessageDeltaEvent(
                   delta = AnthropicMessageDelta(
-                      stop_reason = self._get_anthropic_stop_reason(
-                          completion_tokens, request.max_tokens),
+                      stop_reason = ("tool_use" if emitted_tool_use
+                                     else self._get_anthropic_stop_reason(
+                                         completion_tokens, request.max_tokens)),
                       stop_sequence = None,
                   ),
                   usage = AnthropicUsage(input_tokens = input_token_len,
