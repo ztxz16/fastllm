@@ -294,6 +294,304 @@ def test_models_list(base_url: str, model: str, api_key: str) -> bool:
     return True
 
 
+WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "获取指定城市的天气信息",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": "城市名称，例如 北京",
+                },
+            },
+            "required": ["city"],
+        },
+    },
+}
+
+
+def test_tool_call(base_url: str, model: str, api_key: str) -> bool:
+    """测试非流式 tool call"""
+    url = f"{base_url}/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = {
+        "model": model,
+        "max_tokens": 256,
+        "messages": [
+            {"role": "user", "content": "北京今天天气怎么样？"},
+        ],
+        "tools": [WEATHER_TOOL],
+        "tool_choice": "auto",
+        "stream": False,
+    }
+
+    print("=" * 60)
+    print("[7] 测试非流式 Tool Call")
+    print(f"    POST {url}")
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    except requests.exceptions.ConnectionError as e:
+        print(f"    ✗ 连接失败: {e}")
+        return False
+    except requests.exceptions.Timeout:
+        print("    ✗ 请求超时")
+        return False
+
+    if resp.status_code != 200:
+        print(f"    ✗ HTTP {resp.status_code}")
+        print(f"    响应: {resp.text[:500]}")
+        return False
+
+    data = resp.json()
+    choices = data.get("choices", [])
+    if not choices:
+        print("    ✗ 响应中没有 choices")
+        return False
+
+    message = choices[0].get("message", {})
+    finish_reason = choices[0].get("finish_reason")
+    tool_calls = message.get("tool_calls")
+
+    if not tool_calls:
+        print(f"    ✗ 未返回 tool_calls（finish_reason={finish_reason}）")
+        print(f"    响应内容: {message.get('content', '')[:200]}")
+        return False
+
+    print(f"    ✓ finish_reason: {finish_reason}")
+    for i, tc in enumerate(tool_calls):
+        func = tc.get("function", {})
+        name = func.get("name", "?")
+        args_raw = func.get("arguments", "")
+        args_str = args_raw if isinstance(args_raw, str) else json.dumps(args_raw, ensure_ascii=False)
+        print(f"    ✓ tool_call[{i}]: id={tc.get('id', '?')}, name={name}, args={args_str[:200]}")
+        try:
+            parsed = json.loads(args_str) if isinstance(args_raw, str) else args_raw
+            if "city" in parsed:
+                print(f"    ✓ 解析参数 city={parsed['city']}")
+        except json.JSONDecodeError:
+            print(f"    △ arguments 不是合法 JSON: {args_str[:100]}")
+
+    return True
+
+
+def test_tool_call_stream(base_url: str, model: str, api_key: str) -> bool:
+    """测试流式 tool call"""
+    url = f"{base_url}/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = {
+        "model": model,
+        "max_tokens": 256,
+        "messages": [
+            {"role": "user", "content": "北京今天天气怎么样？"},
+        ],
+        "tools": [WEATHER_TOOL],
+        "tool_choice": "auto",
+        "stream": True,
+    }
+
+    print("=" * 60)
+    print("[8] 测试流式 Tool Call")
+    print(f"    POST {url} (stream=true)")
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=60, stream=True)
+    except requests.exceptions.ConnectionError as e:
+        print(f"    ✗ 连接失败: {e}")
+        return False
+    except requests.exceptions.Timeout:
+        print("    ✗ 请求超时")
+        return False
+
+    if resp.status_code != 200:
+        print(f"    ✗ HTTP {resp.status_code}")
+        print(f"    响应: {resp.text[:500]}")
+        return False
+
+    tool_calls_by_index = {}
+    collected_content = ""
+    finish_reason = None
+    start_time = time.time()
+
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        if not line.startswith("data:"):
+            continue
+        data_str = line[len("data:"):].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        choices = chunk.get("choices", [])
+        if not choices:
+            continue
+
+        delta = choices[0].get("delta", {})
+        fr = choices[0].get("finish_reason")
+        if fr:
+            finish_reason = fr
+
+        content = delta.get("content")
+        if content:
+            collected_content += content
+
+        for tc_delta in delta.get("tool_calls", []):
+            idx = tc_delta.get("index", 0)
+            if idx not in tool_calls_by_index:
+                tool_calls_by_index[idx] = {
+                    "id": tc_delta.get("id", ""),
+                    "name": "",
+                    "arguments": "",
+                }
+            entry = tool_calls_by_index[idx]
+            if tc_delta.get("id"):
+                entry["id"] = tc_delta["id"]
+            func = tc_delta.get("function", {})
+            if func.get("name"):
+                entry["name"] += func["name"]
+            if func.get("arguments"):
+                entry["arguments"] += func["arguments"]
+
+    elapsed = time.time() - start_time
+
+    if not tool_calls_by_index:
+        print(f"    ✗ 流式响应未收到 tool_calls（finish_reason={finish_reason}）")
+        if collected_content:
+            print(f"    收到文本内容: {collected_content[:200]}")
+        return False
+
+    print(f"    ✓ finish_reason: {finish_reason}")
+    print(f"    ✓ 总耗时: {elapsed:.3f}s")
+    for idx in sorted(tool_calls_by_index):
+        entry = tool_calls_by_index[idx]
+        print(f"    ✓ tool_call[{idx}]: id={entry['id']}, name={entry['name']}, args={entry['arguments'][:200]}")
+        try:
+            parsed = json.loads(entry["arguments"])
+            if "city" in parsed:
+                print(f"    ✓ 解析参数 city={parsed['city']}")
+        except json.JSONDecodeError:
+            print(f"    △ arguments 不是合法 JSON: {entry['arguments'][:100]}")
+
+    return True
+
+
+def test_tool_call_multi_turn(base_url: str, model: str, api_key: str) -> bool:
+    """测试 tool call 多轮：发送 tool 结果后模型应给出最终回复"""
+    url = f"{base_url}/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    # 第一轮：模型应调用 get_weather
+    payload_1 = {
+        "model": model,
+        "max_tokens": 256,
+        "messages": [
+            {"role": "user", "content": "北京今天天气怎么样？"},
+        ],
+        "tools": [WEATHER_TOOL],
+        "tool_choice": "auto",
+        "stream": False,
+    }
+
+    print("=" * 60)
+    print("[9] 测试 Tool Call 多轮对话")
+    print(f"    POST {url} (第一轮: 触发 tool call)")
+    try:
+        resp1 = requests.post(url, headers=headers, json=payload_1, timeout=60)
+    except requests.exceptions.ConnectionError as e:
+        print(f"    ✗ 连接失败: {e}")
+        return False
+    except requests.exceptions.Timeout:
+        print("    ✗ 请求超时")
+        return False
+
+    if resp1.status_code != 200:
+        print(f"    ✗ HTTP {resp1.status_code}")
+        return False
+
+    data1 = resp1.json()
+    choices1 = data1.get("choices", [])
+    if not choices1:
+        print("    ✗ 第一轮响应中没有 choices")
+        return False
+
+    msg1 = choices1[0].get("message", {})
+    tool_calls = msg1.get("tool_calls")
+    if not tool_calls:
+        print(f"    ✗ 第一轮未返回 tool_calls")
+        print(f"    内容: {msg1.get('content', '')[:200]}")
+        return False
+
+    tc = tool_calls[0]
+    tc_id = tc.get("id", "call_test")
+    func_name = tc.get("function", {}).get("name", "?")
+    print(f"    ✓ 第一轮返回 tool_call: name={func_name}, id={tc_id}")
+
+    # 第二轮：将 tool 结果返回给模型
+    assistant_msg = {"role": "assistant", "content": msg1.get("content") or None, "tool_calls": tool_calls}
+    tool_result_msg = {
+        "role": "tool",
+        "tool_call_id": tc_id,
+        "name": func_name,
+        "content": json.dumps({"city": "北京", "weather": "晴", "temperature": "25°C"}, ensure_ascii=False),
+    }
+    payload_2 = {
+        "model": model,
+        "max_tokens": 256,
+        "messages": [
+            {"role": "user", "content": "北京今天天气怎么样？"},
+            assistant_msg,
+            tool_result_msg,
+        ],
+        "tools": [WEATHER_TOOL],
+        "stream": False,
+    }
+
+    print(f"    POST {url} (第二轮: 提交 tool 结果)")
+    try:
+        resp2 = requests.post(url, headers=headers, json=payload_2, timeout=60)
+    except requests.exceptions.ConnectionError as e:
+        print(f"    ✗ 连接失败: {e}")
+        return False
+    except requests.exceptions.Timeout:
+        print("    ✗ 请求超时")
+        return False
+
+    if resp2.status_code != 200:
+        print(f"    ✗ HTTP {resp2.status_code}")
+        print(f"    响应: {resp2.text[:500]}")
+        return False
+
+    data2 = resp2.json()
+    choices2 = data2.get("choices", [])
+    if not choices2:
+        print("    ✗ 第二轮响应中没有 choices")
+        return False
+
+    text2 = choices2[0].get("message", {}).get("content", "")
+    if not text2.strip():
+        print("    ✗ 第二轮响应文本为空")
+        return False
+
+    print(f"    ✓ 第二轮回复: {text2[:200]}")
+    has_weather_info = any(kw in text2 for kw in ["晴", "25", "天气", "北京"])
+    print(f"    {'✓' if has_weather_info else '△'} 回复中{'包含' if has_weather_info else '未包含'}天气相关信息")
+    return True
+
+
 def test_chat_temperature(base_url: str, model: str, api_key: str) -> bool:
     """测试 temperature 参数（temperature=0 应产生较稳定的输出）"""
     url = f"{base_url}/v1/chat/completions"
@@ -389,6 +687,9 @@ def main():
         ("System Prompt", test_chat_system_prompt),
         ("Models 列表", test_models_list),
         ("Temperature 参数", test_chat_temperature),
+        ("非流式 Tool Call", test_tool_call),
+        ("流式 Tool Call", test_tool_call_stream),
+        ("Tool Call 多轮对话", test_tool_call_multi_turn),
     ]
 
     results = []
