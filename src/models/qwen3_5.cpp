@@ -145,12 +145,6 @@ namespace fastllm {
             rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
         }
 
-        std::pair<std::vector<float>, std::vector<float>> &&pair = this->UpdateRotaryPosEmb(rope_base, rope_factor);
-        sinData.ToDevice(DataDevice::CPU);
-        cosData.ToDevice(DataDevice::CPU);
-        sinData.CopyFrom(Data(DataType::FLOAT32, { (int)this->sin.size(), (int)this->sin[0].size() }, pair.first));
-        cosData.CopyFrom(Data(DataType::FLOAT32, { (int)this->cos.size(), (int)this->cos[0].size() }, pair.second));
-
         for (int i = 0; i < block_cnt; i++) {
             std::string w1WeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate_proj.weight";
             std::string w3WeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.up_proj.weight";
@@ -173,32 +167,6 @@ namespace fastllm {
             );
 */
         }
-    }
-
-    std::pair<std::vector<float>, std::vector<float>> Qwen3_5Model::UpdateRotaryPosEmb(float base, float factor, int seqLen) {
-        int positions = std::max(max_positions, seqLen);
-        sin.resize(positions);
-        cos.resize(positions);
-        std::vector <float> invFreq;
-        for (int i = 0; i < rotary_dim; i += 2) {
-            invFreq.push_back(1.0 / pow(base, (float)i / rotary_dim));
-        }
-
-        float scale = rope_type == RoPEType::LINEAR_SCALE ? factor : 1.0;
-        for (int i = 0; i < positions; i++) {
-            sin[i].resize(rotary_dim);
-            cos[i].resize(rotary_dim);
-            for (int j = 0; j < invFreq.size(); j++) {
-                sin[i][j] = ::sin((float)i / scale * invFreq[j]);
-                cos[i][j] = ::cos((float)i / scale * invFreq[j]);
-            }
-        }
-        std::vector <float> fsin, fcos;
-        for (int i = 0; i < sin.size(); i++) {
-            fsin.insert(fsin.end(), sin[i].begin(), sin[i].end());
-            fcos.insert(fcos.end(), cos[i].begin(), cos[i].end());
-        }
-        return std::make_pair(fsin, fcos);
     }
 
     std::vector <int> Qwen3_5Model::ForwardV2(
@@ -256,9 +224,6 @@ namespace fastllm {
         // Data &attenOutput = this->forwardDataManager.GetData("attenOutput");
         bool generatedBatchDecodeParams = false;
         bool generatedAppendPagedCacheBatchParams = false;
-
-        Data* sinDataPtr = &sinData;
-        Data* cosDataPtr = &cosData;
 
         bool all1 = true;
         for (int i = 0; i < batch; i++) {
@@ -342,17 +307,15 @@ namespace fastllm {
 
                 RMSNorm(q, this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.q_norm.weight"], rms_norm_eps, q);
                 RMSNorm(k, this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.k_norm.weight"], rms_norm_eps, k);
-
                 {
-                    int dim = cosDataPtr->dims.back();
-                    fastllm::LlamaRotatePosition2DPart(q, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim, dim);
-                    fastllm::LlamaRotatePosition2DPart(k, allPositionIds, *sinDataPtr, *cosDataPtr, rotary_dim, dim);
+                    float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
+                    fastllm::RopeEncoding(q, allPositionIds, rotary_dim, rope_base, ropeScale);
+                    fastllm::RopeEncoding(k, allPositionIds, rotary_dim, rope_base, ropeScale);
                 }
 
                 PermuteSelf(q, {0, 2, 1, 3});
                 PermuteSelf(k, {0, 2, 1, 3});
                 PermuteSelf(v, {0, 2, 1, 3});
-
                 std::vector <int> qkvSize = {-1, seqlen, head_dim};
                 q.Reshape(qkvSize);
                 k.Reshape(qkvSize);
