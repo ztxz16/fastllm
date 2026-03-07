@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .openai_server.protocal.openai_protocol import *
+from .openai_server.protocal.anthropic_protocol import *
 from .openai_server.fastllm_completion import FastLLmCompletion
 from .openai_server.fastllm_embed import FastLLmEmbed
 from .openai_server.fastllm_reranker import FastLLmReranker
@@ -86,6 +87,22 @@ async def create_chat_completion(request: ChatCompletionRequest,
     else:
         assert isinstance(generator, ChatCompletionResponse)
         return JSONResponse(content = generator.model_dump())
+
+@app.post("/v1/messages")
+async def create_anthropic_message(request: AnthropicMessageRequest,
+                                   raw_request: Request):
+    generator = await fastllm_completion.create_anthropic_message(
+        request, raw_request)
+    if isinstance(generator, ErrorResponse):
+        return JSONResponse(content = generator.model_dump(),
+                            status_code = generator.code)
+    if request.stream:
+        return StreamingResponse(content = generator[0],
+                                 background = generator[1],
+                                 media_type = "text/event-stream")
+    else:
+        assert isinstance(generator, AnthropicMessageResponse)
+        return JSONResponse(content = generator.model_dump(exclude_none = True))
 
 @app.post("/v1/embed")
 async def create_embed(request: EmbedRequest,
@@ -170,7 +187,10 @@ def fastllm_server(args):
             url_path = request.url.path            
             if not url_path.startswith("/v1"):
                 return await call_next(request)
-            if request.headers.get("Authorization") != "Bearer " + args.api_key:
+            auth_header = request.headers.get("Authorization")
+            anthropic_api_key = request.headers.get("x-api-key")
+            if (auth_header != "Bearer " + args.api_key
+                    and anthropic_api_key != args.api_key):
                 return JSONResponse(content={"error": "Unauthorized"},
                                     status_code=401)
             return await call_next(request)

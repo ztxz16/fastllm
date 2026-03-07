@@ -14,6 +14,7 @@ from openai.types.chat import (ChatCompletionContentPartParam,
 from starlette.background import BackgroundTask
 
 from .protocal.openai_protocol import *
+from .protocal.anthropic_protocol import *
 
 class ConversationMessage:
     def __init__(self, role:str, content:str, tool_calls=None, tool_call_id=None, name=None):
@@ -101,6 +102,84 @@ class FastLLmCompletion:
                                       tool_call_id=tool_call_id,
                                       name=name)], []
       raise NotImplementedError("Complex input not supported yet")
+
+  def _get_anthropic_stop_reason(self, completion_tokens: int,
+                                 max_tokens: Optional[int]) -> str:
+      if max_tokens is not None and completion_tokens >= max_tokens:
+          return "max_tokens"
+      return "end_turn"
+
+  def _create_anthropic_sse_event(self, event_name: str, payload: BaseModel) -> str:
+      data = payload.model_dump_json(exclude_none = True)
+      return f"event: {event_name}\ndata: {data}\n\n"
+
+  async def create_anthropic_message(
+      self, request: AnthropicMessageRequest, raw_request: Request
+  ) -> Union[ErrorResponse, AsyncGenerator[str, None],
+             AnthropicMessageResponse,
+             Tuple[AsyncGenerator[str, None], AsyncGenerator]]:
+      error_check_ret = await self._check_model(request)
+      if error_check_ret is not None:
+          return error_check_ret
+
+      try:
+          conversation: List[ConversationMessage] = []
+          if request.system is not None:
+              system_messages, _ = self._parse_chat_message_content(
+                  "system", request.system)
+              conversation.extend(system_messages)
+
+          for m in request.messages:
+              messages, _ = self._parse_chat_message_content(
+                  m.role, m.content)
+              conversation.extend(messages)
+
+          if len(conversation) == 0:
+              raise Exception("Empty msg")
+
+          messages = []
+          for msg in conversation:
+              messages.append({
+                  "role": msg.role,
+                  "content": msg.content,
+              })
+      except Exception as e:
+          logging.error("Error in applying anthropic request: %s", e)
+          traceback.print_exc()
+          return self.create_error_response(str(e))
+
+      request_id = f"msg_{shortuuid.random()}"
+      default_gen = self.model.default_generation_config
+      top_p = request.top_p if request.top_p is not None else default_gen['top_p']
+      top_k = request.top_k if request.top_k is not None else default_gen['top_k']
+      temperature = request.temperature if request.temperature is not None else default_gen['temperature']
+      frequency_penalty = default_gen['repetition_penalty']
+      max_length = request.max_tokens if request.max_tokens else 32768
+
+      if request.stop_sequences:
+          logging.warning("Anthropic stop_sequences are not supported yet and will be ignored.")
+
+      if (not(self.hide_input)):
+         logging.info(f"fastllm anthropic input message: {messages}")
+
+      input_token_len = self.model.get_input_token_len(messages)
+      handle = self.model.launch_stream_response(messages,
+                        max_length = max_length, min_length = 0, do_sample = True,
+                        top_p = top_p, top_k = top_k, temperature = temperature,
+                        repeat_penalty = frequency_penalty, one_by_one = True)
+      self.conversation_handles[request_id] = handle
+      result_generator = self.model.stream_response_handle_async(handle)
+
+      if request.stream:
+          return (self.anthropic_message_stream_generator(
+              request, raw_request, result_generator, request_id, input_token_len),
+              BackgroundTask(self.check_disconnect, raw_request, request_id, handle))
+      else:
+          try:
+              return await self.anthropic_message_full_generator(
+                  request, raw_request, handle, result_generator, request_id, input_token_len)
+          except ValueError as e:
+              return self.create_error_response(str(e))
 
   async def create_chat_completion(
       self, request: ChatCompletionRequest, raw_request: Request
@@ -441,6 +520,116 @@ class FastLLmCompletion:
           # logging.info(f"Removed completed stream conversation from tracking: {request_id}")
       
       yield "data: [DONE]\n\n"
+      await asyncio.sleep(0)
+
+  async def anthropic_message_full_generator(
+              self, request: AnthropicMessageRequest, raw_request: Request,
+              handle: int,
+              result_generator: AsyncIterator,
+              request_id: str,
+              input_token_len: int) -> Union[ErrorResponse, AnthropicMessageResponse]:
+      model_name = self.model_name
+      result = ""
+      completion_tokens = 0
+      async for res in result_generator:
+        if (res == "[unused16]"):
+            res = "<think>"
+        elif (res == "[unused17]"):
+            res = "</think>"
+        result += res
+        completion_tokens += 1
+        if await raw_request.is_disconnected():
+           print("is_disconnected!!!")
+           self.model.abort_handle(handle)
+           logging.info(f"Abort request: {request_id}")
+           return self.create_error_response("Client disconnected")
+
+      response = AnthropicMessageResponse(
+          id = request_id,
+          content = [AnthropicTextContentBlock(text = result)],
+          model = model_name,
+          stop_reason = self._get_anthropic_stop_reason(
+              completion_tokens, request.max_tokens),
+          usage = AnthropicUsage(input_tokens = input_token_len,
+                                 output_tokens = completion_tokens)
+      )
+
+      if request_id in self.conversation_handles:
+          del self.conversation_handles[request_id]
+
+      return response
+
+  async def anthropic_message_stream_generator(
+          self, request: AnthropicMessageRequest, raw_request: Request,
+          result_generator: AsyncIterator,
+          request_id: str,
+          input_token_len: int) -> AsyncGenerator[str, None]:
+      model_name = self.model_name
+      completion_tokens = 0
+
+      try:
+          message = AnthropicMessageResponse(
+              id = request_id,
+              content = [],
+              model = model_name,
+              stop_reason = None,
+              stop_sequence = None,
+              usage = AnthropicUsage(input_tokens = input_token_len,
+                                     output_tokens = 0),
+          )
+          yield self._create_anthropic_sse_event(
+              "message_start", MessageStartEvent(message = message))
+          yield self._create_anthropic_sse_event(
+              "content_block_start",
+              ContentBlockStartEvent(
+                  index = 0,
+                  content_block = AnthropicTextContentBlock(text = ""),
+              ))
+
+          async for res in result_generator:
+              if (res == "[unused16]"):
+                  res = "<think>"
+              elif (res == "[unused17]"):
+                  res = "</think>"
+              completion_tokens += 1
+              yield self._create_anthropic_sse_event(
+                  "content_block_delta",
+                  ContentBlockDeltaEvent(
+                      index = 0,
+                      delta = AnthropicTextDelta(text = res),
+                  ))
+
+          yield self._create_anthropic_sse_event(
+              "content_block_stop",
+              ContentBlockStopEvent(index = 0))
+          yield self._create_anthropic_sse_event(
+              "message_delta",
+              MessageDeltaEvent(
+                  delta = AnthropicMessageDelta(
+                      stop_reason = self._get_anthropic_stop_reason(
+                          completion_tokens, request.max_tokens),
+                      stop_sequence = None,
+                  ),
+                  usage = AnthropicUsage(input_tokens = input_token_len,
+                                         output_tokens = completion_tokens),
+              ))
+          yield self._create_anthropic_sse_event(
+              "message_stop",
+              MessageStopEvent())
+      except ValueError as e:
+          error_data = json.dumps({
+              "type": "error",
+              "error": {
+                  "type": "invalid_request_error",
+                  "message": str(e),
+              }
+          })
+          yield f"event: error\ndata: {error_data}\n\n"
+          await asyncio.sleep(0)
+
+      if request_id in self.conversation_handles:
+          del self.conversation_handles[request_id]
+
       await asyncio.sleep(0)
       
   def create_streaming_error_response(
