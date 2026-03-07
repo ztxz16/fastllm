@@ -120,7 +120,11 @@ namespace fastllm {
         if (this->weight.dicts.find("head_dim") != this->weight.dicts.end()) {
             head_dim = atoi(this->weight.dicts["head_dim"].c_str());
         }
-        rotary_dim = head_dim;
+        if (this->weight.dicts.find("partial_rotary_factor") != this->weight.dicts.end()) {
+            rotary_dim = (int)(head_dim * atof(this->weight.dicts["partial_rotary_factor"].c_str()) + 1e-5);
+        } else {
+            rotary_dim = (int)(head_dim * 0.25 + 1e-5); // qwen3.5的默认值
+        }
         if (this->weight.dicts.find("max_position_embeddings") != this->weight.dicts.end()) {
             max_positions = atoi(this->weight.dicts["max_position_embeddings"].c_str());
         }
