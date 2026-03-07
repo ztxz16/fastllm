@@ -1970,6 +1970,62 @@ FlashInferWorkSpaceManager& getFastllmFlashInferWorkSpace() {
     return *ptr;
 }
 
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, typename DType, typename Params>
+static cudaError_t FastllmDispatchPagedPrefillKernel(Params &prefill_params, DType *tmp_v, float *tmp_s,
+                                                     bool enable_pdl, cudaStream_t stream) {
+    return flashinfer::BatchPrefillWithPagedKVCacheDispatched<
+        CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
+        flashinfer::PosEncodingMode::kNone, /*USE_FP16_QK_REDUCTION=*/false,
+        flashinfer::MaskMode::kCausal, flashinfer::DefaultAttention<false, false, false, false>,
+        Params>(prefill_params, tmp_v, tmp_s, enable_pdl, stream);
+}
+
+template <uint32_t HEAD_DIM, typename DType, typename Params>
+static cudaError_t FastllmDispatchPagedPrefillByCtaTile(long cta_tile_q, Params &prefill_params, DType *tmp_v,
+                                                        float *tmp_s, bool enable_pdl, cudaStream_t stream,
+                                                        const char *op_name) {
+    switch (cta_tile_q) {
+        case 16:
+            return FastllmDispatchPagedPrefillKernel<16, HEAD_DIM>(prefill_params, tmp_v, tmp_s, enable_pdl, stream);
+        case 64:
+            return FastllmDispatchPagedPrefillKernel<64, HEAD_DIM>(prefill_params, tmp_v, tmp_s, enable_pdl, stream);
+        case 128:
+            return FastllmDispatchPagedPrefillKernel<128, HEAD_DIM>(prefill_params, tmp_v, tmp_s, enable_pdl, stream);
+        default:
+            printf("%s: Unsupported cta_tile_q: %ld\n", op_name, cta_tile_q);
+            return cudaErrorNotSupported;
+    }
+}
+
+template <typename DType, typename Params>
+static cudaError_t FastllmDispatchPagedPrefillByHeadDim(uint32_t head_dim, long cta_tile_q, Params &prefill_params,
+                                                        DType *tmp_v, float *tmp_s, bool enable_pdl,
+                                                        cudaStream_t stream, const char *op_name) {
+    switch (head_dim) {
+        case 64:
+            return FastllmDispatchPagedPrefillByCtaTile<64>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        case 80:
+            return FastllmDispatchPagedPrefillByCtaTile<80>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        case 96:
+            return FastllmDispatchPagedPrefillByCtaTile<96>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        case 112:
+            return FastllmDispatchPagedPrefillByCtaTile<112>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        case 128:
+            return FastllmDispatchPagedPrefillByCtaTile<128>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        case 160:
+            return FastllmDispatchPagedPrefillByCtaTile<160>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        case 192:
+            return FastllmDispatchPagedPrefillByCtaTile<192>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        case 256:
+            return FastllmDispatchPagedPrefillByCtaTile<256>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        case 512:
+            return FastllmDispatchPagedPrefillByCtaTile<512>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        default:
+            printf("%s: Unsupported head_dim %u\n", op_name, head_dim);
+            return cudaErrorNotSupported;
+    }
+}
+
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited) {
     using namespace flashinfer;
     FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
@@ -2006,6 +2062,7 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
     int pageLen = k.pageLen;
     int numHeads = pagedKVCacheK->dims[2];  // [maxPages, pageLen, numHeads, headDim]
     int headDim = pagedKVCacheK->dims[3];
+    int valueHeadDim = pagedKVCacheV->dims[3];
 
     // 检查数据类型
     bool useBFloat16 = (q.dataType == fastllm::DataType::BFLOAT16);
@@ -2018,9 +2075,9 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         return true;
     }
     
-    if (q2 != 128 || v2 != 128 || headDim != 128) {
-        printf("DoCudaAttentionPaged: head_dim must be 128, got q2=%d, v2=%d, headDim=%d\n", 
-                       q2, v2, headDim);
+    if (q2 != headDim || v2 != valueHeadDim || headDim != valueHeadDim) {
+        printf("DoCudaAttentionPaged: head_dim mismatch, got q2=%d, v2=%d, kHeadDim=%d, vHeadDim=%d\n",
+                       q2, v2, headDim, valueHeadDim);
         exit(0);
     }
     
@@ -2175,33 +2232,9 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         }
         
         bool enable_pdl = false;
-        if (plan_info.cta_tile_q == 16) {
-            status = BatchPrefillWithPagedKVCacheDispatched<
-                /*CTA_TILE_Q=*/16, /*HEAD_DIM_QK=*/128, /*HEAD_DIM_VO=*/128,
-                PosEncodingMode::kNone, /*USE_FP16_QK_REDUCTION=*/false,
-                MaskMode::kCausal, DefaultAttention<false, false, false, false>,
-                BatchPrefillPagedParams<DType, DType, DType, uint32_t>>(
-                prefill_params, tmp_v, tmp_s, enable_pdl, stream);
-        } else if (plan_info.cta_tile_q == 64) {
-            status = BatchPrefillWithPagedKVCacheDispatched<
-                /*CTA_TILE_Q=*/64, /*HEAD_DIM_QK=*/128, /*HEAD_DIM_VO=*/128,
-                PosEncodingMode::kNone, /*USE_FP16_QK_REDUCTION=*/false,
-                MaskMode::kCausal, DefaultAttention<false, false, false, false>,
-                BatchPrefillPagedParams<DType, DType, DType, uint32_t>>(
-                prefill_params, tmp_v, tmp_s, enable_pdl, stream);
-        } else if (plan_info.cta_tile_q == 128) {
-            status = BatchPrefillWithPagedKVCacheDispatched<
-                /*CTA_TILE_Q=*/128, /*HEAD_DIM_QK=*/128, /*HEAD_DIM_VO=*/128,
-                PosEncodingMode::kNone, /*USE_FP16_QK_REDUCTION=*/false,
-                MaskMode::kCausal, DefaultAttention<false, false, false, false>,
-                BatchPrefillPagedParams<DType, DType, DType, uint32_t>>(
-                prefill_params, tmp_v, tmp_s, enable_pdl, stream);
-        } else {
-            printf("DoCudaAttentionPaged: Unsupported cta_tile_q: %ld\n", plan_info.cta_tile_q);
-            cudaStreamSynchronize(stream);
-            FastllmCudaFree(q_indptr_gpu);
-            exit(0);
-        }
+        status = FastllmDispatchPagedPrefillByHeadDim(
+            headDim, (long)plan_info.cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream,
+            "DoCudaAttentionPaged");
         
         FastllmCudaFree(q_indptr_gpu);
         ((fastllm::Data*)&output)->Resize({output.dims[1], output.dims[0], output.dims[2]});
@@ -2283,6 +2316,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
     int pageLen = kCaches.pageLen;
     int numHeads = pagedKVCacheK->dims[2];  // [maxPages, pageLen, numHeads, headDim]
     int headDim = pagedKVCacheK->dims[3];
+    int valueHeadDim = pagedKVCacheV->dims[3];
     
     // 检查数据类型
     bool useBFloat16 = (q.dataType == fastllm::DataType::BFLOAT16);
@@ -2295,9 +2329,9 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         return false;
     }
     
-    if (q2 != 128 || v2 != 128 || headDim != 128) {
-        printf("FastllmCudaHalfPagedAttentionBatch: head_dim must be 128, got q2=%d, v2=%d, headDim=%d\n", 
-               q2, v2, headDim);
+    if (q2 != headDim || v2 != valueHeadDim || headDim != valueHeadDim) {
+        printf("FastllmCudaHalfPagedAttentionBatch: head_dim mismatch, got q2=%d, v2=%d, kHeadDim=%d, vHeadDim=%d\n",
+               q2, v2, headDim, valueHeadDim);
         exit(0);
     }
     
@@ -2401,32 +2435,9 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         }
         
         bool enable_pdl = false;
-        if (plan_info.cta_tile_q == 16) {
-            status = BatchPrefillWithPagedKVCacheDispatched<
-                /*CTA_TILE_Q=*/16, /*HEAD_DIM_QK=*/128, /*HEAD_DIM_VO=*/128,
-                PosEncodingMode::kNone, /*USE_FP16_QK_REDUCTION=*/false,
-                MaskMode::kCausal, DefaultAttention<false, false, false, false>,
-                BatchPrefillPagedParams<DType, DType, DType, uint32_t>>(
-                prefill_params, tmp_v, tmp_s, enable_pdl, stream);
-        } else if (plan_info.cta_tile_q == 64) {
-            status = BatchPrefillWithPagedKVCacheDispatched<
-                /*CTA_TILE_Q=*/64, /*HEAD_DIM_QK=*/128, /*HEAD_DIM_VO=*/128,
-                PosEncodingMode::kNone, /*USE_FP16_QK_REDUCTION=*/false,
-                MaskMode::kCausal, DefaultAttention<false, false, false, false>,
-                BatchPrefillPagedParams<DType, DType, DType, uint32_t>>(
-                prefill_params, tmp_v, tmp_s, enable_pdl, stream);
-        } else if (plan_info.cta_tile_q == 128) {
-            status = BatchPrefillWithPagedKVCacheDispatched<
-                /*CTA_TILE_Q=*/128, /*HEAD_DIM_QK=*/128, /*HEAD_DIM_VO=*/128,
-                PosEncodingMode::kNone, /*USE_FP16_QK_REDUCTION=*/false,
-                MaskMode::kCausal, DefaultAttention<false, false, false, false>,
-                BatchPrefillPagedParams<DType, DType, DType, uint32_t>>(
-                prefill_params, tmp_v, tmp_s, enable_pdl, stream);
-        } else {
-            printf("FastllmCudaHalfPagedAttentionBatch: Unsupported cta_tile_q: %ld\n", plan_info.cta_tile_q);
-            cudaStreamSynchronize(stream);
-            exit(0);
-        }
+        status = FastllmDispatchPagedPrefillByHeadDim(
+            headDim, (long)plan_info.cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream,
+            "FastllmCudaHalfPagedAttentionBatch");
     };
 
     if (useBFloat16) {
