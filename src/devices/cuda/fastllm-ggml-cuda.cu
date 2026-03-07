@@ -16,6 +16,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include <cuda_bf16.h>
 
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
@@ -2090,4 +2091,120 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
     FastllmCudaFinishOutput(output, cudaOutput);
 
     return true;   
+}
+
+static __global__ void FastllmCudaHalf2Bf16KernelGGML(const half *src, __nv_bfloat16 *dst, int len) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len)
+        dst[idx] = __float2bfloat16_rn(__half2float(src[idx]));
+}
+
+bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
+    if (weight.cudaData == nullptr ||
+        (weight.extraCudaHalfData.size() == 0 && bias.dims.size() > 0)) {
+        __nv_bfloat16 *cudaBiasData;
+        cudaError_t state = cudaSuccess;
+        state = cudaMalloc(&cudaBiasData, k * sizeof(__nv_bfloat16));
+        if (bias.dims.size() > 0) {
+            float *tempBiasData;
+            state = cudaMalloc(&tempBiasData, k * sizeof(float));
+            state = cudaMemcpy(tempBiasData, (uint8_t *)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
+            int threadPerBlock = std::min(256, k);
+            FastllmCudaFloat2Bf16Kernel <<<(k - 1) / threadPerBlock + 1, threadPerBlock>>>(tempBiasData, cudaBiasData, k);
+            state = cudaFree(tempBiasData);
+        } else {
+            state = cudaMemset(cudaBiasData, 0, k * sizeof(__nv_bfloat16));
+        }
+        checkCudaErrors("Error: CUDA error when moving bias (bf16) to device!", state);
+        weight.extraCudaHalfData.push_back((void *)cudaBiasData);
+    }
+
+    __nv_bfloat16 *cudaBiasData = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *)weight.extraCudaHalfData[0];
+    __nv_bfloat16 *cudaInput = (__nv_bfloat16 *)FastllmCudaPrepareInput(input);
+    __nv_bfloat16 *cudaOutput = (__nv_bfloat16 *)FastllmCudaPrepareOutput(output);
+
+    block_q8_1 *q8Input = (block_q8_1 *)FastllmCudaMalloc(n * m * sizeof(__nv_bfloat16));
+    quantize_row_q8_1_cuda(
+        cudaInput, q8Input, m, n, 1, m, GGML_TYPE_Q8_1, nullptr
+    );
+
+    ggml_backend_cuda_context ctx;
+
+    auto dequant = ggml_get_to_fp16_cuda((ggml_type)weight.ggmlType);
+    auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
+
+    if ((n > 32 || !has_vec_dot) && dequant != nullptr) {
+        auto fastllmCublasHandle = getFastllmCublasHandle();
+
+        half *cudaFp16Weight = (half *)FastllmCudaMalloc(k * m * sizeof(half));
+        dequant((const char *)weight.cudaData, cudaFp16Weight, k, m, nullptr);
+
+        __nv_bfloat16 *cudaBf16Weight = (__nv_bfloat16 *)FastllmCudaMalloc(k * m * sizeof(__nv_bfloat16));
+        int len = k * m;
+        int threadPerBlock = std::min(256, len);
+        FastllmCudaHalf2Bf16KernelGGML <<<(len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaFp16Weight, cudaBf16Weight, len);
+        FastllmCudaFree(cudaFp16Weight);
+
+        float h_alpha = 1.0f, h_beta = 0.0f;
+        cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
+        cublasStatus_t status;
+
+        status = cublasGemmEx(fastllmCublasHandle,
+                              CUBLAS_OP_T, CUBLAS_OP_N,
+                              k, n, m,
+                              &h_alpha, cudaBf16Weight, AType,
+                              m, cudaInput, BType,
+                              m, &h_beta,
+                              cudaOutput, CType,
+                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            printf("Error: cublas error (BFloat16MatMulGGUF).\n");
+            throw("cublas error");
+            exit(0);
+        }
+
+        FastllmCudaFree(cudaBf16Weight);
+    } else if (n > 1) {
+        int i = 0;
+        for (; i + 15 < n; i += 16) {
+            ggml_cuda_op_mul_mat_vec_q_impl(
+                ctx, (ggml_type)weight.ggmlType, m, k, 1,
+                0, 0, 0, 0,
+                (char *)weight.cudaData,
+                (char *)(q8Input + i * (m / QK8_1)),
+                cudaOutput + i * k,
+                nullptr,
+                0, k, 16, m, nullptr
+            );
+        }
+
+        if (n - i > 0) {
+            ggml_cuda_op_mul_mat_vec_q_impl(
+                ctx, (ggml_type)weight.ggmlType, m, k, 1,
+                0, 0, 0, 0,
+                (char *)weight.cudaData,
+                (char *)(q8Input + i * (m / QK8_1)),
+                cudaOutput + i * k,
+                nullptr,
+                0, k, n - i, m, nullptr
+            );
+        }
+    } else {
+        ggml_cuda_op_mul_mat_vec_q_impl(
+            ctx, (ggml_type)weight.ggmlType, m, k, 1,
+            0, 0, 0, 0,
+            (char *)weight.cudaData, (char *)q8Input, cudaOutput, nullptr,
+            0, k, n, m, nullptr
+        );
+    }
+
+    if (bias.dims.size() > 0) {
+        FastllmCudaBiasKernel <<<n, 256>>>(cudaOutput, cudaBiasData, k);
+    }
+
+    FastllmCudaFree(q8Input);
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+
+    return true;
 }
