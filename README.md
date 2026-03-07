@@ -390,7 +390,15 @@ pip uninstall ftllm
 
 建议使用cmake编译，需要提前安装gcc，g++ (建议9.4以上), make, cmake (建议3.23以上)
 
-GPU编译需要提前安装好CUDA编译环境，建议使用尽可能新的CUDA版本
+需要安装numa库，在Ubuntu下的安装命令一般使用：
+
+```
+apt-get install libnuma-dev
+```
+
+如果编译出错，建议使用AI工具帮忙安装环境
+
+GPU编译需要提前安装好CUDA编译环境，建议使用尽可能新的CUDA版本，并安装NCCL包
 
 使用如下命令编译
 
