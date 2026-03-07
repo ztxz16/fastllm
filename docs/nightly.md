@@ -64,7 +64,7 @@ ftllm server Qwen/Qwen3-0.6B
   - **示例**: `ftllm run Qwen/Qwen3-0.6B --cache_dir /mnt/model_cache`
 
 - `--ori`:
-  - **描述**: 指定原始模型权重路径，读取 GGUF 格式文件时需要配合使用。GGUF 文件不包含完整的模型配置，需要从原始模型中读取。
+  - **描述**: 指定原始模型权重路径，读取 GGUF 格式文件时需要配合使用。ftllm暂不支持从GGUF文件中读取模型配置
   - **示例**:
 
 ``` sh
@@ -136,6 +136,8 @@ ftllm server DeepSeek-V3-0324-Q4_K_M-00001-of-00009.gguf --ori DeepSeek-V3
 |-------:|--------|------------:|
 | 稠密模型 | cuda   |   不生效    |
 | MOE模型  | cuda   |   numa    |
+
+如果只设置了device没设置moe_device，则moe_device会跟随device
 
 - `-t` 或 `--threads`:
   - **描述**: 设置使用的 CPU 线程数。不设定时自动检测

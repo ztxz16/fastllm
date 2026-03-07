@@ -2,6 +2,8 @@
 
 | [快速开始](#快速开始) | [部署DeepSeek](docs/deepseek.md) | [部署Qwen3](docs/qwen3.md) | [版本日志](docs/version.md) | [English Document](README_EN.md)
 
+- 近期更新较大，发布了 `fastllm-nightly` 版本供提前体验，使用文档参见 [fastllm-nightly 使用文档](docs/nightly.md)
+
 # 引用说明
 
 本项目参考了许多开源项目的代码和相关文章，具体请参考 [参考代码和文章](#参考代码和文章)
@@ -20,7 +22,6 @@ fastllm是c++实现自有算子替代Pytorch的高性能全功能大模型推理
 
 ## 新功能速览
 
-- 近期更新较大，发布了 `fastllm-nightly` 版本供提前体验，使用文档参见 [fastllm-nightly 使用文档](docs/nightly.md)
 - Fastllm目前支持Qwen3-Next模型的混合推理了！
 - Fastllm目前支持导出通用动态量化模型了！参考[动态量化说明](docs/dtype_config.md)
 - Fastllm目前可以支持部分GGUF模型的读取了！需要注意，目前需要使用`--ori`参数指定源模型配置文件夹，请阅读 [使用指南](#使用指南)
@@ -239,6 +240,8 @@ ftllm server deepseek-ai/DeepSeek-V3-0324 --dtype fp8 --moe_dtype int4
 |-------:|--------|------------:|
 | 稠密模型 | cuda   |   不生效    |
 | MOE模型  | cuda   |   cpu    |
+
+如果只设置了device没设置moe_device，则moe_device会跟随device
 
 对于发烧友而言，如果想更进一步榨干硬件，可以参考 [混合推理指南](docs/mixforward.md)
 
