@@ -870,9 +870,8 @@ class model:
         config_base_path = None
 
         if id != -99999:
-            self.model = id
             # 使用已存在的 model id，无法自动关联配置文件，保持默认配置
-            pass
+            self.model = id
         else:
             if len(path) > 5 and path[-5:].lower() == ".gguf":
                 # GGUF 文件
