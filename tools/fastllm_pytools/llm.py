@@ -870,6 +870,7 @@ class model:
         config_base_path = None
 
         if id != -99999:
+            self.model = id
             # 使用已存在的 model id，无法自动关联配置文件，保持默认配置
             pass
         else:
@@ -931,7 +932,7 @@ class model:
             'top_k': 1,
             'temperature': 1.0
         }
-        
+
         # 统一尝试加载 generation_config.json
         if config_base_path:
             generation_config_path = os.path.join(config_base_path, "generation_config.json")
