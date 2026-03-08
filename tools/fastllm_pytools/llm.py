@@ -866,31 +866,47 @@ class model:
         self.tool_call_parser = tool_call_parser
         self.force_chat_template = False
 
-        if (id != -99999):
-            self.model = id;
+        # 确定配置根目录（用于加载 generation_config.json）
+        config_base_path = None
+
+        if id != -99999:
+            # 使用已存在的 model id，无法自动关联配置文件，保持默认配置
+            pass
         else:
             if len(path) > 5 and path[-5:].lower() == ".gguf":
+                # GGUF 文件
                 self.hf_tokenizer = try_load_hf_tokenizer(ori_model_path)
                 self.model = fastllm_lib.create_llm_model_from_gguf(path.encode(), ori_model_path.encode())
+                # 配置目录：优先用 ori_model_path（若存在且为目录），否则用 GGUF 文件所在目录
+                if ori_model_path and os.path.isdir(ori_model_path):
+                    config_base_path = ori_model_path
+                else:
+                    config_base_path = os.path.dirname(path)
             elif os.path.isfile(path):
-                self.model = fastllm_lib.create_llm_model(path.encode());
+                # 其他格式的单文件模型（如 safetensors）
+                self.model = fastllm_lib.create_llm_model(path.encode())
+                config_base_path = os.path.dirname(path)
             elif os.path.isdir(path):
+                # HuggingFace 格式目录
                 if tokenizer_type != "fastllm":
                     self.hf_tokenizer = try_load_hf_tokenizer(path)
-                    if (chat_template != ""):
+                    if chat_template != "":
                         self.hf_tokenizer.chat_template = chat_template
                         self.force_chat_template = True
                 if model_json != "":
-                    self.model = fastllm_lib.create_llm_model_fromhf_with_config(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, 
-                                                                 ctypes.c_bool(self.hf_tokenizer != None), model_json.encode());
+                    self.model = fastllm_lib.create_llm_model_fromhf_with_config(
+                        path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
+                        ctypes.c_bool(self.hf_tokenizer != None), model_json.encode())
                 else:
-                    self.model = fastllm_lib.create_llm_model_fromhf(path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt, 
-                                                                 ctypes.c_bool(self.hf_tokenizer != None), lora.encode(), 
-                                                                 use_moe_dtype, fastllm_data_type_dict[moe_dtype], moe_int4g_groupcnt, dtype_config.encode());
-                if (os.path.isfile(os.path.join(path, "config.json"))):
+                    self.model = fastllm_lib.create_llm_model_fromhf(
+                        path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
+                        ctypes.c_bool(self.hf_tokenizer != None), lora.encode(),
+                        use_moe_dtype, fastllm_data_type_dict[moe_dtype], moe_int4g_groupcnt, dtype_config.encode())
+                if os.path.isfile(os.path.join(path, "config.json")):
                     self.config = json.load(open(os.path.join(path, "config.json"), "r"))
+                config_base_path = path
             else:
-                print("path error: ", path);
+                print("path error: ", path)
                 exit(0)
 
         self.direct_query = False;
@@ -915,14 +931,17 @@ class model:
             'top_k': 1,
             'temperature': 1.0
         }
-        generation_config_path = os.path.join(path, "generation_config.json") if os.path.isdir(path) else None
-        if generation_config_path and os.path.isfile(generation_config_path):
-            with open(generation_config_path, "r", encoding="utf-8") as f:
-                gen_cfg = json.load(f)
-                if gen_cfg.get('do_sample', False):
-                    for key in ["repetition_penalty", "top_p", "top_k", "temperature"]:
-                        if key in gen_cfg:
-                            self.default_generation_config[key] = gen_cfg[key]
+        
+        # 统一尝试加载 generation_config.json
+        if config_base_path:
+            generation_config_path = os.path.join(config_base_path, "generation_config.json")
+            if os.path.isfile(generation_config_path):
+                with open(generation_config_path, "r", encoding="utf-8") as f:
+                    gen_cfg = json.load(f)
+                    if gen_cfg.get('do_sample', False):
+                        for key in ["repetition_penalty", "top_p", "top_k", "temperature"]:
+                            if key in gen_cfg:
+                                self.default_generation_config[key] = gen_cfg[key]
         print(f"[Fastllm] default generation config: {self.default_generation_config}")
     
     def apply_chat_template(
