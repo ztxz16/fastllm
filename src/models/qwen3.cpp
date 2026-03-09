@@ -356,6 +356,12 @@ namespace fastllm {
             std::string inputRmsName = "model.layers." + std::to_string(i) + ".input_layernorm.weight";
             std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
             std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
+            std::string qWeightName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+            std::string qBiasName = "model.layers." + std::to_string(i) + ".self_attn.q_proj.bias";
+            std::string kWeightName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.weight";
+            std::string kBiasName = "model.layers." + std::to_string(i) + ".self_attn.k_proj.bias";
+            std::string vWeightName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string vBiasName = "model.layers." + std::to_string(i) + ".self_attn.v_proj.bias";
             std::string qNormName = "model.layers." + std::to_string(i) + ".self_attn.q_norm.weight";
             std::string kNormName = "model.layers." + std::to_string(i) + ".self_attn.k_norm.weight";
             std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
@@ -364,10 +370,21 @@ namespace fastllm {
             std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
             std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
 
+            bool hasMergeQkv = (weight.weight.find(mergeQkvWeightName) != weight.weight.end());
+            Data *mergeW = hasMergeQkv ? &weight[mergeQkvWeightName] : GetEmptyData();
+            Data *mergeB = hasMergeQkv ? &weight[mergeQkvBiasName] : GetEmptyData();
+            Data *qW = hasMergeQkv ? GetEmptyData() : &weight[qWeightName];
+            Data *qB = hasMergeQkv ? GetEmptyData() : &weight[qBiasName];
+            Data *kW = hasMergeQkv ? GetEmptyData() : &weight[kWeightName];
+            Data *kB = hasMergeQkv ? GetEmptyData() : &weight[kBiasName];
+            Data *vW = hasMergeQkv ? GetEmptyData() : &weight[vWeightName];
+            Data *vB = hasMergeQkv ? GetEmptyData() : &weight[vBiasName];
+
             RMSNorm(hiddenStates, this->weight[inputRmsName], rms_norm_eps, attenInput);
             AttentionPagedBlock(
                 &attenInput,
-                &weight[mergeQkvWeightName], &weight[mergeQkvBiasName],
+                mergeW, mergeB,
+                qW, qB, kW, kB, vW, vB,
                 GetEmptyData(), GetEmptyData(),
                 &weight[qNormName], &weight[kNormName],
                 &weight[oWeightName], &weight[oBiasName],

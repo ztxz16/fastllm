@@ -22,6 +22,9 @@ namespace fastllm {
     void AttentionPagedBlock (
         Data *attenInput,
         Data *mergeQkvWeight, Data *mergeQkvBias,
+        Data *qWeight, Data *qBias,
+        Data *kWeight, Data *kBias,
+        Data *vWeight, Data *vBias,
         Data *preQNormWeight, Data *preKNormWeight,
         Data *qNormWeight, Data *kNormWeight,
         Data *oWeight, Data *oBias,
@@ -46,7 +49,17 @@ namespace fastllm {
         bool doPostQKNorm
     ) {
         // 1. Linear QKV projection
-        Linear(*attenInput, *mergeQkvWeight, *mergeQkvBias, *qkv);
+        bool mergedQkv = (mergeQkvWeight->dims.size() > 0);
+        if (mergedQkv) {
+            Linear(*attenInput, *mergeQkvWeight, *mergeQkvBias, *qkv);
+        } else {
+            Data qResult, kResult, vResult, qkResult;
+            Linear(*attenInput, *qWeight, *qBias, qResult);
+            Linear(*attenInput, *kWeight, *kBias, kResult);
+            Linear(*attenInput, *vWeight, *vBias, vResult);
+            Cat(qResult, kResult, -1, qkResult);
+            Cat(qkResult, vResult, -1, *qkv);
+        }
 
         if (doPostQKNorm) {
             int per = qkv->dims.back() / (num_attention_heads / num_key_value_heads + 2);

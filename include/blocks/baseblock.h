@@ -80,6 +80,9 @@ namespace fastllm {
     void AttentionPagedBlock (
         Data *attenInput,
         Data *mergeQkvWeight, Data *mergeQkvBias,
+        Data *qWeight, Data *qBias,
+        Data *kWeight, Data *kBias,
+        Data *vWeight, Data *vBias,
         Data *preQNormWeight, Data *preKNormWeight,
         Data *qNormWeight, Data *kNormWeight,
         Data *oWeight, Data *oBias,
