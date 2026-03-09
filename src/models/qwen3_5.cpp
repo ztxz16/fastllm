@@ -11,6 +11,8 @@
 #include <unordered_map>
 
 #include <cstring>
+#include <cstdlib>
+#include <cmath>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -409,7 +411,7 @@ namespace fastllm {
 
                 Data &last_recurrent_state = pastValue;
 
-                Data core_attn_out, core_attn_out_temp;
+                Data core_attn_out, core_attn_out_temp, core_attn_out_ready;
                 if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
                     // torch_recurrent_gated_delta_rule
                     {
@@ -530,64 +532,107 @@ namespace fastllm {
                     CausalMask(attn, 1, 0.0f);
 
                     if (last_recurrent_state.dims.size() == 0) {
+#ifdef USE_CUDA
+                        if (qq.dataDevice == DataDevice::CUDA) {
+                            last_recurrent_state.dataDevice = qq.dataDevice;
+                            last_recurrent_state.dataDeviceIds = qq.dataDeviceIds;
+                        }
+#endif
                         last_recurrent_state.Resize({key_batch_size, key_sequence_length, key_k_head_dim, v_head_dim_local});
                         last_recurrent_state.Allocate(0.0f);
                     }
 
-                    auto makeChunk4D = [](Data &src, int idx, Data &dst) {
-                        dst.dims = {src.dims[1], src.dims[2], src.dims[3], src.dims[4]};
-                        dst.strides = {src.strides[1], src.strides[2], src.strides[3], src.strides[4]};
-                        dst.FakeFrom(src, (size_t) idx * src.strides[0] * src.unitSize);
-                    };
-                    auto makeChunk3D = [](Data &src, int idx, Data &dst) {
-                        dst.dims = {src.dims[1], src.dims[2], src.dims[3]};
-                        dst.strides = {src.strides[1], src.strides[2], src.strides[3]};
-                        dst.FakeFrom(src, (size_t) idx * src.strides[0] * src.unitSize);
-                    };
+                    auto runChunkPrefillReference = [&](Data &state, Data &out) {
+                        auto makeChunk4D = [](Data &src, int idx, Data &dst) {
+                            dst.dims = {src.dims[1], src.dims[2], src.dims[3], src.dims[4]};
+                            dst.strides = {src.strides[1], src.strides[2], src.strides[3], src.strides[4]};
+                            dst.FakeFrom(src, (size_t) idx * src.strides[0] * src.unitSize);
+                        };
+                        auto makeChunk3D = [](Data &src, int idx, Data &dst) {
+                            dst.dims = {src.dims[1], src.dims[2], src.dims[3]};
+                            dst.strides = {src.strides[1], src.strides[2], src.strides[3]};
+                            dst.FakeFrom(src, (size_t) idx * src.strides[0] * src.unitSize);
+                        };
 
-                    for (int ci = 0; ci < tot_heads / chunk_size; ci++) {
-                        Data q_i, k_i, v_i, attn_i, k_cumdecay_i;
-                        makeChunk4D(qq, ci, q_i);
-                        makeChunk4D(kk, ci, k_i);
-                        makeChunk4D(vv, ci, v_i);
-                        makeChunk4D(attn, ci, attn_i);
-                        makeChunk4D(k_cumdecay, ci, k_cumdecay_i);
+                        for (int ci = 0; ci < tot_heads / chunk_size; ci++) {
+                            Data q_i, k_i, v_i, attn_i, k_cumdecay_i;
+                            makeChunk4D(qq, ci, q_i);
+                            makeChunk4D(kk, ci, k_i);
+                            makeChunk4D(vv, ci, v_i);
+                            makeChunk4D(attn, ci, attn_i);
+                            makeChunk4D(k_cumdecay, ci, k_cumdecay_i);
 
-                        Data v_prime, v_new;
-                        MatMul(k_cumdecay_i, last_recurrent_state, v_prime);
-                        Mul(v_prime, -1.0f, v_new);
-                        AddTo(v_new, v_i);
+                            Data v_prime, v_new;
+                            MatMul(k_cumdecay_i, state, v_prime);
+                            Mul(v_prime, -1.0f, v_new);
+                            AddTo(v_new, v_i);
 
-                        Data attn_inter, g_i, g_i_exp;
-                        makeChunk3D(gg, ci, g_i);
-                        makeChunk3D(g, ci, g_i_exp);
-                        g_i_exp.Resize({g_i_exp.dims[0], g_i_exp.dims[1], g_i_exp.dims[2], 1});
-                        MulTo(q_i, g_i_exp);
+                            Data attn_inter, g_i, g_i_exp;
+                            makeChunk3D(gg, ci, g_i);
+                            makeChunk3D(g, ci, g_i_exp);
+                            g_i_exp.Resize({g_i_exp.dims[0], g_i_exp.dims[1], g_i_exp.dims[2], 1});
+                            MulTo(q_i, g_i_exp);
 
-                        MatMul(q_i, last_recurrent_state, attn_inter);
-                        Data atv;
-                        MatMul(attn_i, v_new, atv);
-                        AddTo(atv, attn_inter);
-                        atv.Resize({atv.dims[0], atv.dims[1], 1, atv.dims[2], atv.dims[3]});
-                        if (ci == 0) {
-                            Mul(atv, 1.0f, core_attn_out);
-                        } else {
-                            Mul(core_attn_out, 1.0f, core_attn_out_temp);
-                            Cat(core_attn_out_temp, atv, 3, core_attn_out);
+                            MatMul(q_i, state, attn_inter);
+                            Data atv;
+                            MatMul(attn_i, v_new, atv);
+                            AddTo(atv, attn_inter);
+                            atv.Resize({atv.dims[0], atv.dims[1], 1, atv.dims[2], atv.dims[3]});
+                            if (ci == 0) {
+                                Mul(atv, 1.0f, out);
+                            } else {
+                                Mul(out, 1.0f, core_attn_out_temp);
+                                Cat(core_attn_out_temp, atv, 3, out);
+                            }
+
+                            Data g_i_last, g_i_last_repeat, g_i_delta, g_i_scale;
+                            Split(g_i, 2, g_i.dims[2] - 1, g_i.dims[2], g_i_last);
+                            Repeat(g_i_last, 2, g_i.dims[2], g_i_last_repeat);
+                            Mul(g_i, -1.0f, g_i_delta);
+                            AddTo(g_i_last_repeat, g_i_delta);
+                            Exp(g_i_last_repeat, g_i_scale);
+                            g_i_scale.Resize({g_i_scale.dims[0], g_i_scale.dims[1], g_i_scale.dims[2], 1});
+                            MulTo(k_i, g_i_scale);
+
+                            Data k_i_v_new;
+                            PermuteSelf(k_i, {0, 1, 3, 2});
+                            MatMul(k_i, v_new, k_i_v_new);
+
+                            Data g_i_exp_last;
+                            g_i_exp_last.dims = {g_i_exp.dims[0], g_i_exp.dims[1], 1, g_i_exp.dims[3]};
+                            g_i_exp_last.strides = {g_i_exp.strides[0], g_i_exp.strides[1], g_i_exp.strides[2], g_i_exp.strides[3]};
+                            g_i_exp_last.FakeFrom(g_i_exp, (size_t)(g_i_exp.dims[2] - 1) * g_i_exp.strides[2] * g_i_exp.unitSize);
+                            MulTo(state, g_i_exp_last);
+                            AddTo(state, k_i_v_new);
                         }
+                    };
 
-                        ApplyChunkDecayByLastLogG(k_i, g_i);
+                    bool useFusedChunkPrefill = false;
+#ifdef USE_CUDA
+                    if (qq.dataDevice == DataDevice::CUDA &&
+                        kk.dataDevice == DataDevice::CUDA &&
+                        vv.dataDevice == DataDevice::CUDA &&
+                        gg.dataDevice == DataDevice::CUDA &&
+                        attn.dataDevice == DataDevice::CUDA &&
+                        k_cumdecay.dataDevice == DataDevice::CUDA &&
+                        last_recurrent_state.dataDevice == DataDevice::CUDA) {
+                        useFusedChunkPrefill = true;
+                        const char *useFusedEnv = std::getenv("FASTLLM_USE_FUSED_GDN_PREFILL");
+                        if (useFusedEnv != nullptr && std::strcmp(useFusedEnv, "0") == 0) {
+                            useFusedChunkPrefill = false;
+                        }
+                    }
+#endif
 
-                        Data k_i_v_new;
-                        PermuteSelf(k_i, {0, 1, 3, 2});
-                        MatMul(k_i, v_new, k_i_v_new);
-
-                        Data g_i_exp_last;
-                        g_i_exp_last.dims = {g_i_exp.dims[0], g_i_exp.dims[1], 1, g_i_exp.dims[3]};
-                        g_i_exp_last.strides = {g_i_exp.strides[0], g_i_exp.strides[1], g_i_exp.strides[2], g_i_exp.strides[3]};
-                        g_i_exp_last.FakeFrom(g_i_exp, (size_t)(g_i_exp.dims[2] - 1) * g_i_exp.strides[2] * g_i_exp.unitSize);
-                        MulTo(last_recurrent_state, g_i_exp_last);
-                        AddTo(last_recurrent_state, k_i_v_new);
+                    if (useFusedChunkPrefill) {
+#ifdef USE_CUDA
+                        FastllmChunkGatedDeltaRulePrefill(
+                            qq, kk, vv, gg, attn, k_cumdecay,
+                            last_recurrent_state, core_attn_out
+                        );
+#endif
+                    } else {
+                        runChunkPrefillReference(last_recurrent_state, core_attn_out);
                     }
 
                     core_attn_out.Reshape({core_attn_out.dims[0], core_attn_out.dims[1], -1, core_attn_out.dims.back()});
@@ -602,15 +647,17 @@ namespace fastllm {
 
                 {
                     std::vector <int> zShape = z.dims;
-                    core_attn_out.Reshape({-1, core_attn_out.dims.back()});
+                    // Materialize a contiguous buffer for both prefill and decode paths.
+                    Mul(core_attn_out, 1.0f, core_attn_out_ready);
+                    core_attn_out_ready.Reshape({-1, core_attn_out_ready.dims.back()});
                     z.Reshape({-1, z.dims.back()});
 
-                    RMSNorm(core_attn_out, this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.norm.weight"], rms_norm_eps, core_attn_out);
+                    RMSNorm(core_attn_out_ready, this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.norm.weight"], rms_norm_eps, core_attn_out_ready);
                     Silu(z, z);
-                    MulTo(core_attn_out, z);
+                    MulTo(core_attn_out_ready, z);
 
-                    core_attn_out.Reshape({zShape[0], zShape[1], -1});
-                    Linear(core_attn_out, 
+                    core_attn_out_ready.Reshape({zShape[0], zShape[1], -1});
+                    Linear(core_attn_out_ready, 
                         this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"], 
                         Data(), attenInput);
                 }
