@@ -189,20 +189,6 @@ namespace fastllm {
         return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, &batchLogits)[0];
     }
 
-    void FakePad(Data &input, Data &output, int axis, int dim) {
-        if (dim == 0) {
-            Mul(input, 1.0f, output);
-            return;
-        }
-        Data temp;
-        std::vector <int> dims = input.dims;
-        dims[axis] = dim;
-        temp.Resize(dims);
-        temp.Allocate(0.0f);
-        ToDataType(temp, input.dataType);
-        Cat(input, temp, axis, output);
-    }
-
     void Add1(Data &input) {
         if (input.dims.size() == 0) {
             return;
@@ -537,11 +523,11 @@ namespace fastllm {
                     Data qtemp, qq, kk, vv, bb, gg, decayMask;
                     {
                         // pad 
-                        FakePad(q, qtemp, 2, pad_size); // query = F.pad(query, (0, 0, 0, pad_size))
-                        FakePad(k, kk, 2, pad_size); // key = F.pad(key, (0, 0, 0, pad_size))
-                        FakePad(v, vv, 2, pad_size); // value = F.pad(value, (0, 0, 0, pad_size))
-                        FakePad(b, bb, 2, pad_size); // beta = F.pad(beta, (0, pad_size))
-                        FakePad(g, gg, 2, pad_size); // g = F.pad(g, (0, pad_size))
+                        Pad(q, 2, pad_size, qtemp); // query = F.pad(query, (0, 0, 0, pad_size))
+                        Pad(k, 2, pad_size, kk); // key = F.pad(key, (0, 0, 0, pad_size))
+                        Pad(v, 2, pad_size, vv); // value = F.pad(value, (0, 0, 0, pad_size))
+                        Pad(b, 2, pad_size, bb); // beta = F.pad(beta, (0, pad_size))
+                        Pad(g, 2, pad_size, gg); // g = F.pad(g, (0, pad_size))
                     }
 
                     int tot_heads = seq + pad_size;

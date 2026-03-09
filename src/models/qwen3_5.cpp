@@ -17,20 +17,6 @@
 #endif
 
 namespace fastllm {
-    static void FakePad(Data &input, Data &output, int axis, int dim) {
-        if (dim == 0) {
-            Mul(input, 1.0f, output);
-            return;
-        }
-        Data temp;
-        std::vector <int> dims = input.dims;
-        dims[axis] = dim;
-        temp.Resize(dims);
-        temp.Allocate(0.0f);
-        ToDataType(temp, input.dataType);
-        Cat(input, temp, axis, output);
-    }
-
     static void Add1(Data &input) {
         if (input.dims.size() == 0) {
             return;
@@ -285,6 +271,7 @@ namespace fastllm {
             Data &pastKey = *pastKeyValues[i].first, &pastValue = *pastKeyValues[i].second;
 
             if (weight.weight.find(language_prefix + "layers." + std::to_string(i) + ".self_attn.o_proj.weight") != weight.weight.end()) {
+                // Gate Attention Block
                 std::string qWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.weight";
                 std::string qBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.bias";
                 std::string kWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.k_proj.weight";
@@ -347,6 +334,7 @@ namespace fastllm {
                 Data oBias = (weight.weight.find(oBiasName) != weight.weight.end()) ? weight[oBiasName] : Data();
                 Linear(qkv, weight[oWeightName], oBias, attenInput);
             } else {
+                // Gated Delta Net Block
                 Data &pastKey = *pastKeyValues[i].first, &pastValue = *pastKeyValues[i].second;
                 pastKey.isLinearAttention = pastValue.isLinearAttention = true;
                 std::string qkvWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkv.weight";
@@ -481,11 +469,11 @@ namespace fastllm {
 
                     Data qtemp, qq, kk, vv, bb, gg, decayMask;
                     {
-                        FakePad(q, qtemp, 2, pad_size);
-                        FakePad(k, kk, 2, pad_size);
-                        FakePad(v, vv, 2, pad_size);
-                        FakePad(b, bb, 2, pad_size);
-                        FakePad(g, gg, 2, pad_size);
+                        Pad(q, 2, pad_size, qtemp);
+                        Pad(k, 2, pad_size, kk);
+                        Pad(v, 2, pad_size, vv);
+                        Pad(b, 2, pad_size, bb);
+                        Pad(g, 2, pad_size, gg);
                     }
 
                     int tot_heads = seq + pad_size;
@@ -613,6 +601,7 @@ namespace fastllm {
                         Data(), attenInput);
                 }
             }
+
             AddTo(hiddenStates, attenInput);
             RMSNorm(hiddenStates, this->weight[postRmsName], rms_norm_eps, attenInput);
             MLPBlock(&attenInput, &weight[swigluWeightName], &weight[downWeightName], &v, &q, &hiddenStates);

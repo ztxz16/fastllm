@@ -801,6 +801,8 @@ namespace fastllm {
 
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 
+    void Pad(const Data &input, int axis, int padSize, Data &output);
+
     void CatDirect(Data &input0, const Data &input1, int axis); // 直接把input1的数据拷贝到input0后面（需要input0提前扩容了足够的空间）
 
     void MatMul(const Data &input0, const Data &input1, Data &output, float alpha = 1.0, int group = 1);

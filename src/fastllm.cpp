@@ -3013,6 +3013,12 @@ namespace fastllm {
         }, {}, {{"axis", axis}});
     }
 
+    void Pad(const Data &input, int axis, int padSize, Data &output) {
+        curExecutor->Run("Pad", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {{"axis", axis}, {"padSize", padSize}});
+    }
+
     void CatDirect(Data &input0, const Data &input1, int axis) {
         curExecutor->Run("CatDirect", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}

@@ -51,6 +51,7 @@ namespace fastllm {
         this->ops["Split"] = (BaseOperator*)(new CpuSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CpuRepeatOp());
         this->ops["Cat"] = (BaseOperator*)(new CpuCatOp());
+        this->ops["Pad"] = (BaseOperator*)(new CpuPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CpuCatDirectOp());
         this->ops["MatMul"] = (BaseOperator*)(new CpuMatMulOp());
         this->ops["MatMulTransB"] = (BaseOperator*)(new CpuMatMulTransBOp());
@@ -5038,6 +5039,60 @@ ops += (long long)lines * inputDim * interDim * 2;
             memcpy(output.cpuData + o * outputStride * unitSize + input0.dims[axis] * inner * unitSize,
                    input1.cpuData + (o * input1Stride) * unitSize,
                    input1.dims[axis] * inner * unitSize);
+        }
+    }
+
+    void CpuPadOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+
+        int padSize = intParams.find("padSize") != intParams.end() ? intParams.find("padSize")->second : 0;
+        AssertInFastLLM(padSize >= 0, "Pad Error: padSize should be non-negative.");
+
+        output.dataType = input.dataType;
+        if (input.dims.empty()) {
+            output.Resize(input.dims);
+            return;
+        }
+
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+        std::vector<int> dims = input.dims;
+        dims[axis] += padSize;
+        output.Resize(dims);
+    }
+
+    void CpuPadOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+
+        int padSize = intParams.find("padSize") != intParams.end() ? intParams.find("padSize")->second : 0;
+        AssertInFastLLM(padSize >= 0, "Pad Error: padSize should be non-negative.");
+        if (input.dims.empty() || padSize == 0) {
+            output.CopyFrom(input);
+            return;
+        }
+
+        int axis = intParams.find("axis") != intParams.end() ? intParams.find("axis")->second : -1;
+        int dimsLen = input.dims.size();
+        axis = (axis % dimsLen + dimsLen) % dimsLen;
+
+        output.Allocate();
+        memset(output.cpuData, 0, output.GetBytes());
+
+        int outer = output.Count(0) / output.Count(axis);
+        int inputStride = input.Count(axis);
+        int outputStride = output.Count(axis);
+        int inner = input.strides[axis];
+        int unitSize = input.unitSize;
+
+        for (int o = 0; o < outer; o++) {
+            memcpy(output.cpuData + o * outputStride * unitSize,
+                   input.cpuData + o * inputStride * unitSize,
+                   input.dims[axis] * inner * unitSize);
         }
     }
 
