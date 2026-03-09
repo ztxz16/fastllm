@@ -470,12 +470,18 @@ namespace fastllm {
                     int pad_size = (chunk_size - seq % chunk_size) % chunk_size;
 
                     Data qtemp, qq, kk, vv, bb, gg, decayMask;
-                    {
+                    if (pad_size > 0) {
                         Pad(q, 2, pad_size, qtemp);
                         Pad(k, 2, pad_size, kk);
                         Pad(v, 2, pad_size, vv);
                         Pad(b, 2, pad_size, bb);
                         Pad(g, 2, pad_size, gg);
+                    } else {
+                        Mul(q, 1.0f, qtemp);
+                        Mul(k, 1.0f, kk);
+                        Mul(v, 1.0f, vv);
+                        Mul(b, 1.0f, bb);
+                        Mul(g, 1.0f, gg);
                     }
 
                     int tot_heads = seq + pad_size;
@@ -494,6 +500,12 @@ namespace fastllm {
                     k_beta.Reshape({k_beta.dims[0], k_beta.dims[1], -1, chunk_size, k_beta.dims.back()});
                     v_beta.Reshape({v_beta.dims[0], v_beta.dims[1], -1, chunk_size, v_beta.dims.back()});
                     gg.Reshape({gg.dims[0], gg.dims[1], -1, chunk_size});
+
+                    PermuteSelf(qq, {2, 0, 1, 3, 4});
+                    PermuteSelf(kk, {2, 0, 1, 3, 4});
+                    PermuteSelf(k_beta, {2, 0, 1, 3, 4});
+                    PermuteSelf(v_beta, {2, 0, 1, 3, 4});
+                    PermuteSelf(gg, {2, 0, 1, 3});
 
                     CumSumLastDim(gg);
                     MakeDecayMask(gg, decayMask);
@@ -522,21 +534,24 @@ namespace fastllm {
                         last_recurrent_state.Allocate(0.0f);
                     }
 
+                    auto makeChunk4D = [](Data &src, int idx, Data &dst) {
+                        dst.dims = {src.dims[1], src.dims[2], src.dims[3], src.dims[4]};
+                        dst.strides = {src.strides[1], src.strides[2], src.strides[3], src.strides[4]};
+                        dst.FakeFrom(src, (size_t) idx * src.strides[0] * src.unitSize);
+                    };
+                    auto makeChunk3D = [](Data &src, int idx, Data &dst) {
+                        dst.dims = {src.dims[1], src.dims[2], src.dims[3]};
+                        dst.strides = {src.strides[1], src.strides[2], src.strides[3]};
+                        dst.FakeFrom(src, (size_t) idx * src.strides[0] * src.unitSize);
+                    };
+
                     for (int ci = 0; ci < tot_heads / chunk_size; ci++) {
                         Data q_i, k_i, v_i, attn_i, k_cumdecay_i;
-                        Split(qq, 2, ci, ci + 1, q_i);
-                        Split(kk, 2, ci, ci + 1, k_i);
-                        Split(vv, 2, ci, ci + 1, v_i);
-
-                        q_i.Resize({q_i.dims[0], q_i.dims[1], q_i.dims[3], q_i.dims[4]});
-                        k_i.Resize({k_i.dims[0], k_i.dims[1], k_i.dims[3], k_i.dims[4]});
-                        v_i.Resize({v_i.dims[0], v_i.dims[1], v_i.dims[3], v_i.dims[4]});
-
-                        Split(attn, 2, ci, ci + 1, attn_i);
-                        attn_i.Resize({attn_i.dims[0], attn_i.dims[1], attn_i.dims[3], attn_i.dims[4]});
-
-                        Split(k_cumdecay, 2, ci, ci + 1, k_cumdecay_i);
-                        k_cumdecay_i.Resize({k_cumdecay_i.dims[0], k_cumdecay_i.dims[1], k_cumdecay_i.dims[3], k_cumdecay_i.dims[4]});
+                        makeChunk4D(qq, ci, q_i);
+                        makeChunk4D(kk, ci, k_i);
+                        makeChunk4D(vv, ci, v_i);
+                        makeChunk4D(attn, ci, attn_i);
+                        makeChunk4D(k_cumdecay, ci, k_cumdecay_i);
 
                         Data v_prime, v_new;
                         MatMul(k_cumdecay_i, last_recurrent_state, v_prime);
@@ -544,10 +559,9 @@ namespace fastllm {
                         AddTo(v_new, v_i);
 
                         Data attn_inter, g_i, g_i_exp;
-                        Split(gg, 2, ci, ci + 1, g_i);
-                        g_i.Resize({g_i.dims[0], g_i.dims[1], g_i.dims[3]});
-                        Split(g, 2, ci, ci + 1, g_i_exp);
-                        g_i_exp.Resize({g_i_exp.dims[0], g_i_exp.dims[1], g_i_exp.dims[3], 1});
+                        makeChunk3D(gg, ci, g_i);
+                        makeChunk3D(g, ci, g_i_exp);
+                        g_i_exp.Resize({g_i_exp.dims[0], g_i_exp.dims[1], g_i_exp.dims[2], 1});
                         MulTo(q_i, g_i_exp);
 
                         MatMul(q_i, last_recurrent_state, attn_inter);
@@ -570,9 +584,9 @@ namespace fastllm {
                         Exp(g_i_l_temp, g_i_l_temp);
                         g_i_l_temp.Resize({g_i_l_temp.dims[0], g_i_l_temp.dims[1], g_i_l_temp.dims[2], 1});
                         MulTo(k_i, g_i_l_temp);
-                        PermuteSelf(k_i, {0, 1, 3, 2});
 
                         Data k_i_v_new;
+                        PermuteSelf(k_i, {0, 1, 3, 2});
                         MatMul(k_i, v_new, k_i_v_new);
 
                         Data g_i_exp_last;
@@ -582,9 +596,13 @@ namespace fastllm {
                     }
 
                     core_attn_out.Reshape({core_attn_out.dims[0], core_attn_out.dims[1], -1, core_attn_out.dims.back()});
-                    Split(core_attn_out, 2, 0, seq, core_attn_out_temp);
-                    PermuteSelf(core_attn_out_temp, {0, 2, 1, 3});
-                    Mul(core_attn_out_temp, 1.0f, core_attn_out);
+                    if (pad_size > 0) {
+                        Split(core_attn_out, 2, 0, seq, core_attn_out_temp);
+                        PermuteSelf(core_attn_out_temp, {0, 2, 1, 3});
+                        Mul(core_attn_out_temp, 1.0f, core_attn_out);
+                    } else {
+                        PermuteSelf(core_attn_out, {0, 2, 1, 3});
+                    }
                 }
 
                 {
