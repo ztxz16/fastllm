@@ -423,10 +423,6 @@ namespace fastllm {
 
                 Data &last_recurrent_state = pastValue;
 
-                float inv_scale = pow((float)head_k_dim, -0.5);
-                std::vector <float> v_inv_scale = std::vector <float> (head_k_dim, inv_scale);
-                Data inv_scale_data = Data(DataType::FLOAT32, std::vector<int>{head_k_dim}, v_inv_scale);
-
                 Data core_attn_out, core_attn_out_temp;
                 if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
                     // torch_recurrent_gated_delta_rule
