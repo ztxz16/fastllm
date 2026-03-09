@@ -2167,24 +2167,24 @@ static cudaError_t FastllmDispatchPagedPrefillByHeadDim(uint32_t head_dim, long 
                                                         DType *tmp_v, float *tmp_s, bool enable_pdl,
                                                         cudaStream_t stream, const char *op_name) {
     switch (head_dim) {
-        case 64:
-            return FastllmDispatchPagedPrefillByCtaTile<64>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
-        case 80:
-            return FastllmDispatchPagedPrefillByCtaTile<80>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
-        case 96:
-            return FastllmDispatchPagedPrefillByCtaTile<96>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
-        case 112:
-            return FastllmDispatchPagedPrefillByCtaTile<112>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        // case 64:
+        //     return FastllmDispatchPagedPrefillByCtaTile<64>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        // case 80:
+        //    return FastllmDispatchPagedPrefillByCtaTile<80>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        // case 96:
+        //    return FastllmDispatchPagedPrefillByCtaTile<96>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        // case 112:
+        //    return FastllmDispatchPagedPrefillByCtaTile<112>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
         case 128:
             return FastllmDispatchPagedPrefillByCtaTile<128>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
-        case 160:
-            return FastllmDispatchPagedPrefillByCtaTile<160>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
-        case 192:
-            return FastllmDispatchPagedPrefillByCtaTile<192>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        // case 160:
+        //    return FastllmDispatchPagedPrefillByCtaTile<160>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        // case 192:
+        //     return FastllmDispatchPagedPrefillByCtaTile<192>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
         case 256:
             return FastllmDispatchPagedPrefillByCtaTile<256>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
-        case 512:
-            return FastllmDispatchPagedPrefillByCtaTile<512>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
+        // case 512:
+        //    return FastllmDispatchPagedPrefillByCtaTile<512>(cta_tile_q, prefill_params, tmp_v, tmp_s, enable_pdl, stream, op_name);
         default:
             printf("%s: Unsupported head_dim %u\n", op_name, head_dim);
             return cudaErrorNotSupported;
