@@ -513,13 +513,17 @@ namespace fastllm {
                     MulTo(k_temp, g);
                     MatMul(attn, k_temp, k_cumdecay);
 
+                    MatMulTransB(qq, kk, attn);
+                    MulTo(attn, decayMask);
+                    CausalMask(attn, 1, 0.0f);
+
                     if (last_recurrent_state.dims.size() == 0) {
                         last_recurrent_state.Resize({key_batch_size, key_sequence_length, key_k_head_dim, v_head_dim_local});
                         last_recurrent_state.Allocate(0.0f);
                     }
 
                     for (int ci = 0; ci < tot_heads / chunk_size; ci++) {
-                        Data q_i, k_i, v_i, decay_mask_i, k_cumdecay_i;
+                        Data q_i, k_i, v_i, attn_i, k_cumdecay_i;
                         Split(qq, 2, ci, ci + 1, q_i);
                         Split(kk, 2, ci, ci + 1, k_i);
                         Split(vv, 2, ci, ci + 1, v_i);
@@ -528,12 +532,8 @@ namespace fastllm {
                         k_i.Resize({k_i.dims[0], k_i.dims[1], k_i.dims[3], k_i.dims[4]});
                         v_i.Resize({v_i.dims[0], v_i.dims[1], v_i.dims[3], v_i.dims[4]});
 
-                        Split(decayMask, 2, ci, ci + 1, decay_mask_i);
-                        decay_mask_i.Resize({decay_mask_i.dims[0], decay_mask_i.dims[1], decay_mask_i.dims[3], decay_mask_i.dims[4]});
-
-                        MatMulTransB(q_i, k_i, attn);
-                        MulTo(attn, decay_mask_i);
-                        CausalMask(attn, 1, 0.0f);
+                        Split(attn, 2, ci, ci + 1, attn_i);
+                        attn_i.Resize({attn_i.dims[0], attn_i.dims[1], attn_i.dims[3], attn_i.dims[4]});
 
                         Split(k_cumdecay, 2, ci, ci + 1, k_cumdecay_i);
                         k_cumdecay_i.Resize({k_cumdecay_i.dims[0], k_cumdecay_i.dims[1], k_cumdecay_i.dims[3], k_cumdecay_i.dims[4]});
@@ -543,16 +543,16 @@ namespace fastllm {
                         Mul(v_prime, -1.0f, v_new);
                         AddTo(v_new, v_i);
 
-                        Data attn_inter, g_i, g_i_exp, q_i_temp;
+                        Data attn_inter, g_i, g_i_exp;
                         Split(gg, 2, ci, ci + 1, g_i);
-                        g_i.Resize({g_i.dims[0], g_i.dims[1], g_i.dims[3], 1});
-                        Exp(g_i, g_i_exp);
-                        Mul(q_i, 1.0f, q_i_temp);
-                        MulTo(q_i_temp, g_i_exp);
+                        g_i.Resize({g_i.dims[0], g_i.dims[1], g_i.dims[3]});
+                        Split(g, 2, ci, ci + 1, g_i_exp);
+                        g_i_exp.Resize({g_i_exp.dims[0], g_i_exp.dims[1], g_i_exp.dims[3], 1});
+                        MulTo(q_i, g_i_exp);
 
-                        MatMul(q_i_temp, last_recurrent_state, attn_inter);
+                        MatMul(q_i, last_recurrent_state, attn_inter);
                         Data atv;
-                        MatMul(attn, v_new, atv);
+                        MatMul(attn_i, v_new, atv);
                         AddTo(atv, attn_inter);
                         atv.Resize({atv.dims[0], atv.dims[1], 1, atv.dims[2], atv.dims[3]});
                         if (ci == 0) {
@@ -562,7 +562,6 @@ namespace fastllm {
                             Cat(core_attn_out_temp, atv, 3, core_attn_out);
                         }
 
-                        g_i.Resize({g_i.dims[0], g_i.dims[1], g_i.dims[2]});
                         Data g_i_last, g_i_last_repeat, g_i_l_temp;
                         Split(g_i, -1, g_i.dims.back() - 1, g_i.dims.back(), g_i_last);
                         Repeat(g_i_last, -1, g_i.dims.back(), g_i_last_repeat);

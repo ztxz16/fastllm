@@ -2297,61 +2297,69 @@ __device__ __forceinline__ __nv_fp8_e4m3 FastllmCudaFloatToValue<__nv_fp8_e4m3>(
     return __nv_fp8_e4m3(value);
 }
 
-// CUDA kernel for the main transformation
 template<typename T>
-__global__ void TransferAttnKernel(T *data, int n, int m, int outer, int row_idx) {
-    int o = blockIdx.z;  // batch index
+__global__ void TransferAttnKernelFused(T *data, int n, int m, int outer) {
+    extern __shared__ float shared[];
+
+    int o = blockIdx.x;
     if (o >= outer) return;
-    
-    int j = threadIdx.x + blockIdx.x * blockDim.x;  // column index
-    if (j >= row_idx) return;  // 只处理前row_idx个元素
-    
-    T *batchData = data + o * n * m;
-    
-    // 保存原始的第row_idx行的值
-    float original_val = FastllmCudaValueToFloat(batchData[row_idx * m + j]);
-    
-    // 计算新值: original_val + sum(row[k] * matrix[k][j] for k in [0, row_idx))
-    float sum = original_val;
-    for (int k = 0; k < row_idx; k++) {
-        sum += FastllmCudaValueToFloat(batchData[row_idx * m + k]) *
-               FastllmCudaValueToFloat(batchData[k * m + j]);
+
+    T *batchData = data + (size_t)o * n * m;
+    float *matrix = shared;
+    float *row = shared + n * m;
+
+    for (int idx = threadIdx.x; idx < n * m; idx += blockDim.x) {
+        matrix[idx] = FastllmCudaValueToFloat(batchData[idx]);
     }
-    
-    // 更新值
-    batchData[row_idx * m + j] = FastllmCudaFloatToValue<T>(sum);
+    __syncthreads();
+
+    for (int i = 1; i < n; i++) {
+        for (int j = threadIdx.x; j < i; j += blockDim.x) {
+            row[j] = matrix[i * m + j];
+        }
+        __syncthreads();
+
+        for (int j = threadIdx.x; j < i; j += blockDim.x) {
+            float sum = row[j];
+            for (int k = 0; k < i; k++) {
+                sum += row[k] * matrix[k * m + j];
+            }
+            matrix[i * m + j] = sum;
+        }
+        __syncthreads();
+    }
+
+    for (int idx = threadIdx.x; idx < n * m; idx += blockDim.x) {
+        int i = idx / m;
+        int j = idx % m;
+        float value = matrix[idx] + (i == j ? 1.0f : 0.0f);
+        batchData[idx] = FastllmCudaFloatToValue<T>(value);
+    }
 }
 
-// 使用共享内存的优化版本
 template<typename T>
-__global__ void TransferAttnKernelShared(T *data, int n, int m, int outer, int row_idx) {
+__global__ void TransferAttnKernelRow(T *data, int n, int m, int outer, int row_idx) {
     extern __shared__ float shared[];
-    
+
     int o = blockIdx.z;
     if (o >= outer) return;
-    
+
     int tid = threadIdx.x;
     int j = tid + blockIdx.x * blockDim.x;
-    
-    T *batchData = data + o * n * m;
-    float *row_i = shared;  // 存储第row_idx行的前row_idx个元素
-    
-    // 协作加载第row_idx行的前row_idx个元素到共享内存
+
+    T *batchData = data + (size_t)o * n * m;
+    float *row_i = shared;
+
     for (int idx = tid; idx < row_idx; idx += blockDim.x) {
         row_i[idx] = FastllmCudaValueToFloat(batchData[row_idx * m + idx]);
     }
     __syncthreads();
-    
+
     if (j < row_idx) {
-        // 使用共享内存中的原始值计算
         float sum = row_i[j];
-        
-        // 累加：注意这里row_i[k]是原始值，batchData[k * m + j]是可能已更新的值
         for (int k = 0; k < row_idx; k++) {
             sum += row_i[k] * FastllmCudaValueToFloat(batchData[k * m + j]);
         }
-        
-        // 写回结果
         batchData[row_idx * m + j] = FastllmCudaFloatToValue<T>(sum);
     }
 }
@@ -2379,44 +2387,52 @@ bool FastllmCudaTransferAttn(fastllm::Data &input) {
     int m = input.dims[dimsLen - 1]; 
     int outer = input.Count(0) / input.Count(dimsLen - 2);
 
-    // 逐行处理，从第1行开始（第0行不需要处理）
-    for (int i = 1; i < n; i++) {
-        // 每行只需要处理前i个元素
-        int elementsToProcess = i;
-        int threadsPerBlock = min(256, elementsToProcess);
-        int blocksPerGrid = (elementsToProcess + threadsPerBlock - 1) / threadsPerBlock;
-        
-        dim3 blocks(blocksPerGrid, 1, outer);
-        dim3 threads(threadsPerBlock, 1, 1);
-        
-        // 使用共享内存版本
-        int sharedMemSize = elementsToProcess * sizeof(float);
+    if (n <= 64 && m <= 64) {
+        int threadsPerBlock = 64;
+        int sharedMemSize = (n * m + n) * sizeof(float);
         if (input.dataType == fastllm::DataType::FLOAT32) {
-            TransferAttnKernelShared<<<blocks, threads, sharedMemSize>>>(
-                (float*)inputData, n, m, outer, i);
+            TransferAttnKernelFused<<<outer, threadsPerBlock, sharedMemSize>>>(
+                (float*)inputData, n, m, outer);
         } else if (input.dataType == fastllm::DataType::FLOAT16) {
-            TransferAttnKernelShared<<<blocks, threads, sharedMemSize>>>(
-                (half*)inputData, n, m, outer, i);
+            TransferAttnKernelFused<<<outer, threadsPerBlock, sharedMemSize>>>(
+                (half*)inputData, n, m, outer);
         } else if (input.dataType == fastllm::DataType::BFLOAT16) {
-            TransferAttnKernelShared<<<blocks, threads, sharedMemSize>>>(
-                (__nv_bfloat16*)inputData, n, m, outer, i);
+            TransferAttnKernelFused<<<outer, threadsPerBlock, sharedMemSize>>>(
+                (__nv_bfloat16*)inputData, n, m, outer);
         }
-        
-        // 必须同步，因为下一行的计算依赖于当前行的结果
-        cudaDeviceSynchronize();
-    }
+    } else {
+        for (int i = 1; i < n; i++) {
+            int elementsToProcess = i;
+            int threadsPerBlock = min(256, elementsToProcess);
+            int blocksPerGrid = (elementsToProcess + threadsPerBlock - 1) / threadsPerBlock;
 
-    // 添加单位矩阵
-    int totalDiag = outer * n;
-    int threadsPerBlock = 256;
-    int blocksPerGrid = (totalDiag + threadsPerBlock - 1) / threadsPerBlock;
-    
-    if (input.dataType == fastllm::DataType::FLOAT32) {
-        AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((float*)inputData, n, m, outer);
-    } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((half*)inputData, n, m, outer);
-    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
-        AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((__nv_bfloat16*)inputData, n, m, outer);
+            dim3 blocks(blocksPerGrid, 1, outer);
+            dim3 threads(threadsPerBlock, 1, 1);
+            int sharedMemSize = elementsToProcess * sizeof(float);
+
+            if (input.dataType == fastllm::DataType::FLOAT32) {
+                TransferAttnKernelRow<<<blocks, threads, sharedMemSize>>>(
+                    (float*)inputData, n, m, outer, i);
+            } else if (input.dataType == fastllm::DataType::FLOAT16) {
+                TransferAttnKernelRow<<<blocks, threads, sharedMemSize>>>(
+                    (half*)inputData, n, m, outer, i);
+            } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+                TransferAttnKernelRow<<<blocks, threads, sharedMemSize>>>(
+                    (__nv_bfloat16*)inputData, n, m, outer, i);
+            }
+            cudaDeviceSynchronize();
+        }
+
+        int totalDiag = outer * n;
+        int threadsPerBlock = 256;
+        int blocksPerGrid = (totalDiag + threadsPerBlock - 1) / threadsPerBlock;
+        if (input.dataType == fastllm::DataType::FLOAT32) {
+            AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((float*)inputData, n, m, outer);
+        } else if (input.dataType == fastllm::DataType::FLOAT16) {
+            AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((half*)inputData, n, m, outer);
+        } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+            AddIdentityKernel<<<blocksPerGrid, threadsPerBlock>>>((__nv_bfloat16*)inputData, n, m, outer);
+        }
     }
 
     DeviceSync();
