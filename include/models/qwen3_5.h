@@ -68,6 +68,8 @@ namespace fastllm {
         bool initialized_add1 = false;
 
         int num_k_heads, num_v_heads, head_k_dim, head_v_dim;
+
+        Data inv_scale_data;
     };
 }
 

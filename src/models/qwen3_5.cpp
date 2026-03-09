@@ -153,6 +153,11 @@ namespace fastllm {
             );
 */
         }
+
+        float inv_scale = pow((float)head_k_dim, -0.5);
+        std::vector <float> v_inv_scale(head_k_dim, inv_scale);
+        Data temp(DataType::FLOAT32, std::vector<int>{head_k_dim}, v_inv_scale);
+        inv_scale_data.CopyFrom(temp);
     }
 
     std::vector <int> Qwen3_5Model::ForwardV2(
