@@ -406,20 +406,6 @@ namespace fastllm {
                 Sigmoid(b, b);
                 MambaSoftplus(a, weight[aLogName], weight[dtBiasName], g);
 
-                if (num_v_heads / num_k_heads > 1) {
-                    Data qtemp, ktemp;
-                    Mul(q, 1.0f, qtemp);
-                    Mul(k, 1.0f, ktemp);
-
-                    qtemp.Resize({q.dims[0], q.dims[1], q.dims[2], 1, q.dims[3]});
-                    ktemp.Resize({k.dims[0], k.dims[1], k.dims[2], 1, k.dims[3]});
-
-                    Repeat(qtemp, 3, num_v_heads / num_k_heads, q);
-                    Repeat(ktemp, 3, num_v_heads / num_k_heads, k);
-
-                    q.Reshape({q.dims[0], q.dims[1], -1, q.dims.back()});
-                    k.Reshape({k.dims[0], k.dims[1], -1, k.dims.back()});
-                }
 
                 Data &last_recurrent_state = pastValue;
 
@@ -450,6 +436,21 @@ namespace fastllm {
                     PermuteSelf(core_attn_out, {0, 2, 1, 3});
                 } else {
                     // torch_chunk_gated_delta_rule
+                    if (num_v_heads / num_k_heads > 1) {
+                        Data qrepeat, krepeat;
+                        Mul(q, 1.0f, qrepeat);
+                        Mul(k, 1.0f, krepeat);
+
+                        qrepeat.Resize({q.dims[0], q.dims[1], q.dims[2], 1, q.dims[3]});
+                        krepeat.Resize({k.dims[0], k.dims[1], k.dims[2], 1, k.dims[3]});
+
+                        Repeat(qrepeat, 3, num_v_heads / num_k_heads, q);
+                        Repeat(krepeat, 3, num_v_heads / num_k_heads, k);
+
+                        q.Reshape({q.dims[0], q.dims[1], -1, q.dims.back()});
+                        k.Reshape({k.dims[0], k.dims[1], -1, k.dims.back()});
+                    }
+
                     {
                         RMSNorm(q, inv_scale_data, rms_norm_eps, q);
                         RMSNorm(k, inv_scale_data, rms_norm_eps, k);
