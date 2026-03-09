@@ -899,6 +899,8 @@ namespace fastllm {
 
     void MakeDecayMask(Data &input, Data &output);
 
+    void ApplyChunkDecayByLastLogG(Data &input, const Data &g);
+
     void MulBatch(std::vector <Data*> &input, float v, std::vector <Data*> &output);
 
     void SplitBatch(const Data &input, int axis, int part, std::vector <Data*> &outputs); // 将input沿着axis轴切开，每份axis上的尺寸为1，放到outputs里

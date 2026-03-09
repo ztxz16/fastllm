@@ -56,6 +56,7 @@ namespace fastllm {
         this->ops["AttentionMask"] = (BaseOperator*)(new CudaAttentionMaskOp());
         this->ops["AlibiMask"] = (BaseOperator*)(new CudaAlibiMaskOp());
         this->ops["TransferAttn"] = (BaseOperator*)(new CudaTransferAttnOp());
+        this->ops["ApplyChunkDecayByLastLogG"] = (BaseOperator*)(new CudaApplyChunkDecayByLastLogGOp());
         this->ops["CumSumLastDim"] = (BaseOperator*)(new CudaCumSumLastDimOp());
         this->ops["TopK"] = (BaseOperator*)(new CudaTopKOp());
         this->ops["SelectExpert"] = (BaseOperator*)(new CudaSelectExpertOp());
@@ -1315,6 +1316,22 @@ namespace fastllm {
                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         FastllmCudaTransferAttn(input);
+    }
+
+    void CudaApplyChunkDecayByLastLogGOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &g = *(datas.find("g")->second);
+        AssertInFastLLM((input.dataType == DataType::FLOAT32 && g.dataType == DataType::FLOAT32) ||
+                        (input.dataType == DataType::FLOAT16 && g.dataType == DataType::FLOAT16) ||
+                        (input.dataType == DataType::BFLOAT16 && g.dataType == DataType::BFLOAT16),
+                        "ApplyChunkDecayByLastLogG's input's type should be float32, float16 or bfloat16.\n");
+        AssertInFastLLM(input.dims.size() >= 2 && g.dims.size() >= 1,
+                        "ApplyChunkDecayByLastLogG error: invalid dims.\n");
+        int dim = input.dims[input.dims.size() - 2];
+        AssertInFastLLM(g.dims.back() == dim && input.Count(0) == g.Count(0) * input.dims.back(),
+                        "ApplyChunkDecayByLastLogG error: input and g shape mismatch.\n");
+        FastllmCudaApplyChunkDecayByLastLogG(input, g);
     }
 
     void CudaCumSumLastDimOp::Run(const std::string &opType, const fastllm::DataDict &datas,

@@ -576,21 +576,16 @@ namespace fastllm {
                             Cat(core_attn_out_temp, atv, 3, core_attn_out);
                         }
 
-                        Data g_i_last, g_i_last_repeat, g_i_l_temp;
-                        Split(g_i, -1, g_i.dims.back() - 1, g_i.dims.back(), g_i_last);
-                        Repeat(g_i_last, -1, g_i.dims.back(), g_i_last_repeat);
-                        Mul(g_i, -1.0f, g_i_l_temp);
-                        AddTo(g_i_l_temp, g_i_last_repeat);
-                        Exp(g_i_l_temp, g_i_l_temp);
-                        g_i_l_temp.Resize({g_i_l_temp.dims[0], g_i_l_temp.dims[1], g_i_l_temp.dims[2], 1});
-                        MulTo(k_i, g_i_l_temp);
+                        ApplyChunkDecayByLastLogG(k_i, g_i);
 
                         Data k_i_v_new;
                         PermuteSelf(k_i, {0, 1, 3, 2});
                         MatMul(k_i, v_new, k_i_v_new);
 
                         Data g_i_exp_last;
-                        Split(g_i_exp, 2, g_i_exp.dims[2] - 1, g_i_exp.dims[2], g_i_exp_last);
+                        g_i_exp_last.dims = {g_i_exp.dims[0], g_i_exp.dims[1], 1, g_i_exp.dims[3]};
+                        g_i_exp_last.strides = {g_i_exp.strides[0], g_i_exp.strides[1], g_i_exp.strides[2], g_i_exp.strides[3]};
+                        g_i_exp_last.FakeFrom(g_i_exp, (size_t)(g_i_exp.dims[2] - 1) * g_i_exp.strides[2] * g_i_exp.unitSize);
                         MulTo(last_recurrent_state, g_i_exp_last);
                         AddTo(last_recurrent_state, k_i_v_new);
                     }

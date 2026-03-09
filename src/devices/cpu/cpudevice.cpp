@@ -76,6 +76,7 @@ namespace fastllm {
         this->ops["AttentionExtendedMask"] = (BaseOperator*)(new CpuAttentionExtendedMaskOp());
         this->ops["AlibiMask"] = (BaseOperator*)(new CpuAlibiMaskOp());
         this->ops["TransferAttn"] = (BaseOperator*)(new CpuTransferAttnOp());
+        this->ops["ApplyChunkDecayByLastLogG"] = (BaseOperator*)(new CpuApplyChunkDecayByLastLogGOp());
         this->ops["RecurrentGatedDeltaRule"] = (BaseOperator*)(new CpuRecurrentGatedDeltaRuleOp());
         this->ops["CausalMask"] = (BaseOperator*)(new CpuCausalMaskOp());
         this->ops["TopK"] = (BaseOperator*)(new CpuTopKOp());
@@ -6656,6 +6657,62 @@ ops += (long long)lines * inputDim * interDim * 2;
 
         if (input.dataType == DataType::FLOAT16) {
             Float32ToFloat16(inputData, (uint16_t*)input.cpuData, (int)floatInputVector.size());
+        }
+    }
+
+    void CpuApplyChunkDecayByLastLogGOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &g = *(datas.find("g")->second);
+        AssertInFastLLM((input.dataType == DataType::FLOAT32 && g.dataType == DataType::FLOAT32) ||
+                        (input.dataType == DataType::FLOAT16 && g.dataType == DataType::FLOAT16) ||
+                        (input.dataType == DataType::BFLOAT16 && g.dataType == DataType::BFLOAT16),
+                        "ApplyChunkDecayByLastLogG's input's type should be float32, float16 or bfloat16.\n");
+        AssertInFastLLM(input.dims.size() >= 2 && g.dims.size() >= 1,
+                        "ApplyChunkDecayByLastLogG error: invalid dims.\n");
+        int dim = input.dims[input.dims.size() - 2];
+        int channels = input.dims.back();
+        AssertInFastLLM(g.dims.back() == dim && input.Count(0) == g.Count(0) * channels,
+                        "ApplyChunkDecayByLastLogG error: input and g shape mismatch.\n");
+
+        int outer = g.Count(0) / dim;
+        std::vector<float> inputFp32, gFp32;
+        float *inputData = nullptr, *gData = nullptr;
+
+        if (input.dataType == DataType::FLOAT32) {
+            inputData = (float*)input.cpuData;
+            gData = (float*)g.cpuData;
+        } else if (input.dataType == DataType::FLOAT16) {
+            inputFp32.resize(input.Count(0));
+            gFp32.resize(g.Count(0));
+            inputData = inputFp32.data();
+            gData = gFp32.data();
+            Float16ToFloat32((uint16_t*)input.cpuData, inputData, input.Count(0));
+            Float16ToFloat32((uint16_t*)g.cpuData, gData, g.Count(0));
+        } else {
+            inputFp32.resize(input.Count(0));
+            gFp32.resize(g.Count(0));
+            inputData = inputFp32.data();
+            gData = gFp32.data();
+            BFloat16ToFloat32((uint16_t*)input.cpuData, inputData, input.Count(0));
+            BFloat16ToFloat32((uint16_t*)g.cpuData, gData, g.Count(0));
+        }
+
+        for (int o = 0; o < outer; o++) {
+            float last = gData[o * dim + dim - 1];
+            for (int i = 0; i < dim; i++) {
+                float scale = std::exp(last - gData[o * dim + i]);
+                float *cur = inputData + ((size_t)o * dim + i) * channels;
+                for (int c = 0; c < channels; c++) {
+                    cur[c] *= scale;
+                }
+            }
+        }
+
+        if (input.dataType == DataType::FLOAT16) {
+            Float32ToFloat16(inputData, (uint16_t*)input.cpuData, input.Count(0));
+        } else if (input.dataType == DataType::BFLOAT16) {
+            Float32ToBFloat16(inputData, (uint16_t*)input.cpuData, input.Count(0));
         }
     }
 

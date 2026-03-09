@@ -2484,6 +2484,50 @@ bool FastllmCudaCumSumLastDim(fastllm::Data &input) {
     return true; // 添加返回值
 }
 
+template<typename T>
+__global__ void ApplyChunkDecayByLastLogGKernel(T *input, const T *g, int dim, int channels, int outer) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = outer * dim * channels;
+
+    if (idx < total) {
+        int tokenIdx = (idx / channels) % dim;
+        int outerIdx = idx / (dim * channels);
+        float last = FastllmCudaValueToFloat(g[outerIdx * dim + dim - 1]);
+        float cur = FastllmCudaValueToFloat(g[outerIdx * dim + tokenIdx]);
+        float scale = expf(last - cur);
+        float value = FastllmCudaValueToFloat(input[idx]) * scale;
+        input[idx] = FastllmCudaFloatToValue<T>(value);
+    }
+}
+
+bool FastllmCudaApplyChunkDecayByLastLogG(fastllm::Data &input, const fastllm::Data &g) {
+    void *inputData = FastllmCudaPrepareInput(input);
+    void *gData = FastllmCudaPrepareInput(g);
+
+    int dim = input.dims[input.dims.size() - 2];
+    int channels = input.dims.back();
+    int outer = g.Count(0) / dim;
+    int total = outer * dim * channels;
+    int blockSize = 256;
+    int gridSize = (total + blockSize - 1) / blockSize;
+
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        ApplyChunkDecayByLastLogGKernel<float><<<gridSize, blockSize>>>(
+            (float*)inputData, (float*)gData, dim, channels, outer);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        ApplyChunkDecayByLastLogGKernel<half><<<gridSize, blockSize>>>(
+            (half*)inputData, (half*)gData, dim, channels, outer);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        ApplyChunkDecayByLastLogGKernel<__nv_bfloat16><<<gridSize, blockSize>>>(
+            (__nv_bfloat16*)inputData, (__nv_bfloat16*)gData, dim, channels, outer);
+    }
+
+    DeviceSync();
+    FastllmCudaFinishInput(g, gData);
+    FastllmCudaFinishOutput(input, inputData);
+    return true;
+}
+
 // CUDA核函数模板，支持float和half
 template<typename T>
 __global__ void CausalMaskKernel(T *data, int n, int m, int outer, int base, T maskValue) {

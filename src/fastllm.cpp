@@ -3286,6 +3286,12 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void ApplyChunkDecayByLastLogG(Data &input, const Data &g) {
+        curExecutor->Run("ApplyChunkDecayByLastLogG", {
+            {"input", &input}, {"g", (Data*)&g}
+        }, {}, {});
+    }
+
     void SplitBatch(const Data &input, int axis, int part, std::vector <Data*> &outputs) {
         curExecutor->Run("SplitBatch", {
                 {"input", (Data*)&input}, {"output", (Data*)outputs.data()}
