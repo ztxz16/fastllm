@@ -302,6 +302,8 @@ fastllm_lib.set_max_batch_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 
 fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 
+fastllm_lib.set_model_kv_cache_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
+
 fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
 
 fastllm_lib.warmup_llm_model.argtypes = [ctypes.c_int]
@@ -803,6 +805,7 @@ class model:
     def __init__ (self, path : str,
                   id : int = -99999,
                   dtype : str = "float16",
+                  kv_cache_dtype : str = "auto",
                   moe_dtype : str = "",
                   system_prompt : str = "",
                   eos_token: List[str] = [],
@@ -943,6 +946,8 @@ class model:
                             if key in gen_cfg:
                                 self.default_generation_config[key] = gen_cfg[key]
         print(f"[Fastllm] default generation config: {self.default_generation_config}")
+        if (kv_cache_dtype != "" and kv_cache_dtype != "auto"):
+            self.set_kv_cache_dtype(kv_cache_dtype)
     
     def apply_chat_template(
         self,
@@ -1693,6 +1698,9 @@ class model:
 
     def set_moe_atype(self, moe_atype: str):
         fastllm_lib.set_model_moe_atype(self.model, str(moe_atype).encode())
+
+    def set_kv_cache_dtype(self, kv_cache_dtype: str):
+        fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())
 
     def warmup(self):
         fastllm_lib.warmup_llm_model(self.model)

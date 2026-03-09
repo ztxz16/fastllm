@@ -358,11 +358,13 @@ namespace fastllm {
 
     // 分页缓存追加
     class CudaAppendPagedCacheOp : CpuAppendPagedCacheOp {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
     // 分页缓存批量追加
     class CudaAppendPagedCacheBatchOp : CpuAppendPagedCacheBatchOp {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 

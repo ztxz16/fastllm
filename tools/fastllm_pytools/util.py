@@ -12,6 +12,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--moe_dtype', type = str, default = "", help = 'MOE层使用的权重类型（读取HF模型时有效）')
     parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用float32、float16或bfloat16')
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
+    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16或fp8_e4m3')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
@@ -242,7 +243,8 @@ def make_normal_llm_model(args):
     if (args.chat_template != "" and os.path.exists(args.chat_template)):
         with open(args.chat_template, "r", encoding="utf-8") as file:
             args.chat_template = file.read()
-    model = llm.model(args.path, dtype = args.dtype, moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora, 
+    model = llm.model(args.path, dtype = args.dtype, kv_cache_dtype = args.kv_cache_dtype,
+                        moe_dtype = args.moe_dtype, graph = graph, tokenizer_type = "auto", lora = args.lora, 
                         dtype_config = args.dtype_config, ori_model_path = args.ori, chat_template = args.chat_template, tool_call_parser = args.tool_call_parser)
     if (args.enable_thinking.lower() in ["", "false", "0", "off"]):
         model.enable_thinking = False

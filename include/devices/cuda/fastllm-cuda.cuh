@@ -139,8 +139,12 @@ void FastllmCudaMemcpy2DDeviceToDeviceBatch(void ** 	dsts, size_t *	dpitchs, voi
                                        size_t *	spitchs, size_t *widths, size_t *	heights,
                                        int batch);
 void FastllmCudaRepeat(void *input, void *output, int outer, int repeatTimes, int inputStride, int outputStride0, int outputStride1, int copyLen);
-void FastllmCudaPagedCacheCopy(uint8_t *pagedData, int pageIdx, int pageLen, int numHeads, int headDim, int unitSize, uint8_t *inputData, int seqLen, int inputOffset, int copyLen, int pageOffset);
-void FastllmCudaPagedCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray, int32_t *pageOffsetArray, int pageLen, int batch, int numHeads, int headDim, int unitSize, uint8_t *inputData);
+void FastllmCudaPagedCacheCopy(uint8_t *pagedData, int pageIdx, int pageLen, int numHeads, int headDim,
+                               fastllm::DataType dstType, uint8_t *inputData, fastllm::DataType srcType,
+                               int seqLen, int inputOffset, int copyLen, int pageOffset);
+void FastllmCudaPagedCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray, int32_t *pageOffsetArray,
+                                    int pageLen, int batch, int numHeads, int headDim,
+                                    fastllm::DataType dstType, uint8_t *inputData, fastllm::DataType srcType);
 
 bool FastllmFloatToHalf(void *a, void *b, int len);
 bool FastllmHalfToFloat(void *a, void *b, int len);
@@ -238,7 +242,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int32_t *insertIndexs, int32_t *insertPositions,
     int q_heads, int k_heads, int head_dim,
     int rotateDim, float eps, float ropeTheta, float ropeScale,
-    int pageLen, int unitSize, int batch,
+    int pageLen, fastllm::DataType pagedDataType, int batch,
     int doQKNorm);
 bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fastllm::Data &penaltyScale);
 bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,

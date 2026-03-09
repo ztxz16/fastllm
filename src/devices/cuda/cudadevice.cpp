@@ -1511,7 +1511,6 @@ namespace fastllm {
         float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
         float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
 
-        int unitSize = qkv.unitSize;
         int doQKNorm = intParams.find("doQKNorm") != intParams.end() ? intParams.find("doQKNorm")->second : 1;
 
         // 分配 qOutput 内存
@@ -1523,7 +1522,7 @@ namespace fastllm {
             (uint8_t*)pagedKCacheData.cudaData, (uint8_t*)pagedVCacheData.cudaData,
             (int32_t*)insertIndexs.cudaData, (int32_t*)insertPositions.cudaData,
             q_heads, k_heads, head_dim, rotateDim, eps, ropeTheta, ropeScale,
-            pageLen, unitSize, batch, doQKNorm);
+            pageLen, pagedKCacheData.dataType, batch, doQKNorm);
     }
 
     void CudaRepeatPenaltyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -2301,6 +2300,62 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         DoCudaLinear(qkv, weight1, bias1, output);
     }
 
+    void CudaAppendPagedCacheOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &cache = *(datas.find("cache")->second);
+        Data &input = *(datas.find("input")->second);
+        PagedCacheManager &pagedCacheManager = *((PagedCacheManager*)datas.find("pagedCacheManager")->second);
+
+        AssertInFastLLM(cache.dataType == DataType::FLOAT32 ||
+                        cache.dataType == DataType::FLOAT16 ||
+                        cache.dataType == DataType::BFLOAT16 ||
+                        cache.dataType == DataType::FP8_E4M3,
+                        "CudaAppendPagedCacheOp's cache's type should be float32, float16, bfloat16 or fp8_e4m3.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "CudaAppendPagedCacheOp's input type should be float32, float16 or bfloat16.\n");
+        AssertInFastLLM(input.dims.size() == 3,
+                        "CudaAppendPagedCacheOp's input should have 3 dimensions [numHeads, seqLen, headDim].\n");
+
+        cache.isPagedKVCache = true;
+
+        int numHeads = input.dims[0];
+        int seqLen = input.dims[1];
+        int headDim = input.dims[2];
+
+        if (cache.pagedKVCacheData == nullptr) {
+            cache.pagedKVCacheData = &pagedCacheManager;
+        }
+        cache.pageLen = pagedCacheManager.pageLen;
+
+        AssertInFastLLM(cache.pagedKVCacheData->dims.size() == 4,
+                        "CudaAppendPagedCacheOp's pagedKVCacheData should have 4 dimensions.\n");
+        AssertInFastLLM(cache.pagedKVCacheData->dims[1] == cache.pageLen,
+                        "CudaAppendPagedCacheOp's pagedKVCacheData pageLen mismatch.\n");
+        AssertInFastLLM(cache.pagedKVCacheData->dims[2] == numHeads,
+                        "CudaAppendPagedCacheOp's pagedKVCacheData numHeads mismatch.\n");
+        AssertInFastLLM(cache.pagedKVCacheData->dims[3] == headDim,
+                        "CudaAppendPagedCacheOp's pagedKVCacheData headDim mismatch.\n");
+
+        int currentUsedTokens = 0;
+        if (cache.pageIndex.size() > 0) {
+            currentUsedTokens = (cache.pageIndex.size() - 1) * cache.pageLen + cache.lastPageLen;
+        }
+        int totalNeededTokens = currentUsedTokens + seqLen;
+        int totalNeededPages = (totalNeededTokens + cache.pageLen - 1) / cache.pageLen;
+        int maxPages = cache.pagedKVCacheData->dims[0];
+        if (totalNeededPages > maxPages) {
+            ErrorInFastLLM("CudaAppendPagedCacheOp: No more pages available. Need to resize pagedKVCacheData.\n");
+        }
+
+        if (cache.dims.size() == 0) {
+            cache.Resize(input.dims);
+        } else {
+            cache.Resize({cache.dims[0], cache.dims[1] + input.dims[1], cache.dims[2]});
+        }
+    }
+
     void CudaAppendPagedCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &cache = *(datas.find("cache")->second);
@@ -2340,8 +2395,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 pageLen,
                 numHeads,
                 headDim,
-                unitSize,
+                pagedKVCache->dataType,
                 inputData, // src: input.cudaData
+                input.dataType,
                 seqLen,    // input sequence length
                 inputOffset,
                 copyLen,
@@ -2367,8 +2423,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 pageLen,
                 numHeads,
                 headDim,
-                unitSize,
+                pagedKVCache->dataType,
                 inputData, // src: input.cudaData
+                input.dataType,
                 seqLen,    // input sequence length
                 inputOffset,
                 copyLen,
@@ -2398,6 +2455,45 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         DoCudaAttentionPaged(q, k, v, output, group, scale, inited);
     }
 
+    void CudaAppendPagedCacheBatchOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data **currentCaches = (Data**)(datas.find("currentCaches")->second);
+        Data &insertIndexs = *(datas.find("insertIndexs")->second);
+        Data &insertPositions = *(datas.find("insertPositions")->second);
+        PagedCacheManager &manager = *(PagedCacheManager*)datas.find("pagedCacheManager")->second;
+
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "CudaAppendPagedCacheBatchOp's input type should be float32, float16 or bfloat16.\n");
+        AssertInFastLLM(((Data*)&manager)->dataType == DataType::FLOAT32 ||
+                        ((Data*)&manager)->dataType == DataType::FLOAT16 ||
+                        ((Data*)&manager)->dataType == DataType::BFLOAT16 ||
+                        ((Data*)&manager)->dataType == DataType::FP8_E4M3,
+                        "CudaAppendPagedCacheBatchOp's cache type should be float32, float16, bfloat16 or fp8_e4m3.\n");
+        AssertInFastLLM(input.dims.size() == 3,
+                        "CudaAppendPagedCacheBatchOp's input should have 3 dimensions [batch, numHeads, headDim].\n");
+        AssertInFastLLM(insertIndexs.dims.size() == 1 && insertIndexs.dims[0] == input.dims[0],
+                        "CudaAppendPagedCacheBatchOp's insertIndexs length should match batch.\n");
+        AssertInFastLLM(insertPositions.dims.size() == 1 && insertPositions.dims[0] == input.dims[0],
+                        "CudaAppendPagedCacheBatchOp's insertPositions length should match batch.\n");
+        AssertInFastLLM(((Data*)&manager)->dims.size() == 4,
+                        "CudaAppendPagedCacheBatchOp's pagedCacheManager storage should have 4 dimensions.\n");
+
+        int batch = input.dims[0];
+        for (int i = 0; i < batch; i++) {
+            Data *currentCache = currentCaches[i];
+            int pageLen = currentCache->pageLen;
+            if (currentCache->lastPageLen < pageLen) {
+                currentCache->lastPageLen++;
+            } else {
+                currentCache->lastPageLen = 0;
+                currentCache->pageIndex.push_back(manager.GetUnusedPageIndex(true));
+            }
+        }
+    }
+
     void CudaAppendPagedCacheBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second); // batch, num_heads, head_dim
@@ -2421,8 +2517,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             batch,
             numHeads,
             headDim,
-            unitSize,
-            inputData
+            ((Data*)&manager)->dataType,
+            inputData,
+            input.dataType
         );
     }
 

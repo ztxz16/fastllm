@@ -14,8 +14,10 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "utils/utils.h"
 
 #include <cstdlib>
+#include <cuda_fp8.h>
 
 template <int BN, int BM, int BK>
 __global__ void HalfFC(
@@ -1747,21 +1749,61 @@ bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
     return true;
 }
 
+template <typename T>
+__device__ __forceinline__ float FastllmAttentionValueToFloat(T value);
+
+template <>
+__device__ __forceinline__ float FastllmAttentionValueToFloat<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ float FastllmAttentionValueToFloat<half>(half value) {
+    return __half2float(value);
+}
+
+template <>
+__device__ __forceinline__ float FastllmAttentionValueToFloat<__nv_bfloat16>(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T FastllmAttentionFloatToValue(float value);
+
+template <>
+__device__ __forceinline__ float FastllmAttentionFloatToValue<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ half FastllmAttentionFloatToValue<half>(float value) {
+    return __float2half(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 FastllmAttentionFloatToValue<__nv_bfloat16>(float value) {
+    return __float2bfloat16_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_fp8_e4m3 FastllmAttentionFloatToValue<__nv_fp8_e4m3>(float value) {
+    return __nv_fp8_e4m3(value);
+}
+
 // CUDA kernel for copying data from input to paged KV cache
 // input: [numHeads, seqLen, headDim], pagedData: [maxPages, pageLen, numHeads, headDim]
-template <int THREAD_PER_BLOCK>
+template <typename SrcT, typename DstT, int THREAD_PER_BLOCK>
 __global__ void FastllmPagedCacheCopyKernel(
     uint8_t *pagedData,      // dst: [maxPages, pageLen, numHeads, headDim]
-    int pageIdx,              // target page index
-    int pageLen,              // page length
-    int numHeads,             // number of heads
-    int headDim,              // head dimension
-    int unitSize,             // size of each element in bytes
-    uint8_t *inputData,       // src: [numHeads, seqLen, headDim]
-    int seqLen,               // input sequence length
-    int inputOffset,          // offset in input sequence
-    int copyLen,              // number of tokens to copy
-    int pageOffset            // offset in target page (where to start writing)
+    int pageIdx,             // target page index
+    int pageLen,             // page length
+    int numHeads,            // number of heads
+    int headDim,             // head dimension
+    uint8_t *inputData,      // src: [numHeads, seqLen, headDim]
+    int seqLen,              // input sequence length
+    int inputOffset,         // offset in input sequence
+    int copyLen,             // number of tokens to copy
+    int pageOffset           // offset in target page (where to start writing)
 ) {
     // Calculate the linear index for this thread
     // Each thread handles one element: (head, token, dim)
@@ -1782,35 +1824,31 @@ __global__ void FastllmPagedCacheCopyKernel(
     // input layout: [numHeads, seqLen, headDim]
     // For input[head, token_idx, dim] where token_idx = inputOffset + token:
     // srcOffset = head * (seqLen * headDim * unitSize) + token_idx * (headDim * unitSize) + dim * unitSize
-    int srcOffset = head * seqLen * headDim * unitSize + (inputOffset + token) * headDim * unitSize + dim * unitSize;
+    const SrcT *src = (const SrcT*)inputData;
+    DstT *dst = (DstT*)pagedData;
+    int srcOffset = head * seqLen * headDim + (inputOffset + token) * headDim + dim;
     
     // Calculate destination address: pagedData[pageIdx, pageOffset + token, head, dim]
     // pagedData layout: [maxPages, pageLen, numHeads, headDim]
-    int pageStride = pageLen * numHeads * headDim * unitSize;
-    int tokenStride = numHeads * headDim * unitSize;
-    int headStride = headDim * unitSize;
-    int dstOffset = pageIdx * pageStride + (pageOffset + token) * tokenStride + head * headStride + dim * unitSize;
-    
-    // Perform the copy
-    for (int i = 0; i < unitSize; i++) {
-        pagedData[dstOffset + i] = inputData[srcOffset + i];
-    }
+    int pageStride = pageLen * numHeads * headDim;
+    int tokenStride = numHeads * headDim;
+    int headStride = headDim;
+    int dstOffset = pageIdx * pageStride + (pageOffset + token) * tokenStride + head * headStride + dim;
+    dst[dstOffset] = FastllmAttentionFloatToValue<DstT>(FastllmAttentionValueToFloat<SrcT>(src[srcOffset]));
 }
 
-// Host function to launch the kernel
-void FastllmCudaPagedCacheCopy(
-    uint8_t *pagedData,       // dst: pagedKVCache->cudaData
-    int pageIdx,              // page index
-    int pageLen,              // page length
-    int numHeads,             // number of heads
-    int headDim,              // head dimension
-    int unitSize,             // unit size in bytes
-    uint8_t *inputData,       // src: input.cudaData
-    int seqLen,               // input sequence length
-    int inputOffset,          // input offset
-    int copyLen,              // copy length
-    int pageOffset            // offset in target page (where to start writing)
-) {
+template <typename SrcT, typename DstT>
+static void FastllmCudaPagedCacheCopyTyped(
+    uint8_t *pagedData,
+    int pageIdx,
+    int pageLen,
+    int numHeads,
+    int headDim,
+    uint8_t *inputData,
+    int seqLen,
+    int inputOffset,
+    int copyLen,
+    int pageOffset) {
     int totalElements = numHeads * copyLen * headDim;
     if (totalElements == 0) {
         return;
@@ -1819,18 +1857,85 @@ void FastllmCudaPagedCacheCopy(
     const int THREAD_PER_BLOCK = 256;
     int numBlocks = (totalElements + THREAD_PER_BLOCK - 1) / THREAD_PER_BLOCK;
     
-    FastllmPagedCacheCopyKernel<THREAD_PER_BLOCK><<<numBlocks, THREAD_PER_BLOCK>>>(
-        pagedData, pageIdx, pageLen, numHeads, headDim, unitSize,
+    FastllmPagedCacheCopyKernel<SrcT, DstT, THREAD_PER_BLOCK><<<numBlocks, THREAD_PER_BLOCK>>>(
+        pagedData, pageIdx, pageLen, numHeads, headDim,
         inputData, seqLen, inputOffset, copyLen, pageOffset
     );
-    
+
     DeviceSync();
+}
+
+// Host function to launch the kernel
+void FastllmCudaPagedCacheCopy(
+    uint8_t *pagedData,
+    int pageIdx,
+    int pageLen,
+    int numHeads,
+    int headDim,
+    fastllm::DataType dstType,
+    uint8_t *inputData,
+    fastllm::DataType srcType,
+    int seqLen,
+    int inputOffset,
+    int copyLen,
+    int pageOffset) {
+    if (srcType == fastllm::DataType::FLOAT32) {
+        if (dstType == fastllm::DataType::FLOAT32) {
+            FastllmCudaPagedCacheCopyTyped<float, float>(pagedData, pageIdx, pageLen, numHeads, headDim,
+                                                         inputData, seqLen, inputOffset, copyLen, pageOffset);
+        } else if (dstType == fastllm::DataType::FLOAT16) {
+            FastllmCudaPagedCacheCopyTyped<float, half>(pagedData, pageIdx, pageLen, numHeads, headDim,
+                                                        inputData, seqLen, inputOffset, copyLen, pageOffset);
+        } else if (dstType == fastllm::DataType::BFLOAT16) {
+            FastllmCudaPagedCacheCopyTyped<float, __nv_bfloat16>(pagedData, pageIdx, pageLen, numHeads, headDim,
+                                                                 inputData, seqLen, inputOffset, copyLen, pageOffset);
+        } else if (dstType == fastllm::DataType::FP8_E4M3) {
+            FastllmCudaPagedCacheCopyTyped<float, __nv_fp8_e4m3>(pagedData, pageIdx, pageLen, numHeads, headDim,
+                                                                 inputData, seqLen, inputOffset, copyLen, pageOffset);
+        } else {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopy: unsupported dstType.\n");
+        }
+    } else if (srcType == fastllm::DataType::FLOAT16) {
+        if (dstType == fastllm::DataType::FLOAT32) {
+            FastllmCudaPagedCacheCopyTyped<half, float>(pagedData, pageIdx, pageLen, numHeads, headDim,
+                                                        inputData, seqLen, inputOffset, copyLen, pageOffset);
+        } else if (dstType == fastllm::DataType::FLOAT16) {
+            FastllmCudaPagedCacheCopyTyped<half, half>(pagedData, pageIdx, pageLen, numHeads, headDim,
+                                                       inputData, seqLen, inputOffset, copyLen, pageOffset);
+        } else if (dstType == fastllm::DataType::BFLOAT16) {
+            FastllmCudaPagedCacheCopyTyped<half, __nv_bfloat16>(pagedData, pageIdx, pageLen, numHeads, headDim,
+                                                                inputData, seqLen, inputOffset, copyLen, pageOffset);
+        } else if (dstType == fastllm::DataType::FP8_E4M3) {
+            FastllmCudaPagedCacheCopyTyped<half, __nv_fp8_e4m3>(pagedData, pageIdx, pageLen, numHeads, headDim,
+                                                                inputData, seqLen, inputOffset, copyLen, pageOffset);
+        } else {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopy: unsupported dstType.\n");
+        }
+    } else if (srcType == fastllm::DataType::BFLOAT16) {
+        if (dstType == fastllm::DataType::FLOAT32) {
+            FastllmCudaPagedCacheCopyTyped<__nv_bfloat16, float>(pagedData, pageIdx, pageLen, numHeads, headDim,
+                                                                 inputData, seqLen, inputOffset, copyLen, pageOffset);
+        } else if (dstType == fastllm::DataType::FLOAT16) {
+            FastllmCudaPagedCacheCopyTyped<__nv_bfloat16, half>(pagedData, pageIdx, pageLen, numHeads, headDim,
+                                                                inputData, seqLen, inputOffset, copyLen, pageOffset);
+        } else if (dstType == fastllm::DataType::BFLOAT16) {
+            FastllmCudaPagedCacheCopyTyped<__nv_bfloat16, __nv_bfloat16>(pagedData, pageIdx, pageLen, numHeads, headDim,
+                                                                         inputData, seqLen, inputOffset, copyLen, pageOffset);
+        } else if (dstType == fastllm::DataType::FP8_E4M3) {
+            FastllmCudaPagedCacheCopyTyped<__nv_bfloat16, __nv_fp8_e4m3>(pagedData, pageIdx, pageLen, numHeads, headDim,
+                                                                         inputData, seqLen, inputOffset, copyLen, pageOffset);
+        } else {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopy: unsupported dstType.\n");
+        }
+    } else {
+        fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopy: unsupported srcType.\n");
+    }
 }
 
 // CUDA kernel for batch copying data from input to paged KV cache
 // input: [batch, numHeads, headDim], pagedData: [maxPages, pageLen, numHeads, headDim]
 // Each batch has 1 token, so we copy [numHeads, headDim] for each batch
-template <int THREAD_PER_BLOCK>
+template <typename SrcT, typename DstT, int THREAD_PER_BLOCK>
 __global__ void FastllmPagedCacheCopyBatchKernel(
     uint8_t *pagedData,         // dst: [maxPages, pageLen, numHeads, headDim]
     int32_t *pageIdxArray,      // page index for each batch [batch]
@@ -1839,7 +1944,6 @@ __global__ void FastllmPagedCacheCopyBatchKernel(
     int batch,                  // number of batches
     int numHeads,               // number of heads
     int headDim,                // head dimension
-    int unitSize,               // size of each element in bytes
     uint8_t *inputData          // src: [batch, numHeads, headDim]
 ) {
     // Calculate the linear index for this thread
@@ -1863,33 +1967,29 @@ __global__ void FastllmPagedCacheCopyBatchKernel(
     
     // Calculate source address: input[b, h, d]
     // input layout: [batch, numHeads, headDim]
-    int srcOffset = (b * numHeads * headDim + h * headDim + d) * unitSize;
+    const SrcT *src = (const SrcT*)inputData;
+    DstT *dst = (DstT*)pagedData;
+    int srcOffset = b * numHeads * headDim + h * headDim + d;
     
     // Calculate destination address: pagedData[pageIdx, pageOffset, h, d]
     // pagedData layout: [maxPages, pageLen, numHeads, headDim]
-    int pageStride = pageLen * numHeads * headDim * unitSize;
-    int tokenStride = numHeads * headDim * unitSize;
-    int headStride = headDim * unitSize;
-    int dstOffset = pageIdx * pageStride + pageOffset * tokenStride + h * headStride + d * unitSize;
-    
-    // Perform the copy
-    for (int i = 0; i < unitSize; i++) {
-        pagedData[dstOffset + i] = inputData[srcOffset + i];
-    }
+    int pageStride = pageLen * numHeads * headDim;
+    int tokenStride = numHeads * headDim;
+    int headStride = headDim;
+    int dstOffset = pageIdx * pageStride + pageOffset * tokenStride + h * headStride + d;
+    dst[dstOffset] = FastllmAttentionFloatToValue<DstT>(FastllmAttentionValueToFloat<SrcT>(src[srcOffset]));
 }
 
-// Host function to launch the batch kernel
-void FastllmCudaPagedCacheCopyBatch(
-    uint8_t *pagedData,         // dst: pagedKVCache->cudaData
-    int32_t *pageIdxArray,       // page index array for each batch (CUDA memory)
-    int32_t *pageOffsetArray,    // page offset array for each batch (CUDA memory)
-    int pageLen,                 // page length
-    int batch,                   // number of batches
-    int numHeads,                // number of heads
-    int headDim,                 // head dimension
-    int unitSize,                // unit size in bytes
-    uint8_t *inputData           // src: input.cudaData [batch, numHeads, headDim]
-) {
+template <typename SrcT, typename DstT>
+static void FastllmCudaPagedCacheCopyBatchTyped(
+    uint8_t *pagedData,
+    int32_t *pageIdxArray,
+    int32_t *pageOffsetArray,
+    int pageLen,
+    int batch,
+    int numHeads,
+    int headDim,
+    uint8_t *inputData) {
     int totalElements = batch * numHeads * headDim;
     if (totalElements == 0) {
         return;
@@ -1898,11 +1998,76 @@ void FastllmCudaPagedCacheCopyBatch(
     const int THREAD_PER_BLOCK = 256;
     int numBlocks = (totalElements + THREAD_PER_BLOCK - 1) / THREAD_PER_BLOCK;
     
-    FastllmPagedCacheCopyBatchKernel<THREAD_PER_BLOCK><<<numBlocks, THREAD_PER_BLOCK>>>(
-        pagedData, pageIdxArray, pageOffsetArray, pageLen, batch, numHeads, headDim, unitSize, inputData
+    FastllmPagedCacheCopyBatchKernel<SrcT, DstT, THREAD_PER_BLOCK><<<numBlocks, THREAD_PER_BLOCK>>>(
+        pagedData, pageIdxArray, pageOffsetArray, pageLen, batch, numHeads, headDim, inputData
     );
-    
+
     DeviceSync();
+}
+
+// Host function to launch the batch kernel
+void FastllmCudaPagedCacheCopyBatch(
+    uint8_t *pagedData,
+    int32_t *pageIdxArray,
+    int32_t *pageOffsetArray,
+    int pageLen,
+    int batch,
+    int numHeads,
+    int headDim,
+    fastllm::DataType dstType,
+    uint8_t *inputData,
+    fastllm::DataType srcType) {
+    if (srcType == fastllm::DataType::FLOAT32) {
+        if (dstType == fastllm::DataType::FLOAT32) {
+            FastllmCudaPagedCacheCopyBatchTyped<float, float>(pagedData, pageIdxArray, pageOffsetArray,
+                                                              pageLen, batch, numHeads, headDim, inputData);
+        } else if (dstType == fastllm::DataType::FLOAT16) {
+            FastllmCudaPagedCacheCopyBatchTyped<float, half>(pagedData, pageIdxArray, pageOffsetArray,
+                                                             pageLen, batch, numHeads, headDim, inputData);
+        } else if (dstType == fastllm::DataType::BFLOAT16) {
+            FastllmCudaPagedCacheCopyBatchTyped<float, __nv_bfloat16>(pagedData, pageIdxArray, pageOffsetArray,
+                                                                      pageLen, batch, numHeads, headDim, inputData);
+        } else if (dstType == fastllm::DataType::FP8_E4M3) {
+            FastllmCudaPagedCacheCopyBatchTyped<float, __nv_fp8_e4m3>(pagedData, pageIdxArray, pageOffsetArray,
+                                                                      pageLen, batch, numHeads, headDim, inputData);
+        } else {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: unsupported dstType.\n");
+        }
+    } else if (srcType == fastllm::DataType::FLOAT16) {
+        if (dstType == fastllm::DataType::FLOAT32) {
+            FastllmCudaPagedCacheCopyBatchTyped<half, float>(pagedData, pageIdxArray, pageOffsetArray,
+                                                             pageLen, batch, numHeads, headDim, inputData);
+        } else if (dstType == fastllm::DataType::FLOAT16) {
+            FastllmCudaPagedCacheCopyBatchTyped<half, half>(pagedData, pageIdxArray, pageOffsetArray,
+                                                            pageLen, batch, numHeads, headDim, inputData);
+        } else if (dstType == fastllm::DataType::BFLOAT16) {
+            FastllmCudaPagedCacheCopyBatchTyped<half, __nv_bfloat16>(pagedData, pageIdxArray, pageOffsetArray,
+                                                                     pageLen, batch, numHeads, headDim, inputData);
+        } else if (dstType == fastllm::DataType::FP8_E4M3) {
+            FastllmCudaPagedCacheCopyBatchTyped<half, __nv_fp8_e4m3>(pagedData, pageIdxArray, pageOffsetArray,
+                                                                     pageLen, batch, numHeads, headDim, inputData);
+        } else {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: unsupported dstType.\n");
+        }
+    } else if (srcType == fastllm::DataType::BFLOAT16) {
+        if (dstType == fastllm::DataType::FLOAT32) {
+            FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, float>(pagedData, pageIdxArray, pageOffsetArray,
+                                                                      pageLen, batch, numHeads, headDim, inputData);
+        } else if (dstType == fastllm::DataType::FLOAT16) {
+            FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, half>(pagedData, pageIdxArray, pageOffsetArray,
+                                                                     pageLen, batch, numHeads, headDim, inputData);
+        } else if (dstType == fastllm::DataType::BFLOAT16) {
+            FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, __nv_bfloat16>(pagedData, pageIdxArray, pageOffsetArray,
+                                                                              pageLen, batch, numHeads, headDim, inputData);
+        } else if (dstType == fastllm::DataType::FP8_E4M3) {
+            FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, __nv_fp8_e4m3>(pagedData, pageIdxArray, pageOffsetArray,
+                                                                              pageLen, batch, numHeads, headDim, inputData);
+        } else {
+            fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: unsupported dstType.\n");
+        }
+    } else {
+        fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: unsupported srcType.\n");
+    }
 }
 
 static double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {
@@ -2065,13 +2230,20 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
     int valueHeadDim = pagedKVCacheV->dims[3];
 
     // 检查数据类型
-    bool useBFloat16 = (q.dataType == fastllm::DataType::BFLOAT16);
-    if (!useBFloat16 && q.dataType != fastllm::DataType::FLOAT16) {
+    if (q.dataType != fastllm::DataType::FLOAT16 && q.dataType != fastllm::DataType::BFLOAT16) {
         printf("DoCudaAttentionPaged: Only FLOAT16 and BFLOAT16 are supported for paged attention, got q.dataType=%d\n", (int)q.dataType);
         return true;
     }
-    if (q.dataType != k.dataType || q.dataType != v.dataType || q.dataType != output.dataType) {
-        printf("DoCudaAttentionPaged: q/k/v/output dataType mismatch\n");
+    if (output.dataType != q.dataType) {
+        printf("DoCudaAttentionPaged: q/output dataType mismatch\n");
+        return true;
+    }
+    if (pagedKVCacheK->dataType != pagedKVCacheV->dataType) {
+        printf("DoCudaAttentionPaged: paged KV cache dataType mismatch\n");
+        return true;
+    }
+    if (pagedKVCacheK->dataType != q.dataType && pagedKVCacheK->dataType != fastllm::DataType::FP8_E4M3) {
+        printf("DoCudaAttentionPaged: unsupported KV cache dataType=%d\n", (int)pagedKVCacheK->dataType);
         return true;
     }
     
@@ -2148,22 +2320,22 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
     uint32_t *kv_tile_indices_gpu = nullptr;
     uint32_t *kv_chunk_size_ptr_gpu = nullptr;
 
-    // 定义一个 lambda 来执行 prefill 逻辑，模板化 DType
-    auto runPrefill = [&]<typename DType>() {
-        DType *qd = (DType*)q.cudaData;
-        DType *od = (DType*)output.cudaData;
-        DType *pagedKVCacheDataK = (DType*)pagedKVCacheK->cudaData;
-        DType *pagedKVCacheDataV = (DType*)pagedKVCacheV->cudaData;
+    // 定义一个 lambda 来执行 prefill 逻辑，模板化 Q/KV 类型
+    auto runPrefill = [&]<typename QType, typename KVType>() {
+        QType *qd = (QType*)q.cudaData;
+        QType *od = (QType*)output.cudaData;
+        KVType *pagedKVCacheDataK = (KVType*)pagedKVCacheK->cudaData;
+        KVType *pagedKVCacheDataV = (KVType*)pagedKVCacheV->cudaData;
 
         // 构造 paged_kv_t 结构
         // fastllm 的布局是 [maxPages, pageLen, numHeads, headDim]，这是 NHD 布局
-        paged_kv_t<DType, uint32_t> paged_kv(
+        paged_kv_t<KVType, uint32_t> paged_kv(
             numHeads, pageLen, headDim, batch_size,
             QKVLayout::kNHD, pagedKVCacheDataK, pagedKVCacheDataV,
             indices_gpu, indptr_gpu, last_page_len_gpu, nullptr
         );
 
-        DType *tmp_v = nullptr;
+        QType *tmp_v = nullptr;
 // ForceDeviceSync(); printf("start_time = %f\n", GetSpan(st, std::chrono::system_clock::now()));
         // Prefill 阶段
         uint32_t *q_indptr_gpu = nullptr;
@@ -2186,7 +2358,7 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
                 workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
                 workspace.int_workspace_size, plan_info, q_indptr_host.data(), indptr_host.data(), 
                 total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
-                pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(DType), 
+                pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(QType), 
                 /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
                 /*num_colocated_ctas=*/0, stream);
 
@@ -2202,7 +2374,7 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         uint32_t q_stride_n = (q.dims.size() >= 2 && q.strides.size() >= 2) ? q.strides[1] : q2;
         uint32_t q_stride_h = (q.dims.size() >= 3 && q.strides.size() >= 1) ? q.strides[0] : (q1 * q2);
         
-        BatchPrefillPagedParams<DType, DType, DType, uint32_t> prefill_params(
+        BatchPrefillPagedParams<QType, KVType, QType, uint32_t> prefill_params(
             qd, paged_kv, nullptr, q_indptr_gpu, nullptr, nullptr,
             od, nullptr, nullptr,
             num_qo_heads_per_batch, q_stride_n, q_stride_h,
@@ -2225,7 +2397,7 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         if (plan_info.split_kv) {
             prefill_params.merge_indptr = reinterpret_cast<uint32_t*>(
                 static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.merge_indptr_offset);
-            tmp_v = reinterpret_cast<DType*>(
+            tmp_v = reinterpret_cast<QType*>(
                 static_cast<uint8_t*>(workspace.d_float_workspace) + plan_info.v_offset);
             tmp_s = reinterpret_cast<float*>(
                 static_cast<uint8_t*>(workspace.d_float_workspace) + plan_info.s_offset);
@@ -2241,10 +2413,18 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
     };
 
-    if (useBFloat16) {
-        runPrefill.template operator()<__nv_bfloat16>();
+    if (q.dataType == fastllm::DataType::BFLOAT16) {
+        if (pagedKVCacheK->dataType == fastllm::DataType::FP8_E4M3) {
+            runPrefill.template operator()<__nv_bfloat16, __nv_fp8_e4m3>();
+        } else {
+            runPrefill.template operator()<__nv_bfloat16, __nv_bfloat16>();
+        }
     } else {
-        runPrefill.template operator()<half>();
+        if (pagedKVCacheK->dataType == fastllm::DataType::FP8_E4M3) {
+            runPrefill.template operator()<half, __nv_fp8_e4m3>();
+        } else {
+            runPrefill.template operator()<half, half>();
+        }
     }
     
     // 清理 GPU 内存
@@ -2319,13 +2499,20 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
     int valueHeadDim = pagedKVCacheV->dims[3];
     
     // 检查数据类型
-    bool useBFloat16 = (q.dataType == fastllm::DataType::BFLOAT16);
-    if (!useBFloat16 && q.dataType != fastllm::DataType::FLOAT16) {
+    if (q.dataType != fastllm::DataType::FLOAT16 && q.dataType != fastllm::DataType::BFLOAT16) {
         printf("FastllmCudaHalfPagedAttentionBatch: Only FLOAT16 and BFLOAT16 are supported for paged attention, got q.dataType=%d\n", (int)q.dataType);
         return false;
     }
-    if (q.dataType != kCaches.dataType || q.dataType != vCaches.dataType || q.dataType != output.dataType) {
-        printf("FastllmCudaHalfPagedAttentionBatch: q/kCaches/vCaches/output dataType mismatch\n");
+    if (output.dataType != q.dataType) {
+        printf("FastllmCudaHalfPagedAttentionBatch: q/output dataType mismatch\n");
+        return false;
+    }
+    if (pagedKVCacheK->dataType != pagedKVCacheV->dataType) {
+        printf("FastllmCudaHalfPagedAttentionBatch: paged KV cache dataType mismatch\n");
+        return false;
+    }
+    if (pagedKVCacheK->dataType != q.dataType && pagedKVCacheK->dataType != fastllm::DataType::FP8_E4M3) {
+        printf("FastllmCudaHalfPagedAttentionBatch: unsupported KV cache dataType=%d\n", (int)pagedKVCacheK->dataType);
         return false;
     }
     
@@ -2358,15 +2545,15 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
 
     cudaError_t status = cudaSuccess;
 
-    // 定义一个 lambda 来执行 prefill 逻辑，模板化 DType
-    auto runBatchPrefill = [&]<typename DType>() {
-        DType *qd = (DType*)q.cudaData;
-        DType *od = (DType*)output.cudaData;
-        DType *pagedKVCacheDataK = (DType*)pagedKVCacheK->cudaData;
-        DType *pagedKVCacheDataV = (DType*)pagedKVCacheV->cudaData;
+    // 定义一个 lambda 来执行 prefill 逻辑，模板化 Q/KV 类型
+    auto runBatchPrefill = [&]<typename QType, typename KVType>() {
+        QType *qd = (QType*)q.cudaData;
+        QType *od = (QType*)output.cudaData;
+        KVType *pagedKVCacheDataK = (KVType*)pagedKVCacheK->cudaData;
+        KVType *pagedKVCacheDataV = (KVType*)pagedKVCacheV->cudaData;
 
         // 构造 paged_kv_t 结构
-        paged_kv_t<DType, uint32_t> paged_kv(
+        paged_kv_t<KVType, uint32_t> paged_kv(
             numHeads, pageLen, headDim, batch_size,
             QKVLayout::kNHD, pagedKVCacheDataK, pagedKVCacheDataV,
             (uint32_t*)pageIndexsData, (uint32_t*)pageSizesData,
@@ -2387,7 +2574,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
                 workspace.int_workspace_size, plan_info, 
                 (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(), 
                 total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
-                pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(DType), 
+                pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(QType), 
                 /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
                 /*num_colocated_ctas=*/0, stream);
             
@@ -2403,7 +2590,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         uint32_t q_stride_h = (q.dims.size() >= 3 && q.strides.size() >= 1) ? q.strides[0] : (q1 * q2);
         
         int32_t *qSizesData = (int32_t*)qSizes.cudaData;
-        BatchPrefillPagedParams<DType, DType, DType, uint32_t> prefill_params(
+        BatchPrefillPagedParams<QType, KVType, QType, uint32_t> prefill_params(
             qd, paged_kv, nullptr, (uint32_t*)qSizesData, nullptr, nullptr,
             od, nullptr, nullptr,
             num_qo_heads_per_batch, q_stride_n, q_stride_h,
@@ -2423,12 +2610,12 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         prefill_params.padded_batch_size = plan_info.padded_batch_size;
         prefill_params.max_total_num_rows = plan_info.total_num_rows;
         
-        DType *tmp_v = nullptr;
+        QType *tmp_v = nullptr;
         float *tmp_s = nullptr;
         if (plan_info.split_kv) {
             prefill_params.merge_indptr = reinterpret_cast<uint32_t*>(
                 static_cast<uint8_t*>(workspace.d_int_workspace) + plan_info.merge_indptr_offset);
-            tmp_v = reinterpret_cast<DType*>(
+            tmp_v = reinterpret_cast<QType*>(
                 static_cast<uint8_t*>(workspace.d_float_workspace) + plan_info.v_offset);
             tmp_s = reinterpret_cast<float*>(
                 static_cast<uint8_t*>(workspace.d_float_workspace) + plan_info.s_offset);
@@ -2440,10 +2627,18 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
             "FastllmCudaHalfPagedAttentionBatch");
     };
 
-    if (useBFloat16) {
-        runBatchPrefill.template operator()<__nv_bfloat16>();
+    if (q.dataType == fastllm::DataType::BFLOAT16) {
+        if (pagedKVCacheK->dataType == fastllm::DataType::FP8_E4M3) {
+            runBatchPrefill.template operator()<__nv_bfloat16, __nv_fp8_e4m3>();
+        } else {
+            runBatchPrefill.template operator()<__nv_bfloat16, __nv_bfloat16>();
+        }
     } else {
-        runBatchPrefill.template operator()<half>();
+        if (pagedKVCacheK->dataType == fastllm::DataType::FP8_E4M3) {
+            runBatchPrefill.template operator()<half, __nv_fp8_e4m3>();
+        } else {
+            runBatchPrefill.template operator()<half, half>();
+        }
     }
     
     if (status != cudaSuccess) {

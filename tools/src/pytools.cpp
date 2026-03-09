@@ -365,6 +365,26 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT void set_model_kv_cache_dtype(int modelId, char *kv_cache_dtype) {
+        auto model = models.GetModel(modelId);
+        std::string dtypeStr = kv_cache_dtype;
+        if (dtypeStr == "" || dtypeStr == "auto") {
+            model->kvCacheDataType = model->dataType;
+            model->useCustomKVCacheDataType = false;
+        } else if (dtypeStr == "float16" || dtypeStr == "half") {
+            model->SetKVCacheDataType(fastllm::DataType::FLOAT16);
+        } else if (dtypeStr == "bfloat16" || dtypeStr == "bf16") {
+            model->SetKVCacheDataType(fastllm::DataType::BFLOAT16);
+        } else if (dtypeStr == "float" || dtypeStr == "float32") {
+            model->SetKVCacheDataType(fastllm::DataType::FLOAT32);
+        } else if (dtypeStr == "fp8" || dtypeStr == "float8" || dtypeStr == "fp8_e4m3") {
+            model->SetKVCacheDataType(fastllm::DataType::FP8_E4M3);
+        } else {
+            fastllm::ErrorInFastLLM("set_model_kv_cache_dtype error: kv_cache_dtype should be auto, float32, float16, bfloat16 or fp8_e4m3.");
+        }
+        return;
+    }
+
     DLL_EXPORT void init_params_llm_model(int modelId) {
         auto model = models.GetModel(modelId);
         model->InitParams();

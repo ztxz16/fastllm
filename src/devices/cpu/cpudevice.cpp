@@ -8158,6 +8158,8 @@ ops += (long long)lines * inputDim * interDim * 2;
         AssertInFastLLM(input.dims.size() == 3, 
                         "CpuAppendPagedCacheOp's input should have 3 dimensions [numHeads, seqLen, headDim].\n");
         
+        AssertInFastLLM(cache.dataType != DataType::FP8_E4M3,
+                        "CpuAppendPagedCacheOp doesn't support fp8_e4m3 KV cache.\n");
         AssertInFastLLM(input.dataType == cache.dataType,
                         "CpuAppendPagedCacheOp's input and cache should have the same data type.\n");
         
@@ -8747,6 +8749,9 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &output = *(datas.find("output")->second);
         output.Allocate();
         if (k.isPagedKVCache && v.isPagedKVCache) {
+            AssertInFastLLM(k.pagedKVCacheData->dataType != DataType::FP8_E4M3 &&
+                            v.pagedKVCacheData->dataType != DataType::FP8_E4M3,
+                            "CpuAttentionPagedOp doesn't support fp8_e4m3 KV cache.\n");
             int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
             float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
             
@@ -8921,6 +8926,8 @@ ops += (long long)lines * inputDim * interDim * 2;
                         "CpuAppendPagedCacheBatchOp's insertIndexs length should match batch.\n");
         AssertInFastLLM(insertPositions.dims.size() == 1 && insertPositions.dims[0] == input.dims[0],
                         "CpuAppendPagedCacheBatchOp's insertPositions length should match batch.\n");
+        AssertInFastLLM(((Data*)&manager)->dataType != DataType::FP8_E4M3,
+                        "CpuAppendPagedCacheBatchOp doesn't support fp8_e4m3 KV cache.\n");
         AssertInFastLLM(((Data*)&manager)->dims.size() == 4,
                         "CpuAppendPagedCacheBatchOp's pagedCacheManager storage should have 4 dimensions.\n");
         int batch = input.dims[0];

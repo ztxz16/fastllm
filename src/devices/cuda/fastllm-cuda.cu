@@ -7,8 +7,11 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "utils/utils.h"
 
 #include <random>
+#include <type_traits>
+#include <cuda_fp8.h>
 #include "sampling.cuh"
 
 void showError(cudaError_t result, char const* const message, const char* const file,
@@ -2289,6 +2292,11 @@ __device__ __forceinline__ __nv_bfloat16 FastllmCudaFloatToValue<__nv_bfloat16>(
     return __float2bfloat16_rn(value);
 }
 
+template<>
+__device__ __forceinline__ __nv_fp8_e4m3 FastllmCudaFloatToValue<__nv_fp8_e4m3>(float value) {
+    return __nv_fp8_e4m3(value);
+}
+
 // CUDA kernel for the main transformation
 template<typename T>
 __global__ void TransferAttnKernel(T *data, int n, int m, int outer, int row_idx) {
@@ -3911,7 +3919,7 @@ bool FastllmCudaQKVRMSNormRope(
 //   - q_heads <= head_id < q_heads + k_heads: K head -> RMSNorm + RoPE -> 写入 paged K cache
 //   - head_id >= q_heads + k_heads: V head -> 直接拷贝到 paged V cache
 // ============================================================
-template <int THREAD_PER_BLOCK, typename T>
+template <int THREAD_PER_BLOCK, typename T, typename TKV>
 __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
     T *qkvData,              // [bs, seqlen, total_dim], 物理布局; 逻辑含义为 batch 个 token
     float *qNormWeight,      // [head_dim]
@@ -4045,12 +4053,11 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
             int kh = head_id - q_heads;
             int pageIdx = insertIndexs[batch_idx];
             int pageOffset = insertPositions[batch_idx];
-            int unitSize = sizeof(T);
             int pageStride = pageLen * k_heads * head_dim;
             int tokenStride = k_heads * head_dim;
-            T *dst = (T*)(pagedKData + (size_t)pageIdx * pageStride * unitSize) + pageOffset * tokenStride + kh * head_dim;
+            TKV *dst = (TKV*)pagedKData + (size_t)pageIdx * pageStride + pageOffset * tokenStride + kh * head_dim;
             for (int i = tid; i < head_dim; i += THREAD_PER_BLOCK) {
-                dst[i] = base[i];
+                dst[i] = FastllmCudaFloatToValue<TKV>(FastllmCudaValueToFloat(base[i]));
             }
         }
     } else {
@@ -4059,12 +4066,11 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
         int vh = head_id - q_heads - k_heads;
         int pageIdx = insertIndexs[batch_idx];
         int pageOffset = insertPositions[batch_idx];
-        int unitSize = sizeof(T);
         int pageStride = pageLen * v_heads * head_dim;
         int tokenStride = v_heads * head_dim;
-        T *dst = (T*)(pagedVData + (size_t)pageIdx * pageStride * unitSize) + pageOffset * tokenStride + vh * head_dim;
+        TKV *dst = (TKV*)pagedVData + (size_t)pageIdx * pageStride + pageOffset * tokenStride + vh * head_dim;
         for (int i = tid; i < head_dim; i += THREAD_PER_BLOCK) {
-            dst[i] = base[i];
+            dst[i] = FastllmCudaFloatToValue<TKV>(FastllmCudaValueToFloat(base[i]));
         }
     }
 }
@@ -4081,7 +4087,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int32_t *insertPositions,
     int q_heads, int k_heads, int head_dim,
     int rotateDim, float eps, float ropeTheta, float ropeScale,
-    int pageLen, int unitSize, int batch,
+    int pageLen, fastllm::DataType pagedDataType, int batch,
     int doQKNorm
 ) {
     float *cudaQKV = (float *) FastllmCudaPrepareInput(qkv);
@@ -4099,42 +4105,45 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     // 确保 qOutput 已分配
     float *cudaQOutput = (float*)qOutput.cudaData;
 
+    auto launch = [&](auto TPB, auto *qkvPtr, auto *qOutputPtr, auto *pagedTag) {
+        using QT = std::remove_pointer_t<decltype(qkvPtr)>;
+        using KVT = std::remove_pointer_t<decltype(pagedTag)>;
+        FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel<decltype(TPB)::value, QT, KVT><<<grid_size, decltype(TPB)::value>>>(
+            qkvPtr, (float*)qNormWeight.cudaData, (float*)kNormWeight.cudaData,
+            cudaPositionIds, qOutputPtr,
+            pagedKData, pagedVData, insertIndexs, insertPositions,
+            outer, total_dim, q_heads, k_heads, v_heads, head_dim,
+            bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
+    };
+
+    auto launchByPagedType = [&](auto TPB, auto *qkvPtr, auto *qOutputPtr) {
+        if (pagedDataType == fastllm::DataType::FLOAT32) {
+            launch(TPB, qkvPtr, qOutputPtr, (float*)nullptr);
+        } else if (pagedDataType == fastllm::DataType::FLOAT16) {
+            launch(TPB, qkvPtr, qOutputPtr, (half*)nullptr);
+        } else if (pagedDataType == fastllm::DataType::BFLOAT16) {
+            launch(TPB, qkvPtr, qOutputPtr, (__nv_bfloat16*)nullptr);
+        } else if (pagedDataType == fastllm::DataType::FP8_E4M3) {
+            launch(TPB, qkvPtr, qOutputPtr, (__nv_fp8_e4m3*)nullptr);
+        } else {
+            fastllm::ErrorInFastLLM("FastllmCudaQKVRMSNormRopeSplitAppendPagedCache: unsupported pagedDataType.\n");
+        }
+    };
+
     if (qkv.dataType == fastllm::DataType::FLOAT32) {
-        auto launch = [&](auto TPB) {
-            FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel<decltype(TPB)::value> <<< grid_size, decltype(TPB)::value >>>(
-                cudaQKV, (float*)qNormWeight.cudaData, (float*)kNormWeight.cudaData,
-                cudaPositionIds, cudaQOutput,
-                pagedKData, pagedVData, insertIndexs, insertPositions,
-                outer, total_dim, q_heads, k_heads, v_heads, head_dim,
-                bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
-        };
-        if (head_dim <= 64) launch(std::integral_constant<int, 64>{});
-        else if (head_dim <= 128) launch(std::integral_constant<int, 128>{});
-        else launch(std::integral_constant<int, 512>{});
+        if (head_dim <= 64) launchByPagedType(std::integral_constant<int, 64>{}, (float*)cudaQKV, (float*)cudaQOutput);
+        else if (head_dim <= 128) launchByPagedType(std::integral_constant<int, 128>{}, (float*)cudaQKV, (float*)cudaQOutput);
+        else launchByPagedType(std::integral_constant<int, 512>{}, (float*)cudaQKV, (float*)cudaQOutput);
     } else if (qkv.dataType == fastllm::DataType::FLOAT16) {
-        auto launch = [&](auto TPB) {
-            FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel<decltype(TPB)::value> <<< grid_size, decltype(TPB)::value >>>(
-                (half*)cudaQKV, (float*)qNormWeight.cudaData, (float*)kNormWeight.cudaData,
-                cudaPositionIds, (half*)cudaQOutput,
-                pagedKData, pagedVData, insertIndexs, insertPositions,
-                outer, total_dim, q_heads, k_heads, v_heads, head_dim,
-                bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
-        };
-        if (head_dim <= 64) launch(std::integral_constant<int, 64>{});
-        else if (head_dim <= 128) launch(std::integral_constant<int, 128>{});
-        else launch(std::integral_constant<int, 512>{});
+        if (head_dim <= 64) launchByPagedType(std::integral_constant<int, 64>{}, (half*)cudaQKV, (half*)cudaQOutput);
+        else if (head_dim <= 128) launchByPagedType(std::integral_constant<int, 128>{}, (half*)cudaQKV, (half*)cudaQOutput);
+        else launchByPagedType(std::integral_constant<int, 512>{}, (half*)cudaQKV, (half*)cudaQOutput);
     } else if (qkv.dataType == fastllm::DataType::BFLOAT16) {
-        auto launch = [&](auto TPB) {
-            FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel<decltype(TPB)::value> <<< grid_size, decltype(TPB)::value >>>(
-                (__nv_bfloat16*)cudaQKV, (float*)qNormWeight.cudaData, (float*)kNormWeight.cudaData,
-                cudaPositionIds, (__nv_bfloat16*)cudaQOutput,
-                pagedKData, pagedVData, insertIndexs, insertPositions,
-                outer, total_dim, q_heads, k_heads, v_heads, head_dim,
-                bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
-        };
-        if (head_dim <= 64) launch(std::integral_constant<int, 64>{});
-        else if (head_dim <= 128) launch(std::integral_constant<int, 128>{});
-        else launch(std::integral_constant<int, 512>{});
+        if (head_dim <= 64) launchByPagedType(std::integral_constant<int, 64>{}, (__nv_bfloat16*)cudaQKV, (__nv_bfloat16*)cudaQOutput);
+        else if (head_dim <= 128) launchByPagedType(std::integral_constant<int, 128>{}, (__nv_bfloat16*)cudaQKV, (__nv_bfloat16*)cudaQOutput);
+        else launchByPagedType(std::integral_constant<int, 512>{}, (__nv_bfloat16*)cudaQKV, (__nv_bfloat16*)cudaQOutput);
+    } else {
+        fastllm::ErrorInFastLLM("FastllmCudaQKVRMSNormRopeSplitAppendPagedCache: unsupported qkv dataType.\n");
     }
 
     FastllmCudaFinishInput(positionIds, cudaPositionIds);

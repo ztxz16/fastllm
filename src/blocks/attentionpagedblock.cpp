@@ -85,6 +85,14 @@ namespace fastllm {
             (*batchPastValues)[b] = (*pastKeyValues)[b * block_cnt + layerIdx].second;
         }
 
+        bool useFp8KVCache = ((*batchPastKeys)[0]->dataType == DataType::FP8_E4M3 ||
+                              (*batchPastValues)[0]->dataType == DataType::FP8_E4M3);
+        if (useFp8KVCache) {
+            AssertInFastLLM(!kvCacheInCPU, "FP8 KV cache doesn't support kvCacheInCPU.\n");
+            AssertInFastLLM(qkv->dataDevice == DataDevice::CUDA, "FP8 KV cache requires CUDA paged attention.\n");
+            AssertInFastLLM(head_dim != 64, "FP8 KV cache is not supported when head_dim == 64.\n");
+        }
+
         int bsz = attenInput->dims[0], seqlen = attenInput->dims[1];
 
         if (!isPrefill && (*batchPastKeys)[0]->pagedKVCacheData == nullptr) {
@@ -128,11 +136,22 @@ namespace fastllm {
 
             // 2.6 逐 batch 做 AppendPagedCache
             // k/v 形状为 [num_kv_heads, totalSeqLen, head_dim]
+            auto makeCacheDesc = [](const Data &src, DataType targetType) {
+                Data desc(targetType);
+                desc.dims = src.dims;
+                desc.strides = src.strides;
+                desc.dataDevice = src.dataDevice;
+                desc.dataDeviceIds = src.dataDeviceIds;
+                desc.UpdateUnitSize();
+                return desc;
+            };
             if (batch == 1) {
+                Data kCacheDesc = makeCacheDesc(k, (*batchPastKeys)[0]->dataType);
+                Data vCacheDesc = makeCacheDesc(v, (*batchPastValues)[0]->dataType);
                 PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                    layerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
+                    layerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                 PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                    layerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
+                    layerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
                 AppendPagedCache(*pagedCacheKManager, *(*batchPastKeys)[0], k);
                 AppendPagedCache(*pagedCacheVManager, *(*batchPastValues)[0], v);
             } else  {
@@ -146,10 +165,12 @@ namespace fastllm {
                     Split(k, 1, total, total + seqLens[b], curK);
                     Split(v, 1, total, total + seqLens[b], curV);
 
+                    Data kCacheDesc = makeCacheDesc(curK, pastKey.dataType);
+                    Data vCacheDesc = makeCacheDesc(curV, pastValue.dataType);
                     PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                        layerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, curK);
+                        layerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                     PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                        layerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, curV);
+                        layerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
                     AppendPagedCache(*pagedCacheKManager, pastKey, curK);
                     AppendPagedCache(*pagedCacheVManager, pastValue, curV);
 

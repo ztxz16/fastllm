@@ -42,11 +42,11 @@ namespace fastllm {
         locker.unlock();
     }
 
-    void ResponseContext::Init(int blocks, DataType dataType) {
+    void ResponseContext::Init(int blocks, DataType, DataType kvCacheDataType) {
         pastKeyValues.clear();
         for (int i = 0; i < blocks; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(dataType),
-                                                   Data(dataType)));
+            pastKeyValues.push_back(std::make_pair(Data(kvCacheDataType),
+                                                   Data(kvCacheDataType)));
             pastKeyValues.back().first.SetKVCache();
             pastKeyValues.back().second.SetKVCache();
         }
@@ -292,7 +292,7 @@ namespace fastllm {
         if (lastKeyValues == nullptr) {
             lastKeyValues = new std::vector<std::pair<Data, Data> >();
             for (int i = 0; i < block_cnt; i++) {
-                lastKeyValues->push_back(std::make_pair(Data(this->dataType), Data(this->dataType)));
+                lastKeyValues->push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
                 lastKeyValues->back().first.SetKVCache();
                 lastKeyValues->back().second.SetKVCache();
             }
@@ -409,8 +409,8 @@ namespace fastllm {
 
         std::vector <std::pair <Data, Data> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(dataType),
-                                                   Data(dataType)));
+            pastKeyValues.push_back(std::make_pair(Data(this->kvCacheDataType),
+                                                   Data(this->kvCacheDataType)));
             pastKeyValues.back().first.SetKVCache();
             pastKeyValues.back().second.SetKVCache();
         }
@@ -1238,9 +1238,13 @@ namespace fastllm {
                         kvCacheLimit = model->kvCacheLimit;
                     }
 
-                    int unitSize = (model->dataType == DataType::FLOAT32 ? 4 : 2);
-                    int maxTotalLens = kvCacheLimit / (model->elementsInKVCachePerToken * unitSize);
-                    if (model->elementsInKVCachePerToken <= 0) {
+                    int maxTotalLens = kvCacheLimit / 1024 / 1024;
+                    if (model->elementsInKVCachePerToken > 0) {
+                        long long bytesPerToken = GetDataBytes(model->kvCacheDataType, 1, model->elementsInKVCachePerToken);
+                        if (bytesPerToken > 0) {
+                            maxTotalLens = kvCacheLimit / bytesPerToken;
+                        }
+                    } else {
                         maxTotalLens = kvCacheLimit / 1024 / 1024;
                     }
                     if (model->tokensLimit > 0) {
@@ -1640,7 +1644,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         dictLocker.lock();
         int handleId = responseContextDict.CreateHandle();
         ResponseContext *context = responseContextDict.GetHandle(handleId);
-        context->Init(this->block_cnt, this->dataType);
+        context->Init(this->block_cnt, this->dataType, this->kvCacheDataType);
         context->currentTokens = inputTokens;
         context->allTokens = inputTokens;
         context->generationConfig = generationConfig;
@@ -1769,7 +1773,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         Data inputIds, attentionMask, positionIds;
         std::vector<std::pair<Data, Data> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
-            pastKeyValues.push_back(std::make_pair(Data(this->dataType), Data(this->dataType)));
+            pastKeyValues.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
             pastKeyValues.back().first.SetKVCache();
             pastKeyValues.back().second.SetKVCache();
         }
@@ -1975,6 +1979,26 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             ErrorInFastLLM("SetDataType Error: datatype should be float32, float16 or bfloat16");
         }
         this->dataType = dataType;
+        if (!this->useCustomKVCacheDataType) {
+            this->kvCacheDataType = dataType;
+        }
+    }
+
+    void basellm::SetKVCacheDataType(DataType dataType) {
+#ifndef USE_CUDA
+        if (dataType == DataType::FP8_E4M3) {
+            ErrorInFastLLM("SetKVCacheDataType Error: fp8_e4m3 kv cache requires CUDA support.");
+        }
+#endif
+        if (dataType == DataType::FLOAT32 ||
+            dataType == DataType::FLOAT16 ||
+            dataType == DataType::BFLOAT16 ||
+            dataType == DataType::FP8_E4M3) {
+            this->kvCacheDataType = dataType;
+            this->useCustomKVCacheDataType = true;
+        } else {
+            ErrorInFastLLM("SetKVCacheDataType Error: datatype should be float32, float16, bfloat16 or fp8_e4m3");
+        }
     }
 
     void basellm::SetMoeAtype(DataType type) {
@@ -2169,7 +2193,9 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         std::vector <std::pair <Data, Data> > pastKeyValuesStorage;
         std::vector <std::pair <Data*, Data*> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
-            pastKeyValuesStorage.push_back(std::make_pair(Data(this->dataType), Data(this->dataType)));
+            pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
+            pastKeyValuesStorage.back().first.SetKVCache();
+            pastKeyValuesStorage.back().second.SetKVCache();
         }
         for (int i = 0; i < block_cnt; i++) {
             pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage[i].first, &pastKeyValuesStorage[i].second));
@@ -2186,8 +2212,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 #ifdef USE_CUDA
             int numHeads = pastKeyValuesStorage[0].first.dims[0];
             int headDim = pastKeyValuesStorage[0].first.dims[2];
-            int unitSize = (this->dataType == DataType::FLOAT32) ? 4 : 2;
-            long long bytesPerPage = (long long)block_cnt * 2 * pageLen * numHeads * headDim * unitSize;
+            long long bytesPerToken = GetDataBytes(this->kvCacheDataType, 1, numHeads * headDim * 2);
+            long long bytesPerPage = (long long)block_cnt * pageLen * bytesPerToken;
 
             for (auto &kv : pastKeyValuesStorage) {
                 kv.first.pageIndex.clear();
@@ -2240,7 +2266,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 
             if (deviceIds.size() > 1 && !deviceLayerCount.empty()) {
                 // 多卡模式：计算每张卡上的 (剩余显存 / 单页显存)，取最小值
-                long long bytesPerLayerPerPage = (long long)2 * pageLen * numHeads * headDim * unitSize;
+                long long bytesPerLayerPerPage = pageLen * bytesPerToken;
                 int maxPages = INT_MAX;
                 for (int id : deviceIds) {
                     if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
@@ -2286,7 +2312,9 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             pastKeyValuesStorage.clear();
             pastKeyValues.clear();
             for (int i = 0; i < block_cnt; i++) {
-                pastKeyValuesStorage.push_back(std::make_pair(Data(this->dataType), Data(this->dataType)));
+                pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
+                pastKeyValuesStorage.back().first.SetKVCache();
+                pastKeyValuesStorage.back().second.SetKVCache();
             }
             for (int i = 0; i < block_cnt; i++) {
                 pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage[i].first, &pastKeyValuesStorage[i].second));
