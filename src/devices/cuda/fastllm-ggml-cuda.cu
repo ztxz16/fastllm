@@ -726,7 +726,7 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
 }
 
-#define MMVQ_MAX_BATCH_SIZE 16 // Max. batch size for which to use MMVQ kernels.
+#define MMVQ_MAX_BATCH_SIZE 7 // Max. batch size for which to use MMVQ kernels.
 #define WARP_SIZE 32
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -1009,35 +1009,8 @@ static void mul_mat_vec_q_cuda_T(
         case 7:
             mul_mat_vec_q<type, 7, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
             break;
-        case 8:
-            mul_mat_vec_q<type, 8, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
-            break;
-        case 9:
-            mul_mat_vec_q<type, 9, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
-            break;
-        case 10:
-            mul_mat_vec_q<type, 10, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
-            break;
-        case 11:
-            mul_mat_vec_q<type, 11, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
-            break;
-        case 12:
-            mul_mat_vec_q<type, 12, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
-            break;
-        case 13:
-            mul_mat_vec_q<type, 13, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
-            break;
-        case 14:
-            mul_mat_vec_q<type, 14, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
-            break;
-        case 15:
-            mul_mat_vec_q<type, 15, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
-            break;
-        case 16:
-            mul_mat_vec_q<type, 16, nwarps, OType><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ids_data, ncols_x, nrows_x, nrows_y, nrows_dst, nb02, nb12, nb2, ids_nb0);
-            break;
         default:
-            printf("fatal error\n");
+            printf("fatal error: ncols_y = %d exceeds MMVQ_MAX_BATCH_SIZE\n", ncols_y);
             exit(0);
             break;
     }
@@ -1977,7 +1950,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
     auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
     // dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
 
-    if ((n > 32 || !has_vec_dot) && dequant != nullptr) {
+    if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
         half *cudaFp16Input, *cudaFp16Output;
         cudaFp16Input = (half *) FastllmCudaMalloc(n * m * sizeof(half));
         cudaFp16Output = (half *) FastllmCudaMalloc(n * k * sizeof(half));
@@ -2024,7 +1997,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
         FastllmCudaFree(cudaFp16Weight);
     } else if (n > 1) {
         int i = 0;
-        for (; i + 15 < n; i += 16) {
+        for (; i + MMVQ_MAX_BATCH_SIZE - 1 < n; i += MMVQ_MAX_BATCH_SIZE) {
             ggml_cuda_op_mul_mat_vec_q_impl (
                     ctx, (ggml_type)weight.ggmlType, m, k, 1, 
                     0, 0, 0, 0,
@@ -2032,7 +2005,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
                     (char*)(q8Input + i * (m / QK8_1)), 
                     cudaOutput + i * k, 
                     nullptr, 
-                    0, k, 16, m, nullptr 
+                    0, k, MMVQ_MAX_BATCH_SIZE, m, nullptr 
             );        
         }
 
@@ -2101,7 +2074,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
     auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
     // dequant = nullptr; /// TODO: dequant目前似乎有bug，待查
 
-    if ((n > 32 || !has_vec_dot) && dequant != nullptr) {
+    if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         half *cudaFp16Weight;
@@ -2132,7 +2105,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
         FastllmCudaFree(cudaFp16Weight);
     } else if (n > 1) {
         int i = 0;
-        for (; i + 15 < n; i += 16) {
+        for (; i + MMVQ_MAX_BATCH_SIZE - 1 < n; i += MMVQ_MAX_BATCH_SIZE) {
             ggml_cuda_op_mul_mat_vec_q_impl (
                     ctx, (ggml_type)weight.ggmlType, m, k, 1, 
                     0, 0, 0, 0,
@@ -2140,7 +2113,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
                     (char*)(q8Input + i * (m / QK8_1)), 
                     cudaOutput + i * k, 
                     nullptr, 
-                    0, k, 16, m, nullptr 
+                    0, k, MMVQ_MAX_BATCH_SIZE, m, nullptr 
             );        
         }
 
@@ -2208,7 +2181,7 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
     auto dequant = ggml_get_to_bf16_cuda((ggml_type)weight.ggmlType);
     auto has_vec_dot = get_has_vec_dot_q_cuda((ggml_type)weight.ggmlType);
 
-    if ((n > 32 || !has_vec_dot) && dequant != nullptr) {
+    if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
         __nv_bfloat16 *cudaBf16Weight = (__nv_bfloat16 *)FastllmCudaMalloc(k * m * sizeof(__nv_bfloat16));
@@ -2235,7 +2208,7 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
         FastllmCudaFree(cudaBf16Weight);
     } else if (n > 1) {
         int i = 0;
-        for (; i + 15 < n; i += 16) {
+        for (; i + MMVQ_MAX_BATCH_SIZE - 1 < n; i += MMVQ_MAX_BATCH_SIZE) {
             ggml_cuda_op_mul_mat_vec_q_impl(
                 ctx, (ggml_type)weight.ggmlType, m, k, 1,
                 0, 0, 0, 0,
@@ -2243,7 +2216,7 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
                 (char *)(q8Input + i * (m / QK8_1)),
                 cudaOutput + i * k,
                 nullptr,
-                0, k, 16, m, nullptr
+                0, k, MMVQ_MAX_BATCH_SIZE, m, nullptr
             );
         }
 
