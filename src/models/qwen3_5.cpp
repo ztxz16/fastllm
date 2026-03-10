@@ -538,12 +538,6 @@ namespace fastllm {
                     v_beta.Reshape({v_beta.dims[0], v_beta.dims[1], -1, chunk_size, v_beta.dims.back()});
                     pgg->Reshape({(*pgg).dims[0], (*pgg).dims[1], -1, chunk_size});
 
-                    PermuteSelf(qq, {2, 0, 1, 3, 4});
-                    PermuteSelf(*pkk, {2, 0, 1, 3, 4});
-                    PermuteSelf(k_beta, {2, 0, 1, 3, 4});
-                    PermuteSelf(v_beta, {2, 0, 1, 3, 4});
-                    PermuteSelf(*pgg, {2, 0, 1, 3});
-
                     CumSumLastDim(*pgg);
                     MakeDecayMask(*pgg, decayMask);
 
@@ -667,6 +661,12 @@ namespace fastllm {
                         );
 #endif
                     } else {
+                        PermuteSelf(qq, {2, 0, 1, 3, 4});
+                        PermuteSelf(*pkk, {2, 0, 1, 3, 4});
+                        PermuteSelf(vv, {2, 0, 1, 3, 4});
+                        PermuteSelf(attn, {2, 0, 1, 3, 4});
+                        PermuteSelf(k_cumdecay, {2, 0, 1, 3, 4});
+                        PermuteSelf(*pgg, {2, 0, 1, 3});
                         runChunkPrefillReference(last_recurrent_state, core_attn_out);
                     }
 

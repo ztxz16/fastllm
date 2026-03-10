@@ -4838,12 +4838,12 @@ __global__ void FastllmChunkGatedDeltaRulePrefillHKernel(
     float *tempTile = vNewTile + chunk_size * BV;         // [chunk_size, BK]
     float *gScale = tempTile + chunk_size * BK;           // [chunk_size]
 
-    const size_t chunkStrideKV = (size_t)batch * heads * chunk_size;
-    const size_t chunkStrideK = chunkStrideKV * kdim;
-    const size_t chunkStrideV = chunkStrideKV * vdim;
-    const size_t headBaseK = ((size_t)b * heads + h) * chunk_size * kdim;
-    const size_t headBaseV = ((size_t)b * heads + h) * chunk_size * vdim;
-    const size_t headBaseG = ((size_t)b * heads + h) * chunk_size;
+    const size_t chunkStrideK = (size_t)chunk_size * kdim;
+    const size_t chunkStrideV = (size_t)chunk_size * vdim;
+    const size_t chunkStrideG = (size_t)chunk_size;
+    const size_t headBaseK = ((size_t)b * heads + h) * chunks * chunkStrideK;
+    const size_t headBaseV = ((size_t)b * heads + h) * chunks * chunkStrideV;
+    const size_t headBaseG = ((size_t)b * heads + h) * chunks * chunkStrideG;
     const size_t stateBase = ((size_t)b * heads + h) * kdim * vdim;
 
     for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
@@ -4857,10 +4857,10 @@ __global__ void FastllmChunkGatedDeltaRulePrefillHKernel(
     for (int ci = 0; ci < chunks; ci++) {
         const T *kChunk = k + (size_t)ci * chunkStrideK + headBaseK;
         const T *vChunk = v + (size_t)ci * chunkStrideV + headBaseV;
-        const T *gChunk = g + (size_t)ci * chunkStrideKV + headBaseG;
+        const T *gChunk = g + (size_t)ci * chunkStrideG + headBaseG;
         const T *kCumChunk = k_cumdecay + (size_t)ci * chunkStrideK + headBaseK;
-        T *hChunk = h_states + ((((size_t)ci * batch + b) * heads + h) * kdim * vdim + vStart);
-        T *vNewChunk = v_new_store + (size_t)ci * chunkStrideV + headBaseV + vStart;
+        T *hChunk = h_states + ((((size_t)b * heads + h) * chunks + ci) * kdim * vdim + vStart);
+        T *vNewChunk = v_new_store + ((((size_t)b * heads + h) * chunks + ci) * chunkStrideV + vStart);
 
         for (int idx = tid; idx < kdim * BV; idx += blockDim.x) {
             int kd = idx / BV;
@@ -4974,19 +4974,19 @@ __global__ void FastllmChunkGatedDeltaRulePrefillOKernel(
     }
 
     int tid = threadIdx.x;
-    const size_t chunkStrideKV = (size_t)batch * heads * chunk_size;
-    const size_t chunkStrideQ = chunkStrideKV * kdim;
-    const size_t chunkStrideV = chunkStrideKV * vdim;
-    const size_t chunkStrideAttn = chunkStrideKV * chunk_size;
-    const size_t headBaseQ = ((size_t)b * heads + h) * chunk_size * kdim;
-    const size_t headBaseV = ((size_t)b * heads + h) * chunk_size * vdim;
-    const size_t headBaseG = ((size_t)b * heads + h) * chunk_size;
-    const size_t headBaseAttn = ((size_t)b * heads + h) * chunk_size * chunk_size;
+    const size_t chunkStrideQ = (size_t)chunk_size * kdim;
+    const size_t chunkStrideV = (size_t)chunk_size * vdim;
+    const size_t chunkStrideG = (size_t)chunk_size;
+    const size_t chunkStrideAttn = (size_t)chunk_size * chunk_size;
+    const size_t headBaseQ = ((size_t)b * heads + h) * chunks * chunkStrideQ;
+    const size_t headBaseV = ((size_t)b * heads + h) * chunks * chunkStrideV;
+    const size_t headBaseG = ((size_t)b * heads + h) * chunks * chunkStrideG;
+    const size_t headBaseAttn = ((size_t)b * heads + h) * chunks * chunkStrideAttn;
     const T *qChunk = q + (size_t)ci * chunkStrideQ + headBaseQ;
-    const T *gChunk = g + (size_t)ci * chunkStrideKV + headBaseG;
+    const T *gChunk = g + (size_t)ci * chunkStrideG + headBaseG;
     const T *attnChunk = attn + (size_t)ci * chunkStrideAttn + headBaseAttn;
-    const T *hChunk = h_states + ((((size_t)ci * batch + b) * heads + h) * kdim * vdim + vStart);
-    const T *vNewChunk = v_new_store + (size_t)ci * chunkStrideV + headBaseV + vStart;
+    const T *hChunk = h_states + ((((size_t)b * heads + h) * chunks + ci) * kdim * vdim + vStart);
+    const T *vNewChunk = v_new_store + ((((size_t)b * heads + h) * chunks + ci) * chunkStrideV + vStart);
     T *outChunk = core_attn_out + ((((size_t)b * heads + h) * chunks + ci) * chunk_size * vdim + vStart);
 
     for (int t = 0; t < chunk_size; t++) {
@@ -5013,9 +5013,9 @@ __global__ void FastllmChunkGatedDeltaRulePrefillOKernel(
 void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
     fastllm::Data &g, fastllm::Data &attn, fastllm::Data &k_cumdecay,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out) {
-    int chunks = q.dims[0];
-    int batch = q.dims[1];
-    int heads = q.dims[2];
+    int batch = q.dims[0];
+    int heads = q.dims[1];
+    int chunks = q.dims[2];
     int chunk_size = q.dims[3];
     int kdim = q.dims[4];
     int vdim = v.dims[4];
@@ -5029,13 +5029,13 @@ void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastl
     fastllm::Data h_states(v.dataType);
     h_states.dataDevice = v.dataDevice;
     h_states.dataDeviceIds = v.dataDeviceIds;
-    h_states.Resize({chunks, batch, heads, kdim, vdim});
+    h_states.Resize({batch, heads, chunks, kdim, vdim});
     h_states.Allocate();
 
     fastllm::Data v_new_store(v.dataType);
     v_new_store.dataDevice = v.dataDevice;
     v_new_store.dataDeviceIds = v.dataDeviceIds;
-    v_new_store.Resize({chunks, batch, heads, chunk_size, vdim});
+    v_new_store.Resize({batch, heads, chunks, chunk_size, vdim});
     v_new_store.Allocate();
 
     void *qData = FastllmCudaPrepareInput(q);
