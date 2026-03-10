@@ -844,6 +844,10 @@ namespace fastllm {
     void RecurrentGatedDeltaRule(Data &q, Data &k, Data &v, Data &g, Data &b, 
                                 Data &last_recurrent_state, Data &core_attn_out);
 
+    void ChunkGatedDeltaRulePrefill(Data &q, Data &k, Data &v, Data &g,
+                                Data &attn, Data &k_cumdecay,
+                                Data &last_recurrent_state, Data &core_attn_out);
+
     void AddTo(Data &input0, const Data &input1, float alpha = 1.0); // input0 += input1 * alpha
 
     void AttentionMask(Data &input, const Data &mask, float maskValue); // 把input里对应位置mask中为1的部分变成maskValue

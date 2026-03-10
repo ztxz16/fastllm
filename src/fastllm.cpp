@@ -3141,6 +3141,16 @@ namespace fastllm {
         }, {}, {});                 
     }
 
+    void ChunkGatedDeltaRulePrefill(Data &q, Data &k, Data &v, Data &g,
+                                Data &attn, Data &k_cumdecay,
+                                Data &last_recurrent_state, Data &core_attn_out) {
+        curExecutor->Run("ChunkGatedDeltaRulePrefill", {
+            {"q", &q}, {"k", &k}, {"v", &v}, {"g", &g},
+            {"attn", &attn}, {"k_cumdecay", &k_cumdecay},
+            {"last_recurrent_state", &last_recurrent_state}, {"core_attn_out", &core_attn_out}
+        }, {}, {});
+    }
+
     void AddTo(Data &input0, const Data &input1, float alpha) {
         curExecutor->Run("AddTo", {
                 {"input0", &input0}, {"input1", (Data*)&input1}

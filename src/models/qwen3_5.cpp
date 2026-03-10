@@ -144,6 +144,19 @@ namespace fastllm {
                 WeightMergeRule({WeightMergeRuleSingle({w1WeightName, w3WeightName}, swigluWeightName, std::string("linearSwiglu"))})
             );
 
+            std::string qWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+            std::string qBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.bias";
+            std::string kWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.k_proj.weight";
+            std::string kBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.k_proj.bias";
+            std::string vWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.v_proj.weight";
+            std::string vBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.v_proj.bias";
+            std::string mergeQkvWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+            std::string mergeQkvBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
+            this->weightMergeRules.push_back(
+                WeightMergeRule({WeightMergeRuleSingle({qWeightName, kWeightName, vWeightName}, mergeQkvWeightName, std::string("linear")),
+                                 WeightMergeRuleSingle({qBiasName, kBiasName, vBiasName}, mergeQkvBiasName, std::string("bias"))})
+            );
+
             // Merge GDN linear projections: qkv + z -> qkvz, b + a -> ba
             std::string qkvWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkv.weight";
             std::string zWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_z.weight";
@@ -226,7 +239,6 @@ namespace fastllm {
         for (int i = 0; i < batch; i++) {
             all1 &= (seqLens[i] == 1);
         }
-        bool isPrefill = !all1;
         if (all1 && positionIds[0]->dataType == DataType::FLOAT32) {
             std::vector <float> vPositionIds;            
             for (int b = 0; b < batch; b++) {
@@ -289,21 +301,30 @@ namespace fastllm {
                 std::string kBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.k_proj.bias";
                 std::string vWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.v_proj.weight";
                 std::string vBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.v_proj.bias";
-                std::string qkvWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.W_pack.weight";
                 std::string oWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.o_proj.weight";
                 std::string oBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.o_proj.bias";
                 std::string mergeQkvWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
                 std::string mergeQkvBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
 
-                Data qgate, q, gate, k, v;
-                Linear(attenInput, weight[qWeightName], weight[qBiasName], qgate);
+                Data qgate, q, gate, k, v, mergedQkv;
+                if (weight.weight.find(mergeQkvWeightName) != weight.weight.end()) {
+                    Linear(attenInput, weight[mergeQkvWeightName], weight[mergeQkvBiasName], mergedQkv);
+
+                    int qgateDim = num_attention_heads * this->head_dim * 2;
+                    int kvDim = num_key_value_heads * this->head_dim;
+                    Split(mergedQkv, -1, 0, qgateDim, qgate);
+                    Split(mergedQkv, -1, qgateDim, qgateDim + kvDim, k);
+                    Split(mergedQkv, -1, qgateDim + kvDim, qgateDim + kvDim * 2, v);
+                } else {
+                    Linear(attenInput, weight[qWeightName], weight[qBiasName], qgate);
+                    Linear(attenInput, weight[kWeightName], weight[kBiasName], k);
+                    Linear(attenInput, weight[vWeightName], weight[vBiasName], v);
+                }
+
                 qgate.Reshape({bsz, seqlen, -1, this->head_dim * 2});
                 Split(qgate, -1, 0, this->head_dim, q);
                 Split(qgate, -1, this->head_dim, qgate.dims.back(), gate);
                 gate.Reshape({bsz, seqlen, -1});
-
-                Linear(attenInput, weight[kWeightName], weight[kBiasName], k);
-                Linear(attenInput, weight[vWeightName], weight[vBiasName], v);                
 
                 k.Reshape({bsz, seqlen, -1, this->head_dim});
                 v.Reshape({bsz, seqlen, -1, this->head_dim});
@@ -640,7 +661,7 @@ namespace fastllm {
 
                     if (useFusedChunkPrefill) {
 #ifdef USE_CUDA
-                        FastllmChunkGatedDeltaRulePrefill(
+                        ChunkGatedDeltaRulePrefill(
                             qq, *pkk, vv, *pgg, attn, k_cumdecay,
                             last_recurrent_state, core_attn_out
                         );

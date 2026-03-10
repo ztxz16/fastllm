@@ -74,6 +74,7 @@ namespace fastllm {
         this->ops["MergeMLA"] = (BaseOperator*)(new CudaMergeMLA());
         this->ops["MergeMLAPaged"] = (BaseOperator*)(new CudaMergeMLAPaged());
         this->ops["RecurrentGatedDeltaRule"] = (BaseOperator*)(new CudaRecurrentGatedDeltaRuleOp());
+        this->ops["ChunkGatedDeltaRulePrefill"] = (BaseOperator*)(new CudaChunkGatedDeltaRulePrefillOp());
         this->ops["CausalMask"] = (BaseOperator*)(new CudaCausalMaskOp());
         this->ops["MakeDecayMask"] = (BaseOperator*)(new CudaMakeDecayMaskOp());
 
@@ -1603,6 +1604,19 @@ namespace fastllm {
         Data &core_attn_out = *(datas.find("core_attn_out")->second);
         core_attn_out.Allocate();
         FastllmRecurrentGatedDeltaRule(q, k, v, g, b, last_recurrent_state, core_attn_out);
+    }
+
+    void CudaChunkGatedDeltaRulePrefillOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &g = *(datas.find("g")->second);
+        Data &attn = *(datas.find("attn")->second);
+        Data &k_cumdecay = *(datas.find("k_cumdecay")->second);
+        Data &last_recurrent_state = *(datas.find("last_recurrent_state")->second);
+        Data &core_attn_out = *(datas.find("core_attn_out")->second);
+        FastllmChunkGatedDeltaRulePrefill(q, k, v, g, attn, k_cumdecay, last_recurrent_state, core_attn_out);
     }
 
     void CudaCausalMaskOp::Run(const std::string &opType, const fastllm::DataDict &datas,
