@@ -1269,9 +1269,7 @@ if (false) {
                                         mergeData.CalcWeightSum();
 #if defined(USE_TFACC) || defined(USE_NUMA)
                                         try {
-                                            const char *numaEnv = getenv("FASTLLM_ACTIVATE_NUMA");
-                                            std::string s = numaEnv ? numaEnv : "";
-                                            if (s != "" && s != "OFF") {
+                                            if (GetFastllmEnv().activateNuma) {
                                             locker.lock();
                                                 if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
                                                     mergeData.weightSum.resize(1);
@@ -1284,9 +1282,7 @@ if (false) {
 #endif
 #if defined(USE_NUMAS)
                                         try {
-                                            const char *numaEnv = getenv("FASTLLM_ACTIVATE_NUMA");
-                                            std::string s = numaEnv ? numaEnv : "";
-                                            if (s != "" && s != "OFF") {
+                                            if (GetFastllmEnv().activateNuma) {
                                                 if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
                                                     mergeData.weightSum.resize(1);
                                                     RegisterNumas(&mergeData, it.type);       
@@ -1306,9 +1302,7 @@ if (false) {
                             locker.unlock();
 #if defined(USE_TFACC) || defined(USE_NUMA)
                             try {
-                                const char *numaEnv = getenv("FASTLLM_ACTIVATE_NUMA");
-                                std::string s = numaEnv ? numaEnv : "";
-                                if (s != "" && s != "OFF") {
+                                if (GetFastllmEnv().activateNuma) {
                                     if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
                                         locker.lock();
                                             model->weight.weight[weightName].weightSum.resize(1);
@@ -1321,9 +1315,7 @@ if (false) {
 #endif
 #if defined(USE_NUMAS)
                             try {
-                                const char *numaEnv = getenv("FASTLLM_ACTIVATE_NUMA");
-                                std::string s = numaEnv ? numaEnv : "";
-                                if (s != "" && s != "OFF") {
+                                if (GetFastllmEnv().activateNuma) {
                                     if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
                                         model->weight.weight[weightName].weightSum.resize(1);
                                         RegisterNumas(&model->weight.weight[weightName], model->specialWeights[weightName]);       
@@ -1927,9 +1919,7 @@ if (false) {
                                         mergeData.CalcWeightSum();
 #if defined(USE_TFACC) || defined(USE_NUMA)
                                         try {
-                                            const char *numaEnv = getenv("FASTLLM_ACTIVATE_NUMA");
-                                            std::string s = numaEnv ? numaEnv : "";
-                                            if (s != "" && s != "OFF") {
+                                            if (GetFastllmEnv().activateNuma) {
                                                 locker.lock();
                                                 if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
                                                     mergeData.weightSum.resize(1);
@@ -1942,9 +1932,7 @@ if (false) {
 #endif
 #if defined(USE_NUMAS)
                                         try {
-                                            const char *numaEnv = getenv("FASTLLM_ACTIVATE_NUMA");
-                                            std::string s = numaEnv ? numaEnv : "";
-                                            if (s != "" && s != "OFF") {
+                                            if (GetFastllmEnv().activateNuma) {
                                                 if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
                                                     mergeData.weightSum.resize(1);
                                                     RegisterNumas(&mergeData, it.type);       
@@ -1964,9 +1952,7 @@ if (false) {
                             locker.unlock();
 #if defined(USE_TFACC) || defined(USE_NUMA)
                             try {
-                                const char *numaEnv = getenv("FASTLLM_ACTIVATE_NUMA");
-                                std::string s = numaEnv ? numaEnv : "";
-                                if (s != "" && s != "OFF") {
+                                if (GetFastllmEnv().activateNuma) {
                                     if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
                                         locker.lock();
                                             model->weight.weight[weightName].weightSum.resize(1);
@@ -1979,9 +1965,7 @@ if (false) {
 #endif
 #if defined(USE_NUMAS)
                             try {
-                                const char *numaEnv = getenv("FASTLLM_ACTIVATE_NUMA");
-                                std::string s = numaEnv ? numaEnv : "";
-                                if (s != "" && s != "OFF") {
+                                if (GetFastllmEnv().activateNuma) {
                                     if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
                                         model->weight.weight[weightName].weightSum.resize(1);
                                         RegisterNumas(&model->weight.weight[weightName], model->specialWeights[weightName]);       

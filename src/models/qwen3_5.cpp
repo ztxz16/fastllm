@@ -645,11 +645,7 @@ namespace fastllm {
                         attn.dataDevice == DataDevice::CUDA &&
                         k_cumdecay.dataDevice == DataDevice::CUDA &&
                         last_recurrent_state.dataDevice == DataDevice::CUDA) {
-                        useFusedChunkPrefill = true;
-                        const char *useFusedEnv = std::getenv("FASTLLM_USE_FUSED_GDN_PREFILL");
-                        if (useFusedEnv != nullptr && std::strcmp(useFusedEnv, "0") == 0) {
-                            useFusedChunkPrefill = false;
-                        }
+                        useFusedChunkPrefill = GetFastllmEnv().useFusedGdnPrefill;
                     }
 #endif
 

@@ -52,8 +52,7 @@ namespace fastllm {
 #endif
 #ifdef USE_NUMA
         try {
-            std::string s = getenv("FASTLLM_ACTIVATE_NUMA");
-            if (s != "" && s != "OFF") {
+            if (GetFastllmEnv().activateNuma) {
                 printf("ACTIVATE NUMA = ON\n");
                 this->devices.push_back((BaseDevice*) new NumaDevice());
             }

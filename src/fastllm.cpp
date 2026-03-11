@@ -9,6 +9,7 @@
 #include "executor.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <cmath>
 #include <cfloat>
 #include <climits>
@@ -45,6 +46,22 @@ namespace py = pybind11;
 #include "gguf.h"
 
 namespace fastllm {
+    namespace {
+        bool IsEnvValueTrueIgnoreCase(const char *env) {
+            if (env == nullptr) {
+                return false;
+            }
+
+            std::string value(env);
+            for (char &c : value) {
+                if (c >= 'A' && c <= 'Z') {
+                    c = c - 'A' + 'a';
+                }
+            }
+            return value == "1" || value == "on" || value == "true";
+        }
+    }
+
     std::map <std::string, int> defaultDeviceMap, defaultMoeDeviceMap;
     Executor defaultExecutor;
     Executor *curExecutor = &defaultExecutor;
@@ -62,6 +79,7 @@ namespace fastllm {
     static int defaultPageLen = 128;
     static float gpuMemRatio = 0.9f;
     static Data emptyData;
+    static FastllmEnv fastllmEnv;
 
     static std::map <DataType, int> DataTypeBits = {
         {DataType::FLOAT32, 32}, {DataType::BFLOAT16, 16}, {DataType::INT16, 16}, 
@@ -69,6 +87,52 @@ namespace fastllm {
         {DataType::FLOAT16, 16}, {DataType::INT4_NOZERO, 4}, {DataType::INT4_GROUP, 4},
         {DataType::FP8_E4M3, 8}, {DataType::INT2_GROUP, 2}, {DataType::BASE3_GROUP, 2}
     };
+
+    FastllmEnv::FastllmEnv() {
+        const char *activateNumaEnv = std::getenv("FASTLLM_ACTIVATE_NUMA");
+        std::string activateNumaValue = activateNumaEnv ? activateNumaEnv : "";
+        this->activateNuma = !activateNumaValue.empty() && activateNumaValue != "OFF";
+
+        const char *numaThreadsEnv = std::getenv("FASTLLM_NUMA_THREADS");
+        if (numaThreadsEnv != nullptr) {
+            int value = atoi(numaThreadsEnv);
+            if (value > 0) {
+                this->numaThreads = value;
+            }
+        }
+
+        const char *numasEnv = std::getenv("FASTLLM_NUMAS");
+        if (numasEnv != nullptr) {
+            int value = atoi(numasEnv);
+            if (value > 0) {
+                this->numas = value;
+            }
+        }
+
+        const char *cudaSyncEnv = std::getenv("FASTLLM_CUDA_SYNC");
+        this->cudaSync = cudaSyncEnv != nullptr && std::strcmp(cudaSyncEnv, "1") == 0;
+
+        this->printLogits = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_PRINT_LOGITS"));
+
+        const char *useFusedTransferAttnEnv = std::getenv("FASTLLM_USE_FUSED_TRANSFER_ATTN");
+        if (useFusedTransferAttnEnv != nullptr && std::strcmp(useFusedTransferAttnEnv, "0") == 0) {
+            this->useFusedTransferAttn = false;
+        }
+
+        const char *useFusedGdnPrefillEnv = std::getenv("FASTLLM_USE_FUSED_GDN_PREFILL");
+        if (useFusedGdnPrefillEnv != nullptr && std::strcmp(useFusedGdnPrefillEnv, "0") == 0) {
+            this->useFusedGdnPrefill = false;
+        }
+
+        const char *debugTokenIdEnv = std::getenv("FASTLLM_DEBUG_TOKEN_ID");
+        if (debugTokenIdEnv != nullptr) {
+            this->debugTokenId = debugTokenIdEnv;
+        }
+    }
+
+    const FastllmEnv &GetFastllmEnv() {
+        return fastllmEnv;
+    }
 
     void PrintInstructionInfo() {
         std::string avx = "OFF", avx2 = "OFF", aarch64 = "OFF", neonFp16 = "OFF", neonDot = "OFF";

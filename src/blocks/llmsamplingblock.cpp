@@ -6,6 +6,10 @@
 #endif
 
 namespace fastllm {
+    static bool ShouldPrintLogits() {
+        return GetFastllmEnv().printLogits;
+    }
+
     void LLMSamplingBlock (
         basellm *model,
         Data *hiddenStates,
@@ -56,6 +60,10 @@ namespace fastllm {
         }
 
         model->ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfigs);
+        if (ShouldPrintLogits()) {
+            printf("LLMSamplingBlock logits:\n");
+            logits.Print();
+        }
 
         if (allSimple) {
             Data topk;

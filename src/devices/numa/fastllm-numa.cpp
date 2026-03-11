@@ -55,8 +55,7 @@ namespace fastllm {
 
     NumaClient::NumaClient() {
         try {
-            std::string s = getenv("FASTLLM_ACTIVATE_NUMA");
-            if (!(s != "" && s != "OFF")) {
+            if (!GetFastllmEnv().activateNuma) {
                 return;
             }
         } catch (...) {
@@ -75,22 +74,15 @@ namespace fastllm {
 
         int numaThreads = 27;
         try {
-            std::string s = getenv("FASTLLM_NUMA_THREADS");
-            if (s != "") {
-                int t = atoi(s.c_str());
-                if (t > 0) {
-                    numaThreads = t;
-                }
+            if (GetFastllmEnv().numaThreads > 0) {
+                numaThreads = GetFastllmEnv().numaThreads;
             }
         } catch (...) {
         }
         try {
-            std::string s = getenv("FASTLLM_NUMAS");
-            if (s != "") {
-                int t = atoi(s.c_str());
-                if (t > 0 && t < nodes.size()) {
-                    nodes.resize(t);
-                }
+            int t = GetFastllmEnv().numas;
+            if (t > 0 && t < nodes.size()) {
+                nodes.resize(t);
             }
         } catch (...) {
         }

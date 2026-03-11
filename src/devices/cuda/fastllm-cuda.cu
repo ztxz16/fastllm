@@ -169,12 +169,7 @@ CudaInfos *getCudaInfos() {
 }
 
 void DeviceSync() {
-    static int enableSync = -1;
-    if (enableSync == -1) {
-        const char *env = std::getenv("FASTLLM_CUDA_SYNC");
-        enableSync = env != nullptr && std::strcmp(env, "1") == 0;
-    }
-    if (enableSync) {
+    if (fastllm::GetFastllmEnv().cudaSync) {
         cudaDeviceSynchronize();
     }
 }
@@ -2395,11 +2390,8 @@ bool FastllmCudaTransferAttn(fastllm::Data &input) {
     int m = input.dims[dimsLen - 1]; 
     int outer = input.Count(0) / input.Count(dimsLen - 2);
 
-    bool useFusedTransferAttn = (n == m && n <= 64 && m <= 64);
-    const char *useFusedTransferAttnEnv = std::getenv("FASTLLM_USE_FUSED_TRANSFER_ATTN");
-    if (useFusedTransferAttnEnv != nullptr && std::strcmp(useFusedTransferAttnEnv, "0") == 0) {
-        useFusedTransferAttn = false;
-    }
+    bool useFusedTransferAttn = (n == m && n <= 64 && m <= 64) &&
+                                fastllm::GetFastllmEnv().useFusedTransferAttn;
 
     if (useFusedTransferAttn) {
         int threadsPerBlock = 64;

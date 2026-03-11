@@ -32,6 +32,22 @@
 namespace fastllm {
     class Data;
 
+    class FastllmEnv {
+    public:
+        FastllmEnv();
+
+        bool activateNuma = false;
+        int numaThreads = -1;
+        int numas = -1;
+        bool cudaSync = false;
+        bool printLogits = false;
+        bool useFusedTransferAttn = true;
+        bool useFusedGdnPrefill = true;
+        std::string debugTokenId;
+    };
+
+    const FastllmEnv &GetFastllmEnv();
+
     void SetDeviceMap(const std::map <std::string, int> &deviceMap);
     void SetMoeDeviceMap(const std::map <std::string, int> &moeDeviceMap);
 

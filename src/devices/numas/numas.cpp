@@ -249,14 +249,8 @@ namespace fastllm {
                 threads = numaCnt * std::max(1, coresPerNuma / 2 - 2);
             }
         } else {
-            const char* fastllmNumaThreads = std::getenv("FASTLLM_NUMA_THREADS");
-            if (fastllmNumaThreads != nullptr) {
-                int envFastllmNumaThreads = std::atoi(fastllmNumaThreads);
-                if (envFastllmNumaThreads > 0) {
-                    threads = numaCnt * envFastllmNumaThreads;
-                } else {
-                    threads = numaCnt * std::max(1, coresPerNuma / 2 - 2);
-                }
+            if (GetFastllmEnv().numaThreads > 0) {
+                threads = numaCnt * GetFastllmEnv().numaThreads;
             } else {
                 threads = numaCnt * std::max(1, coresPerNuma / 2 - 2);
             }
