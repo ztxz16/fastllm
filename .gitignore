@@ -33,3 +33,4 @@ CLAUDE.md
 /src/devices/hip
 /src/devices/multihip
 /test/mmlu
+/optest

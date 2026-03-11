@@ -397,8 +397,11 @@ add_executable(quant tools/src/quant.cpp)
 target_link_libraries(quant fastllm)
 
 if (UNIT_TEST)
-    add_executable(testOps test/ops/cppOps.cpp)
-    target_link_libraries(testOps fastllm)
+    add_executable(optest test/ops/cppOps.cpp)
+    target_link_libraries(optest fastllm)
+    set_target_properties(optest PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}
+    )
 
     add_executable(testTokenizer test/ops/tokenizerTest.cpp)
     target_link_libraries(testTokenizer fastllm)
