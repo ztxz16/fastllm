@@ -1,0 +1,5 @@
+requests>=2.31.0
+shortuuid
+openai
+fastapi
+uvicorn
