@@ -168,6 +168,27 @@ namespace {
         return fastllm::Data(fastllm::DataType::FLOAT32, dims, data);
     }
 
+    static void InitLinearWeight(const OpTestParams &params, int out, int in, fastllm::Data &weight) {
+        fastllm::Data fp32Weight = MakeTensor({out, in}, 0.4f);
+        std::string weightType = params.Has("weight_type") ? params.GetString("weight_type") : "float32";
+        if (weightType == "float32") {
+            weight.dataType = fastllm::DataType::FLOAT32;
+            weight.Resize({out, in});
+            weight.Allocate();
+            std::memcpy(weight.cpuData, fp32Weight.cpuData, weight.GetBytes());
+            return;
+        }
+        if (weightType == "int4group") {
+            int groupCnt = params.Has("group_cnt") ? params.GetInt("group_cnt") : 128;
+            weight.dataType = fastllm::DataType::INT4_GROUP;
+            weight.Resize({out, in});
+            weight.CreateFromOriData(fastllm::WeightType::LINEAR, fastllm::DataType::FLOAT32,
+                                     (uint8_t *) fp32Weight.cpuData, nullptr, nullptr, groupCnt);
+            return;
+        }
+        throw std::runtime_error("unsupported linear weight_type: " + weightType);
+    }
+
     static int CountElements(const std::vector<int> &dims) {
         int count = 1;
         for (int dim : dims) {
@@ -742,12 +763,15 @@ namespace {
                 params.Add("batch", "4", "batch size");
                 params.Add("in", "8", "input features");
                 params.Add("out", "6", "output features");
+                params.Add("weight_type", "float32", "weight datatype: float32 or int4group");
+                params.Add("group_cnt", "128", "group size used by int4group quantization");
                 return params;
             },
             [](const OpTestParams &params, const std::string &device) {
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
                 fastllm::Data input = MakeTensor({batch, in}, 0.2f);
-                fastllm::Data weight = MakeTensor({out, in}, 0.4f);
+                fastllm::Data weight;
+                InitLinearWeight(params, out, in, weight);
                 fastllm::Data bias = MakeRampTensor({out}, -0.1f);
                 fastllm::Data output;
                 return CanRunOnDevice(device, "Linear", {{"input", &input}, {"weight", &weight}, {"bias", &bias}, {"output", &output}},
@@ -756,7 +780,8 @@ namespace {
             [](const OpTestParams &params, const std::string &device) {
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
                 fastllm::Data input = MakeTensor({batch, in}, 0.2f);
-                fastllm::Data weight = MakeTensor({out, in}, 0.4f);
+                fastllm::Data weight;
+                InitLinearWeight(params, out, in, weight);
                 fastllm::Data bias = MakeRampTensor({out}, -0.1f);
                 fastllm::Data output;
                 ScopedFirstDevice guard(device);
@@ -767,7 +792,8 @@ namespace {
             [](const OpTestParams &params, const std::string &device) {
                 int batch = params.GetInt("batch"), in = params.GetInt("in"), out = params.GetInt("out");
                 auto input = std::make_shared<fastllm::Data>(MakeTensor({batch, in}, 0.2f));
-                auto weight = std::make_shared<fastllm::Data>(MakeTensor({out, in}, 0.4f));
+                auto weight = std::make_shared<fastllm::Data>();
+                InitLinearWeight(params, out, in, *weight);
                 auto bias = std::make_shared<fastllm::Data>(MakeRampTensor({out}, -0.1f));
                 auto output = std::make_shared<fastllm::Data>();
                 return [device, input, weight, bias, output]() {
