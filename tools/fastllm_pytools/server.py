@@ -177,6 +177,21 @@ def init_logging(log_level = logging.INFO, log_file:str = None):
     stdout_handler.setFormatter(logging.Formatter(logging_format))
     root.addHandler(stdout_handler)
 
+def apply_default_generation_config_overrides(model, args):
+    overrides = {}
+    for arg_name, config_name in [
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("top_k", "top_k"),
+        ("repeat_penalty", "repetition_penalty"),
+    ]:
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            model.default_generation_config[config_name] = value
+            overrides[config_name] = value
+    if overrides:
+        logging.info("Override default generation config from cli: %s", overrides)
+
 def fastllm_server(args):
     if args.api_key:
         @app.middleware("http")
@@ -210,6 +225,7 @@ def fastllm_server(args):
     logging.info(args)
     from .util import make_normal_llm_model
     model = make_normal_llm_model(args)
+    apply_default_generation_config_overrides(model, args)
     model.set_verbose(True)
     if (args.model_name is None or args.model_name == ''):
         args.model_name = args.path

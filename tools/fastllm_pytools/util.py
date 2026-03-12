@@ -45,6 +45,11 @@ def add_server_args(parser):
     parser.add_argument("--host", type = str, default="0.0.0.0", help = "API server host")
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
     parser.add_argument("--api_key", type = str, default = "", help = "API Key")
+    parser.add_argument("--temperature", type = float, default = None, help = "覆盖服务端默认 temperature，未指定则使用模型默认值")
+    parser.add_argument("--top_p", type = float, default = None, help = "覆盖服务端默认 top_p，未指定则使用模型默认值")
+    parser.add_argument("--top_k", type = int, default = None, help = "覆盖服务端默认 top_k，未指定则使用模型默认值")
+    parser.add_argument("--repeat_penalty", "--repetition_penalty", dest = "repeat_penalty",
+                        type = float, default = None, help = "覆盖服务端默认 repeat_penalty，未指定则使用模型默认值")
     parser.add_argument("--think", type = str, default = "false", help="if <think> lost")
     parser.add_argument("--hide_input", action = 'store_true', help = "不显示请求信息")
     parser.add_argument("--dev_mode", action = 'store_true', help = "开发模式, 启用后能够获取对话列表并主动停止")
