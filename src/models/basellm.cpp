@@ -2165,6 +2165,9 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
     }
 
     void basellm::AutoWarmup() {
+        if (GetFastllmEnv().skipWarmup) {
+            return;
+        }
         if (!this->use_new_engine) {
             WarmUp();
             return;

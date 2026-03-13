@@ -113,6 +113,7 @@ namespace fastllm {
         this->cudaSync = cudaSyncEnv != nullptr && std::strcmp(cudaSyncEnv, "1") == 0;
 
         this->printLogits = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_PRINT_LOGITS"));
+        this->skipWarmup = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_SKIP_WARMUP"));
 
         const char *useFusedTransferAttnEnv = std::getenv("FASTLLM_USE_FUSED_TRANSFER_ATTN");
         if (useFusedTransferAttnEnv != nullptr && std::strcmp(useFusedTransferAttnEnv, "0") == 0) {
