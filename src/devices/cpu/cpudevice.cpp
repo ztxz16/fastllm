@@ -3272,13 +3272,10 @@ ops += (long long)lines * inputDim * interDim * 2;
         uint64_t inputLen = input.Count(0);
 
         float *inputData = (float*)input.cpuData;
-        float *dstOutputData = (float*)output.cpuData;
-        std::vector <float> tempInputData, tempOutputData;
+        std::vector <float> tempInputData;
         if (input.dataType != DataType::FLOAT32) {
             tempInputData.resize(inputLen);
-            tempOutputData.resize(inputLen * embSize);
             inputData = tempInputData.data();
-            dstOutputData = tempOutputData.data();
 
             if (input.dataType == DataType::FLOAT16) {
                 for (int i = 0; i < inputLen; i++) {
@@ -3289,66 +3286,113 @@ ops += (long long)lines * inputDim * interDim * 2;
             }
         }
 
+        auto writeFloatOutputRow = [&](int row, const float *src) {
+            uint64_t offset = (uint64_t)row * embSize;
+            if (output.dataType == DataType::FLOAT32) {
+                memcpy((float*)output.cpuData + offset, src, (uint64_t)embSize * sizeof(float));
+            } else if (output.dataType == DataType::FLOAT16) {
+                Float32ToFloat16(const_cast<float*>(src), (uint16_t*)output.cpuData + offset, embSize);
+            } else if (output.dataType == DataType::BFLOAT16) {
+                Float32ToBFloat16(const_cast<float*>(src), (uint16_t*)output.cpuData + offset, embSize);
+            } else {
+                ErrorInFastLLM("Embedding error: unsupport output dataType.\n");
+            }
+        };
+
+        auto writePackedOutputRow = [&](int row, const uint16_t *src, DataType srcType) {
+            uint64_t offset = (uint64_t)row * embSize;
+            if (srcType == output.dataType) {
+                memcpy((uint8_t*)output.cpuData + offset * output.unitSize, src, (uint64_t)embSize * output.unitSize);
+            } else if (srcType == DataType::FLOAT16) {
+                if (output.dataType == DataType::FLOAT32) {
+                    for (int j = 0; j < embSize; j++) {
+                        ((float*)output.cpuData)[offset + j] = half_to_float(src[j]);
+                    }
+                } else if (output.dataType == DataType::BFLOAT16) {
+                    Float16ToBFloat16(const_cast<uint16_t*>(src), (uint16_t*)output.cpuData + offset, embSize);
+                } else {
+                    ErrorInFastLLM("Embedding error: unsupport FLOAT16 output dataType.\n");
+                }
+            } else if (srcType == DataType::BFLOAT16) {
+                if (output.dataType == DataType::FLOAT32) {
+                    BFloat16ToFloat32(const_cast<uint16_t*>(src), (float*)output.cpuData + offset, embSize);
+                } else if (output.dataType == DataType::FLOAT16) {
+                    BFloat16ToFloat16(const_cast<uint16_t*>(src), (uint16_t*)output.cpuData + offset, embSize);
+                } else {
+                    ErrorInFastLLM("Embedding error: unsupport BFLOAT16 output dataType.\n");
+                }
+            } else {
+                ErrorInFastLLM("Embedding error: unsupport weight dataType.\n");
+            }
+        };
+
+        auto getToken = [&](int row) {
+            float tokenValue = inputData[row];
+            if (!std::isfinite(tokenValue)) {
+                std::ostringstream oss;
+                oss << "Embedding error: token is not finite. row = " << row
+                    << ", value = " << tokenValue
+                    << ", inputType = " << (int)input.dataType
+                    << ", outputType = " << (int)output.dataType
+                    << ", weightType = " << (int)weight.dataType << "\n";
+                ErrorInFastLLM(oss.str());
+            }
+            int token = (int)(tokenValue + 1e-9);
+            if (token < 0 || token >= vocabSize) {
+                std::ostringstream oss;
+                oss << "Embedding error: token out of range. row = " << row
+                    << ", token = " << token
+                    << ", vocabSize = " << vocabSize
+                    << ", raw = " << tokenValue
+                    << ", inputType = " << (int)input.dataType
+                    << ", outputType = " << (int)output.dataType
+                    << ", weightType = " << (int)weight.dataType << "\n";
+                ErrorInFastLLM(oss.str());
+            }
+            return token;
+        };
+
         if (GetLowMemMode()) {
             FILE *fi = fopen(weight.fileName.c_str(), "rb");
             if (weight.dataType == DataType::FLOAT32) {
-                float *outputData = (float *) dstOutputData;
+                std::vector<float> weightRow(embSize);
                 for (int i = 0; i < inputLen; i++) {
-                    int token = (int) (inputData[i] + 1e-9);
+                    int token = getToken(i);
 #if defined(_WIN32) or defined(_WIN64)
                     _fseeki64(fi, (long long)token * embSize * sizeof(float) + weight.filePos, 0);
 #else
                     fseek(fi, (long long)token * embSize * sizeof(float) + weight.filePos, 0);
 #endif
-                    int ret = fread(outputData + (uint64_t)i * embSize, sizeof(float), embSize, fi);
+                    int ret = fread(weightRow.data(), sizeof(float), embSize, fi);
+                    writeFloatOutputRow(i, weightRow.data());
                 }
             } else {
-                uint16_t *outputData = (uint16_t *) dstOutputData;
-                uint16_t *weightData = new uint16_t[embSize];
+                std::vector<uint16_t> weightRow(embSize);
                 for (int i = 0; i < inputLen; i++) {
-                    int token = (int) (inputData[i] + 1e-9);
+                    int token = getToken(i);
 #if defined(_WIN32) or defined(_WIN64)
                     _fseeki64(fi, (long long)token * embSize * sizeof(uint16_t) + weight.filePos, 0);
 #else
                     fseek(fi, (long long)token * embSize * sizeof(uint16_t) + weight.filePos, 0);
 #endif
-                    int ret = fread(weightData, sizeof(uint16_t), embSize, fi);
-                    for (int j = 0; j < embSize; j++) {
-                        outputData[(uint64_t)i * embSize * 2 + j * 2] = 0;
-                        outputData[(uint64_t)i * embSize * 2 + j * 2 + 1] = weightData[j];
-                    }
+                    int ret = fread(weightRow.data(), sizeof(uint16_t), embSize, fi);
+                    writePackedOutputRow(i, weightRow.data(), weight.dataType);
                 }
-                delete[] weightData;
             }
             fclose(fi);
         } else {
             if (weight.dataType == DataType::FLOAT32) {
-                float *outputData = (float *) dstOutputData;
                 float *weightData = (float *) weight.cpuData;
                 for (int i = 0; i < inputLen; i++) {
-                    int token = (int) (inputData[i] + 1e-9);
-                    memcpy(outputData + (uint64_t)i * embSize, weightData + (uint64_t)token * embSize, embSize * sizeof(float));
+                    int token = getToken(i);
+                    writeFloatOutputRow(i, weightData + (uint64_t)token * embSize);
                 }
             } else {
-                uint16_t *outputData = (uint16_t *) dstOutputData;
                 uint16_t *weightData = (uint16_t *) weight.cpuData;
                 for (int i = 0; i < inputLen; i++) {
-                    int token = (int) (inputData[i] + 1e-9);
-                    for (int j = 0; j < embSize; j++) {
-                        outputData[(uint64_t)i * embSize * 2 + j * 2] = 0;
-                        outputData[(uint64_t)i * embSize * 2 + j * 2 + 1] = weightData[(uint64_t)token * embSize + j];
-                    }
+                    int token = getToken(i);
+                    writePackedOutputRow(i, weightData + (uint64_t)token * embSize, weight.dataType);
                 }
-            }
-        }
-
-        if (output.dataType != DataType::FLOAT32) {
-            if (output.dataType == DataType::FLOAT16) {
-                for (int i = 0; i < inputLen * embSize; i++) {
-                    ((uint16_t*)output.cpuData)[i] = float_to_half(dstOutputData[i]);
-                }
-            } else {
-                ErrorInFastLLM("Embedding error: unsupport dataType.\n");
             }
         }
     }
