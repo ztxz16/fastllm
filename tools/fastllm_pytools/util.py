@@ -113,21 +113,31 @@ def make_normal_llm_model(args):
             import json
             with open(config_path, "r", encoding="utf-8") as file:
                 config = json.load(file)
-            if (config["architectures"][0] == 'Qwen3ForCausalLM' or config["architectures"][0] == 'Qwen3MoeForCausalLM' or
-                config["architectures"][0] == 'Glm4MoeForCausalLM'):
+            architecture = config["architectures"][0]
+            model_type = config.get("model_type", "")
+            text_model_type = ""
+            if isinstance(config.get("text_config"), dict):
+                text_model_type = config["text_config"].get("model_type", "")
+
+            if (architecture == 'Qwen3ForCausalLM' or architecture == 'Qwen3MoeForCausalLM' or
+                architecture == 'Qwen3_5MoeForConditionalGeneration' or
+                model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
+                architecture == 'Glm4MoeForCausalLM'):
                 if (args.enable_thinking == ""):
                     args.enable_thinking = "true"
-            if (config["architectures"][0] == 'DeepseekV3ForCausalLM' or 
-                config["architectures"][0] == 'DeepseekV2ForCausalLM' or 
-                config["architectures"][0] == 'Qwen3MoeForCausalLM' or 
-                config["architectures"][0] == 'MiniMaxM1ForCausalLM' or 
-                config["architectures"][0] == 'MiniMaxText01ForCausalLM' or 
-                config["architectures"][0] == 'HunYuanMoEV1ForCausalLM' or 
-                config["architectures"][0] == 'Ernie4_5_MoeForCausalLM' or 
-                config["architectures"][0] == 'PanguProMoEForCausalLM' or
-                config["architectures"][0] == 'Glm4MoeForCausalLM' or 
-                config["architectures"][0] == 'Qwen3NextForCausalLM' or
-                config["architectures"][0] == 'MiniMaxM2ForCausalLM'):
+            if (architecture == 'DeepseekV3ForCausalLM' or 
+                architecture == 'DeepseekV2ForCausalLM' or 
+                architecture == 'Qwen3MoeForCausalLM' or 
+                architecture == 'Qwen3_5MoeForConditionalGeneration' or
+                model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
+                architecture == 'MiniMaxM1ForCausalLM' or 
+                architecture == 'MiniMaxText01ForCausalLM' or 
+                architecture == 'HunYuanMoEV1ForCausalLM' or 
+                architecture == 'Ernie4_5_MoeForCausalLM' or 
+                architecture == 'PanguProMoEForCausalLM' or
+                architecture == 'Glm4MoeForCausalLM' or 
+                architecture == 'Qwen3NextForCausalLM' or
+                architecture == 'MiniMaxM2ForCausalLM'):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
                 if ((not(args.device and args.device != ""))):
