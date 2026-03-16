@@ -6482,8 +6482,30 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &input1 = *(datas.find("input1")->second);
         float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0;
 
-        AssertInFastLLM(input0.dataType == DataType::FLOAT32 || input0.dataType == DataType::FLOAT16 || input0.dataType == DataType::BFLOAT16,
-                        "AddTo error: Data's type should be float32, float16 or bfloat16.\n");
+        if (!((input0.dataType == DataType::FLOAT32 && input1.dataType == DataType::FLOAT32) ||
+              (input0.dataType == DataType::FLOAT16 && input1.dataType == DataType::FLOAT16) ||
+              (input0.dataType == DataType::BFLOAT16 && input1.dataType == DataType::BFLOAT16))) {
+            std::ostringstream oss;
+            oss << "AddTo error: Data's type should be float32, float16 or bfloat16, and both inputs should use the same type."
+                << " input0.name=" << input0.name
+                << " input1.name=" << input1.name
+                << " input0.type=" << (int) input0.dataType
+                << " input1.type=" << (int) input1.dataType
+                << " input0.device=" << (int) input0.dataDevice
+                << " input1.device=" << (int) input1.dataDevice
+                << " input0.dims=[";
+            for (int i = 0; i < input0.dims.size(); i++) {
+                if (i > 0) oss << ",";
+                oss << input0.dims[i];
+            }
+            oss << "] input1.dims=[";
+            for (int i = 0; i < input1.dims.size(); i++) {
+                if (i > 0) oss << ",";
+                oss << input1.dims[i];
+            }
+            oss << "] alpha=" << alpha;
+            ErrorInFastLLM(oss.str());
+        }
         AssertInFastLLM(input0.dims == input1.dims, "AddTo error: input's shape should be same.\n");
 
         int len = input0.Count(0);
