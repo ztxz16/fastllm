@@ -1,0 +1,36 @@
+{
+  "defaults": {
+    "path": "/path/to/model",
+    "host": "127.0.0.1",
+    "port": 18080,
+    "api_key": "no-key",
+    "device": "cuda",
+    "moe_device": "numa",
+    "prompt_unit": "FastLLM decode benchmark context block. ",
+    "question": "请连续输出数字序列，不要解释。",
+    "prefill_length": 512,
+    "startup_timeout": 600,
+    "request_timeout": 3600,
+    "warmup_max_tokens": 8,
+    "skip_warmup": false
+  },
+  "cases": [
+    {
+      "name": "batch1-out256",
+      "batch_size": 1,
+      "max_tokens": 256
+    },
+    {
+      "name": "batch4-out256",
+      "batch_size": 4,
+      "max_tokens": 256,
+      "max_batch": 4
+    },
+    {
+      "name": "batch8-out256",
+      "batch_size": 8,
+      "max_tokens": 256,
+      "max_batch": 8
+    }
+  ]
+}
