@@ -8,6 +8,7 @@
 #include "cmath"
 
 #include <iostream>
+#include <vector>
 
 namespace fastllm {
     class Qwen3_5Model: public basellm {
@@ -15,6 +16,8 @@ namespace fastllm {
     Qwen3_5Model (); // 构造函数
 
         virtual void InitParams(); // 初始化参数信息
+
+        virtual void OnWeightLoaded(const std::string &weightName, const std::set<std::string> &finishedWeightNames) override;
         
         // 推理
         virtual int Forward(
@@ -70,6 +73,13 @@ namespace fastllm {
         int num_k_heads, num_v_heads, head_k_dim, head_v_dim;
 
         Data inv_scale_data;
+
+        std::vector <std::vector <Data*> > weights;
+        std::vector <std::vector <Data*> > biass;
+        bool moeWeightsPrepared = false;
+
+        void SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix);
+        void PrepareMoeWeights();
     };
 }
 

@@ -6,10 +6,12 @@
 
 #include "qwen3_5.h"
 
+#include <algorithm>
 #include <sstream>
 
 #include <unordered_map>
 
+#include <cctype>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
@@ -18,7 +20,19 @@
 #include "fastllm-cuda.cuh"
 #endif
 
+#ifdef USE_TFACC
+#include "fastllm-tfacc.h"
+#endif
+
+#ifdef USE_NUMA
+#include "fastllm-numa.h"
+#endif
+
 namespace fastllm {
+#ifdef USE_NUMAS
+    extern void RegisterNumas(fastllm::Data *data, std::string weightType);
+#endif
+
     static void Add1(Data &input) {
         if (input.dims.size() == 0) {
             return;
@@ -28,6 +42,75 @@ namespace fastllm {
         for (int i = 0; i < len; i++) {
             v[i] += 1.0f;
         }
+    }
+
+    static bool IsTrueString(const std::string &value) {
+        std::string lowered = value;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        return lowered == "1" || lowered == "true" || lowered == "on";
+    }
+
+    static bool IsFloatLikeType(DataType dataType) {
+        return dataType == DataType::FLOAT32 ||
+               dataType == DataType::FLOAT16 ||
+               dataType == DataType::BFLOAT16;
+    }
+
+    static void CheckAddInputType(const Data &data, const std::string &name, int layer) {
+        if (!IsFloatLikeType(data.dataType)) {
+            ErrorInFastLLM("Qwen3.5 layer " + std::to_string(layer) + " AddTo input `" + name +
+                           "` has unsupported data type " + std::to_string((int)data.dataType) + ".");
+        }
+    }
+
+    static bool TryGetFusedMoeLayerPrefix(const std::string &weightName, std::string &layerPrefix) {
+        static const std::string gateupSuffix = "experts.gate_up_proj";
+        static const std::string downSuffix = "experts.down_proj";
+        if (StringEndWith(weightName, gateupSuffix)) {
+            layerPrefix = weightName.substr(0, weightName.size() - gateupSuffix.size());
+            return true;
+        }
+        if (StringEndWith(weightName, downSuffix)) {
+            layerPrefix = weightName.substr(0, weightName.size() - downSuffix.size());
+            return true;
+        }
+        return false;
+    }
+
+    static void SplitExpertLinearWeight(Data &dst, const Data &src, const std::string &name, int expertIndex) {
+        AssertInFastLLM(src.dims.size() == 3, "Qwen3.5 MoE fused expert weight should be 3D.");
+        AssertInFastLLM(expertIndex >= 0 && expertIndex < src.dims[0], "Qwen3.5 MoE expert index out of range.");
+        AssertInFastLLM(src.dataType == DataType::FLOAT16 || src.dataType == DataType::BFLOAT16 ||
+                        src.dataType == DataType::FLOAT32,
+                        "Qwen3.5 MoE fused expert slicing currently supports float16/bfloat16/float32 weights only.");
+        AssertInFastLLM(src.dataDevice == DataDevice::CPU && src.cpuData != nullptr,
+                        "Qwen3.5 MoE fused expert slicing expects CPU weight data during load.");
+
+        dst = Data(src.dataType, {src.dims[1], src.dims[2]});
+        dst.Allocate();
+        const uint64_t bytesPerExpert = src.GetBytes() / src.dims[0];
+        memcpy(dst.cpuData, src.cpuData + bytesPerExpert * expertIndex, bytesPerExpert);
+        dst.name = name;
+        dst.weightType = WeightType::LINEAR;
+        dst.isModelWeight = true;
+    }
+
+    static void RegisterExpertLinearWeight(Data &data, const std::string &weightType) {
+        if (!GetFastllmEnv().activateNuma) {
+            return;
+        }
+
+        data.CalcWeightSum();
+
+#if defined(USE_TFACC) || defined(USE_NUMA)
+        data.weightSum.resize(1);
+        RegisterFastllmData(&data, weightType);
+#endif
+
+#if defined(USE_NUMAS)
+        RegisterNumas(&data, weightType);
+#endif
     }
 
     const std::string Qwen3_5Model::language_prefix = "model.language_model.";
@@ -56,6 +139,9 @@ namespace fastllm {
         this->model_struct = "qwen3_5";
         this->model_type = "qwen3_5";
         this->use_new_engine = true;
+        this->num_experts = 0;
+        this->num_experts_per_tok = 0;
+        this->norm_topk_prob = true;
 
         weight.embeddingNames.insert(language_prefix + "embed_tokens.weight");
         weight.linearNames = {
@@ -63,6 +149,18 @@ namespace fastllm {
             language_prefix + "layers.*.mlp.down_proj.weight", language_prefix + "layers.*.mlp.up_proj.weight",
             language_prefix + "layers.*.mlp.gate_proj.weight", language_prefix + "layers.*.mlp.gate_proj.weight",
             language_prefix + "layers.*.mlp.gateup_proj.weight",
+            language_prefix + "layers.*.mlp.gate.weight",
+            language_prefix + "layers.*.mlp.shared_expert_gate.weight",
+            language_prefix + "layers.*.mlp.shared_expert.gate_proj.weight",
+            language_prefix + "layers.*.mlp.shared_expert.up_proj.weight",
+            language_prefix + "layers.*.mlp.shared_expert.down_proj.weight",
+            language_prefix + "layers.*.mlp.shared_expert.gateup_proj.weight",
+            language_prefix + "layers.*.mlp.experts.gate_up_proj",
+            language_prefix + "layers.*.mlp.experts.down_proj",
+            language_prefix + "layers.*.mlp.experts.*.gate_proj.weight",
+            language_prefix + "layers.*.mlp.experts.*.up_proj.weight",
+            language_prefix + "layers.*.mlp.experts.*.down_proj.weight",
+            language_prefix + "layers.*.mlp.experts.*.gateup_proj.weight",
             language_prefix + "layers.*.self_attn.o_proj.weight", language_prefix + "layers.*.self_attn.q_proj.weight",
             language_prefix + "layers.*.self_attn.k_proj.weight",
             language_prefix + "layers.*.self_attn.v_proj.weight", language_prefix + "layers.*.self_attn.mergeqkv.weight",
@@ -135,6 +233,27 @@ namespace fastllm {
         if (this->weight.dicts.find("rope_scaling.factor") != this->weight.dicts.end()) {
             rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
         }
+        num_experts = 0;
+        if (this->weight.dicts.find("num_experts") != this->weight.dicts.end()) {
+            num_experts = atoi(this->weight.dicts["num_experts"].c_str());
+        }
+        num_experts_per_tok = 0;
+        if (this->weight.dicts.find("num_experts_per_tok") != this->weight.dicts.end()) {
+            num_experts_per_tok = atoi(this->weight.dicts["num_experts_per_tok"].c_str());
+        }
+        if (this->weight.dicts.find("norm_topk_prob") != this->weight.dicts.end()) {
+            norm_topk_prob = IsTrueString(this->weight.dicts["norm_topk_prob"]);
+        } else {
+            norm_topk_prob = true;
+        }
+        n_shared_experts = 0;
+        if (this->weight.dicts.find("shared_expert_intermediate_size") != this->weight.dicts.end() &&
+            atoi(this->weight.dicts["shared_expert_intermediate_size"].c_str()) > 0) {
+            n_shared_experts = 1;
+        }
+        weights.clear();
+        biass.clear();
+        moeWeightsPrepared = false;
 
         for (int i = 0; i < block_cnt; i++) {
             std::string w1WeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate_proj.weight";
@@ -143,6 +262,30 @@ namespace fastllm {
             this->weightMergeRules.push_back(
                 WeightMergeRule({WeightMergeRuleSingle({w1WeightName, w3WeightName}, swigluWeightName, std::string("linearSwiglu"))})
             );
+
+            if (num_experts > 0) {
+                std::string sharedGateWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.shared_expert.gate_proj.weight";
+                std::string sharedUpWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.shared_expert.up_proj.weight";
+                std::string sharedGateupWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.shared_expert.gateup_proj.weight";
+                this->weightMergeRules.push_back(
+                    WeightMergeRule({WeightMergeRuleSingle({sharedGateWeightName, sharedUpWeightName}, sharedGateupWeightName, std::string("linearSwiglu"))})
+                );
+
+                for (int j = 0; j < num_experts; j++) {
+                    std::string expertGateWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".gate_proj.weight";
+                    std::string expertUpWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".up_proj.weight";
+                    std::string expertGateupWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".gateup_proj.weight";
+                    std::string expertDownWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".down_proj.weight";
+                    this->weightMergeRules.push_back(
+                        WeightMergeRule({WeightMergeRuleSingle({expertGateWeightName, expertUpWeightName}, expertGateupWeightName, std::string("linearSwiglu"))})
+                    );
+                    this->specialWeights[expertGateupWeightName] = "linearSwiglu";
+                    this->specialWeights[expertDownWeightName] = "linearColumn";
+                    this->moeLinears.insert(expertGateWeightName);
+                    this->moeLinears.insert(expertUpWeightName);
+                    this->moeLinears.insert(expertDownWeightName);
+                }
+            }
 
             std::string qWeightName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.weight";
             std::string qBiasName = language_prefix + "layers." + std::to_string(i) + ".self_attn.q_proj.bias";
@@ -177,6 +320,110 @@ namespace fastllm {
         std::vector <float> v_inv_scale(head_k_dim, inv_scale);
         Data temp(DataType::FLOAT32, std::vector<int>{head_k_dim}, v_inv_scale);
         inv_scale_data.CopyFrom(temp);
+    }
+
+    void Qwen3_5Model::SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix) {
+        const std::string fusedGateupName = layerPrefix + "experts.gate_up_proj";
+        const std::string fusedDownName = layerPrefix + "experts.down_proj";
+        const std::string firstExpertGateupName = layerPrefix + "experts.0.gateup_proj.weight";
+        if (this->weight.weight.find(firstExpertGateupName) != this->weight.weight.end()) {
+            return;
+        }
+
+        auto fusedGateupIt = this->weight.weight.find(fusedGateupName);
+        if (fusedGateupIt == this->weight.weight.end()) {
+            return;
+        }
+
+        auto fusedDownIt = this->weight.weight.find(fusedDownName);
+        AssertInFastLLM(fusedDownIt != this->weight.weight.end(), "Qwen3.5 fused MoE weights are incomplete.");
+        Data &fusedGateup = fusedGateupIt->second;
+        Data &fusedDown = fusedDownIt->second;
+        AssertInFastLLM(fusedGateup.dims.size() == 3 && fusedDown.dims.size() == 3,
+                        "Qwen3.5 MoE fused expert weights should be 3D.");
+        AssertInFastLLM(fusedGateup.dims[0] == num_experts && fusedDown.dims[0] == num_experts,
+                        "Qwen3.5 MoE fused expert count mismatch.");
+
+        for (int j = 0; j < num_experts; j++) {
+            const std::string expertGateupName = layerPrefix + "experts." + std::to_string(j) + ".gateup_proj.weight";
+            const std::string expertDownName = layerPrefix + "experts." + std::to_string(j) + ".down_proj.weight";
+            SplitExpertLinearWeight(this->weight.weight[expertGateupName], fusedGateup, expertGateupName, j);
+            SplitExpertLinearWeight(this->weight.weight[expertDownName], fusedDown, expertDownName, j);
+            RegisterExpertLinearWeight(this->weight.weight[expertGateupName], "linearSwiglu");
+            RegisterExpertLinearWeight(this->weight.weight[expertDownName], "linearColumn");
+        }
+
+        this->weight.weight.erase(fusedGateupName);
+        this->weight.weight.erase(fusedDownName);
+    }
+
+    void Qwen3_5Model::OnWeightLoaded(const std::string &weightName, const std::set<std::string> &finishedWeightNames) {
+        if (num_experts <= 0) {
+            return;
+        }
+
+        std::string layerPrefix;
+        if (!TryGetFusedMoeLayerPrefix(weightName, layerPrefix) ||
+            !StartWith(layerPrefix, language_prefix + "layers.")) {
+            return;
+        }
+
+        const std::string fusedGateupName = layerPrefix + "experts.gate_up_proj";
+        const std::string fusedDownName = layerPrefix + "experts.down_proj";
+        if (finishedWeightNames.find(fusedGateupName) == finishedWeightNames.end() ||
+            finishedWeightNames.find(fusedDownName) == finishedWeightNames.end()) {
+            return;
+        }
+
+        SplitFusedMoeWeightsIfNeeded(layerPrefix);
+    }
+
+    void Qwen3_5Model::PrepareMoeWeights() {
+        if (moeWeightsPrepared || num_experts <= 0) {
+            moeWeightsPrepared = true;
+            return;
+        }
+
+        weights.clear();
+        biass.clear();
+        weights.resize(block_cnt);
+        biass.resize(block_cnt);
+
+        for (int i = 0; i < block_cnt; i++) {
+            const std::string layerPrefix = language_prefix + "layers." + std::to_string(i) + ".mlp.";
+            const std::string routerWeightName = layerPrefix + "gate.weight";
+            const std::string fusedGateupName = layerPrefix + "experts.gate_up_proj";
+            const std::string fusedDownName = layerPrefix + "experts.down_proj";
+            const std::string firstExpertGateupName = layerPrefix + "experts.0.gateup_proj.weight";
+
+            const bool hasMoeLayer =
+                this->weight.weight.find(routerWeightName) != this->weight.weight.end() ||
+                this->weight.weight.find(fusedGateupName) != this->weight.weight.end() ||
+                this->weight.weight.find(firstExpertGateupName) != this->weight.weight.end();
+            if (!hasMoeLayer) {
+                continue;
+            }
+
+            SplitFusedMoeWeightsIfNeeded(layerPrefix);
+
+            weights[i].push_back(nullptr);
+            weights[i].push_back(nullptr);
+            biass[i].push_back(nullptr);
+            biass[i].push_back(nullptr);
+            for (int j = 0; j < num_experts; j++) {
+                const std::string expertGateupName = layerPrefix + "experts." + std::to_string(j) + ".gateup_proj.weight";
+                const std::string expertDownName = layerPrefix + "experts." + std::to_string(j) + ".down_proj.weight";
+                AssertInFastLLM(this->weight.weight.find(expertGateupName) != this->weight.weight.end() &&
+                                this->weight.weight.find(expertDownName) != this->weight.weight.end(),
+                                "Qwen3.5 MoE expert weights are incomplete.");
+                weights[i].push_back(&this->weight[expertGateupName]);
+                weights[i].push_back(&this->weight[expertDownName]);
+                biass[i].push_back(nullptr);
+                biass[i].push_back(nullptr);
+            }
+        }
+
+        moeWeightsPrepared = true;
     }
 
     std::vector <int> Qwen3_5Model::ForwardV2(
@@ -232,6 +479,12 @@ namespace fastllm {
         // Data &insertPositions = this->forwardDataManager.GetData("insertPositions");
         Data attenOutput;
         // Data &attenOutput = this->forwardDataManager.GetData("attenOutput");
+        Data w1, w2, w3;
+        Data routerLogits;
+        Data sharedGate;
+        Data moeFinal, moeFinal2;
+        Data tempInput, tempOutput;
+        Data attenPart, moePart;
         bool generatedBatchDecodeParams = false;
         bool generatedAppendPagedCacheBatchParams = false;
 
@@ -255,7 +508,7 @@ namespace fastllm {
             allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, (int)vPositionIds.size()}, vPositionIds));
         }
 
-
+        PrepareMoeWeights();
 
         if (!initialized_add1) {
             for (int i = 0; i < block_cnt; i++) {
@@ -692,9 +945,174 @@ namespace fastllm {
                 }
             }
 
+            CheckAddInputType(hiddenStates, "hiddenStates_after_attn", i);
             AddTo(hiddenStates, attenInput);
             RMSNorm(hiddenStates, this->weight[postRmsName], rms_norm_eps, attenInput);
-            MLPBlock(&attenInput, &weight[swigluWeightName], &weight[downWeightName], &v, &q, &hiddenStates);
+            if (weight.weight.find(swigluWeightName) != weight.weight.end() &&
+                weight.weight.find(downWeightName) != weight.weight.end()) {
+                MLPBlock(&attenInput, &weight[swigluWeightName], &weight[downWeightName], &v, &q, &hiddenStates);
+                continue;
+            }
+
+            std::string gateWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate.weight";
+            if (weight.weight.find(gateWeightName) == weight.weight.end()) {
+                ErrorInFastLLM("Qwen3.5 layer " + std::to_string(i) + " has neither dense MLP nor MoE weights.");
+            }
+
+            std::string gateBiasName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate.e_score_correction_bias";
+            std::string firstExpertGateupName = language_prefix + "layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight";
+            std::string sharedGateupWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.shared_expert.gateup_proj.weight";
+            std::string sharedGateProjWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.shared_expert.gate_proj.weight";
+            std::string sharedUpProjWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.shared_expert.up_proj.weight";
+            std::string sharedDownWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.shared_expert.down_proj.weight";
+            std::string sharedExpertGateWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.shared_expert_gate.weight";
+            Data *gateBiasData = weight.weight.find(gateBiasName) != weight.weight.end() ? &weight[gateBiasName] : nullptr;
+
+            int flatBatch = attenInput.dims[0];
+            int flatLen = attenInput.dims[1];
+            attenInput.Reshape({flatBatch * flatLen, attenInput.dims[2]});
+            moeFinal = Data();
+            moeFinal2 = Data();
+            sharedGate = Data();
+
+            Linear(attenInput, weight[gateWeightName], Data(), routerLogits);
+            ToDataType(routerLogits, DataType::FLOAT32);
+            if (gateBiasData != nullptr) {
+                ToDataType(*gateBiasData, DataType::FLOAT32);
+            }
+            Softmax(routerLogits, routerLogits, -1);
+
+            if (weight.weight.find(sharedDownWeightName) != weight.weight.end()) {
+                if (weight.weight.find(sharedGateupWeightName) != weight.weight.end()) {
+                    Linear(attenInput, weight[sharedGateupWeightName], Data(), w3);
+                    Swiglu(w3, w1);
+                } else if (weight.weight.find(sharedGateProjWeightName) != weight.weight.end() &&
+                           weight.weight.find(sharedUpProjWeightName) != weight.weight.end()) {
+                    Linear(attenInput, weight[sharedGateProjWeightName], Data(), w1);
+                    Silu(w1, w1);
+                    Linear(attenInput, weight[sharedUpProjWeightName], Data(), w3);
+                    MulTo(w1, w3);
+                }
+                if (w1.dims.size() != 0) {
+                    Linear(w1, weight[sharedDownWeightName], Data(), moeFinal2);
+                    if (weight.weight.find(sharedExpertGateWeightName) != weight.weight.end()) {
+                        Linear(attenInput, weight[sharedExpertGateWeightName], Data(), sharedGate);
+                        Sigmoid(sharedGate, sharedGate);
+                        MulTo(moeFinal2, sharedGate);
+                    }
+                }
+            }
+
+            bool useMergeMoe = weight.weight.find(firstExpertGateupName) != weight.weight.end() &&
+                               !weights[i].empty() && CanRunMergeMOE(attenInput, biass[i]);
+            if (useMergeMoe) {
+                Data expertIndex, expertScore;
+                SelectExpert(routerLogits, expertIndex, expertScore, this->num_experts_per_tok, this->norm_topk_prob,
+                             this->routed_scaling_factor, gateBiasData);
+                ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
+                MergeMOE(
+                    attenInput, expertIndex, expertScore,
+                    weights[i], biass[i],
+                    w1, w2, w3, tempInput, tempOutput,
+                    1.0f,
+                    moeFinal, i
+                );
+            } else {
+                routerLogits.ToDevice(DataDevice::CPU);
+                float *cpuRouterLogits = (float*)routerLogits.cpuData;
+                float *cpuBias = nullptr;
+                if (gateBiasData != nullptr) {
+                    gateBiasData->ToDevice(DataDevice::CPU);
+                    cpuBias = (float*)gateBiasData->cpuData;
+                }
+                int expertCount = routerLogits.dims.back();
+
+                moeFinal.dataType = hiddenStates.dataType;
+                moeFinal.dataDevice = attenInput.dataDevice;
+                moeFinal.dataDeviceIds = attenInput.dataDeviceIds;
+                moeFinal.UpdateUnitSize();
+                moeFinal.Resize({0, attenInput.dims[1]});
+                moeFinal.Expansion(attenInput.dims);
+                for (int b = 0; b < flatBatch * flatLen; b++) {
+                    float *cur = cpuRouterLogits + b * expertCount;
+                    std::vector <std::pair <float, int> > candidates;
+                    candidates.reserve(expertCount);
+                    for (int j = 0; j < expertCount; j++) {
+                        float score = cur[j];
+                        if (cpuBias != nullptr) {
+                            score += cpuBias[j];
+                        }
+                        candidates.push_back(std::make_pair(-score, j));
+                    }
+                    std::sort(candidates.begin(), candidates.end());
+
+                    Data *currentData = &attenInput;
+                    if (flatBatch * flatLen != 1) {
+                        Split(attenInput, 0, b, b + 1, attenPart);
+                        currentData = &attenPart;
+                    }
+                    moePart.dataType = hiddenStates.dataType;
+                    moePart.dataDevice = currentData->dataDevice;
+                    moePart.dataDeviceIds = currentData->dataDeviceIds;
+                    moePart.UpdateUnitSize();
+                    moePart.Resize(currentData->dims);
+                    moePart.Allocate(0.0f);
+
+                    float sum = 0.0f;
+                    for (int j = 0; j < this->num_experts_per_tok; j++) {
+                        sum += cur[candidates[j].second];
+                    }
+                    if (!this->norm_topk_prob) {
+                        sum = 1.0f;
+                    }
+
+                    for (int j = 0; j < this->num_experts_per_tok; j++) {
+                        int idx = candidates[j].second;
+                        float value = cur[idx];
+                        if (sum != 0.0f) {
+                            value /= sum;
+                        }
+                        value *= this->routed_scaling_factor;
+
+                        std::string expertGateupWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".gateup_proj.weight";
+                        std::string expertDownWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.experts." + std::to_string(idx) + ".down_proj.weight";
+                        AssertInFastLLM(weight.weight.find(expertGateupWeightName) != weight.weight.end() &&
+                                        weight.weight.find(expertDownWeightName) != weight.weight.end(),
+                                        "Qwen3.5 MoE expert weights are incomplete.");
+                        Linear(*currentData, weight[expertGateupWeightName], Data(), w3);
+                        Swiglu(w3, w1);
+                        Linear(w1, weight[expertDownWeightName], Data(), w2);
+                        if (w2.dataType != moePart.dataType) {
+                            ToDataType(w2, moePart.dataType);
+                        }
+                        CheckAddInputType(moePart, "moePart", i);
+                        AddTo(moePart, w2, value);
+                    }
+                    if (moePart.dataType != moeFinal.dataType) {
+                        ToDataType(moePart, moeFinal.dataType);
+                    }
+                    CatDirect(moeFinal, moePart, 0);
+                }
+                moeFinal.expansionDims.clear();
+            }
+
+            moeFinal.Reshape(hiddenStates.dims);
+            Data tempMoeFinal;
+            tempMoeFinal.CopyFrom(moeFinal);
+            ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+            if (tempMoeFinal.dataType != hiddenStates.dataType) {
+                ToDataType(tempMoeFinal, hiddenStates.dataType);
+            }
+            CheckAddInputType(hiddenStates, "hiddenStates_after_moe", i);
+            AddTo(hiddenStates, tempMoeFinal);
+            if (moeFinal2.dims.size() != 0) {
+                moeFinal2.Reshape(hiddenStates.dims);
+                if (moeFinal2.dataType != hiddenStates.dataType) {
+                    ToDataType(moeFinal2, hiddenStates.dataType);
+                }
+                CheckAddInputType(hiddenStates, "hiddenStates_after_shared_expert", i);
+                AddTo(hiddenStates, moeFinal2);
+            }
         }
 
         std::string lmHeadWeightName = "lm_head.weight";

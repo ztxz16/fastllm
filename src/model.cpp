@@ -246,9 +246,9 @@ namespace fastllm {
         } else if (modelType == "qwen3") {
             model = new Qwen3Model();
             model->model_type = "qwen3";
-        } else if (modelType == "qwen3_5") {
+        } else if (modelType == "qwen3_5" || modelType == "qwen3_5_moe" || modelType == "qwen3_5_moe_text") {
             model = new Qwen3_5Model();
-            model->model_type = "qwen3_5";
+            model->model_type = modelType;
         } else if (modelType == "phi3") {
             model = new Phi3Model();
             model->model_type = "phi3";
@@ -1810,6 +1810,7 @@ if (false) {
 
                             locker.lock();
                             allFinishNames.insert(weightName);
+                            model->OnWeightLoaded(weightName, allFinishNames);
                             // 检查是否需要合并权重
                             bool needMerge = false;
                             for (auto &rule : model->weightMergeRules) {

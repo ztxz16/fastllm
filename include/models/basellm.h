@@ -177,6 +177,9 @@ namespace fastllm {
         virtual std::map <std::string, std::vector <std::pair <std::string, DataType> > >
                 GetTensorMap(const std::vector <std::string> &tensorNames);
 
+        // 某个权重完成加载后，允许模型做额外处理（如拆分 fused MoE 权重）
+        virtual void OnWeightLoaded(const std::string &weightName, const std::set<std::string> &finishedWeightNames) {}
+
         // 推理
         virtual int Forward(
                 const Data &inputIds,
