@@ -62,6 +62,15 @@ class FastLLmCompletion:
                             type=err_type,
                             code=status_code.value)
 
+  def _normalize_sampling_args(self, top_p: float, top_k: int, temperature: float):
+      do_sample = True
+      if temperature is not None and temperature <= 0:
+          do_sample = False
+          temperature = 1.0
+          top_k = 1
+          top_p = 1.0
+      return do_sample, top_p, top_k, temperature
+
   async def _check_model(self, request: ChatCompletionRequest):
     if request.model != self.model_name:
       return self.create_error_response(
@@ -366,6 +375,7 @@ class FastLLmCompletion:
       top_p = request.top_p if request.top_p is not None else default_gen['top_p']
       top_k = request.top_k if request.top_k is not None else default_gen['top_k']
       temperature = request.temperature if request.temperature is not None else default_gen['temperature']
+      do_sample, top_p, top_k, temperature = self._normalize_sampling_args(top_p, top_k, temperature)
       frequency_penalty = default_gen['repetition_penalty']
       max_length = request.max_tokens if request.max_tokens else 32768
 
@@ -375,12 +385,12 @@ class FastLLmCompletion:
       if (not(self.hide_input)):
          logging.info(f"fastllm anthropic input message: {messages}")
 
-      input_token_len = self.model.get_input_token_len(messages)
+      input_token_len = self.model.get_input_token_len(messages, enable_thinking = self.think)
       handle = self.model.launch_stream_response(messages,
-                        max_length = max_length, min_length = 0, do_sample = True,
+                        max_length = max_length, min_length = 0, do_sample = do_sample,
                         top_p = top_p, top_k = top_k, temperature = temperature,
                         repeat_penalty = frequency_penalty, tools = model_tools,
-                        one_by_one = True)
+                        one_by_one = True, enable_thinking = self.think)
       self.conversation_handles[request_id] = handle
       result_generator = self.model.stream_response_handle_async(handle)
 
@@ -468,6 +478,7 @@ class FastLLmCompletion:
       top_p = request.top_p if request.top_p is not None else default_gen['top_p']
       top_k = request.top_k if request.top_k is not None else default_gen['top_k']
       temperature = request.temperature if request.temperature is not None else default_gen['temperature']
+      do_sample, top_p, top_k, temperature = self._normalize_sampling_args(top_p, top_k, temperature)
       frequency_penalty = default_gen['repetition_penalty']
       if request.frequency_penalty and request.frequency_penalty != 0.0:
         frequency_penalty = request.frequency_penalty
@@ -475,7 +486,7 @@ class FastLLmCompletion:
       max_length = request.max_tokens if request.max_tokens else 32768
       min_length = request.min_tokens if request.min_tokens else 0
 
-      enable_thinking = None
+      enable_thinking = self.think
       if request.chat_template_kwargs and "enable_thinking" in request.chat_template_kwargs:
           enable_thinking = bool(request.chat_template_kwargs["enable_thinking"])
 
@@ -489,7 +500,7 @@ class FastLLmCompletion:
       tools = [tool.model_dump(exclude_none=True) for tool in request.tools] if request.tools is not None else None
 
       handle = self.model.launch_stream_response(messages,
-                        max_length = max_length, min_length = min_length, do_sample = True,
+                        max_length = max_length, min_length = min_length, do_sample = do_sample,
                         top_p = top_p, top_k = top_k, temperature = temperature,
                         repeat_penalty = frequency_penalty, tools = tools, one_by_one = True,
                         enable_thinking = enable_thinking)
