@@ -529,6 +529,7 @@ namespace fastllm {
 
         ToDataType(embeddingResult, hiddenStates, this->dataType);
         int seqlen = hiddenStates.dims[1];
+        bool pagedAttentionInited = false;
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
             std::string inputRmsName = language_prefix + "layers." + std::to_string(i) + ".input_layernorm.weight";
@@ -606,7 +607,8 @@ namespace fastllm {
                         i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
                     AppendPagedCache(*pagedCacheKManager, pastKey, k);
                     AppendPagedCache(*pagedCacheVManager, pastValue, v);
-                    AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, i > 0);
+                    AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);
+                    pagedAttentionInited = true;
                 }
 
                 PermuteSelf(qkv, {1, 0, 2});
