@@ -639,7 +639,7 @@ namespace fastllm {
             ctx->intParams.clear();
         };
 
-        auto *pcm = GetPagedCacheManager(model->kvCacheId);
+        auto *pcm = GetPagedCacheManager(model->kvCacheId * 2);
         if (pcm != nullptr) {
             totalPages = pcm->maxPages;
             pageLen = pcm->pageLen;
@@ -2087,15 +2087,95 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         return tokens;    
     }
 
+    static int GetCacheLen(const Data &cache) {
+        if (cache.isPagedKVCache) {
+            if (cache.pageIndex.empty()) {
+                return 0;
+            }
+            return (cache.pageIndex.size() - 1) * cache.pageLen + cache.lastPageLen;
+        }
+        if (cache.dims.size() > 1) {
+            return cache.dims[1];
+        }
+        if (cache.expansionDims.size() > 1) {
+            return cache.expansionDims[1];
+        }
+        return 0;
+    }
+
+    static int GetTokenGrowingCacheLen(const basellm *model, std::vector <std::pair <Data, Data> > &pastKeyValues) {
+        auto tryGetLen = [&](int idx) {
+            if (idx < 0 || idx >= (int)pastKeyValues.size()) {
+                return 0;
+            }
+            auto &pastKey = pastKeyValues[idx].first;
+            auto &pastValue = pastKeyValues[idx].second;
+            if (pastKey.isLinearAttention || pastValue.isLinearAttention) {
+                return 0;
+            }
+            int len = GetCacheLen(pastKey);
+            if (len > 0) {
+                return len;
+            }
+            return GetCacheLen(pastValue);
+        };
+
+        int len = tryGetLen(model->kvCacheId);
+        if (len > 0) {
+            return len;
+        }
+        for (int i = 0; i < (int)pastKeyValues.size(); i++) {
+            len = tryGetLen(i);
+            if (len > 0) {
+                return len;
+            }
+        }
+        return 0;
+    }
+
+    static int GetTokenGrowingCacheLen(const basellm *model, std::vector <std::pair <Data*, Data*> > &pastKeyValues) {
+        auto tryGetLen = [&](int idx) {
+            if (idx < 0 || idx >= (int)pastKeyValues.size()) {
+                return 0;
+            }
+            auto *pastKey = pastKeyValues[idx].first;
+            auto *pastValue = pastKeyValues[idx].second;
+            if (pastKey == nullptr || pastValue == nullptr) {
+                return 0;
+            }
+            if (pastKey->isLinearAttention || pastValue->isLinearAttention) {
+                return 0;
+            }
+            int len = GetCacheLen(*pastKey);
+            if (len > 0) {
+                return len;
+            }
+            return GetCacheLen(*pastValue);
+        };
+
+        int len = tryGetLen(model->kvCacheId);
+        if (len > 0) {
+            return len;
+        }
+        for (int i = 0; i < (int)pastKeyValues.size(); i++) {
+            len = tryGetLen(i);
+            if (len > 0) {
+                return len;
+            }
+        }
+        return 0;
+    }
+
     void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data, Data> > &pastKeyValues, 
             const GenerationConfig &generationConfig) {
         auto &config = generationConfig;
+        int cacheLen = GetTokenGrowingCacheLen(this, pastKeyValues);
         if (logits->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             bool need_reset = false;
             std::vector<int> res_lens, eos_nums, eos_ids;
             for (int b = 0; b < batch; b++) {
-                res_lens.push_back(config.output_token_least - pastKeyValues[0].first.dims[1] + config.input_token_length);
+                res_lens.push_back(config.output_token_least - cacheLen + config.input_token_length);
                 need_reset |= res_lens.back() > 0;
                 eos_nums.push_back(1 + this->eos_token_ids.size() + config.stop_token_ids.size());
                 eos_ids.push_back(this->eos_token_id);
@@ -2111,7 +2191,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 #endif
         } else {
             for (int b = 0; b < batch; b++) {
-                if (config.output_token_least > pastKeyValues[0].first.dims[1] - config.input_token_length) {
+                if (config.output_token_least > cacheLen - config.input_token_length) {
                     ToDataType(*logits, DataType::FLOAT32);
                     float *logit = ((float*)logits->cpuData) + logits->Count(0) / batch * b;
                     logit[this->eos_token_id] = 0;
@@ -2127,13 +2207,14 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 
     void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data*, Data*> > &pastKeyValues, 
             const std::vector <GenerationConfig> &generationConfigs) {
+        int cacheLen = GetTokenGrowingCacheLen(this, pastKeyValues);
         if (logits->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             bool need_reset = false;
             std::vector<int> res_lens, eos_nums, eos_ids;
             for (int b = 0; b < batch; b++) {
                 auto &config = generationConfigs[b];
-                res_lens.push_back(config.output_token_least - pastKeyValues[0].first->dims[1] + config.input_token_length);
+                res_lens.push_back(config.output_token_least - cacheLen + config.input_token_length);
                 need_reset |= res_lens.back() > 0;
                 eos_nums.push_back(1 + this->eos_token_ids.size() + config.stop_token_ids.size());
                 eos_ids.push_back(this->eos_token_id);
@@ -2150,7 +2231,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         } else {
             for (int b = 0; b < batch; b++) {
                 auto &config = generationConfigs[b];
-                if (config.output_token_least > pastKeyValues[0].first->dims[1] - config.input_token_length) {
+                if (config.output_token_least > cacheLen - config.input_token_length) {
                     ToDataType(*logits, DataType::FLOAT32);
                     float *logit = ((float*)logits->cpuData) + logits->Count(0) / batch * b;
                     logit[this->eos_token_id] = 0;
@@ -2179,9 +2260,10 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         int pageLen = fastllm::GetPageLen();
         int len = this->GetChunkedPrefillSize();
         bool autoCalcPages = (fastllm::GetMaxTokens() <= 0);
+        int minPages = -1;
 
         if (autoCalcPages) {
-            int minPages = len / pageLen + 2;
+            minPages = len / pageLen + 2;
             fastllm::SetMaxTokens(minPages * pageLen);
         }
 
@@ -2207,16 +2289,105 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         std::vector <GenerationConfig> generationConfigs = {generationConfig};
         LastTokensManager lastTokens;
         ForwardV2(1, inputIds, attentionMasks, positionIdsVec, seqLens, pastKeyValues, generationConfigs, lastTokens, nullptr);
-        elementsInKVCachePerToken = (long long)block_cnt * 
-            (pastKeyValuesStorage[0].first.dims[0] * pastKeyValuesStorage[0].first.dims[2] + 
-             pastKeyValuesStorage[0].second.dims[0] * pastKeyValuesStorage[0].second.dims[2]);
+
+        this->kvCacheId = 0;
+        elementsInKVCachePerToken = 0;
+        bool foundTokenGrowingCache = false;
+        std::vector <long long> layerElementsPerToken(block_cnt, 0);
+        int tokenGrowingLayerCount = 0, linearLayerCount = 0;
+        long long linearFixedBytes = 0;
+        for (int i = 0; i < block_cnt; i++) {
+            auto &pastKey = pastKeyValuesStorage[i].first;
+            auto &pastValue = pastKeyValuesStorage[i].second;
+            if (pastKey.isLinearAttention || pastValue.isLinearAttention) {
+                linearLayerCount++;
+                linearFixedBytes += pastKey.GetBytes() + pastValue.GetBytes();
+                continue;
+            }
+            if (pastKey.dims.size() < 3 || pastValue.dims.size() < 3) {
+                continue;
+            }
+            tokenGrowingLayerCount++;
+            if (!foundTokenGrowingCache) {
+                this->kvCacheId = i;
+                foundTokenGrowingCache = true;
+            }
+
+            layerElementsPerToken[i] =
+                (long long)pastKey.dims[0] * pastKey.dims[2] +
+                (long long)pastValue.dims[0] * pastValue.dims[2];
+            elementsInKVCachePerToken += layerElementsPerToken[i];
+        }
+
+        long long bytesPerToken = 0;
+        if (elementsInKVCachePerToken > 0) {
+            bytesPerToken = GetDataBytes(this->kvCacheDataType, 1, elementsInKVCachePerToken);
+        }
+        if (autoCalcPages) {
+            printf("[Fastllm] AutoWarmup stats: tokenGrowingLayers=%d, linearLayers=%d, linearFixedCache=%.2f MB, kvBytesPerToken=%.2f KB, firstKVLayer=%d.\n",
+                   tokenGrowingLayerCount, linearLayerCount, linearFixedBytes / 1e6,
+                   bytesPerToken / 1024.0, this->kvCacheId);
+        }
 
         if (autoCalcPages) {
 #ifdef USE_CUDA
-            int numHeads = pastKeyValuesStorage[0].first.dims[0];
-            int headDim = pastKeyValuesStorage[0].first.dims[2];
-            long long bytesPerToken = GetDataBytes(this->kvCacheDataType, 1, numHeads * headDim * 2);
-            long long bytesPerPage = (long long)block_cnt * pageLen * bytesPerToken;
+            std::set <int> deviceIds;
+
+            auto getCudaIdsFromData = [&](Data *data) {
+                std::vector <int> ret;
+                if (data == nullptr || data->dataDevice != DataDevice::CUDA) {
+                    return ret;
+                }
+                ret = data->dataDeviceIds;
+                if (ret.empty()) {
+                    ret.push_back(0);
+                }
+                return ret;
+            };
+
+            auto getLayerCudaIds = [&](int layerIdx) {
+                std::vector <int> ret;
+                auto &pastKey = pastKeyValuesStorage[layerIdx].first;
+                auto &pastValue = pastKeyValuesStorage[layerIdx].second;
+
+                if (pastKey.pagedKVCacheData != nullptr) {
+                    ret = getCudaIdsFromData((Data*)pastKey.pagedKVCacheData);
+                }
+                if (ret.empty() && pastValue.pagedKVCacheData != nullptr) {
+                    ret = getCudaIdsFromData((Data*)pastValue.pagedKVCacheData);
+                }
+                if (ret.empty()) {
+                    ret = getCudaIdsFromData(&pastKey);
+                }
+                if (ret.empty()) {
+                    ret = getCudaIdsFromData(&pastValue);
+                }
+                return ret;
+            };
+
+            long long bytesPerPage = 0;
+            std::map <int, long long> deviceBytesPerPage;
+            std::map <int, int> deviceLayerCount;
+            for (int i = 0; i < block_cnt; i++) {
+                if (layerElementsPerToken[i] <= 0) {
+                    continue;
+                }
+                long long layerBytesPerPage = GetDataBytes(this->kvCacheDataType, pageLen, layerElementsPerToken[i]);
+                auto layerCudaIds = getLayerCudaIds(i);
+                if (layerCudaIds.empty()) {
+                    continue;
+                }
+                for (int id : layerCudaIds) {
+                    deviceIds.insert(id);
+                    deviceBytesPerPage[id] += layerBytesPerPage;
+                    deviceLayerCount[id]++;
+                }
+                bytesPerPage += layerBytesPerPage;
+            }
+
+            bool updatedPages = false;
+            int calculatedMaxPages = -1;
+            std::string fallbackReason = "";
 
             for (auto &kv : pastKeyValuesStorage) {
                 kv.first.pageIndex.clear();
@@ -2230,53 +2401,20 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 
             auto freeSizes = FastllmCudaGetFreeSizes();
             auto totalSizes = FastllmCudaGetTotalSizes();
-            auto dmap = GetDeviceMap();
-            std::map <int, int> ratios;
-
-            // 计算每个设备上分配的层数
-            std::map <int, int> deviceLayerCount;
-            if (dmap.size() > 1) {
-                // 多卡模式：按照 deviceMap 的比例分配层数
-                int sum = 0;
-                for (auto &it : dmap) {
-                    sum += it.second;
-                }
-                int cur = 0, prevLayer = 0;
-                for (auto &it : dmap) {
-                    cur += it.second;
-                    int endLayer = (int)((long long)cur * block_cnt / sum);
-                    int layersOnDevice = endLayer - prevLayer;
-                    if (StartWith(it.first, "cuda")) {
-                        for (int id : ParseDeviceIds(it.first, "cuda", ratios)) {
-                            deviceLayerCount[id] += layersOnDevice;
-                        }
-                    }
-                    prevLayer = endLayer;
-                }
-            }
-
-            std::set <int> deviceIds;
-            for (auto &it : dmap) {
-                if (StartWith(it.first, "cuda")) {
-                    for (int id : ParseDeviceIds(it.first, "cuda", ratios)) {
-                        deviceIds.insert(id);
-                    }
-                }
-            }
-            if (deviceIds.empty()) {
-                deviceIds.insert(0);
-            }
-
-            if (deviceIds.size() > 1 && !deviceLayerCount.empty()) {
-                // 多卡模式：计算每张卡上的 (剩余显存 / 单页显存)，取最小值
-                long long bytesPerLayerPerPage = pageLen * bytesPerToken;
+            if (deviceBytesPerPage.size() > 1) {
+                // 多卡模式：对每张实际承载 token-growing cache 的卡分别限流，取最小值
                 int maxPages = INT_MAX;
-                for (int id : deviceIds) {
+                for (auto &it : deviceBytesPerPage) {
+                    int id = it.first;
                     if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
-                        long long avail = freeSizes[id] - (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
-                        int layers = deviceLayerCount.count(id) ? deviceLayerCount[id] : 0;
-                        if (layers > 0 && avail > 0) {
-                            long long perPageOnDevice = layers * bytesPerLayerPerPage;
+                        long long reserved = (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
+                        long long avail = freeSizes[id] - reserved;
+                        long long perPageOnDevice = it.second;
+                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, availForKV=%.2f GB, kvPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
+                               id, freeSizes[id] / 1e9, totalSizes[id] / 1e9, reserved / 1e9,
+                               avail / 1e9, perPageOnDevice / 1e6,
+                               deviceLayerCount.count(id) ? deviceLayerCount[id] : 0);
+                        if (perPageOnDevice > 0 && avail > 0) {
                             int pages = (int)(avail / perPageOnDevice);
                             maxPages = std::min(maxPages, pages);
                         }
@@ -2284,6 +2422,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 }
                 if (maxPages > 0 && maxPages < INT_MAX) {
                     fastllm::SetMaxTokens(maxPages * pageLen);
+                    updatedPages = true;
+                    calculatedMaxPages = maxPages;
                     printf("Auto set cache pages (multi-gpu): %d (tokens: %d).\n",
                            maxPages, maxPages * pageLen);
                     for (int id : deviceIds) {
@@ -2293,23 +2433,54 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             printf("  GPU %d: layers=%d, avail=%.2f GB.\n", id, layers, avail / 1e9);
                         }
                     }
+                } else {
+                    fallbackReason = "no GPU has positive availForKV / kvPerPage after reserve.";
                 }
             } else {
-                // 单卡模式：原有逻辑
-                long long cacheAvail = 0;
-                for (int id : deviceIds) {
-                    if (id < (int)freeSizes.size() && id < (int)totalSizes.size()) {
-                        cacheAvail += freeSizes[id] - (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
+                // 单卡模式：只看真正承载 paged KV cache 的设备
+                long long cacheAvail = 0, cacheBytesPerPage = bytesPerPage;
+                int cacheDeviceId = -1;
+                if (!deviceBytesPerPage.empty()) {
+                    cacheBytesPerPage = deviceBytesPerPage.begin()->second;
+                    cacheDeviceId = deviceBytesPerPage.begin()->first;
+                    if (cacheDeviceId < (int)freeSizes.size() && cacheDeviceId < (int)totalSizes.size()) {
+                        long long reserved = (long long)(totalSizes[cacheDeviceId] * (1.0 - fastllm::GetGpuMemRatio()));
+                        cacheAvail = freeSizes[cacheDeviceId] - reserved;
+                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, availForKV=%.2f GB, kvPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
+                               cacheDeviceId, freeSizes[cacheDeviceId] / 1e9, totalSizes[cacheDeviceId] / 1e9,
+                               reserved / 1e9, cacheAvail / 1e9, cacheBytesPerPage / 1e6,
+                               deviceLayerCount.count(cacheDeviceId) ? deviceLayerCount[cacheDeviceId] : 0);
                     }
                 }
-                if (cacheAvail > 0 && bytesPerPage > 0) {
-                    int maxPages = (int)(cacheAvail / bytesPerPage);
+                if (cacheAvail > 0 && cacheBytesPerPage > 0) {
+                    int maxPages = (int)(cacheAvail / cacheBytesPerPage);
                     if (maxPages > 0) {
                         fastllm::SetMaxTokens(maxPages * pageLen);
+                        updatedPages = true;
+                        calculatedMaxPages = maxPages;
                         printf("Auto set cache pages: %d (tokens: %d, avail: %.2f GB).\n",
                                maxPages, maxPages * pageLen, cacheAvail / 1e9);
                     }
+                } else {
+                    if (deviceBytesPerPage.empty()) {
+                        fallbackReason = "no CUDA token-growing KV cache layer found.";
+                    } else if (cacheBytesPerPage <= 0) {
+                        fallbackReason = "kvPerPage <= 0.";
+                    } else {
+                        fallbackReason = "availForKV <= 0 after reserve.";
+                    }
                 }
+            }
+
+            if (!updatedPages) {
+                if (fallbackReason == "") {
+                    fallbackReason = "auto page calculation did not produce a positive page count.";
+                }
+                printf("[Fastllm] AutoWarmup fallback to minimum cache pages: %d (tokens: %d). Reason: %s\n",
+                       minPages, minPages * pageLen, fallbackReason.c_str());
+            } else if (minPages > 0 && calculatedMaxPages <= minPages) {
+                printf("[Fastllm] AutoWarmup note: calculated pages (%d) did not exceed minimum warmup pages (%d).\n",
+                       calculatedMaxPages, minPages);
             }
             
             pastKeyValuesStorage.clear();
@@ -2340,7 +2511,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         }
         printf("finish.\n");
 
-        auto *pcm = GetPagedCacheManager(this->kvCacheId);
+        auto *pcm = GetPagedCacheManager(this->kvCacheId * 2);
         if (pcm != nullptr) {
             int totalPages = pcm->maxPages;
             int cachePageLen = pcm->pageLen;

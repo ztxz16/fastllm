@@ -1162,9 +1162,24 @@ namespace fastllm {
             ToDataType(this->weight["lm_head.weight"], this->dataType);
         }
         Forward(inputIds, attentionMask, positionIds, pastKeyValues);
-        elementsInKVCachePerToken = (long long)block_cnt * 
-            (pastKeyValues[0].first.dims[0] * pastKeyValues[0].first.dims[2] + 
-             pastKeyValues[0].second.dims[0] * pastKeyValues[0].second.dims[2]);
+        this->kvCacheId = 0;
+        elementsInKVCachePerToken = 0;
+        bool foundTokenGrowingCache = false;
+        for (int i = 0; i < block_cnt; i++) {
+            if (pastKeyValues[i].first.isLinearAttention || pastKeyValues[i].second.isLinearAttention) {
+                continue;
+            }
+            if (pastKeyValues[i].first.dims.size() < 3 || pastKeyValues[i].second.dims.size() < 3) {
+                continue;
+            }
+            if (!foundTokenGrowingCache) {
+                this->kvCacheId = i;
+                foundTokenGrowingCache = true;
+            }
+            elementsInKVCachePerToken +=
+                (long long)pastKeyValues[i].first.dims[0] * pastKeyValues[i].first.dims[2] +
+                (long long)pastKeyValues[i].second.dims[0] * pastKeyValues[i].second.dims[2];
+        }
         printf("finish.\n");
     }
 }
