@@ -667,7 +667,10 @@ namespace fastllm {
                         Split(mixed_qkv, -1, mixed_qkv.dims.back() - 4, mixed_qkv.dims.back(), pastKey);
                         pastKey.expansionDims = pastKey.dims;
                     } else {
-                        ErrorInFastLLM("mixed_qkv.dims.back() < 4");
+                        Data temp;
+                        Mul(mixed_qkv, 1.0f, temp);
+                        Repeat(temp, -1, 4, mixed_qkv);
+                        // ErrorInFastLLM("mixed_qkv.dims.back() < 4");
                     }
 
                     Conv1DPerChannel(
