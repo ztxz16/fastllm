@@ -479,12 +479,6 @@ namespace fastllm {
         // Data &insertPositions = this->forwardDataManager.GetData("insertPositions");
         Data attenOutput;
         // Data &attenOutput = this->forwardDataManager.GetData("attenOutput");
-        Data w1, w2, w3;
-        Data routerLogits;
-        Data sharedGate;
-        Data moeFinal, moeFinal2;
-        Data tempInput, tempOutput;
-        Data attenPart, moePart;
         bool generatedBatchDecodeParams = false;
         bool generatedAppendPagedCacheBatchParams = false;
 
@@ -964,6 +958,13 @@ namespace fastllm {
                 ErrorInFastLLM("Qwen3.5 layer " + std::to_string(i) + " has neither dense MLP nor MoE weights.");
             }
 
+            Data w1, w2, w3;
+            Data routerLogits;
+            Data sharedGate;
+            Data moeFinal, moeFinal2;
+            Data tempInput, tempOutput;
+            Data attenPart, moePart;
+
             std::string gateBiasName = language_prefix + "layers." + std::to_string(i) + ".mlp.gate.e_score_correction_bias";
             std::string firstExpertGateupName = language_prefix + "layers." + std::to_string(i) + ".mlp.experts.0.gateup_proj.weight";
             std::string sharedGateupWeightName = language_prefix + "layers." + std::to_string(i) + ".mlp.shared_expert.gateup_proj.weight";
@@ -976,9 +977,6 @@ namespace fastllm {
             int flatBatch = attenInput.dims[0];
             int flatLen = attenInput.dims[1];
             attenInput.Reshape({flatBatch * flatLen, attenInput.dims[2]});
-            moeFinal = Data();
-            moeFinal2 = Data();
-            sharedGate = Data();
 
             Linear(attenInput, weight[gateWeightName], Data(), routerLogits);
             ToDataType(routerLogits, DataType::FLOAT32);
