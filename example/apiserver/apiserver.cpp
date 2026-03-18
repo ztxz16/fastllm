@@ -341,10 +341,16 @@ struct WorkQueue {
             }
 
             std::string output = "";
-            fastllm::ChatMessages messages;
-            messages.push_back({"user", node->config["prompt"].string_value()});
-            auto prompt = model->ApplyChatTemplate(messages);
-            auto inputs = model->weight.tokenizer.Encode(prompt);
+            bool rawPrompt = node->config["raw_prompt"].is_bool() && node->config["raw_prompt"].bool_value();
+            fastllm::Data inputs;
+            if (rawPrompt) {
+                inputs = model->weight.tokenizer.Encode(node->config["prompt"].string_value());
+            } else {
+                fastllm::ChatMessages messages;
+                messages.push_back({"user", node->config["prompt"].string_value()});
+                auto prompt = model->ApplyChatTemplate(messages);
+                inputs = model->weight.tokenizer.Encode(prompt);
+            }
             std::vector<int> tokens;
             for (int i = 0; i < inputs.Count(0); i++) {
                 tokens.push_back(((float *) inputs.cpuData)[i]);
@@ -400,8 +406,24 @@ struct WorkQueue {
                 return;
             }
 
-            auto prompt = model->ApplyChatTemplate(chatMessages);
-            auto inputs = model->weight.tokenizer.Encode(prompt);
+            bool rawPrompt = node->config["raw_prompt"].is_bool() && node->config["raw_prompt"].bool_value();
+            fastllm::Data inputs;
+            if (rawPrompt) {
+                if (!node->config["prompt"].is_string()) {
+                    node->error = "raw_prompt requires a string prompt.\n";
+                } else {
+                    inputs = model->weight.tokenizer.Encode(node->config["prompt"].string_value());
+                }
+            } else {
+                auto prompt = model->ApplyChatTemplate(chatMessages);
+                inputs = model->weight.tokenizer.Encode(prompt);
+            }
+            if (node->error != "") {
+                message += node->error;
+                int ret = write(node->client, message.c_str(), message.length());
+                close(node->client);
+                return;
+            }
             std::vector<int> tokens;
             for (int i = 0; i < inputs.Count(0); i++) {
                 tokens.push_back(((float *) inputs.cpuData)[i]);
