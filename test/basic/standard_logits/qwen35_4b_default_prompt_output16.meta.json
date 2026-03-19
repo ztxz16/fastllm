@@ -1,0 +1,27 @@
+{
+  "name": "qwen35_4b_default_prompt_output16",
+  "created_at": "2026-03-18",
+  "model_path": "/home/tf/hfmodels/Qwen/Qwen3.5-4B",
+  "script": "test/basic/logits_test.py",
+  "env": {
+    "FASTLLM_PRINT_LOGITS": "1"
+  },
+  "request": {
+    "system": "You are a helpful assistant.",
+    "prompt": "北京有什么景点？",
+    "output_tokens": 16,
+    "do_sample": false,
+    "top_p": 0.8,
+    "top_k": 1,
+    "temperature": 1.0,
+    "repeat_penalty": 1.0,
+    "warmup": false
+  },
+  "response": "北京作为中国的古都，拥有极其丰富的历史文化遗产和现代都市景观。以下",
+  "artifacts": {
+    "full_log": "test/basic/standard_logits/qwen35_4b_default_prompt_output16.full.log",
+    "logits_log": "test/basic/standard_logits/qwen35_4b_default_prompt_output16.logits.txt",
+    "logits_blocks": 16,
+    "logits_format": "Each token contributes 3 lines: header, shape, data."
+  }
+}

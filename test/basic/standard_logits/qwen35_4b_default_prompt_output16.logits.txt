@@ -1,0 +1,48 @@
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 7.925781 7.554688 13.351562 ... -1.368164 -1.368164 -1.368164 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 4.832031 4.832031 5.292969 ... -2.101562 -2.101562 -2.101562 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: -0.483154 10.445312 4.457031 ... -2.507812 -2.507812 -2.507812 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: -1.725586 9.375000 3.166016 ... -1.501953 -1.502930 -1.501953 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 0.017136 7.851562 4.207031 ... -1.963867 -1.963867 -1.963867 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 1.284180 6.933594 7.988281 ... -2.681641 -2.681641 -2.681641 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 1.616211 10.757812 7.406250 ... -3.968750 -3.968750 -3.968750 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 2.476562 5.585938 7.625000 ... -1.375000 -1.375000 -1.375000 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 2.443359 7.214844 6.929688 ... -2.519531 -2.519531 -2.519531 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 1.878906 2.712891 1.605469 ... -1.919922 -1.919922 -1.919922 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 3.634766 4.089844 3.421875 ... -2.402344 -2.402344 -2.402344 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 2.410156 3.890625 4.054688 ... -2.007812 -2.007812 -2.007812 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 0.885742 3.734375 1.760742 ... -1.037109 -1.037109 -1.037109 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 0.314209 2.847656 0.112793 ... -1.641602 -1.641602 -1.641602 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 5.105469 6.902344 2.191406 ... -1.005859 -1.006836 -1.005859 
+LLMSamplingBlock logits:
+shape: 1 1 248320 
+data: 2.783203 6.957031 5.472656 ... -2.154297 -2.154297 -2.154297 
