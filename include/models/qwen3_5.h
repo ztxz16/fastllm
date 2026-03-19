@@ -77,9 +77,11 @@ namespace fastllm {
         std::vector <std::vector <Data*> > weights;
         std::vector <std::vector <Data*> > biass;
         bool moeWeightsPrepared = false;
+        bool gdnMergedWeightsPrepared = false;
 
         void SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix);
         void PrepareMoeWeights();
+        void PrepareGdnWeights();
     };
 }
 

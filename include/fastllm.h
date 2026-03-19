@@ -850,6 +850,8 @@ namespace fastllm {
 
     void MambaSoftplus(const Data &input, Data &aLog, Data &dtBias, Data &output);
 
+    void SigmoidMambaSoftplus(Data &sigmoidInputOutput, const Data &softplusInput, Data &aLog, Data &dtBias, Data &softplusOutput);
+
     void Mul(const Data &input, float v, Data &output);
 
     void MulTo(Data &input0, const Data &input1); // input0 *= input1
@@ -859,7 +861,7 @@ namespace fastllm {
     void TransferAttn(Data &input);
 
     void RecurrentGatedDeltaRule(Data &q, Data &k, Data &v, Data &g, Data &b, 
-                                Data &last_recurrent_state, Data &core_attn_out);
+                                Data &last_recurrent_state, Data &core_attn_out, float qScale = 1.0f);
 
     void ChunkGatedDeltaRulePrefill(Data &q, Data &k, Data &v, Data &g,
                                 Data &attn, Data &k_cumdecay,

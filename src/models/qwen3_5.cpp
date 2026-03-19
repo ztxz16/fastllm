@@ -7,9 +7,7 @@
 #include "qwen3_5.h"
 
 #include <algorithm>
-#include <sstream>
-
-#include <unordered_map>
+#include <mutex>
 
 #include <cctype>
 #include <cstring>
@@ -51,17 +49,81 @@ namespace fastllm {
         return lowered == "1" || lowered == "true" || lowered == "on";
     }
 
-    static bool IsFloatLikeType(DataType dataType) {
-        return dataType == DataType::FLOAT32 ||
-               dataType == DataType::FLOAT16 ||
-               dataType == DataType::BFLOAT16;
+    static bool CanUseSingleRowLastDimView(const Data &input) {
+        if (input.dims.empty() || input.unitSizeDiv != 1 || input.strides.empty() || input.strides.back() != 1) {
+            return false;
+        }
+        int outer = 1;
+        for (int i = 0; i + 1 < (int) input.dims.size(); i++) {
+            outer *= input.dims[i];
+        }
+        return outer == 1;
     }
 
-    static void CheckAddInputType(const Data &data, const std::string &name, int layer) {
-        if (!IsFloatLikeType(data.dataType)) {
-            ErrorInFastLLM("Qwen3.5 layer " + std::to_string(layer) + " AddTo input `" + name +
-                           "` has unsupported data type " + std::to_string((int)data.dataType) + ".");
+    static void MakeSingleRowLastDimView(const Data &input, int start, int end, Data &output) {
+        AssertInFastLLM(CanUseSingleRowLastDimView(input),
+                        "Single-row last-dim view requires a contiguous one-row tensor.");
+        AssertInFastLLM(start >= 0 && end >= start && end <= input.dims.back(),
+                        "Single-row last-dim view range is out of bounds.");
+
+        std::vector<int> dims = input.dims;
+        dims.back() = end - start;
+        if (input.dataDevice == DataDevice::CPU) {
+            output = Data(input.dataType, dims, input.dataDevice, input.cpuData + (size_t) start * input.unitSize);
+        } else if (input.dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+            output = Data(input.dataType, dims, input.dataDevice, (uint8_t*) input.cudaData + (size_t) start * input.unitSize);
+#else
+            ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
+        } else {
+            ErrorInFastLLM("Single-row last-dim view only supports CPU/CUDA tensors.");
         }
+        output.dataDeviceIds = input.dataDeviceIds;
+    }
+
+    static void ShiftAppendSingleTokenLinearAttentionCache(Data &cache, const Data &newToken) {
+        AssertInFastLLM(cache.dataType == newToken.dataType && cache.unitSizeDiv == 1 && newToken.unitSizeDiv == 1,
+                        "Linear attention decode cache update only supports float-like tensors.");
+        AssertInFastLLM(cache.dataDevice == newToken.dataDevice,
+                        "Linear attention decode cache update expects the same device.");
+        AssertInFastLLM(cache.dims.size() == 3 && newToken.dims.size() == 3 &&
+                        cache.dims[0] == 1 && newToken.dims[0] == 1 &&
+                        cache.dims[1] == newToken.dims[1] && newToken.dims[2] == 1 &&
+                        cache.strides.back() == 1 && newToken.strides.back() == 1,
+                        "Linear attention decode cache update expects [1, channels, window] and [1, channels, 1].");
+
+        int channels = cache.dims[1];
+        int window = cache.dims[2];
+        int unitSize = cache.unitSize;
+        if (cache.dataDevice == DataDevice::CPU) {
+            for (int c = 0; c < channels; c++) {
+                uint8_t *cacheRow = cache.cpuData + (size_t) c * window * unitSize;
+                const uint8_t *newTokenRow = newToken.cpuData + (size_t) c * unitSize;
+                memmove(cacheRow, cacheRow + unitSize, (size_t) (window - 1) * unitSize);
+                memcpy(cacheRow + (size_t) (window - 1) * unitSize, newTokenRow, unitSize);
+            }
+        } else if (cache.dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+            FastllmCudaShiftAppendWindow((uint8_t*) cache.cudaData, (const uint8_t*) newToken.cudaData,
+                                         channels, window, unitSize);
+#else
+            ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
+        } else {
+            ErrorInFastLLM("Linear attention decode cache update only supports CPU/CUDA tensors.");
+        }
+    }
+
+    static void SwapSingleTokenSeqHeadByReshape(Data &input) {
+        AssertInFastLLM(input.dims.size() == 3 || input.dims.size() == 4,
+                        "Single-token seq/head reshape only supports 3D or 4D tensors.");
+        AssertInFastLLM(input.dims.size() >= 3 && input.dims[0] == 1 && (input.dims[1] == 1 || input.dims[2] == 1),
+                        "Single-token seq/head reshape expects batch=1 and one singleton seq/head axis.");
+
+        std::vector<int> dims = input.dims;
+        std::swap(dims[1], dims[2]);
+        input.Reshape(dims);
     }
 
     static bool TryGetFusedMoeLayerPrefix(const std::string &weightName, std::string &layerPrefix) {
@@ -76,6 +138,52 @@ namespace fastllm {
             return true;
         }
         return false;
+    }
+
+    static bool CanMergeLinearWeights(const Data &input0, const Data &input1) {
+        return input0.dims.size() == 2 &&
+               input1.dims.size() == 2 &&
+               input0.dims[1] == input1.dims[1] &&
+               input0.dataType == input1.dataType &&
+               input0.ggmlType == input1.ggmlType &&
+               input0.group == input1.group &&
+               input0.groupCnt == input1.groupCnt &&
+               input0.blockK == input1.blockK &&
+               input0.blockM == input1.blockM &&
+               input0.perChannelAxis == input1.perChannelAxis &&
+               input0.cpuData != nullptr &&
+               input1.cpuData != nullptr;
+    }
+
+    static bool CreateMergedLinearWeight(const Data &input0, const Data &input1,
+                                         const std::string &mergeName, Data &mergeData) {
+        if (!CanMergeLinearWeights(input0, input1)) {
+            return false;
+        }
+
+        int dim0Len = input0.dims[0] + input1.dims[0];
+        mergeData = Data(input0.dataType, {dim0Len, input0.dims[1]});
+        mergeData.name = mergeName;
+        mergeData.isModelWeight = true;
+        mergeData.perChannelAxis = input0.perChannelAxis;
+        mergeData.group = input0.group;
+        mergeData.groupCnt = input0.groupCnt;
+        mergeData.blockK = input0.blockK;
+        mergeData.blockM = input0.blockM;
+        mergeData.Allocate();
+
+        uint64_t offset = 0;
+        for (const Data *input : {&input0, &input1}) {
+            mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, input->perChannelsConfigs);
+            mergeData.zeros = AppendVector(mergeData.zeros, input->zeros);
+            mergeData.scales = AppendVector(mergeData.scales, input->scales);
+            mergeData.mins = AppendVector(mergeData.mins, input->mins);
+            mergeData.halfScales = AppendVector(mergeData.halfScales, input->halfScales);
+            memcpy(mergeData.cpuData + offset, input->cpuData, input->GetBytes());
+            offset += input->GetBytes();
+        }
+        mergeData.CalcWeightSum();
+        return true;
     }
 
     static void SplitExpertLinearWeight(Data &dst, const Data &src, const std::string &name, int expertIndex) {
@@ -165,6 +273,10 @@ namespace fastllm {
             language_prefix + "layers.*.self_attn.k_proj.weight",
             language_prefix + "layers.*.self_attn.v_proj.weight", language_prefix + "layers.*.self_attn.mergeqkv.weight",
             language_prefix + "layers.*.self_attn.W_pack.weight",
+            language_prefix + "layers.*.linear_attn.in_proj_qkv.weight",
+            language_prefix + "layers.*.linear_attn.in_proj_z.weight",
+            language_prefix + "layers.*.linear_attn.in_proj_b.weight",
+            language_prefix + "layers.*.linear_attn.in_proj_a.weight",
             language_prefix + "layers.*.linear_attn.in_proj_qkvz.weight",
             language_prefix + "layers.*.linear_attn.in_proj_ba.weight",
             language_prefix + "layers.*.linear_attn.out_proj.weight"
@@ -426,6 +538,40 @@ namespace fastllm {
         moeWeightsPrepared = true;
     }
 
+    void Qwen3_5Model::PrepareGdnWeights() {
+        if (gdnMergedWeightsPrepared) {
+            return;
+        }
+
+        static std::mutex prepareMutex;
+        std::lock_guard<std::mutex> guard(prepareMutex);
+        if (gdnMergedWeightsPrepared) {
+            return;
+        }
+
+        for (int i = 0; i < block_cnt; i++) {
+            std::string qkvzWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
+            std::string baWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
+            std::string mergedWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvzba.weight";
+            if (this->weight.weight.find(mergedWeightName) != this->weight.weight.end()) {
+                continue;
+            }
+
+            auto qkvzIt = this->weight.weight.find(qkvzWeightName);
+            auto baIt = this->weight.weight.find(baWeightName);
+            if (qkvzIt == this->weight.weight.end() || baIt == this->weight.weight.end()) {
+                continue;
+            }
+
+            Data &mergedWeight = this->weight.weight[mergedWeightName];
+            if (!CreateMergedLinearWeight(qkvzIt->second, baIt->second, mergedWeightName, mergedWeight)) {
+                this->weight.weight.erase(mergedWeightName);
+            }
+        }
+
+        gdnMergedWeightsPrepared = true;
+    }
+
     std::vector <int> Qwen3_5Model::ForwardV2(
         int batch,
         const Data &inputIds,
@@ -502,7 +648,12 @@ namespace fastllm {
             allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, (int)vPositionIds.size()}, vPositionIds));
         }
 
+        bool isSingleTokenDecode = batch == 1 && all1 &&
+                                   !pastKeyValues.empty() &&
+                                   pastKeyValues[0].first->dims.size() > 0;
+
         PrepareMoeWeights();
+        PrepareGdnWeights();
 
         if (!initialized_add1) {
             for (int i = 0; i < block_cnt; i++) {
@@ -540,6 +691,7 @@ namespace fastllm {
             RMSNorm(hiddenStates, this->weight[inputRmsName], rms_norm_eps, attenInput);
             int bsz = attenInput.dims[0], seqlen = attenInput.dims[1];
             Data &pastKey = *pastKeyValues[i].first, &pastValue = *pastKeyValues[i].second;
+            bool residualAddedInBranch = false;
 
             if (weight.weight.find(language_prefix + "layers." + std::to_string(i) + ".self_attn.o_proj.weight") != weight.weight.end()) {
                 // Gate Attention Block
@@ -579,11 +731,9 @@ namespace fastllm {
 
                 RMSNorm(q, this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.q_norm.weight"], rms_norm_eps, q);
                 RMSNorm(k, this->weight[language_prefix + "layers." + std::to_string(i) + ".self_attn.k_norm.weight"], rms_norm_eps, k);
-                {
-                    float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
-                    fastllm::RopeEncoding(q, allPositionIds, rotary_dim, rope_base, ropeScale);
-                    fastllm::RopeEncoding(k, allPositionIds, rotary_dim, rope_base, ropeScale);
-                }
+                float ropeScale = (rope_type == RoPEType::LINEAR_SCALE) ? rope_factor : 1.0f;
+                fastllm::RopeEncoding(q, allPositionIds, rotary_dim, rope_base, ropeScale);
+                fastllm::RopeEncoding(k, allPositionIds, rotary_dim, rope_base, ropeScale);
 
                 PermuteSelf(q, {0, 2, 1, 3});
                 PermuteSelf(k, {0, 2, 1, 3});
@@ -593,17 +743,15 @@ namespace fastllm {
                 k.Reshape(qkvSize);
                 v.Reshape(qkvSize);
 
-                {
-                    // Paged Attention
-                    PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                        i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
-                    PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                        i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
-                    AppendPagedCache(*pagedCacheKManager, pastKey, k);
-                    AppendPagedCache(*pagedCacheVManager, pastValue, v);
-                    AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);
-                    pagedAttentionInited = true;
-                }
+                // Paged Attention
+                PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
+                    i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
+                PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
+                    i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
+                AppendPagedCache(*pagedCacheKManager, pastKey, k);
+                AppendPagedCache(*pagedCacheVManager, pastValue, v);
+                AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);
+                pagedAttentionInited = true;
 
                 PermuteSelf(qkv, {1, 0, 2});
                 qkv.Reshape({seqlen, bsz, -1});
@@ -620,108 +768,190 @@ namespace fastllm {
                 pastKey.isLinearAttention = pastValue.isLinearAttention = true;
                 std::string qkvzWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvz.weight";
                 std::string baWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_ba.weight";
+                std::string qkvzbaWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.in_proj_qkvzba.weight";
                 std::string conv1dWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.weight";
                 std::string conv1dBiasName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.conv1d.bias";
                 std::string aLogName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.A_log";
                 std::string dtBiasName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.dt_bias";
 
                 int kd = num_k_heads * head_k_dim, vd = num_v_heads * head_v_dim;
+                int mixedQkvzDim = this->weight[qkvzWeightName].dims[0];
+                int baMergedDim = this->weight[baWeightName].dims[0];
+                bool hasMergedGdnInLinear = this->weight.weight.find(qkvzbaWeightName) != this->weight.weight.end();
+                if (hasMergedGdnInLinear && !isSingleTokenDecode &&
+                    attenInput.dataDevice == DataDevice::CUDA &&
+                    this->weight[qkvzbaWeightName].dataDevice != DataDevice::CUDA) {
+                    if (!attenInput.dataDeviceIds.empty()) {
+                        this->weight[qkvzbaWeightName].ToDevice(DataDevice::CUDA, attenInput.dataDeviceIds);
+                    } else {
+                        this->weight[qkvzbaWeightName].ToDevice(DataDevice::CUDA);
+                    }
+                }
+                bool useMergedGdnInLinear = isSingleTokenDecode && hasMergedGdnInLinear;
 
-                // Optimization 1: Merge 4 Linear calls into 2
-                // qkv+z fused into one Linear, b+a fused into one Linear
-                Data mixed_qkvz, ba_merged, mixed_qkv, z, b, a, g;
-                Linear(attenInput, weight[qkvzWeightName], Data(), mixed_qkvz);
-                Linear(attenInput, weight[baWeightName], Data(), ba_merged);
+                Data gdn_in_merged, mixed_qkvz, ba_merged, qkvConvInput, z, b, a, g;
+                if (useMergedGdnInLinear) {
+                    Linear(attenInput, weight[qkvzbaWeightName], Data(), gdn_in_merged);
+                    if (CanUseSingleRowLastDimView(gdn_in_merged)) {
+                        MakeSingleRowLastDimView(gdn_in_merged, 0, mixedQkvzDim, mixed_qkvz);
+                        MakeSingleRowLastDimView(gdn_in_merged, mixedQkvzDim, mixedQkvzDim + baMergedDim, ba_merged);
+                    } else {
+                        Split(gdn_in_merged, -1, 0, mixedQkvzDim, mixed_qkvz);
+                        Split(gdn_in_merged, -1, mixedQkvzDim, mixedQkvzDim + baMergedDim, ba_merged);
+                    }
+                } else {
+                    Linear(attenInput, weight[qkvzWeightName], Data(), mixed_qkvz);
+                    Linear(attenInput, weight[baWeightName], Data(), ba_merged);
+                }
 
                 // Split qkvz -> mixed_qkv + z
-                int qkvz_dim = kd * 2 + vd;
-                Split(mixed_qkvz, -1, 0, qkvz_dim, mixed_qkv);
-                Split(mixed_qkvz, -1, qkvz_dim, qkvz_dim + vd, z);
+                int qkvzDim = kd * 2 + vd;
+                if (isSingleTokenDecode && CanUseSingleRowLastDimView(mixed_qkvz)) {
+                    MakeSingleRowLastDimView(mixed_qkvz, 0, qkvzDim, qkvConvInput);
+                    MakeSingleRowLastDimView(mixed_qkvz, qkvzDim, qkvzDim + vd, z);
+                } else {
+                    Split(mixed_qkvz, -1, 0, qkvzDim, qkvConvInput);
+                    Split(mixed_qkvz, -1, qkvzDim, qkvzDim + vd, z);
+                }
 
                 // Split ba -> b + a (note: b and a have dim num_v_heads, not vd)
-                Split(ba_merged, -1, 0, num_v_heads, b);
-                Split(ba_merged, -1, num_v_heads, num_v_heads * 2, a);
+                if (isSingleTokenDecode && CanUseSingleRowLastDimView(ba_merged)) {
+                    MakeSingleRowLastDimView(ba_merged, 0, num_v_heads, b);
+                    MakeSingleRowLastDimView(ba_merged, num_v_heads, num_v_heads * 2, a);
+                } else {
+                    Split(ba_merged, -1, 0, num_v_heads, b);
+                    Split(ba_merged, -1, num_v_heads, num_v_heads * 2, a);
+                }
 
                 // mixed_qkv: (bsz, seqlen, key_dim*2+value_dim) -> transpose to (bsz, key_dim*2+value_dim, seqlen)
-                PermuteSelf(mixed_qkv, {0, 2, 1});
-
-                z.Reshape({bsz, seqlen, -1, head_v_dim});
-                Data conv;
-                if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
-                    Data hidden_states_new;
-                    Cat(pastKey, mixed_qkv, -1, hidden_states_new);
-                    Split(hidden_states_new, -1, hidden_states_new.dims.back() - 4, hidden_states_new.dims.back(), pastKey);
-                    Conv1DPerChannel(
-                        hidden_states_new, weight[conv1dWeightName], weight[conv1dBiasName], 
-                        hidden_states_new.dims[1], weight[conv1dWeightName].dims[0], 4, 1, 0, 
-                        conv
-                    );
-                    Split(conv, -1, conv.dims.back() - 1, conv.dims.back(), mixed_qkv);
-                    Silu(mixed_qkv, mixed_qkv);
+                if (isSingleTokenDecode) {
+                    SwapSingleTokenSeqHeadByReshape(qkvConvInput);
                 } else {
-                    if (mixed_qkv.dims.back() >= 4) {
-                        Split(mixed_qkv, -1, mixed_qkv.dims.back() - 4, mixed_qkv.dims.back(), pastKey);
+                    PermuteSelf(qkvConvInput, {0, 2, 1});
+                }
+                z.Reshape({bsz, seqlen, -1, head_v_dim});
+                Data conv, convOutput;
+                if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
+                    bool fusedDecodeConvSilu = false;
+                    bool canTryFusedDecodeConvSilu = false;
+                    #ifdef USE_CUDA
+                    canTryFusedDecodeConvSilu =
+                        pastKey.dataDevice == DataDevice::CUDA &&
+                        pastKey.dataType == DataType::FLOAT16 &&
+                        qkvConvInput.dataDevice == DataDevice::CUDA &&
+                        qkvConvInput.dataType == DataType::FLOAT16 &&
+                        weight[conv1dWeightName].dataDevice == DataDevice::CUDA &&
+                        weight[conv1dWeightName].dataType == DataType::FLOAT32 &&
+                        weight[conv1dBiasName].dataDevice == DataDevice::CUDA;
+                    #endif
+                    if (!canTryFusedDecodeConvSilu) {
+                        ShiftAppendSingleTokenLinearAttentionCache(pastKey, qkvConvInput);
+                    }
+
+                    #ifdef USE_CUDA
+                    if (canTryFusedDecodeConvSilu) {
+                        fusedDecodeConvSilu = FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(
+                            pastKey, qkvConvInput, weight[conv1dWeightName], weight[conv1dBiasName], convOutput);
+                    }
+                    if (!fusedDecodeConvSilu)
+                    #endif
+                    {
+                        if (canTryFusedDecodeConvSilu) {
+                            ShiftAppendSingleTokenLinearAttentionCache(pastKey, qkvConvInput);
+                        }
+                        Conv1DPerChannel(
+                            pastKey, weight[conv1dWeightName], weight[conv1dBiasName],
+                            pastKey.dims[1], weight[conv1dWeightName].dims[0], 4, 1, 0,
+                            convOutput
+                        );
+                    }
+                    if (!fusedDecodeConvSilu) {
+                        Silu(convOutput, convOutput);
+                    }
+                } else {
+                    if (qkvConvInput.dims.back() >= 4) {
+                        Split(qkvConvInput, -1, qkvConvInput.dims.back() - 4, qkvConvInput.dims.back(), pastKey);
                         pastKey.expansionDims = pastKey.dims;
                     } else {
                         Data temp;
-                        Mul(mixed_qkv, 1.0f, temp);
-                        Repeat(temp, -1, 4, mixed_qkv);
-                        // ErrorInFastLLM("mixed_qkv.dims.back() < 4");
+                        Mul(qkvConvInput, 1.0f, temp);
+                        Repeat(temp, -1, 4, qkvConvInput);
                     }
 
                     Conv1DPerChannel(
-                        mixed_qkv, weight[conv1dWeightName], weight[conv1dBiasName], 
-                        mixed_qkv.dims[1], weight[conv1dWeightName].dims[0], 4, 1, 3, 
+                        qkvConvInput, weight[conv1dWeightName], weight[conv1dBiasName],
+                        qkvConvInput.dims[1], weight[conv1dWeightName].dims[0], 4, 1, 3,
                         conv
                     );
-                    Split(conv, -1, 0, seqlen, mixed_qkv);
-                    Silu(mixed_qkv, mixed_qkv);
+                    Split(conv, -1, 0, seqlen, convOutput);
+                    Silu(convOutput, convOutput);
                 }
 
                 // mixed_qkv: (bsz, conv_dim, seqlen) -> transpose back to (bsz, seqlen, conv_dim)
-                PermuteSelf(mixed_qkv, {0, 2, 1});
+                if (isSingleTokenDecode) {
+                    SwapSingleTokenSeqHeadByReshape(convOutput);
+                } else {
+                    PermuteSelf(convOutput, {0, 2, 1});
+                }
 
-                Split(mixed_qkv, -1, 0, kd, q);
-                Split(mixed_qkv, -1, kd, kd + kd, k);
-                Split(mixed_qkv, -1, kd + kd, kd + kd + vd, v);
+                if (isSingleTokenDecode && CanUseSingleRowLastDimView(convOutput)) {
+                    MakeSingleRowLastDimView(convOutput, 0, kd, q);
+                    MakeSingleRowLastDimView(convOutput, kd, kd + kd, k);
+                    MakeSingleRowLastDimView(convOutput, kd + kd, kd + kd + vd, v);
+                } else {
+                    Split(convOutput, -1, 0, kd, q);
+                    Split(convOutput, -1, kd, kd + kd, k);
+                    Split(convOutput, -1, kd + kd, kd + kd + vd, v);
+                }
                 
                 q.Reshape({q.dims[0], q.dims[1], -1, head_k_dim});
                 k.Reshape({k.dims[0], k.dims[1], -1, head_k_dim});
                 v.Reshape({v.dims[0], v.dims[1], -1, head_v_dim});
 
-                Sigmoid(b, b);
-                MambaSoftplus(a, weight[aLogName], weight[dtBiasName], g);
+                #ifdef USE_CUDA
+                if (b.dataDevice == DataDevice::CUDA &&
+                    a.dataDevice == DataDevice::CUDA &&
+                    (b.dataType == DataType::FLOAT32 || b.dataType == DataType::FLOAT16) &&
+                    a.dataType == b.dataType &&
+                    weight[aLogName].dataDevice == DataDevice::CUDA &&
+                    weight[dtBiasName].dataDevice == DataDevice::CUDA) {
+                    SigmoidMambaSoftplus(b, a, weight[aLogName], weight[dtBiasName], g);
+                } else
+                #endif
+                {
+                    Sigmoid(b, b);
+                    MambaSoftplus(a, weight[aLogName], weight[dtBiasName], g);
+                }
 
 
                 Data &last_recurrent_state = pastValue;
 
                 Data core_attn_out, core_attn_out_temp;
                 if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
-                    // torch_recurrent_gated_delta_rule
-                    {
-                        RMSNorm(q, inv_scale_data, rms_norm_eps, q);
-                        RMSNorm(k, inv_scale_data, rms_norm_eps, k);
-                    }
+                    RMSNorm(q, inv_scale_data, rms_norm_eps, q);
+                    RMSNorm(k, inv_scale_data, rms_norm_eps, k);
 
-                    PermuteSelf(q, {0, 2, 1, 3});
-                    PermuteSelf(k, {0, 2, 1, 3});
-                    PermuteSelf(v, {0, 2, 1, 3});
-                    PermuteSelf(b, {0, 2, 1});
-                    PermuteSelf(g, {0, 2, 1});
+                    SwapSingleTokenSeqHeadByReshape(q);
+                    SwapSingleTokenSeqHeadByReshape(k);
+                    SwapSingleTokenSeqHeadByReshape(v);
+                    SwapSingleTokenSeqHeadByReshape(b);
+                    SwapSingleTokenSeqHeadByReshape(g);
 
-                    int key_batch_size = k.dims[0], key_sequence_length = k.dims[1], key_num_heads = k.dims[2], key_k_head_dim = k.dims[3];
-                    int v_head_dim_local = v.dims.back();
                     float scale = 1.0f / pow(q.dims.back(), 0.5);
-                    Mul(q, scale, q);
+                    float recurrentQScale = 1.0f;
+                    if (q.dataDevice == DataDevice::CUDA) {
+                        recurrentQScale = scale;
+                    } else {
+                        Mul(q, scale, q);
+                    }
 
                     RecurrentGatedDeltaRule (
                         q, k, v, g, b,
                         last_recurrent_state, 
-                        core_attn_out
-                    ); 
-                    PermuteSelf(core_attn_out, {0, 2, 1, 3});
+                        core_attn_out, recurrentQScale
+                    );
+                    SwapSingleTokenSeqHeadByReshape(core_attn_out);
                 } else {
-                    // torch_chunk_gated_delta_rule
                     if (num_v_heads / num_k_heads > 1) {
                         Data qrepeat, krepeat;
                         Mul(q, 1.0f, qrepeat);
@@ -756,7 +986,7 @@ namespace fastllm {
                     int pad_size = (chunk_size - seq % chunk_size) % chunk_size;
 
                     Data qq, kk, vv, bb, gg, decayMask;
-                    Data qq_pad, kk_pad, vv_pad, bb_pad, gg_pad; // used only when pad_size > 0
+                    Data kk_pad, vv_pad, bb_pad, gg_pad;
                     Data *pkk, *pvv, *pbb, *pgg;
                     if (pad_size > 0) {
                         Data qtemp;
@@ -804,7 +1034,6 @@ namespace fastllm {
                     Data k_cumdecay, g_exp;                    
                     Exp(*pgg, g_exp);
 
-                    // Optimization: avoid k_temp copy - MulTo k_beta directly since k_beta is not used after this
                     MulTo(k_beta, g_exp);
                     MatMul(attn, k_beta, k_cumdecay);
 
@@ -930,22 +1159,62 @@ namespace fastllm {
 
                 {
                     std::vector <int> zShape = z.dims;
+                    std::string outNormWeightName = language_prefix + "layers." + std::to_string(i) + ".linear_attn.norm.weight";
                     core_attn_out.Reshape({-1, core_attn_out.dims.back()});
                     z.Reshape({-1, z.dims.back()});
 
-                    RMSNorm(core_attn_out, this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.norm.weight"], rms_norm_eps, core_attn_out);
-                    Silu(z, z);
-                    MulTo(core_attn_out, z);
+#ifdef USE_CUDA
+                    if (isSingleTokenDecode &&
+                        core_attn_out.dataDevice == DataDevice::CUDA &&
+                        core_attn_out.dataType == DataType::FLOAT16 &&
+                        z.dataDevice == DataDevice::CUDA &&
+                        z.dataType == DataType::FLOAT16 &&
+                        this->weight[outNormWeightName].dataDevice == DataDevice::CUDA &&
+                        this->weight[outNormWeightName].dataType == DataType::FLOAT32 &&
+                        core_attn_out.dims == z.dims &&
+                        FastllmCudaRMSNormSiluMulFloat16(
+                            core_attn_out, this->weight[outNormWeightName], z, core_attn_out, rms_norm_eps)) {
+                    } else
+#endif
+                    {
+                        RMSNorm(core_attn_out, this->weight[outNormWeightName], rms_norm_eps, core_attn_out);
+                        Silu(z, z);
+                        MulTo(core_attn_out, z);
+                    }
 
                     core_attn_out.Reshape({zShape[0], zShape[1], -1});
-                    Linear(core_attn_out, 
-                        this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"], 
-                        Data(), attenInput);
+                    if (isSingleTokenDecode &&
+                        core_attn_out.dataDevice == DataDevice::CUDA &&
+                        core_attn_out.dataType == DataType::FLOAT16 &&
+                        hiddenStates.dataDevice == DataDevice::CUDA &&
+                        hiddenStates.dataType == DataType::FLOAT16) {
+                        int n = core_attn_out.Count(0) / core_attn_out.dims.back();
+                        int m = core_attn_out.dims.back();
+                        int k = hiddenStates.dims.back();
+#ifdef USE_CUDA
+                        if (FastllmCudaHalfMatMulFloat16AddToNoBias(
+                                core_attn_out,
+                                this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"],
+                                hiddenStates, n, m, k)) {
+                            residualAddedInBranch = true;
+                        } else
+#endif
+                        {
+                            Linear(core_attn_out,
+                                   this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"],
+                                   Data(), attenInput);
+                        }
+                    } else {
+                        Linear(core_attn_out, 
+                            this->weight[language_prefix + "layers." + std::to_string(i) + ".linear_attn.out_proj.weight"], 
+                            Data(), attenInput);
+                    }
                 }
             }
 
-            CheckAddInputType(hiddenStates, "hiddenStates_after_attn", i);
-            AddTo(hiddenStates, attenInput);
+            if (!residualAddedInBranch) {
+                AddTo(hiddenStates, attenInput);
+            }
             RMSNorm(hiddenStates, this->weight[postRmsName], rms_norm_eps, attenInput);
             if (weight.weight.find(swigluWeightName) != weight.weight.end() &&
                 weight.weight.find(downWeightName) != weight.weight.end()) {
@@ -1088,7 +1357,6 @@ namespace fastllm {
                         if (w2.dataType != moePart.dataType) {
                             ToDataType(w2, moePart.dataType);
                         }
-                        CheckAddInputType(moePart, "moePart", i);
                         AddTo(moePart, w2, value);
                     }
                     if (moePart.dataType != moeFinal.dataType) {
@@ -1106,14 +1374,12 @@ namespace fastllm {
             if (tempMoeFinal.dataType != hiddenStates.dataType) {
                 ToDataType(tempMoeFinal, hiddenStates.dataType);
             }
-            CheckAddInputType(hiddenStates, "hiddenStates_after_moe", i);
             AddTo(hiddenStates, tempMoeFinal);
             if (moeFinal2.dims.size() != 0) {
                 moeFinal2.Reshape(hiddenStates.dims);
                 if (moeFinal2.dataType != hiddenStates.dataType) {
                     ToDataType(moeFinal2, hiddenStates.dataType);
                 }
-                CheckAddInputType(hiddenStates, "hiddenStates_after_shared_expert", i);
                 AddTo(hiddenStates, moeFinal2);
             }
         }
@@ -1146,7 +1412,6 @@ namespace fastllm {
     }
 
     void Qwen3_5Model::WarmUp() {
-        printf("Warmup...\n");
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
         Data attentionMask = Data(this->dataType, {1, 1}, {0});
         Data positionIds = Data(this->dataType, {1, 1}, {0, 0});
@@ -1180,6 +1445,5 @@ namespace fastllm {
                 (long long)pastKeyValues[i].first.dims[0] * pastKeyValues[i].first.dims[2] +
                 (long long)pastKeyValues[i].second.dims[0] * pastKeyValues[i].second.dims[2];
         }
-        printf("finish.\n");
     }
 }

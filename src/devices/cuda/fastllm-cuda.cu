@@ -419,6 +419,33 @@ __global__ void FastllmMambaSoftplusKernel(half* inputData, half *outputData, fl
     }
 }
 
+__global__ void FastllmSigmoidMambaSoftplusKernel(float *sigmoidData, const float *softplusInputData, float *softplusOutputData,
+                                                  const float *aLog, const float *dtBias, int channels) {
+    int o = blockIdx.x;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        int idx = o * channels + i;
+        float x = sigmoidData[idx];
+        sigmoidData[idx] = 1.0f / (1.0f + expf(-x));
+        softplusOutputData[idx] = -expf((double)aLog[i]) * softplus(softplusInputData[idx] + dtBias[i]);
+    }
+}
+
+__global__ void FastllmSigmoidMambaSoftplusKernel(half *sigmoidData, const half *softplusInputData, half *softplusOutputData,
+                                                  const float *aLog, const float *dtBias, int channels) {
+    int o = blockIdx.x;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        int idx = o * channels + i;
+#ifdef CUDA_NO_TENSOR_CORE
+        float x = __half2float(sigmoidData[idx]);
+        sigmoidData[idx] = __float2half(1.0f / (1.0f + expf(-x)));
+#else
+        half x = sigmoidData[idx];
+        sigmoidData[idx] = __hdiv(__float2half(1.0f), __hadd(__float2half(1.0f), hexp(-x)));
+#endif
+        softplusOutputData[idx] = __float2half(-exp((double)aLog[i]) * softplus(__half2float(softplusInputData[idx]) + dtBias[i]));
+    }
+}
+
 __global__ void FastllmSwigluKernel(float* __restrict__ a, float* __restrict__ b, int len, int spatial, int mid) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -1921,6 +1948,35 @@ void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void *
 }
 
 template <int THREAD_PER_BLOCK>
+__global__ void FastllmShiftAppendWindowKernel(uint8_t *cache, const uint8_t *newToken,
+                                               int channels, int window, int unitSize) {
+    int channel = blockIdx.x * THREAD_PER_BLOCK + threadIdx.x;
+    if (channel >= channels) {
+        return;
+    }
+
+    uint8_t *cacheRow = cache + (size_t) channel * window * unitSize;
+    const uint8_t *newTokenRow = newToken + (size_t) channel * unitSize;
+    int shiftBytes = (window - 1) * unitSize;
+    for (int i = 0; i < shiftBytes; i++) {
+        cacheRow[i] = cacheRow[i + unitSize];
+    }
+    for (int i = 0; i < unitSize; i++) {
+        cacheRow[shiftBytes + i] = newTokenRow[i];
+    }
+}
+
+void FastllmCudaShiftAppendWindow(uint8_t *cache, const uint8_t *newToken, int channels, int window, int unitSize) {
+    if (channels <= 0 || window <= 0 || unitSize <= 0) {
+        return;
+    }
+    const int kThreads = 256;
+    FastllmShiftAppendWindowKernel<kThreads>
+        <<< (channels + kThreads - 1) / kThreads, kThreads >>>(cache, newToken, channels, window, unitSize);
+    DeviceSync();
+}
+
+template <int THREAD_PER_BLOCK>
 __global__ void FastllmMemcpy2DKernel (uint8_t * 	dst, size_t 	dpitch, uint8_t * 	src,
                                        size_t 	spitch, size_t 	width, size_t 	height) {
     int id = blockIdx.x;
@@ -2096,6 +2152,35 @@ bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output,
     FastllmCudaFinishInput(aLogData, aLog);
     FastllmCudaFinishInput(dtBiasData, dtBias);
     FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fastllm::Data &softplusInput,
+                                     fastllm::Data &softplusOutput, const fastllm::Data &aLogData, const fastllm::Data &dtBiasData) {
+    if (sigmoidInputOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        softplusInput.dataDevice != fastllm::DataDevice::CUDA ||
+        softplusOutput.dataDevice != fastllm::DataDevice::CUDA ||
+        aLogData.dataDevice != fastllm::DataDevice::CUDA ||
+        dtBiasData.dataDevice != fastllm::DataDevice::CUDA) {
+        return false;
+    }
+
+    int dimsLen = softplusInput.dims.size();
+    int outer = softplusInput.Count(0) / softplusInput.Count(dimsLen - 1);
+    int channels = softplusInput.dims[dimsLen - 1];
+    int threadPerBlock = std::min(64, channels);
+    if (sigmoidInputOutput.dataType == fastllm::DataType::FLOAT32) {
+        FastllmSigmoidMambaSoftplusKernel<<<outer, threadPerBlock>>>(
+            (float *) sigmoidInputOutput.cudaData, (const float *) softplusInput.cudaData,
+            (float *) softplusOutput.cudaData, (const float *) aLogData.cudaData, (const float *) dtBiasData.cudaData, channels);
+    } else if (sigmoidInputOutput.dataType == fastllm::DataType::FLOAT16) {
+        FastllmSigmoidMambaSoftplusKernel<<<outer, threadPerBlock>>>(
+            (half *) sigmoidInputOutput.cudaData, (const half *) softplusInput.cudaData,
+            (half *) softplusOutput.cudaData, (const float *) aLogData.cudaData, (const float *) dtBiasData.cudaData, channels);
+    } else {
+        return false;
+    }
+    DeviceSync();
     return true;
 }
 
@@ -2686,6 +2771,140 @@ bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastl
 
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmRMSNormSiluMulHalfKernel(const half *input, const float *weight,
+                                                const half *gateInput, half *output,
+                                                int channels, float eps) {
+    int o = blockIdx.x;
+    input = input + o * channels;
+    gateInput = gateInput + o * channels;
+    output = output + o * channels;
+
+    constexpr int WARP_SIZE = 32;
+    constexpr int NUM_WARPS = THREAD_PER_BLOCK / WARP_SIZE;
+    __shared__ float warp_sums[NUM_WARPS];
+    __shared__ float scale;
+
+    unsigned int tid = threadIdx.x;
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+
+    int half2_channels = channels / 2;
+    const half2 *input_h2 = reinterpret_cast<const half2 *>(input);
+    float sum2 = 0.0f;
+    for (int i = tid; i < half2_channels; i += THREAD_PER_BLOCK) {
+        half2 v = input_h2[i];
+        float2 fv = __half22float2(v);
+        sum2 += fv.x * fv.x + fv.y * fv.y;
+    }
+    if ((channels & 1) && tid == 0) {
+        float x = __half2float(input[channels - 1]);
+        sum2 += x * x;
+    }
+
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+    }
+    if (lane_id == 0) {
+        warp_sums[warp_id] = sum2;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float val = (lane_id < NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xffffffff, val, offset);
+        }
+        if (lane_id == 0) {
+            scale = rsqrtf(val / channels + eps);
+        }
+    }
+    __syncthreads();
+
+    float s = scale;
+    half2 *output_h2 = reinterpret_cast<half2 *>(output);
+    const half2 *gate_h2 = reinterpret_cast<const half2 *>(gateInput);
+    for (int i = tid; i < half2_channels; i += THREAD_PER_BLOCK) {
+        half2 v = input_h2[i];
+        float2 fv = __half22float2(v);
+
+        half2 gateVec = gate_h2[i];
+        half gate0In = __low2half(gateVec);
+        half gate1In = __high2half(gateVec);
+
+#ifdef CUDA_NO_TENSOR_CORE
+        float gate0Float = __half2float(gate0In);
+        float gate1Float = __half2float(gate1In);
+        half gate0 = __float2half(gate0Float / (1.0f + expf(-gate0Float)));
+        half gate1 = __float2half(gate1Float / (1.0f + expf(-gate1Float)));
+#else
+        half gate0 = __hdiv(gate0In, __hadd(__float2half(1.0f), hexp(-gate0In)));
+        half gate1 = __hdiv(gate1In, __hadd(__float2half(1.0f), hexp(-gate1In)));
+#endif
+
+        half rms0 = __float2half_rn(fv.x * s * __ldg(&weight[i * 2]));
+        half rms1 = __float2half_rn(fv.y * s * __ldg(&weight[i * 2 + 1]));
+
+#ifdef CUDA_NO_TENSOR_CORE
+        half out0 = __float2half(__half2float(rms0) * __half2float(gate0));
+        half out1 = __float2half(__half2float(rms1) * __half2float(gate1));
+#else
+        half out0 = __hmul(rms0, gate0);
+        half out1 = __hmul(rms1, gate1);
+#endif
+        output_h2[i] = __halves2half2(out0, out1);
+    }
+
+    if ((channels & 1) && tid == 0) {
+        int last = channels - 1;
+#ifdef CUDA_NO_TENSOR_CORE
+        float gateFloat = __half2float(gateInput[last]);
+        half gate = __float2half(gateFloat / (1.0f + expf(-gateFloat)));
+        half rms = __float2half(__half2float(input[last]) * s * __ldg(&weight[last]));
+        output[last] = __float2half(__half2float(rms) * __half2float(gate));
+#else
+        half gate = __hdiv(gateInput[last], __hadd(__float2half(1.0f), hexp(-gateInput[last])));
+        half rms = __float2half_rn(__half2float(input[last]) * s * __ldg(&weight[last]));
+        output[last] = __hmul(rms, gate);
+#endif
+    }
+}
+
+bool FastllmCudaRMSNormSiluMulFloat16(const fastllm::Data &input, fastllm::Data &weight,
+                                      const fastllm::Data &gateInput, fastllm::Data &output, float eps) {
+    if (input.dataDevice != fastllm::DataDevice::CUDA || gateInput.dataDevice != fastllm::DataDevice::CUDA ||
+        output.dataDevice != fastllm::DataDevice::CUDA || weight.dataDevice != fastllm::DataDevice::CUDA) {
+        return false;
+    }
+    if (input.dataType != fastllm::DataType::FLOAT16 || gateInput.dataType != fastllm::DataType::FLOAT16 ||
+        output.dataType != fastllm::DataType::FLOAT16 || weight.dataType != fastllm::DataType::FLOAT32) {
+        return false;
+    }
+    if (input.dims.size() == 0 || input.dims != gateInput.dims || output.dims != input.dims ||
+        input.strides.empty() || gateInput.strides.empty() || output.strides.empty() ||
+        input.strides.back() != 1 || gateInput.strides.back() != 1 || output.strides.back() != 1 ||
+        weight.dims.size() != 1 || weight.dims[0] != input.dims.back()) {
+        return false;
+    }
+
+    int channels = input.dims.back();
+    int outer = input.Count(0) / channels;
+    const half *cudaInput = (const half *) input.cudaData;
+    const float *cudaWeight = (const float *) weight.cudaData;
+    const half *cudaGateInput = (const half *) gateInput.cudaData;
+    half *cudaOutput = (half *) output.cudaData;
+
+    if (channels < 512) {
+        FastllmRMSNormSiluMulHalfKernel<64><<<outer, 64>>>(cudaInput, cudaWeight, cudaGateInput, cudaOutput, channels, eps);
+    } else if (channels < 4096) {
+        FastllmRMSNormSiluMulHalfKernel<512><<<outer, 512>>>(cudaInput, cudaWeight, cudaGateInput, cudaOutput, channels, eps);
+    } else {
+        FastllmRMSNormSiluMulHalfKernel<1024><<<outer, 1024>>>(cudaInput, cudaWeight, cudaGateInput, cudaOutput, channels, eps);
+    }
+    DeviceSync();
     return true;
 }
 
@@ -4578,6 +4797,144 @@ bool FastllmCudaConv1DPerChannelFloat32(
     return true;
 }
 
+__global__ void FastllmConv1DPerChannelSiluSingleTokenHalfKernel(const half *input, const float *weight,
+                                                                 const float *bias, half *output, int channels) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) {
+        return;
+    }
+
+    const half *curInput = input + c * 4;
+    const float *curWeight = weight + c * 4;
+    float value = bias ? bias[c] : 0.0f;
+    value += __half2float(curInput[0]) * curWeight[0];
+    value += __half2float(curInput[1]) * curWeight[1];
+    value += __half2float(curInput[2]) * curWeight[2];
+    value += __half2float(curInput[3]) * curWeight[3];
+
+    half conv = __float2half_rn(value);
+#ifdef CUDA_NO_TENSOR_CORE
+    float x = __half2float(conv);
+    output[c] = __float2half(x / (1.0f + expf(-x)));
+#else
+    output[c] = __hdiv(conv, __hadd(__float2half(1.0f), hexp(-conv)));
+#endif
+}
+
+__global__ void FastllmShiftAppendConv1DPerChannelSiluSingleTokenHalfKernel(
+    half *cache, const half *newToken, const float *weight, const float *bias, half *output, int channels) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) {
+        return;
+    }
+
+    half *cacheRow = cache + c * 4;
+    const float *curWeight = weight + c * 4;
+    half x0 = cacheRow[1];
+    half x1 = cacheRow[2];
+    half x2 = cacheRow[3];
+    half x3 = newToken[c];
+    cacheRow[0] = x0;
+    cacheRow[1] = x1;
+    cacheRow[2] = x2;
+    cacheRow[3] = x3;
+
+    float value = bias ? bias[c] : 0.0f;
+    value += __half2float(x0) * curWeight[0];
+    value += __half2float(x1) * curWeight[1];
+    value += __half2float(x2) * curWeight[2];
+    value += __half2float(x3) * curWeight[3];
+
+    half conv = __float2half_rn(value);
+#ifdef CUDA_NO_TENSOR_CORE
+    float x = __half2float(conv);
+    output[c] = __float2half(x / (1.0f + expf(-x)));
+#else
+    output[c] = __hdiv(conv, __hadd(__float2half(1.0f), hexp(-conv)));
+#endif
+}
+
+bool FastllmCudaConv1DPerChannelSiluSingleTokenFloat16(const fastllm::Data &input, fastllm::Data &weight,
+                                                       fastllm::Data &bias, fastllm::Data &output) {
+    if (input.dataDevice != fastllm::DataDevice::CUDA || weight.dataDevice != fastllm::DataDevice::CUDA) {
+        return false;
+    }
+    if (input.dataType != fastllm::DataType::FLOAT16 || weight.dataType != fastllm::DataType::FLOAT32 ||
+        (bias.dims.size() > 0 && (bias.dataDevice != fastllm::DataDevice::CUDA || bias.dataType != fastllm::DataType::FLOAT32))) {
+        return false;
+    }
+    bool validWeightShape =
+        (weight.dims.size() == 2 && weight.dims[0] == input.dims[1] && weight.dims[1] == 4) ||
+        (weight.dims.size() == 3 && weight.dims[0] == input.dims[1] && weight.dims[1] == 1 && weight.dims[2] == 4);
+    if (input.dims.size() != 3 || input.dims[0] != 1 || input.dims[2] != 4 ||
+        input.strides.empty() || input.strides.back() != 1 ||
+        !validWeightShape ||
+        (bias.dims.size() > 0 && (bias.dims.size() != 1 || bias.dims[0] != input.dims[1]))) {
+        return false;
+    }
+
+    output.dataType = input.dataType;
+    output.Resize({1, input.dims[1], 1});
+    output.ToDevice(input.dataDevice, input.dataDeviceIds);
+    output.Allocate();
+
+    int channels = input.dims[1];
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (channels + threadsPerBlock - 1) / threadsPerBlock;
+    const half *cudaInput = (const half *) input.cudaData;
+    const float *cudaWeight = (const float *) weight.cudaData;
+    const float *cudaBias = bias.dims.size() > 0 ? (const float *) bias.cudaData : nullptr;
+    half *cudaOutput = (half *) output.cudaData;
+    FastllmConv1DPerChannelSiluSingleTokenHalfKernel<<<blocksPerGrid, threadsPerBlock>>>(
+        cudaInput, cudaWeight, cudaBias, cudaOutput, channels
+    );
+    DeviceSync();
+    return true;
+}
+
+bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(fastllm::Data &cache, const fastllm::Data &newToken,
+                                                                  fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output) {
+    if (cache.dataDevice != fastllm::DataDevice::CUDA || newToken.dataDevice != fastllm::DataDevice::CUDA ||
+        weight.dataDevice != fastllm::DataDevice::CUDA) {
+        return false;
+    }
+    if (cache.dataType != fastllm::DataType::FLOAT16 || newToken.dataType != fastllm::DataType::FLOAT16 ||
+        weight.dataType != fastllm::DataType::FLOAT32 ||
+        (bias.dims.size() > 0 && (bias.dataDevice != fastllm::DataDevice::CUDA || bias.dataType != fastllm::DataType::FLOAT32))) {
+        return false;
+    }
+    bool validWeightShape =
+        (weight.dims.size() == 2 && weight.dims[0] == cache.dims[1] && weight.dims[1] == 4) ||
+        (weight.dims.size() == 3 && weight.dims[0] == cache.dims[1] && weight.dims[1] == 1 && weight.dims[2] == 4);
+    if (cache.dims.size() != 3 || cache.dims[0] != 1 || cache.dims[2] != 4 ||
+        newToken.dims.size() != 3 || newToken.dims[0] != 1 || newToken.dims[1] != cache.dims[1] || newToken.dims[2] != 1 ||
+        cache.strides.empty() || newToken.strides.empty() ||
+        cache.strides.back() != 1 || newToken.strides.back() != 1 ||
+        !validWeightShape ||
+        (bias.dims.size() > 0 && (bias.dims.size() != 1 || bias.dims[0] != cache.dims[1]))) {
+        return false;
+    }
+
+    output.dataType = cache.dataType;
+    output.Resize({1, cache.dims[1], 1});
+    output.ToDevice(cache.dataDevice, cache.dataDeviceIds);
+    output.Allocate();
+
+    int channels = cache.dims[1];
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (channels + threadsPerBlock - 1) / threadsPerBlock;
+    half *cudaCache = (half *) cache.cudaData;
+    const half *cudaNewToken = (const half *) newToken.cudaData;
+    const float *cudaWeight = (const float *) weight.cudaData;
+    const float *cudaBias = bias.dims.size() > 0 ? (const float *) bias.cudaData : nullptr;
+    half *cudaOutput = (half *) output.cudaData;
+    FastllmShiftAppendConv1DPerChannelSiluSingleTokenHalfKernel<<<blocksPerGrid, threadsPerBlock>>>(
+        cudaCache, cudaNewToken, cudaWeight, cudaBias, cudaOutput, channels
+    );
+    DeviceSync();
+    return true;
+}
+
 bool FastllmCudaConv2DFloat32(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, fastllm::Data &output) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         cudaError_t state = cudaSuccess;
@@ -4706,7 +5063,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleKernel(
     const T* b_t,              // [n0, n1]
     const T* q_t,              // [n0, n1, n2]
     T* core_attn_out,          // [n0, n1, n3]
-    int n0, int n1, int n2, int n3, int group)
+    int n0, int n1, int n2, int n3, int group, float qScale)
 {
     // Each block handles one (n0, n1) position
     int batch_idx = blockIdx.x;
@@ -4767,7 +5124,21 @@ __global__ void FastllmRecurrentGatedDeltaRuleKernel(
     if (tid < n3) {
         float sum = 0.0f;
         for (int j = 0; j < n2; j++) {
-            float q_val = (float)q_t[base_idx / group * n2 + j];
+            float q_val = FastllmCudaValueToFloat(q_t[base_idx / group * n2 + j]);
+            if (qScale != 1.0f) {
+                if constexpr (std::is_same_v<T, float>) {
+                    q_val *= qScale;
+                } else if constexpr (std::is_same_v<T, half>) {
+                    half qScaleHalf = __float2half_rn(qScale);
+#ifdef CUDA_NO_TENSOR_CORE
+                    q_val = __half2float(__float2half(__half2float(q_t[base_idx / group * n2 + j]) * __half2float(qScaleHalf)));
+#else
+                    q_val = __half2float(__hmul(q_t[base_idx / group * n2 + j], qScaleHalf));
+#endif
+                } else {
+                    q_val = FastllmCudaValueToFloat(FastllmCudaFloatToValue<T>(q_val * qScale));
+                }
+            }
             int state_idx = base_idx * n2 * n3 + j * n3 + tid;
             sum += (float)last_recurrent_state[state_idx] * q_val;
         }
@@ -4775,7 +5146,7 @@ __global__ void FastllmRecurrentGatedDeltaRuleKernel(
     }
 }
 
-void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out) {
+void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float qScale) {
     // Get dimensions
     int n0 = last_recurrent_state.dims[0];
     int n1 = last_recurrent_state.dims[1];
@@ -4804,12 +5175,12 @@ void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm:
     if (q.dataType == fastllm::DataType::FLOAT32) {
         FastllmRecurrentGatedDeltaRuleKernel <float> <<<gridDim, threadsPerBlock, sharedMemSize>>>(
             d_last_state, d_g, d_k, d_v, d_b, d_q, d_out,
-            n0, n1, n2, n3, group
+            n0, n1, n2, n3, group, qScale
         ); 
     } else if (q.dataType == fastllm::DataType::FLOAT16) {
         FastllmRecurrentGatedDeltaRuleKernel <half> <<<gridDim, threadsPerBlock, sharedMemSize>>>(
             (half*)d_last_state, (half*)d_g, (half*)d_k, (half*)d_v, (half*)d_b, (half*)d_q, (half*)d_out,
-            n0, n1, n2, n3, group
+            n0, n1, n2, n3, group, qScale
         ); 
     }
     

@@ -169,6 +169,84 @@ __global__ void FastllmGemvFp16Fp16Kernel2MultiRow(half *A, half *B, half *C, ha
 }
 
 template <int THREAD_PER_BLOCK, int PART>
+__global__ void FastllmGemvFp16Fp16AddToNoBiasKernel2MultiRow(half *A, half *B, half *C, int m, int k) {
+    __shared__ float sdata[PART][THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    union_half8 regA;
+    union_half8 regB;
+
+    int p = blockIdx.x;
+#pragma unroll
+    for (int x = 0; x < PART; x++) {
+        sdata[x][tid] = 0;
+    }
+
+    const half *baseB = B + p * m;
+    if (m % 8 == 0) {
+#pragma unroll
+        for (int i = tid * 8; i < m; i += THREAD_PER_BLOCK * 8) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                regA.in = *reinterpret_cast<const uint4 *>(A + x * m + i);
+                regB.in = *reinterpret_cast<const uint4 *>(baseB + i);
+                float sum = 0.0f;
+                if (i < m)
+                    sum += __low2float(regA.out2[0]) * __low2float(regB.out2[0]);
+                if (i + 1 < m)
+                    sum += __high2float(regA.out2[0]) * __high2float(regB.out2[0]);
+                if (i + 2 < m)
+                    sum += __low2float(regA.out2[1]) * __low2float(regB.out2[1]);
+                if (i + 3 < m)
+                    sum += __high2float(regA.out2[1]) * __high2float(regB.out2[1]);
+                if (i + 4 < m)
+                    sum += __low2float(regA.out2[2]) * __low2float(regB.out2[2]);
+                if (i + 5 < m)
+                    sum += __high2float(regA.out2[2]) * __high2float(regB.out2[2]);
+                if (i + 6 < m)
+                    sum += __low2float(regA.out2[3]) * __low2float(regB.out2[3]);
+                if (i + 7 < m)
+                    sum += __high2float(regA.out2[3]) * __high2float(regB.out2[3]);
+                sdata[x][tid] += sum;
+            }
+        }
+    } else {
+        for (int i = tid; i < m; i += THREAD_PER_BLOCK) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                sdata[x][tid] += (float)A[i + x * m] * (float)baseB[i];
+            }
+        }
+    }
+    __syncthreads();
+
+    float diff = 0.0f;
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                float other = sdata[x][tid + s] - diff;
+                float sumTmp = sdata[x][tid] + other;
+                diff = (sumTmp - sdata[x][tid]) - other;
+                sdata[x][tid] = sumTmp;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+#ifdef CUDA_NO_TENSOR_CORE
+            C[p + k * x] = __float2half(__half2float(C[p + k * x]) + __half2float(__float2half_rn(sdata[x][0])));
+#else
+            C[p + k * x] = __hadd(C[p + k * x], __float2half_rn(sdata[x][0]));
+#endif
+        }
+    }
+    __syncthreads();
+}
+
+template <int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvFp32Fp16Kernel2MultiRow(float *A, half *B, float *C, float *bias, int m, int k) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
@@ -400,6 +478,27 @@ void LaunchFastllmGemmFp16Fp16(half *input, half *weight, half *output, half *bi
     }
 }
 
+void LaunchFastllmGemmFp16Fp16AddToNoBias(half *input, half *weight, half *output, int n, int m, int k) {
+    if (n == 1) {
+        FastllmGemvFp16Fp16AddToNoBiasKernel2MultiRow<256, 1> <<< k, 256 >>>(input, weight, output, m, k);
+    } else if (n == 2) {
+        FastllmGemvFp16Fp16AddToNoBiasKernel2MultiRow<256, 2> <<< k, 256 >>>(input, weight, output, m, k);
+    } else if (n == 3) {
+        FastllmGemvFp16Fp16AddToNoBiasKernel2MultiRow<256, 3> <<< k, 256 >>>(input, weight, output, m, k);
+    } else if (n == 4) {
+        FastllmGemvFp16Fp16AddToNoBiasKernel2MultiRow<256, 4> <<< k, 256 >>>(input, weight, output, m, k);
+    } else if (n == 5) {
+        FastllmGemvFp16Fp16AddToNoBiasKernel2MultiRow<256, 5> <<< k, 256 >>>(input, weight, output, m, k);
+    } else if (n == 6) {
+        FastllmGemvFp16Fp16AddToNoBiasKernel2MultiRow<256, 6> <<< k, 256 >>>(input, weight, output, m, k);
+    } else if (n == 7) {
+        FastllmGemvFp16Fp16AddToNoBiasKernel2MultiRow<256, 7> <<< k, 256 >>>(input, weight, output, m, k);
+    } else {
+        printf("Error: LaunchFastllmGemmFp16Fp16AddToNoBias: n > 7.\n");
+        exit(0);
+    }
+}
+
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo) {
     FastllmCudaFP16EnsureBiasOnDevice(weight, bias, k);
     FastllmCudaFP16EnsureBiasHalfOnDevice(weight, bias, k);
@@ -461,6 +560,20 @@ bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &wei
         }
     }
 
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaHalfMatMulFloat16AddToNoBias(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, int n, int m, int k) {
+    if (n >= 8 || input.dataType != fastllm::DataType::FLOAT16 ||
+        weight.dataType != fastllm::DataType::FLOAT16 || output.dataType != fastllm::DataType::FLOAT16) {
+        return false;
+    }
+
+    half *cudaInput = (half *) FastllmCudaPrepareInput(input);
+    half *cudaOutput = (half *) FastllmCudaPrepareOutput(output);
+    LaunchFastllmGemmFp16Fp16AddToNoBias(cudaInput, (half*)weight.cudaData, cudaOutput, n, m, k);
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;

@@ -3168,6 +3168,13 @@ namespace fastllm {
         }, {}, {});
     }
 
+    void SigmoidMambaSoftplus(Data &sigmoidInputOutput, const Data &softplusInput, Data &aLog, Data &dtBias, Data &softplusOutput) {
+        curExecutor->Run("SigmoidMambaSoftplus", {
+                {"sigmoidInputOutput", &sigmoidInputOutput}, {"softplusInput", (Data*)&softplusInput},
+                {"aLog", &aLog}, {"dtBias", &dtBias}, {"softplusOutput", &softplusOutput}
+        }, {}, {});
+    }
+
     void SwigluGptOss(const fastllm::Data &input, fastllm::Data &output) {
         curExecutor->Run("SwigluGptOss", {
                 {"input", (Data*)&input}, {"output", &output}
@@ -3199,11 +3206,11 @@ namespace fastllm {
     }
 
     void RecurrentGatedDeltaRule(Data &q, Data &k, Data &v, Data &g, Data &b, 
-                                Data &last_recurrent_state, Data &core_attn_out) {
+                                Data &last_recurrent_state, Data &core_attn_out, float qScale) {
         curExecutor->Run("RecurrentGatedDeltaRule", {
             {"q", &q}, {"k", &k}, {"v", &v}, {"g", &g}, {"b", &b}, 
             {"last_recurrent_state", &last_recurrent_state}, {"core_attn_out", &core_attn_out}
-        }, {}, {});                 
+        }, {{"qScale", qScale}}, {});                 
     }
 
     void ChunkGatedDeltaRulePrefill(Data &q, Data &k, Data &v, Data &g,

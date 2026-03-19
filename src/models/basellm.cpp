@@ -1030,9 +1030,6 @@ namespace fastllm {
 #endif
                 Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                 std::vector<int> ret;
-// auto st = std::chrono::system_clock::now();
-// ClearProfiler();
-
                 if (seqLens.size() == 1 && seqLens[0] > prefillChunkSize) {
                     int len = seqLens[0];
                     std::vector <std::pair <Data, Data> > *pastKeyValue1;
@@ -1097,14 +1094,6 @@ namespace fastllm {
                         }
                     }
                 }
-
-/*PrintProfiler();
-{
-    int total = 0;
-    for (int i : seqLens) total += i;
-    float spend = GetSpan(st, std::chrono::system_clock::now());
-    printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)total / spend);
-} */
 
                 forwardLocker.unlock();
                 dictLocker.lock();
