@@ -405,6 +405,9 @@ if (UNIT_TEST)
 
     add_executable(testTokenizer test/ops/tokenizerTest.cpp)
     target_link_libraries(testTokenizer fastllm)
+
+    add_executable(regressionOps test/ops/regressionOps.cpp)
+    target_link_libraries(regressionOps fastllm)
 endif()
 
 add_executable(webui example/webui/webui.cpp)

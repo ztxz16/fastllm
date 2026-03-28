@@ -1224,9 +1224,11 @@ namespace fastllm {
 
         std::vector<std::vector <fastllm::MultiThreadBaseOp*> > ops;
         ops.resize(numaConfig->numaCnt);
-
         for (int e = 0; e < (int)expertTasks.size(); e++) {
             if (weights[e * 2] != nullptr && expertTasks[e].size() > 0 && cpuExperts.count(e)) {
+                if (weights[e * 2]->numasData.empty() && weights[e * 2]->cpuData != nullptr) {
+                    RegisterNumas(weights[e * 2], "linearSwiglu");
+                }
                 int lines = expertTasks[e].size();
                 // Prepare input pointer for this expert's batch
                 uint16_t* expertInputPtr = (uint16_t*)(expandInput.data() + offset * GetDataBytes(startDataType, 1, inputDim));
@@ -1241,6 +1243,9 @@ namespace fastllm {
                 int kPer = k / numaConfig->numaCnt;
                     
                 for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+                    if ((int)weights[e * 2]->numasData.size() <= nid || weights[e * 2]->numasData[nid] == nullptr) {
+                        ErrorInFastLLM("NumasMergeMOE gate weight missing NUMA shard: " + weights[e * 2]->name + "\n");
+                    }
                     // Get weight data (assuming weights are stored as `startDataType`)
                     int base = kPer * nid;
                     size_t outputOffset = GetDataBytes(DataType::FLOAT32, 1, base);
@@ -1290,6 +1295,9 @@ namespace fastllm {
 
         for (int e = 0; e < (int)expertTasks.size(); e++) {
             if (weights[e * 2 + 1] != nullptr && expertTasks[e].size() > 0 && cpuExperts.count(e)) {
+                if (weights[e * 2 + 1]->numasData.empty() && weights[e * 2 + 1]->cpuData != nullptr) {
+                    RegisterNumas(weights[e * 2 + 1], "linearColumn");
+                }
                 int lines = expertTasks[e].size();
                 // Prepare input pointer for this expert's batch
                 uint16_t* expertDownInputPtr = (uint16_t*)(downInput.data() + offset * GetDataBytes(downInputDataType, 1, interDim));
@@ -1301,6 +1309,9 @@ namespace fastllm {
                 int kPer = k / numaConfig->numaCnt;
                     
                 for (int nid = 0; nid < numaConfig->numaCnt; nid++) {
+                    AssertInFastLLM((int)weights[e * 2 + 1]->numasData.size() > nid &&
+                                    weights[e * 2 + 1]->numasData[nid] != nullptr,
+                                    "NumasMergeMOE down weight missing NUMA shard: " + weights[e * 2 + 1]->name + "\n");
                     // Get weight data (assuming weights are stored as `downInputDataType`)
                     int base = kPer * nid;
                     size_t outputOffset = GetDataBytes(DataType::FLOAT32, 1, base);
@@ -1786,7 +1797,9 @@ namespace fastllm {
                 }
             }
 // printf("prepare 0 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-            if (gpuPrefill) {
+            // Respect an explicit FT_EXPERT_LIMIT override and skip the dynamic
+            // CPU/GPU expert split benchmark in that case.
+            if (gpuPrefill && !hasExpertLimitOverride) {
                 expertLimit = std::min(expertLimit, 
                     MoeExpertSpeedEstimator::GetInstance().GetDynamicExpertLimit(
                         input, output, w1, w2, w3,
