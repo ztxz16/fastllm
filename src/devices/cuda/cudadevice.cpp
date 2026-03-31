@@ -2639,6 +2639,10 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         }
         AssertInFastLLM(batch > 0, "CudaGenerateAppendPagedCacheBatchParamsOp: batch must be positive.\n");
 
+        insertIndexs.dataType = DataType::INT32;
+        insertPositions.dataType = DataType::INT32;
+        insertIndexs.Resize({batch});
+        insertPositions.Resize({batch});
         insertIndexs.Allocate();
         insertPositions.Allocate();
         
@@ -2703,12 +2707,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         Data &lastPageLens = *(datas.find("lastPageLens")->second);
         
         int batch = intParams.find("pastKeys___batch") != intParams.end() ? intParams.find("pastKeys___batch")->second : 1;
-        
-        // 分配输出内存
-        qSizes.Allocate();
-        pageSizes.Allocate();
-        lastPageLens.Allocate();
-        pageIndexs.Allocate();
+        AssertInFastLLM(batch > 0, "CudaGeneratePagedBatchParamsOp: batch must be positive.\n");
         
         // 先在CPU上计算，然后拷贝到GPU
         auto &qSizesHost = qSizes.cpuIntDatas;
@@ -2728,6 +2727,21 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             totalPages += pastKeys[b]->pageIndex.size();
         }
         pageIndexsHost.resize(totalPages);
+
+        qSizes.dataType = DataType::INT32;
+        pageSizes.dataType = DataType::INT32;
+        lastPageLens.dataType = DataType::INT32;
+        pageIndexs.dataType = DataType::INT32;
+        qSizes.Resize({batch + 1});
+        pageSizes.Resize({batch + 1});
+        lastPageLens.Resize({batch});
+        pageIndexs.Resize({std::max(totalPages, 1)});
+
+        // 分配输出内存
+        qSizes.Allocate();
+        pageSizes.Allocate();
+        lastPageLens.Allocate();
+        pageIndexs.Allocate();
         
         // 生成qSizes: 如果有 seqLens 则按 seqLens 的前缀和，否则按 [0, 1, 2, ..., batch]
         int seqLensSize = intParams.find("seqLens___size") != intParams.end() ? intParams.find("seqLens___size")->second : 0;
@@ -2764,6 +2778,8 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         FastllmCudaCopyFromHostToDevice(qSizes.cudaData, qSizesHost.data(), (batch + 1) * sizeof(int32_t));
         FastllmCudaCopyFromHostToDevice(pageSizes.cudaData, pageSizesHost.data(), (batch + 1) * sizeof(int32_t));
         FastllmCudaCopyFromHostToDevice(lastPageLens.cudaData, lastPageLensHost.data(), batch * sizeof(int32_t));
-        FastllmCudaCopyFromHostToDevice(pageIndexs.cudaData, pageIndexsHost.data(), totalPages * sizeof(int32_t));
+        if (totalPages > 0) {
+            FastllmCudaCopyFromHostToDevice(pageIndexs.cudaData, pageIndexsHost.data(), totalPages * sizeof(int32_t));
+        }
     }
 }
