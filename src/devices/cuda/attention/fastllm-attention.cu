@@ -18,6 +18,7 @@
 
 #include <cstdlib>
 #include <cuda_fp8.h>
+#include <map>
 #include <mutex>
 
 template <int BN, int BM, int BK>
@@ -2351,15 +2352,14 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         cudaMemcpy(q_indptr_gpu, q_indptr_host.data(), (batch_size + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
         uint32_t total_num_rows = q_indptr_host[batch_size];
-        thread_local static PrefillPlanInfo plan_info;
-        thread_local static int last_plan_device_id = -1;
+        thread_local static std::map<int, PrefillPlanInfo> plan_info_map;
+        thread_local static std::map<int, bool> plan_inited_map;
         int current_device_id = -1;
         cudaGetDevice(&current_device_id);
-        bool device_changed = (current_device_id != last_plan_device_id);
-        if (!inited || device_changed) {
+        if (!inited || !plan_inited_map[current_device_id]) {
             cudaError_t plan_status = PrefillPlan<uint32_t>(
                 workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
-                workspace.int_workspace_size, plan_info, q_indptr_host.data(), indptr_host.data(), 
+                workspace.int_workspace_size, plan_info_map[current_device_id], q_indptr_host.data(), indptr_host.data(), 
                 total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
                 pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(QType), 
                 /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
@@ -2371,8 +2371,9 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
                 FastllmCudaFree(q_indptr_gpu);
                 exit(0);
             }
-            last_plan_device_id = current_device_id;
+            plan_inited_map[current_device_id] = true;
         }
+        PrefillPlanInfo &plan_info = plan_info_map[current_device_id];
         
         uint32_t q_stride_n = (q.dims.size() >= 2 && q.strides.size() >= 2) ? q.strides[1] : q2;
         uint32_t q_stride_h = (q.dims.size() >= 3 && q.strides.size() >= 1) ? q.strides[0] : (q1 * q2);
@@ -2566,15 +2567,14 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         uint32_t total_num_rows = qSizes.cpuIntDatas[batch_size];
 
         cudaStream_t stream = nullptr;
-        thread_local static PrefillPlanInfo plan_info;
-        thread_local static int last_plan_device_id = -1;
+        thread_local static std::map<int, PrefillPlanInfo> plan_info_map;
+        thread_local static std::map<int, bool> plan_inited_map;
         int current_device_id = -1;
         cudaGetDevice(&current_device_id);
-        bool device_changed = (current_device_id != last_plan_device_id);
-        if (!inited || device_changed) {
+        if (!inited || !plan_inited_map[current_device_id]) {
             cudaError_t plan_status = PrefillPlan<uint32_t>(
                 workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
-                workspace.int_workspace_size, plan_info, 
+                workspace.int_workspace_size, plan_info_map[current_device_id], 
                 (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(), 
                 total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
                 pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(QType), 
@@ -2586,8 +2586,9 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
                 cudaStreamSynchronize(stream);
                 exit(0);
             }
-            last_plan_device_id = current_device_id;
+            plan_inited_map[current_device_id] = true;
         }
+        PrefillPlanInfo &plan_info = plan_info_map[current_device_id];
         
         uint32_t q_stride_n = (q.dims.size() >= 2 && q.strides.size() >= 2) ? q.strides[1] : q2;
         uint32_t q_stride_h = (q.dims.size() >= 3 && q.strides.size() >= 1) ? q.strides[0] : (q1 * q2);
