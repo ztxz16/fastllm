@@ -2781,5 +2781,18 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         if (totalPages > 0) {
             FastllmCudaCopyFromHostToDevice(pageIndexs.cudaData, pageIndexsHost.data(), totalPages * sizeof(int32_t));
         }
+
+        auto invalidateReplicas = [](Data &d) {
+            for (auto &it : d.multiDeviceDatas) {
+                delete it.second;
+            }
+            d.multiDeviceDatas.clear();
+            d.multiDeviceData = false;
+            d.ClearTensorParallelLayout();
+        };
+        invalidateReplicas(qSizes);
+        invalidateReplicas(pageSizes);
+        invalidateReplicas(pageIndexs);
+        invalidateReplicas(lastPageLens);
     }
 }

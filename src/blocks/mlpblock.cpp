@@ -14,6 +14,7 @@ namespace fastllm {
         Data *swigluResult,
         Data *output
     ) {
+        gateUp->tpPackType = TP_PACK_GATEUP;
         /* if (CanRunMLP()) {
             Data w3;
             Data mlpOutput;

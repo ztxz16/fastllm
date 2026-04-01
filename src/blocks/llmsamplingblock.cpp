@@ -30,6 +30,7 @@ namespace fastllm {
         curLogits.resize(batch);
 
         if (!all1) {
+            hiddenStates->ResetMultiDeviceState();
             int total = 0;
             std::vector<Data> lastToks;
             std::vector<Data*> lastTokPointers;

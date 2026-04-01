@@ -50,7 +50,12 @@ namespace fastllm {
     ) {
         // 1. Linear QKV projection
         bool mergedQkv = (mergeQkvWeight->dims.size() > 0);
+
         if (mergedQkv) {
+            mergeQkvWeight->tpPackType = TP_PACK_QKV;
+            mergeQkvWeight->tpQHeads = num_attention_heads;
+            mergeQkvWeight->tpKVHeads = num_key_value_heads;
+            mergeQkvWeight->tpHeadDim = head_dim;
             Linear(*attenInput, *mergeQkvWeight, *mergeQkvBias, *qkv);
         } else {
             Data qResult, kResult, vResult, qkResult;
