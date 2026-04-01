@@ -18,6 +18,7 @@
 
 #include <cstdlib>
 #include <cuda_fp8.h>
+#include <mutex>
 
 template <int BN, int BM, int BK>
 __global__ void HalfFC(
@@ -2121,10 +2122,12 @@ struct FlashInferWorkSpaceManager {
 };
 
 static std::map<int, std::unique_ptr<FlashInferWorkSpaceManager>> s_fastllmFlashInferWorkSpaceMap;
+static std::mutex s_fastllmFlashInferWorkSpaceMapLock;
 
 FlashInferWorkSpaceManager& getFastllmFlashInferWorkSpace() {
     int id = -1;
     cudaGetDevice(&id);
+    std::lock_guard<std::mutex> guard(s_fastllmFlashInferWorkSpaceMapLock);
     auto it = s_fastllmFlashInferWorkSpaceMap.find(id);
     if (it != s_fastllmFlashInferWorkSpaceMap.end()) {
         return *it->second;
@@ -2348,8 +2351,8 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
         cudaMemcpy(q_indptr_gpu, q_indptr_host.data(), (batch_size + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
         uint32_t total_num_rows = q_indptr_host[batch_size];
-        static PrefillPlanInfo plan_info;
-        static int last_plan_device_id = -1;
+        thread_local static PrefillPlanInfo plan_info;
+        thread_local static int last_plan_device_id = -1;
         int current_device_id = -1;
         cudaGetDevice(&current_device_id);
         bool device_changed = (current_device_id != last_plan_device_id);
@@ -2452,7 +2455,7 @@ bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::
     return true;
 }
 
-bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited) {
+bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync) {
     using namespace flashinfer;
     FlashInferWorkSpaceManager& workspace = getFastllmFlashInferWorkSpace();
     
@@ -2563,8 +2566,8 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         uint32_t total_num_rows = qSizes.cpuIntDatas[batch_size];
 
         cudaStream_t stream = nullptr;
-        static PrefillPlanInfo plan_info;
-        static int last_plan_device_id = -1;
+        thread_local static PrefillPlanInfo plan_info;
+        thread_local static int last_plan_device_id = -1;
         int current_device_id = -1;
         cudaGetDevice(&current_device_id);
         bool device_changed = (current_device_id != last_plan_device_id);
@@ -2650,7 +2653,9 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
 // 避免在 CUDA 侧再做 Permute，由调用方按需做一次 Reshape + Permute 即可得到 [bsz, seqlen, embed_dim]
 ((fastllm::Data*)&output)->Resize({output.dims[1], output.dims[0], output.dims[2]});
     
-    DeviceSync();
+    if (sync) {
+        DeviceSync();
+    }
     return true;
 }
 
