@@ -462,11 +462,13 @@ namespace fastllm {
 
         void Allocate(); // 分配内存
 
+        void Allocate(bool zero); // 分配内存，zero=false 时跳过清零
+
         void Allocate(float v); // 分配内存并初始化
 
         void Expansion(const std::vector <int> &dims); // 预扩容到相应尺寸
 
-        void MallocSpace(uint64_t size); // 在设备上分配
+        void MallocSpace(uint64_t size, bool zero = true); // 在设备上分配
 
         void FreeSpace(); // 回收设备上的内存
 

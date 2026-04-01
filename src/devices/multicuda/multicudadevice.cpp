@@ -958,12 +958,6 @@ namespace fastllm {
 
         output.dataType = input.dataType;
         DoCudaSwigluReshape(middle, output);
-        ResetMultiCudaTensor(output);
-        output.multiDeviceData = true;
-        output.tpLayout = TP_LAYOUT_SHARDED;
-        output.tpAxis = (int)output.dims.size() - 1;
-        output.tpGlobalDims = output.dims;
-        output.cudaData = nullptr;
 
         int mid = weight.dims[0] / 2;
         DivisionScheme outputScheme;
@@ -975,7 +969,16 @@ namespace fastllm {
                     outputScheme[device].push_back({l, r});
                 }
             }
-            output.tpRanges[device] = outputScheme[device];
+        }
+
+        ResetMultiCudaTensor(output);
+        output.multiDeviceData = true;
+        output.tpLayout = TP_LAYOUT_SHARDED;
+        output.tpAxis = (int)output.dims.size() - 1;
+        output.tpGlobalDims = output.dims;
+        output.tpRanges = outputScheme;
+        output.cudaData = nullptr;
+        for (int device : devices) {
             std::vector <int> localDims = output.dims;
             int localLen = 0;
             for (auto &range : outputScheme[device]) {

@@ -707,9 +707,9 @@ bool FastllmCudaHalfMatMulFloat16Swiglu(const fastllm::Data &input, fastllm::Dat
         return false;
     }
 
-    output.Allocate();
+    output.Allocate(false);
 
-    int biasK = k * 2; // weight has 2*k rows, bias has 2*k elements
+    int biasK = k * 2;
     FastllmCudaFP16EnsureBiasOnDevice(weight, bias, biasK);
     FastllmCudaFP16EnsureBiasHalfOnDevice(weight, bias, biasK);
 

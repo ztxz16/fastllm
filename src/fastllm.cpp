@@ -1330,12 +1330,14 @@ namespace fastllm {
         return (this->strides[0] * this->dims[0] * this->unitSize - 1) / this->unitSizeDiv + 1;
     }
 
-    void Data::MallocSpace(uint64_t size) {
+    void Data::MallocSpace(uint64_t size, bool zero) {
         this->expansionSize = size;
         this->expansionBytes = (size * this->unitSize - 1) / this->unitSizeDiv + 1;
         if (this->dataDevice == DataDevice::CPU) {
             this->cpuData = new uint8_t[this->expansionBytes];
-            memset(this->cpuData, 0, this->expansionBytes*sizeof(uint8_t));
+            if (zero) {
+                memset(this->cpuData, 0, this->expansionBytes*sizeof(uint8_t));
+            }
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             if (this->directMemory) {
@@ -1352,7 +1354,9 @@ namespace fastllm {
                 }
                 this->multiDeviceData = false;
             }
-            FastllmCudaMemset0(this->cudaData, this->expansionBytes);
+            if (zero) {
+                FastllmCudaMemset0(this->cudaData, this->expansionBytes);
+            }
 #else
             ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif
@@ -1390,6 +1394,13 @@ namespace fastllm {
         if (!isFake && Count(0) > expansionSize) {
             FreeSpace();
             MallocSpace(Count(0));
+        }
+    }
+
+    void Data::Allocate(bool zero) {
+        if (!isFake && Count(0) > expansionSize) {
+            FreeSpace();
+            MallocSpace(Count(0), zero);
         }
     }
 
