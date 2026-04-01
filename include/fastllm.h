@@ -518,6 +518,12 @@ namespace fastllm {
 
         // 当前权重作为linear的weight时，输入应该是什么类型
         DataType GetLinearActDataType(int batchSize);
+
+        bool IsTensorParallel() const;
+        bool IsTensorParallelReplicated() const;
+        bool IsTensorParallelSharded() const;
+        void ClearTensorParallelLayout();
+        void ResetMultiDeviceState();
     };
 
     struct CacheTrieNode {

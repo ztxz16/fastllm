@@ -584,6 +584,7 @@ namespace fastllm {
         this->UpdateUnitSize();
         this->isFake = true;
         this->dataDevice = ori.dataDevice;
+        this->ClearTensorParallelLayout();
         if (this->dataDevice == DataDevice::CPU) {
             this->cpuData = ori.cpuData + offset;
         } else if (this->dataDevice == DataDevice::CUDA) {
@@ -602,6 +603,15 @@ namespace fastllm {
         this->isLinearAttention = ori.isLinearAttention;
         this->cacheUid = ori.cacheUid;
         this->dataDevice = ori.dataDevice;
+        this->tpLayout = ori.tpLayout;
+        this->tpAxis = ori.tpAxis;
+        this->tpGlobalDims = ori.tpGlobalDims;
+        this->tpRanges = ori.tpRanges;
+        this->tpLinearType = ori.tpLinearType;
+        this->tpPackType = ori.tpPackType;
+        this->tpQHeads = ori.tpQHeads;
+        this->tpKVHeads = ori.tpKVHeads;
+        this->tpHeadDim = ori.tpHeadDim;
         
         // std::cout<<"调用拷贝构造"<<std::endl;
         if (ori.expansionDims != this->expansionDims || ori.dims != this->dims || this->cpuData == nullptr || ori.dataType != this->dataType) {
@@ -1209,6 +1219,7 @@ namespace fastllm {
         if (this->dims == dims) {
             return;
         }
+        std::vector <int> oldDims = this->dims;
         std::vector <int> outputDims = dims;
         uint64_t old = 1;
         for (int i : this->dims) {
@@ -1236,6 +1247,76 @@ namespace fastllm {
             outputDims[index] = old / mul;
         }
         Resize(outputDims);
+
+        if (!this->multiDeviceData || this->tpLayout == TP_LAYOUT_NONE) {
+            return;
+        }
+
+        if (this->tpLayout == TP_LAYOUT_REPLICATED) {
+            this->tpGlobalDims = outputDims;
+            for (auto &it : this->multiDeviceDatas) {
+                if (it.second != nullptr) {
+                    it.second->Resize(outputDims);
+                }
+            }
+            return;
+        }
+
+        auto normalizeAxis = [](int axis, int dimsLen) {
+            return (axis % dimsLen + dimsLen) % dimsLen;
+        };
+        auto scaleRanges = [&](int mul, int div) {
+            for (auto &it : this->tpRanges) {
+                for (auto &range : it.second) {
+                    range.first = range.first * mul / div;
+                    range.second = range.second * mul / div;
+                }
+            }
+        };
+
+        int oldAxis = normalizeAxis(this->tpAxis, (int)oldDims.size());
+        int newAxis = oldAxis;
+        if ((int)oldDims.size() + 1 == (int)outputDims.size() &&
+            oldAxis == (int)oldDims.size() - 1 &&
+            outputDims.back() > 0 &&
+            oldDims.back() == outputDims[(int)outputDims.size() - 2] * outputDims.back()) {
+            newAxis = (int)outputDims.size() - 2;
+            scaleRanges(1, outputDims.back());
+        } else if ((int)oldDims.size() == 4 && (int)outputDims.size() == 3 &&
+                   oldAxis == 1 && oldDims[0] == 1 &&
+                   outputDims[0] == oldDims[1] &&
+                   outputDims[1] == oldDims[2] &&
+                   outputDims[2] == oldDims[3]) {
+            newAxis = 0;
+        } else if ((int)oldDims.size() == 3 && (int)outputDims.size() == 3 &&
+                   oldAxis == 0 && outputDims[0] == 1 &&
+                   outputDims[1] == oldDims[1] &&
+                   outputDims[2] == oldDims[0] * oldDims[2]) {
+            newAxis = 2;
+            scaleRanges(oldDims[2], 1);
+        }
+
+        this->tpAxis = newAxis;
+        this->tpGlobalDims = outputDims;
+
+        int axis = normalizeAxis(this->tpAxis, (int)outputDims.size());
+        long long other = 1;
+        for (int i = 0; i < (int)outputDims.size(); i++) {
+            if (i != axis) {
+                other *= outputDims[i];
+            }
+        }
+        AssertInFastLLM(other > 0, "Tensor parallel reshape error.\n");
+        for (auto &it : this->multiDeviceDatas) {
+            if (it.second == nullptr) {
+                continue;
+            }
+            long long localCount = it.second->Count(0);
+            AssertInFastLLM(localCount % other == 0, "Tensor parallel reshape local count mismatch.\n");
+            std::vector <int> localDims = outputDims;
+            localDims[axis] = (int)(localCount / other);
+            it.second->Resize(localDims);
+        }
     }
 
     uint64_t Data::GetBytes() const {
@@ -1265,7 +1346,7 @@ namespace fastllm {
             if (this->cudaData == nullptr) {
                 ErrorInFastLLM("Error: cuda malloc failed in Data::MallocSpace, maybe no enough GPU memory.\n");
             }
-            if (this->multiDeviceData) {
+            if (this->multiDeviceData && this->tpLayout == TP_LAYOUT_NONE) {
                 for (auto it : this->multiDeviceDatas) {
                     delete it.second;
                 }
@@ -1446,6 +1527,49 @@ namespace fastllm {
             }
         }
 #endif
+    }
+
+    bool Data::IsTensorParallel() const {
+        return this->tpLayout != TP_LAYOUT_NONE;
+    }
+
+    bool Data::IsTensorParallelReplicated() const {
+        return this->tpLayout == TP_LAYOUT_REPLICATED;
+    }
+
+    bool Data::IsTensorParallelSharded() const {
+        return this->tpLayout == TP_LAYOUT_SHARDED;
+    }
+
+    void Data::ClearTensorParallelLayout() {
+        this->tpLayout = TP_LAYOUT_NONE;
+        this->tpAxis = -1;
+        this->tpGlobalDims.clear();
+        this->tpRanges.clear();
+    }
+
+    void Data::ResetMultiDeviceState() {
+        if (!this->multiDeviceData) {
+            ClearTensorParallelLayout();
+            return;
+        }
+        if (this->tpLayout == TP_LAYOUT_REPLICATED && !this->multiDeviceDatas.empty()) {
+            auto it = this->multiDeviceDatas.begin();
+            Data *replica = it->second;
+            if (replica != nullptr && replica->cudaData != nullptr && this->Count(0) > 0) {
+                this->dataDevice = DataDevice::CUDA;
+                this->dataDeviceIds = replica->dataDeviceIds;
+                std::swap(this->cudaData, replica->cudaData);
+                std::swap(this->expansionSize, replica->expansionSize);
+                std::swap(this->expansionBytes, replica->expansionBytes);
+            }
+        }
+        for (auto &it : this->multiDeviceDatas) {
+            delete it.second;
+        }
+        this->multiDeviceDatas.clear();
+        this->multiDeviceData = false;
+        ClearTensorParallelLayout();
     }
 
     void Data::PrintShape() const {
@@ -3458,12 +3582,35 @@ namespace fastllm {
         const Data &cacheData, 
         int pageLen, 
         int maxPages) {
+        int oriDevice = -1;
+        int targetDevice = -1;
+#ifdef USE_CUDA
+        if (cacheData.dataDevice == DataDevice::CUDA && !cacheData.dataDeviceIds.empty()) {
+            oriDevice = FastllmCudaGetDevice();
+            targetDevice = cacheData.dataDeviceIds[0];
+            if (oriDevice != targetDevice) {
+                FastllmCudaSetDevice(targetDevice);
+            }
+        }
+#endif
         if (pageLen <= 0) {
             pageLen = GetPageLen();
         }
         auto it = layerPagedCacheManagers.find(layerIndex);
         if (it != layerPagedCacheManagers.end()) {
-            return it->second;
+            PagedCacheManager *manager = it->second;
+#ifdef USE_CUDA
+            if (targetDevice >= 0 && manager->cudaData != nullptr) {
+                int ptrDevice = GetPointerDeviceId(manager->cudaData);
+                if (ptrDevice >= 0 && ptrDevice != targetDevice) {
+                    ((Data*)manager)->ToDevice(cacheData.dataDevice, cacheData.dataDeviceIds, false);
+                }
+            }
+            if (oriDevice >= 0 && oriDevice != targetDevice) {
+                FastllmCudaSetDevice(oriDevice);
+            }
+#endif
+            return manager;
         }
 
         // 创建新的 PagedCacheManager
@@ -3496,7 +3643,7 @@ namespace fastllm {
 
         // 初始化 pagedKVCacheData
         ((Data*)manager)->directMemory = true;
-        ((Data*)manager)->ToDevice(cacheData.dataDevice);
+        ((Data*)manager)->ToDevice(cacheData.dataDevice, cacheData.dataDeviceIds, false);
 
         // Resize manager: [maxPages, pageLen, numHeads, headDim]
         ((Data*)manager)->Resize({maxPages, pageLen, numHeads, headDim});
@@ -3508,6 +3655,12 @@ namespace fastllm {
 
         // 记录到静态 map 中
         layerPagedCacheManagers[layerIndex] = manager;
+
+#ifdef USE_CUDA
+        if (oriDevice >= 0 && oriDevice != targetDevice) {
+            FastllmCudaSetDevice(oriDevice);
+        }
+#endif
 
         return manager;
     }
