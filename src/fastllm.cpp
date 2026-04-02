@@ -1289,8 +1289,8 @@ namespace fastllm {
                    outputDims[2] == oldDims[3]) {
             newAxis = 0;
         } else if ((int)oldDims.size() == 3 && (int)outputDims.size() == 3 &&
-                   oldAxis == 0 && outputDims[0] == 1 &&
-                   outputDims[1] == oldDims[1] &&
+                   oldAxis == 0 &&
+                   outputDims[0] * outputDims[1] == oldDims[1] &&
                    outputDims[2] == oldDims[0] * oldDims[2]) {
             newAxis = 2;
             scaleRanges(oldDims[2], 1);
