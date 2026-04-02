@@ -568,7 +568,7 @@ namespace fastllm {
     }
 
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output) {
-        output.Allocate();
+        output.Allocate(false);
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();

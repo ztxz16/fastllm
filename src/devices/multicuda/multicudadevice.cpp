@@ -1717,7 +1717,7 @@ namespace fastllm {
             PagedCacheManager *localVManager = GetOrCreateLocalPagedCacheManager(rootVManager, localKDesc, device);
 
             FastllmCudaSetDevice(device);
-            localQ->Allocate();
+            localQ->Allocate(false);
             AssertInFastLLM(localKManager->cudaData != nullptr && localVManager->cudaData != nullptr,
                             "MultiCudaQKVRMSNormRopeSplitAppendPagedCacheOp: local paged cache manager is not allocated.\n");
 
