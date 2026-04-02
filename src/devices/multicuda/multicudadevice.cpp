@@ -921,7 +921,7 @@ namespace fastllm {
                        (bias.dataType == DataType::FLOAT32 || bias.dims.size() == 0) &&
                        n > 0 && n < 8;
         if (!canFuse) {
-            printf("[MultiCuda LinearSwiglu fuse] disabled:\n");
+            /* printf("[MultiCuda LinearSwiglu fuse] disabled:\n");
             if (devices.size() <= 1) {
                 printf("  - devices.size()=%zu (need >1)\n", devices.size());
             }
@@ -946,7 +946,7 @@ namespace fastllm {
             }
             if (n <= 0 || n >= 8) {
                 printf("  - batch token count n=%d (need 0 < n < 8)\n", n);
-            }
+            } */
             Linear(input, weight, bias, middle);
             Swiglu(middle, output);
             return;
