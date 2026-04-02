@@ -213,24 +213,54 @@ void CopyToMultiDevices(fastllm::Data &data, std::vector <int> devices, bool cop
     int oriId = FastllmCudaGetDevice();
 
     if (copyData) {
-        data.ToDevice(fastllm::DataDevice::CPU);
-        for (int device : devices) {
-            int mallocType = 0;
-            std::string specialId = "";
-            SwitchDeviceAndGetInfos(device, specialId, mallocType);
-            fastllm::DataDevice dataDevice = (mallocType == 0 ? fastllm::DataDevice::CPU :fastllm::DataDevice::CUDA);
+        bool srcOnGpu = (data.dataDevice == fastllm::DataDevice::CUDA
+                         && data.cudaData != nullptr
+                         && !data.dataDeviceIds.empty());
+        int srcDevice = srcOnGpu ? data.dataDeviceIds[0] : -1;
 
-            data.multiDeviceDatas[device] = new fastllm::Data();
-            data.multiDeviceDatas[device]->CopyFrom(data);
-            data.multiDeviceDatas[device]->ToDevice(dataDevice, std::vector <int> {device});
-            data.multiDeviceDatas[device]->dataDeviceIds = {device};
+        if (srcOnGpu) {
+            uint64_t bytes = data.GetBytes();
+            for (int device : devices) {
+                FastllmCudaSetDevice(device);
+                auto *local = new fastllm::Data(data.dataType, data.dims);
+                local->dataDevice = fastllm::DataDevice::CUDA;
+                local->dataDeviceIds = {device};
+                local->Allocate();
 
-            data.multiDeviceDatas[device]->group = data.group;
-            data.multiDeviceDatas[device]->groupCnt = data.groupCnt;
-            data.multiDeviceDatas[device]->scales = data.scales;
-            data.multiDeviceDatas[device]->mins = data.mins;
-            data.multiDeviceDatas[device]->zeros = data.zeros;
-            data.multiDeviceDatas[device]->halfScales = data.halfScales;
+                if (device == srcDevice) {
+                    cudaMemcpy(local->cudaData, data.cudaData, bytes, cudaMemcpyDeviceToDevice);
+                } else {
+                    cudaMemcpyPeer(local->cudaData, device, data.cudaData, srcDevice, bytes);
+                }
+
+                local->group = data.group;
+                local->groupCnt = data.groupCnt;
+                local->scales = data.scales;
+                local->mins = data.mins;
+                local->zeros = data.zeros;
+                local->halfScales = data.halfScales;
+                data.multiDeviceDatas[device] = local;
+            }
+        } else {
+            data.ToDevice(fastllm::DataDevice::CPU);
+            for (int device : devices) {
+                int mallocType = 0;
+                std::string specialId = "";
+                SwitchDeviceAndGetInfos(device, specialId, mallocType);
+                fastllm::DataDevice dataDevice = (mallocType == 0 ? fastllm::DataDevice::CPU :fastllm::DataDevice::CUDA);
+
+                data.multiDeviceDatas[device] = new fastllm::Data();
+                data.multiDeviceDatas[device]->CopyFrom(data);
+                data.multiDeviceDatas[device]->ToDevice(dataDevice, std::vector <int> {device});
+                data.multiDeviceDatas[device]->dataDeviceIds = {device};
+
+                data.multiDeviceDatas[device]->group = data.group;
+                data.multiDeviceDatas[device]->groupCnt = data.groupCnt;
+                data.multiDeviceDatas[device]->scales = data.scales;
+                data.multiDeviceDatas[device]->mins = data.mins;
+                data.multiDeviceDatas[device]->zeros = data.zeros;
+                data.multiDeviceDatas[device]->halfScales = data.halfScales;
+            }
         }
     } else {
         for (int device : devices) {
