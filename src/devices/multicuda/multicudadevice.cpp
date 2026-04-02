@@ -1183,8 +1183,32 @@ namespace fastllm {
 
         AssertInFastLLM(input.IsTensorParallelSharded(),
                         "MultiCudaSplit only supports tensor-parallel sharded or replicated input.\n");
-        AssertInFastLLM(axis == NormalizeAxis(input.tpAxis, (int)input.dims.size()),
-                        "MultiCudaSplit currently only supports split on the sharded axis.\n");
+
+        int tpAxisNorm = NormalizeAxis(input.tpAxis, (int)input.dims.size());
+
+        if (axis != tpAxisNorm) {
+            SyncShardedLocalShapeFromRoot(input, devices);
+            ResetMultiCudaTensor(output);
+            output.multiDeviceData = true;
+            output.tpLayout = TP_LAYOUT_SHARDED;
+            output.tpAxis = input.tpAxis;
+            output.tpGlobalDims = output.dims;
+            output.tpRanges = input.tpRanges;
+            output.cudaData = nullptr;
+
+            for (int device : devices) {
+                Data *localInput = input.multiDeviceDatas[device];
+                if (localInput == nullptr) continue;
+                FastllmCudaSetDevice(device);
+                Data *localOutput = new Data(output.dataType);
+                localOutput->dataDevice = DataDevice::CUDA;
+                localOutput->dataDeviceIds = {device};
+                DoCudaSplitReshape(*localInput, axis, start, end, *localOutput);
+                DoCudaSplit(*localInput, axis, start, end, *localOutput);
+                output.multiDeviceDatas[device] = localOutput;
+            }
+            return;
+        }
 
         SyncShardedLocalShapeFromRoot(input, devices);
         ResetMultiCudaTensor(output);
