@@ -2322,38 +2322,6 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 #ifdef USE_CUDA
             std::set <int> deviceIds;
 
-            auto getCudaIdsFromData = [&](Data *data) {
-                std::vector <int> ret;
-                if (data == nullptr || data->dataDevice != DataDevice::CUDA) {
-                    return ret;
-                }
-                ret = data->dataDeviceIds;
-                if (ret.empty()) {
-                    ret.push_back(0);
-                }
-                return ret;
-            };
-
-            auto getLayerCudaIds = [&](int layerIdx) {
-                std::vector <int> ret;
-                auto &pastKey = pastKeyValuesStorage[layerIdx].first;
-                auto &pastValue = pastKeyValuesStorage[layerIdx].second;
-
-                if (pastKey.pagedKVCacheData != nullptr) {
-                    ret = getCudaIdsFromData((Data*)pastKey.pagedKVCacheData);
-                }
-                if (ret.empty() && pastValue.pagedKVCacheData != nullptr) {
-                    ret = getCudaIdsFromData((Data*)pastValue.pagedKVCacheData);
-                }
-                if (ret.empty()) {
-                    ret = getCudaIdsFromData(&pastKey);
-                }
-                if (ret.empty()) {
-                    ret = getCudaIdsFromData(&pastValue);
-                }
-                return ret;
-            };
-
             long long bytesPerPage = 0;
             std::map <int, long long> deviceBytesPerPage;
             std::map <int, int> deviceLayerCount;
@@ -2361,17 +2329,50 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 if (layerElementsPerToken[i] <= 0) {
                     continue;
                 }
-                long long layerBytesPerPage = GetDataBytes(this->kvCacheDataType, pageLen, layerElementsPerToken[i]);
-                auto layerCudaIds = getLayerCudaIds(i);
-                if (layerCudaIds.empty()) {
-                    continue;
+                auto &pastKey = pastKeyValuesStorage[i].first;
+                auto &pastValue = pastKeyValuesStorage[i].second;
+                bool accountedByLocalShard = false;
+
+                if (pastKey.multiDeviceData && pastValue.multiDeviceData &&
+                    !pastKey.multiDeviceDatas.empty() && !pastValue.multiDeviceDatas.empty()) {
+                    for (auto &it : pastKey.multiDeviceDatas) {
+                        int id = it.first;
+                        if (pastValue.multiDeviceDatas.find(id) == pastValue.multiDeviceDatas.end()) {
+                            continue;
+                        }
+                        Data *localKey = it.second;
+                        Data *localValue = pastValue.multiDeviceDatas[id];
+                        if (localKey == nullptr || localValue == nullptr ||
+                            localKey->dataDevice != DataDevice::CUDA || localValue->dataDevice != DataDevice::CUDA ||
+                            localKey->dims.size() < 3 || localValue->dims.size() < 3 ||
+                            localKey->isLinearAttention || localValue->isLinearAttention) {
+                            continue;
+                        }
+
+                        long long localElementsPerToken =
+                            (long long)localKey->dims[0] * localKey->dims[2] +
+                            (long long)localValue->dims[0] * localValue->dims[2];
+                        long long localBytesPerPage = GetDataBytes(this->kvCacheDataType, pageLen, localElementsPerToken);
+                        deviceIds.insert(id);
+                        deviceBytesPerPage[id] += localBytesPerPage;
+                        deviceLayerCount[id]++;
+                        accountedByLocalShard = true;
+                    }
                 }
-                for (int id : layerCudaIds) {
+
+                if (!accountedByLocalShard) {
+                    int id = 0;
+                    if (pastKey.dataDevice == DataDevice::CUDA && !pastKey.dataDeviceIds.empty()) {
+                        id = pastKey.dataDeviceIds[0];
+                    } else if (pastValue.dataDevice == DataDevice::CUDA && !pastValue.dataDeviceIds.empty()) {
+                        id = pastValue.dataDeviceIds[0];
+                    }
+                    long long layerBytesPerPage = GetDataBytes(this->kvCacheDataType, pageLen, layerElementsPerToken[i]);
                     deviceIds.insert(id);
                     deviceBytesPerPage[id] += layerBytesPerPage;
                     deviceLayerCount[id]++;
                 }
-                bytesPerPage += layerBytesPerPage;
+                bytesPerPage += GetDataBytes(this->kvCacheDataType, pageLen, layerElementsPerToken[i]);
             }
 
             bool updatedPages = false;
@@ -2386,6 +2387,11 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 kv.second.pagedKVCacheData = nullptr;
                 kv.second.isPagedKVCache = false;
             }
+            // Tensor-parallel KV cache shards live in multiDeviceDatas. Destroy those
+            // Data objects before tearing down the global paged cache managers, or
+            // their destructors will release page indices through dangling managers.
+            pastKeyValuesStorage.clear();
+            pastKeyValues.clear();
             ClearAllPagedCacheManagers();
 
             auto freeSizes = FastllmCudaGetFreeSizes();
@@ -2472,8 +2478,6 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                        calculatedMaxPages, minPages);
             }
             
-            pastKeyValuesStorage.clear();
-            pastKeyValues.clear();
             for (int i = 0; i < block_cnt; i++) {
                 pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
                 pastKeyValuesStorage.back().first.SetKVCache();
