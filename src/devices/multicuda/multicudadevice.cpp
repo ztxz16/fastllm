@@ -1682,7 +1682,7 @@ namespace fastllm {
         EnsureReplicatedMultiCudaTensor(insertPositions, devices, true);
 
         qOutput.dataType = qkv.dataType;
-        qOutput.Resize({batch * q_heads, qkv.dims[1], head_dim});
+        qOutput.Resize({qkv.dims[0] * q_heads, qkv.dims[1], head_dim});
         ResetMultiCudaTensor(qOutput);
         qOutput.multiDeviceData = true;
         qOutput.tpLayout = TP_LAYOUT_SHARDED;
