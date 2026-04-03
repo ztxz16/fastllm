@@ -1595,8 +1595,11 @@ namespace fastllm {
         return this->dims;
     }
 
-    void Data::Print() const {
+    void Data::Print(const std::string &name) const {
         ((Data*)this)->ToDevice(DataDevice::CPU);
+        if (!name.empty()) {
+            printf("[%s] ", name.c_str());
+        }
         printf("shape: ");
         for (int i : this->dims) {
             printf("%d ", i);

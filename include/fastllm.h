@@ -484,7 +484,7 @@ namespace fastllm {
 
         std::vector<int> Shape() const; 
 
-        void Print() const; // 输出
+        void Print(const std::string &name = "") const; // 输出
 
         void CalcWeightSum(); // 计算WeightSum
 
