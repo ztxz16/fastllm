@@ -3266,10 +3266,14 @@ namespace fastllm {
         }, {}, {{"axis", axis}});
     }
 
-    void Linear(Data &input, Data &weight, const Data &bias, Data &output) {
+    void Linear(Data &input, Data &weight, const Data &bias, Data &output, bool keepTpReplicated) {
+        IntDict intParams;
+        if (keepTpReplicated) {
+            intParams["keepTpReplicated"] = 1;
+        }
         curExecutor->Run("Linear", {
                 {"input", &input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}
-        }, {}, {});
+        }, {}, intParams);
     }
 
     void LinearAdd(const Data &input, const Data &weight, const Data &bias, Data &middle, Data &output) {

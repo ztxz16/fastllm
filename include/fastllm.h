@@ -811,7 +811,7 @@ namespace fastllm {
 
     void LayerNorm(Data &input, Data &gamma, Data &beta, int axis, Data &output);
 
-    void Linear(Data &input, Data &weight, const Data &bias, Data &output);
+    void Linear(Data &input, Data &weight, const Data &bias, Data &output, bool keepTpReplicated = false);
 
     void LinearAdd(const Data &input, const Data &weight, const Data &bias, Data &middle, Data &output);
 

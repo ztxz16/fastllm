@@ -2142,6 +2142,47 @@ namespace fastllm {
         FastllmCudaCopyFromDeviceToDevice(data.cudaData, data.multiDeviceDatas[rootDevice]->cudaData, data.GetBytes());
     }
 
+    static bool RunMultiCudaReplicatedLinear(Data &input, Data &weight, Data &bias, Data &output) {
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || !input.IsTensorParallelReplicated()) {
+            return false;
+        }
+
+        EnsureReplicatedMultiCudaTensor(input, devices, true);
+        EnsureReplicatedMultiCudaTensor(weight, devices, true);
+        EnsureReplicatedMultiCudaTensor(bias, devices, true);
+        EnsureReplicatedMultiCudaTensor(output, devices, false);
+        SyncReplicatedLocalShapeFromRoot(input, devices);
+        SyncReplicatedLocalShapeFromRoot(weight, devices);
+        SyncReplicatedLocalShapeFromRoot(bias, devices);
+        SyncReplicatedLocalShapeFromRoot(output, devices);
+
+        auto *pool = fastllm::GetAlivePool();
+        std::vector <fastllm::MultiThreadBaseOp*> ops;
+        ops.reserve(devices.size());
+        for (int device : devices) {
+            ops.push_back(new MultiCudaDoLinearShardOp(
+                input.multiDeviceDatas[device],
+                weight.multiDeviceDatas[device],
+                bias.multiDeviceDatas[device],
+                output.multiDeviceDatas[device],
+                device
+            ));
+        }
+        for (int i = 0; i < ops.size(); i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < ops.size(); i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+
+        SyncReplicatedRootFromDevice0(output, devices);
+        return true;
+    }
+
     static bool RunMultiCudaRowLinear(Data &input, Data &weight, Data &bias, Data &output) {
         std::vector <int> devices;
         std::map <int, int> ratios;
@@ -2181,7 +2222,8 @@ namespace fastllm {
         return true;
     }
 
-    static bool RunMultiCudaColumnLinear(Data &input, Data &weight, Data &bias, Data &output) {
+    static bool RunMultiCudaColumnLinear(Data &input, Data &weight, Data &bias, Data &output,
+                                         bool keepTpReplicated = false) {
         std::vector <int> devices;
         std::map <int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
@@ -2225,7 +2267,9 @@ namespace fastllm {
         if (!useNccl) {
             ReduceReplicatedOutputOnRoot(output, devices);
         }
-        // SyncReplicatedRootFromDevice0(output, devices);
+        if (keepTpReplicated) {
+            SyncReplicatedRootFromDevice0(output, devices);
+        }
         return true;
     }
 
@@ -2243,6 +2287,11 @@ namespace fastllm {
         }
         Data &input = *(datas.find("input")->second);
         Data &weight = *(datas.find("weight")->second);
+        bool keepTpReplicated = intParams.find("keepTpReplicated") != intParams.end() &&
+                                intParams.find("keepTpReplicated")->second != 0;
+        if (keepTpReplicated && input.IsTensorParallelReplicated()) {
+            return true;
+        }
         if (weight.tpLinearType != TP_LINEAR_NONE || input.IsTensorParallelSharded() ||
             IsTensorParallelRowWeight(weight) || IsTensorParallelColumnWeight(weight)) {
             return true;
@@ -2255,6 +2304,12 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
         Data &bias = *(datas.find("bias")->second);
+        bool keepTpReplicated = intParams.find("keepTpReplicated") != intParams.end() &&
+                                intParams.find("keepTpReplicated")->second != 0;
+        bool isRowLinear = weight.tpLinearType == TP_LINEAR_ROW ||
+                           (!input.IsTensorParallelSharded() && IsTensorParallelRowWeight(weight));
+        bool isColumnLinear = weight.tpLinearType == TP_LINEAR_COLUMN ||
+                              input.IsTensorParallelSharded() || IsTensorParallelColumnWeight(weight);
 /* printf("into multi linear\n");
 auto st = std::chrono::system_clock::now();
 {
@@ -2263,14 +2318,18 @@ auto st = std::chrono::system_clock::now();
     int k = output.dims.back();
     printf("n = %d, m = %d, k = %d\n", n, m, k);
 } */
-        if (weight.tpLinearType == TP_LINEAR_ROW || (!input.IsTensorParallelSharded() && IsTensorParallelRowWeight(weight))) {
+        if (keepTpReplicated && !isRowLinear &&
+            RunMultiCudaReplicatedLinear(input, weight, bias, output)) {
+            return;
+        }
+        if (isRowLinear) {
             if (RunMultiCudaRowLinear(input, weight, bias, output)) {
 // printf("row spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 return;
             }
         }
-        if (weight.tpLinearType == TP_LINEAR_COLUMN || input.IsTensorParallelSharded() || IsTensorParallelColumnWeight(weight)) {
-            if (RunMultiCudaColumnLinear(input, weight, bias, output)) {
+        if (isColumnLinear) {
+            if (RunMultiCudaColumnLinear(input, weight, bias, output, keepTpReplicated)) {
 // printf("column spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                 return;
             }

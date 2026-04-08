@@ -270,7 +270,7 @@ namespace fastllm {
 
                 int batch = attenInput.dims[0], len = attenInput.dims[1];
                 attenInput.Reshape({batch * len, attenInput.dims[2]});
-                Linear(attenInput, weight[gateWeightName], Data(), routerLogits);
+                Linear(attenInput, weight[gateWeightName], Data(), routerLogits, true);
 
                 ToDataType(routerLogits, routerLogitsTemp, DataType::FLOAT32);
                 bool needNorm = true;
