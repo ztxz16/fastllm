@@ -155,11 +155,13 @@ namespace fastllm {
                 printf("%s(invalid layout)\n", linePrefix);
                 return;
             }
+            const int previewRows = 10;
+            bool truncateRows = n > previewRows * 2;
             for (int i = 0; i < n; i++) {
-                if (i == 10) {
+                if (truncateRows && i == previewRows) {
                     printf("%s...\n", linePrefix);
                 }
-                if (i >= 10 && i <= n - 10) {
+                if (truncateRows && i >= previewRows && i < n - previewRows) {
                     continue;
                 }
                 printf("%s", linePrefix);
