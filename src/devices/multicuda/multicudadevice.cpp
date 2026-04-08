@@ -3030,18 +3030,19 @@ auto st = std::chrono::system_clock::now();
         int wBatch;
         float sharedScale;
         Data *output;
+        int rootDeviceId;
         int deviceId;
 
         MultiCudaDoMergeMOEOp(uint8_t *partOutput, 
                 Data *input, Data **weights, Data *index, Data *score, 
                 Data *w1, Data *w2, Data *w3, 
                 int wBatch, float sharedScale,
-                Data *output, int deviceId) : 
+                Data *output, int rootDeviceId, int deviceId) : 
                 partOutput(partOutput),
                 input(input), weights(weights), index(index), score(score), 
                 w1(w1), w2(w2), w3(w3),
                 wBatch(wBatch), sharedScale(sharedScale),
-                output(output), deviceId(deviceId) {}
+                output(output), rootDeviceId(rootDeviceId), deviceId(deviceId) {}
 
         void Run() {
             FastllmCudaSetDevice(deviceId);
@@ -3060,7 +3061,11 @@ auto st = std::chrono::system_clock::now();
             output->Allocate();
             DoCudaMergeMOE(*input, *output, *index, *score, *w1, *w2, *w3, curWeights.data(), nullptr, sharedScale);
 
-            FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
+            if (deviceId == rootDeviceId) {
+                FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
+            } else {
+                FastllmCudaMemcpyBetweenDevices(rootDeviceId, partOutput, deviceId, output->cudaData, output->GetBytes());
+            }
         }
     };
 
@@ -3285,6 +3290,7 @@ auto st = std::chrono::system_clock::now();
 
         auto *pool = fastllm::GetAlivePool();
         std::vector<fastllm::MultiThreadBaseOp*> ops;
+        int rootDeviceId = devices.empty() ? 0 : devices[0];
         for (int i = 0; i < devices.size(); i++) {
             auto device = devices[i];
             std::string specialId = "";
@@ -3297,7 +3303,7 @@ auto st = std::chrono::system_clock::now();
                     input.multiDeviceDatas[device], weights, &index, &score, 
                     w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device], 
                     wBatch, sharedScale, 
-                    curOutput.multiDeviceDatas[device], device
+                    curOutput.multiDeviceDatas[device], rootDeviceId, device
                 ));
             }
         }
@@ -3343,7 +3349,7 @@ auto st = std::chrono::system_clock::now();
         FastllmCudaFree(partOutput);
 
         if (inputReplicated) {
-            PrepareMultiCudaReplicatedData(output, devices, true);
+            RefreshReplicatedMultiCudaTensor(output, devices);
         }
     }
 }
