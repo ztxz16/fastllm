@@ -45,6 +45,7 @@ set(FASTLLM_SOURCES
     ${FASTLLM_ROOT}/src/models/gpt_oss.cpp
     ${FASTLLM_ROOT}/src/models/minimax_m2.cpp
     ${FASTLLM_ROOT}/src/models/qwen2.cpp
+    ${FASTLLM_ROOT}/src/models/gemma4.cpp
     ${FASTLLM_ROOT}/third_party/json11/json11.cpp
     ${FASTLLM_ROOT}/third_party/gguf/gguf.cpp
     ${FASTLLM_ROOT}/third_party/gguf/ggml-quant.cpp

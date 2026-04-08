@@ -6046,16 +6046,31 @@ ops += (long long)lines * inputDim * interDim * 2;
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         output.Allocate();
-        AssertInFastLLM(input.dataType == DataType::FLOAT32, "GeluNew error: Data's type should be float32.\n");
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
+                        input.dataType == DataType::FLOAT16,
+                        "Gelu error: Data's type should be float32 or float16.\n");
 
-        float temp = sqrt(2.0f / M_PI), factor = 0.044715;
+        std::vector<float> floatInputVector, floatOutputVector;
         float *inputData = (float*)input.cpuData;
         float *outputData = (float*)output.cpuData;
+
+        if (input.dataType == DataType::FLOAT16) {
+            floatInputVector.resize(input.Count(0));
+            floatOutputVector.resize(output.Count(0));
+            inputData = floatInputVector.data();
+            outputData = floatOutputVector.data();
+            Float16ToFloat32((uint16_t*)input.cpuData, inputData, (int)floatInputVector.size());
+        }
+
         int len = input.Count(0);
         int i = 0;
         for (; i < len; i++) {
             float x = inputData[i];
             outputData[i] = x * 0.5f * (1.0f + erf(x / sqrt(2.0)));
+        }
+
+        if (input.dataType == DataType::FLOAT16) {
+            Float32ToFloat16(outputData, (uint16_t*)output.cpuData, (int)floatOutputVector.size());
         }
     }
 

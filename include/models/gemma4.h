@@ -1,0 +1,92 @@
+//
+// Created for Gemma4 support in fastllm
+//
+
+#ifndef FASTLLM_GEMMA4_H
+#define FASTLLM_GEMMA4_H
+
+#include "basellm.h"
+#include "cmath"
+
+#include <iostream>
+
+namespace fastllm {
+    class Gemma4Model: public basellm {
+    public:
+    Gemma4Model ();
+
+        virtual void InitParams();
+
+        virtual int Forward(
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector <std::pair <Data, Data> > &pastKeyValues,
+                const GenerationConfig &generationConfig = GenerationConfig(),
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <float> *logits = nullptr);
+
+        std::vector <int> ForwardBatch(
+                int batch,
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector <std::pair <Data, Data> > &pastKeyValues,
+                const GenerationConfig &generationConfig = GenerationConfig(),
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr);
+
+        std::vector <int> ForwardBatch(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr);
+
+        virtual bool NeedAttentionMask(int qlen, int klen);
+
+        virtual void FillLLMInputsBatch(std::vector <std::vector <float> > &inputTokens,
+                                        const std::vector <std::map <std::string, int> > &params,
+                                        Data &inputIds, Data &attentionMask, Data &positionIds);
+
+        virtual void Prepare();
+
+        virtual void WarmUp();
+
+        virtual std::string MakeInput(const std::string &history, int round, const std::string &input);
+
+        virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output);
+
+        std::pair<std::vector<float>, std::vector<float>> UpdateRotaryPosEmb(float base, float factor, int seqLen, int dim);
+
+    protected:
+        float rms_norm_eps = 1e-6;
+        int num_key_value_heads = 32;
+        int global_num_key_value_heads = 4;
+        int sliding_head_dim = 256;
+        int global_head_dim = 512;
+        int sliding_window = 1024;
+        bool attention_k_eq_v = true;
+        float final_logit_softcapping = 0.0f;
+
+        float sliding_rope_base = 10000.0f;
+        float global_rope_base = 1000000.0f;
+        float global_partial_rotary_factor = 0.25f;
+
+        std::vector<int> layer_types; // 0 = sliding, 1 = full
+
+        Data slidingSinData, slidingCosData;
+        Data globalSinData, globalCosData;
+
+        std::vector<std::vector<float>> slidingSin, slidingCos;
+        std::vector<std::vector<float>> globalSin, globalCos;
+
+        bool prepared = false;
+    };
+}
+
+#endif //FASTLLM_GEMMA4_H

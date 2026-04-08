@@ -423,51 +423,54 @@ namespace fastllm {
                 SetSpecialTokens(glmSpecialTokens);
         }
         if (this->type == TokenizerType::BPE || this->type == TokenizerType::GLM) {
-#ifdef USE_SENTENCEPIECE
             std::string &s = const_cast<std::string &>(ori);
             std::vector<float> v;
-            int findPos = 0;
-            while (findPos < s.length()) {
-                int nextSpecialToken = -1;
-                int nextSpecialTokenPos = -1;
-                int nextSpecialTokenLen = -1;
-                for (auto token : this->specialTokens) {
-                    int ind = s.find(token, findPos);
-                    if (ind >= 0 && (nextSpecialTokenPos < 0 || ind < nextSpecialTokenPos)) {
-                        nextSpecialTokenPos = ind;
-                        nextSpecialToken = stringToTokenDict[token];
-                        nextSpecialTokenLen = token.length();
-                    }
-                }
-                std::string subStr;
-                if (nextSpecialTokenPos < 0) {
-                    subStr = s.substr(findPos);
-                    findPos = s.length();
-                } else {
-                    subStr = s.substr(findPos, nextSpecialTokenPos - findPos);
-                    findPos = nextSpecialTokenPos + nextSpecialTokenLen;
-                }
-                if (subStr.length() > 0) {
-                    if (spProcessor != nullptr) {
-                        std::vector<int> ids;
-                        spProcessor->Encode(subStr, &ids);
-                        for (int id : ids) {
-                            v.push_back(id);
+            if (!this->specialTokens.empty()) {
+                int findPos = 0;
+                while (findPos < (int)s.length()) {
+                    int nextSpecialToken = -1;
+                    int nextSpecialTokenPos = -1;
+                    int nextSpecialTokenLen = -1;
+                    for (auto &token : this->specialTokens) {
+                        int ind = s.find(token, findPos);
+                        if (ind >= 0 && (nextSpecialTokenPos < 0 || ind < nextSpecialTokenPos)) {
+                            nextSpecialTokenPos = ind;
+                            nextSpecialToken = stringToTokenDict[token];
+                            nextSpecialTokenLen = token.length();
                         }
+                    }
+                    std::string subStr;
+                    if (nextSpecialTokenPos < 0) {
+                        subStr = s.substr(findPos);
+                        findPos = s.length();
                     } else {
-                        std::string s = Normalize(subStr);
-                        std::vector<float> &&subTokenIds = BytePairEncode(s);
-                        v.insert(v.end(), subTokenIds.begin(), subTokenIds.end());
+                        subStr = s.substr(findPos, nextSpecialTokenPos - findPos);
+                        findPos = nextSpecialTokenPos + nextSpecialTokenLen;
+                    }
+                    if (subStr.length() > 0) {
+#ifdef USE_SENTENCEPIECE
+                        if (spProcessor != nullptr) {
+                            std::vector<int> ids;
+                            spProcessor->Encode(subStr, &ids);
+                            for (int id : ids) {
+                                v.push_back(id);
+                            }
+                        } else
+#endif
+                        {
+                            std::string ns = Normalize(subStr, false);
+                            std::vector<float> &&subTokenIds = BytePairEncode(ns);
+                            v.insert(v.end(), subTokenIds.begin(), subTokenIds.end());
+                        }
+                    }
+                    if (nextSpecialTokenPos >= 0) {
+                        v.push_back(nextSpecialToken);
                     }
                 }
-                if (nextSpecialTokenPos >= 0) {
-                    v.push_back(nextSpecialToken);
-                }
+            } else {
+                std::string ns = Normalize(ori);
+                v = BytePairEncode(ns);
             }
-#else
-            std::string s = Normalize(ori);
-            std::vector<float> &&v = BytePairEncode(s);
-#endif
             return Data (DataType::FLOAT32, {1, (int)v.size()}, v);
         } else if (this->type == TokenizerType::QWEN) {
             std::map<std::string, int> specialTokens = {{"<|im_start|>", 151644}, {"<|im_end|>", 151645}, {"<|endoftext|>", 151643}};

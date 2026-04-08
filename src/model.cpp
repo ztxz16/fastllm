@@ -28,6 +28,7 @@
 #include "bert.h"
 #include "xlmroberta.h"
 #include "graphllm.h"
+#include "gemma4.h"
 #include "phi3.h"
 #include "cogvlm.h"
 #include "minimax.h"
@@ -279,6 +280,9 @@ namespace fastllm {
             model = (basellm*)(new Glm4MOEModel());
         } else if (modelType == "gpt_oss") {
             model = (basellm*)(new GptOssModel());
+        } else if (modelType == "gemma4" || modelType == "gemma4_text") {
+            model = new Gemma4Model();
+            model->model_type = "gemma4";
         } else if (modelType == "fastllmJson") {
             model = new GraphLLMModel("fastllmJson");
         } else {
@@ -711,7 +715,8 @@ namespace fastllm {
             || tokenizerClass == "Qwen2Tokenizer"
             || tokenizerClass == "BloomTokenizer"
             || tokenizerClass == "LlamaTokenizer" || tokenizerClass == "CodeLlamaTokenizer"
-            || tokenizerClass == "MiniCPMTokenizer") {
+            || tokenizerClass == "MiniCPMTokenizer"
+            || tokenizerClass == "GemmaTokenizer" || tokenizerClass == "GemmaTokenizerFast") {
             // PreTrainedTokenizerFast
             std::string tokenizerFile = path + "tokenizer.json";
             if (!fastllm::FileExists(tokenizerFile)) {
