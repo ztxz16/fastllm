@@ -29,6 +29,13 @@ namespace fastllm {
     static bool RunReplicatedMultiCudaUnary(const std::string &opType, Data &input, Data &output,
                                             const FloatDict &floatParams, const IntDict &intParams);
 
+    static void RunCudaSelectExpertOp(const std::string &opType, const DataDict &datas,
+                                      const FloatDict &floatParams, const IntDict &intParams);
+
+    static bool RunReplicatedMultiCudaSelectExpert(const std::string &opType, Data &logits, Data *gateBias,
+                                                   Data &index, Data &score,
+                                                   const FloatDict &floatParams, const IntDict &intParams);
+
     MultiCudaDevice::MultiCudaDevice(CudaDevice *cudaDevice) {
         this->cudaDevice = cudaDevice;
         this->deviceType = "multicuda";
@@ -40,6 +47,7 @@ namespace fastllm {
         this->ops["ToBFloat16"] = (BaseOperator*)(new MultiCudaToBFloat16());
         this->ops["ConvertToBFloat16"] = (BaseOperator*)(new MultiCudaConvertToBFloat16());
         this->ops["SoftMax"] = (BaseOperator*)(new MultiCudaSoftMaxOp());
+        this->ops["SelectExpert"] = (BaseOperator*)(new MultiCudaSelectExpertOp());
         this->ops["LinearAdd"] = (BaseOperator*)(new MultiCudaLinearAddOp());
         this->ops["LinearSwiglu"] = (BaseOperator*)(new MultiCudaLinearSwigluOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new MultiCudaRMSNormOp());
@@ -941,6 +949,18 @@ namespace fastllm {
             return;
         }
         RunCudaUnaryOp<CudaSoftMaxOp>(opType, datas, floatParams, intParams);
+    }
+
+    void MultiCudaSelectExpertOp::Run(const std::string &opType, const DataDict &datas,
+                                      const FloatDict &floatParams, const IntDict &intParams) {
+        Data &logits = *(datas.find("logits")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        Data *gateBias = datas.find("gateBias") != datas.end() ? datas.find("gateBias")->second : nullptr;
+        if (RunReplicatedMultiCudaSelectExpert(opType, logits, gateBias, index, score, floatParams, intParams)) {
+            return;
+        }
+        RunCudaSelectExpertOp(opType, datas, floatParams, intParams);
     }
 
     bool MultiCudaLinearAddOp::CanRun(const std::string &opType, const DataDict &datas,
@@ -2256,6 +2276,12 @@ namespace fastllm {
         ((BaseOperator*)(&cudaOp))->Run(opType, datas, floatParams, intParams);
     }
 
+    static void RunCudaSelectExpertOp(const std::string &opType, const DataDict &datas,
+                                      const FloatDict &floatParams, const IntDict &intParams) {
+        CudaSelectExpertOp cudaOp;
+        ((BaseOperator*)(&cudaOp))->Run(opType, datas, floatParams, intParams);
+    }
+
     template <typename CudaOpType>
     static bool RunReplicatedMultiCudaUnaryInplace(const std::string &opType, Data &input,
                                                    const FloatDict &floatParams, const IntDict &intParams) {
@@ -2311,6 +2337,47 @@ namespace fastllm {
             RunCudaUnaryOp<CudaOpType>(opType, localDatas, floatParams, intParams);
         }
         SyncReplicatedRootFromDevice0(*rootOutput, devices);
+        return true;
+    }
+
+    static bool RunReplicatedMultiCudaSelectExpert(const std::string &opType, Data &logits, Data *gateBias,
+                                                   Data &index, Data &score,
+                                                   const FloatDict &floatParams, const IntDict &intParams) {
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || !logits.multiDeviceData || !logits.IsTensorParallelReplicated()) {
+            return false;
+        }
+
+        EnsureReplicatedMultiCudaTensor(logits, devices, true);
+        SyncReplicatedLocalShapeFromRoot(logits, devices);
+        if (gateBias != nullptr) {
+            EnsureReplicatedMultiCudaTensor(*gateBias, devices, true);
+            SyncReplicatedLocalShapeFromRoot(*gateBias, devices);
+        }
+
+        index.dataDevice = logits.dataDevice;
+        score.dataDevice = logits.dataDevice;
+        EnsureReplicatedMultiCudaTensor(index, devices, false);
+        EnsureReplicatedMultiCudaTensor(score, devices, false);
+        SyncReplicatedLocalShapeFromRoot(index, devices);
+        SyncReplicatedLocalShapeFromRoot(score, devices);
+
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            DataDict localDatas = {
+                {"logits", logits.multiDeviceDatas[device]},
+                {"index", index.multiDeviceDatas[device]},
+                {"score", score.multiDeviceDatas[device]}
+            };
+            if (gateBias != nullptr) {
+                localDatas["gateBias"] = gateBias->multiDeviceDatas[device];
+            }
+            RunCudaSelectExpertOp(opType, localDatas, floatParams, intParams);
+        }
+        SyncReplicatedRootFromDevice0(index, devices);
+        SyncReplicatedRootFromDevice0(score, devices);
         return true;
     }
 
