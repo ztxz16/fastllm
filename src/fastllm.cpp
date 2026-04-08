@@ -69,6 +69,36 @@ namespace fastllm {
             }
         }
 
+        static void PrintBorderLine(char ch, int width = 70, const char *prefix = "") {
+            printf("%s", prefix);
+            for (int i = 0; i < width; i++) {
+                putchar(ch);
+            }
+            printf("\n");
+        }
+
+        static void PrintTensorBlockTitle(const std::string &name) {
+            PrintBorderLine('=');
+            if (name.empty()) {
+                printf("tensor\n");
+            } else {
+                printf("tensor: %s\n", name.c_str());
+            }
+        }
+
+        static void PrintRangesInline(const std::vector <std::pair <int, int> > &ranges) {
+            if (ranges.empty()) {
+                printf("(no range)");
+                return;
+            }
+            for (int i = 0; i < ranges.size(); i++) {
+                if (i > 0) {
+                    printf(" ");
+                }
+                printf("[%d, %d)", ranges[i].first, ranges[i].second);
+            }
+        }
+
         static int NormalizePrintAxis(int axis, int dimsLen) {
             if (dimsLen <= 0) {
                 return axis;
@@ -1702,12 +1732,11 @@ namespace fastllm {
     }
 
     void Data::Print(const std::string &name) const {
-        if (!name.empty()) {
-            printf("[%s] ", name.c_str());
-        }
+        PrintTensorBlockTitle(name);
         if (!this->multiDeviceData) {
             ((Data*)this)->ToDevice(DataDevice::CPU);
             PrintSingleTensor(*this, this->dims);
+            PrintBorderLine('=');
             return;
         }
 
@@ -1728,6 +1757,7 @@ namespace fastllm {
         printf("device layout:\n");
         if (this->multiDeviceDatas.empty()) {
             printf("  (empty)\n");
+            PrintBorderLine('=');
             return;
         }
         for (auto &it : this->multiDeviceDatas) {
@@ -1737,15 +1767,10 @@ namespace fastllm {
                 printf("full replica");
             } else if (this->tpLayout == TP_LAYOUT_SHARDED) {
                 auto rangesIt = this->tpRanges.find(deviceId);
-                if (rangesIt == this->tpRanges.end() || rangesIt->second.empty()) {
+                if (rangesIt == this->tpRanges.end()) {
                     printf("(no range)");
                 } else {
-                    for (int i = 0; i < rangesIt->second.size(); i++) {
-                        if (i > 0) {
-                            printf(" ");
-                        }
-                        printf("[%d, %d)", rangesIt->second[i].first, rangesIt->second[i].second);
-                    }
+                    PrintRangesInline(rangesIt->second);
                 }
             } else {
                 printf("local tensor");
@@ -1756,7 +1781,20 @@ namespace fastllm {
         for (auto &it : this->multiDeviceDatas) {
             int deviceId = it.first;
             Data *local = it.second;
-            printf("device %d:\n", deviceId);
+            PrintBorderLine('-');
+            printf("device %d local", deviceId);
+            if (this->tpLayout == TP_LAYOUT_REPLICATED) {
+                printf(" | replica");
+            } else if (this->tpLayout == TP_LAYOUT_SHARDED) {
+                auto rangesIt = this->tpRanges.find(deviceId);
+                printf(" | range: ");
+                if (rangesIt == this->tpRanges.end()) {
+                    printf("(no range)");
+                } else {
+                    PrintRangesInline(rangesIt->second);
+                }
+            }
+            printf("\n");
             if (local == nullptr) {
                 printf("  (null)\n");
                 continue;
@@ -1764,6 +1802,7 @@ namespace fastllm {
             local->ToDevice(DataDevice::CPU);
             PrintSingleTensor(*local, local->dims, "  ");
         }
+        PrintBorderLine('=');
     }
 
     void Data::CalcWeightSum() {
