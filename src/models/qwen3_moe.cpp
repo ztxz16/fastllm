@@ -175,8 +175,13 @@ namespace fastllm {
                 biass[i].push_back(nullptr);
                 biass[i].push_back(nullptr);
                 for (int j = 0; j < this->num_experts; j++) {
-                    weights[i].push_back(&weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".gateup_proj.weight"]);
-                    weights[i].push_back(&weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".down_proj.weight"]);
+                    Data &gateup = weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".gateup_proj.weight"];
+                    Data &down   = weight["model.layers." + std::to_string(i) + ".mlp.experts." + std::to_string(j) + ".down_proj.weight"];
+                    gateup.tpLinearType = TP_LINEAR_ROW;
+                    gateup.tpPackType   = TP_PACK_GATEUP;
+                    down.tpLinearType   = TP_LINEAR_COLUMN;
+                    weights[i].push_back(&gateup);
+                    weights[i].push_back(&down);
                     biass[i].push_back(nullptr);
                     biass[i].push_back(nullptr);
                 }
