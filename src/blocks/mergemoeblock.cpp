@@ -17,7 +17,7 @@ namespace fastllm {
                      sharedScale, *output, layer);
         } else {
             ToDataType(*input, *moeInputTemp, moeAtype);
-            MergeMOE(*input, *expertIndex, *expertScore,
+            MergeMOE(*moeInputTemp, *expertIndex, *expertScore,
                      *weights, *biass,
                      *w1, *w2, *w3, *tempInput, *tempOutput,
                      sharedScale, *moeOutputTemp, layer);
