@@ -46,6 +46,8 @@ namespace py = pybind11;
 #include "gguf.h"
 
 namespace fastllm {
+    extern BF16ToFP32Manager bf16tofp32;
+
     namespace {
         bool IsEnvValueTrueIgnoreCase(const char *env) {
             if (env == nullptr) {
@@ -59,6 +61,110 @@ namespace fastllm {
                 }
             }
             return value == "1" || value == "on" || value == "true";
+        }
+
+        static void PrintDimsInline(const std::vector <int> &dims) {
+            for (int dim : dims) {
+                printf("%d ", dim);
+            }
+        }
+
+        static int NormalizePrintAxis(int axis, int dimsLen) {
+            if (dimsLen <= 0) {
+                return axis;
+            }
+            return (axis % dimsLen + dimsLen) % dimsLen;
+        }
+
+        static bool TryConvertCpuDataToFloat(const Data &data, std::vector <float> &floatData) {
+            if (data.cpuData == nullptr) {
+                return false;
+            }
+            floatData.resize(data.Count(0));
+            if (data.dataType == DataType::FLOAT32) {
+                memcpy(floatData.data(), data.cpuData, data.Count(0) * sizeof(float));
+                return true;
+            } else if (data.dataType == DataType::FLOAT16) {
+                for (int i = 0; i < floatData.size(); i++) {
+                    floatData[i] = half_to_float(((uint16_t*)data.cpuData)[i]);
+                }
+                return true;
+            } else if (data.dataType == DataType::BFLOAT16) {
+                for (int i = 0; i < floatData.size(); i++) {
+                    floatData[i] = bf16tofp32.dict[(((uint16_t*)data.cpuData)[i])];
+                }
+                return true;
+            } else if (data.dataType == DataType::INT32) {
+                for (int i = 0; i < floatData.size(); i++) {
+                    floatData[i] = ((int32_t*)data.cpuData)[i];
+                }
+                return true;
+            }
+            return false;
+        }
+
+        static void PrintFloatDataPreview(const std::vector <float> &floatData,
+                                          const std::vector <int> &dims,
+                                          const char *linePrefix) {
+            if (floatData.empty()) {
+                printf("%s(empty)\n", linePrefix);
+                return;
+            }
+            if (dims.empty()) {
+                printf("%s%f\n", linePrefix, floatData[0]);
+                return;
+            }
+            int m = dims.back();
+            if (m <= 0) {
+                printf("%s(empty)\n", linePrefix);
+                return;
+            }
+
+            int n = (int)floatData.size() / m;
+            if (n * m != (int)floatData.size()) {
+                printf("%s(invalid layout)\n", linePrefix);
+                return;
+            }
+            for (int i = 0; i < n; i++) {
+                if (i == 10) {
+                    printf("%s...\n", linePrefix);
+                }
+                if (i >= 10 && i <= n - 10) {
+                    continue;
+                }
+                printf("%s", linePrefix);
+                for (int j = 0; j < 3 && j < m; j++) {
+                    printf("%f ", floatData[i * m + j]);
+                }
+                if (m > 3) {
+                    printf("... ");
+                    for (int j = 0; j < 3 && j < m; j++) {
+                        printf("%f ", floatData[i * m + (m - 3 + j)]);
+                    }
+                }
+                printf("\n");
+            }
+        }
+
+        static void PrintCpuDataPreview(const Data &data, const char *linePrefix = "") {
+            if (data.cpuData == nullptr) {
+                printf("%s(cpu data is null)\n", linePrefix);
+                return;
+            }
+
+            std::vector <float> floatData;
+            if (!TryConvertCpuDataToFloat(data, floatData)) {
+                printf("%s(unsupported data type: %s)\n", linePrefix, GetDataTypeName(data.dataType).c_str());
+                return;
+            }
+            PrintFloatDataPreview(floatData, data.dims, linePrefix);
+        }
+
+        static void PrintSingleTensor(const Data &data, const std::vector <int> &shape, const char *linePrefix = "") {
+            printf("%sshape: ", linePrefix);
+            PrintDimsInline(shape);
+            printf("\n%sdata:\n", linePrefix);
+            PrintCpuDataPreview(data, linePrefix);
         }
     }
 
@@ -1596,68 +1702,67 @@ namespace fastllm {
     }
 
     void Data::Print(const std::string &name) const {
-        ((Data*)this)->ToDevice(DataDevice::CPU);
         if (!name.empty()) {
             printf("[%s] ", name.c_str());
         }
-        printf("shape: ");
-        for (int i : this->dims) {
-            printf("%d ", i);
-        }
-        printf("\ndata: ");
-        /*
-        int len = Count(0);
-        if (len < 20) {
-            for (int i = 0; i < len; i++) {
-                printf("%f ", ((float*)cpuData)[i]);
-            }
-        } else {
-            for (int i = 0; i < 10; i++) {
-                printf("%f ", ((float *) cpuData)[i]);
-            }
-            printf("... ");
-            for (int i = 0; i < 10; i++) {
-                printf("%f ", ((float *) cpuData)[len - 10 + i]);
-            }
-        }
-        printf("\n");
-         */
-        int n = Count(0) / dims.back(), m = dims.back();
-        std::vector <float> floatData;
-        floatData.resize(this->Count(0));
-        if (this->dataType == DataType::FLOAT32) {
-            memcpy(floatData.data(), cpuData, this->Count(0) * sizeof(float));
-        } else if (this->dataType == DataType::FLOAT16) {
-            for (int i = 0; i < floatData.size(); i++) {
-                floatData[i] = half_to_float(((uint16_t*)cpuData)[i]);
-            }
-        } else if (this->dataType == DataType::BFLOAT16) {
-            for (int i = 0; i < floatData.size(); i++) {
-                floatData[i] = bf16tofp32.dict[(((uint16_t*)cpuData)[i])];
-            }
-        } else if (this->dataType == DataType::INT32) {
-            for (int i = 0; i < floatData.size(); i++) {
-                floatData[i] = ((int32_t*)cpuData)[i];
-            }
+        if (!this->multiDeviceData) {
+            ((Data*)this)->ToDevice(DataDevice::CPU);
+            PrintSingleTensor(*this, this->dims);
+            return;
         }
 
-        for (int i = 0; i < n; i++) {
-            if (i == 10) {
-                printf("...\n");
-            }
-            if (i >= 10 && i <= n - 10) {
-                continue;
-            }
-            for (int j = 0; j < 3 && j < m; j++) {
-                printf("%f ", floatData[i * m + j]);
-            }
-            if (m > 3) {
-                printf("... ");
-                for (int j = 0; j < 3 && j < m; j++) {
-                    printf("%f ", floatData[i * m + (m - 3 + j)]);
+        const std::vector <int> &globalDims = this->tpGlobalDims.empty() ? this->dims : this->tpGlobalDims;
+        printf("shape: ");
+        PrintDimsInline(globalDims);
+        printf("\n");
+
+        if (this->tpLayout == TP_LAYOUT_REPLICATED) {
+            printf("distribution: replicated\n");
+        } else if (this->tpLayout == TP_LAYOUT_SHARDED) {
+            int axis = NormalizePrintAxis(this->tpAxis, (int)globalDims.size());
+            printf("distribution: sharded(axis=%d)\n", axis);
+        } else {
+            printf("distribution: multi-device\n");
+        }
+
+        printf("device layout:\n");
+        if (this->multiDeviceDatas.empty()) {
+            printf("  (empty)\n");
+            return;
+        }
+        for (auto &it : this->multiDeviceDatas) {
+            int deviceId = it.first;
+            printf("  device %d -> ", deviceId);
+            if (this->tpLayout == TP_LAYOUT_REPLICATED) {
+                printf("full replica");
+            } else if (this->tpLayout == TP_LAYOUT_SHARDED) {
+                auto rangesIt = this->tpRanges.find(deviceId);
+                if (rangesIt == this->tpRanges.end() || rangesIt->second.empty()) {
+                    printf("(no range)");
+                } else {
+                    for (int i = 0; i < rangesIt->second.size(); i++) {
+                        if (i > 0) {
+                            printf(" ");
+                        }
+                        printf("[%d, %d)", rangesIt->second[i].first, rangesIt->second[i].second);
+                    }
                 }
+            } else {
+                printf("local tensor");
             }
             printf("\n");
+        }
+
+        for (auto &it : this->multiDeviceDatas) {
+            int deviceId = it.first;
+            Data *local = it.second;
+            printf("device %d:\n", deviceId);
+            if (local == nullptr) {
+                printf("  (null)\n");
+                continue;
+            }
+            local->ToDevice(DataDevice::CPU);
+            PrintSingleTensor(*local, local->dims, "  ");
         }
     }
 
