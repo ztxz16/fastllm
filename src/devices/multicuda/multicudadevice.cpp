@@ -17,10 +17,29 @@ namespace fastllm {
     static void SyncCudaAndCheck(int device, const char *where);
     static bool NeedTpDebugInfo();
 
+    template <typename CudaOpType>
+    static void RunCudaUnaryOp(const std::string &opType, const DataDict &datas,
+                               const FloatDict &floatParams, const IntDict &intParams);
+
+    template <typename CudaOpType>
+    static bool RunReplicatedMultiCudaUnaryInplace(const std::string &opType, Data &input,
+                                                   const FloatDict &floatParams, const IntDict &intParams);
+
+    template <typename CudaOpType>
+    static bool RunReplicatedMultiCudaUnary(const std::string &opType, Data &input, Data &output,
+                                            const FloatDict &floatParams, const IntDict &intParams);
+
     MultiCudaDevice::MultiCudaDevice(CudaDevice *cudaDevice) {
         this->cudaDevice = cudaDevice;
         this->deviceType = "multicuda";
 
+        this->ops["ToFloat16"] = (BaseOperator*)(new MultiCudaToFloat16());
+        this->ops["ToFloat32"] = (BaseOperator*)(new MultiCudaToFloat32());
+        this->ops["ConvertToFloat16"] = (BaseOperator*)(new MultiCudaConvertToFloat16());
+        this->ops["ConvertToFloat32"] = (BaseOperator*)(new MultiCudaConvertToFloat32());
+        this->ops["ToBFloat16"] = (BaseOperator*)(new MultiCudaToBFloat16());
+        this->ops["ConvertToBFloat16"] = (BaseOperator*)(new MultiCudaConvertToBFloat16());
+        this->ops["SoftMax"] = (BaseOperator*)(new MultiCudaSoftMaxOp());
         this->ops["LinearAdd"] = (BaseOperator*)(new MultiCudaLinearAddOp());
         this->ops["LinearSwiglu"] = (BaseOperator*)(new MultiCudaLinearSwigluOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new MultiCudaRMSNormOp());
@@ -855,6 +874,73 @@ namespace fastllm {
         } else {
             this->ops[opType]->Run(opType, datas, floatParams, intParams);
         }
+    }
+
+    void MultiCudaToFloat16::Run(const std::string &opType, const DataDict &datas,
+                                 const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        if (RunReplicatedMultiCudaUnaryInplace<CudaToFloat16>(opType, input, floatParams, intParams)) {
+            return;
+        }
+        RunCudaUnaryOp<CudaToFloat16>(opType, datas, floatParams, intParams);
+    }
+
+    void MultiCudaToFloat32::Run(const std::string &opType, const DataDict &datas,
+                                 const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        if (RunReplicatedMultiCudaUnaryInplace<CudaToFloat32>(opType, input, floatParams, intParams)) {
+            return;
+        }
+        RunCudaUnaryOp<CudaToFloat32>(opType, datas, floatParams, intParams);
+    }
+
+    void MultiCudaConvertToFloat16::Run(const std::string &opType, const DataDict &datas,
+                                        const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        if (RunReplicatedMultiCudaUnary<CudaConvertToFloat16>(opType, input, output, floatParams, intParams)) {
+            return;
+        }
+        RunCudaUnaryOp<CudaConvertToFloat16>(opType, datas, floatParams, intParams);
+    }
+
+    void MultiCudaConvertToFloat32::Run(const std::string &opType, const DataDict &datas,
+                                        const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        if (RunReplicatedMultiCudaUnary<CudaConvertToFloat32>(opType, input, output, floatParams, intParams)) {
+            return;
+        }
+        RunCudaUnaryOp<CudaConvertToFloat32>(opType, datas, floatParams, intParams);
+    }
+
+    void MultiCudaToBFloat16::Run(const std::string &opType, const DataDict &datas,
+                                  const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        if (RunReplicatedMultiCudaUnaryInplace<CudaToBFloat16>(opType, input, floatParams, intParams)) {
+            return;
+        }
+        RunCudaUnaryOp<CudaToBFloat16>(opType, datas, floatParams, intParams);
+    }
+
+    void MultiCudaConvertToBFloat16::Run(const std::string &opType, const DataDict &datas,
+                                         const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        if (RunReplicatedMultiCudaUnary<CudaConvertToBFloat16>(opType, input, output, floatParams, intParams)) {
+            return;
+        }
+        RunCudaUnaryOp<CudaConvertToBFloat16>(opType, datas, floatParams, intParams);
+    }
+
+    void MultiCudaSoftMaxOp::Run(const std::string &opType, const DataDict &datas,
+                                 const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        if (RunReplicatedMultiCudaUnary<CudaSoftMaxOp>(opType, input, output, floatParams, intParams)) {
+            return;
+        }
+        RunCudaUnaryOp<CudaSoftMaxOp>(opType, datas, floatParams, intParams);
     }
 
     bool MultiCudaLinearAddOp::CanRun(const std::string &opType, const DataDict &datas,
@@ -2130,16 +2216,102 @@ namespace fastllm {
             return;
         }
         int rootDevice = devices[0];
+        auto it = data.multiDeviceDatas.find(rootDevice);
+        if (it == data.multiDeviceDatas.end() || it->second == nullptr) {
+            return;
+        }
+        Data *rootLocal = it->second;
+
         FastllmCudaSetDevice(rootDevice);
-        data.ToDevice(DataDevice::CUDA, {rootDevice}, false);
-        if (data.cudaData == nullptr && data.Count(0) > 0) {
+        bool needRealloc = data.dataType != rootLocal->dataType;
+        data.dataType = rootLocal->dataType;
+        data.UpdateUnitSize();
+        if (data.dims != rootLocal->dims) {
+            data.Resize(rootLocal->dims);
+        }
+        data.expansionDims = rootLocal->expansionDims;
+        data.dataDevice = DataDevice::CUDA;
+        data.dataDeviceIds = {rootDevice};
+        if (!needRealloc) {
+            data.ToDevice(DataDevice::CUDA, {rootDevice}, false);
+        } else {
+            data.FreeSpace();
+        }
+        if ((data.cudaData == nullptr || data.expansionBytes < data.GetBytes()) && data.Count(0) > 0) {
             data.dataDevice = DataDevice::CUDA;
             data.dataDeviceIds = {rootDevice};
             data.expansionSize = 0;
             data.expansionBytes = 0;
             data.Allocate();
         }
-        FastllmCudaCopyFromDeviceToDevice(data.cudaData, data.multiDeviceDatas[rootDevice]->cudaData, data.GetBytes());
+        if (data.cudaData != nullptr && rootLocal->cudaData != nullptr && data.Count(0) > 0) {
+            FastllmCudaCopyFromDeviceToDevice(data.cudaData, rootLocal->cudaData, data.GetBytes());
+        }
+    }
+
+    template <typename CudaOpType>
+    static void RunCudaUnaryOp(const std::string &opType, const DataDict &datas,
+                               const FloatDict &floatParams, const IntDict &intParams) {
+        CudaOpType cudaOp;
+        ((BaseOperator*)(&cudaOp))->Run(opType, datas, floatParams, intParams);
+    }
+
+    template <typename CudaOpType>
+    static bool RunReplicatedMultiCudaUnaryInplace(const std::string &opType, Data &input,
+                                                   const FloatDict &floatParams, const IntDict &intParams) {
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || !input.multiDeviceData || !input.IsTensorParallelReplicated()) {
+            return false;
+        }
+
+        EnsureReplicatedMultiCudaTensor(input, devices, true);
+        SyncReplicatedLocalShapeFromRoot(input, devices);
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            DataDict localDatas = {
+                {"input", input.multiDeviceDatas[device]}
+            };
+            RunCudaUnaryOp<CudaOpType>(opType, localDatas, floatParams, intParams);
+        }
+        SyncReplicatedRootFromDevice0(input, devices);
+        return true;
+    }
+
+    template <typename CudaOpType>
+    static bool RunReplicatedMultiCudaUnary(const std::string &opType, Data &input, Data &output,
+                                            const FloatDict &floatParams, const IntDict &intParams) {
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || !input.multiDeviceData || !input.IsTensorParallelReplicated()) {
+            return false;
+        }
+
+        EnsureReplicatedMultiCudaTensor(input, devices, true);
+        SyncReplicatedLocalShapeFromRoot(input, devices);
+
+        Data *rootOutput = &output;
+        if (&input != &output) {
+            output.dataDevice = input.dataDevice;
+            EnsureReplicatedMultiCudaTensor(output, devices, false);
+            SyncReplicatedLocalShapeFromRoot(output, devices);
+        } else {
+            rootOutput = &input;
+        }
+
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            Data *localOutput = (&input == &output) ? input.multiDeviceDatas[device] : output.multiDeviceDatas[device];
+            DataDict localDatas = {
+                {"input", input.multiDeviceDatas[device]},
+                {"output", localOutput}
+            };
+            RunCudaUnaryOp<CudaOpType>(opType, localDatas, floatParams, intParams);
+        }
+        SyncReplicatedRootFromDevice0(*rootOutput, devices);
+        return true;
     }
 
     static bool RunMultiCudaReplicatedLinear(Data &input, Data &weight, Data &bias, Data &output) {
