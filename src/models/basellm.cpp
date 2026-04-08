@@ -1947,7 +1947,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             this->model_struct == "ernie4_5" || 
                             this->model_struct == "pangu_moe" ||
                             this->model_struct == "glm4_moe" ||
-                            this->model_struct == "qwen3_next",  
+                            this->model_struct == "qwen3_next" ||
+                            this->model_struct == "gemma4",
                             this->model_struct + " doesn't support float16");
         } else if (dataType == DataType::BFLOAT16) {
             AssertInFastLLM(this->use_new_engine ||
@@ -1962,7 +1963,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             this->model_struct == "ernie4_5" || 
                             this->model_struct == "pangu_moe" ||
                             this->model_struct == "glm4_moe" ||
-                            this->model_struct == "qwen3_next",  
+                            this->model_struct == "qwen3_next" ||
+                            this->model_struct == "gemma4",
                             this->model_struct + " doesn't support bfloat16");
         } else {
             ErrorInFastLLM("SetDataType Error: datatype should be float32, float16 or bfloat16");
