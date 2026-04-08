@@ -2,6 +2,32 @@
 #include "fastllm.h"
 
 namespace fastllm {
+    static void ClearStaleReplicatedView(Data *output) {
+        if (output == nullptr || !output->multiDeviceData || !output->IsTensorParallelReplicated()) {
+            return;
+        }
+
+        bool stale = (!output->tpGlobalDims.empty() && output->tpGlobalDims != output->dims);
+        if (!stale) {
+            for (auto &it : output->multiDeviceDatas) {
+                if (it.second != nullptr && it.second->dims != output->dims) {
+                    stale = true;
+                    break;
+                }
+            }
+        }
+        if (!stale) {
+            return;
+        }
+
+        for (auto &it : output->multiDeviceDatas) {
+            delete it.second;
+        }
+        output->multiDeviceDatas.clear();
+        output->multiDeviceData = false;
+        output->ClearTensorParallelLayout();
+    }
+
     void MergeMOEBlock (
         Data *input, Data *expertIndex, Data *expertScore,
         std::vector <Data*> *weights, std::vector <Data*> *biass,
@@ -24,5 +50,6 @@ namespace fastllm {
                      sharedScale, *moeOutputTemp, layer, gateType);
             ToDataType(*moeOutputTemp, *output, dataType);
         }
+        ClearStaleReplicatedView(output);
     }
 }

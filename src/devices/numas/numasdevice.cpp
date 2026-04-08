@@ -1466,6 +1466,12 @@ namespace fastllm {
         int weightsBatch = intParams.find("weights___batch") != intParams.end() ? intParams.find("weights___batch")->second : (topk + 1) * 2;
         int layer = intParams.find("layer") != intParams.end() ? intParams.find("layer")->second : 0;
         FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas = fastllmMoeDataManagerNumasPerLayer[layer % 2];
+        // `moeFinal` is reused across layers and may have been reshaped back to
+        // `[batch, seq, hidden]` by the caller. Reset it to the flattened MoE
+        // input shape here before the NUMA path reads `output.dims[1]`.
+        output.dataType = input.dataType;
+        output.expansionDims.clear();
+        output.Resize(input.dims);
         output.Allocate();
 // printf("allocate spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
         int32_t *indexData = (int32_t*)index.cpuData;
