@@ -89,7 +89,7 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
         if (bias != nullptr) {
 #pragma unroll
             for (int x = 0; x < PART; x++)
-                C[p + k * x] = __float2bfloat16_rn(sdata[x][0] + __bfloat162float(__ldg(bias + p)));
+                C[p + k * x] = __float2bfloat16_rn(sdata[x][0] + __bfloat162float(bias[p]));
         } else {
 #pragma unroll
             for (int x = 0; x < PART; x++)
