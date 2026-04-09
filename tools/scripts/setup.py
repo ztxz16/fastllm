@@ -1,3 +1,4 @@
+import email
 import os
 from setuptools import setup, find_packages
 
@@ -11,9 +12,41 @@ PACKAGE_INFO = {
     "release": {"name": "ftllm", "version": "0.1.5.1"},
     "nightly": {"name": "ftllm-nightly", "version": "0.0.0.3"},
 }
-variant = "nightly" if os.environ.get("FASTLLM_NIGHTLY", "0") == "1" else "release"
-package_name = PACKAGE_INFO[variant]["name"]
-package_version = PACKAGE_INFO[variant]["version"]
+
+
+def load_package_info_from_metadata():
+    metadata_paths = [
+        "PKG-INFO",
+        "ftllm.egg-info/PKG-INFO",
+        "ftllm_nightly.egg-info/PKG-INFO",
+    ]
+    for metadata_path in metadata_paths:
+        if not os.path.exists(metadata_path):
+            continue
+        with open(metadata_path, "r", encoding = "utf-8") as metadata_file:
+            metadata = email.message_from_file(metadata_file)
+        name = metadata.get("Name")
+        version = metadata.get("Version")
+        if name and version:
+            return {
+                "name": name,
+                "version": version,
+            }
+    return None
+
+
+def resolve_package_info():
+    if os.environ.get("FASTLLM_NIGHTLY", "0") == "1":
+        return PACKAGE_INFO["nightly"]
+    metadata_package_info = load_package_info_from_metadata()
+    if metadata_package_info is not None:
+        return metadata_package_info
+    return PACKAGE_INFO["release"]
+
+
+package_info = resolve_package_info()
+package_name = package_info["name"]
+package_version = package_info["version"]
 
 setup (
     name = package_name,
