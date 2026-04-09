@@ -42,6 +42,20 @@ namespace fastllm {
         locker.unlock();
     }
 
+    ResponseContext::~ResponseContext() {
+        for (auto &item : multimodalInput) {
+            for (auto *data : item.second) {
+                delete data;
+            }
+        }
+        multimodalInput.clear();
+
+        while (!resultLogits.empty()) {
+            delete resultLogits.front();
+            resultLogits.pop();
+        }
+    }
+
     void ResponseContext::Init(int blocks, DataType, DataType kvCacheDataType) {
         pastKeyValues.clear();
         for (int i = 0; i < blocks; i++) {
@@ -214,10 +228,33 @@ namespace fastllm {
     }
 
     basellm::~basellm() {
-        dictLocker.lock();
-        this->isFree = true;
-        dictLocker.unlock();
+        {
+            std::lock_guard<std::mutex> guard(dictLocker);
+            this->isFree = true;
+        }
         dictCV.notify_all();
+
+        std::thread *loop = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(mainLoopLocker);
+            loop = this->mainLoop;
+            this->mainLoop = nullptr;
+        }
+        if (loop != nullptr) {
+            if (loop->joinable()) {
+                loop->join();
+            }
+            delete loop;
+        }
+
+        {
+            std::lock_guard<std::mutex> guard(responseContextDict.locker);
+            for (auto &item : responseContextDict.dicts) {
+                delete item.second;
+            }
+            responseContextDict.dicts.clear();
+        }
+
         this->weight.ReleaseWeight();
     }
 

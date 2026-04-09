@@ -22,10 +22,28 @@
 #include "avxMath.h"
 #endif
 
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
+
 #include "utils.h"
 #include "gguf.h"
 
 namespace fastllm {
+    static uint64_t GetConvertedBufferBytes(const Data &data) {
+        uint64_t elementCount = data.expansionSize > 0 ? data.expansionSize : data.Count(0);
+        return (elementCount * data.unitSize - 1) / data.unitSizeDiv + 1;
+    }
+
+    static void InvalidateCudaMirror(Data &data) {
+#ifdef USE_CUDA
+        if (data.cudaData != nullptr) {
+            FastllmCudaFree(data.cudaData);
+            data.cudaData = nullptr;
+        }
+#endif
+    }
+
     CpuDevice::CpuDevice() {
         this->deviceType = "cpu";
         this->ops["ToFloat16"] = (BaseOperator*)(new CpuToFloat16());
@@ -278,7 +296,8 @@ namespace fastllm {
             float *old = (float*)data.cpuData;
             data.dataType = DataType::FLOAT16;
             data.UpdateUnitSize();
-            data.cpuData = new uint8_t[data.GetBytes()];
+            uint64_t newBytes = GetConvertedBufferBytes(data);
+            data.cpuData = new uint8_t[newBytes];
             uint16_t *cur = (uint16_t*)data.cpuData;
             int len = data.Count(0);
             for (int i = 0; i < len; i++) {
@@ -293,6 +312,8 @@ namespace fastllm {
         } else {
             ErrorInFastLLM("ToFloat16: unsupport dataType.\n");
         }
+        data.expansionBytes = GetConvertedBufferBytes(data);
+        InvalidateCudaMirror(data);
     }
 
     void CpuToFloat32::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -310,7 +331,8 @@ namespace fastllm {
             uint16_t *old = (uint16_t*)data.cpuData;
             data.dataType = DataType::FLOAT32;
             data.UpdateUnitSize();
-            data.cpuData = new uint8_t[data.GetBytes()];
+            uint64_t newBytes = GetConvertedBufferBytes(data);
+            data.cpuData = new uint8_t[newBytes];
             float *cur = (float*)data.cpuData;
             int len = data.Count(0);
             for (int i = 0; i < len; i++) {
@@ -321,7 +343,8 @@ namespace fastllm {
             uint16_t *old = (uint16_t*)data.cpuData;
             data.dataType = DataType::FLOAT32;
             data.UpdateUnitSize();
-            data.cpuData = new uint8_t[data.GetBytes()];
+            uint64_t newBytes = GetConvertedBufferBytes(data);
+            data.cpuData = new uint8_t[newBytes];
             float *cur = (float*)data.cpuData;
             int len = data.Count(0);
             for (int i = 0; i < len; i++) {
@@ -332,6 +355,8 @@ namespace fastllm {
         } else {
             ErrorInFastLLM("ToFloat32: unsupport dataType.\n");
         }
+        data.expansionBytes = GetConvertedBufferBytes(data);
+        InvalidateCudaMirror(data);
     }
 
     void CpuConvertToFloat16::Reshape(const std::string &opType, const fastllm::DataDict &datas,
@@ -413,7 +438,8 @@ namespace fastllm {
             float *old = (float*)data.cpuData;
             data.dataType = DataType::BFLOAT16;
             data.UpdateUnitSize();
-            data.cpuData = new uint8_t[data.GetBytes()];
+            uint64_t newBytes = GetConvertedBufferBytes(data);
+            data.cpuData = new uint8_t[newBytes];
             uint16_t *cur = (uint16_t*)data.cpuData;
             int len = data.Count(0);
             Float32ToBFloat16(old, cur, len);
@@ -426,6 +452,8 @@ namespace fastllm {
         } else {
             ErrorInFastLLM("ToBFloat16: unsupport dataType.\n");
         }
+        data.expansionBytes = GetConvertedBufferBytes(data);
+        InvalidateCudaMirror(data);
     }
 
     void CpuConvertToBFloat16::Reshape(const std::string &opType, const fastllm::DataDict &datas,

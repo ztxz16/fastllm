@@ -49,6 +49,8 @@ namespace fastllm {
 
         int cacheLen = 0;
 
+        ~ResponseContext();
+
         void Init(int blocks, DataType dataType, DataType kvCacheDataType);
         void TryRecord(basellm *model);
         void TryRecordPagedCache();

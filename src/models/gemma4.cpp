@@ -350,9 +350,13 @@ namespace fastllm {
 
         {
             std::vector<float> onesGlobal(global_head_dim, 1.0f);
-            weight["__gemma4_v_norm_global.weight"] = Data(DataType::FLOAT32, {global_head_dim}, onesGlobal);
+            weight["__gemma4_v_norm_global.weight"].CopyFrom(
+                Data(DataType::FLOAT32, {global_head_dim}, onesGlobal)
+            );
             std::vector<float> onesSliding(sliding_head_dim, 1.0f);
-            weight["__gemma4_v_norm_sliding.weight"] = Data(DataType::FLOAT32, {sliding_head_dim}, onesSliding);
+            weight["__gemma4_v_norm_sliding.weight"].CopyFrom(
+                Data(DataType::FLOAT32, {sliding_head_dim}, onesSliding)
+            );
         }
 
         int maxPos = std::max(max_positions, 16384);
