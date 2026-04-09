@@ -168,6 +168,7 @@ bool FastllmCudaAttention(const fastllm::Data &q, const fastllm::Data &k, const 
                           const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType);
 bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaGelu(const fastllm::Data &input, fastllm::Data &output);
+bool FastllmCudaGeglu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaRelu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSilu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaSigmoid(const fastllm::Data &input, fastllm::Data &output);

@@ -478,6 +478,33 @@ __global__ void FastllmSwigluKernel(__nv_bfloat16* __restrict__ a, __nv_bfloat16
     }
 }
 
+__global__ void FastllmGegluKernel(float* __restrict__ a, float* __restrict__ b, int len, int spatial, int mid) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        int id = idx / mid * spatial + idx % mid;
+        float gate = a[id], up = a[id + mid];
+        b[idx] = gate * 0.5f * (1.0f + erff(gate / 1.41421356237f)) * up;
+    }
+}
+
+__global__ void FastllmGegluKernel(half* __restrict__ a, half* __restrict__ b, int len, int spatial, int mid) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        int id = idx / mid * spatial + idx % mid;
+        float gate = __half2float(a[id]), up = __half2float(a[id + mid]);
+        b[idx] = __float2half(gate * 0.5f * (1.0f + erff(gate / 1.41421356237f)) * up);
+    }
+}
+
+__global__ void FastllmGegluKernel(__nv_bfloat16* __restrict__ a, __nv_bfloat16* __restrict__ b, int len, int spatial, int mid) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < len) {
+        int id = idx / mid * spatial + idx % mid;
+        float gate = __bfloat162float(a[id]), up = __bfloat162float(a[id + mid]);
+        b[idx] = __float2bfloat16(gate * 0.5f * (1.0f + erff(gate / 1.41421356237f)) * up);
+    }
+}
+
 // CrossSwiglu: 交替存储格式, y[i] = x[i*2+1] * silu(x[i*2])
 __global__ void FastllmCrossSwigluKernel(float* __restrict__ a, float* __restrict__ b, int len, int spatial, int mid) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -2097,6 +2124,26 @@ bool FastllmCudaGeluNew(const fastllm::Data &input, fastllm::Data &output) {
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
     int threadPerBlock = std::min(256, len);
     FastllmGeluNewKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaGeglu(const fastllm::Data &input, fastllm::Data &output) {
+    int len = output.Count(0);
+    float *cudaInput = (float *) FastllmCudaPrepareInput(input);
+    float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
+    int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
+    int threadPerBlock = std::min(1024, len);
+
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmGegluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len, spatial, mid);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        FastllmGegluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, len, spatial, mid);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmGegluKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((__nv_bfloat16*)cudaInput, (__nv_bfloat16*)cudaOutput, len, spatial, mid);
+    }
+
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);
     return true;

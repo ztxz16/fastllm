@@ -3032,6 +3032,7 @@ auto st = std::chrono::system_clock::now();
         Data *output;
         int rootDeviceId;
         int deviceId;
+        MoeGateType gateType;
 
         MultiCudaDoMergeMOEOp(uint8_t *partOutput, 
                 Data *input, Data **weights, Data *index, Data *score, 
@@ -3042,7 +3043,7 @@ auto st = std::chrono::system_clock::now();
                 input(input), weights(weights), index(index), score(score), 
                 w1(w1), w2(w2), w3(w3),
                 wBatch(wBatch), sharedScale(sharedScale),
-                output(output), rootDeviceId(rootDeviceId), deviceId(deviceId) {}
+                output(output), rootDeviceId(rootDeviceId), deviceId(deviceId), gateType(MoeGateSwiglu) {}
 
         void Run() {
             FastllmCudaSetDevice(deviceId);
@@ -3059,7 +3060,7 @@ auto st = std::chrono::system_clock::now();
 
             output->Resize(input->dims);
             output->Allocate();
-            DoCudaMergeMOE(*input, *output, *index, *score, *w1, *w2, *w3, curWeights.data(), nullptr, sharedScale);
+            DoCudaMergeMOE(*input, *output, *index, *score, *w1, *w2, *w3, curWeights.data(), nullptr, sharedScale, gateType);
 
             if (deviceId == rootDeviceId) {
                 FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
@@ -3079,6 +3080,7 @@ auto st = std::chrono::system_clock::now();
         float sharedScale;
         Data *output;
         int deviceId;
+        MoeGateType gateType;
 
         MultiCudaCpuDoMergeMOEOp(uint8_t *oriCpuInput, uint8_t *partOutput, 
                 Data *input, Data **weights, Data *index, Data *score, 
@@ -3089,7 +3091,7 @@ auto st = std::chrono::system_clock::now();
                 input(input), weights(weights), index(index), score(score), 
                 w1(w1), w2(w2), w3(w3),
                 wBatch(wBatch), sharedScale(sharedScale),
-                output(output), deviceId(deviceId) {}
+                output(output), deviceId(deviceId), gateType(MoeGateSwiglu) {}
 
         void Run() {
             // 注意weights里面的值，真正要使用的是weights[x]->multiDeviceDatas[deviceId]
@@ -3126,8 +3128,12 @@ auto st = std::chrono::system_clock::now();
                     DoCpuLinearReshape(*input, *weights[idx * 2]->multiDeviceDatas[deviceId], *w3);
                     DoCpuLinear(*input, *weights[idx * 2]->multiDeviceDatas[deviceId], Data(), *w3);
                     
-                    DoCpuSwigluReshape(*w3, *w1);
-                    DoCpuSwiglu(*w3, *w1);
+                    DoCpuGegluReshape(*w3, *w1);
+                    if (gateType == MoeGateGeglu) {
+                        DoCpuGeglu(*w3, *w1);
+                    } else {
+                        DoCpuSwiglu(*w3, *w1);
+                    }
 
                     DoCpuLinearReshape(*w1, *weights[idx * 2 + 1]->multiDeviceDatas[deviceId], *w2);
                     DoCpuLinear(*w1, *weights[idx * 2 + 1]->multiDeviceDatas[deviceId], Data(), *w2);
@@ -3189,8 +3195,12 @@ auto st = std::chrono::system_clock::now();
                         DoCpuLinearReshape(*currentData, *weights[idx * 2]->multiDeviceDatas[deviceId], *w3);
                         DoCpuLinear(*currentData, *weights[idx * 2]->multiDeviceDatas[deviceId], Data(), *w3);
                         
-                        DoCpuSwigluReshape(*w3, *w1);
-                        DoCpuSwiglu(*w3, *w1);
+                        DoCpuGegluReshape(*w3, *w1);
+                        if (gateType == MoeGateGeglu) {
+                            DoCpuGeglu(*w3, *w1);
+                        } else {
+                            DoCpuSwiglu(*w3, *w1);
+                        }
 
                         DoCpuLinearReshape(*w1, *weights[idx * 2 + 1]->multiDeviceDatas[deviceId], *w2);
                         DoCpuLinear(*w1, *weights[idx * 2 + 1]->multiDeviceDatas[deviceId], Data(), *w2);
@@ -3225,6 +3235,8 @@ auto st = std::chrono::system_clock::now();
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;
+        MoeGateType gateType = intParams.find("gateType") != intParams.end() ?
+            (MoeGateType) intParams.find("gateType")->second : MoeGateSwiglu;
         
         int n = index.dims[0];
         int topk = index.dims[1];        
@@ -3298,13 +3310,15 @@ auto st = std::chrono::system_clock::now();
             DeviceGetInfos(device, specialId, mallocType);
 
             if (specialId != "cpu") {
-                ops.push_back(new MultiCudaDoMergeMOEOp(
+                auto *op = new MultiCudaDoMergeMOEOp(
                     partOutput + output.GetBytes() * i,
                     input.multiDeviceDatas[device], weights, &index, &score, 
                     w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device], 
                     wBatch, sharedScale, 
                     curOutput.multiDeviceDatas[device], rootDeviceId, device
-                ));
+                );
+                op->gateType = gateType;
+                ops.push_back(op);
             }
         }
         for (int i = 0; i < ops.size(); i++) {
@@ -3330,12 +3344,14 @@ auto st = std::chrono::system_clock::now();
                     FastllmCudaSetDevice(devices.empty() ? 0 : devices[0]);
                     FastllmCudaCopyFromDeviceToHost(cpuInputBuf.data(), input.cudaData, input.GetBytes());
                 }
-                MultiCudaCpuDoMergeMOEOp (
+                MultiCudaCpuDoMergeMOEOp op(
                     cpuInputBuf.data(), partOutput + output.GetBytes() * i,
                     input.multiDeviceDatas[device], weights, &index, &score, 
                     w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device], 
                     wBatch, sharedScale, 
-                    curOutput.multiDeviceDatas[device], device).Run();
+                    curOutput.multiDeviceDatas[device], device);
+                op.gateType = gateType;
+                op.Run();
             }
         }
         pool->curActivateThreadInterval = temp;

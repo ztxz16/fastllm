@@ -12,6 +12,8 @@ namespace fastllm {
     void DoCpuLinearReshape(Data &input, Data &weight, Data &output);
     void DoCpuLinear(Data &input, Data &weight, const Data &bias, Data &output);
 
+    void DoCpuGegluReshape(Data &input, Data &output);
+    void DoCpuGeglu(Data &input, Data &output);
     void DoCpuSwigluReshape(Data &input, Data &output);
     void DoCpuSwiglu(Data &input, Data &output);
     
@@ -82,6 +84,18 @@ namespace fastllm {
         void Run();
     };
 
+    struct MultiThreadGegluOp : MultiThreadBaseOp {
+        float *input, *output;
+        int mid, len, n, inputStride, outputStride;
+
+        MultiThreadGegluOp (float *input, int mid, int len, float *output,
+                            int n, int inputStride, int outputStride) :
+            input(input), mid(mid), len(len), output(output),
+            n(n), inputStride(inputStride), outputStride(outputStride) {}
+
+        void Run();
+    };
+
     struct MultiThreadCrossSwigluOp : MultiThreadBaseOp {
         float *input, *output;
         int mid, len, n, inputStride, outputStride;
@@ -106,11 +120,35 @@ namespace fastllm {
         void Run();
     };
 
+    struct MultiThreadGegluFloat16Op : MultiThreadBaseOp {
+        uint16_t *input, *output;
+        int mid, len, n, inputStride, outputStride;
+
+        MultiThreadGegluFloat16Op (uint16_t *input, int mid, int len, uint16_t *output,
+                             int n, int inputStride, int outputStride) :
+            input(input), mid(mid), len(len), output(output),
+            n(n), inputStride(inputStride), outputStride(outputStride) {}
+
+        void Run();
+    };
+
     struct MultiThreadSwigluBFloat16Op : MultiThreadBaseOp {
         uint16_t *input, *output;
         int mid, len, n, inputStride, outputStride;
 
         MultiThreadSwigluBFloat16Op (uint16_t *input, int mid, int len, uint16_t *output,
+                             int n, int inputStride, int outputStride) :
+            input(input), mid(mid), len(len), output(output),
+            n(n), inputStride(inputStride), outputStride(outputStride) {}
+
+        void Run();
+    };
+
+    struct MultiThreadGegluBFloat16Op : MultiThreadBaseOp {
+        uint16_t *input, *output;
+        int mid, len, n, inputStride, outputStride;
+
+        MultiThreadGegluBFloat16Op (uint16_t *input, int mid, int len, uint16_t *output,
                              int n, int inputStride, int outputStride) :
             input(input), mid(mid), len(len), output(output),
             n(n), inputStride(inputStride), outputStride(outputStride) {}
@@ -195,9 +233,15 @@ namespace fastllm {
     void SoftmaxMultiThread(float *input, int n, int m, int lastlen, AliveThreadPool *pool);
     void SwigluMultiThread(float *input, int mid, int len, float *output,
         int n, int inputStride, int outputStride, AliveThreadPool *pool);
+    void GegluMultiThread(float *input, int mid, int len, float *output,
+        int n, int inputStride, int outputStride, AliveThreadPool *pool);
     void SwigluMultiThreadFloat16(uint16_t *input, int mid, int len, uint16_t *output,
         int n, int inputStride, int outputStride, AliveThreadPool *pool);
+    void GegluMultiThreadFloat16(uint16_t *input, int mid, int len, uint16_t *output,
+        int n, int inputStride, int outputStride, AliveThreadPool *pool);
     void SwigluMultiThreadBFloat16(uint16_t *input, int mid, int len, uint16_t *output,
+        int n, int inputStride, int outputStride, AliveThreadPool *pool);
+    void GegluMultiThreadBFloat16(uint16_t *input, int mid, int len, uint16_t *output,
         int n, int inputStride, int outputStride, AliveThreadPool *pool);
     void CrossSwigluMultiThread(float *input, int mid, int len, float *output,
         int n, int inputStride, int outputStride, AliveThreadPool *pool);
@@ -392,6 +436,11 @@ namespace fastllm {
     };
 
     class CpuGeluNewOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CpuGegluOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 

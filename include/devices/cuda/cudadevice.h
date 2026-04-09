@@ -16,13 +16,15 @@ namespace fastllm {
     void DoCudaLinear(Data &input, Data &weight, const Data &bias, Data &output);
     void DoCudaSwigluReshape(Data &input, Data &output);
     void DoCudaSwiglu(Data &input, Data &output);
+    void DoCudaGegluReshape(Data &input, Data &output);
+    void DoCudaGeglu(Data &input, Data &output);
     void DoCudaSplitReshape(Data &input, int axis, int start, int end, Data &output);
     void DoCudaSplit(Data &input, int axis, int start, int end, Data &output);
     void DoCudaCatDirect(Data &input0, Data &input1, int axis);
     void DoCudaCatDirectBatch(Data **input0s, Data **input1s, int batch, int axis);
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis);
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
-        Data **weights, Data **biass, float sharedScale);
+        Data **weights, Data **biass, float sharedScale, MoeGateType gateType = MoeGateSwiglu);
     void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale, bool inited = false);
     
     class CudaDevice : BaseDevice {
@@ -186,6 +188,11 @@ namespace fastllm {
     };
 
     class CudaGeluNewOp : BaseOperator {
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
+    class CudaGegluOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 

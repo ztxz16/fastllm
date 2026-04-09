@@ -3180,7 +3180,7 @@ namespace fastllm {
 
     void MergeMOE(const Data &input, const Data &index, const Data &score, std::vector <Data*> &weights, std::vector <Data*> &biass, 
                 Data &w1, Data &w2, Data &w3, Data &curInput, Data &curOutput,
-                float sharedScale, Data &output, int layer) {
+                float sharedScale, Data &output, int layer, MoeGateType gateType) {
         curExecutor->Run("MergeMOE", {
                 {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
                 {"weights", (Data*)weights.data()}, {"biass", (Data*)biass.data()},
@@ -3188,7 +3188,7 @@ namespace fastllm {
                 {"curInput", &curInput}, {"curOutput", &curOutput},
                 {"output", (Data*)&output}
         }, {{"sharedScale", sharedScale}}, 
-                                        {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()}, {"layer", layer}});
+                                        {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()}, {"layer", layer}, {"gateType", (int)gateType}});
     }
 
     void MergeMLA(Data &qNope, Data &qPe, Data &kvCache, Data &peCache, const Data &mask, Data &output, float softmaxScale) {
@@ -3440,6 +3440,12 @@ namespace fastllm {
 
     void GeluNew(const fastllm::Data &input, fastllm::Data &output) {
         curExecutor->Run("GeluNew", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
+    void Geglu(const fastllm::Data &input, fastllm::Data &output) {
+        curExecutor->Run("Geglu", {
                 {"input", (Data*)&input}, {"output", &output}
         }, {}, {});
     }

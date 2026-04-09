@@ -64,6 +64,7 @@ namespace fastllm {
         this->ops["Sigmoid"] = (BaseOperator*)(new CpuSigmoidOp());
         this->ops["Gelu"] = (BaseOperator*)(new CpuGeluOp());
         this->ops["GeluNew"] = (BaseOperator*)(new CpuGeluNewOp());
+        this->ops["Geglu"] = (BaseOperator*)(new CpuGegluOp());
         this->ops["Swiglu"] = (BaseOperator*)(new CpuSwigluOp());
         this->ops["CrossSwiglu"] = (BaseOperator*)(new CpuCrossSwigluOp());
         this->ops["SwigluGptOss"] = (BaseOperator*)(new CpuSwigluGptOssOp());
@@ -785,6 +786,17 @@ namespace fastllm {
         }
     }
 
+    void MultiThreadGegluOp::Run() {
+        for (int o = 0; o < n; o++) {
+            float *cur = (float*)input + o * inputStride;
+            float *out = (float*)output + o * outputStride;
+            for (int i = 0; i < len; i++) {
+                float gate = cur[i], up = cur[i + mid];
+                out[i] = gate * 0.5f * (1.0f + erff(gate / 1.41421356237f)) * up;
+            }
+        }
+    }
+
     void MultiThreadCrossSwigluOp::Run() {
         // CrossSwiglu: y[i] = x[i*2+1] * silu(x[i*2])  (即 x[1::2] * silu(x[0::2]))
         for (int o = 0; o < n; o++) {
@@ -868,6 +880,19 @@ namespace fastllm {
         }
     }
 
+    void MultiThreadGegluFloat16Op::Run() {
+        for (int o = 0; o < n; o++) {
+            uint16_t *cur = (uint16_t*)input + o * inputStride;
+            uint16_t *out = (uint16_t*)output + o * outputStride;
+            for (int i = 0; i < len; i++) {
+                float gate = fp16tofp32.dict[cur[i]];
+                float up = fp16tofp32.dict[cur[i + mid]];
+                float val = gate * 0.5f * (1.0f + erff(gate / 1.41421356237f)) * up;
+                out[i] = float_to_half(val);
+            }
+        }
+    }
+
     void MultiThreadSwigluBFloat16Op::Run() {
         for (int o = 0; o < n; o++) {
             uint16_t *cur = (uint16_t*)input + o * inputStride;
@@ -876,6 +901,21 @@ namespace fastllm {
             for (; i < len; i++) {
                 float x = bf16tofp32.dict[cur[i]], y = bf16tofp32.dict[cur[i + mid]];
                 float val = (x / (1.0f + expf(-x))) * y;
+                uint32_t tmp;
+                memcpy(&tmp, &val, sizeof(tmp));
+                out[i] = (uint16_t)(tmp >> 16);
+            }
+        }
+    }
+
+    void MultiThreadGegluBFloat16Op::Run() {
+        for (int o = 0; o < n; o++) {
+            uint16_t *cur = (uint16_t*)input + o * inputStride;
+            uint16_t *out = (uint16_t*)output + o * outputStride;
+            for (int i = 0; i < len; i++) {
+                float gate = bf16tofp32.dict[cur[i]];
+                float up = bf16tofp32.dict[cur[i + mid]];
+                float val = gate * 0.5f * (1.0f + erff(gate / 1.41421356237f)) * up;
                 uint32_t tmp;
                 memcpy(&tmp, &val, sizeof(tmp));
                 out[i] = (uint16_t)(tmp >> 16);
@@ -1713,6 +1753,8 @@ namespace fastllm {
         Data **weights = (Data**)(datas.find("weights")->second);
         Data **biass = (Data**)(datas.find("biass")->second);
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;        
+        bool useGeglu = intParams.find("gateType") != intParams.end() &&
+                        intParams.find("gateType")->second == (int)MoeGateGeglu;
         output.Allocate();
 
         // index: [n, topk], score: [n, topk]
@@ -1892,7 +1934,9 @@ namespace fastllm {
                         float *outputData = middles[l].data();
                         int curK = weights[idx * 2]->dims[0];
                         ops[l - st] = new fastllm::MultiThreadMultiOps();
-                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(
+                            useGeglu ? (fastllm::MultiThreadBaseOp*)new fastllm::MultiThreadGegluOp(outputData, mid, mid, outputData, 1, spatial, spatial)
+                                     : (fastllm::MultiThreadBaseOp*)new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
                         Data *weightDown = weights[idx * 2 + 1];
                         int groupDown = weightDown->group, groupCntDown = weightDown->groupCnt;
                         if (weightDown->dataType != DataType::INT4_GROUP) {
@@ -2121,7 +2165,9 @@ namespace fastllm {
                         uinputDown.resize(ggml_row_size(ggml_type_vec_dot_type((ggml_type)weights[idx * 2 + 1]->ggmlType), m));
 
                         ops[l - st] = new fastllm::MultiThreadMultiOps();
-                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial)); 
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(
+                            useGeglu ? (fastllm::MultiThreadBaseOp*)new fastllm::MultiThreadGegluOp(outputData, mid, mid, outputData, 1, spatial, spatial)
+                                     : (fastllm::MultiThreadBaseOp*)new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial)); 
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToQ8KOp(middles[l].data(), (uint8_t*)uinputDown.data(), mid, (ggml_type)weights[idx * 2 + 1]->ggmlType));
                         /* ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new MultiThreadOnlineQuantizationOp(
                                     middles[l].data(), uinputDown.data(), inputConfigs.data(),
@@ -2301,7 +2347,9 @@ namespace fastllm {
                         float *outputData = middles[l].data();
                         int curK = weights[idx * 2]->dims[0];
                         ops[l - st] = new fastllm::MultiThreadMultiOps();
-                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(
+                            useGeglu ? (fastllm::MultiThreadBaseOp*)new fastllm::MultiThreadGegluOp(outputData, mid, mid, outputData, 1, spatial, spatial)
+                                     : (fastllm::MultiThreadBaseOp*)new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
                         pool->PushOp(l - st, ops[l - st]);
                     }
                     for (int l = st; l <= end; l++) {
@@ -2451,7 +2499,9 @@ namespace fastllm {
                         float *outputData = middles[l].data();
                         int curK = weights[idx * 2]->dims[0];
                         ops[l - st] = new fastllm::MultiThreadMultiOps();
-                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
+                        ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(
+                            useGeglu ? (fastllm::MultiThreadBaseOp*)new fastllm::MultiThreadGegluOp(outputData, mid, mid, outputData, 1, spatial, spatial)
+                                     : (fastllm::MultiThreadBaseOp*)new fastllm::MultiThreadSwigluOp(outputData, mid, mid, outputData, 1, spatial, spatial));
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(new fastllm::MultiThreadFloat32ToBFloat16Op(middles[l].data(), (uint16_t*)middles[l].data(), mid));
                         pool->PushOp(l - st, ops[l - st]);
                     }
@@ -2669,8 +2719,13 @@ ops += (long long)lines * inputDim * interDim * 2;
 //printf("gateup spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                 // 3. swiglu
-                SwigluMultiThread((float *) gateUpOutput.data(), interDim, interDim, ((float *) swigluOutput.data()),
-                                    totalLines, interDim * 2, interDim, GetAlivePool());
+                if (useGeglu) {
+                    GegluMultiThread((float *) gateUpOutput.data(), interDim, interDim, ((float *) swigluOutput.data()),
+                                     totalLines, interDim * 2, interDim, GetAlivePool());
+                } else {
+                    SwigluMultiThread((float *) gateUpOutput.data(), interDim, interDim, ((float *) swigluOutput.data()),
+                                      totalLines, interDim * 2, interDim, GetAlivePool());
+                }
 //printf("swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                 // 4. swigluOutput -> downInput
@@ -2796,14 +2851,22 @@ ops += (long long)lines * inputDim * interDim * 2;
                     float value = scoreData[j];
 
                     Linear(input, *weights[(expertIdx + 1) * 2], Data(), w3);
-                    Swiglu(w3, w1);
+                    if (useGeglu) {
+                        Geglu(w3, w1);
+                    } else {
+                        Swiglu(w3, w1);
+                    }
                     Linear(w1, *weights[(expertIdx + 1) * 2 + 1], Data(), w2);
                     AddTo(output, w2, value);
                 }
 
                 if (weights[0] != nullptr) {
                     Linear(input, *weights[0], Data(), w3);
-                    Swiglu(w3, w1);
+                    if (useGeglu) {
+                        Geglu(w3, w1);
+                    } else {
+                        Swiglu(w3, w1);
+                    }
                     Linear(w1, *weights[1], Data(), w2);
                     AddTo(output, w2, sharedScale);
                 }
@@ -2857,11 +2920,29 @@ ops += (long long)lines * inputDim * interDim * 2;
                     w1.Allocate();
 
                     if (w3.dataType == DataType::FLOAT32) {
-                        SwigluMultiThread((float *) w3.cpuData, mid, mid, ((float *) w1.cpuData),
-                                    w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                        if (useGeglu) {
+                            GegluMultiThread((float *) w3.cpuData, mid, mid, ((float *) w1.cpuData),
+                                             w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                        } else {
+                            SwigluMultiThread((float *) w3.cpuData, mid, mid, ((float *) w1.cpuData),
+                                              w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                        }
+                    } else if (w3.dataType == DataType::FLOAT16) {
+                        if (useGeglu) {
+                            GegluMultiThreadFloat16((uint16_t *) w3.cpuData, mid, mid, ((uint16_t *) w1.cpuData),
+                                                    w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                        } else {
+                            SwigluMultiThreadFloat16((uint16_t *) w3.cpuData, mid, mid, ((uint16_t *) w1.cpuData),
+                                                     w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                        }
                     } else {
-                        SwigluMultiThreadFloat16((uint16_t *) w3.cpuData, mid, mid, ((uint16_t *) w1.cpuData),
-                                    w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                        if (useGeglu) {
+                            GegluMultiThreadBFloat16((uint16_t *) w3.cpuData, mid, mid, ((uint16_t *) w1.cpuData),
+                                                     w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                        } else {
+                            SwigluMultiThreadBFloat16((uint16_t *) w3.cpuData, mid, mid, ((uint16_t *) w1.cpuData),
+                                                      w3.dims[0], w3.dims[1], mid, GetAlivePool());
+                        }
                     }
   // cnt["swiglu"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
                     DoCpuLinearReshape(w1, *weights[e * 2 + 1], w3);
@@ -6164,6 +6245,64 @@ ops += (long long)lines * inputDim * interDim * 2;
         output.Resize(dims);
     }
 
+    void DoCpuGegluReshape(Data &input, Data &output) {
+        DoCpuSwigluReshape(input, output);
+    }
+
+    void CpuGegluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        DoCpuGegluReshape(input, output);
+    }
+
+    void DoCpuGeglu(Data &input, Data &output) {
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Geglu error: Data's type should be float32, float16 or bfloat16.\n");
+
+        float *inputData = (float*)input.cpuData;
+        float *outputData = (float*)output.cpuData;
+
+        int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
+        int outer = input.Count(0) / spatial;
+
+        if (input.dataType == DataType::FLOAT32) {
+            (MultiThreadGegluOp((float*)inputData, spatial / 2, spatial / 2, (float*)outputData, outer, spatial, spatial / 2)).Run();
+        } else if (input.dataType == DataType::FLOAT16) {
+            (MultiThreadGegluFloat16Op((uint16_t*)inputData, spatial / 2, spatial / 2, (uint16_t*)outputData, outer, spatial, spatial / 2)).Run();
+        } else if (input.dataType == DataType::BFLOAT16) {
+            (MultiThreadGegluBFloat16Op((uint16_t*)inputData, spatial / 2, spatial / 2, (uint16_t*)outputData, outer, spatial, spatial / 2)).Run();
+        } else {
+            printf("Unsupport geglu type.");
+        }
+    }
+
+    void CpuGegluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16 ||
+                        input.dataType == DataType::BFLOAT16,
+                        "Geglu error: Data's type should be float32, float16 or bfloat16.\n");
+
+        int spatial = input.Count(input.dims.size() - 1), mid = spatial / 2;
+        int outer = input.Count(0) / spatial;
+
+        if (input.dataType == DataType::FLOAT32) {
+            GegluMultiThread((float*)input.cpuData, mid, mid, (float*)output.cpuData, outer, spatial, mid, GetAlivePool());
+        } else if (input.dataType == DataType::FLOAT16) {
+            GegluMultiThreadFloat16((uint16_t*)input.cpuData, mid, mid, (uint16_t*)output.cpuData, outer, spatial, mid, GetAlivePool());
+        } else if (input.dataType == DataType::BFLOAT16) {
+            GegluMultiThreadBFloat16((uint16_t*)input.cpuData, mid, mid, (uint16_t*)output.cpuData, outer, spatial, mid, GetAlivePool());
+        } else {
+            printf("Unsupport geglu type.");
+        }
+    }
+
     void CpuSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -8100,6 +8239,27 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    void GegluMultiThread(float *input, int mid, int len, float *output,
+                          int n, int inputStride, int outputStride, AliveThreadPool *pool) {
+        int threadNum = pool->threads.size();
+        int per = len / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadGegluOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
+            ops.push_back(new fastllm::MultiThreadGegluOp(input + cur, mid, end - cur, output + cur,
+                                                          n, inputStride, outputStride));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
     void SwigluGptOssMultiThread(float *input, int mid, int len, float *output,
                            int n, int inputStride, int outputStride, AliveThreadPool *pool) {
         int threadNum = pool->threads.size();
@@ -8184,6 +8344,27 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
     }
 
+    void GegluMultiThreadFloat16(uint16_t *input, int mid, int len, uint16_t *output,
+                           int n, int inputStride, int outputStride, AliveThreadPool *pool) {
+        int threadNum = pool->threads.size();
+        int per = len / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadGegluFloat16Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
+            ops.push_back(new fastllm::MultiThreadGegluFloat16Op(input + cur, mid, end - cur, output + cur,
+                                                                 n, inputStride, outputStride));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
     void SwigluMultiThreadBFloat16(uint16_t *input, int mid, int len, uint16_t *output,
                            int n, int inputStride, int outputStride, AliveThreadPool *pool) {
         int threadNum = pool->threads.size();
@@ -8194,6 +8375,27 @@ ops += (long long)lines * inputDim * interDim * 2;
             int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
             ops.push_back(new fastllm::MultiThreadSwigluBFloat16Op(input + cur, mid, end - cur, output + cur,
                                                            n, inputStride, outputStride));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
+    void GegluMultiThreadBFloat16(uint16_t *input, int mid, int len, uint16_t *output,
+                           int n, int inputStride, int outputStride, AliveThreadPool *pool) {
+        int threadNum = pool->threads.size();
+        int per = len / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadGegluBFloat16Op*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = (i == threadNum - 1 ? len : cur + per + (cur + per * (threadNum - i) < len));
+            ops.push_back(new fastllm::MultiThreadGegluBFloat16Op(input + cur, mid, end - cur, output + cur,
+                                                                  n, inputStride, outputStride));
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
