@@ -1,11 +1,45 @@
 import argparse
+import base64
+import io
 import json
+import os
 import sys
 import time
+
 import requests
+from PIL import Image
+
+MULTIMODAL_TEST_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "multimodal")
+)
+if MULTIMODAL_TEST_DIR not in sys.path:
+    sys.path.insert(0, MULTIMODAL_TEST_DIR)
+
+from common import create_probe_image, get_default_probe_image_path
 
 
-def test_messages(base_url: str, model: str, api_key: str) -> bool:
+def resolve_image_path(image_path: str = "") -> str:
+    if image_path:
+        return image_path
+    image_path = get_default_probe_image_path("gemma4")
+    image_path, _ = create_probe_image(image_path, label="API")
+    return image_path
+
+
+def build_probe_image_source(image_path: str = "") -> dict:
+    image_path = resolve_image_path(image_path)
+    with Image.open(image_path) as image:
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return {
+        "type": "base64",
+        "media_type": "image/png",
+        "data": encoded,
+    }
+
+
+def test_messages(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试非流式 messages 接口"""
     url = f"{base_url}/v1/messages"
     headers = {
@@ -65,7 +99,63 @@ def test_messages(base_url: str, model: str, api_key: str) -> bool:
     return True
 
 
-def test_messages_stream(base_url: str, model: str, api_key: str) -> bool:
+def test_messages_multimodal(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
+    """测试非流式图文 messages 接口"""
+    url = f"{base_url}/v1/messages"
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+    }
+    payload = {
+        "model": model,
+        "max_tokens": 128,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": build_probe_image_source(image_path)},
+                    {"type": "text", "text": "请用一句话描述这张图片的主要形状和颜色。"},
+                ],
+            }
+        ],
+    }
+
+    print("=" * 60)
+    print("[8] 测试图文 Messages 接口")
+    print(f"    POST {url}")
+    print(f"    图片: {resolve_image_path(image_path)}")
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    except requests.exceptions.ConnectionError as e:
+        print(f"    ✗ 连接失败: {e}")
+        return False
+    except requests.exceptions.Timeout:
+        print("    ✗ 请求超时")
+        return False
+
+    if resp.status_code != 200:
+        print(f"    ✗ HTTP {resp.status_code}")
+        print(f"    响应: {resp.text[:500]}")
+        return False
+
+    data = resp.json()
+    content_blocks = data.get("content", [])
+    text = "".join(
+        block.get("text", "") for block in content_blocks if block.get("type") == "text"
+    )
+    if not text.strip():
+        print("    ✗ 响应文本为空")
+        return False
+
+    print(f"    ✓ 回复内容: {text[:200]}")
+    usage = data.get("usage", {})
+    if usage:
+        print(f"    ✓ token 用量: input={usage.get('input_tokens', '?')}, output={usage.get('output_tokens', '?')}")
+    return True
+
+
+def test_messages_stream(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试流式 messages 接口"""
     url = f"{base_url}/v1/messages"
     headers = {
@@ -142,7 +232,7 @@ def test_messages_stream(base_url: str, model: str, api_key: str) -> bool:
     return True
 
 
-def test_messages_multi_turn(base_url: str, model: str, api_key: str) -> bool:
+def test_messages_multi_turn(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试多轮对话"""
     url = f"{base_url}/v1/messages"
     headers = {
@@ -209,7 +299,7 @@ WEATHER_TOOL = {
 }
 
 
-def test_tool_use(base_url: str, model: str, api_key: str) -> bool:
+def test_tool_use(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试非流式 tool use"""
     url = f"{base_url}/v1/messages"
     headers = {
@@ -270,7 +360,7 @@ def test_tool_use(base_url: str, model: str, api_key: str) -> bool:
     return True
 
 
-def test_tool_use_stream(base_url: str, model: str, api_key: str) -> bool:
+def test_tool_use_stream(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试流式 tool use"""
     url = f"{base_url}/v1/messages"
     headers = {
@@ -381,7 +471,7 @@ def test_tool_use_stream(base_url: str, model: str, api_key: str) -> bool:
     return True
 
 
-def test_tool_use_multi_turn(base_url: str, model: str, api_key: str) -> bool:
+def test_tool_use_multi_turn(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试 tool use 多轮：发送 tool_result 后模型应给出最终回复"""
     url = f"{base_url}/v1/messages"
     headers = {
@@ -490,7 +580,7 @@ def test_tool_use_multi_turn(base_url: str, model: str, api_key: str) -> bool:
     return True
 
 
-def test_messages_system(base_url: str, model: str, api_key: str) -> bool:
+def test_messages_system(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试 system prompt"""
     url = f"{base_url}/v1/messages"
     headers = {
@@ -546,6 +636,7 @@ def main():
 示例:
   python anthropic.py --base-url http://localhost:8080 --model my-model
   python anthropic.py --base-url http://10.0.0.1:1616 --model ds --api-key sk-xxx
+  python anthropic.py --base-url http://localhost:8080 --model my-model --image-path test/beauty_test_input.png
 """,
     )
     parser.add_argument(
@@ -566,12 +657,20 @@ def main():
         default="no-key",
         help="API Key（默认 no-key）",
     )
+    parser.add_argument(
+        "--image-path",
+        type=str,
+        default="",
+        help="图文测试使用的本地图片路径；不传时自动生成 probe 图。",
+    )
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
     print(f"Anthropic API 兼容性测试")
     print(f"服务地址: {base_url}")
     print(f"模型名称: {args.model}")
+    if args.image_path:
+        print(f"图文测试图片: {args.image_path}")
     print()
 
     tests = [
@@ -582,12 +681,13 @@ def main():
         ("非流式 Tool Use", test_tool_use),
         ("流式 Tool Use", test_tool_use_stream),
         ("Tool Use 多轮对话", test_tool_use_multi_turn),
+        ("图文 Messages", test_messages_multimodal),
     ]
 
     results = []
     for name, fn in tests:
         try:
-            ok = fn(base_url, args.model, args.api_key)
+            ok = fn(base_url, args.model, args.api_key, args.image_path)
         except Exception as e:
             print(f"    ✗ 异常: {e}")
             ok = False

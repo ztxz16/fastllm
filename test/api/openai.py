@@ -1,11 +1,41 @@
 import argparse
+import base64
+import io
 import json
+import os
 import sys
 import time
+
 import requests
+from PIL import Image
+
+MULTIMODAL_TEST_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "multimodal")
+)
+if MULTIMODAL_TEST_DIR not in sys.path:
+    sys.path.insert(0, MULTIMODAL_TEST_DIR)
+
+from common import create_probe_image, get_default_probe_image_path
 
 
-def test_chat_completions(base_url: str, model: str, api_key: str) -> bool:
+def resolve_image_path(image_path: str = "") -> str:
+    if image_path:
+        return image_path
+    image_path = get_default_probe_image_path("gemma4")
+    image_path, _ = create_probe_image(image_path, label="API")
+    return image_path
+
+
+def build_probe_image_data_url(image_path: str = "") -> str:
+    image_path = resolve_image_path(image_path)
+    with Image.open(image_path) as image:
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def test_chat_completions(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试非流式 chat/completions 接口"""
     url = f"{base_url}/v1/chat/completions"
     headers = {
@@ -67,7 +97,67 @@ def test_chat_completions(base_url: str, model: str, api_key: str) -> bool:
     return True
 
 
-def test_chat_completions_stream(base_url: str, model: str, api_key: str) -> bool:
+def test_chat_completions_multimodal(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
+    """测试非流式图文 chat/completions 接口"""
+    url = f"{base_url}/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = {
+        "model": model,
+        "max_tokens": 128,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": build_probe_image_data_url(image_path)}},
+                    {"type": "text", "text": "请用一句话描述这张图片的主要形状和颜色。"},
+                ],
+            }
+        ],
+        "stream": False,
+    }
+
+    print("=" * 60)
+    print("[10] 测试图文 Chat Completions 接口")
+    print(f"    POST {url}")
+    print(f"    图片: {resolve_image_path(image_path)}")
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    except requests.exceptions.ConnectionError as e:
+        print(f"    ✗ 连接失败: {e}")
+        return False
+    except requests.exceptions.Timeout:
+        print("    ✗ 请求超时")
+        return False
+
+    if resp.status_code != 200:
+        print(f"    ✗ HTTP {resp.status_code}")
+        print(f"    响应: {resp.text[:500]}")
+        return False
+
+    data = resp.json()
+    choices = data.get("choices", [])
+    if not choices:
+        print("    ✗ 响应中没有 choices")
+        return False
+
+    text = choices[0].get("message", {}).get("content", "")
+    if not text.strip():
+        print("    ✗ 响应文本为空")
+        return False
+
+    print(f"    ✓ 回复内容: {text[:200]}")
+    usage = data.get("usage", {})
+    if usage:
+        print(f"    ✓ token 用量: prompt={usage.get('prompt_tokens', '?')}, "
+              f"completion={usage.get('completion_tokens', '?')}, "
+              f"total={usage.get('total_tokens', '?')}")
+    return True
+
+
+def test_chat_completions_stream(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试流式 chat/completions 接口"""
     url = f"{base_url}/v1/chat/completions"
     headers = {
@@ -154,7 +244,7 @@ def test_chat_completions_stream(base_url: str, model: str, api_key: str) -> boo
     return True
 
 
-def test_chat_multi_turn(base_url: str, model: str, api_key: str) -> bool:
+def test_chat_multi_turn(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试多轮对话"""
     url = f"{base_url}/v1/chat/completions"
     headers = {
@@ -206,7 +296,7 @@ def test_chat_multi_turn(base_url: str, model: str, api_key: str) -> bool:
     return True
 
 
-def test_chat_system_prompt(base_url: str, model: str, api_key: str) -> bool:
+def test_chat_system_prompt(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试 system prompt"""
     url = f"{base_url}/v1/chat/completions"
     headers = {
@@ -255,7 +345,7 @@ def test_chat_system_prompt(base_url: str, model: str, api_key: str) -> bool:
     return True
 
 
-def test_models_list(base_url: str, model: str, api_key: str) -> bool:
+def test_models_list(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试 /v1/models 接口"""
     url = f"{base_url}/v1/models"
     headers = {
@@ -313,7 +403,7 @@ WEATHER_TOOL = {
 }
 
 
-def test_tool_call(base_url: str, model: str, api_key: str) -> bool:
+def test_tool_call(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试非流式 tool call"""
     url = f"{base_url}/v1/chat/completions"
     headers = {
@@ -380,7 +470,7 @@ def test_tool_call(base_url: str, model: str, api_key: str) -> bool:
     return True
 
 
-def test_tool_call_stream(base_url: str, model: str, api_key: str) -> bool:
+def test_tool_call_stream(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试流式 tool call"""
     url = f"{base_url}/v1/chat/completions"
     headers = {
@@ -486,7 +576,7 @@ def test_tool_call_stream(base_url: str, model: str, api_key: str) -> bool:
     return True
 
 
-def test_tool_call_multi_turn(base_url: str, model: str, api_key: str) -> bool:
+def test_tool_call_multi_turn(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试 tool call 多轮：发送 tool 结果后模型应给出最终回复"""
     url = f"{base_url}/v1/chat/completions"
     headers = {
@@ -592,7 +682,7 @@ def test_tool_call_multi_turn(base_url: str, model: str, api_key: str) -> bool:
     return True
 
 
-def test_chat_temperature(base_url: str, model: str, api_key: str) -> bool:
+def test_chat_temperature(base_url: str, model: str, api_key: str, image_path: str = "") -> bool:
     """测试 temperature 参数（temperature=0 应产生较稳定的输出）"""
     url = f"{base_url}/v1/chat/completions"
     headers = {
@@ -652,6 +742,7 @@ def main():
 示例:
   python openai.py --base-url http://localhost:8080 --model my-model
   python openai.py --base-url http://10.0.0.1:1616 --model ds --api-key sk-xxx
+  python openai.py --base-url http://localhost:8080 --model my-model --image-path test/beauty_test_input.png
 """,
     )
     parser.add_argument(
@@ -672,12 +763,20 @@ def main():
         default="no-key",
         help="API Key（默认 no-key）",
     )
+    parser.add_argument(
+        "--image-path",
+        type=str,
+        default="",
+        help="图文测试使用的本地图片路径；不传时自动生成 probe 图。",
+    )
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
     print(f"OpenAI API 兼容性测试")
     print(f"服务地址: {base_url}")
     print(f"模型名称: {args.model}")
+    if args.image_path:
+        print(f"图文测试图片: {args.image_path}")
     print()
 
     tests = [
@@ -690,12 +789,13 @@ def main():
         ("非流式 Tool Call", test_tool_call),
         ("流式 Tool Call", test_tool_call_stream),
         ("Tool Call 多轮对话", test_tool_call_multi_turn),
+        ("图文 Chat Completions", test_chat_completions_multimodal),
     ]
 
     results = []
     for name, fn in tests:
         try:
-            ok = fn(base_url, args.model, args.api_key)
+            ok = fn(base_url, args.model, args.api_key, args.image_path)
         except Exception as e:
             print(f"    ✗ 异常: {e}")
             ok = False
