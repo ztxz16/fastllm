@@ -1,23 +1,47 @@
 import asyncio
-import logging
+import base64
+import binascii
+import copy
+import inspect
+import io
 import json
-import traceback
+import logging
+import os
 import time
+import traceback
+import uuid
+from http import HTTPStatus
+from typing import (Any, AsyncGenerator, AsyncIterator, Awaitable, Dict, Iterable,
+                    List, Optional, Tuple, TypedDict, Union, final)
+from urllib.parse import unquote, urlparse
+from urllib.request import urlopen
+
 import shortuuid
 from fastapi import Request
-from http import HTTPStatus
-from typing import (AsyncGenerator, AsyncIterator, Awaitable, Dict, Iterable, List,
-                    Optional, Tuple, TypedDict, Union, Any, final)
-import uuid
 from openai.types.chat import (ChatCompletionContentPartParam,
                                ChatCompletionRole)
+from PIL import Image
 from starlette.background import BackgroundTask
 
 from .protocal.openai_protocol import *
 from .protocal.anthropic_protocol import *
 
+try:
+    from ..gemma4_multimodal import (
+        normalize_gemma4_conversation,
+        prepare_gemma4_multimodal_inputs,
+    )
+except ImportError:
+    from gemma4_multimodal import (
+        normalize_gemma4_conversation,
+        prepare_gemma4_multimodal_inputs,
+    )
+
+ConversationContent = Union[str, List[Dict[str, Any]]]
+
+
 class ConversationMessage:
-    def __init__(self, role:str, content:str, tool_calls=None, tool_call_id=None, name=None):
+    def __init__(self, role:str, content:ConversationContent, tool_calls=None, tool_call_id=None, name=None):
       self.role = role
       self.content = content
       self.tool_calls = tool_calls
@@ -80,6 +104,196 @@ class FastLLmCompletion:
     else:
       return None
 
+  def _build_message_content(
+      self, parts: List[Dict[str, Any]]
+  ) -> ConversationContent:
+      if any(part.get("type") == "image" for part in parts):
+          return parts
+      text_parts = [
+          part.get("text", "")
+          for part in parts
+          if part.get("type") == "text"
+      ]
+      return "\n".join([text for text in text_parts if text != ""])
+
+  def _load_image_from_bytes(self, image_bytes: bytes) -> Image.Image:
+      try:
+          with Image.open(io.BytesIO(image_bytes)) as image:
+              return image.convert("RGB")
+      except Exception as exc:
+          raise ValueError("Invalid image bytes.") from exc
+
+  def _load_image_from_url(self, image_url: str) -> Image.Image:
+      if not image_url:
+          raise ValueError("Image URL cannot be empty.")
+
+      parsed = urlparse(image_url)
+      scheme = parsed.scheme.lower()
+      try:
+          if scheme in ("http", "https"):
+              with urlopen(image_url, timeout = 20) as response:
+                  return self._load_image_from_bytes(response.read())
+          if scheme == "data":
+              if not image_url.startswith("data:image/"):
+                  raise ValueError("Only image data URLs are supported.")
+              header, encoded = image_url.split(",", 1)
+              if ";base64" not in header:
+                  raise ValueError("Only base64-encoded image data URLs are supported.")
+              try:
+                  image_bytes = base64.b64decode(encoded)
+              except (binascii.Error, ValueError) as exc:
+                  raise ValueError("Invalid base64 image data.") from exc
+              return self._load_image_from_bytes(image_bytes)
+          if scheme == "file":
+              file_path = unquote(parsed.path or "")
+              if (os.name == "nt" and len(file_path) >= 3 and file_path[0] == "/"
+                      and file_path[2] == ":"):
+                  file_path = file_path[1:]
+              with Image.open(file_path) as image:
+                  return image.convert("RGB")
+      except ValueError:
+          raise
+      except Exception as exc:
+          raise ValueError(f"Failed to load image from {image_url!r}: {exc}") from exc
+
+      raise ValueError(
+          f"Unsupported image URL scheme in {image_url!r}. "
+          "Supported schemes are http(s), data:image/... and file://."
+      )
+
+  def _extract_openai_image_url(self, part: Dict[str, Any]) -> str:
+      image_url = part.get("image_url")
+      if isinstance(image_url, dict):
+          image_url = image_url.get("url")
+      if isinstance(image_url, str) and image_url != "":
+          return image_url
+      raise ValueError(
+          "OpenAI image content requires `image_url` to be a non-empty string "
+          "or an object with a non-empty `url` field."
+      )
+
+  def _parse_openai_content_parts(
+      self, content: Iterable[ChatCompletionContentPartParam]
+  ) -> Tuple[ConversationContent, List[Image.Image]]:
+      content_parts: List[Dict[str, Any]] = []
+      images: List[Image.Image] = []
+      for it in content:
+          if isinstance(it, str):
+              content_parts.append({"type": "text", "text": it})
+              continue
+          if not isinstance(it, dict):
+              raise NotImplementedError("Complex input not supported yet")
+
+          part_type = it.get("type")
+          if part_type == "text":
+              content_parts.append({"type": "text", "text": it.get("text", "")})
+              continue
+
+          if part_type == "image_url" or (
+              part_type is None and "image_url" in it
+          ):
+              image_url = self._extract_openai_image_url(it)
+              images.append(self._load_image_from_url(image_url))
+              content_parts.append({"type": "image"})
+              continue
+
+          raise NotImplementedError(
+              f"OpenAI content part type `{part_type}` is not supported yet."
+          )
+
+      return self._build_message_content(content_parts), images
+
+  def _convert_anthropic_image_source_to_url(self, source: Dict[str, Any]) -> str:
+      if not isinstance(source, dict):
+          raise ValueError("Anthropic image source must be an object.")
+      source_type = source.get("type")
+      if source_type == "url":
+          image_url = source.get("url", "")
+          if not image_url:
+              raise ValueError("Anthropic image source.url cannot be empty.")
+          return image_url
+      media_type = source.get("media_type", "image/jpeg")
+      data = source.get("data", "")
+      if not data:
+          raise ValueError("Anthropic base64 image source.data cannot be empty.")
+      return f"data:{media_type};base64,{data}"
+
+  def _parse_anthropic_tool_result_content(
+      self, content: Any
+  ) -> Tuple[str, List[Image.Image]]:
+      if content is None:
+          return "", []
+      if isinstance(content, str):
+          return content, []
+      if isinstance(content, list):
+          text_blocks: List[str] = []
+          images: List[Image.Image] = []
+          for block in content:
+              if not isinstance(block, dict):
+                  text_blocks.append(str(block))
+                  continue
+              block_type = block.get("type")
+              if block_type == "text":
+                  text_blocks.append(block.get("text", ""))
+              elif block_type == "image":
+                  image_url = self._convert_anthropic_image_source_to_url(
+                      block.get("source") or {}
+                  )
+                  images.append(self._load_image_from_url(image_url))
+              else:
+                  text_blocks.append(json.dumps(block, ensure_ascii = False))
+          return "\n".join([text for text in text_blocks if text != ""]), images
+      if isinstance(content, dict):
+          return json.dumps(content, ensure_ascii = False), []
+      return str(content), []
+
+  def _compute_multimodal_input_token_len(
+      self,
+      messages: List[Dict[str, Any]],
+      enable_thinking: bool,
+      images: Optional[List[Image.Image]],
+  ) -> int:
+      if not images:
+          return self.model.get_input_token_len(
+              messages, enable_thinking = enable_thinking)
+
+      try:
+          signature = inspect.signature(self.model.get_input_token_len)
+          if "images" in signature.parameters:
+              return self.model.get_input_token_len(
+                  messages,
+                  enable_thinking = enable_thinking,
+                  images = images)
+      except (TypeError, ValueError):
+          pass
+
+      architecture = ""
+      try:
+          architecture = self.model.config["architectures"][0]
+      except Exception:
+          architecture = ""
+
+      if architecture == "Gemma4ForConditionalGeneration":
+          tokenizer = getattr(self.model, "hf_tokenizer", None)
+          if tokenizer is None:
+              raise ValueError(
+                  "Gemma4 multimodal token counting needs a Hugging Face tokenizer.")
+          gemma_conversation = normalize_gemma4_conversation(
+              copy.deepcopy(messages), len(images))
+          native_inputs = prepare_gemma4_multimodal_inputs(
+              tokenizer = tokenizer,
+              model_dir = (getattr(self.model, "model_path", "") or tokenizer.name_or_path),
+              model_config = getattr(self.model, "config", {}),
+              conversation = gemma_conversation,
+              images = images,
+              add_generation_prompt = True,
+              enable_thinking = enable_thinking,
+          )
+          return len(native_inputs["input_ids"])
+
+      return self.model.get_input_token_len(
+          messages, enable_thinking = enable_thinking)
+
   def _parse_chat_message_content(
       self,
       role: ChatCompletionRole,
@@ -88,7 +302,7 @@ class FastLLmCompletion:
       tool_calls=None,
       tool_call_id=None,
       name=None,
-  ) -> Tuple[List[ConversationMessage], List[Awaitable[object]]]:
+  ) -> Tuple[List[ConversationMessage], List[Image.Image]]:
       if content is None and tool_calls is None and tool_call_id is None:
           return [], []
       if content is None or isinstance(content, str):
@@ -97,19 +311,11 @@ class FastLLmCompletion:
                                       tool_call_id=tool_call_id,
                                       name=name)], []
       if isinstance(content, list):
-          content_str = ""
-          for it in content:
-              if ('type' in it and it['type'] == 'text'):
-                 if (content_str != ""):
-                    content_str += "\n"
-                 if ('text' in it):
-                    content_str += it['text']
-              else:
-                 raise NotImplementedError("Complex input not supported yet")
-          return [ConversationMessage(role=role, content=content_str,
+          parsed_content, images = self._parse_openai_content_parts(content)
+          return [ConversationMessage(role=role, content=parsed_content,
                                       tool_calls=tool_calls,
                                       tool_call_id=tool_call_id,
-                                      name=name)], []
+                                      name=name)], images
       raise NotImplementedError("Complex input not supported yet")
 
   def _stringify_anthropic_block_content(self, content: Any) -> str:
@@ -214,10 +420,9 @@ class FastLLmCompletion:
       self,
       role: str,
       content: Optional[Union[str, Iterable[Dict[str, Any]]]],
-  ) -> List[ConversationMessage]:
+  ) -> Tuple[List[ConversationMessage], List[Image.Image]]:
       if content is None or isinstance(content, str):
-          messages, _ = self._parse_chat_message_content(role, content)
-          return messages
+          return self._parse_chat_message_content(role, content)
 
       if not isinstance(content, list):
           raise NotImplementedError("Complex input not supported yet")
@@ -226,6 +431,8 @@ class FastLLmCompletion:
           text_blocks: List[str] = []
           tool_calls: List[Dict[str, Any]] = []
           for block in content:
+              if not isinstance(block, dict):
+                  raise NotImplementedError("Complex input not supported yet")
               block_type = block.get("type")
               if block_type == "text":
                   text_blocks.append(block.get("text", ""))
@@ -246,39 +453,64 @@ class FastLLmCompletion:
               role = role,
               content = text_content,
               tool_calls = tool_calls or None,
-          )]
+          )], []
 
       if role == "user":
           messages: List[ConversationMessage] = []
-          text_blocks: List[str] = []
+          all_images: List[Image.Image] = []
+          pending_parts: List[Dict[str, Any]] = []
+          pending_images: List[Image.Image] = []
 
-          def flush_text_blocks():
-              if text_blocks:
+          def flush_pending_user_parts():
+              nonlocal pending_parts
+              nonlocal pending_images
+              if pending_parts:
                   messages.append(ConversationMessage(
                       role = "user",
-                      content = "\n".join([text for text in text_blocks if text != ""]),
+                      content = self._build_message_content(pending_parts),
                   ))
-                  text_blocks.clear()
+                  if pending_images:
+                      all_images.extend(pending_images)
+                  pending_parts = []
+                  pending_images = []
 
           for block in content:
+              if not isinstance(block, dict):
+                  raise NotImplementedError("Complex input not supported yet")
               block_type = block.get("type")
               if block_type == "text":
-                  text_blocks.append(block.get("text", ""))
+                  pending_parts.append({
+                      "type": "text",
+                      "text": block.get("text", ""),
+                  })
+              elif block_type == "image":
+                  image_url = self._convert_anthropic_image_source_to_url(
+                      block.get("source") or {}
+                  )
+                  pending_parts.append({"type": "image"})
+                  pending_images.append(self._load_image_from_url(image_url))
               elif block_type == "tool_result":
-                  flush_text_blocks()
+                  flush_pending_user_parts()
+                  tool_text, tool_images = self._parse_anthropic_tool_result_content(
+                      block.get("content")
+                  )
                   messages.append(ConversationMessage(
                       role = "tool",
-                      content = self._stringify_anthropic_block_content(
-                          block.get("content")),
+                      content = tool_text,
                       tool_call_id = block.get("tool_use_id"),
                   ))
+                  if tool_images:
+                      messages.append(ConversationMessage(
+                          role = "user",
+                          content = [{"type": "image"} for _ in tool_images],
+                      ))
+                      all_images.extend(tool_images)
               else:
                   raise NotImplementedError("Complex input not supported yet")
-          flush_text_blocks()
-          return messages
+          flush_pending_user_parts()
+          return messages, all_images
 
-      messages, _ = self._parse_chat_message_content(role, content)
-      return messages
+      return self._parse_chat_message_content(role, content)
 
   def _build_anthropic_response_blocks(
       self,
@@ -335,15 +567,18 @@ class FastLLmCompletion:
 
       try:
           conversation: List[ConversationMessage] = []
+          images: List[Image.Image] = []
           if request.system is not None:
-              system_messages = self._parse_anthropic_message_content(
+              system_messages, system_images = self._parse_anthropic_message_content(
                   "system", request.system)
               conversation.extend(system_messages)
+              images.extend(system_images)
 
           for m in request.messages:
-              messages = self._parse_anthropic_message_content(
+              messages, message_images = self._parse_anthropic_message_content(
                   m.role, m.content)
               conversation.extend(messages)
+              images.extend(message_images)
 
           if len(conversation) == 0:
               raise Exception("Empty msg")
@@ -385,12 +620,17 @@ class FastLLmCompletion:
       if (not(self.hide_input)):
          logging.info(f"fastllm anthropic input message: {messages}")
 
-      input_token_len = self.model.get_input_token_len(messages, enable_thinking = self.think)
+      model_images = images if images else None
+      input_token_len = self._compute_multimodal_input_token_len(
+          messages,
+          enable_thinking = self.think,
+          images = model_images)
       handle = self.model.launch_stream_response(messages,
                         max_length = max_length, min_length = 0, do_sample = do_sample,
                         top_p = top_p, top_k = top_k, temperature = temperature,
                         repeat_penalty = frequency_penalty, tools = model_tools,
-                        one_by_one = True, enable_thinking = self.think)
+                        one_by_one = True, enable_thinking = self.think,
+                        images = model_images)
       self.conversation_handles[request_id] = handle
       result_generator = self.model.stream_response_handle_async(handle)
 
@@ -431,14 +671,16 @@ class FastLLmCompletion:
       try:
           # print("request", str(request))
           conversation: List[ConversationMessage] = []
+          images: List[Image.Image] = []
           for m in request.messages:
-              messages, _ = self._parse_chat_message_content(
+              messages, message_images = self._parse_chat_message_content(
                   m["role"], m.get("content"),
                   tool_calls=m.get("tool_calls"),
                   tool_call_id=m.get("tool_call_id"),
                   name=m.get("name"))
 
               conversation.extend(messages)
+              images.extend(message_images)
 
           if len(conversation) == 0:
             raise Exception("Empty msg")
@@ -494,8 +736,12 @@ class FastLLmCompletion:
       if (not(self.hide_input)):
          logging.info(f"fastllm input message: {messages}")
       #logging.info(f"input tokens: {input_token_len}")
-      
-      input_token_len = self.model.get_input_token_len(messages, enable_thinking = enable_thinking)
+
+      model_images = images if images else None
+      input_token_len = self._compute_multimodal_input_token_len(
+          messages,
+          enable_thinking = enable_thinking,
+          images = model_images)
 
       tools = [tool.model_dump(exclude_none=True) for tool in request.tools] if request.tools is not None else None
 
@@ -503,7 +749,7 @@ class FastLLmCompletion:
                         max_length = max_length, min_length = min_length, do_sample = do_sample,
                         top_p = top_p, top_k = top_k, temperature = temperature,
                         repeat_penalty = frequency_penalty, tools = tools, one_by_one = True,
-                        enable_thinking = enable_thinking)
+                        enable_thinking = enable_thinking, images = model_images)
       # Store the mapping between conversation ID and handle
       self.conversation_handles[request_id] = handle
       # logging.info(f"Created conversation: {request_id}, handle: {handle}")

@@ -1140,9 +1140,32 @@ class model:
                     conversation[i]["content"] = [{"type": "text", "text": conversation[i]["content"]}]
         return conversation
 
-    def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True, enable_thinking = None) -> int:
+    def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True,
+                            enable_thinking = None, images: List = None) -> int:
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
+        if images:
+            architecture = ""
+            try:
+                architecture = self.config["architectures"][0]
+            except:
+                architecture = ""
+            if architecture == "Gemma4ForConditionalGeneration":
+                if self.hf_tokenizer is None:
+                    raise ValueError("Gemma4 multimodal token counting needs a Hugging Face tokenizer.")
+                gemma_conversation = normalize_gemma4_conversation(
+                    copy.deepcopy(conversation), len(images)
+                )
+                native_inputs = prepare_gemma4_multimodal_inputs(
+                    tokenizer = self.hf_tokenizer,
+                    model_dir = self.model_path if self.model_path else self.hf_tokenizer.name_or_path,
+                    model_config = self.config,
+                    conversation = gemma_conversation,
+                    images = images,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                )
+                return len(native_inputs["input_ids"])
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             prompt = self.hf_tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = enable_thinking)
             return len(self.hf_tokenizer.encode(prompt, add_special_tokens = True))
