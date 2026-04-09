@@ -91,6 +91,8 @@ namespace fastllm {
         int moe_intermediate_size = 0;
         bool moeWeightsPrepared = false;
 
+        std::vector<std::vector<Data*>> weights;
+        std::vector<std::vector<Data*>> biass;
         std::vector<std::vector<Data*>> expertGateupWeights;
         std::vector<std::vector<Data*>> expertDownWeights;
 

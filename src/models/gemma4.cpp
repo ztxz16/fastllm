@@ -251,6 +251,8 @@ namespace fastllm {
         routed_scaling_factor = 1.0f;
         norm_topk_prob = true;
         moeWeightsPrepared = false;
+        weights.clear();
+        biass.clear();
         expertGateupWeights.clear();
         expertDownWeights.clear();
 
@@ -460,8 +462,12 @@ namespace fastllm {
             return;
         }
 
+        weights.clear();
+        biass.clear();
         expertGateupWeights.clear();
         expertDownWeights.clear();
+        weights.resize(block_cnt);
+        biass.resize(block_cnt);
         expertGateupWeights.resize(block_cnt);
         expertDownWeights.resize(block_cnt);
 
@@ -484,6 +490,10 @@ namespace fastllm {
             }
 
             SplitFusedMoeWeightsIfNeeded(layerPrefix);
+            weights[i].push_back(nullptr);
+            weights[i].push_back(nullptr);
+            biass[i].push_back(nullptr);
+            biass[i].push_back(nullptr);
             expertGateupWeights[i].resize(num_experts, nullptr);
             expertDownWeights[i].resize(num_experts, nullptr);
             for (int expert = 0; expert < num_experts; expert++) {
@@ -495,6 +505,10 @@ namespace fastllm {
                                 "Gemma4 split MoE expert weights are incomplete.");
                 expertGateupWeights[i][expert] = &gateupIt->second;
                 expertDownWeights[i][expert] = &downIt->second;
+                weights[i].push_back(expertGateupWeights[i][expert]);
+                weights[i].push_back(expertDownWeights[i][expert]);
+                biass[i].push_back(nullptr);
+                biass[i].push_back(nullptr);
             }
         }
 
@@ -550,48 +564,76 @@ namespace fastllm {
 
         Data expertInputFlat;
         RMSNorm(residualFlat, this->weight[preNorm2Name], rms_norm_eps, expertInputFlat);
-        Data moeFlat(expertInputFlat);
-        Mul(moeFlat, 0.0f, moeFlat);
-
         const int tokenCount = expertInputFlat.dims[0];
-        for (int token = 0; token < tokenCount; token++) {
-            Data tokenInput;
-            Data tokenOutput;
-            MakeGemma4MatrixRowView(expertInputFlat, token, tokenInput);
-            MakeGemma4MatrixRowView(moeFlat, token, tokenOutput);
-            for (int k = 0; k < topK; k++) {
-                const int expert = expertIds[token * topK + k];
-                const float expertWeight = expertWeights[token * topK + k];
-                if (expertWeight == 0.0f) {
-                    continue;
-                }
-                AssertInFastLLM(expert >= 0 &&
-                                expert < (int) expertGateupWeights[layerId].size() &&
-                                expert < (int) expertDownWeights[layerId].size() &&
-                                expertGateupWeights[layerId][expert] != nullptr &&
-                                expertDownWeights[layerId][expert] != nullptr,
-                                "Gemma4 expert weights are incomplete.");
+        Data moeFlat;
+        const bool useMergeMoe = layerId >= 0 &&
+                                 layerId < (int) weights.size() &&
+                                 !weights[layerId].empty() &&
+                                 CanRunMergeMOE(expertInputFlat, biass[layerId]);
+        if (useMergeMoe) {
+            Data expertIndexData(DataType::INT32, {tokenCount, topK});
+            expertIndexData.Allocate();
+            memcpy(expertIndexData.cpuData, expertIds.data(), sizeof(int) * expertIds.size());
 
-                Data gateupOut;
-                Data gatePart;
-                Data upPart;
-                Data expertOut;
-                Linear(tokenInput, *expertGateupWeights[layerId][expert], *GetEmptyData(), gateupOut);
-                Split(gateupOut, 1, 0, moe_intermediate_size, gatePart);
-                Split(gateupOut, 1, moe_intermediate_size, gateupOut.dims[1], upPart);
-                if (gatePart.dataType != DataType::FLOAT32) {
-                    ToDataType(gatePart, DataType::FLOAT32);
+            Data expertScoreData(DataType::FLOAT32, {tokenCount, topK});
+            expertScoreData.Allocate();
+            memcpy(expertScoreData.cpuData, expertWeights.data(), sizeof(float) * expertWeights.size());
+
+            Data w1, w2, w3, tempInput, tempOutput;
+            Data moeInputTemp, moeOutputTemp;
+            ApplyDeviceMap(this->moeDeviceMap, layerId + 1, block_cnt);
+            MergeMOEBlock(
+                &expertInputFlat, &expertIndexData, &expertScoreData,
+                &weights[layerId], &biass[layerId],
+                &w1, &w2, &w3, &tempInput, &tempOutput,
+                1.0f, &moeFlat, layerId,
+                expertInputFlat.dataType, this->moeAtype,
+                &moeInputTemp, &moeOutputTemp,
+                MoeGateGeglu
+            );
+            ApplyDeviceMap(this->deviceMap, layerId + 1, block_cnt);
+        } else {
+            moeFlat.CopyFrom(expertInputFlat);
+            Mul(moeFlat, 0.0f, moeFlat);
+            for (int token = 0; token < tokenCount; token++) {
+                Data tokenInput;
+                Data tokenOutput;
+                MakeGemma4MatrixRowView(expertInputFlat, token, tokenInput);
+                MakeGemma4MatrixRowView(moeFlat, token, tokenOutput);
+                for (int k = 0; k < topK; k++) {
+                    const int expert = expertIds[token * topK + k];
+                    const float expertWeight = expertWeights[token * topK + k];
+                    if (expertWeight == 0.0f) {
+                        continue;
+                    }
+                    AssertInFastLLM(expert >= 0 &&
+                                    expert < (int) expertGateupWeights[layerId].size() &&
+                                    expert < (int) expertDownWeights[layerId].size() &&
+                                    expertGateupWeights[layerId][expert] != nullptr &&
+                                    expertDownWeights[layerId][expert] != nullptr,
+                                    "Gemma4 expert weights are incomplete.");
+
+                    Data gateupOut;
+                    Data gatePart;
+                    Data upPart;
+                    Data expertOut;
+                    Linear(tokenInput, *expertGateupWeights[layerId][expert], *GetEmptyData(), gateupOut);
+                    Split(gateupOut, 1, 0, moe_intermediate_size, gatePart);
+                    Split(gateupOut, 1, moe_intermediate_size, gateupOut.dims[1], upPart);
+                    if (gatePart.dataType != DataType::FLOAT32) {
+                        ToDataType(gatePart, DataType::FLOAT32);
+                    }
+                    if (upPart.dataType != DataType::FLOAT32) {
+                        ToDataType(upPart, DataType::FLOAT32);
+                    }
+                    Gelu(gatePart, gatePart);
+                    MulTo(gatePart, upPart);
+                    Linear(gatePart, *expertDownWeights[layerId][expert], *GetEmptyData(), expertOut);
+                    if (expertOut.dataType != tokenOutput.dataType) {
+                        ToDataType(expertOut, tokenOutput.dataType);
+                    }
+                    AddTo(tokenOutput, expertOut, expertWeight);
                 }
-                if (upPart.dataType != DataType::FLOAT32) {
-                    ToDataType(upPart, DataType::FLOAT32);
-                }
-                Gelu(gatePart, gatePart);
-                MulTo(gatePart, upPart);
-                Linear(gatePart, *expertDownWeights[layerId][expert], *GetEmptyData(), expertOut);
-                if (expertOut.dataType != tokenOutput.dataType) {
-                    ToDataType(expertOut, tokenOutput.dataType);
-                }
-                AddTo(tokenOutput, expertOut, expertWeight);
             }
         }
 
