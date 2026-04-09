@@ -17,6 +17,8 @@ namespace fastllm {
 
         virtual void InitParams();
 
+        virtual void OnWeightLoaded(const std::string &weightName, const std::set<std::string> &finishedWeightNames) override;
+
         virtual int Forward(
                 const Data &inputIds,
                 const Data &attentionMask,
@@ -84,6 +86,17 @@ namespace fastllm {
 
         std::vector<std::vector<float>> slidingSin, slidingCos;
         std::vector<std::vector<float>> globalSin, globalCos;
+
+        bool enable_moe_block = false;
+        int moe_intermediate_size = 0;
+        bool moeWeightsPrepared = false;
+
+        std::vector<std::vector<Data*>> expertGateupWeights;
+        std::vector<std::vector<Data*>> expertDownWeights;
+
+        void SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix);
+        void PrepareMoeWeights();
+        bool TryApplyMoeFeedForward(const std::string &layerPrefix, Data &hiddenStates, Data &denseOutput);
 
         bool prepared = false;
     };

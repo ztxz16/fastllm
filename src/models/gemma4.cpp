@@ -32,10 +32,23 @@ namespace fastllm {
             "model.language_model.layers.*.mlp.down_proj.weight",
             "model.language_model.layers.*.mlp.up_proj.weight",
             "model.language_model.layers.*.mlp.gate_proj.weight",
+            "model.language_model.layers.*.router.proj.weight",
+            "model.language_model.layers.*.experts.gate_up_proj",
+            "model.language_model.layers.*.experts.down_proj",
             "model.language_model.layers.*.self_attn.o_proj.weight",
             "model.language_model.layers.*.self_attn.q_proj.weight",
             "model.language_model.layers.*.self_attn.k_proj.weight",
-            "model.language_model.layers.*.self_attn.v_proj.weight"
+            "model.language_model.layers.*.self_attn.v_proj.weight",
+            "model.layers.*.mlp.down_proj.weight",
+            "model.layers.*.mlp.up_proj.weight",
+            "model.layers.*.mlp.gate_proj.weight",
+            "model.layers.*.router.proj.weight",
+            "model.layers.*.experts.gate_up_proj",
+            "model.layers.*.experts.down_proj",
+            "model.layers.*.self_attn.o_proj.weight",
+            "model.layers.*.self_attn.q_proj.weight",
+            "model.layers.*.self_attn.k_proj.weight",
+            "model.layers.*.self_attn.v_proj.weight"
         };
     }
 
@@ -48,6 +61,145 @@ namespace fastllm {
         it = dicts.find(key2);
         if (it != dicts.end()) return it->second;
         return defaultVal;
+    }
+
+    static bool TryGetGemma4FusedMoeLayerPrefix(const std::string &weightName, std::string &layerPrefix) {
+        static const std::string gateupSuffix = "experts.gate_up_proj";
+        static const std::string downSuffix = "experts.down_proj";
+        if (StringEndWith(weightName, gateupSuffix)) {
+            layerPrefix = weightName.substr(0, weightName.size() - gateupSuffix.size());
+            return true;
+        }
+        if (StringEndWith(weightName, downSuffix)) {
+            layerPrefix = weightName.substr(0, weightName.size() - downSuffix.size());
+            return true;
+        }
+        return false;
+    }
+
+    static void SplitGemma4ExpertLinearWeight(Data &dst, const Data &src, const std::string &name, int expertIndex) {
+        AssertInFastLLM(src.dims.size() == 3, "Gemma4 fused expert weight should be 3D.");
+        AssertInFastLLM(expertIndex >= 0 && expertIndex < src.dims[0], "Gemma4 expert index out of range.");
+        AssertInFastLLM(src.dataType == DataType::FLOAT16 || src.dataType == DataType::BFLOAT16 ||
+                        src.dataType == DataType::FLOAT32,
+                        "Gemma4 fused expert slicing currently supports float16/bfloat16/float32 weights only.");
+        AssertInFastLLM(src.dataDevice == DataDevice::CPU && src.cpuData != nullptr,
+                        "Gemma4 fused expert slicing expects CPU weight data during load.");
+
+        dst = Data(src.dataType, {src.dims[1], src.dims[2]});
+        dst.Allocate();
+        const uint64_t bytesPerExpert = src.GetBytes() / src.dims[0];
+        memcpy(dst.cpuData, src.cpuData + bytesPerExpert * expertIndex, bytesPerExpert);
+        dst.name = name;
+        dst.weightType = WeightType::LINEAR;
+        dst.isModelWeight = true;
+    }
+
+    static void MakeGemma4FlatLastDimView(Data &input, Data &output) {
+        AssertInFastLLM((input.dims.size() == 2 || input.dims.size() == 3) &&
+                        input.strides.size() == input.dims.size() &&
+                        input.strides.back() == 1,
+                        "Gemma4 flat last-dim view expects a contiguous 2D/3D tensor.");
+        if (input.dims.size() == 2) {
+            output.dims = input.dims;
+            output.strides = input.strides;
+        } else {
+            output.dims = {input.dims[0] * input.dims[1], input.dims[2]};
+            output.strides = {input.strides[1], input.strides[2]};
+        }
+        output.dataDeviceIds = input.dataDeviceIds;
+        output.FakeFrom(input, 0);
+    }
+
+    static void MakeGemma4MatrixRowView(Data &input, int row, Data &output) {
+        AssertInFastLLM(input.dims.size() == 2 && input.strides.size() == 2 && input.strides[1] == 1,
+                        "Gemma4 row view expects a contiguous 2D tensor.");
+        AssertInFastLLM(row >= 0 && row < input.dims[0], "Gemma4 row index is out of range.");
+        output.dims = {1, input.dims[1]};
+        output.strides = input.strides;
+        output.dataDeviceIds = input.dataDeviceIds;
+        output.FakeFrom(input, (size_t) row * input.strides[0] * input.unitSize);
+    }
+
+    static int ParseGemma4LayerIndex(const std::string &layerPrefix) {
+        size_t pos = layerPrefix.rfind('.');
+        AssertInFastLLM(pos != std::string::npos && pos + 1 < layerPrefix.size(),
+                        "Gemma4 layer prefix is invalid.");
+        return atoi(layerPrefix.substr(pos + 1).c_str());
+    }
+
+    static void BuildGemma4RouterTopKFromLogits(const Data &routerLogits,
+                                                const Data &perExpertScale,
+                                                int topK,
+                                                std::vector<int> &expertIds,
+                                                std::vector<float> &expertWeights) {
+        Data logitsCpu(routerLogits);
+        Data perExpertScaleCpu(perExpertScale);
+        logitsCpu.ToDevice(DataDevice::CPU);
+        perExpertScaleCpu.ToDevice(DataDevice::CPU);
+        if (logitsCpu.dataType != DataType::FLOAT32) {
+            ToDataType(logitsCpu, DataType::FLOAT32);
+        }
+        if (perExpertScaleCpu.dataType != DataType::FLOAT32) {
+            ToDataType(perExpertScaleCpu, DataType::FLOAT32);
+        }
+
+        AssertInFastLLM(logitsCpu.dims.size() == 2 && perExpertScaleCpu.dims.size() == 1,
+                        "Gemma4 router logits/scale tensors should be 2D and 1D.");
+        const int tokenCount = logitsCpu.dims[0];
+        const int expertCount = logitsCpu.dims[1];
+        topK = std::max(0, std::min(topK, expertCount));
+        AssertInFastLLM(perExpertScaleCpu.dims[0] == expertCount,
+                        "Gemma4 per-expert scale shape is inconsistent with router logits.");
+
+        expertIds.assign(tokenCount * topK, 0);
+        expertWeights.assign(tokenCount * topK, 0.0f);
+        if (topK == 0) {
+            return;
+        }
+
+        float *logitsData = (float*) logitsCpu.cpuData;
+        float *perExpertScaleData = (float*) perExpertScaleCpu.cpuData;
+        std::vector<float> probs(expertCount);
+        std::vector<int> order(expertCount);
+        for (int token = 0; token < tokenCount; token++) {
+            const float *tokenLogits = logitsData + (size_t) token * expertCount;
+            float maxLogit = -1e30f;
+            for (int expert = 0; expert < expertCount; expert++) {
+                maxLogit = std::max(maxLogit, tokenLogits[expert]);
+                order[expert] = expert;
+            }
+            float softmaxSum = 0.0f;
+            for (int expert = 0; expert < expertCount; expert++) {
+                probs[expert] = expf(tokenLogits[expert] - maxLogit);
+                softmaxSum += probs[expert];
+            }
+            if (softmaxSum <= 0.0f) {
+                softmaxSum = 1.0f;
+            }
+            for (int expert = 0; expert < expertCount; expert++) {
+                probs[expert] /= softmaxSum;
+            }
+            std::partial_sort(order.begin(), order.begin() + topK, order.end(),
+                              [&](int a, int b) {
+                                  if (probs[a] == probs[b]) {
+                                      return a < b;
+                                  }
+                                  return probs[a] > probs[b];
+                              });
+            float topProbSum = 0.0f;
+            for (int k = 0; k < topK; k++) {
+                topProbSum += probs[order[k]];
+            }
+            if (topProbSum <= 0.0f) {
+                topProbSum = 1.0f;
+            }
+            for (int k = 0; k < topK; k++) {
+                const int expert = order[k];
+                expertIds[token * topK + k] = expert;
+                expertWeights[token * topK + k] = probs[expert] / topProbSum * perExpertScaleData[expert];
+            }
+        }
     }
 
     void Gemma4Model::InitParams() {
@@ -84,6 +236,23 @@ namespace fastllm {
 
         val = GetDictValue(d, "text_config.attention_k_eq_v", "attention_k_eq_v", "true");
         attention_k_eq_v = (val == "true" || val == "True" || val == "1");
+
+        val = GetDictValue(d, "text_config.enable_moe_block", "enable_moe_block", "false");
+        enable_moe_block = (val == "true" || val == "True" || val == "1");
+
+        val = GetDictValue(d, "text_config.num_experts", "num_experts", "0");
+        num_experts = atoi(val.c_str());
+
+        val = GetDictValue(d, "text_config.top_k_experts", "top_k_experts", "0");
+        num_experts_per_tok = atoi(val.c_str());
+
+        val = GetDictValue(d, "text_config.moe_intermediate_size", "moe_intermediate_size", "0");
+        moe_intermediate_size = atoi(val.c_str());
+        routed_scaling_factor = 1.0f;
+        norm_topk_prob = true;
+        moeWeightsPrepared = false;
+        expertGateupWeights.clear();
+        expertDownWeights.clear();
 
         val = GetDictValue(d, "text_config.final_logit_softcapping", "final_logit_softcapping", "30.0");
         if (val != "None" && val != "null" && !val.empty())
@@ -221,6 +390,226 @@ namespace fastllm {
             fcos.insert(fcos.end(), slidingCos[i].begin(), slidingCos[i].end());
         }
         return std::make_pair(fsin, fcos);
+    }
+
+    void Gemma4Model::SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix) {
+        if (num_experts <= 0) {
+            return;
+        }
+
+        const std::string firstExpertGateupName = layerPrefix + "experts.0.gateup_proj.weight";
+        if (this->weight.weight.find(firstExpertGateupName) != this->weight.weight.end()) {
+            return;
+        }
+
+        const std::string fusedGateupName = layerPrefix + "experts.gate_up_proj";
+        const std::string fusedDownName = layerPrefix + "experts.down_proj";
+        auto fusedGateupIt = this->weight.weight.find(fusedGateupName);
+        if (fusedGateupIt == this->weight.weight.end()) {
+            return;
+        }
+
+        auto fusedDownIt = this->weight.weight.find(fusedDownName);
+        AssertInFastLLM(fusedDownIt != this->weight.weight.end(), "Gemma4 fused MoE weights are incomplete.");
+
+        Data &fusedGateup = fusedGateupIt->second;
+        Data &fusedDown = fusedDownIt->second;
+        fusedGateup.ToDevice(DataDevice::CPU);
+        fusedDown.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(fusedGateup.dims.size() == 3 && fusedDown.dims.size() == 3,
+                        "Gemma4 fused expert weights should be 3D.");
+        AssertInFastLLM(fusedGateup.dims[0] == num_experts && fusedDown.dims[0] == num_experts,
+                        "Gemma4 fused expert count mismatch.");
+
+        for (int expert = 0; expert < num_experts; expert++) {
+            const std::string expertGateupName = layerPrefix + "experts." + std::to_string(expert) + ".gateup_proj.weight";
+            const std::string expertDownName = layerPrefix + "experts." + std::to_string(expert) + ".down_proj.weight";
+            SplitGemma4ExpertLinearWeight(this->weight.weight[expertGateupName], fusedGateup, expertGateupName, expert);
+            SplitGemma4ExpertLinearWeight(this->weight.weight[expertDownName], fusedDown, expertDownName, expert);
+        }
+
+        this->weight.weight.erase(fusedGateupName);
+        this->weight.weight.erase(fusedDownName);
+    }
+
+    void Gemma4Model::OnWeightLoaded(const std::string &weightName, const std::set<std::string> &finishedWeightNames) {
+        if (num_experts <= 0) {
+            return;
+        }
+
+        std::string layerPrefix;
+        if (!TryGetGemma4FusedMoeLayerPrefix(weightName, layerPrefix) ||
+            (!StartWith(layerPrefix, "model.language_model.layers.") &&
+             !StartWith(layerPrefix, "model.layers."))) {
+            return;
+        }
+
+        const std::string fusedGateupName = layerPrefix + "experts.gate_up_proj";
+        const std::string fusedDownName = layerPrefix + "experts.down_proj";
+        if (finishedWeightNames.find(fusedGateupName) == finishedWeightNames.end() ||
+            finishedWeightNames.find(fusedDownName) == finishedWeightNames.end()) {
+            return;
+        }
+
+        SplitFusedMoeWeightsIfNeeded(layerPrefix);
+    }
+
+    void Gemma4Model::PrepareMoeWeights() {
+        if (moeWeightsPrepared || num_experts <= 0) {
+            moeWeightsPrepared = true;
+            return;
+        }
+
+        expertGateupWeights.clear();
+        expertDownWeights.clear();
+        expertGateupWeights.resize(block_cnt);
+        expertDownWeights.resize(block_cnt);
+
+        std::string baseLayerPrefix = "model.language_model.layers.";
+        if (weight.weight.find(baseLayerPrefix + "0.input_layernorm.weight") == weight.weight.end()) {
+            baseLayerPrefix = "model.layers.";
+        }
+
+        for (int i = 0; i < block_cnt; i++) {
+            const std::string layerPrefix = baseLayerPrefix + std::to_string(i) + ".";
+            const std::string routerWeightName = layerPrefix + "router.proj.weight";
+            const std::string fusedGateupName = layerPrefix + "experts.gate_up_proj";
+            const std::string firstExpertGateupName = layerPrefix + "experts.0.gateup_proj.weight";
+            const bool hasMoeLayer =
+                this->weight.weight.find(routerWeightName) != this->weight.weight.end() ||
+                this->weight.weight.find(fusedGateupName) != this->weight.weight.end() ||
+                this->weight.weight.find(firstExpertGateupName) != this->weight.weight.end();
+            if (!hasMoeLayer) {
+                continue;
+            }
+
+            SplitFusedMoeWeightsIfNeeded(layerPrefix);
+            expertGateupWeights[i].resize(num_experts, nullptr);
+            expertDownWeights[i].resize(num_experts, nullptr);
+            for (int expert = 0; expert < num_experts; expert++) {
+                const std::string expertGateupName = layerPrefix + "experts." + std::to_string(expert) + ".gateup_proj.weight";
+                const std::string expertDownName = layerPrefix + "experts." + std::to_string(expert) + ".down_proj.weight";
+                auto gateupIt = this->weight.weight.find(expertGateupName);
+                auto downIt = this->weight.weight.find(expertDownName);
+                AssertInFastLLM(gateupIt != this->weight.weight.end() && downIt != this->weight.weight.end(),
+                                "Gemma4 split MoE expert weights are incomplete.");
+                expertGateupWeights[i][expert] = &gateupIt->second;
+                expertDownWeights[i][expert] = &downIt->second;
+            }
+        }
+
+        moeWeightsPrepared = true;
+    }
+
+    bool Gemma4Model::TryApplyMoeFeedForward(const std::string &layerPrefix, Data &hiddenStates, Data &denseOutput) {
+        if (!enable_moe_block || num_experts <= 0 || num_experts_per_tok <= 0) {
+            return false;
+        }
+
+        const std::string routerWeightName = layerPrefix + ".router.proj.weight";
+        const std::string routerScaleName = layerPrefix + ".router.scale";
+        const std::string perExpertScaleName = layerPrefix + ".router.per_expert_scale";
+        const std::string postNorm1Name = layerPrefix + ".post_feedforward_layernorm_1.weight";
+        const std::string preNorm2Name = layerPrefix + ".pre_feedforward_layernorm_2.weight";
+        const std::string postNorm2Name = layerPrefix + ".post_feedforward_layernorm_2.weight";
+        const std::string postNormName = layerPrefix + ".post_feedforward_layernorm.weight";
+        if (this->weight.weight.find(routerWeightName) == this->weight.weight.end() ||
+            this->weight.weight.find(routerScaleName) == this->weight.weight.end() ||
+            this->weight.weight.find(perExpertScaleName) == this->weight.weight.end() ||
+            this->weight.weight.find(postNorm1Name) == this->weight.weight.end() ||
+            this->weight.weight.find(preNorm2Name) == this->weight.weight.end() ||
+            this->weight.weight.find(postNorm2Name) == this->weight.weight.end()) {
+            return false;
+        }
+
+        PrepareMoeWeights();
+        const int layerId = ParseGemma4LayerIndex(layerPrefix);
+        AssertInFastLLM(layerId >= 0 && layerId < (int) expertGateupWeights.size(),
+                        "Gemma4 layer index is out of range.");
+
+        Data denseBranch;
+        RMSNorm(denseOutput, this->weight[postNorm1Name], rms_norm_eps, denseBranch);
+
+        Data residualFlat;
+        MakeGemma4FlatLastDimView(hiddenStates, residualFlat);
+
+        Data routerInput;
+        RMSNorm(residualFlat, this->weight[routerScaleName], rms_norm_eps, routerInput);
+        Mul(routerInput, 1.0f / sqrtf((float) residualFlat.dims[1]), routerInput);
+        Data routerLogits;
+        Linear(routerInput, this->weight[routerWeightName], *GetEmptyData(), routerLogits);
+
+        std::vector<int> expertIds;
+        std::vector<float> expertWeights;
+        const int topK = std::min(num_experts_per_tok, num_experts);
+        BuildGemma4RouterTopKFromLogits(routerLogits,
+                                        this->weight[perExpertScaleName],
+                                        topK,
+                                        expertIds,
+                                        expertWeights);
+
+        Data expertInputFlat;
+        RMSNorm(residualFlat, this->weight[preNorm2Name], rms_norm_eps, expertInputFlat);
+        Data moeFlat(expertInputFlat);
+        Mul(moeFlat, 0.0f, moeFlat);
+
+        const int tokenCount = expertInputFlat.dims[0];
+        for (int token = 0; token < tokenCount; token++) {
+            Data tokenInput;
+            Data tokenOutput;
+            MakeGemma4MatrixRowView(expertInputFlat, token, tokenInput);
+            MakeGemma4MatrixRowView(moeFlat, token, tokenOutput);
+            for (int k = 0; k < topK; k++) {
+                const int expert = expertIds[token * topK + k];
+                const float expertWeight = expertWeights[token * topK + k];
+                if (expertWeight == 0.0f) {
+                    continue;
+                }
+                AssertInFastLLM(expert >= 0 &&
+                                expert < (int) expertGateupWeights[layerId].size() &&
+                                expert < (int) expertDownWeights[layerId].size() &&
+                                expertGateupWeights[layerId][expert] != nullptr &&
+                                expertDownWeights[layerId][expert] != nullptr,
+                                "Gemma4 expert weights are incomplete.");
+
+                Data gateupOut;
+                Data gatePart;
+                Data upPart;
+                Data expertOut;
+                Linear(tokenInput, *expertGateupWeights[layerId][expert], *GetEmptyData(), gateupOut);
+                Split(gateupOut, 1, 0, moe_intermediate_size, gatePart);
+                Split(gateupOut, 1, moe_intermediate_size, gateupOut.dims[1], upPart);
+                if (gatePart.dataType != DataType::FLOAT32) {
+                    ToDataType(gatePart, DataType::FLOAT32);
+                }
+                if (upPart.dataType != DataType::FLOAT32) {
+                    ToDataType(upPart, DataType::FLOAT32);
+                }
+                Gelu(gatePart, gatePart);
+                MulTo(gatePart, upPart);
+                Linear(gatePart, *expertDownWeights[layerId][expert], *GetEmptyData(), expertOut);
+                if (expertOut.dataType != tokenOutput.dataType) {
+                    ToDataType(expertOut, tokenOutput.dataType);
+                }
+                AddTo(tokenOutput, expertOut, expertWeight);
+            }
+        }
+
+        moeFlat.Reshape(hiddenStates.dims);
+        Data moeBranch;
+        RMSNorm(moeFlat, this->weight[postNorm2Name], rms_norm_eps, moeBranch);
+        if (moeBranch.dataType != denseBranch.dataType) {
+            ToDataType(moeBranch, denseBranch.dataType);
+        }
+        AddTo(denseBranch, moeBranch);
+
+        Data mergedBranch;
+        RMSNorm(denseBranch, this->weight[postNormName], rms_norm_eps, mergedBranch);
+        if (mergedBranch.dataType != hiddenStates.dataType) {
+            ToDataType(mergedBranch, hiddenStates.dataType);
+        }
+        AddTo(hiddenStates, mergedBranch);
+        return true;
     }
 
     int Gemma4Model::Forward(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
@@ -402,8 +791,10 @@ namespace fastllm {
                 ToDataType(w2, DataType::FLOAT16);
             }
 
-            RMSNorm(w2, this->weight[pre + ".post_feedforward_layernorm.weight"], rms_norm_eps, w2);
-            AddTo(hiddenStates, w2);
+            if (!TryApplyMoeFeedForward(pre, hiddenStates, w2)) {
+                RMSNorm(w2, this->weight[pre + ".post_feedforward_layernorm.weight"], rms_norm_eps, w2);
+                AddTo(hiddenStates, w2);
+            }
 
             std::string layerScalarName = layerPrefix + std::to_string(i) + ".layer_scalar";
             if (weight.weight.find(layerScalarName) != weight.weight.end()) {
@@ -722,8 +1113,10 @@ namespace fastllm {
                 ToDataType(w2, DataType::FLOAT16);
             }
 
-            RMSNorm(w2, this->weight[pre + ".post_feedforward_layernorm.weight"], rms_norm_eps, w2);
-            AddTo(hiddenStates, w2);
+            if (!TryApplyMoeFeedForward(pre, hiddenStates, w2)) {
+                RMSNorm(w2, this->weight[pre + ".post_feedforward_layernorm.weight"], rms_norm_eps, w2);
+                AddTo(hiddenStates, w2);
+            }
 
             std::string layerScalarName = layerPrefix + std::to_string(i) + ".layer_scalar";
             if (weight.weight.find(layerScalarName) != weight.weight.end()) {
@@ -902,6 +1295,10 @@ namespace fastllm {
         if (!lmHeadExists || this->weight[lmHeadName].dims.size() == 0) {
             this->weight[lmHeadName].CopyFrom(this->weight[embName]);
             ToDataType(this->weight[lmHeadName], this->dataType);
+        }
+
+        if (enable_moe_block) {
+            PrepareMoeWeights();
         }
     }
 
