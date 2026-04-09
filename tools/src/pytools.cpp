@@ -548,18 +548,69 @@ extern "C" {
 
         std::string error;
         auto multimodal_config = json11::Json::parse(multimodal_json, error);
-        int image_channels = multimodal_config["image_channels"].int_value();
-        int image_height = multimodal_config["image_height"].int_value();
-        int image_width = multimodal_config["image_width"].int_value();
-
         std::vector <float> imageInput;
-        imageInput.resize(1 * image_channels * image_height * image_width);
-        memcpy(&imageInput[0], multimodal_data, imageInput.size() * sizeof(float));
-
         std::map <std::string, std::vector <fastllm::Data*> > *multimodalInput = new std::map <std::string, std::vector <fastllm::Data*> > ();
-        fastllm::Data *imageInputData = new fastllm::Data();
-        imageInputData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {1, image_channels, image_height, image_width}, imageInput));
-        (*multimodalInput)["images"].push_back(imageInputData);
+        std::string mode = multimodal_config["mode"].string_value();
+
+        auto readShape = [](const json11::Json &node) {
+            std::vector<int> shape;
+            for (auto &item : node.array_items()) {
+                shape.push_back(item.int_value());
+            }
+            return shape;
+        };
+        auto shapeCount = [](const std::vector<int> &shape) {
+            int total = 1;
+            for (int dim : shape) {
+                total *= dim;
+            }
+            return total;
+        };
+
+        if (mode == "gemma4") {
+            std::vector<int> pixelShape = readShape(multimodal_config["pixel_values_shape"]);
+            std::vector<int> imagePosShape = readShape(multimodal_config["image_position_ids_shape"]);
+            std::vector<int> mmTypeShape = readShape(multimodal_config["mm_token_type_ids_shape"]);
+
+            int pixelOffset = multimodal_config["pixel_values_offset"].int_value();
+            int pixelLength = multimodal_config["pixel_values_length"].int_value();
+            int imagePosOffset = multimodal_config["image_position_ids_offset"].int_value();
+            int imagePosLength = multimodal_config["image_position_ids_length"].int_value();
+            int mmTypeOffset = multimodal_config["mm_token_type_ids_offset"].int_value();
+            int mmTypeLength = multimodal_config["mm_token_type_ids_length"].int_value();
+
+            fastllm::AssertInFastLLM(shapeCount(pixelShape) == pixelLength, "Gemma4 pixel_values payload shape mismatch.");
+            fastllm::AssertInFastLLM(shapeCount(imagePosShape) == imagePosLength, "Gemma4 image_position_ids payload shape mismatch.");
+            fastllm::AssertInFastLLM(shapeCount(mmTypeShape) == mmTypeLength, "Gemma4 mm_token_type_ids payload shape mismatch.");
+
+            std::vector<float> pixelValues(pixelLength);
+            memcpy(pixelValues.data(), multimodal_data + pixelOffset, (size_t) pixelLength * sizeof(float));
+            fastllm::Data *pixelValuesData = new fastllm::Data();
+            pixelValuesData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, pixelShape, pixelValues));
+            (*multimodalInput)["pixel_values"].push_back(pixelValuesData);
+
+            std::vector<float> imagePositionIds(imagePosLength);
+            memcpy(imagePositionIds.data(), multimodal_data + imagePosOffset, (size_t) imagePosLength * sizeof(float));
+            fastllm::Data *imagePositionIdsData = new fastllm::Data();
+            imagePositionIdsData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, imagePosShape, imagePositionIds));
+            (*multimodalInput)["image_position_ids"].push_back(imagePositionIdsData);
+
+            std::vector<float> mmTokenTypeIds(mmTypeLength);
+            memcpy(mmTokenTypeIds.data(), multimodal_data + mmTypeOffset, (size_t) mmTypeLength * sizeof(float));
+            fastllm::Data *mmTokenTypeIdsData = new fastllm::Data();
+            mmTokenTypeIdsData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, mmTypeShape, mmTokenTypeIds));
+            (*multimodalInput)["mm_token_type_ids"].push_back(mmTokenTypeIdsData);
+        } else {
+            int image_channels = multimodal_config["image_channels"].int_value();
+            int image_height = multimodal_config["image_height"].int_value();
+            int image_width = multimodal_config["image_width"].int_value();
+            imageInput.resize(1 * image_channels * image_height * image_width);
+            memcpy(&imageInput[0], multimodal_data, imageInput.size() * sizeof(float));
+
+            fastllm::Data *imageInputData = new fastllm::Data();
+            imageInputData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {1, image_channels, image_height, image_width}, imageInput));
+            (*multimodalInput)["images"].push_back(imageInputData);
+        }
 
         int ret = model->LaunchResponseTokens(input, config, *multimodalInput);
         return ret;

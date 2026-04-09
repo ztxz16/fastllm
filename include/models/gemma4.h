@@ -28,6 +28,16 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <float> *logits = nullptr);
 
+        virtual std::vector <int> ForwardMultimodal(
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector<std::pair<Data, Data> > &pastKeyValues,
+                const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                const GenerationConfig &generationConfig = GenerationConfig(),
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr) override;
+
         std::vector <int> ForwardBatch(
                 int batch,
                 const Data &inputIds,
@@ -91,6 +101,23 @@ namespace fastllm {
         int moe_intermediate_size = 0;
         bool moeWeightsPrepared = false;
 
+        int image_token_id = -1;
+        int boi_token_id = -1;
+        int eoi_token_id = -1;
+
+        int vision_hidden_size = 0;
+        int vision_num_layers = 0;
+        int vision_num_heads = 0;
+        int vision_num_key_value_heads = 0;
+        int vision_head_dim = 0;
+        int vision_patch_size = 16;
+        int vision_pooling_kernel_size = 3;
+        int vision_position_embedding_size = 0;
+        int vision_max_soft_tokens = 280;
+        bool vision_standardize = false;
+
+        Data visionSinData, visionCosData;
+
         std::vector<std::vector<Data*>> weights;
         std::vector<std::vector<Data*>> biass;
         std::vector<std::vector<Data*>> expertGateupWeights;
@@ -99,8 +126,25 @@ namespace fastllm {
         void SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix);
         void PrepareMoeWeights();
         bool TryApplyMoeFeedForward(const std::string &layerPrefix, Data &hiddenStates, Data &denseOutput);
+        void PrepareVision();
+        void ApplyRMSNormNoScale(Data &input, float eps);
+        void BuildVisionPatchPositionIds(const Data &imagePositionIds, Data &posX, Data &posY, std::vector<int> &validPatchCounts);
+        void BuildVisionAttentionMask(const Data &imagePositionIds, Data &visionAttentionMask);
+        void ApplyVisionRotary(Data &input, const Data &posX, const Data &posY);
+        void EncodeImages(const Data &pixelValues, const Data &imagePositionIds, Data &imageFeatures, std::vector<int> &softTokenCounts);
+        void MergeImageFeaturesIntoText(const Data &inputIds, const Data &imageFeatures, Data &hiddenStates);
+        void BuildVisionAwareTextMask(const Data &attentionMask, const Data &mmTokenTypeIds, Data &visionAwareMask);
+        int ForwardTextFromHiddenStates(const Data &inputIds,
+                                        Data &hiddenStates,
+                                        const Data &attentionMask,
+                                        const Data &positionIds,
+                                        std::vector <std::pair <Data, Data> > &pastKeyValues,
+                                        const GenerationConfig &generationConfig = GenerationConfig(),
+                                        const LastTokensManager &lastTokens = LastTokensManager(),
+                                        std::vector <float> *retLogits = nullptr);
 
         bool prepared = false;
+        bool visionPrepared = false;
     };
 }
 

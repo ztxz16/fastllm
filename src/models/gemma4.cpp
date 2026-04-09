@@ -27,6 +27,7 @@ namespace fastllm {
         rotary_dim = 256;
 
         weight.embeddingNames.insert("model.language_model.embed_tokens.weight");
+        weight.embeddingNames.insert("model.vision_tower.patch_embedder.position_embedding_table");
         weight.linearNames = {
             "lm_head.weight",
             "model.language_model.layers.*.mlp.down_proj.weight",
@@ -48,7 +49,16 @@ namespace fastllm {
             "model.layers.*.self_attn.o_proj.weight",
             "model.layers.*.self_attn.q_proj.weight",
             "model.layers.*.self_attn.k_proj.weight",
-            "model.layers.*.self_attn.v_proj.weight"
+            "model.layers.*.self_attn.v_proj.weight",
+            "model.vision_tower.patch_embedder.input_proj.weight",
+            "model.vision_tower.encoder.layers.*.self_attn.q_proj.linear.weight",
+            "model.vision_tower.encoder.layers.*.self_attn.k_proj.linear.weight",
+            "model.vision_tower.encoder.layers.*.self_attn.v_proj.linear.weight",
+            "model.vision_tower.encoder.layers.*.self_attn.o_proj.linear.weight",
+            "model.vision_tower.encoder.layers.*.mlp.gate_proj.linear.weight",
+            "model.vision_tower.encoder.layers.*.mlp.up_proj.linear.weight",
+            "model.vision_tower.encoder.layers.*.mlp.down_proj.linear.weight",
+            "model.embed_vision.embedding_projection.weight"
         };
     }
 
@@ -272,6 +282,34 @@ namespace fastllm {
             this->bos_token_id = atoi(val.c_str());
         }
 
+        val = GetDictValue(d, "image_token_id", "image_token_id", "-1");
+        image_token_id = atoi(val.c_str());
+        val = GetDictValue(d, "boi_token_id", "boi_token_id", "-1");
+        boi_token_id = atoi(val.c_str());
+        val = GetDictValue(d, "eoi_token_id", "eoi_token_id", "-1");
+        eoi_token_id = atoi(val.c_str());
+
+        val = GetDictValue(d, "vision_config.hidden_size", "hidden_size", "1152");
+        vision_hidden_size = atoi(val.c_str());
+        val = GetDictValue(d, "vision_config.num_hidden_layers", "num_hidden_layers", "27");
+        vision_num_layers = atoi(val.c_str());
+        val = GetDictValue(d, "vision_config.num_attention_heads", "num_attention_heads", "16");
+        vision_num_heads = atoi(val.c_str());
+        val = GetDictValue(d, "vision_config.num_key_value_heads", "num_key_value_heads", std::to_string(vision_num_heads));
+        vision_num_key_value_heads = atoi(val.c_str());
+        val = GetDictValue(d, "vision_config.head_dim", "head_dim", "72");
+        vision_head_dim = atoi(val.c_str());
+        val = GetDictValue(d, "vision_config.patch_size", "patch_size", "16");
+        vision_patch_size = atoi(val.c_str());
+        val = GetDictValue(d, "vision_config.pooling_kernel_size", "pooling_kernel_size", "3");
+        vision_pooling_kernel_size = atoi(val.c_str());
+        val = GetDictValue(d, "vision_config.position_embedding_size", "position_embedding_size", "10240");
+        vision_position_embedding_size = atoi(val.c_str());
+        val = GetDictValue(d, "vision_soft_tokens_per_image", "vision_soft_tokens_per_image", "280");
+        vision_max_soft_tokens = atoi(val.c_str());
+        val = GetDictValue(d, "vision_config.standardize", "standardize", "false");
+        vision_standardize = (val == "true" || val == "True" || val == "1");
+
         layer_types.clear();
         val = GetDictValue(d, "text_config.layer_types", "layer_types", "");
         if (!val.empty() && val[0] == '[') {
@@ -366,6 +404,33 @@ namespace fastllm {
             globalCosData.CopyFrom(Data(DataType::FLOAT32,
                 {(int)globalCos.size(), (int)globalCos[0].size()}, fcos));
         }
+
+        {
+            float visionRopeBase = atof(GetDictValue(d,
+                "vision_config.rope_parameters.rope_theta",
+                "rope_parameters.rope_theta", "100.0").c_str());
+            int maxVisionPos = std::max(vision_position_embedding_size, 1);
+            int rotaryHalf = vision_head_dim / 4;
+            std::vector<float> invFreq;
+            for (int i = 0; i < vision_head_dim / 2; i += 2) {
+                invFreq.push_back(1.0f / pow(visionRopeBase, (float)i / (vision_head_dim / 2)));
+            }
+
+            std::vector<float> visionSin, visionCos;
+            visionSin.reserve((size_t)maxVisionPos * rotaryHalf);
+            visionCos.reserve((size_t)maxVisionPos * rotaryHalf);
+            for (int p = 0; p < maxVisionPos; p++) {
+                for (int j = 0; j < rotaryHalf; j++) {
+                    float angle = (float)p * invFreq[j];
+                    visionSin.push_back(::sin(angle));
+                    visionCos.push_back(::cos(angle));
+                }
+            }
+            visionSinData.ToDevice(DataDevice::CPU);
+            visionCosData.ToDevice(DataDevice::CPU);
+            visionSinData.CopyFrom(Data(DataType::FLOAT32, {maxVisionPos, rotaryHalf}, visionSin));
+            visionCosData.CopyFrom(Data(DataType::FLOAT32, {maxVisionPos, rotaryHalf}, visionCos));
+        }
     }
 
     std::pair<std::vector<float>, std::vector<float>> Gemma4Model::UpdateRotaryPosEmb(float base, float factor, int seqLen, int dim) {
@@ -392,6 +457,608 @@ namespace fastllm {
             fcos.insert(fcos.end(), slidingCos[i].begin(), slidingCos[i].end());
         }
         return std::make_pair(fsin, fcos);
+    }
+
+    void Gemma4Model::PrepareVision() {
+        if (visionPrepared) {
+            return;
+        }
+        AssertInFastLLM(this->weight.weight.find("model.vision_tower.patch_embedder.input_proj.weight") != this->weight.weight.end(),
+                        "Gemma4 multimodal needs model.vision_tower.patch_embedder.input_proj.weight.");
+        AssertInFastLLM(this->weight.weight.find("model.embed_vision.embedding_projection.weight") != this->weight.weight.end(),
+                        "Gemma4 multimodal needs model.embed_vision.embedding_projection.weight.");
+        visionPrepared = true;
+    }
+
+    void Gemma4Model::ApplyRMSNormNoScale(Data &input, float eps) {
+        input.ToDevice(DataDevice::CPU);
+        if (input.dataType != DataType::FLOAT32) {
+            ToDataType(input, DataType::FLOAT32);
+        }
+        float *data = (float*) input.cpuData;
+        int lastDim = input.dims.back();
+        uint64_t total = input.Count(0);
+        int outer = (int) (total / lastDim);
+        for (int o = 0; o < outer; o++) {
+            float *row = data + (uint64_t) o * lastDim;
+            float sumSq = 0.0f;
+            for (int j = 0; j < lastDim; j++) {
+                sumSq += row[j] * row[j];
+            }
+            float scale = 1.0f / sqrtf(sumSq / lastDim + eps);
+            for (int j = 0; j < lastDim; j++) {
+                row[j] *= scale;
+            }
+        }
+    }
+
+    void Gemma4Model::BuildVisionPatchPositionIds(const Data &imagePositionIds, Data &posX, Data &posY,
+                                                  std::vector<int> &validPatchCounts) {
+        Data posCpu(imagePositionIds);
+        posCpu.ToDevice(DataDevice::CPU);
+        if (posCpu.dataType != DataType::FLOAT32) {
+            ToDataType(posCpu, DataType::FLOAT32);
+        }
+        AssertInFastLLM(posCpu.dims.size() == 3 && posCpu.dims[2] == 2,
+                        "Gemma4 image_position_ids should have shape [batch, max_patches, 2].");
+
+        int batch = posCpu.dims[0];
+        int seqLen = posCpu.dims[1];
+        validPatchCounts.assign(batch, 0);
+        std::vector<float> vx(batch * seqLen, 0.0f), vy(batch * seqLen, 0.0f);
+        float *posData = (float*) posCpu.cpuData;
+        for (int b = 0; b < batch; b++) {
+            for (int i = 0; i < seqLen; i++) {
+                float x = posData[(b * seqLen + i) * 2];
+                float y = posData[(b * seqLen + i) * 2 + 1];
+                if (x >= 0.0f && y >= 0.0f) {
+                    vx[b * seqLen + i] = x;
+                    vy[b * seqLen + i] = y;
+                    validPatchCounts[b]++;
+                }
+            }
+        }
+        posX.CopyFrom(Data(DataType::FLOAT32, {batch, seqLen}, vx));
+        posY.CopyFrom(Data(DataType::FLOAT32, {batch, seqLen}, vy));
+    }
+
+    void Gemma4Model::BuildVisionAttentionMask(const Data &imagePositionIds, Data &visionAttentionMask) {
+        Data posCpu(imagePositionIds);
+        posCpu.ToDevice(DataDevice::CPU);
+        if (posCpu.dataType != DataType::FLOAT32) {
+            ToDataType(posCpu, DataType::FLOAT32);
+        }
+        AssertInFastLLM(posCpu.dims.size() == 3 && posCpu.dims[2] == 2,
+                        "Gemma4 image_position_ids should have shape [batch, max_patches, 2].");
+
+        int batch = posCpu.dims[0];
+        int seqLen = posCpu.dims[1];
+        std::vector<char> valid(batch * seqLen, 0);
+        float *posData = (float*) posCpu.cpuData;
+        for (int b = 0; b < batch; b++) {
+            for (int i = 0; i < seqLen; i++) {
+                float x = posData[(b * seqLen + i) * 2];
+                float y = posData[(b * seqLen + i) * 2 + 1];
+                valid[b * seqLen + i] = (x >= 0.0f && y >= 0.0f) ? 1 : 0;
+            }
+        }
+
+        std::vector<float> mask((size_t) batch * seqLen * seqLen, 0.0f);
+        for (int b = 0; b < batch; b++) {
+            for (int q = 0; q < seqLen; q++) {
+                for (int k = 0; k < seqLen; k++) {
+                    if (!valid[b * seqLen + q] || !valid[b * seqLen + k]) {
+                        mask[((size_t) b * seqLen + q) * seqLen + k] = 1.0f;
+                    }
+                }
+            }
+        }
+        visionAttentionMask.CopyFrom(Data(DataType::FLOAT32, {batch, seqLen, seqLen}, mask));
+    }
+
+    void Gemma4Model::ApplyVisionRotary(Data &input, const Data &posX, const Data &posY) {
+        AssertInFastLLM(input.dims.size() == 4 && input.dims.back() % 4 == 0,
+                        "Gemma4 vision rotary expects [batch, seq, heads, dim] with dim divisible by 4.");
+        int axis = (int) input.dims.size() - 1;
+        int half = input.dims.back() / 2;
+        int rotaryHalf = input.dims.back() / 4;
+        Data xPart, yPart, rotated;
+        Split(input, axis, 0, half, xPart);
+        Split(input, axis, half, input.dims.back(), yPart);
+        LlamaRotatePosition2DPart(xPart, posX, visionSinData, visionCosData, rotaryHalf, half);
+        LlamaRotatePosition2DPart(yPart, posY, visionSinData, visionCosData, rotaryHalf, half);
+        Cat(xPart, yPart, axis, rotated);
+        input.CopyFrom(rotated);
+    }
+
+    void Gemma4Model::EncodeImages(const Data &pixelValues, const Data &imagePositionIds, Data &imageFeatures,
+                                   std::vector<int> &softTokenCounts) {
+        PrepareVision();
+        AssertInFastLLM(pixelValues.dims.size() == 3, "Gemma4 pixel_values should have shape [batch, max_patches, patch_dim].");
+        AssertInFastLLM(pixelValues.dims[0] == 1, "Gemma4 multimodal MVP currently supports a single image batch only.");
+
+        Data patchPosX, patchPosY, visionMask;
+        std::vector<int> validPatchCounts;
+        BuildVisionPatchPositionIds(imagePositionIds, patchPosX, patchPosY, validPatchCounts);
+        BuildVisionAttentionMask(imagePositionIds, visionMask);
+
+        Data pixelInput(pixelValues);
+        pixelInput.ToDevice(DataDevice::CPU);
+        if (pixelInput.dataType != DataType::FLOAT32) {
+            ToDataType(pixelInput, DataType::FLOAT32);
+        }
+        float *pixelPtr = (float*) pixelInput.cpuData;
+        for (uint64_t i = 0; i < pixelInput.Count(0); i++) {
+            pixelPtr[i] = 2.0f * (pixelPtr[i] - 0.5f);
+        }
+
+        const std::string patchProjName = "model.vision_tower.patch_embedder.input_proj.weight";
+        pixelInput.ToDevice(this->weight[patchProjName].dataDevice);
+        Data hiddenStates;
+        Linear(pixelInput, this->weight[patchProjName], *GetEmptyData(), hiddenStates);
+        ToDataType(hiddenStates, this->dataType);
+
+        Data posTableX, posTableY;
+        Split(this->weight["model.vision_tower.patch_embedder.position_embedding_table"], 0, 0, 1, posTableX);
+        Split(this->weight["model.vision_tower.patch_embedder.position_embedding_table"], 0, 1, 2, posTableY);
+        posTableX.Reshape({vision_position_embedding_size, vision_hidden_size});
+        posTableY.Reshape({vision_position_embedding_size, vision_hidden_size});
+        Data posEmbedX, posEmbedY, posEmbeddings;
+        Embedding(patchPosX, posTableX, posEmbedX);
+        Embedding(patchPosY, posTableY, posEmbedY);
+        posEmbeddings.CopyFrom(posEmbedX);
+        AddTo(posEmbeddings, posEmbedY);
+
+        Data posCpu(imagePositionIds);
+        posCpu.ToDevice(DataDevice::CPU);
+        if (posCpu.dataType != DataType::FLOAT32) {
+            ToDataType(posCpu, DataType::FLOAT32);
+        }
+        posEmbeddings.ToDevice(DataDevice::CPU);
+        if (posEmbeddings.dataType != DataType::FLOAT32) {
+            ToDataType(posEmbeddings, DataType::FLOAT32);
+        }
+        float *posData = (float*) posCpu.cpuData;
+        float *embData = (float*) posEmbeddings.cpuData;
+        int seqLen = posCpu.dims[1];
+        for (int i = 0; i < seqLen; i++) {
+            if (posData[i * 2] < 0.0f || posData[i * 2 + 1] < 0.0f) {
+                memset(embData + (size_t) i * vision_hidden_size, 0, (size_t) vision_hidden_size * sizeof(float));
+            }
+        }
+        posEmbeddings.ToDevice(hiddenStates.dataDevice);
+        if (posEmbeddings.dataType != hiddenStates.dataType) {
+            ToDataType(posEmbeddings, hiddenStates.dataType);
+        }
+        AddTo(hiddenStates, posEmbeddings);
+
+        visionMask.ToDevice(hiddenStates.dataDevice);
+        Data attenInput, q, k, v, qkv, output, residual, ffResidual, gate, up, down;
+        for (int i = 0; i < vision_num_layers; i++) {
+            std::string pre = "model.vision_tower.encoder.layers." + std::to_string(i);
+            int batch = hiddenStates.dims[0];
+            int curSeqLen = hiddenStates.dims[1];
+
+            Mul(hiddenStates, 1.0f, residual);
+            RMSNorm(hiddenStates, this->weight[pre + ".input_layernorm.weight"], rms_norm_eps, attenInput);
+
+            Linear(attenInput, this->weight[pre + ".self_attn.q_proj.linear.weight"], *GetEmptyData(), q);
+            Linear(attenInput, this->weight[pre + ".self_attn.k_proj.linear.weight"], *GetEmptyData(), k);
+            Linear(attenInput, this->weight[pre + ".self_attn.v_proj.linear.weight"], *GetEmptyData(), v);
+
+            q.Reshape({batch, curSeqLen, vision_num_heads, vision_head_dim});
+            k.Reshape({batch, curSeqLen, vision_num_key_value_heads, vision_head_dim});
+            v.Reshape({batch, curSeqLen, vision_num_key_value_heads, vision_head_dim});
+
+            RMSNorm(q, this->weight[pre + ".self_attn.q_norm.weight"], rms_norm_eps, q);
+            RMSNorm(k, this->weight[pre + ".self_attn.k_norm.weight"], rms_norm_eps, k);
+            ApplyRMSNormNoScale(v, rms_norm_eps);
+            v.ToDevice(q.dataDevice);
+            if (v.dataType != q.dataType) {
+                ToDataType(v, q.dataType);
+            }
+
+            ApplyVisionRotary(q, patchPosX, patchPosY);
+            ApplyVisionRotary(k, patchPosX, patchPosY);
+
+            PermuteSelf(q, {0, 2, 1, 3});
+            PermuteSelf(k, {0, 2, 1, 3});
+            PermuteSelf(v, {0, 2, 1, 3});
+
+            q.Reshape({-1, curSeqLen, vision_head_dim});
+            k.Reshape({-1, curSeqLen, vision_head_dim});
+            v.Reshape({-1, curSeqLen, vision_head_dim});
+
+            Attention(q, k, v, visionMask, qkv, q.dims[0] / k.dims[0], 1.0f, 2);
+            PermuteSelf(qkv, {1, 0, 2});
+            qkv.Reshape({curSeqLen, batch, -1});
+            PermuteSelf(qkv, {1, 0, 2});
+
+            Linear(qkv, this->weight[pre + ".self_attn.o_proj.linear.weight"], *GetEmptyData(), output);
+            RMSNorm(output, this->weight[pre + ".post_attention_layernorm.weight"], rms_norm_eps, output);
+            AddTo(residual, output);
+            hiddenStates.CopyFrom(residual);
+
+            Mul(hiddenStates, 1.0f, ffResidual);
+            RMSNorm(hiddenStates, this->weight[pre + ".pre_feedforward_layernorm.weight"], rms_norm_eps, attenInput);
+            Linear(attenInput, this->weight[pre + ".mlp.gate_proj.linear.weight"], *GetEmptyData(), gate);
+            Gelu(gate, gate);
+            Linear(attenInput, this->weight[pre + ".mlp.up_proj.linear.weight"], *GetEmptyData(), up);
+            if (this->dataType == DataType::FLOAT16) {
+                ToDataType(gate, DataType::FLOAT32);
+                ToDataType(up, DataType::FLOAT32);
+            }
+            MulTo(gate, up);
+            Linear(gate, this->weight[pre + ".mlp.down_proj.linear.weight"], *GetEmptyData(), down);
+            if (this->dataType == DataType::FLOAT16) {
+                ToDataType(down, DataType::FLOAT16);
+            }
+            RMSNorm(down, this->weight[pre + ".post_feedforward_layernorm.weight"], rms_norm_eps, down);
+            AddTo(ffResidual, down);
+            hiddenStates.CopyFrom(ffResidual);
+        }
+
+        Data hiddenCpu(hiddenStates);
+        hiddenCpu.ToDevice(DataDevice::CPU);
+        if (hiddenCpu.dataType != DataType::FLOAT32) {
+            ToDataType(hiddenCpu, DataType::FLOAT32);
+        }
+        float *hiddenPtr = (float*) hiddenCpu.cpuData;
+        float *posRaw = (float*) posCpu.cpuData;
+        int outputLength = pixelValues.dims[1] / (vision_pooling_kernel_size * vision_pooling_kernel_size);
+        AssertInFastLLM(outputLength > 0, "Gemma4 vision output length must be positive.");
+
+        std::vector<float> pooled;
+        int validSoftTokens = 0;
+        {
+            int maxX = 0;
+            for (int i = 0; i < seqLen; i++) {
+                if (posRaw[i * 2] >= 0.0f) {
+                    maxX = std::max(maxX, (int) posRaw[i * 2] + 1);
+                }
+            }
+            int gridWidth = std::max(1, maxX / vision_pooling_kernel_size);
+            std::vector<float> pooledFull((size_t) outputLength * vision_hidden_size, 0.0f);
+            std::vector<int> pooledMask(outputLength, 0);
+            for (int i = 0; i < seqLen; i++) {
+                int x = (int) posRaw[i * 2];
+                int y = (int) posRaw[i * 2 + 1];
+                if (x < 0 || y < 0) {
+                    continue;
+                }
+                int kernelIdx = (x / vision_pooling_kernel_size) + gridWidth * (y / vision_pooling_kernel_size);
+                AssertInFastLLM(kernelIdx >= 0 && kernelIdx < outputLength,
+                                "Gemma4 pooled kernel index is out of range.");
+                pooledMask[kernelIdx] = 1;
+                float *src = hiddenPtr + (size_t) i * vision_hidden_size;
+                float *dst = pooledFull.data() + (size_t) kernelIdx * vision_hidden_size;
+                for (int j = 0; j < vision_hidden_size; j++) {
+                    dst[j] += src[j] / (vision_pooling_kernel_size * vision_pooling_kernel_size);
+                }
+            }
+            float scale = sqrtf((float) vision_hidden_size);
+            for (int idx = 0; idx < outputLength; idx++) {
+                if (!pooledMask[idx]) {
+                    continue;
+                }
+                validSoftTokens++;
+                float *src = pooledFull.data() + (size_t) idx * vision_hidden_size;
+                for (int j = 0; j < vision_hidden_size; j++) {
+                    pooled.push_back(src[j] * scale);
+                }
+            }
+        }
+        AssertInFastLLM(validSoftTokens > 0, "Gemma4 produced no valid vision soft tokens.");
+        softTokenCounts = {validSoftTokens};
+        AssertInFastLLM(validSoftTokens <= vision_max_soft_tokens,
+                        "Gemma4 produced more soft tokens than configured vision_max_soft_tokens.");
+
+        if (vision_standardize &&
+            this->weight.weight.find("model.vision_tower.std_bias") != this->weight.weight.end() &&
+            this->weight.weight.find("model.vision_tower.std_scale") != this->weight.weight.end()) {
+            Data stdBias(this->weight["model.vision_tower.std_bias"]);
+            Data stdScale(this->weight["model.vision_tower.std_scale"]);
+            stdBias.ToDevice(DataDevice::CPU);
+            stdScale.ToDevice(DataDevice::CPU);
+            if (stdBias.dataType != DataType::FLOAT32) {
+                ToDataType(stdBias, DataType::FLOAT32);
+            }
+            if (stdScale.dataType != DataType::FLOAT32) {
+                ToDataType(stdScale, DataType::FLOAT32);
+            }
+            float *bias = (float*) stdBias.cpuData;
+            float *scale = (float*) stdScale.cpuData;
+            for (int i = 0; i < validSoftTokens; i++) {
+                float *row = pooled.data() + (size_t) i * vision_hidden_size;
+                for (int j = 0; j < vision_hidden_size; j++) {
+                    row[j] = (row[j] - bias[j]) * scale[j];
+                }
+            }
+        }
+
+        Data pooledData(DataType::FLOAT32, {1, validSoftTokens, vision_hidden_size}, pooled);
+        ApplyRMSNormNoScale(pooledData, rms_norm_eps);
+        pooledData.ToDevice(this->weight["model.embed_vision.embedding_projection.weight"].dataDevice);
+        Linear(pooledData, this->weight["model.embed_vision.embedding_projection.weight"], *GetEmptyData(), imageFeatures);
+        ToDataType(imageFeatures, this->dataType);
+    }
+
+    void Gemma4Model::MergeImageFeaturesIntoText(const Data &inputIds, const Data &imageFeatures, Data &hiddenStates) {
+        Data idsCpu(inputIds);
+        idsCpu.ToDevice(DataDevice::CPU);
+        if (idsCpu.dataType != DataType::FLOAT32) {
+            ToDataType(idsCpu, DataType::FLOAT32);
+        }
+        hiddenStates.ToDevice(DataDevice::CPU);
+        if (hiddenStates.dataType != DataType::FLOAT32) {
+            ToDataType(hiddenStates, DataType::FLOAT32);
+        }
+        Data imageCpu(imageFeatures);
+        imageCpu.ToDevice(DataDevice::CPU);
+        if (imageCpu.dataType != DataType::FLOAT32) {
+            ToDataType(imageCpu, DataType::FLOAT32);
+        }
+
+        int batch = idsCpu.dims[0];
+        int seqLen = idsCpu.dims[1];
+        int featureCount = imageCpu.dims.size() == 3 ? imageCpu.dims[1] : imageCpu.dims[0];
+        AssertInFastLLM(batch == 1, "Gemma4 multimodal MVP currently supports a single text batch only.");
+        std::vector<int> imagePositions;
+        float *idPtr = (float*) idsCpu.cpuData;
+        for (int i = 0; i < seqLen; i++) {
+            if ((int) idPtr[i] == image_token_id) {
+                imagePositions.push_back(i);
+            }
+        }
+        AssertInFastLLM((int) imagePositions.size() == featureCount,
+                        "Gemma4 image feature count does not match image_token placeholders.");
+
+        float *hiddenPtr = (float*) hiddenStates.cpuData;
+        float *imagePtr = (float*) imageCpu.cpuData;
+        int hiddenSize = hiddenStates.dims[2];
+        for (int i = 0; i < featureCount; i++) {
+            memcpy(hiddenPtr + (size_t) imagePositions[i] * hiddenSize,
+                   imagePtr + (size_t) i * hiddenSize,
+                   (size_t) hiddenSize * sizeof(float));
+        }
+    }
+
+    void Gemma4Model::BuildVisionAwareTextMask(const Data &attentionMask, const Data &mmTokenTypeIds, Data &visionAwareMask) {
+        if (attentionMask.dims.size() != 3) {
+            visionAwareMask.CopyFrom(attentionMask);
+            return;
+        }
+        Data maskCpu(attentionMask);
+        maskCpu.ToDevice(DataDevice::CPU);
+        if (maskCpu.dataType != DataType::FLOAT32) {
+            ToDataType(maskCpu, DataType::FLOAT32);
+        }
+        Data mmCpu(mmTokenTypeIds);
+        mmCpu.ToDevice(DataDevice::CPU);
+        if (mmCpu.dataType != DataType::FLOAT32) {
+            ToDataType(mmCpu, DataType::FLOAT32);
+        }
+
+        int batch = maskCpu.dims[0];
+        int seqLen = maskCpu.dims[1];
+        std::vector<float> mask((float*) maskCpu.cpuData, (float*) maskCpu.cpuData + maskCpu.Count(0));
+        float *mmPtr = (float*) mmCpu.cpuData;
+        for (int b = 0; b < batch; b++) {
+            std::vector<int> groupIds(seqLen, -1);
+            int group = -1;
+            for (int i = 0; i < seqLen; i++) {
+                bool isVision = mmPtr[b * seqLen + i] > 0.5f;
+                bool isPrevVision = (i > 0 && mmPtr[b * seqLen + i - 1] > 0.5f);
+                if (isVision && !isPrevVision) {
+                    group++;
+                }
+                if (isVision) {
+                    groupIds[i] = group;
+                }
+            }
+            for (int q = 0; q < seqLen; q++) {
+                if (groupIds[q] < 0) {
+                    continue;
+                }
+                for (int k = 0; k < seqLen; k++) {
+                    if (groupIds[q] == groupIds[k] && groupIds[k] >= 0) {
+                        mask[((size_t) b * seqLen + q) * seqLen + k] = 0.0f;
+                    }
+                }
+            }
+        }
+        visionAwareMask.CopyFrom(Data(DataType::FLOAT32, maskCpu.dims, mask));
+    }
+
+    int Gemma4Model::ForwardTextFromHiddenStates(const Data &inputIds,
+                                                 Data &hiddenStates,
+                                                 const Data &attentionMask,
+                                                 const Data &positionIds,
+                                                 std::vector <std::pair <Data, Data> > &pastKeyValues,
+                                                 const GenerationConfig &generationConfig,
+                                                 const LastTokensManager &lastTokens,
+                                                 std::vector <float> *retLogits) {
+        int maxLen = hiddenStates.dims[1];
+        Data attenInput;
+        Data q, k, v, qkv;
+        Data attenInputOut;
+        Data w1, w2, w3;
+
+        int seqlen = hiddenStates.dims[1];
+        std::string layerPrefix = "model.language_model.layers.";
+        if (weight.weight.find(layerPrefix + "0.input_layernorm.weight") == weight.weight.end()) {
+            layerPrefix = "model.layers.";
+        }
+
+        for (int i = 0; i < block_cnt; i++) {
+            ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+
+            bool isFullAttn = (layer_types[i] == 1);
+            int curHeadDim = isFullAttn ? global_head_dim : sliding_head_dim;
+            int curKVHeads = (isFullAttn && attention_k_eq_v) ? global_num_key_value_heads : num_key_value_heads;
+            int curRotaryDim = isFullAttn ? global_head_dim / 2 : sliding_head_dim;
+            Data *curSinData = isFullAttn ? &globalSinData : &slidingSinData;
+            Data *curCosData = isFullAttn ? &globalCosData : &slidingCosData;
+
+            std::string pre = layerPrefix + std::to_string(i);
+            std::string qWeightName = pre + ".self_attn.q_proj.weight";
+            std::string kWeightName = pre + ".self_attn.k_proj.weight";
+            std::string vWeightName = pre + ".self_attn.v_proj.weight";
+            std::string oWeightName = pre + ".self_attn.o_proj.weight";
+            std::string qNormName = pre + ".self_attn.q_norm.weight";
+            std::string kNormName = pre + ".self_attn.k_norm.weight";
+
+            RMSNorm(hiddenStates, this->weight[pre + ".input_layernorm.weight"], rms_norm_eps, attenInput);
+
+            int bsz = attenInput.dims[0];
+            seqlen = attenInput.dims[1];
+
+            Linear(attenInput, weight[qWeightName], *GetEmptyData(), q);
+            Linear(attenInput, weight[kWeightName], *GetEmptyData(), k);
+            bool useAltAttn = isFullAttn && attention_k_eq_v;
+            if (useAltAttn) {
+                v.CopyFrom(k);
+            } else {
+                Linear(attenInput, weight[vWeightName], *GetEmptyData(), v);
+            }
+
+            q.Reshape({bsz, seqlen, -1, curHeadDim});
+            k.Reshape({bsz, seqlen, -1, curHeadDim});
+            v.Reshape({bsz, seqlen, -1, curHeadDim});
+
+            RMSNorm(q, this->weight[qNormName], rms_norm_eps, q);
+            RMSNorm(k, this->weight[kNormName], rms_norm_eps, k);
+            ApplyRMSNormNoScale(v, rms_norm_eps);
+            v.ToDevice(k.dataDevice);
+            if (v.dataType != k.dataType) {
+                ToDataType(v, k.dataType);
+            }
+
+            Data &pastKey = pastKeyValues[i].first, &pastValue = pastKeyValues[i].second;
+            if (GetKVCacheInCPU()) {
+                pastKey.lockInCPU = true;
+                pastValue.lockInCPU = true;
+            } else {
+                pastKey.ToDevice(k.dataDevice);
+                pastValue.ToDevice(k.dataDevice);
+            }
+
+            fastllm::LlamaRotatePosition2D(q, positionIds, *curSinData, *curCosData, curRotaryDim);
+            fastllm::LlamaRotatePosition2D(k, positionIds, *curSinData, *curCosData, curRotaryDim);
+
+            PermuteSelf(q, {0, 2, 1, 3});
+            PermuteSelf(k, {0, 2, 1, 3});
+            PermuteSelf(v, {0, 2, 1, 3});
+
+            q.Reshape({-1, seqlen, curHeadDim});
+            k.Reshape({-1, seqlen, curHeadDim});
+            v.Reshape({-1, seqlen, curHeadDim});
+
+            int unitLen = 64;
+#ifdef USE_CUDA
+            unitLen = 128;
+#endif
+            while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
+                || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
+                std::vector <int> newDims;
+                if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                    newDims = std::vector <int> {k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
+                } else {
+                    newDims = pastKey.dims;
+                    newDims[1] += ((k.dims[1] - 1) / unitLen + 1) * unitLen;
+                }
+                pastKey.Expansion(newDims);
+            }
+            while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[1] > pastValue.expansionDims[1]))
+                || (pastValue.dims.size() > 0 && pastValue.dims[1] + v.dims[1] > pastValue.expansionDims[1])) {
+                std::vector <int> newDims;
+                if (pastValue.Count(0) == 0 || pastValue.dims.size() == 0) {
+                    newDims = std::vector <int> {v.dims[0], ((v.dims[1] - 1) / unitLen + 1) * unitLen, v.dims[2]};
+                } else {
+                    newDims = pastValue.dims;
+                    newDims[1] += ((v.dims[1] - 1) / unitLen + 1) * unitLen;
+                }
+                pastValue.Expansion(newDims);
+            }
+            CatDirect(pastKey, k, 1);
+            CatDirect(pastValue, v, 1);
+
+            Attention(q, pastKey, pastValue, attentionMask, qkv, q.dims[0] / pastKey.dims[0], 1.0f, 1);
+            PermuteSelf(qkv, {1, 0, 2});
+            qkv.Reshape({seqlen, bsz, -1});
+            PermuteSelf(qkv, {1, 0, 2});
+
+            Linear(qkv, weight[oWeightName], *GetEmptyData(), attenInputOut);
+            RMSNorm(attenInputOut, this->weight[pre + ".post_attention_layernorm.weight"], rms_norm_eps, attenInputOut);
+            AddTo(hiddenStates, attenInputOut);
+
+            RMSNorm(hiddenStates, this->weight[pre + ".pre_feedforward_layernorm.weight"], rms_norm_eps, attenInput);
+            Linear(attenInput, weight[pre + ".mlp.gate_proj.weight"], *GetEmptyData(), w1);
+            Gelu(w1, w1);
+            Linear(attenInput, weight[pre + ".mlp.up_proj.weight"], *GetEmptyData(), w3);
+            if (this->dataType == DataType::FLOAT16) {
+                ToDataType(w1, DataType::FLOAT32);
+                ToDataType(w3, DataType::FLOAT32);
+            }
+            MulTo(w1, w3);
+            Linear(w1, weight[pre + ".mlp.down_proj.weight"], *GetEmptyData(), w2);
+            if (this->dataType == DataType::FLOAT16) {
+                ToDataType(w2, DataType::FLOAT16);
+            }
+            if (!TryApplyMoeFeedForward(pre, hiddenStates, w2)) {
+                RMSNorm(w2, this->weight[pre + ".post_feedforward_layernorm.weight"], rms_norm_eps, w2);
+                AddTo(hiddenStates, w2);
+            }
+
+            std::string layerScalarName = layerPrefix + std::to_string(i) + ".layer_scalar";
+            if (weight.weight.find(layerScalarName) != weight.weight.end()) {
+                Data &ls = weight[layerScalarName];
+                ls.ToDevice(DataDevice::CPU);
+                if (ls.dataType != DataType::FLOAT32) {
+                    ToDataType(ls, DataType::FLOAT32);
+                }
+                float scalar = ((float*) ls.cpuData)[0];
+                Mul(hiddenStates, scalar, hiddenStates);
+            }
+        }
+
+        Data logits, topk, tempHiddenStates;
+        Data *lastHiddenStates = &hiddenStates;
+        if (maxLen > 1) {
+            Split(hiddenStates, 1, maxLen - 1, maxLen, tempHiddenStates);
+            lastHiddenStates = &tempHiddenStates;
+        }
+
+        std::string normName = "model.language_model.norm.weight";
+        if (weight.weight.find(normName) == weight.weight.end()) {
+            normName = "model.norm.weight";
+        }
+        RMSNorm(*lastHiddenStates, this->weight[normName], rms_norm_eps, *lastHiddenStates);
+
+        Linear(*lastHiddenStates, weight["lm_head.weight"], *GetEmptyData(), logits);
+        ToDataType(logits, DataType::FLOAT32);
+        if (final_logit_softcapping > 0.0f) {
+            Mul(logits, 1.0f / final_logit_softcapping, logits);
+            logits.ToDevice(DataDevice::CPU);
+            float *logitsData = (float*) logits.cpuData;
+            int total = logits.Count(0);
+            for (int j = 0; j < total; j++) {
+                logitsData[j] = tanh(logitsData[j]) * final_logit_softcapping;
+            }
+        }
+
+        if (generationConfig.output_logits && retLogits != nullptr) {
+            int size = logits.dims.back();
+            logits.ToDevice(DataDevice::CPU);
+            retLogits->resize(size);
+            memcpy((float*) retLogits->data(),
+                   ((float*) logits.cpuData) + (logits.dims[1] - 1) * size,
+                   (size_t) size * logits.unitSize);
+        }
+
+        TopK(logits, topk, 1);
+        topk.ToDevice(DataDevice::CPU);
+        return (int) (((float *) topk.cpuData)[0] + 1e-3);
     }
 
     void Gemma4Model::SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix) {
@@ -661,6 +1328,62 @@ namespace fastllm {
         std::vector <std::vector <float>*> batchLogits;
         batchLogits.push_back(retLogits);
         return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, &batchLogits)[0];
+    }
+
+    std::vector <int> Gemma4Model::ForwardMultimodal(const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
+                                                     const fastllm::Data &positionIds, std::vector<std::pair<Data, Data>> &pastKeyValues,
+                                                     const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                                                     const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
+                                                     std::vector <std::vector <float>*> *retLogits) {
+        std::vector <int> ret;
+        std::vector <float> *logits = nullptr;
+        if (retLogits != nullptr && !retLogits->empty()) {
+            logits = (*retLogits)[0];
+        }
+
+        if (pastKeyValues.size() > 0 && pastKeyValues[0].second.dims.size() > 0) {
+            ret.push_back(Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, lastTokens, logits));
+            return ret;
+        }
+
+        auto pixelIt = multimodalInput.find("pixel_values");
+        auto imagePosIt = multimodalInput.find("image_position_ids");
+        auto mmTypeIt = multimodalInput.find("mm_token_type_ids");
+        AssertInFastLLM(pixelIt != multimodalInput.end() && !pixelIt->second.empty(),
+                        "Gemma4 multimodal requires pixel_values.");
+        AssertInFastLLM(imagePosIt != multimodalInput.end() && !imagePosIt->second.empty(),
+                        "Gemma4 multimodal requires image_position_ids.");
+        AssertInFastLLM(mmTypeIt != multimodalInput.end() && !mmTypeIt->second.empty(),
+                        "Gemma4 multimodal requires mm_token_type_ids.");
+
+        if (!prepared) {
+            Prepare();
+            prepared = true;
+        }
+
+        std::string embName = "model.language_model.embed_tokens.weight";
+        if (weight.weight.find(embName) == weight.weight.end()) {
+            embName = "model.embed_tokens.weight";
+        }
+
+        Data imageFeatures;
+        std::vector<int> softTokenCounts;
+        EncodeImages(*pixelIt->second[0], *imagePosIt->second[0], imageFeatures, softTokenCounts);
+
+        Data hiddenStates;
+        Embedding(inputIds, this->weight[embName], hiddenStates);
+        Mul(hiddenStates, sqrt((float)embed_dim), hiddenStates);
+        MergeImageFeaturesIntoText(inputIds, imageFeatures, hiddenStates);
+        hiddenStates.ToDevice(this->weight[embName].dataDevice);
+        ToDataType(hiddenStates, this->dataType);
+
+        Data visionAwareMask;
+        BuildVisionAwareTextMask(attentionMask, *mmTypeIt->second[0], visionAwareMask);
+        visionAwareMask.ToDevice(hiddenStates.dataDevice);
+
+        ret.push_back(ForwardTextFromHiddenStates(inputIds, hiddenStates, visionAwareMask, positionIds,
+                                                  pastKeyValues, generationConfig, lastTokens, logits));
+        return ret;
     }
 
     std::vector <int> Gemma4Model::ForwardBatch(int batch, const fastllm::Data &inputIds, const fastllm::Data &attentionMask,
@@ -1342,6 +2065,7 @@ namespace fastllm {
         if (enable_moe_block) {
             PrepareMoeWeights();
         }
+        PrepareVision();
     }
 
     void Gemma4Model::WarmUp() {
