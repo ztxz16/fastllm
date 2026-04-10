@@ -25,7 +25,11 @@ option(BUILD_CLI "build cli" OFF)
 option(UNIT_TEST "build unit tests" OFF)
 
 if(NOT DEFINED CUDA_ARCH)
-    set(CUDA_ARCH "native")
+    if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CUDA_ARCH "${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+        set(CUDA_ARCH "native")
+    endif()
 endif()
 
 # ROCm device detection function
@@ -237,6 +241,8 @@ endif()
 
 if (USE_CUDA)
     enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 20)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     add_compile_definitions(USE_CUDA)
     if (CUDA_NO_TENSOR_CORE)
         add_compile_definitions(CUDA_NO_TENSOR_CORE)
