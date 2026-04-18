@@ -290,7 +290,6 @@ namespace fastllm {
                 false,
                 true
             );
-
             RMSNorm(hiddenStates, this->weight[postRmsName], rms_norm_eps, attenInput);
 
             {
@@ -300,7 +299,7 @@ namespace fastllm {
                 int curBatch = attenInput.dims[0], len = attenInput.dims[1];
                 attenInput.Reshape({curBatch * len, attenInput.dims[2]});
 
-                Linear(attenInput, weight[gateWeightName], *GetEmptyData(), routerLogits);
+                Linear(attenInput, weight[gateWeightName], *GetEmptyData(), routerLogits, true);
                 ToDataType(routerLogits, routerLogitsTemp, DataType::FLOAT32);
                 bool needNorm = true;
                 Sigmoid(routerLogitsTemp, routerLogitsTemp);
