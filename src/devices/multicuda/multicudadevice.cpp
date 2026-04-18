@@ -47,10 +47,12 @@ namespace fastllm {
         this->ops["ToBFloat16"] = (BaseOperator*)(new MultiCudaToBFloat16());
         this->ops["ConvertToBFloat16"] = (BaseOperator*)(new MultiCudaConvertToBFloat16());
         this->ops["SoftMax"] = (BaseOperator*)(new MultiCudaSoftMaxOp());
+        this->ops["Sigmoid"] = (BaseOperator*)(new MultiCudaSigmoidOp());
         this->ops["SelectExpert"] = (BaseOperator*)(new MultiCudaSelectExpertOp());
         this->ops["LinearAdd"] = (BaseOperator*)(new MultiCudaLinearAddOp());
         this->ops["LinearSwiglu"] = (BaseOperator*)(new MultiCudaLinearSwigluOp());
         this->ops["RMSNorm"] = (BaseOperator*)(new MultiCudaRMSNormOp());
+        this->ops["RMSNormPart"] = (BaseOperator*)(new MultiCudaRMSNormPartOp());
         this->ops["AddTo"] = (BaseOperator*)(new MultiCudaAddToOp());
         this->ops["Split"] = (BaseOperator*)(new MultiCudaSplitOp());
         this->ops["Swiglu"] = (BaseOperator*)(new MultiCudaSwigluOp());
@@ -820,6 +822,129 @@ namespace fastllm {
         }
     };
 
+    struct MultiCudaDoRMSNormPartOp : MultiThreadBaseOp {
+        Data *input, *weight, *output;
+        float eps;
+        std::vector <std::pair <int, int> > localRanges;
+        std::vector <size_t> weightOffsets;
+        bool copyInput;
+        int deviceId;
+
+        MultiCudaDoRMSNormPartOp(Data *input, Data *weight, Data *output, float eps,
+                                 std::vector <std::pair <int, int> > localRanges,
+                                 std::vector <size_t> weightOffsets,
+                                 bool copyInput, int deviceId) :
+                input(input), weight(weight), output(output), eps(eps),
+                localRanges(std::move(localRanges)), weightOffsets(std::move(weightOffsets)),
+                copyInput(copyInput), deviceId(deviceId) {}
+
+        void Run() {
+            FastllmCudaSetDevice(deviceId);
+            output->Allocate();
+            if (copyInput && input->cudaData != output->cudaData) {
+                FastllmCudaCopyFromDeviceToDevice(output->cudaData, input->cudaData, input->GetBytes());
+            }
+
+            for (int i = 0; i < (int)localRanges.size(); i++) {
+                int localStart = localRanges[i].first;
+                int localEnd = localRanges[i].second;
+                Data localWeight(weight->dataType, {localEnd - localStart}, DataDevice::CUDA,
+                                 (uint8_t*)weight->cudaData + weightOffsets[i]);
+                localWeight.dataDeviceIds = {deviceId};
+                FastllmCudaRMSNormPart(*output, localWeight, *output, eps, localStart, localEnd);
+            }
+            SyncCudaAndCheck(deviceId, "MultiCudaRMSNormPartOp");
+        }
+    };
+
+    // Sharded 输入下两阶段 RMSNormPart:
+    //   阶段 A: 每张卡计算本地 sum(x^2) 到 float 缓冲 (size = outer)
+    //   阶段 B: 等待 NCCL all-reduce(在调度层做)聚合好的全局 sum 后,使用 partChannelsGlobal 做 normalize。
+    // 该 Op 只负责"算出 sum2 到 sumBuffer 中"。
+    struct MultiCudaRMSNormPartSum2Op : MultiThreadBaseOp {
+        Data *input;                 // 本卡的 local input(已经只持有部分通道)
+        float *sumBuffer;            // device buffer,长度为 outer
+        int localStart;              // 在 local input 上的起始通道(可能不是 0)
+        int localEnd;                // 在 local input 上的终止通道
+        int deviceId;
+
+        MultiCudaRMSNormPartSum2Op(Data *input, float *sumBuffer,
+                                   int localStart, int localEnd, int deviceId)
+            : input(input), sumBuffer(sumBuffer),
+              localStart(localStart), localEnd(localEnd), deviceId(deviceId) {}
+
+        void Run() {
+            FastllmCudaSetDevice(deviceId);
+            int channels = input->dims.back();
+            int outer = (int)(input->Count(0) / input->Count((int)input->dims.size() - 1));
+            if (localStart < localEnd) {
+                FastllmCudaRMSNormPartSum2(*input, sumBuffer, localStart, localEnd);
+            } else {
+                FastllmCudaMemset0(sumBuffer, sizeof(float) * (size_t)outer);
+            }
+            (void)channels;
+        }
+    };
+
+    // 对 sumBuffer 做 NCCL all-reduce(SUM)
+    struct MultiCudaAllReduceFloatOp : MultiThreadBaseOp {
+        float *buffer;
+        int count;
+        int deviceId;
+
+        MultiCudaAllReduceFloatOp(float *buffer, int count, int deviceId)
+            : buffer(buffer), count(count), deviceId(deviceId) {}
+
+        void Run() {
+            FastllmCudaSetDevice(deviceId);
+            FastllmNcclAllReduce(buffer, buffer, count, (int)fastllm::DataType::FLOAT32, deviceId);
+            SyncCudaAndCheck(deviceId, "MultiCudaAllReduceFloatOp");
+        }
+    };
+
+    // 阶段 B: 用聚合好的 sumBuffer 应用 normalize
+    struct MultiCudaRMSNormPartApplyOp : MultiThreadBaseOp {
+        Data *input, *weight, *output;
+        float *sumBuffer;
+        float eps;
+        std::vector <std::pair <int, int> > localRanges;
+        std::vector <size_t> weightOffsets;
+        int partChannelsGlobal;
+        bool copyInput;
+        int deviceId;
+
+        MultiCudaRMSNormPartApplyOp(Data *input, Data *weight, Data *output, float *sumBuffer,
+                                    float eps,
+                                    std::vector <std::pair <int, int> > localRanges,
+                                    std::vector <size_t> weightOffsets,
+                                    int partChannelsGlobal,
+                                    bool copyInput, int deviceId)
+            : input(input), weight(weight), output(output), sumBuffer(sumBuffer),
+              eps(eps),
+              localRanges(std::move(localRanges)), weightOffsets(std::move(weightOffsets)),
+              partChannelsGlobal(partChannelsGlobal),
+              copyInput(copyInput), deviceId(deviceId) {}
+
+        void Run() {
+            FastllmCudaSetDevice(deviceId);
+            output->Allocate();
+            if (copyInput && input->cudaData != output->cudaData) {
+                FastllmCudaCopyFromDeviceToDevice(output->cudaData, input->cudaData, input->GetBytes());
+            }
+
+            for (int i = 0; i < (int)localRanges.size(); i++) {
+                int localStart = localRanges[i].first;
+                int localEnd = localRanges[i].second;
+                Data localWeight(weight->dataType, {localEnd - localStart}, DataDevice::CUDA,
+                                 (uint8_t*)weight->cudaData + weightOffsets[i]);
+                localWeight.dataDeviceIds = {deviceId};
+                FastllmCudaRMSNormPartApply(*output, localWeight, *output, sumBuffer, eps,
+                                            localStart, localEnd, partChannelsGlobal);
+            }
+            SyncCudaAndCheck(deviceId, "MultiCudaRMSNormPartApplyOp");
+        }
+    };
+
     struct MultiCudaDoAddToOp : MultiThreadBaseOp {
         Data *input0, *input1;
         float alpha;
@@ -949,6 +1074,16 @@ namespace fastllm {
             return;
         }
         RunCudaUnaryOp<CudaSoftMaxOp>(opType, datas, floatParams, intParams);
+    }
+
+    void MultiCudaSigmoidOp::Run(const std::string &opType, const DataDict &datas,
+                                 const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        if (RunReplicatedMultiCudaUnary<CudaSigmoidOp>(opType, input, output, floatParams, intParams)) {
+            return;
+        }
+        RunCudaUnaryOp<CudaSigmoidOp>(opType, datas, floatParams, intParams);
     }
 
     void MultiCudaSelectExpertOp::Run(const std::string &opType, const DataDict &datas,
@@ -1197,6 +1332,254 @@ namespace fastllm {
 
         if (!sharded) {
             // SyncReplicatedRootFromReplica((&input == &output) ? input : output, devices);
+        }
+    }
+
+    void MultiCudaRMSNormPartOp::Run(const std::string &opType, const DataDict &datas,
+                                     const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &output = *(datas.find("output")->second);
+        float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-5f;
+        int start = intParams.find("start")->second;
+        int end = intParams.find("end")->second;
+
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || !input.multiDeviceData) {
+            output.dataType = input.dataType;
+            output.Resize(input.dims);
+            output.Allocate();
+            FastllmCudaRMSNormPart(input, weight, output, eps, start, end);
+            return;
+        }
+
+        EnsureReplicatedMultiCudaTensor(weight, devices, true);
+        size_t weightElementBytes = (size_t)weight.unitSize / weight.unitSizeDiv;
+
+        if (input.IsTensorParallelReplicated()) {
+            EnsureReplicatedMultiCudaTensor(input, devices, true);
+            SyncReplicatedLocalShapeFromRoot(input, devices);
+            if (&input != &output) {
+                output.dataType = input.dataType;
+                output.Resize(input.dims);
+                EnsureReplicatedMultiCudaTensor(output, devices, false);
+                SyncReplicatedLocalShapeFromRoot(output, devices);
+            }
+
+            auto *pool = fastllm::GetAlivePool();
+            std::vector <fastllm::MultiThreadBaseOp*> ops;
+            ops.reserve(devices.size());
+            for (int device : devices) {
+                ops.push_back(new MultiCudaDoRMSNormPartOp(
+                    input.multiDeviceDatas[device],
+                    weight.multiDeviceDatas[device],
+                    (&input == &output) ? input.multiDeviceDatas[device] : output.multiDeviceDatas[device],
+                    eps,
+                    {{start, end}},
+                    {0},
+                    (&input != &output),
+                    device
+                ));
+            }
+            for (int i = 0; i < ops.size(); i++) {
+                pool->PushOp(i, ops[i]);
+            }
+            for (int i = 0; i < ops.size(); i++) {
+                pool->Wait(i);
+                delete ops[i];
+            }
+            return;
+        }
+
+        AssertInFastLLM(input.IsTensorParallelSharded(),
+                        "MultiCudaRMSNormPart only supports tensor-parallel sharded or replicated input.\n");
+        int axis = NormalizeAxis(input.tpAxis, (int)input.dims.size());
+        AssertInFastLLM(axis == (int)input.dims.size() - 1,
+                        "MultiCudaRMSNormPart currently requires the sharded axis to be the last axis.\n");
+
+        SyncShardedLocalShapeFromRoot(input, devices);
+        if (&input != &output) {
+            output.dataType = input.dataType;
+            output.Resize(input.dims);
+            ResetMultiCudaTensor(output);
+            CopyShardedLayout(output, input, devices);
+            SyncShardedLocalShapeFromRoot(output, devices);
+        }
+
+        // 计算 outer(每张卡相同),用于 sumBuffer 长度
+        long long outer = 1;
+        for (int i = 0; i < (int)input.dims.size() - 1; i++) {
+            outer *= input.dims[i];
+        }
+        int partChannelsGlobal = end - start;
+
+        // 决定是否需要跨卡聚合:仅当全局 [start, end) 真的跨越多张卡时才需要 NCCL all-reduce。
+        // 如果某张卡完全不持有 [start, end) 范围内的任何通道,则它的本地 sum2 应为 0;
+        // 如果只有一张卡同时持有完整的 [start, end),则可以走快速路径(等价于单卡 RMSNormPart)。
+        std::vector <int> shardedDevices;
+        bool needAllReduce = false;
+        {
+            int devicesWithRange = 0;
+            int onlyDeviceWithRange = -1;
+            int onlyDeviceLocalCount = 0;
+            for (int device : devices) {
+                if (input.multiDeviceDatas[device] == nullptr) continue;
+                shardedDevices.push_back(device);
+                int localPart = 0;
+                for (auto &range : input.tpRanges[device]) {
+                    int l = std::max(start, range.first);
+                    int r = std::min(end, range.second);
+                    if (l < r) localPart += (r - l);
+                }
+                if (localPart > 0) {
+                    devicesWithRange++;
+                    onlyDeviceWithRange = device;
+                    onlyDeviceLocalCount = localPart;
+                }
+            }
+            if (devicesWithRange > 1) {
+                needAllReduce = true;
+            } else if (devicesWithRange == 1 && onlyDeviceLocalCount == partChannelsGlobal) {
+                needAllReduce = false;
+            } else if (devicesWithRange == 1) {
+                // 唯一持有该范围的卡只持有部分通道,这种情况下也需要 NCCL(0 + local 仍要算全局)
+                needAllReduce = true;
+            }
+        }
+
+        auto *pool = fastllm::GetAlivePool();
+
+        if (!needAllReduce) {
+            // 快速路径:一张卡持有完整 [start, end)。直接走旧逻辑。
+            std::vector <fastllm::MultiThreadBaseOp*> ops;
+            ops.reserve(shardedDevices.size());
+            for (int device : shardedDevices) {
+                Data *localInput = input.multiDeviceDatas[device];
+                Data *localOutput = (&input == &output) ? localInput : output.multiDeviceDatas[device];
+                std::vector <std::pair <int, int> > localRanges;
+                std::vector <size_t> weightOffsets;
+                int localOffset = 0;
+                for (auto &range : input.tpRanges[device]) {
+                    int l = std::max(start, range.first);
+                    int r = std::min(end, range.second);
+                    if (l < r) {
+                        localRanges.push_back({localOffset + (l - range.first),
+                                               localOffset + (r - range.first)});
+                        weightOffsets.push_back((size_t)(l - start) * weightElementBytes);
+                    }
+                    localOffset += range.second - range.first;
+                }
+                ops.push_back(new MultiCudaDoRMSNormPartOp(
+                    localInput,
+                    weight.multiDeviceDatas[device],
+                    localOutput,
+                    eps,
+                    std::move(localRanges),
+                    std::move(weightOffsets),
+                    (&input != &output),
+                    device
+                ));
+            }
+            for (int i = 0; i < (int)ops.size(); i++) pool->PushOp(i, ops[i]);
+            for (int i = 0; i < (int)ops.size(); i++) { pool->Wait(i); delete ops[i]; }
+            return;
+        }
+
+        // 慢路径(正确性优先):两阶段 + NCCL all-reduce
+        // 1) 在每张卡上分配 outer 大小的 float buffer,算本地 sum2
+        // 2) NCCL all-reduce 聚合到全局 sum2
+        // 3) 用全局 sum2 + partChannelsGlobal 在每张卡上 apply normalize
+        FastllmInitNccl(devices);
+        std::map <int, float*> sumBuffers;
+        for (int device : shardedDevices) {
+            FastllmCudaSetDevice(device);
+            sumBuffers[device] = (float*)FastllmCudaMalloc(sizeof(float) * (size_t)outer);
+        }
+
+        // 阶段 A: 每张卡算本地 sum2
+        {
+            std::vector <fastllm::MultiThreadBaseOp*> ops;
+            ops.reserve(shardedDevices.size());
+            for (int device : shardedDevices) {
+                Data *localInput = input.multiDeviceDatas[device];
+                int localStart = 0, localEnd = 0;
+                int localOffset = 0;
+                bool found = false;
+                for (auto &range : input.tpRanges[device]) {
+                    int l = std::max(start, range.first);
+                    int r = std::min(end, range.second);
+                    if (l < r && !found) {
+                        localStart = localOffset + (l - range.first);
+                        localEnd = localOffset + (r - range.first);
+                        found = true;
+                    }
+                    localOffset += range.second - range.first;
+                }
+                if (!found) {
+                    localStart = 0;
+                    localEnd = 0;
+                }
+                ops.push_back(new MultiCudaRMSNormPartSum2Op(
+                    localInput, sumBuffers[device], localStart, localEnd, device));
+            }
+            for (int i = 0; i < (int)ops.size(); i++) pool->PushOp(i, ops[i]);
+            for (int i = 0; i < (int)ops.size(); i++) { pool->Wait(i); delete ops[i]; }
+        }
+
+        // 阶段 NCCL: all-reduce sum buffers (SUM)
+        {
+            std::vector <fastllm::MultiThreadBaseOp*> ops;
+            ops.reserve(shardedDevices.size());
+            for (int device : shardedDevices) {
+                ops.push_back(new MultiCudaAllReduceFloatOp(sumBuffers[device], (int)outer, device));
+            }
+            for (int i = 0; i < (int)ops.size(); i++) pool->PushOp(i, ops[i]);
+            for (int i = 0; i < (int)ops.size(); i++) { pool->Wait(i); delete ops[i]; }
+        }
+
+        // 阶段 B: 用聚合后的 sumBuffer apply normalize
+        {
+            std::vector <fastllm::MultiThreadBaseOp*> ops;
+            ops.reserve(shardedDevices.size());
+            for (int device : shardedDevices) {
+                Data *localInput = input.multiDeviceDatas[device];
+                Data *localOutput = (&input == &output) ? localInput : output.multiDeviceDatas[device];
+                std::vector <std::pair <int, int> > localRanges;
+                std::vector <size_t> weightOffsets;
+                int localOffset = 0;
+                for (auto &range : input.tpRanges[device]) {
+                    int l = std::max(start, range.first);
+                    int r = std::min(end, range.second);
+                    if (l < r) {
+                        localRanges.push_back({localOffset + (l - range.first),
+                                               localOffset + (r - range.first)});
+                        weightOffsets.push_back((size_t)(l - start) * weightElementBytes);
+                    }
+                    localOffset += range.second - range.first;
+                }
+                ops.push_back(new MultiCudaRMSNormPartApplyOp(
+                    localInput,
+                    weight.multiDeviceDatas[device],
+                    localOutput,
+                    sumBuffers[device],
+                    eps,
+                    std::move(localRanges),
+                    std::move(weightOffsets),
+                    partChannelsGlobal,
+                    (&input != &output),
+                    device
+                ));
+            }
+            for (int i = 0; i < (int)ops.size(); i++) pool->PushOp(i, ops[i]);
+            for (int i = 0; i < (int)ops.size(); i++) { pool->Wait(i); delete ops[i]; }
+        }
+
+        // 释放临时 buffer
+        for (auto &kv : sumBuffers) {
+            FastllmCudaSetDevice(kv.first);
+            FastllmCudaFree(kv.second);
         }
     }
 
