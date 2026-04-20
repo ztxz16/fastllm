@@ -35,6 +35,13 @@ MODEL_PROFILES = {
         text_only_prompt="Reply with one short sentence confirming the text pipeline is working.",
         description="Gemma4 图文测试配置。",
     ),
+    "qwen35": ModelProfile(
+        name="qwen35",
+        architectures=("Qwen3_5ForConditionalGeneration",),
+        default_prompt="Describe the uploaded image and video together in one short sentence. Mention the main colors and moving shapes.",
+        text_only_prompt="Reply with one short sentence confirming the text pipeline is working.",
+        description="Qwen3.5 图像+视频测试配置。",
+    ),
     "cogvlm": ModelProfile(
         name="cogvlm",
         architectures=("CogVLMForCausalLM",),
@@ -72,6 +79,10 @@ def get_default_probe_image_path(profile_name: str) -> str:
     return os.path.join(TEST_ROOT, f"{profile_name}_probe.png")
 
 
+def get_default_probe_video_path(profile_name: str) -> str:
+    return os.path.join(TEST_ROOT, f"{profile_name}_probe.gif")
+
+
 def create_probe_image(image_path: str, label: str = "MM"):
     os.makedirs(os.path.dirname(image_path), exist_ok=True)
     if os.path.exists(image_path):
@@ -86,6 +97,39 @@ def create_probe_image(image_path: str, label: str = "MM"):
     draw.text((246, 280), label, fill=(30, 30, 30))
     image.save(image_path)
     return image_path, True
+
+
+def create_probe_video(video_path: str, label: str = "MM"):
+    os.makedirs(os.path.dirname(video_path), exist_ok=True)
+    if os.path.exists(video_path):
+        return video_path, False
+
+    frames = []
+    width, height = 320, 240
+    background = (244, 244, 240)
+    for frame_idx in range(6):
+        image = Image.new("RGB", (width, height), background)
+        draw = ImageDraw.Draw(image)
+        offset = frame_idx * 20
+        draw.rectangle((24 + offset, 36, 104 + offset, 116), fill=(220, 40, 40), outline=(90, 0, 0), width=4)
+        draw.ellipse((192 - offset // 2, 42 + offset // 3, 280 - offset // 2, 130 + offset // 3),
+                     fill=(40, 100, 230), outline=(0, 40, 120), width=4)
+        draw.polygon(
+            [(76, 180 - offset // 4), (28, 224 - offset // 4), (124, 224 - offset // 4)],
+            fill=(24, 165, 84), outline=(0, 80, 20), width=4,
+        )
+        draw.rectangle((208, 156, 288, 220), fill=(245, 220, 80), outline=(120, 90, 0), width=4)
+        draw.text((228, 180), f"{label}{frame_idx}", fill=(24, 24, 24))
+        frames.append(image)
+
+    frames[0].save(
+        video_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=180,
+        loop=0,
+    )
+    return video_path, True
 
 
 def _validate_messages(messages: Any) -> List[dict]:
