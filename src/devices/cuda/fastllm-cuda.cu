@@ -872,6 +872,78 @@ __global__ void FastllmRopeEncodingKernel(__nv_bfloat16 *data, float *positionId
     d[i * m + half_dim] = __float2bfloat16(va * curSin + vb * curCos);
 }
 
+__global__ void FastllmQwen35InterleavedRopeKernel(float *data, float *positionIds,
+                                                   int len, int spatial, int n, int m, int positionStride, int rotateDim,
+                                                   int sectionH, int sectionW, float ropeTheta, float ropeScale) {
+    int o = (blockIdx.x / n);
+    int l = o % len;
+    int j = threadIdx.x;
+    int half = rotateDim / 2;
+    int row = 0;
+    if (j % 3 == 1 && j < sectionH * 3) {
+        row = 1;
+    } else if (j % 3 == 2 && j < sectionW * 3) {
+        row = 2;
+    }
+    float position = positionIds[row * positionStride + l] / ropeScale;
+    float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float curSin = sinf(freq);
+    float curCos = cosf(freq);
+    float *d = (float *) data + o * spatial + j;
+    int i = blockIdx.x % n;
+    float va = d[i * m], vb = d[i * m + half];
+    d[i * m] = va * curCos - vb * curSin;
+    d[i * m + half] = va * curSin + vb * curCos;
+}
+
+__global__ void FastllmQwen35InterleavedRopeKernel(half *data, float *positionIds,
+                                                   int len, int spatial, int n, int m, int positionStride, int rotateDim,
+                                                   int sectionH, int sectionW, float ropeTheta, float ropeScale) {
+    int o = (blockIdx.x / n);
+    int l = o % len;
+    int j = threadIdx.x;
+    int half_dim = rotateDim / 2;
+    int row = 0;
+    if (j % 3 == 1 && j < sectionH * 3) {
+        row = 1;
+    } else if (j % 3 == 2 && j < sectionW * 3) {
+        row = 2;
+    }
+    float position = positionIds[row * positionStride + l] / ropeScale;
+    float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float curSin = sinf(freq);
+    float curCos = cosf(freq);
+    half *d = (half *) data + o * spatial + j;
+    int i = blockIdx.x % n;
+    float va = __half2float(d[i * m]), vb = __half2float(d[i * m + half_dim]);
+    d[i * m] = __float2half(va * curCos - vb * curSin);
+    d[i * m + half_dim] = __float2half(va * curSin + vb * curCos);
+}
+
+__global__ void FastllmQwen35InterleavedRopeKernel(__nv_bfloat16 *data, float *positionIds,
+                                                   int len, int spatial, int n, int m, int positionStride, int rotateDim,
+                                                   int sectionH, int sectionW, float ropeTheta, float ropeScale) {
+    int o = (blockIdx.x / n);
+    int l = o % len;
+    int j = threadIdx.x;
+    int half_dim = rotateDim / 2;
+    int row = 0;
+    if (j % 3 == 1 && j < sectionH * 3) {
+        row = 1;
+    } else if (j % 3 == 2 && j < sectionW * 3) {
+        row = 2;
+    }
+    float position = positionIds[row * positionStride + l] / ropeScale;
+    float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+    float curSin = sinf(freq);
+    float curCos = cosf(freq);
+    __nv_bfloat16 *d = (__nv_bfloat16 *) data + o * spatial + j;
+    int i = blockIdx.x % n;
+    float va = __bfloat162float(d[i * m]), vb = __bfloat162float(d[i * m + half_dim]);
+    d[i * m] = __float2bfloat16(va * curCos - vb * curSin);
+    d[i * m + half_dim] = __float2bfloat16(va * curSin + vb * curCos);
+}
+
 __global__ void FastllmLlamaRotatePosition2DPartKernel(float *data, float *positionIds, float *sin, float *cos,
                                                    int len, int bs, int spatial, int n, int m, int partStride, int sinCosStride, int part) {
     int o = (blockIdx.x / n);
@@ -4736,6 +4808,44 @@ bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionI
         FastllmRopeEncodingKernel <<< outer * n, halfDim >>> ((__nv_bfloat16*)cudaData, cudaPositionIds,
                                                                                  len, bs, spatial, n, m,
                                                                                  (int)positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale);
+    }
+    FastllmCudaFinishInput(positionIds, cudaPositionIds);
+    FastllmCudaFinishOutput(data, cudaData);
+    return true;
+}
+
+bool FastllmCudaQwen35InterleavedRope(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
+                                      int sectionT, int sectionH, int sectionW,
+                                      float ropeTheta, float ropeScale) {
+    fastllm::AssertInFastLLM(data.dims.size() == 4, "Qwen3.5 interleaved RoPE expects [batch, seq, heads, dim] input.");
+    fastllm::AssertInFastLLM(data.dims[0] == 1, "Qwen3.5 interleaved RoPE currently supports batch size 1 only.");
+    fastllm::AssertInFastLLM(positionIds.dims.size() == 2 && positionIds.dims[0] == 3,
+                             "Qwen3.5 interleaved RoPE expects position ids with shape [3, seq].");
+    fastllm::AssertInFastLLM(sectionT + sectionH + sectionW == rotaryDim / 2,
+                             "Qwen3.5 interleaved RoPE section sizes must sum to rotary_dim / 2.");
+
+    float *cudaData = (float *) FastllmCudaPrepareInput(data);
+    float *cudaPositionIds = (float *) FastllmCudaPrepareInput(positionIds);
+
+    int outer = data.dims[0] * data.dims[1];
+    int spatial = data.Count(2);
+    int len = data.dims[1];
+    int n = data.dims[2], m = data.dims[3];
+    int halfDim = rotaryDim / 2;
+    int positionStride = (int) positionIds.dims.back();
+
+    if (data.dataType == fastllm::DataType::FLOAT32) {
+        FastllmQwen35InterleavedRopeKernel <<< outer * n, halfDim >>> (
+            cudaData, cudaPositionIds, len, spatial, n, m, positionStride,
+            rotaryDim, sectionH, sectionW, ropeTheta, ropeScale);
+    } else if (data.dataType == fastllm::DataType::FLOAT16) {
+        FastllmQwen35InterleavedRopeKernel <<< outer * n, halfDim >>> (
+            (half*) cudaData, cudaPositionIds, len, spatial, n, m, positionStride,
+            rotaryDim, sectionH, sectionW, ropeTheta, ropeScale);
+    } else if (data.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmQwen35InterleavedRopeKernel <<< outer * n, halfDim >>> (
+            (__nv_bfloat16*) cudaData, cudaPositionIds, len, spatial, n, m, positionStride,
+            rotaryDim, sectionH, sectionW, ropeTheta, ropeScale);
     }
     FastllmCudaFinishInput(positionIds, cudaPositionIds);
     FastllmCudaFinishOutput(data, cudaData);

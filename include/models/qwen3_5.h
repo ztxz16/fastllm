@@ -39,6 +39,16 @@ namespace fastllm {
                 const std::vector <GenerationConfig> &generationConfigs,
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
+
+        virtual std::vector <int> ForwardMultimodal(
+                const Data &inputIds,
+                const Data &attentionMask,
+                const Data &positionIds,
+                std::vector <std::pair <Data, Data> > &pastKeyValues,
+                const std::map <std::string, std::vector <Data*> > &multimodalInput,
+                const GenerationConfig &generationConfig = GenerationConfig(),
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr) override;
         
         // 是否需要生成AttentionMask
         virtual bool NeedAttentionMask(int qlen, int klen);
@@ -78,10 +88,68 @@ namespace fastllm {
         std::vector <std::vector <Data*> > biass;
         bool moeWeightsPrepared = false;
         bool gdnMergedWeightsPrepared = false;
+        std::vector <int> mrope_sections = {11, 11, 10};
+        bool visionPrepared = false;
+        int vision_depth = 0;
+        int vision_hidden_size = 0;
+        int vision_num_heads = 0;
+        int vision_head_dim = 0;
+        int vision_intermediate_size = 0;
+        int vision_patch_size = 16;
+        int vision_temporal_patch_size = 2;
+        int vision_spatial_merge_size = 2;
+        int vision_out_hidden_size = 0;
+        int vision_num_position_embeddings = 0;
+        int vision_num_grid_per_side = 0;
+        int image_token_id = -1;
+        int video_token_id = -1;
+        int vision_start_token_id = -1;
+        int vision_end_token_id = -1;
+        std::vector<int> vision_deepstack_visual_indexes;
+        std::vector<float> vision_image_mean = {0.5f, 0.5f, 0.5f};
+        std::vector<float> vision_image_std = {0.5f, 0.5f, 0.5f};
+        Data visionSinData;
+        Data visionCosData;
 
         void SplitFusedMoeWeightsIfNeeded(const std::string &layerPrefix);
         void PrepareMoeWeights();
         void PrepareGdnWeights();
+        void PrepareVision();
+        Data BuildFlattenedPositionIds(const std::vector <Data*> &positionIds,
+                                      const std::vector <int> &seqLens,
+                                      bool all1);
+        void MergeMultimodalFeaturesIntoText(const Data &mmTokenTypeIds,
+                                             const Data *imageEmbeds,
+                                             const Data *videoEmbeds,
+                                             Data &hiddenStates);
+        void ApplyVisionRotary(Data &input, const Data &posX, const Data &posY);
+        void EncodeVisualItems(const std::vector <Data*> &rawInputs,
+                               const Data *gridThwData,
+                               bool isVideo,
+                               Data &features,
+                               std::vector<std::vector<int>> &gridThwList);
+        void BuildMultimodalPositionData(const Data &inputIds,
+                                         const std::vector<std::vector<int>> &imageGridThwList,
+                                         const std::vector<std::vector<int>> &videoGridThwList,
+                                         Data &mmTokenTypeIds,
+                                         Data &mropePositionIds,
+                                         Data &mropePositionDelta);
+        void ApplyMultimodalRotary(Data &input, const Data &positionIds, float ropeScale);
+        void AdjustPositionIdsWithDelta(const Data &positionIds,
+                                        const Data &mropePositionDelta,
+                                        Data &adjustedPositionIds);
+        std::vector <int> ForwardFromHiddenStates(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const Data &allPositionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *retLogits,
+                Data &hiddenStates,
+                bool all1);
     };
 }
 

@@ -5,6 +5,8 @@
 #ifndef ALIVETHREAD_H
 #define ALIVETHREAD_H
 
+#include <atomic>
+#include <cstdint>
 #include <thread>
 #include <vector>
 #if defined(_WIN32) || defined(_WIN64)
@@ -29,11 +31,13 @@ namespace fastllm {
     };
 
     struct AliveThreadTask {
-        int signal;
+        std::atomic<uint64_t> publishId;
+        std::atomic<uint64_t> doneId;
         MultiThreadBaseOp *op;
 
         AliveThreadTask () {
-            signal = 0;
+            publishId.store(0, std::memory_order_relaxed);
+            doneId.store(0, std::memory_order_relaxed);
             op = nullptr;
         }
     };
@@ -41,7 +45,7 @@ namespace fastllm {
     struct AliveThreadLoop {
         int id;
         AliveThreadTask realTask;
-        volatile AliveThreadTask *task;
+        AliveThreadTask *task;
 
         AliveThreadLoop(int id)  {
             this->id = id;
@@ -50,13 +54,14 @@ namespace fastllm {
 
         void operator()() {
             int cnt = 0;
+            uint64_t lastRunId = 0;
             auto lastRunTime = std::chrono::system_clock::now();
             while (true) {
-                barrier();
-                if (task->signal == 1) {
+                uint64_t currentId = task->publishId.load(std::memory_order_acquire);
+                if (currentId != lastRunId) {
+                    lastRunId = currentId;
                     task->op->Run();
-                    task->signal = 0;
-                    barrier();
+                    task->doneId.store(currentId, std::memory_order_release);
                     lastRunTime = std::chrono::system_clock::now();
                 }
 
@@ -72,24 +77,27 @@ namespace fastllm {
         }
 
         void PushOp(MultiThreadBaseOp *op) {
+            while (this->task->doneId.load(std::memory_order_acquire) !=
+                   this->task->publishId.load(std::memory_order_acquire)) {
+            }
             this->task->op = op;
-            barrier();
-            this->task->signal = 1;
-            barrier();
+            uint64_t nextId = this->task->publishId.load(std::memory_order_relaxed) + 1;
+            this->task->publishId.store(nextId, std::memory_order_release);
         }
 
         void Wait() {
+            uint64_t targetId = task->publishId.load(std::memory_order_acquire);
             while (true) {
-                int a = task->signal;
-                if (a == 0) {
+                uint64_t doneId = task->doneId.load(std::memory_order_acquire);
+                if (doneId == targetId) {
                     break;
                 }
             }
         }
 
         bool TryWait() {
-            int a = task->signal;
-            return a == 0;
+            return task->doneId.load(std::memory_order_acquire) ==
+                   task->publishId.load(std::memory_order_acquire);
         }
     };
 
@@ -102,7 +110,7 @@ namespace fastllm {
         AliveThreadPool (int threadNum) {
             for (int i = 0; i < threadNum; i++) {
                 this->loops.push_back(new AliveThreadLoop(i));
-                this->threads.push_back(new std::thread(*(this->loops[i])));
+                this->threads.push_back(new std::thread([loop = this->loops[i]]() { (*loop)(); }));
             }
             curActivateThreadInterval = std::make_pair(0, threadNum);
         }
@@ -126,7 +134,7 @@ namespace fastllm {
         void ResizeThreads(int threadNum) {
             for (int i = this->threads.size(); i < threadNum; i++) {
                 this->loops.push_back(new AliveThreadLoop(i));
-                this->threads.push_back(new std::thread(*(this->loops[i])));
+                this->threads.push_back(new std::thread([loop = this->loops[i]]() { (*loop)(); }));
             }
             curActivateThreadInterval = std::make_pair(0, threadNum);
         }

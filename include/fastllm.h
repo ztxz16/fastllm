@@ -935,6 +935,10 @@ namespace fastllm {
 
     void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale); // RoPE encoding，直接用rope_theta和rope_scale计算，无需sin/cos缓存
 
+    void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,
+                               int sectionT, int sectionH, int sectionW,
+                               float ropeTheta, float ropeScale); // Qwen3.5 interleaved MRoPE
+
     // 在 qkv 拼接张量上融合执行 RMSNorm + RoPE（仅对 q 和 k 部分），v 不处理
     void QKVRMSNormRope(Data &qkv, Data &qNormWeight, Data &kNormWeight,
                         const Data &positionIds, int q_heads, int k_heads, int head_dim,

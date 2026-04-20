@@ -3609,6 +3609,15 @@ namespace fastllm {
         }, {{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}}, {{"rotaryDim", rotaryDim}});
     }
 
+    void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,
+                               int sectionT, int sectionH, int sectionW,
+                               float ropeTheta, float ropeScale) {
+        curExecutor->Run("Qwen35InterleavedRope", {
+                {"input", &input}, {"positionIds", (Data*)&positionIds}
+        }, {{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
+        {{"rotaryDim", rotaryDim}, {"sectionT", sectionT}, {"sectionH", sectionH}, {"sectionW", sectionW}});
+    }
+
     void QKVRMSNormRope(Data &qkv, Data &qNormWeight, Data &kNormWeight,
                         const Data &positionIds, int q_heads, int k_heads, int head_dim,
                         int rotaryDim, float eps, float ropeTheta, float ropeScale) {

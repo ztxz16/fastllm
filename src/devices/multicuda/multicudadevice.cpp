@@ -58,6 +58,7 @@ namespace fastllm {
         this->ops["Swiglu"] = (BaseOperator*)(new MultiCudaSwigluOp());
         this->ops["PermuteSelf"] = (BaseOperator*)(new MultiCudaPermuteSelfOp());
         this->ops["RopeEncoding"] = (BaseOperator*)(new MultiCudaRopeEncodingOp());
+        this->ops["Qwen35InterleavedRope"] = (BaseOperator*)(new MultiCudaQwen35InterleavedRopeOp());
         this->ops["AppendPagedCache"] = (BaseOperator*)(new MultiCudaAppendPagedCacheOp());
         this->ops["AttentionPagedBatch"] = (BaseOperator*)(new MultiCudaAttentionPagedBatchOp());
         this->ops["QKVRMSNormRopeSplitAppendPagedCache"] =
@@ -1900,6 +1901,43 @@ namespace fastllm {
             FastllmCudaRopeEncoding(*input.multiDeviceDatas[device], *positionIds.multiDeviceDatas[device], rotaryDim, ropeTheta, ropeScale);
         }
         SyncCudaAndCheckAll(devices, "MultiCudaRopeEncodingOp");
+        if (input.IsTensorParallelReplicated()) {
+            SyncReplicatedRootFromReplica(input, devices);
+        }
+    }
+
+    void MultiCudaQwen35InterleavedRopeOp::Run(const std::string &opType, const DataDict &datas,
+                                               const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        int sectionT = intParams.find("sectionT") != intParams.end() ? intParams.find("sectionT")->second : 0;
+        int sectionH = intParams.find("sectionH") != intParams.end() ? intParams.find("sectionH")->second : 0;
+        int sectionW = intParams.find("sectionW") != intParams.end() ? intParams.find("sectionW")->second : 0;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float ropeScale = floatParams.find("ropeScale") != floatParams.end() ? floatParams.find("ropeScale")->second : 1.0f;
+
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || !input.multiDeviceData) {
+            FastllmCudaQwen35InterleavedRope(input, positionIds, rotaryDim, sectionT, sectionH, sectionW, ropeTheta, ropeScale);
+            return;
+        }
+
+        EnsureReplicatedMultiCudaTensor(positionIds, devices, true);
+        if (input.IsTensorParallelReplicated()) {
+            SyncReplicatedLocalShapeFromRoot(input, devices);
+        } else {
+            SyncShardedLocalShapeFromRoot(input, devices);
+        }
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            FastllmCudaQwen35InterleavedRope(
+                *input.multiDeviceDatas[device], *positionIds.multiDeviceDatas[device],
+                rotaryDim, sectionT, sectionH, sectionW, ropeTheta, ropeScale);
+        }
+        SyncCudaAndCheckAll(devices, "MultiCudaQwen35InterleavedRopeOp");
         if (input.IsTensorParallelReplicated()) {
             SyncReplicatedRootFromReplica(input, devices);
         }

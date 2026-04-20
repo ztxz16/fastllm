@@ -346,7 +346,7 @@ namespace fastllm {
         ToDataType(attentionMask, this->dataType);
         while (true) {
             auto st = std::chrono::system_clock::now();
-            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);        
+            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);
             tokens.units[0].Push(ret);
             if (ret == eos_token_id
                 || generationConfig.stop_token_ids.find(ret) != generationConfig.stop_token_ids.end()
@@ -707,10 +707,10 @@ namespace fastllm {
             std::vector <GenerationConfig> generationConfigs;
             LastTokensManager tokensManager;
             std::vector <std::vector <float>* > logits;
-            
+
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
             auto &forwardLocker = model->forwardLocker;
-            
+
             // 单次遍历：处理abort、释放isEnding的KV cache、统计alive、构建orders、检测hasPrefill
             std::vector <int> abortHandles;
             int busyPages = 0, currentActivate = 0;
@@ -782,6 +782,7 @@ namespace fastllm {
                 int prefillTokenCount = 0;
                 int curBusyPages = busyPages;
                 int pendingNewPages = 0;
+                bool selectedMultimodal = false;
 
                 for (auto &ii : orders) {
                     auto &it = *model->responseContextDict.dicts.find(ii.second);
@@ -793,6 +794,14 @@ namespace fastllm {
                         continue;
                     }
                     if (!isPrompt && it.second->preTokens == 0) {
+                        continue;
+                    }
+
+                    bool isMultimodal = !it.second->multimodalInput.empty();
+                    if (selectedMultimodal && !isMultimodal) {
+                        continue;
+                    }
+                    if (isMultimodal && seqLens.size() > 0) {
                         continue;
                     }
 
@@ -914,6 +923,9 @@ namespace fastllm {
 
                     tokensManager.units.push_back(it.second->tokens);
                     handles.push_back(it.first);
+                    if (isMultimodal) {
+                        selectedMultimodal = true;
+                    }
 
                     if (it.second->preTokens == 0) {
                         it.second->intParams["add_special_tokens"] = it.second->cacheLen > 0 ? false : it.second->generationConfig.add_special_tokens;
@@ -954,6 +966,9 @@ namespace fastllm {
                                                                &it.second->pastKeyValues[i].second));
                     }
 
+                    if (selectedMultimodal) {
+                        break;
+                    }
                     if (seqLens.size() >= maxBatch || (totalPages > 0 && curBusyPages >= totalPages)) {
                         break;
                     }
@@ -1060,6 +1075,15 @@ namespace fastllm {
             }
 
             if (seqLens.size() > 0) {
+                ResponseContext *singleContext = nullptr;
+                bool isSingleMultimodal = false;
+                if (handles.size() == 1) {
+                    auto contextIt = model->responseContextDict.dicts.find(handles[0]);
+                    if (contextIt != model->responseContextDict.dicts.end()) {
+                        singleContext = contextIt->second;
+                        isSingleMultimodal = !singleContext->multimodalInput.empty();
+                    }
+                }
                 dictLocker.unlock();
                 forwardLocker.lock();
 #ifdef USE_CUDA
@@ -1067,7 +1091,18 @@ namespace fastllm {
 #endif
                 Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                 std::vector<int> ret;
-                if (seqLens.size() == 1 && seqLens[0] > prefillChunkSize) {
+                if (isSingleMultimodal) {
+                    ret = model->ForwardMultimodal(
+                        inputIds,
+                        attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
+                        positionIds[0] == nullptr ? Data() : *positionIds[0],
+                        singleContext->pastKeyValues,
+                        singleContext->multimodalInput,
+                        singleContext->generationConfig,
+                        tokensManager,
+                        &logits
+                    );
+                } else if (seqLens.size() == 1 && seqLens[0] > prefillChunkSize) {
                     int len = seqLens[0];
                     std::vector <std::pair <Data, Data> > *pastKeyValue1;
                     dictLocker.lock();
@@ -1254,7 +1289,7 @@ namespace fastllm {
                     for (int id : deviceIds) {
                         if (id < freeSizes.size()) {
                             kvCacheLimit += std::max(freeSizes[id] * 3 / 4, freeSizes[id] - (2LL << 30));
-                        } 
+                        }
                     }
                     if (kvCacheLimit == 0) {
                         kvCacheLimit = 16LL << 30;
@@ -1281,7 +1316,7 @@ namespace fastllm {
                     if (model->maxBatch > 0) {
                         maxBatch = model->maxBatch;
                     }
-                    
+
                     model->tokensLimit = maxTotalLens;
                     int limit = maxTotalLens;
                     model->promptLimit = limit * 3 / 4;
@@ -1308,10 +1343,10 @@ namespace fastllm {
                         std::vector <GenerationConfig> generationConfigs;
                         LastTokensManager tokensManager;
                         std::vector <std::vector <float>* > logits;
-                        
+
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
                         auto &forwardLocker = model->forwardLocker;
-                        
+
                         // 首先把已经abort的请求删除掉
                         std::set <int> abortHandles;
                         for (auto &it: model->responseContextDict.dicts) {
@@ -1407,7 +1442,7 @@ namespace fastllm {
                                 if (!isPrompt) {
                                     if (it.second->pastKeyValues[model->kvCacheId].first.isPagedKVCache) {
                                         if (it.second->pastKeyValues[model->kvCacheId].first.pageLen == it.second->pastKeyValues[model->kvCacheId].first.lastPageLen) {
-                                            int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;                                        
+                                            int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;
                                             int predictLen = 256;
                                             if (sur > 0) {
                                                 predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
@@ -1419,7 +1454,7 @@ namespace fastllm {
                                         }
                                     } else {
                                         if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1] == it.second->pastKeyValues[0].first.dims[1]) {
-                                            int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;                                        
+                                            int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;
                                             int predictLen = 256;
                                             if (sur > 0) {
                                                 predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
@@ -1488,7 +1523,7 @@ namespace fastllm {
                                     pastKeyValues.push_back(std::make_pair(&it.second->pastKeyValues[i].first,
                                                                            &it.second->pastKeyValues[i].second));
                                 }
-                                if (isPrompt) {                                    
+                                if (isPrompt) {
                                     cnt += it.second->currentTokens.size();
 
                                     if (cnt > 1024) {
@@ -1524,7 +1559,7 @@ auto st = std::chrono::system_clock::now();
                                         ret.push_back(model->Forward(inputIdNow,
                                                             attentionMasks[i] == nullptr ? Data() : *attentionMasks[i],
                                                             *positionIds[i],
-                                                            model->responseContextDict.dicts[handles[i]]->pastKeyValues, 
+                                                            model->responseContextDict.dicts[handles[i]]->pastKeyValues,
                                                             generationConfigs[i], tokensManager, logits[i]));
                                     }
                                     dictLocker.unlock();
@@ -1558,9 +1593,9 @@ auto st = std::chrono::system_clock::now();
                                         st += curLen;
                                     }
                                 } else {
-                                    if (model->responseContextDict.dicts.begin()->second->multimodalInput.size() > 0) {
-                                        auto context = model->responseContextDict.dicts.begin()->second;
-                                        ret = model->ForwardMultimodal(inputIds, 
+                                    auto context = model->responseContextDict.dicts.begin()->second;
+                                    if (context->multimodalInput.size() > 0) {
+                                        ret = model->ForwardMultimodal(inputIds,
                                                             attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
                                                             *positionIds[0], *pastKeyValue1, context->multimodalInput,
                                                            context->generationConfig, tokensManager, &logits);
@@ -1680,7 +1715,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         auto cache = pastKVCacheManager.Get(inputTokens);
         if (cache.first != nullptr && cache.second > 0) {
             int len = cache.second;
-            
+
             forwardLocker.lock();
             for (int i = 0; i < this->block_cnt; i++) {
                 if (cache.first->kv[i].first.isLinearAttention) {
@@ -1721,14 +1756,14 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
     void basellm::AbortResponse(int handleId) {
         std::unique_lock<std::mutex> dictLocker(this->dictLocker);
         ResponseContext *context = responseContextDict.GetHandle(handleId);
-        
+
         if (context == nullptr) {
             return;
         } else {
             context->isAbort = true;
         }
     }
-    
+
     int basellm::FetchResponseTokens(int handleId) {
         std::unique_lock<std::mutex> dictLocker(this->dictLocker);
         ResponseContext *context = responseContextDict.GetHandle(handleId);
@@ -1841,7 +1876,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             }
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, inputTokens[0]));
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vpids));
-            
+
             if (NeedAttentionMask(seqLen, promptLen)) {
                 std::vector <float> vmask = std::vector <float> (seqLen * promptLen, 0);
                 for (int i = 0; i < seqLen; i++) {
@@ -1973,15 +2008,15 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 
         } else if (dataType == DataType::FLOAT16) {
             AssertInFastLLM(this->use_new_engine ||
-                            this->model_struct == "chatglm" || 
+                            this->model_struct == "chatglm" ||
                             this->model_struct == "llama" ||
                             this->model_struct == "graph" ||
                             this->model_struct == "cogvlm" ||
                             this->model_struct == "deepseek_v2" ||
                             this->model_struct == "qwen3_moe" ||
                             this->model_struct == "minimax_m2" ||
-                            this->model_struct == "hunyuan" || 
-                            this->model_struct == "ernie4_5" || 
+                            this->model_struct == "hunyuan" ||
+                            this->model_struct == "ernie4_5" ||
                             this->model_struct == "pangu_moe" ||
                             this->model_struct == "glm4_moe" ||
                             this->model_struct == "qwen3_next" ||
@@ -1989,15 +2024,15 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             this->model_struct + " doesn't support float16");
         } else if (dataType == DataType::BFLOAT16) {
             AssertInFastLLM(this->use_new_engine ||
-                            this->model_struct == "chatglm" || 
+                            this->model_struct == "chatglm" ||
                             this->model_struct == "llama" ||
                             this->model_struct == "graph" ||
                             this->model_struct == "cogvlm" ||
                             this->model_struct == "deepseek_v2" ||
                             this->model_struct == "qwen3_moe" ||
                             this->model_struct == "minimax_m2" ||
-                            this->model_struct == "hunyuan" || 
-                            this->model_struct == "ernie4_5" || 
+                            this->model_struct == "hunyuan" ||
+                            this->model_struct == "ernie4_5" ||
                             this->model_struct == "pangu_moe" ||
                             this->model_struct == "glm4_moe" ||
                             this->model_struct == "qwen3_next" ||
@@ -2091,7 +2126,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
     }
 
     std::string basellm::ApplyChatTemplate(const JinjaVar &var) {
-        AssertInFastLLM(this->weight.tokenizer.chatTemplate != "", 
+        AssertInFastLLM(this->weight.tokenizer.chatTemplate != "",
                         "ApplyChatTemplate error: model doesn't has chat_template.");
         JinjaVar local = var;
         for (auto &it : this->weight.tokenizer.tokenizerConfig.object_items()) {
@@ -2112,7 +2147,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         for (int i = 0; i < input.Count(0); i++) {
             tokens.push_back(((float *) input.cpuData)[i]);
         }
-        return tokens;    
+        return tokens;
     }
 
     static int GetCacheLen(const Data &cache) {
@@ -2194,7 +2229,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         return 0;
     }
 
-    void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data, Data> > &pastKeyValues, 
+    void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data, Data> > &pastKeyValues,
             const GenerationConfig &generationConfig) {
         auto &config = generationConfig;
         int cacheLen = GetTokenGrowingCacheLen(this, pastKeyValues);
@@ -2226,14 +2261,14 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                     for (auto id: this->eos_token_ids)
                         logit[id] = 0;
                     for (auto id: config.stop_token_ids)
-                        logit[id] = 0; 
+                        logit[id] = 0;
                 }
             }
         }
         return;
     }
 
-    void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data*, Data*> > &pastKeyValues, 
+    void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data*, Data*> > &pastKeyValues,
             const std::vector <GenerationConfig> &generationConfigs) {
         int cacheLen = GetTokenGrowingCacheLen(this, pastKeyValues);
         if (logits->dataDevice == DataDevice::CUDA) {
@@ -2266,7 +2301,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                     for (auto id: this->eos_token_ids)
                         logit[id] = 0;
                     for (auto id: config.stop_token_ids)
-                        logit[id] = 0; 
+                        logit[id] = 0;
                 }
             }
         }
@@ -2539,7 +2574,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 printf("[Fastllm] AutoWarmup note: calculated pages (%d) did not exceed minimum warmup pages (%d).\n",
                        calculatedMaxPages, minPages);
             }
-            
+
             for (int i = 0; i < block_cnt; i++) {
                 pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
                 pastKeyValuesStorage.back().first.SetKVCache();
