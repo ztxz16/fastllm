@@ -4891,8 +4891,7 @@ __global__ void FastllmTemperatureSoftmaxKernel(float *logits, float *probs, flo
     }
     typedef cub::BlockReduce<float, BLOCK_THREADS> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
-    struct FMax { __device__ __forceinline__ float operator()(float a, float b) const { return fmaxf(a, b); } };
-    float blockMax = BlockReduce(tempStorage).Reduce(localMax, FMax());
+    float blockMax = BlockReduce(tempStorage).Reduce(localMax, MaxReduceOp{});
     if (threadIdx.x == 0) sMaxVal = blockMax;
     __syncthreads();
     float maxVal = sMaxVal;
