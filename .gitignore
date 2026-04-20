@@ -34,3 +34,6 @@ CLAUDE.md
 /src/devices/multihip
 /test/mmlu
 /optest
+/vllm/
+/test/multimodal/*_probe*.png
+/test/multimodal/*_probe*.gif
