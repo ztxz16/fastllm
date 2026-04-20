@@ -63,12 +63,16 @@ class FastLLmCompletion:
   def __init__(self,
                model_name,
                model,
-               think, 
-               hide_input):
+               think,
+               hide_input,
+               enable_thinking = None):
     self.model_name = model_name
     self.model = model
     self.init_fast_llm_model()
     self.think = think
+    if enable_thinking is None:
+        enable_thinking = getattr(model, "enable_thinking", True)
+    self.enable_thinking = enable_thinking
     self.hide_input = hide_input
     # Store mapping between conversation IDs and handles
     self.conversation_handles = {}
@@ -623,13 +627,13 @@ class FastLLmCompletion:
       model_images = images if images else None
       input_token_len = self._compute_multimodal_input_token_len(
           messages,
-          enable_thinking = self.think,
+          enable_thinking = self.enable_thinking,
           images = model_images)
       handle = self.model.launch_stream_response(messages,
                         max_length = max_length, min_length = 0, do_sample = do_sample,
                         top_p = top_p, top_k = top_k, temperature = temperature,
                         repeat_penalty = frequency_penalty, tools = model_tools,
-                        one_by_one = True, enable_thinking = self.think,
+                        one_by_one = True, enable_thinking = self.enable_thinking,
                         images = model_images)
       self.conversation_handles[request_id] = handle
       result_generator = self.model.stream_response_handle_async(handle)
@@ -728,7 +732,7 @@ class FastLLmCompletion:
       max_length = request.max_tokens if request.max_tokens else 32768
       min_length = request.min_tokens if request.min_tokens else 0
 
-      enable_thinking = self.think
+      enable_thinking = self.enable_thinking
       if request.chat_template_kwargs and "enable_thinking" in request.chat_template_kwargs:
           enable_thinking = bool(request.chat_template_kwargs["enable_thinking"])
 
@@ -754,15 +758,19 @@ class FastLLmCompletion:
       self.conversation_handles[request_id] = handle
       # logging.info(f"Created conversation: {request_id}, handle: {handle}")
       result_generator = self.model.stream_response_handle_async(handle)
+      # --think 是用户显式指定"在输出前补 <think>\n 起始标签"的开关，
+      # 严格按用户意愿执行，与 enable_thinking（是否进入思考模式）解耦。
+      need_think_prefix = self.think
       # Streaming response
       if request.stream:
           return (self.chat_completion_stream_generator(
-              request, raw_request, result_generator, request_id, input_token_len, think = self.think),
+              request, raw_request, result_generator, request_id, input_token_len, think = need_think_prefix),
               BackgroundTask(self.check_disconnect, raw_request, request_id, handle))
       else:
           try:
               return await self.chat_completion_full_generator(
-                  request, raw_request, handle, result_generator, request_id, input_token_len)
+                  request, raw_request, handle, result_generator, request_id, input_token_len,
+                  think = need_think_prefix)
           except ValueError as e:
               return self.create_error_response(str(e))
 
@@ -784,10 +792,11 @@ class FastLLmCompletion:
               handle: int,
               result_generator: AsyncIterator,
               request_id: str,
-              input_token_len: int) -> Union[ErrorResponse, ChatCompletionResponse]:
+              input_token_len: int,
+              think: bool = False) -> Union[ErrorResponse, ChatCompletionResponse]:
       model_name = self.model_name
       created_time = int(time.time())
-      result = ""
+      result = "<think>\n" if think else ""
       completion_tokens = 0
       async for res in result_generator:
         result += res
