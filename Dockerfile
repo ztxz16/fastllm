@@ -5,7 +5,7 @@ FROM nvidia/cuda:12.1.0-devel-ubuntu22.04
 RUN apt-get update 
 
 # Install and configure Python
-RUN apt-get -y --no-install-recommends install wget build-essential python3.10 python3-pip
+RUN apt-get -y --no-install-recommends install wget build-essential libnuma-dev python3.10 python3-pip
 RUN update-alternatives --install /usr/bin/python  python /usr/bin/python3.10 1
 RUN pip install setuptools streamlit-chat
 
@@ -17,6 +17,6 @@ RUN wget -c https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.2
 WORKDIR $WORKDIR
 ADD . $WORKDIR/
 
-RUN mkdir $WORKDIR/build && cd build && cmake .. -DUSE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native && make -j && cd tools && python setup.py install
+RUN mkdir $WORKDIR/build && cd build && cmake .. -DUSE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="80;86;89;90" && make -j && cd tools && python setup.py install
 
 CMD /fastllm/build/webui -p /models/chatglm2-6b-int8.flm
