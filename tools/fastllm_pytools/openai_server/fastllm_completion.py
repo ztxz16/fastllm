@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import os
+import tempfile
 import time
 import traceback
 import uuid
@@ -37,6 +38,17 @@ except ImportError:
         prepare_gemma4_multimodal_inputs,
     )
 
+try:
+    from ..qwen35_multimodal_native import (
+        normalize_qwen35_conversation,
+        prepare_qwen35_multimodal_inputs,
+    )
+except ImportError:
+    from qwen35_multimodal_native import (
+        normalize_qwen35_conversation,
+        prepare_qwen35_multimodal_inputs,
+    )
+
 ConversationContent = Union[str, List[Dict[str, Any]]]
 
 
@@ -47,6 +59,18 @@ class ConversationMessage:
       self.tool_calls = tool_calls
       self.tool_call_id = tool_call_id
       self.name = name
+
+
+class LoadedMedia:
+    def __init__(self):
+        self.images: List[Image.Image] = []
+        self.videos: List[Any] = []
+        self.temp_paths: List[str] = []
+
+    def extend(self, other: "LoadedMedia"):
+        self.images.extend(other.images)
+        self.videos.extend(other.videos)
+        self.temp_paths.extend(other.temp_paths)
 
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
@@ -111,7 +135,7 @@ class FastLLmCompletion:
   def _build_message_content(
       self, parts: List[Dict[str, Any]]
   ) -> ConversationContent:
-      if any(part.get("type") == "image" for part in parts):
+      if any(part.get("type") in {"image", "video"} for part in parts):
           return parts
       text_parts = [
           part.get("text", "")
@@ -176,11 +200,104 @@ class FastLLmCompletion:
           "or an object with a non-empty `url` field."
       )
 
+  def _extract_openai_video_url(self, part: Dict[str, Any]) -> str:
+      video_url = part.get("video_url")
+      if isinstance(video_url, dict):
+          video_url = video_url.get("url")
+      if isinstance(video_url, str) and video_url != "":
+          return video_url
+      raise ValueError(
+          "OpenAI video content requires `video_url` to be a non-empty string "
+          "or an object with a non-empty `url` field."
+      )
+
+  def _guess_media_suffix(
+      self,
+      path: str,
+      media_type: Optional[str],
+      default_suffix: str,
+  ) -> str:
+      suffix = os.path.splitext(path or "")[1]
+      if suffix:
+          return suffix
+      media_to_suffix = {
+          "image/gif": ".gif",
+          "video/mp4": ".mp4",
+          "video/webm": ".webm",
+          "video/quicktime": ".mov",
+          "video/x-matroska": ".mkv",
+          "video/avi": ".avi",
+      }
+      return media_to_suffix.get((media_type or "").lower(), default_suffix)
+
+  def _write_temp_media_file(self, media_bytes: bytes, suffix: str) -> str:
+      with tempfile.NamedTemporaryFile(delete = False, suffix = suffix) as tmp:
+          tmp.write(media_bytes)
+          return tmp.name
+
+  def _load_video_from_url(self, video_url: str) -> Tuple[Any, Optional[str]]:
+      if not video_url:
+          raise ValueError("Video URL cannot be empty.")
+
+      parsed = urlparse(video_url)
+      scheme = parsed.scheme.lower()
+      try:
+          if scheme in ("http", "https"):
+              with urlopen(video_url, timeout = 20) as response:
+                  media_bytes = response.read()
+                  media_type = None
+                  headers = getattr(response, "headers", None)
+                  if headers is not None and hasattr(headers, "get_content_type"):
+                      media_type = headers.get_content_type()
+              suffix = self._guess_media_suffix(parsed.path, media_type, ".mp4")
+              temp_path = self._write_temp_media_file(media_bytes, suffix)
+              return temp_path, temp_path
+          if scheme == "data":
+              if not video_url.startswith("data:"):
+                  raise ValueError("Only data URLs are supported.")
+              header, encoded = video_url.split(",", 1)
+              if ";base64" not in header:
+                  raise ValueError("Only base64-encoded video data URLs are supported.")
+              media_type = header[5:].split(";", 1)[0].lower()
+              if not (media_type.startswith("video/") or media_type == "image/gif"):
+                  raise ValueError("Only video/* or image/gif data URLs are supported for video content.")
+              try:
+                  media_bytes = base64.b64decode(encoded)
+              except (binascii.Error, ValueError) as exc:
+                  raise ValueError("Invalid base64 video data.") from exc
+              suffix = self._guess_media_suffix("", media_type, ".mp4")
+              temp_path = self._write_temp_media_file(media_bytes, suffix)
+              return temp_path, temp_path
+          if scheme == "file":
+              file_path = unquote(parsed.path or "")
+              if (os.name == "nt" and len(file_path) >= 3 and file_path[0] == "/"
+                      and file_path[2] == ":"):
+                  file_path = file_path[1:]
+              return file_path, None
+      except ValueError:
+          raise
+      except Exception as exc:
+          raise ValueError(f"Failed to load video from {video_url!r}: {exc}") from exc
+
+      raise ValueError(
+          f"Unsupported video URL scheme in {video_url!r}. "
+          "Supported schemes are http(s), data:video/... / data:image/gif, and file://."
+      )
+
+  def _cleanup_temp_paths(self, paths: Iterable[str]):
+      for path in sorted(set(paths)):
+          if not path:
+              continue
+          try:
+              os.remove(path)
+          except OSError:
+              pass
+
   def _parse_openai_content_parts(
       self, content: Iterable[ChatCompletionContentPartParam]
-  ) -> Tuple[ConversationContent, List[Image.Image]]:
+  ) -> Tuple[ConversationContent, LoadedMedia]:
       content_parts: List[Dict[str, Any]] = []
-      images: List[Image.Image] = []
+      media = LoadedMedia()
       for it in content:
           if isinstance(it, str):
               content_parts.append({"type": "text", "text": it})
@@ -197,15 +314,26 @@ class FastLLmCompletion:
               part_type is None and "image_url" in it
           ):
               image_url = self._extract_openai_image_url(it)
-              images.append(self._load_image_from_url(image_url))
+              media.images.append(self._load_image_from_url(image_url))
               content_parts.append({"type": "image"})
+              continue
+
+          if part_type == "video_url" or (
+              part_type is None and "video_url" in it
+          ):
+              video_url = self._extract_openai_video_url(it)
+              video, temp_path = self._load_video_from_url(video_url)
+              media.videos.append(video)
+              if temp_path is not None:
+                  media.temp_paths.append(temp_path)
+              content_parts.append({"type": "video"})
               continue
 
           raise NotImplementedError(
               f"OpenAI content part type `{part_type}` is not supported yet."
           )
 
-      return self._build_message_content(content_parts), images
+      return self._build_message_content(content_parts), media
 
   def _convert_anthropic_image_source_to_url(self, source: Dict[str, Any]) -> str:
       if not isinstance(source, dict):
@@ -224,14 +352,14 @@ class FastLLmCompletion:
 
   def _parse_anthropic_tool_result_content(
       self, content: Any
-  ) -> Tuple[str, List[Image.Image]]:
+  ) -> Tuple[str, LoadedMedia]:
+      media = LoadedMedia()
       if content is None:
-          return "", []
+          return "", media
       if isinstance(content, str):
-          return content, []
+          return content, media
       if isinstance(content, list):
           text_blocks: List[str] = []
-          images: List[Image.Image] = []
           for block in content:
               if not isinstance(block, dict):
                   text_blocks.append(str(block))
@@ -243,31 +371,34 @@ class FastLLmCompletion:
                   image_url = self._convert_anthropic_image_source_to_url(
                       block.get("source") or {}
                   )
-                  images.append(self._load_image_from_url(image_url))
+                  media.images.append(self._load_image_from_url(image_url))
               else:
                   text_blocks.append(json.dumps(block, ensure_ascii = False))
-          return "\n".join([text for text in text_blocks if text != ""]), images
+          return "\n".join([text for text in text_blocks if text != ""]), media
       if isinstance(content, dict):
-          return json.dumps(content, ensure_ascii = False), []
-      return str(content), []
+          return json.dumps(content, ensure_ascii = False), media
+      return str(content), media
 
   def _compute_multimodal_input_token_len(
       self,
       messages: List[Dict[str, Any]],
       enable_thinking: bool,
       images: Optional[List[Image.Image]],
+      videos: Optional[List[Any]],
   ) -> int:
-      if not images:
+      if not images and not videos:
           return self.model.get_input_token_len(
               messages, enable_thinking = enable_thinking)
 
       try:
           signature = inspect.signature(self.model.get_input_token_len)
-          if "images" in signature.parameters:
-              return self.model.get_input_token_len(
-                  messages,
-                  enable_thinking = enable_thinking,
-                  images = images)
+          if "images" in signature.parameters or "videos" in signature.parameters:
+              kwargs = {"enable_thinking": enable_thinking}
+              if "images" in signature.parameters:
+                  kwargs["images"] = images
+              if "videos" in signature.parameters:
+                  kwargs["videos"] = videos
+              return self.model.get_input_token_len(messages, **kwargs)
       except (TypeError, ValueError):
           pass
 
@@ -294,6 +425,24 @@ class FastLLmCompletion:
               enable_thinking = enable_thinking,
           )
           return len(native_inputs["input_ids"])
+      if architecture == "Qwen3_5ForConditionalGeneration":
+          tokenizer = getattr(self.model, "hf_tokenizer", None)
+          qwen_conversation = normalize_qwen35_conversation(
+              copy.deepcopy(messages), len(images or []), len(videos or []))
+          model_dir = getattr(self.model, "model_path", "") or (tokenizer.name_or_path if tokenizer is not None else "")
+          native_inputs = prepare_qwen35_multimodal_inputs(
+              tokenizer = tokenizer,
+              model_dir = model_dir,
+              model_config = getattr(self.model, "config", {}),
+              conversation = qwen_conversation,
+              images = images,
+              videos = videos,
+              add_generation_prompt = True,
+              enable_thinking = enable_thinking,
+              encode_vision = False,
+              encode_fn = self.model.encode,
+          )
+          return len(native_inputs["input_ids"])
 
       return self.model.get_input_token_len(
           messages, enable_thinking = enable_thinking)
@@ -306,20 +455,21 @@ class FastLLmCompletion:
       tool_calls=None,
       tool_call_id=None,
       name=None,
-  ) -> Tuple[List[ConversationMessage], List[Image.Image]]:
+  ) -> Tuple[List[ConversationMessage], LoadedMedia]:
+      empty_media = LoadedMedia()
       if content is None and tool_calls is None and tool_call_id is None:
-          return [], []
+          return [], empty_media
       if content is None or isinstance(content, str):
           return [ConversationMessage(role=role, content=content or "",
                                       tool_calls=tool_calls,
                                       tool_call_id=tool_call_id,
-                                      name=name)], []
+                                      name=name)], empty_media
       if isinstance(content, list):
-          parsed_content, images = self._parse_openai_content_parts(content)
+          parsed_content, media = self._parse_openai_content_parts(content)
           return [ConversationMessage(role=role, content=parsed_content,
                                       tool_calls=tool_calls,
                                       tool_call_id=tool_call_id,
-                                      name=name)], images
+                                      name=name)], media
       raise NotImplementedError("Complex input not supported yet")
 
   def _stringify_anthropic_block_content(self, content: Any) -> str:
@@ -424,7 +574,7 @@ class FastLLmCompletion:
       self,
       role: str,
       content: Optional[Union[str, Iterable[Dict[str, Any]]]],
-  ) -> Tuple[List[ConversationMessage], List[Image.Image]]:
+  ) -> Tuple[List[ConversationMessage], LoadedMedia]:
       if content is None or isinstance(content, str):
           return self._parse_chat_message_content(role, content)
 
@@ -457,26 +607,25 @@ class FastLLmCompletion:
               role = role,
               content = text_content,
               tool_calls = tool_calls or None,
-          )], []
+          )], LoadedMedia()
 
       if role == "user":
           messages: List[ConversationMessage] = []
-          all_images: List[Image.Image] = []
+          all_media = LoadedMedia()
           pending_parts: List[Dict[str, Any]] = []
-          pending_images: List[Image.Image] = []
+          pending_media = LoadedMedia()
 
           def flush_pending_user_parts():
               nonlocal pending_parts
-              nonlocal pending_images
+              nonlocal pending_media
               if pending_parts:
                   messages.append(ConversationMessage(
                       role = "user",
                       content = self._build_message_content(pending_parts),
                   ))
-                  if pending_images:
-                      all_images.extend(pending_images)
+                  all_media.extend(pending_media)
                   pending_parts = []
-                  pending_images = []
+                  pending_media = LoadedMedia()
 
           for block in content:
               if not isinstance(block, dict):
@@ -492,10 +641,10 @@ class FastLLmCompletion:
                       block.get("source") or {}
                   )
                   pending_parts.append({"type": "image"})
-                  pending_images.append(self._load_image_from_url(image_url))
+                  pending_media.images.append(self._load_image_from_url(image_url))
               elif block_type == "tool_result":
                   flush_pending_user_parts()
-                  tool_text, tool_images = self._parse_anthropic_tool_result_content(
+                  tool_text, tool_media = self._parse_anthropic_tool_result_content(
                       block.get("content")
                   )
                   messages.append(ConversationMessage(
@@ -503,16 +652,16 @@ class FastLLmCompletion:
                       content = tool_text,
                       tool_call_id = block.get("tool_use_id"),
                   ))
-                  if tool_images:
+                  if tool_media.images:
                       messages.append(ConversationMessage(
                           role = "user",
-                          content = [{"type": "image"} for _ in tool_images],
+                          content = [{"type": "image"} for _ in tool_media.images],
                       ))
-                      all_images.extend(tool_images)
+                      all_media.extend(tool_media)
               else:
                   raise NotImplementedError("Complex input not supported yet")
           flush_pending_user_parts()
-          return messages, all_images
+          return messages, all_media
 
       return self._parse_chat_message_content(role, content)
 
@@ -571,18 +720,18 @@ class FastLLmCompletion:
 
       try:
           conversation: List[ConversationMessage] = []
-          images: List[Image.Image] = []
+          media = LoadedMedia()
           if request.system is not None:
-              system_messages, system_images = self._parse_anthropic_message_content(
+              system_messages, system_media = self._parse_anthropic_message_content(
                   "system", request.system)
               conversation.extend(system_messages)
-              images.extend(system_images)
+              media.extend(system_media)
 
           for m in request.messages:
-              messages, message_images = self._parse_anthropic_message_content(
+              messages, message_media = self._parse_anthropic_message_content(
                   m.role, m.content)
               conversation.extend(messages)
-              images.extend(message_images)
+              media.extend(message_media)
 
           if len(conversation) == 0:
               raise Exception("Empty msg")
@@ -604,6 +753,7 @@ class FastLLmCompletion:
       except Exception as e:
           logging.error("Error in applying anthropic request: %s", e)
           traceback.print_exc()
+          self._cleanup_temp_paths(media.temp_paths if "media" in locals() else [])
           return self.create_error_response(str(e))
 
       request_id = f"msg_{shortuuid.random()}"
@@ -624,17 +774,22 @@ class FastLLmCompletion:
       if (not(self.hide_input)):
          logging.info(f"fastllm anthropic input message: {messages}")
 
-      model_images = images if images else None
-      input_token_len = self._compute_multimodal_input_token_len(
-          messages,
-          enable_thinking = self.enable_thinking,
-          images = model_images)
-      handle = self.model.launch_stream_response(messages,
-                        max_length = max_length, min_length = 0, do_sample = do_sample,
-                        top_p = top_p, top_k = top_k, temperature = temperature,
-                        repeat_penalty = frequency_penalty, tools = model_tools,
-                        one_by_one = True, enable_thinking = self.enable_thinking,
-                        images = model_images)
+      model_images = media.images if media.images else None
+      model_videos = media.videos if media.videos else None
+      try:
+          input_token_len = self._compute_multimodal_input_token_len(
+              messages,
+              enable_thinking = self.enable_thinking,
+              images = model_images,
+              videos = model_videos)
+          handle = self.model.launch_stream_response(messages,
+                            max_length = max_length, min_length = 0, do_sample = do_sample,
+                            top_p = top_p, top_k = top_k, temperature = temperature,
+                            repeat_penalty = frequency_penalty, tools = model_tools,
+                            one_by_one = True, enable_thinking = self.enable_thinking,
+                            images = model_images, videos = model_videos)
+      finally:
+          self._cleanup_temp_paths(media.temp_paths)
       self.conversation_handles[request_id] = handle
       result_generator = self.model.stream_response_handle_async(handle)
 
@@ -675,16 +830,16 @@ class FastLLmCompletion:
       try:
           # print("request", str(request))
           conversation: List[ConversationMessage] = []
-          images: List[Image.Image] = []
+          media = LoadedMedia()
           for m in request.messages:
-              messages, message_images = self._parse_chat_message_content(
+              messages, message_media = self._parse_chat_message_content(
                   m["role"], m.get("content"),
                   tool_calls=m.get("tool_calls"),
                   tool_call_id=m.get("tool_call_id"),
                   name=m.get("name"))
 
               conversation.extend(messages)
-              images.extend(message_images)
+              media.extend(message_media)
 
           if len(conversation) == 0:
             raise Exception("Empty msg")
@@ -716,6 +871,7 @@ class FastLLmCompletion:
       except Exception as e:
           logging.error("Error in applying chat template from request: %s", e)
           traceback.print_exc()
+          self._cleanup_temp_paths(media.temp_paths if "media" in locals() else [])
           return self.create_error_response(str(e))
 
       request_id = f"fastllm-{self.model_name}-{random_uuid()}"
@@ -741,19 +897,26 @@ class FastLLmCompletion:
          logging.info(f"fastllm input message: {messages}")
       #logging.info(f"input tokens: {input_token_len}")
 
-      model_images = images if images else None
-      input_token_len = self._compute_multimodal_input_token_len(
-          messages,
-          enable_thinking = enable_thinking,
-          images = model_images)
+      model_images = media.images if media.images else None
+      model_videos = media.videos if media.videos else None
 
       tools = [tool.model_dump(exclude_none=True) for tool in request.tools] if request.tools is not None else None
 
-      handle = self.model.launch_stream_response(messages,
-                        max_length = max_length, min_length = min_length, do_sample = do_sample,
-                        top_p = top_p, top_k = top_k, temperature = temperature,
-                        repeat_penalty = frequency_penalty, tools = tools, one_by_one = True,
-                        enable_thinking = enable_thinking, images = model_images)
+      try:
+          input_token_len = self._compute_multimodal_input_token_len(
+              messages,
+              enable_thinking = enable_thinking,
+              images = model_images,
+              videos = model_videos)
+
+          handle = self.model.launch_stream_response(messages,
+                            max_length = max_length, min_length = min_length, do_sample = do_sample,
+                            top_p = top_p, top_k = top_k, temperature = temperature,
+                            repeat_penalty = frequency_penalty, tools = tools, one_by_one = True,
+                            enable_thinking = enable_thinking, images = model_images,
+                            videos = model_videos)
+      finally:
+          self._cleanup_temp_paths(media.temp_paths)
       # Store the mapping between conversation ID and handle
       self.conversation_handles[request_id] = handle
       # logging.info(f"Created conversation: {request_id}, handle: {handle}")

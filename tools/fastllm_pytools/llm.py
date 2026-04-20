@@ -27,6 +27,21 @@ except ImportError:
     )
 
 try:
+    from .qwen35_multimodal_native import (
+        build_qwen35_multimodal_payload,
+        build_qwen35_prompt,
+        normalize_qwen35_conversation,
+        prepare_qwen35_multimodal_inputs,
+    )
+except ImportError:
+    from qwen35_multimodal_native import (
+        build_qwen35_multimodal_payload,
+        build_qwen35_prompt,
+        normalize_qwen35_conversation,
+        prepare_qwen35_multimodal_inputs,
+    )
+
+try:
     import sentencepiece # 先加载sentencepiece，防止libc冲突
 except:
     pass
@@ -801,13 +816,23 @@ class TokenizerCache:
 def try_load_hf_tokenizer(path):
     try:
         import logging
+        import os
         # 1. 保存当前的日志级别
         original_level = logging.root.manager.disable
-        # 2. 完全禁止所有 logging 输出
-        logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
-        from transformers import AutoTokenizer
-        logging.disable(original_level)  # 恢复原来的日志级别
-        ret = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
+        original_use_torch = os.environ.get("USE_TORCH")
+        try:
+            # tokenizer 加载不需要 torch；显式关闭可避免无 torch 环境下 transformers 导入失败
+            os.environ["USE_TORCH"] = "0"
+            # 2. 完全禁止所有 logging 输出
+            logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
+            from transformers import AutoTokenizer
+            ret = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
+        finally:
+            logging.disable(original_level)  # 恢复原来的日志级别
+            if original_use_torch is None:
+                os.environ.pop("USE_TORCH", None)
+            else:
+                os.environ["USE_TORCH"] = original_use_torch
     except:
         ret = None
         print("Load AutoTokenizer failed. (you can try install transformers)")
@@ -927,6 +952,21 @@ class model:
                 exit(0)
         if config_base_path is not None:
             self.model_path = config_base_path
+
+        architecture = ""
+        model_type = ""
+        if isinstance(getattr(self, "config", None), dict):
+            architectures = self.config.get("architectures")
+            if isinstance(architectures, list) and len(architectures) > 0:
+                architecture = architectures[0]
+            model_type = str(self.config.get("model_type", ""))
+        atype = ""
+        if dtype in ("float16", "fp16", "half"):
+            atype = "float16"
+        elif dtype in ("bfloat16", "bf16"):
+            atype = "bfloat16"
+        if atype and (architecture == "Qwen3_5ForConditionalGeneration" or model_type.startswith("qwen3_5")):
+            self.set_atype(atype)
 
         self.direct_query = False;
         self.system_prompt = system_prompt;
@@ -1141,10 +1181,12 @@ class model:
         return conversation
 
     def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True,
-                            enable_thinking = None, images: List = None) -> int:
+                            enable_thinking = None, images: List = None, videos: List = None) -> int:
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
-        if images:
+        multimodal_images = list(images or [])
+        multimodal_videos = list(videos or [])
+        if multimodal_images or multimodal_videos:
             architecture = ""
             try:
                 architecture = self.config["architectures"][0]
@@ -1154,23 +1196,60 @@ class model:
                 if self.hf_tokenizer is None:
                     raise ValueError("Gemma4 multimodal token counting needs a Hugging Face tokenizer.")
                 gemma_conversation = normalize_gemma4_conversation(
-                    copy.deepcopy(conversation), len(images)
+                    copy.deepcopy(conversation), len(multimodal_images)
                 )
                 native_inputs = prepare_gemma4_multimodal_inputs(
                     tokenizer = self.hf_tokenizer,
                     model_dir = self.model_path if self.model_path else self.hf_tokenizer.name_or_path,
                     model_config = self.config,
                     conversation = gemma_conversation,
-                    images = images,
+                    images = multimodal_images,
                     add_generation_prompt = add_generation_prompt,
                     enable_thinking = enable_thinking,
                 )
                 return len(native_inputs["input_ids"])
+            if architecture == "Qwen3_5ForConditionalGeneration":
+                qwen_conversation = normalize_qwen35_conversation(
+                    copy.deepcopy(conversation),
+                    len(multimodal_images),
+                    len(multimodal_videos),
+                )
+                model_dir = self.model_path if self.model_path else (self.hf_tokenizer.name_or_path if self.hf_tokenizer is not None else "")
+                native_inputs = prepare_qwen35_multimodal_inputs(
+                    tokenizer = self.hf_tokenizer,
+                    model_dir = model_dir,
+                    model_config = self.config,
+                    conversation = qwen_conversation,
+                    images = multimodal_images,
+                    videos = multimodal_videos,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                    encode_vision = False,
+                    encode_fn = self.encode,
+                )
+                return len(native_inputs["input_ids"])
+        architecture = ""
+        try:
+            architecture = self.config["architectures"][0]
+        except:
+            architecture = ""
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             prompt = self.hf_tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = enable_thinking)
             return len(self.hf_tokenizer.encode(prompt, add_special_tokens = True))
         else:
-            prompt = self.apply_chat_template(conversation)
+            if architecture == "Qwen3_5ForConditionalGeneration":
+                prompt = build_qwen35_prompt(
+                    tokenizer = None,
+                    conversation = copy.deepcopy(conversation),
+                    image_grid_thw = None,
+                    video_grid_thw = None,
+                    video_timestamps = None,
+                    merge_size = 1,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                )
+            else:
+                prompt = self.apply_chat_template(conversation)
             return len(self.encode(prompt))
 
     def token_healing(self, 
@@ -1396,7 +1475,7 @@ class model:
                         max_length: int = 8192, min_length: int = 0, do_sample = True, 
                         top_p = 0.8, top_k = 1, temperature = 1.0, repeat_penalty = 1.0,
                         one_by_one = True, stop_token_ids: List[int] = None, add_generation_prompt = True, 
-                        images: List = None, tools: List = None, enable_thinking = None):
+                        images: List = None, videos: List = None, tools: List = None, enable_thinking = None):
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
         conversation = None
@@ -1408,7 +1487,9 @@ class model:
         #print("conversation", conversation)
         #print("tools", tools)
 
-        if (images != None):
+        multimodal_images = list(images or [])
+        multimodal_videos = list(videos or [])
+        if (len(multimodal_images) > 0 or len(multimodal_videos) > 0):
             architecture = ""
             try:
                 architecture = self.config["architectures"][0]
@@ -1416,6 +1497,9 @@ class model:
                 print("Error: can't detect architectures for this model.")
                 exit(0)
             if (architecture == "CogVLMForCausalLM"):
+                if (len(multimodal_videos) > 0):
+                    print("Error: CogVLM multimodal only supports images.")
+                    exit(0)
                 image_channels = int(self.config["vision_config"]["in_channels"])
                 image_size = int(self.config["vision_config"]["image_size"])
                 configs = {
@@ -1434,7 +1518,7 @@ class model:
                         transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
                     ]
                 )
-                image = transform(images[0]).reshape([-1]).tolist()
+                image = transform(multimodal_images[0]).reshape([-1]).tolist()
                 tokenizer = self.hf_tokenizer
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
@@ -1456,12 +1540,12 @@ class model:
 
                 gemma_conversation = None
                 if (conversation != None and len(conversation) != 0):
-                    gemma_conversation = normalize_gemma4_conversation(copy.deepcopy(conversation), len(images))
+                    gemma_conversation = normalize_gemma4_conversation(copy.deepcopy(conversation), len(multimodal_images))
                 else:
                     prompt_text = query if self.direct_query else self.get_prompt(query, history)
                     gemma_conversation = normalize_gemma4_conversation(
                         [{"role": "user", "content": prompt_text}],
-                        len(images),
+                        len(multimodal_images),
                     )
 
                 native_inputs = prepare_gemma4_multimodal_inputs(
@@ -1469,7 +1553,7 @@ class model:
                     model_dir = self.model_path if self.model_path else tokenizer.name_or_path,
                     model_config = self.config,
                     conversation = gemma_conversation,
-                    images = images,
+                    images = multimodal_images,
                     add_generation_prompt = add_generation_prompt,
                     enable_thinking = enable_thinking,
                 )
@@ -1480,6 +1564,49 @@ class model:
                 handle = fastllm_lib.launch_response_llm_model_multimodal(
                     self.model, len(input), (ctypes.c_int * len(input))(*input),
                     payload_json.encode(), (ctypes.c_float * len(payload))(*payload.tolist()),
+                    max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                    False, stop_token_len, stop_token_list
+                )
+                return handle
+            elif (architecture == "Qwen3_5ForConditionalGeneration"):
+                tokenizer = self.hf_tokenizer
+                qwen_conversation = None
+                if (conversation != None and len(conversation) != 0):
+                    qwen_conversation = normalize_qwen35_conversation(
+                        copy.deepcopy(conversation),
+                        len(multimodal_images),
+                        len(multimodal_videos),
+                    )
+                else:
+                    prompt_text = query if self.direct_query else self.get_prompt(query, history)
+                    qwen_conversation = normalize_qwen35_conversation(
+                        [{"role": "user", "content": prompt_text}],
+                        len(multimodal_images),
+                        len(multimodal_videos),
+                    )
+
+                model_dir = self.model_path if self.model_path else (tokenizer.name_or_path if tokenizer is not None else "")
+                native_inputs = prepare_qwen35_multimodal_inputs(
+                    tokenizer = tokenizer,
+                    model_dir = model_dir,
+                    model_config = self.config,
+                    conversation = qwen_conversation,
+                    images = multimodal_images,
+                    videos = multimodal_videos,
+                    add_generation_prompt = add_generation_prompt,
+                    enable_thinking = enable_thinking,
+                    encode_fn = self.encode,
+                )
+                payload_config, payload = build_qwen35_multimodal_payload(
+                    native_inputs, tokenizer, model_config = self.config
+                )
+                payload_json = json.dumps(payload_config)
+                payload_buffer = ctypes.create_string_buffer(payload) if payload else None
+                input = native_inputs["input_ids"]
+                stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+                handle = fastllm_lib.launch_response_llm_model_multimodal(
+                    self.model, len(input), (ctypes.c_int * len(input))(*input),
+                    payload_json.encode(), payload_buffer,
                     max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                     False, stop_token_len, stop_token_list
                 )
@@ -1522,8 +1649,25 @@ class model:
             return handle
         else:
             prompt = ""
+            architecture = ""
+            try:
+                architecture = self.config["architectures"][0]
+            except:
+                architecture = ""
             if (conversation != None and len(conversation) != 0):
-                prompt = self.apply_chat_template(conversation)
+                if architecture == "Qwen3_5ForConditionalGeneration":
+                    prompt = build_qwen35_prompt(
+                        tokenizer = None,
+                        conversation = copy.deepcopy(conversation),
+                        image_grid_thw = None,
+                        video_grid_thw = None,
+                        video_timestamps = None,
+                        merge_size = 1,
+                        add_generation_prompt = add_generation_prompt,
+                        enable_thinking = enable_thinking,
+                    )
+                else:
+                    prompt = self.apply_chat_template(conversation)
             else:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)

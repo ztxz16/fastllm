@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <csignal>
+#include <cstdint>
 
 #ifdef WIN32
 #define DLL_EXPORT _declspec(dllexport)
@@ -532,7 +533,7 @@ extern "C" {
     }
 
     DLL_EXPORT int launch_response_llm_model_multimodal(int modelId, int len, int *values, 
-                                  char *multimodal_json, float *multimodal_data,
+                                  char *multimodal_json, uint8_t *multimodal_data,
                                   int max_length, int min_length, bool do_sample, float top_p, int top_k,
                                   float temperature, float repeat_penalty, bool output_logits,
                                   int stop_token_len, int * stop_token_ids) {
@@ -551,6 +552,7 @@ extern "C" {
         std::vector <float> imageInput;
         std::map <std::string, std::vector <fastllm::Data*> > *multimodalInput = new std::map <std::string, std::vector <fastllm::Data*> > ();
         std::string mode = multimodal_config["mode"].string_value();
+        const float *multimodalFloat = (const float*) multimodal_data;
 
         auto readShape = [](const json11::Json &node) {
             std::vector<int> shape;
@@ -560,11 +562,67 @@ extern "C" {
             return shape;
         };
         auto shapeCount = [](const std::vector<int> &shape) {
+            if (shape.empty()) {
+                return 0;
+            }
             int total = 1;
             for (int dim : shape) {
                 total *= dim;
             }
             return total;
+        };
+        auto addPayloadTensor = [&](const std::string &name, const std::vector<int> &shape, int offset, int length) {
+            fastllm::AssertInFastLLM(shapeCount(shape) == length,
+                                     (std::string("Payload shape mismatch for ") + name + ".").c_str());
+            if (length == 0) {
+                return;
+            }
+            std::vector<float> values(length);
+            memcpy(values.data(), multimodalFloat + offset, (size_t) length * sizeof(float));
+            fastllm::Data *tensorData = new fastllm::Data();
+            tensorData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, shape, values));
+            (*multimodalInput)[name].push_back(tensorData);
+        };
+        auto parseDataType = [](const std::string &dtype) {
+            if (dtype == "float32") {
+                return fastllm::DataType::FLOAT32;
+            }
+            if (dtype == "float16") {
+                return fastllm::DataType::FLOAT16;
+            }
+            if (dtype == "bfloat16") {
+                return fastllm::DataType::BFLOAT16;
+            }
+            if (dtype == "int32") {
+                return fastllm::DataType::INT32;
+            }
+            fastllm::ErrorInFastLLM(("Unsupported multimodal payload dtype: " + dtype).c_str());
+            return fastllm::DataType::FLOAT32;
+        };
+        auto dataTypeBytes = [](fastllm::DataType dataType) -> int {
+            switch (dataType) {
+                case fastllm::DataType::FLOAT32:
+                case fastllm::DataType::INT32:
+                    return 4;
+                case fastllm::DataType::FLOAT16:
+                case fastllm::DataType::BFLOAT16:
+                    return 2;
+                default:
+                    return 0;
+            }
+        };
+        auto addTypedPayloadTensor = [&](const std::string &name, fastllm::DataType dataType,
+                                         const std::vector<int> &shape, int offsetBytes, int nbytes) {
+            int expectedBytes = shapeCount(shape) * dataTypeBytes(dataType);
+            fastllm::AssertInFastLLM(expectedBytes == nbytes,
+                                     (std::string("Payload byte size mismatch for ") + name + ".").c_str());
+            if (nbytes == 0) {
+                return;
+            }
+            fastllm::Data *tensorData = new fastllm::Data(dataType, shape);
+            tensorData->Allocate(false);
+            memcpy(tensorData->cpuData, multimodal_data + offsetBytes, (size_t) nbytes);
+            (*multimodalInput)[name].push_back(tensorData);
         };
 
         if (mode == "gemma4") {
@@ -584,28 +642,71 @@ extern "C" {
             fastllm::AssertInFastLLM(shapeCount(mmTypeShape) == mmTypeLength, "Gemma4 mm_token_type_ids payload shape mismatch.");
 
             std::vector<float> pixelValues(pixelLength);
-            memcpy(pixelValues.data(), multimodal_data + pixelOffset, (size_t) pixelLength * sizeof(float));
+            memcpy(pixelValues.data(), multimodalFloat + pixelOffset, (size_t) pixelLength * sizeof(float));
             fastllm::Data *pixelValuesData = new fastllm::Data();
             pixelValuesData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, pixelShape, pixelValues));
             (*multimodalInput)["pixel_values"].push_back(pixelValuesData);
 
             std::vector<float> imagePositionIds(imagePosLength);
-            memcpy(imagePositionIds.data(), multimodal_data + imagePosOffset, (size_t) imagePosLength * sizeof(float));
+            memcpy(imagePositionIds.data(), multimodalFloat + imagePosOffset, (size_t) imagePosLength * sizeof(float));
             fastllm::Data *imagePositionIdsData = new fastllm::Data();
             imagePositionIdsData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, imagePosShape, imagePositionIds));
             (*multimodalInput)["image_position_ids"].push_back(imagePositionIdsData);
 
             std::vector<float> mmTokenTypeIds(mmTypeLength);
-            memcpy(mmTokenTypeIds.data(), multimodal_data + mmTypeOffset, (size_t) mmTypeLength * sizeof(float));
+            memcpy(mmTokenTypeIds.data(), multimodalFloat + mmTypeOffset, (size_t) mmTypeLength * sizeof(float));
             fastllm::Data *mmTokenTypeIdsData = new fastllm::Data();
             mmTokenTypeIdsData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, mmTypeShape, mmTokenTypeIds));
             (*multimodalInput)["mm_token_type_ids"].push_back(mmTokenTypeIdsData);
+        } else if (mode == "qwen35") {
+            if (multimodal_config["tensors"].is_array()) {
+                for (auto &tensorNode : multimodal_config["tensors"].array_items()) {
+                    addTypedPayloadTensor(
+                        tensorNode["name"].string_value(),
+                        parseDataType(tensorNode["dtype"].string_value()),
+                        readShape(tensorNode["shape"]),
+                        tensorNode["offset_bytes"].int_value(),
+                        tensorNode["nbytes"].int_value()
+                    );
+                }
+            } else {
+                addPayloadTensor(
+                    "image_embeds",
+                    readShape(multimodal_config["image_embeds_shape"]),
+                    multimodal_config["image_embeds_offset"].int_value(),
+                    multimodal_config["image_embeds_length"].int_value()
+                );
+                addPayloadTensor(
+                    "video_embeds",
+                    readShape(multimodal_config["video_embeds_shape"]),
+                    multimodal_config["video_embeds_offset"].int_value(),
+                    multimodal_config["video_embeds_length"].int_value()
+                );
+                addPayloadTensor(
+                    "mrope_position_ids",
+                    readShape(multimodal_config["mrope_position_ids_shape"]),
+                    multimodal_config["mrope_position_ids_offset"].int_value(),
+                    multimodal_config["mrope_position_ids_length"].int_value()
+                );
+                addPayloadTensor(
+                    "mrope_position_delta",
+                    readShape(multimodal_config["mrope_position_delta_shape"]),
+                    multimodal_config["mrope_position_delta_offset"].int_value(),
+                    multimodal_config["mrope_position_delta_length"].int_value()
+                );
+                addPayloadTensor(
+                    "mm_token_type_ids",
+                    readShape(multimodal_config["mm_token_type_ids_shape"]),
+                    multimodal_config["mm_token_type_ids_offset"].int_value(),
+                    multimodal_config["mm_token_type_ids_length"].int_value()
+                );
+            }
         } else {
             int image_channels = multimodal_config["image_channels"].int_value();
             int image_height = multimodal_config["image_height"].int_value();
             int image_width = multimodal_config["image_width"].int_value();
             imageInput.resize(1 * image_channels * image_height * image_width);
-            memcpy(&imageInput[0], multimodal_data, imageInput.size() * sizeof(float));
+            memcpy(&imageInput[0], multimodalFloat, imageInput.size() * sizeof(float));
 
             fastllm::Data *imageInputData = new fastllm::Data();
             imageInputData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, {1, image_channels, image_height, image_width}, imageInput));
