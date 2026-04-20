@@ -564,11 +564,18 @@ class FastLLmCompletion:
 
   def _ensure_tool_parser(self):
       if self.tool_parser is None:
+          tokenizer = self.model.hf_tokenizer
+          chat_template = getattr(tokenizer, "chat_template", None)
+          if tokenizer is None or chat_template is None:
+              raise ValueError(
+                  "Tool calling requires a Hugging Face tokenizer with chat_template. "
+                  "Please use an HF model directory or provide the original tokenizer files."
+              )
           from .tool_parsers import ToolParserManager
           self.tool_parser = ToolParserManager.get_tool_parser_auto(
-              self.model.get_type(), self.model.hf_tokenizer.chat_template,
+              self.model.get_type(), chat_template,
               force_chat_template = self.model.force_chat_template,
-              force_type = self.model.tool_call_parser)(self.model.hf_tokenizer)
+              force_type = self.model.tool_call_parser)(tokenizer)
 
   def _parse_anthropic_message_content(
       self,
@@ -970,12 +977,8 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
-      if (request.tools and self.tool_parser is None):
-          from .tool_parsers import ToolParser, ToolParserManager
-          self.tool_parser = ToolParserManager.get_tool_parser_auto(
-              self.model.get_type(), self.model.hf_tokenizer.chat_template,
-              force_chat_template=self.model.force_chat_template,
-              force_type=self.model.tool_call_parser)(self.model.hf_tokenizer)
+      if request.tools:
+          self._ensure_tool_parser()
 
       if request.tools:
           tool_call_info = self.tool_parser.extract_tool_calls(result, request)
@@ -1071,13 +1074,8 @@ class FastLLmCompletion:
 
         # 2. content部分
 
-        if (request.tools and self.tool_parser is None):
-            # tools不为空
-            from .tool_parsers import ToolParser, ToolParserManager            
-            self.tool_parser = ToolParserManager.get_tool_parser_auto (
-                self.model.get_type(), self.model.hf_tokenizer.chat_template, 
-                force_chat_template = self.model.force_chat_template, 
-                force_type = self.model.tool_call_parser) (self.model.hf_tokenizer)
+        if request.tools:
+            self._ensure_tool_parser()
         
         completion_tokens = 0
 
