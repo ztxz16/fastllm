@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <thread>
 #include <mutex>
+#include <memory>
 
 #include <cfloat>
 #include <climits>
@@ -349,10 +350,102 @@ namespace fastllm {
         }
     }
 
+    #ifdef USE_CUDA
+    struct FastllmCudaHostFreeDeleter {
+        void operator()(void *ptr) const {
+            if (ptr != nullptr) {
+                FastllmCudaHostFree(ptr);
+            }
+        }
+    };
+
+    struct FastllmCudaFreeDeleter {
+        void operator()(void *ptr) const {
+            if (ptr != nullptr) {
+                FastllmCudaFree(ptr);
+            }
+        }
+    };
+
+    struct FastllmCudaStreamDestroyDeleter {
+        int device = -1;
+
+        void operator()(void *stream) const {
+            if (stream == nullptr) {
+                return;
+            }
+            int oriDevice = FastllmCudaGetDevice();
+            if (device >= 0 && oriDevice != device) {
+                FastllmCudaSetDevice(device);
+            }
+            FastllmCudaStreamDestroy(stream);
+            if (device >= 0 && oriDevice != device) {
+                FastllmCudaSetDevice(oriDevice);
+            }
+        }
+    };
+    #endif
+
     struct FastllmMoeDataManagerNumas {
             std::vector <float, alignedAllocator<float, 64> > gateUpOutput, swigluOutput, downOutput, reduceOutput;
             std::vector <float, alignedAllocator<float, 64> > inputFloat32;  // 当 input 非 FLOAT32 时暂存转成 float32 的数据
             std::vector <uint8_t, alignedAllocator<uint8_t, 64> > realInput, expandInput, downInput;
+    #ifdef USE_CUDA
+            std::unique_ptr<void, FastllmCudaHostFreeDeleter> pinnedOutput {nullptr};
+            size_t pinnedOutputBytes = 0;
+            std::unique_ptr<void, FastllmCudaFreeDeleter> gpuOutputStaging {nullptr};
+            size_t gpuOutputStagingBytes = 0;
+            int gpuOutputStagingDevice = -1;
+            std::unique_ptr<void, FastllmCudaStreamDestroyDeleter> gpuOutputCopyStream {
+                nullptr, FastllmCudaStreamDestroyDeleter {}
+            };
+
+            uint8_t *EnsurePinnedOutput(size_t bytes) {
+                if (pinnedOutputBytes < bytes || pinnedOutput.get() == nullptr) {
+                    pinnedOutput.reset(FastllmCudaHostMalloc(bytes));
+                    pinnedOutputBytes = bytes;
+                }
+                return (uint8_t*)pinnedOutput.get();
+            }
+
+            void *EnsureGpuOutputStaging(size_t bytes, int gpuId) {
+                if (gpuOutputStagingDevice != gpuId) {
+                    gpuOutputStaging.reset(nullptr);
+                    gpuOutputStagingBytes = 0;
+                    gpuOutputStagingDevice = gpuId;
+                }
+                if (gpuOutputStagingBytes < bytes || gpuOutputStaging.get() == nullptr) {
+                    int oriDevice = FastllmCudaGetDevice();
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(gpuId);
+                    }
+                    gpuOutputStaging.reset(FastllmCudaMalloc(bytes));
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(oriDevice);
+                    }
+                    gpuOutputStagingBytes = bytes;
+                }
+                return gpuOutputStaging.get();
+            }
+
+            void *EnsureGpuOutputCopyStream(int gpuId) {
+                if (gpuOutputCopyStream.get() == nullptr ||
+                    gpuOutputCopyStream.get_deleter().device != gpuId) {
+                    gpuOutputCopyStream.reset(nullptr);
+                    int oriDevice = FastllmCudaGetDevice();
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(gpuId);
+                    }
+                    gpuOutputCopyStream = std::unique_ptr<void, FastllmCudaStreamDestroyDeleter>(
+                        FastllmCudaStreamCreate(true), FastllmCudaStreamDestroyDeleter {gpuId}
+                    );
+                    if (oriDevice != gpuId) {
+                        FastllmCudaSetDevice(oriDevice);
+                    }
+                }
+                return gpuOutputCopyStream.get();
+            }
+    #endif
     };
     // 每层一个 MoE 缓存，避免层间共享导致的数据竞争
     std::unordered_map<int, FastllmMoeDataManagerNumas> fastllmMoeDataManagerNumasPerLayer;
@@ -696,7 +789,8 @@ namespace fastllm {
         float sharedScale,
         int weightsBatch, int topk,
         const std::unordered_set<int> &cpuExperts,
-        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas
+        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas,
+        uint8_t *cpuOutputBuffer
     );
 
     struct MoeBenchmarkShapeKey {
@@ -990,7 +1084,7 @@ namespace fastllm {
                     for (int i = 0; i < warmupRounds; i++) {
                         DoNumasMergeMOEOnCPU(
                             benchInput, cpuOutput, benchIndexK, benchScoreK, weights, biass,
-                            sharedScale, weightsBatch, 1, cpuExperts, cpuBenchDataManager
+                            sharedScale, weightsBatch, 1, cpuExperts, cpuBenchDataManager, nullptr
                         );
                     }
                     double cpuElapsed = 0.0;
@@ -998,7 +1092,7 @@ namespace fastllm {
                         auto st = std::chrono::steady_clock::now();
                         DoNumasMergeMOEOnCPU(
                             benchInput, cpuOutput, benchIndexK, benchScoreK, weights, biass,
-                            sharedScale, weightsBatch, 1, cpuExperts, cpuBenchDataManager
+                            sharedScale, weightsBatch, 1, cpuExperts, cpuBenchDataManager, nullptr
                         );
                         auto ed = std::chrono::steady_clock::now();
                         cpuElapsed += std::chrono::duration<double, std::micro>(ed - st).count();
@@ -1057,7 +1151,8 @@ namespace fastllm {
         float sharedScale,
         int weightsBatch, int topk,
         const std::unordered_set<int> &cpuExperts,
-        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas
+        FastllmMoeDataManagerNumas &fastllmMoeDataManagerNumas,
+        uint8_t *cpuOutputBuffer
     ) {
         int bs = input.dims[0];
         int m = weightsBatch / 2 - 1; // num experts
@@ -1380,6 +1475,8 @@ namespace fastllm {
             }
         } */
 
+        uint8_t *finalCpuOutput = cpuOutputBuffer != nullptr ? cpuOutputBuffer : (uint8_t*)output.cpuData;
+
         // 6. reduce
         {
             // 计算每个样本选择的专家数 k
@@ -1415,7 +1512,7 @@ namespace fastllm {
             }
 
             // 有一些token不会被关联到任何专家，也需要先清零
-            float *lastOutput = output.dataType == DataType::FLOAT32 ? (float*)output.cpuData : reduceOutput.data();
+            float *lastOutput = output.dataType == DataType::FLOAT32 ? (float*)finalCpuOutput : reduceOutput.data();
             memset(lastOutput, 0, bs * dim * sizeof(float));
 
             // 调用多线程函数
@@ -1434,10 +1531,10 @@ namespace fastllm {
         // 7. reduceOutput -> last Output
         if (output.dataType != DataType::FLOAT32) {
             if (output.dataType == DataType::FLOAT16) {
-                RunMultiThreadConvertFromFloat32((uint16_t*)output.cpuData, DataType::FLOAT16, 
+                RunMultiThreadConvertFromFloat32((uint16_t*)finalCpuOutput, DataType::FLOAT16, 
                     reduceOutput.data(), bs, dim, GetAlivePool());
             } else if (output.dataType == DataType::BFLOAT16) {
-                RunMultiThreadConvertFromFloat32((uint16_t*)output.cpuData, DataType::BFLOAT16, 
+                RunMultiThreadConvertFromFloat32((uint16_t*)finalCpuOutput, DataType::BFLOAT16, 
                     reduceOutput.data(), bs, dim, GetAlivePool());
             }
         }
@@ -1831,6 +1928,7 @@ namespace fastllm {
 // printf("MoE expertLimit=%d, cpuExperts=%d, gpuExperts=%d\n", expertLimit, (int)cpuExperts.size(), (int)gpuExperts.size());
 // printf("prepare 1 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
             // 若 gpuPrefill 且所有专家都归 GPU（cpuExperts 为空），直接调用 GPU 处理并返回
+            uint8_t *cpuOutputPinned = nullptr;
 #ifdef USE_CUDA
             if (gpuPrefill && cpuExperts.empty()) {
                 DoCudaMergeMOEFromCPU (
@@ -1841,6 +1939,8 @@ namespace fastllm {
 
             int gpuId = FastllmCudaGetDevice();
             std::thread gpuThread;
+            void *cpuOutputStaging = nullptr;
+            void *cpuOutputCopyStream = nullptr;
             if (gpuPrefill && !gpuExperts.empty()) {
                 gpuThread = std::thread([&, gpuId, gpuExperts]() {
                     FastllmCudaSetDevice(gpuId);
@@ -1852,16 +1952,39 @@ namespace fastllm {
 // printf("gpu prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 #endif
             if (!cpuExperts.empty()) {
+#ifdef USE_CUDA
+                if (gpuPrefill && !gpuExperts.empty()) {
+                    cpuOutputPinned = fastllmMoeDataManagerNumas.EnsurePinnedOutput(output.GetBytes());
+                }
+#endif
                 DoNumasMergeMOEOnCPU(
                     input, output, index, score, weights, biass,
-                    sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas
+                    sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas, cpuOutputPinned
                 );
+#ifdef USE_CUDA
+                // CPU partial 直接写入 pinned buffer，再异步搬到复用的 GPU staging buffer。
+                if (gpuPrefill && !gpuExperts.empty() && cpuOutputPinned != nullptr) {
+                    FastllmCudaSetDevice(gpuId);
+                    size_t outputBytes = output.GetBytes();
+                    cpuOutputStaging = fastllmMoeDataManagerNumas.EnsureGpuOutputStaging(outputBytes, gpuId);
+                    cpuOutputCopyStream = fastllmMoeDataManagerNumas.EnsureGpuOutputCopyStream(gpuId);
+                    FastllmCudaCopyFromPinnedHostToDeviceAsync(
+                        cpuOutputStaging, cpuOutputPinned, outputBytes, cpuOutputCopyStream
+                    );
+                }
+#endif
             }
 // printf("cpu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 #ifdef USE_CUDA
             if (gpuPrefill && !gpuExperts.empty()) {
                 gpuThread.join();
-                ReduceSumFromCPU(output);
+                FastllmCudaSetDevice(gpuId);
+                if (cpuOutputStaging != nullptr) {
+                    FastllmCudaStreamSynchronize(cpuOutputCopyStream);
+                    Data gpuOutputAlias(output.dataType, output.dims, DataDevice::CUDA, output.cudaData);
+                    Data cpuOutputAlias(output.dataType, output.dims, DataDevice::CUDA, cpuOutputStaging);
+                    FastllmCudaAddTo(gpuOutputAlias, cpuOutputAlias, 1.0f);
+                }
             }
 #endif
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
