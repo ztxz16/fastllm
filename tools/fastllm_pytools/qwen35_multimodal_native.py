@@ -776,23 +776,56 @@ def build_qwen35_multimodal_payload(
 
 # Keep the raw-frame path in this module for future parity work, but use the
 # HF-aligned vision encoder for Qwen3.5 inference today because it matches the
-# reference model's visual features and position data.
-try:
-    from .qwen35_multimodal import (
-        build_qwen35_multimodal_payload as _hf_build_qwen35_multimodal_payload,
-        prepare_qwen35_multimodal_inputs as _hf_prepare_qwen35_multimodal_inputs,
-    )
-except ImportError:
-    import importlib.util
+# reference model's visual features and position data. Load it lazily so text-
+# only server startup does not require the optional torch dependency.
+_hf_build_qwen35_multimodal_payload = None
+_hf_prepare_qwen35_multimodal_inputs = None
 
-    _legacy_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qwen35_multimodal.py")
-    _legacy_spec = importlib.util.spec_from_file_location("fastllm_qwen35_multimodal_legacy", _legacy_path)
-    if _legacy_spec is None or _legacy_spec.loader is None:
-        raise ImportError(f"Failed to load Qwen3.5 legacy multimodal module from {_legacy_path}.")
-    _legacy_module = importlib.util.module_from_spec(_legacy_spec)
-    _legacy_spec.loader.exec_module(_legacy_module)
-    _hf_build_qwen35_multimodal_payload = _legacy_module.build_qwen35_multimodal_payload
-    _hf_prepare_qwen35_multimodal_inputs = _legacy_module.prepare_qwen35_multimodal_inputs
+
+def _raise_missing_qwen35_multimodal_dependency(exc: BaseException) -> None:
+    raise ModuleNotFoundError(
+        "Qwen3.5 multimodal preprocessing requires the optional dependency "
+        "'torch'. Install torch before sending image or video inputs."
+    ) from exc
+
+
+def _load_hf_qwen35_multimodal_impl() -> Tuple[
+    Callable[..., Dict[str, Any]],
+    Callable[..., Tuple[Dict[str, Any], Any]],
+]:
+    global _hf_build_qwen35_multimodal_payload, _hf_prepare_qwen35_multimodal_inputs
+
+    if _hf_prepare_qwen35_multimodal_inputs is not None and _hf_build_qwen35_multimodal_payload is not None:
+        return _hf_prepare_qwen35_multimodal_inputs, _hf_build_qwen35_multimodal_payload
+
+    try:
+        from .qwen35_multimodal import (
+            build_qwen35_multimodal_payload as hf_build_qwen35_multimodal_payload,
+            prepare_qwen35_multimodal_inputs as hf_prepare_qwen35_multimodal_inputs,
+        )
+    except ImportError as exc:
+        if isinstance(exc, ModuleNotFoundError) and exc.name == "torch":
+            _raise_missing_qwen35_multimodal_dependency(exc)
+
+        import importlib.util
+
+        legacy_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qwen35_multimodal.py")
+        legacy_spec = importlib.util.spec_from_file_location("fastllm_qwen35_multimodal_legacy", legacy_path)
+        if legacy_spec is None or legacy_spec.loader is None:
+            raise ImportError(f"Failed to load Qwen3.5 legacy multimodal module from {legacy_path}.")
+        legacy_module = importlib.util.module_from_spec(legacy_spec)
+        try:
+            legacy_spec.loader.exec_module(legacy_module)
+        except ModuleNotFoundError as legacy_exc:
+            if legacy_exc.name == "torch":
+                _raise_missing_qwen35_multimodal_dependency(legacy_exc)
+            raise
+        hf_build_qwen35_multimodal_payload = legacy_module.build_qwen35_multimodal_payload
+        hf_prepare_qwen35_multimodal_inputs = legacy_module.prepare_qwen35_multimodal_inputs
+
+    _hf_build_qwen35_multimodal_payload = hf_build_qwen35_multimodal_payload
+    _hf_prepare_qwen35_multimodal_inputs = hf_prepare_qwen35_multimodal_inputs
+    return _hf_prepare_qwen35_multimodal_inputs, _hf_build_qwen35_multimodal_payload
 
 
 def prepare_qwen35_multimodal_inputs(
@@ -811,7 +844,8 @@ def prepare_qwen35_multimodal_inputs(
     encode_fn = None,
 ) -> Dict[str, Any]:
     del tokenizer_config, encode_fn
-    return _hf_prepare_qwen35_multimodal_inputs(
+    hf_prepare_qwen35_multimodal_inputs, _ = _load_hf_qwen35_multimodal_impl()
+    return hf_prepare_qwen35_multimodal_inputs(
         tokenizer = tokenizer,
         model_dir = model_dir,
         model_config = model_config,
@@ -833,7 +867,8 @@ def build_qwen35_multimodal_payload(
     tokenizer_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], bytes]:
     del model_config, tokenizer_config
-    payload_config, payload = _hf_build_qwen35_multimodal_payload(native_inputs, tokenizer)
+    _, hf_build_qwen35_multimodal_payload = _load_hf_qwen35_multimodal_impl()
+    payload_config, payload = hf_build_qwen35_multimodal_payload(native_inputs, tokenizer)
     if isinstance(payload, np.ndarray):
         return payload_config, payload.astype(np.float32, copy=False).tobytes(order="C")
     if isinstance(payload, (bytes, bytearray, memoryview)):
