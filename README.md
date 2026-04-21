@@ -313,7 +313,7 @@ numactl -C 0-31 -m 0 ftllm server fastllm/DeepSeek-V3-0324-INT4 --device cuda --
 
 - `--cache_dir`:
   - **描述**: 指定在线Huggingface模型的缓存目录
-  - **示例**: `ftllm --cache_dir /mnt`
+  - **示例**: `ftllm run Qwen/Qwen3-0.6B --cache_dir /mnt`
 
 - `--chat_template`:
   - **描述**: 指定chat_template文件

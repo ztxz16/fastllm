@@ -2,43 +2,63 @@ import argparse
 import os
 import sys
 
-def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description = des, add_help = add_help)
-    parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹或配置文件')
-    parser.add_argument('-p', '--path', type = str, required = False, default = '', help = '模型路径，fastllm模型文件或HF模型文件夹')
-    parser.add_argument('-t', '--threads', type = int, default = -1,  help = '线程数量')
-    parser.add_argument('-l', '--low', action = 'store_true', help = '是否使用低内存模式')
-    parser.add_argument('--dtype', type = str, default = "auto", help = '权重类型（读取HF模型时有效）')
-    parser.add_argument('--moe_dtype', type = str, default = "", help = 'MOE层使用的权重类型（读取HF模型时有效）')
-    parser.add_argument('--moe_atype', type = str, default = "", help = 'MOE层激活类型，可使用float32、float16或bfloat16')
-    parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
-    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16或fp8_e4m3')
-    parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
-    parser.add_argument('--kv_cache_limit', type = str, default = "auto",  help = 'kv缓存最大使用量')
-    parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
-    parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
-    parser.add_argument('--device', type = str, help = '使用的设备')
-    parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
-    parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
-    parser.add_argument("--cache_history", type = str, default = "", help = "缓存历史对话")
-    parser.add_argument("--cache_fast", type = str, default = "", help = "是否启用快速缓存（会消耗一定显存）")
-    parser.add_argument("--enable_thinking", type = str, default = "", help = "是否开启硬思考开关（需要模型支持）")
-    parser.add_argument("--cuda_shared_expert", "--cuda_se", type = str, default = "true", help = "是否使用cuda来执行共享专家")
-    parser.add_argument("--enable_amx", "--amx", type = str, default = "false", help = "是否开启amx加速")
-    parser.add_argument("--tokens", type = int, default = -1, help = "设置总的token数量（用于计算paged cache的最大页数）")
-    parser.add_argument("--page_size", type = int, default = 128, help = "设置paged cache每页的大小（token数）")
-    parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
-    
-    parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
-    parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
-    parser.add_argument('--cache_dir', type = str, default = "", help = '指定缓存模型文件的路径')
-    parser.add_argument('--dtype_config', type = str, default = "", help = '指定权重类型配置文件')
-    parser.add_argument('--ori', type = str, default = "", help = '原始模型权重，读取GGUF文件时可以使用')
 
-    parser.add_argument('--tool_call_parser', type = str, default = "auto", help = '使用的tool_call_parser类型')
-    parser.add_argument('--chat_template', type = str, default = "", help = '使用的chat_template文件')
+def _default_value(value, suppress_defaults: bool):
+    return argparse.SUPPRESS if suppress_defaults else value
 
+
+def add_normal_args(parser: argparse.ArgumentParser,
+                    include_model: bool = True,
+                    suppress_defaults: bool = False) -> argparse.ArgumentParser:
+    if include_model:
+        parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹或配置文件')
+    parser.add_argument('-p', '--path', type = str, required = False,
+                        default = _default_value('', suppress_defaults),
+                        help = '模型路径，fastllm模型文件或HF模型文件夹')
+    parser.add_argument('-t', '--threads', type = int,
+                        default = _default_value(-1, suppress_defaults),
+                        help = '线程数量')
+    parser.add_argument('-l', '--low', action = 'store_true',
+                        default = _default_value(False, suppress_defaults),
+                        help = '是否使用低内存模式')
+    parser.add_argument('--dtype', type = str, default = _default_value("auto", suppress_defaults), help = '权重类型（读取HF模型时有效）')
+    parser.add_argument('--moe_dtype', type = str, default = _default_value("", suppress_defaults), help = 'MOE层使用的权重类型（读取HF模型时有效）')
+    parser.add_argument('--moe_atype', type = str, default = _default_value("", suppress_defaults), help = 'MOE层激活类型，可使用float32、float16或bfloat16')
+    parser.add_argument('--atype', type = str, default = _default_value("auto", suppress_defaults), help = '推理类型，可使用float32或float16')
+    parser.add_argument('--kv_cache_dtype', type = str, default = _default_value("auto", suppress_defaults), help = 'KV Cache类型，可使用auto、float16、bfloat16或fp8_e4m3')
+    parser.add_argument('--cuda_embedding', action = 'store_true',
+                        default = _default_value(False, suppress_defaults),
+                        help = '在cuda上进行embedding')
+    parser.add_argument('--kv_cache_limit', type = str, default = _default_value("auto", suppress_defaults),  help = 'kv缓存最大使用量')
+    parser.add_argument('--max_batch', type = int, default = _default_value(-1, suppress_defaults),  help = '每次最多同时推理的询问数量')
+    parser.add_argument('--chunked_prefill_size', type = int, default = _default_value(-1, suppress_defaults), help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
+    parser.add_argument('--device', type = str, default = _default_value(None, suppress_defaults), help = '使用的设备')
+    parser.add_argument('--moe_device', type = str, default = _default_value("", suppress_defaults), help = 'moe使用的设备')
+    parser.add_argument('--moe_experts', type = int, default = _default_value(-1, suppress_defaults), help = 'moe使用的专家数')
+    parser.add_argument("--cache_history", type = str, default = _default_value("", suppress_defaults), help = "缓存历史对话")
+    parser.add_argument("--cache_fast", type = str, default = _default_value("", suppress_defaults), help = "是否启用快速缓存（会消耗一定显存）")
+    parser.add_argument("--enable_thinking", type = str, default = _default_value("", suppress_defaults), help = "是否开启硬思考开关（需要模型支持）")
+    parser.add_argument("--cuda_shared_expert", "--cuda_se", type = str, default = _default_value("true", suppress_defaults), help = "是否使用cuda来执行共享专家")
+    parser.add_argument("--enable_amx", "--amx", type = str, default = _default_value("false", suppress_defaults), help = "是否开启amx加速")
+    parser.add_argument("--tokens", type = int, default = _default_value(-1, suppress_defaults), help = "设置总的token数量（用于计算paged cache的最大页数）")
+    parser.add_argument("--page_size", type = int, default = _default_value(128, suppress_defaults), help = "设置paged cache每页的大小（token数）")
+    parser.add_argument("--gpu_mem_ratio", type = float, default = _default_value(0.9, suppress_defaults), help = "GPU显存使用比例，如0.9表示使用90%%的显存")
+
+    parser.add_argument('--custom', type = str, default = _default_value("", suppress_defaults), help = '指定描述自定义模型的python文件')
+    parser.add_argument('--lora', type = str, default = _default_value("", suppress_defaults), help = '指定lora路径')
+    parser.add_argument('--cache_dir', type = str, default = _default_value("", suppress_defaults), help = '指定缓存模型文件的路径')
+    parser.add_argument('--dtype_config', type = str, default = _default_value("", suppress_defaults), help = '指定权重类型配置文件')
+    parser.add_argument('--ori', type = str, default = _default_value("", suppress_defaults), help = '原始模型权重，读取GGUF文件时可以使用')
+
+    parser.add_argument('--tool_call_parser', type = str, default = _default_value("auto", suppress_defaults), help = '使用的tool_call_parser类型')
+    parser.add_argument('--chat_template', type = str, default = _default_value("", suppress_defaults), help = '使用的chat_template文件')
     return parser
+
+
+def make_normal_parser(des: str, add_help = True, include_model: bool = True,
+                       suppress_defaults: bool = False) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description = des, add_help = add_help)
+    return add_normal_args(parser, include_model = include_model, suppress_defaults = suppress_defaults)
 
 def add_server_args(parser):
     parser.add_argument("--model_name", type = str, default = '', help = "部署的模型名称, 调用api时会进行名称核验")
