@@ -15,7 +15,6 @@
 
 namespace fastllm {
     static void SyncCudaAndCheck(int device, const char *where);
-    static bool NeedTpDebugInfo();
 
     template <typename CudaOpType>
     static void RunCudaUnaryOp(const std::string &opType, const DataDict &datas,
@@ -341,18 +340,6 @@ namespace fastllm {
         if (remainingInCurrentPage > 0 && tokensToAppend > 0) {
             int currentPageIdx = cache.pageIndex.back();
             int copyLen = std::min(remainingInCurrentPage, tokensToAppend);
-            static int appendCopyDebugCount = 0;
-            if (NeedTpDebugInfo() && appendCopyDebugCount < 8) {
-                printf("[tp append copy] device=%d page=%d inputOffset=%d copyLen=%d pageOffset=%d mgr=[%d,%d,%d,%d] paged=%p input=%p\n",
-                       input.dataDeviceIds.empty() ? -1 : input.dataDeviceIds[0],
-                       currentPageIdx, inputOffset, copyLen, cache.lastPageLen,
-                       pagedKVCache.dims.size() > 0 ? pagedKVCache.dims[0] : -1,
-                       pagedKVCache.dims.size() > 1 ? pagedKVCache.dims[1] : -1,
-                       pagedKVCache.dims.size() > 2 ? pagedKVCache.dims[2] : -1,
-                       pagedKVCache.dims.size() > 3 ? pagedKVCache.dims[3] : -1,
-                       pagedData, inputData);
-                fflush(stdout);
-            }
             directCopyPage(currentPageIdx, inputOffset, copyLen, cache.lastPageLen);
             SyncCudaAndCheck(input.dataDeviceIds.empty() ? 0 : input.dataDeviceIds[0], "AppendPagedCacheLocal");
             cache.lastPageLen += copyLen;
@@ -364,19 +351,6 @@ namespace fastllm {
             int newPageIdx = pagedKVCache.GetUnusedPageIndex(true);
             cache.pageIndex.push_back(newPageIdx);
             int copyLen = std::min(pageLen, tokensToAppend);
-            static int appendCopyDebugCount = 0;
-            if (NeedTpDebugInfo() && appendCopyDebugCount < 8) {
-                printf("[tp append copy] device=%d page=%d inputOffset=%d copyLen=%d pageOffset=%d mgr=[%d,%d,%d,%d] paged=%p input=%p\n",
-                       input.dataDeviceIds.empty() ? -1 : input.dataDeviceIds[0],
-                       newPageIdx, inputOffset, copyLen, 0,
-                       pagedKVCache.dims.size() > 0 ? pagedKVCache.dims[0] : -1,
-                       pagedKVCache.dims.size() > 1 ? pagedKVCache.dims[1] : -1,
-                       pagedKVCache.dims.size() > 2 ? pagedKVCache.dims[2] : -1,
-                       pagedKVCache.dims.size() > 3 ? pagedKVCache.dims[3] : -1,
-                       pagedData, inputData);
-                fflush(stdout);
-                appendCopyDebugCount++;
-            }
             directCopyPage(newPageIdx, inputOffset, copyLen, 0);
             SyncCudaAndCheck(input.dataDeviceIds.empty() ? 0 : input.dataDeviceIds[0], "AppendPagedCacheLocal");
             cache.lastPageLen = copyLen;
@@ -779,21 +753,9 @@ namespace fastllm {
         return cached != 0 || GetFastllmEnv().cudaSync;
     }
 
-    static bool NeedTpDebugInfo() {
-        return false;
-    }
-
     static void SyncCudaAndCheck(int device, const char *where) {
         if (!NeedTpCudaCheck()) {
             return;
-        }
-        static const bool verbose = []() {
-            const char *env = getenv("FASTLLM_TP_CUDA_CHECK_VERBOSE");
-            return env != nullptr && strcmp(env, "0") != 0;
-        }();
-        if (verbose) {
-            printf("[tp cuda check] device=%d where=%s\n", device, where == nullptr ? "unknown" : where);
-            fflush(stdout);
         }
         FastllmCudaSyncDevice(device);
     }
@@ -2004,21 +1966,6 @@ namespace fastllm {
                 localCache = it->second;
             }
             PagedCacheManager *localManager = GetOrCreateLocalPagedCacheManager(rootManager, *localInput, device);
-            if (NeedTpDebugInfo()) {
-                printf("[tp append mgr] device=%d mgr=[%d,%d,%d,%d] ptr=%p free=%d maxPages=%d input=[%d,%d,%d]\n",
-                       device,
-                       localManager->dims.size() > 0 ? localManager->dims[0] : -1,
-                       localManager->dims.size() > 1 ? localManager->dims[1] : -1,
-                       localManager->dims.size() > 2 ? localManager->dims[2] : -1,
-                       localManager->dims.size() > 3 ? localManager->dims[3] : -1,
-                       localManager->cudaData,
-                       localManager->FreePageCount(),
-                       localManager->maxPages,
-                       localInput->dims.size() > 0 ? localInput->dims[0] : -1,
-                       localInput->dims.size() > 1 ? localInput->dims[1] : -1,
-                       localInput->dims.size() > 2 ? localInput->dims[2] : -1);
-                fflush(stdout);
-            }
             SyncCudaAndCheck(device, "MultiCudaAppendPagedCacheOp::localManagerReady");
             localCache->dataType = cache.dataType;
             localCache->UpdateUnitSize();
@@ -2027,23 +1974,6 @@ namespace fastllm {
             localCache->isPagedKVCache = true;
             EnsureEmptyPagedCacheCapacity(*localManager, *localCache, localInput->dims[1]);
             SyncCudaAndCheck(device, "MultiCudaAppendPagedCacheOp::capacityReady");
-            static int appendDebugCount = 0;
-            if (NeedTpDebugInfo() && appendDebugCount < 12) {
-                printf("[tp append] device=%d input=[%d,%d,%d] cache=[%d,%d,%d] maxPages=%d free=%zu trie=%zu pageLen=%d\n",
-                       device,
-                       localInput->dims.size() > 0 ? localInput->dims[0] : -1,
-                       localInput->dims.size() > 1 ? localInput->dims[1] : -1,
-                       localInput->dims.size() > 2 ? localInput->dims[2] : -1,
-                       localCache->dims.size() > 0 ? localCache->dims[0] : -1,
-                       localCache->dims.size() > 1 ? localCache->dims[1] : -1,
-                       localCache->dims.size() > 2 ? localCache->dims[2] : -1,
-                       localManager->maxPages,
-                       localManager->freePages.size(),
-                       localManager->triePages.size(),
-                       localManager->pageLen);
-                fflush(stdout);
-                appendDebugCount++;
-            }
             FastllmCudaSetDevice(device);
             AppendPagedCacheLocal(*localManager, *localCache, *localInput);
             SyncCudaAndCheck(device, "MultiCudaAppendPagedCacheOp");

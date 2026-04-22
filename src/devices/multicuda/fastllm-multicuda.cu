@@ -64,12 +64,6 @@ void FastllmCudaMemcpy2D(void* dst, size_t dpitch, const void* src,
 #endif
 
     if (state != cudaSuccess) {
-        static int memcpy2dErrorPrint = 0;
-        if (memcpy2dErrorPrint < 16) {
-            printf("[multicuda memcpy2d] dstDev=%d srcDev=%d type=%d dpitch=%zu spitch=%zu width=%zu height=%zu\n",
-                   dstDeviceId, srcDeviceId, (int)type, dpitch, spitch, width, height);
-            memcpy2dErrorPrint++;
-        }
         checkCudaErrors("Error: CUDA error when memcpy2D!", state);
     }
 }
