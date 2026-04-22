@@ -750,9 +750,16 @@ namespace fastllm {
         this->tpQHeads = ori.tpQHeads;
         this->tpKVHeads = ori.tpKVHeads;
         this->tpHeadDim = ori.tpHeadDim;
+        bool needRebuildGGUFTensor = ori.dataType == DataType::DATA_GGUF_FORMAT &&
+                                     (this->ggmlTensor == nullptr || this->ggmlType != ori.ggmlType);
+        this->isGGUFData = ori.isGGUFData || ori.dataType == DataType::DATA_GGUF_FORMAT;
+        this->ggmlType = ori.ggmlType;
+        this->IsRepacked = ori.IsRepacked;
         
         // std::cout<<"调用拷贝构造"<<std::endl;
-        if (ori.expansionDims != this->expansionDims || ori.dims != this->dims || this->cpuData == nullptr || ori.dataType != this->dataType) {
+        if (needRebuildGGUFTensor ||
+            ori.expansionDims != this->expansionDims || ori.dims != this->dims ||
+            this->cpuData == nullptr || ori.dataType != this->dataType) {
             if (ori.dims.size() == 0) {
                 this->dataType = ori.dataType;
                 this->UpdateUnitSize();

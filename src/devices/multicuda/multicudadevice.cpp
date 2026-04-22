@@ -8,6 +8,7 @@
 #include "devices/multicuda/multicudadevice.h"
 
 #include "fastllm-multicuda.cuh"
+#include "gguf.h"
 
 #include "utils.h"
 
@@ -157,6 +158,59 @@ namespace fastllm {
     static bool HasSuffix(const std::string &value, const std::string &suffix) {
         return value.size() >= suffix.size() &&
                value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+    static int GcdInt(int a, int b) {
+        a = a < 0 ? -a : a;
+        b = b < 0 ? -b : b;
+        while (b != 0) {
+            int t = a % b;
+            a = b;
+            b = t;
+        }
+        return a == 0 ? 1 : a;
+    }
+
+    static int LcmInt(int a, int b) {
+        a = std::max(1, a);
+        b = std::max(1, b);
+        return a / GcdInt(a, b) * b;
+    }
+
+    static bool IsGGUFTensor(const fastllm::Data &data) {
+        return data.dataType == fastllm::DataType::DATA_GGUF_FORMAT && data.ggmlType >= 0;
+    }
+
+    static int GetGGUFBlockSize(const fastllm::Data &data) {
+        return IsGGUFTensor(data) ? (int)ggml_blck_size((ggml_type)data.ggmlType) : 1;
+    }
+
+    static int GetMultiCudaSplitUnit(const fastllm::Data &data) {
+        int unit = data.groupCnt <= 0 ? 128 : data.groupCnt;
+        if (data.dataType == fastllm::DataType::FP8_E4M3) {
+            unit = data.blockM;
+        }
+        if (IsGGUFTensor(data)) {
+            unit = LcmInt(unit, GetGGUFBlockSize(data));
+        }
+        return std::max(1, unit);
+    }
+
+    static int GetMultiCudaSplitUnit(const fastllm::Data &data0, const fastllm::Data &data1) {
+        int unit = GetMultiCudaSplitUnit(data0);
+        if (IsGGUFTensor(data1)) {
+            unit = LcmInt(unit, GetGGUFBlockSize(data1));
+        }
+        return std::max(1, unit);
+    }
+
+    static int GetGGUFHeadSplitUnit(const fastllm::Data &data, int widthPerHead) {
+        if (!IsGGUFTensor(data)) {
+            return 1;
+        }
+        int blockSize = GetGGUFBlockSize(data);
+        int gcd = GcdInt(blockSize, std::max(1, widthPerHead));
+        return std::max(1, blockSize / gcd);
     }
 
     static bool IsTensorParallelRowWeight(const fastllm::Data &weight) {
@@ -2343,10 +2397,9 @@ namespace fastllm {
         output.Allocate();
 // auto st = std::chrono::system_clock::now();
         int mid = weight0.dims[0] / 2;
-        int unit = weight0.groupCnt <= 0 ? 128 : weight0.groupCnt;
-        if (weight0.dataType == fastllm::DataType::FP8_E4M3) {
-            unit = weight0.blockM;
-        }
+        int unit = GetMultiCudaSplitUnit(weight0, weight1);
+        AssertInFastLLM((!IsGGUFTensor(weight0) && !IsGGUFTensor(weight1)) || mid % unit == 0,
+                        "GGUF MLP tensor parallel requires aligned split unit " + std::to_string(unit) + ".\n");
         std::vector <int> devices;
         std::map <int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, false);
@@ -2931,10 +2984,9 @@ auto st = std::chrono::system_clock::now();
         int m = input.dims.back();
         int k = output.dims.back();
 
-        int unit = weight.groupCnt <= 0 ? 128 : weight.groupCnt;
-        if (weight.dataType == fastllm::DataType::FP8_E4M3) {
-            unit = weight.blockM;
-        }
+        int unit = GetMultiCudaSplitUnit(weight);
+        AssertInFastLLM(!IsGGUFTensor(weight) || weight.dims[0] % unit == 0,
+                        "GGUF row split requires aligned split unit " + std::to_string(unit) + ".\n");
         std::vector <int> devices;
         std::map <int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
@@ -3251,7 +3303,10 @@ auto st = std::chrono::system_clock::now();
         std::vector <int> devices;
         std::map <int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
-        std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, kvNum, 1);
+        int headUnit = GetGGUFHeadSplitUnit(weight1, group * vDim);
+        AssertInFastLLM(!IsGGUFTensor(weight1) || kvNum % headUnit == 0,
+                        "GGUF attention tensor parallel requires aligned head unit " + std::to_string(headUnit) + ".\n");
+        std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, kvNum, headUnit);
 
         FastllmInitNccl(devices);
         
@@ -3602,7 +3657,12 @@ auto st = std::chrono::system_clock::now();
                     continue;
                 }
                 int k = weights[i]->dims[0];
-                std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, k / 2, weights[i]->groupCnt <= 0 ? 128 : weights[i]->groupCnt);
+                int unit = weights[i + 1] == nullptr ? GetMultiCudaSplitUnit(*weights[i])
+                                                     : GetMultiCudaSplitUnit(*weights[i], *weights[i + 1]);
+                AssertInFastLLM((!IsGGUFTensor(*weights[i]) && (weights[i + 1] == nullptr || !IsGGUFTensor(*weights[i + 1]))) ||
+                                (k / 2) % unit == 0,
+                                "GGUF MoE tensor parallel requires aligned split unit " + std::to_string(unit) + ".\n");
+                std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, k / 2, unit);
                 DivisionScheme divisionScheme, divisionSchemeO;
                 int mid = weights[i]->dims[0] / 2;
                 for (int i = 0; i < devices.size(); i++) {
