@@ -340,7 +340,7 @@ namespace fastllm {
     static PagedCacheManager* GetOrCreateLocalPagedCacheManager(PagedCacheManager &rootManager,
                                                                 const fastllm::Data &localInput,
                                                                 int deviceId) {
-        Data localDesc(localInput.dataType, localInput.dims);
+        Data localDesc(rootManager.dataType, localInput.dims);
         localDesc.dataDevice = DataDevice::CUDA;
         localDesc.dataDeviceIds = {deviceId};
         int maxPages = rootManager.maxPages > 0 ? rootManager.maxPages : (rootManager.dims.empty() ? 0 : rootManager.dims[0]);

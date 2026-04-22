@@ -112,6 +112,26 @@ namespace fastllm {
         }
 
         int bsz = attenInput->dims[0], seqlen = attenInput->dims[1];
+        auto resolvePagedAttentionQType = [&](DataType cacheType, DataType queryType) -> DataType {
+            if (cacheType == DataType::FLOAT16 || cacheType == DataType::BFLOAT16) {
+                return cacheType;
+            }
+            if (queryType == DataType::FLOAT16 || queryType == DataType::BFLOAT16) {
+                return queryType;
+            }
+            if (attenInput->dataType == DataType::BFLOAT16) {
+                return DataType::BFLOAT16;
+            }
+            return DataType::FLOAT16;
+        };
+        auto preparePagedAttentionQ = [&](Data &src, DataType cacheType, Data &casted) -> Data& {
+            DataType targetType = resolvePagedAttentionQType(cacheType, src.dataType);
+            if (src.dataType == targetType) {
+                return src;
+            }
+            ToDataType(src, casted, targetType);
+            return casted;
+        };
 
         if (!isPrefill && (*batchPastKeys)[0]->pagedKVCacheData == nullptr) {
             isPrefill = true;
@@ -200,15 +220,17 @@ namespace fastllm {
             {
                 Data &kCaches = *(*batchPastKeys)[0];
                 Data &vCaches = *(*batchPastValues)[0];
+                Data qForAttentionHolder;
+                Data &qForAttention = preparePagedAttentionQ(*q, kCaches.dataType, qForAttentionHolder);
 
                 // 生成 PagedBatch 参数，传入 seqLens 使 qSizes 按各 batch 的 seqLen 前缀和生成
-                GeneratePagedBatchParams(*q, *batchPastKeys, batch,
+                GeneratePagedBatchParams(qForAttention, *batchPastKeys, batch,
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens, seqLens);
 
-                AttentionPagedBatch(*q,
+                AttentionPagedBatch(qForAttention,
                     kCaches, vCaches,
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                    *attenOutput, q->dims[0] / kCaches.dims[0], 1.0 / sqrt(head_dim), 1, layerIdx > 0);
+                    *attenOutput, qForAttention.dims[0] / kCaches.dims[0], 1.0 / sqrt(head_dim), 1, layerIdx > 0);
             }
 
             // 2.8 AttentionPagedBatch 输出形状为 [seqlen, num_heads, head_dim]
@@ -264,14 +286,18 @@ namespace fastllm {
 
             // 8. 生成分页批量参数并执行 AttentionPagedBatch
             if (!(*generatedDecodeParams)) {
-                GeneratePagedBatchParams(*q, *batchPastKeys, batch, 
+                Data qForAttentionHolder;
+                Data &qForAttention = preparePagedAttentionQ(*q, kCaches.dataType, qForAttentionHolder);
+                GeneratePagedBatchParams(qForAttention, *batchPastKeys, batch, 
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens);
                 *generatedDecodeParams = true;
             }
-            AttentionPagedBatch(*q, 
+            Data qForAttentionHolder;
+            Data &qForAttention = preparePagedAttentionQ(*q, kCaches.dataType, qForAttentionHolder);
+            AttentionPagedBatch(qForAttention, 
                 kCaches, vCaches, 
                 *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                *attenOutput, q->dims[0] / kCaches.dims[0], 1.0 / sqrt(head_dim), 1, layerIdx > 0);
+                *attenOutput, qForAttention.dims[0] / kCaches.dims[0], 1.0 / sqrt(head_dim), 1, layerIdx > 0);
 
             // 9. Reshape + Permute
             attenOutput->Reshape({seqlen, bsz, -1});
