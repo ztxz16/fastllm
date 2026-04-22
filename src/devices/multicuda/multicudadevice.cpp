@@ -29,6 +29,10 @@ namespace fastllm {
     static bool RunReplicatedMultiCudaUnary(const std::string &opType, Data &input, Data &output,
                                             const FloatDict &floatParams, const IntDict &intParams);
 
+    template <typename CudaOpType>
+    static bool RunShardedMultiCudaUnary(const std::string &opType, Data &input, Data &output,
+                                         const FloatDict &floatParams, const IntDict &intParams);
+
     static void RunCudaSelectExpertOp(const std::string &opType, const DataDict &datas,
                                       const FloatDict &floatParams, const IntDict &intParams);
 
@@ -54,12 +58,16 @@ namespace fastllm {
         this->ops["RMSNorm"] = (BaseOperator*)(new MultiCudaRMSNormOp());
         this->ops["RMSNormPart"] = (BaseOperator*)(new MultiCudaRMSNormPartOp());
         this->ops["AddTo"] = (BaseOperator*)(new MultiCudaAddToOp());
+        this->ops["Cat"] = (BaseOperator*)(new MultiCudaCatOp());
         this->ops["Split"] = (BaseOperator*)(new MultiCudaSplitOp());
         this->ops["Swiglu"] = (BaseOperator*)(new MultiCudaSwigluOp());
         this->ops["PermuteSelf"] = (BaseOperator*)(new MultiCudaPermuteSelfOp());
+        this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new MultiCudaLlamaRotatePosition2DOp());
+        this->ops["LlamaRotatePosition2DPart"] = (BaseOperator*)(new MultiCudaLlamaRotatePosition2DPartOp());
         this->ops["RopeEncoding"] = (BaseOperator*)(new MultiCudaRopeEncodingOp());
         this->ops["Qwen35InterleavedRope"] = (BaseOperator*)(new MultiCudaQwen35InterleavedRopeOp());
         this->ops["AppendPagedCache"] = (BaseOperator*)(new MultiCudaAppendPagedCacheOp());
+        this->ops["AttentionPaged"] = (BaseOperator*)(new MultiCudaAttentionPagedOp());
         this->ops["AttentionPagedBatch"] = (BaseOperator*)(new MultiCudaAttentionPagedBatchOp());
         this->ops["QKVRMSNormRopeSplitAppendPagedCache"] =
                 (BaseOperator*)(new MultiCudaQKVRMSNormRopeSplitAppendPagedCacheOp());
@@ -262,17 +270,33 @@ namespace fastllm {
             }
         }
         AssertInFastLLM(other > 0, "Tensor parallel local shape sync failed.\n");
+        long long totalRange = 0;
+        for (auto &it : data.tpRanges) {
+            for (auto &range : it.second) {
+                totalRange += range.second - range.first;
+            }
+        }
+        bool validRanges = totalRange == data.dims[axis];
         for (int device : devices) {
             auto it = data.multiDeviceDatas.find(device);
             if (it == data.multiDeviceDatas.end() || it->second == nullptr) {
                 continue;
             }
             Data *local = it->second;
-            long long localCount = local->Count(0);
-            AssertInFastLLM(localCount % other == 0,
-                            "Tensor parallel local shape sync failed: local count mismatch.\n");
             std::vector <int> localDims = data.dims;
-            localDims[axis] = (int)(localCount / other);
+            auto rangeIt = data.tpRanges.find(device);
+            if (validRanges && rangeIt != data.tpRanges.end() && !rangeIt->second.empty()) {
+                int localAxis = 0;
+                for (auto &range : rangeIt->second) {
+                    localAxis += range.second - range.first;
+                }
+                localDims[axis] = localAxis;
+            } else {
+                long long localCount = local->Count(0);
+                AssertInFastLLM(localCount % other == 0,
+                                "Tensor parallel local shape sync failed: local count mismatch.\n");
+                localDims[axis] = (int)(localCount / other);
+            }
             if (local->dims != localDims) {
                 local->Resize(localDims);
             }
@@ -1048,6 +1072,9 @@ namespace fastllm {
                                         const FloatDict &floatParams, const IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
+        if (RunShardedMultiCudaUnary<CudaConvertToFloat16>(opType, input, output, floatParams, intParams)) {
+            return;
+        }
         if (RunReplicatedMultiCudaUnary<CudaConvertToFloat16>(opType, input, output, floatParams, intParams)) {
             return;
         }
@@ -1058,6 +1085,9 @@ namespace fastllm {
                                         const FloatDict &floatParams, const IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
+        if (RunShardedMultiCudaUnary<CudaConvertToFloat32>(opType, input, output, floatParams, intParams)) {
+            return;
+        }
         if (RunReplicatedMultiCudaUnary<CudaConvertToFloat32>(opType, input, output, floatParams, intParams)) {
             return;
         }
@@ -1077,6 +1107,9 @@ namespace fastllm {
                                          const FloatDict &floatParams, const IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
+        if (RunShardedMultiCudaUnary<CudaConvertToBFloat16>(opType, input, output, floatParams, intParams)) {
+            return;
+        }
         if (RunReplicatedMultiCudaUnary<CudaConvertToBFloat16>(opType, input, output, floatParams, intParams)) {
             return;
         }
@@ -1638,6 +1671,177 @@ namespace fastllm {
         // SyncReplicatedRootFromReplica(input0, devices);
     }
 
+    static void DoCudaCatReshape(const Data &input0, const Data &input1, int axis, Data &output) {
+        if (input0.dims.empty() && !input1.dims.empty()) {
+            output.dataType = input1.dataType;
+            output.Resize(input1.dims);
+            return;
+        }
+        if (input1.dims.empty() && !input0.dims.empty()) {
+            output.dataType = input0.dataType;
+            output.Resize(input0.dims);
+            return;
+        }
+
+        AssertInFastLLM(input0.dataType == input1.dataType, "Cat Error: input data types should be same.\n");
+        AssertInFastLLM(input0.dims.size() == input1.dims.size(), "Cat Error: input's shape's size should be same.\n");
+        int dimsLen = (int)input0.dims.size();
+        axis = NormalizeAxis(axis, dimsLen);
+        for (int i = 0; i < dimsLen; i++) {
+            if (i != axis) {
+                AssertInFastLLM(input0.dims[i] == input1.dims[i], "Cat Error: input's shape doesn't match.");
+            }
+        }
+
+        std::vector <int> dims = input0.dims;
+        dims[axis] += input1.dims[axis];
+        output.dataType = input0.dataType;
+        output.Resize(dims);
+    }
+
+    static void DoCudaCat(const Data &input0, const Data &input1, int axis, Data &output) {
+        DoCudaCatReshape(input0, input1, axis, output);
+        if (input0.dims.empty() && !input1.dims.empty()) {
+            output.CopyFrom(input1);
+            return;
+        }
+        if (input1.dims.empty() && !input0.dims.empty()) {
+            output.CopyFrom(input0);
+            return;
+        }
+
+        axis = NormalizeAxis(axis, (int)input0.dims.size());
+        output.Allocate();
+
+        int outer = output.Count(0) / output.Count(axis);
+        int input0Stride = input0.Count(axis);
+        int input1Stride = input1.Count(axis);
+        int outputStride = output.Count(axis);
+        int inner = input0.strides[axis];
+        int unitSize = input0.unitSize;
+        int outputDevice = output.dataDeviceIds.empty() ? 0 : output.dataDeviceIds[0];
+        int input0Device = input0.dataDeviceIds.empty() ? outputDevice : input0.dataDeviceIds[0];
+        int input1Device = input1.dataDeviceIds.empty() ? outputDevice : input1.dataDeviceIds[0];
+
+        FastllmCudaMemcpy2DDeviceToDeviceAuto(
+            (uint8_t*)output.cudaData, outputStride * unitSize,
+            (uint8_t*)input0.cudaData, input0Stride * unitSize,
+            input0.dims[axis] * inner * unitSize, outer,
+            outputDevice, input0Device
+        );
+        FastllmCudaMemcpy2DDeviceToDeviceAuto(
+            (uint8_t*)output.cudaData + input0.dims[axis] * inner * unitSize, outputStride * unitSize,
+            (uint8_t*)input1.cudaData, input1Stride * unitSize,
+            input1.dims[axis] * inner * unitSize, outer,
+            outputDevice, input1Device
+        );
+    }
+
+    void MultiCudaCatOp::Reshape(const std::string &opType, const DataDict &datas,
+                                 const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis")->second;
+        DoCudaCatReshape(input0, input1, axis, output);
+    }
+
+    void MultiCudaCatOp::Run(const std::string &opType, const DataDict &datas,
+                             const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input0 = *(datas.find("input0")->second);
+        Data &input1 = *(datas.find("input1")->second);
+        Data &output = *(datas.find("output")->second);
+        int axis = intParams.find("axis")->second;
+
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || (!input0.multiDeviceData && !input1.multiDeviceData)) {
+            DoCudaCat(input0, input1, axis, output);
+            return;
+        }
+
+        if (input0.dims.empty() || input1.dims.empty()) {
+            DoCudaCat(input0, input1, axis, output);
+            return;
+        }
+
+        axis = NormalizeAxis(axis, (int)input0.dims.size());
+        bool sharded0 = input0.IsTensorParallelSharded();
+        bool sharded1 = input1.IsTensorParallelSharded();
+
+        if (!sharded0 && !sharded1) {
+            DoCudaCatReshape(input0, input1, axis, output);
+            EnsureReplicatedMultiCudaTensor(input0, devices, true);
+            EnsureReplicatedMultiCudaTensor(input1, devices, true);
+            EnsureReplicatedMultiCudaTensor(output, devices, false);
+            SyncReplicatedLocalShapeFromRoot(input0, devices);
+            SyncReplicatedLocalShapeFromRoot(input1, devices);
+            SyncReplicatedLocalShapeFromRoot(output, devices);
+            for (int device : devices) {
+                FastllmCudaSetDevice(device);
+                DoCudaCat(*input0.multiDeviceDatas[device], *input1.multiDeviceDatas[device], axis,
+                          *output.multiDeviceDatas[device]);
+            }
+            return;
+        }
+
+        AssertInFastLLM(sharded0 && sharded1,
+                        "MultiCudaCat mixed sharded/non-sharded inputs are not supported.\n");
+        int tpAxis0 = NormalizeAxis(input0.tpAxis, (int)input0.dims.size());
+        int tpAxis1 = NormalizeAxis(input1.tpAxis, (int)input1.dims.size());
+        AssertInFastLLM(tpAxis0 == tpAxis1, "MultiCudaCat requires both sharded inputs use the same tp axis.\n");
+
+        SyncShardedLocalShapeFromRoot(input0, devices);
+        SyncShardedLocalShapeFromRoot(input1, devices);
+
+        DoCudaCatReshape(input0, input1, axis, output);
+        ResetMultiCudaTensor(output);
+        output.multiDeviceData = true;
+        output.tpLayout = TP_LAYOUT_SHARDED;
+        output.tpAxis = tpAxis0;
+        output.tpGlobalDims = output.dims;
+        output.cudaData = nullptr;
+
+        if (axis != tpAxis0) {
+            AssertInFastLLM(input0.tpRanges == input1.tpRanges,
+                            "MultiCudaCat requires identical tp ranges when concatenating on a non-sharded axis.\n");
+            output.tpRanges = input0.tpRanges;
+        } else {
+            int shift = input0.dims[axis];
+            for (int device : devices) {
+                auto it0 = input0.tpRanges.find(device);
+                if (it0 != input0.tpRanges.end()) {
+                    output.tpRanges[device] = it0->second;
+                }
+                auto it1 = input1.tpRanges.find(device);
+                if (it1 != input1.tpRanges.end()) {
+                    for (auto &range : it1->second) {
+                        output.tpRanges[device].push_back({range.first + shift, range.second + shift});
+                    }
+                }
+            }
+        }
+
+        for (int device : devices) {
+            auto it0 = input0.multiDeviceDatas.find(device);
+            auto it1 = input1.multiDeviceDatas.find(device);
+            if ((it0 == input0.multiDeviceDatas.end() || it0->second == nullptr) &&
+                (it1 == input1.multiDeviceDatas.end() || it1->second == nullptr)) {
+                continue;
+            }
+            AssertInFastLLM(it0 != input0.multiDeviceDatas.end() && it0->second != nullptr &&
+                            it1 != input1.multiDeviceDatas.end() && it1->second != nullptr,
+                            "MultiCudaCat requires both sharded inputs to have local tensors on the same devices.\n");
+            FastllmCudaSetDevice(device);
+            Data *localOutput = new Data(output.dataType);
+            localOutput->dataDevice = DataDevice::CUDA;
+            localOutput->dataDeviceIds = {device};
+            DoCudaCat(*it0->second, *it1->second, axis, *localOutput);
+            output.multiDeviceDatas[device] = localOutput;
+        }
+    }
+
     void MultiCudaSplitOp::Reshape(const std::string &opType, const DataDict &datas,
                                    const FloatDict &floatParams, const IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -1890,6 +2094,83 @@ namespace fastllm {
         input.tpGlobalDims = input.dims;
     }
 
+    void MultiCudaLlamaRotatePosition2DOp::Run(const std::string &opType, const DataDict &datas,
+                                               const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &sinData = *(datas.find("sin")->second);
+        Data &cosData = *(datas.find("cos")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || !input.multiDeviceData) {
+            FastllmCudaLlamaRotatePosition2D(input, positionIds, sinData, cosData, rotaryDim);
+            return;
+        }
+
+        EnsureReplicatedMultiCudaTensor(positionIds, devices, true);
+        EnsureReplicatedMultiCudaTensor(sinData, devices, true);
+        EnsureReplicatedMultiCudaTensor(cosData, devices, true);
+        if (input.IsTensorParallelReplicated()) {
+            SyncReplicatedLocalShapeFromRoot(input, devices);
+        } else {
+            SyncShardedLocalShapeFromRoot(input, devices);
+        }
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            FastllmCudaLlamaRotatePosition2D(*input.multiDeviceDatas[device],
+                                            *positionIds.multiDeviceDatas[device],
+                                            *sinData.multiDeviceDatas[device],
+                                            *cosData.multiDeviceDatas[device],
+                                            rotaryDim);
+        }
+        SyncCudaAndCheckAll(devices, "MultiCudaLlamaRotatePosition2DOp");
+        if (input.IsTensorParallelReplicated()) {
+            SyncReplicatedRootFromReplica(input, devices);
+        }
+    }
+
+    void MultiCudaLlamaRotatePosition2DPartOp::Run(const std::string &opType, const DataDict &datas,
+                                                   const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        Data &sinData = *(datas.find("sin")->second);
+        Data &cosData = *(datas.find("cos")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        int part = intParams.find("part") != intParams.end() ? intParams.find("part")->second : 128;
+
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || !input.multiDeviceData) {
+            FastllmCudaLlamaRotatePosition2DPart(input, positionIds, sinData, cosData, rotaryDim, part);
+            return;
+        }
+
+        EnsureReplicatedMultiCudaTensor(positionIds, devices, true);
+        EnsureReplicatedMultiCudaTensor(sinData, devices, true);
+        EnsureReplicatedMultiCudaTensor(cosData, devices, true);
+        if (input.IsTensorParallelReplicated()) {
+            SyncReplicatedLocalShapeFromRoot(input, devices);
+        } else {
+            SyncShardedLocalShapeFromRoot(input, devices);
+        }
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            FastllmCudaLlamaRotatePosition2DPart(*input.multiDeviceDatas[device],
+                                                *positionIds.multiDeviceDatas[device],
+                                                *sinData.multiDeviceDatas[device],
+                                                *cosData.multiDeviceDatas[device],
+                                                rotaryDim, part);
+        }
+        SyncCudaAndCheckAll(devices, "MultiCudaLlamaRotatePosition2DPartOp");
+        if (input.IsTensorParallelReplicated()) {
+            SyncReplicatedRootFromReplica(input, devices);
+        }
+    }
+
     void MultiCudaRopeEncodingOp::Run(const std::string &opType, const DataDict &datas,
                                       const FloatDict &floatParams, const IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
@@ -2037,6 +2318,70 @@ namespace fastllm {
         Data *rootLocal = cache.multiDeviceDatas[rootDevice];
         SyncRootPagedCacheMeta(cache, *rootLocal, rootManager);
         cache.Resize({input.dims[0], rootLocal->dims[1], input.dims[2]});
+    }
+
+    void MultiCudaAttentionPagedOp::Run(const std::string &opType, const DataDict &datas,
+                                        const FloatDict &floatParams, const IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        Data &k = *(datas.find("k")->second);
+        Data &v = *(datas.find("v")->second);
+        Data &output = *(datas.find("output")->second);
+        int group = intParams.find("group") != intParams.end() ? intParams.find("group")->second : q.dims[0] / k.dims[0];
+        float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0f;
+        bool inited = intParams.find("inited") != intParams.end() ? (intParams.find("inited")->second != 0) : false;
+
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || !q.multiDeviceData) {
+            output.Allocate();
+            FastllmCudaHalfPagedAttention(q, k, v, output, group, scale, inited);
+            return;
+        }
+
+        AssertInFastLLM(q.IsTensorParallelSharded(), "MultiCudaAttentionPaged only supports sharded q.\n");
+        SyncShardedLocalShapeFromRoot(q, devices);
+        if (k.IsTensorParallelSharded()) {
+            SyncShardedLocalShapeFromRoot(k, devices);
+        } else {
+            EnsureReplicatedMultiCudaTensor(k, devices, true);
+            SyncReplicatedLocalShapeFromRoot(k, devices);
+        }
+        if (v.IsTensorParallelSharded()) {
+            SyncShardedLocalShapeFromRoot(v, devices);
+        } else {
+            EnsureReplicatedMultiCudaTensor(v, devices, true);
+            SyncReplicatedLocalShapeFromRoot(v, devices);
+        }
+
+        output.dataType = q.dataType;
+        output.Resize(q.dims);
+        if (!output.multiDeviceData || !output.IsTensorParallelSharded()) {
+            ResetMultiCudaTensor(output);
+            CopyShardedLayout(output, q, devices);
+            SyncShardedLocalShapeFromRoot(output, devices);
+        } else {
+            output.tpAxis = q.tpAxis;
+            output.tpGlobalDims = q.dims;
+            output.tpRanges = q.tpRanges;
+            output.cudaData = nullptr;
+            SyncShardedLocalShapeFromRoot(output, devices);
+        }
+
+        for (int device : devices) {
+            Data *localQ = q.multiDeviceDatas[device];
+            Data *localK = k.multiDeviceDatas[device];
+            Data *localV = v.multiDeviceDatas[device];
+            Data *localOutput = output.multiDeviceDatas[device];
+            FastllmCudaSetDevice(device);
+            localOutput->Allocate();
+            int localGroup = group;
+            if (localK != nullptr && !localK->dims.empty() && localK->dims[0] > 0) {
+                localGroup = std::max(1, localQ->dims[0] / localK->dims[0]);
+            }
+            FastllmCudaHalfPagedAttention(*localQ, *localK, *localV, *localOutput, localGroup, scale, inited);
+        }
+        SyncCudaAndCheckAll(devices, "MultiCudaAttentionPagedOp");
     }
 
     void MultiCudaAttentionPagedBatchOp::Run(const std::string &opType, const DataDict &datas,
@@ -2744,6 +3089,56 @@ namespace fastllm {
         return true;
     }
 
+    template <typename CudaOpType>
+    static bool RunShardedMultiCudaUnary(const std::string &opType, Data &input, Data &output,
+                                         const FloatDict &floatParams, const IntDict &intParams) {
+        std::vector <int> devices;
+        std::map <int, int> ratios;
+        FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+        if (devices.size() <= 1 || !input.multiDeviceData || !input.IsTensorParallelSharded()) {
+            return false;
+        }
+
+        SyncShardedLocalShapeFromRoot(input, devices);
+
+        {
+            CudaOpType cudaOp;
+            DataDict rootDatas = {
+                {"input", &input},
+                {"output", &output}
+            };
+            ((BaseOperator*)(&cudaOp))->Reshape(opType, rootDatas, floatParams, intParams);
+        }
+
+        ResetMultiCudaTensor(output);
+        output.multiDeviceData = true;
+        output.tpLayout = TP_LAYOUT_SHARDED;
+        output.tpAxis = input.tpAxis;
+        output.tpGlobalDims = output.dims;
+        output.tpRanges = input.tpRanges;
+        output.cudaData = nullptr;
+
+        for (int device : devices) {
+            auto it = input.multiDeviceDatas.find(device);
+            if (it == input.multiDeviceDatas.end() || it->second == nullptr) {
+                continue;
+            }
+            FastllmCudaSetDevice(device);
+            Data *localOutput = new Data();
+            localOutput->dataDevice = DataDevice::CUDA;
+            localOutput->dataDeviceIds = {device};
+            CudaOpType cudaOp;
+            DataDict localDatas = {
+                {"input", it->second},
+                {"output", localOutput}
+            };
+            ((BaseOperator*)(&cudaOp))->Reshape(opType, localDatas, floatParams, intParams);
+            ((BaseOperator*)(&cudaOp))->Run(opType, localDatas, floatParams, intParams);
+            output.multiDeviceDatas[device] = localOutput;
+        }
+        return true;
+    }
+
     static bool RunReplicatedMultiCudaSelectExpert(const std::string &opType, Data &logits, Data *gateBias,
                                                    Data &index, Data &score,
                                                    const FloatDict &floatParams, const IntDict &intParams) {
@@ -2949,10 +3344,10 @@ namespace fastllm {
         Data &bias = *(datas.find("bias")->second);
         bool keepTpReplicated = intParams.find("keepTpReplicated") != intParams.end() &&
                                 intParams.find("keepTpReplicated")->second != 0;
-        bool isRowLinear = weight.tpLinearType == TP_LINEAR_ROW ||
-                           (!input.IsTensorParallelSharded() && IsTensorParallelRowWeight(weight));
-        bool isColumnLinear = weight.tpLinearType == TP_LINEAR_COLUMN ||
-                              input.IsTensorParallelSharded() || IsTensorParallelColumnWeight(weight);
+        bool preferRowLinear = weight.tpLinearType == TP_LINEAR_ROW || IsTensorParallelRowWeight(weight);
+        bool preferColumnLinear = weight.tpLinearType == TP_LINEAR_COLUMN || IsTensorParallelColumnWeight(weight);
+        bool isRowLinear = preferRowLinear;
+        bool isColumnLinear = !preferRowLinear && (preferColumnLinear || input.IsTensorParallelSharded());
 /* printf("into multi linear\n");
 auto st = std::chrono::system_clock::now();
 {

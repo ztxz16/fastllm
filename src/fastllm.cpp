@@ -1320,6 +1320,14 @@ namespace fastllm {
     }
 
     void Data::Resize(const std::vector<int> &dims) {
+        std::vector <int> oldDims = this->dims;
+        uint64_t oldCount = 1, newCount = 1;
+        for (int v : oldDims) {
+            oldCount *= v;
+        }
+        for (int v : dims) {
+            newCount *= v;
+        }
         this->dims = dims;
         this->UpdateUnitSize();
 
@@ -1356,6 +1364,25 @@ namespace fastllm {
             this->strides.back() = 1;
             for (int i = this->dims.size() - 2; i >= 0; i--) {
                 this->strides[i] = this->dims[i + 1] * this->strides[i + 1];
+            }
+        }
+
+        if (this->multiDeviceData && this->tpLayout == TP_LAYOUT_SHARDED && !this->dims.empty()) {
+            int axis = (this->tpAxis % (int)this->dims.size() + (int)this->dims.size()) % (int)this->dims.size();
+            long long totalRange = 0;
+            for (auto &it : this->tpRanges) {
+                for (auto &range : it.second) {
+                    totalRange += range.second - range.first;
+                }
+            }
+            if (oldCount != newCount && totalRange > 0 && totalRange != this->dims[axis]) {
+                for (auto &it : this->multiDeviceDatas) {
+                    delete it.second;
+                }
+                this->multiDeviceDatas.clear();
+                this->multiDeviceData = false;
+                this->ClearTensorParallelLayout();
+                return;
             }
         }
     }
@@ -1410,6 +1437,15 @@ namespace fastllm {
         auto normalizeAxis = [](int axis, int dimsLen) {
             return (axis % dimsLen + dimsLen) % dimsLen;
         };
+        auto sumRanges = [](const std::map<int, std::vector<std::pair<int, int>>> &tpRanges) {
+            long long total = 0;
+            for (auto &it : tpRanges) {
+                for (auto &range : it.second) {
+                    total += range.second - range.first;
+                }
+            }
+            return total;
+        };
         auto scaleRanges = [&](int mul, int div) {
             for (auto &it : this->tpRanges) {
                 for (auto &range : it.second) {
@@ -1421,12 +1457,15 @@ namespace fastllm {
 
         int oldAxis = normalizeAxis(this->tpAxis, (int)oldDims.size());
         int newAxis = oldAxis;
+        bool validOldRanges = sumRanges(this->tpRanges) == oldDims[oldAxis];
         if ((int)oldDims.size() + 1 == (int)outputDims.size() &&
             oldAxis == (int)oldDims.size() - 1 &&
             outputDims.back() > 0 &&
             oldDims.back() == outputDims[(int)outputDims.size() - 2] * outputDims.back()) {
             newAxis = (int)outputDims.size() - 2;
-            scaleRanges(1, outputDims.back());
+            if (validOldRanges) {
+                scaleRanges(1, outputDims.back());
+            }
         } else if ((int)oldDims.size() == 4 && (int)outputDims.size() == 3 &&
                    oldAxis == 1 && oldDims[0] == 1 &&
                    outputDims[0] == oldDims[1] &&
@@ -1438,7 +1477,9 @@ namespace fastllm {
                    outputDims[0] * outputDims[1] == oldDims[1] &&
                    outputDims[2] == oldDims[0] * oldDims[2]) {
             newAxis = 2;
-            scaleRanges(oldDims[2], 1);
+            if (validOldRanges) {
+                scaleRanges(oldDims[2], 1);
+            }
         }
 
         this->tpAxis = newAxis;
@@ -1452,14 +1493,28 @@ namespace fastllm {
             }
         }
         AssertInFastLLM(other > 0, "Tensor parallel reshape error.\n");
+        int offset = 0;
         for (auto &it : this->multiDeviceDatas) {
             if (it.second == nullptr) {
                 continue;
             }
-            long long localCount = it.second->Count(0);
-            AssertInFastLLM(localCount % other == 0, "Tensor parallel reshape local count mismatch.\n");
             std::vector <int> localDims = outputDims;
-            localDims[axis] = (int)(localCount / other);
+            auto rangeIt = this->tpRanges.find(it.first);
+            if (validOldRanges && rangeIt != this->tpRanges.end() && !rangeIt->second.empty()) {
+                int localAxis = 0;
+                for (auto &range : rangeIt->second) {
+                    localAxis += range.second - range.first;
+                }
+                localDims[axis] = localAxis;
+            } else {
+                long long localCount = it.second->Count(0);
+                AssertInFastLLM(localCount % other == 0, "Tensor parallel reshape local count mismatch.\n");
+                int localAxis = (int)(localCount / other);
+                localDims[axis] = localAxis;
+                this->tpRanges[it.first].clear();
+                this->tpRanges[it.first].push_back({offset, offset + localAxis});
+                offset += localAxis;
+            }
             it.second->Resize(localDims);
         }
     }
