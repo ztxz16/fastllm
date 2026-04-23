@@ -2139,6 +2139,44 @@ FlashInferWorkSpaceManager& getFastllmFlashInferWorkSpace() {
     return *ptr;
 }
 
+void *FastllmCudaGetFlashInferFloatWorkspace(size_t *outSize) {
+    FlashInferWorkSpaceManager &workspace = getFastllmFlashInferWorkSpace();
+    if (outSize != nullptr) {
+        *outSize = workspace.float_workspace_size;
+    }
+    return workspace.d_float_workspace;
+}
+
+void *FastllmBorrowDequantScratch(size_t needBytes, size_t *outBytes, bool *outOwn) {
+    size_t wsBytes = 0;
+    void *ws = FastllmCudaGetFlashInferFloatWorkspace(&wsBytes);
+    if (ws != nullptr && wsBytes > 0) {
+        if (outBytes != nullptr) {
+            *outBytes = wsBytes;
+        }
+        if (outOwn != nullptr) {
+            *outOwn = false;
+        }
+        return ws;
+    }
+    // 兜底：拿不到 workspace 就用 bigBuffer 池整块申请。
+    size_t allocBytes = needBytes > 0 ? needBytes : 1;
+    void *ret = FastllmCudaMalloc(allocBytes);
+    if (outBytes != nullptr) {
+        *outBytes = allocBytes;
+    }
+    if (outOwn != nullptr) {
+        *outOwn = true;
+    }
+    return ret;
+}
+
+void FastllmReleaseDequantScratch(void *ptr, bool own) {
+    if (own && ptr != nullptr) {
+        FastllmCudaFree(ptr);
+    }
+}
+
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, typename DType, typename Params>
 static cudaError_t FastllmDispatchPagedPrefillKernel(Params &prefill_params, DType *tmp_v, float *tmp_s,
                                                      bool enable_pdl, cudaStream_t stream) {

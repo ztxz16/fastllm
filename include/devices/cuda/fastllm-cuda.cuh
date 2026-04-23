@@ -114,6 +114,25 @@ void * FastllmCudaDirectMalloc(size_t size);
 void FastllmCudaDirectFree(void *ret);
 void FastllmCudaMemset0(void *ret, size_t size);
 
+// 借用 FlashInfer 的 d_float_workspace 作为临时 scratch（例如 INT4 反量化为 FP16 的临时缓冲）。
+// 语义：
+//   - 当前 device 的 workspace 指针 + 字节大小通过出参返回；
+//   - 仅在两次 attention 调用之间使用是安全的，因为下一次 attention 会重新 plan 并覆盖里面的 tmp_v/tmp_s；
+//   - 调用方需自行保证调用本身是串行的（同一个 stream），且不要在 attention kernel 还在跑时使用；
+//   - 如果 workspace 还没有创建，会按默认大小（FT_FLOAT_WORKSPACE_SIZE 或 256MB）惰性分配。
+// 注意：返回的指针只是借用，不需要 free。
+void *FastllmCudaGetFlashInferFloatWorkspace(size_t *outSize);
+
+// 借/还 dequant 用的临时 scratch buffer。
+// FastllmBorrowDequantScratch:
+//   - needBytes: 期望大小（字节）；如果为 0，按 workspace 大小返回。
+//   - outBytes:  实际可用字节数（>= 1，可能小于 needBytes，表示需要分块）。
+//   - outOwn:    true 表示 scratch 是用 FastllmCudaMalloc 分配的，使用完必须调用 Release 归还。
+// 行为：优先借用 FlashInfer workspace；workspace 为空或大小为 0 时回退为 FastllmCudaMalloc(needBytes)。
+void *FastllmBorrowDequantScratch(size_t needBytes, size_t *outBytes, bool *outOwn);
+// 与 Borrow 配对。仅当 outOwn==true 时才真正调用 FastllmCudaFree。
+void FastllmReleaseDequantScratch(void *ptr, bool own);
+
 void FastllmCudaCopyFromHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromPinnedHostToDevice(void *dst, void *src, size_t size);
 void FastllmCudaCopyFromHostToDeviceAsync(void *dst, void *src, size_t size, void *stream);
