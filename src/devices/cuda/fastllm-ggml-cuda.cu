@@ -1962,8 +1962,17 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
         }
 
         auto fastllmCublasHandle = getFastllmCublasHandle();
-        half *cudaFp16Weight;
-        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+
+        // GGML 的 dequant 是 type-specific 的整行回调，不容易按行 chunk；
+        // 只在 workspace 一次能装下整张权重时借用，否则回退到老路径。
+        size_t needBytes = (size_t)k * m * sizeof(half);
+        size_t wsBytes = 0;
+        bool ownScratch = false;
+        half *cudaFp16Weight = (half *) FastllmBorrowDequantScratch(needBytes, &wsBytes, &ownScratch);
+        if (!ownScratch && wsBytes < needBytes) {
+            cudaFp16Weight = (half *) FastllmCudaMalloc(needBytes);
+            ownScratch = true;
+        }
 
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
@@ -1994,7 +2003,7 @@ bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weigh
 
         FastllmCudaFree(cudaFp16Input);
         FastllmCudaFree(cudaFp16Output);
-        FastllmCudaFree(cudaFp16Weight);
+        FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
     } else if (n > 1) {
         int i = 0;
         for (; i + MMVQ_MAX_BATCH_SIZE - 1 < n; i += MMVQ_MAX_BATCH_SIZE) {
@@ -2077,8 +2086,14 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
     if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
-        half *cudaFp16Weight;
-        cudaFp16Weight = (half *) FastllmCudaMalloc(k * m * sizeof(half));
+        size_t needBytes = (size_t)k * m * sizeof(half);
+        size_t wsBytes = 0;
+        bool ownScratch = false;
+        half *cudaFp16Weight = (half *) FastllmBorrowDequantScratch(needBytes, &wsBytes, &ownScratch);
+        if (!ownScratch && wsBytes < needBytes) {
+            cudaFp16Weight = (half *) FastllmCudaMalloc(needBytes);
+            ownScratch = true;
+        }
 
         __half h_alpha = __float2half_rn(1.0), h_beta = __float2half_rn(0.0);
         cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
@@ -2102,7 +2117,7 @@ bool FastllmCudaHalfMatMulGGUF(const fastllm::Data &input, fastllm::Data &weight
             exit(0);
         }
 
-        FastllmCudaFree(cudaFp16Weight);
+        FastllmReleaseDequantScratch(cudaFp16Weight, ownScratch);
     } else if (n > 1) {
         int i = 0;
         for (; i + MMVQ_MAX_BATCH_SIZE - 1 < n; i += MMVQ_MAX_BATCH_SIZE) {
@@ -2184,7 +2199,14 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
     if ((n > MMVQ_MAX_BATCH_SIZE || !has_vec_dot) && dequant != nullptr) {
         auto fastllmCublasHandle = getFastllmCublasHandle();
 
-        __nv_bfloat16 *cudaBf16Weight = (__nv_bfloat16 *)FastllmCudaMalloc(k * m * sizeof(__nv_bfloat16));
+        size_t needBytes = (size_t)k * m * sizeof(__nv_bfloat16);
+        size_t wsBytes = 0;
+        bool ownScratch = false;
+        __nv_bfloat16 *cudaBf16Weight = (__nv_bfloat16 *) FastllmBorrowDequantScratch(needBytes, &wsBytes, &ownScratch);
+        if (!ownScratch && wsBytes < needBytes) {
+            cudaBf16Weight = (__nv_bfloat16 *) FastllmCudaMalloc(needBytes);
+            ownScratch = true;
+        }
         dequant((const char *)weight.cudaData, cudaBf16Weight, k, m, nullptr);
 
         float h_alpha = 1.0f, h_beta = 0.0f;
@@ -2205,7 +2227,7 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
             exit(0);
         }
 
-        FastllmCudaFree(cudaBf16Weight);
+        FastllmReleaseDequantScratch(cudaBf16Weight, ownScratch);
     } else if (n > 1) {
         int i = 0;
         for (; i + MMVQ_MAX_BATCH_SIZE - 1 < n; i += MMVQ_MAX_BATCH_SIZE) {
