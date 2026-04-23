@@ -777,6 +777,10 @@ namespace fastllm {
     void ToDataType(const Data &input, DataType dataType);
     void ToDataType(const Data &input, Data &output, DataType dataType);
 
+    // 与 ToDataType(input, dataType) 行为相同，但强制只在 CPU device 上完成转换。
+    // 适用于希望权重保留在 CPU 上、避免被算子派发逻辑迁移到 GPU 的场景（例如不开 cuda_embedding 时的 embedding 权重）。
+    void ToDataTypeForceCPU(const Data &input, DataType dataType);
+
     void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset);
 
     bool CanRunMergeMOE(const Data &input, std::vector <Data*> &biass);

@@ -3228,6 +3228,27 @@ namespace fastllm {
         }
     }
 
+    void ToDataTypeForceCPU(const Data &input, DataType dataType) {
+        if (input.dataType == dataType) {
+            return;
+        }
+        if (dataType == DataType::FLOAT32) {
+            curExecutor->RunOnDevice("cpu", "ToFloat32", {
+                    {"input", (Data*)&input}
+            }, {}, {});
+        } else if (dataType == DataType::FLOAT16) {
+            curExecutor->RunOnDevice("cpu", "ToFloat16", {
+                    {"input", (Data*)&input}
+            }, {}, {});
+        } else if (dataType == DataType::BFLOAT16) {
+            curExecutor->RunOnDevice("cpu", "ToBFloat16", {
+                    {"input", (Data*)&input}
+            }, {}, {});
+        } else {
+            ErrorInFastLLM("ToDataTypeForceCPU: Unsupport data type.\n");
+        }
+    }
+
     void CopyKVCache(Data &oldCache, Data &newCache, int oldBsStart, int newBsStart, int bs, int offset) {
         curExecutor->Run("CopyKVCache", {
                 {"oldCache", (Data*)&oldCache}, {"newCache", (Data*)&newCache}

@@ -37,6 +37,14 @@ namespace fastllm {
         void Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                  const fastllm::IntDict &intParams);
 
+        // 强制在指定 deviceType 的设备上运行一个 op (例如 "cpu")。
+        // 如果存在多个匹配的设备，按 devices 列表中的注册顺序选择第一个能跑该 op 的设备。
+        void RunOnDevice(const std::string &deviceType,
+                         const std::string &opType,
+                         const fastllm::DataDict &datas,
+                         const fastllm::FloatDict &floatParams,
+                         const fastllm::IntDict &intParams);
+
         void ClearProfiler();
 
         void PrintProfiler();
