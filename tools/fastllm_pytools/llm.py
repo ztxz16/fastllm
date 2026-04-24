@@ -1064,12 +1064,46 @@ class model:
                 outputs[i].append(cur_token)
         return outputs
         
+    def _get_architecture(self) -> str:
+        try:
+            archs = self.config.get("architectures") if isinstance(getattr(self, "config", None), dict) else None
+            if isinstance(archs, list) and len(archs) > 0:
+                return str(archs[0])
+        except Exception:
+            pass
+        return ""
+
+    def _is_deepseek_v4(self) -> bool:
+        if self._get_architecture() == "DeepseekV4ForCausalLM":
+            return True
+        try:
+            mt = self.config.get("model_type", "") if isinstance(getattr(self, "config", None), dict) else ""
+            return str(mt) == "deepseek_v4"
+        except Exception:
+            return False
+
+    def _build_messages(self, query: str, history: List[Tuple[str, str]]) -> List[Dict[str, str]]:
+        messages = []
+        if (self.system_prompt != ""):
+            messages.append({"role": "system", "content": self.system_prompt})
+        for his in history:
+            messages.append({"role": "user", "content": his[0]})
+            messages.append({"role": "assistant", "content": his[1]})
+        messages.append({"role": "user", "content": query})
+        return messages
+
     def get_prompt(self,
                    query: str,
                    history: List[Tuple[str, str]] = None) -> str:
         if (not(history)):
             history = [];
         messages = []
+
+        # DeepSeek-V4 系列模型未提供 Jinja chat_template，使用官方 encoding_dsv4 编码
+        if (self._is_deepseek_v4() and not self.force_chat_template):
+            from ftllm.encoding_dsv4 import encode_messages
+            thinking_mode = "thinking" if self.enable_thinking else "chat"
+            return encode_messages(self._build_messages(query, history), thinking_mode=thinking_mode)
 
         if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
             if (self.system_prompt != ""):
