@@ -20,6 +20,7 @@
 #include "minimax_m2.h"
 #include "hunyuan.h"
 #include "deepseekv2.h"
+#include "deepseekv4.h"
 #include "qwen.h"
 #include "glm.h"
 #include "minicpm.h"
@@ -240,6 +241,9 @@ namespace fastllm {
             model = (basellm*)(new Qwen3NextModel());
         } else if (modelType == "deepseek_v2" || modelType == "deepseek_v3" || modelType == "kimi_k2" || modelType == "deepseek_v32") {
             model = (basellm*)(new DeepSeekV2Model());
+            model->model_type = modelType;
+        } else if (modelType == "deepseek_v4") {
+            model = (basellm*)(new DeepSeekV4Model());
             model->model_type = modelType;
         } else if (modelType == "qwen2") {
             model = (basellm*)(new Qwen2Model());

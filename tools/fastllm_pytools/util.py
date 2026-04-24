@@ -127,6 +127,7 @@ def make_normal_llm_model(args):
                     args.enable_thinking = "true"
             if (architecture == 'DeepseekV3ForCausalLM' or 
                 architecture == 'DeepseekV2ForCausalLM' or 
+                architecture == 'DeepseekV4ForCausalLM' or 
                 architecture == 'Qwen3MoeForCausalLM' or 
                 architecture == 'Qwen3_5MoeForConditionalGeneration' or
                 model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
