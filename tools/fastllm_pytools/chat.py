@@ -32,9 +32,7 @@ def fastllm_chat(args):
 
     print(hint)
     while True:
-        #query = input("\nUser：")
-        #query = "北京有什么景点？"
-        query = "你好"
+        query = input("\nUser：")
         if query.strip() == "stop":
             break
         if query.strip() == "clear":
@@ -47,12 +45,10 @@ def fastllm_chat(args):
                                               repeat_penalty = generation_config["repetition_penalty"],
                                               top_p = generation_config["top_p"],
                                               top_k = generation_config["top_k"],
-                                              temperature = generation_config["temperature"], max_length = 64):
+                                              temperature = generation_config["temperature"]):
             curResponse += response;
             print(response, flush = True, end = "")
         history.append((query, curResponse))
-        break
-    exit(0)
     model.release_memory()
 
 if __name__ == "__main__":
