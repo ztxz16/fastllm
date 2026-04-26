@@ -34,6 +34,20 @@
 #include <iostream>
 
 namespace fastllm {
+    struct DeepSeekV4DecodeLayerCache {
+        bool initialized = false;
+        int bsz = 0;
+        int totalLen = 0;
+        int headDim = 0;
+        int windowSize = 0;
+        int compressRatio = 0;
+        int compressorWideDim = 0;
+        std::vector<float> windowKV;
+        std::vector<float> compressorKVRaw;
+        std::vector<float> compressorScoreRaw;
+        Data compressedKV;
+    };
+
     class DeepSeekV4Model : public basellm {
     public:
         DeepSeekV4Model(); // 构造函数
@@ -150,6 +164,13 @@ namespace fastllm {
         // -------- 缓存 --------
         std::vector <std::vector <Data*> > weights;
         std::vector <std::vector <Data*> > biass;
+
+        // 调试对齐用：decode 阶段保存已生成 token，并可选择完整重算上下文。
+        std::vector<int> debugFullRecomputeTokens;
+        int debugGeneratedTokens = 0;
+
+        // 单请求 decode cache。当前 ForwardBatch(batch=1) 路径使用，后续可迁移到 paged cache。
+        std::vector<DeepSeekV4DecodeLayerCache> decodeLayerCaches;
     };
 }
 

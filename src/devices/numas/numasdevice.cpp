@@ -1599,6 +1599,19 @@ namespace fastllm {
                         v.push_back(std::make_pair(0, sharedScale));
                     }
 
+                    for (auto &expert : v) {
+                        int e = expert.first;
+                        if (weights[e * 2] == nullptr || weights[e * 2 + 1] == nullptr) {
+                            ErrorInFastLLM("NumasMergeMOE small batch: missing expert weight.\n");
+                        }
+                        if (weights[e * 2]->numasData.empty() && weights[e * 2]->cpuData != nullptr) {
+                            RegisterNumas(weights[e * 2], "linearSwiglu");
+                        }
+                        if (weights[e * 2 + 1]->numasData.empty() && weights[e * 2 + 1]->cpuData != nullptr) {
+                            RegisterNumas(weights[e * 2 + 1], "linearColumn");
+                        }
+                    }
+
                     DataType startDataType = weights[2]->GetLinearActDataType(1);
                     DataType downInputDataType = weights[3]->GetLinearActDataType(1);
 
@@ -1721,6 +1734,9 @@ namespace fastllm {
                                 // 仅当 downInputDataType 支持直接转换时，才传 dstOutputData
                                 uint8_t *dstPtr = canFuseDstConvert ?
                                     (uint8_t*)downInput.data() + expertIdx * GetDataBytes(downInputDataType, 1, interDim) : nullptr;
+                                AssertInFastLLM((int)weights[e * 2]->numasData.size() > nid &&
+                                                weights[e * 2]->numasData[nid] != nullptr,
+                                                "NumasMergeMOE small batch gate weight missing NUMA shard: " + weights[e * 2]->name + "\n");
                                 ((MultiThreadMultiOps*)ops[numaConfig->numaToCpuDict[nid][tid].first])->ops.push_back(
                                     new MultiThreadGemmAndCrossSwigluOp(
                                         (uint8_t*)realInput.data(), startDataType,
@@ -1807,6 +1823,9 @@ namespace fastllm {
                                     size_t outputOffset = GetDataBytes(DataType::FLOAT32, expertIdx, k) + 
                                                         GetDataBytes(DataType::FLOAT32, 1, base);
                                     
+                                    AssertInFastLLM((int)weights[e * 2 + 1]->numasData.size() > nid &&
+                                                    weights[e * 2 + 1]->numasData[nid] != nullptr,
+                                                    "NumasMergeMOE small batch down weight missing NUMA shard: " + weights[e * 2 + 1]->name + "\n");
                                     ((MultiThreadMultiOps*)ops[numaConfig->numaToCpuDict[nid][tid].first])->ops.push_back(
                                         new MultiThreadGemmOp(
                                             (uint8_t*)downInput.data() + inputOffset, downInputDataType,

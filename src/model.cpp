@@ -7,6 +7,7 @@
 #include <fstream>
 #include <regex>
 #include <iomanip>
+#include <cstdlib>
 
 #include "chatglm.h"
 #include "moss.h"
@@ -537,7 +538,18 @@ namespace fastllm {
                     ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
                 }
             } else if (this->dtype == "I64") {
-                printf("skip I64 tensor %s\n", this->tensorName.c_str());
+                if (dstType != DataType::INT32 && dstType != DataType::INT32PARAM) {
+                    ErrorInFastLLM("SafeTensorItem.CreateBuffer: I64 tensor " + this->tensorName + " should be loaded as int32.\n");
+                }
+                ClearBuffer();
+                buffer = new uint8_t[(size_t)len * sizeof(int32_t)];
+                std::vector<int64_t> ori(len);
+                ret = fread(ori.data(), sizeof(int64_t), len, fi);
+                int32_t *dst = (int32_t*)buffer;
+                for (int i = 0; i < len; i++) {
+                    dst[i] = (int32_t)ori[i];
+                }
+                fclose(fi);
                 return;
             } else {
                 ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
@@ -548,6 +560,8 @@ namespace fastllm {
                 unitSize = 4;
             } else if (dstType == DataType::FLOAT16 || dstType == DataType::BFLOAT16) {
                 unitSize = 2;
+            } else if (dstType == DataType::INT32 || dstType == DataType::INT32PARAM) {
+                unitSize = 4;
             } else {
                 ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport dst dtype " + std::to_string(dstType) + "\n");
             }
@@ -1515,25 +1529,27 @@ if (false) {
 
         // 4.1 读取权重
         auto tensors = safeTensors.GetSortedItemNames();
-
-if (false) {
-    auto temp = tensors;
-    tensors.clear();
-    for (int i = 0; i < temp.size(); i++) {
-        std::string tensorName = temp[i];
-        std::string prefix = "model.layers.";
-        if (StartWith(tensorName, prefix)) {
-            int id = 0;
-            for (int i = prefix.size(); tensorName[i] >= '0' && tensorName[i] <= '9'; i++) {
-                id = id * 10 + tensorName[i] - '0';
-            }
-            if (id > 9) {
-                continue;
+        int debugLayerLimit = -1;
+        if (const char *env = std::getenv("FASTLLM_DEBUG_LAYERS")) {
+            debugLayerLimit = atoi(env);
+        }
+        if (debugLayerLimit > 0) {
+            auto temp = tensors;
+            tensors.clear();
+            std::string prefix = "layers.";
+            for (auto &tensorName : temp) {
+                if (StartWith(tensorName, prefix)) {
+                    int id = 0;
+                    for (int i = prefix.size(); i < (int)tensorName.size() && tensorName[i] >= '0' && tensorName[i] <= '9'; i++) {
+                        id = id * 10 + tensorName[i] - '0';
+                    }
+                    if (id >= debugLayerLimit) {
+                        continue;
+                    }
+                }
+                tensors.push_back(tensorName);
             }
         }
-        tensors.push_back(tensorName);
-    }
-}
         
         // tensorMap[name]代表本名为name的tensor，创建后的名字以及类型
         // 有些tensor被共享，可能需要创建多次
@@ -1595,6 +1611,9 @@ if (false) {
                     if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
                         dataType = DataType::FLOAT16;
                     }
+                }
+                if (tensor.dtype == "I64") {
+                    dataType = DataType::INT32PARAM;
                 }
                 if (it.second == DATA_AUTO_CONV) {
                     std::vector <int> realShape = tensor.intShape;
@@ -1681,6 +1700,10 @@ if (false) {
                             if (dataType >= DATA_AUTO_NONE) {
                                 // AUTO类型
                                 dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
+                            }
+                            if (tensor.dtype == "I64") {
+                                dataType = DataType::INT32PARAM;
+                                oriDataType = DataType::INT32PARAM;
                             }
                             if (tensor.dtype == "BF16" &&
                                 (dataType == DataType::FLOAT16 || dataType == DataType::BFLOAT16 ||
@@ -2186,6 +2209,9 @@ if (false) {
                         dataType = DataType::FLOAT16;
                     }
                 }
+                if (tensor.dtype == "I64") {
+                    dataType = DataType::INT32PARAM;
+                }
                 if (dataType== DATA_AUTO_CONV) {
                     std::vector <int> realShape = tensor.intShape;
                     std::swap(realShape[0], realShape[1]);
@@ -2236,6 +2262,10 @@ if (false) {
                             if (dataType >= DATA_AUTO_NONE) {
                                 // AUTO类型
                                 dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
+                            }
+                            if (tensor.dtype == "I64") {
+                                dataType = DataType::INT32PARAM;
+                                oriDataType = DataType::INT32PARAM;
                             }
                             if (tensor.dtype == "BF16" &&
                                 (dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO)) {

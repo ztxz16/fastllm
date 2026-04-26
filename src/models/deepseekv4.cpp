@@ -16,6 +16,7 @@
 
 #include "deepseekv4.h"
 
+#include "baseblock.h"
 #include "executor.h"
 #include "utils.h"
 
@@ -23,6 +24,12 @@
 #include <random>
 #include <unordered_map>
 #include <cstring>
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <limits>
+#include <cstdlib>
+#include <cctype>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -36,6 +43,1303 @@ namespace fastllm {
     extern void yarn_find_correction_range(int low_rot, int high_rot, int dim, float base, int max_position_embeddings, int &low, int &high);
     extern float yarn_get_mscale(float scale, float mscale);
     extern std::vector <float> yarn_linear_ramp_mask(float min, float max, int dim);
+
+    namespace {
+        static int GetIntWithFallback(const WeightMap &weight, const std::vector<std::string> &keys, int fallback) {
+            for (auto &key : keys) {
+                auto it = weight.dicts.find(key);
+                if (it != weight.dicts.end() && !it->second.empty()) {
+                    return atoi(it->second.c_str());
+                }
+            }
+            return fallback;
+        }
+
+        static float GetFloatWithFallback(const WeightMap &weight, const std::vector<std::string> &keys, float fallback) {
+            for (auto &key : keys) {
+                auto it = weight.dicts.find(key);
+                if (it != weight.dicts.end() && !it->second.empty()) {
+                    return atof(it->second.c_str());
+                }
+            }
+            return fallback;
+        }
+
+        static std::string GetStringWithFallback(const WeightMap &weight, const std::vector<std::string> &keys, const std::string &fallback) {
+            for (auto &key : keys) {
+                auto it = weight.dicts.find(key);
+                if (it != weight.dicts.end() && !it->second.empty()) {
+                    return it->second;
+                }
+            }
+            return fallback;
+        }
+
+        static bool EnvFlagEnabled(const char *name) {
+            const char *v = std::getenv(name);
+            if (v == nullptr) {
+                return false;
+            }
+            std::string s(v);
+            std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+                return (char)std::tolower(c);
+            });
+            return !(s.empty() || s == "0" || s == "false" || s == "off" || s == "no");
+        }
+
+        static int EnvInt(const char *name, int fallback) {
+            const char *v = std::getenv(name);
+            return v == nullptr ? fallback : atoi(v);
+        }
+
+        static uint64_t CountDims(const std::vector<int> &dims) {
+            uint64_t ret = 1;
+            for (int v : dims) {
+                ret *= (uint64_t)v;
+            }
+            return ret;
+        }
+
+        static float BFloat16ToFloat(uint16_t v);
+
+        static std::vector<float> ReadFloatData(const Data &input) {
+            if (input.dataType == DataType::INT32 || input.dataType == DataType::INT32PARAM) {
+                Data tmp;
+                tmp.CopyFrom(input);
+                tmp.ToDevice(DataDevice::CPU);
+                uint64_t cnt = tmp.Count(0);
+                std::vector<float> ret(cnt);
+                int32_t *p = (int32_t*)tmp.cpuData;
+                for (uint64_t i = 0; i < cnt; i++) {
+                    ret[i] = (float)p[i];
+                }
+                return ret;
+            }
+            if (input.dataType == DataType::BFLOAT16 || input.dataType == DataType::FLOAT16) {
+                Data tmp;
+                tmp.CopyFrom(input);
+                tmp.ToDevice(DataDevice::CPU);
+                uint64_t cnt = tmp.Count(0);
+                std::vector<float> ret(cnt);
+                uint16_t *p = (uint16_t*)tmp.cpuData;
+                if (input.dataType == DataType::BFLOAT16) {
+                    for (uint64_t i = 0; i < cnt; i++) {
+                        ret[i] = BFloat16ToFloat(p[i]);
+                    }
+                } else {
+                    for (uint64_t i = 0; i < cnt; i++) {
+                        ret[i] = half_to_float(p[i]);
+                    }
+                }
+                return ret;
+            }
+            Data tmp;
+            ToDataType(input, tmp, DataType::FLOAT32);
+            tmp.ToDevice(DataDevice::CPU);
+            uint64_t cnt = tmp.Count(0);
+            std::vector<float> ret(cnt);
+            memcpy(ret.data(), tmp.cpuData, cnt * sizeof(float));
+            return ret;
+        }
+
+        static std::vector<int> ReadTokenIds(const Data &inputIds) {
+            Data tmp;
+            ToDataType(inputIds, tmp, DataType::FLOAT32);
+            tmp.ToDevice(DataDevice::CPU);
+            int cnt = (int)tmp.Count(0);
+            std::vector<int> ret(cnt);
+            float *p = (float*)tmp.cpuData;
+            for (int i = 0; i < cnt; i++) {
+                ret[i] = (int)(p[i] + 0.5f);
+            }
+            return ret;
+        }
+
+        static uint16_t FloatToBFloat16(float v) {
+            uint32_t x;
+            memcpy(&x, &v, sizeof(uint32_t));
+            x += 0x7FFF + ((x >> 16) & 1);
+            return (uint16_t)(x >> 16);
+        }
+
+        static float BFloat16ToFloat(uint16_t v) {
+            uint32_t x = ((uint32_t)v) << 16;
+            float ret;
+            memcpy(&ret, &x, sizeof(float));
+            return ret;
+        }
+
+        static void ResetData(Data &data) {
+            data.FreeSpace();
+            data = Data();
+        }
+
+        static void WriteFloatData(const std::vector<float> &values, const std::vector<int> &dims,
+                                   Data &output, DataType dtype = DataType::FLOAT32) {
+            Data tmp(dtype, dims);
+            tmp.Allocate();
+            if (dtype == DataType::FLOAT32) {
+                memcpy(tmp.cpuData, values.data(), values.size() * sizeof(float));
+            } else if (dtype == DataType::BFLOAT16) {
+                uint16_t *dst = (uint16_t*)tmp.cpuData;
+                for (size_t i = 0; i < values.size(); i++) {
+                    dst[i] = FloatToBFloat16(values[i]);
+                }
+            } else if (dtype == DataType::FLOAT16) {
+                uint16_t *dst = (uint16_t*)tmp.cpuData;
+                for (size_t i = 0; i < values.size(); i++) {
+                    dst[i] = float_to_half(values[i]);
+                }
+            } else {
+                ErrorInFastLLM("DeepSeekV4Model: unsupported WriteFloatData dtype.");
+            }
+            ResetData(output);
+            output.CopyFrom(tmp);
+        }
+
+        static void WriteIntData(const std::vector<int> &values, const std::vector<int> &dims,
+                                 Data &output) {
+            Data tmp(DataType::INT32, dims);
+            tmp.Allocate();
+            memcpy(tmp.cpuData, values.data(), values.size() * sizeof(int));
+            ResetData(output);
+            output.CopyFrom(tmp);
+        }
+
+        static void UpdateDebugPastKeyValues(std::vector<std::pair<Data, Data>> &pastKeyValues,
+                                             int bsz, int totalLen, int blocks) {
+            if (pastKeyValues.empty()) {
+                return;
+            }
+            int paddedLen = ((std::max(totalLen, 1) - 1) / 128 + 1) * 128;
+            std::vector<float> zeros((uint64_t)bsz * totalLen, 0.0f);
+            for (int i = 0; i < std::min(blocks, (int)pastKeyValues.size()); i++) {
+                Data key(DataType::FLOAT32, {bsz, totalLen, 1}, zeros);
+                Data value(DataType::FLOAT32, {bsz, totalLen, 1}, zeros);
+                key.SetKVCache();
+                value.SetKVCache();
+                key.Expansion({bsz, paddedLen, 1});
+                value.Expansion({bsz, paddedLen, 1});
+                ResetData(pastKeyValues[i].first);
+                ResetData(pastKeyValues[i].second);
+                pastKeyValues[i].first.CopyFrom(key);
+                pastKeyValues[i].second.CopyFrom(value);
+                pastKeyValues[i].first.SetKVCache();
+                pastKeyValues[i].second.SetKVCache();
+            }
+        }
+
+        static float SigmoidFloat(float x) {
+            if (x >= 0.0f) {
+                float z = std::exp(-x);
+                return 1.0f / (1.0f + z);
+            }
+            float z = std::exp(x);
+            return z / (1.0f + z);
+        }
+
+        static float SoftplusFloat(float x) {
+            if (x > 20.0f) {
+                return x;
+            }
+            if (x < -20.0f) {
+                return std::exp(x);
+            }
+            return std::log1p(std::exp(x));
+        }
+
+        static void DebugDumpData(const std::string &name, const Data &input, int startPos = -1) {
+            Data tmp;
+            ToDataType(input, tmp, DataType::FLOAT32);
+            tmp.ToDevice(DataDevice::CPU);
+            printf("[fastllm-debug] %-10s shape=(", name.c_str());
+            for (int i = 0; i < (int)tmp.dims.size(); i++) {
+                if (i) {
+                    printf(", ");
+                }
+                printf("%d", tmp.dims[i]);
+            }
+            printf(") dtype=%s", GetDataTypeName(input.dataType).c_str());
+            if (startPos >= 0) {
+                printf(" start_pos=%d", startPos);
+            }
+            printf("\n");
+
+            float *p = (float*)tmp.cpuData;
+            uint64_t cnt = tmp.Count(0);
+            if (cnt == 0) {
+                return;
+            }
+            float mn = std::numeric_limits<float>::infinity();
+            float mx = -std::numeric_limits<float>::infinity();
+            double sum = 0.0, sq = 0.0;
+            bool hasNan = false, hasInf = false;
+            uint64_t finiteCount = 0, nanCount = 0, infCount = 0;
+            uint64_t firstNan = cnt, firstInf = cnt;
+            for (uint64_t i = 0; i < cnt; i++) {
+                float v = p[i];
+                if (std::isnan(v)) {
+                    hasNan = true;
+                    nanCount++;
+                    if (firstNan == cnt) {
+                        firstNan = i;
+                    }
+                    continue;
+                }
+                if (std::isinf(v)) {
+                    hasInf = true;
+                    infCount++;
+                    if (firstInf == cnt) {
+                        firstInf = i;
+                    }
+                    continue;
+                }
+                mn = std::min(mn, v);
+                mx = std::max(mx, v);
+                sum += v;
+                sq += (double)v * (double)v;
+                finiteCount++;
+            }
+            if (finiteCount == 0) {
+                mn = mx = std::numeric_limits<float>::quiet_NaN();
+            }
+            double mean = finiteCount == 0 ? std::numeric_limits<double>::quiet_NaN() : sum / finiteCount;
+            double var = finiteCount == 0 ? std::numeric_limits<double>::quiet_NaN()
+                                          : std::max(0.0, sq / finiteCount - mean * mean);
+            printf("[fastllm-debug]            min=%.4f max=%.4f mean=%.4f std=%.4f nan=%s inf=%s\n",
+                   mn, mx, (float)mean, (float)std::sqrt(var), hasNan ? "true" : "false", hasInf ? "true" : "false");
+            if (hasNan || hasInf) {
+                auto printLocation = [&](uint64_t flat) {
+                    printf("[");
+                    std::vector<int> coords(tmp.dims.size(), 0);
+                    for (int d = (int)tmp.dims.size() - 1; d >= 0; d--) {
+                        coords[d] = flat % tmp.dims[d];
+                        flat /= tmp.dims[d];
+                    }
+                    for (int d = 0; d < (int)coords.size(); d++) {
+                        if (d) {
+                            printf(", ");
+                        }
+                        printf("%d", coords[d]);
+                    }
+                    printf("]");
+                };
+                printf("[fastllm-debug]            finite=%llu nan_count=%llu inf_count=%llu",
+                       (unsigned long long)finiteCount,
+                       (unsigned long long)nanCount,
+                       (unsigned long long)infCount);
+                if (firstNan != cnt) {
+                    printf(" first_nan=");
+                    printLocation(firstNan);
+                }
+                if (firstInf != cnt) {
+                    printf(" first_inf=");
+                    printLocation(firstInf);
+                }
+                printf("\n");
+            }
+
+            uint64_t sampleOffset = 0;
+            int sampleLen = 8;
+            if (tmp.dims.size() == 4) {
+                sampleOffset = (((uint64_t)0 * tmp.dims[1] + (tmp.dims[1] - 1)) * tmp.dims[2] + 0) * tmp.dims[3];
+                sampleLen = std::min(sampleLen, tmp.dims[3]);
+            } else if (tmp.dims.size() == 3) {
+                sampleOffset = ((uint64_t)0 * tmp.dims[1] + (tmp.dims[1] - 1)) * tmp.dims[2];
+                sampleLen = std::min(sampleLen, tmp.dims[2]);
+            } else if (tmp.dims.size() == 2) {
+                sampleOffset = 0;
+                sampleLen = std::min(sampleLen, tmp.dims[1]);
+            } else {
+                sampleOffset = 0;
+                sampleLen = std::min<uint64_t>(sampleLen, cnt);
+            }
+            printf("[fastllm-debug]            sample=[");
+            for (int i = 0; i < sampleLen; i++) {
+                if (i) {
+                    printf(", ");
+                }
+                printf("%.9g", p[sampleOffset + i]);
+            }
+            printf("]\n");
+        }
+
+        static void DebugDumpInputIds(const Data &inputIds, int startPos) {
+            auto ids = ReadTokenIds(inputIds);
+            printf("[fastllm-debug] input_ids  shape=(");
+            for (int i = 0; i < (int)inputIds.dims.size(); i++) {
+                if (i) {
+                    printf(", ");
+                }
+                printf("%d", inputIds.dims[i]);
+            }
+            printf(") start_pos=%d\n[fastllm-debug]            values=[", startPos);
+            int idx = 0;
+            for (int b = 0; b < inputIds.dims[0]; b++) {
+                if (b) {
+                    printf(", ");
+                }
+                printf("[");
+                for (int s = 0; s < inputIds.dims[1]; s++, idx++) {
+                    if (s) {
+                        printf(", ");
+                    }
+                    printf("%d", ids[idx]);
+                }
+                printf("]");
+            }
+            printf("]\n");
+        }
+
+        struct HcMix {
+            Data y;
+            std::vector<float> post;
+            std::vector<float> comb;
+            int b = 0, s = 0, hc = 0;
+        };
+
+        static HcMix HcPreReference(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
+                                    int hcMult, int sinkhornIters, float eps, float normEps) {
+            int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
+            int flatDim = hcMult * dim;
+            int mixHc = (2 + hcMult) * hcMult;
+            auto xv = ReadFloatData(x);
+            auto fn = ReadFloatData(hcFn);
+            auto scale = ReadFloatData(hcScale);
+            auto base = ReadFloatData(hcBase);
+
+            std::vector<float> y((uint64_t)bsz * seqlen * dim, 0.0f);
+            std::vector<float> post((uint64_t)bsz * seqlen * hcMult, 0.0f);
+            std::vector<float> comb((uint64_t)bsz * seqlen * hcMult * hcMult, 0.0f);
+            std::vector<float> mixes(mixHc);
+            std::vector<float> pre(hcMult);
+            std::vector<float> combLocal(hcMult * hcMult);
+
+            for (int t = 0; t < bsz * seqlen; t++) {
+                const float *xrow = xv.data() + (uint64_t)t * flatDim;
+                double ss = 0.0;
+                for (int k = 0; k < flatDim; k++) {
+                    ss += (double)xrow[k] * xrow[k];
+                }
+                float rsqrt = 1.0f / std::sqrt((float)(ss / flatDim) + normEps);
+                for (int m = 0; m < mixHc; m++) {
+                    double v = 0.0;
+                    const float *w = fn.data() + (uint64_t)m * flatDim;
+                    for (int k = 0; k < flatDim; k++) {
+                        v += (double)xrow[k] * w[k];
+                    }
+                    mixes[m] = (float)v * rsqrt;
+                }
+                for (int h = 0; h < hcMult; h++) {
+                    pre[h] = SigmoidFloat(mixes[h] * scale[0] + base[h]) + eps;
+                    post[(uint64_t)t * hcMult + h] =
+                        2.0f * SigmoidFloat(mixes[h + hcMult] * scale[1] + base[h + hcMult]);
+                }
+                for (int r = 0; r < hcMult; r++) {
+                    float rowMax = -std::numeric_limits<float>::infinity();
+                    for (int c = 0; c < hcMult; c++) {
+                        int idx = r * hcMult + c + 2 * hcMult;
+                        combLocal[r * hcMult + c] = mixes[idx] * scale[2] + base[idx];
+                        rowMax = std::max(rowMax, combLocal[r * hcMult + c]);
+                    }
+                    float rowSum = 0.0f;
+                    for (int c = 0; c < hcMult; c++) {
+                        float v = std::exp(combLocal[r * hcMult + c] - rowMax);
+                        combLocal[r * hcMult + c] = v;
+                        rowSum += v;
+                    }
+                    for (int c = 0; c < hcMult; c++) {
+                        combLocal[r * hcMult + c] = combLocal[r * hcMult + c] / rowSum + eps;
+                    }
+                }
+                for (int c = 0; c < hcMult; c++) {
+                    float colSum = 0.0f;
+                    for (int r = 0; r < hcMult; r++) {
+                        colSum += combLocal[r * hcMult + c];
+                    }
+                    for (int r = 0; r < hcMult; r++) {
+                        combLocal[r * hcMult + c] /= (colSum + eps);
+                    }
+                }
+                for (int it = 1; it < sinkhornIters; it++) {
+                    for (int r = 0; r < hcMult; r++) {
+                        float rowSum = 0.0f;
+                        for (int c = 0; c < hcMult; c++) {
+                            rowSum += combLocal[r * hcMult + c];
+                        }
+                        for (int c = 0; c < hcMult; c++) {
+                            combLocal[r * hcMult + c] /= (rowSum + eps);
+                        }
+                    }
+                    for (int c = 0; c < hcMult; c++) {
+                        float colSum = 0.0f;
+                        for (int r = 0; r < hcMult; r++) {
+                            colSum += combLocal[r * hcMult + c];
+                        }
+                        for (int r = 0; r < hcMult; r++) {
+                            combLocal[r * hcMult + c] /= (colSum + eps);
+                        }
+                    }
+                }
+                memcpy(comb.data() + (uint64_t)t * hcMult * hcMult, combLocal.data(),
+                       hcMult * hcMult * sizeof(float));
+                for (int d = 0; d < dim; d++) {
+                    double v = 0.0;
+                    for (int h = 0; h < hcMult; h++) {
+                        v += (double)pre[h] * xrow[(uint64_t)h * dim + d];
+                    }
+                    y[(uint64_t)t * dim + d] = (float)v;
+                }
+            }
+
+            HcMix ret;
+            WriteFloatData(y, {bsz, seqlen, dim}, ret.y, x.dataType);
+            ret.post = std::move(post);
+            ret.comb = std::move(comb);
+            ret.b = bsz;
+            ret.s = seqlen;
+            ret.hc = hcMult;
+            return ret;
+        }
+
+        static void HcPostReference(const Data &x, const Data &residual, const HcMix &mix, Data &output) {
+            int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
+            auto xv = ReadFloatData(x);
+            auto rv = ReadFloatData(residual);
+            std::vector<float> y((uint64_t)bsz * seqlen * hcMult * dim, 0.0f);
+            for (int t = 0; t < bsz * seqlen; t++) {
+                const float *xrow = xv.data() + (uint64_t)t * dim;
+                const float *rrow = rv.data() + (uint64_t)t * hcMult * dim;
+                const float *post = mix.post.data() + (uint64_t)t * hcMult;
+                const float *comb = mix.comb.data() + (uint64_t)t * hcMult * hcMult;
+                for (int target = 0; target < hcMult; target++) {
+                    for (int d = 0; d < dim; d++) {
+                        double v = (double)post[target] * xrow[d];
+                        for (int src = 0; src < hcMult; src++) {
+                            v += (double)comb[src * hcMult + target] * rrow[(uint64_t)src * dim + d];
+                        }
+                        y[((uint64_t)t * hcMult + target) * dim + d] = (float)v;
+                    }
+                }
+            }
+            WriteFloatData(y, {bsz, seqlen, hcMult, dim}, output, x.dataType);
+        }
+
+        static void RMSNormReference(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
+            auto xv = ReadFloatData(input);
+            auto wv = ReadFloatData(weight);
+            int dim = input.dims.back();
+            int rows = (int)(xv.size() / dim);
+            std::vector<float> y(xv.size());
+            for (int r = 0; r < rows; r++) {
+                const float *src = xv.data() + (uint64_t)r * dim;
+                double ss = 0.0;
+                for (int d = 0; d < dim; d++) {
+                    ss += (double)src[d] * src[d];
+                }
+                float scale = 1.0f / std::sqrt((float)(ss / dim) + eps);
+                for (int d = 0; d < dim; d++) {
+                    y[(uint64_t)r * dim + d] = src[d] * scale * wv[d];
+                }
+            }
+            WriteFloatData(y, input.dims, output, dtype);
+        }
+
+        static std::vector<float> BuildInvFreqReference(int ropeDim, float base, int originalSeqLen,
+                                                        float factor, int betaFast, int betaSlow) {
+            std::vector<float> invFreq;
+            for (int i = 0; i < ropeDim; i += 2) {
+                invFreq.push_back(1.0f / std::pow(base, (float)i / ropeDim));
+            }
+            if (originalSeqLen > 0) {
+                float lowF = ropeDim * std::log((float)originalSeqLen / (betaFast * 2.0f * (float)M_PI)) /
+                             (2.0f * std::log(base));
+                float highF = ropeDim * std::log((float)originalSeqLen / (betaSlow * 2.0f * (float)M_PI)) /
+                              (2.0f * std::log(base));
+                int low = std::max((int)std::floor(lowF), 0);
+                int high = std::min((int)std::ceil(highF), ropeDim - 1);
+                if (low == high) {
+                    high++;
+                }
+                for (int i = 0; i < (int)invFreq.size(); i++) {
+                    float ramp = std::max(0.0f, std::min(1.0f, ((float)i - low) / (high - low)));
+                    float smooth = 1.0f - ramp;
+                    invFreq[i] = invFreq[i] / factor * (1.0f - smooth) + invFreq[i] * smooth;
+                }
+            }
+            return invFreq;
+        }
+
+        static void ApplyRotaryReference(std::vector<float> &x, const std::vector<int> &dims,
+                                         int ropeDim, float base, int startPos, bool inverse,
+                                         int originalSeqLen = 0, float factor = 1.0f,
+                                         int betaFast = 32, int betaSlow = 1, int posStep = 1) {
+            int bsz = dims[0], seqlen = dims[1];
+            int heads = (dims.size() == 4) ? dims[2] : 1;
+            int dim = (dims.size() == 4) ? dims[3] : dims[2];
+            int off = dim - ropeDim;
+            auto invFreq = BuildInvFreqReference(ropeDim, base, originalSeqLen, factor, betaFast, betaSlow);
+            for (int b = 0; b < bsz; b++) {
+                for (int s = 0; s < seqlen; s++) {
+                    int pos = startPos + s * posStep;
+                    for (int h = 0; h < heads; h++) {
+                        uint64_t rowIndex = dims.size() == 4 ? (((uint64_t)b * seqlen + s) * heads + h)
+                                                             : ((uint64_t)b * seqlen + s);
+                        float *row = x.data() + rowIndex * dim + off;
+                        for (int i = 0; i < ropeDim; i += 2) {
+                            float ang = pos * invFreq[i / 2];
+                            float c = std::cos(ang), sn = std::sin(ang);
+                            if (inverse) {
+                                sn = -sn;
+                            }
+                            float a = row[i], bb = row[i + 1];
+                            row[i] = a * c - bb * sn;
+                            row[i + 1] = a * sn + bb * c;
+                        }
+                    }
+                }
+            }
+        }
+
+        static void ScaleQReference(Data &q, float eps) {
+            auto qv = ReadFloatData(q);
+            int dim = q.dims.back();
+            int rows = (int)(qv.size() / dim);
+            for (int r = 0; r < rows; r++) {
+                float *row = qv.data() + (uint64_t)r * dim;
+                double ss = 0.0;
+                for (int d = 0; d < dim; d++) {
+                    ss += (double)row[d] * row[d];
+                }
+                float scale = 1.0f / std::sqrt((float)(ss / dim) + eps);
+                for (int d = 0; d < dim; d++) {
+                    row[d] *= scale;
+                }
+            }
+            WriteFloatData(qv, q.dims, q, DataType::BFLOAT16);
+        }
+
+        static void ActQuantInplaceReference(std::vector<float> &x, const std::vector<int> &dims,
+                                             int quantDim, int blockSize) {
+            int dim = dims.back();
+            int rows = (int)(x.size() / dim);
+            for (int r = 0; r < rows; r++) {
+                float *row = x.data() + (uint64_t)r * dim;
+                for (int start = 0; start < quantDim; start += blockSize) {
+                    int end = std::min(start + blockSize, quantDim);
+                    float amax = 1e-4f;
+                    for (int d = start; d < end; d++) {
+                        amax = std::max(amax, std::fabs(row[d]));
+                    }
+                    float scale = std::pow(2.0f, std::ceil(std::log2(amax / 448.0f)));
+                    for (int d = start; d < end; d++) {
+                        float q = std::max(-448.0f, std::min(448.0f, row[d] / scale));
+                        row[d] = BFloat16ToFloat(FloatToBFloat16(q)) * scale;
+                    }
+                }
+            }
+        }
+
+        static void StoreWindowKVCache(const std::vector<float> &kv, int bsz, int seqlen, int headDim,
+                                       int startPos, int windowSize, std::vector<float> &windowKV) {
+            windowKV.assign((uint64_t)bsz * windowSize * headDim, 0.0f);
+            if (startPos == 0) {
+                if (seqlen <= windowSize) {
+                    for (int b = 0; b < bsz; b++) {
+                        memcpy(windowKV.data() + (uint64_t)b * windowSize * headDim,
+                               kv.data() + (uint64_t)b * seqlen * headDim,
+                               (uint64_t)seqlen * headDim * sizeof(float));
+                    }
+                } else {
+                    int cutoff = seqlen % windowSize;
+                    int first = windowSize - cutoff;
+                    for (int b = 0; b < bsz; b++) {
+                        const float *src = kv.data() + ((uint64_t)b * seqlen + seqlen - windowSize) * headDim;
+                        memcpy(windowKV.data() + ((uint64_t)b * windowSize + cutoff) * headDim,
+                               src, (uint64_t)first * headDim * sizeof(float));
+                        if (cutoff > 0) {
+                            memcpy(windowKV.data() + (uint64_t)b * windowSize * headDim,
+                                   src + (uint64_t)first * headDim,
+                                   (uint64_t)cutoff * headDim * sizeof(float));
+                        }
+                    }
+                }
+                return;
+            }
+            for (int b = 0; b < bsz; b++) {
+                memcpy(windowKV.data() + ((uint64_t)b * windowSize + (startPos % windowSize)) * headDim,
+                       kv.data() + (uint64_t)b * headDim,
+                       (uint64_t)headDim * sizeof(float));
+            }
+        }
+
+        static void UpdateWindowKVCache(const std::vector<float> &kv, int bsz, int headDim,
+                                        int startPos, int windowSize, std::vector<float> &windowKV) {
+            for (int b = 0; b < bsz; b++) {
+                memcpy(windowKV.data() + ((uint64_t)b * windowSize + (startPos % windowSize)) * headDim,
+                       kv.data() + (uint64_t)b * headDim,
+                       (uint64_t)headDim * sizeof(float));
+            }
+        }
+
+        static void ComputeCompressorRaw(WeightMap &weight, const std::string &prefix, const Data &x,
+                                         std::vector<float> &kv, std::vector<float> &score) {
+            Data kvData, scoreData;
+            Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kvData);
+            Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), scoreData);
+            kv = ReadFloatData(kvData);
+            score = ReadFloatData(scoreData);
+        }
+
+        static void AppendCompressorRaw(const std::vector<float> &kv, const std::vector<float> &score,
+                                        int bsz, int seqlen, int wideDim,
+                                        std::vector<float> &allKV, std::vector<float> &allScore) {
+            int oldLen = allKV.empty() ? 0 : (int)(allKV.size() / ((uint64_t)bsz * wideDim));
+            std::vector<float> nextKV((uint64_t)bsz * (oldLen + seqlen) * wideDim);
+            std::vector<float> nextScore((uint64_t)bsz * (oldLen + seqlen) * wideDim);
+            for (int b = 0; b < bsz; b++) {
+                if (oldLen > 0) {
+                    memcpy(nextKV.data() + (uint64_t)b * (oldLen + seqlen) * wideDim,
+                           allKV.data() + (uint64_t)b * oldLen * wideDim,
+                           (uint64_t)oldLen * wideDim * sizeof(float));
+                    memcpy(nextScore.data() + (uint64_t)b * (oldLen + seqlen) * wideDim,
+                           allScore.data() + (uint64_t)b * oldLen * wideDim,
+                           (uint64_t)oldLen * wideDim * sizeof(float));
+                }
+                memcpy(nextKV.data() + ((uint64_t)b * (oldLen + seqlen) + oldLen) * wideDim,
+                       kv.data() + (uint64_t)b * seqlen * wideDim,
+                       (uint64_t)seqlen * wideDim * sizeof(float));
+                memcpy(nextScore.data() + ((uint64_t)b * (oldLen + seqlen) + oldLen) * wideDim,
+                       score.data() + (uint64_t)b * seqlen * wideDim,
+                       (uint64_t)seqlen * wideDim * sizeof(float));
+            }
+            allKV.swap(nextKV);
+            allScore.swap(nextScore);
+        }
+
+        static bool BuildCompressedKVFromRaw(WeightMap &weight, const std::string &prefix,
+                                             const std::vector<float> &kv, const std::vector<float> &score,
+                                             int bsz, int totalLen, int compressRatio,
+                                             int headDim, int ropeDim, float ropeBase,
+                                             float ropeFactor, int betaFast, int betaSlow,
+                                             int originalSeqLen, Data &output) {
+            if (compressRatio <= 0 || totalLen < compressRatio) {
+                return false;
+            }
+            int cutoff = totalLen - (totalLen % compressRatio);
+            int blocks = cutoff / compressRatio;
+            if (blocks <= 0) {
+                return false;
+            }
+            bool overlap = (compressRatio == 4);
+            int coff = overlap ? 2 : 1;
+            int wideDim = coff * headDim;
+            auto ape = ReadFloatData(weight[prefix + ".ape"]);
+
+            std::vector<float> compressed((uint64_t)bsz * blocks * headDim, 0.0f);
+            std::vector<float> vals(overlap ? 2 * compressRatio : compressRatio);
+            std::vector<float> logits(vals.size());
+            for (int b = 0; b < bsz; b++) {
+                for (int block = 0; block < blocks; block++) {
+                    for (int d = 0; d < headDim; d++) {
+                        int count = 0;
+                        if (overlap) {
+                            for (int r = 0; r < compressRatio; r++) {
+                                if (block == 0) {
+                                    vals[count] = 0.0f;
+                                    logits[count++] = -std::numeric_limits<float>::infinity();
+                                } else {
+                                    int tok = (block - 1) * compressRatio + r;
+                                    uint64_t off = ((uint64_t)b * totalLen + tok) * wideDim + d;
+                                    vals[count] = kv[off];
+                                    logits[count++] = score[off] + ape[(uint64_t)r * wideDim + d];
+                                }
+                            }
+                            for (int r = 0; r < compressRatio; r++) {
+                                int tok = block * compressRatio + r;
+                                uint64_t off = ((uint64_t)b * totalLen + tok) * wideDim + headDim + d;
+                                vals[count] = kv[off];
+                                logits[count++] = score[off] + ape[(uint64_t)r * wideDim + headDim + d];
+                            }
+                        } else {
+                            for (int r = 0; r < compressRatio; r++) {
+                                int tok = block * compressRatio + r;
+                                uint64_t off = ((uint64_t)b * totalLen + tok) * wideDim + d;
+                                vals[count] = kv[off];
+                                logits[count++] = score[off] + ape[(uint64_t)r * wideDim + d];
+                            }
+                        }
+                        float mx = -std::numeric_limits<float>::infinity();
+                        for (int i = 0; i < count; i++) {
+                            mx = std::max(mx, logits[i]);
+                        }
+                        double sum = 0.0, value = 0.0;
+                        for (int i = 0; i < count; i++) {
+                            double e = std::exp((double)logits[i] - mx);
+                            sum += e;
+                            value += e * vals[i];
+                        }
+                        compressed[((uint64_t)b * blocks + block) * headDim + d] = (float)(value / std::max(sum, 1e-30));
+                    }
+                }
+            }
+
+            Data compressedData, normed;
+            WriteFloatData(compressed, {bsz, blocks, headDim}, compressedData, DataType::BFLOAT16);
+            RMSNormReference(compressedData, weight[prefix + ".norm.weight"], 1e-6f, normed, DataType::BFLOAT16);
+            auto out = ReadFloatData(normed);
+            ApplyRotaryReference(out, normed.dims, ropeDim, ropeBase, 0, false,
+                                 originalSeqLen, ropeFactor, betaFast, betaSlow, compressRatio);
+            ActQuantInplaceReference(out, normed.dims, headDim - ropeDim, 64);
+            WriteFloatData(out, normed.dims, output, DataType::BFLOAT16);
+            return true;
+        }
+
+        static void BuildDecodeKVData(const std::vector<float> &windowKV, const Data &compressedKV,
+                                      int bsz, int windowSize, int compressedCount, int headDim,
+                                      Data &output) {
+            std::vector<float> y((uint64_t)bsz * (windowSize + compressedCount) * headDim, 0.0f);
+            for (int b = 0; b < bsz; b++) {
+                memcpy(y.data() + (uint64_t)b * (windowSize + compressedCount) * headDim,
+                       windowKV.data() + (uint64_t)b * windowSize * headDim,
+                       (uint64_t)windowSize * headDim * sizeof(float));
+            }
+            if (compressedCount > 0) {
+                auto cv = ReadFloatData(compressedKV);
+                for (int b = 0; b < bsz; b++) {
+                    memcpy(y.data() + ((uint64_t)b * (windowSize + compressedCount) + windowSize) * headDim,
+                           cv.data() + (uint64_t)b * compressedCount * headDim,
+                           (uint64_t)compressedCount * headDim * sizeof(float));
+                }
+            }
+            WriteFloatData(y, {bsz, windowSize + compressedCount, headDim}, output, DataType::BFLOAT16);
+        }
+
+        static void SparseAttentionReference(Data &q, Data &kv, Data &attnSink, int windowSize,
+                                             int ropeDim, float ropeBase, int startPos, float softmaxScale,
+                                             Data &output, int compressRatio = 0, int originalSeqLen = 0,
+                                             float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
+            auto qv = ReadFloatData(q);
+            auto kvv = ReadFloatData(kv);
+            auto sink = ReadFloatData(attnSink);
+            int bsz = q.dims[0], seqlen = q.dims[1], heads = q.dims[2], dim = q.dims[3];
+            int windowTopk = std::min(windowSize, seqlen);
+            int compressedCount = std::max(0, kv.dims[1] - seqlen);
+            std::vector<float> out((uint64_t)bsz * seqlen * heads * dim, 0.0f);
+            for (int b = 0; b < bsz; b++) {
+                for (int s = 0; s < seqlen; s++) {
+                    std::vector<int> idxs(windowTopk, -1);
+                    int begin = std::max(0, s - windowSize + 1);
+                    for (int k = 0; k <= s - begin && k < windowTopk; k++) {
+                        idxs[k] = begin + k;
+                    }
+                    if (compressRatio > 0) {
+                        int availableCompressed = (s + 1) / compressRatio;
+                        for (int k = 0; k < compressedCount; k++) {
+                            idxs.push_back(k < availableCompressed ? seqlen + k : -1);
+                        }
+                    }
+                    std::vector<float> scores(idxs.size());
+                    for (int h = 0; h < heads; h++) {
+                        const float *qrow = qv.data() + (((uint64_t)b * seqlen + s) * heads + h) * dim;
+                        float mx = -std::numeric_limits<float>::infinity();
+                        for (int k = 0; k < (int)idxs.size(); k++) {
+                            if (idxs[k] < 0) {
+                                scores[k] = -std::numeric_limits<float>::infinity();
+                                continue;
+                            }
+                            const float *kvrow = kvv.data() + ((uint64_t)b * kv.dims[1] + idxs[k]) * dim;
+                            double dot = 0.0;
+                            for (int d = 0; d < dim; d++) {
+                                dot += (double)qrow[d] * kvrow[d];
+                            }
+                            scores[k] = (float)dot * softmaxScale;
+                            mx = std::max(mx, scores[k]);
+                        }
+                        float safeMx = std::isfinite(mx) ? mx : 0.0f;
+                        double denom = std::exp((double)sink[h] - safeMx);
+                        for (int k = 0; k < (int)idxs.size(); k++) {
+                            if (std::isfinite(scores[k])) {
+                                denom += std::exp((double)scores[k] - safeMx);
+                            }
+                        }
+                        float *orow = out.data() + (((uint64_t)b * seqlen + s) * heads + h) * dim;
+                        for (int k = 0; k < (int)idxs.size(); k++) {
+                            if (!std::isfinite(scores[k])) {
+                                continue;
+                            }
+                            float w = (float)(std::exp((double)scores[k] - safeMx) / std::max(denom, 1e-30));
+                            const float *kvrow = kvv.data() + ((uint64_t)b * kv.dims[1] + idxs[k]) * dim;
+                            for (int d = 0; d < dim; d++) {
+                                orow[d] += w * kvrow[d];
+                            }
+                        }
+                    }
+                }
+            }
+            ApplyRotaryReference(out, {bsz, seqlen, heads, dim}, ropeDim, ropeBase, startPos, true,
+                                 originalSeqLen, ropeFactor, betaFast, betaSlow);
+            WriteFloatData(out, {bsz, seqlen, heads, dim}, output, DataType::BFLOAT16);
+        }
+
+        static void SparseAttentionDecodeReference(Data &q, Data &cacheKV, Data &attnSink,
+                                                   int windowSize, int startPos, int compressedCount,
+                                                   int ropeDim, float ropeBase, float softmaxScale,
+                                                   Data &output, int originalSeqLen = 0,
+                                                   float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
+            auto qv = ReadFloatData(q);
+            auto kvv = ReadFloatData(cacheKV);
+            auto sink = ReadFloatData(attnSink);
+            int bsz = q.dims[0], heads = q.dims[2], dim = q.dims[3];
+            std::vector<float> out((uint64_t)bsz * heads * dim, 0.0f);
+            std::vector<int> idxs;
+            if (startPos >= windowSize - 1) {
+                int pos = startPos % windowSize;
+                for (int i = pos + 1; i < windowSize; i++) {
+                    idxs.push_back(i);
+                }
+                for (int i = 0; i <= pos; i++) {
+                    idxs.push_back(i);
+                }
+            } else {
+                for (int i = 0; i <= startPos; i++) {
+                    idxs.push_back(i);
+                }
+            }
+            for (int i = 0; i < compressedCount; i++) {
+                idxs.push_back(windowSize + i);
+            }
+
+            for (int b = 0; b < bsz; b++) {
+                for (int h = 0; h < heads; h++) {
+                    const float *qrow = qv.data() + ((uint64_t)b * heads + h) * dim;
+                    std::vector<float> scores(idxs.size());
+                    float mx = -std::numeric_limits<float>::infinity();
+                    for (int k = 0; k < (int)idxs.size(); k++) {
+                        const float *kvrow = kvv.data() + ((uint64_t)b * cacheKV.dims[1] + idxs[k]) * dim;
+                        double dot = 0.0;
+                        for (int d = 0; d < dim; d++) {
+                            dot += (double)qrow[d] * kvrow[d];
+                        }
+                        scores[k] = (float)dot * softmaxScale;
+                        mx = std::max(mx, scores[k]);
+                    }
+                    float safeMx = std::isfinite(mx) ? mx : 0.0f;
+                    double denom = std::exp((double)sink[h] - safeMx);
+                    for (float score : scores) {
+                        denom += std::exp((double)score - safeMx);
+                    }
+                    float *orow = out.data() + ((uint64_t)b * heads + h) * dim;
+                    for (int k = 0; k < (int)idxs.size(); k++) {
+                        float w = (float)(std::exp((double)scores[k] - safeMx) / std::max(denom, 1e-30));
+                        const float *kvrow = kvv.data() + ((uint64_t)b * cacheKV.dims[1] + idxs[k]) * dim;
+                        for (int d = 0; d < dim; d++) {
+                            orow[d] += w * kvrow[d];
+                        }
+                    }
+                }
+            }
+            ApplyRotaryReference(out, {bsz, 1, heads, dim}, ropeDim, ropeBase, startPos, true,
+                                 originalSeqLen, ropeFactor, betaFast, betaSlow);
+            WriteFloatData(out, {bsz, 1, heads, dim}, output, DataType::BFLOAT16);
+        }
+
+        static bool CompressKVReference(WeightMap &weight, const std::string &prefix, const Data &x,
+                                        int compressRatio, int headDim, int ropeDim, float ropeBase,
+                                        float ropeFactor, int betaFast, int betaSlow, int originalSeqLen,
+                                        int startPos, Data &output) {
+            if (startPos != 0 || compressRatio <= 0) {
+                return false;
+            }
+            int bsz = x.dims[0], seqlen = x.dims[1];
+            if (seqlen < compressRatio) {
+                return false;
+            }
+            int cutoff = seqlen - (seqlen % compressRatio);
+            if (cutoff <= 0) {
+                return false;
+            }
+            int blocks = cutoff / compressRatio;
+            bool overlap = (compressRatio == 4);
+            int coff = overlap ? 2 : 1;
+
+            Data kvData, scoreData;
+            Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kvData);
+            Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), scoreData);
+            auto kv = ReadFloatData(kvData);
+            auto score = ReadFloatData(scoreData);
+            auto ape = ReadFloatData(weight[prefix + ".ape"]);
+
+            int wideDim = coff * headDim;
+            std::vector<float> compressed((uint64_t)bsz * blocks * headDim, 0.0f);
+            std::vector<float> vals(overlap ? 2 * compressRatio : compressRatio);
+            std::vector<float> logits(vals.size());
+
+            for (int b = 0; b < bsz; b++) {
+                for (int block = 0; block < blocks; block++) {
+                    for (int d = 0; d < headDim; d++) {
+                        int count = 0;
+                        if (overlap) {
+                            for (int r = 0; r < compressRatio; r++) {
+                                if (block == 0) {
+                                    vals[count] = 0.0f;
+                                    logits[count++] = -std::numeric_limits<float>::infinity();
+                                } else {
+                                    int tok = (block - 1) * compressRatio + r;
+                                    uint64_t off = ((uint64_t)b * seqlen + tok) * wideDim + d;
+                                    vals[count] = kv[off];
+                                    logits[count++] = score[off] + ape[(uint64_t)r * wideDim + d];
+                                }
+                            }
+                            for (int r = 0; r < compressRatio; r++) {
+                                int tok = block * compressRatio + r;
+                                uint64_t off = ((uint64_t)b * seqlen + tok) * wideDim + headDim + d;
+                                vals[count] = kv[off];
+                                logits[count++] = score[off] + ape[(uint64_t)r * wideDim + headDim + d];
+                            }
+                        } else {
+                            for (int r = 0; r < compressRatio; r++) {
+                                int tok = block * compressRatio + r;
+                                uint64_t off = ((uint64_t)b * seqlen + tok) * wideDim + d;
+                                vals[count] = kv[off];
+                                logits[count++] = score[off] + ape[(uint64_t)r * wideDim + d];
+                            }
+                        }
+
+                        float mx = -std::numeric_limits<float>::infinity();
+                        for (int i = 0; i < count; i++) {
+                            mx = std::max(mx, logits[i]);
+                        }
+                        double sum = 0.0, value = 0.0;
+                        for (int i = 0; i < count; i++) {
+                            double e = std::exp((double)logits[i] - mx);
+                            sum += e;
+                            value += e * vals[i];
+                        }
+                        compressed[((uint64_t)b * blocks + block) * headDim + d] = (float)(value / std::max(sum, 1e-30));
+                    }
+                }
+            }
+
+            Data compressedData, normed;
+            WriteFloatData(compressed, {bsz, blocks, headDim}, compressedData, DataType::BFLOAT16);
+            RMSNormReference(compressedData, weight[prefix + ".norm.weight"], 1e-6f, normed, DataType::BFLOAT16);
+            auto out = ReadFloatData(normed);
+            ApplyRotaryReference(out, normed.dims, ropeDim, ropeBase, 0, false,
+                                 originalSeqLen, ropeFactor, betaFast, betaSlow, compressRatio);
+            ActQuantInplaceReference(out, normed.dims, headDim - ropeDim, 64);
+            WriteFloatData(out, normed.dims, output, DataType::BFLOAT16);
+            return true;
+        }
+
+        static void ConcatSeqReference(const Data &a, const Data &b, Data &output) {
+            auto av = ReadFloatData(a);
+            auto bv = ReadFloatData(b);
+            int bsz = a.dims[0], aSeq = a.dims[1], bSeq = b.dims[1], dim = a.dims[2];
+            std::vector<float> y((uint64_t)bsz * (aSeq + bSeq) * dim);
+            for (int batch = 0; batch < bsz; batch++) {
+                memcpy(y.data() + (uint64_t)batch * (aSeq + bSeq) * dim,
+                       av.data() + (uint64_t)batch * aSeq * dim,
+                       (uint64_t)aSeq * dim * sizeof(float));
+                memcpy(y.data() + ((uint64_t)batch * (aSeq + bSeq) + aSeq) * dim,
+                       bv.data() + (uint64_t)batch * bSeq * dim,
+                       (uint64_t)bSeq * dim * sizeof(float));
+            }
+            WriteFloatData(y, {bsz, aSeq + bSeq, dim}, output, a.dataType);
+        }
+
+        static void WoAReference(Data &o, Data &woA, int groups, int oRank, Data &output) {
+            auto ov = ReadFloatData(o);
+            auto wv = ReadFloatData(woA);
+            int bsz = o.dims[0], seqlen = o.dims[1], heads = o.dims[2], headDim = o.dims[3];
+            int headsPerGroup = heads / groups;
+            int groupDim = headsPerGroup * headDim;
+            std::vector<float> y((uint64_t)bsz * seqlen * groups * oRank, 0.0f);
+            for (int b = 0; b < bsz; b++) {
+                for (int s = 0; s < seqlen; s++) {
+                    for (int g = 0; g < groups; g++) {
+                        std::vector<float> in(groupDim);
+                        for (int hh = 0; hh < headsPerGroup; hh++) {
+                            const float *src = ov.data() + (((uint64_t)b * seqlen + s) * heads + g * headsPerGroup + hh) * headDim;
+                            memcpy(in.data() + (uint64_t)hh * headDim, src, headDim * sizeof(float));
+                        }
+                        for (int r = 0; r < oRank; r++) {
+                            const float *w = wv.data() + ((uint64_t)g * oRank + r) * groupDim;
+                            double v = 0.0;
+                            for (int d = 0; d < groupDim; d++) {
+                                v += (double)in[d] * w[d];
+                            }
+                            y[(((uint64_t)b * seqlen + s) * groups + g) * oRank + r] = (float)v;
+                        }
+                    }
+                }
+            }
+            WriteFloatData(y, {bsz, seqlen, groups * oRank}, output, DataType::BFLOAT16);
+        }
+
+        static void RunExpertReference(WeightMap &weight, const std::string &prefix, const Data &x,
+                                       float routeWeight, float swigluLimit, std::vector<float> &accum) {
+            Data gate, up, gateup;
+            int interDim = 0;
+            if (weight.weight.find(prefix + ".gateup.weight") != weight.weight.end()) {
+                Linear((Data&)x, weight[prefix + ".gateup.weight"], Data(), gateup);
+                auto gv = ReadFloatData(gateup);
+                interDim = gateup.dims.back() / 2;
+                std::vector<float> act(interDim);
+                for (int i = 0; i < interDim; i++) {
+                    float g = gv[i];
+                    float u = gv[interDim + i];
+                    if (swigluLimit > 0.0f) {
+                        g = std::min(g, swigluLimit);
+                        u = std::max(-swigluLimit, std::min(u, swigluLimit));
+                    }
+                    act[i] = (g * SigmoidFloat(g)) * u * routeWeight;
+                }
+                WriteFloatData(act, {1, interDim}, gate, DataType::BFLOAT16);
+            } else {
+                Linear((Data&)x, weight[prefix + ".w1.weight"], Data(), gate);
+                Linear((Data&)x, weight[prefix + ".w3.weight"], Data(), up);
+                auto gv = ReadFloatData(gate);
+                auto uv = ReadFloatData(up);
+                interDim = (int)gv.size();
+                std::vector<float> act(interDim);
+                for (int i = 0; i < interDim; i++) {
+                    float g = gv[i], u = uv[i];
+                    if (swigluLimit > 0.0f) {
+                        g = std::min(g, swigluLimit);
+                        u = std::max(-swigluLimit, std::min(u, swigluLimit));
+                    }
+                    act[i] = (g * SigmoidFloat(g)) * u * routeWeight;
+                }
+                WriteFloatData(act, {1, interDim}, gate, DataType::BFLOAT16);
+            }
+            Data down;
+            Linear(gate, weight[prefix + ".w2.weight"], Data(), down);
+            auto dv = ReadFloatData(down);
+            for (int i = 0; i < (int)accum.size(); i++) {
+                accum[i] += dv[i];
+            }
+        }
+
+        static void BuildMoERoutingData(WeightMap &weight, const std::string &prefix, const Data &x,
+                                        const std::vector<int> &inputIds, int nRoutedExperts,
+                                        int topk, const std::string &scoreFunc, float routeScale,
+                                        Data &expertIndex, Data &expertScore) {
+            Data xFloat, routerLogits;
+            ToDataType(x, xFloat, DataType::FLOAT32);
+            Linear(xFloat, weight[prefix + ".gate.weight"], Data(), routerLogits, true);
+            auto rawScores = ReadFloatData(routerLogits);
+
+            bool hashRouting = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
+            std::vector<float> tid2eid, gateBias;
+            if (hashRouting) {
+                tid2eid = ReadFloatData(weight[prefix + ".gate.tid2eid"]);
+            } else if (weight.weight.find(prefix + ".gate.bias") != weight.weight.end()) {
+                gateBias = ReadFloatData(weight[prefix + ".gate.bias"]);
+            }
+
+            int tokens = x.dims[0];
+            std::vector<int> indices((uint64_t)tokens * topk);
+            std::vector<float> weights((uint64_t)tokens * topk);
+
+            for (int t = 0; t < tokens; t++) {
+                std::vector<float> originalScores(nRoutedExperts);
+                if (scoreFunc == "softmax") {
+                    float mx = -std::numeric_limits<float>::infinity();
+                    for (int e = 0; e < nRoutedExperts; e++) {
+                        mx = std::max(mx, rawScores[(uint64_t)t * nRoutedExperts + e]);
+                    }
+                    double sum = 0.0;
+                    for (int e = 0; e < nRoutedExperts; e++) {
+                        double v = std::exp((double)rawScores[(uint64_t)t * nRoutedExperts + e] - mx);
+                        originalScores[e] = (float)v;
+                        sum += v;
+                    }
+                    for (int e = 0; e < nRoutedExperts; e++) {
+                        originalScores[e] /= (float)sum;
+                    }
+                } else {
+                    for (int e = 0; e < nRoutedExperts; e++) {
+                        float raw = rawScores[(uint64_t)t * nRoutedExperts + e];
+                        originalScores[e] = (scoreFunc == "sigmoid") ? SigmoidFloat(raw) : std::sqrt(SoftplusFloat(raw));
+                    }
+                }
+
+                std::vector<int> curIndices(topk);
+                if (hashRouting) {
+                    for (int k = 0; k < topk; k++) {
+                        curIndices[k] = (int)(tid2eid[(uint64_t)inputIds[t] * topk + k] + 0.5f);
+                    }
+                } else {
+                    std::vector<float> selectScores = originalScores;
+                    if (!gateBias.empty()) {
+                        for (int e = 0; e < nRoutedExperts; e++) {
+                            selectScores[e] += gateBias[e];
+                        }
+                    }
+                    for (int k = 0; k < topk; k++) {
+                        int best = 0;
+                        float bestScore = -std::numeric_limits<float>::infinity();
+                        for (int e = 0; e < nRoutedExperts; e++) {
+                            if (selectScores[e] > bestScore) {
+                                bestScore = selectScores[e];
+                                best = e;
+                            }
+                        }
+                        curIndices[k] = best;
+                        selectScores[best] = -std::numeric_limits<float>::infinity();
+                    }
+                }
+
+                float sum = 0.0f;
+                for (int k = 0; k < topk; k++) {
+                    sum += originalScores[curIndices[k]];
+                }
+                for (int k = 0; k < topk; k++) {
+                    float v = originalScores[curIndices[k]];
+                    if (scoreFunc != "softmax") {
+                        v = v / sum;
+                    }
+                    indices[(uint64_t)t * topk + k] = curIndices[k];
+                    weights[(uint64_t)t * topk + k] = v * routeScale;
+                }
+            }
+
+            WriteIntData(indices, {tokens, topk}, expertIndex);
+            WriteFloatData(weights, {tokens, topk}, expertScore, DataType::FLOAT32);
+        }
+
+        static void MoEReference(WeightMap &weight, const std::string &prefix, const Data &x,
+                                 const std::vector<int> &inputIds, int nRoutedExperts,
+                                 int topk, const std::string &scoreFunc, float routeScale,
+                                 float swigluLimit, Data &output) {
+            Data xFloat, routerLogits;
+            ToDataType(x, xFloat, DataType::FLOAT32);
+            Linear(xFloat, weight[prefix + ".gate.weight"], Data(), routerLogits, true);
+            auto rawScores = ReadFloatData(routerLogits);
+            bool hashRouting = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
+            std::vector<float> tid2eid, gateBias;
+            if (hashRouting) {
+                tid2eid = ReadFloatData(weight[prefix + ".gate.tid2eid"]);
+            } else if (weight.weight.find(prefix + ".gate.bias") != weight.weight.end()) {
+                gateBias = ReadFloatData(weight[prefix + ".gate.bias"]);
+            }
+            int tokens = x.dims[0] * x.dims[1];
+            int dim = x.dims.back();
+            std::vector<float> y((uint64_t)tokens * dim, 0.0f);
+            for (int t = 0; t < tokens; t++) {
+                std::vector<float> originalScores(nRoutedExperts);
+                if (scoreFunc == "softmax") {
+                    float mx = -std::numeric_limits<float>::infinity();
+                    for (int e = 0; e < nRoutedExperts; e++) {
+                        mx = std::max(mx, rawScores[(uint64_t)t * nRoutedExperts + e]);
+                    }
+                    double sum = 0.0;
+                    for (int e = 0; e < nRoutedExperts; e++) {
+                        double v = std::exp((double)rawScores[(uint64_t)t * nRoutedExperts + e] - mx);
+                        originalScores[e] = (float)v;
+                        sum += v;
+                    }
+                    for (int e = 0; e < nRoutedExperts; e++) {
+                        originalScores[e] /= (float)sum;
+                    }
+                } else {
+                    for (int e = 0; e < nRoutedExperts; e++) {
+                        float raw = rawScores[(uint64_t)t * nRoutedExperts + e];
+                        if (scoreFunc == "sigmoid") {
+                            originalScores[e] = SigmoidFloat(raw);
+                        } else {
+                            originalScores[e] = std::sqrt(SoftplusFloat(raw));
+                        }
+                    }
+                }
+
+                std::vector<int> indices(topk);
+                if (hashRouting) {
+                    for (int k = 0; k < topk; k++) {
+                        indices[k] = (int)(tid2eid[(uint64_t)inputIds[t] * topk + k] + 0.5f);
+                    }
+                } else {
+                    std::vector<float> selectScores = originalScores;
+                    if (!gateBias.empty()) {
+                        for (int e = 0; e < nRoutedExperts; e++) {
+                            selectScores[e] += gateBias[e];
+                        }
+                    }
+                    for (int k = 0; k < topk; k++) {
+                        int best = 0;
+                        float bestScore = -std::numeric_limits<float>::infinity();
+                        for (int e = 0; e < nRoutedExperts; e++) {
+                            if (selectScores[e] > bestScore) {
+                                bestScore = selectScores[e];
+                                best = e;
+                            }
+                        }
+                        indices[k] = best;
+                        selectScores[best] = -std::numeric_limits<float>::infinity();
+                    }
+                }
+                std::vector<float> weights(topk);
+                float sum = 0.0f;
+                for (int k = 0; k < topk; k++) {
+                    float v = originalScores[indices[k]];
+                    weights[k] = v;
+                    sum += v;
+                }
+                if (scoreFunc != "softmax") {
+                    for (int k = 0; k < topk; k++) {
+                        weights[k] = weights[k] / sum * routeScale;
+                    }
+                } else {
+                    for (int k = 0; k < topk; k++) {
+                        weights[k] *= routeScale;
+                    }
+                }
+                Data tokenX;
+                Split(x, 1, t, t + 1, tokenX);
+                tokenX.Reshape({1, dim});
+                std::vector<float> accum(dim, 0.0f);
+                for (int k = 0; k < topk; k++) {
+                    RunExpertReference(weight, prefix + ".experts." + std::to_string(indices[k]), tokenX,
+                                       weights[k], swigluLimit, accum);
+                }
+                RunExpertReference(weight, prefix + ".shared_experts", tokenX, 1.0f, 0.0f, accum);
+                memcpy(y.data() + (uint64_t)t * dim, accum.data(), dim * sizeof(float));
+            }
+            WriteFloatData(y, x.dims, output, x.dataType);
+        }
+
+        static void HcHeadReference(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
+                                    int hcMult, float eps, float normEps, Data &output) {
+            int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
+            int flatDim = hcMult * dim;
+            auto xv = ReadFloatData(x);
+            auto fn = ReadFloatData(hcFn);
+            auto scale = ReadFloatData(hcScale);
+            auto base = ReadFloatData(hcBase);
+            std::vector<float> y((uint64_t)bsz * seqlen * dim, 0.0f);
+            for (int t = 0; t < bsz * seqlen; t++) {
+                const float *xrow = xv.data() + (uint64_t)t * flatDim;
+                double ss = 0.0;
+                for (int k = 0; k < flatDim; k++) {
+                    ss += (double)xrow[k] * xrow[k];
+                }
+                float rsqrt = 1.0f / std::sqrt((float)(ss / flatDim) + normEps);
+                for (int h = 0; h < hcMult; h++) {
+                    const float *w = fn.data() + (uint64_t)h * flatDim;
+                    double mix = 0.0;
+                    for (int k = 0; k < flatDim; k++) {
+                        mix += (double)xrow[k] * w[k];
+                    }
+                    float pre = SigmoidFloat((float)mix * rsqrt * scale[0] + base[h]) + eps;
+                    for (int d = 0; d < dim; d++) {
+                        y[(uint64_t)t * dim + d] += pre * xrow[(uint64_t)h * dim + d];
+                    }
+                }
+            }
+            WriteFloatData(y, {bsz, seqlen, dim}, output, x.dataType);
+        }
+    }
 
     DeepSeekV4Model::DeepSeekV4Model() {
         this->model_type = "deepseek_v4";
@@ -91,31 +1395,32 @@ namespace fastllm {
         basellm::InitParams();
 
         // -------- 基础尺寸 --------
-        max_position_embeddings = atoi(this->weight.dicts["max_position_embeddings"].c_str());
+        block_cnt = GetIntWithFallback(this->weight, {"num_hidden_layers", "n_layers"}, block_cnt > 0 ? block_cnt : 1);
+        embed_dim = GetIntWithFallback(this->weight, {"hidden_size", "dim"}, embed_dim > 0 ? embed_dim : 4096);
+        num_attention_heads = GetIntWithFallback(this->weight, {"num_attention_heads", "n_heads"}, num_attention_heads > 0 ? num_attention_heads : 64);
+        max_positions = GetIntWithFallback(this->weight, {"max_position_embeddings", "max_seq_len"}, max_positions > 0 ? max_positions : 4096);
+        max_position_embeddings = max_positions;
         if (this->weight.dicts.find("rms_norm_eps") != this->weight.dicts.end()) {
             rms_norm_eps = atof(this->weight.dicts["rms_norm_eps"].c_str());
         }
+        rms_norm_eps = GetFloatWithFallback(this->weight, {"rms_norm_eps", "norm_eps"}, rms_norm_eps);
 
         // num_attention_heads / num_key_value_heads / embed_dim / block_cnt 已由 basellm 解析
         if (this->weight.dicts.find("num_key_value_heads") != this->weight.dicts.end()) {
             num_key_value_heads = atoi(this->weight.dicts["num_key_value_heads"].c_str());
+        } else {
+            num_key_value_heads = 1;
         }
         if (this->weight.dicts.find("max_position_embeddings") != this->weight.dicts.end()) {
             max_positions = atoi(this->weight.dicts["max_position_embeddings"].c_str());
         }
 
         // -------- Attention 维度 --------
-        q_lora_rank = atoi(this->weight.dicts["q_lora_rank"].c_str());
-        if (this->weight.dicts.find("o_lora_rank") != this->weight.dicts.end()) {
-            o_lora_rank = atoi(this->weight.dicts["o_lora_rank"].c_str());
-        }
-        if (this->weight.dicts.find("o_groups") != this->weight.dicts.end()) {
-            o_groups = atoi(this->weight.dicts["o_groups"].c_str());
-        }
-        if (this->weight.dicts.find("head_dim") != this->weight.dicts.end()) {
-            head_dim_full = atoi(this->weight.dicts["head_dim"].c_str());
-        }
-        qk_rope_head_dim = atoi(this->weight.dicts["qk_rope_head_dim"].c_str());
+        q_lora_rank = GetIntWithFallback(this->weight, {"q_lora_rank"}, q_lora_rank);
+        o_lora_rank = GetIntWithFallback(this->weight, {"o_lora_rank"}, o_lora_rank);
+        o_groups = GetIntWithFallback(this->weight, {"o_groups"}, o_groups);
+        head_dim_full = GetIntWithFallback(this->weight, {"head_dim"}, head_dim_full);
+        qk_rope_head_dim = GetIntWithFallback(this->weight, {"qk_rope_head_dim", "rope_head_dim"}, qk_rope_head_dim);
         qk_nope_head_dim = head_dim_full - qk_rope_head_dim;
         head_dim = head_dim_full;
         rotary_dim = qk_rope_head_dim;
@@ -151,26 +1456,14 @@ namespace fastllm {
         }
 
         // -------- MoE --------
-        if (this->weight.dicts.find("moe_intermediate_size") != this->weight.dicts.end()) {
-            moe_intermediate_size = atoi(this->weight.dicts["moe_intermediate_size"].c_str());
-        }
-        if (this->weight.dicts.find("n_shared_experts") != this->weight.dicts.end()) {
-            n_shared_experts = atoi(this->weight.dicts["n_shared_experts"].c_str());
-        }
-        if (this->weight.dicts.find("n_routed_experts") != this->weight.dicts.end()) {
-            num_experts = atoi(this->weight.dicts["n_routed_experts"].c_str());
-        }
-        if (this->weight.dicts.find("num_experts_per_tok") != this->weight.dicts.end()) {
-            num_experts_per_tok = atoi(this->weight.dicts["num_experts_per_tok"].c_str());
-        }
+        moe_intermediate_size = GetIntWithFallback(this->weight, {"moe_intermediate_size", "moe_inter_dim"}, moe_intermediate_size);
+        n_shared_experts = GetIntWithFallback(this->weight, {"n_shared_experts"}, n_shared_experts);
+        num_experts = GetIntWithFallback(this->weight, {"n_routed_experts", "num_experts"}, num_experts);
+        num_experts_per_tok = GetIntWithFallback(this->weight, {"num_experts_per_tok", "n_activated_experts"}, num_experts_per_tok);
         norm_topk_prob = (this->weight.dicts.find("norm_topk_prob") != this->weight.dicts.end() &&
                           this->weight.dicts["norm_topk_prob"] == "true");
-        if (this->weight.dicts.find("routed_scaling_factor") != this->weight.dicts.end()) {
-            routed_scaling_factor = atof(this->weight.dicts["routed_scaling_factor"].c_str());
-        }
-        if (this->weight.dicts.find("scoring_func") != this->weight.dicts.end()) {
-            scoring_func = this->weight.dicts["scoring_func"];
-        }
+        routed_scaling_factor = GetFloatWithFallback(this->weight, {"routed_scaling_factor", "route_scale"}, routed_scaling_factor);
+        scoring_func = GetStringWithFallback(this->weight, {"scoring_func", "score_func"}, scoring_func);
         if (this->weight.dicts.find("topk_method") != this->weight.dicts.end()) {
             topk_method = this->weight.dicts["topk_method"];
         }
@@ -179,31 +1472,17 @@ namespace fastllm {
         }
 
         // -------- Hash 路由 / MTP --------
-        if (this->weight.dicts.find("num_hash_layers") != this->weight.dicts.end()) {
-            num_hash_layers = atoi(this->weight.dicts["num_hash_layers"].c_str());
-        }
-        if (this->weight.dicts.find("num_nextn_predict_layers") != this->weight.dicts.end()) {
-            num_nextn_predict_layers = atoi(this->weight.dicts["num_nextn_predict_layers"].c_str());
-        }
+        num_hash_layers = GetIntWithFallback(this->weight, {"num_hash_layers", "n_hash_layers"}, num_hash_layers);
+        num_nextn_predict_layers = GetIntWithFallback(this->weight, {"num_nextn_predict_layers", "n_mtp_layers"}, num_nextn_predict_layers);
 
         // -------- Hyper-Connections --------
-        if (this->weight.dicts.find("hc_mult") != this->weight.dicts.end()) {
-            hc_mult = atoi(this->weight.dicts["hc_mult"].c_str());
-        }
-        if (this->weight.dicts.find("hc_sinkhorn_iters") != this->weight.dicts.end()) {
-            hc_sinkhorn_iters = atoi(this->weight.dicts["hc_sinkhorn_iters"].c_str());
-        }
-        if (this->weight.dicts.find("hc_eps") != this->weight.dicts.end()) {
-            hc_eps = atof(this->weight.dicts["hc_eps"].c_str());
-        }
+        hc_mult = GetIntWithFallback(this->weight, {"hc_mult"}, hc_mult);
+        hc_sinkhorn_iters = GetIntWithFallback(this->weight, {"hc_sinkhorn_iters"}, hc_sinkhorn_iters);
+        hc_eps = GetFloatWithFallback(this->weight, {"hc_eps"}, hc_eps);
 
         // -------- RoPE / YaRN --------
-        if (this->weight.dicts.find("rope_theta") != this->weight.dicts.end()) {
-            rope_base = atof(this->weight.dicts["rope_theta"].c_str());
-        }
-        if (this->weight.dicts.find("compress_rope_theta") != this->weight.dicts.end()) {
-            compress_rope_theta = atof(this->weight.dicts["compress_rope_theta"].c_str());
-        }
+        rope_base = GetFloatWithFallback(this->weight, {"rope_theta"}, rope_base);
+        compress_rope_theta = GetFloatWithFallback(this->weight, {"compress_rope_theta"}, compress_rope_theta);
         if (this->weight.dicts.find("rope_scaling.type") != this->weight.dicts.end()) {
             rope_scaling_type = this->weight.dicts["rope_scaling.type"];
             if (rope_scaling_type == "yarn") {
@@ -217,15 +1496,21 @@ namespace fastllm {
         if (this->weight.dicts.find("rope_scaling.factor") != this->weight.dicts.end()) {
             rope_factor = atof(this->weight.dicts["rope_scaling.factor"].c_str());
         }
+        rope_factor = GetFloatWithFallback(this->weight, {"rope_scaling.factor", "rope_factor"}, rope_factor);
         if (this->weight.dicts.find("rope_scaling.beta_fast") != this->weight.dicts.end()) {
             rope_scaling_beta_fast = atoi(this->weight.dicts["rope_scaling.beta_fast"].c_str());
         }
+        rope_scaling_beta_fast = GetIntWithFallback(this->weight, {"rope_scaling.beta_fast", "beta_fast"}, rope_scaling_beta_fast);
         if (this->weight.dicts.find("rope_scaling.beta_slow") != this->weight.dicts.end()) {
             rope_scaling_beta_slow = atoi(this->weight.dicts["rope_scaling.beta_slow"].c_str());
         }
+        rope_scaling_beta_slow = GetIntWithFallback(this->weight, {"rope_scaling.beta_slow", "beta_slow"}, rope_scaling_beta_slow);
         if (this->weight.dicts.find("rope_scaling.original_max_position_embeddings") != this->weight.dicts.end()) {
             rope_scaling_original_max_position_embeddings = atof(this->weight.dicts["rope_scaling.original_max_position_embeddings"].c_str());
         }
+        rope_scaling_original_max_position_embeddings =
+            GetFloatWithFallback(this->weight, {"rope_scaling.original_max_position_embeddings", "original_seq_len"},
+                                 rope_scaling_original_max_position_embeddings);
         if (this->weight.dicts.find("rope_scaling.mscale") != this->weight.dicts.end()) {
             rope_scaling_mscale = atof(this->weight.dicts["rope_scaling.mscale"].c_str());
         } else {
@@ -381,8 +1666,332 @@ namespace fastllm {
                                                    const GenerationConfig &generationConfig,
                                                    const LastTokensManager &lastTokens,
                                                    std::vector <std::vector <float>*> *retLogits) {
-        inputIds.Print();
-        return std::vector<int>(batch, 0);
+        Data hiddenStates;
+        int startPos = 0;
+        if (positionIds.dims.size() >= 2 && positionIds.Count(0) > 0) {
+            auto pids = ReadTokenIds(positionIds);
+            startPos = pids.empty() ? 0 : pids[0];
+        }
+        int originalStartPos = startPos;
+        bool debugFullRecomputeDecode = EnvFlagEnabled("FASTLLM_DEBUG_FULL_RECOMPUTE_DECODE") && batch == 1;
+        Data recomputeInputIds;
+        const Data *forwardInputIds = &inputIds;
+        if (debugFullRecomputeDecode) {
+            auto ids = ReadTokenIds(inputIds);
+            if (originalStartPos == 0) {
+                debugFullRecomputeTokens = ids;
+                debugGeneratedTokens = 0;
+            } else {
+                debugFullRecomputeTokens.insert(debugFullRecomputeTokens.end(), ids.begin(), ids.end());
+                std::vector<float> fullIds(debugFullRecomputeTokens.begin(), debugFullRecomputeTokens.end());
+                recomputeInputIds.CopyFrom(Data(DataType::FLOAT32, {1, (int)fullIds.size()}, fullIds));
+                forwardInputIds = &recomputeInputIds;
+                startPos = 0;
+            }
+        }
+        bool debugThisStep = (originalStartPos == 0) || EnvFlagEnabled("FASTLLM_DEBUG_ALL_STEPS");
+        bool debugLogitsThisStep = debugThisStep || EnvFlagEnabled("FASTLLM_DEBUG_LOGITS_ALL_STEPS") || debugFullRecomputeDecode;
+        bool useDecodeCache = (!debugFullRecomputeDecode && batch == 1);
+
+        if (debugThisStep || debugFullRecomputeDecode) {
+            DebugDumpInputIds(*forwardInputIds, originalStartPos);
+        }
+        Embedding(*forwardInputIds, weight["embed.weight"], hiddenStates);
+        if (debugThisStep) {
+            DebugDumpData("embed", hiddenStates);
+        }
+
+        int bsz = forwardInputIds->dims[0];
+        int seqlen = forwardInputIds->dims[1];
+        int dim = embed_dim;
+        auto hv = ReadFloatData(hiddenStates);
+        std::vector<float> expanded((uint64_t)bsz * seqlen * hc_mult * dim);
+        for (int b = 0; b < bsz; b++) {
+            for (int s = 0; s < seqlen; s++) {
+                const float *src = hv.data() + ((uint64_t)b * seqlen + s) * dim;
+                for (int h = 0; h < hc_mult; h++) {
+                    memcpy(expanded.data() + (((uint64_t)b * seqlen + s) * hc_mult + h) * dim,
+                           src, dim * sizeof(float));
+                }
+            }
+        }
+        WriteFloatData(expanded, {bsz, seqlen, hc_mult, dim}, hiddenStates, hiddenStates.dataType);
+        if (debugThisStep) {
+            DebugDumpData("hc_expand", hiddenStates);
+        }
+
+        if (block_cnt <= 0) {
+            ErrorInFastLLM("DeepSeekV4Model: invalid block_cnt.");
+        }
+        if (useDecodeCache && originalStartPos == 0) {
+            decodeLayerCaches.clear();
+            decodeLayerCaches.resize(block_cnt);
+        }
+
+        // 默认跑完全部主层；FASTLLM_DEBUG_LAYERS 可限制调试层数，便于逐层排查。
+        int debugLayers = block_cnt;
+        if (const char *env = std::getenv("FASTLLM_DEBUG_LAYERS")) {
+            int limit = atoi(env);
+            if (limit > 0) {
+                debugLayers = std::min(limit, block_cnt);
+            }
+        }
+        int debugDetailLayer = -1;
+        if (const char *env = std::getenv("FASTLLM_DEBUG_DETAIL_LAYER")) {
+            debugDetailLayer = atoi(env);
+        }
+        std::vector<int> tokenIds = ReadTokenIds(*forwardInputIds);
+        if (weights.empty()) {
+            auto getWeightPtr = [this](const std::string &name) -> Data* {
+                auto it = this->weight.weight.find(name);
+                return it == this->weight.weight.end() ? nullptr : &it->second;
+            };
+            weights.resize(block_cnt);
+            biass.resize(block_cnt);
+            for (int layer = 0; layer < block_cnt; layer++) {
+                std::string pre = "layers." + std::to_string(layer) + ".ffn";
+                weights[layer].push_back(getWeightPtr(pre + ".shared_experts.gateup.weight"));
+                weights[layer].push_back(getWeightPtr(pre + ".shared_experts.w2.weight"));
+                biass[layer].push_back(nullptr);
+                biass[layer].push_back(nullptr);
+                for (int expert = 0; expert < num_experts; expert++) {
+                    weights[layer].push_back(getWeightPtr(pre + ".experts." + std::to_string(expert) + ".gateup.weight"));
+                    weights[layer].push_back(getWeightPtr(pre + ".experts." + std::to_string(expert) + ".w2.weight"));
+                    biass[layer].push_back(nullptr);
+                    biass[layer].push_back(nullptr);
+                }
+            }
+        }
+        for (int layer = 0; layer < debugLayers; layer++) {
+            std::string pre = "layers." + std::to_string(layer);
+            int compressRatio = compress_ratios.size() > layer ? compress_ratios[layer] : 0;
+            bool useCompressRope = compressRatio != 0;
+            float layerRopeBase = useCompressRope ? compress_rope_theta : rope_base;
+            int layerOriginalSeqLen = useCompressRope ? (int)rope_scaling_original_max_position_embeddings : 0;
+
+            Data residual;
+            residual.CopyFrom(hiddenStates);
+            HcMix attnMix = HcPreReference(hiddenStates, weight[pre + ".hc_attn_fn"],
+                                           weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
+                                           hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
+            Data attnInput;
+            RMSNormReference(attnMix.y, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput, DataType::BFLOAT16);
+
+            Data qr, qNorm, q;
+            Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr);
+            RMSNormReference(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm, DataType::BFLOAT16);
+            Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
+            q.Reshape({bsz, seqlen, num_attention_heads, head_dim_full});
+            ScaleQReference(q, rms_norm_eps);
+            {
+                auto qv = ReadFloatData(q);
+                ApplyRotaryReference(qv, q.dims, qk_rope_head_dim, layerRopeBase, startPos, false,
+                                     layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
+                                     rope_scaling_beta_slow);
+                WriteFloatData(qv, q.dims, q, DataType::BFLOAT16);
+            }
+
+            Data kv;
+            Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv);
+            RMSNormReference(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv, DataType::BFLOAT16);
+            kv.Reshape({bsz, seqlen, 1, head_dim_full});
+            {
+                auto kvv = ReadFloatData(kv);
+                ApplyRotaryReference(kvv, kv.dims, qk_rope_head_dim, layerRopeBase, startPos, false,
+                                     layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
+                                     rope_scaling_beta_slow);
+                ActQuantInplaceReference(kvv, kv.dims, head_dim_full - qk_rope_head_dim, 64);
+                WriteFloatData(kvv, kv.dims, kv, DataType::BFLOAT16);
+            }
+            kv.Reshape({bsz, seqlen, head_dim_full});
+            DeepSeekV4DecodeLayerCache *decodeCache = nullptr;
+            if (useDecodeCache && layer < (int)decodeLayerCaches.size()) {
+                decodeCache = &decodeLayerCaches[layer];
+            }
+            int decodeCompressedCount = 0;
+            if (decodeCache != nullptr) {
+                auto kvValues = ReadFloatData(kv);
+                if (startPos == 0) {
+                    decodeCache->initialized = true;
+                    decodeCache->bsz = bsz;
+                    decodeCache->totalLen = seqlen;
+                    decodeCache->headDim = head_dim_full;
+                    decodeCache->windowSize = window_size;
+                    decodeCache->compressRatio = compressRatio;
+                    decodeCache->compressorWideDim = (compressRatio == 4 ? 2 : 1) * head_dim_full;
+                    StoreWindowKVCache(kvValues, bsz, seqlen, head_dim_full, startPos, window_size,
+                                       decodeCache->windowKV);
+                } else {
+                    if (!decodeCache->initialized) {
+                        ErrorInFastLLM("DeepSeekV4Model: decode cache is not initialized.");
+                    }
+                    decodeCache->totalLen = startPos + seqlen;
+                    UpdateWindowKVCache(kvValues, bsz, head_dim_full, startPos, window_size,
+                                        decodeCache->windowKV);
+                }
+            }
+            if (compressRatio > 0) {
+                if (decodeCache != nullptr) {
+                    std::vector<float> compressorKV, compressorScore;
+                    ComputeCompressorRaw(weight, pre + ".attn.compressor", attnInput, compressorKV, compressorScore);
+                    if (startPos == 0) {
+                        decodeCache->compressorKVRaw = std::move(compressorKV);
+                        decodeCache->compressorScoreRaw = std::move(compressorScore);
+                    } else {
+                        AppendCompressorRaw(compressorKV, compressorScore, bsz, seqlen,
+                                            decodeCache->compressorWideDim,
+                                            decodeCache->compressorKVRaw,
+                                            decodeCache->compressorScoreRaw);
+                    }
+                    if (BuildCompressedKVFromRaw(weight, pre + ".attn.compressor",
+                                                 decodeCache->compressorKVRaw,
+                                                 decodeCache->compressorScoreRaw,
+                                                 bsz, decodeCache->totalLen, compressRatio,
+                                                 head_dim_full, qk_rope_head_dim, layerRopeBase,
+                                                 rope_factor, rope_scaling_beta_fast, rope_scaling_beta_slow,
+                                                 layerOriginalSeqLen, decodeCache->compressedKV)) {
+                        decodeCompressedCount = decodeCache->compressedKV.dims[1];
+                        if (startPos == 0) {
+                            Data catKV;
+                            ConcatSeqReference(kv, decodeCache->compressedKV, catKV);
+                            kv.CopyFrom(catKV);
+                        }
+                    }
+                } else {
+                    Data compressedKV;
+                    if (CompressKVReference(weight, pre + ".attn.compressor", attnInput, compressRatio,
+                                            head_dim_full, qk_rope_head_dim, layerRopeBase, rope_factor,
+                                            rope_scaling_beta_fast, rope_scaling_beta_slow,
+                                            layerOriginalSeqLen, startPos, compressedKV)) {
+                        Data catKV;
+                        ConcatSeqReference(kv, compressedKV, catKV);
+                        kv.CopyFrom(catKV);
+                    }
+                }
+            }
+
+            Data attnOut4, woAOut, attnOut;
+            if (decodeCache != nullptr && startPos > 0) {
+                Data cacheKV;
+                BuildDecodeKVData(decodeCache->windowKV, decodeCache->compressedKV,
+                                  bsz, window_size, decodeCompressedCount, head_dim_full, cacheKV);
+                SparseAttentionDecodeReference(q, cacheKV, weight[pre + ".attn.attn_sink"],
+                                               window_size, startPos, decodeCompressedCount,
+                                               qk_rope_head_dim, layerRopeBase,
+                                               1.0f / std::sqrt((float)head_dim_full), attnOut4,
+                                               layerOriginalSeqLen, rope_factor,
+                                               rope_scaling_beta_fast, rope_scaling_beta_slow);
+            } else {
+                SparseAttentionReference(q, kv, weight[pre + ".attn.attn_sink"], window_size,
+                                         qk_rope_head_dim, layerRopeBase, startPos,
+                                         1.0f / std::sqrt((float)head_dim_full), attnOut4,
+                                         compressRatio, layerOriginalSeqLen, rope_factor,
+                                         rope_scaling_beta_fast, rope_scaling_beta_slow);
+            }
+            WoAReference(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+            Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
+            if (debugThisStep && layer == debugDetailLayer) {
+                DebugDumpData("layer" + std::to_string(layer) + "_attn_out", attnOut);
+            }
+            HcPostReference(attnOut, residual, attnMix, hiddenStates);
+            if (debugThisStep && layer == debugDetailLayer) {
+                DebugDumpData("layer" + std::to_string(layer) + "_after_attn", hiddenStates);
+            }
+
+            residual.CopyFrom(hiddenStates);
+            HcMix ffnMix = HcPreReference(hiddenStates, weight[pre + ".hc_ffn_fn"],
+                                          weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
+                                          hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
+            Data ffnInput, ffnOut;
+            RMSNormReference(ffnMix.y, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput, DataType::BFLOAT16);
+            if (debugThisStep && layer == debugDetailLayer) {
+                DebugDumpData("layer" + std::to_string(layer) + "_ffn_in", ffnInput);
+            }
+            std::vector<int> ffnDims = ffnInput.dims;
+            ffnInput.Reshape({bsz * seqlen, dim});
+            Data expertIndex, expertScore;
+            BuildMoERoutingData(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
+                                num_experts_per_tok, scoring_func, routed_scaling_factor,
+                                expertIndex, expertScore);
+            if (layer >= (int)weights.size() || weights[layer].empty() ||
+                weights[layer][0] == nullptr || weights[layer][1] == nullptr ||
+                weights[layer].size() < 4 || weights[layer][2] == nullptr || weights[layer][3] == nullptr ||
+                !CanRunMergeMOE(ffnInput, biass[layer])) {
+                ffnInput.Reshape(ffnDims);
+                MoEReference(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
+                             num_experts_per_tok, scoring_func, routed_scaling_factor, swiglu_limit, ffnOut);
+            } else {
+                Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
+                ApplyDeviceMap(this->moeDeviceMap, layer + 1, block_cnt);
+                // NumasMergeMOE 的小 batch 路径直接读取 cpuData，先保证输入在 CPU 可见。
+                ffnInput.ToDevice(DataDevice::CPU);
+                expertIndex.ToDevice(DataDevice::CPU);
+                expertScore.ToDevice(DataDevice::CPU);
+                MergeMOEBlock(&ffnInput, &expertIndex, &expertScore,
+                              &weights[layer], &biass[layer],
+                              &w1, &w2, &w3, &tempInput, &tempOutput,
+                              1.0f, &ffnOut, layer,
+                              ffnInput.dataType, this->moeAtype,
+                              &moeInputTemp, &moeOutputTemp);
+                ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
+            }
+            ffnOut.Reshape(ffnDims);
+            if (debugThisStep && layer == debugDetailLayer) {
+                DebugDumpData("layer" + std::to_string(layer) + "_ffn_out", ffnOut);
+            }
+            HcPostReference(ffnOut, residual, ffnMix, hiddenStates);
+            if (debugThisStep) {
+                DebugDumpData("layer" + std::to_string(layer), hiddenStates);
+            }
+        }
+
+        Data headInput, normed, lastHidden, logits;
+        HcHeadReference(hiddenStates, weight["hc_head_fn"], weight["hc_head_scale"], weight["hc_head_base"],
+                        hc_mult, hc_eps, rms_norm_eps, headInput);
+        RMSNormReference(headInput, weight["norm.weight"], rms_norm_eps, normed, DataType::BFLOAT16);
+        Split(normed, 1, seqlen - 1, seqlen, lastHidden);
+        Linear(lastHidden, weight["head.weight"], Data(), logits);
+        ToDataType(logits, DataType::FLOAT32);
+        if (debugLogitsThisStep) {
+            DebugDumpData("logits", logits);
+        }
+        if (originalStartPos == 0 && std::getenv("FASTLLM_DEBUG_EXIT_AFTER_PREFILL") != nullptr) {
+            fflush(stdout);
+            std::_Exit(0);
+        }
+
+        if (generationConfig.output_logits && retLogits != nullptr) {
+            logits.ToDevice(DataDevice::CPU);
+            int vocabSize = logits.dims.back();
+            for (int b = 0; b < batch; b++) {
+                (*retLogits)[b]->resize(vocabSize);
+                memcpy((float*)(*retLogits)[b]->data(),
+                       ((float*)logits.cpuData) + ((uint64_t)b * logits.dims[1] + logits.dims[1] - 1) * vocabSize,
+                       vocabSize * sizeof(float));
+            }
+        }
+
+        Data topk;
+        TopK(logits, topk, 1);
+        topk.ToDevice(DataDevice::CPU);
+        std::vector<int> ret;
+        for (int b = 0; b < batch; b++) {
+            ret.push_back((int)(((float*)topk.cpuData)[b * 2] + 1e-3));
+        }
+
+        if (debugFullRecomputeDecode) {
+            debugGeneratedTokens++;
+            printf("[fastllm-debug] generated step=%d start_pos=%d token=%d\n",
+                   debugGeneratedTokens, originalStartPos, ret.empty() ? -1 : ret[0]);
+            int stopAfter = EnvInt("FASTLLM_DEBUG_STOP_AFTER_TOKENS", 0);
+            if (stopAfter > 0 && debugGeneratedTokens >= stopAfter) {
+                fflush(stdout);
+                std::_Exit(0);
+            }
+        }
+
+        UpdateDebugPastKeyValues(pastKeyValues, bsz, originalStartPos + inputIds.dims[1], block_cnt);
+        return ret;
     }
 
     std::vector <int> DeepSeekV4Model::ForwardBatch(int batch,
