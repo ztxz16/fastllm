@@ -20,6 +20,7 @@
 #include <array>  // For std::array
 #include "gguf.h"
 #include <assert.h>
+#include <cstdlib>
 
 namespace fastllm {
     extern CPUInstructInfo cpuInstructInfo;
@@ -506,7 +507,7 @@ namespace fastllm {
                 return;
             }
         }
-        if (cpuInstructInfo.hasAVX2 && n > 1) {
+        if (cpuInstructInfo.hasAVX2 && (n > 1 || std::getenv("FASTLLM_DSV4_ENABLE_CPU_F32_F16_AVX2_N1") != nullptr)) {
             if (LinearFloat32Float16_AVX2_Kernel(
                 inputData, weightData, biasData, outputData, n, m, k, st, end
                 )) {

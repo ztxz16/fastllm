@@ -56,16 +56,76 @@ __global__ void DeepSeekV4WoAKernel(const InT *o, const WT *w, __nv_bfloat16 *ou
     int headsPerGroup = heads / groups;
     int groupDim = headsPerGroup * headDim;
     const WT *wrow = w + ((uint64_t)g * oRank + r) * groupDim;
+    const InT *src = o + (((uint64_t)b * seqlen + s) * heads + g * headsPerGroup) * headDim;
 
     double v = 0.0;
-    int d = 0;
-    for (int hh = 0; hh < headsPerGroup; hh++) {
-        const InT *src = o + (((uint64_t)b * seqlen + s) * heads + g * headsPerGroup + hh) * headDim;
-        for (int localD = 0; localD < headDim; localD++, d++) {
-            v += (double)Dsv4ToFloat(src[localD]) * Dsv4ToFloat(wrow[d]);
-        }
+    for (int d = 0; d < groupDim; d++) {
+        v += (double)Dsv4ToFloat(src[d]) * Dsv4ToFloat(wrow[d]);
     }
     output[idx] = __float2bfloat16_rn((float)v);
+}
+
+template <typename InT, typename WT>
+__global__ void DeepSeekV4WoAFloatAccKernel(const InT *o, const WT *w, __nv_bfloat16 *output,
+                                            int bsz, int seqlen, int heads, int headDim,
+                                            int groups, int oRank) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = bsz * seqlen * groups * oRank;
+    if (idx >= total) {
+        return;
+    }
+
+    int r = idx % oRank;
+    int tmp = idx / oRank;
+    int g = tmp % groups;
+    tmp /= groups;
+    int s = tmp % seqlen;
+    int b = tmp / seqlen;
+
+    int headsPerGroup = heads / groups;
+    int groupDim = headsPerGroup * headDim;
+    const WT *wrow = w + ((uint64_t)g * oRank + r) * groupDim;
+    const InT *src = o + (((uint64_t)b * seqlen + s) * heads + g * headsPerGroup) * headDim;
+
+    float v = 0.0f;
+    for (int d = 0; d < groupDim; d++) {
+        v += Dsv4ToFloat(src[d]) * Dsv4ToFloat(wrow[d]);
+    }
+    output[idx] = __float2bfloat16_rn(v);
+}
+
+template <typename InT, typename WT>
+__global__ void DeepSeekV4WoAKahanAccKernel(const InT *o, const WT *w, __nv_bfloat16 *output,
+                                            int bsz, int seqlen, int heads, int headDim,
+                                            int groups, int oRank) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = bsz * seqlen * groups * oRank;
+    if (idx >= total) {
+        return;
+    }
+
+    int r = idx % oRank;
+    int tmp = idx / oRank;
+    int g = tmp % groups;
+    tmp /= groups;
+    int s = tmp % seqlen;
+    int b = tmp / seqlen;
+
+    int headsPerGroup = heads / groups;
+    int groupDim = headsPerGroup * headDim;
+    const WT *wrow = w + ((uint64_t)g * oRank + r) * groupDim;
+    const InT *src = o + (((uint64_t)b * seqlen + s) * heads + g * headsPerGroup) * headDim;
+
+    float sum = 0.0f;
+    float c = 0.0f;
+    for (int d = 0; d < groupDim; d++) {
+        float prod = Dsv4ToFloat(src[d]) * Dsv4ToFloat(wrow[d]);
+        float y = prod - c;
+        float t = sum + y;
+        c = (t - sum) - y;
+        sum = t;
+    }
+    output[idx] = __float2bfloat16_rn(sum);
 }
 
 template <typename InT, typename WT>
@@ -418,6 +478,8 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
                                  int oRank, fastllm::Data &output, int bsz, int seqlen,
                                  int heads, int headDim) {
     bool usePair = std::getenv("FASTLLM_DSV4_ENABLE_CUDA_WOA_PAIR") != nullptr && (oRank % 2 == 0);
+    bool useFloatAcc = !usePair && std::getenv("FASTLLM_DSV4_ENABLE_CUDA_WOA_FLOAT_ACC") != nullptr;
+    bool useKahanAcc = !usePair && !useFloatAcc && std::getenv("FASTLLM_DSV4_ENABLE_CUDA_WOA_KAHAN_ACC") != nullptr;
     int total = bsz * seqlen * groups * oRank;
     int threads = std::min(256, std::max(1, total));
     int pairTotal = bsz * seqlen * groups * (oRank / 2);
@@ -430,6 +492,12 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
         if (usePair) {
             DeepSeekV4WoAPairKernel<<<blocks, threads>>>(oData, (const __nv_bfloat16 *)woA.cudaData, outData,
                                                          bsz, seqlen, heads, headDim, groups, oRank);
+        } else if (useFloatAcc) {
+            DeepSeekV4WoAFloatAccKernel<<<blocks, threads>>>(oData, (const __nv_bfloat16 *)woA.cudaData, outData,
+                                                             bsz, seqlen, heads, headDim, groups, oRank);
+        } else if (useKahanAcc) {
+            DeepSeekV4WoAKahanAccKernel<<<blocks, threads>>>(oData, (const __nv_bfloat16 *)woA.cudaData, outData,
+                                                             bsz, seqlen, heads, headDim, groups, oRank);
         } else {
             DeepSeekV4WoAKernel<<<blocks, threads>>>(oData, (const __nv_bfloat16 *)woA.cudaData, outData,
                                                      bsz, seqlen, heads, headDim, groups, oRank);
@@ -438,6 +506,12 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
         if (usePair) {
             DeepSeekV4WoAPairKernel<<<blocks, threads>>>(oData, (const half *)woA.cudaData, outData,
                                                          bsz, seqlen, heads, headDim, groups, oRank);
+        } else if (useFloatAcc) {
+            DeepSeekV4WoAFloatAccKernel<<<blocks, threads>>>(oData, (const half *)woA.cudaData, outData,
+                                                             bsz, seqlen, heads, headDim, groups, oRank);
+        } else if (useKahanAcc) {
+            DeepSeekV4WoAKahanAccKernel<<<blocks, threads>>>(oData, (const half *)woA.cudaData, outData,
+                                                             bsz, seqlen, heads, headDim, groups, oRank);
         } else {
             DeepSeekV4WoAKernel<<<blocks, threads>>>(oData, (const half *)woA.cudaData, outData,
                                                      bsz, seqlen, heads, headDim, groups, oRank);
@@ -446,6 +520,12 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
         if (usePair) {
             DeepSeekV4WoAPairKernel<<<blocks, threads>>>(oData, (const float *)woA.cudaData, outData,
                                                          bsz, seqlen, heads, headDim, groups, oRank);
+        } else if (useFloatAcc) {
+            DeepSeekV4WoAFloatAccKernel<<<blocks, threads>>>(oData, (const float *)woA.cudaData, outData,
+                                                             bsz, seqlen, heads, headDim, groups, oRank);
+        } else if (useKahanAcc) {
+            DeepSeekV4WoAKahanAccKernel<<<blocks, threads>>>(oData, (const float *)woA.cudaData, outData,
+                                                             bsz, seqlen, heads, headDim, groups, oRank);
         } else {
             DeepSeekV4WoAKernel<<<blocks, threads>>>(oData, (const float *)woA.cudaData, outData,
                                                      bsz, seqlen, heads, headDim, groups, oRank);

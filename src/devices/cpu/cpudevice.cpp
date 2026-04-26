@@ -2348,6 +2348,8 @@ namespace fastllm {
             output.Allocate(0.0f);
             double fp16PrepareMs = 0.0, fp16GateMs = 0.0, fp16SwigluMs = 0.0;
             double fp16DownMs = 0.0, fp16ReduceMs = 0.0, fp16OutputMs = 0.0;
+            double fp16RoutedGateMs = 0.0, fp16SharedGateMs = 0.0;
+            double fp16RoutedDownMs = 0.0, fp16SharedDownMs = 0.0;
             int fp16ExpertCalls = 0;
 
             if (input.dataType == DataType::FLOAT16) {
@@ -2422,7 +2424,23 @@ namespace fastllm {
                         pool->Wait(j);
                         delete ops[j];
                     }
+                    double beforeGateLap = profileLast;
                     profileLap(fp16GateMs);
+                    if (profileDetail) {
+                        double span = profileLast - beforeGateLap;
+                        bool onlyShared = true;
+                        for (int l = st; l <= end; l++) {
+                            if (v[l].first != 0) {
+                                onlyShared = false;
+                                break;
+                            }
+                        }
+                        if (onlyShared) {
+                            fp16SharedGateMs += span;
+                        } else {
+                            fp16RoutedGateMs += span;
+                        }
+                    }
 
                     // swiglu
                     threadSt = 0;
@@ -2458,7 +2476,23 @@ namespace fastllm {
                         pool->Wait(j);
                         delete ops[j];
                     }
+                    double beforeDownLap = profileLast;
                     profileLap(fp16DownMs);
+                    if (profileDetail) {
+                        double span = profileLast - beforeDownLap;
+                        bool onlyShared = true;
+                        for (int l = st; l <= end; l++) {
+                            if (v[l].first != 0) {
+                                onlyShared = false;
+                                break;
+                            }
+                        }
+                        if (onlyShared) {
+                            fp16SharedDownMs += span;
+                        } else {
+                            fp16RoutedDownMs += span;
+                        }
+                    }
                     st = end;
                 }
                 float *fLastOutput = ((float*)output.cpuData) + o * m;
@@ -2505,9 +2539,10 @@ namespace fastllm {
             }
             if (profileDetail) {
                 double total = fp16PrepareMs + fp16GateMs + fp16SwigluMs + fp16DownMs + fp16ReduceMs + fp16OutputMs;
-                printf("[fastllm-profile-cpu-moe] fp16_small outer=%d topk=%d experts=%d prepare=%.3f gate=%.3f swiglu=%.3f down=%.3f reduce=%.3f output=%.3f total=%.3f\n",
-                       outer, topk, fp16ExpertCalls, fp16PrepareMs, fp16GateMs, fp16SwigluMs,
-                       fp16DownMs, fp16ReduceMs, fp16OutputMs, total);
+                printf("[fastllm-profile-cpu-moe] fp16_small outer=%d topk=%d experts=%d prepare=%.3f gate=%.3f gate_routed=%.3f gate_shared=%.3f swiglu=%.3f down=%.3f down_routed=%.3f down_shared=%.3f reduce=%.3f output=%.3f total=%.3f\n",
+                       outer, topk, fp16ExpertCalls, fp16PrepareMs, fp16GateMs,
+                       fp16RoutedGateMs, fp16SharedGateMs, fp16SwigluMs, fp16DownMs,
+                       fp16RoutedDownMs, fp16SharedDownMs, fp16ReduceMs, fp16OutputMs, total);
                 fflush(stdout);
             }
         } else if ((input.dataType == DataType::FLOAT32) && 
