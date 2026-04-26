@@ -18,6 +18,34 @@ __device__ __forceinline__ float Dsv4ToFloat(__nv_bfloat16 v) {
     return __bfloat162float(v);
 }
 
+template <typename XT, typename WT>
+__device__ __forceinline__ float Dsv4PairDot(const XT *x, const WT *w, int k) {
+    return Dsv4ToFloat(x[k]) * Dsv4ToFloat(w[k]) +
+           Dsv4ToFloat(x[k + 1]) * Dsv4ToFloat(w[k + 1]);
+}
+
+__device__ __forceinline__ float Dsv4PairDot(const __nv_bfloat16 *x, const __nv_bfloat16 *w, int k) {
+    __nv_bfloat162 xv = *reinterpret_cast<const __nv_bfloat162 *>(x + k);
+    __nv_bfloat162 wv = *reinterpret_cast<const __nv_bfloat162 *>(w + k);
+    float2 xf = __bfloat1622float2(xv);
+    float2 wf = __bfloat1622float2(wv);
+    return xf.x * wf.x + xf.y * wf.y;
+}
+
+__device__ __forceinline__ float Dsv4PairDot(const half *x, const half *w, int k) {
+    half2 xv = *reinterpret_cast<const half2 *>(x + k);
+    half2 wv = *reinterpret_cast<const half2 *>(w + k);
+    float2 xf = __half22float2(xv);
+    float2 wf = __half22float2(wv);
+    return xf.x * wf.x + xf.y * wf.y;
+}
+
+__device__ __forceinline__ float Dsv4PairDot(const float *x, const float *w, int k) {
+    float2 xv = *reinterpret_cast<const float2 *>(x + k);
+    float2 wv = *reinterpret_cast<const float2 *>(w + k);
+    return xv.x * wv.x + xv.y * wv.y;
+}
+
 template <typename T>
 __device__ __forceinline__ T Dsv4FromFloat(float v);
 
@@ -618,7 +646,11 @@ __global__ void DeepSeekV4HcPreDotsBlockKernel(const XT *x, const WT *w, float *
     const XT *xrow = x + (uint64_t)t * flatDim;
     const WT *wrow = w + (uint64_t)m * flatDim;
     float partial = 0.0f;
-    for (int k = threadIdx.x; k < flatDim; k += blockDim.x) {
+    for (int k = threadIdx.x * 2; k + 1 < flatDim; k += blockDim.x * 2) {
+        partial += Dsv4PairDot(xrow, wrow, k);
+    }
+    if ((flatDim & 1) && threadIdx.x == 0) {
+        int k = flatDim - 1;
         partial += Dsv4ToFloat(xrow[k]) * Dsv4ToFloat(wrow[k]);
     }
     red[threadIdx.x] = partial;
