@@ -284,6 +284,14 @@ namespace fastllm {
         profiler[opType] += spend;
     }
 
+    float Executor::GetProfilerTotal() const {
+        float sum = 0.0f;
+        for (auto &it : profiler) {
+            sum += it.second;
+        }
+        return sum;
+    }
+
     void Executor::PrintProfiler() {
         float sum = 0.0;
         for (auto &it : profiler) {

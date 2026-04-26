@@ -111,6 +111,39 @@ namespace fastllm {
             return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
         }
 
+        static Executor *GetProfilerExecutor() {
+            return (Executor*)GetExecutor();
+        }
+
+        static float ExecutorProfileTotal() {
+            auto *executor = GetProfilerExecutor();
+            return executor == nullptr ? 0.0f : executor->GetProfilerTotal();
+        }
+
+        struct ScopedExecutorProfiler {
+            std::string opType;
+            double startMs = 0.0;
+            float startProfile = 0.0f;
+            bool active = false;
+
+            ScopedExecutorProfiler(const std::string &opType)
+                : opType(opType), startMs(NowMs()), startProfile(ExecutorProfileTotal()),
+                  active(GetProfilerExecutor() != nullptr) {}
+
+            ~ScopedExecutorProfiler() {
+                auto *executor = GetProfilerExecutor();
+                if (!active || executor == nullptr) {
+                    return;
+                }
+                float elapsed = (float)((NowMs() - startMs) * 0.001);
+                float alreadyProfiled = ExecutorProfileTotal() - startProfile;
+                float unprofiled = elapsed - alreadyProfiled;
+                if (unprofiled > 1e-7f) {
+                    executor->AddProfiler(opType, unprofiled);
+                }
+            }
+        };
+
         static void ProfileSyncIfNeeded(bool sync) {
 #ifdef USE_CUDA
             if (sync) {
@@ -352,6 +385,7 @@ namespace fastllm {
 
         static void UpdateDebugPastKeyValues(std::vector<std::pair<Data, Data>> &pastKeyValues,
                                              int bsz, int totalLen, int blocks) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4PastKVStub");
             if (pastKeyValues.empty()) {
                 return;
             }
@@ -393,6 +427,7 @@ namespace fastllm {
         }
 
         static void DebugDumpData(const std::string &name, const Data &input, int startPos = -1) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4DebugDump");
             Data tmp;
             ToDataType(input, tmp, DataType::FLOAT32);
             tmp.ToDevice(DataDevice::CPU);
@@ -509,6 +544,7 @@ namespace fastllm {
         }
 
         static void DebugDumpInputIds(const Data &inputIds, int startPos) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4DebugDump");
             auto ids = ReadTokenIds(inputIds);
             printf("[fastllm-debug] input_ids  shape=(");
             for (int i = 0; i < (int)inputIds.dims.size(); i++) {
@@ -654,6 +690,7 @@ namespace fastllm {
 
         static HcMix HcPreReference(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
                                     int hcMult, int sinkhornIters, float eps, float normEps) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4HcPre");
             HcMix ret;
             if (HcPreCudaIfAvailable(x, hcFn, hcScale, hcBase, hcMult, sinkhornIters, eps, normEps, ret)) {
                 return ret;
@@ -859,6 +896,7 @@ namespace fastllm {
         }
 
         static void HcPostReference(const Data &x, const Data &residual, const HcMix &mix, Data &output) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4HcPost");
 #ifdef USE_CUDA
             if (x.dataDevice == DataDevice::CUDA || DeepSeekV4PreferCuda()) {
                 Data cudaX, cudaResidual;
@@ -954,6 +992,7 @@ namespace fastllm {
         }
 
         static void RMSNormReference(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4RMSNorm");
             if (RMSNormCudaIfAvailable(input, weight, eps, output, dtype)) {
                 return;
             }
@@ -1079,6 +1118,7 @@ namespace fastllm {
 
         static void ScaleQRotary(Data &q, float eps, int ropeDim, float ropeBase, int startPos,
                                  int originalSeqLen, float ropeFactor, int betaFast, int betaSlow) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4ScaleQRotary");
             if (ScaleQRotaryCudaIfAvailable(q, ropeDim, ropeBase, startPos, originalSeqLen,
                                             ropeFactor, betaFast, betaSlow, eps)) {
                 return;
@@ -1143,6 +1183,7 @@ namespace fastllm {
         static void RotaryQuant(Data &x, int ropeDim, float ropeBase, int startPos,
                                 int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
                                 int quantDim, int blockSize, int posStep = 1) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4RotaryQuant");
             if (RotaryQuantCudaIfAvailable(x, ropeDim, ropeBase, startPos, originalSeqLen,
                                            ropeFactor, betaFast, betaSlow, quantDim, blockSize, posStep)) {
                 return;
@@ -1156,6 +1197,7 @@ namespace fastllm {
 
         static void StoreWindowKVCache(const std::vector<float> &kv, int bsz, int seqlen, int headDim,
                                        int startPos, int windowSize, std::vector<float> &windowKV) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4KVCache");
             windowKV.assign((uint64_t)bsz * windowSize * headDim, 0.0f);
             if (startPos == 0) {
                 if (seqlen <= windowSize) {
@@ -1189,6 +1231,7 @@ namespace fastllm {
 
         static void UpdateWindowKVCache(const std::vector<float> &kv, int bsz, int headDim,
                                         int startPos, int windowSize, std::vector<float> &windowKV) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4KVCache");
             for (int b = 0; b < bsz; b++) {
                 memcpy(windowKV.data() + ((uint64_t)b * windowSize + (startPos % windowSize)) * headDim,
                        kv.data() + (uint64_t)b * headDim,
@@ -1198,6 +1241,7 @@ namespace fastllm {
 
         static void ComputeCompressorRaw(WeightMap &weight, const std::string &prefix, const Data &x,
                                          std::vector<float> &kv, std::vector<float> &score) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4CompressorRaw");
             Data kvData, scoreData;
             Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kvData);
             Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), scoreData);
@@ -1208,6 +1252,7 @@ namespace fastllm {
         static void AppendCompressorRaw(const std::vector<float> &kv, const std::vector<float> &score,
                                         int bsz, int seqlen, int wideDim,
                                         std::vector<float> &allKV, std::vector<float> &allScore) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4CompressorAppend");
             int oldLen = allKV.empty() ? 0 : (int)(allKV.size() / ((uint64_t)bsz * wideDim));
             std::vector<float> nextKV((uint64_t)bsz * (oldLen + seqlen) * wideDim);
             std::vector<float> nextScore((uint64_t)bsz * (oldLen + seqlen) * wideDim);
@@ -1237,6 +1282,7 @@ namespace fastllm {
                                              int headDim, int ropeDim, float ropeBase,
                                              float ropeFactor, int betaFast, int betaSlow,
                                              int originalSeqLen, Data &output) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4BuildCompressedKV");
             if (compressRatio <= 0 || totalLen < compressRatio) {
                 return false;
             }
@@ -1313,6 +1359,7 @@ namespace fastllm {
         static void BuildDecodeKVData(const std::vector<float> &windowKV, const Data &compressedKV,
                                       int bsz, int windowSize, int compressedCount, int headDim,
                                       Data &output) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4BuildDecodeKV");
             std::vector<float> y((uint64_t)bsz * (windowSize + compressedCount) * headDim, 0.0f);
             for (int b = 0; b < bsz; b++) {
                 memcpy(y.data() + (uint64_t)b * (windowSize + compressedCount) * headDim,
@@ -1334,6 +1381,7 @@ namespace fastllm {
                                              int ropeDim, float ropeBase, int startPos, float softmaxScale,
                                              Data &output, int compressRatio = 0, int originalSeqLen = 0,
                                              float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4SparseAttention");
             auto qv = ReadFloatData(q);
             auto kvv = ReadFloatData(kv);
             auto sinkPtr = ReadWeightFloatDataCached(attnSink);
@@ -1403,6 +1451,7 @@ namespace fastllm {
                                                    int ropeDim, float ropeBase, float softmaxScale,
                                                    Data &output, int originalSeqLen = 0,
                                                    float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4SparseDecode");
             auto qv = ReadFloatData(q);
             auto kvv = ReadFloatData(cacheKV);
             auto sinkPtr = ReadWeightFloatDataCached(attnSink);
@@ -1470,6 +1519,7 @@ namespace fastllm {
                                                          int ropeDim, float ropeBase, float softmaxScale,
                                                          Data &output, int originalSeqLen = 0,
                                                          float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4SparseDecodeCached");
 #ifdef USE_CUDA
             if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE")) {
                 Data qCuda, compressedCuda;
@@ -1571,6 +1621,7 @@ namespace fastllm {
                                         int compressRatio, int headDim, int ropeDim, float ropeBase,
                                         float ropeFactor, int betaFast, int betaSlow, int originalSeqLen,
                                         int startPos, Data &output) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4CompressKV");
             if (startPos != 0 || compressRatio <= 0) {
                 return false;
             }
@@ -1657,6 +1708,7 @@ namespace fastllm {
         }
 
         static void ConcatSeqReference(const Data &a, const Data &b, Data &output) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4ConcatSeq");
             auto av = ReadFloatData(a);
             auto bv = ReadFloatData(b);
             int bsz = a.dims[0], aSeq = a.dims[1], bSeq = b.dims[1], dim = a.dims[2];
@@ -1773,6 +1825,7 @@ namespace fastllm {
         }
 
         static void WoA(Data &o, Data &woA, int groups, int oRank, Data &output) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4WoA");
             if (WoACudaIfAvailable(o, woA, groups, oRank, output)) {
                 return;
             }
@@ -1828,6 +1881,7 @@ namespace fastllm {
                                         int topk, const std::string &scoreFunc, float routeScale,
                                         Data &expertIndex, Data &expertScore,
                                         DeepSeekV4LayerProfile *profile = nullptr, bool profileSync = false) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4RouteScore");
             if (profile != nullptr) {
                 ProfileSyncIfNeeded(profileSync);
             }
@@ -1974,6 +2028,7 @@ namespace fastllm {
                                  const std::vector<int> &inputIds, int nRoutedExperts,
                                  int topk, const std::string &scoreFunc, float routeScale,
                                  float swigluLimit, Data &output) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4MoEReference");
             Data xFloat, routerLogits;
             ToDataType(x, xFloat, DataType::FLOAT32);
             Linear(xFloat, weight[prefix + ".gate.weight"], Data(), routerLogits, true);
@@ -2076,6 +2131,7 @@ namespace fastllm {
 
         static void HcHeadReference(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
                                     int hcMult, float eps, float normEps, Data &output) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4HcHead");
             int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
             int flatDim = hcMult * dim;
             auto xv = ReadFloatData(x);
@@ -2434,6 +2490,7 @@ namespace fastllm {
                                                    const GenerationConfig &generationConfig,
                                                    const LastTokensManager &lastTokens,
                                                    std::vector <std::vector <float>*> *retLogits) {
+        ScopedExecutorProfiler forwardOtherProfile("DeepSeekV4ForwardOther");
         bool profileEnabled = EnvFlagEnabled("FASTLLM_PROFILE") || EnvFlagEnabled("FASTLLM_PROFILE_DEEPSEEKV4");
         bool profileSync = profileEnabled && !EnvFlagEnabled("FASTLLM_PROFILE_NO_SYNC");
         double profileLastMs = NowMs();
@@ -2516,6 +2573,7 @@ namespace fastllm {
         int seqlen = forwardInputIds->dims[1];
         int dim = embed_dim;
         {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4HcExpand");
             auto hv = ReadFloatData(hiddenStates);
             std::vector<float> expanded((uint64_t)bsz * seqlen * hc_mult * dim);
             for (int b = 0; b < bsz; b++) {
@@ -2811,6 +2869,7 @@ namespace fastllm {
         }
 
         if (generationConfig.output_logits && retLogits != nullptr) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4LogitsRead");
             logits.ToDevice(DataDevice::CPU);
             int vocabSize = logits.dims.back();
             for (int b = 0; b < batch; b++) {
@@ -2825,6 +2884,7 @@ namespace fastllm {
         TopK(logits, topk, 1);
         std::vector<int> ret;
         {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4TopKRead");
             topk.ToDevice(DataDevice::CPU);
             for (int b = 0; b < batch; b++) {
                 ret.push_back((int)(((float*)topk.cpuData)[b * 2] + 1e-3));

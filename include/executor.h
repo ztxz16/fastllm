@@ -49,6 +49,8 @@ namespace fastllm {
 
         void AddProfiler(const std::string &opType, float spend);
 
+        float GetProfilerTotal() const;
+
         void PrintProfiler();
 
         std::string firstDevice;
