@@ -95,6 +95,15 @@ namespace fastllm {
             return v == nullptr ? fallback : atoi(v);
         }
 
+        static bool DeepSeekV4PreferCuda() {
+#ifdef USE_CUDA
+            auto *executor = (Executor*)GetExecutor();
+            return executor != nullptr && executor->firstDevice == "cuda";
+#else
+            return false;
+#endif
+        }
+
         static std::vector<float> ReadFloatData(const Data &input);
 
         static double NowMs() {
@@ -330,6 +339,17 @@ namespace fastllm {
             output.CopyFrom(tmp);
         }
 
+#ifdef USE_CUDA
+        static bool PrepareCudaData(Data &output, DataType dtype, const std::vector<int> &dims) {
+            ResetData(output);
+            output.dataType = dtype;
+            output.Resize(dims);
+            output.ToDevice(DataDevice::CUDA, false);
+            output.Allocate(false);
+            return output.cudaData != nullptr;
+        }
+#endif
+
         static void UpdateDebugPastKeyValues(std::vector<std::pair<Data, Data>> &pastKeyValues,
                                              int bsz, int totalLen, int blocks) {
             if (pastKeyValues.empty()) {
@@ -517,10 +537,69 @@ namespace fastllm {
 
         struct HcMix {
             Data y;
+            Data postData;
+            Data combData;
             std::vector<float> post;
             std::vector<float> comb;
             int b = 0, s = 0, hc = 0;
         };
+
+        static bool HcPreCudaIfAvailable(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
+                                         int hcMult, int sinkhornIters, float eps, float normEps,
+                                         HcMix &ret) {
+#ifdef USE_CUDA
+            auto fail = [](const char *) {
+                return false;
+            };
+            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_HCPRE") ||
+                x.dims.size() != 4 || (x.dataDevice != DataDevice::CUDA && !DeepSeekV4PreferCuda())) {
+                return fail("disabled_or_not_cuda");
+            }
+            if (hcScale.dataType != DataType::FLOAT32 || hcBase.dataType != DataType::FLOAT32 ||
+                (hcFn.dataType != DataType::FLOAT32 && hcFn.dataType != DataType::FLOAT16 &&
+                 hcFn.dataType != DataType::BFLOAT16)) {
+                return fail("unsupported_dtype");
+            }
+            int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
+            int flatDim = hcMult * dim;
+            int mixHc = (2 + hcMult) * hcMult;
+            if (x.dims[2] != hcMult || hcFn.Count(0) != (uint64_t)mixHc * flatDim ||
+                hcScale.Count(0) < 3 || hcBase.Count(0) < (uint64_t)mixHc ||
+                bsz <= 0 || seqlen <= 0 || dim <= 0 || sinkhornIters <= 0) {
+                return fail("shape_mismatch");
+            }
+            Data cudaX;
+            const Data *cudaInput = &x;
+            if (x.dataDevice != DataDevice::CUDA) {
+                cudaX.CopyFrom(x);
+                cudaX.ToDevice(DataDevice::CUDA);
+                cudaInput = &cudaX;
+            }
+            hcFn.ToDevice(DataDevice::CUDA);
+            hcScale.ToDevice(DataDevice::CUDA);
+            hcBase.ToDevice(DataDevice::CUDA);
+            if (!FastllmCudaDeepSeekV4HcPre(*cudaInput, hcFn, hcScale, hcBase, hcMult,
+                                            sinkhornIters, eps, normEps,
+                                            ret.y, ret.postData, ret.combData)) {
+                ErrorInFastLLM("DeepSeekV4HcPre CUDA error: kernel rejected valid input.\n");
+            }
+            ret.b = bsz;
+            ret.s = seqlen;
+            ret.hc = hcMult;
+            return true;
+#else
+            (void)x;
+            (void)hcFn;
+            (void)hcScale;
+            (void)hcBase;
+            (void)hcMult;
+            (void)sinkhornIters;
+            (void)eps;
+            (void)normEps;
+            (void)ret;
+            return false;
+#endif
+        }
 
         struct HcPreDotsOp : MultiThreadBaseOp {
             const float *xrow;
@@ -575,6 +654,10 @@ namespace fastllm {
 
         static HcMix HcPreReference(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
                                     int hcMult, int sinkhornIters, float eps, float normEps) {
+            HcMix ret;
+            if (HcPreCudaIfAvailable(x, hcFn, hcScale, hcBase, hcMult, sinkhornIters, eps, normEps, ret)) {
+                return ret;
+            }
             int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
             int flatDim = hcMult * dim;
             int mixHc = (2 + hcMult) * hcMult;
@@ -711,10 +794,9 @@ namespace fastllm {
                 profileLap(profileY);
             }
 
-            HcMix ret;
             WriteFloatData(y, {bsz, seqlen, dim}, ret.y, x.dataType);
 #ifdef USE_CUDA
-            if (x.dataDevice == DataDevice::CUDA && EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_RMSNORM")) {
+            if (x.dataDevice == DataDevice::CUDA) {
                 ret.y.ToDevice(DataDevice::CUDA);
             }
 #endif
@@ -738,19 +820,33 @@ namespace fastllm {
 
         static bool HcPostCudaIfAvailable(Data &x, Data &residual, const HcMix &mix, Data &output) {
 #ifdef USE_CUDA
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_WOA_HCPOST")) {
+            auto fail = [](const char *) {
                 return false;
+            };
+            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_WOA_HCPOST")) {
+                return fail("disabled");
             }
             if (x.dataDevice != DataDevice::CUDA || x.dims.size() < 2 || residual.dims.size() != 4) {
-                return false;
+                return fail("shape_or_device");
             }
             int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
-            if ((int)mix.post.size() != bsz * seqlen * hcMult ||
-                (int)mix.comb.size() != bsz * seqlen * hcMult * hcMult ||
-                x.Count(0) != (uint64_t)bsz * seqlen * dim) {
-                return false;
+            if (x.Count(0) != (uint64_t)bsz * seqlen * dim) {
+                return fail("x_count");
             }
             residual.ToDevice(DataDevice::CUDA);
+            if (mix.postData.dataDevice == DataDevice::CUDA && mix.combData.dataDevice == DataDevice::CUDA &&
+                mix.postData.Count(0) == (uint64_t)bsz * seqlen * hcMult &&
+                mix.combData.Count(0) == (uint64_t)bsz * seqlen * hcMult * hcMult) {
+                if (FastllmCudaDeepSeekV4HcPostCudaMix(x, residual, mix.postData, mix.combData,
+                                                       bsz, seqlen, hcMult, dim, output)) {
+                    return true;
+                }
+                return fail("cuda_mix_kernel");
+            }
+            if ((int)mix.post.size() != bsz * seqlen * hcMult ||
+                (int)mix.comb.size() != bsz * seqlen * hcMult * hcMult) {
+                return fail("host_mix_shape");
+            }
             return FastllmCudaDeepSeekV4HcPost(x, residual, mix.post.data(), mix.comb.data(),
                                                bsz, seqlen, hcMult, dim, output);
 #else
@@ -764,10 +860,12 @@ namespace fastllm {
 
         static void HcPostReference(const Data &x, const Data &residual, const HcMix &mix, Data &output) {
 #ifdef USE_CUDA
-            if (x.dataDevice == DataDevice::CUDA) {
+            if (x.dataDevice == DataDevice::CUDA || DeepSeekV4PreferCuda()) {
                 Data cudaX, cudaResidual;
                 cudaX.CopyFrom(x);
+                cudaX.ToDevice(DataDevice::CUDA);
                 cudaResidual.CopyFrom(residual);
+                cudaResidual.ToDevice(DataDevice::CUDA);
                 if (HcPostCudaIfAvailable(cudaX, cudaResidual, mix, output)) {
                     return;
                 }
@@ -777,12 +875,28 @@ namespace fastllm {
             int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
             auto xv = ReadFloatData(x);
             auto rv = ReadFloatData(residual);
+            std::vector<float> postHost, combHost;
+            const std::vector<float> *postVec = &mix.post;
+            const std::vector<float> *combVec = &mix.comb;
+            if ((int)postVec->size() != bsz * seqlen * hcMult && mix.postData.Count(0) == (uint64_t)bsz * seqlen * hcMult) {
+                postHost = ReadFloatData(mix.postData);
+                postVec = &postHost;
+            }
+            if ((int)combVec->size() != bsz * seqlen * hcMult * hcMult &&
+                mix.combData.Count(0) == (uint64_t)bsz * seqlen * hcMult * hcMult) {
+                combHost = ReadFloatData(mix.combData);
+                combVec = &combHost;
+            }
+            if ((int)postVec->size() != bsz * seqlen * hcMult ||
+                (int)combVec->size() != bsz * seqlen * hcMult * hcMult) {
+                ErrorInFastLLM("DeepSeekV4HcPost error: invalid hc mix shape.\n");
+            }
             std::vector<float> y((uint64_t)bsz * seqlen * hcMult * dim, 0.0f);
             for (int t = 0; t < bsz * seqlen; t++) {
                 const float *xrow = xv.data() + (uint64_t)t * dim;
                 const float *rrow = rv.data() + (uint64_t)t * hcMult * dim;
-                const float *post = mix.post.data() + (uint64_t)t * hcMult;
-                const float *comb = mix.comb.data() + (uint64_t)t * hcMult * hcMult;
+                const float *post = postVec->data() + (uint64_t)t * hcMult;
+                const float *comb = combVec->data() + (uint64_t)t * hcMult * hcMult;
                 for (int target = 0; target < hcMult; target++) {
                     for (int d = 0; d < dim; d++) {
                         double v = (double)post[target] * xrow[d];
@@ -799,13 +913,36 @@ namespace fastllm {
         static bool RMSNormCudaIfAvailable(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
 #ifdef USE_CUDA
             if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_PREP") ||
-                !EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_RMSNORM") ||
-                input.dataDevice != DataDevice::CUDA || dtype != input.dataType ||
                 weight.dataType != DataType::FLOAT32 || input.dims.empty()) {
                 return false;
             }
+            if (input.dataType != DataType::FLOAT32 && input.dataType != DataType::FLOAT16 &&
+                input.dataType != DataType::BFLOAT16) {
+                return false;
+            }
+            if (dtype != DataType::FLOAT32 && dtype != DataType::FLOAT16 && dtype != DataType::BFLOAT16) {
+                return false;
+            }
             weight.ToDevice(DataDevice::CUDA);
-            return FastllmCudaDeepSeekV4RMSNorm(input, weight, eps, output, dtype);
+            Data cudaInput;
+            const Data *cudaInputPtr = &input;
+            if (input.dataDevice != DataDevice::CUDA) {
+                if (!DeepSeekV4PreferCuda()) {
+                    return false;
+                }
+                cudaInput.CopyFrom(input);
+                cudaInput.ToDevice(DataDevice::CUDA);
+                cudaInputPtr = &cudaInput;
+            }
+            if (&input == &output && dtype != input.dataType) {
+                Data tmp;
+                if (!FastllmCudaDeepSeekV4RMSNorm(*cudaInputPtr, weight, eps, tmp, dtype)) {
+                    return false;
+                }
+                output.CopyFrom(tmp);
+                return true;
+            }
+            return FastllmCudaDeepSeekV4RMSNorm(*cudaInputPtr, weight, eps, output, dtype);
 #else
             (void)input;
             (void)weight;
@@ -920,7 +1057,6 @@ namespace fastllm {
                                                 int betaFast, int betaSlow, float eps) {
 #ifdef USE_CUDA
             if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_PREP") ||
-                !EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_ROTARY_PREP") ||
                 q.dataDevice != DataDevice::CUDA || q.dims.size() != 4 ||
                 q.dataType != DataType::BFLOAT16) {
                 return false;
@@ -981,7 +1117,6 @@ namespace fastllm {
                                                int blockSize, int posStep = 1) {
 #ifdef USE_CUDA
             if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_PREP") ||
-                !EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_ROTARY_PREP") ||
                 x.dataDevice != DataDevice::CUDA || x.dataType != DataType::BFLOAT16 ||
                 x.dims.size() < 3 || x.dims.size() > 4) {
                 return false;
@@ -1328,6 +1463,7 @@ namespace fastllm {
 
         static void SparseAttentionDecodeCachedReference(Data &q,
                                                          const std::vector<float> &windowKV,
+                                                         const Data *windowKVData,
                                                          const Data &compressedKV,
                                                          Data &attnSink,
                                                          int windowSize, int startPos, int compressedCount,
@@ -1335,27 +1471,31 @@ namespace fastllm {
                                                          Data &output, int originalSeqLen = 0,
                                                          float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
 #ifdef USE_CUDA
-            if (EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_SPARSE_DECODE")) {
+            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE")) {
                 Data qCuda, compressedCuda;
-                qCuda.CopyFrom(q);
-                qCuda.ToDevice(DataDevice::CUDA);
+                const Data *qForCuda = &q;
+                if (q.dataDevice != DataDevice::CUDA) {
+                    qCuda.CopyFrom(q);
+                    qCuda.ToDevice(DataDevice::CUDA);
+                    qForCuda = &qCuda;
+                }
                 const Data *compressedForCuda = &compressedKV;
-                if (compressedCount > 0) {
+                if (compressedCount > 0 && compressedKV.dataDevice != DataDevice::CUDA) {
                     compressedCuda.CopyFrom(compressedKV);
                     compressedCuda.ToDevice(DataDevice::CUDA);
                     compressedForCuda = &compressedCuda;
                 }
                 attnSink.ToDevice(DataDevice::CUDA);
-                Data preRotary;
-                if (FastllmCudaDeepSeekV4SparseAttentionDecodeCached(qCuda, windowKV.data(), *compressedForCuda,
+                if (FastllmCudaDeepSeekV4SparseAttentionDecodeCached(*qForCuda, windowKVData, windowKV.data(),
+                                                                     *compressedForCuda,
                                                                      attnSink, windowSize, startPos,
-                                                                     compressedCount, softmaxScale, preRotary)) {
-                    auto out = ReadFloatData(preRotary);
-                    int bsz = q.dims[0], heads = q.dims[2], dim = q.dims[3];
-                    ApplyRotaryReference(out, {bsz, 1, heads, dim}, ropeDim, ropeBase, startPos, true,
-                                         originalSeqLen, ropeFactor, betaFast, betaSlow);
-                    WriteFloatData(out, {bsz, 1, heads, dim}, output, DataType::BFLOAT16);
+                                                                     compressedCount, ropeDim, ropeBase,
+                                                                     originalSeqLen, ropeFactor,
+                                                                     betaFast, betaSlow, softmaxScale, output)) {
                     return;
+                }
+                if (windowKVData != nullptr && windowKVData->dataDevice == DataDevice::CUDA) {
+                    ErrorInFastLLM("DeepSeekV4SparseDecodeCached CUDA error: kernel rejected valid CUDA cache.\n");
                 }
             }
 #endif
@@ -1709,7 +1849,19 @@ namespace fastllm {
 
 #ifdef USE_CUDA
             bool hashRoutingForCuda = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
-            if (EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_ROUTE") && !hashRoutingForCuda &&
+            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_ROUTE") && hashRoutingForCuda &&
+                routerLogits.dataDevice == DataDevice::CUDA && routerLogits.dataType == DataType::FLOAT32 &&
+                inputIds.size() >= (size_t)x.dims[0]) {
+                int scoreFuncMode = scoreFunc == "softmax" ? 0 : (scoreFunc == "sigmoid" ? 1 : 2);
+                if (FastllmCudaDeepSeekV4HashRouteScore(routerLogits, weight[prefix + ".gate.tid2eid"],
+                                                        inputIds.data(), x.dims[0], topk,
+                                                        scoreFuncMode, routeScale,
+                                                        expertIndex, expertScore)) {
+                    detailLap(profile != nullptr ? profile->routeScore : detailLastMs);
+                    return;
+                }
+            }
+            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_ROUTE") && !hashRoutingForCuda &&
                 routerLogits.dataDevice == DataDevice::CUDA && routerLogits.dataType == DataType::FLOAT32) {
                 int scoreFuncMode = scoreFunc == "softmax" ? 0 : (scoreFunc == "sigmoid" ? 1 : 2);
                 Data *gateBiasData = nullptr;
@@ -1719,10 +1871,10 @@ namespace fastllm {
                 }
                 if (FastllmCudaDeepSeekV4RouteScoreTransform(routerLogits, scoreFuncMode)) {
                     int tokens = x.dims[0];
-                    std::vector<int> zeroIndex((uint64_t)tokens * topk, 0);
-                    std::vector<float> zeroScore((uint64_t)tokens * topk, 0.0f);
-                    WriteIntData(zeroIndex, {tokens, topk}, expertIndex);
-                    WriteFloatData(zeroScore, {tokens, topk}, expertScore, DataType::FLOAT32);
+                    if (!PrepareCudaData(expertIndex, DataType::INT32, {tokens, topk}) ||
+                        !PrepareCudaData(expertScore, DataType::FLOAT32, {tokens, topk})) {
+                        ErrorInFastLLM("DeepSeekV4RouteScore CUDA error: failed to allocate route outputs.");
+                    }
                     bool needNorm = scoreFunc != "softmax";
                     if (FastllmCudaSelectExpert(routerLogits, gateBiasData, expertIndex, expertScore,
                                                 topk, needNorm, routeScale)) {
@@ -2363,18 +2515,20 @@ namespace fastllm {
         int bsz = forwardInputIds->dims[0];
         int seqlen = forwardInputIds->dims[1];
         int dim = embed_dim;
-        auto hv = ReadFloatData(hiddenStates);
-        std::vector<float> expanded((uint64_t)bsz * seqlen * hc_mult * dim);
-        for (int b = 0; b < bsz; b++) {
-            for (int s = 0; s < seqlen; s++) {
-                const float *src = hv.data() + ((uint64_t)b * seqlen + s) * dim;
-                for (int h = 0; h < hc_mult; h++) {
-                    memcpy(expanded.data() + (((uint64_t)b * seqlen + s) * hc_mult + h) * dim,
-                           src, dim * sizeof(float));
+        {
+            auto hv = ReadFloatData(hiddenStates);
+            std::vector<float> expanded((uint64_t)bsz * seqlen * hc_mult * dim);
+            for (int b = 0; b < bsz; b++) {
+                for (int s = 0; s < seqlen; s++) {
+                    const float *src = hv.data() + ((uint64_t)b * seqlen + s) * dim;
+                    for (int h = 0; h < hc_mult; h++) {
+                        memcpy(expanded.data() + (((uint64_t)b * seqlen + s) * hc_mult + h) * dim,
+                               src, dim * sizeof(float));
+                    }
                 }
             }
+            WriteFloatData(expanded, {bsz, seqlen, hc_mult, dim}, hiddenStates, hiddenStates.dataType);
         }
-        WriteFloatData(expanded, {bsz, seqlen, hc_mult, dim}, hiddenStates, hiddenStates.dataType);
         profileLap(profileHcExpandMs);
         if (debugThisStep) {
             DebugDumpData("hc_expand", hiddenStates);
@@ -2469,8 +2623,8 @@ namespace fastllm {
             }
             int decodeCompressedCount = 0;
             if (decodeCache != nullptr) {
-                auto kvValues = ReadFloatData(kv);
                 if (startPos == 0) {
+                    auto kvValues = ReadFloatData(kv);
                     decodeCache->initialized = true;
                     decodeCache->bsz = bsz;
                     decodeCache->totalLen = seqlen;
@@ -2480,13 +2634,32 @@ namespace fastllm {
                     decodeCache->compressorWideDim = (compressRatio == 4 ? 2 : 1) * head_dim_full;
                     StoreWindowKVCache(kvValues, bsz, seqlen, head_dim_full, startPos, window_size,
                                        decodeCache->windowKV);
+#ifdef USE_CUDA
+                    if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") && DeepSeekV4PreferCuda()) {
+                        WriteFloatData(decodeCache->windowKV, {bsz, window_size, head_dim_full},
+                                       decodeCache->windowKVData, DataType::FLOAT32);
+                        decodeCache->windowKVData.ToDevice(DataDevice::CUDA);
+                    }
+#endif
                 } else {
                     if (!decodeCache->initialized) {
                         ErrorInFastLLM("DeepSeekV4Model: decode cache is not initialized.");
                     }
                     decodeCache->totalLen = startPos + seqlen;
-                    UpdateWindowKVCache(kvValues, bsz, head_dim_full, startPos, window_size,
-                                        decodeCache->windowKV);
+                    bool updatedWindowKVData = false;
+#ifdef USE_CUDA
+                    if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") &&
+                        kv.dataDevice == DataDevice::CUDA &&
+                        decodeCache->windowKVData.dataDevice == DataDevice::CUDA) {
+                        updatedWindowKVData = FastllmCudaDeepSeekV4UpdateWindowKVCache(
+                            kv, startPos, window_size, decodeCache->windowKVData);
+                    }
+#endif
+                    if (!updatedWindowKVData) {
+                        auto kvValues = ReadFloatData(kv);
+                        UpdateWindowKVCache(kvValues, bsz, head_dim_full, startPos, window_size,
+                                            decodeCache->windowKV);
+                    }
                 }
             }
             if (compressRatio > 0) {
@@ -2532,8 +2705,8 @@ namespace fastllm {
 
             Data attnOut4, woAOut, attnOut;
             if (decodeCache != nullptr && startPos > 0) {
-                SparseAttentionDecodeCachedReference(q, decodeCache->windowKV, decodeCache->compressedKV,
-                                                     weight[pre + ".attn.attn_sink"],
+                SparseAttentionDecodeCachedReference(q, decodeCache->windowKV, &decodeCache->windowKVData,
+                                                     decodeCache->compressedKV, weight[pre + ".attn.attn_sink"],
                                                      window_size, startPos, decodeCompressedCount,
                                                      qk_rope_head_dim, layerRopeBase,
                                                      1.0f / std::sqrt((float)head_dim_full), attnOut4,
@@ -2650,10 +2823,12 @@ namespace fastllm {
 
         Data topk;
         TopK(logits, topk, 1);
-        topk.ToDevice(DataDevice::CPU);
         std::vector<int> ret;
-        for (int b = 0; b < batch; b++) {
-            ret.push_back((int)(((float*)topk.cpuData)[b * 2] + 1e-3));
+        {
+            topk.ToDevice(DataDevice::CPU);
+            for (int b = 0; b < batch; b++) {
+                ret.push_back((int)(((float*)topk.cpuData)[b * 2] + 1e-3));
+            }
         }
         profileLap(profileTopkMs);
 

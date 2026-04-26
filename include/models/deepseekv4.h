@@ -43,6 +43,7 @@ namespace fastllm {
         int compressRatio = 0;
         int compressorWideDim = 0;
         std::vector<float> windowKV;
+        Data windowKVData;
         std::vector<float> compressorKVRaw;
         std::vector<float> compressorScoreRaw;
         Data compressedKV;

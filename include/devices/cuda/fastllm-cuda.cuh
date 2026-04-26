@@ -220,16 +220,33 @@ bool FastllmCudaDeepSeekV4RotaryQuant(fastllm::Data &x, int ropeDim, float ropeB
                                       int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
                                       int quantDim, int blockSize, int posStep);
 bool FastllmCudaDeepSeekV4RouteScoreTransform(fastllm::Data &logits, int scoreFuncMode);
+bool FastllmCudaDeepSeekV4HashRouteScore(const fastllm::Data &logits, fastllm::Data &tid2eid,
+                                         const int *inputIds, int tokens, int topk,
+                                         int scoreFuncMode, float routeScale,
+                                         fastllm::Data &expertIndex, fastllm::Data &expertScore);
+bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data &hcFn,
+                                fastllm::Data &hcScale, fastllm::Data &hcBase,
+                                int hcMult, int sinkhornIters, float eps, float normEps,
+                                fastllm::Data &y, fastllm::Data &post, fastllm::Data &comb);
 bool FastllmCudaDeepSeekV4HcPreDots(const fastllm::Data &x, const fastllm::Data &hcFn,
                                     int hcMult, fastllm::Data &dotsFloat);
-bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::Data &q, const float *windowKV,
+bool FastllmCudaDeepSeekV4UpdateWindowKVCache(const fastllm::Data &kv, int startPos,
+                                             int windowSize, fastllm::Data &windowKV);
+bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::Data &q, const fastllm::Data *windowKVData,
+                                                      const float *windowKV,
                                                       const fastllm::Data &compressedKV, fastllm::Data &attnSink,
                                                       int windowSize, int startPos, int compressedCount,
-                                                      float softmaxScale, fastllm::Data &outputFloat);
+                                                      int ropeDim, float ropeBase, int originalSeqLen,
+                                                      float ropeFactor, int betaFast, int betaSlow,
+                                                      float softmaxScale, fastllm::Data &output);
 bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA, int groups, int oRank, fastllm::Data &output);
 bool FastllmCudaDeepSeekV4HcPost(const fastllm::Data &x, const fastllm::Data &residual, const float *post,
                                  const float *comb, int bsz, int seqlen, int hcMult, int dim,
                                  fastllm::Data &output);
+bool FastllmCudaDeepSeekV4HcPostCudaMix(const fastllm::Data &x, const fastllm::Data &residual,
+                                        const fastllm::Data &post, const fastllm::Data &comb,
+                                        int bsz, int seqlen, int hcMult, int dim,
+                                        fastllm::Data &output);
 // 计算每个 outer 行在 [start, end) 范围内的 sum(x^2) (FP32)，用于多卡 RMSNorm 的跨卡归约。
 // outer 与通道的物理布局来自 input；output sumOut 长度为 outer。
 // 同时如果 copyInput == true 且 input != outputBuffer，会把 input 完整内容拷到 outputBuffer（用于后续 apply 阶段就地写回）。
