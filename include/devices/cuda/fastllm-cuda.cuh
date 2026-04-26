@@ -211,6 +211,25 @@ bool FastllmCudaApplyChunkDecayByLastLogG(fastllm::Data &input, const fastllm::D
 
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps);
 bool FastllmCudaRMSNormPart(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps, int start, int end);
+bool FastllmCudaDeepSeekV4RMSNorm(const fastllm::Data &input, fastllm::Data &weight, float eps,
+                                  fastllm::Data &output, fastllm::DataType outputType);
+bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase, int startPos,
+                                       int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
+                                       float eps);
+bool FastllmCudaDeepSeekV4RotaryQuant(fastllm::Data &x, int ropeDim, float ropeBase, int startPos,
+                                      int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
+                                      int quantDim, int blockSize, int posStep);
+bool FastllmCudaDeepSeekV4RouteScoreTransform(fastllm::Data &logits, int scoreFuncMode);
+bool FastllmCudaDeepSeekV4HcPreDots(const fastllm::Data &x, const fastllm::Data &hcFn,
+                                    int hcMult, fastllm::Data &dotsFloat);
+bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::Data &q, const float *windowKV,
+                                                      const fastllm::Data &compressedKV, fastllm::Data &attnSink,
+                                                      int windowSize, int startPos, int compressedCount,
+                                                      float softmaxScale, fastllm::Data &outputFloat);
+bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA, int groups, int oRank, fastllm::Data &output);
+bool FastllmCudaDeepSeekV4HcPost(const fastllm::Data &x, const fastllm::Data &residual, const float *post,
+                                 const float *comb, int bsz, int seqlen, int hcMult, int dim,
+                                 fastllm::Data &output);
 // 计算每个 outer 行在 [start, end) 范围内的 sum(x^2) (FP32)，用于多卡 RMSNorm 的跨卡归约。
 // outer 与通道的物理布局来自 input；output sumOut 长度为 outer。
 // 同时如果 copyInput == true 且 input != outputBuffer，会把 input 完整内容拷到 outputBuffer（用于后续 apply 阶段就地写回）。

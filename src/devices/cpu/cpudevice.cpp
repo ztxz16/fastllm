@@ -8,6 +8,7 @@
 
 #include <cstring>
 #include <thread>
+#include <chrono>
 
 #include <cfloat>
 #include <cmath>
@@ -30,6 +31,11 @@
 #include "gguf.h"
 
 namespace fastllm {
+    static double CpuProfileNowMs() {
+        using Clock = std::chrono::steady_clock;
+        return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
+    }
+
     static uint64_t GetConvertedBufferBytes(const Data &data) {
         uint64_t elementCount = data.expansionSize > 0 ? data.expansionSize : data.Count(0);
         return (elementCount * data.unitSize - 1) / data.unitSizeDiv + 1;
@@ -1794,6 +1800,28 @@ namespace fastllm {
         ToDataType(score, DataType::FLOAT32);
         int32_t *indexData = (int32_t*)index.cpuData;
         float *scoreData = (float*)score.cpuData;
+        bool profileDetail = std::getenv("FASTLLM_PROFILE_DETAIL") != nullptr &&
+                             (std::getenv("FASTLLM_PROFILE") != nullptr ||
+                              std::getenv("FASTLLM_PROFILE_DEEPSEEKV4") != nullptr ||
+                              std::getenv("FASTLLM_PROFILE_CPU_MOE") != nullptr);
+        if (profileDetail && std::getenv("FASTLLM_PROFILE_CPU_MOE_BRANCH") != nullptr) {
+            printf("[fastllm-profile-cpu-moe] branch input=%s weight=%s bs=%d topk=%d weights_batch=%d\n",
+                   GetDataTypeName(input.dataType).c_str(), GetDataTypeName(weights[2]->dataType).c_str(),
+                   input.dims.empty() ? -1 : input.dims[0], topk, weightsBatch);
+            fflush(stdout);
+        }
+        double profileLast = CpuProfileNowMs();
+        double profileQuantInMs = 0.0, profilePrepareMs = 0.0, profileGateMs = 0.0;
+        double profileSwigluQuantMs = 0.0, profileDownMs = 0.0, profileReduceMs = 0.0, profileOutputMs = 0.0;
+        int profileExpertCalls = 0;
+        auto profileLap = [&](double &bucket) {
+            if (!profileDetail) {
+                return;
+            }
+            double now = CpuProfileNowMs();
+            bucket += now - profileLast;
+            profileLast = now;
+        };
 
         if (weights[2]->dataType == DataType::DATA_GGUF_FORMAT && 
             !weights[2]->IsRepacked) {
@@ -1848,6 +1876,9 @@ namespace fastllm {
                 }
                 floatInput = vInputs.data();
             }
+            if (profileDetail) {
+                profileLast = CpuProfileNowMs();
+            }
             
             for (int o = 0; o < outer; o++) {
                 std::vector <std::pair <int, float> > v;
@@ -1876,6 +1907,7 @@ namespace fastllm {
 // record.push_back(std::make_pair("before OnlineQuantization", GetSpan(ttt, std::chrono::system_clock::now())));
                 OnlineQuantization(inputData, uinput, inputConfigs, 1, m, group, groupCnt, 
                                     inputSums, iscales, izeros, permuteType);
+                profileLap(profileQuantInMs);
 // record.push_back(std::make_pair("OnlineQuantization", GetSpan(ttt, std::chrono::system_clock::now())));
                 std::vector <std::vector <float> > &middles = moeIntSingleVarManager.middles;
                 std::vector <std::vector <float> > &results = moeIntSingleVarManager.results;
@@ -1891,6 +1923,7 @@ namespace fastllm {
                     middles[j].resize(weights[idx * 2]->dims[0]);
                     results[j].resize(weights[idx * 2 + 1]->dims[0]);
                 }
+                profileExpertCalls += (int)v.size();
                 std::vector<fastllm::MultiThreadBaseOp*> ops;
                 auto *pool = GetAlivePool();
                 int threads = pool->threads.size();
@@ -1906,6 +1939,7 @@ namespace fastllm {
                 inputSumsDown.resize(v.size());
                 iscalesDown.resize(v.size());
                 izerosDown.resize(v.size());
+                profileLap(profilePrepareMs);
  // record.push_back(std::make_pair("prepare", GetSpan(ttt, std::chrono::system_clock::now())));
                 for (int st = 0; st < v.size(); st++) {
                     int k = weights[v[st].first * 2]->dims[0];
@@ -1952,6 +1986,7 @@ namespace fastllm {
                         pool->Wait(j);
                         delete ops[j];
                     }
+                    profileLap(profileGateMs);
 // record.push_back(std::make_pair("mul0", GetSpan(ttt, std::chrono::system_clock::now())));
 // float spend = record.back().second - record[record.size() - 2].second;
 //printf("speed = %f gops.\n", xxx / spend / 1e9);
@@ -1993,6 +2028,7 @@ namespace fastllm {
                         pool->Wait(l - st);
                         delete ops[l - st];
                     }
+                    profileLap(profileSwigluQuantMs);
 // record.push_back(std::make_pair("swiglu", GetSpan(ttt, std::chrono::system_clock::now())));
  // record.push_back(std::make_pair("quant", GetSpan(ttt, std::chrono::system_clock::now())));
                     threadSt = 0;
@@ -2030,6 +2066,7 @@ namespace fastllm {
                         pool->Wait(j);
                         delete ops[j];
                     }
+                    profileLap(profileDownMs);
  // record.push_back(std::make_pair("mul1", GetSpan(ttt, std::chrono::system_clock::now())));
                     st = end;
                 }
@@ -2082,14 +2119,24 @@ namespace fastllm {
                         fLastOutput[i] += curOutput[i] * value;
                     }
                 }
+                profileLap(profileReduceMs);
  // record.push_back(std::make_pair("get f32 output", GetSpan(ttt, std::chrono::system_clock::now())));
                 if (output.dataType == DataType::FLOAT16) {
                     Float32ToFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
                 }
+                profileLap(profileOutputMs);
 // record.push_back(std::make_pair("finish output", GetSpan(ttt, std::chrono::system_clock::now())));
 // for (int i = 0; i < record.size(); i++) {
     //printf("%s spend %f s.\n", record[i].first.c_str(), record[i].second);
 // }
+            }
+            if (profileDetail) {
+                double total = profileQuantInMs + profilePrepareMs + profileGateMs +
+                               profileSwigluQuantMs + profileDownMs + profileReduceMs + profileOutputMs;
+                printf("[fastllm-profile-cpu-moe] lowbit_small outer=%d topk=%d experts=%d quant_in=%.3f prepare=%.3f gate=%.3f swiglu_quant=%.3f down=%.3f reduce=%.3f output=%.3f total=%.3f\n",
+                       outer, topk, profileExpertCalls, profileQuantInMs, profilePrepareMs, profileGateMs,
+                       profileSwigluQuantMs, profileDownMs, profileReduceMs, profileOutputMs, total);
+                fflush(stdout);
             }
         } else if ((input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16) && 
                 (weights[2]->dataType == DataType::DATA_GGUF_FORMAT) &&
@@ -2299,6 +2346,9 @@ namespace fastllm {
             float *floatInput = (float*)input.cpuData;
             std::vector <float> vInputs;
             output.Allocate(0.0f);
+            double fp16PrepareMs = 0.0, fp16GateMs = 0.0, fp16SwigluMs = 0.0;
+            double fp16DownMs = 0.0, fp16ReduceMs = 0.0, fp16OutputMs = 0.0;
+            int fp16ExpertCalls = 0;
 
             if (input.dataType == DataType::FLOAT16) {
                 int len = input.Count(0);
@@ -2307,6 +2357,9 @@ namespace fastllm {
                     vInputs[i] = fp16tofp32.dict[((uint16_t*)input.cpuData)[i]];
                 }
                 floatInput = vInputs.data();
+            }
+            if (profileDetail) {
+                profileLast = CpuProfileNowMs();
             }
             for (int o = 0; o < outer; o++) {
                 std::vector <std::pair <int, float> > v;
@@ -2330,6 +2383,8 @@ namespace fastllm {
                     middles[j].resize(weights[idx * 2]->dims[0]);
                     results[j].resize(weights[idx * 2 + 1]->dims[0]);
                 }
+                fp16ExpertCalls += (int)v.size();
+                profileLap(fp16PrepareMs);
                 std::vector<fastllm::MultiThreadBaseOp*> ops;
                 auto *pool = GetAlivePool();
                 int threads = pool->threads.size();
@@ -2367,6 +2422,7 @@ namespace fastllm {
                         pool->Wait(j);
                         delete ops[j];
                     }
+                    profileLap(fp16GateMs);
 
                     // swiglu
                     threadSt = 0;
@@ -2385,6 +2441,7 @@ namespace fastllm {
                         pool->Wait(l - st);
                         delete ops[l - st];
                     }
+                    profileLap(fp16SwigluMs);
 
                     threadSt = 0;
                     for (int l = st; l <= end; l++) {
@@ -2401,6 +2458,7 @@ namespace fastllm {
                         pool->Wait(j);
                         delete ops[j];
                     }
+                    profileLap(fp16DownMs);
                     st = end;
                 }
                 float *fLastOutput = ((float*)output.cpuData) + o * m;
@@ -2439,9 +2497,18 @@ namespace fastllm {
                         fLastOutput[i] += curOutput[i] * value;
                     }
                 }
+                profileLap(fp16ReduceMs);
                 if (output.dataType == DataType::FLOAT16) {
                     Float32ToFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
                 }
+                profileLap(fp16OutputMs);
+            }
+            if (profileDetail) {
+                double total = fp16PrepareMs + fp16GateMs + fp16SwigluMs + fp16DownMs + fp16ReduceMs + fp16OutputMs;
+                printf("[fastllm-profile-cpu-moe] fp16_small outer=%d topk=%d experts=%d prepare=%.3f gate=%.3f swiglu=%.3f down=%.3f reduce=%.3f output=%.3f total=%.3f\n",
+                       outer, topk, fp16ExpertCalls, fp16PrepareMs, fp16GateMs, fp16SwigluMs,
+                       fp16DownMs, fp16ReduceMs, fp16OutputMs, total);
+                fflush(stdout);
             }
         } else if ((input.dataType == DataType::FLOAT32) && 
                 (weights[2]->dataType == DataType::FP8_E4M3 ||

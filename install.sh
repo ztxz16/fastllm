@@ -8,7 +8,7 @@ fi
 
 cd $folder
 cmake .. "$@"
-make -j$(nproc)
+make -j16
 
 #编译失败停止执行
 if [ $? != 0 ]; then

@@ -16,6 +16,7 @@
 #include <thread>
 #include <mutex>
 #include <memory>
+#include <chrono>
 
 #include <cfloat>
 #include <climits>
@@ -38,6 +39,11 @@
 
 namespace fastllm {
     extern CPUInstructInfo *GetCPUInstructInfo();
+
+    static double NumasProfileNowMs() {
+        using Clock = std::chrono::steady_clock;
+        return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
+    }
 
     class MoeEnvConfig {
     public:
@@ -1574,6 +1580,24 @@ namespace fastllm {
         int32_t *indexData = (int32_t*)index.cpuData;
         float *scoreData = (float*)score.cpuData;
 
+        bool profileDetail = std::getenv("FASTLLM_PROFILE_DETAIL") != nullptr &&
+                             (std::getenv("FASTLLM_PROFILE") != nullptr ||
+                              std::getenv("FASTLLM_PROFILE_DEEPSEEKV4") != nullptr ||
+                              std::getenv("FASTLLM_PROFILE_NUMAS_MOE") != nullptr);
+        double profileLast = NumasProfileNowMs();
+        double profileRegisterMs = 0.0, profileResizeMs = 0.0, profileInputMs = 0.0;
+        double profileGatePrepMs = 0.0, profileGateMs = 0.0, profileSwigluConvertMs = 0.0;
+        double profileDownPrepMs = 0.0, profileDownMs = 0.0, profileReduceMs = 0.0, profileOutputMs = 0.0;
+        int profileExpertCalls = 0;
+        auto profileLap = [&](double &bucket) {
+            if (!profileDetail) {
+                return;
+            }
+            double now = NumasProfileNowMs();
+            bucket += now - profileLast;
+            profileLast = now;
+        };
+
         if (input.dims[0] < 32) {
 // auto st = std::chrono::system_clock::now();
             int32_t *indexData = (int32_t*)index.cpuData;
@@ -1588,6 +1612,9 @@ namespace fastllm {
                 int outputDim = output.dims[1];
 
                 for (int o = 0; o < bs; o++) {
+                    if (profileDetail) {
+                        profileLast = NumasProfileNowMs();
+                    }
                     std::vector <std::pair <int, float> > v;
                     for (int j = 0; j < topk; j++) {
                         // index 存储的是专家索引（从0开始），需要+1因为0表示shared expert
@@ -1611,6 +1638,8 @@ namespace fastllm {
                             RegisterNumas(weights[e * 2 + 1], "linearColumn");
                         }
                     }
+                    profileExpertCalls += (int)v.size();
+                    profileLap(profileRegisterMs);
 
                     DataType startDataType = weights[2]->GetLinearActDataType(1);
                     DataType downInputDataType = weights[3]->GetLinearActDataType(1);
@@ -1655,6 +1684,7 @@ namespace fastllm {
                     if (reduceOutput.size() < reduceOutputSize) {
                         reduceOutput.resize(reduceOutputSize);
                     }
+                    profileLap(profileResizeMs);
 
 // printf("malloc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     // 0. input -> realInput（若 input 非 FLOAT32 则先转为 float32）
@@ -1677,6 +1707,7 @@ namespace fastllm {
                         }
                         RunMultiThreadConvertFromFloat32(realInput.data(), startDataType, inputF32Ptr, 1, inputDim, GetAlivePool());
                     }
+                    profileLap(profileInputMs);
 // printf("RunMultiThreadConvertFromFloat32 spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
                     // 1. gateUp + swiglu (融合算子)
@@ -1759,6 +1790,7 @@ namespace fastllm {
                             currentRow = endRow;
                         }
                     }
+                    profileLap(profileGatePrepMs);
 // printf("gateup+swiglu prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     for (int i = 0; i < ops.size(); i++) {
                         pool->PushOp(i, ops[i]);
@@ -1768,6 +1800,7 @@ namespace fastllm {
                         pool->Wait(i);
                         delete ops[i];
                     }
+                    profileLap(profileGateMs);
 
 // printf("gateup+swiglu spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
 
@@ -1783,6 +1816,7 @@ namespace fastllm {
                                 1, interDim, GetAlivePool());
                         }
                     }
+                    profileLap(profileSwigluConvertMs);
 
                     // 5. down
                     ops.resize(numaConfig->threads);
@@ -1842,6 +1876,7 @@ namespace fastllm {
                             currentRow = endRow;
                         }
                     }
+                    profileLap(profileDownPrepMs);
 
 // printf("down prepare spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     for (int i = 0; i < ops.size(); i++) {
@@ -1851,6 +1886,7 @@ namespace fastllm {
                         pool->Wait(i);
                         delete ops[i];
                     }
+                    profileLap(profileDownMs);
 
 // printf("down spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     float *fLastOutput = reduceOutput.data();
@@ -1872,6 +1908,7 @@ namespace fastllm {
                             }
                         }
                     }
+                    profileLap(profileReduceMs);
 
 // printf("reduce spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
                     // 7. reduceOutput -> last Output
@@ -1882,7 +1919,18 @@ namespace fastllm {
                             Float32ToBFloat16(reduceOutput.data(), (uint16_t*)output.cpuData + o * outputDim, outputDim);
                         }
                     }
+                    profileLap(profileOutputMs);
 // printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
+                }
+                if (profileDetail) {
+                    double total = profileRegisterMs + profileResizeMs + profileInputMs + profileGatePrepMs +
+                                   profileGateMs + profileSwigluConvertMs + profileDownPrepMs + profileDownMs +
+                                   profileReduceMs + profileOutputMs;
+                    printf("[fastllm-profile-numas-moe] small_batch bs=%d topk=%d experts=%d register=%.3f resize=%.3f input=%.3f gate_prep=%.3f gate_swiglu=%.3f swiglu_convert=%.3f down_prep=%.3f down=%.3f reduce=%.3f output=%.3f total=%.3f\n",
+                           bs, topk, profileExpertCalls, profileRegisterMs, profileResizeMs, profileInputMs,
+                           profileGatePrepMs, profileGateMs, profileSwigluConvertMs, profileDownPrepMs,
+                           profileDownMs, profileReduceMs, profileOutputMs, total);
+                    fflush(stdout);
                 }
             }
         } else {

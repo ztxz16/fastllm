@@ -26,10 +26,13 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <iomanip>
 #include <limits>
 #include <cstdlib>
 #include <cctype>
+#include <memory>
+#include <mutex>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -90,6 +93,127 @@ namespace fastllm {
         static int EnvInt(const char *name, int fallback) {
             const char *v = std::getenv(name);
             return v == nullptr ? fallback : atoi(v);
+        }
+
+        static std::vector<float> ReadFloatData(const Data &input);
+
+        static double NowMs() {
+            using Clock = std::chrono::steady_clock;
+            return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
+        }
+
+        static void ProfileSyncIfNeeded(bool sync) {
+#ifdef USE_CUDA
+            if (sync) {
+                ForceDeviceSync();
+            }
+#else
+            (void)sync;
+#endif
+        }
+
+        static uint64_t CachedWeightMaxBytes() {
+            static uint64_t maxBytes = []() -> uint64_t {
+                int mb = EnvInt("FASTLLM_WEIGHT_CACHE_MAX_MB", 256);
+                if (mb <= 0) {
+                    return 0;
+                }
+                return (uint64_t)mb * 1024ULL * 1024ULL;
+            }();
+            return maxBytes;
+        }
+
+        struct CachedFloatTensor {
+            DataType dataType = DataType::FLOAT32;
+            DataDevice dataDevice = DataDevice::CPU;
+            uint64_t count = 0;
+            uint64_t bytes = 0;
+            const uint8_t *cpuData = nullptr;
+            const void *cudaData = nullptr;
+            std::vector<int> dims;
+            std::shared_ptr<const std::vector<float>> values;
+        };
+
+        static std::mutex &CachedWeightMutex() {
+            static std::mutex mutex;
+            return mutex;
+        }
+
+        static std::unordered_map<const Data*, CachedFloatTensor> &CachedWeightFloats() {
+            static std::unordered_map<const Data*, CachedFloatTensor> cache;
+            return cache;
+        }
+
+        static bool CachedFloatTensorMatches(const CachedFloatTensor &cached, const Data &input) {
+            return cached.dataType == input.dataType &&
+                   cached.dataDevice == input.dataDevice &&
+                   cached.count == input.Count(0) &&
+                   cached.bytes == input.GetBytes() &&
+                   cached.cpuData == input.cpuData &&
+                   cached.cudaData == input.cudaData &&
+                   cached.dims == input.dims &&
+                   cached.values != nullptr;
+        }
+
+        static std::shared_ptr<const std::vector<float>> ReadWeightFloatDataCached(const Data &input) {
+            uint64_t bytes = input.GetBytes();
+            if (CachedWeightMaxBytes() == 0 || bytes == 0 || bytes > CachedWeightMaxBytes() || input.multiDeviceData) {
+                return std::make_shared<const std::vector<float>>(ReadFloatData(input));
+            }
+
+            {
+                std::lock_guard<std::mutex> guard(CachedWeightMutex());
+                auto &cache = CachedWeightFloats();
+                auto it = cache.find(&input);
+                if (it != cache.end() && CachedFloatTensorMatches(it->second, input)) {
+                    return it->second.values;
+                }
+            }
+
+            auto values = std::make_shared<const std::vector<float>>(ReadFloatData(input));
+            CachedFloatTensor cached;
+            cached.dataType = input.dataType;
+            cached.dataDevice = input.dataDevice;
+            cached.count = input.Count(0);
+            cached.bytes = bytes;
+            cached.cpuData = input.cpuData;
+            cached.cudaData = input.cudaData;
+            cached.dims = input.dims;
+            cached.values = values;
+            {
+                std::lock_guard<std::mutex> guard(CachedWeightMutex());
+                CachedWeightFloats()[&input] = std::move(cached);
+            }
+            return values;
+        }
+
+        struct DeepSeekV4LayerProfile {
+            double attnPrep = 0.0;
+            double cache = 0.0;
+            double sparseAttn = 0.0;
+            double attnOut = 0.0;
+            double route = 0.0;
+            double moeMove = 0.0;
+            double moe = 0.0;
+            double ffnPost = 0.0;
+            double attnHcPre = 0.0;
+            double attnNorm = 0.0;
+            double qProj = 0.0;
+            double qPost = 0.0;
+            double kvProjNorm = 0.0;
+            double kvPost = 0.0;
+            double attnWoA = 0.0;
+            double attnWoB = 0.0;
+            double attnHcPost = 0.0;
+            double ffnHcPre = 0.0;
+            double ffnNorm = 0.0;
+            double routeGate = 0.0;
+            double routeScore = 0.0;
+        };
+
+        static double LayerProfileTotal(const DeepSeekV4LayerProfile &p) {
+            return p.attnPrep + p.cache + p.sparseAttn + p.attnOut +
+                   p.route + p.moeMove + p.moe + p.ffnPost;
         }
 
         static uint64_t CountDims(const std::vector<int> &dims) {
@@ -398,15 +522,104 @@ namespace fastllm {
             int b = 0, s = 0, hc = 0;
         };
 
+        struct HcPreDotsOp : MultiThreadBaseOp {
+            const float *xrow;
+            const float *fn;
+            float *mixes;
+            float rsqrt;
+            int flatDim, mixSt, mixEnd;
+
+            HcPreDotsOp(const float *xrow, const float *fn, float *mixes, float rsqrt,
+                        int flatDim, int mixSt, int mixEnd)
+                : xrow(xrow), fn(fn), mixes(mixes), rsqrt(rsqrt),
+                  flatDim(flatDim), mixSt(mixSt), mixEnd(mixEnd) {}
+
+            void Run() override {
+                for (int m = mixSt; m < mixEnd; m++) {
+                    double v = 0.0;
+                    const float *w = fn + (uint64_t)m * flatDim;
+                    for (int k = 0; k < flatDim; k++) {
+                        v += (double)xrow[k] * w[k];
+                    }
+                    mixes[m] = (float)v * rsqrt;
+                }
+            }
+        };
+
+        static void HcPreComputeDotsCpu(const float *xrow, const float *fn, float *mixes,
+                                        float rsqrt, int flatDim, int mixHc) {
+            auto *pool = GetAlivePool();
+            int threadNum = std::min((int)pool->threads.size(), mixHc);
+            if (threadNum <= 1 || mixHc < 8 || EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CPU_HCPRE_PARALLEL")) {
+                HcPreDotsOp(xrow, fn, mixes, rsqrt, flatDim, 0, mixHc).Run();
+                return;
+            }
+            std::vector<HcPreDotsOp*> ops;
+            int per = (mixHc + threadNum - 1) / threadNum;
+            for (int i = 0; i < threadNum; i++) {
+                int st = i * per;
+                int end = std::min(mixHc, st + per);
+                if (st >= end) {
+                    break;
+                }
+                ops.push_back(new HcPreDotsOp(xrow, fn, mixes, rsqrt, flatDim, st, end));
+            }
+            for (int i = 0; i < (int)ops.size(); i++) {
+                pool->PushOp(i, ops[i]);
+            }
+            for (int i = 0; i < (int)ops.size(); i++) {
+                pool->Wait(i);
+                delete ops[i];
+            }
+        }
+
         static HcMix HcPreReference(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
                                     int hcMult, int sinkhornIters, float eps, float normEps) {
             int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
             int flatDim = hcMult * dim;
             int mixHc = (2 + hcMult) * hcMult;
+            bool profileHcPre = EnvFlagEnabled("FASTLLM_PROFILE_HCPRE");
+            double profileLast = profileHcPre ? NowMs() : 0.0;
+            double profileRead = 0.0, profileCudaDots = 0.0, profileAlloc = 0.0;
+            double profileNorm = 0.0, profileDots = 0.0, profileGates = 0.0;
+            double profileSinkhorn = 0.0, profileY = 0.0, profileWrite = 0.0;
+            auto profileLap = [&](double &bucket) {
+                if (!profileHcPre) {
+                    return;
+                }
+                double now = NowMs();
+                bucket += now - profileLast;
+                profileLast = now;
+            };
             auto xv = ReadFloatData(x);
-            auto fn = ReadFloatData(hcFn);
-            auto scale = ReadFloatData(hcScale);
-            auto base = ReadFloatData(hcBase);
+            auto scalePtr = ReadWeightFloatDataCached(hcScale);
+            auto basePtr = ReadWeightFloatDataCached(hcBase);
+            const auto &scale = *scalePtr;
+            const auto &base = *basePtr;
+            std::shared_ptr<const std::vector<float>> fnPtr;
+            const std::vector<float> *fn = nullptr;
+            std::vector<float> dotCache;
+            profileLap(profileRead);
+
+#ifdef USE_CUDA
+            if (EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_HCPRE_DOTS") && x.dataDevice == DataDevice::CUDA) {
+                Data dots;
+                hcFn.ToDevice(DataDevice::CUDA);
+                if (FastllmCudaDeepSeekV4HcPreDots(x, hcFn, hcMult, dots)) {
+                    dotCache = ReadFloatData(dots);
+                    if ((int)dotCache.size() != bsz * seqlen * mixHc) {
+                        dotCache.clear();
+                    }
+                }
+                profileLap(profileCudaDots);
+            }
+#endif
+
+            if (dotCache.empty()) {
+                fnPtr = ReadWeightFloatDataCached(hcFn);
+                fn = fnPtr.get();
+                profileLap(profileRead);
+            }
 
             std::vector<float> y((uint64_t)bsz * seqlen * dim, 0.0f);
             std::vector<float> post((uint64_t)bsz * seqlen * hcMult, 0.0f);
@@ -414,6 +627,7 @@ namespace fastllm {
             std::vector<float> mixes(mixHc);
             std::vector<float> pre(hcMult);
             std::vector<float> combLocal(hcMult * hcMult);
+            profileLap(profileAlloc);
 
             for (int t = 0; t < bsz * seqlen; t++) {
                 const float *xrow = xv.data() + (uint64_t)t * flatDim;
@@ -422,19 +636,22 @@ namespace fastllm {
                     ss += (double)xrow[k] * xrow[k];
                 }
                 float rsqrt = 1.0f / std::sqrt((float)(ss / flatDim) + normEps);
+                profileLap(profileNorm);
                 for (int m = 0; m < mixHc; m++) {
-                    double v = 0.0;
-                    const float *w = fn.data() + (uint64_t)m * flatDim;
-                    for (int k = 0; k < flatDim; k++) {
-                        v += (double)xrow[k] * w[k];
+                    if (!dotCache.empty()) {
+                        mixes[m] = dotCache[(uint64_t)t * mixHc + m] * rsqrt;
+                    } else {
+                        HcPreComputeDotsCpu(xrow, fn->data(), mixes.data(), rsqrt, flatDim, mixHc);
+                        break;
                     }
-                    mixes[m] = (float)v * rsqrt;
                 }
+                profileLap(profileDots);
                 for (int h = 0; h < hcMult; h++) {
                     pre[h] = SigmoidFloat(mixes[h] * scale[0] + base[h]) + eps;
                     post[(uint64_t)t * hcMult + h] =
                         2.0f * SigmoidFloat(mixes[h + hcMult] * scale[1] + base[h + hcMult]);
                 }
+                profileLap(profileGates);
                 for (int r = 0; r < hcMult; r++) {
                     float rowMax = -std::numeric_limits<float>::infinity();
                     for (int c = 0; c < hcMult; c++) {
@@ -483,6 +700,7 @@ namespace fastllm {
                 }
                 memcpy(comb.data() + (uint64_t)t * hcMult * hcMult, combLocal.data(),
                        hcMult * hcMult * sizeof(float));
+                profileLap(profileSinkhorn);
                 for (int d = 0; d < dim; d++) {
                     double v = 0.0;
                     for (int h = 0; h < hcMult; h++) {
@@ -490,19 +708,72 @@ namespace fastllm {
                     }
                     y[(uint64_t)t * dim + d] = (float)v;
                 }
+                profileLap(profileY);
             }
 
             HcMix ret;
             WriteFloatData(y, {bsz, seqlen, dim}, ret.y, x.dataType);
+#ifdef USE_CUDA
+            if (x.dataDevice == DataDevice::CUDA && EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_RMSNORM")) {
+                ret.y.ToDevice(DataDevice::CUDA);
+            }
+#endif
             ret.post = std::move(post);
             ret.comb = std::move(comb);
             ret.b = bsz;
             ret.s = seqlen;
             ret.hc = hcMult;
+            profileLap(profileWrite);
+            if (profileHcPre) {
+                double total = profileRead + profileCudaDots + profileAlloc + profileNorm +
+                               profileDots + profileGates + profileSinkhorn + profileY + profileWrite;
+                printf("[fastllm-profile-hcpre] rows=%d hc=%d dim=%d cuda_dots=%d read=%.3f cuda=%.3f alloc=%.3f norm=%.3f dots=%.3f gates=%.3f sinkhorn=%.3f y=%.3f write=%.3f total=%.3f\n",
+                       bsz * seqlen, hcMult, dim, dotCache.empty() ? 0 : 1, profileRead,
+                       profileCudaDots, profileAlloc, profileNorm, profileDots, profileGates,
+                       profileSinkhorn, profileY, profileWrite, total);
+                fflush(stdout);
+            }
             return ret;
         }
 
+        static bool HcPostCudaIfAvailable(Data &x, Data &residual, const HcMix &mix, Data &output) {
+#ifdef USE_CUDA
+            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_WOA_HCPOST")) {
+                return false;
+            }
+            if (x.dataDevice != DataDevice::CUDA || x.dims.size() < 2 || residual.dims.size() != 4) {
+                return false;
+            }
+            int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
+            if ((int)mix.post.size() != bsz * seqlen * hcMult ||
+                (int)mix.comb.size() != bsz * seqlen * hcMult * hcMult ||
+                x.Count(0) != (uint64_t)bsz * seqlen * dim) {
+                return false;
+            }
+            residual.ToDevice(DataDevice::CUDA);
+            return FastllmCudaDeepSeekV4HcPost(x, residual, mix.post.data(), mix.comb.data(),
+                                               bsz, seqlen, hcMult, dim, output);
+#else
+            (void)x;
+            (void)residual;
+            (void)mix;
+            (void)output;
+            return false;
+#endif
+        }
+
         static void HcPostReference(const Data &x, const Data &residual, const HcMix &mix, Data &output) {
+#ifdef USE_CUDA
+            if (x.dataDevice == DataDevice::CUDA) {
+                Data cudaX, cudaResidual;
+                cudaX.CopyFrom(x);
+                cudaResidual.CopyFrom(residual);
+                if (HcPostCudaIfAvailable(cudaX, cudaResidual, mix, output)) {
+                    return;
+                }
+            }
+#endif
+
             int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
             auto xv = ReadFloatData(x);
             auto rv = ReadFloatData(residual);
@@ -525,9 +796,34 @@ namespace fastllm {
             WriteFloatData(y, {bsz, seqlen, hcMult, dim}, output, x.dataType);
         }
 
+        static bool RMSNormCudaIfAvailable(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
+#ifdef USE_CUDA
+            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_PREP") ||
+                !EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_RMSNORM") ||
+                input.dataDevice != DataDevice::CUDA || dtype != input.dataType ||
+                weight.dataType != DataType::FLOAT32 || input.dims.empty()) {
+                return false;
+            }
+            weight.ToDevice(DataDevice::CUDA);
+            return FastllmCudaDeepSeekV4RMSNorm(input, weight, eps, output, dtype);
+#else
+            (void)input;
+            (void)weight;
+            (void)eps;
+            (void)output;
+            (void)dtype;
+            return false;
+#endif
+        }
+
         static void RMSNormReference(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
+            if (RMSNormCudaIfAvailable(input, weight, eps, output, dtype)) {
+                return;
+            }
+
             auto xv = ReadFloatData(input);
-            auto wv = ReadFloatData(weight);
+            auto wvPtr = ReadWeightFloatDataCached(weight);
+            const auto &wv = *wvPtr;
             int dim = input.dims.back();
             int rows = (int)(xv.size() / dim);
             std::vector<float> y(xv.size());
@@ -619,6 +915,45 @@ namespace fastllm {
             WriteFloatData(qv, q.dims, q, DataType::BFLOAT16);
         }
 
+        static bool ScaleQRotaryCudaIfAvailable(Data &q, int ropeDim, float ropeBase, int startPos,
+                                                int originalSeqLen, float ropeFactor,
+                                                int betaFast, int betaSlow, float eps) {
+#ifdef USE_CUDA
+            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_PREP") ||
+                !EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_ROTARY_PREP") ||
+                q.dataDevice != DataDevice::CUDA || q.dims.size() != 4 ||
+                q.dataType != DataType::BFLOAT16) {
+                return false;
+            }
+            return FastllmCudaDeepSeekV4ScaleQRotary(q, ropeDim, ropeBase, startPos,
+                                                     originalSeqLen, ropeFactor, betaFast, betaSlow, eps);
+#else
+            (void)q;
+            (void)ropeDim;
+            (void)ropeBase;
+            (void)startPos;
+            (void)originalSeqLen;
+            (void)ropeFactor;
+            (void)betaFast;
+            (void)betaSlow;
+            (void)eps;
+            return false;
+#endif
+        }
+
+        static void ScaleQRotary(Data &q, float eps, int ropeDim, float ropeBase, int startPos,
+                                 int originalSeqLen, float ropeFactor, int betaFast, int betaSlow) {
+            if (ScaleQRotaryCudaIfAvailable(q, ropeDim, ropeBase, startPos, originalSeqLen,
+                                            ropeFactor, betaFast, betaSlow, eps)) {
+                return;
+            }
+            ScaleQReference(q, eps);
+            auto qv = ReadFloatData(q);
+            ApplyRotaryReference(qv, q.dims, ropeDim, ropeBase, startPos, false,
+                                 originalSeqLen, ropeFactor, betaFast, betaSlow);
+            WriteFloatData(qv, q.dims, q, DataType::BFLOAT16);
+        }
+
         static void ActQuantInplaceReference(std::vector<float> &x, const std::vector<int> &dims,
                                              int quantDim, int blockSize) {
             int dim = dims.back();
@@ -638,6 +973,50 @@ namespace fastllm {
                     }
                 }
             }
+        }
+
+        static bool RotaryQuantCudaIfAvailable(Data &x, int ropeDim, float ropeBase, int startPos,
+                                               int originalSeqLen, float ropeFactor,
+                                               int betaFast, int betaSlow, int quantDim,
+                                               int blockSize, int posStep = 1) {
+#ifdef USE_CUDA
+            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_PREP") ||
+                !EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_ROTARY_PREP") ||
+                x.dataDevice != DataDevice::CUDA || x.dataType != DataType::BFLOAT16 ||
+                x.dims.size() < 3 || x.dims.size() > 4) {
+                return false;
+            }
+            return FastllmCudaDeepSeekV4RotaryQuant(x, ropeDim, ropeBase, startPos,
+                                                   originalSeqLen, ropeFactor, betaFast, betaSlow,
+                                                   quantDim, blockSize, posStep);
+#else
+            (void)x;
+            (void)ropeDim;
+            (void)ropeBase;
+            (void)startPos;
+            (void)originalSeqLen;
+            (void)ropeFactor;
+            (void)betaFast;
+            (void)betaSlow;
+            (void)quantDim;
+            (void)blockSize;
+            (void)posStep;
+            return false;
+#endif
+        }
+
+        static void RotaryQuant(Data &x, int ropeDim, float ropeBase, int startPos,
+                                int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
+                                int quantDim, int blockSize, int posStep = 1) {
+            if (RotaryQuantCudaIfAvailable(x, ropeDim, ropeBase, startPos, originalSeqLen,
+                                           ropeFactor, betaFast, betaSlow, quantDim, blockSize, posStep)) {
+                return;
+            }
+            auto xv = ReadFloatData(x);
+            ApplyRotaryReference(xv, x.dims, ropeDim, ropeBase, startPos, false,
+                                 originalSeqLen, ropeFactor, betaFast, betaSlow, posStep);
+            ActQuantInplaceReference(xv, x.dims, quantDim, blockSize);
+            WriteFloatData(xv, x.dims, x, DataType::BFLOAT16);
         }
 
         static void StoreWindowKVCache(const std::vector<float> &kv, int bsz, int seqlen, int headDim,
@@ -734,7 +1113,8 @@ namespace fastllm {
             bool overlap = (compressRatio == 4);
             int coff = overlap ? 2 : 1;
             int wideDim = coff * headDim;
-            auto ape = ReadFloatData(weight[prefix + ".ape"]);
+            auto apePtr = ReadWeightFloatDataCached(weight[prefix + ".ape"]);
+            const auto &ape = *apePtr;
 
             std::vector<float> compressed((uint64_t)bsz * blocks * headDim, 0.0f);
             std::vector<float> vals(overlap ? 2 * compressRatio : compressRatio);
@@ -821,7 +1201,8 @@ namespace fastllm {
                                              float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
             auto qv = ReadFloatData(q);
             auto kvv = ReadFloatData(kv);
-            auto sink = ReadFloatData(attnSink);
+            auto sinkPtr = ReadWeightFloatDataCached(attnSink);
+            const auto &sink = *sinkPtr;
             int bsz = q.dims[0], seqlen = q.dims[1], heads = q.dims[2], dim = q.dims[3];
             int windowTopk = std::min(windowSize, seqlen);
             int compressedCount = std::max(0, kv.dims[1] - seqlen);
@@ -889,7 +1270,8 @@ namespace fastllm {
                                                    float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
             auto qv = ReadFloatData(q);
             auto kvv = ReadFloatData(cacheKV);
-            auto sink = ReadFloatData(attnSink);
+            auto sinkPtr = ReadWeightFloatDataCached(attnSink);
+            const auto &sink = *sinkPtr;
             int bsz = q.dims[0], heads = q.dims[2], dim = q.dims[3];
             std::vector<float> out((uint64_t)bsz * heads * dim, 0.0f);
             std::vector<int> idxs;
@@ -911,9 +1293,9 @@ namespace fastllm {
             }
 
             for (int b = 0; b < bsz; b++) {
+                std::vector<float> scores(idxs.size());
                 for (int h = 0; h < heads; h++) {
                     const float *qrow = qv.data() + ((uint64_t)b * heads + h) * dim;
-                    std::vector<float> scores(idxs.size());
                     float mx = -std::numeric_limits<float>::infinity();
                     for (int k = 0; k < (int)idxs.size(); k++) {
                         const float *kvrow = kvv.data() + ((uint64_t)b * cacheKV.dims[1] + idxs[k]) * dim;
@@ -933,6 +1315,107 @@ namespace fastllm {
                     for (int k = 0; k < (int)idxs.size(); k++) {
                         float w = (float)(std::exp((double)scores[k] - safeMx) / std::max(denom, 1e-30));
                         const float *kvrow = kvv.data() + ((uint64_t)b * cacheKV.dims[1] + idxs[k]) * dim;
+                        for (int d = 0; d < dim; d++) {
+                            orow[d] += w * kvrow[d];
+                        }
+                    }
+                }
+            }
+            ApplyRotaryReference(out, {bsz, 1, heads, dim}, ropeDim, ropeBase, startPos, true,
+                                 originalSeqLen, ropeFactor, betaFast, betaSlow);
+            WriteFloatData(out, {bsz, 1, heads, dim}, output, DataType::BFLOAT16);
+        }
+
+        static void SparseAttentionDecodeCachedReference(Data &q,
+                                                         const std::vector<float> &windowKV,
+                                                         const Data &compressedKV,
+                                                         Data &attnSink,
+                                                         int windowSize, int startPos, int compressedCount,
+                                                         int ropeDim, float ropeBase, float softmaxScale,
+                                                         Data &output, int originalSeqLen = 0,
+                                                         float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
+#ifdef USE_CUDA
+            if (EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_SPARSE_DECODE")) {
+                Data qCuda, compressedCuda;
+                qCuda.CopyFrom(q);
+                qCuda.ToDevice(DataDevice::CUDA);
+                const Data *compressedForCuda = &compressedKV;
+                if (compressedCount > 0) {
+                    compressedCuda.CopyFrom(compressedKV);
+                    compressedCuda.ToDevice(DataDevice::CUDA);
+                    compressedForCuda = &compressedCuda;
+                }
+                attnSink.ToDevice(DataDevice::CUDA);
+                Data preRotary;
+                if (FastllmCudaDeepSeekV4SparseAttentionDecodeCached(qCuda, windowKV.data(), *compressedForCuda,
+                                                                     attnSink, windowSize, startPos,
+                                                                     compressedCount, softmaxScale, preRotary)) {
+                    auto out = ReadFloatData(preRotary);
+                    int bsz = q.dims[0], heads = q.dims[2], dim = q.dims[3];
+                    ApplyRotaryReference(out, {bsz, 1, heads, dim}, ropeDim, ropeBase, startPos, true,
+                                         originalSeqLen, ropeFactor, betaFast, betaSlow);
+                    WriteFloatData(out, {bsz, 1, heads, dim}, output, DataType::BFLOAT16);
+                    return;
+                }
+            }
+#endif
+            auto qv = ReadFloatData(q);
+            std::vector<float> compressed;
+            if (compressedCount > 0) {
+                compressed = ReadFloatData(compressedKV);
+            }
+            auto sinkPtr = ReadWeightFloatDataCached(attnSink);
+            const auto &sink = *sinkPtr;
+            int bsz = q.dims[0], heads = q.dims[2], dim = q.dims[3];
+            std::vector<float> out((uint64_t)bsz * heads * dim, 0.0f);
+            std::vector<int> idxs;
+            if (startPos >= windowSize - 1) {
+                int pos = startPos % windowSize;
+                for (int i = pos + 1; i < windowSize; i++) {
+                    idxs.push_back(i);
+                }
+                for (int i = 0; i <= pos; i++) {
+                    idxs.push_back(i);
+                }
+            } else {
+                for (int i = 0; i <= startPos; i++) {
+                    idxs.push_back(i);
+                }
+            }
+            for (int i = 0; i < compressedCount; i++) {
+                idxs.push_back(windowSize + i);
+            }
+
+            auto getKVRow = [&](int b, int idx) -> const float* {
+                if (idx < windowSize) {
+                    return windowKV.data() + ((uint64_t)b * windowSize + idx) * dim;
+                }
+                return compressed.data() + ((uint64_t)b * compressedCount + (idx - windowSize)) * dim;
+            };
+
+            for (int b = 0; b < bsz; b++) {
+                std::vector<float> scores(idxs.size());
+                for (int h = 0; h < heads; h++) {
+                    const float *qrow = qv.data() + ((uint64_t)b * heads + h) * dim;
+                    float mx = -std::numeric_limits<float>::infinity();
+                    for (int k = 0; k < (int)idxs.size(); k++) {
+                        const float *kvrow = getKVRow(b, idxs[k]);
+                        double dot = 0.0;
+                        for (int d = 0; d < dim; d++) {
+                            dot += (double)qrow[d] * kvrow[d];
+                        }
+                        scores[k] = (float)dot * softmaxScale;
+                        mx = std::max(mx, scores[k]);
+                    }
+                    float safeMx = std::isfinite(mx) ? mx : 0.0f;
+                    double denom = std::exp((double)sink[h] - safeMx);
+                    for (float score : scores) {
+                        denom += std::exp((double)score - safeMx);
+                    }
+                    float *orow = out.data() + ((uint64_t)b * heads + h) * dim;
+                    for (int k = 0; k < (int)idxs.size(); k++) {
+                        float w = (float)(std::exp((double)scores[k] - safeMx) / std::max(denom, 1e-30));
+                        const float *kvrow = getKVRow(b, idxs[k]);
                         for (int d = 0; d < dim; d++) {
                             orow[d] += w * kvrow[d];
                         }
@@ -968,7 +1451,8 @@ namespace fastllm {
             Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), scoreData);
             auto kv = ReadFloatData(kvData);
             auto score = ReadFloatData(scoreData);
-            auto ape = ReadFloatData(weight[prefix + ".ape"]);
+            auto apePtr = ReadWeightFloatDataCached(weight[prefix + ".ape"]);
+            const auto &ape = *apePtr;
 
             int wideDim = coff * headDim;
             std::vector<float> compressed((uint64_t)bsz * blocks * headDim, 0.0f);
@@ -1048,33 +1532,111 @@ namespace fastllm {
             WriteFloatData(y, {bsz, aSeq + bSeq, dim}, output, a.dataType);
         }
 
+        struct WoAReferenceOp : MultiThreadBaseOp {
+            const std::vector<float> *ov;
+            const std::vector<float> *wv;
+            float *y;
+            int st, end;
+            int bsz, seqlen, heads, headDim, groups, oRank, headsPerGroup, groupDim;
+
+            WoAReferenceOp(const std::vector<float> *ov, const std::vector<float> *wv, float *y,
+                           int st, int end, int bsz, int seqlen, int heads, int headDim,
+                           int groups, int oRank)
+                : ov(ov), wv(wv), y(y), st(st), end(end), bsz(bsz), seqlen(seqlen),
+                  heads(heads), headDim(headDim), groups(groups), oRank(oRank) {
+                headsPerGroup = heads / groups;
+                groupDim = headsPerGroup * headDim;
+            }
+
+            void Run() override {
+                const float *ovData = ov->data();
+                const float *wvData = wv->data();
+                for (int idx = st; idx < end; idx++) {
+                    int r = idx % oRank;
+                    int tmp = idx / oRank;
+                    int g = tmp % groups;
+                    tmp /= groups;
+                    int s = tmp % seqlen;
+                    int b = tmp / seqlen;
+                    const float *w = wvData + ((uint64_t)g * oRank + r) * groupDim;
+                    double v = 0.0;
+                    int d = 0;
+                    for (int hh = 0; hh < headsPerGroup; hh++) {
+                        const float *src = ovData + (((uint64_t)b * seqlen + s) * heads +
+                                                     g * headsPerGroup + hh) * headDim;
+                        for (int localD = 0; localD < headDim; localD++, d++) {
+                            v += (double)src[localD] * w[d];
+                        }
+                    }
+                    y[idx] = (float)v;
+                }
+            }
+        };
+
         static void WoAReference(Data &o, Data &woA, int groups, int oRank, Data &output) {
             auto ov = ReadFloatData(o);
-            auto wv = ReadFloatData(woA);
+            auto wvPtr = ReadWeightFloatDataCached(woA);
+            const auto &wv = *wvPtr;
             int bsz = o.dims[0], seqlen = o.dims[1], heads = o.dims[2], headDim = o.dims[3];
             int headsPerGroup = heads / groups;
             int groupDim = headsPerGroup * headDim;
             std::vector<float> y((uint64_t)bsz * seqlen * groups * oRank, 0.0f);
-            for (int b = 0; b < bsz; b++) {
-                for (int s = 0; s < seqlen; s++) {
-                    for (int g = 0; g < groups; g++) {
-                        std::vector<float> in(groupDim);
-                        for (int hh = 0; hh < headsPerGroup; hh++) {
-                            const float *src = ov.data() + (((uint64_t)b * seqlen + s) * heads + g * headsPerGroup + hh) * headDim;
-                            memcpy(in.data() + (uint64_t)hh * headDim, src, headDim * sizeof(float));
-                        }
-                        for (int r = 0; r < oRank; r++) {
-                            const float *w = wv.data() + ((uint64_t)g * oRank + r) * groupDim;
-                            double v = 0.0;
-                            for (int d = 0; d < groupDim; d++) {
-                                v += (double)in[d] * w[d];
-                            }
-                            y[(((uint64_t)b * seqlen + s) * groups + g) * oRank + r] = (float)v;
-                        }
-                    }
+            int total = bsz * seqlen * groups * oRank;
+            auto *pool = GetAlivePool();
+            int threadNum = std::min((int)pool->threads.size(), total);
+            if (threadNum <= 1 || total < 1024) {
+                WoAReferenceOp(&ov, &wv, y.data(), 0, total, bsz, seqlen, heads, headDim, groups, oRank).Run();
+            } else {
+                std::vector<WoAReferenceOp*> ops;
+                int per = total / threadNum;
+                int cur = 0;
+                for (int i = 0; i < threadNum; i++) {
+                    int end = (i == threadNum - 1) ? total : cur + per;
+                    ops.push_back(new WoAReferenceOp(&ov, &wv, y.data(), cur, end,
+                                                     bsz, seqlen, heads, headDim, groups, oRank));
+                    cur = end;
+                }
+                for (int i = 0; i < (int)ops.size(); i++) {
+                    pool->PushOp(i, ops[i]);
+                }
+                for (int i = 0; i < (int)ops.size(); i++) {
+                    pool->Wait(i);
+                    delete ops[i];
                 }
             }
             WriteFloatData(y, {bsz, seqlen, groups * oRank}, output, DataType::BFLOAT16);
+        }
+
+        static bool WoACudaIfAvailable(Data &o, Data &woA, int groups, int oRank, Data &output) {
+#ifdef USE_CUDA
+            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_WOA_HCPOST")) {
+                return false;
+            }
+            if (o.dims.size() != 4 || groups <= 0 || oRank <= 0) {
+                return false;
+            }
+            int heads = o.dims[2], headDim = o.dims[3];
+            if (heads % groups != 0 || woA.Count(0) != (uint64_t)groups * oRank * (heads / groups) * headDim) {
+                return false;
+            }
+            o.ToDevice(DataDevice::CUDA);
+            woA.ToDevice(DataDevice::CUDA);
+            return FastllmCudaDeepSeekV4WoA(o, woA, groups, oRank, output);
+#else
+            (void)o;
+            (void)woA;
+            (void)groups;
+            (void)oRank;
+            (void)output;
+            return false;
+#endif
+        }
+
+        static void WoA(Data &o, Data &woA, int groups, int oRank, Data &output) {
+            if (WoACudaIfAvailable(o, woA, groups, oRank, output)) {
+                return;
+            }
+            WoAReference(o, woA, groups, oRank, output);
         }
 
         static void RunExpertReference(WeightMap &weight, const std::string &prefix, const Data &x,
@@ -1124,18 +1686,64 @@ namespace fastllm {
         static void BuildMoERoutingData(WeightMap &weight, const std::string &prefix, const Data &x,
                                         const std::vector<int> &inputIds, int nRoutedExperts,
                                         int topk, const std::string &scoreFunc, float routeScale,
-                                        Data &expertIndex, Data &expertScore) {
+                                        Data &expertIndex, Data &expertScore,
+                                        DeepSeekV4LayerProfile *profile = nullptr, bool profileSync = false) {
+            if (profile != nullptr) {
+                ProfileSyncIfNeeded(profileSync);
+            }
+            double detailLastMs = NowMs();
+            auto detailLap = [&](double &bucket) {
+                if (profile == nullptr) {
+                    return;
+                }
+                ProfileSyncIfNeeded(profileSync);
+                double now = NowMs();
+                bucket += now - detailLastMs;
+                detailLastMs = now;
+            };
+
             Data xFloat, routerLogits;
             ToDataType(x, xFloat, DataType::FLOAT32);
             Linear(xFloat, weight[prefix + ".gate.weight"], Data(), routerLogits, true);
+            detailLap(profile != nullptr ? profile->routeGate : detailLastMs);
+
+#ifdef USE_CUDA
+            bool hashRoutingForCuda = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
+            if (EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_ROUTE") && !hashRoutingForCuda &&
+                routerLogits.dataDevice == DataDevice::CUDA && routerLogits.dataType == DataType::FLOAT32) {
+                int scoreFuncMode = scoreFunc == "softmax" ? 0 : (scoreFunc == "sigmoid" ? 1 : 2);
+                Data *gateBiasData = nullptr;
+                if (weight.weight.find(prefix + ".gate.bias") != weight.weight.end()) {
+                    gateBiasData = &weight[prefix + ".gate.bias"];
+                    gateBiasData->ToDevice(DataDevice::CUDA);
+                }
+                if (FastllmCudaDeepSeekV4RouteScoreTransform(routerLogits, scoreFuncMode)) {
+                    int tokens = x.dims[0];
+                    std::vector<int> zeroIndex((uint64_t)tokens * topk, 0);
+                    std::vector<float> zeroScore((uint64_t)tokens * topk, 0.0f);
+                    WriteIntData(zeroIndex, {tokens, topk}, expertIndex);
+                    WriteFloatData(zeroScore, {tokens, topk}, expertScore, DataType::FLOAT32);
+                    bool needNorm = scoreFunc != "softmax";
+                    if (FastllmCudaSelectExpert(routerLogits, gateBiasData, expertIndex, expertScore,
+                                                topk, needNorm, routeScale)) {
+                        detailLap(profile != nullptr ? profile->routeScore : detailLastMs);
+                        return;
+                    }
+                }
+            }
+#endif
             auto rawScores = ReadFloatData(routerLogits);
 
             bool hashRouting = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
-            std::vector<float> tid2eid, gateBias;
+            std::shared_ptr<const std::vector<float>> tid2eidPtr, gateBiasPtr;
+            const std::vector<float> *tid2eid = nullptr;
+            const std::vector<float> *gateBias = nullptr;
             if (hashRouting) {
-                tid2eid = ReadFloatData(weight[prefix + ".gate.tid2eid"]);
+                tid2eidPtr = ReadWeightFloatDataCached(weight[prefix + ".gate.tid2eid"]);
+                tid2eid = tid2eidPtr.get();
             } else if (weight.weight.find(prefix + ".gate.bias") != weight.weight.end()) {
-                gateBias = ReadFloatData(weight[prefix + ".gate.bias"]);
+                gateBiasPtr = ReadWeightFloatDataCached(weight[prefix + ".gate.bias"]);
+                gateBias = gateBiasPtr.get();
             }
 
             int tokens = x.dims[0];
@@ -1168,13 +1776,13 @@ namespace fastllm {
                 std::vector<int> curIndices(topk);
                 if (hashRouting) {
                     for (int k = 0; k < topk; k++) {
-                        curIndices[k] = (int)(tid2eid[(uint64_t)inputIds[t] * topk + k] + 0.5f);
+                        curIndices[k] = (int)((*tid2eid)[(uint64_t)inputIds[t] * topk + k] + 0.5f);
                     }
                 } else {
                     std::vector<float> selectScores = originalScores;
-                    if (!gateBias.empty()) {
+                    if (gateBias != nullptr) {
                         for (int e = 0; e < nRoutedExperts; e++) {
-                            selectScores[e] += gateBias[e];
+                            selectScores[e] += (*gateBias)[e];
                         }
                     }
                     for (int k = 0; k < topk; k++) {
@@ -1207,6 +1815,7 @@ namespace fastllm {
 
             WriteIntData(indices, {tokens, topk}, expertIndex);
             WriteFloatData(weights, {tokens, topk}, expertScore, DataType::FLOAT32);
+            detailLap(profile != nullptr ? profile->routeScore : detailLastMs);
         }
 
         static void MoEReference(WeightMap &weight, const std::string &prefix, const Data &x,
@@ -1218,11 +1827,15 @@ namespace fastllm {
             Linear(xFloat, weight[prefix + ".gate.weight"], Data(), routerLogits, true);
             auto rawScores = ReadFloatData(routerLogits);
             bool hashRouting = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
-            std::vector<float> tid2eid, gateBias;
+            std::shared_ptr<const std::vector<float>> tid2eidPtr, gateBiasPtr;
+            const std::vector<float> *tid2eid = nullptr;
+            const std::vector<float> *gateBias = nullptr;
             if (hashRouting) {
-                tid2eid = ReadFloatData(weight[prefix + ".gate.tid2eid"]);
+                tid2eidPtr = ReadWeightFloatDataCached(weight[prefix + ".gate.tid2eid"]);
+                tid2eid = tid2eidPtr.get();
             } else if (weight.weight.find(prefix + ".gate.bias") != weight.weight.end()) {
-                gateBias = ReadFloatData(weight[prefix + ".gate.bias"]);
+                gateBiasPtr = ReadWeightFloatDataCached(weight[prefix + ".gate.bias"]);
+                gateBias = gateBiasPtr.get();
             }
             int tokens = x.dims[0] * x.dims[1];
             int dim = x.dims.back();
@@ -1257,13 +1870,13 @@ namespace fastllm {
                 std::vector<int> indices(topk);
                 if (hashRouting) {
                     for (int k = 0; k < topk; k++) {
-                        indices[k] = (int)(tid2eid[(uint64_t)inputIds[t] * topk + k] + 0.5f);
+                        indices[k] = (int)((*tid2eid)[(uint64_t)inputIds[t] * topk + k] + 0.5f);
                     }
                 } else {
                     std::vector<float> selectScores = originalScores;
-                    if (!gateBias.empty()) {
+                    if (gateBias != nullptr) {
                         for (int e = 0; e < nRoutedExperts; e++) {
-                            selectScores[e] += gateBias[e];
+                            selectScores[e] += (*gateBias)[e];
                         }
                     }
                     for (int k = 0; k < topk; k++) {
@@ -1314,9 +1927,12 @@ namespace fastllm {
             int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
             int flatDim = hcMult * dim;
             auto xv = ReadFloatData(x);
-            auto fn = ReadFloatData(hcFn);
-            auto scale = ReadFloatData(hcScale);
-            auto base = ReadFloatData(hcBase);
+            auto fnPtr = ReadWeightFloatDataCached(hcFn);
+            auto scalePtr = ReadWeightFloatDataCached(hcScale);
+            auto basePtr = ReadWeightFloatDataCached(hcBase);
+            const auto &fn = *fnPtr;
+            const auto &scale = *scalePtr;
+            const auto &base = *basePtr;
             std::vector<float> y((uint64_t)bsz * seqlen * dim, 0.0f);
             for (int t = 0; t < bsz * seqlen; t++) {
                 const float *xrow = xv.data() + (uint64_t)t * flatDim;
@@ -1666,6 +2282,41 @@ namespace fastllm {
                                                    const GenerationConfig &generationConfig,
                                                    const LastTokensManager &lastTokens,
                                                    std::vector <std::vector <float>*> *retLogits) {
+        bool profileEnabled = EnvFlagEnabled("FASTLLM_PROFILE") || EnvFlagEnabled("FASTLLM_PROFILE_DEEPSEEKV4");
+        bool profileSync = profileEnabled && !EnvFlagEnabled("FASTLLM_PROFILE_NO_SYNC");
+        double profileLastMs = NowMs();
+        auto profileLap = [&](double &bucket) {
+            if (!profileEnabled) {
+                return;
+            }
+            ProfileSyncIfNeeded(profileSync);
+            double now = NowMs();
+            bucket += now - profileLastMs;
+            profileLastMs = now;
+        };
+        auto profileLapDetail = [&](double &bucket, double &detailBucket) {
+            if (!profileEnabled) {
+                return;
+            }
+            ProfileSyncIfNeeded(profileSync);
+            double now = NowMs();
+            double span = now - profileLastMs;
+            bucket += span;
+            detailBucket += span;
+            profileLastMs = now;
+        };
+        double profilePrepareMs = 0.0;
+        double profileEmbedMs = 0.0;
+        double profileDebugDumpMs = 0.0;
+        double profileHcExpandMs = 0.0;
+        double profileSetupMs = 0.0;
+        double profileLayersMs = 0.0;
+        double profileHeadMs = 0.0;
+        double profileLogitsDumpMs = 0.0;
+        double profileTopkMs = 0.0;
+        double profilePastMs = 0.0;
+        std::vector<DeepSeekV4LayerProfile> layerProfiles;
+        bool debugStopNow = false;
         Data hiddenStates;
         int startPos = 0;
         if (positionIds.dims.size() >= 2 && positionIds.Count(0) > 0) {
@@ -1692,13 +2343,21 @@ namespace fastllm {
         bool debugThisStep = (originalStartPos == 0) || EnvFlagEnabled("FASTLLM_DEBUG_ALL_STEPS");
         bool debugLogitsThisStep = debugThisStep || EnvFlagEnabled("FASTLLM_DEBUG_LOGITS_ALL_STEPS") || debugFullRecomputeDecode;
         bool useDecodeCache = (!debugFullRecomputeDecode && batch == 1);
+        int debugStopAfterTokens = EnvInt("FASTLLM_DEBUG_STOP_AFTER_TOKENS", 0);
+        if (!debugFullRecomputeDecode && originalStartPos == 0 && debugStopAfterTokens > 0) {
+            debugGeneratedTokens = 0;
+        }
 
+        profileLap(profilePrepareMs);
         if (debugThisStep || debugFullRecomputeDecode) {
             DebugDumpInputIds(*forwardInputIds, originalStartPos);
+            profileLap(profileDebugDumpMs);
         }
         Embedding(*forwardInputIds, weight["embed.weight"], hiddenStates);
+        profileLap(profileEmbedMs);
         if (debugThisStep) {
             DebugDumpData("embed", hiddenStates);
+            profileLap(profileDebugDumpMs);
         }
 
         int bsz = forwardInputIds->dims[0];
@@ -1716,8 +2375,10 @@ namespace fastllm {
             }
         }
         WriteFloatData(expanded, {bsz, seqlen, hc_mult, dim}, hiddenStates, hiddenStates.dataType);
+        profileLap(profileHcExpandMs);
         if (debugThisStep) {
             DebugDumpData("hc_expand", hiddenStates);
+            profileLap(profileDebugDumpMs);
         }
 
         if (block_cnt <= 0) {
@@ -1762,7 +2423,9 @@ namespace fastllm {
                 }
             }
         }
+        profileLap(profileSetupMs);
         for (int layer = 0; layer < debugLayers; layer++) {
+            DeepSeekV4LayerProfile layerProfile;
             std::string pre = "layers." + std::to_string(layer);
             int compressRatio = compress_ratios.size() > layer ? compress_ratios[layer] : 0;
             bool useCompressRope = compressRatio != 0;
@@ -1774,36 +2437,32 @@ namespace fastllm {
             HcMix attnMix = HcPreReference(hiddenStates, weight[pre + ".hc_attn_fn"],
                                            weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
                                            hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
+            profileLapDetail(layerProfile.attnPrep, layerProfile.attnHcPre);
             Data attnInput;
             RMSNormReference(attnMix.y, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput, DataType::BFLOAT16);
+            profileLapDetail(layerProfile.attnPrep, layerProfile.attnNorm);
 
             Data qr, qNorm, q;
             Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr);
             RMSNormReference(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm, DataType::BFLOAT16);
             Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
+            profileLapDetail(layerProfile.attnPrep, layerProfile.qProj);
             q.Reshape({bsz, seqlen, num_attention_heads, head_dim_full});
-            ScaleQReference(q, rms_norm_eps);
-            {
-                auto qv = ReadFloatData(q);
-                ApplyRotaryReference(qv, q.dims, qk_rope_head_dim, layerRopeBase, startPos, false,
-                                     layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
-                                     rope_scaling_beta_slow);
-                WriteFloatData(qv, q.dims, q, DataType::BFLOAT16);
-            }
+            ScaleQRotary(q, rms_norm_eps, qk_rope_head_dim, layerRopeBase, startPos,
+                         layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
+                         rope_scaling_beta_slow);
+            profileLapDetail(layerProfile.attnPrep, layerProfile.qPost);
 
             Data kv;
             Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv);
             RMSNormReference(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv, DataType::BFLOAT16);
+            profileLapDetail(layerProfile.attnPrep, layerProfile.kvProjNorm);
             kv.Reshape({bsz, seqlen, 1, head_dim_full});
-            {
-                auto kvv = ReadFloatData(kv);
-                ApplyRotaryReference(kvv, kv.dims, qk_rope_head_dim, layerRopeBase, startPos, false,
-                                     layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
-                                     rope_scaling_beta_slow);
-                ActQuantInplaceReference(kvv, kv.dims, head_dim_full - qk_rope_head_dim, 64);
-                WriteFloatData(kvv, kv.dims, kv, DataType::BFLOAT16);
-            }
+            RotaryQuant(kv, qk_rope_head_dim, layerRopeBase, startPos,
+                        layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
+                        rope_scaling_beta_slow, head_dim_full - qk_rope_head_dim, 64);
             kv.Reshape({bsz, seqlen, head_dim_full});
+            profileLapDetail(layerProfile.attnPrep, layerProfile.kvPost);
             DeepSeekV4DecodeLayerCache *decodeCache = nullptr;
             if (useDecodeCache && layer < (int)decodeLayerCaches.size()) {
                 decodeCache = &decodeLayerCaches[layer];
@@ -1869,18 +2528,17 @@ namespace fastllm {
                     }
                 }
             }
+            profileLap(layerProfile.cache);
 
             Data attnOut4, woAOut, attnOut;
             if (decodeCache != nullptr && startPos > 0) {
-                Data cacheKV;
-                BuildDecodeKVData(decodeCache->windowKV, decodeCache->compressedKV,
-                                  bsz, window_size, decodeCompressedCount, head_dim_full, cacheKV);
-                SparseAttentionDecodeReference(q, cacheKV, weight[pre + ".attn.attn_sink"],
-                                               window_size, startPos, decodeCompressedCount,
-                                               qk_rope_head_dim, layerRopeBase,
-                                               1.0f / std::sqrt((float)head_dim_full), attnOut4,
-                                               layerOriginalSeqLen, rope_factor,
-                                               rope_scaling_beta_fast, rope_scaling_beta_slow);
+                SparseAttentionDecodeCachedReference(q, decodeCache->windowKV, decodeCache->compressedKV,
+                                                     weight[pre + ".attn.attn_sink"],
+                                                     window_size, startPos, decodeCompressedCount,
+                                                     qk_rope_head_dim, layerRopeBase,
+                                                     1.0f / std::sqrt((float)head_dim_full), attnOut4,
+                                                     layerOriginalSeqLen, rope_factor,
+                                                     rope_scaling_beta_fast, rope_scaling_beta_slow);
             } else {
                 SparseAttentionReference(q, kv, weight[pre + ".attn.attn_sink"], window_size,
                                          qk_rope_head_dim, layerRopeBase, startPos,
@@ -1888,12 +2546,16 @@ namespace fastllm {
                                          compressRatio, layerOriginalSeqLen, rope_factor,
                                          rope_scaling_beta_fast, rope_scaling_beta_slow);
             }
-            WoAReference(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+            profileLap(layerProfile.sparseAttn);
+            WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+            profileLapDetail(layerProfile.attnOut, layerProfile.attnWoA);
             Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
+            profileLapDetail(layerProfile.attnOut, layerProfile.attnWoB);
             if (debugThisStep && layer == debugDetailLayer) {
                 DebugDumpData("layer" + std::to_string(layer) + "_attn_out", attnOut);
             }
             HcPostReference(attnOut, residual, attnMix, hiddenStates);
+            profileLapDetail(layerProfile.attnOut, layerProfile.attnHcPost);
             if (debugThisStep && layer == debugDetailLayer) {
                 DebugDumpData("layer" + std::to_string(layer) + "_after_attn", hiddenStates);
             }
@@ -1902,8 +2564,10 @@ namespace fastllm {
             HcMix ffnMix = HcPreReference(hiddenStates, weight[pre + ".hc_ffn_fn"],
                                           weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
                                           hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
+            profileLapDetail(layerProfile.route, layerProfile.ffnHcPre);
             Data ffnInput, ffnOut;
             RMSNormReference(ffnMix.y, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput, DataType::BFLOAT16);
+            profileLapDetail(layerProfile.route, layerProfile.ffnNorm);
             if (debugThisStep && layer == debugDetailLayer) {
                 DebugDumpData("layer" + std::to_string(layer) + "_ffn_in", ffnInput);
             }
@@ -1912,7 +2576,9 @@ namespace fastllm {
             Data expertIndex, expertScore;
             BuildMoERoutingData(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
                                 num_experts_per_tok, scoring_func, routed_scaling_factor,
-                                expertIndex, expertScore);
+                                expertIndex, expertScore,
+                                profileEnabled ? &layerProfile : nullptr, profileSync);
+            profileLap(layerProfile.route);
             if (layer >= (int)weights.size() || weights[layer].empty() ||
                 weights[layer][0] == nullptr || weights[layer][1] == nullptr ||
                 weights[layer].size() < 4 || weights[layer][2] == nullptr || weights[layer][3] == nullptr ||
@@ -1920,6 +2586,7 @@ namespace fastllm {
                 ffnInput.Reshape(ffnDims);
                 MoEReference(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
                              num_experts_per_tok, scoring_func, routed_scaling_factor, swiglu_limit, ffnOut);
+                profileLap(layerProfile.moe);
             } else {
                 Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
                 ApplyDeviceMap(this->moeDeviceMap, layer + 1, block_cnt);
@@ -1927,13 +2594,16 @@ namespace fastllm {
                 ffnInput.ToDevice(DataDevice::CPU);
                 expertIndex.ToDevice(DataDevice::CPU);
                 expertScore.ToDevice(DataDevice::CPU);
+                profileLap(layerProfile.moeMove);
                 MergeMOEBlock(&ffnInput, &expertIndex, &expertScore,
                               &weights[layer], &biass[layer],
                               &w1, &w2, &w3, &tempInput, &tempOutput,
                               1.0f, &ffnOut, layer,
                               ffnInput.dataType, this->moeAtype,
                               &moeInputTemp, &moeOutputTemp);
+                profileLap(layerProfile.moe);
                 ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
+                profileLap(layerProfile.moeMove);
             }
             ffnOut.Reshape(ffnDims);
             if (debugThisStep && layer == debugDetailLayer) {
@@ -1942,6 +2612,11 @@ namespace fastllm {
             HcPostReference(ffnOut, residual, ffnMix, hiddenStates);
             if (debugThisStep) {
                 DebugDumpData("layer" + std::to_string(layer), hiddenStates);
+            }
+            profileLap(layerProfile.ffnPost);
+            if (profileEnabled) {
+                profileLayersMs += LayerProfileTotal(layerProfile);
+                layerProfiles.push_back(layerProfile);
             }
         }
 
@@ -1952,8 +2627,10 @@ namespace fastllm {
         Split(normed, 1, seqlen - 1, seqlen, lastHidden);
         Linear(lastHidden, weight["head.weight"], Data(), logits);
         ToDataType(logits, DataType::FLOAT32);
+        profileLap(profileHeadMs);
         if (debugLogitsThisStep) {
             DebugDumpData("logits", logits);
+            profileLap(profileLogitsDumpMs);
         }
         if (originalStartPos == 0 && std::getenv("FASTLLM_DEBUG_EXIT_AFTER_PREFILL") != nullptr) {
             fflush(stdout);
@@ -1978,19 +2655,56 @@ namespace fastllm {
         for (int b = 0; b < batch; b++) {
             ret.push_back((int)(((float*)topk.cpuData)[b * 2] + 1e-3));
         }
+        profileLap(profileTopkMs);
 
         if (debugFullRecomputeDecode) {
             debugGeneratedTokens++;
             printf("[fastllm-debug] generated step=%d start_pos=%d token=%d\n",
                    debugGeneratedTokens, originalStartPos, ret.empty() ? -1 : ret[0]);
-            int stopAfter = EnvInt("FASTLLM_DEBUG_STOP_AFTER_TOKENS", 0);
-            if (stopAfter > 0 && debugGeneratedTokens >= stopAfter) {
-                fflush(stdout);
-                std::_Exit(0);
+            if (debugStopAfterTokens > 0 && debugGeneratedTokens >= debugStopAfterTokens) {
+                debugStopNow = true;
+            }
+        } else if (debugStopAfterTokens > 0) {
+            debugGeneratedTokens++;
+            printf("[fastllm-debug] generated step=%d start_pos=%d token=%d\n",
+                   debugGeneratedTokens, originalStartPos, ret.empty() ? -1 : ret[0]);
+            if (debugGeneratedTokens >= debugStopAfterTokens) {
+                debugStopNow = true;
             }
         }
 
         UpdateDebugPastKeyValues(pastKeyValues, bsz, originalStartPos + inputIds.dims[1], block_cnt);
+        profileLap(profilePastMs);
+        if (profileEnabled) {
+            double totalMs = profilePrepareMs + profileEmbedMs + profileDebugDumpMs +
+                             profileHcExpandMs + profileSetupMs + profileLayersMs +
+                             profileHeadMs + profileLogitsDumpMs + profileTopkMs + profilePastMs;
+            printf("[fastllm-profile] step start_pos=%d seqlen=%d batch=%d mode=%s token=%d total_ms=%.3f\n",
+                   originalStartPos, seqlen, batch, originalStartPos == 0 ? "prefill" : "decode",
+                   ret.empty() ? -1 : ret[0], totalMs);
+            printf("[fastllm-profile]   prepare=%.3f embed=%.3f debug_dump=%.3f hc_expand=%.3f setup=%.3f layers=%.3f head=%.3f logits_dump=%.3f topk=%.3f past=%.3f\n",
+                   profilePrepareMs, profileEmbedMs, profileDebugDumpMs, profileHcExpandMs,
+                   profileSetupMs, profileLayersMs, profileHeadMs, profileLogitsDumpMs,
+                   profileTopkMs, profilePastMs);
+            for (int i = 0; i < (int)layerProfiles.size(); i++) {
+                const auto &p = layerProfiles[i];
+                printf("[fastllm-profile]   layer=%02d total=%.3f attn_prep=%.3f cache=%.3f sparse_attn=%.3f attn_out=%.3f route=%.3f moe_move=%.3f moe=%.3f ffn_post=%.3f\n",
+                       i, LayerProfileTotal(p), p.attnPrep, p.cache, p.sparseAttn,
+                       p.attnOut, p.route, p.moeMove, p.moe, p.ffnPost);
+                if (EnvFlagEnabled("FASTLLM_PROFILE_DETAIL")) {
+                    printf("[fastllm-profile-detail] layer=%02d attn_hc_pre=%.3f attn_norm=%.3f q_proj=%.3f q_post=%.3f kv_proj_norm=%.3f kv_post=%.3f attn_woa=%.3f attn_wob=%.3f attn_hc_post=%.3f ffn_hc_pre=%.3f ffn_norm=%.3f route_gate=%.3f route_score=%.3f\n",
+                           i, p.attnHcPre, p.attnNorm, p.qProj, p.qPost,
+                           p.kvProjNorm, p.kvPost, p.attnWoA, p.attnWoB,
+                           p.attnHcPost, p.ffnHcPre, p.ffnNorm, p.routeGate,
+                           p.routeScore);
+                }
+            }
+            fflush(stdout);
+        }
+        if (debugStopNow) {
+            fflush(stdout);
+            std::_Exit(0);
+        }
         return ret;
     }
 

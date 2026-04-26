@@ -268,7 +268,8 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-int8.cu
         src/devices/cuda/linear/fastllm-linear-int4.cu
         src/devices/cuda/linear/fastllm-linear-int4group.cu
-        src/devices/cuda/linear/fastllm-linear-int4nozero.cu)
+        src/devices/cuda/linear/fastllm-linear-int4nozero.cu
+        src/devices/cuda/models/deepseekv4-kernels.cu)
 
     include_directories(include/devices/multicuda)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES} src/devices/multicuda/multicudadevice.cpp src/devices/multicuda/fastllm-multicuda.cu)
