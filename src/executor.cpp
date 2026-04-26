@@ -280,6 +280,10 @@ namespace fastllm {
         profiler.clear();
     }
 
+    void Executor::AddProfiler(const std::string &opType, float spend) {
+        profiler[opType] += spend;
+    }
+
     void Executor::PrintProfiler() {
         float sum = 0.0;
         for (auto &it : profiler) {
