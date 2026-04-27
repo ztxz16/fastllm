@@ -2851,12 +2851,16 @@ namespace fastllm {
             }
         }
 
-        Data headInput, normed, lastHidden, logits;
-        HcHeadReference(hiddenStates, weight["hc_head_fn"], weight["hc_head_scale"], weight["hc_head_base"],
+        Data headStates, headInput, normed, logits;
+        const Data *headSource = &hiddenStates;
+        if (seqlen > 1) {
+            Split(hiddenStates, 1, seqlen - 1, seqlen, headStates);
+            headSource = &headStates;
+        }
+        HcHeadReference(*headSource, weight["hc_head_fn"], weight["hc_head_scale"], weight["hc_head_base"],
                         hc_mult, hc_eps, rms_norm_eps, headInput);
         RMSNormReference(headInput, weight["norm.weight"], rms_norm_eps, normed, DataType::BFLOAT16);
-        Split(normed, 1, seqlen - 1, seqlen, lastHidden);
-        Linear(lastHidden, weight["head.weight"], Data(), logits);
+        Linear(normed, weight["head.weight"], Data(), logits);
         ToDataType(logits, DataType::FLOAT32);
         profileLap(profileHeadMs);
         if (debugLogitsThisStep) {
