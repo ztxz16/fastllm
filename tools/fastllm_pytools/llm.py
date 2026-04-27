@@ -1461,7 +1461,12 @@ class model:
         else:
             prompt = ""
             if (conversation != None and len(conversation) != 0):
-                prompt = self.apply_chat_template(conversation)
+                if self._is_deepseek_v4() and not self.force_chat_template:
+                    from ftllm.encoding_dsv4 import encode_messages
+                    thinking_mode = "thinking" if self.enable_thinking else "chat"
+                    prompt = encode_messages(conversation, thinking_mode=thinking_mode)
+                else:
+                    prompt = self.apply_chat_template(conversation)
             else:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids);
@@ -1700,6 +1705,10 @@ class model:
                         add_generation_prompt = add_generation_prompt,
                         enable_thinking = enable_thinking,
                     )
+                elif self._is_deepseek_v4() and not self.force_chat_template:
+                    from ftllm.encoding_dsv4 import encode_messages
+                    thinking_mode = "thinking" if enable_thinking else "chat"
+                    prompt = encode_messages(conversation, thinking_mode=thinking_mode)
                 else:
                     prompt = self.apply_chat_template(conversation)
             else:
