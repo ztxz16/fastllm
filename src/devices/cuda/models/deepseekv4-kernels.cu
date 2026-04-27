@@ -690,23 +690,30 @@ __global__ void DeepSeekV4HcPreDotsKernel(const XT *x, const WT *w, float *dots,
 
 template <typename XT, typename WT>
 __global__ void DeepSeekV4HcPreDotsBlockKernel(const XT *x, const WT *w, float *dots,
-                                               int tokens, int flatDim, int mixHc) {
+                                               int tokens, int flatDim, int mixHc, int dotsStride) {
     extern __shared__ float red[];
     int idx = blockIdx.x;
-    if (idx >= tokens * mixHc) {
+    if (idx >= tokens * dotsStride) {
         return;
     }
-    int m = idx % mixHc;
-    int t = idx / mixHc;
+    int m = idx % dotsStride;
+    int t = idx / dotsStride;
     const XT *xrow = x + (uint64_t)t * flatDim;
-    const WT *wrow = w + (uint64_t)m * flatDim;
     float partial = 0.0f;
-    for (int k = threadIdx.x * 2; k + 1 < flatDim; k += blockDim.x * 2) {
-        partial += Dsv4PairDot(xrow, wrow, k);
-    }
-    if ((flatDim & 1) && threadIdx.x == 0) {
-        int k = flatDim - 1;
-        partial += Dsv4ToFloat(xrow[k]) * Dsv4ToFloat(wrow[k]);
+    if (m == mixHc) {
+        for (int k = threadIdx.x; k < flatDim; k += blockDim.x) {
+            float v = Dsv4ToFloat(xrow[k]);
+            partial += v * v;
+        }
+    } else {
+        const WT *wrow = w + (uint64_t)m * flatDim;
+        for (int k = threadIdx.x * 2; k + 1 < flatDim; k += blockDim.x * 2) {
+            partial += Dsv4PairDot(xrow, wrow, k);
+        }
+        if ((flatDim & 1) && threadIdx.x == 0) {
+            int k = flatDim - 1;
+            partial += Dsv4ToFloat(xrow[k]) * Dsv4ToFloat(wrow[k]);
+        }
     }
     red[threadIdx.x] = partial;
     __syncthreads();
@@ -717,7 +724,7 @@ __global__ void DeepSeekV4HcPreDotsBlockKernel(const XT *x, const WT *w, float *
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        dots[idx] = red[0];
+        dots[(uint64_t)t * dotsStride + m] = red[0];
     }
 }
 
@@ -725,10 +732,9 @@ template <typename XT>
 __global__ void DeepSeekV4HcPreFinishKernel(const XT *x, const float *dots, const float *scale,
                                             const float *base, XT *y, float *post, float *comb,
                                             int tokens, int dim, int hcMult, int sinkhornIters,
-                                            float eps, float normEps) {
+                                            float eps, float normEps, int dotsStride) {
     extern __shared__ float shared[];
-    float *red = shared;
-    float *mixes = red + blockDim.x;
+    float *mixes = shared;
     float *pre = mixes + (2 + hcMult) * hcMult;
     float *combLocal = pre + hcMult;
 
@@ -737,22 +743,9 @@ __global__ void DeepSeekV4HcPreFinishKernel(const XT *x, const float *dots, cons
     int mixHc = (2 + hcMult) * hcMult;
     const XT *xrow = x + (uint64_t)t * flatDim;
 
-    float partial = 0.0f;
-    for (int k = threadIdx.x; k < flatDim; k += blockDim.x) {
-        float v = Dsv4ToFloat(xrow[k]);
-        partial += v * v;
-    }
-    red[threadIdx.x] = partial;
-    __syncthreads();
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            red[threadIdx.x] += red[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    float rsqrt = rsqrtf(red[0] / flatDim + normEps);
+    float rsqrt = rsqrtf(dots[(uint64_t)t * dotsStride + mixHc] / flatDim + normEps);
     for (int m = threadIdx.x; m < mixHc; m += blockDim.x) {
-        mixes[m] = dots[(uint64_t)t * mixHc + m] * rsqrt;
+        mixes[m] = dots[(uint64_t)t * dotsStride + m] * rsqrt;
     }
     __syncthreads();
 
@@ -1362,9 +1355,10 @@ bool DeepSeekV4LaunchHcPreByWeight(const fastllm::Data &x, const fastllm::Data &
     int threads = 256;
     int mixHc = (2 + hcMult) * hcMult;
     int flatDim = hcMult * dim;
-    int dotBlocks = tokens * mixHc;
+    int dotsStride = mixHc + 1;
+    int dotBlocks = tokens * dotsStride;
     size_t dotSharedBytes = (size_t)threads * sizeof(float);
-    size_t finishSharedBytes = (size_t)(threads + mixHc + hcMult + hcMult * hcMult) * sizeof(float);
+    size_t finishSharedBytes = (size_t)(mixHc + hcMult + hcMult * hcMult) * sizeof(float);
     const XT *xData = (const XT *)x.cudaData;
     XT *yData = (XT *)y.cudaData;
     float *postData = (float *)post.cudaData;
@@ -1373,19 +1367,19 @@ bool DeepSeekV4LaunchHcPreByWeight(const fastllm::Data &x, const fastllm::Data &
     const float *baseData = (const float *)hcBase.cudaData;
     if (hcFn.dataType == fastllm::DataType::BFLOAT16) {
         DeepSeekV4HcPreDotsBlockKernel<<<dotBlocks, threads, dotSharedBytes>>>(
-            xData, (const __nv_bfloat16 *)hcFn.cudaData, dotsData, tokens, flatDim, mixHc);
+            xData, (const __nv_bfloat16 *)hcFn.cudaData, dotsData, tokens, flatDim, mixHc, dotsStride);
     } else if (hcFn.dataType == fastllm::DataType::FLOAT16) {
         DeepSeekV4HcPreDotsBlockKernel<<<dotBlocks, threads, dotSharedBytes>>>(
-            xData, (const half *)hcFn.cudaData, dotsData, tokens, flatDim, mixHc);
+            xData, (const half *)hcFn.cudaData, dotsData, tokens, flatDim, mixHc, dotsStride);
     } else if (hcFn.dataType == fastllm::DataType::FLOAT32) {
         DeepSeekV4HcPreDotsBlockKernel<<<dotBlocks, threads, dotSharedBytes>>>(
-            xData, (const float *)hcFn.cudaData, dotsData, tokens, flatDim, mixHc);
+            xData, (const float *)hcFn.cudaData, dotsData, tokens, flatDim, mixHc, dotsStride);
     } else {
         return false;
     }
     DeepSeekV4HcPreFinishKernel<<<tokens, threads, finishSharedBytes>>>(
         xData, dotsData, scaleData, baseData, yData, postData, combData,
-        tokens, dim, hcMult, sinkhornIters, eps, normEps);
+        tokens, dim, hcMult, sinkhornIters, eps, normEps, dotsStride);
     return true;
 }
 
@@ -1462,7 +1456,7 @@ extern "C" bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data
         !DeepSeekV4PrepareCudaOutput(comb, fastllm::DataType::FLOAT32, {bsz, seqlen, hcMult, hcMult})) {
         return false;
     }
-    float *dotsData = (float *)FastllmCudaMalloc((size_t)tokens * mixHc * sizeof(float));
+    float *dotsData = (float *)FastllmCudaMalloc((size_t)tokens * (mixHc + 1) * sizeof(float));
     if (dotsData == nullptr) {
         return false;
     }
