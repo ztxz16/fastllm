@@ -136,6 +136,61 @@ __global__ void DeepSeekV4WoABlockReduceKernel(const InT *o, const WT *w, __nv_b
 }
 
 template <typename InT, typename WT>
+__global__ void DeepSeekV4WoAPairBlockReduceKernel(const InT *o, const WT *w, __nv_bfloat16 *output,
+                                                   int bsz, int seqlen, int heads, int headDim,
+                                                   int groups, int oRank) {
+    extern __shared__ float partial[];
+    float *partial0 = partial;
+    float *partial1 = partial + blockDim.x;
+    int pairsPerGroup = oRank / 2;
+    int idx = blockIdx.x;
+    int total = bsz * seqlen * groups * pairsPerGroup;
+    if (idx >= total) {
+        return;
+    }
+
+    int pair = idx % pairsPerGroup;
+    int r0 = pair * 2;
+    int r1 = r0 + 1;
+    int tmp = idx / pairsPerGroup;
+    int g = tmp % groups;
+    tmp /= groups;
+    int s = tmp % seqlen;
+    int b = tmp / seqlen;
+
+    int headsPerGroup = heads / groups;
+    int groupDim = headsPerGroup * headDim;
+    const WT *wrow0 = w + ((uint64_t)g * oRank + r0) * groupDim;
+    const WT *wrow1 = wrow0 + groupDim;
+    const InT *src = o + (((uint64_t)b * seqlen + s) * heads + g * headsPerGroup) * headDim;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (int d = threadIdx.x; d < groupDim; d += blockDim.x) {
+        float x = Dsv4ToFloat(src[d]);
+        sum0 += x * Dsv4ToFloat(wrow0[d]);
+        sum1 += x * Dsv4ToFloat(wrow1[d]);
+    }
+    partial0[threadIdx.x] = sum0;
+    partial1[threadIdx.x] = sum1;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial0[threadIdx.x] += partial0[threadIdx.x + stride];
+            partial1[threadIdx.x] += partial1[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        uint64_t outBase = (((uint64_t)b * seqlen + s) * groups + g) * oRank;
+        output[outBase + r0] = __float2bfloat16_rn(partial0[0]);
+        output[outBase + r1] = __float2bfloat16_rn(partial1[0]);
+    }
+}
+
+template <typename InT, typename WT>
 __global__ void DeepSeekV4WoAFloatAccKernel(const InT *o, const WT *w, __nv_bfloat16 *output,
                                             int bsz, int seqlen, int heads, int headDim,
                                             int groups, int oRank) {
@@ -1141,10 +1196,12 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
     bool useKahanAcc = !usePair && !useFloatAcc && std::getenv("FASTLLM_DSV4_ENABLE_CUDA_WOA_KAHAN_ACC") != nullptr;
     bool useBlockReduce = !usePair && !useFloatAcc && !useKahanAcc &&
                           std::getenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_BLOCK") == nullptr;
+    bool usePairBlockReduce = useBlockReduce && seqlen == 1 && (oRank % 2 == 0) &&
+                              std::getenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_PAIR_BLOCK") == nullptr;
     int total = bsz * seqlen * groups * oRank;
     int threads = std::min(256, std::max(1, total));
     int pairTotal = bsz * seqlen * groups * (oRank / 2);
-    int launchTotal = usePair ? pairTotal : total;
+    int launchTotal = (usePair || usePairBlockReduce) ? pairTotal : total;
     int blocks = (launchTotal + threads - 1) / threads;
     const InT *oData = (const InT *)o.cudaData;
     __nv_bfloat16 *outData = (__nv_bfloat16 *)output.cudaData;
@@ -1153,6 +1210,10 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
         if (usePair) {
             DeepSeekV4WoAPairKernel<<<blocks, threads>>>(oData, (const __nv_bfloat16 *)woA.cudaData, outData,
                                                          bsz, seqlen, heads, headDim, groups, oRank);
+        } else if (usePairBlockReduce) {
+            DeepSeekV4WoAPairBlockReduceKernel<<<pairTotal, 256, 512 * sizeof(float)>>>(
+                oData, (const __nv_bfloat16 *)woA.cudaData, outData,
+                bsz, seqlen, heads, headDim, groups, oRank);
         } else if (useBlockReduce) {
             DeepSeekV4WoABlockReduceKernel<<<total, 256, 256 * sizeof(float)>>>(
                 oData, (const __nv_bfloat16 *)woA.cudaData, outData,
@@ -1171,6 +1232,10 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
         if (usePair) {
             DeepSeekV4WoAPairKernel<<<blocks, threads>>>(oData, (const half *)woA.cudaData, outData,
                                                          bsz, seqlen, heads, headDim, groups, oRank);
+        } else if (usePairBlockReduce) {
+            DeepSeekV4WoAPairBlockReduceKernel<<<pairTotal, 256, 512 * sizeof(float)>>>(
+                oData, (const half *)woA.cudaData, outData,
+                bsz, seqlen, heads, headDim, groups, oRank);
         } else if (useBlockReduce) {
             DeepSeekV4WoABlockReduceKernel<<<total, 256, 256 * sizeof(float)>>>(
                 oData, (const half *)woA.cudaData, outData,
@@ -1189,6 +1254,10 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
         if (usePair) {
             DeepSeekV4WoAPairKernel<<<blocks, threads>>>(oData, (const float *)woA.cudaData, outData,
                                                          bsz, seqlen, heads, headDim, groups, oRank);
+        } else if (usePairBlockReduce) {
+            DeepSeekV4WoAPairBlockReduceKernel<<<pairTotal, 256, 512 * sizeof(float)>>>(
+                oData, (const float *)woA.cudaData, outData,
+                bsz, seqlen, heads, headDim, groups, oRank);
         } else if (useBlockReduce) {
             DeepSeekV4WoABlockReduceKernel<<<total, 256, 256 * sizeof(float)>>>(
                 oData, (const float *)woA.cudaData, outData,
