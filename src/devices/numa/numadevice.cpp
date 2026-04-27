@@ -82,6 +82,7 @@ namespace fastllm {
                 weight->dataType == DataType::FLOAT32 ||
                 weight->dataType == DataType::FLOAT16 || 
                 weight->dataType == DataType::FP8_E4M3 ||
+                weight->dataType == DataType::NVFP4 ||
                 weight->dataType == DataType::DATA_GGUF_FORMAT;
     }
 
@@ -130,6 +131,7 @@ namespace fastllm {
 
         if (input.dataType == DataType::FLOAT32 && output.dataType == DataType::FLOAT32) {
             if (weight.dataType == DataType::FLOAT32 || weight.dataType == DataType::FLOAT16 || weight.dataType == DataType::FP8_E4M3
+                || weight.dataType == DataType::NVFP4
                 || weight.dataType == DataType::DATA_GGUF_FORMAT) {
                 GetNumaClient()->RunNumaLinearF(n, m, k, &weight, &bias, (float*)input.cpuData, (float*)output.cpuData, exType, input.dataType);
 /*
@@ -330,6 +332,7 @@ namespace fastllm {
         int n = input.dims[0], m = input.dims[1], k = output.dims[1];
 
         if (weights[2]->dataType == DataType::FP8_E4M3 ||
+            weights[2]->dataType == DataType::NVFP4 ||
             weights[2]->dataType == DataType::FLOAT16 ||
             weights[2]->dataType == DataType::BFLOAT16 ||
             weights[2]->dataType == DataType::DATA_GGUF_FORMAT) {

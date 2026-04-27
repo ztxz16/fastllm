@@ -235,7 +235,7 @@ namespace fastllm {
         if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
             buffer.WriteInt((int) dataType);
             buffer.WriteBytes(data->cpuData, data->GetBytes());
-        } else if (dataType == DataType::FP8_E4M3) {
+        } else if (dataType == DataType::FP8_E4M3 || dataType == DataType::NVFP4) {
             buffer.WriteInt((int) dataType);
             buffer.WriteInt(data->blockK);
             buffer.WriteInt(data->blockM);
@@ -392,6 +392,9 @@ namespace fastllm {
         }
         if (weight->dataType == DataType::FP8_E4M3) {
             opType = ComputeTaskType::LinearFP8E4M3;
+        }
+        if (weight->dataType == DataType::NVFP4) {
+            opType = ComputeTaskType::LinearNVFP4;
         }
         float *biasData = bias->dims.size() > 0 ? (float *) bias->cpuData : nullptr;
         std::string biasName = biasData == nullptr ? "" : bias->name;

@@ -33,6 +33,7 @@ namespace fastllm {
 
         LinearFP8E4M3 = 10,
         MOEFP8E4M3 = 11,
+        LinearNVFP4 = 12,
 
         GetComputeServerInfo = 10000,
         StartLongData = 10001,

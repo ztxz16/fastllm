@@ -549,6 +549,37 @@ namespace fastllm {
                         data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
                         memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
                     }
+                } else if (data->dataType == DataType::NVFP4) {
+                    if (data->blockM != 16) {
+                        ErrorInFastLLM("RegisterNumas can't support nvfp4 with blockM = " + std::to_string(data->blockM));
+                    }
+                    int ms = (m - 1) / data->blockM + 1;
+                    size_t packedBytesPerRow = GetDataBytes(DataType::NVFP4_BLOCK_16, 1, m);
+                    std::vector<uint8_t> nvfp4Packed((size_t)k * packedBytesPerRow);
+                    size_t rawBytesPerRow = GetDataBytes(DataType::NVFP4, 1, m);
+                    for (int row = 0; row < k; row++) {
+                        uint8_t *dst = nvfp4Packed.data() + (size_t)row * packedBytesPerRow;
+                        uint8_t *src = data->cpuData + (size_t)row * rawBytesPerRow;
+                        for (int block = 0; block < ms; block++) {
+                            int blockElems = std::min(data->blockM, m - block * data->blockM);
+                            int blockBytes = blockElems / 2;
+                            memcpy(dst, src + block * (data->blockM / 2), blockBytes);
+                            dst += data->blockM / 2;
+                            float scale = data->scales[row / data->blockK * ms + block];
+                            memcpy(dst, &scale, sizeof(float));
+                            dst += sizeof(float);
+                        }
+                    }
+                    data->dataType = DataType::NVFP4_BLOCK_16;
+                    if (isCrossSwiglu) {
+                        std::vector<uint8_t> reordered;
+                        CrossSwigluReorder(nvfp4Packed.data(), k, packedBytesPerRow, reordered);
+                        nvfp4Packed.swap(reordered);
+                    }
+                    for (int i = 0; i < numaConfig->numaCnt; i++) {
+                        data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * packedBytesPerRow, i);
+                        memcpy(data->numasData[i], nvfp4Packed.data() + (size_t)i * kPerNuma * packedBytesPerRow, kPerNuma * packedBytesPerRow);
+                    }
                 } else if (data->dataType == DataType::INT8) {
                     std::vector <uint8_t> int8Packed;
                     Int8ToFastllmInt8PerchannelPacked(1, k, m, (uint8_t*)data->cpuData, data->zeros.data(), data->scales.data(), int8Packed);
