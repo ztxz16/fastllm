@@ -1521,7 +1521,7 @@ namespace fastllm {
                                                          float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4SparseDecodeCached");
 #ifdef USE_CUDA
-            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE")) {
+            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") && q.dims[1] == 1) {
                 Data qCuda, compressedCuda;
                 const Data *qForCuda = &q;
                 if (q.dataDevice != DataDevice::CUDA) {
@@ -1545,7 +1545,21 @@ namespace fastllm {
                     return;
                 }
                 if (windowKVData != nullptr && windowKVData->dataDevice == DataDevice::CUDA) {
-                    ErrorInFastLLM("DeepSeekV4SparseDecodeCached CUDA error: kernel rejected valid CUDA cache.\n");
+                    // windowKVData on CUDA may be out of sync with the CPU windowKV vector
+                    // (e.g. when an earlier decode step updated only the CPU side).
+                    // Move to CPU so the retry below re-uploads the fresh CPU data.
+                    const_cast<Data *>(windowKVData)->ToDevice(DataDevice::CPU);
+                    // Retry with the now-CPU windowKVData — the wrapper will fall through
+                    // to the CPU windowKV pointer and upload it to a temp CUDA buffer.
+                    if (FastllmCudaDeepSeekV4SparseAttentionDecodeCached(*qForCuda, windowKVData, windowKV.data(),
+                                                                         *compressedForCuda,
+                                                                         attnSink, windowSize, startPos,
+                                                                         compressedCount, ropeDim, ropeBase,
+                                                                         originalSeqLen, ropeFactor,
+                                                                         betaFast, betaSlow, softmaxScale, output)) {
+                        return;
+                    }
+                    ErrorInFastLLM("DeepSeekV4SparseDecodeCached CUDA error: kernel rejected even after CPU fallback.\n");
                 }
             }
 #endif
@@ -2717,6 +2731,14 @@ namespace fastllm {
                         auto kvValues = ReadFloatData(kv);
                         UpdateWindowKVCache(kvValues, bsz, head_dim_full, startPos, window_size,
                                             decodeCache->windowKV);
+    #ifdef USE_CUDA
+                        // Keep CUDA windowKVData in sync with the CPU windowKV just updated.
+                        if (decodeCache->windowKVData.dataDevice == DataDevice::CUDA) {
+                            WriteFloatData(decodeCache->windowKV, {bsz, window_size, head_dim_full},
+                                           decodeCache->windowKVData, DataType::FLOAT32);
+                            decodeCache->windowKVData.ToDevice(DataDevice::CUDA);
+                        }
+    #endif
                     }
                 }
             }
@@ -2762,7 +2784,10 @@ namespace fastllm {
             profileLap(layerProfile.cache);
 
             Data attnOut4, woAOut, attnOut;
-            if (decodeCache != nullptr && startPos > 0) {
+            // SparseAttentionDecodeCachedReference (both CUDA and CPU paths) only
+            // handles single-token queries. For chunked prefill (seqlen > 1), use
+            // full sparse attention instead.
+            if (decodeCache != nullptr && startPos > 0 && seqlen == 1) {
                 SparseAttentionDecodeCachedReference(q, decodeCache->windowKV, &decodeCache->windowKVData,
                                                      decodeCache->compressedKV, weight[pre + ".attn.attn_sink"],
                                                      window_size, startPos, decodeCompressedCount,
