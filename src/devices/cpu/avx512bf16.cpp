@@ -14,9 +14,31 @@
 #include <cmath>
 #include <vector>
 #include <cstring>
+#include <algorithm>
 
 namespace fastllm {
     extern void AddBiasAVX512(float *outputData, float *biasData, int n, int k, int st, int end);
+
+    bool Float32ToBFloat16_AVX512BF16_RNE(float *float32, uint16_t *bfloat16, int len) {
+#ifdef __AVX512BF16__
+        int i = 0;
+        for (; i + 31 < len; i += 32) {
+            __m512 lo = _mm512_loadu_ps(float32 + i);
+            __m512 hi = _mm512_loadu_ps(float32 + i + 16);
+            __m512bh out = _mm512_cvtne2ps_pbh(hi, lo);
+            _mm512_storeu_si512((__m512i*)(bfloat16 + i), (__m512i)out);
+        }
+        for (; i < len; i++) {
+            uint32_t val;
+            memcpy(&val, float32 + i, sizeof(val));
+            val += 0x7FFF + ((val >> 16) & 1);
+            bfloat16[i] = (uint16_t)(val >> 16);
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
     
 	template <int BROW, int AROW>
     void mul_mat_fp8e4m3_bf16_direct_avx512(
@@ -483,5 +505,124 @@ namespace fastllm {
         return true;
 #endif
         return false;
+    }
+
+#if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+    static inline __m512bh NVFP4ToBFloat16_AVX512BF16(const uint8_t *packed) {
+        __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed));
+        const __m128i lowMask = _mm_set1_epi8(0x0F);
+        __m128i low = _mm_and_si128(bytes, lowMask);
+        __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), lowMask);
+        __m128i interleavedLo = _mm_unpacklo_epi8(low, high);
+        __m128i interleavedHi = _mm_unpackhi_epi8(low, high);
+        __m256i fp4Bytes = _mm256_set_m128i(interleavedHi, interleavedLo);
+
+        __m512i fp4 = _mm512_cvtepu8_epi16(fp4Bytes);
+        __m512i sign = _mm512_slli_epi16(_mm512_and_si512(fp4, _mm512_set1_epi16(0x8)), 12);
+        __m512i body = _mm512_and_si512(fp4, _mm512_set1_epi16(0x7));
+
+        __m512i exp = _mm512_slli_epi16(_mm512_add_epi16(_mm512_srli_epi16(body, 1), _mm512_set1_epi16(126)), 7);
+        __m512i mant = _mm512_slli_epi16(_mm512_and_si512(body, _mm512_set1_epi16(1)), 6);
+        mant = _mm512_maskz_mov_epi16(_mm512_cmpneq_epi16_mask(body, _mm512_set1_epi16(1)), mant);
+
+        __m512i bits = _mm512_or_si512(sign, _mm512_or_si512(exp, mant));
+        bits = _mm512_maskz_mov_epi16(_mm512_cmpneq_epi16_mask(body, _mm512_setzero_si512()), bits);
+        return (__m512bh)bits;
+    }
+#endif
+
+    bool LinearBFloat16NVFP4_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end, int blockK, int blockM, float *scales,
+                        int ks, int ms) {
+#if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+        (void)ks;
+        if (blockM % 32 != 0 || (m & 1)) {
+            return false;
+        }
+        static const float table[16] = {
+            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+           -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
+        };
+        int packedM = m >> 1;
+        for (int i = 0; i < n; i++) {
+            uint16_t *input = inputData + i * m;
+            int j = st;
+            for (; j < end; j++) {
+                float now = biasData ? biasData[j] : 0.0f;
+                int currentBlockK = j / blockK;
+                __m512 scaledSum = _mm512_setzero_ps();
+                for (int midx = 0; midx < ms; midx++) {
+                    float curScale = scales[currentBlockK * ms + midx];
+                    int l = midx * blockM;
+                    int blockEnd = std::min(m, (midx + 1) * blockM);
+                    __m512 sum = _mm512_setzero_ps();
+                    for (; l + 31 < blockEnd; l += 32) {
+                        __m512bh vi = (__m512bh)_mm512_loadu_si512(reinterpret_cast<const __m512i*>(input + l));
+                        __m512bh vw = NVFP4ToBFloat16_AVX512BF16(weightData + j * packedM + (l >> 1));
+                        sum = _mm512_dpbf16_ps(sum, vi, vw);
+                    }
+                    scaledSum = _mm512_fmadd_ps(sum, _mm512_set1_ps(curScale), scaledSum);
+                    for (; l < blockEnd; l++) {
+                        uint8_t packed = weightData[j * packedM + (l >> 1)];
+                        uint8_t fp4 = (l & 1) ? (packed >> 4) : (packed & 0xF);
+                        uint32_t inputBits = static_cast<uint32_t>(input[l]) << 16;
+                        float inputFloat = *reinterpret_cast<float*>(&inputBits);
+                        now += curScale * inputFloat * table[fp4];
+                    }
+                }
+                outputData[i * k + j] = now + _mm512_reduce_add_ps(scaledSum);
+            }
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool LinearFloat32NVFP4_AVX512BF16_Kernel(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
+                        int n, int m, int k, int st, int end, int blockK, int blockM, float *scales,
+                        int ks, int ms) {
+#if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+        (void)ks;
+        if (blockM % 32 != 0 || (m & 1)) {
+            return false;
+        }
+        static const float table[16] = {
+            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+           -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
+        };
+        int packedM = m >> 1;
+        for (int i = 0; i < n; i++) {
+            float *input = inputData + i * m;
+            for (int j = st; j < end; j++) {
+                float now = biasData ? biasData[j] : 0.0f;
+                int currentBlockK = j / blockK;
+                __m512 scaledSum = _mm512_setzero_ps();
+                for (int midx = 0; midx < ms; midx++) {
+                    float curScale = scales[currentBlockK * ms + midx];
+                    int l = midx * blockM;
+                    int blockEnd = std::min(m, (midx + 1) * blockM);
+                    __m512 sum = _mm512_setzero_ps();
+                    for (; l + 31 < blockEnd; l += 32) {
+                        __m512 in0 = _mm512_loadu_ps(input + l);
+                        __m512 in1 = _mm512_loadu_ps(input + l + 16);
+                        __m512bh vi = _mm512_cvtne2ps_pbh(in1, in0);
+                        __m512bh vw = NVFP4ToBFloat16_AVX512BF16(weightData + j * packedM + (l >> 1));
+                        sum = _mm512_dpbf16_ps(sum, vi, vw);
+                    }
+                    scaledSum = _mm512_fmadd_ps(sum, _mm512_set1_ps(curScale), scaledSum);
+                    for (; l < blockEnd; l++) {
+                        uint8_t packed = weightData[j * packedM + (l >> 1)];
+                        uint8_t fp4 = (l & 1) ? (packed >> 4) : (packed & 0xF);
+                        now += curScale * input[l] * table[fp4];
+                    }
+                }
+                outputData[i * k + j] = now + _mm512_reduce_add_ps(scaledSum);
+            }
+        }
+        return true;
+#else
+        return false;
+#endif
     }
 }
