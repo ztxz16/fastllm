@@ -8,6 +8,7 @@
 #include <regex>
 #include <iomanip>
 #include <cstdlib>
+#include <cmath>
 
 #include "chatglm.h"
 #include "moss.h"
@@ -328,6 +329,22 @@ namespace fastllm {
     }
     extern void Transpose(float *pDst, float *pSrc, int dstStride, int srcStride, int n, int m);
 
+    struct SafeTensors;
+
+    static float FP8E8M0ToFloat(uint8_t v) {
+        return std::ldexp(1.0f, (int)v - 127);
+    }
+
+    static float FP4E2M1ToFloat(uint8_t v) {
+        static const float table[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+        float ret = table[v & 7];
+        return (v & 8) ? -ret : ret;
+    }
+
+    static std::string FindSafeTensorScaleTensorName(const SafeTensors &safeTensors,
+                                                     const std::string &tensorName);
+    static bool IsPackedFP4Tensor(const SafeTensors &safeTensors, const std::string &name);
+
     struct SafeTensorItem {
         std::string tensorName;
         std::string fileName;
@@ -371,13 +388,13 @@ namespace fastllm {
 
         void CreateBufferWithScale(DataType dstType, SafeTensorItem &scale) {
             AssertInFastLLM(this->shape.size() == 2 && scale.shape.size() == 2, "CreateBufferWithScale error: shape.size() should be 2.");
-            DataType srcType;
-            if (this->dtype == "F8_E4M3") {
-                srcType = DataType::FP8_E4M3;
-            } else {
-                ErrorInFastLLM("CreateBufferWithScale error: dtype should be FP8_E4M3");
+            bool isFp8 = this->dtype == "F8_E4M3";
+            bool isPackedFp4 = this->dtype == "I8";
+            if (!isFp8 && !isPackedFp4) {
+                ErrorInFastLLM("CreateBufferWithScale error: dtype should be FP8_E4M3 or packed FP4 I8");
             }
-            int n = this->shape[0], m = this->shape[1];
+            int n = this->shape[0], packedM = this->shape[1];
+            int m = isPackedFp4 ? packedM * 2 : packedM;
             int ns = scale.shape[0], ms = scale.shape[1];
             int blockN = n / ns, blockM = m / ms;
 
@@ -389,10 +406,17 @@ namespace fastllm {
             }
             ClearBuffer();
 
-            if (dstType == DataType::FP8_E4M3) {
+            if (dstType == DataType::FP8_E4M3 || dstType == DataType::NVFP4) {
+                if (dstType == DataType::FP8_E4M3 && !isFp8) {
+                    ErrorInFastLLM("CreateBufferWithScale error: packed FP4 cannot be loaded as FP8_E4M3.");
+                }
+                if (dstType == DataType::NVFP4 && !isPackedFp4) {
+                    ErrorInFastLLM("CreateBufferWithScale error: only packed FP4 I8 can be loaded as NVFP4.");
+                }
                 this->blockK = blockN;
                 this->blockM = blockM;
-                buffer = new uint8_t[n * m];
+                size_t dataBytes = dstType == DataType::NVFP4 ? (size_t)n * (m / 2) : (size_t)n * m;
+                buffer = new uint8_t[dataBytes];
                 FILE *fi = fopen(this->fileName.c_str(), "rb");
 #if defined(_WIN32) || defined(_WIN64)
                 _fseeki64(fi, this->data_offsets[0], 0);
@@ -422,7 +446,13 @@ namespace fastllm {
                         float curScale = ((float*)scale.buffer)[bi * ms + bj];
                         for (int i = bi * blockN; i < (bi + 1) * blockN && i < n; i++) {
                             for (int j = bj * blockM; j < (bj + 1) * blockM && j < m; j++) {
-                                floatBuffer[i * m + j] = curScale * fp8e4m3tofp32.dict[ori[i * m + j]];
+                                if (isFp8) {
+                                    floatBuffer[i * m + j] = curScale * fp8e4m3tofp32.dict[ori[i * packedM + j]];
+                                } else {
+                                    uint8_t packed = ori[i * packedM + (j >> 1)];
+                                    uint8_t fp4 = (j & 1) ? (packed >> 4) : (packed & 0xF);
+                                    floatBuffer[i * m + j] = curScale * FP4E2M1ToFloat(fp4);
+                                }
                             }
                         }
                     }
@@ -537,6 +567,20 @@ namespace fastllm {
                 if (dstType != DataType::FLOAT32) {
                     ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
                 }
+            } else if (this->dtype == "F8_E8M0") {
+                if (dstType != DataType::FLOAT32) {
+                    ErrorInFastLLM("SafeTensorItem.CreateBuffer: F8_E8M0 tensor " + this->tensorName + " should be loaded as float32.\n");
+                }
+                ClearBuffer();
+                buffer = new uint8_t[(size_t)len * sizeof(float)];
+                std::vector<uint8_t> ori(len);
+                ret = fread(ori.data(), sizeof(uint8_t), len, fi);
+                float *dst = (float*)buffer;
+                for (int i = 0; i < len; i++) {
+                    dst[i] = FP8E8M0ToFloat(ori[i]);
+                }
+                fclose(fi);
+                return;
             } else if (this->dtype == "I64") {
                 if (dstType != DataType::INT32 && dstType != DataType::INT32PARAM) {
                     ErrorInFastLLM("SafeTensorItem.CreateBuffer: I64 tensor " + this->tensorName + " should be loaded as int32.\n");
@@ -645,6 +689,57 @@ namespace fastllm {
             return ret;
         }
     };
+
+    static bool IsPackedFP4Tensor(const SafeTensors &safeTensors, const std::string &name) {
+        auto it = safeTensors.itmeDict.find(name);
+        if (it == safeTensors.itmeDict.end() || it->second.dtype != "I8") {
+            return false;
+        }
+        std::string scaleName = FindSafeTensorScaleTensorName(safeTensors, name);
+        auto scaleIt = safeTensors.itmeDict.find(scaleName);
+        return scaleIt != safeTensors.itmeDict.end() && scaleIt->second.dtype == "F8_E8M0";
+    }
+
+    static bool IsSafeTensorQuantScaleTensorName(const SafeTensors &safeTensors,
+                                                 const std::string &name) {
+        auto isQuantTensor = [&](const std::string &candidate) {
+            auto it = safeTensors.itmeDict.find(candidate);
+            return it != safeTensors.itmeDict.end() &&
+                   (it->second.dtype == "F8_E4M3" || it->second.dtype == "I8");
+        };
+        if (StringEndWith(name, "_scale_inv")) {
+            return isQuantTensor(name.substr(0, name.size() - strlen("_scale_inv")));
+        }
+        if (StringEndWith(name, "_scale")) {
+            return isQuantTensor(name.substr(0, name.size() - strlen("_scale")));
+        }
+        if (StringEndWith(name, ".scale_inv")) {
+            return isQuantTensor(name.substr(0, name.size() - strlen(".scale_inv")) + ".weight");
+        }
+        if (StringEndWith(name, ".scale")) {
+            return isQuantTensor(name.substr(0, name.size() - strlen(".scale")) + ".weight");
+        }
+        return false;
+    }
+
+    static std::string FindSafeTensorScaleTensorName(const SafeTensors &safeTensors,
+                                                     const std::string &tensorName) {
+        std::vector<std::string> candidates = {
+            tensorName + "_scale_inv",
+            tensorName + "_scale",
+        };
+        if (StringEndWith(tensorName, ".weight")) {
+            std::string prefix = tensorName.substr(0, tensorName.size() - strlen(".weight"));
+            candidates.push_back(prefix + ".scale_inv");
+            candidates.push_back(prefix + ".scale");
+        }
+        for (auto &candidate : candidates) {
+            if (safeTensors.itmeDict.find(candidate) != safeTensors.itmeDict.end()) {
+                return candidate;
+            }
+        }
+        return "";
+    }
 
     std::string Base64Decode(const std::string &encoded) {
         static const std::string base64_chars =
@@ -1587,6 +1682,11 @@ if (false) {
 
         for (auto &tensorName : tensors) {
             auto &tensor = safeTensors.itmeDict[tensorName];
+            if (IsSafeTensorQuantScaleTensorName(safeTensors, tensorName)) {
+                printf("Load %d \r", (++cur) * 100 / (int)safeTensors.itmeDict.size());
+                fflush(stdout);
+                continue;
+            }
             auto oriDataType = DataType::FLOAT32;
             for (auto &it : tensorMap[tensorName]) {
                 std::string weightName = it.first;
@@ -1601,6 +1701,9 @@ if (false) {
                     if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
                         dataType = DataType::FLOAT16;
                     }
+                    if (IsPackedFP4Tensor(safeTensors, tensorName)) {
+                        dataType = DataType::NVFP4;
+                    }
                 }
 
                 if (dataType >= DATA_AUTO_NONE) {
@@ -1611,6 +1714,12 @@ if (false) {
                     if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
                         dataType = DataType::FLOAT16;
                     }
+                    if (IsPackedFP4Tensor(safeTensors, tensorName)) {
+                        dataType = DataType::NVFP4;
+                    }
+                }
+                if (IsPackedFP4Tensor(safeTensors, tensorName)) {
+                    dataType = DataType::NVFP4;
                 }
                 if (tensor.dtype == "I64") {
                     dataType = DataType::INT32PARAM;
@@ -1618,6 +1727,10 @@ if (false) {
                 if (it.second == DATA_AUTO_CONV) {
                     std::vector <int> realShape = tensor.intShape;
                     std::swap(realShape[0], realShape[1]);
+                    model->weight.AddEmptyWeight(weightName, realShape, dataType);
+                } else if (IsPackedFP4Tensor(safeTensors, tensorName)) {
+                    std::vector<int> realShape = tensor.intShape;
+                    realShape[1] *= 2;
                     model->weight.AddEmptyWeight(weightName, realShape, dataType);
                 } else if (isAwqModel && StringEndWith(tensorName, ".qweight")) {
                     model->weight.AddEmptyWeight(weightName, {tensor.intShape[1] * 8, tensor.intShape[0]}, dataType);
@@ -1667,7 +1780,7 @@ if (false) {
                 new std::thread([&](int st, int end) {
                     for (int i = st; i < end; i++) {
                         auto &tensorName = tensors[i];
-                        if (StringEndWith(tensorName, "_scale_inv") ||
+                        if (IsSafeTensorQuantScaleTensorName(safeTensors, tensorName) ||
                             (isAwqModel && (StringEndWith(tensorName, ".scales") || StringEndWith(tensorName, ".qzeros")))) {
                             locker.lock();
                             printf("Loading %d \r", (++cnt) * 100 / (int)tensorMap.size());
@@ -1701,6 +1814,12 @@ if (false) {
                                 // AUTO类型
                                 dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
                             }
+                            if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
+                                dataType = DataType::FLOAT16;
+                            }
+                            if (IsPackedFP4Tensor(safeTensors, tensorName)) {
+                                dataType = DataType::NVFP4;
+                            }
                             if (tensor.dtype == "I64") {
                                 dataType = DataType::INT32PARAM;
                                 oriDataType = DataType::INT32PARAM;
@@ -1714,30 +1833,22 @@ if (false) {
                                 dataType == DataType::FLOAT16) {
                                 oriDataType = DataType::FLOAT16;
                             }
-                            if (tensor.dtype == "F8_E4M3" && 
-                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8 
+                            if (tensor.dtype == "F8_E4M3" &&
+                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8
                                 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO
-                                || dataType == DataType::INT2_GROUP)
-                                || dataType == DataType::DATA_GGUF_FORMAT) {
+                                || dataType == DataType::INT2_GROUP
+                                || dataType == DataType::DATA_GGUF_FORMAT)) {
                                 oriDataType = DataType::FLOAT32;
-                                scaleTensorName = tensorName + "_scale_inv";
-                                if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
-                                    scaleTensorName = tensorName + "_scale";
-                                }
-                                if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
-                                    scaleTensorName = "";
-                                }
+                                scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensorName);
                             }
                             if (tensor.dtype == "F8_E4M3" && 
                                 (dataType == FP8_E4M3)) {
                                 oriDataType = DataType::FP8_E4M3;
-                                scaleTensorName = tensorName + "_scale_inv";
-                                if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
-                                    scaleTensorName = tensorName + "_scale";
-                                }
-                                if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
-                                    scaleTensorName = "";
-                                }
+                                scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensorName);
+                            }
+                            if (IsPackedFP4Tensor(safeTensors, tensorName)) {
+                                oriDataType = DataType::NVFP4;
+                                scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensorName);
                             }
 
                             if (tensor.dtype == "I32" && isAwqModel && StringEndWith(tensorName, "qweight")) {
@@ -1757,8 +1868,8 @@ if (false) {
                                 tensor.CreateBuffer(oriDataType);
                             } else if(!isAwqModel) {
                                 auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
-                                AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16"
-                                    , "Tensor scale error: scale's dtype should be F32 or BF16.");
+                                AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" || scaleTensor.dtype == "F8_E8M0"
+                                    , "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
                                 scaleTensor.CreateBuffer(DataType::FLOAT32);
                                 tensor.CreateBufferWithScale(oriDataType, scaleTensor);
                             } else {
@@ -2185,6 +2296,9 @@ if (false) {
             json11::Json::object config;
             for (auto it : items) {
                 auto &tensor = *it;
+                if (IsSafeTensorQuantScaleTensorName(safeTensors, tensor.tensorName)) {
+                    continue;
+                }
                 auto oriDataType = DataType::FLOAT32;
                 auto dataType = tensorMap[tensor.tensorName][0].second;
                 auto weightName = tensor.tensorName;
@@ -2198,6 +2312,9 @@ if (false) {
                     if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
                         dataType = DataType::FLOAT16;
                     }
+                    if (IsPackedFP4Tensor(safeTensors, tensor.tensorName)) {
+                        dataType = DataType::NVFP4;
+                    }
                 }
 
                 if (dataType >= DATA_AUTO_NONE) {
@@ -2208,6 +2325,12 @@ if (false) {
                     if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
                         dataType = DataType::FLOAT16;
                     }
+                    if (IsPackedFP4Tensor(safeTensors, tensor.tensorName)) {
+                        dataType = DataType::NVFP4;
+                    }
+                }
+                if (IsPackedFP4Tensor(safeTensors, tensor.tensorName)) {
+                    dataType = DataType::NVFP4;
                 }
                 if (tensor.dtype == "I64") {
                     dataType = DataType::INT32PARAM;
@@ -2215,6 +2338,10 @@ if (false) {
                 if (dataType== DATA_AUTO_CONV) {
                     std::vector <int> realShape = tensor.intShape;
                     std::swap(realShape[0], realShape[1]);
+                    weights[weightName] = Data(dataType, realShape);
+                } else if (IsPackedFP4Tensor(safeTensors, tensor.tensorName)) {
+                    std::vector<int> realShape = tensor.intShape;
+                    realShape[1] *= 2;
                     weights[weightName] = Data(dataType, realShape);
                 } else {
                     if (dataType == DATA_GGUF_FORMAT) {
@@ -2236,7 +2363,7 @@ if (false) {
                     new std::thread([&](int st, int end) {
                         for (int i = st; i < end; i++) {
                             auto &tensor = *items[i];
-                            if (StringEndWith(tensor.tensorName, "_scale_inv")) {
+                            if (IsSafeTensorQuantScaleTensorName(safeTensors, tensor.tensorName)) {
                                 continue;
                             }
                             std::string scaleTensorName = "";
@@ -2263,6 +2390,12 @@ if (false) {
                                 // AUTO类型
                                 dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
                             }
+                            if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
+                                dataType = DataType::FLOAT16;
+                            }
+                            if (IsPackedFP4Tensor(safeTensors, tensor.tensorName)) {
+                                dataType = DataType::NVFP4;
+                            }
                             if (tensor.dtype == "I64") {
                                 dataType = DataType::INT32PARAM;
                                 oriDataType = DataType::INT32PARAM;
@@ -2278,26 +2411,24 @@ if (false) {
                             if (tensor.dtype == "F8_E4M3" && 
                                 (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO || dataType == DataType::DATA_GGUF_FORMAT)) {
                                 oriDataType = DataType::FLOAT32;
-                                scaleTensorName = tensor.tensorName + "_scale_inv";
-                                if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
-                                    scaleTensorName = "";
-                                }
+                                scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensor.tensorName);
                             }
                             if (tensor.dtype == "F8_E4M3" && 
                                 (dataType == FP8_E4M3)) {
                                 oriDataType = DataType::FP8_E4M3;
-                                scaleTensorName = tensor.tensorName + "_scale_inv";
-                                if (safeTensors.itmeDict.find(scaleTensorName) == safeTensors.itmeDict.end()) {
-                                    scaleTensorName = "";
-                                }
+                                scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensor.tensorName);
+                            }
+                            if (IsPackedFP4Tensor(safeTensors, tensor.tensorName)) {
+                                oriDataType = DataType::NVFP4;
+                                scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensor.tensorName);
                             }
 
                             if (scaleTensorName == "") {
                                 tensor.CreateBuffer(oriDataType);
                             } else {
                                 auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
-                                AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16"
-                                    , "Tensor scale error: scale's dtype should be F32 or BF16.");
+                                AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" || scaleTensor.dtype == "F8_E8M0"
+                                    , "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
                                 scaleTensor.CreateBuffer(DataType::FLOAT32);
                                 tensor.CreateBufferWithScale(oriDataType, scaleTensor);
                             }

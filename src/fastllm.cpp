@@ -223,7 +223,8 @@ namespace fastllm {
         {DataType::FLOAT32, 32}, {DataType::BFLOAT16, 16}, {DataType::INT16, 16}, 
         {DataType::INT8, 8}, {DataType::INT4, 4}, {DataType::INT2, 2}, {DataType::BIT, 1}, 
         {DataType::FLOAT16, 16}, {DataType::INT4_NOZERO, 4}, {DataType::INT4_GROUP, 4},
-        {DataType::FP8_E4M3, 8}, {DataType::INT2_GROUP, 2}, {DataType::BASE3_GROUP, 2}
+        {DataType::FP8_E4M3, 8}, {DataType::INT2_GROUP, 2}, {DataType::BASE3_GROUP, 2},
+        {DataType::NVFP4, 4}
     };
 
     FastllmEnv::FastllmEnv() {
@@ -413,10 +414,11 @@ namespace fastllm {
         {DataType::INT8, {"int8"}}, {DataType::INT4, {"int4o"}}, {DataType::INT2, {"int2"}}, {DataType::BIT, {"bit"}}, 
         {DataType::FLOAT16, {"float16", "fp16", "half"}}, {DataType::INT4_NOZERO, {"int4"}}, {DataType::INT4_GROUP, {"int4g"}},
         {DataType::FP8_E4M3, {"float8", "fp8", "fp8_e4m3"}}, {DataType::INT2_GROUP, {"int2g"}}, {DataType::BASE3_GROUP, {"base3g"}},
-        {DataType::INT32, {"int32"}}, {DataType::INT32PARAM, {"int32param"}},
+        {DataType::INT32, {"int32"}}, {DataType::NVFP4, {"nvfp4", "fp4_e2m1"}}, {DataType::INT32PARAM, {"int32param"}},
         {DataType::FP8_E4M3_BLOCK_128, {"fp8_e4m3_block_128"}}, {DataType::AWQ_4BIT_128, {"awq_4bit_128"}},
         {DataType::INT4_PERCHANNEL, {"int4_perchannel"}}, {DataType::FP8_E4M3_PERCHANNEL, {"fp8_e4m3_perchannel"}},
         {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
+        {DataType::NVFP4_BLOCK_16, {"nvfp4_block_16"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
         {DataType::DATA_AUTO_NONE, {"data_auto_none"}}, {DataType::DATA_AUTO_LINEAR, {"data_auto_linear"}},
         {DataType::DATA_AUTO_EMBEDDING, {"data_auto_embedding"}}, {DataType::DATA_AUTO_CONV, {"data_auto_conv"}}
@@ -437,7 +439,8 @@ namespace fastllm {
             return rows * columns * sizeof(float);
         } else if (type == DataType::BFLOAT16 || type == DataType::FLOAT16) {
             return rows * columns * sizeof(uint16_t);
-        } else if (type == DataType::INT4_NOZERO || type == DataType::INT4 || type == DataType::INT4_GROUP) {
+        } else if (type == DataType::INT4_NOZERO || type == DataType::INT4 || type == DataType::INT4_GROUP ||
+                   type == DataType::NVFP4) {
             return rows * (columns / 2);
         } else if (type == DataType::INT8) {
             return rows * columns;
@@ -446,6 +449,9 @@ namespace fastllm {
             return rows * (columns + ((columns - 1) / 128 + 1) * sizeof(float));
         } else if (type == DataType::FP8_E4M3_PERCHANNEL) {
             return rows * (columns + sizeof(float));
+        } else if (type == DataType::NVFP4_BLOCK_16) {
+            int blocks = (columns - 1) / 16 + 1;
+            return rows * blocks * (8 + sizeof(float));
         } else if (type == DataType::FP8_E4M3) {
             return rows * columns * sizeof(uint8_t);
         } else if (type == DataType::INT4_PERCHANNEL) {
@@ -1106,7 +1112,7 @@ namespace fastllm {
                     data.perChannelsConfigs[i].min = data.mins[i];
                     data.perChannelsConfigs[i].scale = data.scales[i];
                 } */
-            } else if (dataType == DataType::FP8_E4M3) {
+            } else if (dataType == DataType::FP8_E4M3 || dataType == DataType::NVFP4) {
                 this->blockK = blockK;
                 this->blockM = blockM;
                 int ks = (this->dims[0] - 1) / this->blockK + 1;
@@ -1295,6 +1301,9 @@ namespace fastllm {
         } else if (this->dataType == DataType::INT8 || this->dataType == DataType::FP8_E4M3) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
+        } else if (this->dataType == DataType::NVFP4) {
+            this->unitSize = 1;
+            this->unitSizeDiv = 2;
         } else if (this->dataType == DataType::INT4 
                 || this->dataType == DataType::INT4_NOZERO
                 || this->dataType == DataType::INT4_GROUP) {
@@ -2271,7 +2280,7 @@ namespace fastllm {
         } 
         uint64_t ret = 0;
         ret += sizeof(int) * 2;
-        if (this->dataType == FP8_E4M3) {
+        if (this->dataType == FP8_E4M3 || this->dataType == NVFP4) {
             ret += sizeof(int) * 3;
             ret += this->scales.size() * sizeof(float);
             ret += this->GetBytes();
@@ -2305,7 +2314,7 @@ namespace fastllm {
         } 
         writer.WriteInt(1); // 版本号
         writer.WriteInt((int)this->dataType);
-        if (this->dataType == FP8_E4M3) {
+        if (this->dataType == FP8_E4M3 || this->dataType == NVFP4) {
             writer.WriteInt(this->blockK);
             writer.WriteInt(this->blockM);
             writer.WriteInt((int)this->scales.size());
@@ -2356,7 +2365,7 @@ namespace fastllm {
             if (this->dataType == FLOAT16 || this->dataType == FLOAT32 || this->dataType == BFLOAT16) {
                 reader.ReadBytes(this->cpuData, len);
                 return;
-            } else if (this->dataType == FP8_E4M3) {
+            } else if (this->dataType == FP8_E4M3 || this->dataType == NVFP4) {
                 this->blockK = reader.ReadInt();
                 this->blockM = reader.ReadInt();
                 this->scales.resize(reader.ReadInt());
@@ -2433,6 +2442,9 @@ namespace fastllm {
                 return (DataType)((int)DataType::DATA_GGUF_FORMAT + ggml_type_vec_dot_type((ggml_type)this->ggmlType));
             }
         } else if (this->dataType == DataType::FLOAT16) {
+            return DataType::FLOAT32;
+        } else if (this->dataType == DataType::NVFP4 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16) {
             return DataType::FLOAT32;
         } else if (this->dataType == DataType::INT4_PERCHANNEL ||
                     this->dataType == DataType::INT8_PERCHANNEL) {
