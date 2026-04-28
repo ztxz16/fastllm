@@ -235,6 +235,37 @@ namespace fastllm {
         }
     }
 
+    void Nvfp4ToFastllmNVFP4_BLOCK16(int experts, int k, int m, uint8_t *nvfp4, float *scales, int blockK, int blockM, std::vector<uint8_t> &nvfp4Packed) {
+        const int packBlockM = 16;
+        const int fp4BytesPerBlock = packBlockM / 2;
+        int scaleKs = (k - 1) / blockK + 1;
+        int scaleMs = (m - 1) / blockM + 1;
+        int packedBlocks = (m - 1) / packBlockM + 1;
+        size_t rawBytesPerRow = GetDataBytes(DataType::NVFP4, 1, m);
+        size_t packedBytesPerRow = GetDataBytes(DataType::NVFP4_BLOCK_16, 1, m);
+        nvfp4Packed.assign((size_t)experts * k * packedBytesPerRow, 0);
+
+        for (int e = 0; e < experts; e++) {
+            for (int row = 0; row < k; row++) {
+                uint8_t *dst = nvfp4Packed.data() + ((size_t)e * k + row) * packedBytesPerRow;
+                uint8_t *src = nvfp4 + ((size_t)e * k + row) * rawBytesPerRow;
+                for (int block = 0; block < packedBlocks; block++) {
+                    int blockStart = block * packBlockM;
+                    int blockElems = std::min(packBlockM, m - blockStart);
+                    int blockBytes = blockElems / 2;
+                    memcpy(dst, src + blockStart / 2, blockBytes);
+                    dst += fp4BytesPerBlock;
+
+                    int scaleCol = blockStart / blockM;
+                    size_t scaleIdx = (size_t)e * scaleKs * scaleMs + (row / blockK) * scaleMs + scaleCol;
+                    float scale = scales[scaleIdx];
+                    memcpy(dst, &scale, sizeof(float));
+                    dst += sizeof(float);
+                }
+            }
+        }
+    }
+
     void Int4ToFastllmInt4PerchannelRow(uint8_t *newWeight, uint8_t *oldWeight, int m) {
         if (GetCPUInstructInfo()->hasAVX512VNNI) {
             uint8_t *temp = new uint8_t[64];
@@ -550,27 +581,13 @@ namespace fastllm {
                         memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
                     }
                 } else if (data->dataType == DataType::NVFP4) {
-                    if (data->blockM != 16) {
+                    if (data->blockM < 16 || (data->blockM % 16 != 0 && data->blockM != m)) {
                         ErrorInFastLLM("RegisterNumas can't support nvfp4 with blockM = " + std::to_string(data->blockM));
                     }
-                    int ms = (m - 1) / data->blockM + 1;
-                    size_t packedBytesPerRow = GetDataBytes(DataType::NVFP4_BLOCK_16, 1, m);
-                    std::vector<uint8_t> nvfp4Packed((size_t)k * packedBytesPerRow);
-                    size_t rawBytesPerRow = GetDataBytes(DataType::NVFP4, 1, m);
-                    for (int row = 0; row < k; row++) {
-                        uint8_t *dst = nvfp4Packed.data() + (size_t)row * packedBytesPerRow;
-                        uint8_t *src = data->cpuData + (size_t)row * rawBytesPerRow;
-                        for (int block = 0; block < ms; block++) {
-                            int blockElems = std::min(data->blockM, m - block * data->blockM);
-                            int blockBytes = blockElems / 2;
-                            memcpy(dst, src + block * (data->blockM / 2), blockBytes);
-                            dst += data->blockM / 2;
-                            float scale = data->scales[row / data->blockK * ms + block];
-                            memcpy(dst, &scale, sizeof(float));
-                            dst += sizeof(float);
-                        }
-                    }
+                    std::vector<uint8_t> nvfp4Packed;
+                    Nvfp4ToFastllmNVFP4_BLOCK16(1, k, m, (uint8_t*)data->cpuData, data->scales.data(), data->blockK, data->blockM, nvfp4Packed);
                     data->dataType = DataType::NVFP4_BLOCK_16;
+                    size_t packedBytesPerRow = GetDataBytes(DataType::NVFP4_BLOCK_16, 1, m);
                     if (isCrossSwiglu) {
                         std::vector<uint8_t> reordered;
                         CrossSwigluReorder(nvfp4Packed.data(), k, packedBytesPerRow, reordered);
@@ -644,6 +661,14 @@ namespace fastllm {
 
         delete[] data->cpuData;
         data->cpuData = nullptr;
+    }
+
+    static DataType GetNumasLinearActDataType(Data *weight, int batchSize) {
+        if (weight != nullptr &&
+            (weight->dataType == DataType::NVFP4 || weight->dataType == DataType::NVFP4_BLOCK_16)) {
+            return DataType::BFLOAT16;
+        }
+        return weight->GetLinearActDataType(batchSize);
     }
 
     struct NumaWorkStealingOp : MultiThreadBaseOp {
@@ -1221,8 +1246,8 @@ namespace fastllm {
             }
         }
 
-        DataType startDataType = weights[2]->GetLinearActDataType(bs);
-        DataType downInputDataType = weights[3]->GetLinearActDataType(bs);
+        DataType startDataType = GetNumasLinearActDataType(weights[2], bs);
+        DataType downInputDataType = GetNumasLinearActDataType(weights[3], bs);
 
         // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
         auto& realInput = fastllmMoeDataManagerNumas.realInput;
@@ -1672,8 +1697,8 @@ namespace fastllm {
                     profileExpertCalls += (int)v.size();
                     profileLap(profileRegisterMs);
 
-                    DataType startDataType = weights[2]->GetLinearActDataType(1);
-                    DataType downInputDataType = weights[3]->GetLinearActDataType(1);
+                    DataType startDataType = GetNumasLinearActDataType(weights[2], 1);
+                    DataType downInputDataType = GetNumasLinearActDataType(weights[3], 1);
 
                     // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
                     auto& realInput = fastllmMoeDataManagerNumas.realInput;

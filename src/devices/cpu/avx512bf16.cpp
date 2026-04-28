@@ -508,8 +508,7 @@ namespace fastllm {
     }
 
 #if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
-    static inline __m512bh NVFP4ToBFloat16_AVX512BF16(const uint8_t *packed) {
-        __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed));
+    static inline __m512bh NVFP4BytesToBFloat16_AVX512BF16(__m128i bytes) {
         const __m128i lowMask = _mm_set1_epi8(0x0F);
         __m128i low = _mm_and_si128(bytes, lowMask);
         __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), lowMask);
@@ -529,7 +528,135 @@ namespace fastllm {
         bits = _mm512_maskz_mov_epi16(_mm512_cmpneq_epi16_mask(body, _mm512_setzero_si512()), bits);
         return (__m512bh)bits;
     }
+
+    static inline __m512bh NVFP4ToBFloat16_AVX512BF16(const uint8_t *packed) {
+        __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed));
+        return NVFP4BytesToBFloat16_AVX512BF16(bytes);
+    }
+
+    static inline __m512bh NVFP4Block16ToBFloat16_AVX512BF16(const uint8_t *packed) {
+        uint64_t lo;
+        memcpy(&lo, packed, sizeof(lo));
+        __m128i bytes = _mm_cvtsi64_si128((long long)lo);
+        return NVFP4BytesToBFloat16_AVX512BF16(bytes);
+    }
+
+    static inline __m512bh NVFP4TwoBlock16ToBFloat16_AVX512BF16(const uint8_t *first, const uint8_t *second) {
+        uint64_t lo, hi;
+        memcpy(&lo, first, sizeof(lo));
+        memcpy(&hi, second, sizeof(hi));
+        __m128i bytes = _mm_set_epi64x((long long)hi, (long long)lo);
+        return NVFP4BytesToBFloat16_AVX512BF16(bytes);
+    }
 #endif
+
+    bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16(
+        const void *A, long lda,
+        const void *B, long ldb,
+        void *C, long ldc,
+        int n, int m, int k, int st, int end
+    ) {
+#if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+        for (int i = 0; i < n; i++) {
+            const uint16_t *input = (const uint16_t*)((const uint8_t*)A + (size_t)i * lda);
+            float *output = (float*)((uint8_t*)C + (size_t)i * ldc);
+            for (int j = st; j < end; j++) {
+                const uint8_t *rowStart = (const uint8_t*)B + (size_t)j * ldb;
+                int block = 0;
+                int blocks = (m - 1) / 16 + 1;
+                __m512 scaledSum = _mm512_setzero_ps();
+                while (block < blocks) {
+                    const uint8_t *blockStart = rowStart + block * (8 + sizeof(float));
+                    float scale;
+                    memcpy(&scale, blockStart + 8, sizeof(float));
+                    int l = block * 16;
+
+                    if (block + 1 < blocks && l + 31 < m) {
+                        const uint8_t *nextBlockStart = rowStart + (block + 1) * (8 + sizeof(float));
+                        float nextScale;
+                        memcpy(&nextScale, nextBlockStart + 8, sizeof(float));
+                        if (scale == nextScale) {
+                            __m512bh vi = (__m512bh)_mm512_loadu_si512((const __m512i*)(input + l));
+                            __m512bh vw = NVFP4TwoBlock16ToBFloat16_AVX512BF16(blockStart, nextBlockStart);
+                            __m512 sum = _mm512_dpbf16_ps(_mm512_setzero_ps(), vi, vw);
+                            scaledSum = _mm512_fmadd_ps(sum, _mm512_set1_ps(scale), scaledSum);
+                            block += 2;
+                            continue;
+                        }
+                    }
+
+                    int blockElems = std::min(16, m - l);
+                    __mmask32 mask = (__mmask32)((1u << blockElems) - 1u);
+                    __m512bh vi = (__m512bh)_mm512_maskz_loadu_epi16(mask, input + l);
+                    __m512bh vw = NVFP4Block16ToBFloat16_AVX512BF16(blockStart);
+                    __m512 sum = _mm512_dpbf16_ps(_mm512_setzero_ps(), vi, vw);
+                    scaledSum = _mm512_fmadd_ps(sum, _mm512_set1_ps(scale), scaledSum);
+                    block++;
+                }
+                output[j] = _mm512_reduce_add_ps(scaledSum);
+            }
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    bool FastllmGemmFloat32NVFP4Block16_AVX512BF16(
+        const void *A, long lda,
+        const void *B, long ldb,
+        void *C, long ldc,
+        int n, int m, int k, int st, int end
+    ) {
+#if defined(__AVX512BF16__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+        for (int i = 0; i < n; i++) {
+            const float *input = (const float*)((const uint8_t*)A + (size_t)i * lda);
+            float *output = (float*)((uint8_t*)C + (size_t)i * ldc);
+            for (int j = st; j < end; j++) {
+                const uint8_t *rowStart = (const uint8_t*)B + (size_t)j * ldb;
+                int block = 0;
+                int blocks = (m - 1) / 16 + 1;
+                __m512 scaledSum = _mm512_setzero_ps();
+                while (block < blocks) {
+                    const uint8_t *blockStart = rowStart + block * (8 + sizeof(float));
+                    float scale;
+                    memcpy(&scale, blockStart + 8, sizeof(float));
+                    int l = block * 16;
+
+                    if (block + 1 < blocks && l + 31 < m) {
+                        const uint8_t *nextBlockStart = rowStart + (block + 1) * (8 + sizeof(float));
+                        float nextScale;
+                        memcpy(&nextScale, nextBlockStart + 8, sizeof(float));
+                        if (scale == nextScale) {
+                            __m512 in0 = _mm512_loadu_ps(input + l);
+                            __m512 in1 = _mm512_loadu_ps(input + l + 16);
+                            __m512bh vi = _mm512_cvtne2ps_pbh(in1, in0);
+                            __m512bh vw = NVFP4TwoBlock16ToBFloat16_AVX512BF16(blockStart, nextBlockStart);
+                            __m512 sum = _mm512_dpbf16_ps(_mm512_setzero_ps(), vi, vw);
+                            scaledSum = _mm512_fmadd_ps(sum, _mm512_set1_ps(scale), scaledSum);
+                            block += 2;
+                            continue;
+                        }
+                    }
+
+                    int blockElems = std::min(16, m - l);
+                    __mmask16 mask = (__mmask16)((1u << blockElems) - 1u);
+                    __m512 in0 = _mm512_maskz_loadu_ps(mask, input + l);
+                    __m512 in1 = _mm512_setzero_ps();
+                    __m512bh vi = _mm512_cvtne2ps_pbh(in1, in0);
+                    __m512bh vw = NVFP4Block16ToBFloat16_AVX512BF16(blockStart);
+                    __m512 sum = _mm512_dpbf16_ps(_mm512_setzero_ps(), vi, vw);
+                    scaledSum = _mm512_fmadd_ps(sum, _mm512_set1_ps(scale), scaledSum);
+                    block++;
+                }
+                output[j] = _mm512_reduce_add_ps(scaledSum);
+            }
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
 
     bool LinearBFloat16NVFP4_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                         int n, int m, int k, int st, int end, int blockK, int blockM, float *scales,

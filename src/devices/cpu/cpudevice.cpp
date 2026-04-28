@@ -32,6 +32,12 @@
 
 namespace fastllm {
     extern bool Float32ToBFloat16_AVX512BF16_RNE(float *float32, uint16_t *bfloat16, int len);
+    extern bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end);
+    extern bool FastllmGemmFloat32NVFP4Block16_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end);
 
     static double CpuProfileNowMs() {
         using Clock = std::chrono::steady_clock;
@@ -1209,6 +1215,83 @@ namespace fastllm {
                         (float*)A, (uint16_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end
                     ).Run();
                     finish = true;
+                } else if (BType == DataType::FP8_E4M3_BLOCK_128) {
+                    const int blockSize = 128;
+                    int blocks = (m - 1) / blockSize + 1;
+                    for (int i = 0; i < n; i++) {
+                        float *floatA = (float*)((uint8_t*)A + i * lda);
+                        float *floatC = (float*)((uint8_t*)C + i * ldc);
+                        for (int j = st; j < end; j++) {
+                            uint8_t *rowStart = (uint8_t*)B + j * ldb;
+                            float now = 0.0f;
+                            for (int block = 0; block < blocks; block++) {
+                                uint8_t *blockStart = rowStart + block * (blockSize + sizeof(float));
+                                float scale;
+                                memcpy(&scale, blockStart + blockSize, sizeof(float));
+                                int l = block * blockSize;
+                                int blockEnd = std::min(m, l + blockSize);
+                                for (; l < blockEnd; l++) {
+                                    now += scale * floatA[l] * fp8e4m3tofp32.dict[blockStart[l - block * blockSize]];
+                                }
+                            }
+                            floatC[j] = now;
+                        }
+                    }
+                    finish = true;
+                } else if (BType == DataType::FP8_E4M3_PERCHANNEL) {
+                    for (int i = 0; i < n; i++) {
+                        float *floatA = (float*)((uint8_t*)A + i * lda);
+                        float *floatC = (float*)((uint8_t*)C + i * ldc);
+                        for (int j = st; j < end; j++) {
+                            uint8_t *rowStart = (uint8_t*)B + j * ldb;
+                            float scale;
+                            memcpy(&scale, rowStart + m, sizeof(float));
+                            float now = 0.0f;
+                            for (int l = 0; l < m; l++) {
+                                now += scale * floatA[l] * fp8e4m3tofp32.dict[rowStart[l]];
+                            }
+                            floatC[j] = now;
+                        }
+                    }
+                    finish = true;
+                } else if (BType == DataType::NVFP4_BLOCK_16) {
+                    if (FastllmGemmFloat32NVFP4Block16_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                        finish = true;
+                        return;
+                    }
+                    int blocks = (m - 1) / 16 + 1;
+                    for (int i = 0; i < n; i++) {
+                        float *floatA = (float*)((uint8_t*)A + i * lda);
+                        float *floatC = (float*)((uint8_t*)C + i * ldc);
+                        for (int j = st; j < end; j++) {
+                            uint8_t *rowStart = (uint8_t*)B + j * ldb;
+                            float now = 0.0f;
+                            for (int block = 0; block < blocks; block++) {
+                                uint8_t *blockStart = rowStart + block * (8 + sizeof(float));
+                                float scale;
+                                memcpy(&scale, blockStart + 8, sizeof(float));
+                                int l = block * 16;
+                                int blockEnd = std::min(m, l + 16);
+#ifdef __AVX2__
+                                __m256 vsum = _mm256_setzero_ps();
+                                for (; l + 7 < blockEnd; l += 8) {
+                                    __m256 vi = _mm256_loadu_ps(floatA + l);
+                                    __m256 vw = _mm256_nvfp4_to_fp32_ps(blockStart + ((l - block * 16) >> 1));
+                                    vsum = _mm256_fmadd_ps(vi, vw, vsum);
+                                }
+                                now += Floatsum(vsum) * scale;
+#endif
+                                for (; l < blockEnd; l++) {
+                                    int offset = l - block * 16;
+                                    uint8_t packed = blockStart[offset >> 1];
+                                    uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
+                                    now += scale * floatA[l] * NVFP4E2M1ToFloat(fp4);
+                                }
+                            }
+                            floatC[j] = now;
+                        }
+                    }
+                    finish = true;
                 }
             }
         } else if (AType == DataType::BFLOAT16) {
@@ -1313,6 +1396,10 @@ namespace fastllm {
                         finish = true;
                     }
                 } else if (BType == NVFP4_BLOCK_16) {
+                    if (FastllmGemmBFloat16NVFP4Block16_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                        finish = true;
+                        return;
+                    }
                     int blocks = (m - 1) / 16 + 1;
                     for (int i = 0; i < n; i++) {
                         uint16_t *bf16A = (uint16_t*)A + i * m;
