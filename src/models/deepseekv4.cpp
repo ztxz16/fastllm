@@ -1254,6 +1254,15 @@ namespace fastllm {
                                         std::vector<float> &allKV, std::vector<float> &allScore) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4CompressorAppend");
             int oldLen = allKV.empty() ? 0 : (int)(allKV.size() / ((uint64_t)bsz * wideDim));
+            if (bsz == 1) {
+                uint64_t oldSize = (uint64_t)oldLen * wideDim;
+                uint64_t addSize = (uint64_t)seqlen * wideDim;
+                allKV.resize(oldSize + addSize);
+                allScore.resize(oldSize + addSize);
+                memcpy(allKV.data() + oldSize, kv.data(), addSize * sizeof(float));
+                memcpy(allScore.data() + oldSize, score.data(), addSize * sizeof(float));
+                return;
+            }
             std::vector<float> nextKV((uint64_t)bsz * (oldLen + seqlen) * wideDim);
             std::vector<float> nextScore((uint64_t)bsz * (oldLen + seqlen) * wideDim);
             for (int b = 0; b < bsz; b++) {
@@ -2755,14 +2764,21 @@ namespace fastllm {
                                             decodeCache->compressorKVRaw,
                                             decodeCache->compressorScoreRaw);
                     }
-                    if (BuildCompressedKVFromRaw(weight, pre + ".attn.compressor",
-                                                 decodeCache->compressorKVRaw,
-                                                 decodeCache->compressorScoreRaw,
-                                                 bsz, decodeCache->totalLen, compressRatio,
-                                                 head_dim_full, qk_rope_head_dim, layerRopeBase,
-                                                 rope_factor, rope_scaling_beta_fast, rope_scaling_beta_slow,
-                                                 layerOriginalSeqLen, decodeCache->compressedKV)) {
-                        decodeCompressedCount = decodeCache->compressedKV.dims[1];
+                    int compressedCutoff = decodeCache->totalLen - (decodeCache->totalLen % compressRatio);
+                    int targetCompressedBlocks = compressRatio > 0 ? compressedCutoff / compressRatio : 0;
+                    if (targetCompressedBlocks > 0 &&
+                        decodeCache->compressedBlocks == targetCompressedBlocks &&
+                        decodeCache->compressedKV.dims.size() >= 2) {
+                        decodeCompressedCount = decodeCache->compressedBlocks;
+                    } else if (BuildCompressedKVFromRaw(weight, pre + ".attn.compressor",
+                                                        decodeCache->compressorKVRaw,
+                                                        decodeCache->compressorScoreRaw,
+                                                        bsz, decodeCache->totalLen, compressRatio,
+                                                        head_dim_full, qk_rope_head_dim, layerRopeBase,
+                                                        rope_factor, rope_scaling_beta_fast, rope_scaling_beta_slow,
+                                                        layerOriginalSeqLen, decodeCache->compressedKV)) {
+                        decodeCache->compressedBlocks = decodeCache->compressedKV.dims[1];
+                        decodeCompressedCount = decodeCache->compressedBlocks;
                         if (startPos == 0) {
                             Data catKV;
                             ConcatSeqReference(kv, decodeCache->compressedKV, catKV);

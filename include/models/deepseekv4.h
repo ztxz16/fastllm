@@ -47,6 +47,7 @@ namespace fastllm {
         std::vector<float> compressorKVRaw;
         std::vector<float> compressorScoreRaw;
         Data compressedKV;
+        int compressedBlocks = 0;
     };
 
     class DeepSeekV4Model : public basellm {
