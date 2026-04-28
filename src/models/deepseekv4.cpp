@@ -1285,6 +1285,201 @@ namespace fastllm {
             allScore.swap(nextScore);
         }
 
+        struct BuildCompressedKVRangeOp : MultiThreadBaseOp {
+            const float *kv;
+            const float *score;
+            const float *ape;
+            float *compressed;
+            uint64_t st, end;
+            int bsz, rawLen, blockStart, blockCount, compressRatio, headDim, wideDim;
+            bool overlap;
+
+            BuildCompressedKVRangeOp(const float *kv, const float *score, const float *ape,
+                                     float *compressed, uint64_t st, uint64_t end,
+                                     int bsz, int rawLen, int blockStart, int blockCount,
+                                     int compressRatio, int headDim, int wideDim, bool overlap)
+                : kv(kv), score(score), ape(ape), compressed(compressed), st(st), end(end),
+                  bsz(bsz), rawLen(rawLen), blockStart(blockStart), blockCount(blockCount),
+                  compressRatio(compressRatio), headDim(headDim), wideDim(wideDim),
+                  overlap(overlap) {}
+
+            void ScanTerms(int b, int block, int d, float &mx) const {
+                if (overlap) {
+                    if (block > 0) {
+                        for (int r = 0; r < compressRatio; r++) {
+                            int tok = (block - 1) * compressRatio + r;
+                            uint64_t off = ((uint64_t)b * rawLen + tok) * wideDim + d;
+                            mx = std::max(mx, score[off] + ape[(uint64_t)r * wideDim + d]);
+                        }
+                    }
+                    for (int r = 0; r < compressRatio; r++) {
+                        int tok = block * compressRatio + r;
+                        uint64_t off = ((uint64_t)b * rawLen + tok) * wideDim + headDim + d;
+                        mx = std::max(mx, score[off] + ape[(uint64_t)r * wideDim + headDim + d]);
+                    }
+                } else {
+                    for (int r = 0; r < compressRatio; r++) {
+                        int tok = block * compressRatio + r;
+                        uint64_t off = ((uint64_t)b * rawLen + tok) * wideDim + d;
+                        mx = std::max(mx, score[off] + ape[(uint64_t)r * wideDim + d]);
+                    }
+                }
+            }
+
+            void AccumulateTerms(int b, int block, int d, float mx, double &sum, double &value) const {
+                if (overlap) {
+                    if (block > 0) {
+                        for (int r = 0; r < compressRatio; r++) {
+                            int tok = (block - 1) * compressRatio + r;
+                            uint64_t off = ((uint64_t)b * rawLen + tok) * wideDim + d;
+                            double e = std::exp((double)(score[off] + ape[(uint64_t)r * wideDim + d]) - mx);
+                            sum += e;
+                            value += e * kv[off];
+                        }
+                    }
+                    for (int r = 0; r < compressRatio; r++) {
+                        int tok = block * compressRatio + r;
+                        uint64_t off = ((uint64_t)b * rawLen + tok) * wideDim + headDim + d;
+                        double e = std::exp((double)(score[off] + ape[(uint64_t)r * wideDim + headDim + d]) - mx);
+                        sum += e;
+                        value += e * kv[off];
+                    }
+                } else {
+                    for (int r = 0; r < compressRatio; r++) {
+                        int tok = block * compressRatio + r;
+                        uint64_t off = ((uint64_t)b * rawLen + tok) * wideDim + d;
+                        double e = std::exp((double)(score[off] + ape[(uint64_t)r * wideDim + d]) - mx);
+                        sum += e;
+                        value += e * kv[off];
+                    }
+                }
+            }
+
+            void Run() override {
+                (void)bsz;
+                for (uint64_t idx = st; idx < end; idx++) {
+                    int d = (int)(idx % headDim);
+                    uint64_t tmp = idx / headDim;
+                    int localBlock = (int)(tmp % blockCount);
+                    int b = (int)(tmp / blockCount);
+                    int block = blockStart + localBlock;
+
+                    float mx = -std::numeric_limits<float>::infinity();
+                    ScanTerms(b, block, d, mx);
+
+                    double sum = 0.0, value = 0.0;
+                    AccumulateTerms(b, block, d, mx, sum, value);
+                    compressed[((uint64_t)b * blockCount + localBlock) * headDim + d] =
+                        (float)(value / std::max(sum, 1e-30));
+                }
+            }
+        };
+
+        static void ComputeCompressedKVRangeCpu(const std::vector<float> &kv,
+                                                const std::vector<float> &score,
+                                                const std::vector<float> &ape,
+                                                int bsz, int rawLen, int blockStart, int blockCount,
+                                                int compressRatio, int headDim, int wideDim, bool overlap,
+                                                std::vector<float> &compressed) {
+            compressed.assign((uint64_t)bsz * blockCount * headDim, 0.0f);
+            uint64_t total = (uint64_t)bsz * blockCount * headDim;
+            if (total == 0) {
+                return;
+            }
+            auto *pool = GetAlivePool();
+            int threadNum = std::min((int)pool->threads.size(), (int)std::min<uint64_t>(total, 64));
+            if (threadNum <= 1 || total < 4096 ||
+                EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CPU_COMPRESSKV_PARALLEL")) {
+                BuildCompressedKVRangeOp(kv.data(), score.data(), ape.data(), compressed.data(), 0, total,
+                                         bsz, rawLen, blockStart, blockCount, compressRatio,
+                                         headDim, wideDim, overlap).Run();
+                return;
+            }
+
+            std::vector<BuildCompressedKVRangeOp*> ops;
+            uint64_t per = (total + threadNum - 1) / threadNum;
+            for (int i = 0; i < threadNum; i++) {
+                uint64_t st = (uint64_t)i * per;
+                uint64_t end = std::min(total, st + per);
+                if (st >= end) {
+                    break;
+                }
+                ops.push_back(new BuildCompressedKVRangeOp(
+                    kv.data(), score.data(), ape.data(), compressed.data(), st, end,
+                    bsz, rawLen, blockStart, blockCount, compressRatio, headDim, wideDim, overlap));
+            }
+            for (int i = 0; i < (int)ops.size(); i++) {
+                pool->PushOp(i, ops[i]);
+            }
+            for (int i = 0; i < (int)ops.size(); i++) {
+                pool->Wait(i);
+                delete ops[i];
+            }
+        }
+
+        static void FinalizeCompressedKVRows(WeightMap &weight, const std::string &prefix,
+                                             std::vector<float> &compressed, int bsz, int blockStart,
+                                             int blockCount, int compressRatio, int headDim,
+                                             int ropeDim, float ropeBase, float ropeFactor,
+                                             int betaFast, int betaSlow, int originalSeqLen,
+                                             Data &output) {
+            Data compressedData, normed;
+            WriteFloatData(compressed, {bsz, blockCount, headDim}, compressedData, DataType::BFLOAT16);
+            RMSNormReference(compressedData, weight[prefix + ".norm.weight"], 1e-6f, normed, DataType::BFLOAT16);
+            auto out = ReadFloatData(normed);
+            ApplyRotaryReference(out, normed.dims, ropeDim, ropeBase, blockStart * compressRatio, false,
+                                 originalSeqLen, ropeFactor, betaFast, betaSlow, compressRatio);
+            ActQuantInplaceReference(out, normed.dims, headDim - ropeDim, 64);
+            WriteFloatData(out, normed.dims, output, DataType::BFLOAT16);
+        }
+
+        static int GetReusableCompressedBlocks(const Data &output, int bsz, int blocks, int headDim) {
+            if (output.dataType != DataType::BFLOAT16 || output.dims.size() != 3 ||
+                output.dims[0] != bsz || output.dims[2] != headDim ||
+                output.dims[1] < 0 || output.dims[1] > blocks) {
+                return 0;
+            }
+            return output.dims[1];
+        }
+
+        static void AppendCompressedKVRows(Data &output, const Data &newRows,
+                                           int bsz, int oldBlocks, int addBlocks, int headDim) {
+            if (oldBlocks <= 0) {
+                output.CopyFrom(newRows);
+                return;
+            }
+
+            Data oldCpu, rowsCpu;
+            const Data *oldPtr = &output;
+            const Data *rowsPtr = &newRows;
+            if (output.dataDevice != DataDevice::CPU) {
+                oldCpu.CopyFrom(output);
+                oldCpu.ToDevice(DataDevice::CPU);
+                oldPtr = &oldCpu;
+            }
+            if (newRows.dataDevice != DataDevice::CPU) {
+                rowsCpu.CopyFrom(newRows);
+                rowsCpu.ToDevice(DataDevice::CPU);
+                rowsPtr = &rowsCpu;
+            }
+
+            int blocks = oldBlocks + addBlocks;
+            Data merged(DataType::BFLOAT16, {bsz, blocks, headDim});
+            merged.Allocate(false);
+            uint16_t *dst = (uint16_t*)merged.cpuData;
+            const uint16_t *oldData = (const uint16_t*)oldPtr->cpuData;
+            const uint16_t *newData = (const uint16_t*)rowsPtr->cpuData;
+            for (int b = 0; b < bsz; b++) {
+                memcpy(dst + (uint64_t)b * blocks * headDim,
+                       oldData + (uint64_t)b * oldBlocks * headDim,
+                       (uint64_t)oldBlocks * headDim * sizeof(uint16_t));
+                memcpy(dst + ((uint64_t)b * blocks + oldBlocks) * headDim,
+                       newData + (uint64_t)b * addBlocks * headDim,
+                       (uint64_t)addBlocks * headDim * sizeof(uint16_t));
+            }
+            output.CopyFrom(merged);
+        }
+
         static bool BuildCompressedKVFromRaw(WeightMap &weight, const std::string &prefix,
                                              const std::vector<float> &kv, const std::vector<float> &score,
                                              int bsz, int totalLen, int compressRatio,
@@ -1306,62 +1501,21 @@ namespace fastllm {
             auto apePtr = ReadWeightFloatDataCached(weight[prefix + ".ape"]);
             const auto &ape = *apePtr;
 
-            std::vector<float> compressed((uint64_t)bsz * blocks * headDim, 0.0f);
-            std::vector<float> vals(overlap ? 2 * compressRatio : compressRatio);
-            std::vector<float> logits(vals.size());
-            for (int b = 0; b < bsz; b++) {
-                for (int block = 0; block < blocks; block++) {
-                    for (int d = 0; d < headDim; d++) {
-                        int count = 0;
-                        if (overlap) {
-                            for (int r = 0; r < compressRatio; r++) {
-                                if (block == 0) {
-                                    vals[count] = 0.0f;
-                                    logits[count++] = -std::numeric_limits<float>::infinity();
-                                } else {
-                                    int tok = (block - 1) * compressRatio + r;
-                                    uint64_t off = ((uint64_t)b * totalLen + tok) * wideDim + d;
-                                    vals[count] = kv[off];
-                                    logits[count++] = score[off] + ape[(uint64_t)r * wideDim + d];
-                                }
-                            }
-                            for (int r = 0; r < compressRatio; r++) {
-                                int tok = block * compressRatio + r;
-                                uint64_t off = ((uint64_t)b * totalLen + tok) * wideDim + headDim + d;
-                                vals[count] = kv[off];
-                                logits[count++] = score[off] + ape[(uint64_t)r * wideDim + headDim + d];
-                            }
-                        } else {
-                            for (int r = 0; r < compressRatio; r++) {
-                                int tok = block * compressRatio + r;
-                                uint64_t off = ((uint64_t)b * totalLen + tok) * wideDim + d;
-                                vals[count] = kv[off];
-                                logits[count++] = score[off] + ape[(uint64_t)r * wideDim + d];
-                            }
-                        }
-                        float mx = -std::numeric_limits<float>::infinity();
-                        for (int i = 0; i < count; i++) {
-                            mx = std::max(mx, logits[i]);
-                        }
-                        double sum = 0.0, value = 0.0;
-                        for (int i = 0; i < count; i++) {
-                            double e = std::exp((double)logits[i] - mx);
-                            sum += e;
-                            value += e * vals[i];
-                        }
-                        compressed[((uint64_t)b * blocks + block) * headDim + d] = (float)(value / std::max(sum, 1e-30));
-                    }
-                }
+            int reusableBlocks = GetReusableCompressedBlocks(output, bsz, blocks, headDim);
+            if (reusableBlocks == blocks) {
+                return true;
             }
 
-            Data compressedData, normed;
-            WriteFloatData(compressed, {bsz, blocks, headDim}, compressedData, DataType::BFLOAT16);
-            RMSNormReference(compressedData, weight[prefix + ".norm.weight"], 1e-6f, normed, DataType::BFLOAT16);
-            auto out = ReadFloatData(normed);
-            ApplyRotaryReference(out, normed.dims, ropeDim, ropeBase, 0, false,
-                                 originalSeqLen, ropeFactor, betaFast, betaSlow, compressRatio);
-            ActQuantInplaceReference(out, normed.dims, headDim - ropeDim, 64);
-            WriteFloatData(out, normed.dims, output, DataType::BFLOAT16);
+            int addBlocks = blocks - reusableBlocks;
+            std::vector<float> compressed;
+            ComputeCompressedKVRangeCpu(kv, score, ape, bsz, totalLen, reusableBlocks, addBlocks,
+                                        compressRatio, headDim, wideDim, overlap, compressed);
+
+            Data newRows;
+            FinalizeCompressedKVRows(weight, prefix, compressed, bsz, reusableBlocks, addBlocks,
+                                     compressRatio, headDim, ropeDim, ropeBase, ropeFactor,
+                                     betaFast, betaSlow, originalSeqLen, newRows);
+            AppendCompressedKVRows(output, newRows, bsz, reusableBlocks, addBlocks, headDim);
             return true;
         }
 
@@ -1391,6 +1545,31 @@ namespace fastllm {
                                              Data &output, int compressRatio = 0, int originalSeqLen = 0,
                                              float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4SparseAttention");
+#ifdef USE_CUDA
+            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_PREFILL") &&
+                DeepSeekV4PreferCuda() && q.dims.size() == 4 && kv.dims.size() == 3) {
+                Data qCuda, kvCuda;
+                const Data *qForCuda = &q;
+                const Data *kvForCuda = &kv;
+                if (q.dataDevice != DataDevice::CUDA) {
+                    qCuda.CopyFrom(q);
+                    qCuda.ToDevice(DataDevice::CUDA);
+                    qForCuda = &qCuda;
+                }
+                if (kv.dataDevice != DataDevice::CUDA) {
+                    kvCuda.CopyFrom(kv);
+                    kvCuda.ToDevice(DataDevice::CUDA);
+                    kvForCuda = &kvCuda;
+                }
+                attnSink.ToDevice(DataDevice::CUDA);
+                if (FastllmCudaDeepSeekV4SparseAttentionPrefill(
+                        *qForCuda, *kvForCuda, attnSink, windowSize, startPos, compressRatio,
+                        ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow,
+                        softmaxScale, output)) {
+                    return;
+                }
+            }
+#endif
             auto qv = ReadFloatData(q);
             auto kvv = ReadFloatData(kv);
             auto sinkPtr = ReadWeightFloatDataCached(attnSink);
@@ -1568,7 +1747,6 @@ namespace fastllm {
                                                                          betaFast, betaSlow, softmaxScale, output)) {
                         return;
                     }
-                    ErrorInFastLLM("DeepSeekV4SparseDecodeCached CUDA error: kernel rejected even after CPU fallback.\n");
                 }
             }
 #endif
@@ -1669,64 +1847,12 @@ namespace fastllm {
             const auto &ape = *apePtr;
 
             int wideDim = coff * headDim;
-            std::vector<float> compressed((uint64_t)bsz * blocks * headDim, 0.0f);
-            std::vector<float> vals(overlap ? 2 * compressRatio : compressRatio);
-            std::vector<float> logits(vals.size());
-
-            for (int b = 0; b < bsz; b++) {
-                for (int block = 0; block < blocks; block++) {
-                    for (int d = 0; d < headDim; d++) {
-                        int count = 0;
-                        if (overlap) {
-                            for (int r = 0; r < compressRatio; r++) {
-                                if (block == 0) {
-                                    vals[count] = 0.0f;
-                                    logits[count++] = -std::numeric_limits<float>::infinity();
-                                } else {
-                                    int tok = (block - 1) * compressRatio + r;
-                                    uint64_t off = ((uint64_t)b * seqlen + tok) * wideDim + d;
-                                    vals[count] = kv[off];
-                                    logits[count++] = score[off] + ape[(uint64_t)r * wideDim + d];
-                                }
-                            }
-                            for (int r = 0; r < compressRatio; r++) {
-                                int tok = block * compressRatio + r;
-                                uint64_t off = ((uint64_t)b * seqlen + tok) * wideDim + headDim + d;
-                                vals[count] = kv[off];
-                                logits[count++] = score[off] + ape[(uint64_t)r * wideDim + headDim + d];
-                            }
-                        } else {
-                            for (int r = 0; r < compressRatio; r++) {
-                                int tok = block * compressRatio + r;
-                                uint64_t off = ((uint64_t)b * seqlen + tok) * wideDim + d;
-                                vals[count] = kv[off];
-                                logits[count++] = score[off] + ape[(uint64_t)r * wideDim + d];
-                            }
-                        }
-
-                        float mx = -std::numeric_limits<float>::infinity();
-                        for (int i = 0; i < count; i++) {
-                            mx = std::max(mx, logits[i]);
-                        }
-                        double sum = 0.0, value = 0.0;
-                        for (int i = 0; i < count; i++) {
-                            double e = std::exp((double)logits[i] - mx);
-                            sum += e;
-                            value += e * vals[i];
-                        }
-                        compressed[((uint64_t)b * blocks + block) * headDim + d] = (float)(value / std::max(sum, 1e-30));
-                    }
-                }
-            }
-
-            Data compressedData, normed;
-            WriteFloatData(compressed, {bsz, blocks, headDim}, compressedData, DataType::BFLOAT16);
-            RMSNormReference(compressedData, weight[prefix + ".norm.weight"], 1e-6f, normed, DataType::BFLOAT16);
-            auto out = ReadFloatData(normed);
-            ApplyRotaryReference(out, normed.dims, ropeDim, ropeBase, 0, false,
-                                 originalSeqLen, ropeFactor, betaFast, betaSlow, compressRatio);
-            ActQuantInplaceReference(out, normed.dims, headDim - ropeDim, 64);
-            WriteFloatData(out, normed.dims, output, DataType::BFLOAT16);
+            std::vector<float> compressed;
+            ComputeCompressedKVRangeCpu(kv, score, ape, bsz, seqlen, 0, blocks,
+                                        compressRatio, headDim, wideDim, overlap, compressed);
+            FinalizeCompressedKVRows(weight, prefix, compressed, bsz, 0, blocks,
+                                     compressRatio, headDim, ropeDim, ropeBase, ropeFactor,
+                                     betaFast, betaSlow, originalSeqLen, output);
             return true;
         }
 
@@ -2572,8 +2698,28 @@ namespace fastllm {
                 startPos = 0;
             }
         }
+        if (!debugFullRecomputeDecode && batch == 1 && inputIds.dims.size() >= 2 &&
+            inputIds.dims[1] > 1 && originalStartPos > 0 &&
+            !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_PREFIX_CACHE_SEQUENTIAL")) {
+            std::vector<int> ret(1, 0);
+            int seq = inputIds.dims[1];
+            for (int s = 0; s < seq; s++) {
+                Data curInputIds, curPositionIds;
+                Split(inputIds, 1, s, s + 1, curInputIds);
+                if (positionIds.dims.size() >= 2) {
+                    Split(positionIds, 1, s, s + 1, curPositionIds);
+                } else {
+                    curPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)(originalStartPos + s)}));
+                }
+                ret = ForwardBatch(1, curInputIds, Data(), curPositionIds, pastKeyValues,
+                                   generationConfig, lastTokens,
+                                   (s + 1 == seq) ? retLogits : nullptr);
+            }
+            return ret;
+        }
         bool debugThisStep = (originalStartPos == 0) || EnvFlagEnabled("FASTLLM_DEBUG_ALL_STEPS");
         bool debugLogitsThisStep = debugThisStep || EnvFlagEnabled("FASTLLM_DEBUG_LOGITS_ALL_STEPS") || debugFullRecomputeDecode;
+        bool debugDumpStates = EnvFlagEnabled("FASTLLM_DEBUG_DUMP_STATES");
         bool useDecodeCache = (!debugFullRecomputeDecode && batch == 1);
         int debugStopAfterTokens = EnvInt("FASTLLM_DEBUG_STOP_AFTER_TOKENS", 0);
         if (!debugFullRecomputeDecode && originalStartPos == 0 && debugStopAfterTokens > 0) {
@@ -2587,7 +2733,7 @@ namespace fastllm {
         }
         Embedding(*forwardInputIds, weight["embed.weight"], hiddenStates);
         profileLap(profileEmbedMs);
-        if (debugThisStep) {
+        if (debugThisStep && debugDumpStates) {
             DebugDumpData("embed", hiddenStates);
             profileLap(profileDebugDumpMs);
         }
@@ -2611,7 +2757,7 @@ namespace fastllm {
             WriteFloatData(expanded, {bsz, seqlen, hc_mult, dim}, hiddenStates, hiddenStates.dataType);
         }
         profileLap(profileHcExpandMs);
-        if (debugThisStep) {
+        if (debugThisStep && debugDumpStates) {
             DebugDumpData("hc_expand", hiddenStates);
             profileLap(profileDebugDumpMs);
         }
@@ -2882,7 +3028,7 @@ namespace fastllm {
                 DebugDumpData("layer" + std::to_string(layer) + "_ffn_out", ffnOut);
             }
             HcPostReference(ffnOut, residual, ffnMix, hiddenStates);
-            if (debugThisStep) {
+            if (debugThisStep && debugDumpStates) {
                 DebugDumpData("layer" + std::to_string(layer), hiddenStates);
             }
             profileLap(layerProfile.ffnPost);
