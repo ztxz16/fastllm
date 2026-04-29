@@ -1249,6 +1249,82 @@ __global__ void DeepSeekV4SparseAttentionDecodeCachedOnlineKernel(const QT *q, c
     }
 }
 
+template <typename QT>
+__global__ void DeepSeekV4SparseDecodeConvertQKernel(const QT *q, float *qFloat, uint64_t total) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        qFloat[idx] = Dsv4ToFloat(q[idx]);
+    }
+}
+
+template <typename CT>
+__global__ void DeepSeekV4SparseDecodeGatherKVKernel(const float *windowKV, const CT *compressedKV,
+                                                     float *kvFloat, int bsz, int dim, int windowSize,
+                                                     int startPos, int compressedCount, int liveWindow,
+                                                     int keyCount) {
+    uint64_t total = (uint64_t)bsz * keyCount * dim;
+    uint64_t linear = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (linear >= total) {
+        return;
+    }
+    int d = (int)(linear % dim);
+    uint64_t tmp = linear / dim;
+    int k = (int)(tmp % keyCount);
+    int b = (int)(tmp / keyCount);
+    int pos = startPos % windowSize;
+
+    float kv;
+    if (k < liveWindow) {
+        int idx = (startPos >= windowSize - 1) ? ((pos + 1 + k) % windowSize) : k;
+        kv = windowKV[((uint64_t)b * windowSize + idx) * dim + d];
+    } else {
+        int ck = k - liveWindow;
+        kv = Dsv4ToFloat(compressedKV[((uint64_t)b * compressedCount + ck) * dim + d]);
+    }
+    kvFloat[((uint64_t)b * keyCount + k) * dim + d] = kv;
+}
+
+__global__ void DeepSeekV4SparseDecodeSoftmaxSinkKernel(float *scores, const float *sink,
+                                                        int bsz, int heads, int keyCount) {
+    extern __shared__ float red[];
+    int row = blockIdx.x;
+    int h = row % heads;
+    float *rowScores = scores + (uint64_t)row * keyCount;
+
+    float mx = -INFINITY;
+    for (int k = threadIdx.x; k < keyCount; k += blockDim.x) {
+        mx = fmaxf(mx, rowScores[k]);
+    }
+    red[threadIdx.x] = mx;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    float safeMx = isfinite(red[0]) ? red[0] : 0.0f;
+
+    float sum = 0.0f;
+    for (int k = threadIdx.x; k < keyCount; k += blockDim.x) {
+        sum += expf(rowScores[k] - safeMx);
+    }
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            red[threadIdx.x] += red[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    float denom = red[0] + expf(sink[h] - safeMx);
+    denom = fmaxf(denom, 1e-30f);
+
+    for (int k = threadIdx.x; k < keyCount; k += blockDim.x) {
+        rowScores[k] = expf(rowScores[k] - safeMx) / denom;
+    }
+}
+
 template <typename QT, typename KT>
 __global__ void DeepSeekV4SparseAttentionPrefillBlockKernel(const QT *q, const KT *kv,
                                                             const float *sink, float *output,
@@ -1675,17 +1751,140 @@ bool DeepSeekV4LaunchHcPostByResidual(const fastllm::Data &x, const fastllm::Dat
 }
 
 template <typename QT>
+bool DeepSeekV4LaunchSparseDecodeCublas(const void *cudaQ, const void *cudaCompressed,
+                                        fastllm::DataType compressedType, const float *cudaWindow,
+                                        const float *cudaSink, float *outData,
+                                        int bsz, int heads, int dim, int windowSize,
+                                        int startPos, int compressedCount, int liveWindow,
+                                        int keyCount, float softmaxScale) {
+    if (std::getenv("FASTLLM_DSV4_DISABLE_CUBLAS_SPARSE_DECODE") != nullptr) {
+        return false;
+    }
+    int maxCublasKeys = 256 * 1024;
+    if (const char *env = std::getenv("FASTLLM_DSV4_CUBLAS_SPARSE_DECODE_MAX_KEYS")) {
+        maxCublasKeys = std::max(1, std::atoi(env));
+    }
+    if (keyCount <= 0 || keyCount > maxCublasKeys || dim <= 0 || heads <= 0 || bsz <= 0) {
+        return false;
+    }
+
+    uint64_t qElems = (uint64_t)bsz * heads * dim;
+    uint64_t kvElems = (uint64_t)bsz * keyCount * dim;
+    uint64_t scoreElems = (uint64_t)bsz * heads * keyCount;
+    float *qFloat = (float *)FastllmCudaMalloc(qElems * sizeof(float));
+    float *kvFloat = (float *)FastllmCudaMalloc(kvElems * sizeof(float));
+    float *scores = (float *)FastllmCudaMalloc(scoreElems * sizeof(float));
+    if (qFloat == nullptr || kvFloat == nullptr || scores == nullptr) {
+        if (qFloat != nullptr) {
+            FastllmCudaFree(qFloat);
+        }
+        if (kvFloat != nullptr) {
+            FastllmCudaFree(kvFloat);
+        }
+        if (scores != nullptr) {
+            FastllmCudaFree(scores);
+        }
+        return false;
+    }
+
+    int threads = 256;
+    DeepSeekV4SparseDecodeConvertQKernel<QT><<<
+        (int)((qElems + threads - 1) / threads), threads>>>((const QT *)cudaQ, qFloat, qElems);
+
+    bool gathered = true;
+    if (compressedCount == 0 || cudaCompressed == nullptr) {
+        DeepSeekV4SparseDecodeGatherKVKernel<float><<<
+            (int)((kvElems + threads - 1) / threads), threads>>>(
+                cudaWindow, (const float *)nullptr, kvFloat, bsz, dim, windowSize,
+                startPos, 0, liveWindow, keyCount);
+    } else if (compressedType == fastllm::DataType::BFLOAT16) {
+        DeepSeekV4SparseDecodeGatherKVKernel<__nv_bfloat16><<<
+            (int)((kvElems + threads - 1) / threads), threads>>>(
+                cudaWindow, (const __nv_bfloat16 *)cudaCompressed, kvFloat, bsz, dim, windowSize,
+                startPos, compressedCount, liveWindow, keyCount);
+    } else if (compressedType == fastllm::DataType::FLOAT16) {
+        DeepSeekV4SparseDecodeGatherKVKernel<half><<<
+            (int)((kvElems + threads - 1) / threads), threads>>>(
+                cudaWindow, (const half *)cudaCompressed, kvFloat, bsz, dim, windowSize,
+                startPos, compressedCount, liveWindow, keyCount);
+    } else if (compressedType == fastllm::DataType::FLOAT32) {
+        DeepSeekV4SparseDecodeGatherKVKernel<float><<<
+            (int)((kvElems + threads - 1) / threads), threads>>>(
+                cudaWindow, (const float *)cudaCompressed, kvFloat, bsz, dim, windowSize,
+                startPos, compressedCount, liveWindow, keyCount);
+    } else {
+        gathered = false;
+    }
+
+    bool ok = false;
+    if (gathered) {
+        float alpha = softmaxScale;
+        float beta = 0.0f;
+        auto handle = getFastllmCublasHandle();
+        cublasStatus_t status = cublasSgemmStridedBatched(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            keyCount, heads, dim,
+            &alpha,
+            kvFloat, dim, (long long)keyCount * dim,
+            qFloat, dim, (long long)heads * dim,
+            &beta,
+            scores, keyCount, (long long)heads * keyCount,
+            bsz);
+
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            DeepSeekV4SparseDecodeSoftmaxSinkKernel<<<bsz * heads, 256, 256 * sizeof(float)>>>(
+                scores, cudaSink, bsz, heads, keyCount);
+
+            alpha = 1.0f;
+            status = cublasSgemmStridedBatched(
+                handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                dim, heads, keyCount,
+                &alpha,
+                kvFloat, dim, (long long)keyCount * dim,
+                scores, keyCount, (long long)heads * keyCount,
+                &beta,
+                outData, dim, (long long)heads * dim,
+                bsz);
+        }
+        ok = status == CUBLAS_STATUS_SUCCESS;
+        if (!ok && std::getenv("FASTLLM_DSV4_DEBUG_CUBLAS_SPARSE_DECODE") != nullptr) {
+            std::fprintf(stderr,
+                         "DeepSeekV4SparseDecode cuBLAS fallback: status=%d bsz=%d heads=%d dim=%d keys=%d compressed=%d\n",
+                         (int)status, bsz, heads, dim, keyCount, compressedCount);
+        }
+    }
+
+    FastllmCudaFree(qFloat);
+    FastllmCudaFree(kvFloat);
+    FastllmCudaFree(scores);
+    return ok;
+}
+
+template <typename QT>
 bool DeepSeekV4LaunchSparseDecodeByCompressed(const void *cudaQ, const void *cudaCompressed,
                                               fastllm::DataType compressedType, const float *cudaWindow,
                                               const float *cudaSink, float *outData,
                                               int bsz, int heads, int dim, int windowSize,
-                                              int startPos, int compressedCount, float softmaxScale) {
+                                              int startPos, int compressedCount, float softmaxScale,
+                                              int *launchMode = nullptr) {
     const QT *qData = (const QT *)cudaQ;
     int blocks = bsz * heads;
     int liveWindow = startPos >= windowSize - 1 ? windowSize : (startPos + 1);
     int maxKeys = liveWindow + compressedCount;
     if (maxKeys <= 0 || maxKeys > kDeepSeekV4SparseDecodeMaxKeys) {
         return false;
+    }
+    if (launchMode != nullptr) {
+        *launchMode = 0;
+    }
+    if (DeepSeekV4LaunchSparseDecodeCublas<QT>(
+            cudaQ, cudaCompressed, compressedType, cudaWindow, cudaSink, outData,
+            bsz, heads, dim, windowSize, startPos, compressedCount, liveWindow,
+            maxKeys, softmaxScale)) {
+        if (launchMode != nullptr) {
+            *launchMode = 2;
+        }
+        return true;
     }
     bool useOnlineDecode = dim <= 256 * 4 &&
                            std::getenv("FASTLLM_DSV4_DISABLE_ONLINE_SPARSE_DECODE") == nullptr;
@@ -1708,6 +1907,9 @@ bool DeepSeekV4LaunchSparseDecodeByCompressed(const void *cudaQ, const void *cud
                 bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale);
         } else {
             return false;
+        }
+        if (launchMode != nullptr) {
+            *launchMode = 1;
         }
         return true;
     }
@@ -2289,21 +2491,22 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::
     bool ok = false;
     bool sparseDecodeStats = std::getenv("FASTLLM_DSV4_SPARSE_DECODE_STATS") != nullptr;
     auto sparseDecodeStart = std::chrono::steady_clock::now();
+    int sparseDecodeMode = 0;
     if (q.dataType == fastllm::DataType::BFLOAT16) {
         ok = DeepSeekV4LaunchSparseDecodeByCompressed<__nv_bfloat16>(
             q.cudaData, compressedCount > 0 ? compressedKV.cudaData : nullptr, compressedKV.dataType,
             cudaWindow, (const float *)attnSink.cudaData, cudaTemp,
-            bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale);
+            bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale, &sparseDecodeMode);
     } else if (q.dataType == fastllm::DataType::FLOAT16) {
         ok = DeepSeekV4LaunchSparseDecodeByCompressed<half>(
             q.cudaData, compressedCount > 0 ? compressedKV.cudaData : nullptr, compressedKV.dataType,
             cudaWindow, (const float *)attnSink.cudaData, cudaTemp,
-            bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale);
+            bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale, &sparseDecodeMode);
     } else if (q.dataType == fastllm::DataType::FLOAT32) {
         ok = DeepSeekV4LaunchSparseDecodeByCompressed<float>(
             q.cudaData, compressedCount > 0 ? compressedKV.cudaData : nullptr, compressedKV.dataType,
             cudaWindow, (const float *)attnSink.cudaData, cudaTemp,
-            bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale);
+            bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale, &sparseDecodeMode);
     }
     if (ok) {
         int rows = bsz * heads;
@@ -2318,9 +2521,7 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::
         auto sparseDecodeEnd = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(sparseDecodeEnd - sparseDecodeStart).count();
         int liveWindow = startPos >= windowSize - 1 ? windowSize : (startPos + 1);
-        bool usedOnlineDecode = dim <= 256 * 4 &&
-                                std::getenv("FASTLLM_DSV4_DISABLE_ONLINE_SPARSE_DECODE") == nullptr;
-        int kvPasses = usedOnlineDecode ? 1 : 2;
+        int kvPasses = sparseDecodeMode == 0 ? 2 : 1;
         double windowBytes = (double)bsz * heads * dim * liveWindow * sizeof(float) * kvPasses;
         double compressedBytes = compressedCount > 0
                                      ? (double)bsz * heads * fastllm::GetDataBytes(compressedKV.dataType,
@@ -2349,7 +2550,7 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::
                          "liveWindow=%d compressedCount=%d dim=%d heads=%d kvPasses=%d mode=%s\n",
                          statCalls, ms, avgMs, kvGB, avgKvGB, avgGBps, startPos,
                          liveWindow, compressedCount, dim, heads, kvPasses,
-                         usedOnlineDecode ? "online" : "two-pass");
+                         sparseDecodeMode == 2 ? "cublas" : (sparseDecodeMode == 1 ? "online" : "two-pass"));
             std::fflush(stderr);
             statMs = 0.0;
             statKvGB = 0.0;
