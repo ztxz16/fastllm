@@ -1777,7 +1777,7 @@ namespace fastllm {
         // output : {b * s, h, c}
 
         Data score0, score1;
-        if (b == 1 && s == 1) {
+        if (b == 1 && s == 1 && mask.dims.size() == 0) {
             FastllmCudaMLA(qNope, qPe, kvCache, peCache, score0, output, softmaxScale);
         } else {
             if ((double)b * s * h * t * 2 * 4 > 1e9) {
