@@ -659,19 +659,6 @@ namespace fastllm {
             int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
             int flatDim = hcMult * dim;
             int mixHc = (2 + hcMult) * hcMult;
-            bool profileHcPre = EnvFlagEnabled("FASTLLM_PROFILE_HCPRE");
-            double profileLast = profileHcPre ? NowMs() : 0.0;
-            double profileRead = 0.0, profileCudaDots = 0.0, profileAlloc = 0.0;
-            double profileNorm = 0.0, profileDots = 0.0, profileGates = 0.0;
-            double profileSinkhorn = 0.0, profileY = 0.0, profileWrite = 0.0;
-            auto profileLap = [&](double &bucket) {
-                if (!profileHcPre) {
-                    return;
-                }
-                double now = NowMs();
-                bucket += now - profileLast;
-                profileLast = now;
-            };
             auto xv = ReadFloatData(x);
             auto scalePtr = ReadWeightFloatDataCached(hcScale);
             auto basePtr = ReadWeightFloatDataCached(hcBase);
@@ -680,7 +667,6 @@ namespace fastllm {
             std::shared_ptr<const std::vector<float>> fnPtr;
             const std::vector<float> *fn = nullptr;
             std::vector<float> dotCache;
-            profileLap(profileRead);
 
 #ifdef USE_CUDA
             if (EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_HCPRE_DOTS") && x.dataDevice == DataDevice::CUDA) {
@@ -692,14 +678,12 @@ namespace fastllm {
                         dotCache.clear();
                     }
                 }
-                profileLap(profileCudaDots);
             }
 #endif
 
             if (dotCache.empty()) {
                 fnPtr = ReadWeightFloatDataCached(hcFn);
                 fn = fnPtr.get();
-                profileLap(profileRead);
             }
 
             std::vector<float> y((uint64_t)bsz * seqlen * dim, 0.0f);
@@ -708,7 +692,6 @@ namespace fastllm {
             std::vector<float> mixes(mixHc);
             std::vector<float> pre(hcMult);
             std::vector<float> combLocal(hcMult * hcMult);
-            profileLap(profileAlloc);
 
             for (int t = 0; t < bsz * seqlen; t++) {
                 const float *xrow = xv.data() + (uint64_t)t * flatDim;
@@ -717,7 +700,6 @@ namespace fastllm {
                     ss += (double)xrow[k] * xrow[k];
                 }
                 float rsqrt = 1.0f / std::sqrt((float)(ss / flatDim) + normEps);
-                profileLap(profileNorm);
                 for (int m = 0; m < mixHc; m++) {
                     if (!dotCache.empty()) {
                         mixes[m] = dotCache[(uint64_t)t * mixHc + m] * rsqrt;
@@ -726,13 +708,11 @@ namespace fastllm {
                         break;
                     }
                 }
-                profileLap(profileDots);
                 for (int h = 0; h < hcMult; h++) {
                     pre[h] = SigmoidFloat(mixes[h] * scale[0] + base[h]) + eps;
                     post[(uint64_t)t * hcMult + h] =
                         2.0f * SigmoidFloat(mixes[h + hcMult] * scale[1] + base[h + hcMult]);
                 }
-                profileLap(profileGates);
                 for (int r = 0; r < hcMult; r++) {
                     float rowMax = -std::numeric_limits<float>::infinity();
                     for (int c = 0; c < hcMult; c++) {
@@ -781,7 +761,6 @@ namespace fastllm {
                 }
                 memcpy(comb.data() + (uint64_t)t * hcMult * hcMult, combLocal.data(),
                        hcMult * hcMult * sizeof(float));
-                profileLap(profileSinkhorn);
                 for (int d = 0; d < dim; d++) {
                     double v = 0.0;
                     for (int h = 0; h < hcMult; h++) {
@@ -789,7 +768,6 @@ namespace fastllm {
                     }
                     y[(uint64_t)t * dim + d] = (float)v;
                 }
-                profileLap(profileY);
             }
 
             WriteFloatData(y, {bsz, seqlen, dim}, ret.y, x.dataType);
@@ -803,16 +781,6 @@ namespace fastllm {
             ret.b = bsz;
             ret.s = seqlen;
             ret.hc = hcMult;
-            profileLap(profileWrite);
-            if (profileHcPre) {
-                double total = profileRead + profileCudaDots + profileAlloc + profileNorm +
-                               profileDots + profileGates + profileSinkhorn + profileY + profileWrite;
-                printf("[fastllm-profile-hcpre] rows=%d hc=%d dim=%d cuda_dots=%d read=%.3f cuda=%.3f alloc=%.3f norm=%.3f dots=%.3f gates=%.3f sinkhorn=%.3f y=%.3f write=%.3f total=%.3f\n",
-                       bsz * seqlen, hcMult, dim, dotCache.empty() ? 0 : 1, profileRead,
-                       profileCudaDots, profileAlloc, profileNorm, profileDots, profileGates,
-                       profileSinkhorn, profileY, profileWrite, total);
-                fflush(stdout);
-            }
             return ret;
         }
 
