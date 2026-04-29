@@ -76,7 +76,10 @@ namespace fastllm {
 
     void ResponseContext::TryRecord(basellm *model) {
         if (model->saveHistoryChat) {
-            model->pastKVCacheManager.Record(this->allTokens, this->allTokens.size(), &this->pastKeyValues);
+            model->TryRecordHistoryCache(this->allTokens);
+            if (model->UseGenericHistoryCache()) {
+                model->pastKVCacheManager.Record(this->allTokens, this->allTokens.size(), &this->pastKeyValues);
+            }
         }
     }
 
@@ -1717,7 +1720,11 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         context->multimodalInput = multimodalInput;
         context->tokens = LastTokensUnit(generationConfig.last_n);
 
-        auto cache = pastKVCacheManager.Get(inputTokens);
+        bool restoredNativeHistory = this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
+
+        auto cache = restoredNativeHistory || !this->UseGenericHistoryCache() ?
+                     std::make_pair((PastKVCacheMemory*)nullptr, 0) :
+                     pastKVCacheManager.Get(inputTokens);
         if (cache.first != nullptr && cache.second > 0) {
             int len = cache.second;
 
