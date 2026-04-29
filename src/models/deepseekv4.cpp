@@ -1592,70 +1592,6 @@ namespace fastllm {
             WriteFloatData(out, {bsz, seqlen, heads, dim}, output, DataType::BFLOAT16);
         }
 
-        static void SparseAttentionDecodeReference(Data &q, Data &cacheKV, Data &attnSink,
-                                                   int windowSize, int startPos, int compressedCount,
-                                                   int ropeDim, float ropeBase, float softmaxScale,
-                                                   Data &output, int originalSeqLen = 0,
-                                                   float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4SparseDecode");
-            auto qv = ReadFloatData(q);
-            auto kvv = ReadFloatData(cacheKV);
-            auto sinkPtr = ReadWeightFloatDataCached(attnSink);
-            const auto &sink = *sinkPtr;
-            int bsz = q.dims[0], heads = q.dims[2], dim = q.dims[3];
-            std::vector<float> out((uint64_t)bsz * heads * dim, 0.0f);
-            std::vector<int> idxs;
-            if (startPos >= windowSize - 1) {
-                int pos = startPos % windowSize;
-                for (int i = pos + 1; i < windowSize; i++) {
-                    idxs.push_back(i);
-                }
-                for (int i = 0; i <= pos; i++) {
-                    idxs.push_back(i);
-                }
-            } else {
-                for (int i = 0; i <= startPos; i++) {
-                    idxs.push_back(i);
-                }
-            }
-            for (int i = 0; i < compressedCount; i++) {
-                idxs.push_back(windowSize + i);
-            }
-
-            for (int b = 0; b < bsz; b++) {
-                std::vector<float> scores(idxs.size());
-                for (int h = 0; h < heads; h++) {
-                    const float *qrow = qv.data() + ((uint64_t)b * heads + h) * dim;
-                    float mx = -std::numeric_limits<float>::infinity();
-                    for (int k = 0; k < (int)idxs.size(); k++) {
-                        const float *kvrow = kvv.data() + ((uint64_t)b * cacheKV.dims[1] + idxs[k]) * dim;
-                        double dot = 0.0;
-                        for (int d = 0; d < dim; d++) {
-                            dot += (double)qrow[d] * kvrow[d];
-                        }
-                        scores[k] = (float)dot * softmaxScale;
-                        mx = std::max(mx, scores[k]);
-                    }
-                    float safeMx = std::isfinite(mx) ? mx : 0.0f;
-                    double denom = std::exp((double)sink[h] - safeMx);
-                    for (float score : scores) {
-                        denom += std::exp((double)score - safeMx);
-                    }
-                    float *orow = out.data() + ((uint64_t)b * heads + h) * dim;
-                    for (int k = 0; k < (int)idxs.size(); k++) {
-                        float w = (float)(std::exp((double)scores[k] - safeMx) / std::max(denom, 1e-30));
-                        const float *kvrow = kvv.data() + ((uint64_t)b * cacheKV.dims[1] + idxs[k]) * dim;
-                        for (int d = 0; d < dim; d++) {
-                            orow[d] += w * kvrow[d];
-                        }
-                    }
-                }
-            }
-            ApplyRotaryReference(out, {bsz, 1, heads, dim}, ropeDim, ropeBase, startPos, true,
-                                 originalSeqLen, ropeFactor, betaFast, betaSlow);
-            WriteFloatData(out, {bsz, 1, heads, dim}, output, DataType::BFLOAT16);
-        }
-
         static void SparseAttentionDecodeCachedReference(Data &q,
                                                          const std::vector<float> &windowKV,
                                                          const Data *windowKVData,
@@ -2110,111 +2046,6 @@ namespace fastllm {
 
             WriteIntData(indices, {tokens, topk}, expertIndex);
             WriteFloatData(weights, {tokens, topk}, expertScore, DataType::FLOAT32);
-        }
-
-        static void MoEReference(WeightMap &weight, const std::string &prefix, const Data &x,
-                                 const std::vector<int> &inputIds, int nRoutedExperts,
-                                 int topk, const std::string &scoreFunc, float routeScale,
-                                 float swigluLimit, Data &output) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4MoEReference");
-            Data xFloat, routerLogits;
-            ToDataType(x, xFloat, DataType::FLOAT32);
-            Linear(xFloat, weight[prefix + ".gate.weight"], Data(), routerLogits, true);
-            auto rawScores = ReadFloatData(routerLogits);
-            bool hashRouting = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
-            std::shared_ptr<const std::vector<float>> tid2eidPtr, gateBiasPtr;
-            const std::vector<float> *tid2eid = nullptr;
-            const std::vector<float> *gateBias = nullptr;
-            if (hashRouting) {
-                tid2eidPtr = ReadWeightFloatDataCached(weight[prefix + ".gate.tid2eid"]);
-                tid2eid = tid2eidPtr.get();
-            } else if (weight.weight.find(prefix + ".gate.bias") != weight.weight.end()) {
-                gateBiasPtr = ReadWeightFloatDataCached(weight[prefix + ".gate.bias"]);
-                gateBias = gateBiasPtr.get();
-            }
-            int tokens = x.dims[0] * x.dims[1];
-            int dim = x.dims.back();
-            std::vector<float> y((uint64_t)tokens * dim, 0.0f);
-            for (int t = 0; t < tokens; t++) {
-                std::vector<float> originalScores(nRoutedExperts);
-                if (scoreFunc == "softmax") {
-                    float mx = -std::numeric_limits<float>::infinity();
-                    for (int e = 0; e < nRoutedExperts; e++) {
-                        mx = std::max(mx, rawScores[(uint64_t)t * nRoutedExperts + e]);
-                    }
-                    double sum = 0.0;
-                    for (int e = 0; e < nRoutedExperts; e++) {
-                        double v = std::exp((double)rawScores[(uint64_t)t * nRoutedExperts + e] - mx);
-                        originalScores[e] = (float)v;
-                        sum += v;
-                    }
-                    for (int e = 0; e < nRoutedExperts; e++) {
-                        originalScores[e] /= (float)sum;
-                    }
-                } else {
-                    for (int e = 0; e < nRoutedExperts; e++) {
-                        float raw = rawScores[(uint64_t)t * nRoutedExperts + e];
-                        if (scoreFunc == "sigmoid") {
-                            originalScores[e] = SigmoidFloat(raw);
-                        } else {
-                            originalScores[e] = std::sqrt(SoftplusFloat(raw));
-                        }
-                    }
-                }
-
-                std::vector<int> indices(topk);
-                if (hashRouting) {
-                    for (int k = 0; k < topk; k++) {
-                        indices[k] = (int)((*tid2eid)[(uint64_t)inputIds[t] * topk + k] + 0.5f);
-                    }
-                } else {
-                    std::vector<float> selectScores = originalScores;
-                    if (gateBias != nullptr) {
-                        for (int e = 0; e < nRoutedExperts; e++) {
-                            selectScores[e] += (*gateBias)[e];
-                        }
-                    }
-                    for (int k = 0; k < topk; k++) {
-                        int best = 0;
-                        float bestScore = -std::numeric_limits<float>::infinity();
-                        for (int e = 0; e < nRoutedExperts; e++) {
-                            if (selectScores[e] > bestScore) {
-                                bestScore = selectScores[e];
-                                best = e;
-                            }
-                        }
-                        indices[k] = best;
-                        selectScores[best] = -std::numeric_limits<float>::infinity();
-                    }
-                }
-                std::vector<float> weights(topk);
-                float sum = 0.0f;
-                for (int k = 0; k < topk; k++) {
-                    float v = originalScores[indices[k]];
-                    weights[k] = v;
-                    sum += v;
-                }
-                if (scoreFunc != "softmax") {
-                    for (int k = 0; k < topk; k++) {
-                        weights[k] = weights[k] / sum * routeScale;
-                    }
-                } else {
-                    for (int k = 0; k < topk; k++) {
-                        weights[k] *= routeScale;
-                    }
-                }
-                Data tokenX;
-                Split(x, 1, t, t + 1, tokenX);
-                tokenX.Reshape({1, dim});
-                std::vector<float> accum(dim, 0.0f);
-                for (int k = 0; k < topk; k++) {
-                    RunExpertReference(weight, prefix + ".experts." + std::to_string(indices[k]), tokenX,
-                                       weights[k], swigluLimit, accum);
-                }
-                RunExpertReference(weight, prefix + ".shared_experts", tokenX, 1.0f, 0.0f, accum);
-                memcpy(y.data() + (uint64_t)t * dim, accum.data(), dim * sizeof(float));
-            }
-            WriteFloatData(y, x.dims, output, x.dataType);
         }
 
         static void HcHeadReference(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
@@ -3305,14 +3136,8 @@ namespace fastllm {
             BuildMoERoutingData(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
                                 num_experts_per_tok, scoring_func, routed_scaling_factor,
                                 expertIndex, expertScore);
-            if (layer >= (int)weights.size() || weights[layer].empty() ||
-                weights[layer][0] == nullptr || weights[layer][1] == nullptr ||
-                weights[layer].size() < 4 || weights[layer][2] == nullptr || weights[layer][3] == nullptr ||
-                !CanRunMergeMOE(ffnInput, biass[layer])) {
-                ffnInput.Reshape(ffnDims);
-                MoEReference(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
-                             num_experts_per_tok, scoring_func, routed_scaling_factor, swiglu_limit, ffnOut);
-            } else {
+            {
+                // MOE
                 Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
                 ApplyDeviceMap(this->moeDeviceMap, layer + 1, block_cnt);
                 // NumasMergeMOE 的小 batch 路径直接读取 cpuData，先保证输入在 CPU 可见。
