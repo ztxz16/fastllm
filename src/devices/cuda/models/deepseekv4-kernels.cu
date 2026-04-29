@@ -6,8 +6,34 @@
 
 namespace {
 
-constexpr int kDeepSeekV4SparseDecodeMaxKeys = 4096;
-constexpr int kDeepSeekV4SparsePrefillMaxKeys = 1024;
+constexpr int kDeepSeekV4SparseDecodeMaxKeys = 256 * 1024;
+constexpr int kDeepSeekV4SparsePrefillMaxKeys = 256 * 1024;
+
+template <typename Kernel>
+bool DeepSeekV4EnsureDynamicSharedMemory(Kernel kernel, size_t sharedBytes) {
+    constexpr size_t kDefaultDynamicSharedLimit = 48 * 1024;
+    if (sharedBytes <= kDefaultDynamicSharedLimit) {
+        return true;
+    }
+    int device = 0;
+    cudaError_t state = cudaGetDevice(&device);
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    int maxOptinShared = 0;
+    state = cudaDeviceGetAttribute(&maxOptinShared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (state != cudaSuccess || sharedBytes > (size_t)maxOptinShared) {
+        cudaGetLastError();
+        return false;
+    }
+    state = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sharedBytes);
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
 
 __device__ __forceinline__ float Dsv4ToFloat(float v) {
     return v;
@@ -1026,10 +1052,10 @@ __global__ void DeepSeekV4SparseAttentionDecodeCachedBlockKernel(const QT *q, co
                                                                  const CT *compressedKV, const float *sink,
                                                                  float *output, int bsz, int heads, int dim,
                                                                  int windowSize, int startPos, int compressedCount,
-                                                                 float softmaxScale) {
+                                                                 int keyCapacity, float softmaxScale) {
     extern __shared__ float shared[];
     float *scores = shared;
-    float *red = shared + kDeepSeekV4SparseDecodeMaxKeys;
+    float *red = shared + keyCapacity;
 
     int bh = blockIdx.x;
     int b = bh / heads;
@@ -1039,7 +1065,7 @@ __global__ void DeepSeekV4SparseAttentionDecodeCachedBlockKernel(const QT *q, co
 
     int liveWindow = startPos >= windowSize - 1 ? windowSize : (startPos + 1);
     int idxCount = liveWindow + compressedCount;
-    if (idxCount <= 0 || idxCount > kDeepSeekV4SparseDecodeMaxKeys) {
+    if (idxCount <= 0 || idxCount > keyCapacity || idxCount > kDeepSeekV4SparseDecodeMaxKeys) {
         return;
     }
     int pos = startPos % windowSize;
@@ -1131,7 +1157,7 @@ __global__ void DeepSeekV4SparseAttentionPrefillBlockKernel(const QT *q, const K
                                                             const float *sink, float *output,
                                                             int bsz, int seqlen, int heads, int dim,
                                                             int kvLen, int windowSize, int compressRatio,
-                                                            float softmaxScale) {
+                                                            int startPos, int prefixLen, float softmaxScale) {
     extern __shared__ float scores[];
 
     int row = blockIdx.x;
@@ -1143,12 +1169,15 @@ __global__ void DeepSeekV4SparseAttentionPrefillBlockKernel(const QT *q, const K
         return;
     }
 
-    int compressedCount = max(0, kvLen - seqlen);
-    int liveWindow = min(windowSize, s + 1);
-    int begin = s - liveWindow + 1;
+    int realPrefixLen = max(0, min(prefixLen, kvLen - seqlen));
+    int compressedStart = realPrefixLen + seqlen;
+    int compressedCount = max(0, kvLen - compressedStart);
+    int liveWindow = min(windowSize, realPrefixLen + s + 1);
+    int beginPos = startPos + s - liveWindow + 1;
+    int prefixStartPos = startPos - realPrefixLen;
     int liveCompressed = 0;
     if (compressRatio > 0 && compressedCount > 0) {
-        liveCompressed = min(compressedCount, (s + 1) / compressRatio);
+        liveCompressed = min(compressedCount, (startPos + s + 1) / compressRatio);
     }
     int idxCount = liveWindow + liveCompressed;
     if (idxCount <= 0 || idxCount > kDeepSeekV4SparsePrefillMaxKeys) {
@@ -1166,7 +1195,13 @@ __global__ void DeepSeekV4SparseAttentionPrefillBlockKernel(const QT *q, const K
         int k = base + warpId;
         float dot = 0.0f;
         if (k < idxCount) {
-            int idx = k < liveWindow ? (begin + k) : (seqlen + k - liveWindow);
+            int idx;
+            if (k < liveWindow) {
+                int pos = beginPos + k;
+                idx = (pos < startPos) ? (pos - prefixStartPos) : (realPrefixLen + pos - startPos);
+            } else {
+                idx = compressedStart + k - liveWindow;
+            }
             const KT *kvrow = kv + ((uint64_t)b * kvLen + idx) * dim;
             for (int d = lane; d < dim; d += 32) {
                 dot += Dsv4ToFloat(qrow[d]) * Dsv4ToFloat(kvrow[d]);
@@ -1204,7 +1239,13 @@ __global__ void DeepSeekV4SparseAttentionPrefillBlockKernel(const QT *q, const K
     for (int d = threadIdx.x; d < dim; d += blockDim.x) {
         float v = 0.0f;
         for (int k = 0; k < idxCount; k++) {
-            int idx = k < liveWindow ? (begin + k) : (seqlen + k - liveWindow);
+            int idx;
+            if (k < liveWindow) {
+                int pos = beginPos + k;
+                idx = (pos < startPos) ? (pos - prefixStartPos) : (realPrefixLen + pos - startPos);
+            } else {
+                idx = compressedStart + k - liveWindow;
+            }
             const KT *kvrow = kv + ((uint64_t)b * kvLen + idx) * dim;
             v += scores[k] * Dsv4ToFloat(kvrow[d]);
         }
@@ -1544,22 +1585,44 @@ bool DeepSeekV4LaunchSparseDecodeByCompressed(const void *cudaQ, const void *cud
                                               int startPos, int compressedCount, float softmaxScale) {
     const QT *qData = (const QT *)cudaQ;
     int blocks = bsz * heads;
+    int liveWindow = startPos >= windowSize - 1 ? windowSize : (startPos + 1);
+    int maxKeys = liveWindow + compressedCount;
+    if (maxKeys <= 0 || maxKeys > kDeepSeekV4SparseDecodeMaxKeys) {
+        return false;
+    }
+    size_t sharedBytes = ((size_t)maxKeys + 256) * sizeof(float);
     if (compressedCount == 0 || cudaCompressed == nullptr) {
-        DeepSeekV4SparseAttentionDecodeCachedBlockKernel<<<blocks, 256, (kDeepSeekV4SparseDecodeMaxKeys + 256) * sizeof(float)>>>(
+        auto kernel = DeepSeekV4SparseAttentionDecodeCachedBlockKernel<QT, float>;
+        if (!DeepSeekV4EnsureDynamicSharedMemory(kernel, sharedBytes)) {
+            return false;
+        }
+        kernel<<<blocks, 256, sharedBytes>>>(
             qData, cudaWindow, (const float *)nullptr, cudaSink, outData,
-            bsz, heads, dim, windowSize, startPos, 0, softmaxScale);
+            bsz, heads, dim, windowSize, startPos, 0, maxKeys, softmaxScale);
     } else if (compressedType == fastllm::DataType::BFLOAT16) {
-        DeepSeekV4SparseAttentionDecodeCachedBlockKernel<<<blocks, 256, (kDeepSeekV4SparseDecodeMaxKeys + 256) * sizeof(float)>>>(
+        auto kernel = DeepSeekV4SparseAttentionDecodeCachedBlockKernel<QT, __nv_bfloat16>;
+        if (!DeepSeekV4EnsureDynamicSharedMemory(kernel, sharedBytes)) {
+            return false;
+        }
+        kernel<<<blocks, 256, sharedBytes>>>(
             qData, cudaWindow, (const __nv_bfloat16 *)cudaCompressed, cudaSink, outData,
-            bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale);
+            bsz, heads, dim, windowSize, startPos, compressedCount, maxKeys, softmaxScale);
     } else if (compressedType == fastllm::DataType::FLOAT16) {
-        DeepSeekV4SparseAttentionDecodeCachedBlockKernel<<<blocks, 256, (kDeepSeekV4SparseDecodeMaxKeys + 256) * sizeof(float)>>>(
+        auto kernel = DeepSeekV4SparseAttentionDecodeCachedBlockKernel<QT, half>;
+        if (!DeepSeekV4EnsureDynamicSharedMemory(kernel, sharedBytes)) {
+            return false;
+        }
+        kernel<<<blocks, 256, sharedBytes>>>(
             qData, cudaWindow, (const half *)cudaCompressed, cudaSink, outData,
-            bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale);
+            bsz, heads, dim, windowSize, startPos, compressedCount, maxKeys, softmaxScale);
     } else if (compressedType == fastllm::DataType::FLOAT32) {
-        DeepSeekV4SparseAttentionDecodeCachedBlockKernel<<<blocks, 256, (kDeepSeekV4SparseDecodeMaxKeys + 256) * sizeof(float)>>>(
+        auto kernel = DeepSeekV4SparseAttentionDecodeCachedBlockKernel<QT, float>;
+        if (!DeepSeekV4EnsureDynamicSharedMemory(kernel, sharedBytes)) {
+            return false;
+        }
+        kernel<<<blocks, 256, sharedBytes>>>(
             qData, cudaWindow, (const float *)cudaCompressed, cudaSink, outData,
-            bsz, heads, dim, windowSize, startPos, compressedCount, softmaxScale);
+            bsz, heads, dim, windowSize, startPos, compressedCount, maxKeys, softmaxScale);
     } else {
         return false;
     }
@@ -1570,16 +1633,23 @@ template <typename QT, typename KT>
 bool DeepSeekV4LaunchSparsePrefillByKV(const fastllm::Data &q, const fastllm::Data &kv,
                                        const float *cudaSink, float *outData,
                                        int bsz, int seqlen, int heads, int dim, int kvLen,
-                                       int windowSize, int compressRatio, float softmaxScale) {
-    int compressedCount = std::max(0, kvLen - seqlen);
-    int maxKeys = std::min(windowSize, seqlen) + (compressRatio > 0 ? compressedCount : 0);
+                                       int windowSize, int compressRatio, int startPos, int prefixLen,
+                                       float softmaxScale) {
+    int realPrefixLen = std::max(0, std::min(prefixLen, kvLen - seqlen));
+    int compressedCount = std::max(0, kvLen - realPrefixLen - seqlen);
+    int maxKeys = std::min(windowSize, realPrefixLen + seqlen) + (compressRatio > 0 ? compressedCount : 0);
     if (maxKeys <= 0 || maxKeys > kDeepSeekV4SparsePrefillMaxKeys) {
         return false;
     }
     int blocks = bsz * seqlen * heads;
-    DeepSeekV4SparseAttentionPrefillBlockKernel<<<blocks, 256, kDeepSeekV4SparsePrefillMaxKeys * sizeof(float)>>>(
+    size_t sharedBytes = (size_t)maxKeys * sizeof(float);
+    auto kernel = DeepSeekV4SparseAttentionPrefillBlockKernel<QT, KT>;
+    if (!DeepSeekV4EnsureDynamicSharedMemory(kernel, sharedBytes)) {
+        return false;
+    }
+    kernel<<<blocks, 256, sharedBytes>>>(
         (const QT *)q.cudaData, (const KT *)kv.cudaData, cudaSink, outData,
-        bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, softmaxScale);
+        bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen, softmaxScale);
     return true;
 }
 
@@ -1587,18 +1657,22 @@ template <typename QT>
 bool DeepSeekV4LaunchSparsePrefillByQ(const fastllm::Data &q, const fastllm::Data &kv,
                                       const float *cudaSink, float *outData,
                                       int bsz, int seqlen, int heads, int dim, int kvLen,
-                                      int windowSize, int compressRatio, float softmaxScale) {
+                                      int windowSize, int compressRatio, int startPos, int prefixLen,
+                                      float softmaxScale) {
     if (kv.dataType == fastllm::DataType::BFLOAT16) {
         return DeepSeekV4LaunchSparsePrefillByKV<QT, __nv_bfloat16>(
-            q, kv, cudaSink, outData, bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, softmaxScale);
+            q, kv, cudaSink, outData, bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio,
+            startPos, prefixLen, softmaxScale);
     }
     if (kv.dataType == fastllm::DataType::FLOAT16) {
         return DeepSeekV4LaunchSparsePrefillByKV<QT, half>(
-            q, kv, cudaSink, outData, bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, softmaxScale);
+            q, kv, cudaSink, outData, bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio,
+            startPos, prefixLen, softmaxScale);
     }
     if (kv.dataType == fastllm::DataType::FLOAT32) {
         return DeepSeekV4LaunchSparsePrefillByKV<QT, float>(
-            q, kv, cudaSink, outData, bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, softmaxScale);
+            q, kv, cudaSink, outData, bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio,
+            startPos, prefixLen, softmaxScale);
     }
     return false;
 }
@@ -1978,7 +2052,7 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data 
                                                             int originalSeqLen,
                                                             float ropeFactor, int betaFast,
                                                             int betaSlow, float softmaxScale,
-                                                            fastllm::Data &output) {
+                                                            fastllm::Data &output, int prefixLen) {
     if (q.dataDevice != fastllm::DataDevice::CUDA ||
         kv.dataDevice != fastllm::DataDevice::CUDA ||
         attnSink.dataDevice != fastllm::DataDevice::CUDA ||
@@ -1989,12 +2063,13 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data 
     }
     int bsz = q.dims[0], seqlen = q.dims[1], heads = q.dims[2], dim = q.dims[3];
     int kvLen = kv.dims[1];
+    int realPrefixLen = std::max(0, std::min(prefixLen, kvLen - seqlen));
     if (seqlen <= 0 || kv.dims[0] != bsz || kv.dims[2] != dim ||
-        kvLen < seqlen || attnSink.Count(0) != (uint64_t)heads) {
+        kvLen < realPrefixLen + seqlen || attnSink.Count(0) != (uint64_t)heads) {
         return false;
     }
-    int compressedCount = std::max(0, kvLen - seqlen);
-    int maxKeys = std::min(windowSize, seqlen) + (compressRatio > 0 ? compressedCount : 0);
+    int compressedCount = std::max(0, kvLen - realPrefixLen - seqlen);
+    int maxKeys = std::min(windowSize, realPrefixLen + seqlen) + (compressRatio > 0 ? compressedCount : 0);
     if (maxKeys <= 0 || maxKeys > kDeepSeekV4SparsePrefillMaxKeys) {
         return false;
     }
@@ -2013,15 +2088,15 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data 
     if (q.dataType == fastllm::DataType::BFLOAT16) {
         ok = DeepSeekV4LaunchSparsePrefillByQ<__nv_bfloat16>(
             q, kv, (const float *)attnSink.cudaData, cudaTemp,
-            bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, softmaxScale);
+            bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen, softmaxScale);
     } else if (q.dataType == fastllm::DataType::FLOAT16) {
         ok = DeepSeekV4LaunchSparsePrefillByQ<half>(
             q, kv, (const float *)attnSink.cudaData, cudaTemp,
-            bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, softmaxScale);
+            bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen, softmaxScale);
     } else if (q.dataType == fastllm::DataType::FLOAT32) {
         ok = DeepSeekV4LaunchSparsePrefillByQ<float>(
             q, kv, (const float *)attnSink.cudaData, cudaTemp,
-            bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, softmaxScale);
+            bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen, softmaxScale);
     }
     if (ok) {
         int rows = bsz * seqlen * heads;

@@ -243,7 +243,8 @@ bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data &q, const f
                                                  fastllm::Data &attnSink, int windowSize, int startPos,
                                                  int compressRatio, int ropeDim, float ropeBase,
                                                  int originalSeqLen, float ropeFactor, int betaFast,
-                                                 int betaSlow, float softmaxScale, fastllm::Data &output);
+                                                 int betaSlow, float softmaxScale, fastllm::Data &output,
+                                                 int prefixLen = 0);
 bool FastllmCudaDeepSeekV4WoA(const fastllm::Data &o, const fastllm::Data &woA, int groups, int oRank, fastllm::Data &output);
 bool FastllmCudaDeepSeekV4HcPost(const fastllm::Data &x, const fastllm::Data &residual, const float *post,
                                  const float *comb, int bsz, int seqlen, int hcMult, int dim,

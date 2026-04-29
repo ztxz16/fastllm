@@ -1232,11 +1232,35 @@ namespace fastllm {
         static void UpdateWindowKVCache(const std::vector<float> &kv, int bsz, int headDim,
                                         int startPos, int windowSize, std::vector<float> &windowKV) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4KVCache");
+            int seqlen = (int)(kv.size() / ((uint64_t)bsz * headDim));
             for (int b = 0; b < bsz; b++) {
-                memcpy(windowKV.data() + ((uint64_t)b * windowSize + (startPos % windowSize)) * headDim,
-                       kv.data() + (uint64_t)b * headDim,
-                       (uint64_t)headDim * sizeof(float));
+                for (int s = 0; s < seqlen; s++) {
+                    memcpy(windowKV.data() + ((uint64_t)b * windowSize + ((startPos + s) % windowSize)) * headDim,
+                           kv.data() + ((uint64_t)b * seqlen + s) * headDim,
+                           (uint64_t)headDim * sizeof(float));
+                }
             }
+        }
+
+        static int BuildWindowKVPrefixData(const std::vector<float> &windowKV, int bsz, int headDim,
+                                           int startPos, int windowSize, Data &output) {
+            int prefixLen = std::min(windowSize, startPos);
+            if (prefixLen <= 0 || windowKV.empty()) {
+                return 0;
+            }
+            ScopedExecutorProfiler executorProfile("DeepSeekV4KVCache");
+            std::vector<float> prefix((uint64_t)bsz * prefixLen * headDim);
+            int firstPos = startPos - prefixLen;
+            for (int b = 0; b < bsz; b++) {
+                for (int s = 0; s < prefixLen; s++) {
+                    int srcSlot = (firstPos + s) % windowSize;
+                    memcpy(prefix.data() + ((uint64_t)b * prefixLen + s) * headDim,
+                           windowKV.data() + ((uint64_t)b * windowSize + srcSlot) * headDim,
+                           (uint64_t)headDim * sizeof(float));
+                }
+            }
+            WriteFloatData(prefix, {bsz, prefixLen, headDim}, output, DataType::FLOAT32);
+            return prefixLen;
         }
 
         static void ComputeCompressorRaw(WeightMap &weight, const std::string &prefix, const Data &x,
@@ -1543,7 +1567,8 @@ namespace fastllm {
         static void SparseAttentionReference(Data &q, Data &kv, Data &attnSink, int windowSize,
                                              int ropeDim, float ropeBase, int startPos, float softmaxScale,
                                              Data &output, int compressRatio = 0, int originalSeqLen = 0,
-                                             float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
+                                             float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1,
+                                             int prefixLen = 0) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4SparseAttention");
 #ifdef USE_CUDA
             if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_PREFILL") &&
@@ -1565,7 +1590,7 @@ namespace fastllm {
                 if (FastllmCudaDeepSeekV4SparseAttentionPrefill(
                         *qForCuda, *kvForCuda, attnSink, windowSize, startPos, compressRatio,
                         ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow,
-                        softmaxScale, output)) {
+                        softmaxScale, output, prefixLen)) {
                     return;
                 }
             }
@@ -1575,20 +1600,24 @@ namespace fastllm {
             auto sinkPtr = ReadWeightFloatDataCached(attnSink);
             const auto &sink = *sinkPtr;
             int bsz = q.dims[0], seqlen = q.dims[1], heads = q.dims[2], dim = q.dims[3];
-            int windowTopk = std::min(windowSize, seqlen);
-            int compressedCount = std::max(0, kv.dims[1] - seqlen);
+            int realPrefixLen = std::max(0, std::min(prefixLen, kv.dims[1] - seqlen));
+            int compressedStart = realPrefixLen + seqlen;
+            int compressedCount = std::max(0, kv.dims[1] - compressedStart);
+            int prefixStartPos = startPos - realPrefixLen;
             std::vector<float> out((uint64_t)bsz * seqlen * heads * dim, 0.0f);
             for (int b = 0; b < bsz; b++) {
                 for (int s = 0; s < seqlen; s++) {
-                    std::vector<int> idxs(windowTopk, -1);
-                    int begin = std::max(0, s - windowSize + 1);
-                    for (int k = 0; k <= s - begin && k < windowTopk; k++) {
-                        idxs[k] = begin + k;
+                    int liveWindow = std::min(windowSize, realPrefixLen + s + 1);
+                    std::vector<int> idxs(liveWindow, -1);
+                    int beginPos = startPos + s - liveWindow + 1;
+                    for (int k = 0; k < liveWindow; k++) {
+                        int pos = beginPos + k;
+                        idxs[k] = (pos < startPos) ? (pos - prefixStartPos) : (realPrefixLen + pos - startPos);
                     }
                     if (compressRatio > 0) {
-                        int availableCompressed = (s + 1) / compressRatio;
+                        int availableCompressed = (startPos + s + 1) / compressRatio;
                         for (int k = 0; k < compressedCount; k++) {
-                            idxs.push_back(k < availableCompressed ? seqlen + k : -1);
+                            idxs.push_back(k < availableCompressed ? compressedStart + k : -1);
                         }
                     }
                     std::vector<float> scores(idxs.size());
@@ -2700,7 +2729,7 @@ namespace fastllm {
         }
         if (!debugFullRecomputeDecode && batch == 1 && inputIds.dims.size() >= 2 &&
             inputIds.dims[1] > 1 && originalStartPos > 0 &&
-            !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_PREFIX_CACHE_SEQUENTIAL")) {
+            EnvFlagEnabled("FASTLLM_DSV4_ENABLE_PREFIX_CACHE_SEQUENTIAL")) {
             std::vector<int> ret(1, 0);
             int seq = inputIds.dims[1];
             for (int s = 0; s < seq; s++) {
@@ -2848,6 +2877,8 @@ namespace fastllm {
             if (useDecodeCache && layer < (int)decodeLayerCaches.size()) {
                 decodeCache = &decodeLayerCaches[layer];
             }
+            Data chunkPrefixKV;
+            int chunkPrefixLen = 0;
             int decodeCompressedCount = 0;
             if (decodeCache != nullptr) {
                 if (startPos == 0) {
@@ -2872,10 +2903,15 @@ namespace fastllm {
                     if (!decodeCache->initialized) {
                         ErrorInFastLLM("DeepSeekV4Model: decode cache is not initialized.");
                     }
+                    if (seqlen > 1) {
+                        chunkPrefixLen = BuildWindowKVPrefixData(decodeCache->windowKV, bsz, head_dim_full,
+                                                                 startPos, window_size, chunkPrefixKV);
+                    }
                     decodeCache->totalLen = startPos + seqlen;
                     bool updatedWindowKVData = false;
 #ifdef USE_CUDA
                     if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") &&
+                        seqlen == 1 &&
                         kv.dataDevice == DataDevice::CUDA &&
                         decodeCache->windowKVData.dataDevice == DataDevice::CUDA) {
                         updatedWindowKVData = FastllmCudaDeepSeekV4UpdateWindowKVCache(
@@ -2946,9 +2982,23 @@ namespace fastllm {
             profileLap(layerProfile.cache);
 
             Data attnOut4, woAOut, attnOut;
-            // SparseAttentionDecodeCachedReference (both CUDA and CPU paths) only
-            // handles single-token queries. For chunked prefill (seqlen > 1), use
-            // full sparse attention instead.
+            Data sparsePrefillKV;
+            Data *sparsePrefillKVPtr = &kv;
+            int sparsePrefillPrefixLen = 0;
+            if (decodeCache != nullptr && startPos > 0 && seqlen > 1) {
+                sparsePrefillPrefixLen = chunkPrefixLen;
+                if (chunkPrefixLen > 0) {
+                    ConcatSeqReference(chunkPrefixKV, kv, sparsePrefillKV);
+                } else {
+                    sparsePrefillKV.CopyFrom(kv);
+                }
+                if (decodeCompressedCount > 0 && decodeCache->compressedKV.dims.size() >= 2) {
+                    Data catKV;
+                    ConcatSeqReference(sparsePrefillKV, decodeCache->compressedKV, catKV);
+                    sparsePrefillKV.CopyFrom(catKV);
+                }
+                sparsePrefillKVPtr = &sparsePrefillKV;
+            }
             if (decodeCache != nullptr && startPos > 0 && seqlen == 1) {
                 SparseAttentionDecodeCachedReference(q, decodeCache->windowKV, &decodeCache->windowKVData,
                                                      decodeCache->compressedKV, weight[pre + ".attn.attn_sink"],
@@ -2958,11 +3008,12 @@ namespace fastllm {
                                                      layerOriginalSeqLen, rope_factor,
                                                      rope_scaling_beta_fast, rope_scaling_beta_slow);
             } else {
-                SparseAttentionReference(q, kv, weight[pre + ".attn.attn_sink"], window_size,
+                SparseAttentionReference(q, *sparsePrefillKVPtr, weight[pre + ".attn.attn_sink"], window_size,
                                          qk_rope_head_dim, layerRopeBase, startPos,
                                          1.0f / std::sqrt((float)head_dim_full), attnOut4,
                                          compressRatio, layerOriginalSeqLen, rope_factor,
-                                         rope_scaling_beta_fast, rope_scaling_beta_slow);
+                                         rope_scaling_beta_fast, rope_scaling_beta_slow,
+                                         sparsePrefillPrefixLen);
             }
             profileLap(layerProfile.sparseAttn);
             WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
