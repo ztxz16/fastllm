@@ -2299,6 +2299,8 @@ namespace fastllm {
         } else if (this->dataType == DATA_GGUF_FORMAT) {
             ret += sizeof(int);
             ret += this->GetBytes();
+        } else if (this->dataType == INT32 || this->dataType == INT32PARAM) {
+            ret += this->GetBytes();
         } else {
             ErrorInFastLLM("ExportFastllmFormat Error: data type error.");
         }
@@ -2344,6 +2346,8 @@ namespace fastllm {
             writer.WriteBytes(this->cpuData, this->GetBytes());
         } else if (this->dataType == DATA_GGUF_FORMAT) {
             writer.WriteInt(this->ggmlType);
+            writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else if (this->dataType == INT32 || this->dataType == INT32PARAM) {
             writer.WriteBytes(this->cpuData, this->GetBytes());
         } else {
             ErrorInFastLLM("ExportFastllmFormat Error: data type error.");
@@ -2417,6 +2421,8 @@ namespace fastllm {
                 }
                 reader.ReadBytes(this->cpuData, this->GetBytes());
             } else if (this->dataType == DATA_GGUF_FORMAT) {
+                reader.ReadBytes(this->cpuData, this->GetBytes());
+            } else if (this->dataType == INT32 || this->dataType == INT32PARAM) {
                 reader.ReadBytes(this->cpuData, this->GetBytes());
             } else {
                 ErrorInFastLLM("CreateFromFastllmFormat Error: data type error.");
