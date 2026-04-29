@@ -3117,8 +3117,6 @@ namespace fastllm {
             float layerRopeBase = useCompressRope ? compress_rope_theta : rope_base;
             int layerOriginalSeqLen = useCompressRope ? (int)rope_scaling_original_max_position_embeddings : 0;
 
-            Data residual;
-            residual.CopyFrom(hiddenStates);
             HcMix attnMix = HcPreReference(hiddenStates, weight[pre + ".hc_attn_fn"],
                                            weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
                                            hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
@@ -3288,12 +3286,11 @@ namespace fastllm {
             if (debugThisStep && layer == debugDetailLayer) {
                 DebugDumpData("layer" + std::to_string(layer) + "_attn_out", attnOut);
             }
-            HcPostReference(attnOut, residual, attnMix, hiddenStates);
+            HcPostReference(attnOut, hiddenStates, attnMix, hiddenStates);
             if (debugThisStep && layer == debugDetailLayer) {
                 DebugDumpData("layer" + std::to_string(layer) + "_after_attn", hiddenStates);
             }
 
-            residual.CopyFrom(hiddenStates);
             HcMix ffnMix = HcPreReference(hiddenStates, weight[pre + ".hc_ffn_fn"],
                                           weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
                                           hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
@@ -3334,7 +3331,7 @@ namespace fastllm {
             if (debugThisStep && layer == debugDetailLayer) {
                 DebugDumpData("layer" + std::to_string(layer) + "_ffn_out", ffnOut);
             }
-            HcPostReference(ffnOut, residual, ffnMix, hiddenStates);
+            HcPostReference(ffnOut, hiddenStates, ffnMix, hiddenStates);
             if (debugThisStep && debugDumpStates) {
                 DebugDumpData("layer" + std::to_string(layer), hiddenStates);
             }
