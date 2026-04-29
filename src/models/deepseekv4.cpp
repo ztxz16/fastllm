@@ -144,16 +144,6 @@ namespace fastllm {
             }
         };
 
-        static void ProfileSyncIfNeeded(bool sync) {
-#ifdef USE_CUDA
-            if (sync) {
-                ForceDeviceSync();
-            }
-#else
-            (void)sync;
-#endif
-        }
-
         static uint64_t CachedWeightMaxBytes() {
             static uint64_t maxBytes = []() -> uint64_t {
                 int mb = EnvInt("FASTLLM_WEIGHT_CACHE_MAX_MB", 256);
@@ -227,35 +217,6 @@ namespace fastllm {
                 CachedWeightFloats()[&input] = std::move(cached);
             }
             return values;
-        }
-
-        struct DeepSeekV4LayerProfile {
-            double attnPrep = 0.0;
-            double cache = 0.0;
-            double sparseAttn = 0.0;
-            double attnOut = 0.0;
-            double route = 0.0;
-            double moeMove = 0.0;
-            double moe = 0.0;
-            double ffnPost = 0.0;
-            double attnHcPre = 0.0;
-            double attnNorm = 0.0;
-            double qProj = 0.0;
-            double qPost = 0.0;
-            double kvProjNorm = 0.0;
-            double kvPost = 0.0;
-            double attnWoA = 0.0;
-            double attnWoB = 0.0;
-            double attnHcPost = 0.0;
-            double ffnHcPre = 0.0;
-            double ffnNorm = 0.0;
-            double routeGate = 0.0;
-            double routeScore = 0.0;
-        };
-
-        static double LayerProfileTotal(const DeepSeekV4LayerProfile &p) {
-            return p.attnPrep + p.cache + p.sparseAttn + p.attnOut +
-                   p.route + p.moeMove + p.moe + p.ffnPost;
         }
 
         static uint64_t CountDims(const std::vector<int> &dims) {
@@ -2057,27 +2018,11 @@ namespace fastllm {
         static void BuildMoERoutingData(WeightMap &weight, const std::string &prefix, const Data &x,
                                         const std::vector<int> &inputIds, int nRoutedExperts,
                                         int topk, const std::string &scoreFunc, float routeScale,
-                                        Data &expertIndex, Data &expertScore,
-                                        DeepSeekV4LayerProfile *profile = nullptr, bool profileSync = false) {
+                                        Data &expertIndex, Data &expertScore) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4RouteScore");
-            if (profile != nullptr) {
-                ProfileSyncIfNeeded(profileSync);
-            }
-            double detailLastMs = NowMs();
-            auto detailLap = [&](double &bucket) {
-                if (profile == nullptr) {
-                    return;
-                }
-                ProfileSyncIfNeeded(profileSync);
-                double now = NowMs();
-                bucket += now - detailLastMs;
-                detailLastMs = now;
-            };
-
             Data xFloat, routerLogits;
             ToDataType(x, xFloat, DataType::FLOAT32);
             Linear(xFloat, weight[prefix + ".gate.weight"], Data(), routerLogits, true);
-            detailLap(profile != nullptr ? profile->routeGate : detailLastMs);
 
 #ifdef USE_CUDA
             bool hashRoutingForCuda = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
@@ -2089,7 +2034,6 @@ namespace fastllm {
                                                         inputIds.data(), x.dims[0], topk,
                                                         scoreFuncMode, routeScale,
                                                         expertIndex, expertScore)) {
-                    detailLap(profile != nullptr ? profile->routeScore : detailLastMs);
                     return;
                 }
             }
@@ -2110,7 +2054,6 @@ namespace fastllm {
                     bool needNorm = scoreFunc != "softmax";
                     if (FastllmCudaSelectExpert(routerLogits, gateBiasData, expertIndex, expertScore,
                                                 topk, needNorm, routeScale)) {
-                        detailLap(profile != nullptr ? profile->routeScore : detailLastMs);
                         return;
                     }
                 }
@@ -2199,7 +2142,6 @@ namespace fastllm {
 
             WriteIntData(indices, {tokens, topk}, expertIndex);
             WriteFloatData(weights, {tokens, topk}, expertScore, DataType::FLOAT32);
-            detailLap(profile != nullptr ? profile->routeScore : detailLastMs);
         }
 
         static void MoEReference(WeightMap &weight, const std::string &prefix, const Data &x,
@@ -3024,40 +2966,6 @@ namespace fastllm {
                                                    const LastTokensManager &lastTokens,
                                                    std::vector <std::vector <float>*> *retLogits) {
         ScopedExecutorProfiler forwardOtherProfile("DeepSeekV4ForwardOther");
-        bool profileEnabled = EnvFlagEnabled("FASTLLM_PROFILE") || EnvFlagEnabled("FASTLLM_PROFILE_DEEPSEEKV4");
-        bool profileSync = profileEnabled && !EnvFlagEnabled("FASTLLM_PROFILE_NO_SYNC");
-        double profileLastMs = NowMs();
-        auto profileLap = [&](double &bucket) {
-            if (!profileEnabled) {
-                return;
-            }
-            ProfileSyncIfNeeded(profileSync);
-            double now = NowMs();
-            bucket += now - profileLastMs;
-            profileLastMs = now;
-        };
-        auto profileLapDetail = [&](double &bucket, double &detailBucket) {
-            if (!profileEnabled) {
-                return;
-            }
-            ProfileSyncIfNeeded(profileSync);
-            double now = NowMs();
-            double span = now - profileLastMs;
-            bucket += span;
-            detailBucket += span;
-            profileLastMs = now;
-        };
-        double profilePrepareMs = 0.0;
-        double profileEmbedMs = 0.0;
-        double profileDebugDumpMs = 0.0;
-        double profileHcExpandMs = 0.0;
-        double profileSetupMs = 0.0;
-        double profileLayersMs = 0.0;
-        double profileHeadMs = 0.0;
-        double profileLogitsDumpMs = 0.0;
-        double profileTopkMs = 0.0;
-        double profilePastMs = 0.0;
-        std::vector<DeepSeekV4LayerProfile> layerProfiles;
         bool debugStopNow = false;
         Data hiddenStates;
         int startPos = 0;
@@ -3148,16 +3056,12 @@ namespace fastllm {
             debugGeneratedTokens = 0;
         }
 
-        profileLap(profilePrepareMs);
         if (debugThisStep || debugFullRecomputeDecode) {
             DebugDumpInputIds(*forwardInputIds, originalStartPos);
-            profileLap(profileDebugDumpMs);
         }
         Embedding(*forwardInputIds, weight["embed.weight"], hiddenStates);
-        profileLap(profileEmbedMs);
         if (debugThisStep && debugDumpStates) {
             DebugDumpData("embed", hiddenStates);
-            profileLap(profileDebugDumpMs);
         }
 
         int bsz = forwardInputIds->dims[0];
@@ -3178,10 +3082,8 @@ namespace fastllm {
             }
             WriteFloatData(expanded, {bsz, seqlen, hc_mult, dim}, hiddenStates, hiddenStates.dataType);
         }
-        profileLap(profileHcExpandMs);
         if (debugThisStep && debugDumpStates) {
             DebugDumpData("hc_expand", hiddenStates);
-            profileLap(profileDebugDumpMs);
         }
 
         if (block_cnt <= 0) {
@@ -3240,9 +3142,7 @@ namespace fastllm {
                 }
             }
         }
-        profileLap(profileSetupMs);
         for (int layer = 0; layer < debugLayers; layer++) {
-            DeepSeekV4LayerProfile layerProfile;
             std::string pre = "layers." + std::to_string(layer);
             int compressRatio = compress_ratios.size() > layer ? compress_ratios[layer] : 0;
             bool useCompressRope = compressRatio != 0;
@@ -3254,32 +3154,26 @@ namespace fastllm {
             HcMix attnMix = HcPreReference(hiddenStates, weight[pre + ".hc_attn_fn"],
                                            weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
                                            hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
-            profileLapDetail(layerProfile.attnPrep, layerProfile.attnHcPre);
             Data attnInput;
             RMSNormReference(attnMix.y, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput, DataType::BFLOAT16);
-            profileLapDetail(layerProfile.attnPrep, layerProfile.attnNorm);
 
             Data qr, qNorm, q;
             Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr);
             RMSNormReference(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm, DataType::BFLOAT16);
             Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
-            profileLapDetail(layerProfile.attnPrep, layerProfile.qProj);
             q.Reshape({bsz, seqlen, num_attention_heads, head_dim_full});
             ScaleQRotary(q, rms_norm_eps, qk_rope_head_dim, layerRopeBase, startPos,
                          layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
                          rope_scaling_beta_slow);
-            profileLapDetail(layerProfile.attnPrep, layerProfile.qPost);
 
             Data kv;
             Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv);
             RMSNormReference(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv, DataType::BFLOAT16);
-            profileLapDetail(layerProfile.attnPrep, layerProfile.kvProjNorm);
             kv.Reshape({bsz, seqlen, 1, head_dim_full});
             RotaryQuant(kv, qk_rope_head_dim, layerRopeBase, startPos,
                         layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
                         rope_scaling_beta_slow, head_dim_full - qk_rope_head_dim, 64);
             kv.Reshape({bsz, seqlen, head_dim_full});
-            profileLapDetail(layerProfile.attnPrep, layerProfile.kvPost);
             DeepSeekV4DecodeLayerCache *decodeCache = nullptr;
             if (useDecodeCache && layer < (int)decodeLayerCaches.size()) {
                 decodeCache = &decodeLayerCaches[layer];
@@ -3386,7 +3280,6 @@ namespace fastllm {
                     }
                 }
             }
-            profileLap(layerProfile.cache);
 
             Data attnOut4, woAOut, attnOut;
             Data sparsePrefillKV;
@@ -3422,16 +3315,12 @@ namespace fastllm {
                                          rope_scaling_beta_fast, rope_scaling_beta_slow,
                                          sparsePrefillPrefixLen);
             }
-            profileLap(layerProfile.sparseAttn);
             WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
-            profileLapDetail(layerProfile.attnOut, layerProfile.attnWoA);
             Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
-            profileLapDetail(layerProfile.attnOut, layerProfile.attnWoB);
             if (debugThisStep && layer == debugDetailLayer) {
                 DebugDumpData("layer" + std::to_string(layer) + "_attn_out", attnOut);
             }
             HcPostReference(attnOut, residual, attnMix, hiddenStates);
-            profileLapDetail(layerProfile.attnOut, layerProfile.attnHcPost);
             if (debugThisStep && layer == debugDetailLayer) {
                 DebugDumpData("layer" + std::to_string(layer) + "_after_attn", hiddenStates);
             }
@@ -3440,10 +3329,8 @@ namespace fastllm {
             HcMix ffnMix = HcPreReference(hiddenStates, weight[pre + ".hc_ffn_fn"],
                                           weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
                                           hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
-            profileLapDetail(layerProfile.route, layerProfile.ffnHcPre);
             Data ffnInput, ffnOut;
             RMSNormReference(ffnMix.y, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput, DataType::BFLOAT16);
-            profileLapDetail(layerProfile.route, layerProfile.ffnNorm);
             if (debugThisStep && layer == debugDetailLayer) {
                 DebugDumpData("layer" + std::to_string(layer) + "_ffn_in", ffnInput);
             }
@@ -3452,9 +3339,7 @@ namespace fastllm {
             Data expertIndex, expertScore;
             BuildMoERoutingData(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
                                 num_experts_per_tok, scoring_func, routed_scaling_factor,
-                                expertIndex, expertScore,
-                                profileEnabled ? &layerProfile : nullptr, profileSync);
-            profileLap(layerProfile.route);
+                                expertIndex, expertScore);
             if (layer >= (int)weights.size() || weights[layer].empty() ||
                 weights[layer][0] == nullptr || weights[layer][1] == nullptr ||
                 weights[layer].size() < 4 || weights[layer][2] == nullptr || weights[layer][3] == nullptr ||
@@ -3462,7 +3347,6 @@ namespace fastllm {
                 ffnInput.Reshape(ffnDims);
                 MoEReference(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
                              num_experts_per_tok, scoring_func, routed_scaling_factor, swiglu_limit, ffnOut);
-                profileLap(layerProfile.moe);
             } else {
                 Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
                 ApplyDeviceMap(this->moeDeviceMap, layer + 1, block_cnt);
@@ -3470,16 +3354,13 @@ namespace fastllm {
                 ffnInput.ToDevice(DataDevice::CPU);
                 expertIndex.ToDevice(DataDevice::CPU);
                 expertScore.ToDevice(DataDevice::CPU);
-                profileLap(layerProfile.moeMove);
                 MergeMOEBlock(&ffnInput, &expertIndex, &expertScore,
                               &weights[layer], &biass[layer],
                               &w1, &w2, &w3, &tempInput, &tempOutput,
                               1.0f, &ffnOut, layer,
                               ffnInput.dataType, this->moeAtype,
                               &moeInputTemp, &moeOutputTemp);
-                profileLap(layerProfile.moe);
                 ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
-                profileLap(layerProfile.moeMove);
             }
             ffnOut.Reshape(ffnDims);
             if (debugThisStep && layer == debugDetailLayer) {
@@ -3488,11 +3369,6 @@ namespace fastllm {
             HcPostReference(ffnOut, residual, ffnMix, hiddenStates);
             if (debugThisStep && debugDumpStates) {
                 DebugDumpData("layer" + std::to_string(layer), hiddenStates);
-            }
-            profileLap(layerProfile.ffnPost);
-            if (profileEnabled) {
-                profileLayersMs += LayerProfileTotal(layerProfile);
-                layerProfiles.push_back(layerProfile);
             }
         }
 
@@ -3507,10 +3383,8 @@ namespace fastllm {
         RMSNormReference(headInput, weight["norm.weight"], rms_norm_eps, normed, DataType::BFLOAT16);
         Linear(normed, weight["head.weight"], Data(), logits);
         ToDataType(logits, DataType::FLOAT32);
-        profileLap(profileHeadMs);
         if (debugLogitsThisStep) {
             DebugDumpData("logits", logits);
-            profileLap(profileLogitsDumpMs);
         }
         if (originalStartPos == 0 && std::getenv("FASTLLM_DEBUG_EXIT_AFTER_PREFILL") != nullptr) {
             fflush(stdout);
@@ -3539,7 +3413,6 @@ namespace fastllm {
                 ret.push_back((int)(((float*)topk.cpuData)[b * 2] + 1e-3));
             }
         }
-        profileLap(profileTopkMs);
 
         if (debugFullRecomputeDecode) {
             debugGeneratedTokens++;
@@ -3567,33 +3440,6 @@ namespace fastllm {
                    batch == 1 && finalTotalLen % 256 == 0 && DeepSeekV4PrefixCacheDebugEnabled()) {
             printf("[fastllm-dsv4-prefix-cache] skip boundary record: final_len=%d history_tokens=%d\n",
                    finalTotalLen, (int)this->deepseekV4HistoryTokens.size());
-            fflush(stdout);
-        }
-        profileLap(profilePastMs);
-        if (profileEnabled) {
-            double totalMs = profilePrepareMs + profileEmbedMs + profileDebugDumpMs +
-                             profileHcExpandMs + profileSetupMs + profileLayersMs +
-                             profileHeadMs + profileLogitsDumpMs + profileTopkMs + profilePastMs;
-            printf("[fastllm-profile] step start_pos=%d seqlen=%d batch=%d mode=%s token=%d total_ms=%.3f\n",
-                   originalStartPos, seqlen, batch, originalStartPos == 0 ? "prefill" : "decode",
-                   ret.empty() ? -1 : ret[0], totalMs);
-            printf("[fastllm-profile]   prepare=%.3f embed=%.3f debug_dump=%.3f hc_expand=%.3f setup=%.3f layers=%.3f head=%.3f logits_dump=%.3f topk=%.3f past=%.3f\n",
-                   profilePrepareMs, profileEmbedMs, profileDebugDumpMs, profileHcExpandMs,
-                   profileSetupMs, profileLayersMs, profileHeadMs, profileLogitsDumpMs,
-                   profileTopkMs, profilePastMs);
-            for (int i = 0; i < (int)layerProfiles.size(); i++) {
-                const auto &p = layerProfiles[i];
-                printf("[fastllm-profile]   layer=%02d total=%.3f attn_prep=%.3f cache=%.3f sparse_attn=%.3f attn_out=%.3f route=%.3f moe_move=%.3f moe=%.3f ffn_post=%.3f\n",
-                       i, LayerProfileTotal(p), p.attnPrep, p.cache, p.sparseAttn,
-                       p.attnOut, p.route, p.moeMove, p.moe, p.ffnPost);
-                if (EnvFlagEnabled("FASTLLM_PROFILE_DETAIL")) {
-                    printf("[fastllm-profile-detail] layer=%02d attn_hc_pre=%.3f attn_norm=%.3f q_proj=%.3f q_post=%.3f kv_proj_norm=%.3f kv_post=%.3f attn_woa=%.3f attn_wob=%.3f attn_hc_post=%.3f ffn_hc_pre=%.3f ffn_norm=%.3f route_gate=%.3f route_score=%.3f\n",
-                           i, p.attnHcPre, p.attnNorm, p.qProj, p.qPost,
-                           p.kvProjNorm, p.kvPost, p.attnWoA, p.attnWoB,
-                           p.attnHcPost, p.ffnHcPre, p.ffnNorm, p.routeGate,
-                           p.routeScore);
-                }
-            }
             fflush(stdout);
         }
         if (debugStopNow) {
