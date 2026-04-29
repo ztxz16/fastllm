@@ -2343,10 +2343,365 @@ namespace fastllm {
         }
     }
 
+    static uint64_t DeepSeekV4TokenBlockHash(const std::vector<int> &tokens, int len, int blockSize) {
+        uint64_t h = 1469598103934665603ULL;
+        auto mix = [&](uint64_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            h *= 1099511628211ULL;
+        };
+        mix((uint64_t)blockSize);
+        for (int i = 0; i < len; i++) {
+            mix((uint64_t)(uint32_t)tokens[i]);
+            if ((i + 1) % blockSize == 0) {
+                mix(0xff51afd7ed558ccdULL ^ (uint64_t)((i + 1) / blockSize));
+            }
+        }
+        return h;
+    }
+
+    static bool DeepSeekV4PrefixCacheDebugEnabled() {
+        return EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_DEBUG") ||
+               EnvFlagEnabled("FASTLLM_DSV4_DEBUG_PREFIX_CACHE");
+    }
+
+    static bool DeepSeekV4PrefixCacheDisabled() {
+        return EnvFlagEnabled("FASTLLM_DSV4_DISABLE_PREFIX_CACHE");
+    }
+
+    void DeepSeekV4HistoryCacheManager::SetMaxRecordNum(int maxRecordNum) {
+        std::lock_guard<std::mutex> guard(this->locker);
+        this->maxRecordNum = std::max(1, maxRecordNum);
+    }
+
+    void DeepSeekV4HistoryCacheManager::Record(const DeepSeekV4HistoryCacheMemory &memory) {
+        if (memory.tokens <= 0 || memory.tokens % this->logicalBlockSize != 0 ||
+            (int)memory.inputToken.size() != memory.tokens || memory.layers.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(this->locker);
+        int envMax = EnvInt("FASTLLM_DSV4_PREFIX_CACHE_MAX_RECORDS", this->maxRecordNum);
+        this->maxRecordNum = std::max(1, envMax);
+
+        auto old = this->memorys.find(memory.inputToken);
+        if (old != this->memorys.end()) {
+            old->second = memory;
+            old->second.recordTimes++;
+            old->second.flushTime = ++this->flushTime;
+            this->blockIndex[old->second.blockHash] = old->second.inputToken;
+            return;
+        }
+
+        while ((int)this->memorys.size() >= this->maxRecordNum) {
+            auto eraseIt = this->memorys.end();
+            long long minFlushTime = (1LL << 60);
+            for (auto it = this->memorys.begin(); it != this->memorys.end(); ++it) {
+                if (it->second.flushTime < minFlushTime) {
+                    minFlushTime = it->second.flushTime;
+                    eraseIt = it;
+                }
+            }
+            if (eraseIt == this->memorys.end()) {
+                break;
+            }
+            auto blockIt = this->blockIndex.find(eraseIt->second.blockHash);
+            if (blockIt != this->blockIndex.end() && blockIt->second == eraseIt->second.inputToken) {
+                this->blockIndex.erase(blockIt);
+            }
+            this->memorys.erase(eraseIt);
+        }
+
+        auto inserted = this->memorys.emplace(memory.inputToken, memory);
+        inserted.first->second.recordTimes = 1;
+        inserted.first->second.flushTime = ++this->flushTime;
+        this->blockIndex[inserted.first->second.blockHash] = inserted.first->second.inputToken;
+    }
+
+    bool DeepSeekV4HistoryCacheManager::Get(const std::vector<int> &inputToken,
+                                            DeepSeekV4HistoryCacheMemory &memory,
+                                            int &hitLen) {
+        hitLen = 0;
+        if ((int)inputToken.size() <= this->logicalBlockSize) {
+            return false;
+        }
+        std::lock_guard<std::mutex> guard(this->locker);
+        if (this->memorys.empty()) {
+            return false;
+        }
+
+        int maxAligned = ((int)inputToken.size() - 1) / this->logicalBlockSize * this->logicalBlockSize;
+        for (int len = maxAligned; len >= this->logicalBlockSize; len -= this->logicalBlockSize) {
+            uint64_t hash = DeepSeekV4TokenBlockHash(inputToken, len, this->logicalBlockSize);
+            auto idxIt = this->blockIndex.find(hash);
+            if (idxIt == this->blockIndex.end() || (int)idxIt->second.size() != len) {
+                continue;
+            }
+            auto memIt = this->memorys.find(idxIt->second);
+            if (memIt == this->memorys.end()) {
+                continue;
+            }
+            bool match = true;
+            for (int i = 0; i < len; i++) {
+                if (inputToken[i] != memIt->second.inputToken[i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (!match) {
+                continue;
+            }
+            memIt->second.flushTime = ++this->flushTime;
+            memory = memIt->second;
+            hitLen = len;
+            return true;
+        }
+
+        for (auto &it : this->memorys) {
+            int len = (int)it.first.size();
+            if (len <= hitLen || len > maxAligned) {
+                continue;
+            }
+            bool match = true;
+            for (int i = 0; i < len; i++) {
+                if (inputToken[i] != it.first[i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                hitLen = len;
+                memory = it.second;
+            }
+        }
+        if (hitLen > 0) {
+            this->memorys[memory.inputToken].flushTime = ++this->flushTime;
+            return true;
+        }
+        return false;
+    }
+
+    bool DeepSeekV4Model::RestoreHistoryCacheMemory(const DeepSeekV4HistoryCacheMemory &memory) {
+        if (memory.tokens <= 0 || memory.layers.empty()) {
+            return false;
+        }
+        this->decodeLayerCaches.clear();
+        this->decodeLayerCaches.resize(memory.layers.size());
+        for (int i = 0; i < (int)memory.layers.size(); i++) {
+            const auto &src = memory.layers[i];
+            auto &dst = this->decodeLayerCaches[i];
+            dst.initialized = src.initialized;
+            dst.bsz = src.bsz;
+            dst.totalLen = src.totalLen;
+            dst.headDim = src.headDim;
+            dst.windowSize = src.windowSize;
+            dst.compressRatio = src.compressRatio;
+            dst.compressorWideDim = src.compressorWideDim;
+            dst.windowKV = src.windowKV;
+            dst.compressedBlocks = src.compressedBlocks;
+            dst.compressedTokenBase = src.compressedTokenBase;
+            dst.rawTailStartPos = src.rawTailStartPos;
+            dst.compressorTailKV = src.compressorTailKV;
+            dst.compressorTailScore = src.compressorTailScore;
+
+            ResetData(dst.windowKVData);
+            ResetData(dst.compressedKV);
+            if (src.compressedBlocks > 0 && src.compressedKV.dims.size() >= 2) {
+                dst.compressedKV.CopyFrom(src.compressedKV);
+            }
+
+            if (!src.compressorKVRaw.empty()) {
+                dst.compressorKVRaw = src.compressorKVRaw;
+                dst.compressorScoreRaw = src.compressorScoreRaw;
+            } else if (src.compressRatio > 0 && src.compressorWideDim > 0 &&
+                       !src.compressorTailKV.empty() && !src.compressorTailScore.empty()) {
+                uint64_t rawSize = (uint64_t)src.bsz * src.totalLen * src.compressorWideDim;
+                dst.compressorKVRaw.assign(rawSize, 0.0f);
+                dst.compressorScoreRaw.assign(rawSize, 0.0f);
+                int tailTokens = (int)(src.compressorTailKV.size() /
+                                       ((uint64_t)std::max(1, src.bsz) * src.compressorWideDim));
+                int tailStart = std::max(0, std::min(src.rawTailStartPos, src.totalLen));
+                tailTokens = std::min(tailTokens, src.totalLen - tailStart);
+                for (int b = 0; b < src.bsz; b++) {
+                    memcpy(dst.compressorKVRaw.data() + ((uint64_t)b * src.totalLen + tailStart) * src.compressorWideDim,
+                           src.compressorTailKV.data() + (uint64_t)b * tailTokens * src.compressorWideDim,
+                           (uint64_t)tailTokens * src.compressorWideDim * sizeof(float));
+                    memcpy(dst.compressorScoreRaw.data() + ((uint64_t)b * src.totalLen + tailStart) * src.compressorWideDim,
+                           src.compressorTailScore.data() + (uint64_t)b * tailTokens * src.compressorWideDim,
+                           (uint64_t)tailTokens * src.compressorWideDim * sizeof(float));
+                }
+            } else {
+                dst.compressorKVRaw.clear();
+                dst.compressorScoreRaw.clear();
+            }
+
+#ifdef USE_CUDA
+            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") &&
+                DeepSeekV4PreferCuda() && !dst.windowKV.empty() && dst.bsz > 0 &&
+                dst.windowSize > 0 && dst.headDim > 0) {
+                WriteFloatData(dst.windowKV, {dst.bsz, dst.windowSize, dst.headDim},
+                               dst.windowKVData, DataType::FLOAT32);
+                dst.windowKVData.ToDevice(DataDevice::CUDA);
+            }
+#endif
+        }
+        this->deepseekV4HistoryTokens = memory.inputToken;
+        if (DeepSeekV4PrefixCacheDebugEnabled()) {
+            printf("[fastllm-dsv4-prefix-cache] restore hit_len=%d blocks=%d layers=%d\n",
+                   memory.tokens, memory.blockCount, (int)memory.layers.size());
+            for (int i = 0; i < (int)this->decodeLayerCaches.size(); i++) {
+                const auto &layer = this->decodeLayerCaches[i];
+                printf("[fastllm-dsv4-prefix-cache]   layer=%02d ratio=%d total_len=%d compressed_blocks=%d window=%d raw_tail_start=%d tail_tokens=%d\n",
+                       i, layer.compressRatio, layer.totalLen, layer.compressedBlocks,
+                       (int)(layer.windowKV.size() / std::max(1, layer.headDim)),
+                       layer.rawTailStartPos,
+                       layer.compressorWideDim > 0 && layer.bsz > 0 ?
+                           (int)(layer.compressorTailKV.size() / ((uint64_t)layer.bsz * layer.compressorWideDim)) : 0);
+            }
+            fflush(stdout);
+        }
+        return true;
+    }
+
+    void DeepSeekV4Model::RecordHistorySnapshot(const std::vector<int> &tokens, int totalLen) {
+        if (!this->saveHistoryChat || DeepSeekV4PrefixCacheDisabled() ||
+            totalLen <= 0 || totalLen % 256 != 0 || (int)tokens.size() < totalLen ||
+            this->decodeLayerCaches.empty()) {
+            return;
+        }
+        DeepSeekV4HistoryCacheMemory memory;
+        memory.tokens = totalLen;
+        memory.blockCount = totalLen / 256;
+        memory.inputToken.assign(tokens.begin(), tokens.begin() + totalLen);
+        memory.blockHash = DeepSeekV4TokenBlockHash(memory.inputToken, totalLen, 256);
+        memory.layers.resize(this->decodeLayerCaches.size());
+        bool storeFullRaw = EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_FULL_RAW");
+        for (int i = 0; i < (int)this->decodeLayerCaches.size(); i++) {
+            const auto &src = this->decodeLayerCaches[i];
+            auto &dst = memory.layers[i];
+            if (!src.initialized || src.totalLen != totalLen) {
+                return;
+            }
+            dst.initialized = src.initialized;
+            dst.bsz = src.bsz;
+            dst.totalLen = src.totalLen;
+            dst.headDim = src.headDim;
+            dst.windowSize = src.windowSize;
+            dst.compressRatio = src.compressRatio;
+            dst.compressorWideDim = src.compressorWideDim;
+            dst.windowKV = src.windowKV;
+            dst.compressedBlocks = src.compressedBlocks;
+            dst.compressedTokenBase = src.compressedBlocks * std::max(1, src.compressRatio);
+            dst.compressedKV = Data();
+            if (src.compressedBlocks > 0 && src.compressedKV.dims.size() >= 2) {
+                dst.compressedKV.CopyFrom(src.compressedKV);
+                dst.compressedKV.ToDevice(DataDevice::CPU);
+                dst.compressedKV.lockInCPU = true;
+            }
+
+            if (src.compressRatio > 0 && src.compressorWideDim > 0) {
+                int tailTokens = src.compressRatio == 4 ? 8 : (src.compressRatio == 128 ? 128 : src.compressRatio);
+                tailTokens = std::min(tailTokens, src.totalLen);
+                dst.rawTailStartPos = src.totalLen - tailTokens;
+                if (storeFullRaw) {
+                    dst.compressorKVRaw = src.compressorKVRaw;
+                    dst.compressorScoreRaw = src.compressorScoreRaw;
+                }
+                if (!src.compressorKVRaw.empty() && !src.compressorScoreRaw.empty()) {
+                    dst.compressorTailKV.assign((uint64_t)src.bsz * tailTokens * src.compressorWideDim, 0.0f);
+                    dst.compressorTailScore.assign((uint64_t)src.bsz * tailTokens * src.compressorWideDim, 0.0f);
+                    for (int b = 0; b < src.bsz; b++) {
+                        memcpy(dst.compressorTailKV.data() + (uint64_t)b * tailTokens * src.compressorWideDim,
+                               src.compressorKVRaw.data() + ((uint64_t)b * src.totalLen + dst.rawTailStartPos) * src.compressorWideDim,
+                               (uint64_t)tailTokens * src.compressorWideDim * sizeof(float));
+                        memcpy(dst.compressorTailScore.data() + (uint64_t)b * tailTokens * src.compressorWideDim,
+                               src.compressorScoreRaw.data() + ((uint64_t)b * src.totalLen + dst.rawTailStartPos) * src.compressorWideDim,
+                               (uint64_t)tailTokens * src.compressorWideDim * sizeof(float));
+                    }
+                }
+            }
+        }
+        this->deepseekV4HistoryCacheManager.Record(memory);
+        if (DeepSeekV4PrefixCacheDebugEnabled()) {
+            printf("[fastllm-dsv4-prefix-cache] record tokens=%d blocks=%d layers=%d residual_only=%d\n",
+                   totalLen, memory.blockCount, (int)memory.layers.size(), storeFullRaw ? 0 : 1);
+            fflush(stdout);
+        }
+    }
+
+    bool DeepSeekV4Model::TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) {
+        bool debugPrefixCache = DeepSeekV4PrefixCacheDebugEnabled();
+        if (!this->saveHistoryChat) {
+            if (debugPrefixCache) {
+                printf("[fastllm-dsv4-prefix-cache] disabled: cache_history is off input_tokens=%d\n",
+                       (int)inputTokens.size());
+                fflush(stdout);
+            }
+            return false;
+        }
+        if (DeepSeekV4PrefixCacheDisabled()) {
+            if (debugPrefixCache) {
+                printf("[fastllm-dsv4-prefix-cache] disabled: FASTLLM_DSV4_DISABLE_PREFIX_CACHE input_tokens=%d\n",
+                       (int)inputTokens.size());
+                fflush(stdout);
+            }
+            return false;
+        }
+        if (inputTokens.size() <= 256) {
+            if (debugPrefixCache) {
+                printf("[fastllm-dsv4-prefix-cache] skip: input_tokens=%d <= logical_block=256\n",
+                       (int)inputTokens.size());
+                fflush(stdout);
+            }
+            return false;
+        }
+        DeepSeekV4HistoryCacheMemory memory;
+        int hitLen = 0;
+        if (!this->deepseekV4HistoryCacheManager.Get(inputTokens, memory, hitLen) || hitLen <= 0) {
+            if (debugPrefixCache) {
+                int alignedProbeLen = ((int)inputTokens.size() - 1) / 256 * 256;
+                printf("[fastllm-dsv4-prefix-cache] miss input_tokens=%d aligned_probe=%d\n",
+                       (int)inputTokens.size(), alignedProbeLen);
+                fflush(stdout);
+            }
+            return false;
+        }
+        if (!this->RestoreHistoryCacheMemory(memory)) {
+            return false;
+        }
+        inputTokens.erase(inputTokens.begin(), inputTokens.begin() + hitLen);
+        cacheLen = hitLen;
+        if (DeepSeekV4PrefixCacheDebugEnabled()) {
+            printf("[fastllm-dsv4-prefix-cache] hit lcp_aligned=%d remaining=%d\n",
+                   hitLen, (int)inputTokens.size());
+            fflush(stdout);
+        }
+        return true;
+    }
+
+    void DeepSeekV4Model::TryRecordHistoryCache(const std::vector<int> &allTokens) {
+        if (!this->saveHistoryChat || DeepSeekV4PrefixCacheDisabled() ||
+            this->decodeLayerCaches.empty() || allTokens.empty()) {
+            if (DeepSeekV4PrefixCacheDebugEnabled()) {
+                printf("[fastllm-dsv4-prefix-cache] skip record: save=%d disabled=%d caches=%d tokens=%d\n",
+                       this->saveHistoryChat ? 1 : 0, DeepSeekV4PrefixCacheDisabled() ? 1 : 0,
+                       (int)this->decodeLayerCaches.size(), (int)allTokens.size());
+                fflush(stdout);
+            }
+            return;
+        }
+        int totalLen = this->decodeLayerCaches[0].totalLen;
+        if (totalLen > 0 && totalLen % 256 == 0 && (int)allTokens.size() >= totalLen) {
+            this->RecordHistorySnapshot(allTokens, totalLen);
+        } else if (DeepSeekV4PrefixCacheDebugEnabled()) {
+            printf("[fastllm-dsv4-prefix-cache] skip record: total_len=%d aligned=%d all_tokens=%d\n",
+                   totalLen, totalLen / 256 * 256, (int)allTokens.size());
+            fflush(stdout);
+        }
+    }
+
     DeepSeekV4Model::DeepSeekV4Model() {
         this->model_type = "deepseek_v4";
         this->model_struct = "deepseek_v4";
-        this->defaultChunkedPrefillSize = 2048;
+        this->defaultChunkedPrefillSize = 4096;
 
         // V4 推荐 thinking 模式，需配合外部 chat_template；这里给一份最小默认值
         this->pre_prompt = "";
@@ -2727,6 +3082,44 @@ namespace fastllm {
                 startPos = 0;
             }
         }
+        if (!debugFullRecomputeDecode && this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
+            batch == 1 && inputIds.dims.size() >= 2 && inputIds.dims[1] > 1 &&
+            !EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_DISABLE_CHUNK_SPLIT")) {
+            int seq = inputIds.dims[1];
+            int nextBoundary = ((originalStartPos / 256) + 1) * 256;
+            if (originalStartPos + seq > nextBoundary) {
+                if (DeepSeekV4PrefixCacheDebugEnabled()) {
+                    printf("[fastllm-dsv4-prefix-cache] split prefill start=%d seq=%d next_boundary=%d\n",
+                           originalStartPos, seq, nextBoundary);
+                    fflush(stdout);
+                }
+                std::vector<int> ret(1, 0);
+                for (int offset = 0; offset < seq; ) {
+                    int pos = originalStartPos + offset;
+                    int boundary = ((pos / 256) + 1) * 256;
+                    int curLen = std::min(seq - offset, boundary - pos);
+                    if (curLen <= 0) {
+                        curLen = std::min(256, seq - offset);
+                    }
+                    Data curInputIds, curPositionIds;
+                    Split(inputIds, 1, offset, offset + curLen, curInputIds);
+                    if (positionIds.dims.size() >= 2) {
+                        Split(positionIds, 1, offset, offset + curLen, curPositionIds);
+                    } else {
+                        std::vector<float> pids(curLen);
+                        for (int i = 0; i < curLen; i++) {
+                            pids[i] = (float)(pos + i);
+                        }
+                        curPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, curLen}, pids));
+                    }
+                    ret = ForwardBatch(1, curInputIds, Data(), curPositionIds, pastKeyValues,
+                                       generationConfig, lastTokens,
+                                       (offset + curLen == seq) ? retLogits : nullptr);
+                    offset += curLen;
+                }
+                return ret;
+            }
+        }
         if (!debugFullRecomputeDecode && batch == 1 && inputIds.dims.size() >= 2 &&
             inputIds.dims[1] > 1 && originalStartPos > 0 &&
             EnvFlagEnabled("FASTLLM_DSV4_ENABLE_PREFIX_CACHE_SEQUENTIAL")) {
@@ -2812,6 +3205,20 @@ namespace fastllm {
             debugDetailLayer = atoi(env);
         }
         std::vector<int> tokenIds = ReadTokenIds(*forwardInputIds);
+        if (!debugFullRecomputeDecode && this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() && batch == 1) {
+            if (originalStartPos == 0) {
+                this->deepseekV4HistoryTokens = tokenIds;
+            } else if ((int)this->deepseekV4HistoryTokens.size() == originalStartPos) {
+                this->deepseekV4HistoryTokens.insert(this->deepseekV4HistoryTokens.end(), tokenIds.begin(), tokenIds.end());
+            } else if ((int)this->deepseekV4HistoryTokens.size() < originalStartPos) {
+                if (DeepSeekV4PrefixCacheDebugEnabled()) {
+                    printf("[fastllm-dsv4-prefix-cache] reset token history: history=%d start=%d add=%d\n",
+                           (int)this->deepseekV4HistoryTokens.size(), originalStartPos, (int)tokenIds.size());
+                    fflush(stdout);
+                }
+                this->deepseekV4HistoryTokens.clear();
+            }
+        }
         if (weights.empty()) {
             auto getWeightPtr = [this](const std::string &name) -> Data* {
                 auto it = this->weight.weight.find(name);
@@ -3150,7 +3557,18 @@ namespace fastllm {
             }
         }
 
-        UpdateDebugPastKeyValues(pastKeyValues, bsz, originalStartPos + inputIds.dims[1], block_cnt);
+        int finalTotalLen = originalStartPos + inputIds.dims[1];
+        UpdateDebugPastKeyValues(pastKeyValues, bsz, finalTotalLen, block_cnt);
+        if (!debugFullRecomputeDecode && this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
+            batch == 1 && finalTotalLen % 256 == 0 &&
+            (int)this->deepseekV4HistoryTokens.size() >= finalTotalLen) {
+            this->RecordHistorySnapshot(this->deepseekV4HistoryTokens, finalTotalLen);
+        } else if (!debugFullRecomputeDecode && this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
+                   batch == 1 && finalTotalLen % 256 == 0 && DeepSeekV4PrefixCacheDebugEnabled()) {
+            printf("[fastllm-dsv4-prefix-cache] skip boundary record: final_len=%d history_tokens=%d\n",
+                   finalTotalLen, (int)this->deepseekV4HistoryTokens.size());
+            fflush(stdout);
+        }
         profileLap(profilePastMs);
         if (profileEnabled) {
             double totalMs = profilePrepareMs + profileEmbedMs + profileDebugDumpMs +

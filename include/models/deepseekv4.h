@@ -31,7 +31,10 @@
 
 #include "cmath"
 
+#include <cstdint>
 #include <iostream>
+#include <map>
+#include <mutex>
 
 namespace fastllm {
     struct DeepSeekV4DecodeLayerCache {
@@ -48,6 +51,52 @@ namespace fastllm {
         std::vector<float> compressorScoreRaw;
         Data compressedKV;
         int compressedBlocks = 0;
+        int compressedTokenBase = 0;
+        int rawTailStartPos = 0;
+        std::vector<float> compressorTailKV;
+        std::vector<float> compressorTailScore;
+    };
+
+    struct DeepSeekV4HistoryLayerCache {
+        bool initialized = false;
+        int bsz = 0;
+        int totalLen = 0;
+        int headDim = 0;
+        int windowSize = 0;
+        int compressRatio = 0;
+        int compressorWideDim = 0;
+        std::vector<float> windowKV;
+        std::vector<float> compressorKVRaw;
+        std::vector<float> compressorScoreRaw;
+        Data compressedKV;
+        int compressedBlocks = 0;
+        int compressedTokenBase = 0;
+        int rawTailStartPos = 0;
+        std::vector<float> compressorTailKV;
+        std::vector<float> compressorTailScore;
+    };
+
+    struct DeepSeekV4HistoryCacheMemory {
+        std::vector<int> inputToken;
+        int tokens = 0;
+        int blockCount = 0;
+        uint64_t blockHash = 0;
+        int recordTimes = 0;
+        long long flushTime = 0;
+        std::vector<DeepSeekV4HistoryLayerCache> layers;
+    };
+
+    struct DeepSeekV4HistoryCacheManager {
+        std::mutex locker;
+        int logicalBlockSize = 256;
+        int maxRecordNum = 8;
+        long long flushTime = 0;
+        std::map<std::vector<int>, DeepSeekV4HistoryCacheMemory> memorys;
+        std::map<uint64_t, std::vector<int> > blockIndex;
+
+        void SetMaxRecordNum(int maxRecordNum);
+        void Record(const DeepSeekV4HistoryCacheMemory &memory);
+        bool Get(const std::vector<int> &inputToken, DeepSeekV4HistoryCacheMemory &memory, int &hitLen);
     };
 
     class DeepSeekV4Model : public basellm {
@@ -96,6 +145,12 @@ namespace fastllm {
                                         Data &inputIds, Data &attentionMask, Data &positionIds);
 
         virtual void WarmUp(); // 预热
+
+        virtual bool TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) override;
+
+        virtual void TryRecordHistoryCache(const std::vector<int> &allTokens) override;
+
+        virtual bool UseGenericHistoryCache() const override { return false; }
 
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成 prompt
 
@@ -173,6 +228,12 @@ namespace fastllm {
 
         // 单请求 decode cache。当前 ForwardBatch(batch=1) 路径使用，后续可迁移到 paged cache。
         std::vector<DeepSeekV4DecodeLayerCache> decodeLayerCaches;
+
+        DeepSeekV4HistoryCacheManager deepseekV4HistoryCacheManager;
+        std::vector<int> deepseekV4HistoryTokens;
+
+        bool RestoreHistoryCacheMemory(const DeepSeekV4HistoryCacheMemory &memory);
+        void RecordHistorySnapshot(const std::vector<int> &tokens, int totalLen);
     };
 }
 

@@ -280,6 +280,13 @@ namespace fastllm {
 
         virtual void AddPromptCache(const std::vector <int> &inputTokens);
 
+        // 模型可覆盖这三个 hook 来管理不兼容通用 pair<Data, Data> 的历史缓存。
+        virtual bool TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) { return false; }
+
+        virtual void TryRecordHistoryCache(const std::vector<int> &allTokens) {}
+
+        virtual bool UseGenericHistoryCache() const { return true; }
+
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input) = 0; // 根据历史信息和当前输入生成prompt
 
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output) = 0; // 根据当前回复更新history
