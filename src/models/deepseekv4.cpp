@@ -2109,14 +2109,18 @@ namespace fastllm {
         return EnvFlagEnabled("FASTLLM_DSV4_DISABLE_PREFIX_CACHE");
     }
 
+    static bool DeepSeekV4PrefixCacheEveryBlockSplitEnabled() {
+        return EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_ENABLE_CHUNK_SPLIT") &&
+               !EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_DISABLE_CHUNK_SPLIT");
+    }
+
     void DeepSeekV4HistoryCacheManager::SetMaxRecordNum(int maxRecordNum) {
         std::lock_guard<std::mutex> guard(this->locker);
         this->maxRecordNum = std::max(1, maxRecordNum);
     }
 
     void DeepSeekV4HistoryCacheManager::Record(const DeepSeekV4HistoryCacheMemory &memory) {
-        if (memory.tokens <= 0 || memory.tokens % this->logicalBlockSize != 0 ||
-            (int)memory.inputToken.size() != memory.tokens || memory.layers.empty()) {
+        if (memory.tokens <= 0 || (int)memory.inputToken.size() != memory.tokens || memory.layers.empty()) {
             return;
         }
         std::lock_guard<std::mutex> guard(this->locker);
@@ -2169,7 +2173,8 @@ namespace fastllm {
             return false;
         }
 
-        int maxAligned = ((int)inputToken.size() - 1) / this->logicalBlockSize * this->logicalBlockSize;
+        int maxProbeLen = (int)inputToken.size() - 1;
+        int maxAligned = maxProbeLen / this->logicalBlockSize * this->logicalBlockSize;
         for (int len = maxAligned; len >= this->logicalBlockSize; len -= this->logicalBlockSize) {
             uint64_t hash = DeepSeekV4TokenBlockHash(inputToken, len, this->logicalBlockSize);
             auto idxIt = this->blockIndex.find(hash);
@@ -2198,7 +2203,7 @@ namespace fastllm {
 
         for (auto &it : this->memorys) {
             int len = (int)it.first.size();
-            if (len <= hitLen || len > maxAligned) {
+            if (len <= hitLen || len > maxProbeLen) {
                 continue;
             }
             bool match = true;
@@ -2304,13 +2309,13 @@ namespace fastllm {
 
     void DeepSeekV4Model::RecordHistorySnapshot(const std::vector<int> &tokens, int totalLen) {
         if (!this->saveHistoryChat || DeepSeekV4PrefixCacheDisabled() ||
-            totalLen <= 0 || totalLen % 256 != 0 || (int)tokens.size() < totalLen ||
+            totalLen <= 0 || (int)tokens.size() < totalLen ||
             this->decodeLayerCaches.empty()) {
             return;
         }
         DeepSeekV4HistoryCacheMemory memory;
         memory.tokens = totalLen;
-        memory.blockCount = totalLen / 256;
+        memory.blockCount = (totalLen + 255) / 256;
         memory.inputToken.assign(tokens.begin(), tokens.begin() + totalLen);
         memory.blockHash = DeepSeekV4TokenBlockHash(memory.inputToken, totalLen, 256);
         memory.layers.resize(this->decodeLayerCaches.size());
@@ -2430,11 +2435,11 @@ namespace fastllm {
             return;
         }
         int totalLen = this->decodeLayerCaches[0].totalLen;
-        if (totalLen > 0 && totalLen % 256 == 0 && (int)allTokens.size() >= totalLen) {
+        if (totalLen > 0 && (int)allTokens.size() >= totalLen) {
             this->RecordHistorySnapshot(allTokens, totalLen);
         } else if (DeepSeekV4PrefixCacheDebugEnabled()) {
-            printf("[fastllm-dsv4-prefix-cache] skip record: total_len=%d aligned=%d all_tokens=%d\n",
-                   totalLen, totalLen / 256 * 256, (int)allTokens.size());
+            printf("[fastllm-dsv4-prefix-cache] skip record: total_len=%d all_tokens=%d\n",
+                   totalLen, (int)allTokens.size());
             fflush(stdout);
         }
     }
@@ -2793,8 +2798,43 @@ namespace fastllm {
             batch == 1 && inputIds.dims.size() >= 2 && inputIds.dims[1] > 1 &&
             !EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_DISABLE_CHUNK_SPLIT")) {
             int seq = inputIds.dims[1];
+            int finalTotalLen = originalStartPos + seq;
+            int lastRecordBoundary = (finalTotalLen / 256) * 256;
+            if (!DeepSeekV4PrefixCacheEveryBlockSplitEnabled() &&
+                lastRecordBoundary > originalStartPos && lastRecordBoundary < finalTotalLen) {
+                int prefixLen = lastRecordBoundary - originalStartPos;
+                Data prefixInputIds, prefixPositionIds;
+                Split(inputIds, 1, 0, prefixLen, prefixInputIds);
+                if (positionIds.dims.size() >= 2) {
+                    Split(positionIds, 1, 0, prefixLen, prefixPositionIds);
+                } else {
+                    std::vector<float> pids(prefixLen);
+                    for (int i = 0; i < prefixLen; i++) {
+                        pids[i] = (float)(originalStartPos + i);
+                    }
+                    prefixPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, prefixLen}, pids));
+                }
+                ForwardBatch(1, prefixInputIds, Data(), prefixPositionIds, pastKeyValues,
+                             generationConfig, lastTokens, nullptr);
+
+                Data suffixInputIds, suffixPositionIds;
+                Split(inputIds, 1, prefixLen, seq, suffixInputIds);
+                if (positionIds.dims.size() >= 2) {
+                    Split(positionIds, 1, prefixLen, seq, suffixPositionIds);
+                } else {
+                    int suffixLen = seq - prefixLen;
+                    std::vector<float> pids(suffixLen);
+                    for (int i = 0; i < suffixLen; i++) {
+                        pids[i] = (float)(lastRecordBoundary + i);
+                    }
+                    suffixPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, suffixLen}, pids));
+                }
+                return ForwardBatch(1, suffixInputIds, Data(), suffixPositionIds, pastKeyValues,
+                                    generationConfig, lastTokens, retLogits);
+            }
+
             int nextBoundary = ((originalStartPos / 256) + 1) * 256;
-            if (originalStartPos + seq > nextBoundary) {
+            if (DeepSeekV4PrefixCacheEveryBlockSplitEnabled() && originalStartPos + seq > nextBoundary) {
                 if (DeepSeekV4PrefixCacheDebugEnabled()) {
                     printf("[fastllm-dsv4-prefix-cache] split prefill start=%d seq=%d next_boundary=%d\n",
                            originalStartPos, seq, nextBoundary);
