@@ -1125,6 +1125,13 @@ class model:
         messages.append({"role": "user", "content": query})
         return messages
 
+    def _inject_deepseek_v4_tools(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        if not tools:
+            return messages
+        messages = copy.deepcopy(messages)
+        messages.insert(0, {"role": "system", "tools": tools})
+        return messages
+
     def get_prompt(self,
                    query: str,
                    history: List[Tuple[str, str]] = None) -> str:
@@ -1766,6 +1773,7 @@ class model:
                 elif self._is_deepseek_v4() and not self.force_chat_template:
                     from ftllm.encoding_dsv4 import encode_messages
                     thinking_mode = "thinking" if enable_thinking else "chat"
+                    conversation = self._inject_deepseek_v4_tools(conversation, tools)
                     prompt = encode_messages(conversation, thinking_mode=thinking_mode)
                 else:
                     prompt = self.apply_chat_template(conversation)

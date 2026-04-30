@@ -75,6 +75,10 @@ class LoadedMedia:
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
+class _EmptyToolTokenizer:
+    def get_vocab(self):
+        return {}
+
 class ChatCompletionStreamResponseWithUsage(BaseModel):
     id: str = Field(default_factory = lambda: f"chatcmpl-{shortuuid.random()}")
     object: str = "chat.completion.chunk"
@@ -564,18 +568,26 @@ class FastLLmCompletion:
 
   def _ensure_tool_parser(self):
       if self.tool_parser is None:
-          tokenizer = self.model.hf_tokenizer
+          tokenizer = getattr(self.model, "hf_tokenizer", None)
+          model_type = self.model.get_type()
           chat_template = getattr(tokenizer, "chat_template", None)
-          if tokenizer is None or chat_template is None:
+          force_type = getattr(self.model, "tool_call_parser", "auto")
+          allow_without_chat_template = (
+              model_type == "deepseek_v4" or
+              force_type in ("deepseek_v4",)
+          )
+          if tokenizer is None and allow_without_chat_template:
+              tokenizer = _EmptyToolTokenizer()
+          if tokenizer is None or (chat_template is None and not allow_without_chat_template):
               raise ValueError(
                   "Tool calling requires a Hugging Face tokenizer with chat_template. "
                   "Please use an HF model directory or provide the original tokenizer files."
               )
           from .tool_parsers import ToolParserManager
           self.tool_parser = ToolParserManager.get_tool_parser_auto(
-              self.model.get_type(), chat_template,
+              model_type, chat_template,
               force_chat_template = self.model.force_chat_template,
-              force_type = self.model.tool_call_parser)(tokenizer)
+              force_type = force_type)(tokenizer)
 
   def _parse_anthropic_message_content(
       self,
@@ -1135,11 +1147,14 @@ class FastLLmCompletion:
             #await asyncio.sleep(0)
 
         # 3. 结束标志
+        finish_reason = 'stop'
+        if request.tools and self.tool_parser and getattr(self.tool_parser, "prev_tool_call_arr", None):
+            finish_reason = 'tool_calls'
         choice_data = ChatCompletionResponseStreamChoice(
             index = 0,
             delta = DeltaMessage(),
             logprobs = None,
-            finish_reason = 'stop')
+            finish_reason = finish_reason)
         chunk = ChatCompletionStreamResponseWithUsage(
             id = request_id,
             object = chunk_object_type,
