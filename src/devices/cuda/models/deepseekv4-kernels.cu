@@ -1533,26 +1533,31 @@ __global__ void DeepSeekV4SparseDecodeRotaryCastKernel(const float *input, __nv_
                                                        float ropeBase, int startPos,
                                                        int originalSeqLen, float ropeFactor,
                                                        int betaFast, int betaSlow) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) {
+    int off = dim - ropeDim;
+    int ropePairs = ropeDim >> 1;
+    int workPerRow = off + ropePairs;
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t total = (uint64_t)rows * workPerRow;
+    if (idx >= total) {
         return;
     }
+    int item = idx % workPerRow;
+    int row = idx / workPerRow;
     const float *src = input + (uint64_t)row * dim;
     __nv_bfloat16 *dst = output + (uint64_t)row * dim;
-    int off = dim - ropeDim;
-    for (int d = 0; d < off; d++) {
-        dst[d] = __float2bfloat16_rn(src[d]);
+    if (item < off) {
+        dst[item] = __float2bfloat16_rn(src[item]);
+        return;
     }
-    for (int i = 0; i < ropeDim; i += 2) {
-        float inv = DeepSeekV4InvFreq(i / 2, ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
-        float ang = startPos * inv;
-        float c = cosf(ang);
-        float sn = -sinf(ang);
-        float a = src[off + i];
-        float b = src[off + i + 1];
-        dst[off + i] = __float2bfloat16_rn(a * c - b * sn);
-        dst[off + i + 1] = __float2bfloat16_rn(a * sn + b * c);
-    }
+    int i = (item - off) << 1;
+    float inv = DeepSeekV4InvFreq(i / 2, ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
+    float ang = startPos * inv;
+    float c = cosf(ang);
+    float sn = -sinf(ang);
+    float a = src[off + i];
+    float b = src[off + i + 1];
+    dst[off + i] = __float2bfloat16_rn(a * c - b * sn);
+    dst[off + i + 1] = __float2bfloat16_rn(a * sn + b * c);
 }
 
 template <typename XT, typename RT, typename OT>
@@ -2588,7 +2593,8 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::
     if (ok) {
         int rows = bsz * heads;
         int threads = 128;
-        int blocks = (rows + threads - 1) / threads;
+        int rotaryWorkPerRow = dim - ropeDim + (ropeDim >> 1);
+        int blocks = (rows * rotaryWorkPerRow + threads - 1) / threads;
         DeepSeekV4SparseDecodeRotaryCastKernel<<<blocks, threads>>>(
             cudaTemp, (__nv_bfloat16 *)output.cudaData, rows, dim, ropeDim, ropeBase,
             startPos, originalSeqLen, ropeFactor, betaFast, betaSlow);
