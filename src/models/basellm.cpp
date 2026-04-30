@@ -15,6 +15,14 @@
 #endif
 
 namespace fastllm {
+    static int NormalizeMaxBatchByModelCapability(basellm *model, int maxBatch) {
+        if (model != nullptr && !model->canDoBatchForward) {
+            model->maxBatch = 1;
+            return 1;
+        }
+        return maxBatch;
+    }
+
     int ResponseContextDict::CreateHandle() {
         locker.lock();
         int newId = 0;
@@ -652,6 +660,7 @@ namespace fastllm {
         if (model->maxBatch > 0) {
             maxBatch = model->maxBatch;
         }
+        maxBatch = NormalizeMaxBatchByModelCapability(model, maxBatch);
 
         int prefillChunkSize = model->GetChunkedPrefillSize();
 
@@ -1324,6 +1333,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                     if (model->maxBatch > 0) {
                         maxBatch = model->maxBatch;
                     }
+                    maxBatch = NormalizeMaxBatchByModelCapability(model, maxBatch);
 
                     model->tokensLimit = maxTotalLens;
                     int limit = maxTotalLens;
@@ -2626,6 +2636,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 if (this->maxBatch > 0) {
                     mBatch = this->maxBatch;
                 }
+                mBatch = NormalizeMaxBatchByModelCapability(this, mBatch);
                 mBatch = std::max(1, std::min(mBatch, this->tokensLimit / 128));
                 printf("[Fastllm] KV Cache Token limit: %d tokens (totalPages=%d, pageLen=%d).\n", this->tokensLimit, totalPages, cachePageLen);
                 printf("[Fastllm] AddPrefill Pages limit: %d pages (80%% of %d).\n", totalPages * 4 / 5, totalPages);

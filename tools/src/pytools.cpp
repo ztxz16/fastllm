@@ -749,6 +749,9 @@ extern "C" {
 
     DLL_EXPORT void set_max_batch_llm_model(int modelId, int batch) {
         auto model = models.GetModel(modelId);
+        if (!model->canDoBatchForward) {
+            batch = 1;
+        }
         model->maxBatch = batch;
     }
 

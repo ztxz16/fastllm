@@ -2445,6 +2445,7 @@ namespace fastllm {
     }
 
     DeepSeekV4Model::DeepSeekV4Model() {
+        this->canDoBatchForward = false;
         this->model_type = "deepseek_v4";
         this->model_struct = "deepseek_v4";
         this->defaultChunkedPrefillSize = 4096;
@@ -2886,7 +2887,7 @@ namespace fastllm {
             }
             return ret;
         }
-        bool debugThisStep = (originalStartPos == 0) || EnvFlagEnabled("FASTLLM_DEBUG_ALL_STEPS");
+        bool debugThisStep = /* (originalStartPos == 0) || */ EnvFlagEnabled("FASTLLM_DEBUG_ALL_STEPS");
         bool debugLogitsThisStep = debugThisStep || EnvFlagEnabled("FASTLLM_DEBUG_LOGITS_ALL_STEPS") || debugFullRecomputeDecode;
         bool debugDumpStates = EnvFlagEnabled("FASTLLM_DEBUG_DUMP_STATES");
         bool useDecodeCache = (!debugFullRecomputeDecode && batch == 1);
