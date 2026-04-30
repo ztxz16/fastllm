@@ -2920,6 +2920,7 @@ namespace fastllm {
                 this->deepseekV4HistoryTokens.clear();
             }
         }
+        bool cudaSe = GetCudaSharedExpert();
         if (weights.empty()) {
             auto getWeightPtr = [this](const std::string &name) -> Data* {
                 auto it = this->weight.weight.find(name);
@@ -3138,7 +3139,15 @@ namespace fastllm {
                                 expertIndex, expertScore);
             {
                 // MOE
-                Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
+                Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp, sharedExpertOut;
+                Data ww1, ww3;
+                if (cudaSe &&
+                    weight.weight.find(pre + ".ffn.shared_experts.gateup.weight") != weight.weight.end() &&
+                    weight.weight.find(pre + ".ffn.shared_experts.w2.weight") != weight.weight.end()) {
+                    LinearSwigluBlock(&ffnInput, &weight[pre + ".ffn.shared_experts.gateup.weight"], GetEmptyData(), &ww3, &ww1);
+                    Linear(ww1, weight[pre + ".ffn.shared_experts.w2.weight"], *GetEmptyData(), sharedExpertOut);
+                    weights[layer][0] = weights[layer][1] = nullptr;
+                }
                 ApplyDeviceMap(this->moeDeviceMap, layer + 1, block_cnt);
                 // NumasMergeMOE 的小 batch 路径直接读取 cpuData，先保证输入在 CPU 可见。
                 ffnInput.ToDevice(DataDevice::CPU);
@@ -3151,6 +3160,10 @@ namespace fastllm {
                               ffnInput.dataType, this->moeAtype,
                               &moeInputTemp, &moeOutputTemp);
                 ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
+                if (sharedExpertOut.dims.size() > 0) {
+                    ffnOut.ToDevice(sharedExpertOut.dataDevice);
+                    AddTo(ffnOut, sharedExpertOut);
+                }
             }
             ffnOut.Reshape(ffnDims);
             if (debugThisStep && layer == debugDetailLayer) {
