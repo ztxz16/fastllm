@@ -12,6 +12,14 @@ namespace {
 constexpr int kDeepSeekV4SparseDecodeMaxKeys = 256 * 1024;
 constexpr int kDeepSeekV4SparsePrefillMaxKeys = 256 * 1024;
 
+inline int DeepSeekV4HcPreDotParts(int flatDim, int threads) {
+    return std::min(16, std::max(1, (flatDim + threads * 4 - 1) / (threads * 4)));
+}
+
+inline int DeepSeekV4HcPreFinishParts(int dim, int threads) {
+    return std::min(16, std::max(1, (dim + threads - 1) / threads));
+}
+
 template <typename Kernel>
 bool DeepSeekV4EnsureDynamicSharedMemory(Kernel kernel, size_t sharedBytes) {
     constexpr size_t kDefaultDynamicSharedLimit = 48 * 1024;
@@ -722,28 +730,39 @@ __global__ void DeepSeekV4HcPreDotsKernel(const XT *x, const WT *w, float *dots,
 
 template <typename XT, typename WT>
 __global__ void DeepSeekV4HcPreDotsBlockKernel(const XT *x, const WT *w, float *dots,
-                                               int tokens, int flatDim, int mixHc, int dotsStride) {
+                                               int tokens, int flatDim, int mixHc, int dotsStride,
+                                               int dotParts) {
     extern __shared__ float red[];
-    int idx = blockIdx.x;
+    int idx = blockIdx.x / dotParts;
+    int part = blockIdx.x - idx * dotParts;
     if (idx >= tokens * dotsStride) {
         return;
     }
     int m = idx % dotsStride;
     int t = idx / dotsStride;
+    int chunkStart = (int)(((uint64_t)flatDim * part) / dotParts);
+    int chunkEnd = (int)(((uint64_t)flatDim * (part + 1)) / dotParts);
     const XT *xrow = x + (uint64_t)t * flatDim;
     float partial = 0.0f;
     if (m == mixHc) {
-        for (int k = threadIdx.x; k < flatDim; k += blockDim.x) {
+        for (int k = chunkStart + threadIdx.x; k < chunkEnd; k += blockDim.x) {
             float v = Dsv4ToFloat(xrow[k]);
             partial += v * v;
         }
     } else {
         const WT *wrow = w + (uint64_t)m * flatDim;
-        for (int k = threadIdx.x * 2; k + 1 < flatDim; k += blockDim.x * 2) {
+        int pairStart = chunkStart;
+        if (pairStart & 1) {
+            if (threadIdx.x == 0) {
+                partial += Dsv4ToFloat(xrow[pairStart]) * Dsv4ToFloat(wrow[pairStart]);
+            }
+            pairStart++;
+        }
+        for (int k = pairStart + threadIdx.x * 2; k + 1 < chunkEnd; k += blockDim.x * 2) {
             partial += Dsv4PairDot(xrow, wrow, k);
         }
-        if ((flatDim & 1) && threadIdx.x == 0) {
-            int k = flatDim - 1;
+        if (((chunkEnd - pairStart) & 1) && threadIdx.x == 0) {
+            int k = chunkEnd - 1;
             partial += Dsv4ToFloat(xrow[k]) * Dsv4ToFloat(wrow[k]);
         }
     }
@@ -756,7 +775,7 @@ __global__ void DeepSeekV4HcPreDotsBlockKernel(const XT *x, const WT *w, float *
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        dots[(uint64_t)t * dotsStride + m] = red[0];
+        dots[((uint64_t)t * dotsStride + m) * dotParts + part] = red[0];
     }
 }
 
@@ -764,92 +783,146 @@ template <typename XT>
 __global__ void DeepSeekV4HcPreFinishKernel(const XT *x, const float *dots, const float *scale,
                                             const float *base, XT *y, float *post, float *comb,
                                             int tokens, int dim, int hcMult, int sinkhornIters,
-                                            float eps, float normEps, int dotsStride) {
+                                            float eps, float normEps, int dotsStride, int dotParts) {
     extern __shared__ float shared[];
     float *mixes = shared;
     float *pre = mixes + (2 + hcMult) * hcMult;
     float *combLocal = pre + hcMult;
+    float *rowStats = combLocal + hcMult * hcMult;
+    float *colStats = rowStats + hcMult;
 
     int t = blockIdx.x;
+    int finishPart = blockIdx.y;
+    int finishParts = gridDim.y;
     int flatDim = hcMult * dim;
     int mixHc = (2 + hcMult) * hcMult;
     const XT *xrow = x + (uint64_t)t * flatDim;
 
-    float rsqrt = rsqrtf(dots[(uint64_t)t * dotsStride + mixHc] / flatDim + normEps);
+    if (threadIdx.x == 0) {
+        float sqSum = 0.0f;
+        uint64_t sqBase = ((uint64_t)t * dotsStride + mixHc) * dotParts;
+        for (int part = 0; part < dotParts; part++) {
+            sqSum += dots[sqBase + part];
+        }
+        rowStats[0] = rsqrtf(sqSum / flatDim + normEps);
+    }
+    __syncthreads();
+    float rsqrt = rowStats[0];
     for (int m = threadIdx.x; m < mixHc; m += blockDim.x) {
-        mixes[m] = dots[(uint64_t)t * dotsStride + m] * rsqrt;
+        float dotSum = 0.0f;
+        uint64_t dotBase = ((uint64_t)t * dotsStride + m) * dotParts;
+        for (int part = 0; part < dotParts; part++) {
+            dotSum += dots[dotBase + part];
+        }
+        mixes[m] = dotSum * rsqrt;
     }
     __syncthreads();
 
-    if (threadIdx.x == 0) {
-        for (int h = 0; h < hcMult; h++) {
-            pre[h] = DeepSeekV4Sigmoid(mixes[h] * scale[0] + base[h]) + eps;
+    for (int h = threadIdx.x; h < hcMult; h += blockDim.x) {
+        pre[h] = DeepSeekV4Sigmoid(mixes[h] * scale[0] + base[h]) + eps;
+        if (finishPart == 0) {
             post[(uint64_t)t * hcMult + h] =
                 2.0f * DeepSeekV4Sigmoid(mixes[h + hcMult] * scale[1] + base[h + hcMult]);
         }
+    }
+    __syncthreads();
 
-        for (int r = 0; r < hcMult; r++) {
+    const int combThreads = 32;
+    int hcSq = hcMult * hcMult;
+    if (finishPart == 0 && threadIdx.x < combThreads) {
+        int lane = threadIdx.x;
+        for (int idx = lane; idx < hcSq; idx += combThreads) {
+            int mixIdx = idx + 2 * hcMult;
+            combLocal[idx] = mixes[mixIdx] * scale[2] + base[mixIdx];
+        }
+        __syncwarp();
+
+        for (int r = lane; r < hcMult; r += combThreads) {
             float rowMax = -INFINITY;
             for (int c = 0; c < hcMult; c++) {
-                int idx = r * hcMult + c;
-                int mixIdx = idx + 2 * hcMult;
-                combLocal[idx] = mixes[mixIdx] * scale[2] + base[mixIdx];
-                rowMax = fmaxf(rowMax, combLocal[idx]);
+                rowMax = fmaxf(rowMax, combLocal[r * hcMult + c]);
             }
+            rowStats[r] = rowMax;
+        }
+        __syncwarp();
+        for (int idx = lane; idx < hcSq; idx += combThreads) {
+            int r = idx / hcMult;
+            combLocal[idx] = expf(combLocal[idx] - rowStats[r]);
+        }
+        __syncwarp();
+        for (int r = lane; r < hcMult; r += combThreads) {
             float rowSum = 0.0f;
             for (int c = 0; c < hcMult; c++) {
-                int idx = r * hcMult + c;
-                float v = expf(combLocal[idx] - rowMax);
-                combLocal[idx] = v;
-                rowSum += v;
+                rowSum += combLocal[r * hcMult + c];
             }
-            for (int c = 0; c < hcMult; c++) {
-                int idx = r * hcMult + c;
-                combLocal[idx] = combLocal[idx] / rowSum + eps;
-            }
+            rowStats[r] = rowSum;
         }
-        for (int c = 0; c < hcMult; c++) {
+        __syncwarp();
+        for (int idx = lane; idx < hcSq; idx += combThreads) {
+            int r = idx / hcMult;
+            combLocal[idx] = combLocal[idx] / rowStats[r] + eps;
+        }
+        __syncwarp();
+
+        for (int c = lane; c < hcMult; c += combThreads) {
             float colSum = 0.0f;
             for (int r = 0; r < hcMult; r++) {
                 colSum += combLocal[r * hcMult + c];
             }
-            for (int r = 0; r < hcMult; r++) {
-                combLocal[r * hcMult + c] /= (colSum + eps);
-            }
+            colStats[c] = colSum;
         }
+        __syncwarp();
+        for (int idx = lane; idx < hcSq; idx += combThreads) {
+            int c = idx % hcMult;
+            combLocal[idx] /= (colStats[c] + eps);
+        }
+        __syncwarp();
+
         for (int it = 1; it < sinkhornIters; it++) {
-            for (int r = 0; r < hcMult; r++) {
+            for (int r = lane; r < hcMult; r += combThreads) {
                 float rowSum = 0.0f;
                 for (int c = 0; c < hcMult; c++) {
                     rowSum += combLocal[r * hcMult + c];
                 }
-                for (int c = 0; c < hcMult; c++) {
-                    combLocal[r * hcMult + c] /= (rowSum + eps);
-                }
+                rowStats[r] = rowSum;
             }
-            for (int c = 0; c < hcMult; c++) {
+            __syncwarp();
+            for (int idx = lane; idx < hcSq; idx += combThreads) {
+                int r = idx / hcMult;
+                combLocal[idx] /= (rowStats[r] + eps);
+            }
+            __syncwarp();
+
+            for (int c = lane; c < hcMult; c += combThreads) {
                 float colSum = 0.0f;
                 for (int r = 0; r < hcMult; r++) {
                     colSum += combLocal[r * hcMult + c];
                 }
-                for (int r = 0; r < hcMult; r++) {
-                    combLocal[r * hcMult + c] /= (colSum + eps);
-                }
+                colStats[c] = colSum;
             }
+            __syncwarp();
+            for (int idx = lane; idx < hcSq; idx += combThreads) {
+                int c = idx % hcMult;
+                combLocal[idx] /= (colStats[c] + eps);
+            }
+            __syncwarp();
         }
-        for (int i = 0; i < hcMult * hcMult; i++) {
+        for (int i = lane; i < hcSq; i += combThreads) {
             comb[(uint64_t)t * hcMult * hcMult + i] = combLocal[i];
         }
-    }
-    __syncthreads();
-
-    XT *yrow = y + (uint64_t)t * dim;
-    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-        float v = 0.0f;
-        for (int h = 0; h < hcMult; h++) {
-            v += pre[h] * Dsv4ToFloat(xrow[(uint64_t)h * dim + d]);
+    } else {
+        int yStart = (int)(((uint64_t)dim * finishPart) / finishParts);
+        int yEnd = (int)(((uint64_t)dim * (finishPart + 1)) / finishParts);
+        int yThreads = finishPart == 0 ? blockDim.x - combThreads : blockDim.x;
+        int yThread = finishPart == 0 ? threadIdx.x - combThreads : threadIdx.x;
+        XT *yrow = y + (uint64_t)t * dim;
+        for (int d = yStart + yThread; d < yEnd; d += yThreads) {
+            float v = 0.0f;
+            for (int h = 0; h < hcMult; h++) {
+                v += pre[h] * Dsv4ToFloat(xrow[(uint64_t)h * dim + d]);
+            }
+            yrow[d] = Dsv4FromFloat<XT>(v);
         }
-        yrow[d] = Dsv4FromFloat<XT>(v);
     }
 }
 
@@ -2011,9 +2084,12 @@ bool DeepSeekV4LaunchHcPreByWeight(const fastllm::Data &x, const fastllm::Data &
     int mixHc = (2 + hcMult) * hcMult;
     int flatDim = hcMult * dim;
     int dotsStride = mixHc + 1;
-    int dotBlocks = tokens * dotsStride;
+    int dotParts = DeepSeekV4HcPreDotParts(flatDim, threads);
+    int dotBlocks = tokens * dotsStride * dotParts;
+    int finishParts = DeepSeekV4HcPreFinishParts(dim, threads);
+    dim3 finishGrid(tokens, finishParts);
     size_t dotSharedBytes = (size_t)threads * sizeof(float);
-    size_t finishSharedBytes = (size_t)(mixHc + hcMult + hcMult * hcMult) * sizeof(float);
+    size_t finishSharedBytes = (size_t)(mixHc + hcMult + hcMult * hcMult + hcMult * 2) * sizeof(float);
     const XT *xData = (const XT *)x.cudaData;
     XT *yData = (XT *)y.cudaData;
     float *postData = (float *)post.cudaData;
@@ -2022,19 +2098,19 @@ bool DeepSeekV4LaunchHcPreByWeight(const fastllm::Data &x, const fastllm::Data &
     const float *baseData = (const float *)hcBase.cudaData;
     if (hcFn.dataType == fastllm::DataType::BFLOAT16) {
         DeepSeekV4HcPreDotsBlockKernel<<<dotBlocks, threads, dotSharedBytes>>>(
-            xData, (const __nv_bfloat16 *)hcFn.cudaData, dotsData, tokens, flatDim, mixHc, dotsStride);
+            xData, (const __nv_bfloat16 *)hcFn.cudaData, dotsData, tokens, flatDim, mixHc, dotsStride, dotParts);
     } else if (hcFn.dataType == fastllm::DataType::FLOAT16) {
         DeepSeekV4HcPreDotsBlockKernel<<<dotBlocks, threads, dotSharedBytes>>>(
-            xData, (const half *)hcFn.cudaData, dotsData, tokens, flatDim, mixHc, dotsStride);
+            xData, (const half *)hcFn.cudaData, dotsData, tokens, flatDim, mixHc, dotsStride, dotParts);
     } else if (hcFn.dataType == fastllm::DataType::FLOAT32) {
         DeepSeekV4HcPreDotsBlockKernel<<<dotBlocks, threads, dotSharedBytes>>>(
-            xData, (const float *)hcFn.cudaData, dotsData, tokens, flatDim, mixHc, dotsStride);
+            xData, (const float *)hcFn.cudaData, dotsData, tokens, flatDim, mixHc, dotsStride, dotParts);
     } else {
         return false;
     }
-    DeepSeekV4HcPreFinishKernel<<<tokens, threads, finishSharedBytes>>>(
+    DeepSeekV4HcPreFinishKernel<<<finishGrid, threads, finishSharedBytes>>>(
         xData, dotsData, scaleData, baseData, yData, postData, combData,
-        tokens, dim, hcMult, sinkhornIters, eps, normEps, dotsStride);
+        tokens, dim, hcMult, sinkhornIters, eps, normEps, dotsStride, dotParts);
     return true;
 }
 
@@ -2111,7 +2187,8 @@ extern "C" bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data
         !DeepSeekV4PrepareCudaOutput(comb, fastllm::DataType::FLOAT32, {bsz, seqlen, hcMult, hcMult})) {
         return false;
     }
-    float *dotsData = (float *)FastllmCudaMalloc((size_t)tokens * (mixHc + 1) * sizeof(float));
+    int dotParts = DeepSeekV4HcPreDotParts(flatDim, 256);
+    float *dotsData = (float *)FastllmCudaMalloc((size_t)tokens * (mixHc + 1) * dotParts * sizeof(float));
     if (dotsData == nullptr) {
         return false;
     }
