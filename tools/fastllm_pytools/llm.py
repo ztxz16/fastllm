@@ -1004,6 +1004,39 @@ class model:
         print(f"[Fastllm] default generation config: {self.default_generation_config}")
         if (kv_cache_dtype != "" and kv_cache_dtype != "auto"):
             self.set_kv_cache_dtype(kv_cache_dtype)
+
+    def encode(self, text: str, **kwargs) -> List[int]:
+        output_buffer_init_len = 1024
+        if "tokenizer_encode_string__output_buffer" not in dir(self.thread_local_obj) or self.thread_local_obj.tokenizer_encode_string__output_buffer is None:
+            self.thread_local_obj.tokenizer_encode_string__output_buffer = (ctypes.c_int * output_buffer_init_len)()
+
+        buffer = self.thread_local_obj.tokenizer_encode_string__output_buffer
+        buffer_len = len(buffer)
+        result_len = fastllm_lib.token_encode_string(self.model, text.encode(), buffer_len, buffer)
+        if result_len > buffer_len:
+            if result_len > 10240:
+                temp_buffer = (ctypes.c_int * result_len)()
+                fastllm_lib.token_encode_string(self.model, text.encode(), result_len, temp_buffer)
+                return [temp_buffer[i] for i in range(result_len)]
+            new_buffer_len = round(math.ceil(result_len / 1024.0)) * 1024
+            buffer = (ctypes.c_int * new_buffer_len)()
+            self.thread_local_obj.tokenizer_encode_string__output_buffer = buffer
+            result_len = fastllm_lib.token_encode_string(self.model, text.encode(), new_buffer_len, buffer)
+        return [buffer[i] for i in range(result_len)]
+
+    def _decode_fastllm_token(self, token_id: int) -> bytes:
+        output_buffer_init_len = 1024
+        if "tokenizer_decode_token__output_buffer" not in dir(self.thread_local_obj) or self.thread_local_obj.tokenizer_decode_token__output_buffer is None:
+            self.thread_local_obj.tokenizer_decode_token__output_buffer = (ctypes.c_char * output_buffer_init_len)()
+
+        buffer = self.thread_local_obj.tokenizer_decode_token__output_buffer
+        buffer_len = len(buffer)
+        result_len = fastllm_lib.token_decode(self.model, token_id, buffer_len, buffer)
+        if result_len > buffer_len:
+            buffer = (ctypes.c_char * result_len)()
+            self.thread_local_obj.tokenizer_decode_token__output_buffer = buffer
+            fastllm_lib.token_decode(self.model, token_id, result_len, buffer)
+        return bytes(buffer.value)
     
     def apply_chat_template(
         self,
@@ -1170,7 +1203,7 @@ class model:
 
         return [buffer[i] for i in range(result_len)]
     
-    def encode(self, content: str) -> List[int]:
+    def encode(self, content: str, **kwargs) -> List[int]:
         return self.tokenizer_encode_string(content)
     
     def tokenizer_decode_token(self, token_id: int) -> bytes:
@@ -1470,15 +1503,36 @@ class model:
             else:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids);
-            handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+            if (self.save_history):
+                input = self.tokenizer_cache.tokenize_with_cache(self, prompt)
+                handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                             ctypes.c_int(max_length), ctypes.c_int(0), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
                                                             ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
                                                             stop_token_len, stop_token_list);
+                self.current_tokenizer_cache[handle] = [[prompt], [input]]
+            else:
+                handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+                                                                ctypes.c_int(max_length), ctypes.c_int(0), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
+                                                                ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
+                                                                stop_token_len, stop_token_list);
             res = "";
             ret = b'';
+            pending_tokens = []
             fail_cnt = 0;
             while True:
-                ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle);
+                if (self.save_history):
+                    token = fastllm_lib.fetch_response_llm_model(self.model, handle)
+                    if (token <= -1):
+                        try:
+                            cur_cache = self.current_tokenizer_cache.pop(handle)
+                            self.tokenizer_cache.add(cur_cache[0], cur_cache[1])
+                        except:
+                            pass
+                        break
+                    ret += self._decode_fastllm_token(token)
+                    pending_tokens.append(token)
+                else:
+                    ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle);
                 cur = "";
                 try:
                     cur = ret.decode();
@@ -1492,6 +1546,10 @@ class model:
                 fail_cnt = 0;
                 if (cur == "<flmeos>"):
                     break;
+                if (self.save_history and handle in self.current_tokenizer_cache):
+                    self.current_tokenizer_cache[handle][0].append(cur)
+                    self.current_tokenizer_cache[handle][1].append([] + pending_tokens)
+                    pending_tokens.clear()
                 if one_by_one:
                     yield cur;
                 else:
@@ -1714,10 +1772,18 @@ class model:
             else:
                 prompt = query if self.direct_query else self.get_prompt(query, history)
             stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
-            handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+            if (self.save_history):
+                input = self.tokenizer_cache.tokenize_with_cache(self, prompt)
+                handle = fastllm_lib.launch_response_llm_model(self.model, len(input), (ctypes.c_int * len(input))(*input),
                                                             ctypes.c_int(max_length), ctypes.c_int(min_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
                                                             ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
                                                             stop_token_len, stop_token_list)
+                self.current_tokenizer_cache[handle] = [[prompt], [input]]
+            else:
+                handle = fastllm_lib.launch_response_str_llm_model(self.model, prompt.encode(),
+                                                                ctypes.c_int(max_length), ctypes.c_int(min_length), ctypes.c_bool(do_sample), ctypes.c_float(top_p), ctypes.c_int(top_k),
+                                                                ctypes.c_float(temperature), ctypes.c_float(repeat_penalty), ctypes.c_bool(False),
+                                                                stop_token_len, stop_token_list)
             return handle
     
     def abort_handle(self, handle):
@@ -1754,11 +1820,24 @@ class model:
         else:
             res = ""
             ret = b''
+            pending_tokens = []
             fail_cnt = 0
             while True:
                 if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
                     continue
-                ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
+                if (self.save_history and handle in self.current_tokenizer_cache):
+                    token = fastllm_lib.fetch_response_llm_model(self.model, handle)
+                    if (token <= -1):
+                        try:
+                            cur_cache = self.current_tokenizer_cache.pop(handle)
+                            self.tokenizer_cache.add(cur_cache[0], cur_cache[1])
+                        except:
+                            pass
+                        break
+                    ret += self._decode_fastllm_token(token)
+                    pending_tokens.append(token)
+                else:
+                    ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
                 cur = ""
                 try:
                     cur = ret.decode()
@@ -1772,6 +1851,10 @@ class model:
                 fail_cnt = 0
                 if (cur == "<flmeos>"):
                     break
+                if (self.save_history and handle in self.current_tokenizer_cache):
+                    self.current_tokenizer_cache[handle][0].append(cur)
+                    self.current_tokenizer_cache[handle][1].append([] + pending_tokens)
+                    pending_tokens.clear()
                 yield cur
 
     async def stream_response_handle_async(self, handle):
@@ -1819,12 +1902,25 @@ class model:
         else:
             res = ""
             ret = b''
+            pending_tokens = []
             fail_cnt = 0
             while True:
                 if not(fastllm_lib.can_fetch_response_llm_model(self.model, handle)):
                     await asyncio.sleep(0)
                     continue
-                ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
+                if (self.save_history and handle in self.current_tokenizer_cache):
+                    token = fastllm_lib.fetch_response_llm_model(self.model, handle)
+                    if (token <= -1):
+                        try:
+                            cur = self.current_tokenizer_cache.pop(handle)
+                            self.tokenizer_cache.add(cur[0], cur[1])
+                        except:
+                            pass
+                        break
+                    ret += self._decode_fastllm_token(token)
+                    pending_tokens.append(token)
+                else:
+                    ret += fastllm_lib.fetch_response_str_llm_model(self.model, handle)
                 cur = ""
                 try:
                     cur = ret.decode()
@@ -1838,6 +1934,10 @@ class model:
                 fail_cnt = 0
                 if (cur == "<flmeos>"):
                     break
+                if (self.save_history and handle in self.current_tokenizer_cache):
+                    self.current_tokenizer_cache[handle][0].append(cur)
+                    self.current_tokenizer_cache[handle][1].append([] + pending_tokens)
+                    pending_tokens.clear()
                 yield cur
                     
     async def stream_response_async(self,
