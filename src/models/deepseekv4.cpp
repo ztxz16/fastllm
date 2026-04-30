@@ -3340,8 +3340,38 @@ namespace fastllm {
     }
 
     void DeepSeekV4Model::WarmUp() {
-        // forward 尚未实现，warmup 暂时只打印提示，保持构造期间不崩溃
-        printf("DeepSeekV4Model warmup skipped: forward not implemented yet.\n");
+        printf("Warmup...\n");
+
+        Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
+        Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});
+        Data positionIds = Data(DataType::FLOAT32, {1, 1}, {0});
+
+        std::vector <std::pair <Data, Data> > pastKeyValues;
+        for (int i = 0; i < block_cnt; i++) {
+            pastKeyValues.push_back(std::make_pair(Data(this->dataType),
+                                                   Data(this->dataType)));
+        }
+        Forward(inputIds, attentionMask, positionIds, pastKeyValues);
+
+        this->kvCacheId = 0;
+        elementsInKVCachePerToken = 0;
+        bool foundTokenGrowingCache = false;
+        for (int i = 0; i < block_cnt; i++) {
+            if (pastKeyValues[i].first.isLinearAttention || pastKeyValues[i].second.isLinearAttention) {
+                continue;
+            }
+            if (pastKeyValues[i].first.dims.size() < 3 || pastKeyValues[i].second.dims.size() < 3) {
+                continue;
+            }
+            if (!foundTokenGrowingCache) {
+                this->kvCacheId = i;
+                foundTokenGrowingCache = true;
+            }
+            elementsInKVCachePerToken +=
+                (long long)pastKeyValues[i].first.dims[0] * pastKeyValues[i].first.dims[2] +
+                (long long)pastKeyValues[i].second.dims[0] * pastKeyValues[i].second.dims[2];
+        }
+        printf("finish.\n");
     }
 
     std::string DeepSeekV4Model::MakeInput(const std::string &history, int round, const std::string &input) {
