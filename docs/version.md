@@ -1,3 +1,36 @@
+## V0.1.6.0
+
+- 支持DeepSeek V4模型，补充DeepSeek V4的分词和chat_template处理
+- 修复DeepSeek V4缺少chat_template时加载出错的问题
+- 修复DeepSeek V4工具调用解析的问题
+- 支持Qwen3.5多模态推理，补充Qwen3.5多模态Python接口
+- 支持Qwen3.5 MoE模型识别和默认参数设置
+- 初步支持Gemma4多模态推理
+- 支持Minimax-M2模型，补充Minimax-M2工具调用解析
+- 初步支持Anthropic API兼容接口，新增`/v1/messages`接口
+- 修复Anthropic API工具调用的问题
+- OpenAI兼容API支持图文输入，支持http、data url和file url图片
+- 修复多模态推理资源管理的问题
+- 支持参数`--kv_cache_dtype`设置KV缓存类型
+- 增加`--chunked_prefill_size`参数设置分块prefill大小
+- 增加`--tokens`、`--page_size`、`--gpu_mem_ratio`等参数，方便控制长上下文和缓存
+- 增加`--moe_atype`参数，可指定MOE层激活类型
+- 增加`--cuda_se`参数，可控制共享专家是否使用CUDA执行
+- 支持`cudapp=N`、`cudapp=1:2:3`形式简写多卡串行执行参数
+- API server支持读取模型默认采样参数
+- API server支持通过命令行覆盖temperature、top_p、top_k、repeat_penalty等采样参数
+- 修复API server中enable_thinking和think参数透传的问题
+- API server启动时会尝试提高ulimit，减少请求较多时文件描述符不足的问题
+- 新增`ftllm.env`模块，可读取当前wheel的编译信息
+- 优化Python包版本读取，支持从`ftllm`、`ftllm-nightly`、`ftllm-rocm`读取版本号
+- 优化CUDA wheel依赖库加载，支持从pip安装的nvidia依赖中查找CUDA、cuBLAS、NCCL库
+- CUDA wheel补充NCCL依赖和SM80预编译架构
+- 修复Python历史缓存的问题
+- 修复读取GGUF模型时未加载generation_config的问题
+- 修复CPU embedding、tie weight等模型加载问题
+- 修复tool parser在tokenizer缺失时可能出错的问题
+- 修复nightly打包元数据和Python包编译脚本相关问题
+
 ## V0.1.5.1
 
 - 初步支持AMX加速，在支持AMX的机器上通过参数--amx true来开启
