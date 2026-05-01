@@ -1103,7 +1103,7 @@ namespace fastllm {
 #endif
                 Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                 std::vector<int> ret;
-auto st = std::chrono::system_clock::now();
+// auto st = std::chrono::system_clock::now();
                 if (isSingleMultimodal) {
                     ret = model->ForwardMultimodal(
                         inputIds,
@@ -1179,10 +1179,10 @@ auto st = std::chrono::system_clock::now();
                         }
                     }
                 }
-int total = 0;
+/*int total = 0;
 for (int i : seqLens) total += i;
 float spend = GetSpan(st, std::chrono::system_clock::now());
-printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)total / spend);
+printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)total / spend);*/
 
                 forwardLocker.unlock();
                 dictLocker.lock();
