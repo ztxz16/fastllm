@@ -1618,6 +1618,58 @@ static void dequantize_row_q4_K_r4_cuda(const void * vx, dst_t * y, const int64_
     dequantize_block_q4_K_r4<<<nblocks, 128, 0, stream>>>(vx, y, n_per_row);
 }
 
+// Dequantize q2_K_r4 (4-row interleaved) format back to float/half/bf16.
+// Each block_q2_k_r4 encodes 4 rows x QK_K elements.
+template<typename dst_t>
+static __global__ void dequantize_block_q2_K_r4(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                                 const int64_t n_per_row) {
+    const block_q2_k_r4 * x = (const block_q2_k_r4 *) vx;
+    const int64_t i = blockIdx.x;
+
+    const int64_t tid  = threadIdx.x;
+    const int64_t k    = tid / 32;     // row 0..3
+    const int64_t ltid = tid % 32;     // 0..31
+
+    const int nblock = n_per_row / QK_K;
+    const int64_t group = i / nblock;
+    const int64_t ibl   = i % nblock;
+    dst_t * y = yy + group * 4 * n_per_row + k * n_per_row + ibl * QK_K;
+
+    const float d = __half2float(x[i].d[k]);
+    const float dmin = __half2float(x[i].d[k + 4]);
+
+    // ltid = 0..31 -> ib = 0..7, j = 0..3. Each ib covers 32 values:
+    // the first 16 and last 16 values use separate scale/min nibbles.
+    const int ib = ltid / 4;
+    const int j  = ltid % 4;
+
+    const uint8_t sc0 = x[i].scales[8 * ib + k + 0];
+    const uint8_t sc1 = x[i].scales[8 * ib + k + 4];
+    const float d0 = d * (sc0 & 0xF);
+    const float m0 = dmin * (sc0 >> 4);
+    const float d1 = d * (sc1 & 0xF);
+    const float m1 = dmin * (sc1 >> 4);
+
+    const uint8_t * qs_base = x[i].qs + 32 * ib + 4 * k;
+    const uint8_t q0 = qs_base[j + 0];
+    const uint8_t q1 = qs_base[j + 16];
+
+    y[32 * ib + j +  0] = DequantizeCast<dst_t>::cast(d0 * ((q0 >> 0) & 0x3) - m0);
+    y[32 * ib + j +  4] = DequantizeCast<dst_t>::cast(d0 * ((q0 >> 2) & 0x3) - m0);
+    y[32 * ib + j +  8] = DequantizeCast<dst_t>::cast(d0 * ((q0 >> 4) & 0x3) - m0);
+    y[32 * ib + j + 12] = DequantizeCast<dst_t>::cast(d0 * ((q0 >> 6) & 0x3) - m0);
+    y[32 * ib + j + 16] = DequantizeCast<dst_t>::cast(d1 * ((q1 >> 0) & 0x3) - m1);
+    y[32 * ib + j + 20] = DequantizeCast<dst_t>::cast(d1 * ((q1 >> 2) & 0x3) - m1);
+    y[32 * ib + j + 24] = DequantizeCast<dst_t>::cast(d1 * ((q1 >> 4) & 0x3) - m1);
+    y[32 * ib + j + 28] = DequantizeCast<dst_t>::cast(d1 * ((q1 >> 6) & 0x3) - m1);
+}
+
+template<typename dst_t>
+static void dequantize_row_q2_K_r4_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
+    const int64_t nblocks = (nrows / 4) * (n_per_row / QK_K);
+    dequantize_block_q2_K_r4<<<nblocks, 128, 0, stream>>>(vx, y, n_per_row);
+}
+
 template<typename dst_t>
 static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t nrows, const int64_t n_per_row, cudaStream_t stream) {
     const int64_t k = nrows * n_per_row;
@@ -1817,6 +1869,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_q4_K_cuda;
         case GGML_TYPE_Q4_K_R4:
             return dequantize_row_q4_K_r4_cuda;
+        case GGML_TYPE_Q2_K_R4:
+            return dequantize_row_q2_K_r4_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q5_K_R4:
@@ -1902,6 +1956,8 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return dequantize_row_q4_K_cuda;
         case GGML_TYPE_Q4_K_R4:
             return dequantize_row_q4_K_r4_cuda;
+        case GGML_TYPE_Q2_K_R4:
+            return dequantize_row_q2_K_r4_cuda;
         case GGML_TYPE_Q5_K:
             return dequantize_row_q5_K_cuda;
         case GGML_TYPE_Q5_K_R4:
