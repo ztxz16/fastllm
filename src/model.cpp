@@ -2511,6 +2511,9 @@ if (false) {
             long long currentOffset = 0;
             for (auto it : items) {
                 std::string weightName = it->tensorName;
+                if (IsSafeTensorQuantScaleTensorName(safeTensors, weightName)) {
+                    continue;
+                }
                 long long currentBytes = weights[weightName].GetFastllmFormateBytes();
                 offsets[weightName] = {currentOffset, currentOffset + currentBytes};
                 currentOffset += currentBytes;
@@ -2537,7 +2540,7 @@ if (false) {
 
             for (auto it : items) {
                 std::string weightName = it->tensorName;
-                if (StringEndWith(weightName, "_scale_inv")) {
+                if (IsSafeTensorQuantScaleTensorName(safeTensors, weightName)) {
                     continue;
                 }
                 weights[weightName].ExportFastllmFormat(bytes.data() + offsets[weightName][0]);

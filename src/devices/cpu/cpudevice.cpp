@@ -1945,6 +1945,13 @@ namespace fastllm {
         int n = index.dims[0];
         int topk = index.dims[1];
         int weightsBatch = intParams.find("weights___batch") != intParams.end() ? intParams.find("weights___batch")->second : (topk + 1) * 2;
+        int routedExpertCount = std::max(0, weightsBatch / 2 - 1);
+        auto normalizeExpertIdx = [&](int expertIdx) {
+            if (routedExpertCount <= 0) {
+                return 0;
+            }
+            return std::max(0, std::min(expertIdx, routedExpertCount - 1));
+        };
         
         ToDataType(score, DataType::FLOAT32);
         int32_t *indexData = (int32_t*)index.cpuData;
@@ -1974,8 +1981,7 @@ namespace fastllm {
 
         if (weights[2]->dataType == DataType::DATA_GGUF_FORMAT && 
             !weights[2]->IsRepacked) {
-            int channels = n > 0 ? (weightsBatch / 2 - 1) : 0; // 专家数量
-            int len = channels * 2;
+            int len = weightsBatch;
             
             auto *pool = GetAlivePool();
             int threadNum = pool->threads.size();
@@ -2033,7 +2039,7 @@ namespace fastllm {
                 std::vector <std::pair <int, float> > v;
                 for (int j = 0; j < topk; j++) {
                     // index 存储的是专家索引（从0开始），需要+1因为0表示shared expert
-                    int expertIdx = indexData[o * topk + j];
+                    int expertIdx = normalizeExpertIdx(indexData[o * topk + j]);
                     float expertScore = scoreData[o * topk + j];
                     v.push_back(std::make_pair(expertIdx + 1, expertScore));
                 }
@@ -2306,7 +2312,7 @@ namespace fastllm {
             for (int o = 0; o < outer; o++) {
                 std::vector <std::pair <int, float> > v;
                 for (int j = 0; j < topk; j++) {
-                    int expertIdx = indexData[o * topk + j];
+                    int expertIdx = normalizeExpertIdx(indexData[o * topk + j]);
                     float expertScore = scoreData[o * topk + j];
                     v.push_back(std::make_pair(expertIdx + 1, expertScore));
                 }
@@ -2387,7 +2393,7 @@ namespace fastllm {
                         int curK = weights[idx * 2]->dims[0];
                         auto &uinputDown = q8kInputsDown[l];
                         int rowCount = mid / QK_K; // 每行有多少个block
-                        uinputDown.resize(ggml_row_size(ggml_type_vec_dot_type((ggml_type)weights[idx * 2 + 1]->ggmlType), m));
+                        uinputDown.resize(ggml_row_size(ggml_type_vec_dot_type((ggml_type)weights[idx * 2 + 1]->ggmlType), mid));
 
                         ops[l - st] = new fastllm::MultiThreadMultiOps();
                         ((fastllm::MultiThreadMultiOps*)ops[l - st])->ops.push_back(
@@ -2515,7 +2521,7 @@ namespace fastllm {
             for (int o = 0; o < outer; o++) {
                 std::vector <std::pair <int, float> > v;
                 for (int j = 0; j < topk; j++) {
-                    int expertIdx = indexData[o * topk + j];
+                    int expertIdx = normalizeExpertIdx(indexData[o * topk + j]);
                     float expertScore = scoreData[o * topk + j];
                     v.push_back(std::make_pair(expertIdx + 1, expertScore));
                 }
@@ -2706,7 +2712,7 @@ namespace fastllm {
             for (int o = 0; o < outer; o++) {
                 std::vector <std::pair <int, float> > v;
                 for (int j = 0; j < topk; j++) {
-                    int expertIdx = indexData[o * topk + j];
+                    int expertIdx = normalizeExpertIdx(indexData[o * topk + j]);
                     float expertScore = scoreData[o * topk + j];
                     v.push_back(std::make_pair(expertIdx + 1, expertScore));
                 }
@@ -2904,7 +2910,7 @@ namespace fastllm {
                 for (int b = 0; b < bs; b++) {
                     expertTasks[0].push_back(std::make_pair(b, sharedScale));
                     for (int j = 0; j < topk; j++) {
-                        int expertIdx = indexData[b * topk + j];
+                        int expertIdx = normalizeExpertIdx(indexData[b * topk + j]);
                         float value = scoreData[b * topk + j];
                         expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
                     }
@@ -3158,7 +3164,7 @@ ops += (long long)lines * inputDim * interDim * 2;
             if (input.dims[0] == 1) {
                 output.Allocate(0.0f);
                 for (int j = 0; j < topk; j++) {
-                    int expertIdx = indexData[j];
+                    int expertIdx = normalizeExpertIdx(indexData[j]);
                     float value = scoreData[j];
 
                     Linear(input, *weights[(expertIdx + 1) * 2], Data(), w3);
@@ -3198,7 +3204,7 @@ ops += (long long)lines * inputDim * interDim * 2;
                 for (int b = 0; b < bs; b++) {
                     expertTasks[0].push_back(std::make_pair(b, sharedScale));
                     for (int j = 0; j < topk; j++) {
-                        int expertIdx = indexData[b * topk + j];
+                        int expertIdx = normalizeExpertIdx(indexData[b * topk + j]);
                         float value = scoreData[b * topk + j];
                         expertTasks[expertIdx + 1].push_back(std::make_pair(b, value));
                     }

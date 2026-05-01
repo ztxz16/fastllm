@@ -387,151 +387,6 @@ namespace fastllm {
             return std::log1p(std::exp(x));
         }
 
-        static void DebugDumpData(const std::string &name, const Data &input, int startPos = -1) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4DebugDump");
-            Data tmp;
-            ToDataType(input, tmp, DataType::FLOAT32);
-            tmp.ToDevice(DataDevice::CPU);
-            printf("[fastllm-debug] %-10s shape=(", name.c_str());
-            for (int i = 0; i < (int)tmp.dims.size(); i++) {
-                if (i) {
-                    printf(", ");
-                }
-                printf("%d", tmp.dims[i]);
-            }
-            printf(") dtype=%s", GetDataTypeName(input.dataType).c_str());
-            if (startPos >= 0) {
-                printf(" start_pos=%d", startPos);
-            }
-            printf("\n");
-
-            float *p = (float*)tmp.cpuData;
-            uint64_t cnt = tmp.Count(0);
-            if (cnt == 0) {
-                return;
-            }
-            float mn = std::numeric_limits<float>::infinity();
-            float mx = -std::numeric_limits<float>::infinity();
-            double sum = 0.0, sq = 0.0;
-            bool hasNan = false, hasInf = false;
-            uint64_t finiteCount = 0, nanCount = 0, infCount = 0;
-            uint64_t firstNan = cnt, firstInf = cnt;
-            for (uint64_t i = 0; i < cnt; i++) {
-                float v = p[i];
-                if (std::isnan(v)) {
-                    hasNan = true;
-                    nanCount++;
-                    if (firstNan == cnt) {
-                        firstNan = i;
-                    }
-                    continue;
-                }
-                if (std::isinf(v)) {
-                    hasInf = true;
-                    infCount++;
-                    if (firstInf == cnt) {
-                        firstInf = i;
-                    }
-                    continue;
-                }
-                mn = std::min(mn, v);
-                mx = std::max(mx, v);
-                sum += v;
-                sq += (double)v * (double)v;
-                finiteCount++;
-            }
-            if (finiteCount == 0) {
-                mn = mx = std::numeric_limits<float>::quiet_NaN();
-            }
-            double mean = finiteCount == 0 ? std::numeric_limits<double>::quiet_NaN() : sum / finiteCount;
-            double var = finiteCount == 0 ? std::numeric_limits<double>::quiet_NaN()
-                                          : std::max(0.0, sq / finiteCount - mean * mean);
-            printf("[fastllm-debug]            min=%.4f max=%.4f mean=%.4f std=%.4f nan=%s inf=%s\n",
-                   mn, mx, (float)mean, (float)std::sqrt(var), hasNan ? "true" : "false", hasInf ? "true" : "false");
-            if (hasNan || hasInf) {
-                auto printLocation = [&](uint64_t flat) {
-                    printf("[");
-                    std::vector<int> coords(tmp.dims.size(), 0);
-                    for (int d = (int)tmp.dims.size() - 1; d >= 0; d--) {
-                        coords[d] = flat % tmp.dims[d];
-                        flat /= tmp.dims[d];
-                    }
-                    for (int d = 0; d < (int)coords.size(); d++) {
-                        if (d) {
-                            printf(", ");
-                        }
-                        printf("%d", coords[d]);
-                    }
-                    printf("]");
-                };
-                printf("[fastllm-debug]            finite=%llu nan_count=%llu inf_count=%llu",
-                       (unsigned long long)finiteCount,
-                       (unsigned long long)nanCount,
-                       (unsigned long long)infCount);
-                if (firstNan != cnt) {
-                    printf(" first_nan=");
-                    printLocation(firstNan);
-                }
-                if (firstInf != cnt) {
-                    printf(" first_inf=");
-                    printLocation(firstInf);
-                }
-                printf("\n");
-            }
-
-            uint64_t sampleOffset = 0;
-            int sampleLen = 8;
-            if (tmp.dims.size() == 4) {
-                sampleOffset = (((uint64_t)0 * tmp.dims[1] + (tmp.dims[1] - 1)) * tmp.dims[2] + 0) * tmp.dims[3];
-                sampleLen = std::min(sampleLen, tmp.dims[3]);
-            } else if (tmp.dims.size() == 3) {
-                sampleOffset = ((uint64_t)0 * tmp.dims[1] + (tmp.dims[1] - 1)) * tmp.dims[2];
-                sampleLen = std::min(sampleLen, tmp.dims[2]);
-            } else if (tmp.dims.size() == 2) {
-                sampleOffset = 0;
-                sampleLen = std::min(sampleLen, tmp.dims[1]);
-            } else {
-                sampleOffset = 0;
-                sampleLen = std::min<uint64_t>(sampleLen, cnt);
-            }
-            printf("[fastllm-debug]            sample=[");
-            for (int i = 0; i < sampleLen; i++) {
-                if (i) {
-                    printf(", ");
-                }
-                printf("%.9g", p[sampleOffset + i]);
-            }
-            printf("]\n");
-        }
-
-        static void DebugDumpInputIds(const Data &inputIds, int startPos) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4DebugDump");
-            auto ids = ReadTokenIds(inputIds);
-            printf("[fastllm-debug] input_ids  shape=(");
-            for (int i = 0; i < (int)inputIds.dims.size(); i++) {
-                if (i) {
-                    printf(", ");
-                }
-                printf("%d", inputIds.dims[i]);
-            }
-            printf(") start_pos=%d\n[fastllm-debug]            values=[", startPos);
-            int idx = 0;
-            for (int b = 0; b < inputIds.dims[0]; b++) {
-                if (b) {
-                    printf(", ");
-                }
-                printf("[");
-                for (int s = 0; s < inputIds.dims[1]; s++, idx++) {
-                    if (s) {
-                        printf(", ");
-                    }
-                    printf("%d", ids[idx]);
-                }
-                printf("]");
-            }
-            printf("]\n");
-        }
-
         struct HcMix {
             Data y;
             Data postData;
@@ -2005,11 +1860,7 @@ namespace fastllm {
                 }
 
                 std::vector<int> curIndices(topk);
-                if (hashRouting) {
-                    for (int k = 0; k < topk; k++) {
-                        curIndices[k] = (int)((*tid2eid)[(uint64_t)inputIds[t] * topk + k] + 0.5f);
-                    }
-                } else {
+                auto selectByScore = [&]() {
                     std::vector<float> selectScores = originalScores;
                     if (gateBias != nullptr) {
                         for (int e = 0; e < nRoutedExperts; e++) {
@@ -2028,6 +1879,18 @@ namespace fastllm {
                         curIndices[k] = best;
                         selectScores[best] = -std::numeric_limits<float>::infinity();
                     }
+                };
+                bool useHashRow = hashRouting && inputIds.size() > (size_t)t && inputIds[t] >= 0 &&
+                                  tid2eid != nullptr &&
+                                  tid2eid->size() >= (uint64_t)(inputIds[t] + 1) * topk;
+                if (useHashRow) {
+                    uint64_t routeOffset = (uint64_t)inputIds[t] * topk;
+                    for (int k = 0; k < topk; k++) {
+                        int expert = (int)((*tid2eid)[routeOffset + k] + 0.5f);
+                        curIndices[k] = std::max(0, std::min(expert, nRoutedExperts - 1));
+                    }
+                } else {
+                    selectByScore();
                 }
 
                 float sum = 0.0f;
@@ -2771,7 +2634,6 @@ namespace fastllm {
                                                    const LastTokensManager &lastTokens,
                                                    std::vector <std::vector <float>*> *retLogits) {
         ScopedExecutorProfiler forwardOtherProfile("DeepSeekV4ForwardOther");
-        bool debugStopNow = false;
         Data hiddenStates;
         int startPos = 0;
         if (positionIds.dims.size() >= 2 && positionIds.Count(0) > 0) {
@@ -2779,23 +2641,7 @@ namespace fastllm {
             startPos = pids.empty() ? 0 : pids[0];
         }
         int originalStartPos = startPos;
-        bool debugFullRecomputeDecode = EnvFlagEnabled("FASTLLM_DEBUG_FULL_RECOMPUTE_DECODE") && batch == 1;
-        Data recomputeInputIds;
-        const Data *forwardInputIds = &inputIds;
-        if (debugFullRecomputeDecode) {
-            auto ids = ReadTokenIds(inputIds);
-            if (originalStartPos == 0) {
-                debugFullRecomputeTokens = ids;
-                debugGeneratedTokens = 0;
-            } else {
-                debugFullRecomputeTokens.insert(debugFullRecomputeTokens.end(), ids.begin(), ids.end());
-                std::vector<float> fullIds(debugFullRecomputeTokens.begin(), debugFullRecomputeTokens.end());
-                recomputeInputIds.CopyFrom(Data(DataType::FLOAT32, {1, (int)fullIds.size()}, fullIds));
-                forwardInputIds = &recomputeInputIds;
-                startPos = 0;
-            }
-        }
-        if (!debugFullRecomputeDecode && this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
+        if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
             batch == 1 && inputIds.dims.size() >= 2 && inputIds.dims[1] > 1 &&
             !EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_DISABLE_CHUNK_SPLIT")) {
             int seq = inputIds.dims[1];
@@ -2868,7 +2714,7 @@ namespace fastllm {
                 return ret;
             }
         }
-        if (!debugFullRecomputeDecode && batch == 1 && inputIds.dims.size() >= 2 &&
+        if (batch == 1 && inputIds.dims.size() >= 2 &&
             inputIds.dims[1] > 1 && originalStartPos > 0 &&
             EnvFlagEnabled("FASTLLM_DSV4_ENABLE_PREFIX_CACHE_SEQUENTIAL")) {
             std::vector<int> ret(1, 0);
@@ -2887,25 +2733,11 @@ namespace fastllm {
             }
             return ret;
         }
-        bool debugThisStep = /* (originalStartPos == 0) || */ EnvFlagEnabled("FASTLLM_DEBUG_ALL_STEPS");
-        bool debugLogitsThisStep = debugThisStep || EnvFlagEnabled("FASTLLM_DEBUG_LOGITS_ALL_STEPS") || debugFullRecomputeDecode;
-        bool debugDumpStates = EnvFlagEnabled("FASTLLM_DEBUG_DUMP_STATES");
-        bool useDecodeCache = (!debugFullRecomputeDecode && batch == 1);
-        int debugStopAfterTokens = EnvInt("FASTLLM_DEBUG_STOP_AFTER_TOKENS", 0);
-        if (!debugFullRecomputeDecode && originalStartPos == 0 && debugStopAfterTokens > 0) {
-            debugGeneratedTokens = 0;
-        }
+        bool useDecodeCache = batch == 1;
+        Embedding(inputIds, weight["embed.weight"], hiddenStates);
 
-        if (debugThisStep || debugFullRecomputeDecode) {
-            DebugDumpInputIds(*forwardInputIds, originalStartPos);
-        }
-        Embedding(*forwardInputIds, weight["embed.weight"], hiddenStates);
-        if (debugThisStep && debugDumpStates) {
-            DebugDumpData("embed", hiddenStates);
-        }
-
-        int bsz = forwardInputIds->dims[0];
-        int seqlen = forwardInputIds->dims[1];
+        int bsz = inputIds.dims[0];
+        int seqlen = inputIds.dims[1];
         int dim = embed_dim;
         {
             ScopedExecutorProfiler executorProfile("DeepSeekV4HcExpand");
@@ -2922,9 +2754,6 @@ namespace fastllm {
             }
             WriteFloatData(expanded, {bsz, seqlen, hc_mult, dim}, hiddenStates, hiddenStates.dataType);
         }
-        if (debugThisStep && debugDumpStates) {
-            DebugDumpData("hc_expand", hiddenStates);
-        }
 
         if (block_cnt <= 0) {
             ErrorInFastLLM("DeepSeekV4Model: invalid block_cnt.");
@@ -2934,20 +2763,8 @@ namespace fastllm {
             decodeLayerCaches.resize(block_cnt);
         }
 
-        // 默认跑完全部主层；FASTLLM_DEBUG_LAYERS 可限制调试层数，便于逐层排查。
-        int debugLayers = block_cnt;
-        if (const char *env = std::getenv("FASTLLM_DEBUG_LAYERS")) {
-            int limit = atoi(env);
-            if (limit > 0) {
-                debugLayers = std::min(limit, block_cnt);
-            }
-        }
-        int debugDetailLayer = -1;
-        if (const char *env = std::getenv("FASTLLM_DEBUG_DETAIL_LAYER")) {
-            debugDetailLayer = atoi(env);
-        }
-        std::vector<int> tokenIds = ReadTokenIds(*forwardInputIds);
-        if (!debugFullRecomputeDecode && this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() && batch == 1) {
+        std::vector<int> tokenIds = ReadTokenIds(inputIds);
+        if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() && batch == 1) {
             if (originalStartPos == 0) {
                 this->deepseekV4HistoryTokens = tokenIds;
             } else if ((int)this->deepseekV4HistoryTokens.size() == originalStartPos) {
@@ -2983,7 +2800,7 @@ namespace fastllm {
                 }
             }
         }
-        for (int layer = 0; layer < debugLayers; layer++) {
+        for (int layer = 0; layer < block_cnt; layer++) {
             std::string pre = "layers." + std::to_string(layer);
             int compressRatio = compress_ratios.size() > layer ? compress_ratios[layer] : 0;
             bool useCompressRope = compressRatio != 0;
@@ -3156,22 +2973,13 @@ namespace fastllm {
             }
             WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
             Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
-            if (debugThisStep && layer == debugDetailLayer) {
-                DebugDumpData("layer" + std::to_string(layer) + "_attn_out", attnOut);
-            }
             HcPostReference(attnOut, hiddenStates, attnMix, hiddenStates);
-            if (debugThisStep && layer == debugDetailLayer) {
-                DebugDumpData("layer" + std::to_string(layer) + "_after_attn", hiddenStates);
-            }
 
             HcMix ffnMix = HcPreReference(hiddenStates, weight[pre + ".hc_ffn_fn"],
                                           weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
                                           hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
             Data ffnInput, ffnOut;
             RMSNormReference(ffnMix.y, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput, DataType::BFLOAT16);
-            if (debugThisStep && layer == debugDetailLayer) {
-                DebugDumpData("layer" + std::to_string(layer) + "_ffn_in", ffnInput);
-            }
             std::vector<int> ffnDims = ffnInput.dims;
             ffnInput.Reshape({bsz * seqlen, dim});
             Data expertIndex, expertScore;
@@ -3207,13 +3015,7 @@ namespace fastllm {
                 }
             }
             ffnOut.Reshape(ffnDims);
-            if (debugThisStep && layer == debugDetailLayer) {
-                DebugDumpData("layer" + std::to_string(layer) + "_ffn_out", ffnOut);
-            }
             HcPostReference(ffnOut, hiddenStates, ffnMix, hiddenStates);
-            if (debugThisStep && debugDumpStates) {
-                DebugDumpData("layer" + std::to_string(layer), hiddenStates);
-            }
         }
 
         Data headStates, headInput, normed, logits;
@@ -3227,13 +3029,6 @@ namespace fastllm {
         RMSNormReference(headInput, weight["norm.weight"], rms_norm_eps, normed, DataType::BFLOAT16);
         Linear(normed, weight["head.weight"], Data(), logits);
         ToDataType(logits, DataType::FLOAT32);
-        if (debugLogitsThisStep) {
-            DebugDumpData("logits", logits);
-        }
-        if (originalStartPos == 0 && std::getenv("FASTLLM_DEBUG_EXIT_AFTER_PREFILL") != nullptr) {
-            fflush(stdout);
-            std::_Exit(0);
-        }
 
         if (generationConfig.output_logits && retLogits != nullptr) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4LogitsRead");
@@ -3258,37 +3053,17 @@ namespace fastllm {
             }
         }
 
-        if (debugFullRecomputeDecode) {
-            debugGeneratedTokens++;
-            printf("[fastllm-debug] generated step=%d start_pos=%d token=%d\n",
-                   debugGeneratedTokens, originalStartPos, ret.empty() ? -1 : ret[0]);
-            if (debugStopAfterTokens > 0 && debugGeneratedTokens >= debugStopAfterTokens) {
-                debugStopNow = true;
-            }
-        } else if (debugStopAfterTokens > 0) {
-            debugGeneratedTokens++;
-            printf("[fastllm-debug] generated step=%d start_pos=%d token=%d\n",
-                   debugGeneratedTokens, originalStartPos, ret.empty() ? -1 : ret[0]);
-            if (debugGeneratedTokens >= debugStopAfterTokens) {
-                debugStopNow = true;
-            }
-        }
-
         int finalTotalLen = originalStartPos + inputIds.dims[1];
         UpdateDebugPastKeyValues(pastKeyValues, bsz, finalTotalLen, block_cnt);
-        if (!debugFullRecomputeDecode && this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
+        if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
             batch == 1 && finalTotalLen % 256 == 0 &&
             (int)this->deepseekV4HistoryTokens.size() >= finalTotalLen) {
             this->RecordHistorySnapshot(this->deepseekV4HistoryTokens, finalTotalLen);
-        } else if (!debugFullRecomputeDecode && this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
+        } else if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
                    batch == 1 && finalTotalLen % 256 == 0 && DeepSeekV4PrefixCacheDebugEnabled()) {
             printf("[fastllm-dsv4-prefix-cache] skip boundary record: final_len=%d history_tokens=%d\n",
                    finalTotalLen, (int)this->deepseekV4HistoryTokens.size());
             fflush(stdout);
-        }
-        if (debugStopNow) {
-            fflush(stdout);
-            std::_Exit(0);
         }
         return ret;
     }
