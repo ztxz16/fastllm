@@ -1,3 +1,10 @@
+## V0.1.6.1
+
+- 更新DeepSeek V4量化配置，补充Q2、Q4、UD-Q2_K_L、UD-Q2_K_M量化示例
+- 支持CUDA NVFP4线性计算
+- 支持CUDA Q2_K_R4反量化
+- 优化DeepSeek V4 compressedKV CUDA缓存，提升稀疏解码性能
+
 ## V0.1.6.0
 
 - 支持DeepSeek V4模型，补充DeepSeek V4的分词和chat_template处理

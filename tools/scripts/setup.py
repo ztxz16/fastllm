@@ -9,7 +9,7 @@ tokenizer_require = ['tiktoken', 'blobfile', 'partial_json_parser']
 all_require = server_require + webui_require + download_require + tokenizer_require
 
 PACKAGE_INFO = {
-    "release": {"name": "ftllm", "version": "0.1.6.0"},
+    "release": {"name": "ftllm", "version": "0.1.6.1"},
     "nightly": {"name": "ftllm-nightly", "version": "0.0.0.3"},
 }
 
