@@ -2113,6 +2113,7 @@ namespace fastllm {
 
             ResetData(dst.windowKVData);
             ResetData(dst.compressedKV);
+            ResetData(dst.compressedKVCuda);
             if (src.compressedBlocks > 0 && src.compressedKV.dims.size() >= 2) {
                 dst.compressedKV.CopyFrom(src.compressedKV);
             }
@@ -2890,8 +2891,15 @@ namespace fastllm {
                     }
                 }
             }
+            const Data *decodeCompressedKVForAttention =
+                decodeCache != nullptr ? &decodeCache->compressedKV : nullptr;
             if (compressRatio > 0) {
                 if (decodeCache != nullptr) {
+#ifdef USE_CUDA
+                    bool keepCompressedKVOnCuda = startPos > 0 && seqlen == 1 &&
+                        !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") &&
+                        DeepSeekV4PreferCuda();
+#endif
                     std::vector<float> compressorKV, compressorScore;
                     ComputeCompressorRaw(weight, pre + ".attn.compressor", attnInput, compressorKV, compressorScore);
                     if (startPos == 0) {
@@ -2909,6 +2917,18 @@ namespace fastllm {
                         decodeCache->compressedBlocks == targetCompressedBlocks &&
                         decodeCache->compressedKV.dims.size() >= 2) {
                         decodeCompressedCount = decodeCache->compressedBlocks;
+#ifdef USE_CUDA
+                        if (keepCompressedKVOnCuda) {
+                            if (decodeCache->compressedKVCuda.dataDevice != DataDevice::CUDA ||
+                                decodeCache->compressedKVCuda.dataType != decodeCache->compressedKV.dataType ||
+                                decodeCache->compressedKVCuda.dims != decodeCache->compressedKV.dims) {
+                                ResetData(decodeCache->compressedKVCuda);
+                                decodeCache->compressedKVCuda.CopyFrom(decodeCache->compressedKV);
+                                decodeCache->compressedKVCuda.ToDevice(DataDevice::CUDA);
+                            }
+                            decodeCompressedKVForAttention = &decodeCache->compressedKVCuda;
+                        }
+#endif
                     } else if (BuildCompressedKVFromRaw(weight, pre + ".attn.compressor",
                                                         decodeCache->compressorKVRaw,
                                                         decodeCache->compressorScoreRaw,
@@ -2923,6 +2943,14 @@ namespace fastllm {
                             ConcatSeqReference(kv, decodeCache->compressedKV, catKV);
                             kv.CopyFrom(catKV);
                         }
+#ifdef USE_CUDA
+                        if (keepCompressedKVOnCuda) {
+                            ResetData(decodeCache->compressedKVCuda);
+                            decodeCache->compressedKVCuda.CopyFrom(decodeCache->compressedKV);
+                            decodeCache->compressedKVCuda.ToDevice(DataDevice::CUDA);
+                            decodeCompressedKVForAttention = &decodeCache->compressedKVCuda;
+                        }
+#endif
                     }
                 } else {
                     Data compressedKV;
@@ -2957,7 +2985,7 @@ namespace fastllm {
             }
             if (decodeCache != nullptr && startPos > 0 && seqlen == 1) {
                 SparseAttentionDecodeCachedReference(q, decodeCache->windowKV, &decodeCache->windowKVData,
-                                                     decodeCache->compressedKV, weight[pre + ".attn.attn_sink"],
+                                                     *decodeCompressedKVForAttention, weight[pre + ".attn.attn_sink"],
                                                      window_size, startPos, decodeCompressedCount,
                                                      qk_rope_head_dim, layerRopeBase,
                                                      1.0f / std::sqrt((float)head_dim_full), attnOut4,

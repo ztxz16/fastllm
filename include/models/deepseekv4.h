@@ -50,6 +50,7 @@ namespace fastllm {
         std::vector<float> compressorKVRaw;
         std::vector<float> compressorScoreRaw;
         Data compressedKV;
+        Data compressedKVCuda;
         int compressedBlocks = 0;
         int compressedTokenBase = 0;
         int rawTailStartPos = 0;
