@@ -2,8 +2,6 @@
 
 | [快速开始](#快速开始) | [部署DeepSeek](docs/deepseek.md) | [部署Qwen3](docs/qwen3.md) | [版本日志](docs/version.md) | [English Document](README_EN.md)
 
-- 近期更新较大，发布了 `fastllm-nightly` 版本供提前体验，使用文档参见 [fastllm-nightly 使用文档](docs/nightly.md)
-
 # 引用说明
 
 本项目参考了许多开源项目的代码和相关文章，具体请参考 [参考代码和文章](#参考代码和文章)
@@ -16,13 +14,16 @@ fastllm是c++实现自有算子替代Pytorch的高性能全功能大模型推理
 - 任意显卡只需要显存 > 10G就可以支持单卡推理满血DeepSeek R1 671B模型
 - 双路9004/9005服务器 + 单显卡部署DeepSeek R1 671B - FP8原版模型，单并发速度可达20左右，部署INT4模型单并发速度可达30左右，最高并发速度可达60+
 
-部署交流QQ群： 831641348
+部署交流QQ群：831641348
 
-微信群：目前群聊超过200人，请添加小助手微信号`fastllmxzs`加群: 
+**微信**
+
+- **用户交流群**（使用、部署等问题）：![用户交流群二维码](docs/wechat_group0.jpg)
+- **社区开发群**（参与贡献与开发讨论）：![社区开发群二维码](docs/develop-group.png)
 
 ## 新功能速览
 
-- Fastllm目前支持Qwen3-Next模型的混合推理了！
+- Fastllm目前支持DeepSeek-V4模型了
 - Fastllm目前支持导出通用动态量化模型了！参考[动态量化说明](docs/dtype_config.md)
 - Fastllm目前可以支持部分GGUF模型的读取了！需要注意，目前需要使用`--ori`参数指定源模型配置文件夹，请阅读 [使用指南](#使用指南)
 
@@ -44,7 +45,6 @@ fastllm是c++实现自有算子替代Pytorch的高性能全功能大模型推理
 
 ### 安装
 
-
 - `pip`安装支持`Nvidia GPU`和`AMD GPU`，其余`GPU`请使用[源码安装](#源码安装)
 - `pip`安装速度慢时，可使用镜像加速
 
@@ -53,14 +53,6 @@ pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/si
 ```
 
 #### Linux系统 + Nvidia GPU:
-
-由于目前PyPI限制库大小，安装包中不含CUDA依赖，安装ftllm之前建议先手动安装CUDA 12以上版本 (已安装cuda可跳过)
-```
-wget https://developer.download.nvidia.com/compute/cuda/12.8.1/local_installers/cuda_12.8.1_570.124.06_linux.run
-sudo sh cuda_12.8.1_570.124.06_linux.run
-```
-
-然后用pip安装，命令如下：
 
 ```
 pip install ftllm -U
