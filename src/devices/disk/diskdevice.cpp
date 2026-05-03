@@ -196,6 +196,11 @@ namespace fastllm {
         loaded->groupCnt = weight->groupCnt;
         loaded->blockK = weight->blockK;
         loaded->blockM = weight->blockM;
+        loaded->perChannelsConfigs = weight->perChannelsConfigs;
+        loaded->scales = weight->scales;
+        loaded->mins = weight->mins;
+        loaded->zeros = weight->zeros;
+        loaded->halfScales = weight->halfScales;
         loaded->Allocate(false);
 
         uint64_t dstOffset = 0;
@@ -253,7 +258,7 @@ namespace fastllm {
                 dst[i] = BF16ToFloat(src[i]);
             }
         } else {
-            ErrorInFastLLM("Disk MoE only supports FLOAT32/FLOAT16/BFLOAT16 input for BF16 weights.\n");
+            ErrorInFastLLM("Disk MoE only supports FLOAT32/FLOAT16/BFLOAT16 input for quantized weights.\n");
         }
     }
 
@@ -276,7 +281,7 @@ namespace fastllm {
                 dst[i] = FloatToBF16(src[i]);
             }
         } else {
-            ErrorInFastLLM("Disk MoE only supports FLOAT32/FLOAT16/BFLOAT16 output for BF16 weights.\n");
+            ErrorInFastLLM("Disk MoE only supports FLOAT32/FLOAT16/BFLOAT16 output for quantized weights.\n");
         }
     }
 
@@ -370,18 +375,20 @@ namespace fastllm {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         DataType originalOutputType = output.dataType;
-        bool promoteForBf16 = tempWeights[2] != nullptr &&
-                              tempWeights[2]->dataType == DataType::BFLOAT16 &&
-                              input.dataType != DataType::FLOAT32;
-        if (promoteForBf16) {
+        bool promoteInput = tempWeights[2] != nullptr &&
+                            (tempWeights[2]->dataType == DataType::BFLOAT16 ||
+                             tempWeights[2]->dataType == DataType::FP8_E4M3 ||
+                             tempWeights[2]->dataType == DataType::NVFP4) &&
+                            input.dataType != DataType::FLOAT32;
+        if (promoteInput) {
             ConvertInputToFloat32(input, promotedInput);
             promotedOutput.dataType = DataType::FLOAT32;
-            promotedOutput.Resize(input.dims);
+            promotedOutput.Resize(output.dims);
             diskDatas["input"] = &promotedInput;
             diskDatas["output"] = &promotedOutput;
         }
         CpuMergeMOE::Run(opType, diskDatas, floatParams, intParams);
-        if (promoteForBf16) {
+        if (promoteInput) {
             ConvertFloat32ToOutput(promotedOutput, output, originalOutputType);
         }
 
