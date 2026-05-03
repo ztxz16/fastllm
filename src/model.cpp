@@ -782,7 +782,7 @@ namespace fastllm {
         if (!GetDiskSourceDataType(tensor.dtype, sourceDataType) || !IsDiskTargetDataType(targetDataType)) {
             ErrorInFastLLM("Disk MoE only supports F32/F16/BF16 safetensors in the first version: " + weight.name + "\n");
         }
-        weight.dataType = targetDataType;
+        weight.dataType = sourceDataType;
         weight.UpdateUnitSize();
         weight.isDiskWeight = true;
         weight.diskWeightParts.clear();
