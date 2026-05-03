@@ -741,6 +741,98 @@ namespace fastllm {
         return "";
     }
 
+    static bool UseDiskMoeDevice() {
+        auto moeDeviceMap = GetMoeDeviceMap();
+        for (auto &it : moeDeviceMap) {
+            if (StartWith(it.first, "disk")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool IsDiskMoeWeight(basellm *model, const std::string &weightName, bool useDiskMoe) {
+        return useDiskMoe && model != nullptr && model->moeLinears.find(weightName) != model->moeLinears.end();
+    }
+
+    static bool GetDiskSourceDataType(const std::string &dtype, DataType &dataType) {
+        if (dtype == "F32") {
+            dataType = DataType::FLOAT32;
+            return true;
+        }
+        if (dtype == "F16") {
+            dataType = DataType::FLOAT16;
+            return true;
+        }
+        if (dtype == "BF16") {
+            dataType = DataType::BFLOAT16;
+            return true;
+        }
+        return false;
+    }
+
+    static bool IsDiskTargetDataType(DataType dataType) {
+        return dataType == DataType::FLOAT32 ||
+               dataType == DataType::FLOAT16 ||
+               dataType == DataType::BFLOAT16;
+    }
+
+    static void SetDiskWeightMeta(Data &weight, const SafeTensorItem &tensor, DataType targetDataType) {
+        DataType sourceDataType;
+        if (!GetDiskSourceDataType(tensor.dtype, sourceDataType) || !IsDiskTargetDataType(targetDataType)) {
+            ErrorInFastLLM("Disk MoE only supports F32/F16/BF16 safetensors in the first version: " + weight.name + "\n");
+        }
+        weight.dataType = targetDataType;
+        weight.UpdateUnitSize();
+        weight.isDiskWeight = true;
+        weight.diskWeightParts.clear();
+        weight.weightType = WeightType::LINEAR;
+        weight.expansionSize = 0;
+        weight.expansionBytes = 0;
+        weight.cpuData = nullptr;
+        weight.dataDevice = DataDevice::CPU;
+
+        DiskWeightPart part;
+        part.fileName = tensor.fileName;
+        part.fileOffset = (long long)tensor.data_offsets[0];
+        part.bytes = tensor.bytes;
+        part.sourceDataType = sourceDataType;
+        part.dims = tensor.intShape;
+        weight.diskWeightParts.push_back(part);
+    }
+
+    static bool AllInputsAreDiskWeights(const std::unordered_map<std::string, Data> &weights,
+                                        const std::vector<std::string> &inputs) {
+        for (auto &input : inputs) {
+            auto it = weights.find(input);
+            if (it == weights.end() || !it->second.isDiskWeight) {
+                return false;
+            }
+        }
+        return !inputs.empty();
+    }
+
+    static void MergeDiskWeightMeta(const std::unordered_map<std::string, Data> &weights,
+                                    const std::vector<std::string> &inputs,
+                                    Data &mergeData) {
+        mergeData.isDiskWeight = true;
+        mergeData.diskWeightParts.clear();
+        mergeData.cpuData = nullptr;
+        mergeData.expansionSize = 0;
+        mergeData.expansionBytes = 0;
+        mergeData.dataDevice = DataDevice::CPU;
+        mergeData.weightType = WeightType::LINEAR;
+        for (auto &input : inputs) {
+            auto it = weights.find(input);
+            if (it == weights.end()) {
+                continue;
+            }
+            mergeData.diskWeightParts.insert(mergeData.diskWeightParts.end(),
+                                             it->second.diskWeightParts.begin(),
+                                             it->second.diskWeightParts.end());
+        }
+    }
+
     std::string Base64Decode(const std::string &encoded) {
         static const std::string base64_chars =
              "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -1348,11 +1440,15 @@ if (false) {
                                         Data &mergeData = model->weight[mergeName];
                                         mergeData.name = mergeName;
                                         mergeData.isModelWeight = true;
-                                        mergeData.Allocate();
-                                        uint64_t offset = 0;
-                                        for (auto input : it.inputs) {
-                                            memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
-                                            offset += model->weight[input].GetBytes();
+                                        if (AllInputsAreDiskWeights(model->weight.weight, it.inputs)) {
+                                            MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
+                                        } else {
+                                            mergeData.Allocate();
+                                            uint64_t offset = 0;
+                                            for (auto input : it.inputs) {
+                                                memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
+                                                offset += model->weight[input].GetBytes();
+                                            }
                                         }
                                     } else {
                                         std::string input0 = it.inputs[0];
@@ -1649,6 +1745,11 @@ if (false) {
         // tensorMap[name]代表本名为name的tensor，创建后的名字以及类型
         // 有些tensor被共享，可能需要创建多次
         auto tensorMap = model->GetTensorMap(tensors);
+        bool useDiskMoe = UseDiskMoeDevice();
+        if (useDiskMoe && model->moeLinears.size() > 0) {
+            printf("Use disk MoE weights.\n");
+            fflush(stdout);
+        }
 
         // 如果有需要，为moe设置特定的量化参数
         if (model->moeLinears.size() > 0 && useMoeDataType) {
@@ -1864,22 +1965,30 @@ if (false) {
                                 }
                             }
 
-                            if (scaleTensorName == "") {
-                                tensor.CreateBuffer(oriDataType);
-                            } else if(!isAwqModel) {
-                                auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
-                                AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" || scaleTensor.dtype == "F8_E8M0"
-                                    , "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
-                                scaleTensor.CreateBuffer(DataType::FLOAT32);
-                                tensor.CreateBufferWithScale(oriDataType, scaleTensor);
+                            bool diskLazyWeight = IsDiskMoeWeight(model, weightName, useDiskMoe);
+                            if (diskLazyWeight) {
+                                if (scaleTensorName != "" || isAwqModel || tensor.dtype == "fastllm" ||
+                                    loraDicts.find(weightName) != loraDicts.end()) {
+                                    ErrorInFastLLM("Disk MoE does not support scaled/AWQ/fastllm/lora expert weight yet: " + weightName + "\n");
+                                }
+                                SetDiskWeightMeta(model->weight[weightName], tensor, dataType);
                             } else {
-                                auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
-                                auto &qzeroTensor = safeTensors.itmeDict[qzeroTensorName];
-                                scaleTensor.CreateBuffer(DataType::FLOAT32);
-                                tensor.CreateBufferWithAWQ(oriDataType, scaleTensor, qzeroTensor);
-                            }
+                                if (scaleTensorName == "") {
+                                    tensor.CreateBuffer(oriDataType);
+                                } else if(!isAwqModel) {
+                                    auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
+                                    AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" || scaleTensor.dtype == "F8_E8M0"
+                                        , "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
+                                    scaleTensor.CreateBuffer(DataType::FLOAT32);
+                                    tensor.CreateBufferWithScale(oriDataType, scaleTensor);
+                                } else {
+                                    auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
+                                    auto &qzeroTensor = safeTensors.itmeDict[qzeroTensorName];
+                                    scaleTensor.CreateBuffer(DataType::FLOAT32);
+                                    tensor.CreateBufferWithAWQ(oriDataType, scaleTensor, qzeroTensor);
+                                }
 
-                            if (loraDicts.find(weightName) != loraDicts.end()) {
+                                if (loraDicts.find(weightName) != loraDicts.end()) {
                                 std::string loraA = loraDicts[weightName].first;
                                 std::string loraB = loraDicts[weightName].second;
 
@@ -1935,20 +2044,21 @@ if (false) {
                                 } else {
                                     ErrorInFastLLM("Lora error, dtype should be float32, float16 or bfloat16.");
                                 }
-                            }
-
-                            if (tensor.dtype == "fastllm") {
-                                model->weight[weightName].CreateFromFastllmFormat(tensor.buffer, tensor.bytes);
-                            } else {
-                                if (it.second == DATA_AUTO_CONV) {
-                                    tensor.Transpose(oriDataType);
                                 }
-                                model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
-                                        tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
-                                        curGroupCnt, tensor.blockK, tensor.blockM);
+
+                                if (tensor.dtype == "fastllm") {
+                                    model->weight[weightName].CreateFromFastllmFormat(tensor.buffer, tensor.bytes);
+                                } else {
+                                    if (it.second == DATA_AUTO_CONV) {
+                                        tensor.Transpose(oriDataType);
+                                    }
+                                    model->weight[weightName].CreateFromOriData(WeightType::AUTO, oriDataType, 
+                                            tensor.buffer, tensor.minsBuffer, tensor.scalesBuffer,
+                                            curGroupCnt, tensor.blockK, tensor.blockM);
+                                }
+                                if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV)
+                                    model->weight[weightName].CalcWeightSum();
                             }
-                            if (it.second == DATA_AUTO_LINEAR || it.second == DATA_AUTO_CONV)
-                                model->weight[weightName].CalcWeightSum();
                             tensor.ClearBuffer();
 
                             locker.lock();
@@ -2048,43 +2158,47 @@ if (false) {
                                         mergeData.blockK = model->weight[input0].blockK;
                                         mergeData.blockM = model->weight[input0].blockM;
 
-                                        mergeData.Allocate();
-                                        uint64_t offset = 0;
-                                        for (auto input : it.inputs) {
-                                            mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, model->weight[input].perChannelsConfigs);
-                                            mergeData.zeros = AppendVector(mergeData.zeros, model->weight[input].zeros);
-                                            mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
-                                            mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
-                                            mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
-                                            memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
-                                            offset += model->weight[input].GetBytes();
-                                        }
-
-                                        mergeData.CalcWeightSum();
-#if defined(USE_TFACC) || defined(USE_NUMA)
-                                        try {
-                                            if (GetFastllmEnv().activateNuma) {
-                                                locker.lock();
-                                                if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
-                                                    mergeData.weightSum.resize(1);
-                                                    RegisterFastllmData(&mergeData, it.type);       
-                                                }
-                                                locker.unlock();
+                                        if (AllInputsAreDiskWeights(model->weight.weight, it.inputs)) {
+                                            MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
+                                        } else {
+                                            mergeData.Allocate();
+                                            uint64_t offset = 0;
+                                            for (auto input : it.inputs) {
+                                                mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, model->weight[input].perChannelsConfigs);
+                                                mergeData.zeros = AppendVector(mergeData.zeros, model->weight[input].zeros);
+                                                mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
+                                                mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
+                                                mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
+                                                memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
+                                                offset += model->weight[input].GetBytes();
                                             }
-                                        } catch (...) {
-                                        }
+
+                                            mergeData.CalcWeightSum();
+#if defined(USE_TFACC) || defined(USE_NUMA)
+                                            try {
+                                                if (GetFastllmEnv().activateNuma) {
+                                                    locker.lock();
+                                                    if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
+                                                        mergeData.weightSum.resize(1);
+                                                        RegisterFastllmData(&mergeData, it.type);       
+                                                    }
+                                                    locker.unlock();
+                                                }
+                                            } catch (...) {
+                                            }
 #endif
 #if defined(USE_NUMAS)
-                                        try {
-                                            if (GetFastllmEnv().activateNuma) {
-                                                if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
-                                                    mergeData.weightSum.resize(1);
-                                                    RegisterNumas(&mergeData, it.type);       
+                                            try {
+                                                if (GetFastllmEnv().activateNuma) {
+                                                    if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
+                                                        mergeData.weightSum.resize(1);
+                                                        RegisterNumas(&mergeData, it.type);       
+                                                    }
                                                 }
+                                            } catch (...) {
                                             }
-                                        } catch (...) {
-                                        }
 #endif
+                                        }
                                     }
 
                                     for (auto input : it.inputs) {

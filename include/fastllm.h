@@ -286,6 +286,14 @@ namespace fastllm {
         CPU = 0, CUDA = 1
     };
 
+    struct DiskWeightPart {
+        std::string fileName;
+        long long fileOffset = 0;
+        uint64_t bytes = 0;
+        DataType sourceDataType = DataType::FLOAT32;
+        std::vector <int> dims;
+    };
+
     enum WeightType {
         NONE = 0, LINEAR = 1, EMBEDDING = 2, CONV2D = 3, CONV1D = 4, AUTO = 99999
     };
@@ -406,6 +414,8 @@ namespace fastllm {
         std::string fileName;
         long long filePos;
         std::shared_ptr<FileMmap> mapFile;
+        bool isDiskWeight = false; // 权重仅保留磁盘位置，计算时按需读取
+        std::vector <DiskWeightPart> diskWeightParts;
 
         bool directMemory = false; // 直接分配/释放Memory，不经过缓存
 

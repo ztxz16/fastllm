@@ -7,6 +7,7 @@
 #include "executor.h"
 
 #include "devices/cpu/cpudevice.h"
+#include "devices/disk/diskdevice.h"
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -63,6 +64,7 @@ namespace fastllm {
 #ifdef USE_NUMAS
         this->devices.push_back((BaseDevice*) new NumasDevice());
 #endif
+        this->devices.push_back((BaseDevice*) new DiskDevice());
         this->devices.push_back((BaseDevice*) new CpuDevice());
     }
 
@@ -165,7 +167,7 @@ namespace fastllm {
                     if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
                         int batch = intParams.find(it.first + "___batch")->second;
                         if ((it.first == "weights" || it.first == "biass") && ((Data**)it.second)[2]) {
-                            if ((device->deviceType == "cpu" || device->deviceType == "numa" || device->deviceType == "tfacc") && 
+                            if ((device->deviceType == "cpu" || device->deviceType == "numa" || device->deviceType == "tfacc" || device->deviceType == "disk") && 
                                 ((Data**)it.second)[2]->dataDevice == DataDevice::CPU) {
                                 continue;
                             }
@@ -236,7 +238,7 @@ namespace fastllm {
                 if (intParamsSize > 0 && intParams.find(it.first + "___batch") != intParams.end()) {
                     int batch = intParams.find(it.first + "___batch")->second;
                     if ((it.first == "weights" || it.first == "biass") && ((Data**)it.second)[2]) {
-                        if ((device->deviceType == "cpu" || device->deviceType == "numa" || device->deviceType == "tfacc") &&
+                        if ((device->deviceType == "cpu" || device->deviceType == "numa" || device->deviceType == "tfacc" || device->deviceType == "disk") &&
                             ((Data**)it.second)[2]->dataDevice == DataDevice::CPU) {
                             continue;
                         }

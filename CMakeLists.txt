@@ -207,6 +207,7 @@ file(GLOB BLOCK_FILES "src/blocks/*.cpp")
 file(GLOB CPU_DEVICE_FILES "src/devices/cpu/*.cpp")
 set(FASTLLM_CXX_SOURCES src/fastllm.cpp src/device.cpp src/model.cpp src/executor.cpp src/template.cpp src/graph.cpp src/tokenizer.cpp
         src/devices/cpu/cpudevice.cpp src/devices/cpu/cpudevicebatch.cpp
+        src/devices/disk/diskdevice.cpp
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
         src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/qwen3_next.cpp
@@ -225,6 +226,7 @@ include_directories(include/utils)
 include_directories(include/models)
 include_directories(include/blocks)
 include_directories(include/devices/cpu)
+include_directories(include/devices/disk)
 include_directories(third_party/json11)
 include_directories(third_party/gguf)
 include_directories(third_party/flashinfer)

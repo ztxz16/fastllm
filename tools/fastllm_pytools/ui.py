@@ -142,7 +142,7 @@ class FastLLMCommandGenerator:
         
         # MOE设备
         ttk.Label(param_frame, text="moe_device:").grid(row=4, column=0, padx=5, pady=5, sticky=tk.W)
-        self.moe_device = ttk.Combobox(param_frame, values=["cpu", "cuda", "numa"])
+        self.moe_device = ttk.Combobox(param_frame, values=["cpu", "cuda", "numa", "disk"])
         self.moe_device.grid(row=4, column=1, padx=5, pady=5, sticky=tk.EW)
         
         # 线程数
