@@ -1,4 +1,5 @@
 #include "devices/disk/diskdevice.h"
+#include "gguf.h"
 #include "utils.h"
 
 #include <algorithm>
@@ -185,7 +186,7 @@ namespace fastllm {
         if (weight == nullptr || !weight->isDiskWeight) {
             return (Data*)weight;
         }
-        Data *loaded = new Data(weight->dataType, weight->dims);
+        Data *loaded = new Data(weight->dataType);
         loaded->name = weight->name;
         loaded->isModelWeight = false;
         loaded->weightType = weight->weightType;
@@ -201,6 +202,34 @@ namespace fastllm {
         loaded->mins = weight->mins;
         loaded->zeros = weight->zeros;
         loaded->halfScales = weight->halfScales;
+        loaded->isGGUFData = weight->isGGUFData;
+        loaded->ggmlType = weight->ggmlType;
+        loaded->IsRepacked = weight->IsRepacked;
+        if (weight->ggmlTensor != nullptr) {
+            loaded->ggmlTensor = (void*)(new ggml_tensor());
+            (*(ggml_tensor*)loaded->ggmlTensor) = (*(ggml_tensor*)weight->ggmlTensor);
+        }
+        loaded->Resize(weight->dims);
+
+        if (weight->dataType == DataType::DATA_GGUF_FORMAT) {
+            uint64_t bytes = 0;
+            for (auto &part : weight->diskWeightParts) {
+                bytes += part.bytes;
+            }
+            loaded->expansionSize = bytes;
+            loaded->expansionBytes = bytes;
+            loaded->cpuData = new uint8_t[bytes];
+            uint64_t dstOffset = 0;
+            for (auto &part : weight->diskWeightParts) {
+                ReadDiskPartBytes(part, loaded->cpuData + dstOffset);
+                dstOffset += part.bytes;
+            }
+            // Disk weights are temporary per token; repacking them every decode step
+            // costs more than the saved Q4_K_M read bandwidth. Use GGUF blocks as-is.
+            loaded->IsRepacked = true;
+            return loaded;
+        }
+
         loaded->Allocate(false);
 
         uint64_t dstOffset = 0;
@@ -323,8 +352,6 @@ namespace fastllm {
         if (weights[0] != nullptr) {
             selectedExperts.insert(0);
         }
-        // CpuMergeMOE uses weights[2] as the representative dtype/shape.
-        selectedExperts.insert(1);
 
         std::vector<Data*> tempWeights(weightsBatch, nullptr);
         std::vector<Data*> ownedWeights;
@@ -367,6 +394,25 @@ namespace fastllm {
             for (int index : loadIndices) {
                 ownedWeights.push_back(tempWeights[index]);
             }
+        }
+        for (int i = 0; i < weightsBatch; i++) {
+            if (tempWeights[i] != nullptr && tempWeights[i]->isDiskWeight) {
+                tempWeights[i] = nullptr;
+            }
+        }
+        if (tempWeights[2] == nullptr) {
+            for (int expert : selectedExperts) {
+                int gate = expert * 2;
+                if (gate < weightsBatch && tempWeights[gate] != nullptr) {
+                    // CpuMergeMOE uses weights[2] only as the representative dtype/shape
+                    // when expert 0 is not selected. Avoid loading expert 0 just for that.
+                    tempWeights[2] = tempWeights[gate];
+                    break;
+                }
+            }
+        }
+        if (tempWeights[2] == nullptr) {
+            ErrorInFastLLM("Disk MoE failed to load representative expert weight.\n");
         }
 
         DataDict diskDatas = datas;

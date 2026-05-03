@@ -833,6 +833,63 @@ namespace fastllm {
         }
     }
 
+    static void UpdateGGUFTensorShape(ggml_tensor *tensor, const std::vector<int> &dims) {
+        tensor->dims = dims;
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            tensor->ne[i] = 1;
+        }
+        if (dims.size() > 0) {
+            tensor->ne[0] = dims.back();
+        }
+        if (dims.size() > 1) {
+            tensor->ne[1] = dims[dims.size() - 2];
+        }
+        for (int i = 2; i < dims.size() && i < GGML_MAX_DIMS; i++) {
+            tensor->ne[i] = dims[dims.size() - 1 - i];
+        }
+        const size_t typeSize = ggml_type_size(tensor->type);
+        const int64_t blockSize = ggml_blck_size(tensor->type);
+        tensor->nb[0] = typeSize;
+        tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / blockSize);
+        for (int i = 2; i < GGML_MAX_DIMS; i++) {
+            tensor->nb[i] = tensor->nb[i - 1] * tensor->ne[i - 1];
+        }
+    }
+
+    static void SetDiskGGUFWeightMeta(Data &weight, const ggml_tensor &tensor,
+                                      const std::string &fileName, uint64_t offset) {
+        if (tensor.type == ggml_type::GGML_TYPE_F32) {
+            weight.dataType = DataType::FLOAT32;
+        } else if (tensor.type == ggml_type::GGML_TYPE_F16) {
+            weight.dataType = DataType::FLOAT16;
+        } else {
+            weight.dataType = DataType::DATA_GGUF_FORMAT;
+            weight.isGGUFData = true;
+            weight.ggmlType = tensor.type;
+            if (weight.ggmlTensor == nullptr) {
+                weight.ggmlTensor = (void*)(new ggml_tensor());
+            }
+            (*(ggml_tensor*)weight.ggmlTensor) = tensor;
+        }
+        weight.UpdateUnitSize();
+        weight.Resize(tensor.dims);
+        weight.isDiskWeight = true;
+        weight.diskWeightParts.clear();
+        weight.weightType = WeightType::LINEAR;
+        weight.expansionSize = 0;
+        weight.expansionBytes = weight.dataType == DataType::DATA_GGUF_FORMAT ? ggml_nbytes(&tensor) : 0;
+        weight.cpuData = nullptr;
+        weight.dataDevice = DataDevice::CPU;
+
+        DiskWeightPart part;
+        part.fileName = fileName;
+        part.fileOffset = (long long)offset;
+        part.bytes = ggml_nbytes(&tensor);
+        part.sourceDataType = weight.dataType;
+        part.dims = tensor.dims;
+        weight.diskWeightParts.push_back(part);
+    }
+
     static bool AllInputsAreDiskWeights(const std::unordered_map<std::string, Data> &weights,
                                         const std::vector<std::string> &inputs) {
         for (auto &input : inputs) {
@@ -888,6 +945,19 @@ namespace fastllm {
             mergeData.perChannelsConfigs.insert(mergeData.perChannelsConfigs.end(),
                                                 it->second.perChannelsConfigs.begin(),
                                                 it->second.perChannelsConfigs.end());
+        }
+        if (mergeData.dataType == DataType::DATA_GGUF_FORMAT && !inputs.empty()) {
+            auto it = weights.find(inputs[0]);
+            if (it != weights.end() && it->second.ggmlTensor != nullptr) {
+                if (mergeData.ggmlTensor == nullptr) {
+                    mergeData.ggmlTensor = (void*)(new ggml_tensor());
+                }
+                (*(ggml_tensor*)mergeData.ggmlTensor) = (*(ggml_tensor*)it->second.ggmlTensor);
+                UpdateGGUFTensorShape((ggml_tensor*)mergeData.ggmlTensor, mergeData.dims);
+                mergeData.ggmlType = ((ggml_tensor*)mergeData.ggmlTensor)->type;
+                mergeData.isGGUFData = true;
+                mergeData.expansionBytes = ggml_nbytes((ggml_tensor*)mergeData.ggmlTensor);
+            }
         }
     }
 
@@ -1352,6 +1422,11 @@ namespace fastllm {
 
         // 3.0 更新模型信息
         model->InitParams();
+        bool useDiskMoe = UseDiskMoeDevice();
+        if (useDiskMoe && model->moeLinears.size() > 0) {
+            printf("Use disk MoE weights.\n");
+            fflush(stdout);
+        }
 
         int cur = 0;
         long long totalBytes = 0;
@@ -1419,9 +1494,14 @@ if (false) {
                     for (int i = st; i < end; i++) {
                         auto &weightName = tensors[i];
                         if (readGGUFTaskDict.find(weightName) != readGGUFTaskDict.end()) {
-                            WeightImportGGUFTensor(readGGUFTaskDict[weightName]->weight, 
-                                        &readGGUFTaskDict[weightName]->tensor, readGGUFTaskDict[weightName]->fileName, 
-                                        readGGUFTaskDict[weightName]->offset, readGGUFTaskDict[weightName]->replaceType);
+                            auto *task = readGGUFTaskDict[weightName];
+                            if (IsDiskMoeWeight(model, weightName, useDiskMoe) &&
+                                task->replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
+                                SetDiskGGUFWeightMeta(*task->weight, task->tensor, task->fileName, task->offset);
+                            } else {
+                                WeightImportGGUFTensor(task->weight, &task->tensor, task->fileName,
+                                                       task->offset, task->replaceType);
+                            }
                         } 
                         {
                             // try merge                                
@@ -1527,18 +1607,22 @@ if (false) {
                                         mergeData.blockK = model->weight[input0].blockK;
                                         mergeData.blockM = model->weight[input0].blockM;
 
-                                        mergeData.Allocate();
-                                        uint64_t offset = 0;
-                                        for (auto input : it.inputs) {
-                                            mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, model->weight[input].perChannelsConfigs);
-                                            mergeData.zeros = AppendVector(mergeData.zeros, model->weight[input].zeros);
-                                            mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
-                                            mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
-                                            mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
-                                            memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
-                                            offset += model->weight[input].GetBytes();
+                                        if (AllInputsAreDiskWeights(model->weight.weight, it.inputs)) {
+                                            MergeDiskWeightMeta(model->weight.weight, it.inputs, mergeData);
+                                        } else {
+                                            mergeData.Allocate();
+                                            uint64_t offset = 0;
+                                            for (auto input : it.inputs) {
+                                                mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, model->weight[input].perChannelsConfigs);
+                                                mergeData.zeros = AppendVector(mergeData.zeros, model->weight[input].zeros);
+                                                mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
+                                                mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
+                                                mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
+                                                memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
+                                                offset += model->weight[input].GetBytes();
+                                            }
+                                            mergeData.CalcWeightSum();
                                         }
-                                        mergeData.CalcWeightSum();
 #if defined(USE_TFACC) || defined(USE_NUMA)
                                         try {
                                             if (GetFastllmEnv().activateNuma) {
