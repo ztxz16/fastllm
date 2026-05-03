@@ -6,6 +6,7 @@ from .deepseekv3_tool_parser import DeepSeekV3ToolParser
 from .deepseekv31_tool_parser import DeepSeekV31ToolParser
 from .deepseekv4_tool_parser import DeepSeekV4ToolParser
 from .glm4_moe_tool_parser import Glm4MoeModelToolParser
+from .glm47_moe_tool_parser import Glm47MoeModelToolParser
 #from .granite_20b_fc_tool_parser import Granite20bFCToolParser
 #from .granite_tool_parser import GraniteToolParser
 from .hermes_tool_parser import Hermes2ProToolParser
@@ -46,6 +47,7 @@ __all__ = [
     "KimiK2ToolParser",
     #"HunyuanA13BToolParser",
     "Glm4MoeModelToolParser",
+    "Glm47MoeModelToolParser",
     "Qwen3CoderToolParser",
     #"Step3ToolParser",
 ]
