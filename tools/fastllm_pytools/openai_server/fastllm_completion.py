@@ -463,6 +463,14 @@ class FastLLmCompletion:
       empty_media = LoadedMedia()
       if content is None and tool_calls is None and tool_call_id is None:
           return [], empty_media
+      if role == "tool" and isinstance(content, dict):
+          return [ConversationMessage(
+              role = role,
+              content = self._serialize_tool_arguments(content),
+              tool_calls = tool_calls,
+              tool_call_id = tool_call_id,
+              name = name,
+          )], empty_media
       if content is None or isinstance(content, str):
           return [ConversationMessage(role=role, content=content or "",
                                       tool_calls=tool_calls,
