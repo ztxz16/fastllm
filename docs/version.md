@@ -1,3 +1,13 @@
+
+## V0.1.6.2
+
+- 支持磁盘MoE推理，补充磁盘设备后端和SSD读取速度测试工具
+- 优化GGUF磁盘MoE推理，修复磁盘MoE及FP8磁盘MoE加载问题
+- 支持DeepSeek V4思考输出
+- 优化DeepSeek V4显存缓存拼接，修复解码缓存内存增长问题
+- 限制DeepSeek V4稀疏预填充临时显存，降低长上下文预填充显存峰值
+- 调整DeepSeek V4默认采样参数，默认使用top_k = 5
+
 ## V0.1.6.1
 
 - 更新DeepSeek V4量化配置，补充Q2、Q4、UD-Q2_K_L、UD-Q2_K_M量化示例
