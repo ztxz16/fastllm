@@ -3046,7 +3046,7 @@ namespace fastllm {
             HcPostReference(ffnOut, hiddenStates, ffnMix, hiddenStates);
         }
 
-        Data headStates, headInput, normed, logits;
+        Data headStates, headInput;
         const Data *headSource = &hiddenStates;
         if (seqlen > 1) {
             Split(hiddenStates, 1, seqlen - 1, seqlen, headStates);
@@ -3054,32 +3054,27 @@ namespace fastllm {
         }
         HcHeadReference(*headSource, weight["hc_head_fn"], weight["hc_head_scale"], weight["hc_head_base"],
                         hc_mult, hc_eps, rms_norm_eps, headInput);
-        RMSNormReference(headInput, weight["norm.weight"], rms_norm_eps, normed, DataType::BFLOAT16);
-        Linear(normed, weight["head.weight"], Data(), logits);
-        ToDataType(logits, DataType::FLOAT32);
 
-        if (generationConfig.output_logits && retLogits != nullptr) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4LogitsRead");
-            logits.ToDevice(DataDevice::CPU);
-            int vocabSize = logits.dims.back();
-            for (int b = 0; b < batch; b++) {
-                (*retLogits)[b]->resize(vocabSize);
-                memcpy((float*)(*retLogits)[b]->data(),
-                       ((float*)logits.cpuData) + ((uint64_t)b * logits.dims[1] + logits.dims[1] - 1) * vocabSize,
-                       vocabSize * sizeof(float));
-            }
-        }
-
-        Data topk;
-        TopK(logits, topk, 1);
         std::vector<int> ret;
-        {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4TopKRead");
-            topk.ToDevice(DataDevice::CPU);
-            for (int b = 0; b < batch; b++) {
-                ret.push_back((int)(((float*)topk.cpuData)[b * 2] + 1e-3));
-            }
+        std::vector<int> samplingSeqLens(batch, 1);
+        std::vector<GenerationConfig> generationConfigs(batch, generationConfig);
+        if (generationConfig.top_k <= 1) {
+            generationConfigs[0].top_k = 5;
         }
+        std::vector<std::pair<Data*, Data*> > samplingPastKeyValues;
+        samplingPastKeyValues.reserve(pastKeyValues.size());
+        for (auto &kv : pastKeyValues) {
+            samplingPastKeyValues.push_back(std::make_pair(&kv.first, &kv.second));
+        }
+        LastTokensManager samplingLastTokens;
+        const LastTokensManager *samplingLastTokensPtr = &lastTokens;
+        if ((int)lastTokens.units.size() < batch) {
+            samplingLastTokens = LastTokensManager(batch, generationConfig.last_n);
+            samplingLastTokensPtr = &samplingLastTokens;
+        }
+        LLMSamplingBlock(this, &headInput, &weight["norm.weight"], &weight["head.weight"],
+                         rms_norm_eps, batch, true, samplingSeqLens, samplingPastKeyValues,
+                         generationConfigs, *samplingLastTokensPtr, retLogits, ret);
 
         int finalTotalLen = originalStartPos + inputIds.dims[1];
         UpdateDebugPastKeyValues(pastKeyValues, bsz, finalTotalLen, block_cnt);
