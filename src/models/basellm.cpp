@@ -83,8 +83,8 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecord(basellm *model) {
+        model->TryRecordHistoryCache(this->allTokens);
         if (model->saveHistoryChat) {
-            model->TryRecordHistoryCache(this->allTokens);
             if (model->UseGenericHistoryCache()) {
                 model->pastKVCacheManager.Record(this->allTokens, this->allTokens.size(), &this->pastKeyValues);
             }

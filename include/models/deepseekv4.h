@@ -49,6 +49,7 @@ namespace fastllm {
         Data windowKVData;
         std::vector<float> compressorKVRaw;
         std::vector<float> compressorScoreRaw;
+        int compressorRawTokenBase = 0;
         Data compressedKV;
         Data compressedKVCuda;
         int compressedBlocks = 0;
@@ -69,6 +70,7 @@ namespace fastllm {
         std::vector<float> windowKV;
         std::vector<float> compressorKVRaw;
         std::vector<float> compressorScoreRaw;
+        int compressorRawTokenBase = 0;
         Data compressedKV;
         int compressedBlocks = 0;
         int compressedTokenBase = 0;
