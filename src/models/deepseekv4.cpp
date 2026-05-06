@@ -1353,6 +1353,65 @@ namespace fastllm {
             output.CopyFrom(merged);
         }
 
+        static bool AppendCompressedKVRowsCuda(Data &output, const Data &newRows,
+                                               int bsz, int oldBlocks, int addBlocks, int headDim) {
+#ifdef USE_CUDA
+            if (!DeepSeekV4PreferCuda()) {
+                return false;
+            }
+            Data rowsCuda;
+            const Data *rowsPtr = &newRows;
+            if (newRows.dataDevice != DataDevice::CUDA) {
+                rowsCuda.CopyFrom(newRows);
+                rowsCuda.ToDevice(DataDevice::CUDA);
+                rowsPtr = &rowsCuda;
+            }
+            if (oldBlocks <= 0 || output.dims.size() < 2 || output.Count(0) <= 0 ||
+                (output.cpuData == nullptr && output.cudaData == nullptr)) {
+                ResetData(output);
+                output.CopyFrom(*rowsPtr);
+                output.SetKVCache();
+                output.ToDevice(DataDevice::CUDA);
+                return true;
+            }
+            if (output.dataDevice != DataDevice::CUDA || output.cudaData == nullptr) {
+                return false;
+            }
+            int blocks = oldBlocks + addBlocks;
+            Data merged;
+            if (!PrepareCudaData(merged, DataType::BFLOAT16, {bsz, blocks, headDim})) {
+                return false;
+            }
+            merged.SetKVCache();
+
+            size_t unit = sizeof(uint16_t);
+            size_t oldPitch = (size_t)oldBlocks * headDim * unit;
+            size_t addPitch = (size_t)addBlocks * headDim * unit;
+            size_t mergedPitch = (size_t)blocks * headDim * unit;
+            FastllmCudaMemcpy2DDeviceToDevice(
+                merged.cudaData, mergedPitch,
+                output.cudaData, oldPitch,
+                oldPitch, bsz);
+            FastllmCudaMemcpy2DDeviceToDevice(
+                (uint8_t*)merged.cudaData + (size_t)oldBlocks * headDim * unit, mergedPitch,
+                rowsPtr->cudaData, addPitch,
+                addPitch, bsz);
+            ResetData(output);
+            output.CopyFrom(merged);
+            output.SetKVCache();
+            output.ToDevice(DataDevice::CUDA);
+            return true;
+#else
+            (void)output;
+            (void)newRows;
+            (void)bsz;
+            (void)oldBlocks;
+            (void)addBlocks;
+            (void)headDim;
+            return false;
+#endif
+        }
+
         static bool HasCompressedKVData(const Data &data) {
             return data.dims.size() >= 2 && data.Count(0) > 0 &&
                    (data.cpuData != nullptr || data.cudaData != nullptr);
@@ -1402,7 +1461,8 @@ namespace fastllm {
                                              int bsz, int rawTokenBase, int totalLen, int compressRatio,
                                              int headDim, int ropeDim, float ropeBase,
                                              float ropeFactor, int betaFast, int betaSlow,
-                                             int originalSeqLen, Data &output) {
+                                             int originalSeqLen, Data &output,
+                                             Data *cudaOutput = nullptr, bool preferCudaOutput = false) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4BuildCompressedKV");
             if (compressRatio <= 0 || totalLen < compressRatio) {
                 return false;
@@ -1422,7 +1482,20 @@ namespace fastllm {
             auto apePtr = ReadWeightFloatDataCached(weight[prefix + ".ape"]);
             const auto &ape = *apePtr;
 
-            int reusableBlocks = GetReusableCompressedBlocks(output, bsz, blocks, headDim);
+            int reusableBlocks = 0;
+            bool reusableFromCuda = false;
+#ifdef USE_CUDA
+            if (preferCudaOutput && cudaOutput != nullptr) {
+                reusableBlocks = GetReusableCompressedBlocks(*cudaOutput, bsz, blocks, headDim);
+                reusableFromCuda = reusableBlocks > 0;
+            }
+#else
+            (void)cudaOutput;
+            (void)preferCudaOutput;
+#endif
+            if (reusableBlocks <= 0) {
+                reusableBlocks = GetReusableCompressedBlocks(output, bsz, blocks, headDim);
+            }
             if (reusableBlocks == blocks) {
                 return true;
             }
@@ -1446,6 +1519,18 @@ namespace fastllm {
             FinalizeCompressedKVRows(weight, prefix, compressed, bsz, reusableBlocks, addBlocks,
                                      compressRatio, headDim, ropeDim, ropeBase, ropeFactor,
                                      betaFast, betaSlow, originalSeqLen, newRows);
+#ifdef USE_CUDA
+            if (preferCudaOutput && cudaOutput != nullptr &&
+                AppendCompressedKVRowsCuda(*cudaOutput, newRows, bsz, reusableBlocks, addBlocks, headDim)) {
+                if (HasCompressedKVData(output)) {
+                    ResetData(output);
+                }
+                return true;
+            }
+            if (reusableFromCuda && !HasCompressedKVData(output)) {
+                return false;
+            }
+#endif
             AppendCompressedKVRows(output, newRows, bsz, reusableBlocks, addBlocks, headDim);
             return true;
         }
@@ -3087,7 +3172,15 @@ namespace fastllm {
                         decodeCompressedKVForAttention = HasCompressedKVData(decodeCache->compressedKVCuda) ?
                             &decodeCache->compressedKVCuda : &decodeCache->compressedKV;
                     } else {
+#ifdef USE_CUDA
+                        bool buildCompressedOnCuda = keepCompressedKVOnCuda && startPos > 0 && seqlen == 1;
+                        if (!buildCompressedOnCuda) {
+                            EnsureCompressedKVOnCpuFromCuda(*decodeCache);
+                        }
+#else
+                        bool buildCompressedOnCuda = false;
                         EnsureCompressedKVOnCpuFromCuda(*decodeCache);
+#endif
                         if (BuildCompressedKVFromRaw(weight, pre + ".attn.compressor",
                                                      decodeCache->compressorKVRaw,
                                                      decodeCache->compressorScoreRaw,
@@ -3095,8 +3188,17 @@ namespace fastllm {
                                                      decodeCache->totalLen, compressRatio,
                                                      head_dim_full, qk_rope_head_dim, layerRopeBase,
                                                      rope_factor, rope_scaling_beta_fast, rope_scaling_beta_slow,
-                                                     layerOriginalSeqLen, decodeCache->compressedKV)) {
-                            decodeCache->compressedBlocks = decodeCache->compressedKV.dims[1];
+                                                     layerOriginalSeqLen, decodeCache->compressedKV,
+                                                     &decodeCache->compressedKVCuda, buildCompressedOnCuda)) {
+                            int builtBlocks = GetReusableCompressedBlocks(decodeCache->compressedKVCuda,
+                                                                         bsz, targetCompressedBlocks,
+                                                                         head_dim_full);
+                            if (builtBlocks <= 0) {
+                                builtBlocks = GetReusableCompressedBlocks(decodeCache->compressedKV,
+                                                                          bsz, targetCompressedBlocks,
+                                                                          head_dim_full);
+                            }
+                            decodeCache->compressedBlocks = builtBlocks;
                             decodeCompressedCount = decodeCache->compressedBlocks;
                             TrimCompressorRawCache(bsz, decodeCache->totalLen, compressRatio,
                                                    decodeCache->compressorWideDim,
@@ -3110,7 +3212,7 @@ namespace fastllm {
                                 kv.CopyFrom(catKV);
                             }
 #ifdef USE_CUDA
-                            if (keepCompressedKVOnCuda) {
+                            if (!buildCompressedOnCuda && keepCompressedKVOnCuda) {
                                 bool releaseCpuNow = (startPos == 0 || seqlen == 1);
                                 MoveCompressedKVToCuda(*decodeCache, releaseCpuNow);
                                 releaseCpuCompressedAfterSparse = !releaseCpuNow;
