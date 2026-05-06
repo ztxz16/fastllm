@@ -3,7 +3,7 @@
 
 - 支持磁盘MoE推理，补充磁盘设备后端和SSD读取速度测试工具
 - 优化GGUF磁盘MoE推理，修复磁盘MoE及FP8磁盘MoE加载问题
-- 支持DeepSeek V4思考输出
+- 支持DeepSeek V4思考输出, 可以使用参数--enable_thinking控制
 - 优化DeepSeek V4显存缓存拼接，修复解码缓存内存增长问题
 - 限制DeepSeek V4稀疏预填充临时显存，降低长上下文预填充显存峰值
 - 调整DeepSeek V4默认采样参数，默认使用top_k = 5
