@@ -11,6 +11,18 @@ namespace {
 
 constexpr int kDeepSeekV4SparseDecodeMaxKeys = 256 * 1024;
 constexpr int kDeepSeekV4SparsePrefillMaxKeys = 256 * 1024;
+constexpr size_t kDeepSeekV4SparsePrefillDefaultTempBytes = 256ULL * 1024ULL * 1024ULL;
+
+size_t DeepSeekV4SparsePrefillTempBytesLimit() {
+    size_t ret = kDeepSeekV4SparsePrefillDefaultTempBytes;
+    if (const char *env = std::getenv("FASTLLM_DSV4_SPARSE_PREFILL_TEMP_MB")) {
+        int mb = std::atoi(env);
+        if (mb > 0) {
+            ret = (size_t)mb * 1024ULL * 1024ULL;
+        }
+    }
+    return ret;
+}
 
 inline int DeepSeekV4HcPreDotParts(int flatDim, int threads) {
     return std::min(16, std::max(1, (flatDim + threads * 4 - 1) / (threads * 4)));
@@ -1403,10 +1415,12 @@ __global__ void DeepSeekV4SparseAttentionPrefillBlockKernel(const QT *q, const K
                                                             const float *sink, float *output,
                                                             int bsz, int seqlen, int heads, int dim,
                                                             int kvLen, int windowSize, int compressRatio,
-                                                            int startPos, int prefixLen, float softmaxScale) {
+                                                            int startPos, int prefixLen, float softmaxScale,
+                                                            int rowOffset) {
     extern __shared__ float scores[];
 
-    int row = blockIdx.x;
+    int localRow = blockIdx.x;
+    int row = rowOffset + localRow;
     int h = row % heads;
     int tmp = row / heads;
     int s = tmp % seqlen;
@@ -1481,7 +1495,7 @@ __global__ void DeepSeekV4SparseAttentionPrefillBlockKernel(const QT *q, const K
     }
     __syncthreads();
 
-    float *orow = output + (((uint64_t)b * seqlen + s) * heads + h) * dim;
+    float *orow = output + (uint64_t)localRow * dim;
     for (int d = threadIdx.x; d < dim; d += blockDim.x) {
         float v = 0.0f;
         for (int k = 0; k < idxCount; k++) {
@@ -1500,7 +1514,8 @@ __global__ void DeepSeekV4SparseAttentionPrefillBlockKernel(const QT *q, const K
 }
 
 __global__ void DeepSeekV4SparsePrefillRotaryCastKernel(const float *input, __nv_bfloat16 *output,
-                                                        int rows, int seqlen, int heads, int dim,
+                                                        int rows, int rowOffset,
+                                                        int seqlen, int heads, int dim,
                                                         int ropeDim, float ropeBase, int startPos,
                                                         int originalSeqLen, float ropeFactor,
                                                         int betaFast, int betaSlow) {
@@ -1508,10 +1523,11 @@ __global__ void DeepSeekV4SparsePrefillRotaryCastKernel(const float *input, __nv
     if (row >= rows) {
         return;
     }
-    int s = (row / heads) % seqlen;
+    int globalRow = rowOffset + row;
+    int s = (globalRow / heads) % seqlen;
     int pos = startPos + s;
     const float *src = input + (uint64_t)row * dim;
-    __nv_bfloat16 *dst = output + (uint64_t)row * dim;
+    __nv_bfloat16 *dst = output + (uint64_t)globalRow * dim;
     int off = dim - ropeDim;
     for (int d = 0; d < off; d++) {
         dst[d] = __float2bfloat16_rn(src[d]);
@@ -2035,22 +2051,22 @@ bool DeepSeekV4LaunchSparsePrefillByKV(const fastllm::Data &q, const fastllm::Da
                                        const float *cudaSink, float *outData,
                                        int bsz, int seqlen, int heads, int dim, int kvLen,
                                        int windowSize, int compressRatio, int startPos, int prefixLen,
-                                       float softmaxScale) {
+                                       float softmaxScale, int rowOffset, int rows) {
     int realPrefixLen = std::max(0, std::min(prefixLen, kvLen - seqlen));
     int compressedCount = std::max(0, kvLen - realPrefixLen - seqlen);
     int maxKeys = std::min(windowSize, realPrefixLen + seqlen) + (compressRatio > 0 ? compressedCount : 0);
-    if (maxKeys <= 0 || maxKeys > kDeepSeekV4SparsePrefillMaxKeys) {
+    if (maxKeys <= 0 || maxKeys > kDeepSeekV4SparsePrefillMaxKeys || rows <= 0) {
         return false;
     }
-    int blocks = bsz * seqlen * heads;
     size_t sharedBytes = (size_t)maxKeys * sizeof(float);
     auto kernel = DeepSeekV4SparseAttentionPrefillBlockKernel<QT, KT>;
     if (!DeepSeekV4EnsureDynamicSharedMemory(kernel, sharedBytes)) {
         return false;
     }
-    kernel<<<blocks, 256, sharedBytes>>>(
+    kernel<<<rows, 256, sharedBytes>>>(
         (const QT *)q.cudaData, (const KT *)kv.cudaData, cudaSink, outData,
-        bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen, softmaxScale);
+        bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen, softmaxScale,
+        rowOffset);
     return true;
 }
 
@@ -2059,21 +2075,21 @@ bool DeepSeekV4LaunchSparsePrefillByQ(const fastllm::Data &q, const fastllm::Dat
                                       const float *cudaSink, float *outData,
                                       int bsz, int seqlen, int heads, int dim, int kvLen,
                                       int windowSize, int compressRatio, int startPos, int prefixLen,
-                                      float softmaxScale) {
+                                      float softmaxScale, int rowOffset, int rows) {
     if (kv.dataType == fastllm::DataType::BFLOAT16) {
         return DeepSeekV4LaunchSparsePrefillByKV<QT, __nv_bfloat16>(
             q, kv, cudaSink, outData, bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio,
-            startPos, prefixLen, softmaxScale);
+            startPos, prefixLen, softmaxScale, rowOffset, rows);
     }
     if (kv.dataType == fastllm::DataType::FLOAT16) {
         return DeepSeekV4LaunchSparsePrefillByKV<QT, half>(
             q, kv, cudaSink, outData, bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio,
-            startPos, prefixLen, softmaxScale);
+            startPos, prefixLen, softmaxScale, rowOffset, rows);
     }
     if (kv.dataType == fastllm::DataType::FLOAT32) {
         return DeepSeekV4LaunchSparsePrefillByKV<QT, float>(
             q, kv, cudaSink, outData, bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio,
-            startPos, prefixLen, softmaxScale);
+            startPos, prefixLen, softmaxScale, rowOffset, rows);
     }
     return false;
 }
@@ -2483,33 +2499,51 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data 
         return false;
     }
 
-    size_t tempBytes = (size_t)bsz * seqlen * heads * dim * sizeof(float);
+    int rows = bsz * seqlen * heads;
+    size_t rowBytes = (size_t)dim * sizeof(float);
+    size_t maxTempBytes = std::max(rowBytes, DeepSeekV4SparsePrefillTempBytesLimit());
+    int rowsPerChunk = (int)std::max<size_t>(1, maxTempBytes / rowBytes);
+    if (rowsPerChunk >= heads) {
+        rowsPerChunk = std::max(heads, (rowsPerChunk / heads) * heads);
+    }
+    rowsPerChunk = std::min(rowsPerChunk, rows);
+    size_t tempBytes = (size_t)rowsPerChunk * rowBytes;
     float *cudaTemp = (float *)FastllmCudaMalloc(tempBytes);
     if (cudaTemp == nullptr) {
         return false;
     }
 
-    bool ok = false;
-    if (q.dataType == fastllm::DataType::BFLOAT16) {
-        ok = DeepSeekV4LaunchSparsePrefillByQ<__nv_bfloat16>(
-            q, kv, (const float *)attnSink.cudaData, cudaTemp,
-            bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen, softmaxScale);
-    } else if (q.dataType == fastllm::DataType::FLOAT16) {
-        ok = DeepSeekV4LaunchSparsePrefillByQ<half>(
-            q, kv, (const float *)attnSink.cudaData, cudaTemp,
-            bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen, softmaxScale);
-    } else if (q.dataType == fastllm::DataType::FLOAT32) {
-        ok = DeepSeekV4LaunchSparsePrefillByQ<float>(
-            q, kv, (const float *)attnSink.cudaData, cudaTemp,
-            bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen, softmaxScale);
+    bool ok = true;
+    for (int rowOffset = 0; rowOffset < rows; rowOffset += rowsPerChunk) {
+        int chunkRows = std::min(rowsPerChunk, rows - rowOffset);
+        bool launched = false;
+        if (q.dataType == fastllm::DataType::BFLOAT16) {
+            launched = DeepSeekV4LaunchSparsePrefillByQ<__nv_bfloat16>(
+                q, kv, (const float *)attnSink.cudaData, cudaTemp,
+                bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen,
+                softmaxScale, rowOffset, chunkRows);
+        } else if (q.dataType == fastllm::DataType::FLOAT16) {
+            launched = DeepSeekV4LaunchSparsePrefillByQ<half>(
+                q, kv, (const float *)attnSink.cudaData, cudaTemp,
+                bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen,
+                softmaxScale, rowOffset, chunkRows);
+        } else if (q.dataType == fastllm::DataType::FLOAT32) {
+            launched = DeepSeekV4LaunchSparsePrefillByQ<float>(
+                q, kv, (const float *)attnSink.cudaData, cudaTemp,
+                bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen,
+                softmaxScale, rowOffset, chunkRows);
+        }
+        if (!launched) {
+            ok = false;
+            break;
+        }
+        int threads = 128;
+        int blocks = (chunkRows + threads - 1) / threads;
+        DeepSeekV4SparsePrefillRotaryCastKernel<<<blocks, threads>>>(
+            cudaTemp, (__nv_bfloat16 *)output.cudaData, chunkRows, rowOffset, seqlen, heads, dim,
+            ropeDim, ropeBase, startPos, originalSeqLen, ropeFactor, betaFast, betaSlow);
     }
     if (ok) {
-        int rows = bsz * seqlen * heads;
-        int threads = 128;
-        int blocks = (rows + threads - 1) / threads;
-        DeepSeekV4SparsePrefillRotaryCastKernel<<<blocks, threads>>>(
-            cudaTemp, (__nv_bfloat16 *)output.cudaData, rows, seqlen, heads, dim,
-            ropeDim, ropeBase, startPos, originalSeqLen, ropeFactor, betaFast, betaSlow);
         DeviceSync();
     }
 
