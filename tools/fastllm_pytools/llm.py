@@ -1311,7 +1311,11 @@ class model:
             prompt = self.hf_tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = enable_thinking)
             return len(self.hf_tokenizer.encode(prompt, add_special_tokens = True))
         else:
-            if architecture == "Qwen3_5ForConditionalGeneration":
+            if self._is_deepseek_v4() and not self.force_chat_template:
+                from ftllm.encoding_dsv4 import encode_messages
+                thinking_mode = "thinking" if enable_thinking else "chat"
+                prompt = encode_messages(conversation, thinking_mode=thinking_mode)
+            elif architecture == "Qwen3_5ForConditionalGeneration":
                 prompt = build_qwen35_prompt(
                     tokenizer = None,
                     conversation = copy.deepcopy(conversation),

@@ -119,6 +119,7 @@ class ToolCall(BaseModel):
 class ChatMessage(BaseModel):
     role: str
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     tool_calls: Optional[list[ToolCall]] = None
 
 

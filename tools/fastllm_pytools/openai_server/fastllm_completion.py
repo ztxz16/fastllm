@@ -127,6 +127,90 @@ class FastLLmCompletion:
           top_p = 1.0
       return do_sample, top_p, top_k, temperature
 
+  def _is_deepseek_v4_model(self) -> bool:
+      try:
+          is_deepseek_v4 = self.model._is_deepseek_v4()
+      except Exception:
+          is_deepseek_v4 = False
+      return is_deepseek_v4 and not getattr(self.model, "force_chat_template", False)
+
+  def _is_deepseek_v4_reasoning_response(self, enable_thinking: bool) -> bool:
+      return enable_thinking and self._is_deepseek_v4_model()
+
+  def _normalize_model_delta(self, text: str) -> str:
+      if text == "[unused16]":
+          return "<think>"
+      if text == "[unused17]":
+          return "</think>"
+      return text
+
+  def _strip_optional_think_start(self, text: str) -> str:
+      if text.startswith("<think>"):
+          text = text[len("<think>"):]
+          if text.startswith("\n"):
+              text = text[1:]
+      return text
+
+  def _partial_tag_overlap(self, text: str, tag: str) -> int:
+      max_len = min(len(text), len(tag) - 1)
+      for length in range(max_len, 0, -1):
+          if text.endswith(tag[:length]):
+              return length
+      return 0
+
+  def _split_deepseek_v4_reasoning(
+      self,
+      result: str,
+      emit_reasoning_content: bool,
+  ) -> Tuple[str, Optional[str]]:
+      if not emit_reasoning_content:
+          return result, None
+      result = self._strip_optional_think_start(result)
+      think_end = "</think>"
+      think_end_idx = result.find(think_end)
+      if think_end_idx < 0:
+          return result, None
+      reasoning_content = result[:think_end_idx]
+      content = result[think_end_idx + len(think_end):]
+      return content, reasoning_content
+
+  def _consume_deepseek_v4_reasoning_delta(
+      self,
+      delta_text: str,
+      state: Dict[str, Any],
+  ) -> Tuple[List[DeltaMessage], str]:
+      if not state.get("active"):
+          return [], delta_text
+
+      think_end = "</think>"
+      state["buffer"] = state.get("buffer", "") + delta_text
+      if not state.get("started"):
+          state["buffer"] = self._strip_optional_think_start(state["buffer"])
+          state["started"] = True
+
+      think_end_idx = state["buffer"].find(think_end)
+      if think_end_idx >= 0:
+          reasoning_delta = state["buffer"][:think_end_idx]
+          content_delta = state["buffer"][think_end_idx + len(think_end):]
+          state["buffer"] = ""
+          state["active"] = False
+          messages = []
+          if reasoning_delta:
+              messages.append(DeltaMessage(reasoning_content=reasoning_delta))
+          return messages, content_delta
+
+      overlap = self._partial_tag_overlap(state["buffer"], think_end)
+      if overlap:
+          reasoning_delta = state["buffer"][:-overlap]
+          state["buffer"] = state["buffer"][-overlap:]
+      else:
+          reasoning_delta = state["buffer"]
+          state["buffer"] = ""
+
+      if reasoning_delta:
+          return [DeltaMessage(reasoning_content=reasoning_delta)], ""
+      return [], ""
+
   async def _check_model(self, request: ChatCompletionRequest):
     if request.model != self.model_name:
       return self.create_error_response(
@@ -389,10 +473,14 @@ class FastLLmCompletion:
       enable_thinking: bool,
       images: Optional[List[Image.Image]],
       videos: Optional[List[Any]],
+      tools: Optional[List[Dict[str, Any]]] = None,
   ) -> int:
+      token_len_messages = messages
+      if tools and self._is_deepseek_v4_model():
+          token_len_messages = self.model._inject_deepseek_v4_tools(messages, tools)
       if not images and not videos:
           return self.model.get_input_token_len(
-              messages, enable_thinking = enable_thinking)
+              token_len_messages, enable_thinking = enable_thinking)
 
       try:
           signature = inspect.signature(self.model.get_input_token_len)
@@ -402,7 +490,7 @@ class FastLLmCompletion:
                   kwargs["images"] = images
               if "videos" in signature.parameters:
                   kwargs["videos"] = videos
-              return self.model.get_input_token_len(messages, **kwargs)
+              return self.model.get_input_token_len(token_len_messages, **kwargs)
       except (TypeError, ValueError):
           pass
 
@@ -418,7 +506,7 @@ class FastLLmCompletion:
               raise ValueError(
                   "Gemma4 multimodal token counting needs a Hugging Face tokenizer.")
           gemma_conversation = normalize_gemma4_conversation(
-              copy.deepcopy(messages), len(images))
+              copy.deepcopy(token_len_messages), len(images))
           native_inputs = prepare_gemma4_multimodal_inputs(
               tokenizer = tokenizer,
               model_dir = (getattr(self.model, "model_path", "") or tokenizer.name_or_path),
@@ -432,7 +520,7 @@ class FastLLmCompletion:
       if architecture == "Qwen3_5ForConditionalGeneration":
           tokenizer = getattr(self.model, "hf_tokenizer", None)
           qwen_conversation = normalize_qwen35_conversation(
-              copy.deepcopy(messages), len(images or []), len(videos or []))
+              copy.deepcopy(token_len_messages), len(images or []), len(videos or []))
           model_dir = getattr(self.model, "model_path", "") or (tokenizer.name_or_path if tokenizer is not None else "")
           native_inputs = prepare_qwen35_multimodal_inputs(
               tokenizer = tokenizer,
@@ -449,7 +537,7 @@ class FastLLmCompletion:
           return len(native_inputs["input_ids"])
 
       return self.model.get_input_token_len(
-          messages, enable_thinking = enable_thinking)
+          token_len_messages, enable_thinking = enable_thinking)
 
   def _parse_chat_message_content(
       self,
@@ -800,7 +888,8 @@ class FastLLmCompletion:
               messages,
               enable_thinking = self.enable_thinking,
               images = model_images,
-              videos = model_videos)
+              videos = model_videos,
+              tools = model_tools)
           handle = self.model.launch_stream_response(messages,
                             max_length = max_length, min_length = 0, do_sample = do_sample,
                             top_p = top_p, top_k = top_k, temperature = temperature,
@@ -926,7 +1015,8 @@ class FastLLmCompletion:
               messages,
               enable_thinking = enable_thinking,
               images = model_images,
-              videos = model_videos)
+              videos = model_videos,
+              tools = tools)
 
           handle = self.model.launch_stream_response(messages,
                             max_length = max_length, min_length = min_length, do_sample = do_sample,
@@ -943,16 +1033,18 @@ class FastLLmCompletion:
       # --think 是用户显式指定"在输出前补 <think>\n 起始标签"的开关，
       # 严格按用户意愿执行，与 enable_thinking（是否进入思考模式）解耦。
       need_think_prefix = self.think
+      emit_reasoning_content = self._is_deepseek_v4_reasoning_response(enable_thinking)
       # Streaming response
       if request.stream:
           return (self.chat_completion_stream_generator(
-              request, raw_request, result_generator, request_id, input_token_len, think = need_think_prefix),
+              request, raw_request, result_generator, request_id, input_token_len,
+              think = need_think_prefix, emit_reasoning_content = emit_reasoning_content),
               BackgroundTask(self.check_disconnect, raw_request, request_id, handle))
       else:
           try:
               return await self.chat_completion_full_generator(
                   request, raw_request, handle, result_generator, request_id, input_token_len,
-                  think = need_think_prefix)
+                  think = need_think_prefix, emit_reasoning_content = emit_reasoning_content)
           except ValueError as e:
               return self.create_error_response(str(e))
 
@@ -975,12 +1067,14 @@ class FastLLmCompletion:
               result_generator: AsyncIterator,
               request_id: str,
               input_token_len: int,
-              think: bool = False) -> Union[ErrorResponse, ChatCompletionResponse]:
+              think: bool = False,
+              emit_reasoning_content: bool = False) -> Union[ErrorResponse, ChatCompletionResponse]:
       model_name = self.model_name
       created_time = int(time.time())
-      result = "<think>\n" if think else ""
+      result = "" if emit_reasoning_content else ("<think>\n" if think else "")
       completion_tokens = 0
       async for res in result_generator:
+        res = self._normalize_model_delta(res)
         result += res
         completion_tokens += 1
         if await raw_request.is_disconnected():
@@ -988,6 +1082,9 @@ class FastLLmCompletion:
            self.model.abort_handle(handle)
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
+
+      result, reasoning_content = self._split_deepseek_v4_reasoning(
+          result, emit_reasoning_content)
 
       if request.tools:
           self._ensure_tool_parser()
@@ -1004,6 +1101,7 @@ class FastLLmCompletion:
               message=ChatMessage(
                   role="assistant",
                   content=tool_call_info.content or None,
+                  reasoning_content=reasoning_content or None,
                   tool_calls=tool_call_info.tool_calls,
               ),
               logprobs=None,
@@ -1012,7 +1110,11 @@ class FastLLmCompletion:
       else:
           choice_data = ChatCompletionResponseChoice(
               index=0,
-              message=ChatMessage(role="assistant", content=result),
+              message=ChatMessage(
+                  role="assistant",
+                  content=tool_call_info.content,
+                  reasoning_content=reasoning_content or None,
+              ),
               logprobs=None,
               finish_reason='stop',
           )
@@ -1039,7 +1141,8 @@ class FastLLmCompletion:
           self, request: ChatCompletionRequest, raw_request: Request,
           result_generator: AsyncIterator,
           request_id: str,
-          input_token_len: int, think: bool) -> AsyncGenerator[str, None]:
+          input_token_len: int, think: bool,
+          emit_reasoning_content: bool = False) -> AsyncGenerator[str, None]:
       model_name = self.model_name
       created_time = int(time.time())
       chunk_object_type = "chat.completion.chunk"
@@ -1066,7 +1169,7 @@ class FastLLmCompletion:
 
         # 新增：发送<think>标签
         has_sent_label = False
-        if not has_sent_label and think:
+        if not has_sent_label and think and not emit_reasoning_content:
             choice_data = ChatCompletionResponseStreamChoice(
                 index=0,
                 delta=DeltaMessage(content="<think>\n"),
@@ -1095,14 +1198,35 @@ class FastLLmCompletion:
         current_token_ids = []
         previous_text = ""
         current_text = ""
+        reasoning_state = {
+            "active": emit_reasoning_content,
+            "buffer": "",
+            "started": False,
+        }
 
         async for res in result_generator:
-            if (res == "[unused16]"):
-                res = "<think>"
-            elif (res == "[unused17]"):
-                res = "</think>" 
+            res = self._normalize_model_delta(res)
             completion_tokens += 1
             delta_text = res
+
+            reasoning_delta_messages, delta_text = self._consume_deepseek_v4_reasoning_delta(
+                delta_text, reasoning_state)
+            for reasoning_delta_message in reasoning_delta_messages:
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index = 0,
+                    delta = reasoning_delta_message,
+                    logprobs = None,
+                    finish_reason = None)
+                chunk = ChatCompletionStreamResponseWithUsage(
+                    id = request_id,
+                    object = chunk_object_type,
+                    created = created_time,
+                    choices = [choice_data],
+                    model = model_name)
+                data = chunk.model_dump_json(exclude_unset=True)
+                yield f"data: {data}\n\n"
+            if delta_text == "":
+                continue
 
             # print("delta_text", delta_text)
 
@@ -1145,6 +1269,23 @@ class FastLLmCompletion:
                 data = chunk.model_dump_json(exclude_unset=True)
                 yield f"data: {data}\n\n"
             #await asyncio.sleep(0)
+
+        if (emit_reasoning_content and reasoning_state.get("active")
+                and reasoning_state.get("buffer")):
+            choice_data = ChatCompletionResponseStreamChoice(
+                index = 0,
+                delta = DeltaMessage(reasoning_content = reasoning_state["buffer"]),
+                logprobs = None,
+                finish_reason = None)
+            chunk = ChatCompletionStreamResponseWithUsage(
+                id = request_id,
+                object = chunk_object_type,
+                created = created_time,
+                choices = [choice_data],
+                model = model_name)
+            data = chunk.model_dump_json(exclude_unset=True)
+            yield f"data: {data}\n\n"
+            reasoning_state["buffer"] = ""
 
         # 3. 结束标志
         finish_reason = 'stop'

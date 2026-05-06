@@ -120,6 +120,7 @@ def make_normal_llm_model(args):
                 text_model_type = config["text_config"].get("model_type", "")
 
             if (architecture == 'Qwen3ForCausalLM' or architecture == 'Qwen3MoeForCausalLM' or
+                architecture == 'DeepseekV4ForCausalLM' or model_type == 'deepseek_v4' or
                 architecture == 'Qwen3_5MoeForConditionalGeneration' or
                 model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
                 architecture == 'Glm4MoeForCausalLM'):
@@ -128,6 +129,7 @@ def make_normal_llm_model(args):
             if (architecture == 'DeepseekV3ForCausalLM' or 
                 architecture == 'DeepseekV2ForCausalLM' or 
                 architecture == 'DeepseekV4ForCausalLM' or 
+                model_type == 'deepseek_v4' or
                 architecture == 'Qwen3MoeForCausalLM' or 
                 architecture == 'Qwen3_5MoeForConditionalGeneration' or
                 model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
