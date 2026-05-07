@@ -935,14 +935,15 @@ class model:
                     if chat_template != "":
                         self.hf_tokenizer.chat_template = chat_template
                         self.force_chat_template = True
+                skip_tokenizer = self._has_hf_chat_template()
                 if model_json != "":
                     self.model = fastllm_lib.create_llm_model_fromhf_with_config(
                         path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
-                        ctypes.c_bool(self.hf_tokenizer != None), model_json.encode())
+                        ctypes.c_bool(skip_tokenizer), model_json.encode())
                 else:
                     self.model = fastllm_lib.create_llm_model_fromhf(
                         path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
-                        ctypes.c_bool(self.hf_tokenizer != None), lora.encode(),
+                        ctypes.c_bool(skip_tokenizer), lora.encode(),
                         use_moe_dtype, fastllm_data_type_dict[moe_dtype], moe_int4g_groupcnt, dtype_config.encode())
                 if os.path.isfile(os.path.join(path, "config.json")):
                     self.config = json.load(open(os.path.join(path, "config.json"), "r"))
@@ -1115,6 +1116,12 @@ class model:
         except Exception:
             return False
 
+    def _has_hf_chat_template(self) -> bool:
+        if self.hf_tokenizer is None:
+            return False
+        chat_template = getattr(self.hf_tokenizer, "chat_template", None)
+        return isinstance(chat_template, str) and chat_template != ""
+
     def _build_messages(self, query: str, history: List[Tuple[str, str]]) -> List[Dict[str, str]]:
         messages = []
         if (self.system_prompt != ""):
@@ -1145,7 +1152,7 @@ class model:
             thinking_mode = "thinking" if self.enable_thinking else "chat"
             return encode_messages(self._build_messages(query, history), thinking_mode=thinking_mode)
 
-        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+        if self._has_hf_chat_template():
             if (self.system_prompt != ""):
                 messages.append({"role": "system", "content": self.system_prompt})
             for his in history:
@@ -1307,7 +1314,7 @@ class model:
             architecture = self.config["architectures"][0]
         except:
             architecture = ""
-        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+        if self._has_hf_chat_template():
             prompt = self.hf_tokenizer.apply_chat_template(self.trans_conversation(conversation), add_generation_prompt = add_generation_prompt, tokenize = False, enable_thinking = enable_thinking)
             return len(self.hf_tokenizer.encode(prompt, add_special_tokens = True))
         else:
@@ -1461,7 +1468,7 @@ class model:
         conversation = None
         if (isinstance(query, List)):
             conversation = query
-        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+        if self._has_hf_chat_template():
             tokenizer = self.hf_tokenizer
             type = None
             if (hasattr(tokenizer, "name") 
@@ -1723,7 +1730,7 @@ class model:
                 print("Error: can't support architectures: " + architecture)
                 exit(0)
 
-        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+        if self._has_hf_chat_template():
             tokenizer = self.hf_tokenizer
             type = None
             if (hasattr(tokenizer, "name") 
@@ -1809,7 +1816,7 @@ class model:
         fastllm_lib.abort_response_llm_model(self.model, handle)
     
     def stream_response_handle(self, handle):
-        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+        if self._has_hf_chat_template():
             tokenizer = self.hf_tokenizer
             tokens = []
             while True:
@@ -1874,7 +1881,7 @@ class model:
         is_prefill = True
         start_time = time.time()
 
-        if (self.hf_tokenizer != None and hasattr(self.hf_tokenizer, "chat_template") and self.hf_tokenizer.chat_template != ""):
+        if self._has_hf_chat_template():
             tokenizer = self.hf_tokenizer
             tokens = []
             while True:
