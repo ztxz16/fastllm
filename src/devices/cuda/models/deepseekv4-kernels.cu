@@ -1513,6 +1513,108 @@ __global__ void DeepSeekV4SparseAttentionPrefillBlockKernel(const QT *q, const K
     }
 }
 
+template <typename QT, typename KT>
+__global__ void DeepSeekV4SparseAttentionPrefillCublasCompressedKernel(
+        const QT *q, const KT *kv, const float *sink, float *compressedScores, float *output,
+        int bsz, int seqlen, int heads, int dim, int kvLen, int windowSize, int compressRatio,
+        int startPos, int prefixLen, int compressedStart, int compressedCount, float softmaxScale,
+        int rowOffset) {
+    extern __shared__ float localScores[];
+
+    int localRow = blockIdx.x;
+    int row = rowOffset + localRow;
+    int h = row % heads;
+    int tmp = row / heads;
+    int s = tmp % seqlen;
+    int b = tmp / seqlen;
+    if (b >= bsz) {
+        return;
+    }
+
+    int realPrefixLen = max(0, min(prefixLen, kvLen - seqlen));
+    int liveWindow = min(windowSize, realPrefixLen + s + 1);
+    int beginPos = startPos + s - liveWindow + 1;
+    int prefixStartPos = startPos - realPrefixLen;
+    int liveCompressed = 0;
+    if (compressRatio > 0 && compressedCount > 0) {
+        liveCompressed = min(compressedCount, (startPos + s + 1) / compressRatio);
+    }
+    if (liveWindow + liveCompressed <= 0) {
+        return;
+    }
+
+    __shared__ float mxShared;
+    __shared__ float denomShared;
+    const QT *qrow = q + (((uint64_t)b * seqlen + s) * heads + h) * dim;
+    float *crow = compressedScores + (uint64_t)localRow * compressedCount;
+
+    int lane = threadIdx.x & 31;
+    int warpId = threadIdx.x >> 5;
+    int warps = blockDim.x >> 5;
+    for (int base = 0; base < liveWindow; base += warps) {
+        int k = base + warpId;
+        float dot = 0.0f;
+        if (k < liveWindow) {
+            int pos = beginPos + k;
+            int idx = (pos < startPos) ? (pos - prefixStartPos) : (realPrefixLen + pos - startPos);
+            const KT *kvrow = kv + ((uint64_t)b * kvLen + idx) * dim;
+            for (int d = lane; d < dim; d += 32) {
+                dot += Dsv4ToFloat(qrow[d]) * Dsv4ToFloat(kvrow[d]);
+            }
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            dot += __shfl_down_sync(0xffffffff, dot, offset);
+        }
+        if (lane == 0 && k < liveWindow) {
+            localScores[k] = dot * softmaxScale;
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float mx = -INFINITY;
+        for (int k = 0; k < liveWindow; k++) {
+            mx = fmaxf(mx, localScores[k]);
+        }
+        for (int k = 0; k < liveCompressed; k++) {
+            mx = fmaxf(mx, crow[k]);
+        }
+        mxShared = isfinite(mx) ? mx : 0.0f;
+        float denom = expf(sink[h] - mxShared);
+        for (int k = 0; k < liveWindow; k++) {
+            denom += expf(localScores[k] - mxShared);
+        }
+        for (int k = 0; k < liveCompressed; k++) {
+            denom += expf(crow[k] - mxShared);
+        }
+        denomShared = fmaxf(denom, 1e-30f);
+    }
+    __syncthreads();
+
+    for (int k = threadIdx.x; k < liveWindow; k += blockDim.x) {
+        localScores[k] = expf(localScores[k] - mxShared) / denomShared;
+    }
+    for (int k = threadIdx.x; k < liveCompressed; k += blockDim.x) {
+        crow[k] = expf(crow[k] - mxShared) / denomShared;
+    }
+    for (int k = liveCompressed + threadIdx.x; k < compressedCount; k += blockDim.x) {
+        crow[k] = 0.0f;
+    }
+    __syncthreads();
+
+    float *orow = output + (uint64_t)localRow * dim;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float v = 0.0f;
+        for (int k = 0; k < liveWindow; k++) {
+            int pos = beginPos + k;
+            int idx = (pos < startPos) ? (pos - prefixStartPos) : (realPrefixLen + pos - startPos);
+            const KT *kvrow = kv + ((uint64_t)b * kvLen + idx) * dim;
+            v += localScores[k] * Dsv4ToFloat(kvrow[d]);
+        }
+        orow[d] = v;
+    }
+}
+
 __global__ void DeepSeekV4SparsePrefillRotaryCastKernel(const float *input, __nv_bfloat16 *output,
                                                         int rows, int rowOffset,
                                                         int seqlen, int heads, int dim,
@@ -2047,6 +2149,219 @@ bool DeepSeekV4LaunchSparseDecodeByCompressed(const void *cudaQ, const void *cud
 }
 
 template <typename QT, typename KT>
+bool DeepSeekV4LaunchSparsePrefillCompressedCublasSegment(
+        const fastllm::Data &q, const fastllm::Data &kv, const float *cudaSink,
+        float *compressedScores, float *compressedKVFloat, float *outData,
+        int bsz, int seqlen, int heads, int dim, int kvLen,
+        int windowSize, int compressRatio, int startPos, int prefixLen,
+        int compressedStart, int compressedCount, float softmaxScale,
+        int rowOffset, int rows) {
+    if (rows <= 0 || compressedCount <= 0 || q.dataType != kv.dataType) {
+        return false;
+    }
+    cudaDataType_t inputType;
+    if (!DeepSeekV4CublasDataType(q.dataType, inputType)) {
+        return false;
+    }
+
+    int rowsPerBatch = seqlen * heads;
+    int b = rowOffset / rowsPerBatch;
+    if (b < 0 || b >= bsz || rowOffset + rows > (b + 1) * rowsPerBatch) {
+        return false;
+    }
+
+    const QT *qPtr = (const QT *)q.cudaData + (uint64_t)rowOffset * dim;
+    const KT *kvPtr = (const KT *)kv.cudaData + ((uint64_t)b * kvLen + compressedStart) * dim;
+    float alpha = softmaxScale;
+    float beta = 0.0f;
+    auto handle = getFastllmCublasHandle();
+    cublasStatus_t status;
+    if (q.dataType == fastllm::DataType::FLOAT32) {
+        status = cublasSgemm(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            compressedCount, rows, dim,
+            &alpha,
+            (const float *)kvPtr, dim,
+            (const float *)qPtr, dim,
+            &beta,
+            compressedScores, compressedCount);
+    } else {
+        status = cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
+            compressedCount, rows, dim,
+            &alpha,
+            kvPtr, inputType, dim,
+            qPtr, inputType, dim,
+            &beta,
+            compressedScores, CUDA_R_32F, compressedCount,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        if (std::getenv("FASTLLM_DSV4_DEBUG_CUBLAS_SPARSE_PREFILL") != nullptr) {
+            std::fprintf(stderr,
+                         "DeepSeekV4SparsePrefill compressed cuBLAS QK failed: status=%d rows=%d dim=%d compressed=%d type=%d\n",
+                         (int)status, rows, dim, compressedCount, (int)q.dataType);
+        }
+        return false;
+    }
+
+    int realPrefixLen = std::max(0, std::min(prefixLen, kvLen - seqlen));
+    int maxLocalKeys = std::min(windowSize, realPrefixLen + seqlen);
+    if (maxLocalKeys <= 0 || maxLocalKeys > kDeepSeekV4SparsePrefillMaxKeys) {
+        return false;
+    }
+    size_t sharedBytes = (size_t)maxLocalKeys * sizeof(float);
+    auto kernel = DeepSeekV4SparseAttentionPrefillCublasCompressedKernel<QT, KT>;
+    if (!DeepSeekV4EnsureDynamicSharedMemory(kernel, sharedBytes)) {
+        return false;
+    }
+    kernel<<<rows, 256, sharedBytes>>>(
+        (const QT *)q.cudaData, (const KT *)kv.cudaData, cudaSink, compressedScores, outData,
+        bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen,
+        compressedStart, compressedCount, softmaxScale, rowOffset);
+
+    const float *compressedKVForGemm = nullptr;
+    if (kv.dataType == fastllm::DataType::FLOAT32) {
+        compressedKVForGemm = (const float *)kvPtr;
+    } else {
+        if (compressedKVFloat == nullptr) {
+            return false;
+        }
+        uint64_t kvElems = (uint64_t)compressedCount * dim;
+        int threads = 256;
+        DeepSeekV4SparseDecodeGatherKVKernel<KT><<<
+            (int)((kvElems + threads - 1) / threads), threads>>>(
+                (const float *)nullptr, kvPtr, compressedKVFloat, 1, dim, 1,
+                0, compressedCount, 0, compressedCount);
+        compressedKVForGemm = compressedKVFloat;
+    }
+
+    float avAlpha = 1.0f;
+    float avBeta = 1.0f;
+    status = cublasSgemm(
+        handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        dim, rows, compressedCount,
+        &avAlpha,
+        compressedKVForGemm, dim,
+        compressedScores, compressedCount,
+        &avBeta,
+        outData, dim);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        if (std::getenv("FASTLLM_DSV4_DEBUG_CUBLAS_SPARSE_PREFILL") != nullptr) {
+            std::fprintf(stderr,
+                         "DeepSeekV4SparsePrefill compressed cuBLAS AV failed: status=%d rows=%d dim=%d compressed=%d type=%d\n",
+                         (int)status, rows, dim, compressedCount, (int)kv.dataType);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool DeepSeekV4RunSparsePrefillCompressedCublas(
+        const fastllm::Data &q, const fastllm::Data &kv, const float *cudaSink,
+        fastllm::Data &output,
+        int bsz, int seqlen, int heads, int dim, int kvLen,
+        int windowSize, int compressRatio, int startPos, int prefixLen,
+        int ropeDim, float ropeBase, int originalSeqLen, float ropeFactor,
+        int betaFast, int betaSlow, float softmaxScale) {
+    if (std::getenv("FASTLLM_DSV4_ENABLE_CUBLAS_SPARSE_PREFILL_COMPRESSED") == nullptr) {
+        return false;
+    }
+    if (q.dataType != kv.dataType || compressRatio <= 0 || windowSize <= 0 ||
+        dim <= 0 || heads <= 0 || seqlen <= 0) {
+        return false;
+    }
+    int realPrefixLen = std::max(0, std::min(prefixLen, kvLen - seqlen));
+    int compressedStart = realPrefixLen + seqlen;
+    int compressedCount = std::max(0, kvLen - compressedStart);
+    if (compressedCount <= 0) {
+        return false;
+    }
+    int maxCompressed = 8192;
+    if (const char *env = std::getenv("FASTLLM_DSV4_CUBLAS_SPARSE_PREFILL_MAX_COMPRESSED")) {
+        maxCompressed = std::max(1, std::atoi(env));
+    }
+    if (compressedCount > maxCompressed) {
+        return false;
+    }
+
+    int rows = bsz * seqlen * heads;
+    size_t rowBytes = (size_t)dim * sizeof(float);
+    size_t scoreRowBytes = (size_t)compressedCount * sizeof(float);
+    size_t perRowBytes = rowBytes + scoreRowBytes;
+    size_t maxTempBytes = std::max(perRowBytes, DeepSeekV4SparsePrefillTempBytesLimit());
+    int rowsPerChunk = (int)std::max<size_t>(1, maxTempBytes / perRowBytes);
+    rowsPerChunk = std::min(rowsPerChunk, rows);
+    if (rowsPerChunk <= 0) {
+        return false;
+    }
+    size_t tempBytes = (size_t)rowsPerChunk * rowBytes;
+    size_t scoreBytes = (size_t)rowsPerChunk * scoreRowBytes;
+    size_t kvFloatBytes = q.dataType == fastllm::DataType::FLOAT32 ?
+        0 : (size_t)compressedCount * dim * sizeof(float);
+    uint8_t *scratch = (uint8_t *)FastllmCudaMalloc(tempBytes + scoreBytes + kvFloatBytes);
+    if (scratch == nullptr) {
+        return false;
+    }
+    float *cudaTemp = (float *)scratch;
+    float *compressedScores = (float *)(scratch + tempBytes);
+    float *compressedKVFloat = kvFloatBytes == 0 ? nullptr : (float *)(scratch + tempBytes + scoreBytes);
+
+    bool ok = true;
+    int rowsPerBatch = seqlen * heads;
+    for (int rowOffset = 0; rowOffset < rows && ok; rowOffset += rowsPerChunk) {
+        int chunkRows = std::min(rowsPerChunk, rows - rowOffset);
+        for (int localStart = 0; localStart < chunkRows && ok;) {
+            int globalRow = rowOffset + localStart;
+            int b = globalRow / rowsPerBatch;
+            int batchEnd = std::min(rowOffset + chunkRows, (b + 1) * rowsPerBatch);
+            int segmentRows = batchEnd - globalRow;
+            float *segmentScores = compressedScores + (uint64_t)localStart * compressedCount;
+            float *segmentTemp = cudaTemp + (uint64_t)localStart * dim;
+            if (q.dataType == fastllm::DataType::BFLOAT16) {
+                ok = DeepSeekV4LaunchSparsePrefillCompressedCublasSegment<__nv_bfloat16, __nv_bfloat16>(
+                    q, kv, cudaSink, segmentScores, compressedKVFloat, segmentTemp,
+                    bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos,
+                    realPrefixLen, compressedStart, compressedCount, softmaxScale,
+                    globalRow, segmentRows);
+            } else if (q.dataType == fastllm::DataType::FLOAT16) {
+                ok = DeepSeekV4LaunchSparsePrefillCompressedCublasSegment<half, half>(
+                    q, kv, cudaSink, segmentScores, compressedKVFloat, segmentTemp,
+                    bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos,
+                    realPrefixLen, compressedStart, compressedCount, softmaxScale,
+                    globalRow, segmentRows);
+            } else if (q.dataType == fastllm::DataType::FLOAT32) {
+                ok = DeepSeekV4LaunchSparsePrefillCompressedCublasSegment<float, float>(
+                    q, kv, cudaSink, segmentScores, compressedKVFloat, segmentTemp,
+                    bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos,
+                    realPrefixLen, compressedStart, compressedCount, softmaxScale,
+                    globalRow, segmentRows);
+            } else {
+                ok = false;
+            }
+            localStart += segmentRows;
+        }
+        if (!ok) {
+            break;
+        }
+        int threads = 128;
+        int blocks = (chunkRows + threads - 1) / threads;
+        DeepSeekV4SparsePrefillRotaryCastKernel<<<blocks, threads>>>(
+            cudaTemp, (__nv_bfloat16 *)output.cudaData, chunkRows, rowOffset, seqlen, heads, dim,
+            ropeDim, ropeBase, startPos, originalSeqLen, ropeFactor, betaFast, betaSlow);
+    }
+    if (ok) {
+        DeviceSync();
+    } else if (std::getenv("FASTLLM_DSV4_DEBUG_CUBLAS_SPARSE_PREFILL") != nullptr) {
+        std::fprintf(stderr, "DeepSeekV4SparsePrefill compressed cuBLAS path fell back to row-wise kernel.\n");
+    }
+
+    FastllmCudaFree(scratch);
+    return ok;
+}
+
+template <typename QT, typename KT>
 bool DeepSeekV4LaunchSparsePrefillByKV(const fastllm::Data &q, const fastllm::Data &kv,
                                        const float *cudaSink, float *outData,
                                        int bsz, int seqlen, int heads, int dim, int kvLen,
@@ -2497,6 +2812,12 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data 
     if (!DeepSeekV4PrepareCudaOutput(output, fastllm::DataType::BFLOAT16,
                                      {bsz, seqlen, heads, dim})) {
         return false;
+    }
+    if (DeepSeekV4RunSparsePrefillCompressedCublas(
+            q, kv, (const float *)attnSink.cudaData, output,
+            bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen,
+            ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow, softmaxScale)) {
+        return true;
     }
 
     int rows = bsz * seqlen * heads;
