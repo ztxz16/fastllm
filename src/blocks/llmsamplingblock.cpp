@@ -1,13 +1,76 @@
 #include "baseblock.h"
 #include "models/basellm.h"
 
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <string>
+
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #endif
 
 namespace fastllm {
+    struct LogitsDebugOptions {
+        bool printLogits = false;
+        std::string dumpPath;
+    };
+
+    static bool IsLogitsEnvEnabled(const char *v) {
+        return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+    }
+
+    static const LogitsDebugOptions &GetLogitsDebugOptions() {
+        static const LogitsDebugOptions options = []() {
+            LogitsDebugOptions ret;
+            ret.printLogits = GetFastllmEnv().printLogits ||
+                              IsLogitsEnvEnabled(std::getenv("FASTLLM_PRINT_LOGITS"));
+            const char *path = std::getenv("FASTLLM_DSV4_DUMP_LOGITS");
+            if (path != nullptr) {
+                ret.dumpPath = path;
+            }
+            return ret;
+        }();
+        return options;
+    }
+
     static bool ShouldPrintLogits() {
-        return GetFastllmEnv().printLogits;
+        return GetLogitsDebugOptions().printLogits;
+    }
+
+    static const std::string &LogitsDumpPath() {
+        return GetLogitsDebugOptions().dumpPath;
+    }
+
+    static void DumpLogitsIfNeeded(Data &logits) {
+        const std::string &path = LogitsDumpPath();
+        bool needDump = !path.empty();
+        bool needPrint = ShouldPrintLogits();
+        if (!needDump && !needPrint) {
+            return;
+        }
+        logits.ToDevice(DataDevice::CPU);
+        float *p = (float*)logits.cpuData;
+        uint64_t count = logits.Count(0);
+        if (needPrint) {
+            printf("[fastllm-dsv4-logits] count=%llu\n", (unsigned long long)count);
+            for (uint64_t i = 0; i < count; i++) {
+                printf("%.9g%c", p[i], (i + 1 == count) ? '\n' : ' ');
+            }
+            fflush(stdout);
+        }
+        if (needDump) {
+            std::ofstream ofs(path.c_str(), std::ios::app);
+            ofs << "count=" << count << "\n";
+            ofs << std::setprecision(9);
+            for (uint64_t i = 0; i < count; i++) {
+                if (i > 0) {
+                    ofs << ' ';
+                }
+                ofs << p[i];
+            }
+            ofs << "\n";
+        }
     }
 
     void LLMSamplingBlock (
@@ -61,6 +124,7 @@ namespace fastllm {
         }
 
         model->ResetLogitsOfEOS(batch, &logits, pastKeyValues, generationConfigs);
+        DumpLogitsIfNeeded(logits);
         if (ShouldPrintLogits()) {
             printf("LLMSamplingBlock logits:\n");
             logits.Print();
