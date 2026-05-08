@@ -229,6 +229,97 @@ namespace fastllm {
         DeepSeekV4HcPreWriteFloatData(values, input);
     }
 
+    struct DeepSeekV4WoAReferenceOp : MultiThreadBaseOp {
+        const std::vector<float> *ov;
+        const std::vector<float> *wv;
+        float *y;
+        int st, end;
+        int bsz, seqlen, heads, headDim, groups, oRank, headsPerGroup, groupDim;
+
+        DeepSeekV4WoAReferenceOp(const std::vector<float> *ov, const std::vector<float> *wv, float *y,
+                                 int st, int end, int bsz, int seqlen, int heads, int headDim,
+                                 int groups, int oRank)
+            : ov(ov), wv(wv), y(y), st(st), end(end), bsz(bsz), seqlen(seqlen),
+              heads(heads), headDim(headDim), groups(groups), oRank(oRank) {
+            headsPerGroup = heads / groups;
+            groupDim = headsPerGroup * headDim;
+        }
+
+        void Run() override {
+            const float *ovData = ov->data();
+            const float *wvData = wv->data();
+            for (int idx = st; idx < end; idx++) {
+                int r = idx % oRank;
+                int tmp = idx / oRank;
+                int g = tmp % groups;
+                tmp /= groups;
+                int s = tmp % seqlen;
+                int b = tmp / seqlen;
+                const float *w = wvData + ((uint64_t)g * oRank + r) * groupDim;
+                double v = 0.0;
+                int d = 0;
+                for (int hh = 0; hh < headsPerGroup; hh++) {
+                    const float *src = ovData + (((uint64_t)b * seqlen + s) * heads +
+                                                 g * headsPerGroup + hh) * headDim;
+                    for (int localD = 0; localD < headDim; localD++, d++) {
+                        v += (double)src[localD] * w[d];
+                    }
+                }
+                y[idx] = (float)v;
+            }
+        }
+    };
+
+    void CpuDeepSeekV4WoAOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &output = *(datas.find("output")->second);
+        int groups = intParams.find("groups") != intParams.end() ? intParams.find("groups")->second : 1;
+        int oRank = intParams.find("oRank") != intParams.end() ? intParams.find("oRank")->second : 1;
+
+        AssertInFastLLM(input.dims.size() == 4, "DeepSeekV4WoA error: input's shape's size should be 4.\n");
+        AssertInFastLLM(groups > 0 && oRank > 0, "DeepSeekV4WoA error: invalid groups or oRank.\n");
+        int bsz = input.dims[0], seqlen = input.dims[1], heads = input.dims[2], headDim = input.dims[3];
+        AssertInFastLLM(heads % groups == 0, "DeepSeekV4WoA error: heads should be divisible by groups.\n");
+        int headsPerGroup = heads / groups;
+        int groupDim = headsPerGroup * headDim;
+        AssertInFastLLM(weight.Count(0) == (uint64_t)groups * oRank * groupDim,
+                        "DeepSeekV4WoA error: weight shape mismatch.\n");
+
+        auto ov = DeepSeekV4HcPreReadFloatData(input);
+        auto wv = DeepSeekV4HcPreReadFloatData(weight);
+        std::vector<float> y((uint64_t)bsz * seqlen * groups * oRank, 0.0f);
+        int total = bsz * seqlen * groups * oRank;
+        auto *pool = GetAlivePool();
+        int threadNum = std::min((int)pool->threads.size(), total);
+        if (threadNum <= 1 || total < 1024) {
+            DeepSeekV4WoAReferenceOp(&ov, &wv, y.data(), 0, total, bsz, seqlen,
+                                     heads, headDim, groups, oRank).Run();
+        } else {
+            std::vector<DeepSeekV4WoAReferenceOp*> ops;
+            int per = total / threadNum;
+            int cur = 0;
+            for (int i = 0; i < threadNum; i++) {
+                int end = (i == threadNum - 1) ? total : cur + per;
+                ops.push_back(new DeepSeekV4WoAReferenceOp(&ov, &wv, y.data(), cur, end,
+                                                           bsz, seqlen, heads, headDim, groups, oRank));
+                cur = end;
+            }
+            for (int i = 0; i < (int)ops.size(); i++) {
+                pool->PushOp(i, ops[i]);
+            }
+            for (int i = 0; i < (int)ops.size(); i++) {
+                pool->Wait(i);
+                delete ops[i];
+            }
+        }
+
+        output.dataType = DataType::BFLOAT16;
+        output.Resize({bsz, seqlen, groups * oRank});
+        DeepSeekV4HcPreWriteFloatData(y, output);
+    }
+
     struct DeepSeekV4HcPreDotsOp : MultiThreadBaseOp {
         const float *xrow;
         const float *fn;

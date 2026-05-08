@@ -56,6 +56,7 @@ namespace fastllm {
         this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CudaDeepSeekV4HcPreOp());
         this->ops["ScaleQRatory"] = (BaseOperator*)(new CudaScaleQRatoryOp());
         this->ops["DeepSeekV4RotaryQuant"] = (BaseOperator*)(new CudaDeepSeekV4RotaryQuantOp());
+        this->ops["DeepSeekV4WoA"] = (BaseOperator*)(new CudaDeepSeekV4WoAOp());
         this->ops["Cat"] = (BaseOperator*)(new CudaCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CudaPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
@@ -1004,6 +1005,39 @@ namespace fastllm {
                                               originalSeqLen, ropeFactor, betaFast, betaSlow,
                                               quantDim, blockSize, posStep)) {
             ErrorInFastLLM("DeepSeekV4RotaryQuant CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4WoAOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight = *(datas.find("weight")->second);
+        int groups = intParams.find("groups") != intParams.end() ? intParams.find("groups")->second : 1;
+        int oRank = intParams.find("oRank") != intParams.end() ? intParams.find("oRank")->second : 1;
+        if (input.dims.size() != 4 || groups <= 0 || oRank <= 0) {
+            return false;
+        }
+        int heads = input.dims[2], headDim = input.dims[3];
+        if (heads % groups != 0 ||
+            weight.Count(0) != (uint64_t)groups * oRank * (heads / groups) * headDim) {
+            return false;
+        }
+        return input.dataType == DataType::FLOAT32 ||
+               input.dataType == DataType::FLOAT16 ||
+               input.dataType == DataType::BFLOAT16;
+    }
+
+    void CudaDeepSeekV4WoAOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &output = *(datas.find("output")->second);
+        int groups = intParams.find("groups") != intParams.end() ? intParams.find("groups")->second : 1;
+        int oRank = intParams.find("oRank") != intParams.end() ? intParams.find("oRank")->second : 1;
+        input.ToDevice(DataDevice::CUDA);
+        weight.ToDevice(DataDevice::CUDA);
+        if (!FastllmCudaDeepSeekV4WoA(input, weight, groups, oRank, output)) {
+            ErrorInFastLLM("DeepSeekV4WoA CUDA error: kernel rejected input.\n");
         }
     }
 

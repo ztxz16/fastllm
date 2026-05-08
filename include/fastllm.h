@@ -883,6 +883,8 @@ namespace fastllm {
                                int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
                                int quantDim, int blockSize, int posStep = 1);
 
+    void DeepSeekV4WoA(Data &o, Data &woA, int groups, int oRank, Data &output);
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 
     void Pad(const Data &input, int axis, int padSize, Data &output);

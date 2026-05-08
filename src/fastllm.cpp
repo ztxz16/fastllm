@@ -3490,6 +3490,12 @@ namespace fastllm {
             {"blockSize", blockSize}, {"posStep", posStep}});
     }
 
+    void DeepSeekV4WoA(Data &o, Data &woA, int groups, int oRank, Data &output) {
+        curExecutor->Run("DeepSeekV4WoA", {
+                {"input", &o}, {"weight", &woA}, {"output", &output}
+        }, {}, {{"groups", groups}, {"oRank", oRank}});
+    }
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output) {
         curExecutor->Run("Cat", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}, {"output", &output}

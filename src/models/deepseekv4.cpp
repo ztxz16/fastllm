@@ -1422,114 +1422,6 @@ namespace fastllm {
             WriteFloatData(y, {bsz, aSeq + bSeq, dim}, output, a.dataType);
         }
 
-        struct WoAReferenceOp : MultiThreadBaseOp {
-            const std::vector<float> *ov;
-            const std::vector<float> *wv;
-            float *y;
-            int st, end;
-            int bsz, seqlen, heads, headDim, groups, oRank, headsPerGroup, groupDim;
-
-            WoAReferenceOp(const std::vector<float> *ov, const std::vector<float> *wv, float *y,
-                           int st, int end, int bsz, int seqlen, int heads, int headDim,
-                           int groups, int oRank)
-                : ov(ov), wv(wv), y(y), st(st), end(end), bsz(bsz), seqlen(seqlen),
-                  heads(heads), headDim(headDim), groups(groups), oRank(oRank) {
-                headsPerGroup = heads / groups;
-                groupDim = headsPerGroup * headDim;
-            }
-
-            void Run() override {
-                const float *ovData = ov->data();
-                const float *wvData = wv->data();
-                for (int idx = st; idx < end; idx++) {
-                    int r = idx % oRank;
-                    int tmp = idx / oRank;
-                    int g = tmp % groups;
-                    tmp /= groups;
-                    int s = tmp % seqlen;
-                    int b = tmp / seqlen;
-                    const float *w = wvData + ((uint64_t)g * oRank + r) * groupDim;
-                    double v = 0.0;
-                    int d = 0;
-                    for (int hh = 0; hh < headsPerGroup; hh++) {
-                        const float *src = ovData + (((uint64_t)b * seqlen + s) * heads +
-                                                     g * headsPerGroup + hh) * headDim;
-                        for (int localD = 0; localD < headDim; localD++, d++) {
-                            v += (double)src[localD] * w[d];
-                        }
-                    }
-                    y[idx] = (float)v;
-                }
-            }
-        };
-
-        static void WoAReference(Data &o, Data &woA, int groups, int oRank, Data &output) {
-            auto ov = ReadFloatData(o);
-            auto wvPtr = ReadWeightFloatDataCached(woA);
-            const auto &wv = *wvPtr;
-            int bsz = o.dims[0], seqlen = o.dims[1], heads = o.dims[2], headDim = o.dims[3];
-            int headsPerGroup = heads / groups;
-            int groupDim = headsPerGroup * headDim;
-            std::vector<float> y((uint64_t)bsz * seqlen * groups * oRank, 0.0f);
-            int total = bsz * seqlen * groups * oRank;
-            auto *pool = GetAlivePool();
-            int threadNum = std::min((int)pool->threads.size(), total);
-            if (threadNum <= 1 || total < 1024) {
-                WoAReferenceOp(&ov, &wv, y.data(), 0, total, bsz, seqlen, heads, headDim, groups, oRank).Run();
-            } else {
-                std::vector<WoAReferenceOp*> ops;
-                int per = total / threadNum;
-                int cur = 0;
-                for (int i = 0; i < threadNum; i++) {
-                    int end = (i == threadNum - 1) ? total : cur + per;
-                    ops.push_back(new WoAReferenceOp(&ov, &wv, y.data(), cur, end,
-                                                     bsz, seqlen, heads, headDim, groups, oRank));
-                    cur = end;
-                }
-                for (int i = 0; i < (int)ops.size(); i++) {
-                    pool->PushOp(i, ops[i]);
-                }
-                for (int i = 0; i < (int)ops.size(); i++) {
-                    pool->Wait(i);
-                    delete ops[i];
-                }
-            }
-            WriteFloatData(y, {bsz, seqlen, groups * oRank}, output, DataType::BFLOAT16);
-        }
-
-        static bool WoACudaIfAvailable(Data &o, Data &woA, int groups, int oRank, Data &output) {
-#ifdef USE_CUDA
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_WOA_HCPOST")) {
-                return false;
-            }
-            if (o.dims.size() != 4 || groups <= 0 || oRank <= 0) {
-                return false;
-            }
-            int heads = o.dims[2], headDim = o.dims[3];
-            if (heads % groups != 0 || woA.Count(0) != (uint64_t)groups * oRank * (heads / groups) * headDim) {
-                return false;
-            }
-            o.ToDevice(DataDevice::CUDA);
-            woA.ToDevice(DataDevice::CUDA);
-            return FastllmCudaDeepSeekV4WoA(o, woA, groups, oRank, output);
-#else
-            (void)o;
-            (void)woA;
-            (void)groups;
-            (void)oRank;
-            (void)output;
-            return false;
-#endif
-        }
-
-        static void WoA(Data &o, Data &woA, int groups, int oRank, Data &output) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4WoA");
-            if (WoACudaIfAvailable(o, woA, groups, oRank, output)) {
-                return;
-            }
-            WoAReference(o, woA, groups, oRank, output);
-        }
-
         static void RunExpertReference(WeightMap &weight, const std::string &prefix, const Data &x,
                                        float routeWeight, float swigluLimit, std::vector<float> &accum) {
             Data gate, up, gateup;
@@ -2840,7 +2732,7 @@ namespace fastllm {
             if (releaseCpuCompressedAfterSparse) {
                 ResetData(decodeCache->compressedKV);
             }
-            WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+            DeepSeekV4WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
             Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
             HcPostReference(attnOut, hiddenStates, attnMix, hiddenStates);
             DeepSeekV4HcPre(hiddenStates, weight[pre + ".hc_ffn_fn"],
