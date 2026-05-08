@@ -562,6 +562,13 @@ __global__ void FastllmAddKernel(half* a, half *b, half v, int len) {
     }
 }
 
+__global__ void FastllmCopyKernel(uint8_t* a, uint8_t *b, uint64_t len) {
+    uint64_t idx = (uint64_t)threadIdx.x + (uint64_t)blockIdx.x * blockDim.x;
+    if (idx < len) {
+        b[idx] = a[idx];
+    }
+}
+
 __global__ void FastllmMulKernel(float* a, float *b, float v, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
@@ -2354,6 +2361,22 @@ bool FastllmCudaAdd(const fastllm::Data &input, float v, fastllm::Data &output) 
     } else {
         FastllmAddKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>((half*)cudaInput, (half*)cudaOutput, __float2half_rn(v), len);
     }
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+    return true;
+}
+
+bool FastllmCudaCopy(const fastllm::Data &input, fastllm::Data &output) {
+    uint64_t len = input.GetBytes();
+    if (len == 0) {
+        return true;
+    }
+    uint8_t *cudaInput = (uint8_t *) FastllmCudaPrepareInput(input);
+    uint8_t *cudaOutput = (uint8_t *) FastllmCudaPrepareOutput(output);
+    int threadPerBlock = 256;
+
+    FastllmCopyKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock>>>(cudaInput, cudaOutput, len);
 
     FastllmCudaFinishInput(input, cudaInput);
     FastllmCudaFinishOutput(output, cudaOutput);

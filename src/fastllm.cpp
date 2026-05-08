@@ -3461,6 +3461,12 @@ namespace fastllm {
         }, {}, {{"axis", axis}, {"repeatTimes", repeatTimes}});
     }
 
+    void Copy(const Data &input, Data &output) {
+        curExecutor->Run("Copy", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
     void DeepSeekV4HcPre(const Data &input, Data &hcFn, Data &hcScale, Data &hcBase,
                          int hcMult, int sinkhornIters, float eps, float normEps,
                          Data &output, Data &post, Data &comb) {
@@ -3471,19 +3477,10 @@ namespace fastllm {
     }
 
     void DeepSeekV4HcPost(const Data &input, const Data &residual, const Data &post, const Data &comb, Data &output) {
-        auto run = [&](Data &out) {
-            curExecutor->Run("DeepSeekV4HcPost", {
-                    {"input", (Data*)&input}, {"residual", (Data*)&residual},
-                    {"post", (Data*)&post}, {"comb", (Data*)&comb}, {"output", &out}
-            }, {}, {});
-        };
-        if (&residual == &output) {
-            Data temp;
-            run(temp);
-            output.CopyFrom(temp);
-        } else {
-            run(output);
-        }
+        curExecutor->Run("DeepSeekV4HcPost", {
+                {"input", (Data*)&input}, {"residual", (Data*)&residual},
+                {"post", (Data*)&post}, {"comb", (Data*)&comb}, {"output", &output}
+        }, {}, {});
     }
 
     void ScaleQRatory(Data &q, float eps, int ropeDim, float ropeBase, int startPos,

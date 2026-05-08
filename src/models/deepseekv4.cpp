@@ -2404,6 +2404,7 @@ namespace fastllm {
         Data attnInput;
         Data qr, qNorm, q, kv;
         HcMix attnMix, ffnMix;
+        Data hiddenStatesTemp;
 
         for (int layer = 0; layer < block_cnt; layer++) {
             std::string pre = "layers." + std::to_string(layer);
@@ -2641,7 +2642,8 @@ namespace fastllm {
             }
             DeepSeekV4WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
             Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
-            DeepSeekV4HcPost(attnOut, hiddenStates, attnMix.postData, attnMix.combData, hiddenStates);
+            Copy(hiddenStates, hiddenStatesTemp);
+            DeepSeekV4HcPost(attnOut, hiddenStatesTemp, attnMix.postData, attnMix.combData, hiddenStates);
             DeepSeekV4HcPre(hiddenStates, weight[pre + ".hc_ffn_fn"],
                             weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
                             hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
@@ -2686,7 +2688,8 @@ namespace fastllm {
                 }
             }
             ffnOut.Reshape(ffnDims);
-            DeepSeekV4HcPost(ffnOut, hiddenStates, ffnMix.postData, ffnMix.combData, hiddenStates);
+            Copy(hiddenStates, hiddenStatesTemp);
+            DeepSeekV4HcPost(ffnOut, hiddenStatesTemp, ffnMix.postData, ffnMix.combData, hiddenStates);
         }
 
         Data headStates, headInput;

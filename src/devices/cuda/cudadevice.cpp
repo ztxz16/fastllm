@@ -63,6 +63,7 @@ namespace fastllm {
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CudaRepeatOp());
+        this->ops["Copy"] = (BaseOperator*)(new CudaCopyOp());
         this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CudaDeepSeekV4HcPreOp());
         this->ops["DeepSeekV4HcPost"] = (BaseOperator*)(new CudaDeepSeekV4HcPostOp());
         this->ops["ScaleQRatory"] = (BaseOperator*)(new CudaScaleQRatoryOp());
@@ -908,6 +909,19 @@ namespace fastllm {
         int inner = input.strides[axis];
         int unitSize = input.unitSize;
         FastllmCudaRepeat(input.cudaData, output.cudaData, outer, repeatTimes, inputStride * unitSize, outputStride * unitSize, channels * inner * unitSize, channels * inner * unitSize);
+    }
+
+    void CudaCopyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        if (&input == &output) {
+            return;
+        }
+        output.Allocate();
+        if (!FastllmCudaCopy(input, output)) {
+            ErrorInFastLLM("Copy CUDA error: kernel rejected input.\n");
+        }
     }
 
     bool CudaDeepSeekV4HcPreOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
