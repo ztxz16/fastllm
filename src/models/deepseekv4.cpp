@@ -1258,7 +1258,7 @@ namespace fastllm {
                                                          float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4SparseDecodeCached");
 #ifdef USE_CUDA
-            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") && q.dims[1] == 1) {
+            if (q.dims[1] == 1) {
                 Data qCuda, compressedCuda;
                 const Data *qForCuda = &q;
                 if (q.dataDevice != DataDevice::CUDA) {
@@ -1939,8 +1939,7 @@ namespace fastllm {
             }
 
 #ifdef USE_CUDA
-            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") &&
-                DeepSeekV4PreferCuda() && !dst.windowKV.empty() && dst.bsz > 0 &&
+            if (DeepSeekV4PreferCuda() && !dst.windowKV.empty() && dst.bsz > 0 &&
                 dst.windowSize > 0 && dst.headDim > 0) {
                 WriteFloatData(dst.windowKV, {dst.bsz, dst.windowSize, dst.headDim},
                                dst.windowKVData, DataType::FLOAT32);
@@ -2657,7 +2656,7 @@ namespace fastllm {
                     StoreWindowKVCache(kvValues, bsz, seqlen, head_dim_full, startPos, window_size,
                                        decodeCache->windowKV);
 #ifdef USE_CUDA
-                    if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") && DeepSeekV4PreferCuda()) {
+                    if (DeepSeekV4PreferCuda()) {
                         WriteFloatData(decodeCache->windowKV, {bsz, window_size, head_dim_full},
                                        decodeCache->windowKVData, DataType::FLOAT32);
                         decodeCache->windowKVData.ToDevice(DataDevice::CUDA);
@@ -2674,8 +2673,7 @@ namespace fastllm {
                     decodeCache->totalLen = startPos + seqlen;
                     bool updatedWindowKVData = false;
 #ifdef USE_CUDA
-                    if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") &&
-                        seqlen == 1 &&
+                    if (seqlen == 1 &&
                         kv.dataDevice == DataDevice::CUDA &&
                         decodeCache->windowKVData.dataDevice == DataDevice::CUDA) {
                         updatedWindowKVData = FastllmCudaDeepSeekV4UpdateWindowKVCache(
