@@ -211,8 +211,6 @@ bool FastllmCudaApplyChunkDecayByLastLogG(fastllm::Data &input, const fastllm::D
 
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps);
 bool FastllmCudaRMSNormPart(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps, int start, int end);
-bool FastllmCudaDeepSeekV4RMSNorm(const fastllm::Data &input, fastllm::Data &weight, float eps,
-                                  fastllm::Data &output, fastllm::DataType outputType);
 bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase, int startPos,
                                        int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
                                        float eps);

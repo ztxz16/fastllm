@@ -367,35 +367,6 @@ __device__ __forceinline__ float DeepSeekV4InvFreq(int idx, int ropeDim, float b
     return inv;
 }
 
-template <typename InT, typename OutT>
-__global__ void DeepSeekV4RMSNormKernel(const InT *input, const float *weight, OutT *output,
-                                        int rows, int dim, float eps) {
-    int row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-    extern __shared__ float red[];
-    const InT *src = input + (uint64_t)row * dim;
-    OutT *dst = output + (uint64_t)row * dim;
-    float ss = 0.0f;
-    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-        float v = Dsv4ToFloat(src[d]);
-        ss += v * v;
-    }
-    red[threadIdx.x] = ss;
-    __syncthreads();
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            red[threadIdx.x] += red[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    float scale = rsqrtf(red[0] / dim + eps);
-    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-        dst[d] = Dsv4FromFloat<OutT>(Dsv4ToFloat(src[d]) * scale * weight[d]);
-    }
-}
-
 template <typename T>
 __global__ void DeepSeekV4ScaleQRotaryKernel(T *q, int rows, int seqlen, int heads, int dim,
                                              int ropeDim, float ropeBase, int startPos,
@@ -2833,30 +2804,6 @@ bool DeepSeekV4LaunchHcPreByWeight(const fastllm::Data &x, const fastllm::Data &
     return true;
 }
 
-template <typename InT, typename OutT>
-void DeepSeekV4LaunchRMSNormTyped(const fastllm::Data &input, const fastllm::Data &weight,
-                                  fastllm::Data &output, int rows, int dim, float eps) {
-    int threads = 256;
-    DeepSeekV4RMSNormKernel<<<rows, threads, threads * sizeof(float)>>>(
-        (const InT *)input.cudaData, (const float *)weight.cudaData,
-        (OutT *)output.cudaData, rows, dim, eps);
-}
-
-template <typename InT>
-bool DeepSeekV4LaunchRMSNormByOutput(const fastllm::Data &input, const fastllm::Data &weight,
-                                     fastllm::Data &output, int rows, int dim, float eps) {
-    if (output.dataType == fastllm::DataType::BFLOAT16) {
-        DeepSeekV4LaunchRMSNormTyped<InT, __nv_bfloat16>(input, weight, output, rows, dim, eps);
-    } else if (output.dataType == fastllm::DataType::FLOAT16) {
-        DeepSeekV4LaunchRMSNormTyped<InT, half>(input, weight, output, rows, dim, eps);
-    } else if (output.dataType == fastllm::DataType::FLOAT32) {
-        DeepSeekV4LaunchRMSNormTyped<InT, float>(input, weight, output, rows, dim, eps);
-    } else {
-        return false;
-    }
-    return true;
-}
-
 template <typename XT>
 bool DeepSeekV4LaunchHcPreDotsByWeight(const fastllm::Data &x, const fastllm::Data &hcFn,
                                        fastllm::Data &dotsFloat, int tokens, int flatDim, int mixHc) {
@@ -2962,39 +2909,6 @@ extern "C" bool FastllmCudaDeepSeekV4HcPreDots(const fastllm::Data &x, const fas
     FastllmCudaFinishOutput(dotsFloat, cudaOutput);
     dotsFloat.cudaData = nullptr;
     dotsFloat.dataDevice = fastllm::DataDevice::CPU;
-    return ok;
-}
-
-extern "C" bool FastllmCudaDeepSeekV4RMSNorm(const fastllm::Data &input, fastllm::Data &weight,
-                                             float eps, fastllm::Data &output,
-                                             fastllm::DataType outputType) {
-    if (input.dataDevice != fastllm::DataDevice::CUDA || weight.dataDevice != fastllm::DataDevice::CUDA ||
-        input.dims.empty() || weight.dataType != fastllm::DataType::FLOAT32 ||
-        weight.Count(0) != (uint64_t)input.dims.back()) {
-        return false;
-    }
-
-    bool inPlace = (&input == &output);
-    if (inPlace && outputType != input.dataType) {
-        return false;
-    }
-    if (!inPlace && !DeepSeekV4PrepareCudaOutput(output, outputType, input.dims)) {
-        return false;
-    }
-
-    int dim = input.dims.back();
-    int rows = (int)(input.Count(0) / dim);
-    bool ok = false;
-    if (input.dataType == fastllm::DataType::BFLOAT16) {
-        ok = DeepSeekV4LaunchRMSNormByOutput<__nv_bfloat16>(input, weight, output, rows, dim, eps);
-    } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        ok = DeepSeekV4LaunchRMSNormByOutput<half>(input, weight, output, rows, dim, eps);
-    } else if (input.dataType == fastllm::DataType::FLOAT32) {
-        ok = DeepSeekV4LaunchRMSNormByOutput<float>(input, weight, output, rows, dim, eps);
-    } else {
-        return false;
-    }
-    DeviceSync();
     return ok;
 }
 

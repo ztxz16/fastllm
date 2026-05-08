@@ -489,73 +489,9 @@ namespace fastllm {
             WriteFloatData(y, {bsz, seqlen, hcMult, dim}, output, x.dataType);
         }
 
-        static bool RMSNormCudaIfAvailable(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
-#ifdef USE_CUDA
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_PREP") ||
-                weight.dataType != DataType::FLOAT32 || input.dims.empty()) {
-                return false;
-            }
-            if (input.dataType != DataType::FLOAT32 && input.dataType != DataType::FLOAT16 &&
-                input.dataType != DataType::BFLOAT16) {
-                return false;
-            }
-            if (dtype != DataType::FLOAT32 && dtype != DataType::FLOAT16 && dtype != DataType::BFLOAT16) {
-                return false;
-            }
-            weight.ToDevice(DataDevice::CUDA);
-            Data cudaInput;
-            const Data *cudaInputPtr = &input;
-            if (input.dataDevice != DataDevice::CUDA) {
-                if (!DeepSeekV4PreferCuda()) {
-                    return false;
-                }
-                cudaInput.CopyFrom(input);
-                cudaInput.ToDevice(DataDevice::CUDA);
-                cudaInputPtr = &cudaInput;
-            }
-            if (&input == &output && dtype != input.dataType) {
-                Data tmp;
-                if (!FastllmCudaDeepSeekV4RMSNorm(*cudaInputPtr, weight, eps, tmp, dtype)) {
-                    return false;
-                }
-                output.CopyFrom(tmp);
-                return true;
-            }
-            return FastllmCudaDeepSeekV4RMSNorm(*cudaInputPtr, weight, eps, output, dtype);
-#else
-            (void)input;
-            (void)weight;
-            (void)eps;
-            (void)output;
-            (void)dtype;
-            return false;
-#endif
-        }
-
         static void RMSNormReference(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4RMSNorm");
-            if (RMSNormCudaIfAvailable(input, weight, eps, output, dtype)) {
-                return;
-            }
-
-            auto xv = ReadFloatData(input);
-            auto wvPtr = ReadWeightFloatDataCached(weight);
-            const auto &wv = *wvPtr;
-            int dim = input.dims.back();
-            int rows = (int)(xv.size() / dim);
-            std::vector<float> y(xv.size());
-            for (int r = 0; r < rows; r++) {
-                const float *src = xv.data() + (uint64_t)r * dim;
-                double ss = 0.0;
-                for (int d = 0; d < dim; d++) {
-                    ss += (double)src[d] * src[d];
-                }
-                float scale = 1.0f / std::sqrt((float)(ss / dim) + eps);
-                for (int d = 0; d < dim; d++) {
-                    y[(uint64_t)r * dim + d] = src[d] * scale * wv[d];
-                }
-            }
-            WriteFloatData(y, input.dims, output, dtype);
+            RMSNorm(input, weight, eps, output);
+            ToDataType(output, dtype);
         }
 
         static std::vector<float> BuildInvFreqReference(int ropeDim, float base, int originalSeqLen,
