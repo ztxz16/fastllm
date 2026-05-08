@@ -396,249 +396,6 @@ namespace fastllm {
             int b = 0, s = 0, hc = 0;
         };
 
-        static bool HcPreCudaIfAvailable(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
-                                         int hcMult, int sinkhornIters, float eps, float normEps,
-                                         HcMix &ret) {
-#ifdef USE_CUDA
-            auto fail = [](const char *) {
-                return false;
-            };
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_HCPRE") ||
-                x.dims.size() != 4 || (x.dataDevice != DataDevice::CUDA && !DeepSeekV4PreferCuda())) {
-                return fail("disabled_or_not_cuda");
-            }
-            if (hcScale.dataType != DataType::FLOAT32 || hcBase.dataType != DataType::FLOAT32 ||
-                (hcFn.dataType != DataType::FLOAT32 && hcFn.dataType != DataType::FLOAT16 &&
-                 hcFn.dataType != DataType::BFLOAT16)) {
-                return fail("unsupported_dtype");
-            }
-            int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
-            int flatDim = hcMult * dim;
-            int mixHc = (2 + hcMult) * hcMult;
-            if (x.dims[2] != hcMult || hcFn.Count(0) != (uint64_t)mixHc * flatDim ||
-                hcScale.Count(0) < 3 || hcBase.Count(0) < (uint64_t)mixHc ||
-                bsz <= 0 || seqlen <= 0 || dim <= 0 || sinkhornIters <= 0) {
-                return fail("shape_mismatch");
-            }
-            Data cudaX;
-            const Data *cudaInput = &x;
-            if (x.dataDevice != DataDevice::CUDA) {
-                cudaX.CopyFrom(x);
-                cudaX.ToDevice(DataDevice::CUDA);
-                cudaInput = &cudaX;
-            }
-            hcFn.ToDevice(DataDevice::CUDA);
-            hcScale.ToDevice(DataDevice::CUDA);
-            hcBase.ToDevice(DataDevice::CUDA);
-            if (!FastllmCudaDeepSeekV4HcPre(*cudaInput, hcFn, hcScale, hcBase, hcMult,
-                                            sinkhornIters, eps, normEps,
-                                            ret.y, ret.postData, ret.combData)) {
-                ErrorInFastLLM("DeepSeekV4HcPre CUDA error: kernel rejected valid input.\n");
-            }
-            ret.b = bsz;
-            ret.s = seqlen;
-            ret.hc = hcMult;
-            return true;
-#else
-            (void)x;
-            (void)hcFn;
-            (void)hcScale;
-            (void)hcBase;
-            (void)hcMult;
-            (void)sinkhornIters;
-            (void)eps;
-            (void)normEps;
-            (void)ret;
-            return false;
-#endif
-        }
-
-        struct HcPreDotsOp : MultiThreadBaseOp {
-            const float *xrow;
-            const float *fn;
-            float *mixes;
-            float rsqrt;
-            int flatDim, mixSt, mixEnd;
-
-            HcPreDotsOp(const float *xrow, const float *fn, float *mixes, float rsqrt,
-                        int flatDim, int mixSt, int mixEnd)
-                : xrow(xrow), fn(fn), mixes(mixes), rsqrt(rsqrt),
-                  flatDim(flatDim), mixSt(mixSt), mixEnd(mixEnd) {}
-
-            void Run() override {
-                for (int m = mixSt; m < mixEnd; m++) {
-                    double v = 0.0;
-                    const float *w = fn + (uint64_t)m * flatDim;
-                    for (int k = 0; k < flatDim; k++) {
-                        v += (double)xrow[k] * w[k];
-                    }
-                    mixes[m] = (float)v * rsqrt;
-                }
-            }
-        };
-
-        static void HcPreComputeDotsCpu(const float *xrow, const float *fn, float *mixes,
-                                        float rsqrt, int flatDim, int mixHc) {
-            auto *pool = GetAlivePool();
-            int threadNum = std::min((int)pool->threads.size(), mixHc);
-            if (threadNum <= 1 || mixHc < 8 || EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CPU_HCPRE_PARALLEL")) {
-                HcPreDotsOp(xrow, fn, mixes, rsqrt, flatDim, 0, mixHc).Run();
-                return;
-            }
-            std::vector<HcPreDotsOp*> ops;
-            int per = (mixHc + threadNum - 1) / threadNum;
-            for (int i = 0; i < threadNum; i++) {
-                int st = i * per;
-                int end = std::min(mixHc, st + per);
-                if (st >= end) {
-                    break;
-                }
-                ops.push_back(new HcPreDotsOp(xrow, fn, mixes, rsqrt, flatDim, st, end));
-            }
-            for (int i = 0; i < (int)ops.size(); i++) {
-                pool->PushOp(i, ops[i]);
-            }
-            for (int i = 0; i < (int)ops.size(); i++) {
-                pool->Wait(i);
-                delete ops[i];
-            }
-        }
-
-        static HcMix HcPreReference(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
-                                    int hcMult, int sinkhornIters, float eps, float normEps) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4HcPre");
-            HcMix ret;
-            if (HcPreCudaIfAvailable(x, hcFn, hcScale, hcBase, hcMult, sinkhornIters, eps, normEps, ret)) {
-                return ret;
-            }
-            int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
-            int flatDim = hcMult * dim;
-            int mixHc = (2 + hcMult) * hcMult;
-            auto xv = ReadFloatData(x);
-            auto scalePtr = ReadWeightFloatDataCached(hcScale);
-            auto basePtr = ReadWeightFloatDataCached(hcBase);
-            const auto &scale = *scalePtr;
-            const auto &base = *basePtr;
-            std::shared_ptr<const std::vector<float>> fnPtr;
-            const std::vector<float> *fn = nullptr;
-            std::vector<float> dotCache;
-
-#ifdef USE_CUDA
-            if (EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_HCPRE_DOTS") && x.dataDevice == DataDevice::CUDA) {
-                Data dots;
-                hcFn.ToDevice(DataDevice::CUDA);
-                if (FastllmCudaDeepSeekV4HcPreDots(x, hcFn, hcMult, dots)) {
-                    dotCache = ReadFloatData(dots);
-                    if ((int)dotCache.size() != bsz * seqlen * mixHc) {
-                        dotCache.clear();
-                    }
-                }
-            }
-#endif
-
-            if (dotCache.empty()) {
-                fnPtr = ReadWeightFloatDataCached(hcFn);
-                fn = fnPtr.get();
-            }
-
-            std::vector<float> y((uint64_t)bsz * seqlen * dim, 0.0f);
-            std::vector<float> post((uint64_t)bsz * seqlen * hcMult, 0.0f);
-            std::vector<float> comb((uint64_t)bsz * seqlen * hcMult * hcMult, 0.0f);
-            std::vector<float> mixes(mixHc);
-            std::vector<float> pre(hcMult);
-            std::vector<float> combLocal(hcMult * hcMult);
-
-            for (int t = 0; t < bsz * seqlen; t++) {
-                const float *xrow = xv.data() + (uint64_t)t * flatDim;
-                double ss = 0.0;
-                for (int k = 0; k < flatDim; k++) {
-                    ss += (double)xrow[k] * xrow[k];
-                }
-                float rsqrt = 1.0f / std::sqrt((float)(ss / flatDim) + normEps);
-                for (int m = 0; m < mixHc; m++) {
-                    if (!dotCache.empty()) {
-                        mixes[m] = dotCache[(uint64_t)t * mixHc + m] * rsqrt;
-                    } else {
-                        HcPreComputeDotsCpu(xrow, fn->data(), mixes.data(), rsqrt, flatDim, mixHc);
-                        break;
-                    }
-                }
-                for (int h = 0; h < hcMult; h++) {
-                    pre[h] = SigmoidFloat(mixes[h] * scale[0] + base[h]) + eps;
-                    post[(uint64_t)t * hcMult + h] =
-                        2.0f * SigmoidFloat(mixes[h + hcMult] * scale[1] + base[h + hcMult]);
-                }
-                for (int r = 0; r < hcMult; r++) {
-                    float rowMax = -std::numeric_limits<float>::infinity();
-                    for (int c = 0; c < hcMult; c++) {
-                        int idx = r * hcMult + c + 2 * hcMult;
-                        combLocal[r * hcMult + c] = mixes[idx] * scale[2] + base[idx];
-                        rowMax = std::max(rowMax, combLocal[r * hcMult + c]);
-                    }
-                    float rowSum = 0.0f;
-                    for (int c = 0; c < hcMult; c++) {
-                        float v = std::exp(combLocal[r * hcMult + c] - rowMax);
-                        combLocal[r * hcMult + c] = v;
-                        rowSum += v;
-                    }
-                    for (int c = 0; c < hcMult; c++) {
-                        combLocal[r * hcMult + c] = combLocal[r * hcMult + c] / rowSum + eps;
-                    }
-                }
-                for (int c = 0; c < hcMult; c++) {
-                    float colSum = 0.0f;
-                    for (int r = 0; r < hcMult; r++) {
-                        colSum += combLocal[r * hcMult + c];
-                    }
-                    for (int r = 0; r < hcMult; r++) {
-                        combLocal[r * hcMult + c] /= (colSum + eps);
-                    }
-                }
-                for (int it = 1; it < sinkhornIters; it++) {
-                    for (int r = 0; r < hcMult; r++) {
-                        float rowSum = 0.0f;
-                        for (int c = 0; c < hcMult; c++) {
-                            rowSum += combLocal[r * hcMult + c];
-                        }
-                        for (int c = 0; c < hcMult; c++) {
-                            combLocal[r * hcMult + c] /= (rowSum + eps);
-                        }
-                    }
-                    for (int c = 0; c < hcMult; c++) {
-                        float colSum = 0.0f;
-                        for (int r = 0; r < hcMult; r++) {
-                            colSum += combLocal[r * hcMult + c];
-                        }
-                        for (int r = 0; r < hcMult; r++) {
-                            combLocal[r * hcMult + c] /= (colSum + eps);
-                        }
-                    }
-                }
-                memcpy(comb.data() + (uint64_t)t * hcMult * hcMult, combLocal.data(),
-                       hcMult * hcMult * sizeof(float));
-                for (int d = 0; d < dim; d++) {
-                    double v = 0.0;
-                    for (int h = 0; h < hcMult; h++) {
-                        v += (double)pre[h] * xrow[(uint64_t)h * dim + d];
-                    }
-                    y[(uint64_t)t * dim + d] = (float)v;
-                }
-            }
-
-            WriteFloatData(y, {bsz, seqlen, dim}, ret.y, x.dataType);
-#ifdef USE_CUDA
-            if (x.dataDevice == DataDevice::CUDA) {
-                ret.y.ToDevice(DataDevice::CUDA);
-            }
-#endif
-            ret.post = std::move(post);
-            ret.comb = std::move(comb);
-            ret.b = bsz;
-            ret.s = seqlen;
-            ret.hc = hcMult;
-            return ret;
-        }
-
         static bool HcPostCudaIfAvailable(Data &x, Data &residual, const HcMix &mix, Data &output) {
 #ifdef USE_CUDA
             auto fail = [](const char *) {
@@ -2955,7 +2712,7 @@ namespace fastllm {
             }
         }
         bool useDecodeCache = batch == 1;
-        Embedding(inputIds, weight["embed.weight"], hiddenStates);
+        Embedding(inputIds, weight["embed.weight"], hiddenStatesBeforeHcExpand);
 
         int bsz = inputIds.dims[0];
         int seqlen = inputIds.dims[1];
@@ -3017,9 +2774,14 @@ namespace fastllm {
             float layerRopeBase = useCompressRope ? compress_rope_theta : rope_base;
             int layerOriginalSeqLen = useCompressRope ? (int)rope_scaling_original_max_position_embeddings : 0;
 
-            HcMix attnMix = HcPreReference(hiddenStates, weight[pre + ".hc_attn_fn"],
-                                           weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
-                                           hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
+            HcMix attnMix;
+            DeepSeekV4HcPre(hiddenStates, weight[pre + ".hc_attn_fn"],
+                            weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
+                            hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                            attnMix.y, attnMix.postData, attnMix.combData);
+            attnMix.b = bsz;
+            attnMix.s = seqlen;
+            attnMix.hc = hc_mult;
             Data attnInput;
             RMSNormReference(attnMix.y, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput, DataType::BFLOAT16);
 
@@ -3250,9 +3012,14 @@ namespace fastllm {
             Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
             HcPostReference(attnOut, hiddenStates, attnMix, hiddenStates);
 
-            HcMix ffnMix = HcPreReference(hiddenStates, weight[pre + ".hc_ffn_fn"],
-                                          weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
-                                          hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
+            HcMix ffnMix;
+            DeepSeekV4HcPre(hiddenStates, weight[pre + ".hc_ffn_fn"],
+                            weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
+                            hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                            ffnMix.y, ffnMix.postData, ffnMix.combData);
+            ffnMix.b = bsz;
+            ffnMix.s = seqlen;
+            ffnMix.hc = hc_mult;
             Data ffnInput, ffnOut;
             RMSNormReference(ffnMix.y, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput, DataType::BFLOAT16);
             std::vector<int> ffnDims = ffnInput.dims;

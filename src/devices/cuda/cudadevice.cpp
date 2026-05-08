@@ -53,6 +53,7 @@ namespace fastllm {
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CudaRepeatOp());
+        this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CudaDeepSeekV4HcPreOp());
         this->ops["Cat"] = (BaseOperator*)(new CudaCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CudaPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
@@ -893,6 +894,53 @@ namespace fastllm {
         int inner = input.strides[axis];
         int unitSize = input.unitSize;
         FastllmCudaRepeat(input.cudaData, output.cudaData, outer, repeatTimes, inputStride * unitSize, outputStride * unitSize, channels * inner * unitSize, channels * inner * unitSize);
+    }
+
+    bool CudaDeepSeekV4HcPreOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &hcFn = *(datas.find("hcFn")->second);
+        Data &hcScale = *(datas.find("hcScale")->second);
+        Data &hcBase = *(datas.find("hcBase")->second);
+        int hcMult = intParams.find("hcMult") != intParams.end() ? intParams.find("hcMult")->second : 1;
+        int sinkhornIters = intParams.find("sinkhornIters") != intParams.end() ? intParams.find("sinkhornIters")->second : 1;
+        if (input.dims.size() != 4 || hcMult <= 0 || sinkhornIters <= 0 ||
+            input.dims[2] != hcMult ||
+            hcScale.dataType != DataType::FLOAT32 || hcBase.dataType != DataType::FLOAT32) {
+            return false;
+        }
+        if (input.dataType != DataType::FLOAT32 && input.dataType != DataType::FLOAT16 &&
+            input.dataType != DataType::BFLOAT16) {
+            return false;
+        }
+        if (hcFn.dataType != DataType::FLOAT32 && hcFn.dataType != DataType::FLOAT16 &&
+            hcFn.dataType != DataType::BFLOAT16) {
+            return false;
+        }
+        int dim = input.dims[3];
+        int flatDim = hcMult * dim;
+        int mixHc = (2 + hcMult) * hcMult;
+        return hcFn.Count(0) == (uint64_t)mixHc * flatDim &&
+               hcScale.Count(0) >= 3 && hcBase.Count(0) >= (uint64_t)mixHc;
+    }
+
+    void CudaDeepSeekV4HcPreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &hcFn = *(datas.find("hcFn")->second);
+        Data &hcScale = *(datas.find("hcScale")->second);
+        Data &hcBase = *(datas.find("hcBase")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &post = *(datas.find("post")->second);
+        Data &comb = *(datas.find("comb")->second);
+        int hcMult = intParams.find("hcMult") != intParams.end() ? intParams.find("hcMult")->second : 1;
+        int sinkhornIters = intParams.find("sinkhornIters") != intParams.end() ? intParams.find("sinkhornIters")->second : 1;
+        float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-6f;
+        float normEps = floatParams.find("normEps") != floatParams.end() ? floatParams.find("normEps")->second : 1e-6f;
+        if (!FastllmCudaDeepSeekV4HcPre(input, hcFn, hcScale, hcBase, hcMult, sinkhornIters,
+                                        eps, normEps, output, post, comb)) {
+            ErrorInFastLLM("DeepSeekV4HcPre CUDA error: kernel rejected input.\n");
+        }
     }
 
     void CudaCatOp::Run(const std::string &opType, const fastllm::DataDict &datas,

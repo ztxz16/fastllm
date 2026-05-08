@@ -872,6 +872,10 @@ namespace fastllm {
 
     void Repeat(const Data &input, int axis, int repeatTimes, Data &output);
 
+    void DeepSeekV4HcPre(const Data &input, Data &hcFn, Data &hcScale, Data &hcBase,
+                         int hcMult, int sinkhornIters, float eps, float normEps,
+                         Data &output, Data &post, Data &comb);
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 
     void Pad(const Data &input, int axis, int padSize, Data &output);

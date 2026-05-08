@@ -3461,6 +3461,15 @@ namespace fastllm {
         }, {}, {{"axis", axis}, {"repeatTimes", repeatTimes}});
     }
 
+    void DeepSeekV4HcPre(const Data &input, Data &hcFn, Data &hcScale, Data &hcBase,
+                         int hcMult, int sinkhornIters, float eps, float normEps,
+                         Data &output, Data &post, Data &comb) {
+        curExecutor->Run("DeepSeekV4HcPre", {
+                {"input", (Data*)&input}, {"hcFn", &hcFn}, {"hcScale", &hcScale}, {"hcBase", &hcBase},
+                {"output", &output}, {"post", &post}, {"comb", &comb}
+        }, {{"eps", eps}, {"normEps", normEps}}, {{"hcMult", hcMult}, {"sinkhornIters", sinkhornIters}});
+    }
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output) {
         curExecutor->Run("Cat", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}, {"output", &output}

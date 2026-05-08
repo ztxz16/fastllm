@@ -82,6 +82,7 @@ namespace fastllm {
         this->ops["Conv2D"] = (BaseOperator*)(new CpuConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CpuSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CpuRepeatOp());
+        this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CpuDeepSeekV4HcPreOp());
         this->ops["Cat"] = (BaseOperator*)(new CpuCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CpuPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CpuCatDirectOp());
