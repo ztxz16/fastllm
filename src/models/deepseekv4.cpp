@@ -2874,7 +2874,7 @@ namespace fastllm {
                                                    const LastTokensManager &lastTokens,
                                                    std::vector <std::vector <float>*> *retLogits) {
         ScopedExecutorProfiler forwardOtherProfile("DeepSeekV4ForwardOther");
-        Data hiddenStates;
+        Data hiddenStates, hiddenStatesBeforeHcExpand;
         int startPos = 0;
         if (positionIds.dims.size() >= 2 && positionIds.Count(0) > 0) {
             auto pids = ReadTokenIds(positionIds);
@@ -2960,25 +2960,14 @@ namespace fastllm {
         int bsz = inputIds.dims[0];
         int seqlen = inputIds.dims[1];
         int dim = embed_dim;
-        {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4HcExpand");
-            auto hv = ReadFloatData(hiddenStates);
-            std::vector<float> expanded((uint64_t)bsz * seqlen * hc_mult * dim);
-            for (int b = 0; b < bsz; b++) {
-                for (int s = 0; s < seqlen; s++) {
-                    const float *src = hv.data() + ((uint64_t)b * seqlen + s) * dim;
-                    for (int h = 0; h < hc_mult; h++) {
-                        memcpy(expanded.data() + (((uint64_t)b * seqlen + s) * hc_mult + h) * dim,
-                               src, dim * sizeof(float));
-                    }
-                }
-            }
-            WriteFloatData(expanded, {bsz, seqlen, hc_mult, dim}, hiddenStates, hiddenStates.dataType);
-        }
 
-        if (block_cnt <= 0) {
-            ErrorInFastLLM("DeepSeekV4Model: invalid block_cnt.");
+
+        {
+            // hc expand
+            hiddenStatesBeforeHcExpand.Reshape({bsz, seqlen, 1, dim});
+            Repeat(hiddenStatesBeforeHcExpand, 2, hc_mult, hiddenStates);
         }
+        
         if (useDecodeCache && originalStartPos == 0) {
             decodeLayerCaches.clear();
             decodeLayerCaches.resize(block_cnt);
