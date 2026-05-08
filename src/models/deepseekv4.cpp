@@ -2954,25 +2954,6 @@ namespace fastllm {
                 return ret;
             }
         }
-        if (batch == 1 && inputIds.dims.size() >= 2 &&
-            inputIds.dims[1] > 1 && originalStartPos > 0 &&
-            EnvFlagEnabled("FASTLLM_DSV4_ENABLE_PREFIX_CACHE_SEQUENTIAL")) {
-            std::vector<int> ret(1, 0);
-            int seq = inputIds.dims[1];
-            for (int s = 0; s < seq; s++) {
-                Data curInputIds, curPositionIds;
-                Split(inputIds, 1, s, s + 1, curInputIds);
-                if (positionIds.dims.size() >= 2) {
-                    Split(positionIds, 1, s, s + 1, curPositionIds);
-                } else {
-                    curPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)(originalStartPos + s)}));
-                }
-                ret = ForwardBatch(1, curInputIds, Data(), curPositionIds, pastKeyValues,
-                                   generationConfig, lastTokens,
-                                   (s + 1 == seq) ? retLogits : nullptr);
-            }
-            return ret;
-        }
         bool useDecodeCache = batch == 1;
         Embedding(inputIds, weight["embed.weight"], hiddenStates);
 
