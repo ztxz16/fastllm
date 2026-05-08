@@ -879,6 +879,10 @@ namespace fastllm {
     void ScaleQRatory(Data &q, float eps, int ropeDim, float ropeBase, int startPos,
                       int originalSeqLen, float ropeFactor, int betaFast, int betaSlow);
 
+    void DeepSeekV4RotaryQuant(Data &x, int ropeDim, float ropeBase, int startPos,
+                               int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
+                               int quantDim, int blockSize, int posStep = 1);
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 
     void Pad(const Data &input, int axis, int padSize, Data &output);

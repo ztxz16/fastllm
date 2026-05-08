@@ -108,6 +108,55 @@ namespace fastllm {
         return invFreq;
     }
 
+    static void DeepSeekV4ApplyRotaryReference(std::vector<float> &x, const std::vector<int> &dims,
+                                               int ropeDim, float base, int startPos,
+                                               int originalSeqLen, float factor,
+                                               int betaFast, int betaSlow, int posStep = 1) {
+        int bsz = dims[0], seqlen = dims[1];
+        int heads = (dims.size() == 4) ? dims[2] : 1;
+        int dim = (dims.size() == 4) ? dims[3] : dims[2];
+        int off = dim - ropeDim;
+        auto invFreq = ScaleQRatoryBuildInvFreq(ropeDim, base, originalSeqLen, factor, betaFast, betaSlow);
+        for (int b = 0; b < bsz; b++) {
+            for (int s = 0; s < seqlen; s++) {
+                int pos = startPos + s * posStep;
+                for (int h = 0; h < heads; h++) {
+                    uint64_t rowIndex = dims.size() == 4 ? (((uint64_t)b * seqlen + s) * heads + h)
+                                                         : ((uint64_t)b * seqlen + s);
+                    float *row = x.data() + rowIndex * dim + off;
+                    for (int i = 0; i < ropeDim; i += 2) {
+                        float ang = pos * invFreq[i / 2];
+                        float c = std::cos(ang), sn = std::sin(ang);
+                        float a = row[i], bb = row[i + 1];
+                        row[i] = a * c - bb * sn;
+                        row[i + 1] = a * sn + bb * c;
+                    }
+                }
+            }
+        }
+    }
+
+    static void DeepSeekV4ActQuantInplaceReference(std::vector<float> &x, const std::vector<int> &dims,
+                                                   int quantDim, int blockSize) {
+        int dim = dims.back();
+        int rows = (int)(x.size() / dim);
+        for (int r = 0; r < rows; r++) {
+            float *row = x.data() + (uint64_t)r * dim;
+            for (int start = 0; start < quantDim; start += blockSize) {
+                int end = std::min(start + blockSize, quantDim);
+                float amax = 1e-4f;
+                for (int d = start; d < end; d++) {
+                    amax = std::max(amax, std::fabs(row[d]));
+                }
+                float scale = std::pow(2.0f, std::ceil(std::log2(amax / 448.0f)));
+                for (int d = start; d < end; d++) {
+                    float q = std::max(-448.0f, std::min(448.0f, row[d] / scale));
+                    row[d] = DeepSeekV4HcPreBFloat16ToFloat(DeepSeekV4HcPreFloatToBFloat16(q)) * scale;
+                }
+            }
+        }
+    }
+
     void CpuScaleQRatoryOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &q = *(datas.find("q")->second);
@@ -139,27 +188,45 @@ namespace fastllm {
             }
         }
 
-        int off = dim - ropeDim;
-        auto invFreq = ScaleQRatoryBuildInvFreq(ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
-        for (int b = 0; b < bsz; b++) {
-            for (int s = 0; s < seqlen; s++) {
-                int pos = startPos + s;
-                for (int h = 0; h < heads; h++) {
-                    float *row = qv.data() + (((uint64_t)b * seqlen + s) * heads + h) * dim + off;
-                    for (int i = 0; i < ropeDim; i += 2) {
-                        float ang = pos * invFreq[i / 2];
-                        float c = std::cos(ang), sn = std::sin(ang);
-                        float a = row[i], bb = row[i + 1];
-                        row[i] = a * c - bb * sn;
-                        row[i + 1] = a * sn + bb * c;
-                    }
-                }
-            }
-        }
+        DeepSeekV4ApplyRotaryReference(qv, q.dims, ropeDim, ropeBase, startPos,
+                                       originalSeqLen, ropeFactor, betaFast, betaSlow);
 
         q.dataType = DataType::BFLOAT16;
         q.Resize({bsz, seqlen, heads, dim});
         DeepSeekV4HcPreWriteFloatData(qv, q);
+    }
+
+    void CpuDeepSeekV4RotaryQuantOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int originalSeqLen = intParams.find("originalSeqLen") != intParams.end() ? intParams.find("originalSeqLen")->second : 0;
+        int betaFast = intParams.find("betaFast") != intParams.end() ? intParams.find("betaFast")->second : 32;
+        int betaSlow = intParams.find("betaSlow") != intParams.end() ? intParams.find("betaSlow")->second : 1;
+        int quantDim = intParams.find("quantDim") != intParams.end() ? intParams.find("quantDim")->second : 0;
+        int blockSize = intParams.find("blockSize") != intParams.end() ? intParams.find("blockSize")->second : 64;
+        int posStep = intParams.find("posStep") != intParams.end() ? intParams.find("posStep")->second : 1;
+        float ropeBase = floatParams.find("ropeBase") != floatParams.end() ? floatParams.find("ropeBase")->second : 10000.0f;
+        float ropeFactor = floatParams.find("ropeFactor") != floatParams.end() ? floatParams.find("ropeFactor")->second : 1.0f;
+
+        AssertInFastLLM(input.dims.size() >= 3 && input.dims.size() <= 4,
+                        "DeepSeekV4RotaryQuant error: input's shape's size should be 3 or 4.\n");
+        int dim = input.dims.back();
+        AssertInFastLLM(ropeDim > 0 && ropeDim <= dim && ropeDim % 2 == 0,
+                        "DeepSeekV4RotaryQuant error: invalid ropeDim.\n");
+        AssertInFastLLM(quantDim >= 0 && quantDim <= dim && blockSize > 0,
+                        "DeepSeekV4RotaryQuant error: invalid quant params.\n");
+
+        std::vector<int> dims = input.dims;
+        auto values = DeepSeekV4HcPreReadFloatData(input);
+        DeepSeekV4ApplyRotaryReference(values, dims, ropeDim, ropeBase, startPos,
+                                       originalSeqLen, ropeFactor, betaFast, betaSlow, posStep);
+        DeepSeekV4ActQuantInplaceReference(values, dims, quantDim, blockSize);
+
+        input.dataType = DataType::BFLOAT16;
+        input.Resize(dims);
+        DeepSeekV4HcPreWriteFloatData(values, input);
     }
 
     struct DeepSeekV4HcPreDotsOp : MultiThreadBaseOp {

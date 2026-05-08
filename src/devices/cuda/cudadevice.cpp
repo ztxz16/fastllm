@@ -55,6 +55,7 @@ namespace fastllm {
         this->ops["Repeat"] = (BaseOperator*)(new CudaRepeatOp());
         this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CudaDeepSeekV4HcPreOp());
         this->ops["ScaleQRatory"] = (BaseOperator*)(new CudaScaleQRatoryOp());
+        this->ops["DeepSeekV4RotaryQuant"] = (BaseOperator*)(new CudaDeepSeekV4RotaryQuantOp());
         this->ops["Cat"] = (BaseOperator*)(new CudaCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CudaPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
@@ -968,6 +969,41 @@ namespace fastllm {
         if (!FastllmCudaDeepSeekV4ScaleQRotary(q, ropeDim, ropeBase, startPos,
                                                originalSeqLen, ropeFactor, betaFast, betaSlow, eps)) {
             ErrorInFastLLM("ScaleQRatory CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4RotaryQuantOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int quantDim = intParams.find("quantDim") != intParams.end() ? intParams.find("quantDim")->second : 0;
+        int blockSize = intParams.find("blockSize") != intParams.end() ? intParams.find("blockSize")->second : 64;
+        int dim = input.dims.empty() ? 0 : input.dims.back();
+        return input.dataDevice == DataDevice::CUDA &&
+               input.dataType == DataType::BFLOAT16 &&
+               input.dims.size() >= 3 && input.dims.size() <= 4 &&
+               ropeDim > 0 && ropeDim <= dim && ropeDim % 2 == 0 &&
+               quantDim >= 0 && quantDim <= dim &&
+               blockSize > 0;
+    }
+
+    void CudaDeepSeekV4RotaryQuantOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int originalSeqLen = intParams.find("originalSeqLen") != intParams.end() ? intParams.find("originalSeqLen")->second : 0;
+        int betaFast = intParams.find("betaFast") != intParams.end() ? intParams.find("betaFast")->second : 32;
+        int betaSlow = intParams.find("betaSlow") != intParams.end() ? intParams.find("betaSlow")->second : 1;
+        int quantDim = intParams.find("quantDim") != intParams.end() ? intParams.find("quantDim")->second : 0;
+        int blockSize = intParams.find("blockSize") != intParams.end() ? intParams.find("blockSize")->second : 64;
+        int posStep = intParams.find("posStep") != intParams.end() ? intParams.find("posStep")->second : 1;
+        float ropeBase = floatParams.find("ropeBase") != floatParams.end() ? floatParams.find("ropeBase")->second : 10000.0f;
+        float ropeFactor = floatParams.find("ropeFactor") != floatParams.end() ? floatParams.find("ropeFactor")->second : 1.0f;
+        if (!FastllmCudaDeepSeekV4RotaryQuant(input, ropeDim, ropeBase, startPos,
+                                              originalSeqLen, ropeFactor, betaFast, betaSlow,
+                                              quantDim, blockSize, posStep)) {
+            ErrorInFastLLM("DeepSeekV4RotaryQuant CUDA error: kernel rejected input.\n");
         }
     }
 

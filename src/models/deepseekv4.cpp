@@ -571,50 +571,6 @@ namespace fastllm {
             }
         }
 
-        static bool RotaryQuantCudaIfAvailable(Data &x, int ropeDim, float ropeBase, int startPos,
-                                               int originalSeqLen, float ropeFactor,
-                                               int betaFast, int betaSlow, int quantDim,
-                                               int blockSize, int posStep = 1) {
-#ifdef USE_CUDA
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_PREP") ||
-                x.dataDevice != DataDevice::CUDA || x.dataType != DataType::BFLOAT16 ||
-                x.dims.size() < 3 || x.dims.size() > 4) {
-                return false;
-            }
-            return FastllmCudaDeepSeekV4RotaryQuant(x, ropeDim, ropeBase, startPos,
-                                                   originalSeqLen, ropeFactor, betaFast, betaSlow,
-                                                   quantDim, blockSize, posStep);
-#else
-            (void)x;
-            (void)ropeDim;
-            (void)ropeBase;
-            (void)startPos;
-            (void)originalSeqLen;
-            (void)ropeFactor;
-            (void)betaFast;
-            (void)betaSlow;
-            (void)quantDim;
-            (void)blockSize;
-            (void)posStep;
-            return false;
-#endif
-        }
-
-        static void RotaryQuant(Data &x, int ropeDim, float ropeBase, int startPos,
-                                int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
-                                int quantDim, int blockSize, int posStep = 1) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4RotaryQuant");
-            if (RotaryQuantCudaIfAvailable(x, ropeDim, ropeBase, startPos, originalSeqLen,
-                                           ropeFactor, betaFast, betaSlow, quantDim, blockSize, posStep)) {
-                return;
-            }
-            auto xv = ReadFloatData(x);
-            ApplyRotaryReference(xv, x.dims, ropeDim, ropeBase, startPos, false,
-                                 originalSeqLen, ropeFactor, betaFast, betaSlow, posStep);
-            ActQuantInplaceReference(xv, x.dims, quantDim, blockSize);
-            WriteFloatData(xv, x.dims, x, DataType::BFLOAT16);
-        }
-
         static void StoreWindowKVCache(const std::vector<float> &kv, int bsz, int seqlen, int headDim,
                                        int startPos, int windowSize, std::vector<float> &windowKV) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4KVCache");
@@ -2648,15 +2604,15 @@ namespace fastllm {
         }
 
         Data attnInput;
-        Data qr, qNorm, q;
+        Data qr, qNorm, q, kv;
+        HcMix attnMix, ffnMix;
+
         for (int layer = 0; layer < block_cnt; layer++) {
             std::string pre = "layers." + std::to_string(layer);
             int compressRatio = compress_ratios.size() > layer ? compress_ratios[layer] : 0;
             bool useCompressRope = compressRatio != 0;
             float layerRopeBase = useCompressRope ? compress_rope_theta : rope_base;
             int layerOriginalSeqLen = useCompressRope ? (int)rope_scaling_original_max_position_embeddings : 0;
-
-            HcMix attnMix;
             DeepSeekV4HcPre(hiddenStates, weight[pre + ".hc_attn_fn"],
                             weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
                             hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
@@ -2673,14 +2629,12 @@ namespace fastllm {
             ScaleQRatory(q, rms_norm_eps, qk_rope_head_dim, layerRopeBase, startPos,
                          layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
                          rope_scaling_beta_slow);
-
-            Data kv;
             Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv);
             RMSNormReference(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv, DataType::BFLOAT16);
             kv.Reshape({bsz, seqlen, 1, head_dim_full});
-            RotaryQuant(kv, qk_rope_head_dim, layerRopeBase, startPos,
-                        layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
-                        rope_scaling_beta_slow, head_dim_full - qk_rope_head_dim, 64);
+            DeepSeekV4RotaryQuant(kv, qk_rope_head_dim, layerRopeBase, startPos,
+                                  layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
+                                  rope_scaling_beta_slow, head_dim_full - qk_rope_head_dim, 64);
             kv.Reshape({bsz, seqlen, head_dim_full});
             DeepSeekV4DecodeLayerCache *decodeCache = nullptr;
             if (useDecodeCache && layer < (int)decodeLayerCaches.size()) {
@@ -2891,8 +2845,6 @@ namespace fastllm {
             WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
             Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
             HcPostReference(attnOut, hiddenStates, attnMix, hiddenStates);
-
-            HcMix ffnMix;
             DeepSeekV4HcPre(hiddenStates, weight[pre + ".hc_ffn_fn"],
                             weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
                             hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,

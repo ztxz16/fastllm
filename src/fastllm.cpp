@@ -3479,6 +3479,17 @@ namespace fastllm {
             {"betaFast", betaFast}, {"betaSlow", betaSlow}});
     }
 
+    void DeepSeekV4RotaryQuant(Data &x, int ropeDim, float ropeBase, int startPos,
+                               int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
+                               int quantDim, int blockSize, int posStep) {
+        curExecutor->Run("DeepSeekV4RotaryQuant", {
+                {"input", &x}
+        }, {{"ropeBase", ropeBase}, {"ropeFactor", ropeFactor}},
+           {{"ropeDim", ropeDim}, {"startPos", startPos}, {"originalSeqLen", originalSeqLen},
+            {"betaFast", betaFast}, {"betaSlow", betaSlow}, {"quantDim", quantDim},
+            {"blockSize", blockSize}, {"posStep", posStep}});
+    }
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output) {
         curExecutor->Run("Cat", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}, {"output", &output}
