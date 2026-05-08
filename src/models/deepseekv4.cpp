@@ -396,99 +396,6 @@ namespace fastllm {
             int b = 0, s = 0, hc = 0;
         };
 
-        static bool HcPostCudaIfAvailable(Data &x, Data &residual, const HcMix &mix, Data &output) {
-#ifdef USE_CUDA
-            auto fail = [](const char *) {
-                return false;
-            };
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_WOA_HCPOST")) {
-                return fail("disabled");
-            }
-            if (x.dataDevice != DataDevice::CUDA || x.dims.size() < 2 || residual.dims.size() != 4) {
-                return fail("shape_or_device");
-            }
-            int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
-            if (x.Count(0) != (uint64_t)bsz * seqlen * dim) {
-                return fail("x_count");
-            }
-            residual.ToDevice(DataDevice::CUDA);
-            if (mix.postData.dataDevice == DataDevice::CUDA && mix.combData.dataDevice == DataDevice::CUDA &&
-                mix.postData.Count(0) == (uint64_t)bsz * seqlen * hcMult &&
-                mix.combData.Count(0) == (uint64_t)bsz * seqlen * hcMult * hcMult) {
-                if (FastllmCudaDeepSeekV4HcPostCudaMix(x, residual, mix.postData, mix.combData,
-                                                       bsz, seqlen, hcMult, dim, output)) {
-                    return true;
-                }
-                return fail("cuda_mix_kernel");
-            }
-            if ((int)mix.post.size() != bsz * seqlen * hcMult ||
-                (int)mix.comb.size() != bsz * seqlen * hcMult * hcMult) {
-                return fail("host_mix_shape");
-            }
-            return FastllmCudaDeepSeekV4HcPost(x, residual, mix.post.data(), mix.comb.data(),
-                                               bsz, seqlen, hcMult, dim, output);
-#else
-            (void)x;
-            (void)residual;
-            (void)mix;
-            (void)output;
-            return false;
-#endif
-        }
-
-        static void HcPostReference(const Data &x, const Data &residual, const HcMix &mix, Data &output) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4HcPost");
-#ifdef USE_CUDA
-            if (x.dataDevice == DataDevice::CUDA || DeepSeekV4PreferCuda()) {
-                Data cudaX, cudaResidual;
-                cudaX.CopyFrom(x);
-                cudaX.ToDevice(DataDevice::CUDA);
-                cudaResidual.CopyFrom(residual);
-                cudaResidual.ToDevice(DataDevice::CUDA);
-                if (HcPostCudaIfAvailable(cudaX, cudaResidual, mix, output)) {
-                    return;
-                }
-            }
-#endif
-
-            int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
-            auto xv = ReadFloatData(x);
-            auto rv = ReadFloatData(residual);
-            std::vector<float> postHost, combHost;
-            const std::vector<float> *postVec = &mix.post;
-            const std::vector<float> *combVec = &mix.comb;
-            if ((int)postVec->size() != bsz * seqlen * hcMult && mix.postData.Count(0) == (uint64_t)bsz * seqlen * hcMult) {
-                postHost = ReadFloatData(mix.postData);
-                postVec = &postHost;
-            }
-            if ((int)combVec->size() != bsz * seqlen * hcMult * hcMult &&
-                mix.combData.Count(0) == (uint64_t)bsz * seqlen * hcMult * hcMult) {
-                combHost = ReadFloatData(mix.combData);
-                combVec = &combHost;
-            }
-            if ((int)postVec->size() != bsz * seqlen * hcMult ||
-                (int)combVec->size() != bsz * seqlen * hcMult * hcMult) {
-                ErrorInFastLLM("DeepSeekV4HcPost error: invalid hc mix shape.\n");
-            }
-            std::vector<float> y((uint64_t)bsz * seqlen * hcMult * dim, 0.0f);
-            for (int t = 0; t < bsz * seqlen; t++) {
-                const float *xrow = xv.data() + (uint64_t)t * dim;
-                const float *rrow = rv.data() + (uint64_t)t * hcMult * dim;
-                const float *post = postVec->data() + (uint64_t)t * hcMult;
-                const float *comb = combVec->data() + (uint64_t)t * hcMult * hcMult;
-                for (int target = 0; target < hcMult; target++) {
-                    for (int d = 0; d < dim; d++) {
-                        double v = (double)post[target] * xrow[d];
-                        for (int src = 0; src < hcMult; src++) {
-                            v += (double)comb[src * hcMult + target] * rrow[(uint64_t)src * dim + d];
-                        }
-                        y[((uint64_t)t * hcMult + target) * dim + d] = (float)v;
-                    }
-                }
-            }
-            WriteFloatData(y, {bsz, seqlen, hcMult, dim}, output, x.dataType);
-        }
-
         static void RMSNormReference(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
             RMSNorm(input, weight, eps, output);
             ToDataType(output, dtype);
@@ -2734,7 +2641,7 @@ namespace fastllm {
             }
             DeepSeekV4WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
             Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
-            HcPostReference(attnOut, hiddenStates, attnMix, hiddenStates);
+            DeepSeekV4HcPost(attnOut, hiddenStates, attnMix.postData, attnMix.combData, hiddenStates);
             DeepSeekV4HcPre(hiddenStates, weight[pre + ".hc_ffn_fn"],
                             weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
                             hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
@@ -2779,7 +2686,7 @@ namespace fastllm {
                 }
             }
             ffnOut.Reshape(ffnDims);
-            HcPostReference(ffnOut, hiddenStates, ffnMix, hiddenStates);
+            DeepSeekV4HcPost(ffnOut, hiddenStates, ffnMix.postData, ffnMix.combData, hiddenStates);
         }
 
         Data headStates, headInput;

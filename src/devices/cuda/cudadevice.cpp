@@ -9,10 +9,20 @@
 
 #include "utils.h"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace fastllm {
     static uint64_t GetConvertedBufferBytes(const Data &data) {
         uint64_t elementCount = data.expansionSize > 0 ? data.expansionSize : data.Count(0);
         return (elementCount * data.unitSize - 1) / data.unitSizeDiv + 1;
+    }
+
+    static bool CudaEnvFlagEnabled(const char *name) {
+        const char *v = std::getenv(name);
+        return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0 &&
+               strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0 &&
+               strcmp(v, "off") != 0 && strcmp(v, "OFF") != 0;
     }
 
     static void InvalidateCpuMirror(Data &data) {
@@ -54,6 +64,7 @@ namespace fastllm {
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CudaRepeatOp());
         this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CudaDeepSeekV4HcPreOp());
+        this->ops["DeepSeekV4HcPost"] = (BaseOperator*)(new CudaDeepSeekV4HcPostOp());
         this->ops["ScaleQRatory"] = (BaseOperator*)(new CudaScaleQRatoryOp());
         this->ops["DeepSeekV4RotaryQuant"] = (BaseOperator*)(new CudaDeepSeekV4RotaryQuantOp());
         this->ops["DeepSeekV4WoA"] = (BaseOperator*)(new CudaDeepSeekV4WoAOp());
@@ -943,6 +954,42 @@ namespace fastllm {
         if (!FastllmCudaDeepSeekV4HcPre(input, hcFn, hcScale, hcBase, hcMult, sinkhornIters,
                                         eps, normEps, output, post, comb)) {
             ErrorInFastLLM("DeepSeekV4HcPre CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4HcPostOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &residual = *(datas.find("residual")->second);
+        Data &post = *(datas.find("post")->second);
+        Data &comb = *(datas.find("comb")->second);
+        if (residual.dims.size() != 4 || post.dataType != DataType::FLOAT32 ||
+            comb.dataType != DataType::FLOAT32) {
+            return false;
+        }
+        if ((input.dataType != DataType::FLOAT32 && input.dataType != DataType::FLOAT16 &&
+             input.dataType != DataType::BFLOAT16) ||
+            (residual.dataType != DataType::FLOAT32 && residual.dataType != DataType::FLOAT16 &&
+             residual.dataType != DataType::BFLOAT16)) {
+            return false;
+        }
+        int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
+        return bsz > 0 && seqlen > 0 && hcMult > 0 && dim > 0 &&
+               input.Count(0) == (uint64_t)bsz * seqlen * dim &&
+               post.Count(0) == (uint64_t)bsz * seqlen * hcMult &&
+               comb.Count(0) == (uint64_t)bsz * seqlen * hcMult * hcMult;
+    }
+
+    void CudaDeepSeekV4HcPostOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &residual = *(datas.find("residual")->second);
+        Data &post = *(datas.find("post")->second);
+        Data &comb = *(datas.find("comb")->second);
+        Data &output = *(datas.find("output")->second);
+        int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
+        if (!FastllmCudaDeepSeekV4HcPostCudaMix(input, residual, post, comb, bsz, seqlen, hcMult, dim, output)) {
+            ErrorInFastLLM("DeepSeekV4HcPost CUDA error: kernel rejected input.\n");
         }
     }
 

@@ -500,4 +500,63 @@ namespace fastllm {
         }
         DeepSeekV4HcPreWriteFloatData(y, output);
     }
+
+    void CpuDeepSeekV4HcPostOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &residual = *(datas.find("residual")->second);
+        Data &post = *(datas.find("post")->second);
+        Data &comb = *(datas.find("comb")->second);
+        Data &output = *(datas.find("output")->second);
+
+        AssertInFastLLM(residual.dims.size() == 4, "DeepSeekV4HcPost error: residual's shape's size should be 4.\n");
+        int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
+        AssertInFastLLM(input.Count(0) == (uint64_t)bsz * seqlen * dim,
+                        "DeepSeekV4HcPost error: input shape mismatch.\n");
+        AssertInFastLLM(post.Count(0) == (uint64_t)bsz * seqlen * hcMult &&
+                        comb.Count(0) == (uint64_t)bsz * seqlen * hcMult * hcMult,
+                        "DeepSeekV4HcPost error: mix shape mismatch.\n");
+        AssertInFastLLM(post.dataType == DataType::FLOAT32 && comb.dataType == DataType::FLOAT32,
+                        "DeepSeekV4HcPost error: post and comb should be float32.\n");
+
+        if (&residual == &output) {
+            return;
+        }
+        output.dataType = input.dataType;
+        output.Resize({bsz, seqlen, hcMult, dim});
+    }
+
+    void CpuDeepSeekV4HcPostOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &residual = *(datas.find("residual")->second);
+        Data &postData = *(datas.find("post")->second);
+        Data &combData = *(datas.find("comb")->second);
+        Data &output = *(datas.find("output")->second);
+
+        int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
+        int tokens = bsz * seqlen;
+        auto xv = DeepSeekV4HcPreReadFloatData(input);
+        auto rv = DeepSeekV4HcPreReadFloatData(residual);
+        auto post = DeepSeekV4HcPreReadFloatData(postData);
+        auto comb = DeepSeekV4HcPreReadFloatData(combData);
+        std::vector<float> y((uint64_t)tokens * hcMult * dim, 0.0f);
+
+        for (int t = 0; t < tokens; t++) {
+            const float *xrow = xv.data() + (uint64_t)t * dim;
+            const float *rrow = rv.data() + (uint64_t)t * hcMult * dim;
+            const float *postRow = post.data() + (uint64_t)t * hcMult;
+            const float *combRow = comb.data() + (uint64_t)t * hcMult * hcMult;
+            for (int target = 0; target < hcMult; target++) {
+                for (int d = 0; d < dim; d++) {
+                    double v = (double)postRow[target] * xrow[d];
+                    for (int src = 0; src < hcMult; src++) {
+                        v += (double)combRow[src * hcMult + target] * rrow[(uint64_t)src * dim + d];
+                    }
+                    y[((uint64_t)t * hcMult + target) * dim + d] = (float)v;
+                }
+            }
+        }
+        DeepSeekV4HcPreWriteFloatData(y, output);
+    }
 }

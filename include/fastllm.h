@@ -876,6 +876,8 @@ namespace fastllm {
                          int hcMult, int sinkhornIters, float eps, float normEps,
                          Data &output, Data &post, Data &comb);
 
+    void DeepSeekV4HcPost(const Data &input, const Data &residual, const Data &post, const Data &comb, Data &output);
+
     void ScaleQRatory(Data &q, float eps, int ropeDim, float ropeBase, int startPos,
                       int originalSeqLen, float ropeFactor, int betaFast, int betaSlow);
 

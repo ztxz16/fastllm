@@ -83,6 +83,7 @@ namespace fastllm {
         this->ops["Split"] = (BaseOperator*)(new CpuSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CpuRepeatOp());
         this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CpuDeepSeekV4HcPreOp());
+        this->ops["DeepSeekV4HcPost"] = (BaseOperator*)(new CpuDeepSeekV4HcPostOp());
         this->ops["ScaleQRatory"] = (BaseOperator*)(new CpuScaleQRatoryOp());
         this->ops["DeepSeekV4RotaryQuant"] = (BaseOperator*)(new CpuDeepSeekV4RotaryQuantOp());
         this->ops["DeepSeekV4WoA"] = (BaseOperator*)(new CpuDeepSeekV4WoAOp());

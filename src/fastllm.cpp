@@ -3470,6 +3470,22 @@ namespace fastllm {
         }, {{"eps", eps}, {"normEps", normEps}}, {{"hcMult", hcMult}, {"sinkhornIters", sinkhornIters}});
     }
 
+    void DeepSeekV4HcPost(const Data &input, const Data &residual, const Data &post, const Data &comb, Data &output) {
+        auto run = [&](Data &out) {
+            curExecutor->Run("DeepSeekV4HcPost", {
+                    {"input", (Data*)&input}, {"residual", (Data*)&residual},
+                    {"post", (Data*)&post}, {"comb", (Data*)&comb}, {"output", &out}
+            }, {}, {});
+        };
+        if (&residual == &output) {
+            Data temp;
+            run(temp);
+            output.CopyFrom(temp);
+        } else {
+            run(output);
+        }
+    }
+
     void ScaleQRatory(Data &q, float eps, int ropeDim, float ropeBase, int startPos,
                       int originalSeqLen, float ropeFactor, int betaFast, int betaSlow) {
         curExecutor->Run("ScaleQRatory", {
