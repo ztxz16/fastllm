@@ -1034,8 +1034,6 @@ namespace fastllm {
         Data &output = *(datas.find("output")->second);
         int groups = intParams.find("groups") != intParams.end() ? intParams.find("groups")->second : 1;
         int oRank = intParams.find("oRank") != intParams.end() ? intParams.find("oRank")->second : 1;
-        input.ToDevice(DataDevice::CUDA);
-        weight.ToDevice(DataDevice::CUDA);
         if (!FastllmCudaDeepSeekV4WoA(input, weight, groups, oRank, output)) {
             ErrorInFastLLM("DeepSeekV4WoA CUDA error: kernel rejected input.\n");
         }
