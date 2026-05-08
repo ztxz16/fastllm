@@ -82,6 +82,86 @@ namespace fastllm {
         }
     }
 
+    static std::vector<float> ScaleQRatoryBuildInvFreq(int ropeDim, float base, int originalSeqLen,
+                                                       float factor, int betaFast, int betaSlow) {
+        std::vector<float> invFreq;
+        for (int i = 0; i < ropeDim; i += 2) {
+            invFreq.push_back(1.0f / std::pow(base, (float)i / ropeDim));
+        }
+        if (originalSeqLen > 0) {
+            const float pi = 3.14159265358979323846f;
+            float lowF = ropeDim * std::log((float)originalSeqLen / (betaFast * 2.0f * pi)) /
+                         (2.0f * std::log(base));
+            float highF = ropeDim * std::log((float)originalSeqLen / (betaSlow * 2.0f * pi)) /
+                          (2.0f * std::log(base));
+            int low = std::max((int)std::floor(lowF), 0);
+            int high = std::min((int)std::ceil(highF), ropeDim - 1);
+            if (low == high) {
+                high++;
+            }
+            for (int idx = 0; idx < (int)invFreq.size(); idx++) {
+                float ramp = std::min(1.0f, std::max(0.0f, ((float)idx - low) / (float)(high - low)));
+                float smooth = 1.0f - ramp;
+                invFreq[idx] = invFreq[idx] / factor * (1.0f - smooth) + invFreq[idx] * smooth;
+            }
+        }
+        return invFreq;
+    }
+
+    void CpuScaleQRatoryOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int originalSeqLen = intParams.find("originalSeqLen") != intParams.end() ? intParams.find("originalSeqLen")->second : 0;
+        int betaFast = intParams.find("betaFast") != intParams.end() ? intParams.find("betaFast")->second : 32;
+        int betaSlow = intParams.find("betaSlow") != intParams.end() ? intParams.find("betaSlow")->second : 1;
+        float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-6f;
+        float ropeBase = floatParams.find("ropeBase") != floatParams.end() ? floatParams.find("ropeBase")->second : 10000.0f;
+        float ropeFactor = floatParams.find("ropeFactor") != floatParams.end() ? floatParams.find("ropeFactor")->second : 1.0f;
+
+        AssertInFastLLM(q.dims.size() == 4, "ScaleQRatory error: q's shape's size should be 4.\n");
+        int bsz = q.dims[0], seqlen = q.dims[1], heads = q.dims[2], dim = q.dims[3];
+        AssertInFastLLM(ropeDim > 0 && ropeDim <= dim && ropeDim % 2 == 0,
+                        "ScaleQRatory error: invalid ropeDim.\n");
+
+        auto qv = DeepSeekV4HcPreReadFloatData(q);
+        int rows = bsz * seqlen * heads;
+        for (int r = 0; r < rows; r++) {
+            float *row = qv.data() + (uint64_t)r * dim;
+            double ss = 0.0;
+            for (int d = 0; d < dim; d++) {
+                ss += (double)row[d] * row[d];
+            }
+            float scale = 1.0f / std::sqrt((float)(ss / dim) + eps);
+            for (int d = 0; d < dim; d++) {
+                row[d] *= scale;
+            }
+        }
+
+        int off = dim - ropeDim;
+        auto invFreq = ScaleQRatoryBuildInvFreq(ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
+        for (int b = 0; b < bsz; b++) {
+            for (int s = 0; s < seqlen; s++) {
+                int pos = startPos + s;
+                for (int h = 0; h < heads; h++) {
+                    float *row = qv.data() + (((uint64_t)b * seqlen + s) * heads + h) * dim + off;
+                    for (int i = 0; i < ropeDim; i += 2) {
+                        float ang = pos * invFreq[i / 2];
+                        float c = std::cos(ang), sn = std::sin(ang);
+                        float a = row[i], bb = row[i + 1];
+                        row[i] = a * c - bb * sn;
+                        row[i + 1] = a * sn + bb * c;
+                    }
+                }
+            }
+        }
+
+        q.dataType = DataType::BFLOAT16;
+        q.Resize({bsz, seqlen, heads, dim});
+        DeepSeekV4HcPreWriteFloatData(qv, q);
+    }
+
     struct DeepSeekV4HcPreDotsOp : MultiThreadBaseOp {
         const float *xrow;
         const float *fn;

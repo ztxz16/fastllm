@@ -550,63 +550,6 @@ namespace fastllm {
             }
         }
 
-        static void ScaleQReference(Data &q, float eps) {
-            auto qv = ReadFloatData(q);
-            int dim = q.dims.back();
-            int rows = (int)(qv.size() / dim);
-            for (int r = 0; r < rows; r++) {
-                float *row = qv.data() + (uint64_t)r * dim;
-                double ss = 0.0;
-                for (int d = 0; d < dim; d++) {
-                    ss += (double)row[d] * row[d];
-                }
-                float scale = 1.0f / std::sqrt((float)(ss / dim) + eps);
-                for (int d = 0; d < dim; d++) {
-                    row[d] *= scale;
-                }
-            }
-            WriteFloatData(qv, q.dims, q, DataType::BFLOAT16);
-        }
-
-        static bool ScaleQRotaryCudaIfAvailable(Data &q, int ropeDim, float ropeBase, int startPos,
-                                                int originalSeqLen, float ropeFactor,
-                                                int betaFast, int betaSlow, float eps) {
-#ifdef USE_CUDA
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_PREP") ||
-                q.dataDevice != DataDevice::CUDA || q.dims.size() != 4 ||
-                q.dataType != DataType::BFLOAT16) {
-                return false;
-            }
-            return FastllmCudaDeepSeekV4ScaleQRotary(q, ropeDim, ropeBase, startPos,
-                                                     originalSeqLen, ropeFactor, betaFast, betaSlow, eps);
-#else
-            (void)q;
-            (void)ropeDim;
-            (void)ropeBase;
-            (void)startPos;
-            (void)originalSeqLen;
-            (void)ropeFactor;
-            (void)betaFast;
-            (void)betaSlow;
-            (void)eps;
-            return false;
-#endif
-        }
-
-        static void ScaleQRotary(Data &q, float eps, int ropeDim, float ropeBase, int startPos,
-                                 int originalSeqLen, float ropeFactor, int betaFast, int betaSlow) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4ScaleQRotary");
-            if (ScaleQRotaryCudaIfAvailable(q, ropeDim, ropeBase, startPos, originalSeqLen,
-                                            ropeFactor, betaFast, betaSlow, eps)) {
-                return;
-            }
-            ScaleQReference(q, eps);
-            auto qv = ReadFloatData(q);
-            ApplyRotaryReference(qv, q.dims, ropeDim, ropeBase, startPos, false,
-                                 originalSeqLen, ropeFactor, betaFast, betaSlow);
-            WriteFloatData(qv, q.dims, q, DataType::BFLOAT16);
-        }
-
         static void ActQuantInplaceReference(std::vector<float> &x, const std::vector<int> &dims,
                                              int quantDim, int blockSize) {
             int dim = dims.back();
@@ -2703,6 +2646,9 @@ namespace fastllm {
                 }
             }
         }
+
+        Data attnInput;
+        Data qr, qNorm, q;
         for (int layer = 0; layer < block_cnt; layer++) {
             std::string pre = "layers." + std::to_string(layer);
             int compressRatio = compress_ratios.size() > layer ? compress_ratios[layer] : 0;
@@ -2718,15 +2664,13 @@ namespace fastllm {
             attnMix.b = bsz;
             attnMix.s = seqlen;
             attnMix.hc = hc_mult;
-            Data attnInput;
-            RMSNormReference(attnMix.y, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput, DataType::BFLOAT16);
 
-            Data qr, qNorm, q;
+            RMSNormReference(attnMix.y, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput, DataType::BFLOAT16);
             Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr);
             RMSNormReference(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm, DataType::BFLOAT16);
             Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
             q.Reshape({bsz, seqlen, num_attention_heads, head_dim_full});
-            ScaleQRotary(q, rms_norm_eps, qk_rope_head_dim, layerRopeBase, startPos,
+            ScaleQRatory(q, rms_norm_eps, qk_rope_head_dim, layerRopeBase, startPos,
                          layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
                          rope_scaling_beta_slow);
 

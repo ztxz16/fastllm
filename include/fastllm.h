@@ -876,6 +876,9 @@ namespace fastllm {
                          int hcMult, int sinkhornIters, float eps, float normEps,
                          Data &output, Data &post, Data &comb);
 
+    void ScaleQRatory(Data &q, float eps, int ropeDim, float ropeBase, int startPos,
+                      int originalSeqLen, float ropeFactor, int betaFast, int betaSlow);
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 
     void Pad(const Data &input, int axis, int padSize, Data &output);

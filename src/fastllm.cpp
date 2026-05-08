@@ -3470,6 +3470,15 @@ namespace fastllm {
         }, {{"eps", eps}, {"normEps", normEps}}, {{"hcMult", hcMult}, {"sinkhornIters", sinkhornIters}});
     }
 
+    void ScaleQRatory(Data &q, float eps, int ropeDim, float ropeBase, int startPos,
+                      int originalSeqLen, float ropeFactor, int betaFast, int betaSlow) {
+        curExecutor->Run("ScaleQRatory", {
+                {"q", &q}
+        }, {{"eps", eps}, {"ropeBase", ropeBase}, {"ropeFactor", ropeFactor}},
+           {{"ropeDim", ropeDim}, {"startPos", startPos}, {"originalSeqLen", originalSeqLen},
+            {"betaFast", betaFast}, {"betaSlow", betaSlow}});
+    }
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output) {
         curExecutor->Run("Cat", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}, {"output", &output}
