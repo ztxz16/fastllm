@@ -229,10 +229,18 @@ bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data &hcFn,
                                 fastllm::Data &y, fastllm::Data &post, fastllm::Data &comb);
 bool FastllmCudaDeepSeekV4HcPreDots(const fastllm::Data &x, const fastllm::Data &hcFn,
                                     int hcMult, fastllm::Data &dotsFloat);
+bool FastllmCudaDeepSeekV4StoreWindowKVCache(const fastllm::Data &kv, int startPos,
+                                             int windowSize, fastllm::Data &windowKV);
 bool FastllmCudaDeepSeekV4UpdateWindowKVCache(const fastllm::Data &kv, int startPos,
                                              int windowSize, fastllm::Data &windowKV);
-bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::Data &q, const fastllm::Data *windowKVData,
-                                                      const float *windowKV,
+bool FastllmCudaDeepSeekV4BuildWindowKVPrefix(const fastllm::Data &windowKV, int startPos,
+                                             int windowSize, int prefixLen, fastllm::Data &output);
+bool FastllmCudaDeepSeekV4BuildCompressedKV(const fastllm::Data &kv, const fastllm::Data &score,
+                                            const fastllm::Data &ape, int rawTokenBase, int rawLen,
+                                            int blockStart, int blockCount, int compressRatio,
+                                            int headDim, int wideDim, bool overlap,
+                                            fastllm::Data &output);
+bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::Data &q, const fastllm::Data &windowKV,
                                                       const fastllm::Data &compressedKV, fastllm::Data &attnSink,
                                                       int windowSize, int startPos, int compressedCount,
                                                       int ropeDim, float ropeBase, int originalSeqLen,

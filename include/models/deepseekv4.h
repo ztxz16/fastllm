@@ -38,6 +38,10 @@
 
 namespace fastllm {
     struct DeepSeekV4DecodeLayerCache {
+        DeepSeekV4DecodeLayerCache() = default;
+        DeepSeekV4DecodeLayerCache(const DeepSeekV4DecodeLayerCache &other);
+        DeepSeekV4DecodeLayerCache &operator=(const DeepSeekV4DecodeLayerCache &other);
+
         bool initialized = false;
         int bsz = 0;
         int totalLen = 0;
@@ -45,21 +49,24 @@ namespace fastllm {
         int windowSize = 0;
         int compressRatio = 0;
         int compressorWideDim = 0;
-        std::vector<float> windowKV;
-        Data windowKVData;
-        std::vector<float> compressorKVRaw;
-        std::vector<float> compressorScoreRaw;
+        Data windowKV;
+        Data compressorKVRaw;
+        Data compressorScoreRaw;
         int compressorRawTokenBase = 0;
         Data compressedKV;
         Data compressedKVCuda;
         int compressedBlocks = 0;
         int compressedTokenBase = 0;
         int rawTailStartPos = 0;
-        std::vector<float> compressorTailKV;
-        std::vector<float> compressorTailScore;
+        Data compressorTailKV;
+        Data compressorTailScore;
     };
 
     struct DeepSeekV4HistoryLayerCache {
+        DeepSeekV4HistoryLayerCache() = default;
+        DeepSeekV4HistoryLayerCache(const DeepSeekV4HistoryLayerCache &other);
+        DeepSeekV4HistoryLayerCache &operator=(const DeepSeekV4HistoryLayerCache &other);
+
         bool initialized = false;
         int bsz = 0;
         int totalLen = 0;
@@ -67,16 +74,16 @@ namespace fastllm {
         int windowSize = 0;
         int compressRatio = 0;
         int compressorWideDim = 0;
-        std::vector<float> windowKV;
-        std::vector<float> compressorKVRaw;
-        std::vector<float> compressorScoreRaw;
+        Data windowKV;
+        Data compressorKVRaw;
+        Data compressorScoreRaw;
         int compressorRawTokenBase = 0;
         Data compressedKV;
         int compressedBlocks = 0;
         int compressedTokenBase = 0;
         int rawTailStartPos = 0;
-        std::vector<float> compressorTailKV;
-        std::vector<float> compressorTailScore;
+        Data compressorTailKV;
+        Data compressorTailScore;
     };
 
     struct DeepSeekV4HistoryCacheMemory {
