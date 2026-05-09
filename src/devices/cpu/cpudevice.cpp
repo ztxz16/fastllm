@@ -82,6 +82,15 @@ namespace fastllm {
         this->ops["Conv2D"] = (BaseOperator*)(new CpuConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CpuSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CpuRepeatOp());
+        this->ops["Copy"] = (BaseOperator*)(new CpuCopyOp());
+        this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CpuDeepSeekV4HcPreOp());
+        this->ops["DeepSeekV4HcPost"] = (BaseOperator*)(new CpuDeepSeekV4HcPostOp());
+        this->ops["ScaleQRatory"] = (BaseOperator*)(new CpuScaleQRatoryOp());
+        this->ops["DeepSeekV4RotaryQuant"] = (BaseOperator*)(new CpuDeepSeekV4RotaryQuantOp());
+        this->ops["DeepSeekV4WoA"] = (BaseOperator*)(new CpuDeepSeekV4WoAOp());
+        this->ops["DeepSeekV4BuildCompressedKVFromRaw"] = (BaseOperator*)(new CpuDeepSeekV4BuildCompressedKVFromRawOp());
+        this->ops["DeepSeekV4StoreWindowKVCache"] = (BaseOperator*)(new CpuDeepSeekV4StoreWindowKVCacheOp());
+        this->ops["DeepSeekV4UpdateWindowKVCache"] = (BaseOperator*)(new CpuDeepSeekV4UpdateWindowKVCacheOp());
         this->ops["Cat"] = (BaseOperator*)(new CpuCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CpuPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CpuCatDirectOp());
@@ -5462,6 +5471,61 @@ ops += (long long)lines * inputDim * interDim * 2;
                     input.cpuData + (o * inputStride) * unitSize,
                     channels * inner * unitSize);
             }
+        }
+    }
+
+    struct CpuCopyRangeOp : MultiThreadBaseOp {
+        uint8_t *output;
+        uint8_t *input;
+        uint64_t st, end;
+
+        CpuCopyRangeOp(uint8_t *output, uint8_t *input, uint64_t st, uint64_t end) :
+            output(output), input(input), st(st), end(end) {}
+
+        void Run() {
+            memcpy(output + st, input + st, (size_t)(end - st));
+        }
+    };
+
+    void CpuCopyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        if (&input == &output) {
+            return;
+        }
+        output.Allocate();
+        uint64_t bytes = input.GetBytes();
+        if (bytes == 0) {
+            return;
+        }
+
+        uint8_t *inputData = input.cpuData;
+        uint8_t *outputData = output.cpuData;
+        auto *pool = GetAlivePool();
+        int threadNum = pool == nullptr ? 1 : (int)pool->threads.size();
+        threadNum = std::min(threadNum, 8);
+        if (threadNum <= 1 || bytes < 256 * 1024) {
+            memcpy(outputData, inputData, (size_t)bytes);
+            return;
+        }
+
+        std::vector<CpuCopyRangeOp*> ops;
+        uint64_t per = (bytes + threadNum - 1) / threadNum;
+        for (int i = 0; i < threadNum; i++) {
+            uint64_t st = (uint64_t)i * per;
+            uint64_t end = std::min(bytes, st + per);
+            if (st >= end) {
+                break;
+            }
+            ops.push_back(new CpuCopyRangeOp(outputData, inputData, st, end));
+        }
+        for (int i = 0; i < (int)ops.size(); i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < (int)ops.size(); i++) {
+            pool->Wait(i);
+            delete ops[i];
         }
     }
 

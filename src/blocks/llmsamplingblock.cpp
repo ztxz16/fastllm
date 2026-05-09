@@ -43,34 +43,13 @@ namespace fastllm {
     }
 
     static void DumpLogitsIfNeeded(Data &logits) {
-        const std::string &path = LogitsDumpPath();
-        bool needDump = !path.empty();
         bool needPrint = ShouldPrintLogits();
-        if (!needDump && !needPrint) {
+        if (!needPrint) {
             return;
         }
         logits.ToDevice(DataDevice::CPU);
         float *p = (float*)logits.cpuData;
         uint64_t count = logits.Count(0);
-        if (needPrint) {
-            printf("[fastllm-dsv4-logits] count=%llu\n", (unsigned long long)count);
-            for (uint64_t i = 0; i < count; i++) {
-                printf("%.9g%c", p[i], (i + 1 == count) ? '\n' : ' ');
-            }
-            fflush(stdout);
-        }
-        if (needDump) {
-            std::ofstream ofs(path.c_str(), std::ios::app);
-            ofs << "count=" << count << "\n";
-            ofs << std::setprecision(9);
-            for (uint64_t i = 0; i < count; i++) {
-                if (i > 0) {
-                    ofs << ' ';
-                }
-                ofs << p[i];
-            }
-            ofs << "\n";
-        }
     }
 
     void LLMSamplingBlock (

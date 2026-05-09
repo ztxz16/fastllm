@@ -333,6 +333,47 @@ namespace fastllm {
             output.CopyFrom(tmp);
         }
 
+        static bool HasTensorData(const Data &data) {
+            return !data.dims.empty() && data.Count(0) > 0 &&
+                   (data.cpuData != nullptr || data.cudaData != nullptr);
+        }
+
+        static void CopyTensorData(Data &dst, const Data &src) {
+            ResetData(dst);
+            if (HasTensorData(src)) {
+                Copy(src, dst);
+            }
+        }
+
+        static int GetDataSeqLen(const Data &data, int bsz, int dim) {
+            if (!HasTensorData(data) || data.dims.size() < 3 || bsz <= 0 || dim <= 0 ||
+                data.dims[0] != bsz || data.dims[2] != dim) {
+                return 0;
+            }
+            return data.dims[1];
+        }
+
+        static int RoundUpToBlock(int value, int block) {
+            return ((std::max(value, 1) - 1) / block + 1) * block;
+        }
+
+        static void EnsureCompressorRawCapacity(Data &data, int targetLen) {
+            if (!HasTensorData(data) || data.dims.size() != 3 || targetLen <= 0) {
+                return;
+            }
+            int targetCapacity = RoundUpToBlock(targetLen, 128);
+            int currentCapacity = data.dims[1];
+            if (data.expansionDims.size() == data.dims.size()) {
+                currentCapacity = data.expansionDims[1];
+            }
+            if (currentCapacity >= targetCapacity) {
+                return;
+            }
+            std::vector<int> newDims = data.dims;
+            newDims[1] = targetCapacity;
+            data.Expansion(newDims);
+        }
+
 #ifdef USE_CUDA
         static bool PrepareCudaData(Data &output, DataType dtype, const std::vector<int> &dims) {
             ResetData(output);
@@ -396,409 +437,9 @@ namespace fastllm {
             int b = 0, s = 0, hc = 0;
         };
 
-        static bool HcPreCudaIfAvailable(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
-                                         int hcMult, int sinkhornIters, float eps, float normEps,
-                                         HcMix &ret) {
-#ifdef USE_CUDA
-            auto fail = [](const char *) {
-                return false;
-            };
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_HCPRE") ||
-                x.dims.size() != 4 || (x.dataDevice != DataDevice::CUDA && !DeepSeekV4PreferCuda())) {
-                return fail("disabled_or_not_cuda");
-            }
-            if (hcScale.dataType != DataType::FLOAT32 || hcBase.dataType != DataType::FLOAT32 ||
-                (hcFn.dataType != DataType::FLOAT32 && hcFn.dataType != DataType::FLOAT16 &&
-                 hcFn.dataType != DataType::BFLOAT16)) {
-                return fail("unsupported_dtype");
-            }
-            int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
-            int flatDim = hcMult * dim;
-            int mixHc = (2 + hcMult) * hcMult;
-            if (x.dims[2] != hcMult || hcFn.Count(0) != (uint64_t)mixHc * flatDim ||
-                hcScale.Count(0) < 3 || hcBase.Count(0) < (uint64_t)mixHc ||
-                bsz <= 0 || seqlen <= 0 || dim <= 0 || sinkhornIters <= 0) {
-                return fail("shape_mismatch");
-            }
-            Data cudaX;
-            const Data *cudaInput = &x;
-            if (x.dataDevice != DataDevice::CUDA) {
-                cudaX.CopyFrom(x);
-                cudaX.ToDevice(DataDevice::CUDA);
-                cudaInput = &cudaX;
-            }
-            hcFn.ToDevice(DataDevice::CUDA);
-            hcScale.ToDevice(DataDevice::CUDA);
-            hcBase.ToDevice(DataDevice::CUDA);
-            if (!FastllmCudaDeepSeekV4HcPre(*cudaInput, hcFn, hcScale, hcBase, hcMult,
-                                            sinkhornIters, eps, normEps,
-                                            ret.y, ret.postData, ret.combData)) {
-                ErrorInFastLLM("DeepSeekV4HcPre CUDA error: kernel rejected valid input.\n");
-            }
-            ret.b = bsz;
-            ret.s = seqlen;
-            ret.hc = hcMult;
-            return true;
-#else
-            (void)x;
-            (void)hcFn;
-            (void)hcScale;
-            (void)hcBase;
-            (void)hcMult;
-            (void)sinkhornIters;
-            (void)eps;
-            (void)normEps;
-            (void)ret;
-            return false;
-#endif
-        }
-
-        struct HcPreDotsOp : MultiThreadBaseOp {
-            const float *xrow;
-            const float *fn;
-            float *mixes;
-            float rsqrt;
-            int flatDim, mixSt, mixEnd;
-
-            HcPreDotsOp(const float *xrow, const float *fn, float *mixes, float rsqrt,
-                        int flatDim, int mixSt, int mixEnd)
-                : xrow(xrow), fn(fn), mixes(mixes), rsqrt(rsqrt),
-                  flatDim(flatDim), mixSt(mixSt), mixEnd(mixEnd) {}
-
-            void Run() override {
-                for (int m = mixSt; m < mixEnd; m++) {
-                    double v = 0.0;
-                    const float *w = fn + (uint64_t)m * flatDim;
-                    for (int k = 0; k < flatDim; k++) {
-                        v += (double)xrow[k] * w[k];
-                    }
-                    mixes[m] = (float)v * rsqrt;
-                }
-            }
-        };
-
-        static void HcPreComputeDotsCpu(const float *xrow, const float *fn, float *mixes,
-                                        float rsqrt, int flatDim, int mixHc) {
-            auto *pool = GetAlivePool();
-            int threadNum = std::min((int)pool->threads.size(), mixHc);
-            if (threadNum <= 1 || mixHc < 8 || EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CPU_HCPRE_PARALLEL")) {
-                HcPreDotsOp(xrow, fn, mixes, rsqrt, flatDim, 0, mixHc).Run();
-                return;
-            }
-            std::vector<HcPreDotsOp*> ops;
-            int per = (mixHc + threadNum - 1) / threadNum;
-            for (int i = 0; i < threadNum; i++) {
-                int st = i * per;
-                int end = std::min(mixHc, st + per);
-                if (st >= end) {
-                    break;
-                }
-                ops.push_back(new HcPreDotsOp(xrow, fn, mixes, rsqrt, flatDim, st, end));
-            }
-            for (int i = 0; i < (int)ops.size(); i++) {
-                pool->PushOp(i, ops[i]);
-            }
-            for (int i = 0; i < (int)ops.size(); i++) {
-                pool->Wait(i);
-                delete ops[i];
-            }
-        }
-
-        static HcMix HcPreReference(const Data &x, Data &hcFn, Data &hcScale, Data &hcBase,
-                                    int hcMult, int sinkhornIters, float eps, float normEps) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4HcPre");
-            HcMix ret;
-            if (HcPreCudaIfAvailable(x, hcFn, hcScale, hcBase, hcMult, sinkhornIters, eps, normEps, ret)) {
-                return ret;
-            }
-            int bsz = x.dims[0], seqlen = x.dims[1], dim = x.dims[3];
-            int flatDim = hcMult * dim;
-            int mixHc = (2 + hcMult) * hcMult;
-            auto xv = ReadFloatData(x);
-            auto scalePtr = ReadWeightFloatDataCached(hcScale);
-            auto basePtr = ReadWeightFloatDataCached(hcBase);
-            const auto &scale = *scalePtr;
-            const auto &base = *basePtr;
-            std::shared_ptr<const std::vector<float>> fnPtr;
-            const std::vector<float> *fn = nullptr;
-            std::vector<float> dotCache;
-
-#ifdef USE_CUDA
-            if (EnvFlagEnabled("FASTLLM_DSV4_ENABLE_CUDA_HCPRE_DOTS") && x.dataDevice == DataDevice::CUDA) {
-                Data dots;
-                hcFn.ToDevice(DataDevice::CUDA);
-                if (FastllmCudaDeepSeekV4HcPreDots(x, hcFn, hcMult, dots)) {
-                    dotCache = ReadFloatData(dots);
-                    if ((int)dotCache.size() != bsz * seqlen * mixHc) {
-                        dotCache.clear();
-                    }
-                }
-            }
-#endif
-
-            if (dotCache.empty()) {
-                fnPtr = ReadWeightFloatDataCached(hcFn);
-                fn = fnPtr.get();
-            }
-
-            std::vector<float> y((uint64_t)bsz * seqlen * dim, 0.0f);
-            std::vector<float> post((uint64_t)bsz * seqlen * hcMult, 0.0f);
-            std::vector<float> comb((uint64_t)bsz * seqlen * hcMult * hcMult, 0.0f);
-            std::vector<float> mixes(mixHc);
-            std::vector<float> pre(hcMult);
-            std::vector<float> combLocal(hcMult * hcMult);
-
-            for (int t = 0; t < bsz * seqlen; t++) {
-                const float *xrow = xv.data() + (uint64_t)t * flatDim;
-                double ss = 0.0;
-                for (int k = 0; k < flatDim; k++) {
-                    ss += (double)xrow[k] * xrow[k];
-                }
-                float rsqrt = 1.0f / std::sqrt((float)(ss / flatDim) + normEps);
-                for (int m = 0; m < mixHc; m++) {
-                    if (!dotCache.empty()) {
-                        mixes[m] = dotCache[(uint64_t)t * mixHc + m] * rsqrt;
-                    } else {
-                        HcPreComputeDotsCpu(xrow, fn->data(), mixes.data(), rsqrt, flatDim, mixHc);
-                        break;
-                    }
-                }
-                for (int h = 0; h < hcMult; h++) {
-                    pre[h] = SigmoidFloat(mixes[h] * scale[0] + base[h]) + eps;
-                    post[(uint64_t)t * hcMult + h] =
-                        2.0f * SigmoidFloat(mixes[h + hcMult] * scale[1] + base[h + hcMult]);
-                }
-                for (int r = 0; r < hcMult; r++) {
-                    float rowMax = -std::numeric_limits<float>::infinity();
-                    for (int c = 0; c < hcMult; c++) {
-                        int idx = r * hcMult + c + 2 * hcMult;
-                        combLocal[r * hcMult + c] = mixes[idx] * scale[2] + base[idx];
-                        rowMax = std::max(rowMax, combLocal[r * hcMult + c]);
-                    }
-                    float rowSum = 0.0f;
-                    for (int c = 0; c < hcMult; c++) {
-                        float v = std::exp(combLocal[r * hcMult + c] - rowMax);
-                        combLocal[r * hcMult + c] = v;
-                        rowSum += v;
-                    }
-                    for (int c = 0; c < hcMult; c++) {
-                        combLocal[r * hcMult + c] = combLocal[r * hcMult + c] / rowSum + eps;
-                    }
-                }
-                for (int c = 0; c < hcMult; c++) {
-                    float colSum = 0.0f;
-                    for (int r = 0; r < hcMult; r++) {
-                        colSum += combLocal[r * hcMult + c];
-                    }
-                    for (int r = 0; r < hcMult; r++) {
-                        combLocal[r * hcMult + c] /= (colSum + eps);
-                    }
-                }
-                for (int it = 1; it < sinkhornIters; it++) {
-                    for (int r = 0; r < hcMult; r++) {
-                        float rowSum = 0.0f;
-                        for (int c = 0; c < hcMult; c++) {
-                            rowSum += combLocal[r * hcMult + c];
-                        }
-                        for (int c = 0; c < hcMult; c++) {
-                            combLocal[r * hcMult + c] /= (rowSum + eps);
-                        }
-                    }
-                    for (int c = 0; c < hcMult; c++) {
-                        float colSum = 0.0f;
-                        for (int r = 0; r < hcMult; r++) {
-                            colSum += combLocal[r * hcMult + c];
-                        }
-                        for (int r = 0; r < hcMult; r++) {
-                            combLocal[r * hcMult + c] /= (colSum + eps);
-                        }
-                    }
-                }
-                memcpy(comb.data() + (uint64_t)t * hcMult * hcMult, combLocal.data(),
-                       hcMult * hcMult * sizeof(float));
-                for (int d = 0; d < dim; d++) {
-                    double v = 0.0;
-                    for (int h = 0; h < hcMult; h++) {
-                        v += (double)pre[h] * xrow[(uint64_t)h * dim + d];
-                    }
-                    y[(uint64_t)t * dim + d] = (float)v;
-                }
-            }
-
-            WriteFloatData(y, {bsz, seqlen, dim}, ret.y, x.dataType);
-#ifdef USE_CUDA
-            if (x.dataDevice == DataDevice::CUDA) {
-                ret.y.ToDevice(DataDevice::CUDA);
-            }
-#endif
-            ret.post = std::move(post);
-            ret.comb = std::move(comb);
-            ret.b = bsz;
-            ret.s = seqlen;
-            ret.hc = hcMult;
-            return ret;
-        }
-
-        static bool HcPostCudaIfAvailable(Data &x, Data &residual, const HcMix &mix, Data &output) {
-#ifdef USE_CUDA
-            auto fail = [](const char *) {
-                return false;
-            };
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_WOA_HCPOST")) {
-                return fail("disabled");
-            }
-            if (x.dataDevice != DataDevice::CUDA || x.dims.size() < 2 || residual.dims.size() != 4) {
-                return fail("shape_or_device");
-            }
-            int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
-            if (x.Count(0) != (uint64_t)bsz * seqlen * dim) {
-                return fail("x_count");
-            }
-            residual.ToDevice(DataDevice::CUDA);
-            if (mix.postData.dataDevice == DataDevice::CUDA && mix.combData.dataDevice == DataDevice::CUDA &&
-                mix.postData.Count(0) == (uint64_t)bsz * seqlen * hcMult &&
-                mix.combData.Count(0) == (uint64_t)bsz * seqlen * hcMult * hcMult) {
-                if (FastllmCudaDeepSeekV4HcPostCudaMix(x, residual, mix.postData, mix.combData,
-                                                       bsz, seqlen, hcMult, dim, output)) {
-                    return true;
-                }
-                return fail("cuda_mix_kernel");
-            }
-            if ((int)mix.post.size() != bsz * seqlen * hcMult ||
-                (int)mix.comb.size() != bsz * seqlen * hcMult * hcMult) {
-                return fail("host_mix_shape");
-            }
-            return FastllmCudaDeepSeekV4HcPost(x, residual, mix.post.data(), mix.comb.data(),
-                                               bsz, seqlen, hcMult, dim, output);
-#else
-            (void)x;
-            (void)residual;
-            (void)mix;
-            (void)output;
-            return false;
-#endif
-        }
-
-        static void HcPostReference(const Data &x, const Data &residual, const HcMix &mix, Data &output) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4HcPost");
-#ifdef USE_CUDA
-            if (x.dataDevice == DataDevice::CUDA || DeepSeekV4PreferCuda()) {
-                Data cudaX, cudaResidual;
-                cudaX.CopyFrom(x);
-                cudaX.ToDevice(DataDevice::CUDA);
-                cudaResidual.CopyFrom(residual);
-                cudaResidual.ToDevice(DataDevice::CUDA);
-                if (HcPostCudaIfAvailable(cudaX, cudaResidual, mix, output)) {
-                    return;
-                }
-            }
-#endif
-
-            int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
-            auto xv = ReadFloatData(x);
-            auto rv = ReadFloatData(residual);
-            std::vector<float> postHost, combHost;
-            const std::vector<float> *postVec = &mix.post;
-            const std::vector<float> *combVec = &mix.comb;
-            if ((int)postVec->size() != bsz * seqlen * hcMult && mix.postData.Count(0) == (uint64_t)bsz * seqlen * hcMult) {
-                postHost = ReadFloatData(mix.postData);
-                postVec = &postHost;
-            }
-            if ((int)combVec->size() != bsz * seqlen * hcMult * hcMult &&
-                mix.combData.Count(0) == (uint64_t)bsz * seqlen * hcMult * hcMult) {
-                combHost = ReadFloatData(mix.combData);
-                combVec = &combHost;
-            }
-            if ((int)postVec->size() != bsz * seqlen * hcMult ||
-                (int)combVec->size() != bsz * seqlen * hcMult * hcMult) {
-                ErrorInFastLLM("DeepSeekV4HcPost error: invalid hc mix shape.\n");
-            }
-            std::vector<float> y((uint64_t)bsz * seqlen * hcMult * dim, 0.0f);
-            for (int t = 0; t < bsz * seqlen; t++) {
-                const float *xrow = xv.data() + (uint64_t)t * dim;
-                const float *rrow = rv.data() + (uint64_t)t * hcMult * dim;
-                const float *post = postVec->data() + (uint64_t)t * hcMult;
-                const float *comb = combVec->data() + (uint64_t)t * hcMult * hcMult;
-                for (int target = 0; target < hcMult; target++) {
-                    for (int d = 0; d < dim; d++) {
-                        double v = (double)post[target] * xrow[d];
-                        for (int src = 0; src < hcMult; src++) {
-                            v += (double)comb[src * hcMult + target] * rrow[(uint64_t)src * dim + d];
-                        }
-                        y[((uint64_t)t * hcMult + target) * dim + d] = (float)v;
-                    }
-                }
-            }
-            WriteFloatData(y, {bsz, seqlen, hcMult, dim}, output, x.dataType);
-        }
-
-        static bool RMSNormCudaIfAvailable(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
-#ifdef USE_CUDA
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_PREP") ||
-                weight.dataType != DataType::FLOAT32 || input.dims.empty()) {
-                return false;
-            }
-            if (input.dataType != DataType::FLOAT32 && input.dataType != DataType::FLOAT16 &&
-                input.dataType != DataType::BFLOAT16) {
-                return false;
-            }
-            if (dtype != DataType::FLOAT32 && dtype != DataType::FLOAT16 && dtype != DataType::BFLOAT16) {
-                return false;
-            }
-            weight.ToDevice(DataDevice::CUDA);
-            Data cudaInput;
-            const Data *cudaInputPtr = &input;
-            if (input.dataDevice != DataDevice::CUDA) {
-                if (!DeepSeekV4PreferCuda()) {
-                    return false;
-                }
-                cudaInput.CopyFrom(input);
-                cudaInput.ToDevice(DataDevice::CUDA);
-                cudaInputPtr = &cudaInput;
-            }
-            if (&input == &output && dtype != input.dataType) {
-                Data tmp;
-                if (!FastllmCudaDeepSeekV4RMSNorm(*cudaInputPtr, weight, eps, tmp, dtype)) {
-                    return false;
-                }
-                output.CopyFrom(tmp);
-                return true;
-            }
-            return FastllmCudaDeepSeekV4RMSNorm(*cudaInputPtr, weight, eps, output, dtype);
-#else
-            (void)input;
-            (void)weight;
-            (void)eps;
-            (void)output;
-            (void)dtype;
-            return false;
-#endif
-        }
-
         static void RMSNormReference(const Data &input, Data &weight, float eps, Data &output, DataType dtype) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4RMSNorm");
-            if (RMSNormCudaIfAvailable(input, weight, eps, output, dtype)) {
-                return;
-            }
-
-            auto xv = ReadFloatData(input);
-            auto wvPtr = ReadWeightFloatDataCached(weight);
-            const auto &wv = *wvPtr;
-            int dim = input.dims.back();
-            int rows = (int)(xv.size() / dim);
-            std::vector<float> y(xv.size());
-            for (int r = 0; r < rows; r++) {
-                const float *src = xv.data() + (uint64_t)r * dim;
-                double ss = 0.0;
-                for (int d = 0; d < dim; d++) {
-                    ss += (double)src[d] * src[d];
-                }
-                float scale = 1.0f / std::sqrt((float)(ss / dim) + eps);
-                for (int d = 0; d < dim; d++) {
-                    y[(uint64_t)r * dim + d] = src[d] * scale * wv[d];
-                }
-            }
-            WriteFloatData(y, input.dims, output, dtype);
+            RMSNorm(input, weight, eps, output);
+            ToDataType(output, dtype);
         }
 
         static std::vector<float> BuildInvFreqReference(int ropeDim, float base, int originalSeqLen,
@@ -857,63 +498,6 @@ namespace fastllm {
             }
         }
 
-        static void ScaleQReference(Data &q, float eps) {
-            auto qv = ReadFloatData(q);
-            int dim = q.dims.back();
-            int rows = (int)(qv.size() / dim);
-            for (int r = 0; r < rows; r++) {
-                float *row = qv.data() + (uint64_t)r * dim;
-                double ss = 0.0;
-                for (int d = 0; d < dim; d++) {
-                    ss += (double)row[d] * row[d];
-                }
-                float scale = 1.0f / std::sqrt((float)(ss / dim) + eps);
-                for (int d = 0; d < dim; d++) {
-                    row[d] *= scale;
-                }
-            }
-            WriteFloatData(qv, q.dims, q, DataType::BFLOAT16);
-        }
-
-        static bool ScaleQRotaryCudaIfAvailable(Data &q, int ropeDim, float ropeBase, int startPos,
-                                                int originalSeqLen, float ropeFactor,
-                                                int betaFast, int betaSlow, float eps) {
-#ifdef USE_CUDA
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_PREP") ||
-                q.dataDevice != DataDevice::CUDA || q.dims.size() != 4 ||
-                q.dataType != DataType::BFLOAT16) {
-                return false;
-            }
-            return FastllmCudaDeepSeekV4ScaleQRotary(q, ropeDim, ropeBase, startPos,
-                                                     originalSeqLen, ropeFactor, betaFast, betaSlow, eps);
-#else
-            (void)q;
-            (void)ropeDim;
-            (void)ropeBase;
-            (void)startPos;
-            (void)originalSeqLen;
-            (void)ropeFactor;
-            (void)betaFast;
-            (void)betaSlow;
-            (void)eps;
-            return false;
-#endif
-        }
-
-        static void ScaleQRotary(Data &q, float eps, int ropeDim, float ropeBase, int startPos,
-                                 int originalSeqLen, float ropeFactor, int betaFast, int betaSlow) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4ScaleQRotary");
-            if (ScaleQRotaryCudaIfAvailable(q, ropeDim, ropeBase, startPos, originalSeqLen,
-                                            ropeFactor, betaFast, betaSlow, eps)) {
-                return;
-            }
-            ScaleQReference(q, eps);
-            auto qv = ReadFloatData(q);
-            ApplyRotaryReference(qv, q.dims, ropeDim, ropeBase, startPos, false,
-                                 originalSeqLen, ropeFactor, betaFast, betaSlow);
-            WriteFloatData(qv, q.dims, q, DataType::BFLOAT16);
-        }
-
         static void ActQuantInplaceReference(std::vector<float> &x, const std::vector<int> &dims,
                                              int quantDim, int blockSize) {
             int dim = dims.back();
@@ -935,111 +519,48 @@ namespace fastllm {
             }
         }
 
-        static bool RotaryQuantCudaIfAvailable(Data &x, int ropeDim, float ropeBase, int startPos,
-                                               int originalSeqLen, float ropeFactor,
-                                               int betaFast, int betaSlow, int quantDim,
-                                               int blockSize, int posStep = 1) {
-#ifdef USE_CUDA
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_PREP") ||
-                x.dataDevice != DataDevice::CUDA || x.dataType != DataType::BFLOAT16 ||
-                x.dims.size() < 3 || x.dims.size() > 4) {
-                return false;
-            }
-            return FastllmCudaDeepSeekV4RotaryQuant(x, ropeDim, ropeBase, startPos,
-                                                   originalSeqLen, ropeFactor, betaFast, betaSlow,
-                                                   quantDim, blockSize, posStep);
-#else
-            (void)x;
-            (void)ropeDim;
-            (void)ropeBase;
-            (void)startPos;
-            (void)originalSeqLen;
-            (void)ropeFactor;
-            (void)betaFast;
-            (void)betaSlow;
-            (void)quantDim;
-            (void)blockSize;
-            (void)posStep;
-            return false;
-#endif
+        static void StoreWindowKVCache(const Data &kv, int bsz, int seqlen, int headDim,
+                                       int startPos, int windowSize, Data &windowKV) {
+            (void)bsz;
+            (void)seqlen;
+            (void)headDim;
+            Executor &executor = *((Executor*)GetExecutor());
+            executor.Run("DeepSeekV4StoreWindowKVCache", {
+                {"input", (Data*)&kv}, {"cache", &windowKV}
+            }, {}, {{"startPos", startPos}, {"windowSize", windowSize}});
         }
 
-        static void RotaryQuant(Data &x, int ropeDim, float ropeBase, int startPos,
-                                int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
-                                int quantDim, int blockSize, int posStep = 1) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4RotaryQuant");
-            if (RotaryQuantCudaIfAvailable(x, ropeDim, ropeBase, startPos, originalSeqLen,
-                                           ropeFactor, betaFast, betaSlow, quantDim, blockSize, posStep)) {
-                return;
-            }
-            auto xv = ReadFloatData(x);
-            ApplyRotaryReference(xv, x.dims, ropeDim, ropeBase, startPos, false,
-                                 originalSeqLen, ropeFactor, betaFast, betaSlow, posStep);
-            ActQuantInplaceReference(xv, x.dims, quantDim, blockSize);
-            WriteFloatData(xv, x.dims, x, DataType::BFLOAT16);
+        static void UpdateWindowKVCache(const Data &kv, int bsz, int headDim,
+                                        int startPos, int windowSize, Data &windowKV) {
+            (void)bsz;
+            (void)headDim;
+            Executor &executor = *((Executor*)GetExecutor());
+            executor.Run("DeepSeekV4UpdateWindowKVCache", {
+                {"input", (Data*)&kv}, {"cache", &windowKV}
+            }, {}, {{"startPos", startPos}, {"windowSize", windowSize}});
         }
 
-        static void StoreWindowKVCache(const std::vector<float> &kv, int bsz, int seqlen, int headDim,
-                                       int startPos, int windowSize, std::vector<float> &windowKV) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4KVCache");
-            windowKV.assign((uint64_t)bsz * windowSize * headDim, 0.0f);
-            if (startPos == 0) {
-                if (seqlen <= windowSize) {
-                    for (int b = 0; b < bsz; b++) {
-                        memcpy(windowKV.data() + (uint64_t)b * windowSize * headDim,
-                               kv.data() + (uint64_t)b * seqlen * headDim,
-                               (uint64_t)seqlen * headDim * sizeof(float));
-                    }
-                } else {
-                    int cutoff = seqlen % windowSize;
-                    int first = windowSize - cutoff;
-                    for (int b = 0; b < bsz; b++) {
-                        const float *src = kv.data() + ((uint64_t)b * seqlen + seqlen - windowSize) * headDim;
-                        memcpy(windowKV.data() + ((uint64_t)b * windowSize + cutoff) * headDim,
-                               src, (uint64_t)first * headDim * sizeof(float));
-                        if (cutoff > 0) {
-                            memcpy(windowKV.data() + (uint64_t)b * windowSize * headDim,
-                                   src + (uint64_t)first * headDim,
-                                   (uint64_t)cutoff * headDim * sizeof(float));
-                        }
-                    }
-                }
-                return;
-            }
-            for (int b = 0; b < bsz; b++) {
-                memcpy(windowKV.data() + ((uint64_t)b * windowSize + (startPos % windowSize)) * headDim,
-                       kv.data() + (uint64_t)b * headDim,
-                       (uint64_t)headDim * sizeof(float));
-            }
-        }
-
-        static void UpdateWindowKVCache(const std::vector<float> &kv, int bsz, int headDim,
-                                        int startPos, int windowSize, std::vector<float> &windowKV) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4KVCache");
-            int seqlen = (int)(kv.size() / ((uint64_t)bsz * headDim));
-            for (int b = 0; b < bsz; b++) {
-                for (int s = 0; s < seqlen; s++) {
-                    memcpy(windowKV.data() + ((uint64_t)b * windowSize + ((startPos + s) % windowSize)) * headDim,
-                           kv.data() + ((uint64_t)b * seqlen + s) * headDim,
-                           (uint64_t)headDim * sizeof(float));
-                }
-            }
-        }
-
-        static int BuildWindowKVPrefixData(const std::vector<float> &windowKV, int bsz, int headDim,
+        static int BuildWindowKVPrefixData(const Data &windowKV, int bsz, int headDim,
                                            int startPos, int windowSize, Data &output) {
             int prefixLen = std::min(windowSize, startPos);
-            if (prefixLen <= 0 || windowKV.empty()) {
+            if (prefixLen <= 0 || !HasTensorData(windowKV)) {
                 return 0;
             }
             ScopedExecutorProfiler executorProfile("DeepSeekV4KVCache");
+#ifdef USE_CUDA
+            if (DeepSeekV4PreferCuda() && windowKV.dataDevice == DataDevice::CUDA &&
+                FastllmCudaDeepSeekV4BuildWindowKVPrefix(windowKV, startPos, windowSize, prefixLen, output)) {
+                return prefixLen;
+            }
+#endif
+            auto cached = ReadFloatData(windowKV);
             std::vector<float> prefix((uint64_t)bsz * prefixLen * headDim);
             int firstPos = startPos - prefixLen;
             for (int b = 0; b < bsz; b++) {
                 for (int s = 0; s < prefixLen; s++) {
                     int srcSlot = (firstPos + s) % windowSize;
                     memcpy(prefix.data() + ((uint64_t)b * prefixLen + s) * headDim,
-                           windowKV.data() + ((uint64_t)b * windowSize + srcSlot) * headDim,
+                           cached.data() + ((uint64_t)b * windowSize + srcSlot) * headDim,
                            (uint64_t)headDim * sizeof(float));
                 }
             }
@@ -1048,68 +569,51 @@ namespace fastllm {
         }
 
         static void ComputeCompressorRaw(WeightMap &weight, const std::string &prefix, const Data &x,
-                                         std::vector<float> &kv, std::vector<float> &score) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4CompressorRaw");
-            Data kvData, scoreData;
-            Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kvData);
-            Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), scoreData);
-            kv = ReadFloatData(kvData);
-            score = ReadFloatData(scoreData);
+                                         Data &kv, Data &score) {
+            Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kv);
+            Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), score);
         }
 
-        static void AppendCompressorRaw(const std::vector<float> &kv, const std::vector<float> &score,
+        static void AppendCompressorRaw(const Data &kv, const Data &score,
                                         int bsz, int seqlen, int wideDim,
-                                        std::vector<float> &allKV, std::vector<float> &allScore) {
+                                        Data &allKV, Data &allScore) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4CompressorAppend");
-            int oldLen = allKV.empty() ? 0 : (int)(allKV.size() / ((uint64_t)bsz * wideDim));
-            if (bsz == 1) {
-                uint64_t oldSize = (uint64_t)oldLen * wideDim;
-                uint64_t addSize = (uint64_t)seqlen * wideDim;
-                allKV.resize(oldSize + addSize);
-                allScore.resize(oldSize + addSize);
-                memcpy(allKV.data() + oldSize, kv.data(), addSize * sizeof(float));
-                memcpy(allScore.data() + oldSize, score.data(), addSize * sizeof(float));
+            if (seqlen <= 0 || wideDim <= 0 || kv.dims.size() != 3 || score.dims != kv.dims) {
                 return;
             }
-            std::vector<float> nextKV((uint64_t)bsz * (oldLen + seqlen) * wideDim);
-            std::vector<float> nextScore((uint64_t)bsz * (oldLen + seqlen) * wideDim);
-            for (int b = 0; b < bsz; b++) {
-                if (oldLen > 0) {
-                    memcpy(nextKV.data() + (uint64_t)b * (oldLen + seqlen) * wideDim,
-                           allKV.data() + (uint64_t)b * oldLen * wideDim,
-                           (uint64_t)oldLen * wideDim * sizeof(float));
-                    memcpy(nextScore.data() + (uint64_t)b * (oldLen + seqlen) * wideDim,
-                           allScore.data() + (uint64_t)b * oldLen * wideDim,
-                           (uint64_t)oldLen * wideDim * sizeof(float));
-                }
-                memcpy(nextKV.data() + ((uint64_t)b * (oldLen + seqlen) + oldLen) * wideDim,
-                       kv.data() + (uint64_t)b * seqlen * wideDim,
-                       (uint64_t)seqlen * wideDim * sizeof(float));
-                memcpy(nextScore.data() + ((uint64_t)b * (oldLen + seqlen) + oldLen) * wideDim,
-                       score.data() + (uint64_t)b * seqlen * wideDim,
-                       (uint64_t)seqlen * wideDim * sizeof(float));
+            if (!HasTensorData(allKV)) {
+                Copy(kv, allKV);
+                Copy(score, allScore);
+                EnsureCompressorRawCapacity(allKV, kv.dims[1]);
+                EnsureCompressorRawCapacity(allScore, score.dims[1]);
+                return;
             }
-            allKV.swap(nextKV);
-            allScore.swap(nextScore);
+            int oldLen = GetDataSeqLen(allKV, bsz, wideDim);
+            if (oldLen <= 0 || GetDataSeqLen(allScore, bsz, wideDim) != oldLen) {
+                Copy(kv, allKV);
+                Copy(score, allScore);
+                EnsureCompressorRawCapacity(allKV, kv.dims[1]);
+                EnsureCompressorRawCapacity(allScore, score.dims[1]);
+                return;
+            }
+            EnsureCompressorRawCapacity(allKV, oldLen + kv.dims[1]);
+            EnsureCompressorRawCapacity(allScore, oldLen + score.dims[1]);
+            CatDirect(allKV, kv, 1);
+            CatDirect(allScore, score, 1);
         }
 
-        static int GetCompressorRawLen(const std::vector<float> &raw, int bsz, int wideDim) {
-            if (bsz <= 0 || wideDim <= 0 || raw.empty()) {
-                return 0;
-            }
-            return (int)(raw.size() / ((uint64_t)bsz * wideDim));
+        static int GetCompressorRawLen(const Data &raw, int bsz, int wideDim) {
+            return GetDataSeqLen(raw, bsz, wideDim);
         }
 
         static void TrimCompressorRawCache(int bsz, int totalLen, int compressRatio, int wideDim,
-                                           int compressedBlocks, std::vector<float> &allKV,
-                                           std::vector<float> &allScore, int &rawTokenBase) {
+                                           int compressedBlocks, Data &allKV,
+                                           Data &allScore, int &rawTokenBase) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4CompressorTrim");
             int oldLen = GetCompressorRawLen(allKV, bsz, wideDim);
-            if (oldLen <= 0 || allScore.size() != allKV.size()) {
-                allKV.clear();
-                allScore.clear();
-                std::vector<float>().swap(allKV);
-                std::vector<float>().swap(allScore);
+            if (oldLen <= 0 || GetCompressorRawLen(allScore, bsz, wideDim) != oldLen) {
+                ResetData(allKV);
+                ResetData(allScore);
                 rawTokenBase = std::max(0, totalLen);
                 return;
             }
@@ -1126,27 +630,18 @@ namespace fastllm {
 
             int newLen = rawEnd - retainStart;
             if (newLen <= 0) {
-                allKV.clear();
-                allScore.clear();
-                std::vector<float>().swap(allKV);
-                std::vector<float>().swap(allScore);
+                ResetData(allKV);
+                ResetData(allScore);
                 rawTokenBase = retainStart;
                 return;
             }
 
-            std::vector<float> nextKV((uint64_t)bsz * newLen * wideDim);
-            std::vector<float> nextScore((uint64_t)bsz * newLen * wideDim);
             int dropLen = retainStart - rawTokenBase;
-            for (int b = 0; b < bsz; b++) {
-                memcpy(nextKV.data() + (uint64_t)b * newLen * wideDim,
-                       allKV.data() + ((uint64_t)b * oldLen + dropLen) * wideDim,
-                       (uint64_t)newLen * wideDim * sizeof(float));
-                memcpy(nextScore.data() + (uint64_t)b * newLen * wideDim,
-                       allScore.data() + ((uint64_t)b * oldLen + dropLen) * wideDim,
-                       (uint64_t)newLen * wideDim * sizeof(float));
-            }
-            allKV.swap(nextKV);
-            allScore.swap(nextScore);
+            Data nextKV, nextScore;
+            Split(allKV, 1, dropLen, oldLen, nextKV);
+            Split(allScore, 1, dropLen, oldLen, nextScore);
+            CopyTensorData(allKV, nextKV);
+            CopyTensorData(allScore, nextScore);
             rawTokenBase = retainStart;
         }
 
@@ -1290,15 +785,58 @@ namespace fastllm {
             }
         }
 
+        static bool ComputeCompressedKVRangeData(WeightMap &weight, const std::string &prefix,
+                                                 const Data &kv, const Data &score,
+                                                 int bsz, int rawTokenBase, int rawLen,
+                                                 int blockStart, int blockCount,
+                                                 int compressRatio, int headDim, int wideDim, bool overlap,
+                                                 Data &compressed) {
+#ifdef USE_CUDA
+            if (DeepSeekV4PreferCuda() && kv.dataDevice == DataDevice::CUDA &&
+                score.dataDevice == DataDevice::CUDA) {
+                Data ape, apeCuda;
+                ToDataType(weight[prefix + ".ape"], ape, DataType::FLOAT32);
+                apeCuda.CopyFrom(ape);
+                apeCuda.ToDevice(DataDevice::CUDA);
+                if (FastllmCudaDeepSeekV4BuildCompressedKV(
+                        kv, score, apeCuda, rawTokenBase, rawLen, blockStart, blockCount,
+                        compressRatio, headDim, wideDim, overlap, compressed)) {
+                    return true;
+                }
+            }
+#endif
+            auto kvValues = ReadFloatData(kv);
+            auto scoreValues = ReadFloatData(score);
+            auto apePtr = ReadWeightFloatDataCached(weight[prefix + ".ape"]);
+            std::vector<float> compressedValues;
+            ComputeCompressedKVRangeCpu(kvValues, scoreValues, *apePtr, bsz, rawTokenBase, rawLen,
+                                        blockStart, blockCount, compressRatio, headDim, wideDim,
+                                        overlap, compressedValues);
+            WriteFloatData(compressedValues, {bsz, blockCount, headDim}, compressed, DataType::FLOAT32);
+            return true;
+        }
+
         static void FinalizeCompressedKVRows(WeightMap &weight, const std::string &prefix,
-                                             std::vector<float> &compressed, int bsz, int blockStart,
-                                             int blockCount, int compressRatio, int headDim,
+                                             const Data &compressedData, int blockStart,
+                                             int compressRatio, int headDim,
                                              int ropeDim, float ropeBase, float ropeFactor,
                                              int betaFast, int betaSlow, int originalSeqLen,
                                              Data &output) {
-            Data compressedData, normed;
-            WriteFloatData(compressed, {bsz, blockCount, headDim}, compressedData, DataType::BFLOAT16);
-            RMSNormReference(compressedData, weight[prefix + ".norm.weight"], 1e-6f, normed, DataType::BFLOAT16);
+            Data compressedForNorm, normed;
+            ToDataType(compressedData, compressedForNorm, DataType::BFLOAT16);
+            if (compressedData.dataDevice == DataDevice::CUDA) {
+                compressedForNorm.ToDevice(DataDevice::CUDA);
+            }
+            RMSNormReference(compressedForNorm, weight[prefix + ".norm.weight"], 1e-6f, normed, DataType::BFLOAT16);
+#ifdef USE_CUDA
+            if (normed.dataDevice == DataDevice::CUDA &&
+                FastllmCudaDeepSeekV4RotaryQuant(normed, ropeDim, ropeBase, blockStart * compressRatio,
+                                                 originalSeqLen, ropeFactor, betaFast, betaSlow,
+                                                 headDim - ropeDim, 64, compressRatio)) {
+                CopyTensorData(output, normed);
+                return;
+            }
+#endif
             auto out = ReadFloatData(normed);
             ApplyRotaryReference(out, normed.dims, ropeDim, ropeBase, blockStart * compressRatio, false,
                                  originalSeqLen, ropeFactor, betaFast, betaSlow, compressRatio);
@@ -1417,52 +955,37 @@ namespace fastllm {
                    (data.cpuData != nullptr || data.cudaData != nullptr);
         }
 
-        static bool EnsureCompressedKVOnCpuFromCuda(DeepSeekV4DecodeLayerCache &cache) {
-            if (HasCompressedKVData(cache.compressedKV)) {
-                if (cache.compressedKV.dataDevice != DataDevice::CPU) {
-                    cache.compressedKV.ToDevice(DataDevice::CPU);
-                }
-                return true;
-            }
-            if (!HasCompressedKVData(cache.compressedKVCuda)) {
+        static bool EnsureCompressedKVOnCpu(DeepSeekV4DecodeLayerCache &cache) {
+            if (!HasCompressedKVData(cache.compressedKV)) {
                 return false;
             }
-            ResetData(cache.compressedKV);
-            cache.compressedKV.CopyFrom(cache.compressedKVCuda);
             cache.compressedKV.ToDevice(DataDevice::CPU);
             return HasCompressedKVData(cache.compressedKV);
         }
 
-        static bool MoveCompressedKVToCuda(DeepSeekV4DecodeLayerCache &cache, bool releaseCpu) {
+        static bool EnsureCompressedKVOnCuda(DeepSeekV4DecodeLayerCache &cache) {
 #ifdef USE_CUDA
             if (!DeepSeekV4PreferCuda()) {
                 return false;
             }
             if (!HasCompressedKVData(cache.compressedKV)) {
-                return HasCompressedKVData(cache.compressedKVCuda);
+                return false;
             }
-            ResetData(cache.compressedKVCuda);
-            cache.compressedKVCuda.CopyFrom(cache.compressedKV);
-            cache.compressedKVCuda.SetKVCache();
-            cache.compressedKVCuda.ToDevice(DataDevice::CUDA);
-            if (releaseCpu) {
-                ResetData(cache.compressedKV);
-            }
-            return HasCompressedKVData(cache.compressedKVCuda);
+            cache.compressedKV.SetKVCache();
+            cache.compressedKV.ToDevice(DataDevice::CUDA);
+            return HasCompressedKVData(cache.compressedKV);
 #else
             (void)cache;
-            (void)releaseCpu;
             return false;
 #endif
         }
 
         static bool BuildCompressedKVFromRaw(WeightMap &weight, const std::string &prefix,
-                                             const std::vector<float> &kv, const std::vector<float> &score,
+                                             const Data &kv, const Data &score,
                                              int bsz, int rawTokenBase, int totalLen, int compressRatio,
                                              int headDim, int ropeDim, float ropeBase,
                                              float ropeFactor, int betaFast, int betaSlow,
-                                             int originalSeqLen, Data &output,
-                                             Data *cudaOutput = nullptr, bool preferCudaOutput = false) {
+                                             int originalSeqLen, Data &output, bool preferCudaOutput = false) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4BuildCompressedKV");
             if (compressRatio <= 0 || totalLen < compressRatio) {
                 return false;
@@ -1476,26 +999,19 @@ namespace fastllm {
             int coff = overlap ? 2 : 1;
             int wideDim = coff * headDim;
             int rawLen = GetCompressorRawLen(kv, bsz, wideDim);
-            if (rawLen <= 0 || score.size() != kv.size()) {
+            if (rawLen <= 0 || GetCompressorRawLen(score, bsz, wideDim) != rawLen) {
                 return false;
             }
-            auto apePtr = ReadWeightFloatDataCached(weight[prefix + ".ape"]);
-            const auto &ape = *apePtr;
 
-            int reusableBlocks = 0;
-            bool reusableFromCuda = false;
 #ifdef USE_CUDA
-            if (preferCudaOutput && cudaOutput != nullptr) {
-                reusableBlocks = GetReusableCompressedBlocks(*cudaOutput, bsz, blocks, headDim);
-                reusableFromCuda = reusableBlocks > 0;
+            if (preferCudaOutput && HasCompressedKVData(output) && output.dataDevice != DataDevice::CUDA) {
+                output.SetKVCache();
+                output.ToDevice(DataDevice::CUDA);
             }
 #else
-            (void)cudaOutput;
             (void)preferCudaOutput;
 #endif
-            if (reusableBlocks <= 0) {
-                reusableBlocks = GetReusableCompressedBlocks(output, bsz, blocks, headDim);
-            }
+            int reusableBlocks = GetReusableCompressedBlocks(output, bsz, blocks, headDim);
             if (reusableBlocks == blocks) {
                 return true;
             }
@@ -1510,50 +1026,14 @@ namespace fastllm {
             }
 
             int addBlocks = blocks - reusableBlocks;
-            std::vector<float> compressed;
-            ComputeCompressedKVRangeCpu(kv, score, ape, bsz, rawTokenBase, rawLen,
-                                        reusableBlocks, addBlocks,
-                                        compressRatio, headDim, wideDim, overlap, compressed);
-
-            Data newRows;
-            FinalizeCompressedKVRows(weight, prefix, compressed, bsz, reusableBlocks, addBlocks,
-                                     compressRatio, headDim, ropeDim, ropeBase, ropeFactor,
-                                     betaFast, betaSlow, originalSeqLen, newRows);
-#ifdef USE_CUDA
-            if (preferCudaOutput && cudaOutput != nullptr &&
-                AppendCompressedKVRowsCuda(*cudaOutput, newRows, bsz, reusableBlocks, addBlocks, headDim)) {
-                if (HasCompressedKVData(output)) {
-                    ResetData(output);
-                }
-                return true;
-            }
-            if (reusableFromCuda && !HasCompressedKVData(output)) {
-                return false;
-            }
-#endif
-            AppendCompressedKVRows(output, newRows, bsz, reusableBlocks, addBlocks, headDim);
+            Data ape;
+            ToDataType(weight[prefix + ".ape"], ape, DataType::FLOAT32);
+            DeepSeekV4BuildCompressedKVFromRaw(kv, score, ape, weight[prefix + ".norm.weight"],
+                                               rawTokenBase, rawLen, reusableBlocks, addBlocks,
+                                               compressRatio, headDim, ropeDim, ropeBase, ropeFactor,
+                                               betaFast, betaSlow, originalSeqLen, overlap,
+                                               preferCudaOutput, output);
             return true;
-        }
-
-        static void BuildDecodeKVData(const std::vector<float> &windowKV, const Data &compressedKV,
-                                      int bsz, int windowSize, int compressedCount, int headDim,
-                                      Data &output) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4BuildDecodeKV");
-            std::vector<float> y((uint64_t)bsz * (windowSize + compressedCount) * headDim, 0.0f);
-            for (int b = 0; b < bsz; b++) {
-                memcpy(y.data() + (uint64_t)b * (windowSize + compressedCount) * headDim,
-                       windowKV.data() + (uint64_t)b * windowSize * headDim,
-                       (uint64_t)windowSize * headDim * sizeof(float));
-            }
-            if (compressedCount > 0) {
-                auto cv = ReadFloatData(compressedKV);
-                for (int b = 0; b < bsz; b++) {
-                    memcpy(y.data() + ((uint64_t)b * (windowSize + compressedCount) + windowSize) * headDim,
-                           cv.data() + (uint64_t)b * compressedCount * headDim,
-                           (uint64_t)compressedCount * headDim * sizeof(float));
-                }
-            }
-            WriteFloatData(y, {bsz, windowSize + compressedCount, headDim}, output, DataType::BFLOAT16);
         }
 
         static void SparseAttentionReference(Data &q, Data &kv, Data &attnSink, int windowSize,
@@ -1656,8 +1136,7 @@ namespace fastllm {
         }
 
         static void SparseAttentionDecodeCachedReference(Data &q,
-                                                         const std::vector<float> &windowKV,
-                                                         const Data *windowKVData,
+                                                         const Data &windowKV,
                                                          const Data &compressedKV,
                                                          Data &attnSink,
                                                          int windowSize, int startPos, int compressedCount,
@@ -1666,7 +1145,7 @@ namespace fastllm {
                                                          float ropeFactor = 1.0f, int betaFast = 32, int betaSlow = 1) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4SparseDecodeCached");
 #ifdef USE_CUDA
-            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") && q.dims[1] == 1) {
+            if (q.dims[1] == 1) {
                 Data qCuda, compressedCuda;
                 const Data *qForCuda = &q;
                 if (q.dataDevice != DataDevice::CUDA) {
@@ -1681,7 +1160,7 @@ namespace fastllm {
                     compressedForCuda = &compressedCuda;
                 }
                 attnSink.ToDevice(DataDevice::CUDA);
-                if (FastllmCudaDeepSeekV4SparseAttentionDecodeCached(*qForCuda, windowKVData, windowKV.data(),
+                if (FastllmCudaDeepSeekV4SparseAttentionDecodeCached(*qForCuda, windowKV,
                                                                      *compressedForCuda,
                                                                      attnSink, windowSize, startPos,
                                                                      compressedCount, ropeDim, ropeBase,
@@ -1689,25 +1168,10 @@ namespace fastllm {
                                                                      betaFast, betaSlow, softmaxScale, output)) {
                     return;
                 }
-                if (windowKVData != nullptr && windowKVData->dataDevice == DataDevice::CUDA) {
-                    // windowKVData on CUDA may be out of sync with the CPU windowKV vector
-                    // (e.g. when an earlier decode step updated only the CPU side).
-                    // Move to CPU so the retry below re-uploads the fresh CPU data.
-                    const_cast<Data *>(windowKVData)->ToDevice(DataDevice::CPU);
-                    // Retry with the now-CPU windowKVData — the wrapper will fall through
-                    // to the CPU windowKV pointer and upload it to a temp CUDA buffer.
-                    if (FastllmCudaDeepSeekV4SparseAttentionDecodeCached(*qForCuda, windowKVData, windowKV.data(),
-                                                                         *compressedForCuda,
-                                                                         attnSink, windowSize, startPos,
-                                                                         compressedCount, ropeDim, ropeBase,
-                                                                         originalSeqLen, ropeFactor,
-                                                                         betaFast, betaSlow, softmaxScale, output)) {
-                        return;
-                    }
-                }
             }
 #endif
             auto qv = ReadFloatData(q);
+            auto windowValues = ReadFloatData(windowKV);
             std::vector<float> compressed;
             if (compressedCount > 0) {
                 compressed = ReadFloatData(compressedKV);
@@ -1736,7 +1200,7 @@ namespace fastllm {
 
             auto getKVRow = [&](int b, int idx) -> const float* {
                 if (idx < windowSize) {
-                    return windowKV.data() + ((uint64_t)b * windowSize + idx) * dim;
+                    return windowValues.data() + ((uint64_t)b * windowSize + idx) * dim;
                 }
                 return compressed.data() + ((uint64_t)b * compressedCount + (idx - windowSize)) * dim;
             };
@@ -1794,20 +1258,17 @@ namespace fastllm {
             int blocks = cutoff / compressRatio;
             bool overlap = (compressRatio == 4);
             int coff = overlap ? 2 : 1;
-
-            Data kvData, scoreData;
-            Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kvData);
-            Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), scoreData);
-            auto kv = ReadFloatData(kvData);
-            auto score = ReadFloatData(scoreData);
-            auto apePtr = ReadWeightFloatDataCached(weight[prefix + ".ape"]);
-            const auto &ape = *apePtr;
+            Data kv, score;
+            Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kv);
+            Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), score);
 
             int wideDim = coff * headDim;
-            std::vector<float> compressed;
-            ComputeCompressedKVRangeCpu(kv, score, ape, bsz, 0, seqlen, 0, blocks,
-                                        compressRatio, headDim, wideDim, overlap, compressed);
-            FinalizeCompressedKVRows(weight, prefix, compressed, bsz, 0, blocks,
+            Data compressed;
+            if (!ComputeCompressedKVRangeData(weight, prefix, kv, score, bsz, 0, seqlen, 0, blocks,
+                                              compressRatio, headDim, wideDim, overlap, compressed)) {
+                return false;
+            }
+            FinalizeCompressedKVRows(weight, prefix, compressed, 0,
                                      compressRatio, headDim, ropeDim, ropeBase, ropeFactor,
                                      betaFast, betaSlow, originalSeqLen, output);
             return true;
@@ -1815,6 +1276,12 @@ namespace fastllm {
 
         static void ConcatSeqReference(const Data &a, const Data &b, Data &output) {
             ScopedExecutorProfiler executorProfile("DeepSeekV4ConcatSeq");
+            if (a.dims.size() == 3 && b.dims.size() == 3 &&
+                a.dims[0] == b.dims[0] && a.dims[2] == b.dims[2] &&
+                a.dataType == b.dataType) {
+                Cat(a, b, 1, output);
+                return;
+            }
             auto av = ReadFloatData(a);
             auto bv = ReadFloatData(b);
             int bsz = a.dims[0], aSeq = a.dims[1], bSeq = b.dims[1], dim = a.dims[2];
@@ -1828,158 +1295,6 @@ namespace fastllm {
                        (uint64_t)bSeq * dim * sizeof(float));
             }
             WriteFloatData(y, {bsz, aSeq + bSeq, dim}, output, a.dataType);
-        }
-
-        struct WoAReferenceOp : MultiThreadBaseOp {
-            const std::vector<float> *ov;
-            const std::vector<float> *wv;
-            float *y;
-            int st, end;
-            int bsz, seqlen, heads, headDim, groups, oRank, headsPerGroup, groupDim;
-
-            WoAReferenceOp(const std::vector<float> *ov, const std::vector<float> *wv, float *y,
-                           int st, int end, int bsz, int seqlen, int heads, int headDim,
-                           int groups, int oRank)
-                : ov(ov), wv(wv), y(y), st(st), end(end), bsz(bsz), seqlen(seqlen),
-                  heads(heads), headDim(headDim), groups(groups), oRank(oRank) {
-                headsPerGroup = heads / groups;
-                groupDim = headsPerGroup * headDim;
-            }
-
-            void Run() override {
-                const float *ovData = ov->data();
-                const float *wvData = wv->data();
-                for (int idx = st; idx < end; idx++) {
-                    int r = idx % oRank;
-                    int tmp = idx / oRank;
-                    int g = tmp % groups;
-                    tmp /= groups;
-                    int s = tmp % seqlen;
-                    int b = tmp / seqlen;
-                    const float *w = wvData + ((uint64_t)g * oRank + r) * groupDim;
-                    double v = 0.0;
-                    int d = 0;
-                    for (int hh = 0; hh < headsPerGroup; hh++) {
-                        const float *src = ovData + (((uint64_t)b * seqlen + s) * heads +
-                                                     g * headsPerGroup + hh) * headDim;
-                        for (int localD = 0; localD < headDim; localD++, d++) {
-                            v += (double)src[localD] * w[d];
-                        }
-                    }
-                    y[idx] = (float)v;
-                }
-            }
-        };
-
-        static void WoAReference(Data &o, Data &woA, int groups, int oRank, Data &output) {
-            auto ov = ReadFloatData(o);
-            auto wvPtr = ReadWeightFloatDataCached(woA);
-            const auto &wv = *wvPtr;
-            int bsz = o.dims[0], seqlen = o.dims[1], heads = o.dims[2], headDim = o.dims[3];
-            int headsPerGroup = heads / groups;
-            int groupDim = headsPerGroup * headDim;
-            std::vector<float> y((uint64_t)bsz * seqlen * groups * oRank, 0.0f);
-            int total = bsz * seqlen * groups * oRank;
-            auto *pool = GetAlivePool();
-            int threadNum = std::min((int)pool->threads.size(), total);
-            if (threadNum <= 1 || total < 1024) {
-                WoAReferenceOp(&ov, &wv, y.data(), 0, total, bsz, seqlen, heads, headDim, groups, oRank).Run();
-            } else {
-                std::vector<WoAReferenceOp*> ops;
-                int per = total / threadNum;
-                int cur = 0;
-                for (int i = 0; i < threadNum; i++) {
-                    int end = (i == threadNum - 1) ? total : cur + per;
-                    ops.push_back(new WoAReferenceOp(&ov, &wv, y.data(), cur, end,
-                                                     bsz, seqlen, heads, headDim, groups, oRank));
-                    cur = end;
-                }
-                for (int i = 0; i < (int)ops.size(); i++) {
-                    pool->PushOp(i, ops[i]);
-                }
-                for (int i = 0; i < (int)ops.size(); i++) {
-                    pool->Wait(i);
-                    delete ops[i];
-                }
-            }
-            WriteFloatData(y, {bsz, seqlen, groups * oRank}, output, DataType::BFLOAT16);
-        }
-
-        static bool WoACudaIfAvailable(Data &o, Data &woA, int groups, int oRank, Data &output) {
-#ifdef USE_CUDA
-            if (EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_WOA_HCPOST")) {
-                return false;
-            }
-            if (o.dims.size() != 4 || groups <= 0 || oRank <= 0) {
-                return false;
-            }
-            int heads = o.dims[2], headDim = o.dims[3];
-            if (heads % groups != 0 || woA.Count(0) != (uint64_t)groups * oRank * (heads / groups) * headDim) {
-                return false;
-            }
-            o.ToDevice(DataDevice::CUDA);
-            woA.ToDevice(DataDevice::CUDA);
-            return FastllmCudaDeepSeekV4WoA(o, woA, groups, oRank, output);
-#else
-            (void)o;
-            (void)woA;
-            (void)groups;
-            (void)oRank;
-            (void)output;
-            return false;
-#endif
-        }
-
-        static void WoA(Data &o, Data &woA, int groups, int oRank, Data &output) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4WoA");
-            if (WoACudaIfAvailable(o, woA, groups, oRank, output)) {
-                return;
-            }
-            WoAReference(o, woA, groups, oRank, output);
-        }
-
-        static void RunExpertReference(WeightMap &weight, const std::string &prefix, const Data &x,
-                                       float routeWeight, float swigluLimit, std::vector<float> &accum) {
-            Data gate, up, gateup;
-            int interDim = 0;
-            if (weight.weight.find(prefix + ".gateup.weight") != weight.weight.end()) {
-                Linear((Data&)x, weight[prefix + ".gateup.weight"], Data(), gateup);
-                auto gv = ReadFloatData(gateup);
-                interDim = gateup.dims.back() / 2;
-                std::vector<float> act(interDim);
-                for (int i = 0; i < interDim; i++) {
-                    float g = gv[i];
-                    float u = gv[interDim + i];
-                    if (swigluLimit > 0.0f) {
-                        g = std::min(g, swigluLimit);
-                        u = std::max(-swigluLimit, std::min(u, swigluLimit));
-                    }
-                    act[i] = (g * SigmoidFloat(g)) * u * routeWeight;
-                }
-                WriteFloatData(act, {1, interDim}, gate, DataType::BFLOAT16);
-            } else {
-                Linear((Data&)x, weight[prefix + ".w1.weight"], Data(), gate);
-                Linear((Data&)x, weight[prefix + ".w3.weight"], Data(), up);
-                auto gv = ReadFloatData(gate);
-                auto uv = ReadFloatData(up);
-                interDim = (int)gv.size();
-                std::vector<float> act(interDim);
-                for (int i = 0; i < interDim; i++) {
-                    float g = gv[i], u = uv[i];
-                    if (swigluLimit > 0.0f) {
-                        g = std::min(g, swigluLimit);
-                        u = std::max(-swigluLimit, std::min(u, swigluLimit));
-                    }
-                    act[i] = (g * SigmoidFloat(g)) * u * routeWeight;
-                }
-                WriteFloatData(act, {1, interDim}, gate, DataType::BFLOAT16);
-            }
-            Data down;
-            Linear(gate, weight[prefix + ".w2.weight"], Data(), down);
-            auto dv = ReadFloatData(down);
-            for (int i = 0; i < (int)accum.size(); i++) {
-                accum[i] += dv[i];
-            }
         }
 
         static void BuildMoERoutingData(WeightMap &weight, const std::string &prefix, const Data &x,
@@ -2185,6 +1500,62 @@ namespace fastllm {
                !EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_DISABLE_CHUNK_SPLIT");
     }
 
+    DeepSeekV4DecodeLayerCache::DeepSeekV4DecodeLayerCache(const DeepSeekV4DecodeLayerCache &other) {
+        *this = other;
+    }
+
+    DeepSeekV4DecodeLayerCache &DeepSeekV4DecodeLayerCache::operator=(const DeepSeekV4DecodeLayerCache &other) {
+        if (this == &other) {
+            return *this;
+        }
+        initialized = other.initialized;
+        bsz = other.bsz;
+        totalLen = other.totalLen;
+        headDim = other.headDim;
+        windowSize = other.windowSize;
+        compressRatio = other.compressRatio;
+        compressorWideDim = other.compressorWideDim;
+        compressorRawTokenBase = other.compressorRawTokenBase;
+        compressedBlocks = other.compressedBlocks;
+        compressedTokenBase = other.compressedTokenBase;
+        rawTailStartPos = other.rawTailStartPos;
+        CopyTensorData(windowKV, other.windowKV);
+        CopyTensorData(compressorKVRaw, other.compressorKVRaw);
+        CopyTensorData(compressorScoreRaw, other.compressorScoreRaw);
+        CopyTensorData(compressedKV, other.compressedKV);
+        CopyTensorData(compressorTailKV, other.compressorTailKV);
+        CopyTensorData(compressorTailScore, other.compressorTailScore);
+        return *this;
+    }
+
+    DeepSeekV4HistoryLayerCache::DeepSeekV4HistoryLayerCache(const DeepSeekV4HistoryLayerCache &other) {
+        *this = other;
+    }
+
+    DeepSeekV4HistoryLayerCache &DeepSeekV4HistoryLayerCache::operator=(const DeepSeekV4HistoryLayerCache &other) {
+        if (this == &other) {
+            return *this;
+        }
+        initialized = other.initialized;
+        bsz = other.bsz;
+        totalLen = other.totalLen;
+        headDim = other.headDim;
+        windowSize = other.windowSize;
+        compressRatio = other.compressRatio;
+        compressorWideDim = other.compressorWideDim;
+        compressorRawTokenBase = other.compressorRawTokenBase;
+        compressedBlocks = other.compressedBlocks;
+        compressedTokenBase = other.compressedTokenBase;
+        rawTailStartPos = other.rawTailStartPos;
+        CopyTensorData(windowKV, other.windowKV);
+        CopyTensorData(compressorKVRaw, other.compressorKVRaw);
+        CopyTensorData(compressorScoreRaw, other.compressorScoreRaw);
+        CopyTensorData(compressedKV, other.compressedKV);
+        CopyTensorData(compressorTailKV, other.compressorTailKV);
+        CopyTensorData(compressorTailScore, other.compressorTailScore);
+        return *this;
+    }
+
     void DeepSeekV4HistoryCacheManager::SetMaxRecordNum(int maxRecordNum) {
         std::lock_guard<std::mutex> guard(this->locker);
         this->maxRecordNum = std::max(1, maxRecordNum);
@@ -2312,47 +1683,42 @@ namespace fastllm {
             dst.windowSize = src.windowSize;
             dst.compressRatio = src.compressRatio;
             dst.compressorWideDim = src.compressorWideDim;
-            dst.windowKV = src.windowKV;
+            CopyTensorData(dst.windowKV, src.windowKV);
             dst.compressedBlocks = src.compressedBlocks;
             dst.compressedTokenBase = src.compressedTokenBase;
             dst.rawTailStartPos = src.rawTailStartPos;
             dst.compressorRawTokenBase = src.compressorRawTokenBase;
-            dst.compressorTailKV = src.compressorTailKV;
-            dst.compressorTailScore = src.compressorTailScore;
+            CopyTensorData(dst.compressorTailKV, src.compressorTailKV);
+            CopyTensorData(dst.compressorTailScore, src.compressorTailScore);
 
-            ResetData(dst.windowKVData);
             ResetData(dst.compressedKV);
-            ResetData(dst.compressedKVCuda);
             if (src.compressedBlocks > 0 && src.compressedKV.dims.size() >= 2) {
                 dst.compressedKV.CopyFrom(src.compressedKV);
-                MoveCompressedKVToCuda(dst, true);
+                EnsureCompressedKVOnCuda(dst);
             }
 
-            if (!src.compressorKVRaw.empty()) {
-                dst.compressorKVRaw = src.compressorKVRaw;
-                dst.compressorScoreRaw = src.compressorScoreRaw;
+            if (HasTensorData(src.compressorKVRaw)) {
+                CopyTensorData(dst.compressorKVRaw, src.compressorKVRaw);
+                CopyTensorData(dst.compressorScoreRaw, src.compressorScoreRaw);
             } else if (src.compressRatio > 0 && src.compressorWideDim > 0 &&
-                       !src.compressorTailKV.empty() && !src.compressorTailScore.empty()) {
-                int tailTokens = (int)(src.compressorTailKV.size() /
-                                       ((uint64_t)std::max(1, src.bsz) * src.compressorWideDim));
+                       HasTensorData(src.compressorTailKV) && HasTensorData(src.compressorTailScore)) {
+                int tailTokens = GetDataSeqLen(src.compressorTailKV, std::max(1, src.bsz), src.compressorWideDim);
                 int tailStart = std::max(0, std::min(src.rawTailStartPos, src.totalLen));
                 tailTokens = std::min(tailTokens, src.totalLen - tailStart);
-                dst.compressorKVRaw = src.compressorTailKV;
-                dst.compressorScoreRaw = src.compressorTailScore;
+                CopyTensorData(dst.compressorKVRaw, src.compressorTailKV);
+                CopyTensorData(dst.compressorScoreRaw, src.compressorTailScore);
                 dst.compressorRawTokenBase = tailStart;
             } else {
-                dst.compressorKVRaw.clear();
-                dst.compressorScoreRaw.clear();
+                ResetData(dst.compressorKVRaw);
+                ResetData(dst.compressorScoreRaw);
                 dst.compressorRawTokenBase = src.totalLen;
             }
 
 #ifdef USE_CUDA
-            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") &&
-                DeepSeekV4PreferCuda() && !dst.windowKV.empty() && dst.bsz > 0 &&
+            if (DeepSeekV4PreferCuda() && HasTensorData(dst.windowKV) && dst.bsz > 0 &&
                 dst.windowSize > 0 && dst.headDim > 0) {
-                WriteFloatData(dst.windowKV, {dst.bsz, dst.windowSize, dst.headDim},
-                               dst.windowKVData, DataType::FLOAT32);
-                dst.windowKVData.ToDevice(DataDevice::CUDA);
+                dst.windowKV.SetKVCache();
+                dst.windowKV.ToDevice(DataDevice::CUDA);
             }
 #endif
         }
@@ -2364,10 +1730,10 @@ namespace fastllm {
                 const auto &layer = this->decodeLayerCaches[i];
                 printf("[fastllm-dsv4-prefix-cache]   layer=%02d ratio=%d total_len=%d compressed_blocks=%d window=%d raw_tail_start=%d tail_tokens=%d\n",
                        i, layer.compressRatio, layer.totalLen, layer.compressedBlocks,
-                       (int)(layer.windowKV.size() / std::max(1, layer.headDim)),
+                       GetDataSeqLen(layer.windowKV, std::max(1, layer.bsz), std::max(1, layer.headDim)),
                        layer.rawTailStartPos,
                        layer.compressorWideDim > 0 && layer.bsz > 0 ?
-                           (int)(layer.compressorTailKV.size() / ((uint64_t)layer.bsz * layer.compressorWideDim)) : 0);
+                           GetDataSeqLen(layer.compressorTailKV, layer.bsz, layer.compressorWideDim) : 0);
             }
             fflush(stdout);
         }
@@ -2400,24 +1766,18 @@ namespace fastllm {
             dst.windowSize = src.windowSize;
             dst.compressRatio = src.compressRatio;
             dst.compressorWideDim = src.compressorWideDim;
-            dst.windowKV = src.windowKV;
+            CopyTensorData(dst.windowKV, src.windowKV);
             dst.compressedBlocks = src.compressedBlocks;
             dst.compressedTokenBase = src.compressedBlocks * std::max(1, src.compressRatio);
             dst.compressorRawTokenBase = src.compressorRawTokenBase;
-            dst.compressedKV = Data();
-            const Data *snapshotCompressed = nullptr;
+            ResetData(dst.compressedKV);
             Data compressedCpuTemp;
-            if (src.compressedBlocks > 0) {
-                if (HasCompressedKVData(src.compressedKV)) {
-                    snapshotCompressed = &src.compressedKV;
-                } else if (HasCompressedKVData(src.compressedKVCuda)) {
-                    compressedCpuTemp.CopyFrom(src.compressedKVCuda);
-                    compressedCpuTemp.ToDevice(DataDevice::CPU);
-                    snapshotCompressed = &compressedCpuTemp;
-                }
+            if (src.compressedBlocks > 0 && HasCompressedKVData(src.compressedKV)) {
+                compressedCpuTemp.CopyFrom(src.compressedKV);
+                compressedCpuTemp.ToDevice(DataDevice::CPU);
+                dst.compressedKV.CopyFrom(compressedCpuTemp);
             }
-            if (snapshotCompressed != nullptr) {
-                dst.compressedKV.CopyFrom(*snapshotCompressed);
+            if (HasCompressedKVData(dst.compressedKV)) {
 #ifdef USE_CUDA
                 if (DeepSeekV4PreferCuda()) {
                     dst.compressedKV.SetKVCache();
@@ -2434,27 +1794,27 @@ namespace fastllm {
                 int tailTokens = src.compressRatio == 4 ? 8 : (src.compressRatio == 128 ? 128 : src.compressRatio);
                 tailTokens = std::min(tailTokens, src.totalLen);
                 if (storeFullRaw) {
-                    dst.compressorKVRaw = src.compressorKVRaw;
-                    dst.compressorScoreRaw = src.compressorScoreRaw;
+                    CopyTensorData(dst.compressorKVRaw, src.compressorKVRaw);
+                    CopyTensorData(dst.compressorScoreRaw, src.compressorScoreRaw);
                     dst.compressorRawTokenBase = src.compressorRawTokenBase;
                 }
-                if (!src.compressorKVRaw.empty() && !src.compressorScoreRaw.empty()) {
+                if (HasTensorData(src.compressorKVRaw) && HasTensorData(src.compressorScoreRaw)) {
                     int rawLen = GetCompressorRawLen(src.compressorKVRaw, src.bsz, src.compressorWideDim);
                     int rawEnd = src.compressorRawTokenBase + rawLen;
                     int tailStart = std::max(src.compressorRawTokenBase, src.totalLen - tailTokens);
                     tailStart = std::min(tailStart, rawEnd);
                     tailTokens = std::max(0, rawEnd - tailStart);
                     dst.rawTailStartPos = tailStart;
-                    dst.compressorTailKV.assign((uint64_t)src.bsz * tailTokens * src.compressorWideDim, 0.0f);
-                    dst.compressorTailScore.assign((uint64_t)src.bsz * tailTokens * src.compressorWideDim, 0.0f);
                     int rawOffset = tailStart - src.compressorRawTokenBase;
-                    for (int b = 0; b < src.bsz; b++) {
-                        memcpy(dst.compressorTailKV.data() + (uint64_t)b * tailTokens * src.compressorWideDim,
-                               src.compressorKVRaw.data() + ((uint64_t)b * rawLen + rawOffset) * src.compressorWideDim,
-                               (uint64_t)tailTokens * src.compressorWideDim * sizeof(float));
-                        memcpy(dst.compressorTailScore.data() + (uint64_t)b * tailTokens * src.compressorWideDim,
-                               src.compressorScoreRaw.data() + ((uint64_t)b * rawLen + rawOffset) * src.compressorWideDim,
-                               (uint64_t)tailTokens * src.compressorWideDim * sizeof(float));
+                    if (tailTokens > 0) {
+                        Data tailKV, tailScore;
+                        Split(src.compressorKVRaw, 1, rawOffset, rawOffset + tailTokens, tailKV);
+                        Split(src.compressorScoreRaw, 1, rawOffset, rawOffset + tailTokens, tailScore);
+                        CopyTensorData(dst.compressorTailKV, tailKV);
+                        CopyTensorData(dst.compressorTailScore, tailScore);
+                    } else {
+                        ResetData(dst.compressorTailKV);
+                        ResetData(dst.compressorTailScore);
                     }
                 }
             }
@@ -2874,7 +2234,7 @@ namespace fastllm {
                                                    const LastTokensManager &lastTokens,
                                                    std::vector <std::vector <float>*> *retLogits) {
         ScopedExecutorProfiler forwardOtherProfile("DeepSeekV4ForwardOther");
-        Data hiddenStates;
+        Data hiddenStates, hiddenStatesBeforeHcExpand;
         int startPos = 0;
         if (positionIds.dims.size() >= 2 && positionIds.Count(0) > 0) {
             auto pids = ReadTokenIds(positionIds);
@@ -2954,50 +2314,20 @@ namespace fastllm {
                 return ret;
             }
         }
-        if (batch == 1 && inputIds.dims.size() >= 2 &&
-            inputIds.dims[1] > 1 && originalStartPos > 0 &&
-            EnvFlagEnabled("FASTLLM_DSV4_ENABLE_PREFIX_CACHE_SEQUENTIAL")) {
-            std::vector<int> ret(1, 0);
-            int seq = inputIds.dims[1];
-            for (int s = 0; s < seq; s++) {
-                Data curInputIds, curPositionIds;
-                Split(inputIds, 1, s, s + 1, curInputIds);
-                if (positionIds.dims.size() >= 2) {
-                    Split(positionIds, 1, s, s + 1, curPositionIds);
-                } else {
-                    curPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, 1}, {(float)(originalStartPos + s)}));
-                }
-                ret = ForwardBatch(1, curInputIds, Data(), curPositionIds, pastKeyValues,
-                                   generationConfig, lastTokens,
-                                   (s + 1 == seq) ? retLogits : nullptr);
-            }
-            return ret;
-        }
         bool useDecodeCache = batch == 1;
-        Embedding(inputIds, weight["embed.weight"], hiddenStates);
+        Embedding(inputIds, weight["embed.weight"], hiddenStatesBeforeHcExpand);
 
         int bsz = inputIds.dims[0];
         int seqlen = inputIds.dims[1];
         int dim = embed_dim;
-        {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4HcExpand");
-            auto hv = ReadFloatData(hiddenStates);
-            std::vector<float> expanded((uint64_t)bsz * seqlen * hc_mult * dim);
-            for (int b = 0; b < bsz; b++) {
-                for (int s = 0; s < seqlen; s++) {
-                    const float *src = hv.data() + ((uint64_t)b * seqlen + s) * dim;
-                    for (int h = 0; h < hc_mult; h++) {
-                        memcpy(expanded.data() + (((uint64_t)b * seqlen + s) * hc_mult + h) * dim,
-                               src, dim * sizeof(float));
-                    }
-                }
-            }
-            WriteFloatData(expanded, {bsz, seqlen, hc_mult, dim}, hiddenStates, hiddenStates.dataType);
-        }
 
-        if (block_cnt <= 0) {
-            ErrorInFastLLM("DeepSeekV4Model: invalid block_cnt.");
+
+        {
+            // hc expand
+            hiddenStatesBeforeHcExpand.Reshape({bsz, seqlen, 1, dim});
+            Repeat(hiddenStatesBeforeHcExpand, 2, hc_mult, hiddenStates);
         }
+        
         if (useDecodeCache && originalStartPos == 0) {
             decodeLayerCaches.clear();
             decodeLayerCaches.resize(block_cnt);
@@ -3040,35 +2370,40 @@ namespace fastllm {
                 }
             }
         }
+
+        Data attnInput;
+        Data qr, qNorm, q, kv;
+        HcMix attnMix, ffnMix;
+        Data hiddenStatesTemp;
+
         for (int layer = 0; layer < block_cnt; layer++) {
             std::string pre = "layers." + std::to_string(layer);
             int compressRatio = compress_ratios.size() > layer ? compress_ratios[layer] : 0;
             bool useCompressRope = compressRatio != 0;
             float layerRopeBase = useCompressRope ? compress_rope_theta : rope_base;
             int layerOriginalSeqLen = useCompressRope ? (int)rope_scaling_original_max_position_embeddings : 0;
+            DeepSeekV4HcPre(hiddenStates, weight[pre + ".hc_attn_fn"],
+                            weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
+                            hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                            attnMix.y, attnMix.postData, attnMix.combData);
+            attnMix.b = bsz;
+            attnMix.s = seqlen;
+            attnMix.hc = hc_mult;
 
-            HcMix attnMix = HcPreReference(hiddenStates, weight[pre + ".hc_attn_fn"],
-                                           weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
-                                           hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
-            Data attnInput;
             RMSNormReference(attnMix.y, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput, DataType::BFLOAT16);
-
-            Data qr, qNorm, q;
             Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr);
             RMSNormReference(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm, DataType::BFLOAT16);
             Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
             q.Reshape({bsz, seqlen, num_attention_heads, head_dim_full});
-            ScaleQRotary(q, rms_norm_eps, qk_rope_head_dim, layerRopeBase, startPos,
+            ScaleQRatory(q, rms_norm_eps, qk_rope_head_dim, layerRopeBase, startPos,
                          layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
                          rope_scaling_beta_slow);
-
-            Data kv;
             Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv);
             RMSNormReference(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv, DataType::BFLOAT16);
             kv.Reshape({bsz, seqlen, 1, head_dim_full});
-            RotaryQuant(kv, qk_rope_head_dim, layerRopeBase, startPos,
-                        layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
-                        rope_scaling_beta_slow, head_dim_full - qk_rope_head_dim, 64);
+            DeepSeekV4RotaryQuant(kv, qk_rope_head_dim, layerRopeBase, startPos,
+                                  layerOriginalSeqLen, rope_factor, rope_scaling_beta_fast,
+                                  rope_scaling_beta_slow, head_dim_full - qk_rope_head_dim, 64);
             kv.Reshape({bsz, seqlen, head_dim_full});
             DeepSeekV4DecodeLayerCache *decodeCache = nullptr;
             if (useDecodeCache && layer < (int)decodeLayerCaches.size()) {
@@ -3079,7 +2414,6 @@ namespace fastllm {
             int decodeCompressedCount = 0;
             if (decodeCache != nullptr) {
                 if (startPos == 0) {
-                    auto kvValues = ReadFloatData(kv);
                     decodeCache->initialized = true;
                     decodeCache->bsz = bsz;
                     decodeCache->totalLen = seqlen;
@@ -3088,15 +2422,8 @@ namespace fastllm {
                     decodeCache->compressRatio = compressRatio;
                     decodeCache->compressorWideDim = (compressRatio == 4 ? 2 : 1) * head_dim_full;
                     decodeCache->compressorRawTokenBase = 0;
-                    StoreWindowKVCache(kvValues, bsz, seqlen, head_dim_full, startPos, window_size,
+                    StoreWindowKVCache(kv, bsz, seqlen, head_dim_full, startPos, window_size,
                                        decodeCache->windowKV);
-#ifdef USE_CUDA
-                    if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") && DeepSeekV4PreferCuda()) {
-                        WriteFloatData(decodeCache->windowKV, {bsz, window_size, head_dim_full},
-                                       decodeCache->windowKVData, DataType::FLOAT32);
-                        decodeCache->windowKVData.ToDevice(DataDevice::CUDA);
-                    }
-#endif
                 } else {
                     if (!decodeCache->initialized) {
                         ErrorInFastLLM("DeepSeekV4Model: decode cache is not initialized.");
@@ -3106,47 +2433,21 @@ namespace fastllm {
                                                                  startPos, window_size, chunkPrefixKV);
                     }
                     decodeCache->totalLen = startPos + seqlen;
-                    bool updatedWindowKVData = false;
-#ifdef USE_CUDA
-                    if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_SPARSE_DECODE") &&
-                        seqlen == 1 &&
-                        kv.dataDevice == DataDevice::CUDA &&
-                        decodeCache->windowKVData.dataDevice == DataDevice::CUDA) {
-                        updatedWindowKVData = FastllmCudaDeepSeekV4UpdateWindowKVCache(
-                            kv, startPos, window_size, decodeCache->windowKVData);
-                    }
-#endif
-                    if (!updatedWindowKVData) {
-                        auto kvValues = ReadFloatData(kv);
-                        UpdateWindowKVCache(kvValues, bsz, head_dim_full, startPos, window_size,
-                                            decodeCache->windowKV);
-    #ifdef USE_CUDA
-                        // Keep CUDA windowKVData in sync with the CPU windowKV just updated.
-                        if (decodeCache->windowKVData.dataDevice == DataDevice::CUDA) {
-                            WriteFloatData(decodeCache->windowKV, {bsz, window_size, head_dim_full},
-                                           decodeCache->windowKVData, DataType::FLOAT32);
-                            decodeCache->windowKVData.ToDevice(DataDevice::CUDA);
-                        }
-    #endif
-                    }
+                    UpdateWindowKVCache(kv, bsz, head_dim_full, startPos, window_size,
+                                        decodeCache->windowKV);
                 }
             }
-            bool releaseCpuCompressedAfterSparse = false;
             const Data *decodeCompressedKVForAttention = nullptr;
             if (decodeCache != nullptr) {
-                decodeCompressedKVForAttention = HasCompressedKVData(decodeCache->compressedKVCuda) ?
-                    &decodeCache->compressedKVCuda : &decodeCache->compressedKV;
+                decodeCompressedKVForAttention = &decodeCache->compressedKV;
             }
             if (compressRatio > 0) {
                 if (decodeCache != nullptr) {
-#ifdef USE_CUDA
-                    bool keepCompressedKVOnCuda = DeepSeekV4PreferCuda();
-#endif
-                    std::vector<float> compressorKV, compressorScore;
+                    Data compressorKV, compressorScore;
                     ComputeCompressorRaw(weight, pre + ".attn.compressor", attnInput, compressorKV, compressorScore);
                     if (startPos == 0) {
-                        decodeCache->compressorKVRaw = std::move(compressorKV);
-                        decodeCache->compressorScoreRaw = std::move(compressorScore);
+                        Copy(compressorKV, decodeCache->compressorKVRaw);
+                        Copy(compressorScore, decodeCache->compressorScoreRaw);
                         decodeCache->compressorRawTokenBase = 0;
                     } else {
                         AppendCompressorRaw(compressorKV, compressorScore, bsz, seqlen,
@@ -3158,29 +2459,10 @@ namespace fastllm {
                     int targetCompressedBlocks = compressRatio > 0 ? compressedCutoff / compressRatio : 0;
                     if (targetCompressedBlocks > 0 &&
                         decodeCache->compressedBlocks == targetCompressedBlocks &&
-                        (HasCompressedKVData(decodeCache->compressedKV) ||
-                         HasCompressedKVData(decodeCache->compressedKVCuda))) {
+                        HasCompressedKVData(decodeCache->compressedKV)) {
                         decodeCompressedCount = decodeCache->compressedBlocks;
-#ifdef USE_CUDA
-                        if (keepCompressedKVOnCuda) {
-                            if (!HasCompressedKVData(decodeCache->compressedKVCuda)) {
-                                EnsureCompressedKVOnCpuFromCuda(*decodeCache);
-                                MoveCompressedKVToCuda(*decodeCache, true);
-                            }
-                        }
-#endif
-                        decodeCompressedKVForAttention = HasCompressedKVData(decodeCache->compressedKVCuda) ?
-                            &decodeCache->compressedKVCuda : &decodeCache->compressedKV;
+                        decodeCompressedKVForAttention = &decodeCache->compressedKV;
                     } else {
-#ifdef USE_CUDA
-                        bool buildCompressedOnCuda = keepCompressedKVOnCuda && startPos > 0 && seqlen == 1;
-                        if (!buildCompressedOnCuda) {
-                            EnsureCompressedKVOnCpuFromCuda(*decodeCache);
-                        }
-#else
-                        bool buildCompressedOnCuda = false;
-                        EnsureCompressedKVOnCpuFromCuda(*decodeCache);
-#endif
                         if (BuildCompressedKVFromRaw(weight, pre + ".attn.compressor",
                                                      decodeCache->compressorKVRaw,
                                                      decodeCache->compressorScoreRaw,
@@ -3189,15 +2471,10 @@ namespace fastllm {
                                                      head_dim_full, qk_rope_head_dim, layerRopeBase,
                                                      rope_factor, rope_scaling_beta_fast, rope_scaling_beta_slow,
                                                      layerOriginalSeqLen, decodeCache->compressedKV,
-                                                     &decodeCache->compressedKVCuda, buildCompressedOnCuda)) {
-                            int builtBlocks = GetReusableCompressedBlocks(decodeCache->compressedKVCuda,
-                                                                         bsz, targetCompressedBlocks,
-                                                                         head_dim_full);
-                            if (builtBlocks <= 0) {
-                                builtBlocks = GetReusableCompressedBlocks(decodeCache->compressedKV,
+                                                     true)) {
+                            int builtBlocks = GetReusableCompressedBlocks(decodeCache->compressedKV,
                                                                           bsz, targetCompressedBlocks,
                                                                           head_dim_full);
-                            }
                             decodeCache->compressedBlocks = builtBlocks;
                             decodeCompressedCount = decodeCache->compressedBlocks;
                             TrimCompressorRawCache(bsz, decodeCache->totalLen, compressRatio,
@@ -3208,18 +2485,13 @@ namespace fastllm {
                                                    decodeCache->compressorRawTokenBase);
                             if (startPos == 0) {
                                 Data catKV;
-                                ConcatSeqReference(kv, decodeCache->compressedKV, catKV);
-                                kv.CopyFrom(catKV);
+                                const Data *prefillCompressed = &decodeCache->compressedKV;
+                                if (HasCompressedKVData(*prefillCompressed)) {
+                                    Cat(kv, *prefillCompressed, 1, catKV);
+                                    Copy(catKV, kv);
+                                }
                             }
-#ifdef USE_CUDA
-                            if (!buildCompressedOnCuda && keepCompressedKVOnCuda) {
-                                bool releaseCpuNow = (startPos == 0 || seqlen == 1);
-                                MoveCompressedKVToCuda(*decodeCache, releaseCpuNow);
-                                releaseCpuCompressedAfterSparse = !releaseCpuNow;
-                            }
-#endif
-                            decodeCompressedKVForAttention = HasCompressedKVData(decodeCache->compressedKVCuda) ?
-                                &decodeCache->compressedKVCuda : &decodeCache->compressedKV;
+                            decodeCompressedKVForAttention = &decodeCache->compressedKV;
                         }
                     }
                 } else {
@@ -3229,8 +2501,8 @@ namespace fastllm {
                                             rope_scaling_beta_fast, rope_scaling_beta_slow,
                                             layerOriginalSeqLen, startPos, compressedKV)) {
                         Data catKV;
-                        ConcatSeqReference(kv, compressedKV, catKV);
-                        kv.CopyFrom(catKV);
+                        Cat(kv, compressedKV, 1, catKV);
+                        Copy(catKV, kv);
                     }
                 }
             }
@@ -3247,18 +2519,21 @@ namespace fastllm {
                     sparsePrefillKV.CopyFrom(kv);
                 }
                 if (decodeCompressedCount > 0 &&
-                    (HasCompressedKVData(decodeCache->compressedKV) ||
-                     HasCompressedKVData(decodeCache->compressedKVCuda)) &&
-                    EnsureCompressedKVOnCpuFromCuda(*decodeCache)) {
+                    HasCompressedKVData(decodeCache->compressedKV)) {
+                    if (sparsePrefillKV.dataDevice != DataDevice::CUDA) {
+                        EnsureCompressedKVOnCpu(*decodeCache);
+                    }
+                    const Data *prefillCompressed = &decodeCache->compressedKV;
                     Data catKV;
-                    ConcatSeqReference(sparsePrefillKV, decodeCache->compressedKV, catKV);
-                    sparsePrefillKV.CopyFrom(catKV);
-                    releaseCpuCompressedAfterSparse = HasCompressedKVData(decodeCache->compressedKVCuda);
+                    if (HasCompressedKVData(*prefillCompressed)) {
+                        ConcatSeqReference(sparsePrefillKV, *prefillCompressed, catKV);
+                        sparsePrefillKV.CopyFrom(catKV);
+                    }
                 }
                 sparsePrefillKVPtr = &sparsePrefillKV;
             }
             if (decodeCache != nullptr && startPos > 0 && seqlen == 1) {
-                SparseAttentionDecodeCachedReference(q, decodeCache->windowKV, &decodeCache->windowKVData,
+                SparseAttentionDecodeCachedReference(q, decodeCache->windowKV,
                                                      *decodeCompressedKVForAttention, weight[pre + ".attn.attn_sink"],
                                                      window_size, startPos, decodeCompressedCount,
                                                      qk_rope_head_dim, layerRopeBase,
@@ -3273,16 +2548,17 @@ namespace fastllm {
                                          rope_scaling_beta_fast, rope_scaling_beta_slow,
                                          sparsePrefillPrefixLen);
             }
-            if (releaseCpuCompressedAfterSparse) {
-                ResetData(decodeCache->compressedKV);
-            }
-            WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+            DeepSeekV4WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
             Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
-            HcPostReference(attnOut, hiddenStates, attnMix, hiddenStates);
-
-            HcMix ffnMix = HcPreReference(hiddenStates, weight[pre + ".hc_ffn_fn"],
-                                          weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
-                                          hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps);
+            Copy(hiddenStates, hiddenStatesTemp);
+            DeepSeekV4HcPost(attnOut, hiddenStatesTemp, attnMix.postData, attnMix.combData, hiddenStates);
+            DeepSeekV4HcPre(hiddenStates, weight[pre + ".hc_ffn_fn"],
+                            weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
+                            hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                            ffnMix.y, ffnMix.postData, ffnMix.combData);
+            ffnMix.b = bsz;
+            ffnMix.s = seqlen;
+            ffnMix.hc = hc_mult;
             Data ffnInput, ffnOut;
             RMSNormReference(ffnMix.y, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput, DataType::BFLOAT16);
             std::vector<int> ffnDims = ffnInput.dims;
@@ -3320,7 +2596,8 @@ namespace fastllm {
                 }
             }
             ffnOut.Reshape(ffnDims);
-            HcPostReference(ffnOut, hiddenStates, ffnMix, hiddenStates);
+            Copy(hiddenStates, hiddenStatesTemp);
+            DeepSeekV4HcPost(ffnOut, hiddenStatesTemp, ffnMix.postData, ffnMix.combData, hiddenStates);
         }
 
         Data headStates, headInput;
@@ -3336,7 +2613,7 @@ namespace fastllm {
         std::vector<int> samplingSeqLens(batch, 1);
         std::vector<GenerationConfig> generationConfigs(batch, generationConfig);
         if (generationConfig.top_k <= 1) {
-            generationConfigs[0].top_k = 5;
+            generationConfigs[0].top_k = 1;
         }
         std::vector<std::pair<Data*, Data*> > samplingPastKeyValues;
         samplingPastKeyValues.reserve(pastKeyValues.size());

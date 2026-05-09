@@ -872,6 +872,34 @@ namespace fastllm {
 
     void Repeat(const Data &input, int axis, int repeatTimes, Data &output);
 
+    void Copy(const Data &input, Data &output);
+
+    void DeepSeekV4HcPre(const Data &input, Data &hcFn, Data &hcScale, Data &hcBase,
+                         int hcMult, int sinkhornIters, float eps, float normEps,
+                         Data &output, Data &post, Data &comb);
+
+    void DeepSeekV4HcPost(const Data &input, const Data &residual, const Data &post, const Data &comb, Data &output);
+
+    void ScaleQRatory(Data &q, float eps, int ropeDim, float ropeBase, int startPos,
+                      int originalSeqLen, float ropeFactor, int betaFast, int betaSlow);
+
+    void DeepSeekV4RotaryQuant(Data &x, int ropeDim, float ropeBase, int startPos,
+                               int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
+                               int quantDim, int blockSize, int posStep = 1);
+
+    void DeepSeekV4WoA(Data &o, Data &woA, int groups, int oRank, Data &output);
+
+    void DeepSeekV4BuildCompressedKVFromRaw(const Data &kv, const Data &score,
+                                            Data &ape, Data &normWeight,
+                                            int rawTokenBase, int rawLen,
+                                            int blockStart, int blockCount,
+                                            int compressRatio, int headDim,
+                                            int ropeDim, float ropeBase,
+                                            float ropeFactor, int betaFast,
+                                            int betaSlow, int originalSeqLen,
+                                            bool overlap, bool preferCudaOutput,
+                                            Data &cache);
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output);
 
     void Pad(const Data &input, int axis, int padSize, Data &output);

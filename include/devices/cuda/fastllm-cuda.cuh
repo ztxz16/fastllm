@@ -196,6 +196,7 @@ bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output,
 bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fastllm::Data &softplusInput, fastllm::Data &softplusOutput, const fastllm::Data &aLogData, const fastllm::Data &dtBiasData);
 bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaCrossSwiglu(const fastllm::Data &input, fastllm::Data &output);
+bool FastllmCudaCopy(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaAdd(const fastllm::Data &input, float v, fastllm::Data &output);
 bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output);
 bool FastllmCudaSoftmax(const fastllm::Data &input, fastllm::Data &output, int axis);
@@ -211,8 +212,6 @@ bool FastllmCudaApplyChunkDecayByLastLogG(fastllm::Data &input, const fastllm::D
 
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps);
 bool FastllmCudaRMSNormPart(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps, int start, int end);
-bool FastllmCudaDeepSeekV4RMSNorm(const fastllm::Data &input, fastllm::Data &weight, float eps,
-                                  fastllm::Data &output, fastllm::DataType outputType);
 bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase, int startPos,
                                        int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
                                        float eps);
@@ -230,10 +229,18 @@ bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data &hcFn,
                                 fastllm::Data &y, fastllm::Data &post, fastllm::Data &comb);
 bool FastllmCudaDeepSeekV4HcPreDots(const fastllm::Data &x, const fastllm::Data &hcFn,
                                     int hcMult, fastllm::Data &dotsFloat);
+bool FastllmCudaDeepSeekV4StoreWindowKVCache(const fastllm::Data &kv, int startPos,
+                                             int windowSize, fastllm::Data &windowKV);
 bool FastllmCudaDeepSeekV4UpdateWindowKVCache(const fastllm::Data &kv, int startPos,
                                              int windowSize, fastllm::Data &windowKV);
-bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::Data &q, const fastllm::Data *windowKVData,
-                                                      const float *windowKV,
+bool FastllmCudaDeepSeekV4BuildWindowKVPrefix(const fastllm::Data &windowKV, int startPos,
+                                             int windowSize, int prefixLen, fastllm::Data &output);
+bool FastllmCudaDeepSeekV4BuildCompressedKV(const fastllm::Data &kv, const fastllm::Data &score,
+                                            const fastllm::Data &ape, int rawTokenBase, int rawLen,
+                                            int blockStart, int blockCount, int compressRatio,
+                                            int headDim, int wideDim, bool overlap,
+                                            fastllm::Data &output);
+bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::Data &q, const fastllm::Data &windowKV,
                                                       const fastllm::Data &compressedKV, fastllm::Data &attnSink,
                                                       int windowSize, int startPos, int compressedCount,
                                                       int ropeDim, float ropeBase, int originalSeqLen,

@@ -367,35 +367,6 @@ __device__ __forceinline__ float DeepSeekV4InvFreq(int idx, int ropeDim, float b
     return inv;
 }
 
-template <typename InT, typename OutT>
-__global__ void DeepSeekV4RMSNormKernel(const InT *input, const float *weight, OutT *output,
-                                        int rows, int dim, float eps) {
-    int row = blockIdx.x;
-    if (row >= rows) {
-        return;
-    }
-    extern __shared__ float red[];
-    const InT *src = input + (uint64_t)row * dim;
-    OutT *dst = output + (uint64_t)row * dim;
-    float ss = 0.0f;
-    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-        float v = Dsv4ToFloat(src[d]);
-        ss += v * v;
-    }
-    red[threadIdx.x] = ss;
-    __syncthreads();
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            red[threadIdx.x] += red[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    float scale = rsqrtf(red[0] / dim + eps);
-    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-        dst[d] = Dsv4FromFloat<OutT>(Dsv4ToFloat(src[d]) * scale * weight[d]);
-    }
-}
-
 template <typename T>
 __global__ void DeepSeekV4ScaleQRotaryKernel(T *q, int rows, int seqlen, int heads, int dim,
                                              int ropeDim, float ropeBase, int startPos,
@@ -577,17 +548,138 @@ __global__ void DeepSeekV4RotaryQuantBlockKernel(T *x, int rows, int seqlen, int
 
 template <typename T>
 __global__ void DeepSeekV4UpdateWindowKVCacheKernel(const T *kv, float *windowKV,
-                                                    int bsz, int headDim, int startPos,
+                                                    int bsz, int seqlen, int headDim, int startPos,
                                                     int windowSize) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = bsz * headDim;
+    int total = bsz * seqlen * headDim;
     if (idx >= total) {
         return;
     }
-    int b = idx / headDim;
     int d = idx % headDim;
-    windowKV[((uint64_t)b * windowSize + (startPos % windowSize)) * headDim + d] =
-        Dsv4ToFloat(kv[(uint64_t)b * headDim + d]);
+    int tmp = idx / headDim;
+    int s = tmp % seqlen;
+    int b = tmp / seqlen;
+    windowKV[((uint64_t)b * windowSize + ((startPos + s) % windowSize)) * headDim + d] =
+        Dsv4ToFloat(kv[((uint64_t)b * seqlen + s) * headDim + d]);
+}
+
+template <typename T>
+__global__ void DeepSeekV4StoreWindowKVCacheKernel(const T *kv, float *windowKV,
+                                                   int bsz, int seqlen, int headDim,
+                                                   int startPos, int windowSize) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = bsz * windowSize * headDim;
+    if (idx >= total) {
+        return;
+    }
+    int d = idx % headDim;
+    int slot = (idx / headDim) % windowSize;
+    int b = idx / (windowSize * headDim);
+    int srcToken = -1;
+    if (startPos == 0) {
+        if (seqlen <= windowSize) {
+            srcToken = slot < seqlen ? slot : -1;
+        } else {
+            int cutoff = seqlen % windowSize;
+            srcToken = seqlen - windowSize + ((slot - cutoff + windowSize) % windowSize);
+        }
+    } else {
+        srcToken = slot == (startPos % windowSize) ? 0 : -1;
+    }
+    windowKV[((uint64_t)b * windowSize + slot) * headDim + d] =
+        srcToken >= 0 ? Dsv4ToFloat(kv[((uint64_t)b * seqlen + srcToken) * headDim + d]) : 0.0f;
+}
+
+__global__ void DeepSeekV4BuildWindowKVPrefixKernel(const float *windowKV, float *output,
+                                                    int bsz, int prefixLen, int headDim,
+                                                    int startPos, int windowSize) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = bsz * prefixLen * headDim;
+    if (idx >= total) {
+        return;
+    }
+    int d = idx % headDim;
+    int tmp = idx / headDim;
+    int s = tmp % prefixLen;
+    int b = tmp / prefixLen;
+    int firstPos = startPos - prefixLen;
+    int srcSlot = (firstPos + s) % windowSize;
+    output[((uint64_t)b * prefixLen + s) * headDim + d] =
+        windowKV[((uint64_t)b * windowSize + srcSlot) * headDim + d];
+}
+
+template <typename T>
+__global__ void DeepSeekV4BuildCompressedKVKernel(const T *kv, const T *score, const float *ape,
+                                                  float *compressed, int bsz, int rawTokenBase,
+                                                  int rawLen, int blockStart, int blockCount,
+                                                  int compressRatio, int headDim, int wideDim,
+                                                  bool overlap) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t total = (uint64_t)bsz * blockCount * headDim;
+    if (idx >= total) {
+        return;
+    }
+    int d = (int)(idx % headDim);
+    uint64_t tmp = idx / headDim;
+    int localBlock = (int)(tmp % blockCount);
+    int b = (int)(tmp / blockCount);
+    int block = blockStart + localBlock;
+    float mx = -1.0e30f;
+    if (overlap) {
+        if (block > 0) {
+            for (int r = 0; r < compressRatio; r++) {
+                int tok = (block - 1) * compressRatio + r;
+                int localToken = tok - rawTokenBase;
+                uint64_t off = ((uint64_t)b * rawLen + localToken) * wideDim + d;
+                mx = fmaxf(mx, Dsv4ToFloat(score[off]) + ape[(uint64_t)r * wideDim + d]);
+            }
+        }
+        for (int r = 0; r < compressRatio; r++) {
+            int tok = block * compressRatio + r;
+            int localToken = tok - rawTokenBase;
+            uint64_t off = ((uint64_t)b * rawLen + localToken) * wideDim + headDim + d;
+            mx = fmaxf(mx, Dsv4ToFloat(score[off]) + ape[(uint64_t)r * wideDim + headDim + d]);
+        }
+    } else {
+        for (int r = 0; r < compressRatio; r++) {
+            int tok = block * compressRatio + r;
+            int localToken = tok - rawTokenBase;
+            uint64_t off = ((uint64_t)b * rawLen + localToken) * wideDim + d;
+            mx = fmaxf(mx, Dsv4ToFloat(score[off]) + ape[(uint64_t)r * wideDim + d]);
+        }
+    }
+
+    float sum = 0.0f, value = 0.0f;
+    if (overlap) {
+        if (block > 0) {
+            for (int r = 0; r < compressRatio; r++) {
+                int tok = (block - 1) * compressRatio + r;
+                int localToken = tok - rawTokenBase;
+                uint64_t off = ((uint64_t)b * rawLen + localToken) * wideDim + d;
+                float e = expf(Dsv4ToFloat(score[off]) + ape[(uint64_t)r * wideDim + d] - mx);
+                sum += e;
+                value += e * Dsv4ToFloat(kv[off]);
+            }
+        }
+        for (int r = 0; r < compressRatio; r++) {
+            int tok = block * compressRatio + r;
+            int localToken = tok - rawTokenBase;
+            uint64_t off = ((uint64_t)b * rawLen + localToken) * wideDim + headDim + d;
+            float e = expf(Dsv4ToFloat(score[off]) + ape[(uint64_t)r * wideDim + headDim + d] - mx);
+            sum += e;
+            value += e * Dsv4ToFloat(kv[off]);
+        }
+    } else {
+        for (int r = 0; r < compressRatio; r++) {
+            int tok = block * compressRatio + r;
+            int localToken = tok - rawTokenBase;
+            uint64_t off = ((uint64_t)b * rawLen + localToken) * wideDim + d;
+            float e = expf(Dsv4ToFloat(score[off]) + ape[(uint64_t)r * wideDim + d] - mx);
+            sum += e;
+            value += e * Dsv4ToFloat(kv[off]);
+        }
+    }
+    compressed[((uint64_t)b * blockCount + localBlock) * headDim + d] = value / fmaxf(sum, 1e-30f);
 }
 
 __device__ __forceinline__ float DeepSeekV4Sigmoid(float x) {
@@ -2833,30 +2925,6 @@ bool DeepSeekV4LaunchHcPreByWeight(const fastllm::Data &x, const fastllm::Data &
     return true;
 }
 
-template <typename InT, typename OutT>
-void DeepSeekV4LaunchRMSNormTyped(const fastllm::Data &input, const fastllm::Data &weight,
-                                  fastllm::Data &output, int rows, int dim, float eps) {
-    int threads = 256;
-    DeepSeekV4RMSNormKernel<<<rows, threads, threads * sizeof(float)>>>(
-        (const InT *)input.cudaData, (const float *)weight.cudaData,
-        (OutT *)output.cudaData, rows, dim, eps);
-}
-
-template <typename InT>
-bool DeepSeekV4LaunchRMSNormByOutput(const fastllm::Data &input, const fastllm::Data &weight,
-                                     fastllm::Data &output, int rows, int dim, float eps) {
-    if (output.dataType == fastllm::DataType::BFLOAT16) {
-        DeepSeekV4LaunchRMSNormTyped<InT, __nv_bfloat16>(input, weight, output, rows, dim, eps);
-    } else if (output.dataType == fastllm::DataType::FLOAT16) {
-        DeepSeekV4LaunchRMSNormTyped<InT, half>(input, weight, output, rows, dim, eps);
-    } else if (output.dataType == fastllm::DataType::FLOAT32) {
-        DeepSeekV4LaunchRMSNormTyped<InT, float>(input, weight, output, rows, dim, eps);
-    } else {
-        return false;
-    }
-    return true;
-}
-
 template <typename XT>
 bool DeepSeekV4LaunchHcPreDotsByWeight(const fastllm::Data &x, const fastllm::Data &hcFn,
                                        fastllm::Data &dotsFloat, int tokens, int flatDim, int mixHc) {
@@ -2965,39 +3033,6 @@ extern "C" bool FastllmCudaDeepSeekV4HcPreDots(const fastllm::Data &x, const fas
     return ok;
 }
 
-extern "C" bool FastllmCudaDeepSeekV4RMSNorm(const fastllm::Data &input, fastllm::Data &weight,
-                                             float eps, fastllm::Data &output,
-                                             fastllm::DataType outputType) {
-    if (input.dataDevice != fastllm::DataDevice::CUDA || weight.dataDevice != fastllm::DataDevice::CUDA ||
-        input.dims.empty() || weight.dataType != fastllm::DataType::FLOAT32 ||
-        weight.Count(0) != (uint64_t)input.dims.back()) {
-        return false;
-    }
-
-    bool inPlace = (&input == &output);
-    if (inPlace && outputType != input.dataType) {
-        return false;
-    }
-    if (!inPlace && !DeepSeekV4PrepareCudaOutput(output, outputType, input.dims)) {
-        return false;
-    }
-
-    int dim = input.dims.back();
-    int rows = (int)(input.Count(0) / dim);
-    bool ok = false;
-    if (input.dataType == fastllm::DataType::BFLOAT16) {
-        ok = DeepSeekV4LaunchRMSNormByOutput<__nv_bfloat16>(input, weight, output, rows, dim, eps);
-    } else if (input.dataType == fastllm::DataType::FLOAT16) {
-        ok = DeepSeekV4LaunchRMSNormByOutput<half>(input, weight, output, rows, dim, eps);
-    } else if (input.dataType == fastllm::DataType::FLOAT32) {
-        ok = DeepSeekV4LaunchRMSNormByOutput<float>(input, weight, output, rows, dim, eps);
-    } else {
-        return false;
-    }
-    DeviceSync();
-    return ok;
-}
-
 extern "C" bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase,
                                                   int startPos, int originalSeqLen,
                                                   float ropeFactor, int betaFast, int betaSlow,
@@ -3067,28 +3102,139 @@ extern "C" bool FastllmCudaDeepSeekV4RotaryQuant(fastllm::Data &x, int ropeDim, 
     return true;
 }
 
-extern "C" bool FastllmCudaDeepSeekV4UpdateWindowKVCache(const fastllm::Data &kv, int startPos,
-                                                         int windowSize, fastllm::Data &windowKV) {
-    if (kv.dataDevice != fastllm::DataDevice::CUDA || kv.dims.size() != 3 || kv.dims[1] != 1 ||
+extern "C" bool FastllmCudaDeepSeekV4StoreWindowKVCache(const fastllm::Data &kv, int startPos,
+                                                        int windowSize, fastllm::Data &windowKV) {
+    if (kv.dataDevice != fastllm::DataDevice::CUDA || kv.dims.size() != 3 || kv.dims[1] <= 0 ||
         startPos < 0 || windowSize <= 0) {
         return false;
     }
-    int bsz = kv.dims[0], headDim = kv.dims[2];
+    int bsz = kv.dims[0], seqlen = kv.dims[1], headDim = kv.dims[2];
     if (!DeepSeekV4PrepareCudaOutput(windowKV, fastllm::DataType::FLOAT32, {bsz, windowSize, headDim})) {
         return false;
     }
-    int total = bsz * headDim;
+    int total = bsz * windowSize * headDim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    if (kv.dataType == fastllm::DataType::BFLOAT16) {
+        DeepSeekV4StoreWindowKVCacheKernel<<<blocks, threads>>>(
+            (__nv_bfloat16 *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim, startPos, windowSize);
+    } else if (kv.dataType == fastllm::DataType::FLOAT16) {
+        DeepSeekV4StoreWindowKVCacheKernel<<<blocks, threads>>>(
+            (half *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim, startPos, windowSize);
+    } else if (kv.dataType == fastllm::DataType::FLOAT32) {
+        DeepSeekV4StoreWindowKVCacheKernel<<<blocks, threads>>>(
+            (float *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim, startPos, windowSize);
+    } else {
+        return false;
+    }
+    DeviceSync();
+    return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4UpdateWindowKVCache(const fastllm::Data &kv, int startPos,
+                                                         int windowSize, fastllm::Data &windowKV) {
+    if (kv.dataDevice != fastllm::DataDevice::CUDA || kv.dims.size() != 3 || kv.dims[1] <= 0 ||
+        startPos < 0 || windowSize <= 0) {
+        return false;
+    }
+    int bsz = kv.dims[0], seqlen = kv.dims[1], headDim = kv.dims[2];
+    if (!DeepSeekV4PrepareCudaOutput(windowKV, fastllm::DataType::FLOAT32, {bsz, windowSize, headDim})) {
+        return false;
+    }
+    int total = bsz * seqlen * headDim;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     if (kv.dataType == fastllm::DataType::BFLOAT16) {
         DeepSeekV4UpdateWindowKVCacheKernel<<<blocks, threads>>>(
-            (__nv_bfloat16 *)kv.cudaData, (float *)windowKV.cudaData, bsz, headDim, startPos, windowSize);
+            (__nv_bfloat16 *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim, startPos, windowSize);
     } else if (kv.dataType == fastllm::DataType::FLOAT16) {
         DeepSeekV4UpdateWindowKVCacheKernel<<<blocks, threads>>>(
-            (half *)kv.cudaData, (float *)windowKV.cudaData, bsz, headDim, startPos, windowSize);
+            (half *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim, startPos, windowSize);
     } else if (kv.dataType == fastllm::DataType::FLOAT32) {
         DeepSeekV4UpdateWindowKVCacheKernel<<<blocks, threads>>>(
-            (float *)kv.cudaData, (float *)windowKV.cudaData, bsz, headDim, startPos, windowSize);
+            (float *)kv.cudaData, (float *)windowKV.cudaData, bsz, seqlen, headDim, startPos, windowSize);
+    } else {
+        return false;
+    }
+    DeviceSync();
+    return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4BuildWindowKVPrefix(const fastllm::Data &windowKV, int startPos,
+                                                         int windowSize, int prefixLen,
+                                                         fastllm::Data &output) {
+    if (windowKV.dataDevice != fastllm::DataDevice::CUDA ||
+        windowKV.dataType != fastllm::DataType::FLOAT32 ||
+        windowKV.dims.size() != 3 || prefixLen <= 0 || startPos < prefixLen ||
+        windowSize <= 0 || windowKV.dims[1] != windowSize) {
+        return false;
+    }
+    int bsz = windowKV.dims[0], headDim = windowKV.dims[2];
+    if (!DeepSeekV4PrepareCudaOutput(output, fastllm::DataType::FLOAT32, {bsz, prefixLen, headDim})) {
+        return false;
+    }
+    int total = bsz * prefixLen * headDim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    DeepSeekV4BuildWindowKVPrefixKernel<<<blocks, threads>>>(
+        (const float *)windowKV.cudaData, (float *)output.cudaData,
+        bsz, prefixLen, headDim, startPos, windowSize);
+    DeviceSync();
+    return true;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4BuildCompressedKV(const fastllm::Data &kv,
+                                                       const fastllm::Data &score,
+                                                       const fastllm::Data &ape,
+                                                       int rawTokenBase, int rawLen,
+                                                       int blockStart, int blockCount,
+                                                       int compressRatio, int headDim,
+                                                       int wideDim, bool overlap,
+                                                       fastllm::Data &output) {
+    if (kv.dataDevice != fastllm::DataDevice::CUDA ||
+        score.dataDevice != fastllm::DataDevice::CUDA ||
+        ape.dataDevice != fastllm::DataDevice::CUDA ||
+        ape.dataType != fastllm::DataType::FLOAT32 ||
+        score.dataType != kv.dataType ||
+        kv.dims.size() != 3 || score.dims != kv.dims ||
+        rawLen <= 0 || blockCount <= 0 || compressRatio <= 0 ||
+        headDim <= 0 || wideDim <= 0 || kv.dims[1] < rawLen ||
+        kv.dims[2] != wideDim || rawTokenBase < 0) {
+        return false;
+    }
+    int bsz = kv.dims[0];
+    if (ape.Count(0) < (uint64_t)compressRatio * wideDim) {
+        return false;
+    }
+    int firstNeededToken = blockStart * compressRatio;
+    if (overlap && blockStart > 0) {
+        firstNeededToken = (blockStart - 1) * compressRatio;
+    }
+    int lastNeededToken = (blockStart + blockCount) * compressRatio;
+    if (rawTokenBase > firstNeededToken || rawTokenBase + rawLen < lastNeededToken) {
+        return false;
+    }
+    if (!DeepSeekV4PrepareCudaOutput(output, fastllm::DataType::FLOAT32, {bsz, blockCount, headDim})) {
+        return false;
+    }
+    uint64_t total = (uint64_t)bsz * blockCount * headDim;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    if (kv.dataType == fastllm::DataType::BFLOAT16) {
+        DeepSeekV4BuildCompressedKVKernel<<<blocks, threads>>>(
+            (const __nv_bfloat16 *)kv.cudaData, (const __nv_bfloat16 *)score.cudaData,
+            (const float *)ape.cudaData, (float *)output.cudaData, bsz, rawTokenBase, rawLen,
+            blockStart, blockCount, compressRatio, headDim, wideDim, overlap);
+    } else if (kv.dataType == fastllm::DataType::FLOAT16) {
+        DeepSeekV4BuildCompressedKVKernel<<<blocks, threads>>>(
+            (const half *)kv.cudaData, (const half *)score.cudaData,
+            (const float *)ape.cudaData, (float *)output.cudaData, bsz, rawTokenBase, rawLen,
+            blockStart, blockCount, compressRatio, headDim, wideDim, overlap);
+    } else if (kv.dataType == fastllm::DataType::FLOAT32) {
+        DeepSeekV4BuildCompressedKVKernel<<<blocks, threads>>>(
+            (const float *)kv.cudaData, (const float *)score.cudaData,
+            (const float *)ape.cudaData, (float *)output.cudaData, bsz, rawTokenBase, rawLen,
+            blockStart, blockCount, compressRatio, headDim, wideDim, overlap);
     } else {
         return false;
     }
@@ -3262,8 +3408,7 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data 
 }
 
 extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::Data &q,
-                                                                 const fastllm::Data *windowKVData,
-                                                                 const float *windowKV,
+                                                                 const fastllm::Data &windowKV,
                                                                  const fastllm::Data &compressedKV,
                                                                  fastllm::Data &attnSink,
                                                                  int windowSize, int startPos,
@@ -3278,6 +3423,8 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::
         windowSize + compressedCount > kDeepSeekV4SparseDecodeMaxKeys ||
         ropeDim <= 0 || ropeDim > q.dims[3] ||
         q.dataDevice != fastllm::DataDevice::CUDA ||
+        windowKV.dataDevice != fastllm::DataDevice::CUDA ||
+        windowKV.dataType != fastllm::DataType::FLOAT32 ||
         attnSink.dataDevice != fastllm::DataDevice::CUDA ||
         attnSink.dataType != fastllm::DataType::FLOAT32 ||
         (compressedCount > 0 && compressedKV.dataDevice != fastllm::DataDevice::CUDA)) {
@@ -3285,29 +3432,13 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::
     }
     int bsz = q.dims[0], heads = q.dims[2], dim = q.dims[3];
     if (attnSink.Count(0) != (uint64_t)heads ||
+        windowKV.Count(0) != (uint64_t)bsz * windowSize * dim ||
         (compressedCount > 0 && compressedKV.Count(0) != (uint64_t)bsz * compressedCount * dim)) {
         return false;
     }
-    const float *cudaWindow = nullptr;
-    bool ownCudaWindow = false;
-    if (windowKVData != nullptr && windowKVData->dataDevice == fastllm::DataDevice::CUDA &&
-        windowKVData->dataType == fastllm::DataType::FLOAT32 &&
-        windowKVData->Count(0) == (uint64_t)bsz * windowSize * dim) {
-        cudaWindow = (const float *)windowKVData->cudaData;
-    } else if (windowKV != nullptr) {
-        size_t windowBytes = (size_t)bsz * windowSize * dim * sizeof(float);
-        float *tmpWindow = (float *)FastllmCudaMalloc(windowBytes);
-        FastllmCudaCopyFromHostToDevice(tmpWindow, (void *)windowKV, windowBytes);
-        cudaWindow = tmpWindow;
-        ownCudaWindow = true;
-    } else {
-        return false;
-    }
+    const float *cudaWindow = (const float *)windowKV.cudaData;
 
     if (!DeepSeekV4PrepareCudaOutput(output, fastllm::DataType::BFLOAT16, {bsz, 1, heads, dim})) {
-        if (ownCudaWindow) {
-            FastllmCudaFree((void *)cudaWindow);
-        }
         return false;
     }
 
@@ -3384,9 +3515,6 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::
         }
     }
 
-    if (ownCudaWindow) {
-        FastllmCudaFree((void *)cudaWindow);
-    }
     FastllmCudaFree(cudaTemp);
     return ok;
 }

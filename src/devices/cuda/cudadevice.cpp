@@ -9,10 +9,20 @@
 
 #include "utils.h"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace fastllm {
     static uint64_t GetConvertedBufferBytes(const Data &data) {
         uint64_t elementCount = data.expansionSize > 0 ? data.expansionSize : data.Count(0);
         return (elementCount * data.unitSize - 1) / data.unitSizeDiv + 1;
+    }
+
+    static bool CudaEnvFlagEnabled(const char *name) {
+        const char *v = std::getenv(name);
+        return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0 &&
+               strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0 &&
+               strcmp(v, "off") != 0 && strcmp(v, "OFF") != 0;
     }
 
     static void InvalidateCpuMirror(Data &data) {
@@ -53,6 +63,15 @@ namespace fastllm {
         this->ops["Conv2D"] = (BaseOperator*)(new CudaConv2DOp());
         this->ops["Split"] = (BaseOperator*)(new CudaSplitOp());
         this->ops["Repeat"] = (BaseOperator*)(new CudaRepeatOp());
+        this->ops["Copy"] = (BaseOperator*)(new CudaCopyOp());
+        this->ops["DeepSeekV4HcPre"] = (BaseOperator*)(new CudaDeepSeekV4HcPreOp());
+        this->ops["DeepSeekV4HcPost"] = (BaseOperator*)(new CudaDeepSeekV4HcPostOp());
+        this->ops["ScaleQRatory"] = (BaseOperator*)(new CudaScaleQRatoryOp());
+        this->ops["DeepSeekV4RotaryQuant"] = (BaseOperator*)(new CudaDeepSeekV4RotaryQuantOp());
+        this->ops["DeepSeekV4WoA"] = (BaseOperator*)(new CudaDeepSeekV4WoAOp());
+        this->ops["DeepSeekV4BuildCompressedKVFromRaw"] = (BaseOperator*)(new CudaDeepSeekV4BuildCompressedKVFromRawOp());
+        this->ops["DeepSeekV4StoreWindowKVCache"] = (BaseOperator*)(new CudaDeepSeekV4StoreWindowKVCacheOp());
+        this->ops["DeepSeekV4UpdateWindowKVCache"] = (BaseOperator*)(new CudaDeepSeekV4UpdateWindowKVCacheOp());
         this->ops["Cat"] = (BaseOperator*)(new CudaCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CudaPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
@@ -893,6 +912,361 @@ namespace fastllm {
         int inner = input.strides[axis];
         int unitSize = input.unitSize;
         FastllmCudaRepeat(input.cudaData, output.cudaData, outer, repeatTimes, inputStride * unitSize, outputStride * unitSize, channels * inner * unitSize, channels * inner * unitSize);
+    }
+
+    void CudaCopyOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                         const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        if (&input == &output) {
+            return;
+        }
+        output.Allocate();
+        if (!FastllmCudaCopy(input, output)) {
+            ErrorInFastLLM("Copy CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4HcPreOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &hcFn = *(datas.find("hcFn")->second);
+        Data &hcScale = *(datas.find("hcScale")->second);
+        Data &hcBase = *(datas.find("hcBase")->second);
+        int hcMult = intParams.find("hcMult") != intParams.end() ? intParams.find("hcMult")->second : 1;
+        int sinkhornIters = intParams.find("sinkhornIters") != intParams.end() ? intParams.find("sinkhornIters")->second : 1;
+        if (input.dims.size() != 4 || hcMult <= 0 || sinkhornIters <= 0 ||
+            input.dims[2] != hcMult ||
+            hcScale.dataType != DataType::FLOAT32 || hcBase.dataType != DataType::FLOAT32) {
+            return false;
+        }
+        if (input.dataType != DataType::FLOAT32 && input.dataType != DataType::FLOAT16 &&
+            input.dataType != DataType::BFLOAT16) {
+            return false;
+        }
+        if (hcFn.dataType != DataType::FLOAT32 && hcFn.dataType != DataType::FLOAT16 &&
+            hcFn.dataType != DataType::BFLOAT16) {
+            return false;
+        }
+        int dim = input.dims[3];
+        int flatDim = hcMult * dim;
+        int mixHc = (2 + hcMult) * hcMult;
+        return hcFn.Count(0) == (uint64_t)mixHc * flatDim &&
+               hcScale.Count(0) >= 3 && hcBase.Count(0) >= (uint64_t)mixHc;
+    }
+
+    void CudaDeepSeekV4HcPreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &hcFn = *(datas.find("hcFn")->second);
+        Data &hcScale = *(datas.find("hcScale")->second);
+        Data &hcBase = *(datas.find("hcBase")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &post = *(datas.find("post")->second);
+        Data &comb = *(datas.find("comb")->second);
+        int hcMult = intParams.find("hcMult") != intParams.end() ? intParams.find("hcMult")->second : 1;
+        int sinkhornIters = intParams.find("sinkhornIters") != intParams.end() ? intParams.find("sinkhornIters")->second : 1;
+        float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-6f;
+        float normEps = floatParams.find("normEps") != floatParams.end() ? floatParams.find("normEps")->second : 1e-6f;
+        if (!FastllmCudaDeepSeekV4HcPre(input, hcFn, hcScale, hcBase, hcMult, sinkhornIters,
+                                        eps, normEps, output, post, comb)) {
+            ErrorInFastLLM("DeepSeekV4HcPre CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4HcPostOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                        const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &residual = *(datas.find("residual")->second);
+        Data &post = *(datas.find("post")->second);
+        Data &comb = *(datas.find("comb")->second);
+        if (residual.dims.size() != 4 || post.dataType != DataType::FLOAT32 ||
+            comb.dataType != DataType::FLOAT32) {
+            return false;
+        }
+        if ((input.dataType != DataType::FLOAT32 && input.dataType != DataType::FLOAT16 &&
+             input.dataType != DataType::BFLOAT16) ||
+            (residual.dataType != DataType::FLOAT32 && residual.dataType != DataType::FLOAT16 &&
+             residual.dataType != DataType::BFLOAT16)) {
+            return false;
+        }
+        int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
+        return bsz > 0 && seqlen > 0 && hcMult > 0 && dim > 0 &&
+               input.Count(0) == (uint64_t)bsz * seqlen * dim &&
+               post.Count(0) == (uint64_t)bsz * seqlen * hcMult &&
+               comb.Count(0) == (uint64_t)bsz * seqlen * hcMult * hcMult;
+    }
+
+    void CudaDeepSeekV4HcPostOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &residual = *(datas.find("residual")->second);
+        Data &post = *(datas.find("post")->second);
+        Data &comb = *(datas.find("comb")->second);
+        Data &output = *(datas.find("output")->second);
+        int bsz = residual.dims[0], seqlen = residual.dims[1], hcMult = residual.dims[2], dim = residual.dims[3];
+        if (!FastllmCudaDeepSeekV4HcPostCudaMix(input, residual, post, comb, bsz, seqlen, hcMult, dim, output)) {
+            ErrorInFastLLM("DeepSeekV4HcPost CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaScaleQRatoryOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        return q.dataDevice == DataDevice::CUDA &&
+               q.dims.size() == 4 &&
+               ropeDim > 0 && ropeDim <= q.dims[3] && ropeDim % 2 == 0 &&
+               q.dataType == DataType::BFLOAT16;
+    }
+
+    void CudaScaleQRatoryOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &q = *(datas.find("q")->second);
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int originalSeqLen = intParams.find("originalSeqLen") != intParams.end() ? intParams.find("originalSeqLen")->second : 0;
+        int betaFast = intParams.find("betaFast") != intParams.end() ? intParams.find("betaFast")->second : 32;
+        int betaSlow = intParams.find("betaSlow") != intParams.end() ? intParams.find("betaSlow")->second : 1;
+        float eps = floatParams.find("eps") != floatParams.end() ? floatParams.find("eps")->second : 1e-6f;
+        float ropeBase = floatParams.find("ropeBase") != floatParams.end() ? floatParams.find("ropeBase")->second : 10000.0f;
+        float ropeFactor = floatParams.find("ropeFactor") != floatParams.end() ? floatParams.find("ropeFactor")->second : 1.0f;
+        if (!FastllmCudaDeepSeekV4ScaleQRotary(q, ropeDim, ropeBase, startPos,
+                                               originalSeqLen, ropeFactor, betaFast, betaSlow, eps)) {
+            ErrorInFastLLM("ScaleQRatory CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4RotaryQuantOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int quantDim = intParams.find("quantDim") != intParams.end() ? intParams.find("quantDim")->second : 0;
+        int blockSize = intParams.find("blockSize") != intParams.end() ? intParams.find("blockSize")->second : 64;
+        int dim = input.dims.empty() ? 0 : input.dims.back();
+        return input.dataDevice == DataDevice::CUDA &&
+               input.dataType == DataType::BFLOAT16 &&
+               input.dims.size() >= 3 && input.dims.size() <= 4 &&
+               ropeDim > 0 && ropeDim <= dim && ropeDim % 2 == 0 &&
+               quantDim >= 0 && quantDim <= dim &&
+               blockSize > 0;
+    }
+
+    void CudaDeepSeekV4RotaryQuantOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int originalSeqLen = intParams.find("originalSeqLen") != intParams.end() ? intParams.find("originalSeqLen")->second : 0;
+        int betaFast = intParams.find("betaFast") != intParams.end() ? intParams.find("betaFast")->second : 32;
+        int betaSlow = intParams.find("betaSlow") != intParams.end() ? intParams.find("betaSlow")->second : 1;
+        int quantDim = intParams.find("quantDim") != intParams.end() ? intParams.find("quantDim")->second : 0;
+        int blockSize = intParams.find("blockSize") != intParams.end() ? intParams.find("blockSize")->second : 64;
+        int posStep = intParams.find("posStep") != intParams.end() ? intParams.find("posStep")->second : 1;
+        float ropeBase = floatParams.find("ropeBase") != floatParams.end() ? floatParams.find("ropeBase")->second : 10000.0f;
+        float ropeFactor = floatParams.find("ropeFactor") != floatParams.end() ? floatParams.find("ropeFactor")->second : 1.0f;
+        if (!FastllmCudaDeepSeekV4RotaryQuant(input, ropeDim, ropeBase, startPos,
+                                              originalSeqLen, ropeFactor, betaFast, betaSlow,
+                                              quantDim, blockSize, posStep)) {
+            ErrorInFastLLM("DeepSeekV4RotaryQuant CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4WoAOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight = *(datas.find("weight")->second);
+        int groups = intParams.find("groups") != intParams.end() ? intParams.find("groups")->second : 1;
+        int oRank = intParams.find("oRank") != intParams.end() ? intParams.find("oRank")->second : 1;
+        if (input.dims.size() != 4 || groups <= 0 || oRank <= 0) {
+            return false;
+        }
+        int heads = input.dims[2], headDim = input.dims[3];
+        if (heads % groups != 0 ||
+            weight.Count(0) != (uint64_t)groups * oRank * (heads / groups) * headDim) {
+            return false;
+        }
+        return input.dataType == DataType::FLOAT32 ||
+               input.dataType == DataType::FLOAT16 ||
+               input.dataType == DataType::BFLOAT16;
+    }
+
+    void CudaDeepSeekV4WoAOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &weight = *(datas.find("weight")->second);
+        Data &output = *(datas.find("output")->second);
+        int groups = intParams.find("groups") != intParams.end() ? intParams.find("groups")->second : 1;
+        int oRank = intParams.find("oRank") != intParams.end() ? intParams.find("oRank")->second : 1;
+        if (!FastllmCudaDeepSeekV4WoA(input, weight, groups, oRank, output)) {
+            ErrorInFastLLM("DeepSeekV4WoA CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV4BuildCompressedKVFromRawOp::CanRun(const std::string &opType,
+                                                          const fastllm::DataDict &datas,
+                                                          const fastllm::FloatDict &floatParams,
+                                                          const fastllm::IntDict &intParams) {
+        if (intParams.find("preferCudaOutput") == intParams.end() ||
+            intParams.find("preferCudaOutput")->second == 0) {
+            return false;
+        }
+        Data &kv = *(datas.find("kv")->second);
+        Data &score = *(datas.find("score")->second);
+        Data &ape = *(datas.find("ape")->second);
+        Data &normWeight = *(datas.find("normWeight")->second);
+        int rawLen = intParams.find("rawLen") != intParams.end() ? intParams.find("rawLen")->second : 0;
+        int blockStart = intParams.find("blockStart") != intParams.end() ? intParams.find("blockStart")->second : 0;
+        int blockCount = intParams.find("blockCount") != intParams.end() ? intParams.find("blockCount")->second : 0;
+        int compressRatio = intParams.find("compressRatio") != intParams.end() ? intParams.find("compressRatio")->second : 0;
+        int headDim = intParams.find("headDim") != intParams.end() ? intParams.find("headDim")->second : 0;
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        bool overlap = intParams.find("overlap") != intParams.end() && intParams.find("overlap")->second != 0;
+        int wideDim = (overlap ? 2 : 1) * headDim;
+        if (kv.dims.size() != 3 || score.dims != kv.dims || kv.dims[1] < rawLen ||
+            kv.dims[2] != wideDim || rawLen <= 0 || blockStart < 0 || blockCount <= 0 ||
+            compressRatio <= 0 || headDim <= 0 || ropeDim <= 0 || ropeDim > headDim ||
+            ape.dataType != DataType::FLOAT32 || ape.Count(0) < (uint64_t)compressRatio * wideDim ||
+            normWeight.Count(0) < (uint64_t)headDim) {
+            return false;
+        }
+        return kv.dataType == DataType::FLOAT32 ||
+               kv.dataType == DataType::FLOAT16 ||
+               kv.dataType == DataType::BFLOAT16;
+    }
+
+    void CudaDeepSeekV4BuildCompressedKVFromRawOp::Run(const std::string &opType,
+                                                       const fastllm::DataDict &datas,
+                                                       const fastllm::FloatDict &floatParams,
+                                                       const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("kv")->second);
+        Data &score = *(datas.find("score")->second);
+        Data &ape = *(datas.find("ape")->second);
+        Data &normWeight = *(datas.find("normWeight")->second);
+        Data &cache = *(datas.find("cache")->second);
+        int rawTokenBase = intParams.find("rawTokenBase") != intParams.end() ? intParams.find("rawTokenBase")->second : 0;
+        int rawLen = intParams.find("rawLen") != intParams.end() ? intParams.find("rawLen")->second : 0;
+        int blockStart = intParams.find("blockStart") != intParams.end() ? intParams.find("blockStart")->second : 0;
+        int blockCount = intParams.find("blockCount") != intParams.end() ? intParams.find("blockCount")->second : 0;
+        int compressRatio = intParams.find("compressRatio") != intParams.end() ? intParams.find("compressRatio")->second : 0;
+        int headDim = intParams.find("headDim") != intParams.end() ? intParams.find("headDim")->second : 0;
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int betaFast = intParams.find("betaFast") != intParams.end() ? intParams.find("betaFast")->second : 32;
+        int betaSlow = intParams.find("betaSlow") != intParams.end() ? intParams.find("betaSlow")->second : 1;
+        int originalSeqLen = intParams.find("originalSeqLen") != intParams.end() ? intParams.find("originalSeqLen")->second : 0;
+        bool overlap = intParams.find("overlap") != intParams.end() && intParams.find("overlap")->second != 0;
+        float ropeBase = floatParams.find("ropeBase") != floatParams.end() ? floatParams.find("ropeBase")->second : 10000.0f;
+        float ropeFactor = floatParams.find("ropeFactor") != floatParams.end() ? floatParams.find("ropeFactor")->second : 1.0f;
+        int bsz = kv.dims[0];
+        int wideDim = (overlap ? 2 : 1) * headDim;
+
+        Data compressed;
+        if (!FastllmCudaDeepSeekV4BuildCompressedKV(kv, score, ape, rawTokenBase, rawLen,
+                                                    blockStart, blockCount, compressRatio,
+                                                    headDim, wideDim, overlap, compressed)) {
+            ErrorInFastLLM("DeepSeekV4BuildCompressedKVFromRaw CUDA error: build kernel rejected input.\n");
+        }
+
+        Data compressedForNorm(DataType::BFLOAT16, {bsz, blockCount, headDim});
+        compressedForNorm.ToDevice(DataDevice::CUDA, false);
+        compressedForNorm.Allocate(false);
+        FastllmFloatToBF16(compressed.cudaData, compressedForNorm.cudaData,
+                           (int)compressed.Count(0));
+
+        Data newRows(DataType::BFLOAT16, {bsz, blockCount, headDim});
+        newRows.ToDevice(DataDevice::CUDA, false);
+        newRows.Allocate(false);
+        if (!FastllmCudaRMSNorm(compressedForNorm, normWeight, newRows, 1e-6f)) {
+            ErrorInFastLLM("DeepSeekV4BuildCompressedKVFromRaw CUDA error: rmsnorm failed.\n");
+        }
+        if (!FastllmCudaDeepSeekV4RotaryQuant(newRows, ropeDim, ropeBase, blockStart * compressRatio,
+                                              originalSeqLen, ropeFactor, betaFast, betaSlow,
+                                              headDim - ropeDim, 64, compressRatio)) {
+            ErrorInFastLLM("DeepSeekV4BuildCompressedKVFromRaw CUDA error: rotary quant failed.\n");
+        }
+
+        int totalBlocks = blockStart + blockCount;
+        if (blockStart <= 0 || cache.dims.size() != 3 || cache.dims[1] <= 0 ||
+            cache.cudaData == nullptr) {
+            cache.CopyFrom(newRows);
+            cache.SetKVCache();
+            cache.ToDevice(DataDevice::CUDA);
+            return;
+        }
+        AssertInFastLLM(cache.dataType == DataType::BFLOAT16 &&
+                        cache.dims[0] == bsz && cache.dims[1] >= blockStart &&
+                        cache.dims[2] == headDim,
+                        "DeepSeekV4BuildCompressedKVFromRaw CUDA error: invalid old cache.\n");
+
+        Data merged(DataType::BFLOAT16, {bsz, totalBlocks, headDim});
+        merged.SetKVCache();
+        merged.ToDevice(DataDevice::CUDA, false);
+        merged.Allocate(false);
+        size_t unit = sizeof(uint16_t);
+        size_t oldPitch = (size_t)cache.dims[1] * headDim * unit;
+        size_t copyOldWidth = (size_t)blockStart * headDim * unit;
+        size_t addPitch = (size_t)blockCount * headDim * unit;
+        size_t mergedPitch = (size_t)totalBlocks * headDim * unit;
+        FastllmCudaMemcpy2DDeviceToDevice(merged.cudaData, mergedPitch,
+                                          cache.cudaData, oldPitch,
+                                          copyOldWidth, bsz);
+        FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)merged.cudaData + (size_t)blockStart * headDim * unit,
+                                          mergedPitch, newRows.cudaData, addPitch,
+                                          addPitch, bsz);
+        cache.CopyFrom(merged);
+        cache.SetKVCache();
+        cache.ToDevice(DataDevice::CUDA);
+    }
+
+    bool CudaDeepSeekV4StoreWindowKVCacheOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+        return kv.dims.size() == 3 && kv.dims[1] > 0 && startPos >= 0 && windowSize > 0 &&
+               (kv.dataType == DataType::FLOAT32 || kv.dataType == DataType::FLOAT16 ||
+                kv.dataType == DataType::BFLOAT16);
+    }
+
+    void CudaDeepSeekV4StoreWindowKVCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        Data &windowKV = *(datas.find("cache")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+        if (!FastllmCudaDeepSeekV4StoreWindowKVCache(kv, startPos, windowSize, windowKV)) {
+            ErrorInFastLLM("DeepSeekV4StoreWindowKVCache CUDA error: kernel rejected input.\n");
+        }
+        windowKV.SetKVCache();
+    }
+
+    bool CudaDeepSeekV4UpdateWindowKVCacheOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        Data &windowKV = *(datas.find("cache")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+        if (kv.dims.size() != 3 || kv.dims[1] <= 0 || startPos < 0 || windowSize <= 0 ||
+            (kv.dataType != DataType::FLOAT32 && kv.dataType != DataType::FLOAT16 &&
+             kv.dataType != DataType::BFLOAT16)) {
+            return false;
+        }
+        return windowKV.dataType == DataType::FLOAT32 && windowKV.dims.size() == 3 &&
+               windowKV.dims[0] == kv.dims[0] && windowKV.dims[1] == windowSize &&
+               windowKV.dims[2] == kv.dims[2] &&
+               (windowKV.cpuData != nullptr || windowKV.cudaData != nullptr);
+    }
+
+    void CudaDeepSeekV4UpdateWindowKVCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        Data &windowKV = *(datas.find("cache")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+        if (!FastllmCudaDeepSeekV4UpdateWindowKVCache(kv, startPos, windowSize, windowKV)) {
+            ErrorInFastLLM("DeepSeekV4UpdateWindowKVCache CUDA error: kernel rejected input.\n");
+        }
+        windowKV.SetKVCache();
     }
 
     void CudaCatOp::Run(const std::string &opType, const fastllm::DataDict &datas,
