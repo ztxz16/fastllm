@@ -54,7 +54,6 @@ namespace fastllm {
         Data compressorScoreRaw;
         int compressorRawTokenBase = 0;
         Data compressedKV;
-        Data compressedKVCuda;
         int compressedBlocks = 0;
         int compressedTokenBase = 0;
         int rawTailStartPos = 0;
