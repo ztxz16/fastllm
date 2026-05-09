@@ -521,73 +521,23 @@ namespace fastllm {
 
         static void StoreWindowKVCache(const Data &kv, int bsz, int seqlen, int headDim,
                                        int startPos, int windowSize, Data &windowKV) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4KVCache");
-#ifdef USE_CUDA
-            if (DeepSeekV4PreferCuda() && kv.dataDevice == DataDevice::CUDA &&
-                FastllmCudaDeepSeekV4StoreWindowKVCache(kv, startPos, windowSize, windowKV)) {
-                windowKV.SetKVCache();
-                return;
-            }
-#endif
-            auto kvValues = ReadFloatData(kv);
-            std::vector<float> cached((uint64_t)bsz * windowSize * headDim, 0.0f);
-            if (startPos == 0) {
-                if (seqlen <= windowSize) {
-                    for (int b = 0; b < bsz; b++) {
-                        memcpy(cached.data() + (uint64_t)b * windowSize * headDim,
-                               kvValues.data() + (uint64_t)b * seqlen * headDim,
-                               (uint64_t)seqlen * headDim * sizeof(float));
-                    }
-                } else {
-                    int cutoff = seqlen % windowSize;
-                    int first = windowSize - cutoff;
-                    for (int b = 0; b < bsz; b++) {
-                        const float *src = kvValues.data() + ((uint64_t)b * seqlen + seqlen - windowSize) * headDim;
-                        memcpy(cached.data() + ((uint64_t)b * windowSize + cutoff) * headDim,
-                               src, (uint64_t)first * headDim * sizeof(float));
-                        if (cutoff > 0) {
-                            memcpy(cached.data() + (uint64_t)b * windowSize * headDim,
-                                   src + (uint64_t)first * headDim,
-                                   (uint64_t)cutoff * headDim * sizeof(float));
-                        }
-                    }
-                }
-                WriteFloatData(cached, {bsz, windowSize, headDim}, windowKV, DataType::FLOAT32);
-                return;
-            }
-            for (int b = 0; b < bsz; b++) {
-                memcpy(cached.data() + ((uint64_t)b * windowSize + (startPos % windowSize)) * headDim,
-                       kvValues.data() + (uint64_t)b * seqlen * headDim,
-                       (uint64_t)headDim * sizeof(float));
-            }
-            WriteFloatData(cached, {bsz, windowSize, headDim}, windowKV, DataType::FLOAT32);
+            (void)bsz;
+            (void)seqlen;
+            (void)headDim;
+            Executor &executor = *((Executor*)GetExecutor());
+            executor.Run("DeepSeekV4StoreWindowKVCache", {
+                {"input", (Data*)&kv}, {"cache", &windowKV}
+            }, {}, {{"startPos", startPos}, {"windowSize", windowSize}});
         }
 
         static void UpdateWindowKVCache(const Data &kv, int bsz, int headDim,
                                         int startPos, int windowSize, Data &windowKV) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4KVCache");
-#ifdef USE_CUDA
-            if (DeepSeekV4PreferCuda() && kv.dataDevice == DataDevice::CUDA &&
-                windowKV.dataDevice == DataDevice::CUDA &&
-                FastllmCudaDeepSeekV4UpdateWindowKVCache(kv, startPos, windowSize, windowKV)) {
-                windowKV.SetKVCache();
-                return;
-            }
-#endif
-            auto kvValues = ReadFloatData(kv);
-            auto cached = ReadFloatData(windowKV);
-            int seqlen = (int)(kvValues.size() / ((uint64_t)bsz * headDim));
-            if ((uint64_t)cached.size() != (uint64_t)bsz * windowSize * headDim) {
-                cached.assign((uint64_t)bsz * windowSize * headDim, 0.0f);
-            }
-            for (int b = 0; b < bsz; b++) {
-                for (int s = 0; s < seqlen; s++) {
-                    memcpy(cached.data() + ((uint64_t)b * windowSize + ((startPos + s) % windowSize)) * headDim,
-                           kvValues.data() + ((uint64_t)b * seqlen + s) * headDim,
-                           (uint64_t)headDim * sizeof(float));
-                }
-            }
-            WriteFloatData(cached, {bsz, windowSize, headDim}, windowKV, DataType::FLOAT32);
+            (void)bsz;
+            (void)headDim;
+            Executor &executor = *((Executor*)GetExecutor());
+            executor.Run("DeepSeekV4UpdateWindowKVCache", {
+                {"input", (Data*)&kv}, {"cache", &windowKV}
+            }, {}, {{"startPos", startPos}, {"windowSize", windowSize}});
         }
 
         static int BuildWindowKVPrefixData(const Data &windowKV, int bsz, int headDim,

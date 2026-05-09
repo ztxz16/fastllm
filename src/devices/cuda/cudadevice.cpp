@@ -69,6 +69,8 @@ namespace fastllm {
         this->ops["ScaleQRatory"] = (BaseOperator*)(new CudaScaleQRatoryOp());
         this->ops["DeepSeekV4RotaryQuant"] = (BaseOperator*)(new CudaDeepSeekV4RotaryQuantOp());
         this->ops["DeepSeekV4WoA"] = (BaseOperator*)(new CudaDeepSeekV4WoAOp());
+        this->ops["DeepSeekV4StoreWindowKVCache"] = (BaseOperator*)(new CudaDeepSeekV4StoreWindowKVCacheOp());
+        this->ops["DeepSeekV4UpdateWindowKVCache"] = (BaseOperator*)(new CudaDeepSeekV4UpdateWindowKVCacheOp());
         this->ops["Cat"] = (BaseOperator*)(new CudaCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CudaPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
@@ -1098,6 +1100,57 @@ namespace fastllm {
         if (!FastllmCudaDeepSeekV4WoA(input, weight, groups, oRank, output)) {
             ErrorInFastLLM("DeepSeekV4WoA CUDA error: kernel rejected input.\n");
         }
+    }
+
+    bool CudaDeepSeekV4StoreWindowKVCacheOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+        return kv.dims.size() == 3 && kv.dims[1] > 0 && startPos >= 0 && windowSize > 0 &&
+               (kv.dataType == DataType::FLOAT32 || kv.dataType == DataType::FLOAT16 ||
+                kv.dataType == DataType::BFLOAT16);
+    }
+
+    void CudaDeepSeekV4StoreWindowKVCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        Data &windowKV = *(datas.find("cache")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+        if (!FastllmCudaDeepSeekV4StoreWindowKVCache(kv, startPos, windowSize, windowKV)) {
+            ErrorInFastLLM("DeepSeekV4StoreWindowKVCache CUDA error: kernel rejected input.\n");
+        }
+        windowKV.SetKVCache();
+    }
+
+    bool CudaDeepSeekV4UpdateWindowKVCacheOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        Data &windowKV = *(datas.find("cache")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+        if (kv.dims.size() != 3 || kv.dims[1] <= 0 || startPos < 0 || windowSize <= 0 ||
+            (kv.dataType != DataType::FLOAT32 && kv.dataType != DataType::FLOAT16 &&
+             kv.dataType != DataType::BFLOAT16)) {
+            return false;
+        }
+        return windowKV.dataType == DataType::FLOAT32 && windowKV.dims.size() == 3 &&
+               windowKV.dims[0] == kv.dims[0] && windowKV.dims[1] == windowSize &&
+               windowKV.dims[2] == kv.dims[2] &&
+               (windowKV.cpuData != nullptr || windowKV.cudaData != nullptr);
+    }
+
+    void CudaDeepSeekV4UpdateWindowKVCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                                  const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        Data &windowKV = *(datas.find("cache")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+        if (!FastllmCudaDeepSeekV4UpdateWindowKVCache(kv, startPos, windowSize, windowKV)) {
+            ErrorInFastLLM("DeepSeekV4UpdateWindowKVCache CUDA error: kernel rejected input.\n");
+        }
+        windowKV.SetKVCache();
     }
 
     void CudaCatOp::Run(const std::string &opType, const fastllm::DataDict &datas,

@@ -559,4 +559,81 @@ namespace fastllm {
         }
         DeepSeekV4HcPreWriteFloatData(y, output);
     }
+
+    void CpuDeepSeekV4StoreWindowKVCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        Data &windowKV = *(datas.find("cache")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+
+        AssertInFastLLM(kv.dims.size() == 3 && kv.dims[1] > 0 && startPos >= 0 && windowSize > 0,
+                        "DeepSeekV4StoreWindowKVCache error: invalid input.\n");
+        int bsz = kv.dims[0], seqlen = kv.dims[1], headDim = kv.dims[2];
+        auto kvValues = DeepSeekV4HcPreReadFloatData(kv);
+        std::vector<float> cached((uint64_t)bsz * windowSize * headDim, 0.0f);
+        if (startPos == 0 && seqlen <= windowSize) {
+            for (int b = 0; b < bsz; b++) {
+                memcpy(cached.data() + (uint64_t)b * windowSize * headDim,
+                       kvValues.data() + (uint64_t)b * seqlen * headDim,
+                       (uint64_t)seqlen * headDim * sizeof(float));
+            }
+        } else if (startPos == 0) {
+            int cutoff = seqlen % windowSize;
+            int first = windowSize - cutoff;
+            for (int b = 0; b < bsz; b++) {
+                const float *src = kvValues.data() + ((uint64_t)b * seqlen + seqlen - windowSize) * headDim;
+                memcpy(cached.data() + ((uint64_t)b * windowSize + cutoff) * headDim,
+                       src, (uint64_t)first * headDim * sizeof(float));
+                if (cutoff > 0) {
+                    memcpy(cached.data() + (uint64_t)b * windowSize * headDim,
+                           src + (uint64_t)first * headDim,
+                           (uint64_t)cutoff * headDim * sizeof(float));
+                }
+            }
+        } else {
+            for (int b = 0; b < bsz; b++) {
+                memcpy(cached.data() + ((uint64_t)b * windowSize + (startPos % windowSize)) * headDim,
+                       kvValues.data() + (uint64_t)b * seqlen * headDim,
+                       (uint64_t)headDim * sizeof(float));
+            }
+        }
+        windowKV.dataType = DataType::FLOAT32;
+        windowKV.Resize({bsz, windowSize, headDim});
+        DeepSeekV4HcPreWriteFloatData(cached, windowKV);
+        windowKV.SetKVCache();
+    }
+
+    void CpuDeepSeekV4UpdateWindowKVCacheOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("input")->second);
+        Data &windowKV = *(datas.find("cache")->second);
+        int startPos = intParams.find("startPos") != intParams.end() ? intParams.find("startPos")->second : 0;
+        int windowSize = intParams.find("windowSize") != intParams.end() ? intParams.find("windowSize")->second : 0;
+
+        AssertInFastLLM(kv.dims.size() == 3 && kv.dims[1] > 0 && startPos >= 0 && windowSize > 0,
+                        "DeepSeekV4UpdateWindowKVCache error: invalid input.\n");
+        int bsz = kv.dims[0], seqlen = kv.dims[1], headDim = kv.dims[2];
+        auto kvValues = DeepSeekV4HcPreReadFloatData(kv);
+        std::vector<float> cached;
+        if (windowKV.dataType == DataType::FLOAT32 && windowKV.dims.size() == 3 &&
+            windowKV.dims[0] == bsz && windowKV.dims[1] == windowSize && windowKV.dims[2] == headDim &&
+            windowKV.cpuData != nullptr) {
+            cached = DeepSeekV4HcPreReadFloatData(windowKV);
+        }
+        if ((uint64_t)cached.size() != (uint64_t)bsz * windowSize * headDim) {
+            cached.assign((uint64_t)bsz * windowSize * headDim, 0.0f);
+        }
+        for (int b = 0; b < bsz; b++) {
+            for (int s = 0; s < seqlen; s++) {
+                memcpy(cached.data() + ((uint64_t)b * windowSize + ((startPos + s) % windowSize)) * headDim,
+                       kvValues.data() + ((uint64_t)b * seqlen + s) * headDim,
+                       (uint64_t)headDim * sizeof(float));
+            }
+        }
+        windowKV.dataType = DataType::FLOAT32;
+        windowKV.Resize({bsz, windowSize, headDim});
+        DeepSeekV4HcPreWriteFloatData(cached, windowKV);
+        windowKV.SetKVCache();
+    }
 }
