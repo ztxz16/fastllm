@@ -353,6 +353,27 @@ namespace fastllm {
             return data.dims[1];
         }
 
+        static int RoundUpToBlock(int value, int block) {
+            return ((std::max(value, 1) - 1) / block + 1) * block;
+        }
+
+        static void EnsureCompressorRawCapacity(Data &data, int targetLen) {
+            if (!HasTensorData(data) || data.dims.size() != 3 || targetLen <= 0) {
+                return;
+            }
+            int targetCapacity = RoundUpToBlock(targetLen, 128);
+            int currentCapacity = data.dims[1];
+            if (data.expansionDims.size() == data.dims.size()) {
+                currentCapacity = data.expansionDims[1];
+            }
+            if (currentCapacity >= targetCapacity) {
+                return;
+            }
+            std::vector<int> newDims = data.dims;
+            newDims[1] = targetCapacity;
+            data.Expansion(newDims);
+        }
+
 #ifdef USE_CUDA
         static bool PrepareCudaData(Data &output, DataType dtype, const std::vector<int> &dims) {
             ResetData(output);
@@ -613,13 +634,22 @@ namespace fastllm {
             if (!HasTensorData(allKV)) {
                 CopyTensorData(allKV, kv);
                 CopyTensorData(allScore, score);
+                EnsureCompressorRawCapacity(allKV, kv.dims[1]);
+                EnsureCompressorRawCapacity(allScore, score.dims[1]);
                 return;
             }
-            Data nextKV, nextScore;
-            Cat(allKV, kv, 1, nextKV);
-            Cat(allScore, score, 1, nextScore);
-            CopyTensorData(allKV, nextKV);
-            CopyTensorData(allScore, nextScore);
+            int oldLen = GetDataSeqLen(allKV, bsz, wideDim);
+            if (oldLen <= 0 || GetDataSeqLen(allScore, bsz, wideDim) != oldLen) {
+                CopyTensorData(allKV, kv);
+                CopyTensorData(allScore, score);
+                EnsureCompressorRawCapacity(allKV, kv.dims[1]);
+                EnsureCompressorRawCapacity(allScore, score.dims[1]);
+                return;
+            }
+            EnsureCompressorRawCapacity(allKV, oldLen + kv.dims[1]);
+            EnsureCompressorRawCapacity(allScore, oldLen + score.dims[1]);
+            CatDirect(allKV, kv, 1);
+            CatDirect(allScore, score, 1);
         }
 
         static int GetCompressorRawLen(const Data &raw, int bsz, int wideDim) {
