@@ -341,7 +341,7 @@ namespace fastllm {
         static void CopyTensorData(Data &dst, const Data &src) {
             ResetData(dst);
             if (HasTensorData(src)) {
-                dst.CopyFrom(src);
+                Copy(src, dst);
             }
         }
 
@@ -599,12 +599,8 @@ namespace fastllm {
 
         static void ComputeCompressorRaw(WeightMap &weight, const std::string &prefix, const Data &x,
                                          Data &kv, Data &score) {
-            ScopedExecutorProfiler executorProfile("DeepSeekV4CompressorRaw");
-            Data kvData, scoreData;
-            Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kvData);
-            Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), scoreData);
-            ToDataType(kvData, kv, DataType::FLOAT32);
-            ToDataType(scoreData, score, DataType::FLOAT32);
+            Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kv);
+            Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), score);
         }
 
         static void AppendCompressorRaw(const Data &kv, const Data &score,
@@ -1318,13 +1314,9 @@ namespace fastllm {
             int blocks = cutoff / compressRatio;
             bool overlap = (compressRatio == 4);
             int coff = overlap ? 2 : 1;
-
-            Data kvData, scoreData;
-            Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kvData);
-            Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), scoreData);
             Data kv, score;
-            ToDataType(kvData, kv, DataType::FLOAT32);
-            ToDataType(scoreData, score, DataType::FLOAT32);
+            Linear((Data&)x, weight[prefix + ".wkv.weight"], Data(), kv);
+            Linear((Data&)x, weight[prefix + ".wgate.weight"], Data(), score);
 
             int wideDim = coff * headDim;
             Data compressed;
