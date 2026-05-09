@@ -2445,44 +2445,112 @@ namespace fastllm {
                 if (decodeCache != nullptr) {
                     Data compressorKV, compressorScore;
                     ComputeCompressorRaw(weight, pre + ".attn.compressor", attnInput, compressorKV, compressorScore);
+                    int compressedCutoff = decodeCache->totalLen - (decodeCache->totalLen % compressRatio);
+                    int targetCompressedBlocks = compressRatio > 0 ? compressedCutoff / compressRatio : 0;
+                    bool targetCompressedReady = targetCompressedBlocks > 0 &&
+                        decodeCache->compressedBlocks == targetCompressedBlocks &&
+                        HasCompressedKVData(decodeCache->compressedKV);
+
+                    const Data *compressorKVForBuild = &decodeCache->compressorKVRaw;
+                    const Data *compressorScoreForBuild = &decodeCache->compressorScoreRaw;
+                    int compressorRawTokenBaseForBuild = decodeCache->compressorRawTokenBase;
+                    bool transientCompressorRaw = false;
                     if (startPos == 0) {
                         Copy(compressorKV, decodeCache->compressorKVRaw);
                         Copy(compressorScore, decodeCache->compressorScoreRaw);
                         decodeCache->compressorRawTokenBase = 0;
+                    } else if (!targetCompressedReady && seqlen > 1 &&
+                               !HasTensorData(decodeCache->compressorKVRaw) &&
+                               !HasTensorData(decodeCache->compressorScoreRaw)) {
+                        int reusableBlocks = GetReusableCompressedBlocks(decodeCache->compressedKV,
+                                                                         bsz, targetCompressedBlocks,
+                                                                         head_dim_full);
+                        int firstNeededToken = reusableBlocks * compressRatio;
+                        if (compressRatio == 4 && reusableBlocks > 0) {
+                            firstNeededToken = (reusableBlocks - 1) * compressRatio;
+                        }
+                        int lastNeededToken = targetCompressedBlocks * compressRatio;
+                        if (targetCompressedBlocks > reusableBlocks &&
+                            startPos <= firstNeededToken && startPos + seqlen >= lastNeededToken) {
+                            compressorKVForBuild = &compressorKV;
+                            compressorScoreForBuild = &compressorScore;
+                            compressorRawTokenBaseForBuild = startPos;
+                            transientCompressorRaw = true;
+                        } else {
+                            AppendCompressorRaw(compressorKV, compressorScore, bsz, seqlen,
+                                                decodeCache->compressorWideDim,
+                                                decodeCache->compressorKVRaw,
+                                                decodeCache->compressorScoreRaw);
+                        }
                     } else {
                         AppendCompressorRaw(compressorKV, compressorScore, bsz, seqlen,
                                             decodeCache->compressorWideDim,
                                             decodeCache->compressorKVRaw,
                                             decodeCache->compressorScoreRaw);
                     }
-                    int compressedCutoff = decodeCache->totalLen - (decodeCache->totalLen % compressRatio);
-                    int targetCompressedBlocks = compressRatio > 0 ? compressedCutoff / compressRatio : 0;
-                    if (targetCompressedBlocks > 0 &&
-                        decodeCache->compressedBlocks == targetCompressedBlocks &&
-                        HasCompressedKVData(decodeCache->compressedKV)) {
+                    if (targetCompressedReady) {
                         decodeCompressedCount = decodeCache->compressedBlocks;
                         decodeCompressedKVForAttention = &decodeCache->compressedKV;
                     } else {
-                        if (BuildCompressedKVFromRaw(weight, pre + ".attn.compressor",
-                                                     decodeCache->compressorKVRaw,
-                                                     decodeCache->compressorScoreRaw,
-                                                     bsz, decodeCache->compressorRawTokenBase,
-                                                     decodeCache->totalLen, compressRatio,
-                                                     head_dim_full, qk_rope_head_dim, layerRopeBase,
-                                                     rope_factor, rope_scaling_beta_fast, rope_scaling_beta_slow,
-                                                     layerOriginalSeqLen, decodeCache->compressedKV,
-                                                     true)) {
+                        bool builtCompressed = BuildCompressedKVFromRaw(
+                            weight, pre + ".attn.compressor", *compressorKVForBuild,
+                            *compressorScoreForBuild, bsz, compressorRawTokenBaseForBuild,
+                            decodeCache->totalLen, compressRatio, head_dim_full,
+                            qk_rope_head_dim, layerRopeBase, rope_factor,
+                            rope_scaling_beta_fast, rope_scaling_beta_slow,
+                            layerOriginalSeqLen, decodeCache->compressedKV, true);
+                        if (!builtCompressed && transientCompressorRaw) {
+                            AppendCompressorRaw(compressorKV, compressorScore, bsz, seqlen,
+                                                decodeCache->compressorWideDim,
+                                                decodeCache->compressorKVRaw,
+                                                decodeCache->compressorScoreRaw);
+                            builtCompressed = BuildCompressedKVFromRaw(
+                                weight, pre + ".attn.compressor",
+                                decodeCache->compressorKVRaw,
+                                decodeCache->compressorScoreRaw, bsz,
+                                decodeCache->compressorRawTokenBase,
+                                decodeCache->totalLen, compressRatio, head_dim_full,
+                                qk_rope_head_dim, layerRopeBase, rope_factor,
+                                rope_scaling_beta_fast, rope_scaling_beta_slow,
+                                layerOriginalSeqLen, decodeCache->compressedKV, true);
+                            transientCompressorRaw = false;
+                        }
+                        if (builtCompressed) {
                             int builtBlocks = GetReusableCompressedBlocks(decodeCache->compressedKV,
                                                                           bsz, targetCompressedBlocks,
                                                                           head_dim_full);
                             decodeCache->compressedBlocks = builtBlocks;
                             decodeCompressedCount = decodeCache->compressedBlocks;
-                            TrimCompressorRawCache(bsz, decodeCache->totalLen, compressRatio,
-                                                   decodeCache->compressorWideDim,
-                                                   decodeCache->compressedBlocks,
-                                                   decodeCache->compressorKVRaw,
-                                                   decodeCache->compressorScoreRaw,
-                                                   decodeCache->compressorRawTokenBase);
+                            if (transientCompressorRaw) {
+                                int retainStart = decodeCache->compressedBlocks * std::max(1, compressRatio);
+                                if (compressRatio == 4 && decodeCache->compressedBlocks > 0) {
+                                    retainStart = (decodeCache->compressedBlocks - 1) * compressRatio;
+                                }
+                                int rawEnd = startPos + seqlen;
+                                retainStart = std::max(startPos, std::min(retainStart, rawEnd));
+                                int tailLen = rawEnd - retainStart;
+                                if (tailLen > 0) {
+                                    Data tailKV, tailScore;
+                                    int tailOffset = retainStart - startPos;
+                                    Split(compressorKV, 1, tailOffset, seqlen, tailKV);
+                                    Split(compressorScore, 1, tailOffset, seqlen, tailScore);
+                                    CopyTensorData(decodeCache->compressorKVRaw, tailKV);
+                                    CopyTensorData(decodeCache->compressorScoreRaw, tailScore);
+                                    EnsureCompressorRawCapacity(decodeCache->compressorKVRaw, tailLen);
+                                    EnsureCompressorRawCapacity(decodeCache->compressorScoreRaw, tailLen);
+                                } else {
+                                    ResetData(decodeCache->compressorKVRaw);
+                                    ResetData(decodeCache->compressorScoreRaw);
+                                }
+                                decodeCache->compressorRawTokenBase = retainStart;
+                            } else {
+                                TrimCompressorRawCache(bsz, decodeCache->totalLen, compressRatio,
+                                                       decodeCache->compressorWideDim,
+                                                       decodeCache->compressedBlocks,
+                                                       decodeCache->compressorKVRaw,
+                                                       decodeCache->compressorScoreRaw,
+                                                       decodeCache->compressorRawTokenBase);
+                            }
                             if (startPos == 0) {
                                 Data catKV;
                                 const Data *prefillCompressed = &decodeCache->compressedKV;
@@ -2514,7 +2582,16 @@ namespace fastllm {
             if (decodeCache != nullptr && startPos > 0 && seqlen > 1) {
                 sparsePrefillPrefixLen = chunkPrefixLen;
                 if (chunkPrefixLen > 0) {
-                    ConcatSeqReference(chunkPrefixKV, kv, sparsePrefillKV);
+                    const Data *chunkPrefixForAttention = &chunkPrefixKV;
+                    Data chunkPrefixTyped;
+                    if (chunkPrefixKV.dataType != kv.dataType) {
+                        ToDataType(chunkPrefixKV, chunkPrefixTyped, kv.dataType);
+                        if (chunkPrefixTyped.dataDevice != kv.dataDevice) {
+                            chunkPrefixTyped.ToDevice(kv.dataDevice);
+                        }
+                        chunkPrefixForAttention = &chunkPrefixTyped;
+                    }
+                    ConcatSeqReference(*chunkPrefixForAttention, kv, sparsePrefillKV);
                 } else {
                     sparsePrefillKV.CopyFrom(kv);
                 }
