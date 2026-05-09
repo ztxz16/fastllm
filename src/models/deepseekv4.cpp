@@ -1297,50 +1297,6 @@ namespace fastllm {
             WriteFloatData(y, {bsz, aSeq + bSeq, dim}, output, a.dataType);
         }
 
-        static void RunExpertReference(WeightMap &weight, const std::string &prefix, const Data &x,
-                                       float routeWeight, float swigluLimit, std::vector<float> &accum) {
-            Data gate, up, gateup;
-            int interDim = 0;
-            if (weight.weight.find(prefix + ".gateup.weight") != weight.weight.end()) {
-                Linear((Data&)x, weight[prefix + ".gateup.weight"], Data(), gateup);
-                auto gv = ReadFloatData(gateup);
-                interDim = gateup.dims.back() / 2;
-                std::vector<float> act(interDim);
-                for (int i = 0; i < interDim; i++) {
-                    float g = gv[i];
-                    float u = gv[interDim + i];
-                    if (swigluLimit > 0.0f) {
-                        g = std::min(g, swigluLimit);
-                        u = std::max(-swigluLimit, std::min(u, swigluLimit));
-                    }
-                    act[i] = (g * SigmoidFloat(g)) * u * routeWeight;
-                }
-                WriteFloatData(act, {1, interDim}, gate, DataType::BFLOAT16);
-            } else {
-                Linear((Data&)x, weight[prefix + ".w1.weight"], Data(), gate);
-                Linear((Data&)x, weight[prefix + ".w3.weight"], Data(), up);
-                auto gv = ReadFloatData(gate);
-                auto uv = ReadFloatData(up);
-                interDim = (int)gv.size();
-                std::vector<float> act(interDim);
-                for (int i = 0; i < interDim; i++) {
-                    float g = gv[i], u = uv[i];
-                    if (swigluLimit > 0.0f) {
-                        g = std::min(g, swigluLimit);
-                        u = std::max(-swigluLimit, std::min(u, swigluLimit));
-                    }
-                    act[i] = (g * SigmoidFloat(g)) * u * routeWeight;
-                }
-                WriteFloatData(act, {1, interDim}, gate, DataType::BFLOAT16);
-            }
-            Data down;
-            Linear(gate, weight[prefix + ".w2.weight"], Data(), down);
-            auto dv = ReadFloatData(down);
-            for (int i = 0; i < (int)accum.size(); i++) {
-                accum[i] += dv[i];
-            }
-        }
-
         static void BuildMoERoutingData(WeightMap &weight, const std::string &prefix, const Data &x,
                                         const std::vector<int> &inputIds, int nRoutedExperts,
                                         int topk, const std::string &scoreFunc, float routeScale,
