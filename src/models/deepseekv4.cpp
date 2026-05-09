@@ -2690,7 +2690,7 @@ namespace fastllm {
         std::vector<int> samplingSeqLens(batch, 1);
         std::vector<GenerationConfig> generationConfigs(batch, generationConfig);
         if (generationConfig.top_k <= 1) {
-            generationConfigs[0].top_k = 1;
+            generationConfigs[0].top_k = 5;
         }
         std::vector<std::pair<Data*, Data*> > samplingPastKeyValues;
         samplingPastKeyValues.reserve(pastKeyValues.size());
