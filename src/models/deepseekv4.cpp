@@ -2443,10 +2443,6 @@ namespace fastllm {
             }
             if (compressRatio > 0) {
                 if (decodeCache != nullptr) {
-                    bool keepCompressedKVOnCuda = false;
-#ifdef USE_CUDA
-                    keepCompressedKVOnCuda = DeepSeekV4PreferCuda();
-#endif
                     Data compressorKV, compressorScore;
                     ComputeCompressorRaw(weight, pre + ".attn.compressor", attnInput, compressorKV, compressorScore);
                     if (startPos == 0) {
@@ -2475,7 +2471,7 @@ namespace fastllm {
                                                      head_dim_full, qk_rope_head_dim, layerRopeBase,
                                                      rope_factor, rope_scaling_beta_fast, rope_scaling_beta_slow,
                                                      layerOriginalSeqLen, decodeCache->compressedKV,
-                                                     keepCompressedKVOnCuda)) {
+                                                     true)) {
                             int builtBlocks = GetReusableCompressedBlocks(decodeCache->compressedKV,
                                                                           bsz, targetCompressedBlocks,
                                                                           head_dim_full);
@@ -2491,8 +2487,8 @@ namespace fastllm {
                                 Data catKV;
                                 const Data *prefillCompressed = &decodeCache->compressedKV;
                                 if (HasCompressedKVData(*prefillCompressed)) {
-                                    ConcatSeqReference(kv, *prefillCompressed, catKV);
-                                    kv.CopyFrom(catKV);
+                                    Cat(kv, *prefillCompressed, 1, catKV);
+                                    Copy(catKV, kv);
                                 }
                             }
                             decodeCompressedKVForAttention = &decodeCache->compressedKV;
@@ -2505,8 +2501,8 @@ namespace fastllm {
                                             rope_scaling_beta_fast, rope_scaling_beta_slow,
                                             layerOriginalSeqLen, startPos, compressedKV)) {
                         Data catKV;
-                        ConcatSeqReference(kv, compressedKV, catKV);
-                        kv.CopyFrom(catKV);
+                        Cat(kv, compressedKV, 1, catKV);
+                        Copy(catKV, kv);
                     }
                 }
             }
@@ -2617,7 +2613,7 @@ namespace fastllm {
         std::vector<int> samplingSeqLens(batch, 1);
         std::vector<GenerationConfig> generationConfigs(batch, generationConfig);
         if (generationConfig.top_k <= 1) {
-            generationConfigs[0].top_k = 5;
+            generationConfigs[0].top_k = 1;
         }
         std::vector<std::pair<Data*, Data*> > samplingPastKeyValues;
         samplingPastKeyValues.reserve(pastKeyValues.size());
