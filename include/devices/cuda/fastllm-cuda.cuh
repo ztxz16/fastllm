@@ -290,6 +290,7 @@ bool FastllmCudaHalfMatMulFloat32(const fastllm::Data &input, fastllm::Data &wei
 bool FastllmCudaConv1DPerChannelFloat32(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, int inputChannels, int outputChannels, int kernel, int stride, int pad, fastllm::Data &output);
 bool FastllmCudaConv1DPerChannelSiluSingleTokenFloat16(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
 bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(fastllm::Data &cache, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
+bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchPointers(const std::vector<fastllm::Data*> &caches, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
 
 bool FastllmCudaConv2DFloat32(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, fastllm::Data &output);
 
@@ -380,6 +381,13 @@ void FastllmResetLogitsOfEOS(int batch, fastllm::Data *logits, const std::vector
     const std::vector<int> eos_nums, const std::vector<int> eos_ids);
 
 void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float qScale = 1.0f);
+void FastllmRecurrentGatedDeltaRuleBatch(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out, float qScale = 1.0f);
+void FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
+    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
+    fastllm::Data &aLog, fastllm::Data &dtBias,
+    std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out,
+    int numKHeads, int numVHeads, int headKDim, int headVDim,
+    float eps, float qScale = 1.0f);
 void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
     fastllm::Data &g, fastllm::Data &attn, fastllm::Data &k_cumdecay,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out);

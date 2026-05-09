@@ -89,16 +89,16 @@ namespace fastllm {
         AssertInFastLLM(cache.dataDevice == newToken.dataDevice,
                         "Linear attention decode cache update expects the same device.");
         AssertInFastLLM(cache.dims.size() == 3 && newToken.dims.size() == 3 &&
-                        cache.dims[0] == 1 && newToken.dims[0] == 1 &&
+                        cache.dims[0] == newToken.dims[0] &&
                         cache.dims[1] == newToken.dims[1] && newToken.dims[2] == 1 &&
                         cache.strides.back() == 1 && newToken.strides.back() == 1,
-                        "Linear attention decode cache update expects [1, channels, window] and [1, channels, 1].");
+                        "Linear attention decode cache update expects [batch, channels, window] and [batch, channels, 1].");
 
-        int channels = cache.dims[1];
+        int rows = cache.dims[0] * cache.dims[1];
         int window = cache.dims[2];
         int unitSize = cache.unitSize;
         if (cache.dataDevice == DataDevice::CPU) {
-            for (int c = 0; c < channels; c++) {
+            for (int c = 0; c < rows; c++) {
                 uint8_t *cacheRow = cache.cpuData + (size_t) c * window * unitSize;
                 const uint8_t *newTokenRow = newToken.cpuData + (size_t) c * unitSize;
                 memmove(cacheRow, cacheRow + unitSize, (size_t) (window - 1) * unitSize);
@@ -107,12 +107,77 @@ namespace fastllm {
         } else if (cache.dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             FastllmCudaShiftAppendWindow((uint8_t*) cache.cudaData, (const uint8_t*) newToken.cudaData,
-                                         channels, window, unitSize);
+                                         rows, window, unitSize);
 #else
             ErrorInFastLLM("Error: cuda is not supported.\n");
 #endif
         } else {
             ErrorInFastLLM("Linear attention decode cache update only supports CPU/CUDA tensors.");
+        }
+    }
+
+    static void CatBatchFirstDim(const std::vector<Data*> &inputs, Data &output) {
+        AssertInFastLLM(!inputs.empty(), "CatBatchFirstDim expects non-empty inputs.");
+        Data *first = inputs[0];
+        AssertInFastLLM(first != nullptr && !first->dims.empty() && first->dims[0] == 1,
+                        "CatBatchFirstDim expects inputs with first dimension 1.");
+
+        std::vector<int> dims = first->dims;
+        dims[0] = (int) inputs.size();
+        output.dataType = first->dataType;
+        output.dataDevice = first->dataDevice;
+        output.dataDeviceIds = first->dataDeviceIds;
+        output.Resize(dims);
+        output.Allocate(false);
+
+        size_t inputBytes = first->GetBytes();
+        for (int i = 0; i < (int) inputs.size(); i++) {
+            Data *cur = inputs[i];
+            AssertInFastLLM(cur != nullptr && cur->dataType == first->dataType &&
+                            cur->dataDevice == first->dataDevice && cur->dims == first->dims,
+                            "CatBatchFirstDim expects matching input tensors.");
+            if (output.dataDevice == DataDevice::CPU) {
+                memcpy(output.cpuData + (size_t) i * inputBytes, cur->cpuData, inputBytes);
+            } else if (output.dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+                FastllmCudaCopyFromDeviceToDevice((uint8_t*) output.cudaData + (size_t) i * inputBytes,
+                                                  cur->cudaData, inputBytes);
+#else
+                ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
+            } else {
+                ErrorInFastLLM("CatBatchFirstDim only supports CPU and CUDA tensors.");
+            }
+        }
+    }
+
+    static void SplitBatchFirstDim(const Data &input, const std::vector<Data*> &outputs) {
+        AssertInFastLLM(!input.dims.empty() && input.dims[0] == (int) outputs.size(),
+                        "SplitBatchFirstDim expects input first dimension to match outputs.");
+        std::vector<int> dims = input.dims;
+        dims[0] = 1;
+        size_t outputBytes = input.GetBytes() / input.dims[0];
+        for (int i = 0; i < (int) outputs.size(); i++) {
+            Data *cur = outputs[i];
+            AssertInFastLLM(cur != nullptr, "SplitBatchFirstDim expects non-null outputs.");
+            cur->dataType = input.dataType;
+            cur->dataDevice = input.dataDevice;
+            cur->dataDeviceIds = input.dataDeviceIds;
+            cur->Resize(dims);
+            cur->Allocate(false);
+            if (input.dataDevice == DataDevice::CPU) {
+                memcpy(cur->cpuData, input.cpuData + (size_t) i * outputBytes, outputBytes);
+            } else if (input.dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+                FastllmCudaCopyFromDeviceToDevice(cur->cudaData,
+                                                  (uint8_t*) input.cudaData + (size_t) i * outputBytes,
+                                                  outputBytes);
+#else
+                ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
+            } else {
+                ErrorInFastLLM("SplitBatchFirstDim only supports CPU and CUDA tensors.");
+            }
         }
     }
 
@@ -1503,6 +1568,7 @@ namespace fastllm {
         bool isSingleTokenDecode = batch == 1 && all1 &&
                                    !pastKeyValues.empty() &&
                                    pastKeyValues[0].first->dims.size() > 0;
+        bool isFusedBatchDecode = batch > 1 && all1;
         PrepareMoeWeights();
         PrepareGdnWeights();
 
@@ -1590,9 +1656,14 @@ namespace fastllm {
                 AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);
                 pagedAttentionInited = true;
 
-                PermuteSelf(qkv, {1, 0, 2});
-                qkv.Reshape({seqlen, bsz, -1});
-                PermuteSelf(qkv, {1, 0, 2});
+                if (batch > 1 && all1) {
+                    qkv.Reshape({seqlen, bsz, -1});
+                    PermuteSelf(qkv, {1, 0, 2});
+                } else {
+                    PermuteSelf(qkv, {1, 0, 2});
+                    qkv.Reshape({seqlen, bsz, -1});
+                    PermuteSelf(qkv, {1, 0, 2});
+                }
 
                 Sigmoid(gate, gate);
                 if (gate.dataType != qkv.dataType) {
@@ -1625,7 +1696,7 @@ namespace fastllm {
                         this->weight[qkvzbaWeightName].ToDevice(DataDevice::CUDA);
                     }
                 }
-                bool useMergedGdnInLinear = isSingleTokenDecode && hasMergedGdnInLinear;
+                bool useMergedGdnInLinear = (isSingleTokenDecode || isFusedBatchDecode) && hasMergedGdnInLinear;
 
                 Data gdn_in_merged, mixed_qkvz, ba_merged, qkvConvInput, z, b, a, g;
                 if (useMergedGdnInLinear) {
@@ -1661,6 +1732,8 @@ namespace fastllm {
 
                 if (isSingleTokenDecode) {
                     SwapSingleTokenSeqHeadByReshape(qkvConvInput);
+                } else if (isFusedBatchDecode) {
+                    qkvConvInput.Reshape({batch, qkvConvInput.dims.back(), 1});
                 } else {
                     PermuteSelf(qkvConvInput, {0, 2, 1});
                 }
@@ -1702,6 +1775,42 @@ namespace fastllm {
                     }
                     if (!fusedDecodeConvSilu) {
                         Silu(convOutput, convOutput);
+                    }
+                } else if (isFusedBatchDecode) {
+                    std::vector<Data*> linearConvCaches(batch);
+                    for (int b = 0; b < batch; b++) {
+                        linearConvCaches[b] = pastKeyValues[b * block_cnt + i].first;
+                    }
+                    bool directBatchDecodeConvSilu = false;
+#ifdef USE_CUDA
+                    directBatchDecodeConvSilu =
+                        FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchPointers(
+                            linearConvCaches, qkvConvInput,
+                            weight[conv1dWeightName], weight[conv1dBiasName], convOutput);
+#endif
+                    if (!directBatchDecodeConvSilu) {
+                        Data batchConvCache;
+                        CatBatchFirstDim(linearConvCaches, batchConvCache);
+                        bool fusedBatchDecodeConvSilu = false;
+#ifdef USE_CUDA
+                        fusedBatchDecodeConvSilu =
+                            FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(
+                                batchConvCache, qkvConvInput,
+                                weight[conv1dWeightName], weight[conv1dBiasName], convOutput);
+#endif
+                        if (!fusedBatchDecodeConvSilu) {
+                            ShiftAppendSingleTokenLinearAttentionCache(batchConvCache, qkvConvInput);
+                            Conv1DPerChannel(
+                                batchConvCache, weight[conv1dWeightName], weight[conv1dBiasName],
+                                batchConvCache.dims[1], weight[conv1dWeightName].dims[0], 4, 1, 0,
+                                convOutput
+                            );
+                            Silu(convOutput, convOutput);
+                        }
+                        SplitBatchFirstDim(batchConvCache, linearConvCaches);
+                    }
+                    for (int b = 0; b < batch; b++) {
+                        linearConvCaches[b]->isLinearAttention = true;
                     }
                 } else {
                     if (qkvConvInput.dims.back() >= 4) {
@@ -2377,6 +2486,92 @@ namespace fastllm {
         const std::vector <GenerationConfig> &generationConfigs,
         const LastTokensManager &lastTokens,
         std::vector <std::vector <float>*> *retLogits) {
+        bool all1 = true;
+        for (int i = 0; i < batch; i++) {
+            all1 &= (seqLens[i] == 1);
+        }
+
+        auto runSplitBatchForward = [&]() -> std::vector<int> {
+            std::vector<int> ret;
+            ret.reserve(batch);
+
+            int inputOffset = 0;
+            for (int b = 0; b < batch; b++) {
+                Data curInputIds;
+                Split(inputIds, 1, inputOffset, inputOffset + seqLens[b], curInputIds);
+                inputOffset += seqLens[b];
+
+                std::vector<Data*> curAttentionMask = {
+                    b < (int) attentionMask.size() ? attentionMask[b] : nullptr
+                };
+                std::vector<Data*> curPositionIds = {
+                    b < (int) positionIds.size() ? positionIds[b] : nullptr
+                };
+                std::vector<int> curSeqLens = {seqLens[b]};
+                std::vector<GenerationConfig> curGenerationConfigs = {generationConfigs[b]};
+
+                LastTokensManager curLastTokens;
+                if (b < (int) lastTokens.units.size()) {
+                    curLastTokens.units.push_back(lastTokens.units[b]);
+                } else {
+                    int lastN = generationConfigs[b].last_n <= 0 ? max_positions : generationConfigs[b].last_n;
+                    curLastTokens = LastTokensManager(1, lastN);
+                }
+
+                std::vector<std::pair<Data*, Data*> > curPastKeyValues;
+                curPastKeyValues.reserve(block_cnt);
+                int pastOffset = b * block_cnt;
+                for (int i = 0; i < block_cnt; i++) {
+                    curPastKeyValues.push_back(pastKeyValues[pastOffset + i]);
+                }
+
+                std::vector<std::vector<float>*> curLogits;
+                std::vector<std::vector<float>*> *curLogitsPtr = nullptr;
+                if (retLogits != nullptr) {
+                    curLogits.push_back(b < (int) retLogits->size() ? (*retLogits)[b] : nullptr);
+                    curLogitsPtr = &curLogits;
+                }
+
+                std::vector<int> curRet = ForwardV2(
+                    1, curInputIds, curAttentionMask, curPositionIds, curSeqLens,
+                    curPastKeyValues, curGenerationConfigs, curLastTokens, curLogitsPtr
+                );
+                ret.push_back(curRet[0]);
+            }
+            return ret;
+        };
+
+        auto canRunFusedBatchDecode = [&]() -> bool {
+            if (batch <= 1 || !all1 || (int) pastKeyValues.size() < batch * block_cnt) {
+                return false;
+            }
+            for (int b = 0; b < batch; b++) {
+                for (int i = 0; i < block_cnt; i++) {
+                    Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                    Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                    if (pastKey == nullptr || pastValue == nullptr) {
+                        return false;
+                    }
+                    bool isGatedAttentionLayer =
+                        weight.weight.find(language_prefix + "layers." + std::to_string(i) + ".self_attn.o_proj.weight") != weight.weight.end();
+                    if (isGatedAttentionLayer) {
+                        if (!pastKey->isPagedKVCache || !pastValue->isPagedKVCache ||
+                            pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
+                            pastKey->pageIndex.empty() || pastValue->pageIndex.empty()) {
+                            return false;
+                        }
+                    } else if (pastKey->dims.empty() || pastValue->dims.empty()) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        if (batch > 1 && !canRunFusedBatchDecode()) {
+            return runSplitBatchForward();
+        }
+
         int seqLen = inputIds.dims[1];
 
         Data qkv;
@@ -2422,16 +2617,42 @@ namespace fastllm {
         // Data &attenOutput = this->forwardDataManager.GetData("attenOutput");
         bool generatedBatchDecodeParams = false;
         bool generatedAppendPagedCacheBatchParams = false;
+        auto makeCacheDesc = [](const Data &src, DataType targetType) {
+            Data desc(targetType);
+            desc.dims = src.dims;
+            desc.strides = src.strides;
+            desc.dataDevice = src.dataDevice;
+            desc.dataDeviceIds = src.dataDeviceIds;
+            desc.UpdateUnitSize();
+            return desc;
+        };
+        auto resolvePagedAttentionQType = [&](DataType cacheType, DataType queryType) -> DataType {
+            if (cacheType == DataType::FLOAT16 || cacheType == DataType::BFLOAT16) {
+                return cacheType;
+            }
+            if (queryType == DataType::FLOAT16 || queryType == DataType::BFLOAT16) {
+                return queryType;
+            }
+            if (this->dataType == DataType::BFLOAT16) {
+                return DataType::BFLOAT16;
+            }
+            return DataType::FLOAT16;
+        };
+        auto preparePagedAttentionQ = [&](Data &src, DataType cacheType, Data &casted) -> Data& {
+            DataType targetType = resolvePagedAttentionQType(cacheType, src.dataType);
+            if (src.dataType == targetType) {
+                return src;
+            }
+            ToDataType(src, casted, targetType);
+            return casted;
+        };
 
-        bool all1 = true;
-        for (int i = 0; i < batch; i++) {
-            all1 &= (seqLens[i] == 1);
-        }
         allPositionIds.CopyFrom(BuildFlattenedPositionIds(positionIds, seqLens, all1));
 
         bool isSingleTokenDecode = batch == 1 && all1 &&
                                    !pastKeyValues.empty() &&
                                    pastKeyValues[0].first->dims.size() > 0;
+        bool isFusedBatchDecode = batch > 1 && all1;
 
         PrepareMoeWeights();
         PrepareGdnWeights();
@@ -2525,19 +2746,68 @@ namespace fastllm {
                 v.Reshape(qkvSize);
                 PreparePagedAttentionInputs(q, k, v, this->dataType);
 
-                // Paged Attention
-                PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                    i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
-                PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                    i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
-                AppendPagedCache(*pagedCacheKManager, pastKey, k);
-                AppendPagedCache(*pagedCacheVManager, pastValue, v);
-                AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);
-                pagedAttentionInited = true;
+                if (batch > 1 && all1) {
+                    for (int b = 0; b < batch; b++) {
+                        batchPastKeys[b] = pastKeyValues[b * block_cnt + i].first;
+                        batchPastValues[b] = pastKeyValues[b * block_cnt + i].second;
+                    }
 
-                PermuteSelf(qkv, {1, 0, 2});
-                qkv.Reshape({seqlen, bsz, -1});
-                PermuteSelf(qkv, {1, 0, 2});
+                    Data &kCaches = *batchPastKeys[0];
+                    Data &vCaches = *batchPastValues[0];
+                    PagedCacheManager *pagedCacheKManager = kCaches.pagedKVCacheData;
+                    PagedCacheManager *pagedCacheVManager = vCaches.pagedKVCacheData;
+                    AssertInFastLLM(pagedCacheKManager != nullptr && pagedCacheVManager != nullptr,
+                                    "Qwen3.5 fused batch decode requires paged KV cache.");
+
+                    if (!generatedAppendPagedCacheBatchParams) {
+                        GenerateAppendPagedCacheBatchParams(*pagedCacheKManager, batchPastKeys, batch,
+                                                            insertIndexs, insertPositions);
+                        generatedAppendPagedCacheBatchParams = true;
+                    }
+
+                    Data kAppend, vAppend;
+                    Permute(k, {1, 0, 2}, kAppend);
+                    Permute(v, {1, 0, 2}, vAppend);
+                    AppendPagedCacheBatch(*pagedCacheKManager, batchPastKeys, kAppend, insertIndexs, insertPositions);
+                    AppendPagedCacheBatch(*pagedCacheVManager, batchPastValues, vAppend, insertIndexs, insertPositions);
+
+                    if (!generatedBatchDecodeParams) {
+                        Data qForAttentionHolder;
+                        Data &qForAttention = preparePagedAttentionQ(q, kCaches.dataType, qForAttentionHolder);
+                        GeneratePagedBatchParams(qForAttention, batchPastKeys, batch,
+                                                 qSizes, pageSizes, pageIndexs, lastPageLens);
+                        generatedBatchDecodeParams = true;
+                    }
+
+                    Data qForAttentionHolder;
+                    Data &qForAttention = preparePagedAttentionQ(q, kCaches.dataType, qForAttentionHolder);
+                    AttentionPagedBatch(qForAttention, kCaches, vCaches,
+                                        qSizes, pageSizes, pageIndexs, lastPageLens,
+                                        qkv, qForAttention.dims[0] / kCaches.dims[0],
+                                        1.0 / sqrt(head_dim), 1, pagedAttentionInited);
+                    pagedAttentionInited = true;
+                } else {
+                    // Paged Attention
+                    Data kCacheDesc = makeCacheDesc(k, pastKey.dataType);
+                    Data vCacheDesc = makeCacheDesc(v, pastValue.dataType);
+                    PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
+                        i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
+                    PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
+                        i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                    AppendPagedCache(*pagedCacheKManager, pastKey, k);
+                    AppendPagedCache(*pagedCacheVManager, pastValue, v);
+                    AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0 / sqrt(head_dim), 1, pagedAttentionInited);
+                    pagedAttentionInited = true;
+                }
+
+                if (batch > 1 && all1) {
+                    qkv.Reshape({seqlen, bsz, -1});
+                    PermuteSelf(qkv, {1, 0, 2});
+                } else {
+                    PermuteSelf(qkv, {1, 0, 2});
+                    qkv.Reshape({seqlen, bsz, -1});
+                    PermuteSelf(qkv, {1, 0, 2});
+                }
 
                 Sigmoid(gate, gate);
                 if (gate.dataType != qkv.dataType) {
@@ -2572,7 +2842,7 @@ namespace fastllm {
                         this->weight[qkvzbaWeightName].ToDevice(DataDevice::CUDA);
                     }
                 }
-                bool useMergedGdnInLinear = isSingleTokenDecode && hasMergedGdnInLinear;
+                bool useMergedGdnInLinear = (isSingleTokenDecode || isFusedBatchDecode) && hasMergedGdnInLinear;
 
                 Data gdn_in_merged, mixed_qkvz, ba_merged, qkvConvInput, z, b, a, g;
                 if (useMergedGdnInLinear) {
@@ -2599,18 +2869,25 @@ namespace fastllm {
                     Split(mixed_qkvz, -1, qkvzDim, qkvzDim + vd, z);
                 }
 
-                // Split ba -> b + a (note: b and a have dim num_v_heads, not vd)
+                // Split ba -> b + a (note: b and a have dim num_v_heads, not vd).
+                // Fused batch decode can consume ba_merged directly below, so defer this split
+                // unless the fused recurrent path is unavailable.
+                bool baSplitReady = false;
                 if (isSingleTokenDecode && CanUseSingleRowLastDimView(ba_merged)) {
                     MakeSingleRowLastDimView(ba_merged, 0, num_v_heads, b);
                     MakeSingleRowLastDimView(ba_merged, num_v_heads, num_v_heads * 2, a);
-                } else {
+                    baSplitReady = true;
+                } else if (!isFusedBatchDecode) {
                     Split(ba_merged, -1, 0, num_v_heads, b);
                     Split(ba_merged, -1, num_v_heads, num_v_heads * 2, a);
+                    baSplitReady = true;
                 }
 
                 // mixed_qkv: (bsz, seqlen, key_dim*2+value_dim) -> transpose to (bsz, key_dim*2+value_dim, seqlen)
                 if (isSingleTokenDecode) {
                     SwapSingleTokenSeqHeadByReshape(qkvConvInput);
+                } else if (isFusedBatchDecode) {
+                    qkvConvInput.Reshape({batch, qkvConvInput.dims.back(), 1});
                 } else {
                     PermuteSelf(qkvConvInput, {0, 2, 1});
                 }
@@ -2653,6 +2930,42 @@ namespace fastllm {
                     if (!fusedDecodeConvSilu) {
                         Silu(convOutput, convOutput);
                     }
+                } else if (isFusedBatchDecode) {
+                    std::vector<Data*> linearConvCaches(batch);
+                    for (int b = 0; b < batch; b++) {
+                        linearConvCaches[b] = pastKeyValues[b * block_cnt + i].first;
+                    }
+                    bool directBatchDecodeConvSilu = false;
+#ifdef USE_CUDA
+                    directBatchDecodeConvSilu =
+                        FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchPointers(
+                            linearConvCaches, qkvConvInput,
+                            weight[conv1dWeightName], weight[conv1dBiasName], convOutput);
+#endif
+                    if (!directBatchDecodeConvSilu) {
+                        Data batchConvCache;
+                        CatBatchFirstDim(linearConvCaches, batchConvCache);
+                        bool fusedBatchDecodeConvSilu = false;
+#ifdef USE_CUDA
+                        fusedBatchDecodeConvSilu =
+                            FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(
+                                batchConvCache, qkvConvInput,
+                                weight[conv1dWeightName], weight[conv1dBiasName], convOutput);
+#endif
+                        if (!fusedBatchDecodeConvSilu) {
+                            ShiftAppendSingleTokenLinearAttentionCache(batchConvCache, qkvConvInput);
+                            Conv1DPerChannel(
+                                batchConvCache, weight[conv1dWeightName], weight[conv1dBiasName],
+                                batchConvCache.dims[1], weight[conv1dWeightName].dims[0], 4, 1, 0,
+                                convOutput
+                            );
+                            Silu(convOutput, convOutput);
+                        }
+                        SplitBatchFirstDim(batchConvCache, linearConvCaches);
+                    }
+                    for (int b = 0; b < batch; b++) {
+                        linearConvCaches[b]->isLinearAttention = true;
+                    }
                 } else {
                     if (qkvConvInput.dims.back() >= 4) {
                         Split(qkvConvInput, -1, qkvConvInput.dims.back() - 4, qkvConvInput.dims.back(), pastKey);
@@ -2675,9 +2988,79 @@ namespace fastllm {
                 // mixed_qkv: (bsz, conv_dim, seqlen) -> transpose back to (bsz, seqlen, conv_dim)
                 if (isSingleTokenDecode) {
                     SwapSingleTokenSeqHeadByReshape(convOutput);
+                } else if (isFusedBatchDecode) {
+                    convOutput.Reshape({1, batch, convOutput.dims[1]});
                 } else {
                     PermuteSelf(convOutput, {0, 2, 1});
                 }
+
+                Data core_attn_out, core_attn_out_temp;
+                bool fusedBatchRecurrentFromConvBa = false;
+#ifdef USE_CUDA
+                if (isFusedBatchDecode &&
+                    convOutput.dataDevice == DataDevice::CUDA &&
+                    convOutput.dataType == DataType::FLOAT16 &&
+                    ba_merged.dataDevice == DataDevice::CUDA &&
+                    ba_merged.dataType == DataType::FLOAT16 &&
+                    ba_merged.dims.size() > 0 &&
+                    ba_merged.dims.back() == num_v_heads * 2 &&
+                    convOutput.dims.size() > 0 &&
+                    convOutput.dims.back() == kd + kd + vd &&
+                    weight[aLogName].dataDevice == DataDevice::CUDA &&
+                    weight[aLogName].dataType == DataType::FLOAT32 &&
+                    weight[dtBiasName].dataDevice == DataDevice::CUDA &&
+                    weight[dtBiasName].dataType == DataType::FLOAT32 &&
+                    num_k_heads > 0 &&
+                    num_v_heads % num_k_heads == 0) {
+                    if (inv_scale_data.dataDevice != DataDevice::CUDA) {
+                        if (!convOutput.dataDeviceIds.empty()) {
+                            inv_scale_data.ToDevice(DataDevice::CUDA, convOutput.dataDeviceIds);
+                        } else {
+                            inv_scale_data.ToDevice(DataDevice::CUDA);
+                        }
+                    }
+
+                    std::vector<Data*> recurrentStates(batch);
+                    bool canUseFusedRecurrentFromConvBa =
+                        inv_scale_data.dataDevice == DataDevice::CUDA &&
+                        inv_scale_data.dataType == DataType::FLOAT32 &&
+                        inv_scale_data.dims.size() == 1 &&
+                        inv_scale_data.dims[0] == head_k_dim;
+                    for (int rb = 0; rb < batch; rb++) {
+                        recurrentStates[rb] = pastKeyValues[rb * block_cnt + i].second;
+                        canUseFusedRecurrentFromConvBa &= recurrentStates[rb] != nullptr &&
+                                                          recurrentStates[rb]->dataDevice == DataDevice::CUDA &&
+                                                          recurrentStates[rb]->dataType == DataType::FLOAT16 &&
+                                                          recurrentStates[rb]->dims.size() == 4 &&
+                                                          recurrentStates[rb]->dims[0] == 1 &&
+                                                          recurrentStates[rb]->dims[1] == num_v_heads &&
+                                                          recurrentStates[rb]->dims[2] == head_k_dim &&
+                                                          recurrentStates[rb]->dims[3] == head_v_dim;
+                    }
+
+                    if (canUseFusedRecurrentFromConvBa) {
+                        float recurrentQScale = 1.0f / pow((float)head_k_dim, 0.5f);
+                        FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
+                            convOutput, ba_merged, inv_scale_data, weight[aLogName], weight[dtBiasName],
+                            recurrentStates, core_attn_out,
+                            num_k_heads, num_v_heads, head_k_dim, head_v_dim,
+                            rms_norm_eps, recurrentQScale
+                        );
+                        for (int rb = 0; rb < batch; rb++) {
+                            recurrentStates[rb]->isLinearAttention = true;
+                        }
+                        core_attn_out.Reshape({1, batch, core_attn_out.dims[1], core_attn_out.dims[3]});
+                        fusedBatchRecurrentFromConvBa = true;
+                    }
+                }
+#endif
+
+                if (!fusedBatchRecurrentFromConvBa) {
+                    if (!baSplitReady) {
+                        Split(ba_merged, -1, 0, num_v_heads, b);
+                        Split(ba_merged, -1, num_v_heads, num_v_heads * 2, a);
+                        baSplitReady = true;
+                    }
 
                 // q / k / v are reused later as MLP scratch buffers, so they must not alias
                 // convOutput's lifetime-limited storage in single-token decode.
@@ -2707,7 +3090,6 @@ namespace fastllm {
 
                 Data &last_recurrent_state = pastValue;
 
-                Data core_attn_out, core_attn_out_temp;
                 if (bsz == 1 && seqlen == 1 && pastKey.dims.size() > 0) {
                     RMSNorm(q, inv_scale_data, rms_norm_eps, q);
                     RMSNorm(k, inv_scale_data, rms_norm_eps, k);
@@ -2732,6 +3114,58 @@ namespace fastllm {
                         core_attn_out, recurrentQScale
                     );
                     SwapSingleTokenSeqHeadByReshape(core_attn_out);
+                } else if (isFusedBatchDecode) {
+                    RMSNorm(q, inv_scale_data, rms_norm_eps, q);
+                    RMSNorm(k, inv_scale_data, rms_norm_eps, k);
+
+                    q.Reshape({batch, q.dims[2], 1, q.dims[3]});
+                    k.Reshape({batch, k.dims[2], 1, k.dims[3]});
+                    v.Reshape({batch, v.dims[2], 1, v.dims[3]});
+                    b.Reshape({batch, b.dims[2], 1});
+                    g.Reshape({batch, g.dims[2], 1});
+
+                    std::vector<Data*> recurrentStates(batch);
+                    bool canUseCudaBatchRecurrent = q.dataDevice == DataDevice::CUDA &&
+                                                    q.dataType == DataType::FLOAT16;
+                    for (int rb = 0; rb < batch; rb++) {
+                        recurrentStates[rb] = pastKeyValues[rb * block_cnt + i].second;
+                        canUseCudaBatchRecurrent &= recurrentStates[rb] != nullptr &&
+                                                    recurrentStates[rb]->dataDevice == DataDevice::CUDA &&
+                                                    recurrentStates[rb]->dataType == q.dataType &&
+                                                    recurrentStates[rb]->dims.size() == 4 &&
+                                                    recurrentStates[rb]->dims[0] == 1;
+                    }
+
+                    float scale = 1.0f / pow(q.dims.back(), 0.5);
+                    float recurrentQScale = 1.0f;
+                    if (q.dataDevice == DataDevice::CUDA) {
+                        recurrentQScale = scale;
+                    } else {
+                        Mul(q, scale, q);
+                    }
+
+                    if (canUseCudaBatchRecurrent) {
+#ifdef USE_CUDA
+                        FastllmRecurrentGatedDeltaRuleBatch(q, k, v, g, b, recurrentStates, core_attn_out, recurrentQScale);
+#else
+                        ErrorInFastLLM("Error: cuda is not supported.\n");
+#endif
+                    } else {
+                        Data batchRecurrentState;
+                        CatBatchFirstDim(recurrentStates, batchRecurrentState);
+
+                        RecurrentGatedDeltaRule(
+                            q, k, v, g, b,
+                            batchRecurrentState,
+                            core_attn_out, recurrentQScale
+                        );
+
+                        SplitBatchFirstDim(batchRecurrentState, recurrentStates);
+                    }
+                    for (int rb = 0; rb < batch; rb++) {
+                        recurrentStates[rb]->isLinearAttention = true;
+                    }
+                    core_attn_out.Reshape({1, batch, core_attn_out.dims[1], core_attn_out.dims[3]});
                 } else {
                     if (num_v_heads / num_k_heads > 1) {
                         Data qrepeat, krepeat;
@@ -2936,6 +3370,7 @@ namespace fastllm {
                     } else {
                         PermuteSelf(core_attn_out, {0, 2, 1, 3});
                     }
+                }
                 }
 
                 {
