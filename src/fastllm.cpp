@@ -3509,6 +3509,29 @@ namespace fastllm {
         }, {}, {{"groups", groups}, {"oRank", oRank}});
     }
 
+    void DeepSeekV4BuildCompressedKVFromRaw(const Data &kv, const Data &score,
+                                            Data &ape, Data &normWeight,
+                                            int rawTokenBase, int rawLen,
+                                            int blockStart, int blockCount,
+                                            int compressRatio, int headDim,
+                                            int ropeDim, float ropeBase,
+                                            float ropeFactor, int betaFast,
+                                            int betaSlow, int originalSeqLen,
+                                            bool overlap, bool preferCudaOutput,
+                                            Data &cache) {
+        curExecutor->Run("DeepSeekV4BuildCompressedKVFromRaw", {
+                {"kv", (Data*)&kv}, {"score", (Data*)&score},
+                {"ape", &ape}, {"normWeight", &normWeight}, {"cache", &cache}
+        }, {{"ropeBase", ropeBase}, {"ropeFactor", ropeFactor}},
+           {{"rawTokenBase", rawTokenBase}, {"rawLen", rawLen},
+            {"blockStart", blockStart}, {"blockCount", blockCount},
+            {"compressRatio", compressRatio}, {"headDim", headDim},
+            {"ropeDim", ropeDim}, {"betaFast", betaFast},
+            {"betaSlow", betaSlow}, {"originalSeqLen", originalSeqLen},
+            {"overlap", overlap ? 1 : 0},
+            {"preferCudaOutput", preferCudaOutput ? 1 : 0}});
+    }
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output) {
         curExecutor->Run("Cat", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}, {"output", &output}

@@ -582,16 +582,16 @@ namespace fastllm {
                 return;
             }
             if (!HasTensorData(allKV)) {
-                CopyTensorData(allKV, kv);
-                CopyTensorData(allScore, score);
+                Copy(kv, allKV);
+                Copy(score, allScore);
                 EnsureCompressorRawCapacity(allKV, kv.dims[1]);
                 EnsureCompressorRawCapacity(allScore, score.dims[1]);
                 return;
             }
             int oldLen = GetDataSeqLen(allKV, bsz, wideDim);
             if (oldLen <= 0 || GetDataSeqLen(allScore, bsz, wideDim) != oldLen) {
-                CopyTensorData(allKV, kv);
-                CopyTensorData(allScore, score);
+                Copy(kv, allKV);
+                Copy(score, allScore);
                 EnsureCompressorRawCapacity(allKV, kv.dims[1]);
                 EnsureCompressorRawCapacity(allScore, score.dims[1]);
                 return;
@@ -1026,29 +1026,13 @@ namespace fastllm {
             }
 
             int addBlocks = blocks - reusableBlocks;
-            Data compressed;
-            if (!ComputeCompressedKVRangeData(weight, prefix, kv, score, bsz, rawTokenBase, rawLen,
-                                              reusableBlocks, addBlocks,
-                                              compressRatio, headDim, wideDim, overlap, compressed)) {
-                return false;
-            }
-            Data newRows;
-            FinalizeCompressedKVRows(weight, prefix, compressed, reusableBlocks,
-                                     compressRatio, headDim, ropeDim, ropeBase, ropeFactor,
-                                     betaFast, betaSlow, originalSeqLen, newRows);
-#ifdef USE_CUDA
-            if (preferCudaOutput &&
-                AppendCompressedKVRowsCuda(output, newRows, bsz, reusableBlocks, addBlocks, headDim)) {
-                return true;
-            }
-#endif
-            AppendCompressedKVRows(output, newRows, bsz, reusableBlocks, addBlocks, headDim);
-#ifdef USE_CUDA
-            if (preferCudaOutput && DeepSeekV4PreferCuda()) {
-                output.SetKVCache();
-                output.ToDevice(DataDevice::CUDA);
-            }
-#endif
+            Data ape;
+            ToDataType(weight[prefix + ".ape"], ape, DataType::FLOAT32);
+            DeepSeekV4BuildCompressedKVFromRaw(kv, score, ape, weight[prefix + ".norm.weight"],
+                                               rawTokenBase, rawLen, reusableBlocks, addBlocks,
+                                               compressRatio, headDim, ropeDim, ropeBase, ropeFactor,
+                                               betaFast, betaSlow, originalSeqLen, overlap,
+                                               preferCudaOutput, output);
             return true;
         }
 
@@ -2510,8 +2494,8 @@ namespace fastllm {
                     Data compressorKV, compressorScore;
                     ComputeCompressorRaw(weight, pre + ".attn.compressor", attnInput, compressorKV, compressorScore);
                     if (startPos == 0) {
-                        CopyTensorData(decodeCache->compressorKVRaw, compressorKV);
-                        CopyTensorData(decodeCache->compressorScoreRaw, compressorScore);
+                        Copy(compressorKV, decodeCache->compressorKVRaw);
+                        Copy(compressorScore, decodeCache->compressorScoreRaw);
                         decodeCache->compressorRawTokenBase = 0;
                     } else {
                         AppendCompressorRaw(compressorKV, compressorScore, bsz, seqlen,
@@ -2525,16 +2509,8 @@ namespace fastllm {
                         decodeCache->compressedBlocks == targetCompressedBlocks &&
                         HasCompressedKVData(decodeCache->compressedKV)) {
                         decodeCompressedCount = decodeCache->compressedBlocks;
-#ifdef USE_CUDA
-                        if (keepCompressedKVOnCuda) {
-                            EnsureCompressedKVOnCuda(*decodeCache);
-                        }
-#endif
                         decodeCompressedKVForAttention = &decodeCache->compressedKV;
                     } else {
-                        if (!keepCompressedKVOnCuda) {
-                            EnsureCompressedKVOnCpu(*decodeCache);
-                        }
                         if (BuildCompressedKVFromRaw(weight, pre + ".attn.compressor",
                                                      decodeCache->compressorKVRaw,
                                                      decodeCache->compressorScoreRaw,

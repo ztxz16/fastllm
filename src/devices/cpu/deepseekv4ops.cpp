@@ -320,6 +320,267 @@ namespace fastllm {
         DeepSeekV4HcPreWriteFloatData(y, output);
     }
 
+    struct DeepSeekV4BuildCompressedKVFromRawReferenceOp : MultiThreadBaseOp {
+        const float *kv;
+        const float *score;
+        const float *ape;
+        float *compressed;
+        uint64_t st, end;
+        int bsz, rawTokenBase, rawLen, blockStart, blockCount, compressRatio, headDim, wideDim;
+        bool overlap;
+
+        DeepSeekV4BuildCompressedKVFromRawReferenceOp(const float *kv, const float *score,
+                                                      const float *ape, float *compressed,
+                                                      uint64_t st, uint64_t end,
+                                                      int bsz, int rawTokenBase, int rawLen,
+                                                      int blockStart, int blockCount,
+                                                      int compressRatio, int headDim,
+                                                      int wideDim, bool overlap)
+            : kv(kv), score(score), ape(ape), compressed(compressed), st(st), end(end),
+              bsz(bsz), rawTokenBase(rawTokenBase), rawLen(rawLen), blockStart(blockStart),
+              blockCount(blockCount), compressRatio(compressRatio), headDim(headDim),
+              wideDim(wideDim), overlap(overlap) {}
+
+        uint64_t RawOffset(int b, int token, int dimOffset) const {
+            int localToken = token - rawTokenBase;
+            return ((uint64_t)b * rawLen + localToken) * wideDim + dimOffset;
+        }
+
+        void ScanTerms(int b, int block, int d, float &mx) const {
+            if (overlap) {
+                if (block > 0) {
+                    for (int r = 0; r < compressRatio; r++) {
+                        int tok = (block - 1) * compressRatio + r;
+                        uint64_t off = RawOffset(b, tok, d);
+                        mx = std::max(mx, score[off] + ape[(uint64_t)r * wideDim + d]);
+                    }
+                }
+                for (int r = 0; r < compressRatio; r++) {
+                    int tok = block * compressRatio + r;
+                    uint64_t off = RawOffset(b, tok, headDim + d);
+                    mx = std::max(mx, score[off] + ape[(uint64_t)r * wideDim + headDim + d]);
+                }
+            } else {
+                for (int r = 0; r < compressRatio; r++) {
+                    int tok = block * compressRatio + r;
+                    uint64_t off = RawOffset(b, tok, d);
+                    mx = std::max(mx, score[off] + ape[(uint64_t)r * wideDim + d]);
+                }
+            }
+        }
+
+        void AccumulateTerms(int b, int block, int d, float mx, double &sum, double &value) const {
+            if (overlap) {
+                if (block > 0) {
+                    for (int r = 0; r < compressRatio; r++) {
+                        int tok = (block - 1) * compressRatio + r;
+                        uint64_t off = RawOffset(b, tok, d);
+                        double e = std::exp((double)(score[off] + ape[(uint64_t)r * wideDim + d]) - mx);
+                        sum += e;
+                        value += e * kv[off];
+                    }
+                }
+                for (int r = 0; r < compressRatio; r++) {
+                    int tok = block * compressRatio + r;
+                    uint64_t off = RawOffset(b, tok, headDim + d);
+                    double e = std::exp((double)(score[off] + ape[(uint64_t)r * wideDim + headDim + d]) - mx);
+                    sum += e;
+                    value += e * kv[off];
+                }
+            } else {
+                for (int r = 0; r < compressRatio; r++) {
+                    int tok = block * compressRatio + r;
+                    uint64_t off = RawOffset(b, tok, d);
+                    double e = std::exp((double)(score[off] + ape[(uint64_t)r * wideDim + d]) - mx);
+                    sum += e;
+                    value += e * kv[off];
+                }
+            }
+        }
+
+        void Run() override {
+            (void)bsz;
+            for (uint64_t idx = st; idx < end; idx++) {
+                int d = (int)(idx % headDim);
+                uint64_t tmp = idx / headDim;
+                int localBlock = (int)(tmp % blockCount);
+                int b = (int)(tmp / blockCount);
+                int block = blockStart + localBlock;
+
+                float mx = -FLT_MAX;
+                ScanTerms(b, block, d, mx);
+
+                double sum = 0.0, value = 0.0;
+                AccumulateTerms(b, block, d, mx, sum, value);
+                compressed[((uint64_t)b * blockCount + localBlock) * headDim + d] =
+                    (float)(value / std::max(sum, 1e-30));
+            }
+        }
+    };
+
+    static void DeepSeekV4ComputeCompressedKVFromRawCpu(const std::vector<float> &kv,
+                                                        const std::vector<float> &score,
+                                                        const std::vector<float> &ape,
+                                                        int bsz, int rawTokenBase, int rawLen,
+                                                        int blockStart, int blockCount,
+                                                        int compressRatio, int headDim,
+                                                        int wideDim, bool overlap,
+                                                        std::vector<float> &compressed) {
+        compressed.assign((uint64_t)bsz * blockCount * headDim, 0.0f);
+        uint64_t total = (uint64_t)bsz * blockCount * headDim;
+        if (total == 0) {
+            return;
+        }
+        auto *pool = GetAlivePool();
+        int threadNum = std::min((int)pool->threads.size(), (int)std::min<uint64_t>(total, 64));
+        if (threadNum <= 1 || total < 4096 ||
+            DeepSeekV4HcPreEnvFlagEnabled("FASTLLM_DSV4_DISABLE_CPU_COMPRESSKV_PARALLEL")) {
+            DeepSeekV4BuildCompressedKVFromRawReferenceOp(
+                kv.data(), score.data(), ape.data(), compressed.data(), 0, total,
+                bsz, rawTokenBase, rawLen, blockStart, blockCount,
+                compressRatio, headDim, wideDim, overlap).Run();
+            return;
+        }
+
+        std::vector<DeepSeekV4BuildCompressedKVFromRawReferenceOp*> ops;
+        uint64_t per = (total + threadNum - 1) / threadNum;
+        for (int i = 0; i < threadNum; i++) {
+            uint64_t st = (uint64_t)i * per;
+            uint64_t end = std::min(total, st + per);
+            if (st >= end) {
+                break;
+            }
+            ops.push_back(new DeepSeekV4BuildCompressedKVFromRawReferenceOp(
+                kv.data(), score.data(), ape.data(), compressed.data(), st, end,
+                bsz, rawTokenBase, rawLen, blockStart, blockCount,
+                compressRatio, headDim, wideDim, overlap));
+        }
+        for (int i = 0; i < (int)ops.size(); i++) {
+            pool->PushOp(i, ops[i]);
+        }
+        for (int i = 0; i < (int)ops.size(); i++) {
+            pool->Wait(i);
+            delete ops[i];
+        }
+    }
+
+    static void DeepSeekV4FinalizeCompressedKVRowsCpu(const std::vector<float> &compressed,
+                                                      const std::vector<float> &normWeight,
+                                                      int bsz, int blockCount, int blockStart,
+                                                      int compressRatio, int headDim, int ropeDim,
+                                                      float ropeBase, float ropeFactor,
+                                                      int betaFast, int betaSlow,
+                                                      int originalSeqLen,
+                                                      std::vector<float> &rows) {
+        rows.resize((uint64_t)bsz * blockCount * headDim);
+        for (uint64_t i = 0; i < rows.size(); i++) {
+            rows[i] = DeepSeekV4HcPreBFloat16ToFloat(DeepSeekV4HcPreFloatToBFloat16(compressed[i]));
+        }
+
+        int totalRows = bsz * blockCount;
+        for (int r = 0; r < totalRows; r++) {
+            float *row = rows.data() + (uint64_t)r * headDim;
+            double ss = 0.0;
+            for (int d = 0; d < headDim; d++) {
+                ss += (double)row[d] * row[d];
+            }
+            float scale = 1.0f / std::sqrt((float)(ss / headDim) + 1e-6f);
+            for (int d = 0; d < headDim; d++) {
+                float w = d < (int)normWeight.size() ? normWeight[d] : 1.0f;
+                row[d] = DeepSeekV4HcPreBFloat16ToFloat(DeepSeekV4HcPreFloatToBFloat16(row[d] * scale * w));
+            }
+        }
+
+        DeepSeekV4ApplyRotaryReference(rows, {bsz, blockCount, headDim}, ropeDim, ropeBase,
+                                       blockStart * compressRatio, originalSeqLen, ropeFactor,
+                                       betaFast, betaSlow, compressRatio);
+        DeepSeekV4ActQuantInplaceReference(rows, {bsz, blockCount, headDim}, headDim - ropeDim, 64);
+    }
+
+    void CpuDeepSeekV4BuildCompressedKVFromRawOp::Run(const std::string &opType,
+                                                      const fastllm::DataDict &datas,
+                                                      const fastllm::FloatDict &floatParams,
+                                                      const fastllm::IntDict &intParams) {
+        Data &kv = *(datas.find("kv")->second);
+        Data &score = *(datas.find("score")->second);
+        Data &ape = *(datas.find("ape")->second);
+        Data &normWeight = *(datas.find("normWeight")->second);
+        Data &cache = *(datas.find("cache")->second);
+
+        int rawTokenBase = intParams.find("rawTokenBase") != intParams.end() ? intParams.find("rawTokenBase")->second : 0;
+        int rawLen = intParams.find("rawLen") != intParams.end() ? intParams.find("rawLen")->second : 0;
+        int blockStart = intParams.find("blockStart") != intParams.end() ? intParams.find("blockStart")->second : 0;
+        int blockCount = intParams.find("blockCount") != intParams.end() ? intParams.find("blockCount")->second : 0;
+        int compressRatio = intParams.find("compressRatio") != intParams.end() ? intParams.find("compressRatio")->second : 0;
+        int headDim = intParams.find("headDim") != intParams.end() ? intParams.find("headDim")->second : 0;
+        int ropeDim = intParams.find("ropeDim") != intParams.end() ? intParams.find("ropeDim")->second : 0;
+        int betaFast = intParams.find("betaFast") != intParams.end() ? intParams.find("betaFast")->second : 32;
+        int betaSlow = intParams.find("betaSlow") != intParams.end() ? intParams.find("betaSlow")->second : 1;
+        int originalSeqLen = intParams.find("originalSeqLen") != intParams.end() ? intParams.find("originalSeqLen")->second : 0;
+        bool overlap = intParams.find("overlap") != intParams.end() && intParams.find("overlap")->second != 0;
+        float ropeBase = floatParams.find("ropeBase") != floatParams.end() ? floatParams.find("ropeBase")->second : 10000.0f;
+        float ropeFactor = floatParams.find("ropeFactor") != floatParams.end() ? floatParams.find("ropeFactor")->second : 1.0f;
+
+        if (blockCount <= 0) {
+            return;
+        }
+        int bsz = kv.dims.empty() ? 0 : kv.dims[0];
+        int wideDim = (overlap ? 2 : 1) * headDim;
+        AssertInFastLLM(kv.dims.size() == 3 && score.dims == kv.dims &&
+                        kv.dims[0] == bsz && kv.dims[1] >= rawLen && kv.dims[2] == wideDim,
+                        "DeepSeekV4BuildCompressedKVFromRaw error: invalid kv or score.\n");
+        AssertInFastLLM(ape.Count(0) >= (uint64_t)compressRatio * wideDim &&
+                        rawLen > 0 && compressRatio > 0 && headDim > 0 &&
+                        ropeDim > 0 && ropeDim <= headDim,
+                        "DeepSeekV4BuildCompressedKVFromRaw error: invalid params.\n");
+
+        auto kvValues = DeepSeekV4HcPreReadFloatData(kv);
+        auto scoreValues = DeepSeekV4HcPreReadFloatData(score);
+        auto apeValues = DeepSeekV4HcPreReadFloatData(ape);
+        auto normValues = DeepSeekV4HcPreReadFloatData(normWeight);
+
+        std::vector<float> compressed;
+        DeepSeekV4ComputeCompressedKVFromRawCpu(kvValues, scoreValues, apeValues,
+                                                bsz, rawTokenBase, rawLen,
+                                                blockStart, blockCount, compressRatio,
+                                                headDim, wideDim, overlap, compressed);
+
+        std::vector<float> rowValues;
+        DeepSeekV4FinalizeCompressedKVRowsCpu(compressed, normValues, bsz, blockCount,
+                                              blockStart, compressRatio, headDim, ropeDim,
+                                              ropeBase, ropeFactor, betaFast, betaSlow,
+                                              originalSeqLen, rowValues);
+
+        int totalBlocks = blockStart + blockCount;
+        Data newRows(DataType::BFLOAT16, {bsz, blockCount, headDim});
+        DeepSeekV4HcPreWriteFloatData(rowValues, newRows);
+        if (blockStart <= 0) {
+            cache.CopyFrom(newRows);
+            cache.SetKVCache();
+            return;
+        }
+
+        AssertInFastLLM(cache.dataType == DataType::BFLOAT16 && cache.dims.size() == 3 &&
+                        cache.dims[0] == bsz && cache.dims[1] >= blockStart &&
+                        cache.dims[2] == headDim && cache.cpuData != nullptr,
+                        "DeepSeekV4BuildCompressedKVFromRaw error: invalid old cache.\n");
+        Data merged(DataType::BFLOAT16, {bsz, totalBlocks, headDim});
+        merged.Allocate(false);
+        uint16_t *dst = (uint16_t*)merged.cpuData;
+        const uint16_t *oldData = (const uint16_t*)cache.cpuData;
+        const uint16_t *newData = (const uint16_t*)newRows.cpuData;
+        for (int b = 0; b < bsz; b++) {
+            memcpy(dst + (uint64_t)b * totalBlocks * headDim,
+                   oldData + (uint64_t)b * cache.dims[1] * headDim,
+                   (uint64_t)blockStart * headDim * sizeof(uint16_t));
+            memcpy(dst + ((uint64_t)b * totalBlocks + blockStart) * headDim,
+                   newData + (uint64_t)b * blockCount * headDim,
+                   (uint64_t)blockCount * headDim * sizeof(uint16_t));
+        }
+        cache.CopyFrom(merged);
+        cache.SetKVCache();
+    }
+
     struct DeepSeekV4HcPreDotsOp : MultiThreadBaseOp {
         const float *xrow;
         const float *fn;
