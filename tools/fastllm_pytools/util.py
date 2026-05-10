@@ -161,8 +161,6 @@ def make_normal_llm_model(args):
                     else:
                         args.device = "cpu"
                         args.moe_device = "disk"
-                if (args.max_batch <= 0):
-                    args.max_batch = 1
                 if (args.chunked_prefill_size <= 0):
                     args.chunked_prefill_size = 128
                 if (args.tokens <= 0):

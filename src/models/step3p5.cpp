@@ -356,6 +356,25 @@ namespace fastllm {
         input.ToDevice(originalDevice, originalDeviceIds);
     }
 
+    static DataType Step3p5ResolvePagedAttentionQType(DataType cacheType, DataType queryType, DataType modelType) {
+        if (cacheType == DataType::FLOAT16 || cacheType == DataType::BFLOAT16) {
+            return cacheType;
+        }
+        if (queryType == DataType::FLOAT16 || queryType == DataType::BFLOAT16) {
+            return queryType;
+        }
+        return modelType == DataType::BFLOAT16 ? DataType::BFLOAT16 : DataType::FLOAT16;
+    }
+
+    static Data &Step3p5PreparePagedAttentionQ(Data &src, DataType cacheType, DataType modelType, Data &casted) {
+        DataType targetType = Step3p5ResolvePagedAttentionQType(cacheType, src.dataType, modelType);
+        if (src.dataType == targetType) {
+            return src;
+        }
+        ToDataType(src, casted, targetType);
+        return casted;
+    }
+
     Step3p5Model::Step3p5Model() {
         this->model_type = "step3p5";
         this->model_struct = "step3p5";
@@ -663,16 +682,98 @@ namespace fastllm {
         const std::vector <GenerationConfig> &generationConfigs,
         const LastTokensManager &lastTokens,
         std::vector <std::vector <float>*> *retLogits) {
-        (void)attentionMask;
-        AssertInFastLLM(batch == 1, "Step3p5 currently supports single-batch forward.");
-        PrepareMoeWeights();
-
+        AssertInFastLLM(batch > 0, "Step3p5 batch should be positive.");
+        AssertInFastLLM((int)seqLens.size() >= batch, "Step3p5 seqLens missing.");
+        AssertInFastLLM((int)generationConfigs.size() >= batch, "Step3p5 generation configs missing.");
         bool all1 = true;
         int totalLen = 0;
-        for (int len : seqLens) {
+        for (int b = 0; b < batch; b++) {
+            int len = seqLens[b];
             all1 &= (len == 1);
             totalLen += len;
         }
+
+        auto runSplitBatchForward = [&]() -> std::vector<int> {
+            std::vector<int> ret;
+            ret.reserve(batch);
+
+            int inputOffset = 0;
+            for (int b = 0; b < batch; b++) {
+                Data curInputIds;
+                Split(inputIds, 1, inputOffset, inputOffset + seqLens[b], curInputIds);
+                inputOffset += seqLens[b];
+
+                std::vector<Data*> curAttentionMask = {
+                    b < (int)attentionMask.size() ? attentionMask[b] : nullptr
+                };
+                std::vector<Data*> curPositionIds = {
+                    b < (int)positionIds.size() ? positionIds[b] : nullptr
+                };
+                std::vector<int> curSeqLens = {seqLens[b]};
+                std::vector<GenerationConfig> curGenerationConfigs = {generationConfigs[b]};
+
+                LastTokensManager curLastTokens;
+                if (b < (int)lastTokens.units.size()) {
+                    curLastTokens.units.push_back(lastTokens.units[b]);
+                } else {
+                    int lastN = generationConfigs[b].last_n <= 0 ? max_positions : generationConfigs[b].last_n;
+                    curLastTokens = LastTokensManager(1, lastN);
+                }
+
+                std::vector<std::pair<Data*, Data*> > curPastKeyValues;
+                curPastKeyValues.reserve(block_cnt);
+                int pastOffset = b * block_cnt;
+                AssertInFastLLM((int)pastKeyValues.size() >= pastOffset + block_cnt,
+                                "Step3p5 pastKeyValues missing.");
+                for (int i = 0; i < block_cnt; i++) {
+                    curPastKeyValues.push_back(pastKeyValues[pastOffset + i]);
+                }
+
+                std::vector<std::vector<float>*> curLogits;
+                std::vector<std::vector<float>*> *curLogitsPtr = nullptr;
+                if (retLogits != nullptr) {
+                    curLogits.push_back(b < (int)retLogits->size() ? (*retLogits)[b] : nullptr);
+                    curLogitsPtr = &curLogits;
+                }
+
+                std::vector<int> curRet = ForwardV2(
+                    1, curInputIds, curAttentionMask, curPositionIds, curSeqLens,
+                    curPastKeyValues, curGenerationConfigs, curLastTokens, curLogitsPtr
+                );
+                ret.push_back(curRet[0]);
+            }
+            return ret;
+        };
+
+        auto canRunFusedBatchDecode = [&]() -> bool {
+            if (batch <= 1 || !all1 || (int)pastKeyValues.size() < batch * block_cnt) {
+                return false;
+            }
+            for (int b = 0; b < batch; b++) {
+                for (int i = 0; i < block_cnt; i++) {
+                    Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                    Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                    if (pastKey == nullptr || pastValue == nullptr ||
+                        !pastKey->isPagedKVCache || !pastValue->isPagedKVCache ||
+                        pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
+                        pastKey->pageIndex.empty() || pastValue->pageIndex.empty()) {
+                        return false;
+                    }
+                    Data *cacheStorage = (Data*)pastKey->pagedKVCacheData;
+                    if (cacheStorage->dataDevice != DataDevice::CUDA) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        if (batch > 1 && !canRunFusedBatchDecode()) {
+            return runSplitBatchForward();
+        }
+
+        PrepareMoeWeights();
+
         AssertInFastLLM((int)positionIds.size() >= batch, "Step3p5 positionIds missing.");
         std::vector <Data> positionIdsCpu;
         positionIdsCpu.reserve(batch);
@@ -720,6 +821,10 @@ namespace fastllm {
         Data w1, w2, w3, routerLogits, routerProb, expertIndex, expertScore;
         Data attenPart, moePart, moeFinal, shareOutput;
         Data tempInput, tempOutput;
+        std::vector<Data*> batchPastKeys(batch), batchPastValues(batch);
+        Data qSizes, pageSizes, pageIndexs, lastPageLens, insertIndexs, insertPositions;
+        bool generatedBatchDecodeParams = false;
+        bool generatedAppendPagedCacheBatchParams = false;
 
         for (int i = 0; i < block_cnt; i++) {
             ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
@@ -762,18 +867,62 @@ namespace fastllm {
             k.Reshape({-1, seqlen, head_dim});
             v.Reshape({-1, seqlen, head_dim});
 
-            Data &pastKey = *pastKeyValues[i].first, &pastValue = *pastKeyValues[i].second;
-            PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
-            PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
-            AppendPagedCache(*pagedCacheKManager, pastKey, k);
-            AppendPagedCache(*pagedCacheVManager, pastValue, v);
-            AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0], 1.0f / sqrt((float)head_dim), 1, false);
+            if (batch > 1 && all1) {
+                for (int b = 0; b < batch; b++) {
+                    batchPastKeys[b] = pastKeyValues[b * block_cnt + i].first;
+                    batchPastValues[b] = pastKeyValues[b * block_cnt + i].second;
+                }
 
-            PermuteSelf(qkv, {1, 0, 2});
-            qkv.Reshape({seqlen, bsz, -1});
-            PermuteSelf(qkv, {1, 0, 2});
+                Data &kCaches = *batchPastKeys[0];
+                Data &vCaches = *batchPastValues[0];
+                PagedCacheManager *pagedCacheKManager = kCaches.pagedKVCacheData;
+                PagedCacheManager *pagedCacheVManager = vCaches.pagedKVCacheData;
+                AssertInFastLLM(pagedCacheKManager != nullptr && pagedCacheVManager != nullptr,
+                                "Step3p5 fused batch decode requires paged KV cache.");
+
+                if (!generatedAppendPagedCacheBatchParams) {
+                    GenerateAppendPagedCacheBatchParams(*pagedCacheKManager, batchPastKeys, batch,
+                                                        insertIndexs, insertPositions);
+                    generatedAppendPagedCacheBatchParams = true;
+                }
+
+                Data kAppend, vAppend;
+                Permute(k, {1, 0, 2}, kAppend);
+                Permute(v, {1, 0, 2}, vAppend);
+                AppendPagedCacheBatch(*pagedCacheKManager, batchPastKeys, kAppend, insertIndexs, insertPositions);
+                AppendPagedCacheBatch(*pagedCacheVManager, batchPastValues, vAppend, insertIndexs, insertPositions);
+
+                Data qForAttentionHolder;
+                Data &qForAttention = Step3p5PreparePagedAttentionQ(q, kCaches.dataType, this->dataType, qForAttentionHolder);
+                if (!generatedBatchDecodeParams) {
+                    GeneratePagedBatchParams(qForAttention, batchPastKeys, batch,
+                                             qSizes, pageSizes, pageIndexs, lastPageLens);
+                    generatedBatchDecodeParams = true;
+                }
+                AttentionPagedBatch(qForAttention, kCaches, vCaches,
+                                    qSizes, pageSizes, pageIndexs, lastPageLens,
+                                    qkv, qForAttention.dims[0] / kCaches.dims[0],
+                                    1.0f / sqrt((float)head_dim), 1, false);
+            } else {
+                Data &pastKey = *pastKeyValues[i].first, &pastValue = *pastKeyValues[i].second;
+                PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
+                    i * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, k);
+                PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
+                    i * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, v);
+                AppendPagedCache(*pagedCacheKManager, pastKey, k);
+                AppendPagedCache(*pagedCacheVManager, pastValue, v);
+                AttentionPaged(q, pastKey, pastValue, qkv, q.dims[0] / k.dims[0],
+                               1.0f / sqrt((float)head_dim), 1, false);
+            }
+
+            if (batch > 1 && all1) {
+                qkv.Reshape({seqlen, bsz, -1});
+                PermuteSelf(qkv, {1, 0, 2});
+            } else {
+                PermuteSelf(qkv, {1, 0, 2});
+                qkv.Reshape({seqlen, bsz, -1});
+                PermuteSelf(qkv, {1, 0, 2});
+            }
 
             Sigmoid(gate, gate);
             gate.Reshape({bsz, seqlen, qHeads, 1});
