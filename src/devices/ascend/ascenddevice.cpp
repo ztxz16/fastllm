@@ -165,67 +165,59 @@ namespace fastllm {
         int m = input.dims.back();
         int k = output.dims.back();
 
-        std::vector<aclTensorDesc *> inputTensors;
-        std::vector<aclDataBuffer *> inputBuffers;
+        // 准备重整形的输入和输出数据
         Data fakeReshapedInput;
         fakeReshapedInput.dims = input.dims;
         fakeReshapedInput.strides = input.strides;
         fakeReshapedInput.FakeFrom(input, 0);
         fakeReshapedInput.Reshape({n, m});
-        npu::FastllmAclToTensor(std::make_pair("x1", &fakeReshapedInput), inputTensors, inputBuffers);
-        npu::FastllmAclToTensor(std::make_pair("x2", &weight), inputTensors, inputBuffers);
-        if (bias.dims.size() > 0)
-            npu::FastllmAclToTensor(std::make_pair("bias", &bias), inputTensors, inputBuffers);
-        std::vector<aclTensorDesc *> outputTensors;
-        std::vector<aclDataBuffer *> outputBuffers;
+
         Data fakeReshapedOutput;
         fakeReshapedOutput.dims = output.dims;
         fakeReshapedOutput.strides = output.strides;
         fakeReshapedOutput.FakeFrom(output, 0);
         fakeReshapedOutput.Reshape({n, k});
-        npu::FastllmAclToTensor(std::make_pair("y", &fakeReshapedOutput), outputTensors, outputBuffers);
-        aclopAttr *attr;
-        npu::FastllmAclToOpAttribute({}, {}, {{"adj_x1", false}, {"adj_x2", true}}, &attr);
-        Executor *executor = (Executor *) GetExecutor();
-        std::vector<aclTensorDesc *> inputTensorsForCompile;
-        std::vector<aclTensorDesc *> outputTensorsForCompile;
-        if (warmUpMode) {
-            std::vector<std::vector<int64_t>> shapeRanges(1, std::vector<int64_t>({1L, 2048L}));
-            npu::FastllmAclCreateShape(std::make_pair("x1", &fakeReshapedInput), inputTensorsForCompile, {0}, shapeRanges);
-            npu::FastllmAclCreateShape(std::make_pair("x2", &weight), inputTensorsForCompile);
-            if (bias.dims.size() > 0)
-                npu::FastllmAclCreateShape(std::make_pair("bias", &bias), inputTensorsForCompile);
-            npu::FastllmAclCreateShape(std::make_pair("y", &fakeReshapedOutput), outputTensorsForCompile, {0}, shapeRanges);
+
+        // 构建输入数据映射
+        OrderedData orderedInputData;
+        orderedInputData.push_back(std::make_pair("x1", &fakeReshapedInput));
+        orderedInputData.push_back(std::make_pair("x2", &weight));
+        if (bias.dims.size() > 0) {
+            orderedInputData.push_back(std::make_pair("bias", &bias));
         }
+
+        // 构建输出数据映射
+        fastllm::DataDict outputData;
+        outputData["y"] = &fakeReshapedOutput;
+
+        // 构建动态形状信息（用于warmup模式）
+        DynamicShapeDict dynamicShapes;
+        if (warmUpMode) {
+            // 为x1添加动态形状范围
+            std::vector<std::vector<int64_t>> shapeRanges(1, std::vector<int64_t>({1L, 2048L}));
+            dynamicShapes["x1"] = std::make_pair(std::vector<int>{0}, shapeRanges);
+            dynamicShapes["y"] = std::make_pair(std::vector<int>{0}, shapeRanges);
+        }
+
+        // 构建属性参数
+        BoolDict boolParams = {{"adj_x1", false}, {"adj_x2", true}};
         if (input.dataType == DataType::FLOAT16) {
             if (weight.dataType == DataType::FLOAT16) {
-                if (warmUpMode)
-                    deviceOk = npu::FastllmAclInitOp(this->name, inputTensorsForCompile, outputTensorsForCompile, attr);
-                deviceOk = npu::FastllmAclExecuteAfterInit(this->name, inputTensors, inputBuffers,
-                                                           outputTensors, outputBuffers, attr);
+                deviceOk = CompileAndRunSingleOp(this->name, orderedInputData, outputData,
+                                                dynamicShapes, {}, {}, boolParams);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
         } else if (input.dataType == DataType::FLOAT32) {
-            if (weight.dataType == DataType::FLOAT32) {
-                if (warmUpMode)
-                    deviceOk = npu::FastllmAclInitOp(this->name, inputTensorsForCompile, outputTensorsForCompile, attr);
-                deviceOk = npu::FastllmAclExecuteAfterInit(this->name, inputTensors, inputBuffers,
-                                                           outputTensors, outputBuffers, attr);
-            } else if (weight.dataType == DataType::FLOAT16) {
-                if (warmUpMode)
-                    deviceOk = npu::FastllmAclInitOp(this->name, inputTensorsForCompile, outputTensorsForCompile, attr);
-                deviceOk = npu::FastllmAclExecuteAfterInit(this->name, inputTensors, inputBuffers,
-                                                           outputTensors, outputBuffers, attr);
+            if (weight.dataType == DataType::FLOAT32 || weight.dataType == DataType::FLOAT16) {
+                deviceOk = CompileAndRunSingleOp(this->name, orderedInputData, outputData,
+                                                dynamicShapes, {}, {}, boolParams);
             } else {
                 ErrorInFastLLM("Linear error: unsupport weight's dataType.\n");
             }
         } else {
             ErrorInFastLLM("Linear error: unsupport input's dataType.\n");
         }
-        npu::FastllmAclDestroyShape(inputTensorsForCompile);
-        npu::FastllmAclDestroyShape(outputTensorsForCompile);
-        npu::FastllmAclDestoryTensors(inputTensors, inputBuffers, outputTensors, outputBuffers, &attr);
     }
 
     AscendSplitOp::AscendSplitOp() : 
