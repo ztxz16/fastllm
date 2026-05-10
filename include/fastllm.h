@@ -979,6 +979,10 @@ namespace fastllm {
 
     void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale); // RoPE encoding，直接用rope_theta和rope_scale计算，无需sin/cos缓存
 
+    void Llama3RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
+                            float factor, float originalMaxPosition,
+                            float lowFreqFactor, float highFreqFactor);
+
     void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,
                                int sectionT, int sectionH, int sectionW,
                                float ropeTheta, float ropeScale); // Qwen3.5 interleaved MRoPE

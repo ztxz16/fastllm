@@ -106,6 +106,7 @@ namespace fastllm {
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CudaLlamaRotatePosition2DOp());
         this->ops["LlamaRotatePosition2DPart"] = (BaseOperator*)(new CudaLlamaRotatePosition2DPartOp());
         this->ops["RopeEncoding"] = (BaseOperator*)(new CudaRopeEncodingOp());
+        this->ops["Llama3RopeEncoding"] = (BaseOperator*)(new CudaLlama3RopeEncodingOp());
         this->ops["Qwen35InterleavedRope"] = (BaseOperator*)(new CudaQwen35InterleavedRopeOp());
         this->ops["QKVRMSNormRope"] = (BaseOperator*)(new CudaQKVRMSNormRopeOp());
         this->ops["QKVRMSNormRopeSplitAppendPagedCache"] = (BaseOperator*)(new CudaQKVRMSNormRopeSplitAppendPagedCacheOp());
@@ -1999,6 +2000,21 @@ namespace fastllm {
         FastllmCudaRopeEncoding(data, positionIds, rotaryDim, ropeTheta, ropeScale);
     }
 
+    void CudaLlama3RopeEncodingOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                       const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float factor = floatParams.find("factor") != floatParams.end() ? floatParams.find("factor")->second : 1.0f;
+        float originalMaxPosition = floatParams.find("originalMaxPosition") != floatParams.end() ? floatParams.find("originalMaxPosition")->second : 131072.0f;
+        float lowFreqFactor = floatParams.find("lowFreqFactor") != floatParams.end() ? floatParams.find("lowFreqFactor")->second : 1.0f;
+        float highFreqFactor = floatParams.find("highFreqFactor") != floatParams.end() ? floatParams.find("highFreqFactor")->second : 32.0f;
+
+        FastllmCudaLlama3RopeEncoding(data, positionIds, rotaryDim, ropeTheta, factor,
+                                      originalMaxPosition, lowFreqFactor, highFreqFactor);
+    }
+
     void CudaQwen35InterleavedRopeOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &data = *(datas.find("input")->second);
@@ -2913,7 +2929,13 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         int totalNeededPages = (totalNeededTokens + cache.pageLen - 1) / cache.pageLen;
         int maxPages = cache.pagedKVCacheData->dims[0];
         if (totalNeededPages > maxPages) {
-            ErrorInFastLLM("CudaAppendPagedCacheOp: No more pages available. Need to resize pagedKVCacheData.\n");
+            ErrorInFastLLM("CudaAppendPagedCacheOp: No more pages available. Need to resize pagedKVCacheData. "
+                           "seqLen = " + std::to_string(seqLen) +
+                           ", currentUsedTokens = " + std::to_string(currentUsedTokens) +
+                           ", pageLen = " + std::to_string(cache.pageLen) +
+                           ", currentPages = " + std::to_string((int)cache.pageIndex.size()) +
+                           ", totalNeededPages = " + std::to_string(totalNeededPages) +
+                           ", maxPages = " + std::to_string(maxPages) + ".\n");
         }
 
         if (cache.dims.size() == 0) {

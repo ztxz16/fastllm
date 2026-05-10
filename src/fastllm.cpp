@@ -1115,8 +1115,13 @@ namespace fastllm {
             } else if (dataType == DataType::FP8_E4M3 || dataType == DataType::NVFP4) {
                 this->blockK = blockK;
                 this->blockM = blockM;
-                int ks = (this->dims[0] - 1) / this->blockK + 1;
-                int ms = (this->dims[1] - 1) / this->blockM + 1;
+                int rows = 1;
+                for (int i = 0; i + 1 < (int)this->dims.size(); i++) {
+                    rows *= this->dims[i];
+                }
+                int cols = this->dims.back();
+                int ks = (rows - 1) / this->blockK + 1;
+                int ms = (cols - 1) / this->blockM + 1;
                 data.scales.resize(ks * ms);
                 memcpy(data.scales.data(), oriScales, ks * ms * sizeof(float));
             }
@@ -3777,8 +3782,19 @@ namespace fastllm {
 
     void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale) {
         curExecutor->Run("RopeEncoding", {
-                {"input", &input}, {"positionIds", (Data*)&positionIds}
+            {"input", &input}, {"positionIds", (Data*)&positionIds}
         }, {{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}}, {{"rotaryDim", rotaryDim}});
+    }
+
+    void Llama3RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
+                            float factor, float originalMaxPosition,
+                            float lowFreqFactor, float highFreqFactor) {
+        curExecutor->Run("Llama3RopeEncoding", {
+            {"input", &input}, {"positionIds", (Data*)&positionIds}
+        }, {{"ropeTheta", ropeTheta}, {"factor", factor},
+            {"originalMaxPosition", originalMaxPosition},
+            {"lowFreqFactor", lowFreqFactor}, {"highFreqFactor", highFreqFactor}},
+           {{"rotaryDim", rotaryDim}});
     }
 
     void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,

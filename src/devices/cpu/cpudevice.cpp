@@ -130,6 +130,7 @@ namespace fastllm {
         this->ops["LlamaRotatePosition2D"] = (BaseOperator*)(new CpuLlamaRotatePosition2DOp());
         this->ops["LlamaRotatePosition2DPart"] = (BaseOperator*)(new CpuLlamaRotatePosition2DPartOp());
         this->ops["RopeEncoding"] = (BaseOperator*)(new CpuRopeEncodingOp());
+        this->ops["Llama3RopeEncoding"] = (BaseOperator*)(new CpuLlama3RopeEncodingOp());
         this->ops["Qwen35InterleavedRope"] = (BaseOperator*)(new CpuQwen35InterleavedRopeOp());
         this->ops["QKVRMSNormRope"] = (BaseOperator*)(new CpuQKVRMSNormRopeOp());
         this->ops["QKVRMSNormRopeSplitAppendPagedCache"] = (BaseOperator*)(new CpuQKVRMSNormRopeSplitAppendPagedCacheOp());
@@ -3759,8 +3760,11 @@ ops += (long long)lines * inputDim * interDim * 2;
             return token;
         };
 
-        if (GetLowMemMode()) {
+        if (GetLowMemMode() && !weight.fileName.empty()) {
             FILE *fi = fopen(weight.fileName.c_str(), "rb");
+            if (fi == nullptr) {
+                ErrorInFastLLM("Embedding error: failed to open low-memory weight file " + weight.fileName + ".\n");
+            }
             if (weight.dataType == DataType::FLOAT32) {
                 std::vector<float> weightRow(embSize);
                 for (int i = 0; i < inputLen; i++) {
@@ -8350,7 +8354,7 @@ ops += (long long)lines * inputDim * interDim * 2;
     }
 
     void CpuRopeEncodingOp::Run(const std::string &opType, const fastllm::DataDict &datas,
-                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+	                                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &data = *(datas.find("input")->second);
         Data &positionIds = *(datas.find("positionIds")->second);
         int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
@@ -8363,6 +8367,70 @@ ops += (long long)lines * inputDim * interDim * 2;
         RunMultiThreadRopeEncodingFloat(data.dataType, (float*)data.cpuData, (float*)positionIds.cpuData,
             bs, len, n, m, spatial,
             positionIds.dims.back(), rotaryDim, ropeTheta, ropeScale, GetAlivePool());
+    }
+
+    static inline float CpuLlama3InvFreq(float invFreq, float factor, float originalMaxPosition,
+                                         float lowFreqFactor, float highFreqFactor) {
+        float wavelen = 2.0f * (float)M_PI / invFreq;
+        float lowWavelen = originalMaxPosition / lowFreqFactor;
+        float highWavelen = originalMaxPosition / highFreqFactor;
+        float invLlama = wavelen > lowWavelen ? invFreq / factor : invFreq;
+        if (!(wavelen < highWavelen) && !(wavelen > lowWavelen)) {
+            float smooth = (originalMaxPosition / wavelen - lowFreqFactor) / (highFreqFactor - lowFreqFactor);
+            invLlama = (1.0f - smooth) * invFreq / factor + smooth * invFreq;
+        }
+        return invLlama;
+    }
+
+    static inline float CpuRopeRead(const Data &data, int index) {
+        if (data.dataType == DataType::FLOAT32) {
+            return ((float*)data.cpuData)[index];
+        }
+        uint16_t v = ((uint16_t*)data.cpuData)[index];
+        return data.dataType == DataType::FLOAT16 ? fp16tofp32.dict[v] : bf16tofp32.dict[v];
+    }
+
+    static inline void CpuRopeWrite(Data &data, int index, float value) {
+        if (data.dataType == DataType::FLOAT32) {
+            ((float*)data.cpuData)[index] = value;
+        } else if (data.dataType == DataType::FLOAT16) {
+            ((uint16_t*)data.cpuData)[index] = float_to_half(value);
+        } else {
+            Float32ToBFloat16(&value, ((uint16_t*)data.cpuData) + index, 1);
+        }
+    }
+
+    void CpuLlama3RopeEncodingOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                      const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &data = *(datas.find("input")->second);
+        Data &positionIds = *(datas.find("positionIds")->second);
+        int rotaryDim = intParams.find("rotaryDim") != intParams.end() ? intParams.find("rotaryDim")->second : 128;
+        float ropeTheta = floatParams.find("ropeTheta") != floatParams.end() ? floatParams.find("ropeTheta")->second : 10000.0f;
+        float factor = floatParams.find("factor") != floatParams.end() ? floatParams.find("factor")->second : 1.0f;
+        float originalMaxPosition = floatParams.find("originalMaxPosition") != floatParams.end() ? floatParams.find("originalMaxPosition")->second : 131072.0f;
+        float lowFreqFactor = floatParams.find("lowFreqFactor") != floatParams.end() ? floatParams.find("lowFreqFactor")->second : 1.0f;
+        float highFreqFactor = floatParams.find("highFreqFactor") != floatParams.end() ? floatParams.find("highFreqFactor")->second : 32.0f;
+
+        int bs = data.dims[0], len = data.dims[1], n = data.dims[2], m = data.dims[3];
+        int spatial = data.Count(2), half = rotaryDim / 2, posStride = positionIds.dims.back();
+        for (int b = 0; b < bs; b++) {
+            for (int l = 0; l < len; l++) {
+                float position = ((float*)positionIds.cpuData)[b * posStride + l];
+                for (int h = 0; h < n; h++) {
+                    int headOffset = (b * len + l) * spatial + h * m;
+                    for (int j = 0; j < half; j++) {
+                        float invFreq = 1.0f / powf(ropeTheta, (float)(2 * j) / rotaryDim);
+                        invFreq = CpuLlama3InvFreq(invFreq, factor, originalMaxPosition, lowFreqFactor, highFreqFactor);
+                        float freq = position * invFreq;
+                        float curSin = sinf(freq), curCos = cosf(freq);
+                        float a = CpuRopeRead(data, headOffset + j);
+                        float bval = CpuRopeRead(data, headOffset + j + half);
+                        CpuRopeWrite(data, headOffset + j, a * curCos - bval * curSin);
+                        CpuRopeWrite(data, headOffset + j + half, a * curSin + bval * curCos);
+                    }
+                }
+            }
+        }
     }
 
     static inline int ResolveQwen35InterleavedMRopeIndex(int dim, int sectionH, int sectionW) {
@@ -9162,7 +9230,13 @@ ops += (long long)lines * inputDim * interDim * 2;
         // 检查是否有足够的 pages
         int maxPages = cache.pagedKVCacheData->dims[0];
         if (totalNeededPages > maxPages) {
-            ErrorInFastLLM("CpuAppendPagedCacheOp: No more pages available. Need to resize pagedKVCacheData.\n");
+            ErrorInFastLLM("CpuAppendPagedCacheOp: No more pages available. Need to resize pagedKVCacheData. "
+                           "seqLen = " + std::to_string(seqLen) +
+                           ", currentUsedTokens = " + std::to_string(currentUsedTokens) +
+                           ", pageLen = " + std::to_string(cache.pageLen) +
+                           ", currentPages = " + std::to_string((int)cache.pageIndex.size()) +
+                           ", totalNeededPages = " + std::to_string(totalNeededPages) +
+                           ", maxPages = " + std::to_string(maxPages) + ".\n");
         }
 
         if (cache.dims.size() == 0) {
