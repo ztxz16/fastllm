@@ -396,4 +396,7 @@ extern __global__ void FastllmCudaFloat2Bf16Kernel(float* a, __nv_bfloat16* b, i
 extern __global__ void FastllmCudaBF162HalfKernel(uint16_t* a, half *b, int len);
 extern __global__ void FastllmCudaHalf2BF16Kernel(half* a, __nv_bfloat16 *b, int len);
 extern __global__ void FastllmCudaBiasKernel(__nv_bfloat16* a, __nv_bfloat16* bias, int k);
+extern __global__ void FastllmAddToKernel(float* a, float *b, float alpha, int len);
+extern __global__ void FastllmAddToKernel(half* a, half *b, half alpha, int len);
+extern __global__ void FastllmAddToKernel(__nv_bfloat16* a, __nv_bfloat16 *b, __nv_bfloat16 alpha, int len);
 #endif
