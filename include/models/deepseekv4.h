@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 
 namespace fastllm {
@@ -108,6 +109,11 @@ namespace fastllm {
         bool Get(const std::vector<int> &inputToken, DeepSeekV4HistoryCacheMemory &memory, int &hitLen);
     };
 
+    struct DeepSeekV4RequestState {
+        std::vector<DeepSeekV4DecodeLayerCache> decodeLayerCaches;
+        std::vector<int> historyTokens;
+    };
+
     class DeepSeekV4Model : public basellm {
     public:
         DeepSeekV4Model(); // 构造函数
@@ -159,7 +165,17 @@ namespace fastllm {
 
         virtual void TryRecordHistoryCache(const std::vector<int> &allTokens) override;
 
+        virtual void TryRecordResponseContext(ResponseContext *context) override;
+
+        virtual void OnResponseContextCreated(ResponseContext *context) override;
+
+        virtual void OnResponseContextRemoved(ResponseContext *context) override;
+
         virtual bool UseGenericHistoryCache() const override { return false; }
+
+        virtual bool UseModelSpecificScheduler() const override { return true; }
+
+        virtual void RunModelSpecificScheduler() override;
 
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成 prompt
 
@@ -240,9 +256,17 @@ namespace fastllm {
 
         DeepSeekV4HistoryCacheManager deepseekV4HistoryCacheManager;
         std::vector<int> deepseekV4HistoryTokens;
+        std::mutex requestStateMutex;
+        std::map<const void*, std::shared_ptr<DeepSeekV4RequestState> > requestStates;
+        std::shared_ptr<DeepSeekV4RequestState> pendingRequestState;
 
         bool RestoreHistoryCacheMemory(const DeepSeekV4HistoryCacheMemory &memory);
+        bool RestoreHistoryCacheMemory(const DeepSeekV4HistoryCacheMemory &memory,
+                                       DeepSeekV4RequestState &state);
         void RecordHistorySnapshot(const std::vector<int> &tokens, int totalLen);
+        void RecordHistorySnapshot(const std::vector<int> &tokens, int totalLen,
+                                   const std::vector<DeepSeekV4DecodeLayerCache> &decodeCaches);
+        std::shared_ptr<DeepSeekV4RequestState> GetRequestState(std::vector<std::pair<Data, Data> > &pastKeyValues);
     };
 }
 

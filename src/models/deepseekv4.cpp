@@ -1668,14 +1668,25 @@ namespace fastllm {
     }
 
     bool DeepSeekV4Model::RestoreHistoryCacheMemory(const DeepSeekV4HistoryCacheMemory &memory) {
+        DeepSeekV4RequestState state;
+        if (!RestoreHistoryCacheMemory(memory, state)) {
+            return false;
+        }
+        this->decodeLayerCaches = state.decodeLayerCaches;
+        this->deepseekV4HistoryTokens = state.historyTokens;
+        return true;
+    }
+
+    bool DeepSeekV4Model::RestoreHistoryCacheMemory(const DeepSeekV4HistoryCacheMemory &memory,
+                                                    DeepSeekV4RequestState &state) {
         if (memory.tokens <= 0 || memory.layers.empty()) {
             return false;
         }
-        this->decodeLayerCaches.clear();
-        this->decodeLayerCaches.resize(memory.layers.size());
+        state.decodeLayerCaches.clear();
+        state.decodeLayerCaches.resize(memory.layers.size());
         for (int i = 0; i < (int)memory.layers.size(); i++) {
             const auto &src = memory.layers[i];
-            auto &dst = this->decodeLayerCaches[i];
+            auto &dst = state.decodeLayerCaches[i];
             dst.initialized = src.initialized;
             dst.bsz = src.bsz;
             dst.totalLen = src.totalLen;
@@ -1722,12 +1733,12 @@ namespace fastllm {
             }
 #endif
         }
-        this->deepseekV4HistoryTokens = memory.inputToken;
+        state.historyTokens = memory.inputToken;
         if (DeepSeekV4PrefixCacheDebugEnabled()) {
             printf("[fastllm-dsv4-prefix-cache] restore hit_len=%d blocks=%d layers=%d\n",
                    memory.tokens, memory.blockCount, (int)memory.layers.size());
-            for (int i = 0; i < (int)this->decodeLayerCaches.size(); i++) {
-                const auto &layer = this->decodeLayerCaches[i];
+            for (int i = 0; i < (int)state.decodeLayerCaches.size(); i++) {
+                const auto &layer = state.decodeLayerCaches[i];
                 printf("[fastllm-dsv4-prefix-cache]   layer=%02d ratio=%d total_len=%d compressed_blocks=%d window=%d raw_tail_start=%d tail_tokens=%d\n",
                        i, layer.compressRatio, layer.totalLen, layer.compressedBlocks,
                        GetDataSeqLen(layer.windowKV, std::max(1, layer.bsz), std::max(1, layer.headDim)),
@@ -1741,9 +1752,15 @@ namespace fastllm {
     }
 
     void DeepSeekV4Model::RecordHistorySnapshot(const std::vector<int> &tokens, int totalLen) {
+        RecordHistorySnapshot(tokens, totalLen, this->decodeLayerCaches);
+    }
+
+    void DeepSeekV4Model::RecordHistorySnapshot(const std::vector<int> &tokens,
+                                                int totalLen,
+                                                const std::vector<DeepSeekV4DecodeLayerCache> &decodeCaches) {
         if (!this->saveHistoryChat || DeepSeekV4PrefixCacheDisabled() ||
             totalLen <= 0 || (int)tokens.size() < totalLen ||
-            this->decodeLayerCaches.empty()) {
+            decodeCaches.empty()) {
             return;
         }
         DeepSeekV4HistoryCacheMemory memory;
@@ -1751,10 +1768,10 @@ namespace fastllm {
         memory.blockCount = (totalLen + 255) / 256;
         memory.inputToken.assign(tokens.begin(), tokens.begin() + totalLen);
         memory.blockHash = DeepSeekV4TokenBlockHash(memory.inputToken, totalLen, 256);
-        memory.layers.resize(this->decodeLayerCaches.size());
+        memory.layers.resize(decodeCaches.size());
         bool storeFullRaw = EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_FULL_RAW");
-        for (int i = 0; i < (int)this->decodeLayerCaches.size(); i++) {
-            const auto &src = this->decodeLayerCaches[i];
+        for (int i = 0; i < (int)decodeCaches.size(); i++) {
+            const auto &src = decodeCaches[i];
             auto &dst = memory.layers[i];
             if (!src.initialized || src.totalLen != totalLen) {
                 return;
@@ -1864,8 +1881,13 @@ namespace fastllm {
             }
             return false;
         }
-        if (!this->RestoreHistoryCacheMemory(memory)) {
+        auto restoredState = std::make_shared<DeepSeekV4RequestState>();
+        if (!this->RestoreHistoryCacheMemory(memory, *restoredState)) {
             return false;
+        }
+        {
+            std::lock_guard<std::mutex> guard(this->requestStateMutex);
+            this->pendingRequestState = restoredState;
         }
         inputTokens.erase(inputTokens.begin(), inputTokens.begin() + hitLen);
         cacheLen = hitLen;
@@ -1907,8 +1929,494 @@ namespace fastllm {
         releaseDecodeCaches();
     }
 
+    std::shared_ptr<DeepSeekV4RequestState> DeepSeekV4Model::GetRequestState(std::vector<std::pair<Data, Data> > &pastKeyValues) {
+        const void *key = (const void*)&pastKeyValues;
+        std::lock_guard<std::mutex> guard(this->requestStateMutex);
+        auto it = this->requestStates.find(key);
+        if (it == this->requestStates.end()) {
+            return nullptr;
+        }
+        return it->second;
+    }
+
+    void DeepSeekV4Model::OnResponseContextCreated(ResponseContext *context) {
+        if (context == nullptr) {
+            return;
+        }
+        const void *key = (const void*)&context->pastKeyValues;
+        std::lock_guard<std::mutex> guard(this->requestStateMutex);
+        if (this->pendingRequestState) {
+            this->requestStates[key] = this->pendingRequestState;
+            this->pendingRequestState.reset();
+        } else {
+            this->requestStates[key] = std::make_shared<DeepSeekV4RequestState>();
+        }
+    }
+
+    void DeepSeekV4Model::OnResponseContextRemoved(ResponseContext *context) {
+        if (context == nullptr) {
+            return;
+        }
+        const void *key = (const void*)&context->pastKeyValues;
+        std::lock_guard<std::mutex> guard(this->requestStateMutex);
+        this->requestStates.erase(key);
+    }
+
+    void DeepSeekV4Model::TryRecordResponseContext(ResponseContext *context) {
+        if (context == nullptr) {
+            return;
+        }
+        const void *key = (const void*)&context->pastKeyValues;
+        std::shared_ptr<DeepSeekV4RequestState> state;
+        {
+            std::lock_guard<std::mutex> guard(this->requestStateMutex);
+            auto it = this->requestStates.find(key);
+            if (it != this->requestStates.end()) {
+                state = it->second;
+            }
+        }
+        if (!state) {
+            TryRecordHistoryCache(context->allTokens);
+            return;
+        }
+        if (!this->saveHistoryChat || DeepSeekV4PrefixCacheDisabled() ||
+            state->decodeLayerCaches.empty() || context->allTokens.empty()) {
+            if (DeepSeekV4PrefixCacheDebugEnabled()) {
+                printf("[fastllm-dsv4-prefix-cache] skip record: save=%d disabled=%d caches=%d tokens=%d\n",
+                       this->saveHistoryChat ? 1 : 0, DeepSeekV4PrefixCacheDisabled() ? 1 : 0,
+                       (int)state->decodeLayerCaches.size(), (int)context->allTokens.size());
+                fflush(stdout);
+            }
+            return;
+        }
+        int totalLen = state->decodeLayerCaches[0].totalLen;
+        if (totalLen > 0 && (int)context->allTokens.size() >= totalLen) {
+            this->RecordHistorySnapshot(context->allTokens, totalLen, state->decodeLayerCaches);
+        } else if (DeepSeekV4PrefixCacheDebugEnabled()) {
+            printf("[fastllm-dsv4-prefix-cache] skip record: total_len=%d all_tokens=%d\n",
+                   totalLen, (int)context->allTokens.size());
+            fflush(stdout);
+        }
+    }
+
+    void DeepSeekV4Model::RunModelSpecificScheduler() {
+        DeepSeekV4Model *model = this;
+        long long kvCacheLimit = 16LL << 30;
+#ifdef USE_CUDA
+        auto freeSizes = FastllmCudaGetFreeSizes();
+        auto dmap = GetDeviceMap();
+        std::set<int> deviceIds;
+        std::map<int, int> ratios;
+        for (auto &it : dmap) {
+            if (StartWith(it.first, "cuda")) {
+                for (int id : ParseDeviceIds(it.first, "cuda", ratios)) {
+                    deviceIds.insert(id);
+                }
+            }
+        }
+        if (deviceIds.empty()) {
+            deviceIds.insert(0);
+        }
+        kvCacheLimit = 0;
+        for (int id : deviceIds) {
+            if (id < (int)freeSizes.size()) {
+                kvCacheLimit += std::max(freeSizes[id] * 3 / 4, freeSizes[id] - (2LL << 30));
+            }
+        }
+        if (kvCacheLimit == 0) {
+            kvCacheLimit = 16LL << 30;
+        }
+#endif
+        if (model->kvCacheLimit > 0) {
+            kvCacheLimit = model->kvCacheLimit;
+        }
+
+        int maxTotalLens = kvCacheLimit / 1024 / 1024;
+        if (model->elementsInKVCachePerToken > 0) {
+            long long bytesPerToken = GetDataBytes(model->kvCacheDataType, 1, model->elementsInKVCachePerToken);
+            if (bytesPerToken > 0) {
+                maxTotalLens = kvCacheLimit / bytesPerToken;
+            }
+        }
+        if (model->tokensLimit > 0) {
+            maxTotalLens = model->tokensLimit;
+        }
+
+        int maxBatch = std::max(1, std::min(512, maxTotalLens / 128));
+        if (model->maxBatch > 0) {
+            maxBatch = model->maxBatch;
+        }
+        if (!model->canDoBatchForward && !model->canDoConcurrentForward) {
+            maxBatch = 1;
+        }
+        maxBatch = std::max(1, maxBatch);
+
+        model->tokensLimit = maxTotalLens;
+        int limit = maxTotalLens;
+        model->promptLimit = limit * 3 / 4;
+        int prefillChunkSize = model->GetChunkedPrefillSize();
+
+        auto getContextLen = [&](ResponseContext *ctx) -> int {
+            if (ctx == nullptr) {
+                return 0;
+            }
+            auto state = model->GetRequestState(ctx->pastKeyValues);
+            if (state && !state->decodeLayerCaches.empty()) {
+                int totalLen = state->decodeLayerCaches[0].totalLen;
+                if (totalLen > 0) {
+                    return totalLen;
+                }
+            }
+            if ((int)ctx->pastKeyValues.size() > model->kvCacheId) {
+                const Data &kv = ctx->pastKeyValues[model->kvCacheId].first;
+                if (kv.expansionDims.size() > 1) {
+                    return kv.expansionDims[1];
+                }
+                if (kv.dims.size() > 1) {
+                    return kv.dims[1];
+                }
+            }
+            return ctx->cacheLen + ctx->preTokens;
+        };
+
+        if (model->verbose) {
+            printf("Fastllm KV Cache Limit: %f MB.\n", (double)kvCacheLimit / 1e6);
+            printf("Fastllm KV Cache Token limit: %d tokens.\n", maxTotalLens);
+            printf("Fastllm Prompt Token limit: %d tokens.\n", std::min(model->max_positions, model->promptLimit));
+            printf("Fastllm Batch limit: %d.\n", maxBatch);
+            printf("Fastllm Scheduler: DeepSeekV4.\n");
+        }
+
+        auto lastRecordTime = std::chrono::system_clock::now();
+        long long genTokens = 0;
+        while (true) {
+            if (model->isFree) {
+                break;
+            }
+
+            std::vector<Data*> attentionMasks;
+            std::vector<Data*> positionIds;
+            std::vector<float> ids;
+            std::vector<int> seqLens;
+            std::vector<int> handles;
+            std::vector<GenerationConfig> generationConfigs;
+            LastTokensManager tokensManager;
+            std::vector<std::vector<float>*> logits;
+
+            std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+            auto &forwardLocker = model->forwardLocker;
+
+            std::set<int> abortHandles;
+            for (auto &it : model->responseContextDict.dicts) {
+                if (it.second->isAbort) {
+                    it.second->TryRecord(model);
+                    abortHandles.insert(it.first);
+                }
+            }
+            for (auto &it : abortHandles) {
+                model->RemoveResponseContext(it);
+            }
+
+            int lenSum = 0, currentActivate = 0;
+            for (auto &it : model->responseContextDict.dicts) {
+                if (it.second->isEnding) {
+                    continue;
+                }
+                int ctxLen = getContextLen(it.second);
+                if (it.second->preTokens > 0 || ctxLen > 0) {
+                    lenSum += ctxLen;
+                    currentActivate++;
+                }
+            }
+
+            std::vector<std::pair<int, int> > orders;
+            for (auto &it : model->responseContextDict.dicts) {
+                orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
+            }
+            sort(orders.begin(), orders.end());
+
+            for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
+                if (isPrompt == 0 && !seqLens.empty()) {
+                    continue;
+                }
+
+                for (auto &ii : orders) {
+                    auto contextIt = model->responseContextDict.dicts.find(ii.second);
+                    if (contextIt == model->responseContextDict.dicts.end()) {
+                        continue;
+                    }
+                    auto &it = *contextIt;
+                    ResponseContext *ctx = it.second;
+
+                    if (ctx->isEnding) {
+                        continue;
+                    }
+                    if (isPrompt && ctx->preTokens != 0) {
+                        continue;
+                    }
+                    if (!isPrompt && ctx->preTokens == 0) {
+                        continue;
+                    }
+                    if (isPrompt && !seqLens.empty()) {
+                        continue;
+                    }
+                    if (isPrompt && currentActivate >= maxBatch) {
+                        continue;
+                    }
+
+                    if ((maxTotalLens > 0 && ctx->cacheLen + (int)ctx->currentTokens.size() > maxTotalLens) ||
+                        ctx->cacheLen + (int)ctx->currentTokens.size() > model->max_positions) {
+                        ctx->isEnding = true;
+                        ctx->error = ResponseContextErrorPromptTooLong;
+                        continue;
+                    }
+
+                    if (!isPrompt) {
+                        int sur = ctx->generationConfig.output_token_limit - ctx->curTokens;
+                        int predictLen = 256;
+                        if (sur > 0) {
+                            predictLen = std::min(predictLen, ((sur - 1) / 128 + 1) * 128);
+                        }
+                        if (maxTotalLens > 0 && lenSum + predictLen > maxTotalLens) {
+                            continue;
+                        }
+                        lenSum += predictLen;
+                    } else {
+                        lenSum += ctx->currentTokens.size();
+                        currentActivate++;
+                    }
+
+                    generationConfigs.push_back(ctx->generationConfig);
+                    if (ctx->generationConfig.output_logits) {
+                        ctx->resultLogits.push(new std::vector<float>());
+                        logits.push_back(ctx->resultLogits.back());
+                    } else {
+                        logits.push_back(nullptr);
+                    }
+
+                    tokensManager.units.push_back(ctx->tokens);
+                    handles.push_back(it.first);
+
+                    if (ctx->preTokens == 0) {
+                        ctx->intParams["add_special_tokens"] =
+                            ctx->cacheLen > 0 ? false : ctx->generationConfig.add_special_tokens;
+                        ctx->intParams["promptLen"] = ctx->cacheLen + ctx->currentTokens.size();
+                        ctx->intParams["index"] = 0;
+                    } else {
+                        ctx->intParams["index"]++;
+                    }
+
+                    Data inputIds, attentionMask, curPositionIds;
+                    std::vector<std::vector<float> > tokens(1);
+                    for (int token : ctx->currentTokens) {
+                        tokens[0].push_back(token);
+                    }
+                    model->FillLLMInputs(tokens, ctx->intParams, inputIds, attentionMask, curPositionIds);
+                    ToDataType(attentionMask, model->dataType);
+
+                    seqLens.push_back(inputIds.Count(0));
+                    for (int i = 0; i < inputIds.Count(0); i++) {
+                        ids.push_back(((float*)inputIds.cpuData)[i]);
+                    }
+                    if (attentionMask.dims.empty()) {
+                        attentionMasks.push_back(nullptr);
+                    } else {
+                        attentionMasks.push_back(new Data());
+                        attentionMask.ToDevice(DataDevice::CPU);
+                        attentionMasks.back()->CopyFrom(attentionMask);
+                    }
+                    if (curPositionIds.dims.empty()) {
+                        positionIds.push_back(nullptr);
+                    } else {
+                        positionIds.push_back(new Data());
+                        positionIds.back()->CopyFrom(curPositionIds);
+                    }
+                    ctx->preTokens += seqLens.back();
+
+                    if (isPrompt) {
+                        break;
+                    }
+                    if ((int)seqLens.size() >= maxBatch ||
+                        (maxTotalLens > 0 && lenSum + (int)seqLens.size() * 128 > maxTotalLens)) {
+                        break;
+                    }
+                }
+            }
+
+            if (!seqLens.empty()) {
+                dictLocker.unlock();
+                forwardLocker.lock();
+#ifdef USE_CUDA
+                FastllmCudaClearBigBuffer();
+#endif
+                Data inputIds = Data(DataType::FLOAT32, {1, (int)ids.size()}, ids);
+                std::vector<int> ret;
+
+                if (seqLens.size() > 1) {
+                    for (int i = 0; i < (int)handles.size(); i++) {
+                        Data inputIdNow = Data(DataType::FLOAT32, {1, 1}, {ids[i]});
+                        LastTokensManager singleTokens;
+                        singleTokens.units.push_back(tokensManager.units[i]);
+                        Data emptyAttention, emptyPosition;
+                        dictLocker.lock();
+                        auto contextIt = model->responseContextDict.dicts.find(handles[i]);
+                        if (contextIt == model->responseContextDict.dicts.end()) {
+                            dictLocker.unlock();
+                            ret.push_back(model->eos_token_id);
+                            continue;
+                        }
+                        ResponseContext *ctx = contextIt->second;
+                        ret.push_back(model->Forward(inputIdNow,
+                                                     attentionMasks[i] == nullptr ? emptyAttention : *attentionMasks[i],
+                                                     positionIds[i] == nullptr ? emptyPosition : *positionIds[i],
+                                                     ctx->pastKeyValues,
+                                                     generationConfigs[i], singleTokens, logits[i]));
+                        dictLocker.unlock();
+                    }
+                } else {
+                    dictLocker.lock();
+                    auto contextIt = model->responseContextDict.dicts.find(handles[0]);
+                    ResponseContext *ctx = contextIt == model->responseContextDict.dicts.end() ? nullptr : contextIt->second;
+                    std::vector<std::pair<Data, Data> > *pastKeyValue = ctx == nullptr ? nullptr : &ctx->pastKeyValues;
+                    bool isMultimodal = ctx != nullptr && !ctx->multimodalInput.empty();
+                    dictLocker.unlock();
+
+                    if (ctx == nullptr || pastKeyValue == nullptr) {
+                        ret.push_back(model->eos_token_id);
+                    } else if (isMultimodal) {
+                        Data emptyAttention, emptyPosition;
+                        ret = model->ForwardMultimodal(inputIds,
+                                                       attentionMasks[0] == nullptr ? emptyAttention : *attentionMasks[0],
+                                                       positionIds[0] == nullptr ? emptyPosition : *positionIds[0],
+                                                       *pastKeyValue, ctx->multimodalInput,
+                                                       ctx->generationConfig, tokensManager, &logits);
+                    } else if (seqLens[0] > prefillChunkSize) {
+                        int len = seqLens[0];
+                        for (int st = 0; st < len; ) {
+                            if (model->verbose) {
+                                genTokens += seqLens.size();
+                                auto nowTime = std::chrono::system_clock::now();
+                                float spend = GetSpan(lastRecordTime, nowTime);
+                                if (spend > 1) {
+                                    printf("Long Prefill ... (%d%%)\n", st * 100 / len);
+                                    lastRecordTime = nowTime;
+                                }
+                            }
+                            int curLen = std::min(st == 0 ? prefillChunkSize : prefillChunkSize, len - st);
+                            Data curInput, curPositionIds;
+                            Split(inputIds, 1, st, st + curLen, curInput);
+                            if (positionIds[0] != nullptr) {
+                                Split(*positionIds[0], 1, st, st + curLen, curPositionIds);
+                            }
+                            Data emptyAttention;
+                            ret = std::vector<int>{model->Forward(curInput, emptyAttention, curPositionIds,
+                                                                  *pastKeyValue, generationConfigs[0],
+                                                                  tokensManager, logits[0])};
+                            st += curLen;
+                        }
+                    } else {
+                        Data emptyAttention, emptyPosition;
+                        ret = std::vector<int>{model->Forward(inputIds,
+                                                              attentionMasks[0] == nullptr ? emptyAttention : *attentionMasks[0],
+                                                              positionIds[0] == nullptr ? emptyPosition : *positionIds[0],
+                                                              *pastKeyValue, generationConfigs[0],
+                                                              tokensManager, logits[0])};
+                    }
+                }
+
+                forwardLocker.unlock();
+                dictLocker.lock();
+
+                if (model->verbose) {
+                    genTokens += seqLens.size();
+                    auto nowTime = std::chrono::system_clock::now();
+                    float spend = GetSpan(lastRecordTime, nowTime);
+                    if (spend > 1) {
+                        int alive = 0, pending = 0, aliveLen = 0;
+                        for (auto &it : model->responseContextDict.dicts) {
+                            if (it.second->isEnding) {
+                                continue;
+                            }
+                            int ctxLen = getContextLen(it.second);
+                            if (it.second->preTokens > 0 || ctxLen > 0) {
+                                alive++;
+                                aliveLen += ctxLen;
+                            } else {
+                                pending++;
+                            }
+                        }
+                        printf("[DeepSeekV4 Decode] alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n",
+                               alive, pending, aliveLen, (float)genTokens / spend);
+                        lastRecordTime = nowTime;
+                        genTokens = 0;
+                    }
+                }
+
+                int resultCount = std::min((int)handles.size(), (int)ret.size());
+                for (int i = 0; i < resultCount; i++) {
+                    auto contextIt = model->responseContextDict.dicts.find(handles[i]);
+                    if (contextIt == model->responseContextDict.dicts.end()) {
+                        continue;
+                    }
+                    ResponseContext *ctx = contextIt->second;
+                    int curRet = ret[i];
+                    if (curRet == model->eos_token_id ||
+                        model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
+                        ctx->isEnding = true;
+                        ctx->TryRecord(model);
+                    } else {
+                        auto itStopTk = ctx->generationConfig.stop_token_ids.find(curRet);
+                        if (itStopTk != ctx->generationConfig.stop_token_ids.end()) {
+                            ctx->isEnding = true;
+                            ctx->TryRecord(model);
+                        }
+                    }
+                    if (!ctx->isEnding) {
+                        ctx->currentTokens = std::vector<int>{curRet};
+                        ctx->resultTokenQueue.push(curRet);
+                        ctx->allTokens.push_back(curRet);
+                        ctx->tokens.Push(curRet);
+                        ctx->curTokens++;
+                        if (ctx->curTokens == ctx->generationConfig.output_token_limit ||
+                            ctx->allTokens.size() >= model->max_positions) {
+                            ctx->isEnding = true;
+                            ctx->TryRecord(model);
+                        }
+                    }
+                }
+            } else {
+                int maxLen = -1, select = -1;
+                for (auto &it : model->responseContextDict.dicts) {
+                    if (it.second->isEnding) {
+                        continue;
+                    }
+                    int ctxLen = getContextLen(it.second);
+                    if (ctxLen > maxLen) {
+                        maxLen = ctxLen;
+                        select = it.first;
+                    }
+                }
+                if (select != -1 && maxTotalLens > 0 && maxLen >= maxTotalLens) {
+                    model->responseContextDict.dicts[select]->isEnding = true;
+                }
+            }
+
+            for (int i = 0; i < (int)attentionMasks.size(); i++) {
+                delete attentionMasks[i];
+            }
+            for (int i = 0; i < (int)positionIds.size(); i++) {
+                delete positionIds[i];
+            }
+
+            if (seqLens.empty()) {
+                model->dictCV.wait(dictLocker);
+            }
+        }
+    }
+
     DeepSeekV4Model::DeepSeekV4Model() {
         this->canDoBatchForward = false;
+        this->canDoConcurrentForward = true;
         this->model_type = "deepseek_v4";
         this->model_struct = "deepseek_v4";
         this->defaultChunkedPrefillSize = 4096;
@@ -2241,6 +2749,13 @@ namespace fastllm {
             startPos = pids.empty() ? 0 : pids[0];
         }
         int originalStartPos = startPos;
+        std::shared_ptr<DeepSeekV4RequestState> requestState = GetRequestState(pastKeyValues);
+        std::vector<DeepSeekV4DecodeLayerCache> *decodeCachesPtr =
+            requestState == nullptr ? &this->decodeLayerCaches : &requestState->decodeLayerCaches;
+        std::vector<int> *historyTokensPtr =
+            requestState == nullptr ? &this->deepseekV4HistoryTokens : &requestState->historyTokens;
+        auto &activeDecodeLayerCaches = *decodeCachesPtr;
+        auto &activeHistoryTokens = *historyTokensPtr;
         if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
             batch == 1 && inputIds.dims.size() >= 2 && inputIds.dims[1] > 1 &&
             !EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_DISABLE_CHUNK_SPLIT")) {
@@ -2329,23 +2844,23 @@ namespace fastllm {
         }
         
         if (useDecodeCache && originalStartPos == 0) {
-            decodeLayerCaches.clear();
-            decodeLayerCaches.resize(block_cnt);
+            activeDecodeLayerCaches.clear();
+            activeDecodeLayerCaches.resize(block_cnt);
         }
 
         std::vector<int> tokenIds = ReadTokenIds(inputIds);
         if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() && batch == 1) {
             if (originalStartPos == 0) {
-                this->deepseekV4HistoryTokens = tokenIds;
-            } else if ((int)this->deepseekV4HistoryTokens.size() == originalStartPos) {
-                this->deepseekV4HistoryTokens.insert(this->deepseekV4HistoryTokens.end(), tokenIds.begin(), tokenIds.end());
-            } else if ((int)this->deepseekV4HistoryTokens.size() < originalStartPos) {
+                activeHistoryTokens = tokenIds;
+            } else if ((int)activeHistoryTokens.size() == originalStartPos) {
+                activeHistoryTokens.insert(activeHistoryTokens.end(), tokenIds.begin(), tokenIds.end());
+            } else if ((int)activeHistoryTokens.size() < originalStartPos) {
                 if (DeepSeekV4PrefixCacheDebugEnabled()) {
                     printf("[fastllm-dsv4-prefix-cache] reset token history: history=%d start=%d add=%d\n",
-                           (int)this->deepseekV4HistoryTokens.size(), originalStartPos, (int)tokenIds.size());
+                           (int)activeHistoryTokens.size(), originalStartPos, (int)tokenIds.size());
                     fflush(stdout);
                 }
-                this->deepseekV4HistoryTokens.clear();
+                activeHistoryTokens.clear();
             }
         }
         bool cudaSe = GetCudaSharedExpert();
@@ -2406,8 +2921,8 @@ namespace fastllm {
                                   rope_scaling_beta_slow, head_dim_full - qk_rope_head_dim, 64);
             kv.Reshape({bsz, seqlen, head_dim_full});
             DeepSeekV4DecodeLayerCache *decodeCache = nullptr;
-            if (useDecodeCache && layer < (int)decodeLayerCaches.size()) {
-                decodeCache = &decodeLayerCaches[layer];
+            if (useDecodeCache && layer < (int)activeDecodeLayerCaches.size()) {
+                decodeCache = &activeDecodeLayerCaches[layer];
             }
             Data chunkPrefixKV;
             int chunkPrefixLen = 0;
@@ -2711,12 +3226,12 @@ namespace fastllm {
         UpdateDebugPastKeyValues(pastKeyValues, bsz, finalTotalLen, block_cnt);
         if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
             batch == 1 && finalTotalLen % 256 == 0 &&
-            (int)this->deepseekV4HistoryTokens.size() >= finalTotalLen) {
-            this->RecordHistorySnapshot(this->deepseekV4HistoryTokens, finalTotalLen);
+            (int)activeHistoryTokens.size() >= finalTotalLen) {
+            this->RecordHistorySnapshot(activeHistoryTokens, finalTotalLen, activeDecodeLayerCaches);
         } else if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
                    batch == 1 && finalTotalLen % 256 == 0 && DeepSeekV4PrefixCacheDebugEnabled()) {
             printf("[fastllm-dsv4-prefix-cache] skip boundary record: final_len=%d history_tokens=%d\n",
-                   finalTotalLen, (int)this->deepseekV4HistoryTokens.size());
+                   finalTotalLen, (int)activeHistoryTokens.size());
             fflush(stdout);
         }
         return ret;
