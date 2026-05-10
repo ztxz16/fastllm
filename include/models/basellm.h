@@ -285,6 +285,12 @@ namespace fastllm {
 
         virtual void TryRecordHistoryCache(const std::vector<int> &allTokens) {}
 
+        virtual void TryRecordResponseContext(ResponseContext *context);
+
+        virtual void OnResponseContextCreated(ResponseContext *context) {}
+
+        virtual void OnResponseContextRemoved(ResponseContext *context) {}
+
         virtual bool UseGenericHistoryCache() const { return true; }
 
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input) = 0; // 根据历史信息和当前输入生成prompt
@@ -310,6 +316,11 @@ namespace fastllm {
         virtual void SetMoeAtype(DataType type);
 
         virtual void UpdateRotaryPtr(Data **sinDataPtr, Data **cosDataPtr, const std::string &device);
+
+        // 模型可以覆盖自己的调度器。默认继续使用 basellm 的通用调度逻辑。
+        virtual bool UseModelSpecificScheduler() const { return false; }
+
+        virtual void RunModelSpecificScheduler() { NewMainLoop(); }
 
         // messages: [ (role, content) ... ]
         virtual std::string ApplyChatTemplate(const ChatMessages &messages);
@@ -370,6 +381,8 @@ namespace fastllm {
 
         ResponseContextDict responseContextDict;
 
+        void RemoveResponseContext(int handleId);
+
         std::thread *mainLoop = nullptr;
         std::mutex mainLoopLocker, dictLocker, forwardLocker;
         std::condition_variable dictCV;
@@ -403,6 +416,7 @@ namespace fastllm {
 
         int kvCacheId = 0; // 最早使用kv_cache的层编号 （因为有一些混合架构的模型，其中一些block是线性attention）
         bool canDoBatchForward = true; // 是否支持batch推理
+        bool canDoConcurrentForward = false; // 不支持batch时是否支持多个上下文轮转推理
 
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
