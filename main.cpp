@@ -12,7 +12,10 @@ std::map <std::string, fastllm::DataType> dataTypeDict = {
     {"int4z", fastllm::DataType::INT4},
     {"int4g", fastllm::DataType::INT4_GROUP},
     {"bfloat16", fastllm::DataType::BFLOAT16},
-    {"bf16", fastllm::DataType::BFLOAT16}
+    {"bf16", fastllm::DataType::BFLOAT16},
+    {"fp8", fastllm::DataType::FP8_E4M3},
+    {"float8", fastllm::DataType::FP8_E4M3},
+    {"fp8_e4m3", fastllm::DataType::FP8_E4M3}
 };
 
 struct RunConfig {
@@ -23,8 +26,11 @@ struct RunConfig {
     bool lowMemMode = false; // 是否使用低内存模式
 
     fastllm::DataType dtype = fastllm::DataType::FLOAT16;
+    fastllm::DataType moeDtype = fastllm::DataType::FLOAT32;
     fastllm::DataType atype = fastllm::DataType::FLOAT32;
     int groupCnt = -1;
+    int moeGroupCnt = -1;
+    bool useMoeDtype = false;
 };
 
 void Usage() {
@@ -36,6 +42,7 @@ void Usage() {
     std::cout << "<--system> <args>:            设置系统提示词(system prompt)" << std::endl;
     std::cout << "<--eos_token> <args>:         设置eos token" << std::endl;
     std::cout << "<--dtype> <args>:             设置权重类型(读取hf文件时生效)" << std::endl;
+    std::cout << "<--moe_dtype> <args>:         设置MoE expert权重类型(读取hf文件时生效)" << std::endl;
     std::cout << "<--atype> <args>:             设置推理使用的数据类型(float32/float16)" << std::endl;
     std::cout << "<--top_p> <args>:             采样参数top_p" << std::endl;
     std::cout << "<--top_k> <args>:             采样参数top_k" << std::endl;
@@ -81,6 +88,16 @@ void ParseArgs(int argc, char **argv, RunConfig &config, fastllm::GenerationConf
             fastllm::AssertInFastLLM(dataTypeDict.find(dtypeStr) != dataTypeDict.end(),
                                     "Unsupport data type: " + dtypeStr);
             config.dtype = dataTypeDict[dtypeStr];
+        } else if (sargv[i] == "--moe_dtype") {
+            std::string dtypeStr = sargv[++i];
+            if (dtypeStr.size() > 5 && dtypeStr.substr(0, 5) == "int4g") {
+                config.moeGroupCnt = atoi(dtypeStr.substr(5).c_str());
+                dtypeStr = dtypeStr.substr(0, 5);
+            }
+            fastllm::AssertInFastLLM(dataTypeDict.find(dtypeStr) != dataTypeDict.end(),
+                                    "Unsupport moe data type: " + dtypeStr);
+            config.moeDtype = dataTypeDict[dtypeStr];
+            config.useMoeDtype = true;
         } else if (sargv[i] == "--atype") {
             std::string atypeStr = sargv[++i];
             fastllm::AssertInFastLLM(dataTypeDict.find(atypeStr) != dataTypeDict.end(),
@@ -109,7 +126,10 @@ int main(int argc, char **argv) {
         exit(0);
     }
     bool isHFDir = fastllm::FileExists(config.path + "/config.json") || fastllm::FileExists(config.path + "config.json");
-    auto model = !isHFDir ? fastllm::CreateLLMModelFromFile(config.path) : fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt);
+    auto model = !isHFDir ? fastllm::CreateLLMModelFromFile(config.path) :
+                 fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt,
+                                               false, "", "", false,
+                                               config.useMoeDtype, config.moeDtype, config.moeGroupCnt);
     if (config.atype != fastllm::DataType::FLOAT32) {
         model->SetDataType(config.atype);
     }
