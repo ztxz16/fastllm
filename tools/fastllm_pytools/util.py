@@ -152,19 +152,14 @@ def make_normal_llm_model(args):
             if is_step3p5:
                 if (args.cache_history == ""):
                     args.cache_history = "true"
-                if (args.moe_device == ""):
+                if (args.moe_device == "" and not(args.device and args.device != "")):
                     total_mem_gib = _total_memory_gib()
                     can_hold_cpu_moe = total_mem_gib >= 220.0
-                    if ((not(args.device and args.device != ""))):
-                        if (_has_cuda_device() and can_hold_cpu_moe):
-                            args.device = "cuda"
-                            args.moe_device = "cpu"
-                        else:
-                            args.device = "cpu"
-                            args.moe_device = "disk"
-                    elif (_uses_cuda_device(args.device) and can_hold_cpu_moe):
+                    if (_has_cuda_device() and can_hold_cpu_moe):
+                        args.device = "cuda"
                         args.moe_device = "cpu"
                     else:
+                        args.device = "cpu"
                         args.moe_device = "disk"
                 if (args.max_batch <= 0):
                     args.max_batch = 1
@@ -264,6 +259,8 @@ def make_normal_llm_model(args):
         if expanded != args.device:
             print(f"[device] cudapp expand: {args.device} => {expanded}")
             args.device = expanded
+    if (args.moe_device and args.moe_device != ""):
+        args.moe_device = expand_cudapp_device(args.moe_device)
     from ftllm import llm
     if (args.device and args.device != ""):
         try:

@@ -25,6 +25,24 @@ namespace fastllm {
         return lowered == "1" || lowered == "true" || lowered == "on";
     }
 
+    static bool Step3p5DeviceMapUsesCuda(const std::map<std::string, int> &deviceMap) {
+        for (auto &it : deviceMap) {
+            if (it.first.rfind("cuda", 0) == 0 || it.first.rfind("multicuda", 0) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool Step3p5DeviceMapUsesDisk(const std::map<std::string, int> &deviceMap) {
+        for (auto &it : deviceMap) {
+            if (it.first == "disk") {
+                return true;
+            }
+        }
+        return false;
+    }
+
     static std::string Step3p5GetDict(const std::map<std::string, std::string> &dict,
                                       const std::string &key,
                                       const std::string &defaultValue = "") {
@@ -168,6 +186,38 @@ namespace fastllm {
         }
     }
 
+    static void Step3p5MakeExpertCopy(Data &dst, Data &src, const std::string &name, int expert) {
+        AssertInFastLLM(src.dims.size() == 3, "Step3p5 MoE expert source weight should be 3D.");
+        AssertInFastLLM(expert >= 0 && expert < src.dims[0], "Step3p5 MoE expert index out of range.");
+        src.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(src.cpuData != nullptr, "Step3p5 MoE expert source should be in CPU memory.");
+
+        int rows = src.dims[1], cols = src.dims[2];
+        dst = Data(src.dataType, {rows, cols});
+        dst.name = name;
+        dst.weightType = WeightType::LINEAR;
+        dst.isModelWeight = true;
+        dst.blockK = src.blockK;
+        dst.blockM = src.blockM;
+        dst.group = src.group;
+        dst.groupCnt = src.groupCnt;
+        dst.perChannelAxis = src.perChannelAxis;
+        dst.Allocate();
+
+        uint64_t bytesPerExpert = src.GetBytes() / src.dims[0];
+        memcpy(dst.cpuData, src.cpuData + bytesPerExpert * expert, bytesPerExpert);
+        if ((src.dataType == DataType::FP8_E4M3 || src.dataType == DataType::NVFP4) &&
+            src.blockK > 0 && src.blockM > 0 && !src.scales.empty()) {
+            int ks = (rows - 1) / src.blockK + 1;
+            int ms = (cols - 1) / src.blockM + 1;
+            int perExpert = ks * ms;
+            AssertInFastLLM((expert + 1) * perExpert <= (int)src.scales.size(),
+                            "Step3p5 MoE expert scale range is out of bounds.");
+            dst.scales.assign(src.scales.begin() + expert * perExpert,
+                              src.scales.begin() + (expert + 1) * perExpert);
+        }
+    }
+
     static void Step3p5MakeGateUpWeight(Data &dst, const Data &gate, const Data &up, const std::string &name) {
         AssertInFastLLM(gate.dims.size() == 2 && up.dims.size() == 2 &&
                         gate.dims[0] == up.dims[0] && gate.dims[1] == up.dims[1],
@@ -209,6 +259,37 @@ namespace fastllm {
         dst.halfScales = AppendVector(dst.halfScales, up.halfScales);
         if (!dst.isDiskWeight) {
             dst.CalcWeightSum();
+        }
+    }
+
+    static void Step3p5MakeGateUpSliceView(Data &dst, const Data &src, const std::string &name,
+                                           int rowStart, int rows) {
+        AssertInFastLLM(src.dims.size() == 2, "Step3p5 MoE gateup weight should be 2D.");
+        AssertInFastLLM(rowStart >= 0 && rows > 0 && rowStart + rows <= src.dims[0],
+                        "Step3p5 MoE gateup slice is out of range.");
+        int cols = src.dims[1];
+        dst = Data(src.dataType, {rows, cols});
+        dst.name = name;
+        dst.weightType = WeightType::LINEAR;
+        dst.isModelWeight = true;
+        dst.blockK = src.blockK;
+        dst.blockM = src.blockM;
+        dst.group = src.group;
+        dst.groupCnt = src.groupCnt;
+        dst.perChannelAxis = src.perChannelAxis;
+        dst.FakeFrom(src, (uint64_t)rowStart * cols * src.unitSize / src.unitSizeDiv);
+        if ((src.dataType == DataType::FP8_E4M3 || src.dataType == DataType::NVFP4) &&
+            src.blockK > 0 && src.blockM > 0 && !src.scales.empty()) {
+            AssertInFastLLM(rowStart % src.blockK == 0,
+                            "Step3p5 MoE gateup scale slice should align with blockK.");
+            int ks = (rows - 1) / src.blockK + 1;
+            int ms = (cols - 1) / src.blockM + 1;
+            int scaleOffset = (rowStart / src.blockK) * ms;
+            int scaleCount = ks * ms;
+            AssertInFastLLM(scaleOffset + scaleCount <= (int)src.scales.size(),
+                            "Step3p5 MoE gateup scale slice is out of bounds.");
+            dst.scales.assign(src.scales.begin() + scaleOffset,
+                              src.scales.begin() + scaleOffset + scaleCount);
         }
     }
 
@@ -468,35 +549,33 @@ namespace fastllm {
             Data &gateSource = weight[gateSourceName];
             Data &upSource = weight[upSourceName];
             Data &downSource = weight[downSourceName];
-            bool useMergedMoe = gateSource.isDiskWeight || upSource.isDiskWeight || downSource.isDiskWeight;
+            bool useDiskMergedMoe = gateSource.isDiskWeight || upSource.isDiskWeight || downSource.isDiskWeight;
             moeGateWeights[i].resize(num_experts);
             moeUpWeights[i].resize(num_experts);
             moeDownWeights[i].resize(num_experts);
-            if (useMergedMoe) {
-                weights[i].push_back(nullptr);
-                weights[i].push_back(nullptr);
-                biass[i].push_back(nullptr);
-                biass[i].push_back(nullptr);
-            }
+            weights[i].push_back(nullptr);
+            weights[i].push_back(nullptr);
+            biass[i].push_back(nullptr);
+            biass[i].push_back(nullptr);
             for (int j = 0; j < num_experts; j++) {
                 std::string expertPrefix = prefix + "experts." + std::to_string(j) + ".";
                 std::string gateName = expertPrefix + "gate_proj.weight";
                 std::string upName = expertPrefix + "up_proj.weight";
                 std::string downName = expertPrefix + "down_proj.weight";
                 std::string gateupName = expertPrefix + "gateup_proj.weight";
-                if (weight.weight.find(gateName) == weight.weight.end()) {
-                    Step3p5MakeExpertView(weight.weight[gateName], gateSource, gateName, j);
-                }
-                if (weight.weight.find(upName) == weight.weight.end()) {
-                    Step3p5MakeExpertView(weight.weight[upName], upSource, upName, j);
-                }
-                if (weight.weight.find(downName) == weight.weight.end()) {
-                    Step3p5MakeExpertView(weight.weight[downName], downSource, downName, j);
-                }
-                moeGateWeights[i][j] = &weight[gateName];
-                moeUpWeights[i][j] = &weight[upName];
-                moeDownWeights[i][j] = &weight[downName];
-                if (useMergedMoe) {
+                if (useDiskMergedMoe) {
+                    if (weight.weight.find(gateName) == weight.weight.end()) {
+                        Step3p5MakeExpertView(weight.weight[gateName], gateSource, gateName, j);
+                    }
+                    if (weight.weight.find(upName) == weight.weight.end()) {
+                        Step3p5MakeExpertView(weight.weight[upName], upSource, upName, j);
+                    }
+                    if (weight.weight.find(downName) == weight.weight.end()) {
+                        Step3p5MakeExpertView(weight.weight[downName], downSource, downName, j);
+                    }
+                    moeGateWeights[i][j] = &weight[gateName];
+                    moeUpWeights[i][j] = &weight[upName];
+                    moeDownWeights[i][j] = &weight[downName];
                     if (weight.weight.find(gateupName) == weight.weight.end()) {
                         Step3p5MakeGateUpWeight(weight.weight[gateupName], weight[gateName], weight[upName], gateupName);
                     }
@@ -504,7 +583,40 @@ namespace fastllm {
                     weights[i].push_back(&weight[downName]);
                     biass[i].push_back(nullptr);
                     biass[i].push_back(nullptr);
+                } else {
+                    if (weight.weight.find(gateupName) == weight.weight.end()) {
+                        Data gateCopy, upCopy;
+                        Step3p5MakeExpertCopy(gateCopy, gateSource, gateName, j);
+                        Step3p5MakeExpertCopy(upCopy, upSource, upName, j);
+                        Step3p5MakeGateUpWeight(weight.weight[gateupName], gateCopy, upCopy, gateupName);
+                    }
+                    if (weight.weight.find(downName) == weight.weight.end()) {
+                        Step3p5MakeExpertCopy(weight.weight[downName], downSource, downName, j);
+                    }
+                    Data &gateup = weight[gateupName];
+                    Data &down = weight[downName];
+                    gateup.tpLinearType = TP_LINEAR_ROW;
+                    gateup.tpPackType = TP_PACK_GATEUP;
+                    down.tpLinearType = TP_LINEAR_COLUMN;
+                    if (weight.weight.find(gateName) == weight.weight.end()) {
+                        Step3p5MakeGateUpSliceView(weight.weight[gateName], gateup, gateName, 0, gateup.dims[0] / 2);
+                    }
+                    if (weight.weight.find(upName) == weight.weight.end()) {
+                        Step3p5MakeGateUpSliceView(weight.weight[upName], gateup, upName, gateup.dims[0] / 2, gateup.dims[0] / 2);
+                    }
+                    moeGateWeights[i][j] = &weight[gateName];
+                    moeUpWeights[i][j] = &weight[upName];
+                    moeDownWeights[i][j] = &weight[downName];
+                    weights[i].push_back(&gateup);
+                    weights[i].push_back(&down);
+                    biass[i].push_back(nullptr);
+                    biass[i].push_back(nullptr);
                 }
+            }
+            if (!useDiskMergedMoe) {
+                weight.weight.erase(gateSourceName);
+                weight.weight.erase(upSourceName);
+                weight.weight.erase(downSourceName);
             }
         }
         moeWeightsPrepared = true;
@@ -732,10 +844,11 @@ namespace fastllm {
                 expertIndex.ToDevice(DataDevice::CPU);
                 expertScore.ToDevice(DataDevice::CPU);
                 ToDataType(expertScore, DataType::FLOAT32);
-                if (i < (int)weights.size() && !weights[i].empty()) {
+                bool useCudaMoe = Step3p5DeviceMapUsesCuda(this->moeDeviceMap);
+                bool useDiskMoe = Step3p5DeviceMapUsesDisk(this->moeDeviceMap);
+                if (i < (int)weights.size() && !weights[i].empty() && (useCudaMoe || useDiskMoe)) {
                     Data expertInput;
                     expertInput.CopyFrom(attenInput);
-                    expertInput.ToDevice(DataDevice::CPU);
                     ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
                     MergeMOE(expertInput, expertIndex, expertScore,
                              weights[i], biass[i],
