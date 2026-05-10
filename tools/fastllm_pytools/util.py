@@ -1,6 +1,33 @@
 import argparse
 import os
 import sys
+import subprocess
+
+def _has_cuda_device() -> bool:
+    if os.path.exists("/dev/nvidia0") or os.path.isdir("/proc/driver/nvidia/gpus"):
+        return True
+    try:
+        return subprocess.run(["nvidia-smi", "-L"],
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL,
+                              timeout=8).returncode == 0
+    except Exception:
+        return False
+
+def _total_memory_gib() -> float:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1024 / 1024
+    except Exception:
+        pass
+    return 0.0
+
+def _uses_cuda_device(device) -> bool:
+    if not device:
+        return False
+    return "cuda" in str(device).lower() or str(device).lower().startswith("cudapp=")
 
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description = des, add_help = add_help)
@@ -118,6 +145,33 @@ def make_normal_llm_model(args):
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
+
+            is_step3p5 = (architecture == 'Step3p5ForCausalLM' or
+                          model_type == 'step3p5' or
+                          text_model_type == 'step3p5')
+            if is_step3p5:
+                if (args.cache_history == ""):
+                    args.cache_history = "true"
+                if (args.moe_device == ""):
+                    total_mem_gib = _total_memory_gib()
+                    can_hold_cpu_moe = total_mem_gib >= 220.0
+                    if ((not(args.device and args.device != ""))):
+                        if (_has_cuda_device() and can_hold_cpu_moe):
+                            args.device = "cuda"
+                            args.moe_device = "cpu"
+                        else:
+                            args.device = "cpu"
+                            args.moe_device = "disk"
+                    elif (_uses_cuda_device(args.device) and can_hold_cpu_moe):
+                        args.moe_device = "cpu"
+                    else:
+                        args.moe_device = "disk"
+                if (args.max_batch <= 0):
+                    args.max_batch = 1
+                if (args.chunked_prefill_size <= 0):
+                    args.chunked_prefill_size = 128
+                if (args.tokens <= 0):
+                    args.tokens = 32768
 
             if (architecture == 'Qwen3ForCausalLM' or architecture == 'Qwen3MoeForCausalLM' or
                 architecture == 'DeepseekV4ForCausalLM' or model_type == 'deepseek_v4' or
