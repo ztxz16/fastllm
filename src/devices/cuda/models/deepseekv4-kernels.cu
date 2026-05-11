@@ -886,6 +886,33 @@ __global__ void DeepSeekV4HcPreDotsBlockKernel(const XT *x, const WT *w, float *
 }
 
 template <typename XT>
+__global__ void DeepSeekV4HcPreSqSumKernel(const XT *x, float *dots,
+                                           int tokens, int flatDim, int dotsStride) {
+    extern __shared__ float red[];
+    int t = blockIdx.x;
+    if (t >= tokens) {
+        return;
+    }
+    const XT *xrow = x + (uint64_t)t * flatDim;
+    float partial = 0.0f;
+    for (int k = threadIdx.x; k < flatDim; k += blockDim.x) {
+        float v = Dsv4ToFloat(xrow[k]);
+        partial += v * v;
+    }
+    red[threadIdx.x] = partial;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            red[threadIdx.x] += red[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        dots[(uint64_t)t * dotsStride + (dotsStride - 1)] = red[0];
+    }
+}
+
+template <typename XT>
 __global__ void DeepSeekV4HcPreFinishKernel(const XT *x, const float *dots, const float *scale,
                                             const float *base, XT *y, float *post, float *comb,
                                             int tokens, int dim, int hcMult, int sinkhornIters,
@@ -2993,6 +3020,39 @@ bool DeepSeekV4LaunchSparsePrefillByQ(const fastllm::Data &q, const fastllm::Dat
     return false;
 }
 
+bool DeepSeekV4LaunchHcPreCublasDots(const fastllm::Data &x, const fastllm::Data &hcFn,
+                                     float *dotsData, int tokens, int flatDim,
+                                     int mixHc, int dotsStride) {
+    if (std::getenv("FASTLLM_DSV4_DISABLE_CUDA_HCPRE_CUBLAS") != nullptr) {
+        return false;
+    }
+    cudaDataType_t xType, wType;
+    if (!DeepSeekV4CublasDataType(x.dataType, xType) ||
+        !DeepSeekV4CublasDataType(hcFn.dataType, wType)) {
+        return false;
+    }
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t status = cublasGemmEx(
+        getFastllmCublasHandle(),
+        CUBLAS_OP_T, CUBLAS_OP_N,
+        mixHc, tokens, flatDim,
+        &alpha,
+        hcFn.cudaData, wType, flatDim,
+        x.cudaData, xType, flatDim,
+        &beta,
+        dotsData, CUDA_R_32F, dotsStride,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        if (std::getenv("FASTLLM_DSV4_DEBUG_CUDA_HCPRE_CUBLAS") != nullptr) {
+            std::fprintf(stderr, "DeepSeekV4HcPre cuBLAS dots failed: status=%d tokens=%d flatDim=%d mixHc=%d xType=%d wType=%d\n",
+                         (int)status, tokens, flatDim, mixHc, (int)x.dataType, (int)hcFn.dataType);
+        }
+        return false;
+    }
+    return true;
+}
+
 template <typename XT>
 bool DeepSeekV4LaunchHcPreByWeight(const fastllm::Data &x, const fastllm::Data &hcFn,
                                    const fastllm::Data &hcScale, const fastllm::Data &hcBase,
@@ -3031,6 +3091,35 @@ bool DeepSeekV4LaunchHcPreByWeight(const fastllm::Data &x, const fastllm::Data &
     DeepSeekV4HcPreFinishKernel<<<finishGrid, threads, finishSharedBytes>>>(
         xData, dotsData, scaleData, baseData, yData, postData, combData,
         tokens, dim, hcMult, sinkhornIters, eps, normEps, dotsStride, dotParts);
+    return true;
+}
+
+template <typename XT>
+bool DeepSeekV4LaunchHcPreCublasByWeight(const fastllm::Data &x, const fastllm::Data &hcFn,
+                                         const fastllm::Data &hcScale, const fastllm::Data &hcBase,
+                                         fastllm::Data &y, fastllm::Data &post, fastllm::Data &comb,
+                                         float *dotsData,
+                                         int tokens, int dim, int hcMult, int sinkhornIters,
+                                         float eps, float normEps) {
+    int threads = 256;
+    int mixHc = (2 + hcMult) * hcMult;
+    int flatDim = hcMult * dim;
+    int dotsStride = mixHc + 1;
+    if (!DeepSeekV4LaunchHcPreCublasDots(x, hcFn, dotsData, tokens, flatDim, mixHc, dotsStride)) {
+        return false;
+    }
+
+    DeepSeekV4HcPreSqSumKernel<<<tokens, threads, threads * sizeof(float)>>>(
+        (const XT *)x.cudaData, dotsData, tokens, flatDim, dotsStride);
+
+    int finishParts = DeepSeekV4HcPreFinishParts(dim, threads);
+    dim3 finishGrid(tokens, finishParts);
+    size_t finishSharedBytes = (size_t)(mixHc + hcMult + hcMult * hcMult + hcMult * 2) * sizeof(float);
+    DeepSeekV4HcPreFinishKernel<<<finishGrid, threads, finishSharedBytes>>>(
+        (const XT *)x.cudaData, dotsData,
+        (const float *)hcScale.cudaData, (const float *)hcBase.cudaData,
+        (XT *)y.cudaData, (float *)post.cudaData, (float *)comb.cudaData,
+        tokens, dim, hcMult, sinkhornIters, eps, normEps, dotsStride, 1);
     return true;
 }
 
@@ -3083,6 +3172,36 @@ extern "C" bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data
         !DeepSeekV4PrepareCudaOutput(comb, fastllm::DataType::FLOAT32, {bsz, seqlen, hcMult, hcMult})) {
         return false;
     }
+
+    int cublasMinTokens = 128;
+    if (const char *env = std::getenv("FASTLLM_DSV4_HCPRE_CUBLAS_MIN_TOKENS")) {
+        cublasMinTokens = std::max(1, std::atoi(env));
+    }
+    if (std::getenv("FASTLLM_DSV4_ENABLE_CUDA_HCPRE_CUBLAS") != nullptr && tokens >= cublasMinTokens) {
+        float *cublasDots = (float *)FastllmCudaMalloc((size_t)tokens * (mixHc + 1) * sizeof(float));
+        if (cublasDots != nullptr) {
+            bool cublasOk = false;
+            if (x.dataType == fastllm::DataType::BFLOAT16) {
+                cublasOk = DeepSeekV4LaunchHcPreCublasByWeight<__nv_bfloat16>(
+                    x, hcFn, hcScale, hcBase, y, post, comb, cublasDots,
+                    tokens, dim, hcMult, sinkhornIters, eps, normEps);
+            } else if (x.dataType == fastllm::DataType::FLOAT16) {
+                cublasOk = DeepSeekV4LaunchHcPreCublasByWeight<half>(
+                    x, hcFn, hcScale, hcBase, y, post, comb, cublasDots,
+                    tokens, dim, hcMult, sinkhornIters, eps, normEps);
+            } else if (x.dataType == fastllm::DataType::FLOAT32) {
+                cublasOk = DeepSeekV4LaunchHcPreCublasByWeight<float>(
+                    x, hcFn, hcScale, hcBase, y, post, comb, cublasDots,
+                    tokens, dim, hcMult, sinkhornIters, eps, normEps);
+            }
+            DeviceSync();
+            FastllmCudaFree(cublasDots);
+            if (cublasOk) {
+                return true;
+            }
+        }
+    }
+
     int dotParts = DeepSeekV4HcPreDotParts(flatDim, 256);
     float *dotsData = (float *)FastllmCudaMalloc((size_t)tokens * (mixHc + 1) * dotParts * sizeof(float));
     if (dotsData == nullptr) {
