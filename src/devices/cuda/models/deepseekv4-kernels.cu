@@ -9,8 +9,10 @@
 
 namespace {
 
-constexpr int kDeepSeekV4SparseDecodeMaxKeys = 256 * 1024;
-constexpr int kDeepSeekV4SparsePrefillMaxKeys = 256 * 1024;
+constexpr int kDeepSeekV4Sparse1MCompressedKeys = 256 * 1024;
+constexpr int kDeepSeekV4SparseMaxKeys = kDeepSeekV4Sparse1MCompressedKeys + 64 * 1024;
+constexpr int kDeepSeekV4SparseDecodeMaxKeys = kDeepSeekV4SparseMaxKeys;
+constexpr int kDeepSeekV4SparsePrefillMaxKeys = kDeepSeekV4SparseMaxKeys;
 constexpr size_t kDeepSeekV4SparsePrefillDefaultTempBytes = 256ULL * 1024ULL * 1024ULL;
 
 size_t DeepSeekV4SparsePrefillTempBytesLimit() {
@@ -1461,6 +1463,23 @@ __global__ void DeepSeekV4SparseDecodeGatherKVKernel(const float *windowKV, cons
     kvFloat[((uint64_t)b * keyCount + k) * dim + d] = kv;
 }
 
+template <typename KT>
+__global__ void DeepSeekV4SparsePrefillCastCompressedKVKernel(const KT *kv, float *kvFloat,
+                                                              int bsz, int kvLen, int compressedStart,
+                                                              int compressedCount, int dim) {
+    uint64_t total = (uint64_t)bsz * compressedCount * dim;
+    uint64_t linear = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (linear >= total) {
+        return;
+    }
+    int d = (int)(linear % dim);
+    uint64_t tmp = linear / dim;
+    int k = (int)(tmp % compressedCount);
+    int b = (int)(tmp / compressedCount);
+    kvFloat[((uint64_t)b * compressedCount + k) * dim + d] =
+        Dsv4ToFloat(kv[((uint64_t)b * kvLen + compressedStart + k) * dim + d]);
+}
+
 __global__ void DeepSeekV4SparseDecodeSoftmaxSinkKernel(float *scores, const float *sink,
                                                         int bsz, int heads, int keyCount) {
     extern __shared__ float red[];
@@ -2161,7 +2180,7 @@ bool DeepSeekV4LaunchSparseDecodeCublas(const void *cudaQ, const void *cudaCompr
     if (std::getenv("FASTLLM_DSV4_DISABLE_CUBLAS_SPARSE_DECODE") != nullptr) {
         return false;
     }
-    int maxCublasKeys = 256 * 1024;
+    int maxCublasKeys = kDeepSeekV4SparseDecodeMaxKeys;
     if (const char *env = std::getenv("FASTLLM_DSV4_CUBLAS_SPARSE_DECODE_MAX_KEYS")) {
         maxCublasKeys = std::max(1, std::atoi(env));
     }
@@ -2483,7 +2502,7 @@ bool DeepSeekV4RunSparsePrefillCompressedCublas(
     if (compressedCount <= 0) {
         return false;
     }
-    int maxCompressed = 8192;
+    int maxCompressed = kDeepSeekV4Sparse1MCompressedKeys;
     if (const char *env = std::getenv("FASTLLM_DSV4_CUBLAS_SPARSE_PREFILL_MAX_COMPRESSED")) {
         maxCompressed = std::max(1, std::atoi(env));
     }
@@ -2574,7 +2593,7 @@ bool DeepSeekV4LaunchSparsePrefillLocalCublasSegment(
         int bsz, int seqlen, int heads, int dim, int kvLen,
         int windowSize, int compressRatio, int startPos, int prefixLen,
         int rawStart, int rawKeyCount, int compressedStart, int compressedCount,
-        float softmaxScale, int rowOffset, int rows) {
+        float softmaxScale, int rowOffset, int rows, bool compressedKVFloatReady) {
     if (rows <= 0 || rawKeyCount <= 0 || q.dataType != kv.dataType) {
         return false;
     }
@@ -2618,12 +2637,16 @@ bool DeepSeekV4LaunchSparsePrefillLocalCublasSegment(
             if (compressedKVFloat == nullptr) {
                 return false;
             }
-            uint64_t kvElems = (uint64_t)compressedCount * dim;
-            DeepSeekV4SparseDecodeGatherKVKernel<KT><<<
-                (int)((kvElems + threads - 1) / threads), threads>>>(
-                    (const float *)nullptr, compressedKVPtr, compressedKVFloat, 1, dim, 1,
-                    0, compressedCount, 0, compressedCount);
-            compressedKVForGemm = compressedKVFloat;
+            if (compressedKVFloatReady) {
+                compressedKVForGemm = compressedKVFloat + (uint64_t)b * compressedCount * dim;
+            } else {
+                uint64_t kvElems = (uint64_t)compressedCount * dim;
+                DeepSeekV4SparseDecodeGatherKVKernel<KT><<<
+                    (int)((kvElems + threads - 1) / threads), threads>>>(
+                        (const float *)nullptr, compressedKVPtr, compressedKVFloat, 1, dim, 1,
+                        0, compressedCount, 0, compressedCount);
+                compressedKVForGemm = compressedKVFloat;
+            }
         }
     }
 
@@ -2731,7 +2754,7 @@ bool DeepSeekV4RunSparsePrefillLocalCublas(
     int rawTotal = realPrefixLen + seqlen;
     int compressedStart = realPrefixLen + seqlen;
     int compressedCount = std::max(0, kvLen - compressedStart);
-    int maxCompressed = 8192;
+    int maxCompressed = kDeepSeekV4Sparse1MCompressedKeys;
     if (const char *env = std::getenv("FASTLLM_DSV4_CUBLAS_SPARSE_PREFILL_MAX_COMPRESSED")) {
         maxCompressed = std::max(1, std::atoi(env));
     }
@@ -2753,7 +2776,7 @@ bool DeepSeekV4RunSparsePrefillLocalCublas(
         uint64_t compressedScoreFloats = (uint64_t)rowsMax * compressedCount;
         uint64_t rawKVFloats = q.dataType == fastllm::DataType::FLOAT32 ? 0ULL : (uint64_t)maxRawKeys * dim;
         uint64_t compressedKVFloats = (q.dataType == fastllm::DataType::FLOAT32 || compressedCount <= 0) ?
-            0ULL : (uint64_t)compressedCount * dim;
+            0ULL : (uint64_t)bsz * compressedCount * dim;
         return (tempFloats + localScoreFloats + compressedScoreFloats + rawKVFloats + compressedKVFloats) *
                sizeof(float);
     };
@@ -2768,7 +2791,7 @@ bool DeepSeekV4RunSparsePrefillLocalCublas(
     size_t compressedScoreBytes = (size_t)rowsMax * compressedCount * sizeof(float);
     size_t rawKVBytes = q.dataType == fastllm::DataType::FLOAT32 ? 0 : (size_t)maxRawKeys * dim * sizeof(float);
     size_t compressedKVBytes = (q.dataType == fastllm::DataType::FLOAT32 || compressedCount <= 0) ?
-        0 : (size_t)compressedCount * dim * sizeof(float);
+        0 : (size_t)bsz * compressedCount * dim * sizeof(float);
     size_t scratchBytes = tempBytes + localScoreBytes + compressedScoreBytes + rawKVBytes + compressedKVBytes;
     if (scratchBytes == 0) {
         return false;
@@ -2784,6 +2807,24 @@ bool DeepSeekV4RunSparsePrefillLocalCublas(
         (float *)(scratch + tempBytes + localScoreBytes + compressedScoreBytes);
     float *compressedKVFloat = compressedKVBytes == 0 ? nullptr :
         (float *)(scratch + tempBytes + localScoreBytes + compressedScoreBytes + rawKVBytes);
+    bool compressedKVFloatReady = false;
+    if (compressedKVFloat != nullptr && compressedCount > 0) {
+        uint64_t compressedElems = (uint64_t)bsz * compressedCount * dim;
+        int threads = 256;
+        if (kv.dataType == fastllm::DataType::BFLOAT16) {
+            DeepSeekV4SparsePrefillCastCompressedKVKernel<<<
+                (int)((compressedElems + threads - 1) / threads), threads>>>(
+                    (const __nv_bfloat16 *)kv.cudaData, compressedKVFloat,
+                    bsz, kvLen, compressedStart, compressedCount, dim);
+            compressedKVFloatReady = true;
+        } else if (kv.dataType == fastllm::DataType::FLOAT16) {
+            DeepSeekV4SparsePrefillCastCompressedKVKernel<<<
+                (int)((compressedElems + threads - 1) / threads), threads>>>(
+                    (const half *)kv.cudaData, compressedKVFloat,
+                    bsz, kvLen, compressedStart, compressedCount, dim);
+            compressedKVFloatReady = true;
+        }
+    }
 
     bool ok = true;
     for (int b = 0; b < bsz && ok; b++) {
@@ -2802,17 +2843,20 @@ bool DeepSeekV4RunSparsePrefillLocalCublas(
                 ok = DeepSeekV4LaunchSparsePrefillLocalCublasSegment<__nv_bfloat16, __nv_bfloat16>(
                     q, kv, cudaSink, localScores, compressedScores, rawKVFloat, compressedKVFloat, cudaTemp,
                     bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen,
-                    rawStart, rawKeyCount, compressedStart, compressedCount, softmaxScale, rowOffset, rows);
+                    rawStart, rawKeyCount, compressedStart, compressedCount, softmaxScale, rowOffset, rows,
+                    compressedKVFloatReady);
             } else if (q.dataType == fastllm::DataType::FLOAT16) {
                 ok = DeepSeekV4LaunchSparsePrefillLocalCublasSegment<half, half>(
                     q, kv, cudaSink, localScores, compressedScores, rawKVFloat, compressedKVFloat, cudaTemp,
                     bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen,
-                    rawStart, rawKeyCount, compressedStart, compressedCount, softmaxScale, rowOffset, rows);
+                    rawStart, rawKeyCount, compressedStart, compressedCount, softmaxScale, rowOffset, rows,
+                    compressedKVFloatReady);
             } else if (q.dataType == fastllm::DataType::FLOAT32) {
                 ok = DeepSeekV4LaunchSparsePrefillLocalCublasSegment<float, float>(
                     q, kv, cudaSink, localScores, compressedScores, rawKVFloat, compressedKVFloat, cudaTemp,
                     bsz, seqlen, heads, dim, kvLen, windowSize, compressRatio, startPos, realPrefixLen,
-                    rawStart, rawKeyCount, compressedStart, compressedCount, softmaxScale, rowOffset, rows);
+                    rawStart, rawKeyCount, compressedStart, compressedCount, softmaxScale, rowOffset, rows,
+                    compressedKVFloatReady);
             } else {
                 ok = false;
             }
