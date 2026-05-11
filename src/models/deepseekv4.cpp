@@ -1500,6 +1500,29 @@ namespace fastllm {
                !EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_DISABLE_CHUNK_SPLIT");
     }
 
+    static thread_local int gDeepSeekV4SuppressHistorySnapshot = 0;
+
+    struct ScopedDeepSeekV4HistorySnapshotSuppress {
+        bool active = false;
+
+        explicit ScopedDeepSeekV4HistorySnapshotSuppress(bool active) : active(active) {
+            if (this->active) {
+                gDeepSeekV4SuppressHistorySnapshot++;
+            }
+        }
+
+        ~ScopedDeepSeekV4HistorySnapshotSuppress() {
+            if (active) {
+                gDeepSeekV4SuppressHistorySnapshot--;
+            }
+        }
+    };
+
+    static bool DeepSeekV4HistorySnapshotSuppressed() {
+        return gDeepSeekV4SuppressHistorySnapshot > 0 &&
+               !EnvFlagEnabled("FASTLLM_DSV4_PREFIX_CACHE_RECORD_INTERMEDIATE_CHUNKS");
+    }
+
     DeepSeekV4DecodeLayerCache::DeepSeekV4DecodeLayerCache(const DeepSeekV4DecodeLayerCache &other) {
         *this = other;
     }
@@ -1758,6 +1781,9 @@ namespace fastllm {
     void DeepSeekV4Model::RecordHistorySnapshot(const std::vector<int> &tokens,
                                                 int totalLen,
                                                 const std::vector<DeepSeekV4DecodeLayerCache> &decodeCaches) {
+        if (DeepSeekV4HistorySnapshotSuppressed()) {
+            return;
+        }
         if (!this->saveHistoryChat || DeepSeekV4PrefixCacheDisabled() ||
             totalLen <= 0 || (int)tokens.size() < totalLen ||
             decodeCaches.empty()) {
@@ -1788,11 +1814,20 @@ namespace fastllm {
             dst.compressedTokenBase = src.compressedBlocks * std::max(1, src.compressRatio);
             dst.compressorRawTokenBase = src.compressorRawTokenBase;
             ResetData(dst.compressedKV);
-            Data compressedCpuTemp;
             if (src.compressedBlocks > 0 && HasCompressedKVData(src.compressedKV)) {
-                compressedCpuTemp.CopyFrom(src.compressedKV);
-                compressedCpuTemp.ToDevice(DataDevice::CPU);
-                dst.compressedKV.CopyFrom(compressedCpuTemp);
+                bool copiedCompressed = false;
+#ifdef USE_CUDA
+                if (DeepSeekV4PreferCuda()) {
+                    CopyTensorData(dst.compressedKV, src.compressedKV);
+                    copiedCompressed = true;
+                }
+#endif
+                if (!copiedCompressed) {
+                    Data compressedCpuTemp;
+                    compressedCpuTemp.CopyFrom(src.compressedKV);
+                    compressedCpuTemp.ToDevice(DataDevice::CPU);
+                    dst.compressedKV.CopyFrom(compressedCpuTemp);
+                }
             }
             if (HasCompressedKVData(dst.compressedKV)) {
 #ifdef USE_CUDA
@@ -2309,6 +2344,8 @@ namespace fastllm {
                                 Split(*positionIds[0], 1, st, st + curLen, curPositionIds);
                             }
                             Data emptyAttention;
+                            bool lastChunk = st + curLen >= len;
+                            ScopedDeepSeekV4HistorySnapshotSuppress suppressSnapshot(!lastChunk);
                             ret = std::vector<int>{model->Forward(curInput, emptyAttention, curPositionIds,
                                                                   *pastKeyValue, generationConfigs[0],
                                                                   tokensManager, logits[0])};
