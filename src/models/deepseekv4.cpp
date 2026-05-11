@@ -383,6 +383,7 @@ namespace fastllm {
             output.Allocate(false);
             return output.cudaData != nullptr;
         }
+
 #endif
 
         static void UpdateDebugPastKeyValues(std::vector<std::pair<Data, Data>> &pastKeyValues,
@@ -2771,7 +2772,6 @@ namespace fastllm {
                                                    const GenerationConfig &generationConfig,
                                                    const LastTokensManager &lastTokens,
                                                    std::vector <std::vector <float>*> *retLogits) {
-        ScopedExecutorProfiler forwardOtherProfile("DeepSeekV4ForwardOther");
         Data hiddenStates, hiddenStatesBeforeHcExpand;
         int startPos = 0;
         if (positionIds.dims.size() >= 2 && positionIds.Count(0) > 0) {
@@ -2878,7 +2878,8 @@ namespace fastllm {
             activeDecodeLayerCaches.resize(block_cnt);
         }
 
-        std::vector<int> tokenIds = ReadTokenIds(inputIds);
+        std::vector<int> tokenIds;
+        tokenIds = ReadTokenIds(inputIds);
         if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() && batch == 1) {
             if (originalStartPos == 0) {
                 activeHistoryTokens = tokenIds;
