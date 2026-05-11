@@ -1328,16 +1328,9 @@ namespace fastllm {
                     gateBiasData->ToDevice(DataDevice::CUDA);
                 }
                 if (FastllmCudaDeepSeekV4RouteScoreTransform(routerLogits, scoreFuncMode)) {
-                    int tokens = x.dims[0];
-                    if (!PrepareCudaData(expertIndex, DataType::INT32, {tokens, topk}) ||
-                        !PrepareCudaData(expertScore, DataType::FLOAT32, {tokens, topk})) {
-                        ErrorInFastLLM("DeepSeekV4RouteScore CUDA error: failed to allocate route outputs.");
-                    }
                     bool needNorm = scoreFunc != "softmax";
-                    if (FastllmCudaSelectExpert(routerLogits, gateBiasData, expertIndex, expertScore,
-                                                topk, needNorm, routeScale)) {
-                        return;
-                    }
+                    SelectExpert(routerLogits, expertIndex, expertScore, topk, needNorm, routeScale, gateBiasData);
+                    return;
                 }
             }
 #endif
@@ -2929,6 +2922,8 @@ namespace fastllm {
         Data hiddenStatesTemp;
         Data *curHiddenStates = &hiddenStates;
         Data *nextHiddenStates = &hiddenStatesTemp;
+        Data ffnInput, ffnOut, expertIndex, expertScore;
+        Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         auto runHcPost = [&](Data &input, const HcMix &mix) {
             DeepSeekV4HcPost(input, *curHiddenStates, mix.postData, mix.combData, *nextHiddenStates);
             std::swap(curHiddenStates, nextHiddenStates);
@@ -3193,17 +3188,15 @@ namespace fastllm {
             ffnMix.b = bsz;
             ffnMix.s = seqlen;
             ffnMix.hc = hc_mult;
-            Data ffnInput, ffnOut;
             RMSNormReference(ffnMix.y, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput, DataType::BFLOAT16);
             std::vector<int> ffnDims = ffnInput.dims;
             ffnInput.Reshape({bsz * seqlen, dim});
-            Data expertIndex, expertScore;
             BuildMoERoutingData(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
                                 num_experts_per_tok, scoring_func, routed_scaling_factor,
                                 expertIndex, expertScore);
             {
                 // MOE
-                Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp, sharedExpertOut;
+                Data sharedExpertOut;
                 Data ww1, ww3;
                 if (cudaSe &&
                     weight.weight.find(pre + ".ffn.shared_experts.gateup.weight") != weight.weight.end() &&
@@ -3213,10 +3206,6 @@ namespace fastllm {
                     weights[layer][0] = weights[layer][1] = nullptr;
                 }
                 ApplyDeviceMap(this->moeDeviceMap, layer + 1, block_cnt);
-                // NumasMergeMOE 的小 batch 路径直接读取 cpuData，先保证输入在 CPU 可见。
-                ffnInput.ToDevice(DataDevice::CPU);
-                expertIndex.ToDevice(DataDevice::CPU);
-                expertScore.ToDevice(DataDevice::CPU);
                 MergeMOEBlock(&ffnInput, &expertIndex, &expertScore,
                               &weights[layer], &biass[layer],
                               &w1, &w2, &w3, &tempInput, &tempOutput,
