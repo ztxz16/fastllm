@@ -2927,6 +2927,12 @@ namespace fastllm {
         Data qr, qNorm, q, kv;
         HcMix attnMix, ffnMix;
         Data hiddenStatesTemp;
+        Data *curHiddenStates = &hiddenStates;
+        Data *nextHiddenStates = &hiddenStatesTemp;
+        auto runHcPost = [&](Data &input, const HcMix &mix) {
+            DeepSeekV4HcPost(input, *curHiddenStates, mix.postData, mix.combData, *nextHiddenStates);
+            std::swap(curHiddenStates, nextHiddenStates);
+        };
 
         for (int layer = 0; layer < block_cnt; layer++) {
             std::string pre = "layers." + std::to_string(layer);
@@ -2934,7 +2940,7 @@ namespace fastllm {
             bool useCompressRope = compressRatio != 0;
             float layerRopeBase = useCompressRope ? compress_rope_theta : rope_base;
             int layerOriginalSeqLen = useCompressRope ? (int)rope_scaling_original_max_position_embeddings : 0;
-            DeepSeekV4HcPre(hiddenStates, weight[pre + ".hc_attn_fn"],
+            DeepSeekV4HcPre(*curHiddenStates, weight[pre + ".hc_attn_fn"],
                             weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
                             hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
                             attnMix.y, attnMix.postData, attnMix.combData);
@@ -3179,9 +3185,8 @@ namespace fastllm {
             }
             DeepSeekV4WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
             Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
-            Copy(hiddenStates, hiddenStatesTemp);
-            DeepSeekV4HcPost(attnOut, hiddenStatesTemp, attnMix.postData, attnMix.combData, hiddenStates);
-            DeepSeekV4HcPre(hiddenStates, weight[pre + ".hc_ffn_fn"],
+            runHcPost(attnOut, attnMix);
+            DeepSeekV4HcPre(*curHiddenStates, weight[pre + ".hc_ffn_fn"],
                             weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
                             hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
                             ffnMix.y, ffnMix.postData, ffnMix.combData);
@@ -3225,14 +3230,13 @@ namespace fastllm {
                 }
             }
             ffnOut.Reshape(ffnDims);
-            Copy(hiddenStates, hiddenStatesTemp);
-            DeepSeekV4HcPost(ffnOut, hiddenStatesTemp, ffnMix.postData, ffnMix.combData, hiddenStates);
+            runHcPost(ffnOut, ffnMix);
         }
 
         Data headStates, headInput;
-        const Data *headSource = &hiddenStates;
+        const Data *headSource = curHiddenStates;
         if (seqlen > 1) {
-            Split(hiddenStates, 1, seqlen - 1, seqlen, headStates);
+            Split(*curHiddenStates, 1, seqlen - 1, seqlen, headStates);
             headSource = &headStates;
         }
         HcHeadReference(*headSource, weight["hc_head_fn"], weight["hc_head_scale"], weight["hc_head_base"],
