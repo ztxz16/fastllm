@@ -1929,7 +1929,7 @@ void FastllmCudaFree(void *ret) {
     if (ret == nullptr) {
         return;
     }
-    if (cudaBuffersMap.empty())
+    if (cudaBuffersMap.empty() && bigBuffersMap.empty())
         return;
     int oriId = FastllmCudaGetDevice();
     cudaError_t state = cudaSuccess;
@@ -1967,7 +1967,9 @@ void FastllmCudaFree(void *ret) {
                 return;
             }
         }
-        auto &bigBuffers = bigBuffersMap[it.first];
+    }
+    for (auto &it: bigBuffersMap) {
+        auto &bigBuffers = it.second;
         for (int i = 0; i < bigBuffers.size(); i++) {
             if (bigBuffers[i].data == ret) {
                 bigBuffers[i].busy = false;
@@ -1991,7 +1993,6 @@ void FastllmCudaMallocBigBuffer(size_t size) {
     int id = -1;
     cudaGetDevice(&id);
     auto &bigBuffers = bigBuffersMap[id];
-    cudaMalloc(&ret, size);
     auto state = cudaMalloc(&ret, size);
     if (cudaSuccess != state)
         printf("Error: CUDA error when allocating %lu MB memory! maybe there's no enough memory left on device.", size >> 20);
