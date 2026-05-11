@@ -3197,28 +3197,38 @@ namespace fastllm {
             {
                 // MOE
                 Data sharedExpertOut;
-                Data ww1, ww3;
+                bool hasSharedExpertOut = false;
                 if (cudaSe &&
                     weight.weight.find(pre + ".ffn.shared_experts.gateup.weight") != weight.weight.end() &&
                     weight.weight.find(pre + ".ffn.shared_experts.w2.weight") != weight.weight.end()) {
+                    Data ww1, ww3;
                     LinearSwigluBlock(&ffnInput, &weight[pre + ".ffn.shared_experts.gateup.weight"], GetEmptyData(), &ww3, &ww1);
                     Linear(ww1, weight[pre + ".ffn.shared_experts.w2.weight"], *GetEmptyData(), sharedExpertOut);
                     weights[layer][0] = weights[layer][1] = nullptr;
+                    hasSharedExpertOut = true;
                 }
                 ApplyDeviceMap(this->moeDeviceMap, layer + 1, block_cnt);
-                MergeMOEBlock(&ffnInput, &expertIndex, &expertScore,
-                              &weights[layer], &biass[layer],
-                              &w1, &w2, &w3, &tempInput, &tempOutput,
-                              1.0f, &ffnOut, layer,
-                              ffnInput.dataType, this->moeAtype,
-                              &moeInputTemp, &moeOutputTemp);
+                {
+                    DataType effectiveMoeAtype = ffnInput.dataType;
+                    MergeMOEBlock(&ffnInput, &expertIndex, &expertScore,
+                                  &weights[layer], &biass[layer],
+                                  &w1, &w2, &w3, &tempInput, &tempOutput,
+                                  1.0f, &ffnOut, layer,
+                                  ffnInput.dataType, effectiveMoeAtype,
+                                  &moeInputTemp, &moeOutputTemp);
+                }
                 ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
-                if (sharedExpertOut.dims.size() > 0) {
+                if (hasSharedExpertOut) {
                     ffnOut.ToDevice(sharedExpertOut.dataDevice);
                     AddTo(ffnOut, sharedExpertOut);
                 }
             }
             ffnOut.Reshape(ffnDims);
+#ifdef USE_CUDA
+            if (DeepSeekV4PreferCuda() && ffnOut.dataDevice == DataDevice::CPU && ffnOut.cpuData != nullptr) {
+                ffnOut.ToDevice(DataDevice::CUDA);
+            }
+#endif
             runHcPost(ffnOut, ffnMix);
         }
 
