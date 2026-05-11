@@ -1904,6 +1904,45 @@ __global__ void DeepSeekV4HcPostKernel(const XT *x, const RT *residual, const fl
     output[idx] = Dsv4FromFloat<OT>((float)v);
 }
 
+template <typename XT, typename RT, typename OT>
+__global__ void DeepSeekV4HcPost4Kernel(const XT *x, const RT *residual, const float *post,
+                                        const float *comb, OT *output, int tokens, int dim) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t total = (uint64_t)tokens * dim;
+    if (idx >= total) {
+        return;
+    }
+
+    int d = idx % dim;
+    int t = idx / dim;
+    const RT *resRow = residual + (uint64_t)t * 4 * dim;
+    double r0 = (double)Dsv4ToFloat(resRow[d]);
+    double r1 = (double)Dsv4ToFloat(resRow[(uint64_t)dim + d]);
+    double r2 = (double)Dsv4ToFloat(resRow[(uint64_t)2 * dim + d]);
+    double r3 = (double)Dsv4ToFloat(resRow[(uint64_t)3 * dim + d]);
+    double xv = (double)Dsv4ToFloat(x[(uint64_t)t * dim + d]);
+    const float *postRow = post + (uint64_t)t * 4;
+    const float *combRow = comb + (uint64_t)t * 16;
+    OT *outRow = output + (uint64_t)t * 4 * dim + d;
+
+    double v0 = (double)postRow[0] * xv +
+                (double)combRow[0] * r0 + (double)combRow[4] * r1 +
+                (double)combRow[8] * r2 + (double)combRow[12] * r3;
+    double v1 = (double)postRow[1] * xv +
+                (double)combRow[1] * r0 + (double)combRow[5] * r1 +
+                (double)combRow[9] * r2 + (double)combRow[13] * r3;
+    double v2 = (double)postRow[2] * xv +
+                (double)combRow[2] * r0 + (double)combRow[6] * r1 +
+                (double)combRow[10] * r2 + (double)combRow[14] * r3;
+    double v3 = (double)postRow[3] * xv +
+                (double)combRow[3] * r0 + (double)combRow[7] * r1 +
+                (double)combRow[11] * r2 + (double)combRow[15] * r3;
+    outRow[0] = Dsv4FromFloat<OT>((float)v0);
+    outRow[(uint64_t)dim] = Dsv4FromFloat<OT>((float)v1);
+    outRow[(uint64_t)2 * dim] = Dsv4FromFloat<OT>((float)v2);
+    outRow[(uint64_t)3 * dim] = Dsv4FromFloat<OT>((float)v3);
+}
+
 bool DeepSeekV4PrepareCudaOutput(fastllm::Data &output, fastllm::DataType dataType,
                                  const std::vector<int> &dims) {
     output.dataType = dataType;
@@ -2130,12 +2169,38 @@ template <typename XT, typename RT>
 bool DeepSeekV4LaunchHcPostByOutput(const fastllm::Data &x, const fastllm::Data &residual,
                                     const float *cudaPost, const float *cudaComb,
                                     fastllm::Data &output, int tokens, int hcMult, int dim) {
-    uint64_t total = (uint64_t)tokens * hcMult * dim;
     int threads = 256;
-    int blocks = (int)((total + threads - 1) / threads);
     const XT *xData = (const XT *)x.cudaData;
     const RT *resData = (const RT *)residual.cudaData;
 
+    int hcPost4MinTokens = 16384;
+    if (const char *env = std::getenv("FASTLLM_DSV4_HCPOST4_MIN_TOKENS")) {
+        hcPost4MinTokens = std::max(1, std::atoi(env));
+    }
+    bool useHcPost4 = hcMult == 4 &&
+                      std::getenv("FASTLLM_DSV4_DISABLE_CUDA_HCPOST4") == nullptr &&
+                      (std::getenv("FASTLLM_DSV4_ENABLE_CUDA_HCPOST4") != nullptr ||
+                       tokens >= hcPost4MinTokens);
+    if (useHcPost4) {
+        uint64_t total = (uint64_t)tokens * dim;
+        int blocks = (int)((total + threads - 1) / threads);
+        if (output.dataType == fastllm::DataType::BFLOAT16) {
+            DeepSeekV4HcPost4Kernel<<<blocks, threads>>>(xData, resData, cudaPost, cudaComb,
+                                                         (__nv_bfloat16 *)output.cudaData, tokens, dim);
+            return true;
+        } else if (output.dataType == fastllm::DataType::FLOAT16) {
+            DeepSeekV4HcPost4Kernel<<<blocks, threads>>>(xData, resData, cudaPost, cudaComb,
+                                                         (half *)output.cudaData, tokens, dim);
+            return true;
+        } else if (output.dataType == fastllm::DataType::FLOAT32) {
+            DeepSeekV4HcPost4Kernel<<<blocks, threads>>>(xData, resData, cudaPost, cudaComb,
+                                                         (float *)output.cudaData, tokens, dim);
+            return true;
+        }
+    }
+
+    uint64_t total = (uint64_t)tokens * hcMult * dim;
+    int blocks = (int)((total + threads - 1) / threads);
     if (output.dataType == fastllm::DataType::BFLOAT16) {
         DeepSeekV4HcPostKernel<<<blocks, threads>>>(xData, resData, cudaPost, cudaComb,
                                                     (__nv_bfloat16 *)output.cudaData, tokens, hcMult, dim);
