@@ -1306,7 +1306,33 @@ namespace fastllm {
             }
         } else if (AType == DataType::BFLOAT16) {
             if (CType == DataType::FLOAT32) {
-                if (BType == DataType::BFLOAT16) {                    
+                if (BType == DataType::FLOAT32) {
+                    for (int i = 0; i < n; i++) {
+                        uint16_t *bf16A = (uint16_t*)((uint8_t*)A + i * lda);
+                        float *floatC = (float*)((uint8_t*)C + i * ldc);
+                        for (int j = st; j < end; j++) {
+                            float *floatB = (float*)((uint8_t*)B + j * ldb);
+                            float sum = 0.0f;
+                            int l = 0;
+#ifdef __AVX2__
+                            __m256 vsum = _mm256_setzero_ps();
+                            for (; l + 7 < m; l += 8) {
+                                __m128i bf16 = _mm_loadu_si128((const __m128i*)(bf16A + l));
+                                __m256i extended = _mm256_cvtepu16_epi32(bf16);
+                                __m256 va = _mm256_castsi256_ps(_mm256_slli_epi32(extended, 16));
+                                __m256 vb = _mm256_loadu_ps(floatB + l);
+                                vsum = _mm256_fmadd_ps(va, vb, vsum);
+                            }
+                            sum += Floatsum(vsum);
+#endif
+                            for (; l < m; l++) {
+                                sum += bf16tofp32.dict[bf16A[l]] * floatB[l];
+                            }
+                            floatC[j] = sum;
+                        }
+                    }
+                    finish = true;
+                } else if (BType == DataType::BFLOAT16) {
                     // LinearBFloat16BFloat16_Kernel((uint16_t*)A, (uint16_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
                     MultiThreadLinearBFloat16BFloat16Op (
                         (uint16_t*)A, (uint16_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end
@@ -1475,6 +1501,87 @@ namespace fastllm {
         if (!finish) {
             ErrorInFastLLM("FastllmGemm Error: \nAType = " + GetDataTypeName(AType) + "\nBType = " + GetDataTypeName(BType) + "\nCType = " + GetDataTypeName(CType));
         }
+    }
+
+    static void AddBiasToFloatOutput(float *outputData, float *biasData, int n, int k) {
+        if (biasData == nullptr) {
+            return;
+        }
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < k; j++) {
+                outputData[(uint64_t)i * k + j] += biasData[j];
+            }
+        }
+    }
+
+    static ggml_type GetLinearGGMLType(const Data &weight) {
+        if (weight.ggmlTensor != nullptr) {
+            return ((ggml_tensor*)weight.ggmlTensor)->type;
+        }
+        return (ggml_type)weight.ggmlType;
+    }
+
+    static bool CanRunBFloat16NativeLinearWeight(const Data &weight) {
+        if (weight.dataType == DataType::FLOAT32) {
+            return true;
+        }
+        if (weight.dataType != DataType::DATA_GGUF_FORMAT) {
+            return false;
+        }
+        ggml_type type = GetLinearGGMLType(weight);
+        if ((int)type < 0 || type >= GGML_TYPE_COUNT) {
+            return false;
+        }
+        ggml_type dotType = ggml_type_vec_dot_type(type);
+        return type == GGML_TYPE_F32 ||
+               (ggml_is_quantized(type) &&
+                (dotType == GGML_TYPE_Q8_0 || dotType == GGML_TYPE_Q8_1 ||
+                 dotType == GGML_TYPE_Q8_K || dotType == GGML_TYPE_Q8_K32));
+    }
+
+    static void RunLinearBFloat16GGUF(uint16_t *inputData, Data &weight,
+                                      float *outputData, float *biasData,
+                                      int n, int m, int k,
+                                      AliveThreadPool *pool, int startTid, int threadNum) {
+        std::vector<float> floatInput((uint64_t)n * m);
+        BFloat16ToFloat32(inputData, floatInput.data(), n * m);
+        RunLinearFloat32GGUF(floatInput.data(), (uint8_t*)weight.cpuData, outputData, biasData,
+                             &weight, n, m, k, pool, startTid, threadNum);
+    }
+
+    static void RunLinearBFloat16NativeToFloat32(uint16_t *inputData, Data &weight,
+                                                float *outputData, float *biasData,
+                                                int n, int m, int k,
+                                                AliveThreadPool *pool, int startTid, int threadNum) {
+        if (weight.dataType == DataType::DATA_GGUF_FORMAT && ggml_is_quantized(GetLinearGGMLType(weight))) {
+            RunLinearBFloat16GGUF(inputData, weight, outputData, biasData, n, m, k, pool, startTid, threadNum);
+            return;
+        }
+        DataType weightType = weight.dataType == DataType::DATA_GGUF_FORMAT ?
+            DataType::FLOAT32 : weight.dataType;
+        int per = k / threadNum;
+        int cur = 0;
+        std::vector<fastllm::MultiThreadGemmOp*> ops;
+        for (int i = 0; i < threadNum; i++) {
+            int end = cur + per + (cur + per * (threadNum - i) < k);
+            if (i == threadNum - 1) {
+                end = k;
+            }
+            ops.push_back(new MultiThreadGemmOp(
+                (uint8_t*)inputData, DataType::BFLOAT16,
+                (uint8_t*)weight.cpuData, weightType,
+                (uint8_t*)outputData, DataType::FLOAT32,
+                n, m, k, cur, end));
+            cur = end;
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->PushOp(startTid + i, ops[i]);
+        }
+        for (int i = 0; i < threadNum; i++) {
+            pool->Wait(startTid + i);
+            delete ops[i];
+        }
+        AddBiasToFloatOutput(outputData, biasData, n, k);
     }
 
     void MultiThreadGemmOp::Run() {
@@ -2303,7 +2410,8 @@ namespace fastllm {
                        profileSwigluQuantMs, profileDownMs, profileReduceMs, profileOutputMs, total);
                 fflush(stdout);
             }
-        } else if ((input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16) && 
+        } else if ((input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16 ||
+                    input.dataType == DataType::BFLOAT16) &&
                 (weights[2]->dataType == DataType::DATA_GGUF_FORMAT) &&
             input.dims[0] < 32) {
             int outer = n;
@@ -2317,6 +2425,11 @@ namespace fastllm {
                 for (int i = 0; i < len; i++) {
                     vInputs[i] = fp16tofp32.dict[((uint16_t*)input.cpuData)[i]];
                 }
+                floatInput = vInputs.data();
+            } else if (input.dataType == DataType::BFLOAT16) {
+                int len = input.Count(0);
+                vInputs.resize(len);
+                BFloat16ToFloat32((uint16_t*)input.cpuData, vInputs.data(), len);
                 floatInput = vInputs.data();
             }
             for (int o = 0; o < outer; o++) {
@@ -2460,7 +2573,7 @@ namespace fastllm {
 
                 float *fLastOutput = ((float*)output.cpuData) + o * m;
                 std::vector <float> tempOutput;
-                if (output.dataType == DataType::FLOAT16) {
+                if (output.dataType == DataType::FLOAT16 || output.dataType == DataType::BFLOAT16) {
                     tempOutput.resize(m, 0);
                     fLastOutput = tempOutput.data();
                 }
@@ -2498,6 +2611,8 @@ namespace fastllm {
  // record.push_back(std::make_pair("get f32 output", GetSpan(ttt, std::chrono::system_clock::now())));
                 if (output.dataType == DataType::FLOAT16) {
                     Float32ToFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
+                } else if (output.dataType == DataType::BFLOAT16) {
+                    Float32ToBFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
                 }
 // record.push_back(std::make_pair("finish output", GetSpan(ttt, std::chrono::system_clock::now())));
 // for (int i = 0; i < record.size(); i++) {
@@ -2710,13 +2825,13 @@ namespace fastllm {
                        fp16RoutedDownMs, fp16SharedDownMs, fp16ReduceMs, fp16OutputMs, total);
                 fflush(stdout);
             }
-        } else if ((input.dataType == DataType::FLOAT32) && 
+        } else if ((input.dataType == DataType::FLOAT32 || input.dataType == DataType::BFLOAT16) &&
                 (weights[2]->dataType == DataType::FP8_E4M3 ||
                  weights[2]->dataType == DataType::NVFP4 ||
                  weights[2]->dataType == DataType::BFLOAT16) &&
                 input.dims[0] < 32) {
             int outer = n;
-            float *floatInput = (float*)input.cpuData;
+            float *floatInput = input.dataType == DataType::FLOAT32 ? (float*)input.cpuData : nullptr;
             output.Allocate(0.0f);
 
             for (int o = 0; o < outer; o++) {
@@ -2730,14 +2845,30 @@ namespace fastllm {
                     v.push_back(std::make_pair(0, sharedScale));
                 }
                 int m = input.dims[1];
-                float *inputData = floatInput + o * m;
+                float *inputData = floatInput == nullptr ? nullptr : floatInput + (uint64_t)o * m;
                 auto &bf16Input = moeFloatSingleVarManager.bf16Input;
-                bf16Input.resize(m);
-                Float32ToBFloat16(inputData, bf16Input.data(), m);
                 auto &bf16InputRNE = moeFloatSingleVarManager.bf16InputRNE;
-                if (cpuInstructInfo.hasAVX512BF16) {
-                    bf16InputRNE.resize(m);
-                    Float32ToBFloat16_AVX512BF16_RNE(inputData, bf16InputRNE.data(), m);
+                uint16_t *bf16InputData = nullptr;
+                uint16_t *bf16InputRNEData = nullptr;
+                std::vector<float> floatRow;
+                if (input.dataType == DataType::BFLOAT16) {
+                    bf16InputData = ((uint16_t*)input.cpuData) + (uint64_t)o * m;
+                    bf16InputRNEData = bf16InputData;
+                    if (!cpuInstructInfo.hasAVX512BF16) {
+                        floatRow.resize(m);
+                        BFloat16ToFloat32(bf16InputData, floatRow.data(), m);
+                        inputData = floatRow.data();
+                    }
+                } else {
+                    bf16Input.resize(m);
+                    Float32ToBFloat16(inputData, bf16Input.data(), m);
+                    bf16InputData = bf16Input.data();
+                    bf16InputRNEData = bf16InputData;
+                    if (cpuInstructInfo.hasAVX512BF16) {
+                        bf16InputRNE.resize(m);
+                        Float32ToBFloat16_AVX512BF16_RNE(inputData, bf16InputRNE.data(), m);
+                        bf16InputRNEData = bf16InputRNE.data();
+                    }
                 }
                 
                 auto &middles = moeFloatSingleVarManager.middles;
@@ -2780,15 +2911,15 @@ namespace fastllm {
                         int curK = weight->dims[0];
                         int curThread = (curK / k) * base;
                         if (weight->dataType == DataType::FP8_E4M3) {
-                            LaunchLinearBFloat16FP8E4M3(bf16Input.data(), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                            LaunchLinearBFloat16FP8E4M3(bf16InputData, *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                         } else if (weight->dataType == DataType::NVFP4) {
                             if (cpuInstructInfo.hasAVX512BF16) {
-                                LaunchLinearBFloat16NVFP4(bf16InputRNE.data(), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                                LaunchLinearBFloat16NVFP4(bf16InputRNEData, *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                             } else {
                                 LaunchLinearFloat32NVFP4(inputData, *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                             }
                         } else if (weight->dataType == DataType::BFLOAT16) {
-                            LaunchLinearBFloat16BFloat16(bf16Input.data(), *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
+                            LaunchLinearBFloat16BFloat16(bf16InputData, *weight, outputData, biasData, 1, m, curK, ops, pool, threadSt, curThread);
                         } else {
                             // TODO: other
                         }
@@ -2862,7 +2993,7 @@ namespace fastllm {
                 }
                 float *fLastOutput = ((float*)output.cpuData) + o * m;
                 std::vector <float> tempOutput;
-                if (output.dataType == DataType::FLOAT16) {
+                if (output.dataType == DataType::FLOAT16 || output.dataType == DataType::BFLOAT16) {
                     tempOutput.resize(m, 0);
                     fLastOutput = tempOutput.data();
                 }
@@ -2898,6 +3029,8 @@ namespace fastllm {
                 }
                 if (output.dataType == DataType::FLOAT16) {
                     Float32ToFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
+                } else if (output.dataType == DataType::BFLOAT16) {
+                    Float32ToBFloat16(tempOutput.data(), ((uint16_t*)output.cpuData) + o * m, m);
                 }
             }
         } else if (input.dataType == DataType::FLOAT32 && output.dataType == DataType::FLOAT32
@@ -5262,7 +5395,10 @@ ops += (long long)lines * inputDim * interDim * 2;
                 linearTypeError();
             }
         } else if (input.dataType == DataType::BFLOAT16 && output.dataType == DataType::FLOAT32) {
-            if (weight.dataType == DataType::BFLOAT16) {
+            if (CanRunBFloat16NativeLinearWeight(weight)) {
+                RunLinearBFloat16NativeToFloat32((uint16_t*)input.cpuData, weight, (float*)output.cpuData,
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+            } else if (weight.dataType == DataType::BFLOAT16) {
                 RunLinearBFloat16BFloat16((uint16_t*)input.cpuData, (uint16_t*)weight.cpuData, (float*)output.cpuData,
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::FLOAT16) {
@@ -5283,7 +5419,10 @@ ops += (long long)lines * inputDim * interDim * 2;
         } else if (input.dataType == DataType::BFLOAT16 && output.dataType == DataType::BFLOAT16) {
             std::vector<float> floatOutput;
             floatOutput.resize(n * k);
-            if (weight.dataType == DataType::BFLOAT16) {
+            if (CanRunBFloat16NativeLinearWeight(weight)) {
+                RunLinearBFloat16NativeToFloat32((uint16_t*)input.cpuData, weight, floatOutput.data(),
+                    bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
+            } else if (weight.dataType == DataType::BFLOAT16) {
                 RunLinearBFloat16BFloat16((uint16_t*)input.cpuData, (uint16_t*)weight.cpuData, floatOutput.data(),
                     bias.dims.size() > 0 ? (float *) bias.cpuData : nullptr, n, m, k, GetAlivePool(), threadSt, threadLen);
             } else if (weight.dataType == DataType::FLOAT16) {
