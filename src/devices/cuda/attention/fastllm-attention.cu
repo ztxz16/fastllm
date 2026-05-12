@@ -1,6 +1,7 @@
 //
 // Created by huangyuyang on 1/21/26.
 //
+#ifndef FASTLLM_DISABLE_FLASHINFER
 // FlashInfer includes
 #include "attention_impl.cuh"
 #include "attention/default_prefill_params.cuh"
@@ -11,6 +12,7 @@
 #include "fastdiv.cuh"
 #include "pos_enc.cuh"
 #include "utils.cuh"
+#endif
 
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
@@ -911,7 +913,9 @@ extern bool FastllmCudaPermute(fastllm::Data &input, const std::vector<int> &axi
 
 bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                               const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType) {
+#ifndef FASTLLM_DISABLE_FLASHINFER
     using namespace flashinfer;
+#endif
     
     int q0 = q.dims[0], q1 = q.dims[1], q2 = q.dims[2], k0 = k.dims[0], k1 = k.dims[1], v2 = v.dims[2];
     half *qd = (half*)q.cudaData;
@@ -921,6 +925,7 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
     half *od = (half*)output.cudaData;
     int batch = (mask.dims.size() == 3) ? mask.dims[0] : 1;
     int maskStride = (mask.dims.size() == 3 ? mask.strides[0] : mask.Count(0));
+#ifndef FASTLLM_DISABLE_FLASHINFER
 
     // 使用 FlashInfer 实现 attention
     
@@ -1089,6 +1094,7 @@ FastllmCudaPermute(*((fastllm::Data*)&output), {1, 0, 2});
         }
     }
     
+#endif
     // Fallback 到原始实现
     half beta = __float2half_rn(0.0f), one = __float2half_rn(1.0f), hscale = __float2half_rn(scale);
     if (q1 >= 1024 || (q1 > 1 && q1 != k1 && k1 >= 1024)) {
@@ -2093,6 +2099,7 @@ static size_t ParseSizeFromEnv(const char* env_name, size_t default_size) {
     return result;
 }
 
+#ifndef FASTLLM_DISABLE_FLASHINFER
 struct FlashInferWorkSpaceManager {
     const size_t float_workspace_size = ParseSizeFromEnv("FT_FLOAT_WORKSPACE_SIZE", 256 * 1024 * 1024);
     const size_t int_workspace_size = 64 * 1024 * 1024;     // 64 MB
@@ -2799,3 +2806,42 @@ bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, c
     DeviceSync();
     return true;
 }
+#else
+void *FastllmCudaGetFlashInferFloatWorkspace(size_t *outSize) {
+    if (outSize != nullptr) {
+        *outSize = 0;
+    }
+    return nullptr;
+}
+
+void *FastllmBorrowDequantScratch(size_t needBytes, size_t *outBytes, bool *outOwn) {
+    size_t allocBytes = needBytes > 0 ? needBytes : 1;
+    void *ret = FastllmCudaMalloc(allocBytes);
+    if (outBytes != nullptr) {
+        *outBytes = allocBytes;
+    }
+    if (outOwn != nullptr) {
+        *outOwn = true;
+    }
+    return ret;
+}
+
+void FastllmReleaseDequantScratch(void *ptr, bool own) {
+    if (own && ptr != nullptr) {
+        FastllmCudaFree(ptr);
+    }
+}
+
+bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited) {
+    return false;
+}
+
+bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited, bool sync) {
+    return false;
+}
+
+bool FastllmCudaMLAPaged(const fastllm::Data &qNope, const fastllm::Data &qPe, const fastllm::Data &kvCachePaged, const fastllm::Data &peCachePaged,
+                         fastllm::Data &output, float softmaxScale) {
+    return false;
+}
+#endif

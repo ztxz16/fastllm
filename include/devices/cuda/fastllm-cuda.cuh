@@ -196,7 +196,6 @@ bool FastllmCudaMambaSoftplus(const fastllm::Data &input, fastllm::Data &output,
 bool FastllmCudaSigmoidMambaSoftplus(fastllm::Data &sigmoidInputOutput, const fastllm::Data &softplusInput, fastllm::Data &softplusOutput, const fastllm::Data &aLogData, const fastllm::Data &dtBiasData);
 bool FastllmCudaSwiglu(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaCrossSwiglu(const fastllm::Data &input, fastllm::Data &output);
-bool FastllmCudaCopy(const fastllm::Data &input, fastllm::Data &output);
 bool FastllmCudaAdd(const fastllm::Data &input, float v, fastllm::Data &output);
 bool FastllmCudaMul(const fastllm::Data &input, float v, fastllm::Data &output);
 bool FastllmCudaSoftmax(const fastllm::Data &input, fastllm::Data &output, int axis);
@@ -212,6 +211,8 @@ bool FastllmCudaApplyChunkDecayByLastLogG(fastllm::Data &input, const fastllm::D
 
 bool FastllmCudaRMSNorm(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps);
 bool FastllmCudaRMSNormPart(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float eps, int start, int end);
+bool FastllmCudaDeepSeekV4RMSNorm(const fastllm::Data &input, fastllm::Data &weight, float eps,
+                                  fastllm::Data &output, fastllm::DataType outputType);
 bool FastllmCudaDeepSeekV4ScaleQRotary(fastllm::Data &q, int ropeDim, float ropeBase, int startPos,
                                        int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
                                        float eps);
@@ -229,18 +230,10 @@ bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data &hcFn,
                                 fastllm::Data &y, fastllm::Data &post, fastllm::Data &comb);
 bool FastllmCudaDeepSeekV4HcPreDots(const fastllm::Data &x, const fastllm::Data &hcFn,
                                     int hcMult, fastllm::Data &dotsFloat);
-bool FastllmCudaDeepSeekV4StoreWindowKVCache(const fastllm::Data &kv, int startPos,
-                                             int windowSize, fastllm::Data &windowKV);
 bool FastllmCudaDeepSeekV4UpdateWindowKVCache(const fastllm::Data &kv, int startPos,
                                              int windowSize, fastllm::Data &windowKV);
-bool FastllmCudaDeepSeekV4BuildWindowKVPrefix(const fastllm::Data &windowKV, int startPos,
-                                             int windowSize, int prefixLen, fastllm::Data &output);
-bool FastllmCudaDeepSeekV4BuildCompressedKV(const fastllm::Data &kv, const fastllm::Data &score,
-                                            const fastllm::Data &ape, int rawTokenBase, int rawLen,
-                                            int blockStart, int blockCount, int compressRatio,
-                                            int headDim, int wideDim, bool overlap,
-                                            fastllm::Data &output);
-bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::Data &q, const fastllm::Data &windowKV,
+bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::Data &q, const fastllm::Data *windowKVData,
+                                                      const float *windowKV,
                                                       const fastllm::Data &compressedKV, fastllm::Data &attnSink,
                                                       int windowSize, int startPos, int compressedCount,
                                                       int ropeDim, float ropeBase, int originalSeqLen,
@@ -290,7 +283,6 @@ bool FastllmCudaHalfMatMulFloat32(const fastllm::Data &input, fastllm::Data &wei
 bool FastllmCudaConv1DPerChannelFloat32(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, int inputChannels, int outputChannels, int kernel, int stride, int pad, fastllm::Data &output);
 bool FastllmCudaConv1DPerChannelSiluSingleTokenFloat16(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
 bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16(fastllm::Data &cache, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
-bool FastllmCudaShiftAppendConv1DPerChannelSiluSingleTokenFloat16BatchPointers(const std::vector<fastllm::Data*> &caches, const fastllm::Data &newToken, fastllm::Data &weight, fastllm::Data &bias, fastllm::Data &output);
 
 bool FastllmCudaConv2DFloat32(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias, int inputChannels, int outputChannels, int kernelH, int kernelW, int strideH, int strideW, int padH, int padW, fastllm::Data &output);
 
@@ -311,9 +303,6 @@ bool FastllmCudaLlamaRotatePosition2D(fastllm::Data &data, const fastllm::Data &
 bool FastllmCudaLlamaRotatePosition2DPart(fastllm::Data &data, const fastllm::Data &positionIds,
                                  const fastllm::Data &sinData, const fastllm::Data &cosData, int rotaryDim, int part);
 bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale);
-bool FastllmCudaLlama3RopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
-                                   float ropeTheta, float factor, float originalMaxPosition,
-                                   float lowFreqFactor, float highFreqFactor);
 bool FastllmCudaQwen35InterleavedRope(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim,
                                       int sectionT, int sectionH, int sectionW,
                                       float ropeTheta, float ropeScale);
@@ -384,13 +373,6 @@ void FastllmResetLogitsOfEOS(int batch, fastllm::Data *logits, const std::vector
     const std::vector<int> eos_nums, const std::vector<int> eos_ids);
 
 void FastllmRecurrentGatedDeltaRule(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out, float qScale = 1.0f);
-void FastllmRecurrentGatedDeltaRuleBatch(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &g, fastllm::Data &b, std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out, float qScale = 1.0f);
-void FastllmRecurrentGatedDeltaRuleBatchFromConvBa(
-    fastllm::Data &convOutput, fastllm::Data &ba, fastllm::Data &normWeight,
-    fastllm::Data &aLog, fastllm::Data &dtBias,
-    std::vector<fastllm::Data*> &last_recurrent_states, fastllm::Data &core_attn_out,
-    int numKHeads, int numVHeads, int headKDim, int headVDim,
-    float eps, float qScale = 1.0f);
 void FastllmChunkGatedDeltaRulePrefill(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v,
     fastllm::Data &g, fastllm::Data &attn, fastllm::Data &k_cumdecay,
     fastllm::Data &last_recurrent_state, fastllm::Data &core_attn_out);
@@ -414,4 +396,7 @@ extern __global__ void FastllmCudaFloat2Bf16Kernel(float* a, __nv_bfloat16* b, i
 extern __global__ void FastllmCudaBF162HalfKernel(uint16_t* a, half *b, int len);
 extern __global__ void FastllmCudaHalf2BF16Kernel(half* a, __nv_bfloat16 *b, int len);
 extern __global__ void FastllmCudaBiasKernel(__nv_bfloat16* a, __nv_bfloat16* bias, int k);
+extern __global__ void FastllmAddToKernel(float* a, float *b, float alpha, int len);
+extern __global__ void FastllmAddToKernel(half* a, half *b, half alpha, int len);
+extern __global__ void FastllmAddToKernel(__nv_bfloat16* a, __nv_bfloat16 *b, __nv_bfloat16 alpha, int len);
 #endif
