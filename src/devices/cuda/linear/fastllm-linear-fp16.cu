@@ -81,7 +81,6 @@ __global__ void FastllmGemvBf16Fp16Kernel2MultiRow(__nv_bfloat16 *A, half *B, __
                 C[p + k * x] = __float2bfloat16_rn(sdata[x][0]);
         }
     }
-    __syncthreads();
 }
 
 template <int THREAD_PER_BLOCK, int PART>
