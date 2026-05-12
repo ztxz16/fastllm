@@ -9,12 +9,45 @@
 #include <cstdlib>
 #include <climits>
 #include <algorithm>
+#include <chrono>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #endif
 
 namespace fastllm {
+    namespace {
+        static bool NeedRepeatPenalty(const GenerationConfig &config) {
+            float diff = config.repeat_penalty - 1.0f;
+            return diff > 1e-6f || diff < -1e-6f;
+        }
+
+        static void ReleasePagedCachePages(Data &cache, bool clearDims = false) {
+            auto releaseOne = [](Data &pagedCache) {
+                if (pagedCache.isPagedKVCache && pagedCache.pagedKVCacheData != nullptr &&
+                    !pagedCache.pageIndex.empty()) {
+                    pagedCache.pagedKVCacheData->ReleasePageIndices(pagedCache.pageIndex);
+                    pagedCache.pageIndex.clear();
+                    pagedCache.lastPageLen = 0;
+                }
+            };
+            releaseOne(cache);
+            if (cache.multiDeviceData) {
+                for (auto &it : cache.multiDeviceDatas) {
+                    if (it.second != nullptr) {
+                        releaseOne(*it.second);
+                        if (clearDims) {
+                            it.second->dims.clear();
+                        }
+                    }
+                }
+            }
+            if (clearDims) {
+                cache.dims.clear();
+            }
+        }
+    }
+
     static int NormalizeMaxBatchByModelCapability(basellm *model, int maxBatch) {
         if (model != nullptr && !model->canDoBatchForward && !model->canDoConcurrentForward) {
             model->maxBatch = 1;
@@ -105,17 +138,21 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache() {
+        auto recordPagedCache = [&](Data &cache, PagedCacheManager *manager) {
+            if (cache.multiDeviceData) {
+                return;
+            }
+            if (manager != nullptr && !cache.pageIndex.empty()) {
+                manager->Record(this->allTokens, cache.pageIndex);
+            }
+        };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
             auto &kvFirst = this->pastKeyValues[i].first;
             auto &kvSecond = this->pastKeyValues[i].second;
             PagedCacheManager *kManager = GetPagedCacheManager(i * 2);
             PagedCacheManager *vManager = GetPagedCacheManager(i * 2 + 1);
-            if (kManager != nullptr && !kvFirst.pageIndex.empty()) {
-                kManager->Record(this->allTokens, kvFirst.pageIndex);
-            }
-            if (vManager != nullptr && !kvSecond.pageIndex.empty()) {
-                vManager->Record(this->allTokens, kvSecond.pageIndex);
-            }
+            recordPagedCache(kvFirst, kManager);
+            recordPagedCache(kvSecond, vManager);
         }
     }
 
@@ -683,18 +720,8 @@ namespace fastllm {
             for (int i = 0; i < model->block_cnt; i++) {
                 auto &kvFirst = ctx->pastKeyValues[i].first;
                 auto &kvSecond = ctx->pastKeyValues[i].second;
-                if (kvFirst.isPagedKVCache && kvFirst.pagedKVCacheData != nullptr && !kvFirst.pageIndex.empty()) {
-                    kvFirst.pagedKVCacheData->ReleasePageIndices(kvFirst.pageIndex);
-                    kvFirst.pageIndex.clear();
-                    kvFirst.lastPageLen = 0;
-                    kvFirst.dims.clear();
-                }
-                if (kvSecond.isPagedKVCache && kvSecond.pagedKVCacheData != nullptr && !kvSecond.pageIndex.empty()) {
-                    kvSecond.pagedKVCacheData->ReleasePageIndices(kvSecond.pageIndex);
-                    kvSecond.pageIndex.clear();
-                    kvSecond.lastPageLen = 0;
-                    kvSecond.dims.clear();
-                }
+                ReleasePagedCachePages(kvFirst, true);
+                ReleasePagedCachePages(kvSecond, true);
             }
             ctx->currentTokens = ctx->allTokens;
             ctx->preTokens = 0;
@@ -720,19 +747,41 @@ namespace fastllm {
 
         auto lastRecordTime = std::chrono::system_clock::now();
         long long genTokens = 0;
+        const bool canUseFastDecodeInput = (model->model_type == "qwen3");
         while (true) {
             if (model->isFree) {
                 break;
             }
             std::vector <Data*> attentionMasks;
             std::vector <Data*> positionIds;
+            std::vector <Data*> ownedAttentionMasks;
+            std::vector <Data*> ownedPositionIds;
             std::vector <std::pair <Data*, Data*> > pastKeyValues;
             std::vector <float> ids;
             std::vector <int> seqLens;
             std::vector <int> handles;
             std::vector <GenerationConfig> generationConfigs;
             LastTokensManager tokensManager;
+            std::vector <ResponseContext*> tokenContexts;
             std::vector <std::vector <float>* > logits;
+            std::vector <float> decodePositionValues;
+            std::vector <Data> decodePositionIds;
+            static const std::vector<int> decodeScalarDims = {1, 1};
+            const int reserveBatch = std::max(1, maxBatch);
+            bool selectedNeedLastTokens = false;
+            attentionMasks.reserve(reserveBatch);
+            positionIds.reserve(reserveBatch);
+            ownedAttentionMasks.reserve(reserveBatch);
+            ownedPositionIds.reserve(reserveBatch);
+            pastKeyValues.reserve(reserveBatch * model->block_cnt);
+            ids.reserve(reserveBatch);
+            seqLens.reserve(reserveBatch);
+            handles.reserve(reserveBatch);
+            generationConfigs.reserve(reserveBatch);
+            tokenContexts.reserve(reserveBatch);
+            logits.reserve(reserveBatch);
+            decodePositionValues.reserve(reserveBatch);
+            decodePositionIds.reserve(reserveBatch);
 
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
             auto &forwardLocker = model->forwardLocker;
@@ -741,7 +790,13 @@ namespace fastllm {
             std::vector <int> abortHandles;
             int busyPages = 0, currentActivate = 0;
             bool hasPrefill = false;
-            std::vector <std::pair <int, int> > orders;
+            struct DecodeOrder {
+                int sortKey;
+                int handle;
+                ResponseContext *context;
+            };
+            std::vector <DecodeOrder> orders;
+            orders.reserve(model->responseContextDict.dicts.size());
             int limit = (maxTotalLens > 0) ? maxTotalLens : 999999999;
 
             for (auto &it: model->responseContextDict.dicts) {
@@ -754,16 +809,8 @@ namespace fastllm {
                     for (int i = 0; i < model->block_cnt; i++) {
                         auto &kvFirst = it.second->pastKeyValues[i].first;
                         auto &kvSecond = it.second->pastKeyValues[i].second;
-                        if (kvFirst.isPagedKVCache && kvFirst.pagedKVCacheData != nullptr && !kvFirst.pageIndex.empty()) {
-                            kvFirst.pagedKVCacheData->ReleasePageIndices(kvFirst.pageIndex);
-                            kvFirst.pageIndex.clear();
-                            kvFirst.lastPageLen = 0;
-                        }
-                        if (kvSecond.isPagedKVCache && kvSecond.pagedKVCacheData != nullptr && !kvSecond.pageIndex.empty()) {
-                            kvSecond.pagedKVCacheData->ReleasePageIndices(kvSecond.pageIndex);
-                            kvSecond.pageIndex.clear();
-                            kvSecond.lastPageLen = 0;
-                        }
+                        ReleasePagedCachePages(kvFirst);
+                        ReleasePagedCachePages(kvSecond);
                     }
                     continue;
                 }
@@ -773,12 +820,17 @@ namespace fastllm {
                 if (it.second->preTokens == 0) {
                     hasPrefill = true;
                 }
-                orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
+                orders.push_back({-(int)it.second->currentTokens.size(), it.first, it.second});
             }
             for (auto &it : abortHandles) {
                 model->RemoveResponseContext(it);
             }
-            sort(orders.begin(), orders.end());
+            sort(orders.begin(), orders.end(), [](const DecodeOrder &a, const DecodeOrder &b) {
+                if (a.sortKey != b.sortKey) {
+                    return a.sortKey < b.sortKey;
+                }
+                return a.handle < b.handle;
+            });
 
             // 通过PagedCacheManager获取实际使用的物理页数（复用的页只算一次）
             if (totalPages > 0) {
@@ -811,19 +863,19 @@ namespace fastllm {
                 bool selectedMultimodal = false;
 
                 for (auto &ii : orders) {
-                    auto &it = *model->responseContextDict.dicts.find(ii.second);
+                    ResponseContext *ctx = ii.context;
 
-                    if (it.second->isEnding) {
+                    if (ctx->isEnding) {
                         continue;
                     }
-                    if (isPrompt && it.second->preTokens != 0) {
+                    if (isPrompt && ctx->preTokens != 0) {
                         continue;
                     }
-                    if (!isPrompt && it.second->preTokens == 0) {
+                    if (!isPrompt && ctx->preTokens == 0) {
                         continue;
                     }
 
-                    bool isMultimodal = !it.second->multimodalInput.empty();
+                    bool isMultimodal = !ctx->multimodalInput.empty();
                     if (selectedMultimodal && !isMultimodal) {
                         continue;
                     }
@@ -831,27 +883,27 @@ namespace fastllm {
                         continue;
                     }
 
-                    if ((maxTotalLens > 0 && it.second->cacheLen + it.second->currentTokens.size() > maxTotalLens) ||
-                        it.second->cacheLen + it.second->currentTokens.size() > model->max_positions) {
-                        it.second->isEnding = true;
-                        it.second->error = ResponseContextErrorPromptTooLong;
+                    if ((maxTotalLens > 0 && ctx->cacheLen + ctx->currentTokens.size() > maxTotalLens) ||
+                        ctx->cacheLen + ctx->currentTokens.size() > model->max_positions) {
+                        ctx->isEnding = true;
+                        ctx->error = ResponseContextErrorPromptTooLong;
                         // printf("[Handle %d] Finished. Reason: prompt too long (cacheLen=%d, currentTokens=%d, maxTotalLens=%d, max_positions=%d).\n",
                                // it.first, it.second->cacheLen, (int)it.second->currentTokens.size(), maxTotalLens, model->max_positions);
                         continue;
                     }
 
                     if (isPrompt) {
-                        if (it.second->cacheLen == 0) {
+                        if (ctx->cacheLen == 0) {
                             PagedCacheManager *probeManager = GetPagedCacheManager(model->kvCacheId * 2);
                             if (probeManager != nullptr) {
                                 // 只在代表 layer 上做 Query 确定可命中页数
                                 std::vector<int> probePages;
-                                probeManager->Query(it.second->currentTokens, probePages);
+                                probeManager->Query(ctx->currentTokens, probePages);
                                 int minCachedPages = (int)probePages.size();
 
                                 if (minCachedPages > 0) {
                                     int cachedLen = minCachedPages * probeManager->pageLen;
-                                    if (cachedLen >= (int)it.second->currentTokens.size()) {
+                                    if (cachedLen >= (int)ctx->currentTokens.size()) {
                                         minCachedPages--;
                                         cachedLen = minCachedPages * probeManager->pageLen;
                                     }
@@ -859,13 +911,13 @@ namespace fastllm {
                                 if (minCachedPages > 0) {
                                     int cachedLen = minCachedPages * probeManager->pageLen;
                                     for (int li = 0; li < model->block_cnt; li++) {
-                                        auto &kvFirst = it.second->pastKeyValues[li].first;
-                                        auto &kvSecond = it.second->pastKeyValues[li].second;
+                                        auto &kvFirst = ctx->pastKeyValues[li].first;
+                                        auto &kvSecond = ctx->pastKeyValues[li].second;
                                         PagedCacheManager *kMgr = GetPagedCacheManager(li * 2);
                                         PagedCacheManager *vMgr = GetPagedCacheManager(li * 2 + 1);
                                         if (kMgr != nullptr) {
                                             std::vector<int> kPages;
-                                            kMgr->Query(it.second->currentTokens, kPages);
+                                            kMgr->Query(ctx->currentTokens, kPages);
                                             int actualPages = std::min(minCachedPages, (int)kPages.size());
                                             kvFirst.isPagedKVCache = true;
                                             kvFirst.pagedKVCacheData = kMgr;
@@ -879,7 +931,7 @@ namespace fastllm {
                                         }
                                         if (vMgr != nullptr) {
                                             std::vector<int> vPages;
-                                            vMgr->Query(it.second->currentTokens, vPages);
+                                            vMgr->Query(ctx->currentTokens, vPages);
                                             int actualPages = std::min(minCachedPages, (int)vPages.size());
                                             kvSecond.isPagedKVCache = true;
                                             kvSecond.pagedKVCacheData = vMgr;
@@ -892,8 +944,8 @@ namespace fastllm {
                                             kvSecond.Resize({numHeads, actualPages * vMgr->pageLen, headDim});
                                         }
                                     }
-                                    it.second->currentTokens.erase(it.second->currentTokens.begin(), it.second->currentTokens.begin() + cachedLen);
-                                    it.second->cacheLen = cachedLen;
+                                    ctx->currentTokens.erase(ctx->currentTokens.begin(), ctx->currentTokens.begin() + cachedLen);
+                                    ctx->cacheLen = cachedLen;
                                     {
                                         std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
                                         curBusyPages = probeManager->maxPages - probeManager->FreePageCount() + pendingNewPages;
@@ -909,7 +961,7 @@ namespace fastllm {
                             continue;
                         }
 
-                        int thisLen = (int)it.second->currentTokens.size();
+                        int thisLen = (int)ctx->currentTokens.size();
                         int thisPages = (thisLen + pageLen - 1) / pageLen;
 
                         // Prefill后已用分页不能超过pagesLimit（除非单个请求就超过了）
@@ -939,57 +991,78 @@ namespace fastllm {
                         // Decode阶段：不在这里限制分页，由后续驱逐逻辑统一处理
                     }
 
-                    generationConfigs.push_back(it.second->generationConfig);
-                    if (it.second->generationConfig.output_logits) {
-                        it.second->resultLogits.push(new std::vector<float>());
-                        logits.push_back(it.second->resultLogits.back());
+                    generationConfigs.push_back(ctx->generationConfig);
+                    bool ctxNeedRepeatPenalty = NeedRepeatPenalty(ctx->generationConfig);
+                    selectedNeedLastTokens |= ctxNeedRepeatPenalty ||
+                                              (ctx->generationConfig.output_logits &&
+                                               !ctx->generationConfig.IsSimpleGreedy());
+                    if (ctx->generationConfig.output_logits) {
+                        ctx->resultLogits.push(new std::vector<float>());
+                        logits.push_back(ctx->resultLogits.back());
                     } else {
                         logits.push_back(nullptr);
                     }
 
-                    tokensManager.units.push_back(it.second->tokens);
-                    handles.push_back(it.first);
+                    tokenContexts.push_back(ctx);
+                    handles.push_back(ii.handle);
                     if (isMultimodal) {
                         selectedMultimodal = true;
                     }
 
-                    if (it.second->preTokens == 0) {
-                        it.second->intParams["add_special_tokens"] = it.second->cacheLen > 0 ? false : it.second->generationConfig.add_special_tokens;
-                        it.second->intParams["promptLen"] = it.second->cacheLen + it.second->currentTokens.size();
-                        it.second->intParams["index"] = 0;
-                    } else {
-                        it.second->intParams["index"]++;
-                    }
-                    Data inputIds, attentionMask, curPositionIds;
-                    std::vector<std::vector<float> > tokens;
-                    tokens.resize(1);
-                    for (int i: it.second->currentTokens) {
-                        tokens[0].push_back(i);
-                    }
-                    model->FillLLMInputs(tokens, it.second->intParams, inputIds, attentionMask, curPositionIds);
-                    ToDataType(attentionMask, model->dataType);
-
-                    seqLens.push_back(inputIds.Count(0));
-                    for (int i = 0; i < inputIds.Count(0); i++) {
-                        ids.push_back(((float *) inputIds.cpuData)[i]);
-                    }
-                    if (attentionMask.dims.size() == 0) {
+                    bool fastDecodeInput = canUseFastDecodeInput && !isPrompt && !isMultimodal && ctx->currentTokens.size() == 1;
+                    if (fastDecodeInput) {
+                        ids.push_back((float)ctx->currentTokens[0]);
+                        seqLens.push_back(1);
                         attentionMasks.push_back(nullptr);
+
+                        float position = ctx->allTokens.empty() ? 0.0f : (float)(ctx->allTokens.size() - 1);
+                        decodePositionValues.push_back(position);
+                        decodePositionIds.emplace_back(DataType::FLOAT32, decodeScalarDims,
+                                                       DataDevice::CPU, (void*)&decodePositionValues.back());
+                        positionIds.push_back(&decodePositionIds.back());
+                        ctx->preTokens += 1;
                     } else {
-                        attentionMasks.push_back(new Data());
-                        attentionMask.ToDevice(DataDevice::CPU);
-                        attentionMasks.back()->CopyFrom(attentionMask);
+                        if (ctx->preTokens == 0) {
+                            ctx->intParams["add_special_tokens"] = ctx->cacheLen > 0 ? false : ctx->generationConfig.add_special_tokens;
+                            ctx->intParams["promptLen"] = ctx->cacheLen + ctx->currentTokens.size();
+                            ctx->intParams["index"] = 0;
+                        } else {
+                            ctx->intParams["index"]++;
+                        }
+                        Data inputIds, attentionMask, curPositionIds;
+                        std::vector<std::vector<float> > tokens;
+                        tokens.resize(1);
+                        tokens[0].reserve(ctx->currentTokens.size());
+                        for (int i: ctx->currentTokens) {
+                            tokens[0].push_back(i);
+                        }
+                        model->FillLLMInputs(tokens, ctx->intParams, inputIds, attentionMask, curPositionIds);
+                        ToDataType(attentionMask, model->dataType);
+
+                        seqLens.push_back(inputIds.Count(0));
+                        for (int i = 0; i < inputIds.Count(0); i++) {
+                            ids.push_back(((float *) inputIds.cpuData)[i]);
+                        }
+                        if (attentionMask.dims.size() == 0) {
+                            attentionMasks.push_back(nullptr);
+                        } else {
+                            attentionMasks.push_back(new Data());
+                            ownedAttentionMasks.push_back(attentionMasks.back());
+                            attentionMask.ToDevice(DataDevice::CPU);
+                            attentionMasks.back()->CopyFrom(attentionMask);
+                        }
+                        if (curPositionIds.dims.size() == 0) {
+                            positionIds.push_back(nullptr);
+                        } else {
+                            positionIds.push_back(new Data());
+                            ownedPositionIds.push_back(positionIds.back());
+                            positionIds.back()->CopyFrom(curPositionIds);
+                        }
+                        ctx->preTokens += seqLens.back();
                     }
-                    if (curPositionIds.dims.size() == 0) {
-                        positionIds.push_back(nullptr);
-                    } else {
-                        positionIds.push_back(new Data());
-                        positionIds.back()->CopyFrom(curPositionIds);
-                    }
-                    it.second->preTokens += seqLens.back();
                     for (int i = 0; i < model->block_cnt; i++) {
-                        pastKeyValues.push_back(std::make_pair(&it.second->pastKeyValues[i].first,
-                                                               &it.second->pastKeyValues[i].second));
+                        pastKeyValues.push_back(std::make_pair(&ctx->pastKeyValues[i].first,
+                                                               &ctx->pastKeyValues[i].second));
                     }
 
                     if (selectedMultimodal) {
@@ -1001,12 +1074,19 @@ namespace fastllm {
                 }
             }
 
+            if (selectedNeedLastTokens) {
+                tokensManager.units.reserve(tokenContexts.size());
+                for (auto *ctx : tokenContexts) {
+                    tokensManager.units.push_back(ctx->tokens);
+                }
+            }
+
             // Decode阶段：检查空闲分页是否足够，不够时释放资源
             if (seqLens.size() > 0 && seqLens[0] == 1) {
                 PagedCacheManager *pagedManager = nullptr;
                 int newPagesNeeded = 0;
                 for (int i = 0; i < (int)handles.size(); i++) {
-                    auto &ctx = *model->responseContextDict.dicts[handles[i]];
+                    auto &ctx = *tokenContexts[i];
                     auto &kvFirst = ctx.pastKeyValues[model->kvCacheId].first;
                     if (kvFirst.isPagedKVCache) {
                         if (pagedManager == nullptr) {
@@ -1031,7 +1111,7 @@ namespace fastllm {
                         // 空闲分页不够，从本轮decode批次中选择上下文最长的请求驱逐
                         int maxLen = -1, evictIdx = -1;
                         for (int i = 0; i < (int)handles.size(); i++) {
-                            auto &ctx = *model->responseContextDict.dicts[handles[i]];
+                            auto &ctx = *tokenContexts[i];
                             auto &kvFirst = ctx.pastKeyValues[model->kvCacheId].first;
                             if (kvFirst.pageIndex.size() > 0) {
                                 int curLen = (kvFirst.pageIndex.size() - 1) * kvFirst.pageLen + kvFirst.lastPageLen;
@@ -1052,20 +1132,17 @@ namespace fastllm {
 
                         // 从本轮decode批次中移除被驱逐的请求
                         handles.erase(handles.begin() + evictIdx);
+                        tokenContexts.erase(tokenContexts.begin() + evictIdx);
                         seqLens.erase(seqLens.begin() + evictIdx);
                         generationConfigs.erase(generationConfigs.begin() + evictIdx);
-                        tokensManager.units.erase(tokensManager.units.begin() + evictIdx);
+                        if (!tokensManager.units.empty()) {
+                            tokensManager.units.erase(tokensManager.units.begin() + evictIdx);
+                        }
                         if (logits[evictIdx] != nullptr) {
                             delete logits[evictIdx];
                         }
                         logits.erase(logits.begin() + evictIdx);
-                        if (attentionMasks[evictIdx] != nullptr) {
-                            delete attentionMasks[evictIdx];
-                        }
                         attentionMasks.erase(attentionMasks.begin() + evictIdx);
-                        if (positionIds[evictIdx] != nullptr) {
-                            delete positionIds[evictIdx];
-                        }
                         positionIds.erase(positionIds.begin() + evictIdx);
                         pastKeyValues.erase(pastKeyValues.begin() + evictIdx * model->block_cnt,
                                             pastKeyValues.begin() + (evictIdx + 1) * model->block_cnt);
@@ -1073,7 +1150,7 @@ namespace fastllm {
                         // 重新统计newPagesNeeded和freePages
                         newPagesNeeded = 0;
                         for (int i = 0; i < (int)handles.size(); i++) {
-                            auto &ctx = *model->responseContextDict.dicts[handles[i]];
+                            auto &ctx = *tokenContexts[i];
                             auto &kvFirst = ctx.pastKeyValues[model->kvCacheId].first;
                             if (kvFirst.isPagedKVCache && kvFirst.pageLen == kvFirst.lastPageLen) {
                                 newPagesNeeded++;
@@ -1087,8 +1164,8 @@ namespace fastllm {
                     if (freePages >= newPagesNeeded && newPagesNeeded > 0) {
                         // 重新计算ids
                         ids.clear();
-                        for (int i = 0; i < (int)handles.size(); i++) {
-                            auto &ctx = *model->responseContextDict.dicts[handles[i]];
+                        for (int i = 0; i < (int)tokenContexts.size(); i++) {
+                            auto &ctx = *tokenContexts[i];
                             for (int t : ctx.currentTokens) {
                                 ids.push_back((float)t);
                             }
@@ -1225,34 +1302,40 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 }
 
                 for (int i = 0; i < handles.size(); i++) {
-                    auto &it = *model->responseContextDict.dicts.find(handles[i]);
+                    ResponseContext *ctx = tokenContexts[i];
                     int curRet = ret[i];
                     if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
-                        it.second->isEnding = true;
-                        it.second->TryRecordPagedCache();
+                        ctx->isEnding = true;
+                        ctx->TryRecordPagedCache();
                         // printf("[Handle %d] Finished. Reason: eos token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
                     } else {
-                        auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
-                        if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
-                            it.second->isEnding = true;
-                            it.second->TryRecordPagedCache();
+                        auto itStopTk = ctx->generationConfig.stop_token_ids.find(curRet);
+                        if (itStopTk != ctx->generationConfig.stop_token_ids.end()) {
+                            ctx->isEnding = true;
+                            ctx->TryRecordPagedCache();
                             // printf("[Handle %d] Finished. Reason: stop token (token_id=%d), total tokens: %d.\n", handles[i], curRet, it.second->curTokens);
                         }
                     }
-                    if (it.second->isEnding == false) {
-                        it.second->currentTokens = std::vector<int>{curRet};
-                        it.second->resultTokenQueue.push(curRet);
-                        it.second->allTokens.push_back(curRet);
-                        it.second->tokens.Push(curRet);
-                        it.second->curTokens++;
-                        if (it.second->curTokens == it.second->generationConfig.output_token_limit) {
-                            it.second->isEnding = true;
-                            it.second->TryRecordPagedCache();
+                    if (ctx->isEnding == false) {
+                        if (ctx->currentTokens.size() == 1) {
+                            ctx->currentTokens[0] = curRet;
+                        } else {
+                            ctx->currentTokens.assign(1, curRet);
+                        }
+                        ctx->resultTokenQueue.push(curRet);
+                        ctx->allTokens.push_back(curRet);
+                        if (NeedRepeatPenalty(ctx->generationConfig)) {
+                            ctx->tokens.Push(curRet);
+                        }
+                        ctx->curTokens++;
+                        if (ctx->curTokens == ctx->generationConfig.output_token_limit) {
+                            ctx->isEnding = true;
+                            ctx->TryRecordPagedCache();
                             // printf("[Handle %d] Finished. Reason: output token limit reached (curTokens=%d, limit=%d).\n",
                                    // handles[i], it.second->curTokens, it.second->generationConfig.output_token_limit);
-                        } else if (it.second->allTokens.size() >= model->max_positions) {
-                            it.second->isEnding = true;
-                            it.second->TryRecordPagedCache();
+                        } else if (ctx->allTokens.size() >= model->max_positions) {
+                            ctx->isEnding = true;
+                            ctx->TryRecordPagedCache();
                             // printf("[Handle %d] Finished. Reason: max positions reached (allTokens=%d, max_positions=%d).\n",
                                    //handles[i], (int)it.second->allTokens.size(), model->max_positions);
                         }
@@ -1262,11 +1345,11 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 // 没有任何请求可以调度时，等待新请求
             }
 
-            for (int i = 0; i < attentionMasks.size(); i++) {
-                delete attentionMasks[i];
+            for (int i = 0; i < ownedAttentionMasks.size(); i++) {
+                delete ownedAttentionMasks[i];
             }
-            for (int i = 0; i < positionIds.size(); i++) {
-                delete positionIds[i];
+            for (int i = 0; i < ownedPositionIds.size(); i++) {
+                delete ownedPositionIds[i];
             }
 
             if (seqLens.size() == 0) {
@@ -2280,24 +2363,27 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
     void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data, Data> > &pastKeyValues,
             const GenerationConfig &generationConfig) {
         auto &config = generationConfig;
+        if (config.output_token_least <= 0) {
+            return;
+        }
         int cacheLen = GetTokenGrowingCacheLen(this, pastKeyValues);
         if (logits->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
             bool need_reset = false;
-            std::vector<int> res_lens, eos_nums, eos_ids;
+            std::vector<int> common_eos_ids;
+            common_eos_ids.push_back(this->eos_token_id);
+            for (auto id: this->eos_token_ids) {
+                common_eos_ids.push_back(id);
+            }
+            for (auto id: config.stop_token_ids) {
+                common_eos_ids.push_back(id);
+            }
             for (int b = 0; b < batch; b++) {
-                res_lens.push_back(config.output_token_least - cacheLen + config.input_token_length);
-                need_reset |= res_lens.back() > 0;
-                eos_nums.push_back(1 + this->eos_token_ids.size() + config.stop_token_ids.size());
-                eos_ids.push_back(this->eos_token_id);
-                for (auto id: this->eos_token_ids)
-                    eos_ids.push_back(id);
-                for (auto id: config.stop_token_ids)
-                    eos_ids.push_back(id);
+                need_reset |= config.output_token_least - cacheLen + config.input_token_length > 0;
             }
             if (need_reset) {
                 ToDataType(*logits, DataType::FLOAT32);
-                FastllmResetLogitsOfEOS(batch, logits, res_lens, eos_nums, eos_ids);
+                FastllmResetLogitsOfEOSAll(batch, logits, common_eos_ids);
             }
 #endif
         } else {
@@ -2318,25 +2404,59 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 
     void basellm::ResetLogitsOfEOS(int batch, Data *logits, std::vector <std::pair <Data*, Data*> > &pastKeyValues,
             const std::vector <GenerationConfig> &generationConfigs) {
+        bool hasMinOutputLength = false;
+        for (int b = 0; b < batch; b++) {
+            if (generationConfigs[b].output_token_least > 0) {
+                hasMinOutputLength = true;
+                break;
+            }
+        }
+        if (!hasMinOutputLength) {
+            return;
+        }
         int cacheLen = GetTokenGrowingCacheLen(this, pastKeyValues);
         if (logits->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
-            bool need_reset = false;
-            std::vector<int> res_lens, eos_nums, eos_ids;
+            auto buildEosIds = [&](const GenerationConfig &config) {
+                std::vector<int> ids;
+                ids.push_back(this->eos_token_id);
+                for (auto id: this->eos_token_ids) {
+                    ids.push_back(id);
+                }
+                for (auto id: config.stop_token_ids) {
+                    ids.push_back(id);
+                }
+                return ids;
+            };
+            bool need_reset = false, all_need_reset = true, same_eos_ids = true;
+            std::vector<int> common_eos_ids;
             for (int b = 0; b < batch; b++) {
                 auto &config = generationConfigs[b];
-                res_lens.push_back(config.output_token_least - cacheLen + config.input_token_length);
-                need_reset |= res_lens.back() > 0;
-                eos_nums.push_back(1 + this->eos_token_ids.size() + config.stop_token_ids.size());
-                eos_ids.push_back(this->eos_token_id);
-                for (auto id: this->eos_token_ids)
-                    eos_ids.push_back(id);
-                for (auto id: config.stop_token_ids)
-                    eos_ids.push_back(id);
+                bool curNeedReset = config.output_token_least - cacheLen + config.input_token_length > 0;
+                need_reset |= curNeedReset;
+                all_need_reset &= curNeedReset;
+                std::vector<int> cur_eos_ids = buildEosIds(config);
+                if (b == 0) {
+                    common_eos_ids = std::move(cur_eos_ids);
+                } else if (cur_eos_ids != common_eos_ids) {
+                    same_eos_ids = false;
+                }
             }
             if (need_reset) {
                 ToDataType(*logits, DataType::FLOAT32);
-                FastllmResetLogitsOfEOS(batch, logits, res_lens, eos_nums, eos_ids);
+                if (all_need_reset && same_eos_ids) {
+                    FastllmResetLogitsOfEOSAll(batch, logits, common_eos_ids);
+                } else {
+                    std::vector<int> res_lens, eos_nums, eos_ids;
+                    for (int b = 0; b < batch; b++) {
+                        auto &config = generationConfigs[b];
+                        res_lens.push_back(config.output_token_least - cacheLen + config.input_token_length);
+                        std::vector<int> cur_eos_ids = buildEosIds(config);
+                        eos_nums.push_back((int)cur_eos_ids.size());
+                        eos_ids.insert(eos_ids.end(), cur_eos_ids.begin(), cur_eos_ids.end());
+                    }
+                    FastllmResetLogitsOfEOS(batch, logits, res_lens, eos_nums, eos_ids);
+                }
             }
 #endif
         } else {
