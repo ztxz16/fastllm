@@ -246,6 +246,17 @@ bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::Data &q, co
                                                       int ropeDim, float ropeBase, int originalSeqLen,
                                                       float ropeFactor, int betaFast, int betaSlow,
                                                       float softmaxScale, fastllm::Data &output);
+bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedBatch(
+                                                      const std::vector<fastllm::Data*> &q,
+                                                      const std::vector<fastllm::Data*> &windowKV,
+                                                      const std::vector<fastllm::Data*> &compressedKV,
+                                                      fastllm::Data &attnSink,
+                                                      int windowSize,
+                                                      const std::vector<int> &startPositions,
+                                                      const std::vector<int> &compressedCounts,
+                                                      int ropeDim, float ropeBase, int originalSeqLen,
+                                                      float ropeFactor, int betaFast, int betaSlow,
+                                                      float softmaxScale, fastllm::Data &output);
 bool FastllmCudaDeepSeekV4SparseAttentionPrefill(const fastllm::Data &q, const fastllm::Data &kv,
                                                  fastllm::Data &attnSink, int windowSize, int startPos,
                                                  int compressRatio, int ropeDim, float ropeBase,

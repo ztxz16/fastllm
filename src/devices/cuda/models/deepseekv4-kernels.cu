@@ -1455,6 +1455,112 @@ __global__ void DeepSeekV4SparseAttentionDecodeCachedOnlineKernel(const QT *q, c
     }
 }
 
+template <typename QT, typename CT>
+__global__ void DeepSeekV4SparseAttentionDecodeCachedBatchOnlineKernel(
+        const void * const *qPtrs, const float * const *windowPtrs,
+        const void * const *compressedPtrs, const float *sink,
+        const int *startPositions, const int *compressedCounts,
+        float *output, int batch, int heads, int dim, int windowSize,
+        float softmaxScale) {
+    constexpr int kMaxDimsPerThread = 4;
+    __shared__ float red[256];
+    __shared__ float mxShared;
+    __shared__ float denomShared;
+    __shared__ float alphaShared;
+    __shared__ float betaShared;
+
+    int bh = blockIdx.x;
+    int b = bh / heads;
+    int h = bh % heads;
+    if (b >= batch) {
+        return;
+    }
+
+    const QT *qBase = reinterpret_cast<const QT *>(qPtrs[b]);
+    const float *windowKV = windowPtrs[b];
+    const CT *compressedKV = reinterpret_cast<const CT *>(compressedPtrs[b]);
+    int startPos = startPositions[b];
+    int compressedCount = compressedCounts[b];
+    int liveWindow = startPos >= windowSize - 1 ? windowSize : (startPos + 1);
+    int idxCount = liveWindow + compressedCount;
+    if (qBase == nullptr || windowKV == nullptr || startPos < 0 ||
+        idxCount <= 0 || idxCount > kDeepSeekV4SparseDecodeMaxKeys ||
+        dim > blockDim.x * kMaxDimsPerThread ||
+        (compressedCount > 0 && compressedKV == nullptr)) {
+        return;
+    }
+
+    int pos = startPos % windowSize;
+    const QT *qrow = qBase + (uint64_t)h * dim;
+    float *orow = output + (uint64_t)bh * dim;
+
+    int localDims = 0;
+    int localOffsets[kMaxDimsPerThread];
+    float localAcc[kMaxDimsPerThread];
+    float localKV[kMaxDimsPerThread];
+    for (int d = threadIdx.x; d < dim && localDims < kMaxDimsPerThread; d += blockDim.x) {
+        localOffsets[localDims] = d;
+        localAcc[localDims] = 0.0f;
+        localKV[localDims] = 0.0f;
+        localDims++;
+    }
+
+    if (threadIdx.x == 0) {
+        mxShared = -INFINITY;
+        denomShared = 0.0f;
+    }
+    __syncthreads();
+
+    for (int k = 0; k < idxCount; k++) {
+        int idx = k < liveWindow
+                      ? ((startPos >= windowSize - 1) ? ((pos + 1 + k) % windowSize) : k)
+                      : (windowSize + (k - liveWindow));
+
+        float partial = 0.0f;
+        for (int i = 0; i < localDims; i++) {
+            int d = localOffsets[i];
+            float kv;
+            if (idx < windowSize) {
+                kv = windowKV[(uint64_t)idx * dim + d];
+            } else {
+                kv = Dsv4ToFloat(compressedKV[((uint64_t)(idx - windowSize)) * dim + d]);
+            }
+            localKV[i] = kv;
+            partial += Dsv4ToFloat(qrow[d]) * kv;
+        }
+
+        red[threadIdx.x] = partial;
+        __syncthreads();
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                red[threadIdx.x] += red[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            float score = red[0] * softmaxScale;
+            float oldMx = mxShared;
+            float newMx = fmaxf(oldMx, score);
+            float alpha = isfinite(oldMx) ? expf(oldMx - newMx) : 0.0f;
+            float beta = expf(score - newMx);
+            mxShared = newMx;
+            denomShared = denomShared * alpha + beta;
+            alphaShared = alpha;
+            betaShared = beta;
+        }
+        __syncthreads();
+        for (int i = 0; i < localDims; i++) {
+            localAcc[i] = localAcc[i] * alphaShared + betaShared * localKV[i];
+        }
+    }
+
+    float finalDenom = denomShared + expf(sink[h] - mxShared);
+    finalDenom = fmaxf(finalDenom, 1e-30f);
+    for (int i = 0; i < localDims; i++) {
+        orow[localOffsets[i]] = localAcc[i] / finalDenom;
+    }
+}
+
 template <typename QT>
 __global__ void DeepSeekV4SparseDecodeConvertQKernel(const QT *q, float *qFloat, uint64_t total) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1905,6 +2011,41 @@ __global__ void DeepSeekV4SparseDecodeRotaryCastKernel(const float *input, __nv_
     float b = src[off + i + 1];
     dst[off + i] = __float2bfloat16_rn(a * c - b * sn);
     dst[off + i + 1] = __float2bfloat16_rn(a * sn + b * c);
+}
+
+__global__ void DeepSeekV4SparseDecodeRotaryCastBatchKernel(const float *input, __nv_bfloat16 *output,
+                                                            const int *startPositions,
+                                                            int rows, int heads, int dim, int ropeDim,
+                                                            float ropeBase, int originalSeqLen,
+                                                            float ropeFactor, int betaFast,
+                                                            int betaSlow) {
+    int off = dim - ropeDim;
+    int ropePairs = ropeDim >> 1;
+    int workPerRow = off + ropePairs;
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t total = (uint64_t)rows * workPerRow;
+    if (idx >= total) {
+        return;
+    }
+    int item = idx % workPerRow;
+    int row = idx / workPerRow;
+    int b = row / heads;
+    int startPos = startPositions[b];
+    const float *src = input + (uint64_t)row * dim;
+    __nv_bfloat16 *dst = output + (uint64_t)row * dim;
+    if (item < off) {
+        dst[item] = __float2bfloat16_rn(src[item]);
+        return;
+    }
+    int i = (item - off) << 1;
+    float inv = DeepSeekV4InvFreq(i / 2, ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
+    float ang = startPos * inv;
+    float c = cosf(ang);
+    float sn = -sinf(ang);
+    float a = src[off + i];
+    float bval = src[off + i + 1];
+    dst[off + i] = __float2bfloat16_rn(a * c - bval * sn);
+    dst[off + i + 1] = __float2bfloat16_rn(a * sn + bval * c);
 }
 
 template <typename XT, typename RT, typename OT>
@@ -2462,6 +2603,58 @@ bool DeepSeekV4LaunchSparseDecodeByCompressed(const void *cudaQ, const void *cud
         return false;
     }
     return true;
+}
+
+template <typename QT, typename CT>
+bool DeepSeekV4LaunchSparseDecodeBatchOnline(const void * const *cudaQPtrs,
+                                             const float * const *cudaWindowPtrs,
+                                             const void * const *cudaCompressedPtrs,
+                                             const float *cudaSink,
+                                             const int *cudaStartPositions,
+                                             const int *cudaCompressedCounts,
+                                             float *outData, int batch, int heads,
+                                             int dim, int windowSize,
+                                             float softmaxScale) {
+    if (dim <= 0 || dim > 256 * 4 || batch <= 0 || heads <= 0 || windowSize <= 0) {
+        return false;
+    }
+    DeepSeekV4SparseAttentionDecodeCachedBatchOnlineKernel<QT, CT><<<batch * heads, 256>>>(
+        cudaQPtrs, cudaWindowPtrs, cudaCompressedPtrs, cudaSink,
+        cudaStartPositions, cudaCompressedCounts, outData,
+        batch, heads, dim, windowSize, softmaxScale);
+    return true;
+}
+
+template <typename QT>
+bool DeepSeekV4LaunchSparseDecodeBatchByCompressed(const void * const *cudaQPtrs,
+                                                   const float * const *cudaWindowPtrs,
+                                                   const void * const *cudaCompressedPtrs,
+                                                   fastllm::DataType compressedType,
+                                                   const float *cudaSink,
+                                                   const int *cudaStartPositions,
+                                                   const int *cudaCompressedCounts,
+                                                   float *outData, int batch, int heads,
+                                                   int dim, int windowSize,
+                                                   float softmaxScale) {
+    if (compressedType == fastllm::DataType::BFLOAT16) {
+        return DeepSeekV4LaunchSparseDecodeBatchOnline<QT, __nv_bfloat16>(
+            cudaQPtrs, cudaWindowPtrs, cudaCompressedPtrs, cudaSink,
+            cudaStartPositions, cudaCompressedCounts, outData,
+            batch, heads, dim, windowSize, softmaxScale);
+    }
+    if (compressedType == fastllm::DataType::FLOAT16) {
+        return DeepSeekV4LaunchSparseDecodeBatchOnline<QT, half>(
+            cudaQPtrs, cudaWindowPtrs, cudaCompressedPtrs, cudaSink,
+            cudaStartPositions, cudaCompressedCounts, outData,
+            batch, heads, dim, windowSize, softmaxScale);
+    }
+    if (compressedType == fastllm::DataType::FLOAT32) {
+        return DeepSeekV4LaunchSparseDecodeBatchOnline<QT, float>(
+            cudaQPtrs, cudaWindowPtrs, cudaCompressedPtrs, cudaSink,
+            cudaStartPositions, cudaCompressedCounts, outData,
+            batch, heads, dim, windowSize, softmaxScale);
+    }
+    return false;
 }
 
 template <typename QT, typename KT>
@@ -3743,6 +3936,173 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::
         }
     }
 
+    FastllmCudaFree(cudaTemp);
+    return ok;
+}
+
+extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCachedBatch(
+                                                                 const std::vector<fastllm::Data*> &qParts,
+                                                                 const std::vector<fastllm::Data*> &windowKVs,
+                                                                 const std::vector<fastllm::Data*> &compressedKVs,
+                                                                 fastllm::Data &attnSink,
+                                                                 int windowSize,
+                                                                 const std::vector<int> &startPositions,
+                                                                 const std::vector<int> &compressedCounts,
+                                                                 int ropeDim, float ropeBase,
+                                                                 int originalSeqLen,
+                                                                 float ropeFactor, int betaFast,
+                                                                 int betaSlow, float softmaxScale,
+                                                                 fastllm::Data &output) {
+    if (std::getenv("FASTLLM_DSV4_DISABLE_BATCH_SPARSE_DECODE") != nullptr) {
+        return false;
+    }
+    int batch = (int)qParts.size();
+    if (batch <= 0 || (int)windowKVs.size() != batch || (int)compressedKVs.size() != batch ||
+        (int)startPositions.size() != batch || (int)compressedCounts.size() != batch ||
+        windowSize <= 0 || ropeDim <= 0) {
+        return false;
+    }
+    if (qParts[0] == nullptr || qParts[0]->dims.size() != 4 || qParts[0]->dims[0] != 1 ||
+        qParts[0]->dims[1] != 1 || qParts[0]->dataDevice != fastllm::DataDevice::CUDA) {
+        return false;
+    }
+    int heads = qParts[0]->dims[2], dim = qParts[0]->dims[3];
+    if (heads <= 0 || dim <= 0 || ropeDim > dim || dim > 256 * 4 ||
+        attnSink.dataDevice != fastllm::DataDevice::CUDA ||
+        attnSink.dataType != fastllm::DataType::FLOAT32 ||
+        attnSink.Count(0) != (uint64_t)heads) {
+        return false;
+    }
+
+    fastllm::DataType qType = qParts[0]->dataType;
+    fastllm::DataType compressedType = fastllm::DataType::FLOAT32;
+    bool hasCompressed = false;
+    std::vector<const void*> qPtrs(batch, nullptr);
+    std::vector<const float*> windowPtrs(batch, nullptr);
+    std::vector<const void*> compressedPtrs(batch, nullptr);
+    for (int b = 0; b < batch; b++) {
+        const fastllm::Data *q = qParts[b];
+        const fastllm::Data *windowKV = windowKVs[b];
+        const fastllm::Data *compressedKV = compressedKVs[b];
+        int startPos = startPositions[b];
+        int compressedCount = compressedCounts[b];
+        int liveWindow = startPos >= windowSize - 1 ? windowSize : (startPos + 1);
+        if (q == nullptr || windowKV == nullptr || startPos < 0 || compressedCount < 0 ||
+            liveWindow + compressedCount <= 0 ||
+            liveWindow + compressedCount > kDeepSeekV4SparseDecodeMaxKeys ||
+            q->dims.size() != 4 || q->dims[0] != 1 || q->dims[1] != 1 ||
+            q->dims[2] != heads || q->dims[3] != dim ||
+            q->dataType != qType || q->dataDevice != fastllm::DataDevice::CUDA ||
+            windowKV->dataDevice != fastllm::DataDevice::CUDA ||
+            windowKV->dataType != fastllm::DataType::FLOAT32 ||
+            windowKV->Count(0) != (uint64_t)windowSize * dim) {
+            return false;
+        }
+        qPtrs[b] = q->cudaData;
+        windowPtrs[b] = (const float*)windowKV->cudaData;
+        if (compressedCount > 0) {
+            if (compressedKV == nullptr ||
+                compressedKV->dataDevice != fastllm::DataDevice::CUDA ||
+                compressedKV->Count(0) < (uint64_t)compressedCount * dim) {
+                return false;
+            }
+            if (!hasCompressed) {
+                compressedType = compressedKV->dataType;
+                hasCompressed = true;
+            } else if (compressedKV->dataType != compressedType) {
+                return false;
+            }
+            if (compressedType != fastllm::DataType::BFLOAT16 &&
+                compressedType != fastllm::DataType::FLOAT16 &&
+                compressedType != fastllm::DataType::FLOAT32) {
+                return false;
+            }
+            compressedPtrs[b] = compressedKV->cudaData;
+        }
+    }
+    if (!hasCompressed) {
+        compressedType = fastllm::DataType::FLOAT32;
+    }
+    if (qType != fastllm::DataType::BFLOAT16 &&
+        qType != fastllm::DataType::FLOAT16 &&
+        qType != fastllm::DataType::FLOAT32) {
+        return false;
+    }
+
+    if (!DeepSeekV4PrepareCudaOutput(output, fastllm::DataType::BFLOAT16, {batch, 1, heads, dim})) {
+        return false;
+    }
+
+    const void **cudaQPtrs = (const void**)FastllmCudaMalloc((size_t)batch * sizeof(void*));
+    const float **cudaWindowPtrs = (const float**)FastllmCudaMalloc((size_t)batch * sizeof(float*));
+    const void **cudaCompressedPtrs = (const void**)FastllmCudaMalloc((size_t)batch * sizeof(void*));
+    int *cudaStartPositions = (int*)FastllmCudaMalloc((size_t)batch * sizeof(int));
+    int *cudaCompressedCounts = (int*)FastllmCudaMalloc((size_t)batch * sizeof(int));
+    float *cudaTemp = (float*)FastllmCudaMalloc((size_t)batch * heads * dim * sizeof(float));
+    if (cudaQPtrs == nullptr || cudaWindowPtrs == nullptr || cudaCompressedPtrs == nullptr ||
+        cudaStartPositions == nullptr || cudaCompressedCounts == nullptr || cudaTemp == nullptr) {
+        if (cudaQPtrs != nullptr) {
+            FastllmCudaFree((void*)cudaQPtrs);
+        }
+        if (cudaWindowPtrs != nullptr) {
+            FastllmCudaFree((void*)cudaWindowPtrs);
+        }
+        if (cudaCompressedPtrs != nullptr) {
+            FastllmCudaFree((void*)cudaCompressedPtrs);
+        }
+        if (cudaStartPositions != nullptr) {
+            FastllmCudaFree(cudaStartPositions);
+        }
+        if (cudaCompressedCounts != nullptr) {
+            FastllmCudaFree(cudaCompressedCounts);
+        }
+        if (cudaTemp != nullptr) {
+            FastllmCudaFree(cudaTemp);
+        }
+        return false;
+    }
+
+    cudaMemcpy((void*)cudaQPtrs, qPtrs.data(), (size_t)batch * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy((void*)cudaWindowPtrs, windowPtrs.data(), (size_t)batch * sizeof(float*), cudaMemcpyHostToDevice);
+    cudaMemcpy((void*)cudaCompressedPtrs, compressedPtrs.data(), (size_t)batch * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaStartPositions, startPositions.data(), (size_t)batch * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(cudaCompressedCounts, compressedCounts.data(), (size_t)batch * sizeof(int), cudaMemcpyHostToDevice);
+
+    bool ok = false;
+    if (qType == fastllm::DataType::BFLOAT16) {
+        ok = DeepSeekV4LaunchSparseDecodeBatchByCompressed<__nv_bfloat16>(
+            cudaQPtrs, cudaWindowPtrs, cudaCompressedPtrs, compressedType,
+            (const float*)attnSink.cudaData, cudaStartPositions, cudaCompressedCounts,
+            cudaTemp, batch, heads, dim, windowSize, softmaxScale);
+    } else if (qType == fastllm::DataType::FLOAT16) {
+        ok = DeepSeekV4LaunchSparseDecodeBatchByCompressed<half>(
+            cudaQPtrs, cudaWindowPtrs, cudaCompressedPtrs, compressedType,
+            (const float*)attnSink.cudaData, cudaStartPositions, cudaCompressedCounts,
+            cudaTemp, batch, heads, dim, windowSize, softmaxScale);
+    } else if (qType == fastllm::DataType::FLOAT32) {
+        ok = DeepSeekV4LaunchSparseDecodeBatchByCompressed<float>(
+            cudaQPtrs, cudaWindowPtrs, cudaCompressedPtrs, compressedType,
+            (const float*)attnSink.cudaData, cudaStartPositions, cudaCompressedCounts,
+            cudaTemp, batch, heads, dim, windowSize, softmaxScale);
+    }
+
+    if (ok) {
+        int rows = batch * heads;
+        int threads = 128;
+        int rotaryWorkPerRow = dim - ropeDim + (ropeDim >> 1);
+        int blocks = (rows * rotaryWorkPerRow + threads - 1) / threads;
+        DeepSeekV4SparseDecodeRotaryCastBatchKernel<<<blocks, threads>>>(
+            cudaTemp, (__nv_bfloat16*)output.cudaData, cudaStartPositions,
+            rows, heads, dim, ropeDim, ropeBase, originalSeqLen,
+            ropeFactor, betaFast, betaSlow);
+        DeviceSync();
+    }
+
+    FastllmCudaFree((void*)cudaQPtrs);
+    FastllmCudaFree((void*)cudaWindowPtrs);
+    FastllmCudaFree((void*)cudaCompressedPtrs);
+    FastllmCudaFree(cudaStartPositions);
+    FastllmCudaFree(cudaCompressedCounts);
     FastllmCudaFree(cudaTemp);
     return ok;
 }

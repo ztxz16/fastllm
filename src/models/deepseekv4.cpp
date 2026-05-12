@@ -410,6 +410,37 @@ namespace fastllm {
             }
         }
 
+        static void UpdateDebugPastKeyValues(std::vector<std::pair<Data*, Data*>> &pastKeyValues,
+                                             int batchIndex, int bsz, int totalLen, int blocks) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4PastKVStub");
+            int offset = batchIndex * blocks;
+            if (blocks <= 0 || offset < 0 || offset >= (int)pastKeyValues.size()) {
+                return;
+            }
+            int paddedLen = ((std::max(totalLen, 1) - 1) / 128 + 1) * 128;
+            std::vector<float> zeros((uint64_t)bsz * totalLen, 0.0f);
+            int limit = std::min(blocks, (int)pastKeyValues.size() - offset);
+            for (int i = 0; i < limit; i++) {
+                Data *keyPtr = pastKeyValues[offset + i].first;
+                Data *valuePtr = pastKeyValues[offset + i].second;
+                if (keyPtr == nullptr || valuePtr == nullptr) {
+                    continue;
+                }
+                Data key(DataType::FLOAT32, {bsz, totalLen, 1}, zeros);
+                Data value(DataType::FLOAT32, {bsz, totalLen, 1}, zeros);
+                key.SetKVCache();
+                value.SetKVCache();
+                key.Expansion({bsz, paddedLen, 1});
+                value.Expansion({bsz, paddedLen, 1});
+                ResetData(*keyPtr);
+                ResetData(*valuePtr);
+                keyPtr->CopyFrom(key);
+                valuePtr->CopyFrom(value);
+                keyPtr->SetKVCache();
+                valuePtr->SetKVCache();
+            }
+        }
+
         static float SigmoidFloat(float x) {
             if (x >= 0.0f) {
                 float z = std::exp(-x);
@@ -1240,6 +1271,59 @@ namespace fastllm {
             WriteFloatData(out, {bsz, 1, heads, dim}, output, DataType::BFLOAT16);
         }
 
+        static bool SparseAttentionDecodeCachedBatch(Data &attnSink,
+                                                     int windowSize,
+                                                     int ropeDim, float ropeBase, float softmaxScale,
+                                                     const std::vector<int> &startPositions,
+                                                     const std::vector<int> &compressedCounts,
+                                                     std::vector<Data*> &qParts,
+                                                     std::vector<Data*> &windowKVs,
+                                                     std::vector<Data*> &compressedKVs,
+                                                     Data &output, int originalSeqLen = 0,
+                                                     float ropeFactor = 1.0f,
+                                                     int betaFast = 32, int betaSlow = 1) {
+            ScopedExecutorProfiler executorProfile("DeepSeekV4SparseDecodeCachedBatch");
+#ifdef USE_CUDA
+            if (!DeepSeekV4PreferCuda() || qParts.empty() ||
+                qParts.size() != windowKVs.size() ||
+                qParts.size() != compressedKVs.size() ||
+                qParts.size() != startPositions.size() ||
+                qParts.size() != compressedCounts.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < qParts.size(); i++) {
+                if (qParts[i] == nullptr || windowKVs[i] == nullptr || compressedKVs[i] == nullptr ||
+                    qParts[i]->dataDevice != DataDevice::CUDA ||
+                    windowKVs[i]->dataDevice != DataDevice::CUDA ||
+                    (compressedCounts[i] > 0 && compressedKVs[i]->dataDevice != DataDevice::CUDA)) {
+                    return false;
+                }
+            }
+            attnSink.ToDevice(DataDevice::CUDA);
+            return FastllmCudaDeepSeekV4SparseAttentionDecodeCachedBatch(
+                qParts, windowKVs, compressedKVs, attnSink, windowSize,
+                startPositions, compressedCounts, ropeDim, ropeBase, originalSeqLen,
+                ropeFactor, betaFast, betaSlow, softmaxScale, output);
+#else
+            (void)attnSink;
+            (void)windowSize;
+            (void)ropeDim;
+            (void)ropeBase;
+            (void)softmaxScale;
+            (void)startPositions;
+            (void)compressedCounts;
+            (void)qParts;
+            (void)windowKVs;
+            (void)compressedKVs;
+            (void)output;
+            (void)originalSeqLen;
+            (void)ropeFactor;
+            (void)betaFast;
+            (void)betaSlow;
+            return false;
+#endif
+        }
+
         static bool CompressKVReference(WeightMap &weight, const std::string &prefix, const Data &x,
                                         int compressRatio, int headDim, int ropeDim, float ropeBase,
                                         float ropeFactor, int betaFast, int betaSlow, int originalSeqLen,
@@ -1976,17 +2060,36 @@ namespace fastllm {
         return it->second;
     }
 
+    std::shared_ptr<DeepSeekV4RequestState> DeepSeekV4Model::GetRequestStateByFirstKey(const Data *firstPastKey) {
+        if (firstPastKey == nullptr) {
+            return nullptr;
+        }
+        const void *key = (const void*)firstPastKey;
+        std::lock_guard<std::mutex> guard(this->requestStateMutex);
+        auto it = this->requestStatesByFirstKey.find(key);
+        if (it == this->requestStatesByFirstKey.end()) {
+            return nullptr;
+        }
+        return it->second;
+    }
+
     void DeepSeekV4Model::OnResponseContextCreated(ResponseContext *context) {
         if (context == nullptr) {
             return;
         }
         const void *key = (const void*)&context->pastKeyValues;
         std::lock_guard<std::mutex> guard(this->requestStateMutex);
+        std::shared_ptr<DeepSeekV4RequestState> state;
         if (this->pendingRequestState) {
-            this->requestStates[key] = this->pendingRequestState;
+            state = this->pendingRequestState;
+            this->requestStates[key] = state;
             this->pendingRequestState.reset();
         } else {
-            this->requestStates[key] = std::make_shared<DeepSeekV4RequestState>();
+            state = std::make_shared<DeepSeekV4RequestState>();
+            this->requestStates[key] = state;
+        }
+        if (!context->pastKeyValues.empty()) {
+            this->requestStatesByFirstKey[(const void*)&context->pastKeyValues[0].first] = state;
         }
     }
 
@@ -1997,6 +2100,9 @@ namespace fastllm {
         const void *key = (const void*)&context->pastKeyValues;
         std::lock_guard<std::mutex> guard(this->requestStateMutex);
         this->requestStates.erase(key);
+        if (!context->pastKeyValues.empty()) {
+            this->requestStatesByFirstKey.erase((const void*)&context->pastKeyValues[0].first);
+        }
     }
 
     void DeepSeekV4Model::TryRecordResponseContext(ResponseContext *context) {
@@ -2133,6 +2239,7 @@ namespace fastllm {
 
             std::vector<Data*> attentionMasks;
             std::vector<Data*> positionIds;
+            std::vector<std::pair<Data*, Data*> > pastKeyValues;
             std::vector<float> ids;
             std::vector<int> seqLens;
             std::vector<int> handles;
@@ -2233,6 +2340,10 @@ namespace fastllm {
 
                     tokensManager.units.push_back(ctx->tokens);
                     handles.push_back(it.first);
+                    for (int layer = 0; layer < model->block_cnt; layer++) {
+                        pastKeyValues.push_back(std::make_pair(&ctx->pastKeyValues[layer].first,
+                                                              &ctx->pastKeyValues[layer].second));
+                    }
 
                     if (ctx->preTokens == 0) {
                         ctx->intParams["add_special_tokens"] =
@@ -2286,30 +2397,19 @@ namespace fastllm {
 #ifdef USE_CUDA
                 FastllmCudaClearBigBuffer();
 #endif
-                Data inputIds = Data(DataType::FLOAT32, {1, (int)ids.size()}, ids);
+                bool allDecodeTokens = true;
+                for (int seqLen : seqLens) {
+                    allDecodeTokens &= (seqLen == 1);
+                }
+                Data inputIds = (seqLens.size() > 1 && allDecodeTokens) ?
+                                Data(DataType::FLOAT32, {(int)seqLens.size(), 1}, ids) :
+                                Data(DataType::FLOAT32, {1, (int)ids.size()}, ids);
                 std::vector<int> ret;
 
                 if (seqLens.size() > 1) {
-                    for (int i = 0; i < (int)handles.size(); i++) {
-                        Data inputIdNow = Data(DataType::FLOAT32, {1, 1}, {ids[i]});
-                        LastTokensManager singleTokens;
-                        singleTokens.units.push_back(tokensManager.units[i]);
-                        Data emptyAttention, emptyPosition;
-                        dictLocker.lock();
-                        auto contextIt = model->responseContextDict.dicts.find(handles[i]);
-                        if (contextIt == model->responseContextDict.dicts.end()) {
-                            dictLocker.unlock();
-                            ret.push_back(model->eos_token_id);
-                            continue;
-                        }
-                        ResponseContext *ctx = contextIt->second;
-                        ret.push_back(model->Forward(inputIdNow,
-                                                     attentionMasks[i] == nullptr ? emptyAttention : *attentionMasks[i],
-                                                     positionIds[i] == nullptr ? emptyPosition : *positionIds[i],
-                                                     ctx->pastKeyValues,
-                                                     generationConfigs[i], singleTokens, logits[i]));
-                        dictLocker.unlock();
-                    }
+                    ret = model->ForwardBatch((int)seqLens.size(), inputIds, attentionMasks,
+                                              positionIds, seqLens, pastKeyValues, generationConfigs,
+                                              tokensManager, &logits);
                 } else {
                     dictLocker.lock();
                     auto contextIt = model->responseContextDict.dicts.find(handles[0]);
@@ -3310,8 +3410,383 @@ namespace fastllm {
                                                    const std::vector <GenerationConfig> &generationConfigs,
                                                    const LastTokensManager &lastTokens,
                                                    std::vector <std::vector <float>*> *retLogits) {
-        ErrorInFastLLM("DeepSeekV4Model::ForwardBatch (multi-prompt) is not implemented yet.");
-        return std::vector<int>(batch, 0);
+        if (batch <= 0) {
+            return {};
+        }
+        bool allDecodeTokens = (int)seqLens.size() == batch;
+        for (int i = 0; i < batch; i++) {
+            allDecodeTokens &= (seqLens[i] == 1);
+        }
+        if (!allDecodeTokens) {
+            ErrorInFastLLM("DeepSeekV4Model::ForwardBatch only supports batched decode for now.");
+        }
+        if ((int)pastKeyValues.size() < batch * block_cnt ||
+            (int)generationConfigs.size() < batch ||
+            (int)lastTokens.units.size() < batch) {
+            ErrorInFastLLM("DeepSeekV4Model::ForwardBatch got invalid batched decode inputs.");
+        }
+
+        Data decodeInputIds;
+        Copy(inputIds, decodeInputIds);
+        if ((int)decodeInputIds.Count(0) != batch) {
+            ErrorInFastLLM("DeepSeekV4Model::ForwardBatch decode input size mismatch.");
+        }
+        decodeInputIds.Reshape({batch, 1});
+
+        std::vector<int> startPositions(batch, 0);
+        std::vector<std::shared_ptr<DeepSeekV4RequestState> > requestStates(batch);
+        for (int b = 0; b < batch; b++) {
+            requestStates[b] = GetRequestStateByFirstKey(pastKeyValues[b * block_cnt].first);
+            if (!requestStates[b]) {
+                ErrorInFastLLM("DeepSeekV4Model::ForwardBatch missing request state.");
+            }
+            if (positionIds.size() > b && positionIds[b] != nullptr && positionIds[b]->Count(0) > 0) {
+                auto pids = ReadTokenIds(*positionIds[b]);
+                startPositions[b] = pids.empty() ? 0 : pids[0];
+            } else if (!requestStates[b]->decodeLayerCaches.empty()) {
+                startPositions[b] = requestStates[b]->decodeLayerCaches[0].totalLen;
+            }
+            if (startPositions[b] == 0) {
+                requestStates[b]->decodeLayerCaches.clear();
+                requestStates[b]->decodeLayerCaches.resize(block_cnt);
+            } else if ((int)requestStates[b]->decodeLayerCaches.size() < block_cnt) {
+                ErrorInFastLLM("DeepSeekV4Model::ForwardBatch decode cache is not initialized.");
+            }
+        }
+
+        Data hiddenStates, hiddenStatesBeforeHcExpand;
+        Embedding(decodeInputIds, weight["embed.weight"], hiddenStatesBeforeHcExpand);
+
+        int bsz = batch;
+        int seqlen = 1;
+        int dim = embed_dim;
+        hiddenStatesBeforeHcExpand.Reshape({bsz, seqlen, 1, dim});
+        Repeat(hiddenStatesBeforeHcExpand, 2, hc_mult, hiddenStates);
+
+        std::vector<int> tokenIds = ReadTokenIds(decodeInputIds);
+        if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled()) {
+            for (int b = 0; b < batch; b++) {
+                auto &historyTokens = requestStates[b]->historyTokens;
+                if (startPositions[b] == 0) {
+                    historyTokens = std::vector<int>{tokenIds[b]};
+                } else if ((int)historyTokens.size() == startPositions[b]) {
+                    historyTokens.push_back(tokenIds[b]);
+                } else if ((int)historyTokens.size() < startPositions[b]) {
+                    if (DeepSeekV4PrefixCacheDebugEnabled()) {
+                        printf("[fastllm-dsv4-prefix-cache] reset token history: history=%d start=%d add=1\n",
+                               (int)historyTokens.size(), startPositions[b]);
+                        fflush(stdout);
+                    }
+                    historyTokens.clear();
+                }
+            }
+        }
+
+        bool cudaSe = GetCudaSharedExpert();
+        if (weights.empty()) {
+            auto getWeightPtr = [this](const std::string &name) -> Data* {
+                auto it = this->weight.weight.find(name);
+                return it == this->weight.weight.end() ? nullptr : &it->second;
+            };
+            weights.resize(block_cnt);
+            biass.resize(block_cnt);
+            for (int layer = 0; layer < block_cnt; layer++) {
+                std::string pre = "layers." + std::to_string(layer) + ".ffn";
+                weights[layer].push_back(getWeightPtr(pre + ".shared_experts.gateup.weight"));
+                weights[layer].push_back(getWeightPtr(pre + ".shared_experts.w2.weight"));
+                biass[layer].push_back(nullptr);
+                biass[layer].push_back(nullptr);
+                for (int expert = 0; expert < num_experts; expert++) {
+                    weights[layer].push_back(getWeightPtr(pre + ".experts." + std::to_string(expert) + ".gateup.weight"));
+                    weights[layer].push_back(getWeightPtr(pre + ".experts." + std::to_string(expert) + ".w2.weight"));
+                    biass[layer].push_back(nullptr);
+                    biass[layer].push_back(nullptr);
+                }
+            }
+        }
+
+        Data attnInput;
+        Data qr, qNorm, q, kv;
+        HcMix attnMix, ffnMix;
+        Data hiddenStatesTemp;
+        Data *curHiddenStates = &hiddenStates;
+        Data *nextHiddenStates = &hiddenStatesTemp;
+        Data ffnInput, ffnOut, expertIndex, expertScore;
+        Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
+        auto runHcPost = [&](Data &input, const HcMix &mix) {
+            DeepSeekV4HcPost(input, *curHiddenStates, mix.postData, mix.combData, *nextHiddenStates);
+            std::swap(curHiddenStates, nextHiddenStates);
+        };
+
+        for (int layer = 0; layer < block_cnt; layer++) {
+            std::string pre = "layers." + std::to_string(layer);
+            int compressRatio = compress_ratios.size() > layer ? compress_ratios[layer] : 0;
+            bool useCompressRope = compressRatio != 0;
+            float layerRopeBase = useCompressRope ? compress_rope_theta : rope_base;
+            int layerOriginalSeqLen = useCompressRope ? (int)rope_scaling_original_max_position_embeddings : 0;
+
+            DeepSeekV4HcPre(*curHiddenStates, weight[pre + ".hc_attn_fn"],
+                            weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
+                            hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                            attnMix.y, attnMix.postData, attnMix.combData);
+            attnMix.b = bsz;
+            attnMix.s = seqlen;
+            attnMix.hc = hc_mult;
+
+            RMSNormReference(attnMix.y, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput, DataType::BFLOAT16);
+            Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr);
+            RMSNormReference(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm, DataType::BFLOAT16);
+            Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
+            q.Reshape({bsz, seqlen, num_attention_heads, head_dim_full});
+
+            std::vector<Data> qParts(batch);
+            std::vector<Data*> qPartPtrs(batch);
+            for (int b = 0; b < batch; b++) {
+                Split(q, 0, b, b + 1, qParts[b]);
+                ScaleQRatory(qParts[b], rms_norm_eps, qk_rope_head_dim, layerRopeBase,
+                             startPositions[b], layerOriginalSeqLen, rope_factor,
+                             rope_scaling_beta_fast, rope_scaling_beta_slow);
+                qPartPtrs[b] = &qParts[b];
+            }
+
+            Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv);
+            RMSNormReference(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv, DataType::BFLOAT16);
+            kv.Reshape({bsz, seqlen, 1, head_dim_full});
+            std::vector<Data> kvParts(batch);
+            for (int b = 0; b < batch; b++) {
+                Split(kv, 0, b, b + 1, kvParts[b]);
+                DeepSeekV4RotaryQuant(kvParts[b], qk_rope_head_dim, layerRopeBase,
+                                      startPositions[b], layerOriginalSeqLen, rope_factor,
+                                      rope_scaling_beta_fast, rope_scaling_beta_slow,
+                                      head_dim_full - qk_rope_head_dim, 64);
+                kvParts[b].Reshape({1, 1, head_dim_full});
+            }
+
+            Data compressorKVAll, compressorScoreAll;
+            if (compressRatio > 0) {
+                ComputeCompressorRaw(weight, pre + ".attn.compressor", attnInput,
+                                     compressorKVAll, compressorScoreAll);
+            }
+
+            std::vector<Data> attnOutParts(batch);
+            std::vector<Data*> attnOutPtrs(batch);
+            std::vector<Data*> windowKVPtrs(batch, nullptr);
+            std::vector<Data*> compressedKVPtrs(batch, nullptr);
+            std::vector<int> layerCompressedCounts(batch, 0);
+            std::vector<char> cachedDecode(batch, 0);
+            for (int b = 0; b < batch; b++) {
+                auto &decodeCaches = requestStates[b]->decodeLayerCaches;
+                DeepSeekV4DecodeLayerCache &decodeCache = decodeCaches[layer];
+                int startPos = startPositions[b];
+                int decodeCompressedCount = 0;
+
+                if (startPos == 0) {
+                    decodeCache.initialized = true;
+                    decodeCache.bsz = 1;
+                    decodeCache.totalLen = seqlen;
+                    decodeCache.headDim = head_dim_full;
+                    decodeCache.windowSize = window_size;
+                    decodeCache.compressRatio = compressRatio;
+                    decodeCache.compressorWideDim = (compressRatio == 4 ? 2 : 1) * head_dim_full;
+                    decodeCache.compressorRawTokenBase = 0;
+                    StoreWindowKVCache(kvParts[b], 1, seqlen, head_dim_full, startPos, window_size,
+                                       decodeCache.windowKV);
+                } else {
+                    if (!decodeCache.initialized) {
+                        ErrorInFastLLM("DeepSeekV4Model::ForwardBatch decode cache is not initialized.");
+                    }
+                    decodeCache.totalLen = startPos + seqlen;
+                    UpdateWindowKVCache(kvParts[b], 1, head_dim_full, startPos, window_size,
+                                        decodeCache.windowKV);
+                }
+
+                const Data *decodeCompressedKVForAttention = &decodeCache.compressedKV;
+                if (compressRatio > 0) {
+                    Data compressorKV, compressorScore;
+                    Split(compressorKVAll, 0, b, b + 1, compressorKV);
+                    Split(compressorScoreAll, 0, b, b + 1, compressorScore);
+                    int compressedCutoff = decodeCache.totalLen - (decodeCache.totalLen % compressRatio);
+                    int targetCompressedBlocks = compressRatio > 0 ? compressedCutoff / compressRatio : 0;
+                    bool targetCompressedReady = targetCompressedBlocks > 0 &&
+                        decodeCache.compressedBlocks == targetCompressedBlocks &&
+                        HasCompressedKVData(decodeCache.compressedKV);
+
+                    const Data *compressorKVForBuild = &decodeCache.compressorKVRaw;
+                    const Data *compressorScoreForBuild = &decodeCache.compressorScoreRaw;
+                    int compressorRawTokenBaseForBuild = decodeCache.compressorRawTokenBase;
+                    if (startPos == 0) {
+                        Copy(compressorKV, decodeCache.compressorKVRaw);
+                        Copy(compressorScore, decodeCache.compressorScoreRaw);
+                        decodeCache.compressorRawTokenBase = 0;
+                    } else if (!targetCompressedReady) {
+                        AppendCompressorRaw(compressorKV, compressorScore, 1, seqlen,
+                                            decodeCache.compressorWideDim,
+                                            decodeCache.compressorKVRaw,
+                                            decodeCache.compressorScoreRaw);
+                    }
+
+                    if (targetCompressedReady) {
+                        decodeCompressedCount = decodeCache.compressedBlocks;
+                        decodeCompressedKVForAttention = &decodeCache.compressedKV;
+                    } else {
+                        bool builtCompressed = BuildCompressedKVFromRaw(
+                            weight, pre + ".attn.compressor", *compressorKVForBuild,
+                            *compressorScoreForBuild, 1, compressorRawTokenBaseForBuild,
+                            decodeCache.totalLen, compressRatio, head_dim_full,
+                            qk_rope_head_dim, layerRopeBase, rope_factor,
+                            rope_scaling_beta_fast, rope_scaling_beta_slow,
+                            layerOriginalSeqLen, decodeCache.compressedKV, true);
+                        if (builtCompressed) {
+                            int builtBlocks = GetReusableCompressedBlocks(decodeCache.compressedKV,
+                                                                          1, targetCompressedBlocks,
+                                                                          head_dim_full);
+                            decodeCache.compressedBlocks = builtBlocks;
+                            decodeCompressedCount = decodeCache.compressedBlocks;
+                            TrimCompressorRawCache(1, decodeCache.totalLen, compressRatio,
+                                                   decodeCache.compressorWideDim,
+                                                   decodeCache.compressedBlocks,
+                                                   decodeCache.compressorKVRaw,
+                                                   decodeCache.compressorScoreRaw,
+                                                   decodeCache.compressorRawTokenBase);
+                            decodeCompressedKVForAttention = &decodeCache.compressedKV;
+                        }
+                    }
+                }
+
+                windowKVPtrs[b] = &decodeCache.windowKV;
+                compressedKVPtrs[b] = (Data*)decodeCompressedKVForAttention;
+                layerCompressedCounts[b] = decodeCompressedCount;
+                cachedDecode[b] = startPos > 0 ? 1 : 0;
+            }
+
+            Data attnOut4, woAOut, attnOut;
+            bool allCachedDecode = batch > 1;
+            for (int b = 0; b < batch; b++) {
+                allCachedDecode = allCachedDecode && cachedDecode[b] != 0;
+            }
+            bool usedBatchSparseDecode = false;
+            if (allCachedDecode) {
+                usedBatchSparseDecode = SparseAttentionDecodeCachedBatch(
+                    weight[pre + ".attn.attn_sink"], window_size,
+                    qk_rope_head_dim, layerRopeBase,
+                    1.0f / std::sqrt((float)head_dim_full),
+                    startPositions, layerCompressedCounts, qPartPtrs,
+                    windowKVPtrs, compressedKVPtrs, attnOut4,
+                    layerOriginalSeqLen, rope_factor,
+                    rope_scaling_beta_fast, rope_scaling_beta_slow);
+            }
+
+            if (!usedBatchSparseDecode) {
+                for (int b = 0; b < batch; b++) {
+                    if (startPositions[b] > 0) {
+                        SparseAttentionDecodeCachedReference(qParts[b], *windowKVPtrs[b],
+                                                             *compressedKVPtrs[b],
+                                                             weight[pre + ".attn.attn_sink"],
+                                                             window_size, startPositions[b],
+                                                             layerCompressedCounts[b],
+                                                             qk_rope_head_dim, layerRopeBase,
+                                                             1.0f / std::sqrt((float)head_dim_full),
+                                                             attnOutParts[b], layerOriginalSeqLen,
+                                                             rope_factor, rope_scaling_beta_fast,
+                                                             rope_scaling_beta_slow);
+                    } else {
+                        SparseAttentionReference(qParts[b], kvParts[b], weight[pre + ".attn.attn_sink"], window_size,
+                                                 qk_rope_head_dim, layerRopeBase, startPositions[b],
+                                                 1.0f / std::sqrt((float)head_dim_full), attnOutParts[b],
+                                                 compressRatio, layerOriginalSeqLen, rope_factor,
+                                                 rope_scaling_beta_fast, rope_scaling_beta_slow);
+                    }
+                    attnOutPtrs[b] = &attnOutParts[b];
+                }
+                CatBatch(attnOutPtrs, 0, attnOut4);
+            }
+
+            DeepSeekV4WoA(attnOut4, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+            Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnOut);
+            runHcPost(attnOut, attnMix);
+
+            DeepSeekV4HcPre(*curHiddenStates, weight[pre + ".hc_ffn_fn"],
+                            weight[pre + ".hc_ffn_scale"], weight[pre + ".hc_ffn_base"],
+                            hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                            ffnMix.y, ffnMix.postData, ffnMix.combData);
+            ffnMix.b = bsz;
+            ffnMix.s = seqlen;
+            ffnMix.hc = hc_mult;
+            RMSNormReference(ffnMix.y, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput, DataType::BFLOAT16);
+            std::vector<int> ffnDims = ffnInput.dims;
+            ffnInput.Reshape({bsz * seqlen, dim});
+            BuildMoERoutingData(weight, pre + ".ffn", ffnInput, tokenIds, num_experts,
+                                num_experts_per_tok, scoring_func, routed_scaling_factor,
+                                expertIndex, expertScore);
+            {
+                Data sharedExpertOut;
+                bool hasSharedExpertOut = false;
+                if (cudaSe &&
+                    weight.weight.find(pre + ".ffn.shared_experts.gateup.weight") != weight.weight.end() &&
+                    weight.weight.find(pre + ".ffn.shared_experts.w2.weight") != weight.weight.end()) {
+                    Data ww1, ww3;
+                    LinearSwigluBlock(&ffnInput, &weight[pre + ".ffn.shared_experts.gateup.weight"], GetEmptyData(), &ww3, &ww1);
+                    Linear(ww1, weight[pre + ".ffn.shared_experts.w2.weight"], *GetEmptyData(), sharedExpertOut);
+                    weights[layer][0] = weights[layer][1] = nullptr;
+                    hasSharedExpertOut = true;
+                }
+                ApplyDeviceMap(this->moeDeviceMap, layer + 1, block_cnt);
+                {
+                    DataType effectiveMoeAtype = ffnInput.dataType;
+                    MergeMOEBlock(&ffnInput, &expertIndex, &expertScore,
+                                  &weights[layer], &biass[layer],
+                                  &w1, &w2, &w3, &tempInput, &tempOutput,
+                                  1.0f, &ffnOut, layer,
+                                  ffnInput.dataType, effectiveMoeAtype,
+                                  &moeInputTemp, &moeOutputTemp);
+                }
+                ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
+                if (hasSharedExpertOut) {
+                    ffnOut.ToDevice(sharedExpertOut.dataDevice);
+                    AddTo(ffnOut, sharedExpertOut);
+                }
+            }
+            ffnOut.Reshape(ffnDims);
+#ifdef USE_CUDA
+            if (DeepSeekV4PreferCuda() && ffnOut.dataDevice == DataDevice::CPU && ffnOut.cpuData != nullptr) {
+                ffnOut.ToDevice(DataDevice::CUDA);
+            }
+#endif
+            runHcPost(ffnOut, ffnMix);
+        }
+
+        Data headInput;
+        HcHeadReference(*curHiddenStates, weight["hc_head_fn"], weight["hc_head_scale"], weight["hc_head_base"],
+                        hc_mult, hc_eps, rms_norm_eps, headInput);
+
+        std::vector<int> ret;
+        std::vector<int> samplingSeqLens(batch, 1);
+        std::vector<GenerationConfig> samplingGenerationConfigs = generationConfigs;
+        for (int b = 0; b < batch; b++) {
+            if (samplingGenerationConfigs[b].top_k <= 1) {
+                samplingGenerationConfigs[b].top_k = 5;
+            }
+        }
+        LLMSamplingBlock(this, &headInput, &weight["norm.weight"], &weight["head.weight"],
+                         rms_norm_eps, batch, true, samplingSeqLens, pastKeyValues,
+                         samplingGenerationConfigs, lastTokens, retLogits, ret);
+
+        for (int b = 0; b < batch; b++) {
+            int finalTotalLen = startPositions[b] + 1;
+            UpdateDebugPastKeyValues(pastKeyValues, b, 1, finalTotalLen, block_cnt);
+            if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
+                finalTotalLen % 256 == 0 &&
+                (int)requestStates[b]->historyTokens.size() >= finalTotalLen) {
+                this->RecordHistorySnapshot(requestStates[b]->historyTokens, finalTotalLen,
+                                            requestStates[b]->decodeLayerCaches);
+            } else if (this->saveHistoryChat && !DeepSeekV4PrefixCacheDisabled() &&
+                       finalTotalLen % 256 == 0 && DeepSeekV4PrefixCacheDebugEnabled()) {
+                printf("[fastllm-dsv4-prefix-cache] skip boundary record: final_len=%d history_tokens=%d\n",
+                       finalTotalLen, (int)requestStates[b]->historyTokens.size());
+                fflush(stdout);
+            }
+        }
+        return ret;
     }
 
     bool DeepSeekV4Model::NeedAttentionMask(int qlen, int klen) {

@@ -258,6 +258,7 @@ namespace fastllm {
         std::vector<int> deepseekV4HistoryTokens;
         std::mutex requestStateMutex;
         std::map<const void*, std::shared_ptr<DeepSeekV4RequestState> > requestStates;
+        std::map<const void*, std::shared_ptr<DeepSeekV4RequestState> > requestStatesByFirstKey;
         std::shared_ptr<DeepSeekV4RequestState> pendingRequestState;
 
         bool RestoreHistoryCacheMemory(const DeepSeekV4HistoryCacheMemory &memory);
@@ -267,6 +268,7 @@ namespace fastllm {
         void RecordHistorySnapshot(const std::vector<int> &tokens, int totalLen,
                                    const std::vector<DeepSeekV4DecodeLayerCache> &decodeCaches);
         std::shared_ptr<DeepSeekV4RequestState> GetRequestState(std::vector<std::pair<Data, Data> > &pastKeyValues);
+        std::shared_ptr<DeepSeekV4RequestState> GetRequestStateByFirstKey(const Data *firstPastKey);
     };
 }
 
