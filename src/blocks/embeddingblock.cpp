@@ -19,7 +19,13 @@ namespace fastllm {
             }
         } else {
             if (weight->dataType != outputType) {
-                ToDataType(*weight, outputType);
+                if (weight->dataDevice != DataDevice::CPU) {
+                    weight->ToDevice(DataDevice::CPU);
+                }
+                ToDataTypeForceCPU(*weight, outputType);
+            }
+            if (weight->dataDevice == DataDevice::CPU) {
+                weight->directMemory = true;
             }
         }
         EmbeddingDirect(*input, *weight, *output);

@@ -86,6 +86,20 @@ namespace fastllm {
             }
         }
 
+#ifdef USE_CUDA
+        static void *CudaMallocForData(const Data &data, uint64_t bytes) {
+            return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
+        }
+
+        static void CudaFreeForData(const Data &data, void *ptr) {
+            if (data.directMemory) {
+                FastllmCudaDirectFree(ptr);
+            } else {
+                FastllmCudaFree(ptr);
+            }
+        }
+#endif
+
         static void PrintRangesInline(const std::vector <std::pair <int, int> > &ranges) {
             if (ranges.empty()) {
                 printf("(no range)");
@@ -1811,7 +1825,7 @@ namespace fastllm {
                 int unitSize = this->unitSize;
                 FastllmCudaMemcpy2DDeviceToDevice((uint8_t*)this->cudaData, input0Stride * unitSize,
                                             (uint8_t*)old, input1Stride * unitSize, this->dims[axis] * inner * unitSize, outer);
-                FastllmCudaFree(old);
+                CudaFreeForData(*this, old);
                 FastllmCudaClearBigBuffer();
 #else
                 ErrorInFastLLM("Error: cuda is not supported.\n");
@@ -2186,7 +2200,7 @@ namespace fastllm {
                             needRealloc = (ptrDevice != destDevice);
                         }
                         if (needRealloc) {
-                            FastllmCudaFree(this->cudaData);
+                            CudaFreeForData(*this, this->cudaData);
                             this->cudaData = nullptr;
                         }
                     }
@@ -2201,7 +2215,7 @@ namespace fastllm {
                         }
 #endif
                         if (this->cudaData == nullptr) {
-                            this->cudaData = FastllmCudaMalloc(expansionBytes);
+                            this->cudaData = CudaMallocForData(*this, expansionBytes);
                         }
 
                         if (cpuData != nullptr) {
@@ -2234,7 +2248,7 @@ namespace fastllm {
 #endif
                     } else {
                         if (this->cudaData == nullptr) {
-                            this->cudaData = FastllmCudaMalloc(expansionBytes);
+                            this->cudaData = CudaMallocForData(*this, expansionBytes);
                         }
                     }
                 }
@@ -2248,7 +2262,7 @@ namespace fastllm {
                     }
 
                     if (this->isModelWeight || this->isKVCache) {
-                        FastllmCudaFree(this->cudaData);
+                        CudaFreeForData(*this, this->cudaData);
                         this->cudaData = nullptr;
                     }
                 } else if (device == DataDevice::CUDA) {
@@ -2262,12 +2276,12 @@ namespace fastllm {
                     int destDevice = deviceIds.size() == 0 ? 0 : deviceIds[0];
                     if (sourceDevice != destDevice) {
                                         FastllmCudaSetDevice(destDevice);
-                                        void *newCudaData = FastllmCudaMalloc(expansionBytes);
+                                        void *newCudaData = CudaMallocForData(*this, expansionBytes);
                                         if (copyData) {
                                             FastllmCudaMemcpyBetweenDevices(destDevice, newCudaData, sourceDevice, this->cudaData, expansionBytes);
                                         }
                                         FastllmCudaSetDevice(sourceDevice);
-                                        FastllmCudaFree(this->cudaData);
+                                        CudaFreeForData(*this, this->cudaData);
                                         this->cudaData = newCudaData;
                                         FastllmCudaSetDevice(destDevice);
                     }
