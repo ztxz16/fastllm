@@ -3492,7 +3492,8 @@ extern "C" bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data
     if (const char *env = std::getenv("FASTLLM_DSV4_HCPRE_CUBLAS_MIN_TOKENS")) {
         cublasMinTokens = std::max(1, std::atoi(env));
     }
-    if (std::getenv("FASTLLM_DSV4_ENABLE_CUDA_HCPRE_CUBLAS") != nullptr && tokens >= cublasMinTokens) {
+    if (std::getenv("FASTLLM_DSV4_DISABLE_CUDA_HCPRE_CUBLAS") == nullptr &&
+        tokens >= cublasMinTokens) {
         float *cublasDots = (float *)FastllmCudaMalloc((size_t)tokens * (mixHc + 1) * sizeof(float));
         if (cublasDots != nullptr) {
             bool cublasOk = false;
