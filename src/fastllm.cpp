@@ -2059,8 +2059,19 @@ namespace fastllm {
         // TODO: 这里先直接跳过了
         return;
 #endif
-        if (this->dataDevice == device &&
-            (this->dataDevice == DataDevice::CPU || deviceIds.size() == 0 || this->dataDeviceIds == deviceIds)) {
+        bool alreadyOnTarget = this->dataDevice == device &&
+            (this->dataDevice == DataDevice::CPU || deviceIds.size() == 0 || this->dataDeviceIds == deviceIds);
+#ifdef USE_CUDA
+        if (alreadyOnTarget && this->dataDevice == DataDevice::CUDA &&
+            this->cudaData != nullptr && deviceIds.size() > 0) {
+            int targetDevice = deviceIds.size() == 0 ? FastllmCudaGetDevice() : deviceIds[0];
+            int realDevice = GetPointerDeviceId(this->cudaData);
+            if (realDevice >= 0 && realDevice != targetDevice) {
+                alreadyOnTarget = false;
+            }
+        }
+#endif
+        if (alreadyOnTarget) {
             return;
         }
 
