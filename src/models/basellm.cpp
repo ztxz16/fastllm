@@ -2378,6 +2378,51 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             fastllm::SetMaxTokens(minPages * pageLen);
         }
 
+#ifdef USE_CUDA
+        if (len > 1) {
+            // Load long-lived weights before the large prefill warmup creates
+            // sequence-length-sized activation blocks in the CUDA pool.
+            const int weightWarmupLen = 1;
+            std::vector <float> weightWarmupIds(weightWarmupLen, 1.0f);
+            Data weightWarmupInputIds = Data(DataType::FLOAT32, {1, weightWarmupLen}, weightWarmupIds);
+            std::vector <float> weightWarmupPosData(weightWarmupLen);
+            for (int i = 0; i < weightWarmupLen; i++) weightWarmupPosData[i] = i;
+            Data weightWarmupPositionIds = Data(this->dataType, {1, weightWarmupLen}, weightWarmupPosData);
+            std::vector <Data*> weightWarmupAttentionMasks = {nullptr};
+            std::vector <Data*> weightWarmupPositionIdsVec = {&weightWarmupPositionIds};
+            std::vector <int> weightWarmupSeqLens = {weightWarmupLen};
+            std::vector <std::pair <Data, Data> > weightWarmupPastKeyValuesStorage;
+            std::vector <std::pair <Data*, Data*> > weightWarmupPastKeyValues;
+            for (int i = 0; i < block_cnt; i++) {
+                weightWarmupPastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
+                weightWarmupPastKeyValuesStorage.back().first.SetKVCache();
+                weightWarmupPastKeyValuesStorage.back().second.SetKVCache();
+            }
+            for (int i = 0; i < block_cnt; i++) {
+                weightWarmupPastKeyValues.push_back(std::make_pair(&weightWarmupPastKeyValuesStorage[i].first, &weightWarmupPastKeyValuesStorage[i].second));
+            }
+            GenerationConfig weightWarmupGenerationConfig;
+            std::vector <GenerationConfig> weightWarmupGenerationConfigs = {weightWarmupGenerationConfig};
+            LastTokensManager weightWarmupLastTokens;
+            ForwardV2(1, weightWarmupInputIds, weightWarmupAttentionMasks, weightWarmupPositionIdsVec,
+                      weightWarmupSeqLens, weightWarmupPastKeyValues, weightWarmupGenerationConfigs,
+                      weightWarmupLastTokens, nullptr);
+
+            for (auto &kv : weightWarmupPastKeyValuesStorage) {
+                kv.first.pageIndex.clear();
+                kv.first.pagedKVCacheData = nullptr;
+                kv.first.isPagedKVCache = false;
+                kv.second.pageIndex.clear();
+                kv.second.pagedKVCacheData = nullptr;
+                kv.second.isPagedKVCache = false;
+            }
+            weightWarmupPastKeyValuesStorage.clear();
+            weightWarmupPastKeyValues.clear();
+            ClearAllPagedCacheManagers();
+            FastllmCudaClearBigBuffer();
+        }
+#endif
+
         std::vector <float> ids(len, 1.0f);
         Data inputIds = Data(DataType::FLOAT32, {1, len}, ids);
         std::vector <float> posData(len);
