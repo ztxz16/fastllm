@@ -2330,16 +2330,8 @@ namespace fastllm {
                     } else if (seqLens[0] > prefillChunkSize) {
                         int len = seqLens[0];
                         for (int st = 0; st < len; ) {
-                            if (model->verbose) {
-                                genTokens += seqLens.size();
-                                auto nowTime = std::chrono::system_clock::now();
-                                float spend = GetSpan(lastRecordTime, nowTime);
-                                if (spend > 1) {
-                                    printf("Long Prefill ... (%d%%)\n", st * 100 / len);
-                                    lastRecordTime = nowTime;
-                                }
-                            }
-                            int curLen = std::min(st == 0 ? prefillChunkSize : prefillChunkSize, len - st);
+                            int curLen = std::min(prefillChunkSize, len - st);
+                            auto chunkStartTime = std::chrono::system_clock::now();
                             Data curInput, curPositionIds;
                             Split(inputIds, 1, st, st + curLen, curInput);
                             if (positionIds[0] != nullptr) {
@@ -2352,14 +2344,36 @@ namespace fastllm {
                                                                   *pastKeyValue, generationConfigs[0],
                                                                   tokensManager, logits[0])};
                             st += curLen;
+                            if (model->verbose) {
+                                auto chunkEndTime = std::chrono::system_clock::now();
+                                float chunkSpend = GetSpan(chunkStartTime, chunkEndTime);
+                                float chunkSpeed = chunkSpend > 0 ? curLen / chunkSpend : 0;
+                                printf("[Prompt] Long Prefill ... (%d/%d, %d%%). Speed: %f tokens / s.\n",
+                                       st, len, st * 100 / len, chunkSpeed);
+                                lastRecordTime = chunkEndTime;
+                                genTokens = 0;
+                            }
                         }
                     } else {
                         Data emptyAttention, emptyPosition;
+                        bool recordPrefillSpeed = model->verbose && seqLens[0] > 1;
+                        std::chrono::system_clock::time_point prefillStartTime;
+                        if (recordPrefillSpeed) {
+                            prefillStartTime = std::chrono::system_clock::now();
+                        }
                         ret = std::vector<int>{model->Forward(inputIds,
                                                               attentionMasks[0] == nullptr ? emptyAttention : *attentionMasks[0],
                                                               positionIds[0] == nullptr ? emptyPosition : *positionIds[0],
                                                               *pastKeyValue, generationConfigs[0],
                                                               tokensManager, logits[0])};
+                        if (recordPrefillSpeed) {
+                            auto prefillEndTime = std::chrono::system_clock::now();
+                            float prefillSpend = GetSpan(prefillStartTime, prefillEndTime);
+                            float prefillSpeed = prefillSpend > 0 ? seqLens[0] / prefillSpend : 0;
+                            printf("[Prompt] %d Tokens. Speed: %f tokens / s.\n", seqLens[0], prefillSpeed);
+                            lastRecordTime = prefillEndTime;
+                            genTokens = 0;
+                        }
                     }
                 }
 
@@ -2384,8 +2398,9 @@ namespace fastllm {
                                 pending++;
                             }
                         }
-                        printf("[DeepSeekV4 Decode] alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n",
-                               alive, pending, aliveLen, (float)genTokens / spend);
+                        float kvUsage = maxTotalLens > 0 ? aliveLen * 100.0f / maxTotalLens : 0;
+                        printf("[Decode] alive = %d, pending = %d, context usages: %.1f%%, Speed: %f tokens / s.\n",
+                               alive, pending, kvUsage, (float)genTokens / spend);
                         lastRecordTime = nowTime;
                         genTokens = 0;
                     }
