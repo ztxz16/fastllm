@@ -24,7 +24,7 @@ namespace fastllm {
     void DoCudaCatDirectBatch(Data **input0s, Data **input1s, int batch, int axis);
     void DoCudaPermuteSelf(Data &input, const std::vector <int> &axis);
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
-        Data **weights, Data **biass, float sharedScale, MoeGateType gateType = MoeGateSwiglu);
+        Data **weights, Data **biass, float sharedScale, MoeGateType gateType = MoeGateSwiglu, int weightsBatch = -1);
     void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale, bool inited = false);
     
     class CudaDevice : BaseDevice {

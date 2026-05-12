@@ -525,7 +525,7 @@ bool FastllmCudaMatMulFloatFP8E4M3Block128(const fastllm::Data &input, fastllm::
     return true;
 }
 
-static void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
+void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
     if (weight.cudaData == nullptr || weight.extraCudaData.size() == 0) {
         float *cudaScales;
         cudaError_t state = cudaSuccess;

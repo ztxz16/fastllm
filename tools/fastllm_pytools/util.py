@@ -29,6 +29,23 @@ def _uses_cuda_device(device) -> bool:
         return False
     return "cuda" in str(device).lower() or str(device).lower().startswith("cudapp=")
 
+def _is_moe_architecture(architecture: str, model_type: str = "", text_model_type: str = "") -> bool:
+    return (architecture in [
+        "DeepseekV3ForCausalLM",
+        "DeepseekV2ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
+        "MiniMaxM1ForCausalLM",
+        "MiniMaxText01ForCausalLM",
+        "HunYuanMoEV1ForCausalLM",
+        "Ernie4_5_MoeForCausalLM",
+        "PanguProMoEForCausalLM",
+        "Glm4MoeForCausalLM",
+        "Qwen3NextForCausalLM",
+        "MiniMaxM2ForCausalLM",
+    ] or model_type in ["deepseek_v4", "qwen3_5_moe"] or text_model_type == "qwen3_5_moe_text")
+
 def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description = des, add_help = add_help)
     parser.add_argument('model', nargs='?', help = '模型路径，fastllm模型文件或HF模型文件夹或配置文件')
@@ -135,6 +152,7 @@ def make_normal_llm_model(args):
     config_path = os.path.join(args.path, "config.json")
     if (not(os.path.exists(config_path)) and args.ori != "" and os.path.exists(os.path.join(args.ori, "config.json"))):
         config_path = os.path.join(args.ori, "config.json")
+    is_moe_model = False
     if (os.path.exists(config_path)):
         try:
             import json
@@ -145,6 +163,7 @@ def make_normal_llm_model(args):
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
+            is_moe_model = _is_moe_architecture(architecture, model_type, text_model_type)
 
             is_step3p5 = (architecture == 'Step3p5ForCausalLM' or
                           model_type == 'step3p5' or
@@ -173,21 +192,7 @@ def make_normal_llm_model(args):
                 architecture == 'Glm4MoeForCausalLM'):
                 if (args.enable_thinking == ""):
                     args.enable_thinking = "true"
-            if (architecture == 'DeepseekV3ForCausalLM' or 
-                architecture == 'DeepseekV2ForCausalLM' or 
-                architecture == 'DeepseekV4ForCausalLM' or 
-                model_type == 'deepseek_v4' or
-                architecture == 'Qwen3MoeForCausalLM' or 
-                architecture == 'Qwen3_5MoeForConditionalGeneration' or
-                model_type == 'qwen3_5_moe' or text_model_type == 'qwen3_5_moe_text' or
-                architecture == 'MiniMaxM1ForCausalLM' or 
-                architecture == 'MiniMaxText01ForCausalLM' or 
-                architecture == 'HunYuanMoEV1ForCausalLM' or 
-                architecture == 'Ernie4_5_MoeForCausalLM' or 
-                architecture == 'PanguProMoEForCausalLM' or
-                architecture == 'Glm4MoeForCausalLM' or 
-                architecture == 'Qwen3NextForCausalLM' or
-                architecture == 'MiniMaxM2ForCausalLM'):
+            if (is_moe_model):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
                 if ((not(args.device and args.device != ""))):
@@ -252,6 +257,8 @@ def make_normal_llm_model(args):
         args.dtype = "float16"
     if (args.moe_device == ""):
         args.moe_device = args.device
+    if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3" and _uses_cuda_device(args.moe_device)):
+        args.moe_atype = "float16"
     if (args.device and args.device != ""):
         expanded = expand_cudapp_device(args.device)
         if expanded != args.device:
