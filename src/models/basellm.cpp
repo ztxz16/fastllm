@@ -16,7 +16,7 @@
 
 namespace fastllm {
     static int NormalizeMaxBatchByModelCapability(basellm *model, int maxBatch) {
-        if (model != nullptr && !model->canDoBatchForward) {
+        if (model != nullptr && !model->canDoBatchForward && !model->canDoConcurrentForward) {
             model->maxBatch = 1;
             return 1;
         }
@@ -83,12 +83,25 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecord(basellm *model) {
-        model->TryRecordHistoryCache(this->allTokens);
-        if (model->saveHistoryChat) {
-            if (model->UseGenericHistoryCache()) {
-                model->pastKVCacheManager.Record(this->allTokens, this->allTokens.size(), &this->pastKeyValues);
-            }
+        model->TryRecordResponseContext(this);
+    }
+
+    void basellm::TryRecordResponseContext(ResponseContext *context) {
+        if (context == nullptr) {
+            return;
         }
+        this->TryRecordHistoryCache(context->allTokens);
+        if (this->saveHistoryChat && this->UseGenericHistoryCache()) {
+            this->pastKVCacheManager.Record(context->allTokens, context->allTokens.size(), &context->pastKeyValues);
+        }
+    }
+
+    void basellm::RemoveResponseContext(int handleId) {
+        ResponseContext *context = responseContextDict.GetHandle(handleId);
+        if (context != nullptr) {
+            this->OnResponseContextRemoved(context);
+        }
+        responseContextDict.RemoveHandle(handleId);
     }
 
     void ResponseContext::TryRecordPagedCache() {
@@ -261,6 +274,7 @@ namespace fastllm {
         {
             std::lock_guard<std::mutex> guard(responseContextDict.locker);
             for (auto &item : responseContextDict.dicts) {
+                this->OnResponseContextRemoved(item.second);
                 delete item.second;
             }
             responseContextDict.dicts.clear();
@@ -762,7 +776,7 @@ namespace fastllm {
                 orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
             }
             for (auto &it : abortHandles) {
-                model->responseContextDict.RemoveHandle(it);
+                model->RemoveResponseContext(it);
             }
             sort(orders.begin(), orders.end());
 
@@ -1271,20 +1285,25 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         mainLoopLocker.lock();
         if (mainLoop == nullptr) {
             if (mainLoop == nullptr) {
-                bool useNewEngine = this->use_new_engine;
-                const char *envVal = std::getenv("USE_OLD_ENGINE");
-                if (envVal != nullptr) {
-                    std::string val(envVal);
-                    std::transform(val.begin(), val.end(), val.begin(), ::tolower);
-                    if (val == "on" || val == "1") {
-                        useNewEngine = false;
-                    }
-                }
-                if (useNewEngine) {
+                if (this->UseModelSpecificScheduler()) {
                     mainLoop = new std::thread([](basellm *model) {
-                        model->NewMainLoop();
+                        model->RunModelSpecificScheduler();
                     }, this);
                 } else {
+                    bool useNewEngine = this->use_new_engine;
+                    const char *envVal = std::getenv("USE_OLD_ENGINE");
+                    if (envVal != nullptr) {
+                        std::string val(envVal);
+                        std::transform(val.begin(), val.end(), val.begin(), ::tolower);
+                        if (val == "on" || val == "1") {
+                            useNewEngine = false;
+                        }
+                    }
+                    if (useNewEngine) {
+                        mainLoop = new std::thread([](basellm *model) {
+                            model->NewMainLoop();
+                        }, this);
+                    } else {
                 mainLoop = new std::thread([](basellm *model) {
                     long long kvCacheLimit = 16LL << 30;
 #ifdef USE_CUDA
@@ -1374,7 +1393,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             }
                         }
                         for (auto &it : abortHandles) {
-                            model->responseContextDict.RemoveHandle(it);
+                            model->RemoveResponseContext(it);
                         }
 
                         int limit = maxTotalLens;
@@ -1574,11 +1593,13 @@ auto st = std::chrono::system_clock::now();
                                     dictLocker.lock();
                                     for (int i = 0; i < handles.size(); i++) {
                                         Data inputIdNow = Data(DataType::FLOAT32, {1, 1}, {ids[i]});
+                                        LastTokensManager singleTokens;
+                                        singleTokens.units.push_back(tokensManager.units[i]);
                                         ret.push_back(model->Forward(inputIdNow,
                                                             attentionMasks[i] == nullptr ? Data() : *attentionMasks[i],
                                                             *positionIds[i],
                                                             model->responseContextDict.dicts[handles[i]]->pastKeyValues,
-                                                            generationConfigs[i], tokensManager, logits[i]));
+                                                            generationConfigs[i], singleTokens, logits[i]));
                                     }
                                     dictLocker.unlock();
                                 } else {
@@ -1715,7 +1736,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                         }
                     }
                 }, this);
-                } // end of else (old engine)
+                    } // end of else (old engine)
+                }
             }
         }
         mainLoopLocker.unlock();
@@ -1760,6 +1782,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             context->cacheLen = len;
         }
 
+        this->OnResponseContextCreated(context);
+
         dictLocker.unlock();
         dictCV.notify_one();
         return handleId;
@@ -1800,7 +1824,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 } else {
                     if (context->isEnding) {
                         ResponseContextError err = context->error;
-                        responseContextDict.RemoveHandle(handleId);
+                        RemoveResponseContext(handleId);
                         dictLocker.unlock();
                         dictCV.notify_one();
                         if (err == ResponseContextErrorPromptTooLong) {
@@ -1834,7 +1858,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                     return ret;
                 } else {
                     if (context->isEnding) {
-                        responseContextDict.RemoveHandle(handleId);
+                        RemoveResponseContext(handleId);
                         dictLocker.unlock();
                         dictCV.notify_one();
                         return -1;

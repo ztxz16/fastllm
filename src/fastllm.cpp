@@ -1115,8 +1115,13 @@ namespace fastllm {
             } else if (dataType == DataType::FP8_E4M3 || dataType == DataType::NVFP4) {
                 this->blockK = blockK;
                 this->blockM = blockM;
-                int ks = (this->dims[0] - 1) / this->blockK + 1;
-                int ms = (this->dims[1] - 1) / this->blockM + 1;
+                int rows = 1;
+                for (int i = 0; i + 1 < (int)this->dims.size(); i++) {
+                    rows *= this->dims[i];
+                }
+                int cols = this->dims.back();
+                int ks = (rows - 1) / this->blockK + 1;
+                int ms = (cols - 1) / this->blockM + 1;
                 data.scales.resize(ks * ms);
                 memcpy(data.scales.data(), oriScales, ks * ms * sizeof(float));
             }
@@ -3461,6 +3466,77 @@ namespace fastllm {
         }, {}, {{"axis", axis}, {"repeatTimes", repeatTimes}});
     }
 
+    void Copy(const Data &input, Data &output) {
+        curExecutor->Run("Copy", {
+                {"input", (Data*)&input}, {"output", &output}
+        }, {}, {});
+    }
+
+    void DeepSeekV4HcPre(const Data &input, Data &hcFn, Data &hcScale, Data &hcBase,
+                         int hcMult, int sinkhornIters, float eps, float normEps,
+                         Data &output, Data &post, Data &comb) {
+        curExecutor->Run("DeepSeekV4HcPre", {
+                {"input", (Data*)&input}, {"hcFn", &hcFn}, {"hcScale", &hcScale}, {"hcBase", &hcBase},
+                {"output", &output}, {"post", &post}, {"comb", &comb}
+        }, {{"eps", eps}, {"normEps", normEps}}, {{"hcMult", hcMult}, {"sinkhornIters", sinkhornIters}});
+    }
+
+    void DeepSeekV4HcPost(const Data &input, const Data &residual, const Data &post, const Data &comb, Data &output) {
+        curExecutor->Run("DeepSeekV4HcPost", {
+                {"input", (Data*)&input}, {"residual", (Data*)&residual},
+                {"post", (Data*)&post}, {"comb", (Data*)&comb}, {"output", &output}
+        }, {}, {});
+    }
+
+    void ScaleQRatory(Data &q, float eps, int ropeDim, float ropeBase, int startPos,
+                      int originalSeqLen, float ropeFactor, int betaFast, int betaSlow) {
+        curExecutor->Run("ScaleQRatory", {
+                {"q", &q}
+        }, {{"eps", eps}, {"ropeBase", ropeBase}, {"ropeFactor", ropeFactor}},
+           {{"ropeDim", ropeDim}, {"startPos", startPos}, {"originalSeqLen", originalSeqLen},
+            {"betaFast", betaFast}, {"betaSlow", betaSlow}});
+    }
+
+    void DeepSeekV4RotaryQuant(Data &x, int ropeDim, float ropeBase, int startPos,
+                               int originalSeqLen, float ropeFactor, int betaFast, int betaSlow,
+                               int quantDim, int blockSize, int posStep) {
+        curExecutor->Run("DeepSeekV4RotaryQuant", {
+                {"input", &x}
+        }, {{"ropeBase", ropeBase}, {"ropeFactor", ropeFactor}},
+           {{"ropeDim", ropeDim}, {"startPos", startPos}, {"originalSeqLen", originalSeqLen},
+            {"betaFast", betaFast}, {"betaSlow", betaSlow}, {"quantDim", quantDim},
+            {"blockSize", blockSize}, {"posStep", posStep}});
+    }
+
+    void DeepSeekV4WoA(Data &o, Data &woA, int groups, int oRank, Data &output) {
+        curExecutor->Run("DeepSeekV4WoA", {
+                {"input", &o}, {"weight", &woA}, {"output", &output}
+        }, {}, {{"groups", groups}, {"oRank", oRank}});
+    }
+
+    void DeepSeekV4BuildCompressedKVFromRaw(const Data &kv, const Data &score,
+                                            Data &ape, Data &normWeight,
+                                            int rawTokenBase, int rawLen,
+                                            int blockStart, int blockCount,
+                                            int compressRatio, int headDim,
+                                            int ropeDim, float ropeBase,
+                                            float ropeFactor, int betaFast,
+                                            int betaSlow, int originalSeqLen,
+                                            bool overlap, bool preferCudaOutput,
+                                            Data &cache) {
+        curExecutor->Run("DeepSeekV4BuildCompressedKVFromRaw", {
+                {"kv", (Data*)&kv}, {"score", (Data*)&score},
+                {"ape", &ape}, {"normWeight", &normWeight}, {"cache", &cache}
+        }, {{"ropeBase", ropeBase}, {"ropeFactor", ropeFactor}},
+           {{"rawTokenBase", rawTokenBase}, {"rawLen", rawLen},
+            {"blockStart", blockStart}, {"blockCount", blockCount},
+            {"compressRatio", compressRatio}, {"headDim", headDim},
+            {"ropeDim", ropeDim}, {"betaFast", betaFast},
+            {"betaSlow", betaSlow}, {"originalSeqLen", originalSeqLen},
+            {"overlap", overlap ? 1 : 0},
+            {"preferCudaOutput", preferCudaOutput ? 1 : 0}});
+    }
+
     void Cat(const Data &input0, const Data &input1, int axis, Data &output) {
         curExecutor->Run("Cat", {
                 {"input0", (Data*)&input0}, {"input1", (Data*)&input1}, {"output", &output}
@@ -3706,8 +3782,19 @@ namespace fastllm {
 
     void RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale) {
         curExecutor->Run("RopeEncoding", {
-                {"input", &input}, {"positionIds", (Data*)&positionIds}
+            {"input", &input}, {"positionIds", (Data*)&positionIds}
         }, {{"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}}, {{"rotaryDim", rotaryDim}});
+    }
+
+    void Llama3RopeEncoding(Data &input, const Data &positionIds, int rotaryDim, float ropeTheta,
+                            float factor, float originalMaxPosition,
+                            float lowFreqFactor, float highFreqFactor) {
+        curExecutor->Run("Llama3RopeEncoding", {
+            {"input", &input}, {"positionIds", (Data*)&positionIds}
+        }, {{"ropeTheta", ropeTheta}, {"factor", factor},
+            {"originalMaxPosition", originalMaxPosition},
+            {"lowFreqFactor", lowFreqFactor}, {"highFreqFactor", highFreqFactor}},
+           {{"rotaryDim", rotaryDim}});
     }
 
     void Qwen35InterleavedRope(Data &input, const Data &positionIds, int rotaryDim,

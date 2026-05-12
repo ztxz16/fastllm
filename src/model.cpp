@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <cstdlib>
 #include <cmath>
+#include <climits>
 
 #include "chatglm.h"
 #include "moss.h"
@@ -19,6 +20,7 @@
 #include "qwen3_moe.h"
 #include "qwen3_next.h"
 #include "qwen3_5.h"
+#include "step3p5.h"
 #include "minimax_m2.h"
 #include "hunyuan.h"
 #include "deepseekv2.h"
@@ -256,6 +258,9 @@ namespace fastllm {
         } else if (modelType == "qwen3_5" || modelType == "qwen3_5_moe" || modelType == "qwen3_5_moe_text") {
             model = new Qwen3_5Model();
             model->model_type = modelType;
+        } else if (modelType == "step3p5") {
+            model = new Step3p5Model();
+            model->model_type = modelType;
         } else if (modelType == "phi3") {
             model = new Phi3Model();
             model->model_type = "phi3";
@@ -387,15 +392,26 @@ namespace fastllm {
         struct FP8E4M3ToFP32Manager fp8e4m3tofp32;
 
         void CreateBufferWithScale(DataType dstType, SafeTensorItem &scale) {
-            AssertInFastLLM(this->shape.size() == 2 && scale.shape.size() == 2, "CreateBufferWithScale error: shape.size() should be 2.");
+            AssertInFastLLM(this->shape.size() >= 2 && scale.shape.size() >= 2,
+                            "CreateBufferWithScale error: shape.size() should be >= 2.");
             bool isFp8 = this->dtype == "F8_E4M3";
             bool isPackedFp4 = this->dtype == "I8";
             if (!isFp8 && !isPackedFp4) {
                 ErrorInFastLLM("CreateBufferWithScale error: dtype should be FP8_E4M3 or packed FP4 I8");
             }
-            int n = this->shape[0], packedM = this->shape[1];
+            long long n64 = 1, ns64 = 1;
+            for (int i = 0; i + 1 < (int)this->shape.size(); i++) {
+                n64 *= this->shape[i];
+            }
+            for (int i = 0; i + 1 < (int)scale.shape.size(); i++) {
+                ns64 *= scale.shape[i];
+            }
+            AssertInFastLLM(n64 <= INT_MAX && ns64 <= INT_MAX &&
+                            this->shape.back() <= INT_MAX && scale.shape.back() <= INT_MAX,
+                            "CreateBufferWithScale error: shape is too large.");
+            int n = (int)n64, packedM = (int)this->shape.back();
             int m = isPackedFp4 ? packedM * 2 : packedM;
-            int ns = scale.shape[0], ms = scale.shape[1];
+            int ns = (int)ns64, ms = (int)scale.shape.back();
             int blockN = n / ns, blockM = m / ms;
 
             while ((blockN & -blockN) != blockN && blockN < n) {
@@ -817,8 +833,18 @@ namespace fastllm {
         weight.diskWeightParts.push_back(part);
 
         if (scaleTensor != nullptr) {
-            int n = tensor.shape[0], m = tensor.shape[1];
-            int ns = scaleTensor->shape[0], ms = scaleTensor->shape[1];
+            long long n64 = 1, ns64 = 1;
+            for (int i = 0; i + 1 < (int)tensor.shape.size(); i++) {
+                n64 *= tensor.shape[i];
+            }
+            for (int i = 0; i + 1 < (int)scaleTensor->shape.size(); i++) {
+                ns64 *= scaleTensor->shape[i];
+            }
+            AssertInFastLLM(n64 <= INT_MAX && ns64 <= INT_MAX &&
+                            tensor.shape.back() <= INT_MAX && scaleTensor->shape.back() <= INT_MAX,
+                            "Disk MoE scaled tensor shape is too large: " + weight.name + "\n");
+            int n = (int)n64, m = (int)tensor.shape.back();
+            int ns = (int)ns64, ms = (int)scaleTensor->shape.back();
             int blockK = n / ns, blockM = m / ms;
             while ((blockK & -blockK) != blockK && blockK < n) {
                 blockK++;
@@ -1862,27 +1888,6 @@ if (false) {
 
         // 4.1 读取权重
         auto tensors = safeTensors.GetSortedItemNames();
-        int debugLayerLimit = -1;
-        if (const char *env = std::getenv("FASTLLM_DEBUG_LAYERS")) {
-            debugLayerLimit = atoi(env);
-        }
-        if (debugLayerLimit > 0) {
-            auto temp = tensors;
-            tensors.clear();
-            std::string prefix = "layers.";
-            for (auto &tensorName : temp) {
-                if (StartWith(tensorName, prefix)) {
-                    int id = 0;
-                    for (int i = prefix.size(); i < (int)tensorName.size() && tensorName[i] >= '0' && tensorName[i] <= '9'; i++) {
-                        id = id * 10 + tensorName[i] - '0';
-                    }
-                    if (id >= debugLayerLimit) {
-                        continue;
-                    }
-                }
-                tensors.push_back(tensorName);
-            }
-        }
         
         // tensorMap[name]代表本名为name的tensor，创建后的名字以及类型
         // 有些tensor被共享，可能需要创建多次

@@ -34,10 +34,15 @@
 #include <cstdint>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 
 namespace fastllm {
     struct DeepSeekV4DecodeLayerCache {
+        DeepSeekV4DecodeLayerCache() = default;
+        DeepSeekV4DecodeLayerCache(const DeepSeekV4DecodeLayerCache &other);
+        DeepSeekV4DecodeLayerCache &operator=(const DeepSeekV4DecodeLayerCache &other);
+
         bool initialized = false;
         int bsz = 0;
         int totalLen = 0;
@@ -45,21 +50,23 @@ namespace fastllm {
         int windowSize = 0;
         int compressRatio = 0;
         int compressorWideDim = 0;
-        std::vector<float> windowKV;
-        Data windowKVData;
-        std::vector<float> compressorKVRaw;
-        std::vector<float> compressorScoreRaw;
+        Data windowKV;
+        Data compressorKVRaw;
+        Data compressorScoreRaw;
         int compressorRawTokenBase = 0;
         Data compressedKV;
-        Data compressedKVCuda;
         int compressedBlocks = 0;
         int compressedTokenBase = 0;
         int rawTailStartPos = 0;
-        std::vector<float> compressorTailKV;
-        std::vector<float> compressorTailScore;
+        Data compressorTailKV;
+        Data compressorTailScore;
     };
 
     struct DeepSeekV4HistoryLayerCache {
+        DeepSeekV4HistoryLayerCache() = default;
+        DeepSeekV4HistoryLayerCache(const DeepSeekV4HistoryLayerCache &other);
+        DeepSeekV4HistoryLayerCache &operator=(const DeepSeekV4HistoryLayerCache &other);
+
         bool initialized = false;
         int bsz = 0;
         int totalLen = 0;
@@ -67,16 +74,16 @@ namespace fastllm {
         int windowSize = 0;
         int compressRatio = 0;
         int compressorWideDim = 0;
-        std::vector<float> windowKV;
-        std::vector<float> compressorKVRaw;
-        std::vector<float> compressorScoreRaw;
+        Data windowKV;
+        Data compressorKVRaw;
+        Data compressorScoreRaw;
         int compressorRawTokenBase = 0;
         Data compressedKV;
         int compressedBlocks = 0;
         int compressedTokenBase = 0;
         int rawTailStartPos = 0;
-        std::vector<float> compressorTailKV;
-        std::vector<float> compressorTailScore;
+        Data compressorTailKV;
+        Data compressorTailScore;
     };
 
     struct DeepSeekV4HistoryCacheMemory {
@@ -100,6 +107,11 @@ namespace fastllm {
         void SetMaxRecordNum(int maxRecordNum);
         void Record(const DeepSeekV4HistoryCacheMemory &memory);
         bool Get(const std::vector<int> &inputToken, DeepSeekV4HistoryCacheMemory &memory, int &hitLen);
+    };
+
+    struct DeepSeekV4RequestState {
+        std::vector<DeepSeekV4DecodeLayerCache> decodeLayerCaches;
+        std::vector<int> historyTokens;
     };
 
     class DeepSeekV4Model : public basellm {
@@ -153,7 +165,17 @@ namespace fastllm {
 
         virtual void TryRecordHistoryCache(const std::vector<int> &allTokens) override;
 
+        virtual void TryRecordResponseContext(ResponseContext *context) override;
+
+        virtual void OnResponseContextCreated(ResponseContext *context) override;
+
+        virtual void OnResponseContextRemoved(ResponseContext *context) override;
+
         virtual bool UseGenericHistoryCache() const override { return false; }
+
+        virtual bool UseModelSpecificScheduler() const override { return true; }
+
+        virtual void RunModelSpecificScheduler() override;
 
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成 prompt
 
@@ -234,9 +256,17 @@ namespace fastllm {
 
         DeepSeekV4HistoryCacheManager deepseekV4HistoryCacheManager;
         std::vector<int> deepseekV4HistoryTokens;
+        std::mutex requestStateMutex;
+        std::map<const void*, std::shared_ptr<DeepSeekV4RequestState> > requestStates;
+        std::shared_ptr<DeepSeekV4RequestState> pendingRequestState;
 
         bool RestoreHistoryCacheMemory(const DeepSeekV4HistoryCacheMemory &memory);
+        bool RestoreHistoryCacheMemory(const DeepSeekV4HistoryCacheMemory &memory,
+                                       DeepSeekV4RequestState &state);
         void RecordHistorySnapshot(const std::vector<int> &tokens, int totalLen);
+        void RecordHistorySnapshot(const std::vector<int> &tokens, int totalLen,
+                                   const std::vector<DeepSeekV4DecodeLayerCache> &decodeCaches);
+        std::shared_ptr<DeepSeekV4RequestState> GetRequestState(std::vector<std::pair<Data, Data> > &pastKeyValues);
     };
 }
 
