@@ -221,26 +221,48 @@ namespace fastllm {
         return std::max(1, blockSize / gcd);
     }
 
+    static bool IsTensorParallelExpertWeight(const fastllm::Data &weight) {
+        return weight.name.find(".mlp.experts.") != std::string::npos ||
+               weight.name.find(".mlp.shared_expert.") != std::string::npos;
+    }
+
     static bool IsTensorParallelRowWeight(const fastllm::Data &weight) {
         if (weight.tpLinearType == TP_LINEAR_ROW) {
             return true;
         }
-        return HasSuffix(weight.name, ".self_attn.mergeqkv.weight") ||
-               HasSuffix(weight.name, ".self_attn.W_pack.weight") ||
-               HasSuffix(weight.name, ".self_attn.q_proj.weight") ||
-               HasSuffix(weight.name, ".self_attn.k_proj.weight") ||
-               HasSuffix(weight.name, ".self_attn.v_proj.weight") ||
-               HasSuffix(weight.name, ".mlp.gateup_proj.weight") ||
-               HasSuffix(weight.name, ".mlp.gate_proj.weight") ||
-               HasSuffix(weight.name, ".mlp.up_proj.weight");
+        if (HasSuffix(weight.name, ".self_attn.mergeqkv.weight") ||
+            HasSuffix(weight.name, ".self_attn.W_pack.weight") ||
+            HasSuffix(weight.name, ".self_attn.q_proj.weight") ||
+            HasSuffix(weight.name, ".self_attn.k_proj.weight") ||
+            HasSuffix(weight.name, ".self_attn.v_proj.weight") ||
+            HasSuffix(weight.name, ".mlp.gateup_proj.weight") ||
+            HasSuffix(weight.name, ".mlp.gate_proj.weight") ||
+            HasSuffix(weight.name, ".mlp.up_proj.weight") ||
+            HasSuffix(weight.name, ".linear_attn.in_proj_qkvz.weight") ||
+            HasSuffix(weight.name, ".linear_attn.in_proj_ba.weight")) {
+            return true;
+        }
+        if (IsTensorParallelExpertWeight(weight)) {
+            return HasSuffix(weight.name, ".gateup_proj.weight") ||
+                   HasSuffix(weight.name, ".gate_proj.weight") ||
+                   HasSuffix(weight.name, ".up_proj.weight");
+        }
+        return false;
     }
 
     static bool IsTensorParallelColumnWeight(const fastllm::Data &weight) {
         if (weight.tpLinearType == TP_LINEAR_COLUMN) {
             return true;
         }
-        return HasSuffix(weight.name, ".self_attn.o_proj.weight") ||
-               HasSuffix(weight.name, ".mlp.down_proj.weight");
+        if (HasSuffix(weight.name, ".self_attn.o_proj.weight") ||
+            HasSuffix(weight.name, ".mlp.down_proj.weight") ||
+            HasSuffix(weight.name, ".linear_attn.out_proj.weight")) {
+            return true;
+        }
+        if (IsTensorParallelExpertWeight(weight)) {
+            return HasSuffix(weight.name, ".down_proj.weight");
+        }
+        return false;
     }
 
     static void SyncReplicatedLocalShapeFromRoot(fastllm::Data &data, const std::vector <int> &devices) {
