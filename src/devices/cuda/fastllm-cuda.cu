@@ -6690,10 +6690,29 @@ __global__ void FastllmPickInputKernel(uint8_t *input, uint8_t *partInput, int r
     }
 }
 
+__global__ void FastllmPickInputKernelVec16(const uint4 *__restrict__ input,
+                                            uint4 *__restrict__ partInput,
+                                            int rows, int cols16, int *index) {
+    int row = blockIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < rows && col < cols16) {
+        int srcRow = index[row];
+        partInput[(size_t)row * cols16 + col] = input[(size_t)srcRow * cols16 + col];
+    }
+}
+
 // Host 调用函数
 void FastllmCudaPickInput(uint8_t *input, uint8_t *partInput, int rows, int cols, int *index) {
     // 设定 Block 大小：256 是通过是一个比较通用的高性能值
     dim3 block(256);
+    if ((cols & 15) == 0 &&
+        (((uintptr_t)input | (uintptr_t)partInput) & 15) == 0) {
+        int cols16 = cols / 16;
+        dim3 grid((cols16 + 255) / 256, rows);
+        FastllmPickInputKernelVec16<<<grid, block>>>(
+            (const uint4*)input, (uint4*)partInput, rows, cols16, index);
+        return;
+    }
     // 设定 Grid 大小：
     // x 维度：覆盖所有列 (cols)，向上取整除以 256
     // y 维度：覆盖所有行 (rows)
@@ -6760,6 +6779,23 @@ __global__ void FastllmPickOutputKernel(half *partOutput, half *output, int rows
     }
 }
 
+__global__ void FastllmPickOutputHalf2Kernel(const half2 *__restrict__ partOutput,
+                                             half2 *__restrict__ output,
+                                             int rows, int cols2, int *index, float *scales) {
+    int i = blockIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows && j < cols2) {
+        int idx = index[i];
+        float scale = scales[i];
+        half2 src = partOutput[(size_t)i * cols2 + j];
+        half2 dst = output[(size_t)idx * cols2 + j];
+        float2 src2 = __half22float2(src);
+        float2 dst2 = __half22float2(dst);
+        output[(size_t)idx * cols2 + j] = __floats2half2_rn(dst2.x + scale * src2.x,
+                                                            dst2.y + scale * src2.y);
+    }
+}
+
 // CUDA Kernel 函数
 // 每个线程负责一个 bfloat16 元素的计算和累加
 __global__ void FastllmPickOutputKernel(__nv_bfloat16 *partOutput, __nv_bfloat16 *output, int rows, int cols, int *index, float *scales) {
@@ -6796,6 +6832,14 @@ void FastllmCudaPickOutput(uint8_t *partOutput, uint8_t *output, int rows, int c
     if (dataType == fastllm::DataType::FLOAT32) {
         FastllmPickOutputKernel<<<grid, block>>>((float*)partOutput, (float*)output, rows, cols, index, scales);
     } else if (dataType == fastllm::DataType::FLOAT16) {
+        if ((cols & 1) == 0 &&
+            (((uintptr_t)partOutput | (uintptr_t)output) & 3) == 0) {
+            int cols2 = cols / 2;
+            dim3 grid2((cols2 + 255) / 256, rows);
+            FastllmPickOutputHalf2Kernel<<<grid2, block>>>(
+                (const half2*)partOutput, (half2*)output, rows, cols2, index, scales);
+            return;
+        }
         FastllmPickOutputKernel<<<grid, block>>>((half*)partOutput, (half*)output, rows, cols, index, scales);
     } else if (dataType == fastllm::DataType::BFLOAT16) {
         FastllmPickOutputKernel<<<grid, block>>>((__nv_bfloat16*)partOutput, (__nv_bfloat16*)output, rows, cols, index, scales);
