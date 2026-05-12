@@ -4665,6 +4665,7 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
     uint8_t *pagedVData,     // paged V cache raw data
     int32_t *insertIndexs,   // [batch] page index for each batch (逻辑 batch)
     int32_t *insertPositions,// [batch] page offset for each batch (逻辑 batch)
+    int32_t *lastPageLens,   // optional [batch], filled with page offset after append
     int outer,               // bs * seqlen = 总 token 数
     int total_dim,           // (q_heads + k_heads + v_heads) * head_dim
     int q_heads,
@@ -4697,6 +4698,10 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
     int batch_idx = token_id;  // 每个 token 对应一个逻辑 batch（decode 模式下 seqlen_per_batch=1）
 
     unsigned int tid = threadIdx.x;
+
+    if (lastPageLens != nullptr && head_id == 0 && tid == 0 && batch_idx < batch) {
+        lastPageLens[batch_idx] = insertPositions[batch_idx] + 1;
+    }
 
     // 确定当前 head 在 qkv 中的偏移
     int offset_in_total;
@@ -4820,6 +4825,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     uint8_t *pagedVData,
     int32_t *insertIndexs,
     int32_t *insertPositions,
+    int32_t *lastPageLens,
     int q_heads, int k_heads, int head_dim,
     int rotateDim, float eps, float ropeTheta, float ropeScale,
     int pageLen, fastllm::DataType pagedDataType, int batch,
@@ -4846,7 +4852,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
         FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel<decltype(TPB)::value, QT, KVT><<<grid_size, decltype(TPB)::value>>>(
             qkvPtr, (float*)qNormWeight.cudaData, (float*)kNormWeight.cudaData,
             cudaPositionIds, qOutputPtr,
-            pagedKData, pagedVData, insertIndexs, insertPositions,
+            pagedKData, pagedVData, insertIndexs, insertPositions, lastPageLens,
             outer, total_dim, q_heads, k_heads, v_heads, head_dim,
             bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
     };

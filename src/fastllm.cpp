@@ -4003,14 +4003,18 @@ namespace fastllm {
         Data &insertIndexs, Data &insertPositions,
         int q_heads, int k_heads, int head_dim,
         int rotaryDim, float eps, float ropeTheta, float ropeScale,
-        int pageLen, int batch, bool doQKNorm) {
-        curExecutor->Run("QKVRMSNormRopeSplitAppendPagedCache", {
+        int pageLen, int batch, bool doQKNorm, Data *lastPageLens) {
+        DataDict datas = {
                 {"qkv", &qkv}, {"qNormWeight", &qNormWeight}, {"kNormWeight", &kNormWeight},
                 {"positionIds", (Data*)&positionIds},
                 {"qOutput", &qOutput},
                 {"pagedKCacheData", &pagedKCacheData}, {"pagedVCacheData", &pagedVCacheData},
                 {"insertIndexs", &insertIndexs}, {"insertPositions", &insertPositions}
-        }, {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
+        };
+        if (lastPageLens != nullptr) {
+            datas["lastPageLens"] = lastPageLens;
+        }
+        curExecutor->Run("QKVRMSNormRopeSplitAppendPagedCache", datas, {{"eps", eps}, {"ropeTheta", ropeTheta}, {"ropeScale", ropeScale}},
            {{"q_heads", q_heads}, {"k_heads", k_heads}, {"head_dim", head_dim}, {"rotaryDim", rotaryDim}, {"pageLen", pageLen}, {"batch", batch}, {"doQKNorm", (int)doQKNorm}});
     }
 
@@ -4287,10 +4291,11 @@ namespace fastllm {
     // qSizes, pageSizes, pageIndexs, lastPageLens: 输出的参数
     void GeneratePagedBatchParams(const Data &q, const std::vector<Data*> &pastKeys, 
         int batch, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens,
-        const std::vector<int> &seqLens) {
+        const std::vector<int> &seqLens, bool lastPageLensOnDevice) {
         std::map<std::string, int> intParams = {
             {"batch", batch}, 
-            {"pastKeys___batch", (int)pastKeys.size()}
+            {"pastKeys___batch", (int)pastKeys.size()},
+            {"lastPageLensOnDevice", (int)lastPageLensOnDevice}
         };
         // 将 seqLens 编码到 intParams 中，供设备端实现使用
         intParams["seqLens___size"] = (int)seqLens.size();

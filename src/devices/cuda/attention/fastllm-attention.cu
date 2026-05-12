@@ -2606,10 +2606,30 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
 
         cudaStream_t stream = nullptr;
         thread_local static std::map<int, PrefillPlanInfo> plan_info_map;
-        thread_local static std::map<int, bool> plan_inited_map;
+        thread_local static std::map<int, std::vector<uint32_t>> plan_key_map;
         int current_device_id = -1;
         cudaGetDevice(&current_device_id);
-        if (!inited || !plan_inited_map[current_device_id]) {
+
+        std::vector<uint32_t> plan_key;
+        plan_key.reserve(9 + (batch_size + 1) * 2);
+        plan_key.push_back(total_num_rows);
+        plan_key.push_back(batch_size);
+        plan_key.push_back(num_qo_heads_per_batch);
+        plan_key.push_back((uint32_t)numHeads);
+        plan_key.push_back((uint32_t)headDim);
+        plan_key.push_back((uint32_t)valueHeadDim);
+        plan_key.push_back((uint32_t)pageLen);
+        plan_key.push_back((uint32_t)sizeof(QType));
+        plan_key.push_back((uint32_t)sizeof(KVType));
+        for (uint32_t i = 0; i <= batch_size; i++) {
+            plan_key.push_back((uint32_t)qSizes.cpuIntDatas[i]);
+        }
+        for (uint32_t i = 0; i <= batch_size; i++) {
+            plan_key.push_back((uint32_t)pageSizes.cpuIntDatas[i]);
+        }
+
+        if (plan_key_map.find(current_device_id) == plan_key_map.end() ||
+            plan_key_map[current_device_id] != plan_key) {
             cudaError_t plan_status = PrefillPlan<uint32_t>(
                 workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
                 workspace.int_workspace_size, plan_info_map[current_device_id], 
@@ -2624,7 +2644,7 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
                 cudaStreamSynchronize(stream);
                 exit(0);
             }
-            plan_inited_map[current_device_id] = true;
+            plan_key_map[current_device_id] = std::move(plan_key);
         }
         PrefillPlanInfo &plan_info = plan_info_map[current_device_id];
         

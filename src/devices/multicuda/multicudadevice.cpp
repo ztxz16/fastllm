@@ -113,12 +113,19 @@ namespace fastllm {
         if (data.cpuIntDatas.empty()) {
             return;
         }
+        size_t bytes = data.cpuIntDatas.size() * sizeof(int32_t);
         for (int device : devices) {
             auto it = data.multiDeviceDatas.find(device);
             if (it == data.multiDeviceDatas.end() || it->second == nullptr) {
                 continue;
             }
             it->second->cpuIntDatas = data.cpuIntDatas;
+            if (it->second->cudaData != nullptr) {
+                AssertInFastLLM(it->second->expansionBytes >= bytes,
+                                "SyncReplicatedCpuIntData: cuda buffer is smaller than cpu metadata.\n");
+                FastllmCudaSetDevice(device);
+                FastllmCudaCopyFromHostToDevice(it->second->cudaData, (void*)data.cpuIntDatas.data(), bytes);
+            }
         }
     }
 
@@ -443,6 +450,107 @@ namespace fastllm {
             tokensToAppend -= copyLen;
             inputOffset += copyLen;
         }
+    }
+
+    struct PagedAppendSegment {
+        int pageIdx;
+        int inputOffset;
+        int copyLen;
+        int pageOffset;
+    };
+
+    static void CopyPagedCacheSliceToPosition(PagedCacheManager &pagedKVCache, const fastllm::Data &input,
+                                              int pageIdx, int inputOffset, int copyLen, int pageOffset) {
+        if (copyLen <= 0) {
+            return;
+        }
+        int numHeads = input.dims[0];
+        int seqLen = input.dims[1];
+        int headDim = input.dims[2];
+        int pageLen = pagedKVCache.dims[1];
+        AssertInFastLLM(pageIdx >= 0 && pageIdx < pagedKVCache.dims[0],
+                        "CopyPagedCacheSliceToPosition: invalid page index.\n");
+        AssertInFastLLM(pageOffset >= 0 && pageOffset + copyLen <= pageLen,
+                        "CopyPagedCacheSliceToPosition: page range overflow.\n");
+        AssertInFastLLM(inputOffset >= 0 && inputOffset + copyLen <= seqLen,
+                        "CopyPagedCacheSliceToPosition: input range overflow.\n");
+        AssertInFastLLM(pagedKVCache.dims[2] == numHeads && pagedKVCache.dims[3] == headDim,
+                        "CopyPagedCacheSliceToPosition: paged cache shape mismatch.\n");
+
+        if (input.dataType != pagedKVCache.dataType ||
+            (input.dataType != DataType::FLOAT16 &&
+             input.dataType != DataType::FLOAT32 &&
+             input.dataType != DataType::BFLOAT16)) {
+            FastllmCudaPagedCacheCopy(
+                (uint8_t*)pagedKVCache.cudaData, pageIdx, pageLen,
+                numHeads, headDim, pagedKVCache.dataType,
+                (uint8_t*)input.cudaData, input.dataType, seqLen,
+                inputOffset, copyLen, pageOffset
+            );
+            return;
+        }
+
+        int deviceId = input.dataDeviceIds.empty() ? 0 : input.dataDeviceIds[0];
+        size_t rowBytes = (size_t)headDim * input.unitSize;
+        size_t srcPitch = rowBytes;
+        size_t dstPitch = (size_t)numHeads * headDim * input.unitSize;
+        uint8_t *pagedData = (uint8_t*)pagedKVCache.cudaData;
+        uint8_t *inputData = (uint8_t*)input.cudaData;
+        for (int head = 0; head < numHeads; head++) {
+            uint8_t *src = inputData + ((size_t)head * seqLen + inputOffset) * rowBytes;
+            uint8_t *dst = pagedData + (((size_t)pageIdx * pageLen + pageOffset) * numHeads + head) * rowBytes;
+            FastllmCudaMemcpy2DDeviceToDeviceAuto(dst, dstPitch, src, srcPitch, rowBytes, copyLen,
+                                                  deviceId, deviceId);
+        }
+    }
+
+    static std::vector<PagedAppendSegment> PlanAppendPagedCacheOnRoot(PagedCacheManager &manager,
+                                                                      fastllm::Data &cache,
+                                                                      const fastllm::Data &input) {
+        std::vector<PagedAppendSegment> segments;
+        int seqLen = input.dims[1];
+        int pageLen = manager.pageLen;
+        if (seqLen <= 0) {
+            return segments;
+        }
+
+        if (cache.pagedKVCacheData == nullptr) {
+            cache.pagedKVCacheData = &manager;
+        }
+        cache.pageLen = pageLen;
+        cache.isPagedKVCache = true;
+
+        int oldUsedTokens = cache.pageIndex.empty() ? 0 :
+            (int)(cache.pageIndex.size() - 1) * cache.pageLen + cache.lastPageLen;
+        int tokensToAppend = seqLen;
+        int inputOffset = 0;
+
+        int remainingInCurrentPage = cache.pageIndex.empty() ? 0 : pageLen - cache.lastPageLen;
+        if (remainingInCurrentPage > 0 && tokensToAppend > 0) {
+            int copyLen = std::min(remainingInCurrentPage, tokensToAppend);
+            segments.push_back({cache.pageIndex.back(), inputOffset, copyLen, cache.lastPageLen});
+            cache.lastPageLen += copyLen;
+            tokensToAppend -= copyLen;
+            inputOffset += copyLen;
+        }
+
+        while (tokensToAppend > 0) {
+            int newPageIdx = manager.GetUnusedPageIndex(true);
+            cache.pageIndex.push_back(newPageIdx);
+            int copyLen = std::min(pageLen, tokensToAppend);
+            segments.push_back({newPageIdx, inputOffset, copyLen, 0});
+            cache.lastPageLen = copyLen;
+            tokensToAppend -= copyLen;
+            inputOffset += copyLen;
+        }
+
+        int newSeqLen = oldUsedTokens + seqLen;
+        if (cache.dims.empty()) {
+            cache.Resize(input.dims);
+        } else {
+            cache.Resize({cache.dims[0], newSeqLen, cache.dims[2]});
+        }
+        return segments;
     }
 
     static void SyncRootPagedCacheMeta(fastllm::Data &rootCache, const fastllm::Data &localCache,
@@ -2287,6 +2395,7 @@ namespace fastllm {
                         "MultiCudaAppendPagedCache only supports sharded input now.\n");
         SyncShardedLocalShapeFromRoot(input, devices);
         EnsureEmptyPagedCacheCapacity(rootManager, cache, input.dims[1]);
+        std::vector<PagedAppendSegment> appendSegments = PlanAppendPagedCacheOnRoot(rootManager, cache, input);
 
         if (!cache.multiDeviceData) {
             cache.multiDeviceData = true;
@@ -2312,20 +2421,20 @@ namespace fastllm {
             SyncCudaAndCheck(device, "MultiCudaAppendPagedCacheOp::localManagerReady");
             localCache->dataType = cache.dataType;
             localCache->UpdateUnitSize();
-            localCache->pagedKVCacheData = localManager;
-            localCache->pageLen = localManager->pageLen;
-            localCache->isPagedKVCache = true;
-            EnsureEmptyPagedCacheCapacity(*localManager, *localCache, localInput->dims[1]);
+            localCache->dataDevice = DataDevice::CUDA;
+            localCache->dataDeviceIds = {device};
+            localCache->Resize({localInput->dims[0], cache.dims[1], localInput->dims[2]});
+            SyncLocalPagedCacheMeta(*localCache, cache, *localManager);
             SyncCudaAndCheck(device, "MultiCudaAppendPagedCacheOp::capacityReady");
             FastllmCudaSetDevice(device);
-            AppendPagedCacheLocal(*localManager, *localCache, *localInput);
+            for (const auto &segment : appendSegments) {
+                CopyPagedCacheSliceToPosition(*localManager, *localInput,
+                                              segment.pageIdx, segment.inputOffset,
+                                              segment.copyLen, segment.pageOffset);
+            }
             SyncCudaAndCheck(device, "MultiCudaAppendPagedCacheOp");
         }
-
-        int rootDevice = devices[0];
-        Data *rootLocal = cache.multiDeviceDatas[rootDevice];
-        SyncRootPagedCacheMeta(cache, *rootLocal, rootManager);
-        cache.Resize({input.dims[0], rootLocal->dims[1], input.dims[2]});
+        cache.Resize({input.dims[0], cache.dims[1], input.dims[2]});
     }
 
     void MultiCudaAttentionPagedOp::Run(const std::string &opType, const DataDict &datas,
@@ -2553,6 +2662,7 @@ namespace fastllm {
                 qOutput,
                 (uint8_t*)pagedKCacheData.cudaData, (uint8_t*)pagedVCacheData.cudaData,
                 (int32_t*)insertIndexs.cudaData, (int32_t*)insertPositions.cudaData,
+                nullptr,
                 q_heads, k_heads, head_dim, rotateDim, eps, ropeTheta, ropeScale,
                 pageLen, pagedKCacheData.dataType, batch, doQKNorm
             );
@@ -2619,6 +2729,7 @@ namespace fastllm {
                 (uint8_t*)localVManager->cudaData,
                 (int32_t*)insertIndexs.multiDeviceDatas[device]->cudaData,
                 (int32_t*)insertPositions.multiDeviceDatas[device]->cudaData,
+                nullptr,
                 localQHeads, localKHeads, head_dim, rotateDim, eps, ropeTheta, ropeScale,
                 pageLen, localKManager->dataType, batch, doQKNorm
             );

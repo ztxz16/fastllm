@@ -260,6 +260,9 @@ namespace fastllm {
             q->dataType = qkv->dataType;
             q->Resize({bsz * num_attention_heads, seqlen, head_dim});
             int curPageLen = kCaches.pageLen;
+            bool fillLastPageLensOnDevice = qkv->dataDevice == DataDevice::CUDA &&
+                                             !qkv->multiDeviceData &&
+                                             !(*generatedDecodeParams);
             QKVRMSNormRopeSplitAppendPagedCache(*qkv,
                 *qNormWeight, *kNormWeight,
                 *allPositionIds,
@@ -268,16 +271,17 @@ namespace fastllm {
                 *insertIndexs, *insertPositions,
                 num_attention_heads, num_key_value_heads, head_dim,
                 rotary_dim, rms_norm_eps, curRopeTheta, ropeScale,
-                curPageLen, batch, doQKNorm);
+                curPageLen, batch, doQKNorm,
+                fillLastPageLensOnDevice ? lastPageLens : nullptr);
 
             // 7. 更新 pastKey/pastValue 的 pageIndex 和 lastPageLen
             for (int b = 0; b < batch; b++) {
                 auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
-                    if (cache->lastPageLen < cache->pageLen) {
-                        cache->lastPageLen++;
-                    } else {
-                        cache->lastPageLen = 0;
+                    if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
                         cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
+                        cache->lastPageLen = 1;
+                    } else {
+                        cache->lastPageLen++;
                     }
                 };
                 updatePageMeta((*batchPastKeys)[b], pagedCacheKManager);
@@ -289,7 +293,7 @@ namespace fastllm {
                 Data qForAttentionHolder;
                 Data &qForAttention = preparePagedAttentionQ(*q, kCaches.dataType, qForAttentionHolder);
                 GeneratePagedBatchParams(qForAttention, *batchPastKeys, batch, 
-                    *qSizes, *pageSizes, *pageIndexs, *lastPageLens);
+                    *qSizes, *pageSizes, *pageIndexs, *lastPageLens, {}, fillLastPageLensOnDevice);
                 *generatedDecodeParams = true;
             }
             Data qForAttentionHolder;

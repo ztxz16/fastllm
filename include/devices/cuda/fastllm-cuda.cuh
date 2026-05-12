@@ -346,6 +346,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     fastllm::Data &qOutput,
     uint8_t *pagedKData, uint8_t *pagedVData,
     int32_t *insertIndexs, int32_t *insertPositions,
+    int32_t *lastPageLens,
     int q_heads, int k_heads, int head_dim,
     int rotateDim, float eps, float ropeTheta, float ropeScale,
     int pageLen, fastllm::DataType pagedDataType, int batch,

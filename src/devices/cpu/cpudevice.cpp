@@ -10299,11 +10299,11 @@ ops += (long long)lines * inputDim * interDim * 2;
         for (int i = 0; i < batch; i++) {
             Data *currentCache = currentCaches[i];
             int pageLen = currentCache->pageLen;
-            if (currentCache->lastPageLen < pageLen) {
-                currentCache->lastPageLen++;
-            } else {
-                currentCache->lastPageLen = 0;
+            if (currentCache->pageIndex.empty() || currentCache->lastPageLen >= pageLen) {
                 currentCache->pageIndex.push_back(manager.GetUnusedPageIndex(true));
+                currentCache->lastPageLen = 1;
+            } else {
+                currentCache->lastPageLen++;
             }
         }
     }
@@ -10367,19 +10367,40 @@ ops += (long long)lines * inputDim * interDim * 2;
         int32_t *idxData = (int32_t*)insertIndexs.cpuData;
         int32_t *posData = (int32_t*)insertPositions.cpuData;
 
+        int newPageCount = 0;
+        for (int b = 0; b < batch; b++) {
+            Data *pk = pastKeys[b];
+            if (pk->pageIndex.empty() || pk->lastPageLen >= pk->pageLen) {
+                newPageCount++;
+            }
+        }
+
+        std::vector<int> previewNewPages;
+        previewNewPages.reserve(newPageCount);
+        if (newPageCount > 0) {
+            std::lock_guard<std::mutex> guard(manager.pageIndexLocker);
+            for (int i = 0; i < newPageCount && i < (int)manager.freePages.size(); i++) {
+                previewNewPages.push_back(manager.freePages[(int)manager.freePages.size() - 1 - i]);
+            }
+            int trieOffset = newPageCount - (int)previewNewPages.size();
+            for (int i = 0; i < trieOffset && i < (int)manager.triePages.size(); i++) {
+                previewNewPages.push_back(manager.triePages[(int)manager.triePages.size() - 1 - i]);
+            }
+        }
+        AssertInFastLLM((int)previewNewPages.size() >= newPageCount,
+                        "CpuGenerateAppendPagedCacheBatchParamsOp: no enough pages for batch append.\n");
+
+        int newPageOffset = 0;
         for (int b = 0; b < batch; b++) {
             Data *pk = pastKeys[b];
             int pageLen = pk->pageLen;
             int insertIdx, insertPos;
-            if (pk->pageIndex.empty()) {
-                insertIdx = manager.GetUnusedPageIndex(false);
+            if (pk->pageIndex.empty() || pk->lastPageLen >= pageLen) {
+                insertIdx = previewNewPages[newPageOffset++];
                 insertPos = 0;
-            } else if (pk->lastPageLen < pageLen) {
+            } else {
                 insertIdx = pk->pageIndex.back();
                 insertPos = pk->lastPageLen;
-            } else {
-                insertIdx = manager.GetUnusedPageIndex(false);
-                insertPos = 0;
             }
             idxData[b] = insertIdx;
             posData[b] = insertPos;

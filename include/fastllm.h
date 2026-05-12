@@ -1016,7 +1016,7 @@ namespace fastllm {
         Data &insertIndexs, Data &insertPositions,
         int q_heads, int k_heads, int head_dim,
         int rotaryDim, float eps, float ropeTheta, float ropeScale,
-        int pageLen, int batch, bool doQKNorm = true);
+        int pageLen, int batch, bool doQKNorm = true, Data *lastPageLens = nullptr);
 
     void RepeatPenalty(Data &input, const Data &penalty, const Data &penaltyScale); // 重复惩罚
 
@@ -1101,7 +1101,7 @@ namespace fastllm {
     // seqLens: 可选，每个batch的seqLen（prefill时使用）。为空时每个batch的seqLen默认为1（decode）
     void GeneratePagedBatchParams(const Data &q, const std::vector<Data*> &pastKeys, 
         int batch, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens,
-        const std::vector<int> &seqLens = {});
+        const std::vector<int> &seqLens = {}, bool lastPageLensOnDevice = false);
 }
 
 #endif //TEST_FASTLLM_H
