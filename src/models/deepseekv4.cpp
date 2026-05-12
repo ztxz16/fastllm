@@ -1309,7 +1309,14 @@ namespace fastllm {
 
 #ifdef USE_CUDA
             bool hashRoutingForCuda = weight.weight.find(prefix + ".gate.tid2eid") != weight.weight.end();
-            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_ROUTE") && hashRoutingForCuda &&
+            bool useCpuSingleTokenRoute =
+                !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CPU_SINGLE_TOKEN_ROUTE") &&
+                !hashRoutingForCuda && DeepSeekV4PreferCuda() &&
+                x.dims.size() == 2 && x.dims[0] == 1 &&
+                routerLogits.dataDevice == DataDevice::CUDA &&
+                routerLogits.dataType == DataType::FLOAT32;
+            if (!useCpuSingleTokenRoute &&
+                !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_ROUTE") && hashRoutingForCuda &&
                 routerLogits.dataDevice == DataDevice::CUDA && routerLogits.dataType == DataType::FLOAT32 &&
                 inputIds.size() >= (size_t)x.dims[0]) {
                 int scoreFuncMode = scoreFunc == "softmax" ? 0 : (scoreFunc == "sigmoid" ? 1 : 2);
@@ -1320,7 +1327,8 @@ namespace fastllm {
                     return;
                 }
             }
-            if (!EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_ROUTE") && !hashRoutingForCuda &&
+            if (!useCpuSingleTokenRoute &&
+                !EnvFlagEnabled("FASTLLM_DSV4_DISABLE_CUDA_ROUTE") && !hashRoutingForCuda &&
                 routerLogits.dataDevice == DataDevice::CUDA && routerLogits.dataType == DataType::FLOAT32) {
                 int scoreFuncMode = scoreFunc == "softmax" ? 0 : (scoreFunc == "sigmoid" ? 1 : 2);
                 Data *gateBiasData = nullptr;
