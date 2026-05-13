@@ -1146,24 +1146,40 @@ class FastLLmCompletion:
       model_name = self.model_name
       created_time = int(time.time())
       chunk_object_type = "chat.completion.chunk"
+      json_dump = lambda obj: json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+      fast_text_stream = not request.tools and not emit_reasoning_content
 
       # TODO: 支持request.n 和 request.echo配置
       first_iteration = True
       try:
         if first_iteration:
             # 1. role部分
-            choice_data = ChatCompletionResponseStreamChoice(
-                            index = 0,
-                            delta = DeltaMessage(role = "assistant"),
-                            logprobs = None,
-                            finish_reason = None)
-            chunk = ChatCompletionStreamResponseWithUsage(
-                id = request_id,
-                object = chunk_object_type,
-                created = created_time,
-                choices = [choice_data],
-                model = model_name)
-            data = chunk.model_dump_json(exclude_unset=True)
+            if fast_text_stream:
+                data = json_dump({
+                    "id": request_id,
+                    "object": chunk_object_type,
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                        "logprobs": None,
+                        "finish_reason": None,
+                    }],
+                })
+            else:
+                choice_data = ChatCompletionResponseStreamChoice(
+                                index = 0,
+                                delta = DeltaMessage(role = "assistant"),
+                                logprobs = None,
+                                finish_reason = None)
+                chunk = ChatCompletionStreamResponseWithUsage(
+                    id = request_id,
+                    object = chunk_object_type,
+                    created = created_time,
+                    choices = [choice_data],
+                    model = model_name)
+                data = chunk.model_dump_json(exclude_unset=True)
             yield f"data: {data}\n\n"
             first_iteration = False
 
@@ -1254,19 +1270,33 @@ class FastLLmCompletion:
                 delta_message = DeltaMessage(content = delta_text)
 
             if (delta_message):
-                choice_data = ChatCompletionResponseStreamChoice(
-                    index = 0,
-                    #delta = DeltaMessage(content = delta_text),
-                    delta = delta_message,
-                    logprobs = None,
-                    finish_reason = None)
-                chunk = ChatCompletionStreamResponseWithUsage(
-                    id = request_id,
-                    object = chunk_object_type,
-                    created = created_time,
-                    choices = [choice_data],
-                    model = model_name)
-                data = chunk.model_dump_json(exclude_unset=True)
+                if fast_text_stream:
+                    data = json_dump({
+                        "id": request_id,
+                        "object": chunk_object_type,
+                        "created": created_time,
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": delta_text},
+                            "logprobs": None,
+                            "finish_reason": None,
+                        }],
+                    })
+                else:
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index = 0,
+                        #delta = DeltaMessage(content = delta_text),
+                        delta = delta_message,
+                        logprobs = None,
+                        finish_reason = None)
+                    chunk = ChatCompletionStreamResponseWithUsage(
+                        id = request_id,
+                        object = chunk_object_type,
+                        created = created_time,
+                        choices = [choice_data],
+                        model = model_name)
+                    data = chunk.model_dump_json(exclude_unset=True)
                 yield f"data: {data}\n\n"
             #await asyncio.sleep(0)
 
@@ -1291,22 +1321,40 @@ class FastLLmCompletion:
         finish_reason = 'stop'
         if request.tools and self.tool_parser and getattr(self.tool_parser, "prev_tool_call_arr", None):
             finish_reason = 'tool_calls'
-        choice_data = ChatCompletionResponseStreamChoice(
-            index = 0,
-            delta = DeltaMessage(),
-            logprobs = None,
-            finish_reason = finish_reason)
-        chunk = ChatCompletionStreamResponseWithUsage(
-            id = request_id,
-            object = chunk_object_type,
-            created = created_time,
-            choices = [choice_data],
-            model = model_name,
-            usage = UsageInfo(prompt_tokens = input_token_len,
-                              total_tokens = input_token_len + completion_tokens,
-                              completion_tokens = completion_tokens))
-        data = chunk.model_dump_json(exclude_unset = True,
-                                    exclude_none = True)
+        if fast_text_stream:
+            data = json_dump({
+                "id": request_id,
+                "object": chunk_object_type,
+                "created": created_time,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": finish_reason,
+                }],
+                "usage": {
+                    "prompt_tokens": input_token_len,
+                    "total_tokens": input_token_len + completion_tokens,
+                    "completion_tokens": completion_tokens,
+                },
+            })
+        else:
+            choice_data = ChatCompletionResponseStreamChoice(
+                index = 0,
+                delta = DeltaMessage(),
+                logprobs = None,
+                finish_reason = finish_reason)
+            chunk = ChatCompletionStreamResponseWithUsage(
+                id = request_id,
+                object = chunk_object_type,
+                created = created_time,
+                choices = [choice_data],
+                model = model_name,
+                usage = UsageInfo(prompt_tokens = input_token_len,
+                                  total_tokens = input_token_len + completion_tokens,
+                                  completion_tokens = completion_tokens))
+            data = chunk.model_dump_json(exclude_unset = True,
+                                        exclude_none = True)
         yield f"data: {data}\n\n"
       except ValueError as e:
         data = self.create_streaming_error_response(str(e))
