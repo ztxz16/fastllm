@@ -2582,10 +2582,14 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
 //printf("DoCudaMergeMOEFromCPU spend %f s.\n", GetSpan(xxx, std::chrono::system_clock::now()));
     }
 
-    static bool TryCudaMergeMOEBatch1HalfFp8(
+    static bool IsCudaMergeMoeFp8InputType(DataType dataType) {
+        return dataType == DataType::FLOAT16 || dataType == DataType::BFLOAT16;
+    }
+
+    static bool TryCudaMergeMOEBatch1Fp8(
         Data &input, Data &output, int32_t *indexData, const float *scoreData, bool scoresOnCuda, int topk,
         Data &w1, Data **weights, float sharedScale, MoeGateType gateType) {
-        if (gateType != MoeGateSwiglu || input.dataType != DataType::FLOAT16 || input.dims.size() == 0) {
+        if (gateType != MoeGateSwiglu || !IsCudaMergeMoeFp8InputType(input.dataType) || input.dims.size() == 0) {
             return false;
         }
         if (weights[0] != nullptr && sharedScale != 0.0f) {
@@ -2621,9 +2625,13 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                     break;
                 }
             }
-            if (canGroupFp8 && inter > 0 &&
-                FastllmCudaHalfMergeMOEFP8E4M3Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter)) {
-                return true;
+            if (canGroupFp8 && inter > 0) {
+                bool groupOk = input.dataType == DataType::FLOAT16 ?
+                    FastllmCudaHalfMergeMOEFP8E4M3Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter) :
+                    FastllmCudaBFloat16MergeMOEFP8E4M3Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter);
+                if (groupOk) {
+                    return true;
+                }
             }
         }
 
@@ -2653,20 +2661,34 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             }
 
             int inter = down->dims[1];
-            w1.dataType = DataType::FLOAT16;
+            w1.dataType = input.dataType;
             w1.Resize({1, inter});
-            bool swigluOk = isFp8Block128 ?
-                FastllmCudaHalfMatMulFloatFP8E4M3Block128Swiglu(input, *gateup, *GetEmptyData(), w1, 1, hidden, inter) :
-                FastllmCudaHalfMatMulFloatFP8E4M3Swiglu(input, *gateup, *GetEmptyData(), w1, 1, hidden, inter);
+            bool swigluOk = false;
+            if (input.dataType == DataType::FLOAT16) {
+                swigluOk = isFp8Block128 ?
+                    FastllmCudaHalfMatMulFloatFP8E4M3Block128Swiglu(input, *gateup, *GetEmptyData(), w1, 1, hidden, inter) :
+                    FastllmCudaHalfMatMulFloatFP8E4M3Swiglu(input, *gateup, *GetEmptyData(), w1, 1, hidden, inter);
+            } else {
+                swigluOk = isFp8Block128 ?
+                    FastllmCudaBFloat16MatMulFP8E4M3Block128Swiglu(input, *gateup, *GetEmptyData(), w1, 1, hidden, inter) :
+                    FastllmCudaBFloat16MatMulFP8E4M3Swiglu(input, *gateup, *GetEmptyData(), w1, 1, hidden, inter);
+            }
             if (!swigluOk) {
                 return false;
             }
 
-            output.dataType = DataType::FLOAT16;
+            output.dataType = input.dataType;
             output.Resize({1, hidden});
-            bool downOk = isFp8Block128 ?
-                FastllmCudaHalfMatMulFloatFP8E4M3Block128AddTo(w1, *down, output, scoreData[j], !wroteOutput, 1, inter, hidden) :
-                FastllmCudaHalfMatMulFloatFP8E4M3AddTo(w1, *down, output, scoreData[j], !wroteOutput, 1, inter, hidden);
+            bool downOk = false;
+            if (input.dataType == DataType::FLOAT16) {
+                downOk = isFp8Block128 ?
+                    FastllmCudaHalfMatMulFloatFP8E4M3Block128AddTo(w1, *down, output, scoreData[j], !wroteOutput, 1, inter, hidden) :
+                    FastllmCudaHalfMatMulFloatFP8E4M3AddTo(w1, *down, output, scoreData[j], !wroteOutput, 1, inter, hidden);
+            } else {
+                downOk = isFp8Block128 ?
+                    FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(w1, *down, output, scoreData[j], !wroteOutput, 1, inter, hidden) :
+                    FastllmCudaBFloat16MatMulFP8E4M3AddTo(w1, *down, output, scoreData[j], !wroteOutput, 1, inter, hidden);
+            }
             if (!downOk) {
                 return false;
             }
@@ -2676,10 +2698,10 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         return wroteOutput;
     }
 
-    static bool TryCudaMergeMOEBatch1HalfFp8Indexed(
+    static bool TryCudaMergeMOEBatch1Fp8Indexed(
         Data &input, Data &output, Data &index, Data &score, int topk,
         Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
-        if (gateType != MoeGateSwiglu || input.dataType != DataType::FLOAT16 || input.dims.size() == 0 ||
+        if (gateType != MoeGateSwiglu || !IsCudaMergeMoeFp8InputType(input.dataType) || input.dims.size() == 0 ||
             index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
             score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
             weightsBatch < 4) {
@@ -2701,16 +2723,20 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         }
 
         int inter = down->dims[1];
-        return FastllmCudaHalfMergeMOEFP8E4M3Batch1Indexed(input, w1, output, weights, weightsBatch,
-                                                           (const int32_t*)index.cudaData, (const float*)score.cudaData,
-                                                           topk, hidden, inter);
+        return input.dataType == DataType::FLOAT16 ?
+            FastllmCudaHalfMergeMOEFP8E4M3Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                        (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                        topk, hidden, inter) :
+            FastllmCudaBFloat16MergeMOEFP8E4M3Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                            (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                            topk, hidden, inter);
     }
 
-    static bool TryCudaMergeMOESmallBatchHalfFp8Indexed(
+    static bool TryCudaMergeMOESmallBatchFp8Indexed(
         Data &input, Data &output, Data &index, Data &score, int batch, int topk,
         Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
         if (batch <= 1 || batch > 64 ||
-            gateType != MoeGateSwiglu || input.dataType != DataType::FLOAT16 || input.dims.size() == 0 ||
+            gateType != MoeGateSwiglu || !IsCudaMergeMoeFp8InputType(input.dataType) || input.dims.size() == 0 ||
             index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
             score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
             weightsBatch < 4) {
@@ -2732,16 +2758,20 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         }
 
         int inter = down->dims[1];
-        return FastllmCudaHalfMergeMOEFP8E4M3SmallBatchIndexed(input, w1, output, weights, weightsBatch,
-                                                               (const int32_t*)index.cudaData, (const float*)score.cudaData,
-                                                               batch, topk, hidden, inter);
+        return input.dataType == DataType::FLOAT16 ?
+            FastllmCudaHalfMergeMOEFP8E4M3SmallBatchIndexed(input, w1, output, weights, weightsBatch,
+                                                            (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                            batch, topk, hidden, inter) :
+            FastllmCudaBFloat16MergeMOEFP8E4M3SmallBatchIndexed(input, w1, output, weights, weightsBatch,
+                                                                (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                                batch, topk, hidden, inter);
     }
 
-    static bool TryCudaMergeMOELargeBatchHalfFp8Grouped(
+    static bool TryCudaMergeMOELargeBatchFp8Grouped(
         Data &input, Data &output, const int32_t *indexData, const float *scoreData, int batch, int topk,
         Data &w1, Data &w2, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
         int minGroupedBatch = CudaEnvInt("FASTLLM_CUDA_MOE_GROUPED_INDEXED_MIN_BATCH", 16);
-        if (batch < minGroupedBatch || gateType != MoeGateSwiglu || input.dataType != DataType::FLOAT16 ||
+        if (batch < minGroupedBatch || gateType != MoeGateSwiglu || !IsCudaMergeMoeFp8InputType(input.dataType) ||
             input.dims.size() == 0 || weightsBatch < 4 || (weightsBatch & 1) ||
             indexData == nullptr || scoreData == nullptr) {
             return false;
@@ -2805,7 +2835,13 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 routePositions[b * topk + j] = pos;
             }
         }
-        return FastllmCudaHalfMergeMOEFP8E4M3GroupedIndexed(
+        if (input.dataType == DataType::FLOAT16) {
+            return FastllmCudaHalfMergeMOEFP8E4M3GroupedIndexed(
+                input, w1, w2, output, weights, weightsBatch,
+                routeRows.data(), routeScales.data(), routePositions.data(), expertStarts.data(), expertCounts.data(),
+                batch, topk, totalTasks, maxExpertTasks, hidden, inter);
+        }
+        return FastllmCudaBFloat16MergeMOEFP8E4M3GroupedIndexed(
                 input, w1, w2, output, weights, weightsBatch,
                 routeRows.data(), routeScales.data(), routePositions.data(), expertStarts.data(), expertCounts.data(),
                 batch, topk, totalTasks, maxExpertTasks, hidden, inter);
@@ -2832,14 +2868,14 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
 
             if (batch == 1 && index.dims.size() >= 2) {
                 int topk = index.dims[1];
-                if (TryCudaMergeMOEBatch1HalfFp8Indexed(input, output, index, score, topk,
-                                                        w1, weights, weightsBatch, sharedScale, gateType)) {
+                if (TryCudaMergeMOEBatch1Fp8Indexed(input, output, index, score, topk,
+                                                    w1, weights, weightsBatch, sharedScale, gateType)) {
                     return;
                 }
             } else if (batch > 1 && batch <= 64 && index.dims.size() >= 2) {
                 int topk = index.dims[1];
-                if (TryCudaMergeMOESmallBatchHalfFp8Indexed(input, output, index, score, batch, topk,
-                                                            w1, weights, weightsBatch, sharedScale, gateType)) {
+                if (TryCudaMergeMOESmallBatchFp8Indexed(input, output, index, score, batch, topk,
+                                                        w1, weights, weightsBatch, sharedScale, gateType)) {
                     return;
                 }
             }
@@ -2854,7 +2890,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             
             if (batch == 1) {
                 if (score.dataDevice == DataDevice::CUDA && score.dataType == DataType::FLOAT32 &&
-                    TryCudaMergeMOEBatch1HalfFp8(input, output, indexData, (float*)score.cudaData, true, topk, w1, weights, sharedScale, gateType)) {
+                    TryCudaMergeMOEBatch1Fp8(input, output, indexData, (float*)score.cudaData, true, topk, w1, weights, sharedScale, gateType)) {
                     return;
                 }
             }
@@ -2864,7 +2900,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             float *scoreData = (float*)score.cpuData;
 
             if (batch == 1) {
-                if (TryCudaMergeMOEBatch1HalfFp8(input, output, indexData, scoreData, false, topk, w1, weights, sharedScale, gateType)) {
+                if (TryCudaMergeMOEBatch1Fp8(input, output, indexData, scoreData, false, topk, w1, weights, sharedScale, gateType)) {
                     return;
                 }
                 std::vector <std::pair <int, float> > v;
@@ -2906,8 +2942,8 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             } else {
 
                 if (CudaEnvFlagEnabled("FASTLLM_CUDA_MOE_GROUPED_INDEXED") &&
-                    TryCudaMergeMOELargeBatchHalfFp8Grouped(input, output, indexData, scoreData, batch, topk,
-                                                            w1, w2, weights, weightsBatch, sharedScale, gateType)) {
+                    TryCudaMergeMOELargeBatchFp8Grouped(input, output, indexData, scoreData, batch, topk,
+                                                        w1, w2, weights, weightsBatch, sharedScale, gateType)) {
                     return;
                 }
 
