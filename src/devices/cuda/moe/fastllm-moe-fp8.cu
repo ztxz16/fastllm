@@ -994,6 +994,161 @@ __device__ __forceinline__ uint8_t FastllmFloatToFp8E4M3Byte(float value) {
 #endif
 }
 
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmGemvHalfFP8E4M3Block128SwigluKernel(half *A, uint8_t *B, half *C, int m, int k, int perRow) {
+    __shared__ float sdataGate[THREAD_PER_BLOCK];
+    __shared__ float sdataUp[THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    int p = blockIdx.x;
+    const int blockSize = 128;
+    const float magicScaleConstant = exp2f(8.0f);
+    const uint8_t *baseGate = B + (size_t)p * perRow;
+    const uint8_t *baseUp = B + (size_t)(p + k) * perRow;
+    int numBlocks = (m - 1) / blockSize + 1;
+    union_half4 regA;
+
+    sdataGate[tid] = 0.0f;
+    sdataUp[tid] = 0.0f;
+
+    for (int blk = 0; blk < numBlocks; blk++) {
+        int blkStart = blk * blockSize;
+        int blkEnd = min(blkStart + blockSize, m);
+        const uint8_t *gateBlock = baseGate + blk * (blockSize + sizeof(float));
+        const uint8_t *upBlock = baseUp + blk * (blockSize + sizeof(float));
+        float gateScale = *(float*)(gateBlock + blockSize);
+        float upScale = *(float*)(upBlock + blockSize);
+
+        for (int i = blkStart + tid * 4; i < blkEnd; i += THREAD_PER_BLOCK * 4) {
+            int localIdx = i - blkStart;
+            int remaining = blkEnd - i;
+            if (remaining >= 4) {
+                uint32_t gateBytes = *(uint32_t*)(gateBlock + localIdx);
+                uint32_t upBytes = *(uint32_t*)(upBlock + localIdx);
+                __half2 gate01 = make_half2(__short_as_half((((gateBytes >> 0) & 0x80) << 8) | (((gateBytes >> 0) & 0x7F) << 7)),
+                                            __short_as_half((((gateBytes >> 8) & 0x80) << 8) | (((gateBytes >> 8) & 0x7F) << 7)));
+                __half2 gate23 = make_half2(__short_as_half((((gateBytes >> 16) & 0x80) << 8) | (((gateBytes >> 16) & 0x7F) << 7)),
+                                            __short_as_half((((gateBytes >> 24) & 0x80) << 8) | (((gateBytes >> 24) & 0x7F) << 7)));
+                __half2 up01 = make_half2(__short_as_half((((upBytes >> 0) & 0x80) << 8) | (((upBytes >> 0) & 0x7F) << 7)),
+                                          __short_as_half((((upBytes >> 8) & 0x80) << 8) | (((upBytes >> 8) & 0x7F) << 7)));
+                __half2 up23 = make_half2(__short_as_half((((upBytes >> 16) & 0x80) << 8) | (((upBytes >> 16) & 0x7F) << 7)),
+                                          __short_as_half((((upBytes >> 24) & 0x80) << 8) | (((upBytes >> 24) & 0x7F) << 7)));
+                regA.in = *reinterpret_cast<const uint2 *>(A + i);
+#if (CUDART_VERSION < 12000) || defined(CUDA_NO_TENSOR_CORE)
+                sdataGate[tid] += ((float)regA.out[0] * (float)gate01.x +
+                                   (float)regA.out[1] * (float)gate01.y +
+                                   (float)regA.out[2] * (float)gate23.x +
+                                   (float)regA.out[3] * (float)gate23.y) * gateScale;
+                sdataUp[tid] += ((float)regA.out[0] * (float)up01.x +
+                                 (float)regA.out[1] * (float)up01.y +
+                                 (float)regA.out[2] * (float)up23.x +
+                                 (float)regA.out[3] * (float)up23.y) * upScale;
+#else
+                __half2 gateProd01 = __hmul2(regA.out2[0], gate01);
+                __half2 gateProd23 = __hmul2(regA.out2[1], gate23);
+                __half2 gatePair = __hadd2(gateProd01, gateProd23);
+                __half gateSum = __hadd(gatePair.x, gatePair.y);
+                sdataGate[tid] += __half2float(gateSum) * gateScale;
+
+                __half2 upProd01 = __hmul2(regA.out2[0], up01);
+                __half2 upProd23 = __hmul2(regA.out2[1], up23);
+                __half2 upPair = __hadd2(upProd01, upProd23);
+                __half upSum = __hadd(upPair.x, upPair.y);
+                sdataUp[tid] += __half2float(upSum) * upScale;
+#endif
+            } else {
+                for (int j = 0; j < remaining; j++) {
+                    half gateVal = __float2half((float)__ushort_as_half(((gateBlock[localIdx + j] & 0x80) << 8) | ((gateBlock[localIdx + j] & 0x7F) << 7)) * gateScale);
+                    half upVal = __float2half((float)__ushort_as_half(((upBlock[localIdx + j] & 0x80) << 8) | ((upBlock[localIdx + j] & 0x7F) << 7)) * upScale);
+                    float aVal = __half2float(A[i + j]);
+                    sdataGate[tid] += aVal * __half2float(gateVal);
+                    sdataUp[tid] += aVal * __half2float(upVal);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdataGate[tid] += sdataGate[tid + s];
+            sdataUp[tid] += sdataUp[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float gate = (float)(half)(sdataGate[0] * magicScaleConstant);
+        float up = (float)(half)(sdataUp[0] * magicScaleConstant);
+        C[p] = (half)((gate / (1.0f + expf(-gate))) * up);
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmGemvHalfFP8E4M3Block128AddToKernel(half *A, uint8_t *B, half *C, float alpha, bool overwrite, int m, int k, int perRow) {
+    __shared__ float sdata[THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    int st = blockIdx.x;
+    const int blockSize = 128;
+    const float magicScaleConstant = exp2f(8.0f);
+    const uint8_t *baseB = B + (size_t)st * perRow;
+    int numBlocks = (m - 1) / blockSize + 1;
+    union_half4 regA;
+
+    sdata[tid] = 0.0f;
+    for (int blk = 0; blk < numBlocks; blk++) {
+        int blkStart = blk * blockSize;
+        int blkEnd = min(blkStart + blockSize, m);
+        const uint8_t *blkData = baseB + blk * (blockSize + sizeof(float));
+        float blkScale = *(float*)(blkData + blockSize);
+
+        for (int i = blkStart + tid * 4; i < blkEnd; i += THREAD_PER_BLOCK * 4) {
+            int localIdx = i - blkStart;
+            int remaining = blkEnd - i;
+            if (remaining >= 4) {
+                uint32_t bb = *(uint32_t*)(blkData + localIdx);
+                __half2 B01 = make_half2(__short_as_half((((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 7)),
+                                         __short_as_half((((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 7)));
+                __half2 B23 = make_half2(__short_as_half((((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 7)),
+                                         __short_as_half((((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 7)));
+                regA.in = *reinterpret_cast<const uint2 *>(A + i);
+#if (CUDART_VERSION < 12000) || defined(CUDA_NO_TENSOR_CORE)
+                sdata[tid] += ((float)regA.out[0] * (float)B01.x +
+                               (float)regA.out[1] * (float)B01.y +
+                               (float)regA.out[2] * (float)B23.x +
+                               (float)regA.out[3] * (float)B23.y) * blkScale;
+#else
+                __half2 p01 = __hmul2(regA.out2[0], B01);
+                __half2 p23 = __hmul2(regA.out2[1], B23);
+                __half2 sumHalvesVec = __hadd2(p01, p23);
+                __half sumH = __hadd(sumHalvesVec.x, sumHalvesVec.y);
+                sdata[tid] += __half2float(sumH) * blkScale;
+#endif
+            } else {
+                for (int j = 0; j < remaining; j++) {
+                    half bVal = __float2half((float)__ushort_as_half(((blkData[localIdx + j] & 0x80) << 8) | ((blkData[localIdx + j] & 0x7F) << 7)) * blkScale);
+                    sdata[tid] += __half2float(A[i + j]) * __half2float(bVal);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float value = (float)(half)(sdata[0] * magicScaleConstant) * alpha;
+        if (!overwrite) {
+            value += __half2float(C[st]);
+        }
+        C[st] = (half)value;
+    }
+}
+
 void LaunchFastllmGemmFp16FP8E4M3Block128Swiglu(half *input, uint8_t *weight, half *output, int m, int k, int perRow) {
     FastllmGemvHalfFP8E4M3Block128SwigluKernel<64> <<< k, 64 >>>(input, weight, output, m, k, perRow);
 }
