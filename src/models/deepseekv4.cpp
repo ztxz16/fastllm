@@ -342,6 +342,10 @@ namespace fastllm {
                    (data.cpuData != nullptr || data.cudaData != nullptr);
         }
 
+        static bool IsDiskWeight(const Data *weight) {
+            return weight != nullptr && weight->isDiskWeight;
+        }
+
 #ifdef USE_CUDA
         static std::vector<int> GetCudaDeviceIdsForData(const Data &data) {
             if (data.cudaData != nullptr) {
@@ -3380,12 +3384,13 @@ namespace fastllm {
                 // MOE
                 Data sharedExpertOut;
                 bool hasSharedExpertOut = false;
-                if (cudaSe &&
-                    weight.weight.find(pre + ".ffn.shared_experts.gateup.weight") != weight.weight.end() &&
-                    weight.weight.find(pre + ".ffn.shared_experts.w2.weight") != weight.weight.end()) {
+                auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
+                auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
+                if (cudaSe && sharedGateupIt != weight.weight.end() && sharedDownIt != weight.weight.end() &&
+                    !IsDiskWeight(&sharedGateupIt->second) && !IsDiskWeight(&sharedDownIt->second)) {
                     Data ww1, ww3;
-                    LinearSwigluBlock(&ffnInput, &weight[pre + ".ffn.shared_experts.gateup.weight"], GetEmptyData(), &ww3, &ww1);
-                    Linear(ww1, weight[pre + ".ffn.shared_experts.w2.weight"], *GetEmptyData(), sharedExpertOut);
+                    LinearSwigluBlock(&ffnInput, &sharedGateupIt->second, GetEmptyData(), &ww3, &ww1);
+                    Linear(ww1, sharedDownIt->second, *GetEmptyData(), sharedExpertOut);
                     weights[layer][0] = weights[layer][1] = nullptr;
                     hasSharedExpertOut = true;
                 }
@@ -3780,12 +3785,13 @@ namespace fastllm {
             {
                 Data sharedExpertOut;
                 bool hasSharedExpertOut = false;
-                if (cudaSe &&
-                    weight.weight.find(pre + ".ffn.shared_experts.gateup.weight") != weight.weight.end() &&
-                    weight.weight.find(pre + ".ffn.shared_experts.w2.weight") != weight.weight.end()) {
+                auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
+                auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
+                if (cudaSe && sharedGateupIt != weight.weight.end() && sharedDownIt != weight.weight.end() &&
+                    !IsDiskWeight(&sharedGateupIt->second) && !IsDiskWeight(&sharedDownIt->second)) {
                     Data ww1, ww3;
-                    LinearSwigluBlock(&ffnInput, &weight[pre + ".ffn.shared_experts.gateup.weight"], GetEmptyData(), &ww3, &ww1);
-                    Linear(ww1, weight[pre + ".ffn.shared_experts.w2.weight"], *GetEmptyData(), sharedExpertOut);
+                    LinearSwigluBlock(&ffnInput, &sharedGateupIt->second, GetEmptyData(), &ww3, &ww1);
+                    Linear(ww1, sharedDownIt->second, *GetEmptyData(), sharedExpertOut);
                     weights[layer][0] = weights[layer][1] = nullptr;
                     hasSharedExpertOut = true;
                 }

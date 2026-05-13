@@ -13,6 +13,7 @@
 #include <cfloat>
 #include <cmath>
 #include <atomic>
+#include <set>
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -2098,27 +2099,40 @@ namespace fastllm {
 
         if (weights[2]->dataType == DataType::DATA_GGUF_FORMAT && 
             !weights[2]->IsRepacked) {
-            int len = weightsBatch;
-            
-            auto *pool = GetAlivePool();
-            int threadNum = pool->threads.size();
-            int per = len / threadNum;
-            int cur = 0;            
-            std::vector<fastllm::MultiThreadRepackWeightsOp*> ops;
-            for (int i = 0; i < threadNum; i++) {
-                int end = cur + per;
-                if (i == threadNum - 1) {
-                    end = len;
+            std::vector<Data*> repackWeights;
+            std::set<Data*> uniqueWeights;
+            for (int i = 0; i < weightsBatch; i++) {
+                if (weights[i] != nullptr &&
+                    weights[i]->dataType == DataType::DATA_GGUF_FORMAT &&
+                    !weights[i]->IsRepacked &&
+                    uniqueWeights.insert(weights[i]).second) {
+                    repackWeights.push_back(weights[i]);
                 }
-                ops.push_back(new MultiThreadRepackWeightsOp(weights, cur, end));
-                cur = end;
             }
-            for (int i = 0; i < ops.size(); i++) {
-                pool->PushOp(i, ops[i]);
-            }
-            for (int i = 0; i < ops.size(); i++) {
-                pool->Wait(i);
-                delete ops[i];
+            int len = (int)repackWeights.size();
+            if (len == 0) {
+                profileLap(profilePrepareMs);
+            } else {
+                auto *pool = GetAlivePool();
+                int threadNum = std::min((int)pool->threads.size(), len);
+                int per = len / threadNum;
+                int cur = 0;
+                std::vector<fastllm::MultiThreadRepackWeightsOp*> ops;
+                for (int i = 0; i < threadNum; i++) {
+                    int end = cur + per;
+                    if (i == threadNum - 1) {
+                        end = len;
+                    }
+                    ops.push_back(new MultiThreadRepackWeightsOp(repackWeights.data(), cur, end));
+                    cur = end;
+                }
+                for (int i = 0; i < ops.size(); i++) {
+                    pool->PushOp(i, ops[i]);
+                }
+                for (int i = 0; i < ops.size(); i++) {
+                    pool->Wait(i);
+                    delete ops[i];
+                }
             }
         }
 
@@ -2257,6 +2271,7 @@ namespace fastllm {
                     for (int j = 0; j < ops.size(); j++) {
                         pool->Wait(j);
                         delete ops[j];
+                        ops[j] = nullptr;
                     }
                     profileLap(profileGateMs);
 // record.push_back(std::make_pair("mul0", GetSpan(ttt, std::chrono::system_clock::now())));
@@ -2299,6 +2314,7 @@ namespace fastllm {
                     for (int l = st; l <= end; l++) {
                         pool->Wait(l - st);
                         delete ops[l - st];
+                        ops[l - st] = nullptr;
                     }
                     profileLap(profileSwigluQuantMs);
 // record.push_back(std::make_pair("swiglu", GetSpan(ttt, std::chrono::system_clock::now())));
@@ -2337,6 +2353,7 @@ namespace fastllm {
                     for (int j = 0; j < ops.size(); j++) {
                         pool->Wait(j);
                         delete ops[j];
+                        ops[j] = nullptr;
                     }
                     profileLap(profileDownMs);
  // record.push_back(std::make_pair("mul1", GetSpan(ttt, std::chrono::system_clock::now())));
@@ -2504,6 +2521,7 @@ namespace fastllm {
                     for (int j = 0; j < ops.size(); j++) {
                         pool->Wait(j);
                         delete ops[j];
+                        ops[j] = nullptr;
                     }
 
                     // swiglu
@@ -2531,6 +2549,7 @@ namespace fastllm {
                     for (int l = st; l <= end; l++) {
                         pool->Wait(l - st);
                         delete ops[l - st];
+                        ops[l - st] = nullptr;
                     }
 /*
                     for (int l = st; l <= end; l++) {
@@ -2566,6 +2585,7 @@ namespace fastllm {
                     for (int j = 0; j < ops.size(); j++) {
                         pool->Wait(j);
                         delete ops[j];
+                        ops[j] = nullptr;
                     }
                     st = end;
                 }
@@ -2702,6 +2722,7 @@ namespace fastllm {
                     for (int j = 0; j < ops.size(); j++) {
                         pool->Wait(j);
                         delete ops[j];
+                        ops[j] = nullptr;
                     }
                     double beforeGateLap = profileLast;
                     profileLap(fp16GateMs);
@@ -2737,6 +2758,7 @@ namespace fastllm {
                     for (int l = st; l <= end; l++) {
                         pool->Wait(l - st);
                         delete ops[l - st];
+                        ops[l - st] = nullptr;
                     }
                     profileLap(fp16SwigluMs);
 
@@ -2754,6 +2776,7 @@ namespace fastllm {
                     for (int j = 0; j < ops.size(); j++) {
                         pool->Wait(j);
                         delete ops[j];
+                        ops[j] = nullptr;
                     }
                     double beforeDownLap = profileLast;
                     profileLap(fp16DownMs);
@@ -2921,6 +2944,7 @@ namespace fastllm {
                     for (int j = 0; j < ops.size(); j++) {
                         pool->Wait(j);
                         delete ops[j];
+                        ops[j] = nullptr;
                     }
 
                     // swiglu
@@ -2946,6 +2970,7 @@ namespace fastllm {
                     for (int l = st; l <= end; l++) {
                         pool->Wait(l - st);
                         delete ops[l - st];
+                        ops[l - st] = nullptr;
                     }
                     threadSt = 0;
                     for (int l = st; l <= end; l++) {
@@ -2973,6 +2998,7 @@ namespace fastllm {
                     for (int j = 0; j < ops.size(); j++) {
                         pool->Wait(j);
                         delete ops[j];
+                        ops[j] = nullptr;
                     }
                     st = end;
                 }
