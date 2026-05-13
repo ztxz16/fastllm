@@ -54,6 +54,10 @@ extern "C" {
         fastllm::SetCudaEmbedding(cuda_embedding);
     }
 
+    DLL_EXPORT void set_cuda_slab(int mb) {
+        fastllm::SetCudaSlabMB(mb);
+    }
+
     DLL_EXPORT void set_cuda_shared_expert(bool cuda_shared_expert) {
         fastllm::SetCudaSharedExpert(cuda_shared_expert);
     }

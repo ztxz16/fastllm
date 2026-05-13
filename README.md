@@ -275,6 +275,10 @@ numactl -C 0-31 -m 0 ftllm server fastllm/DeepSeek-V3-0324-INT4 --device cuda --
   - **描述**: 指定 MOE中的共享专家 是否在cuda上执行，默认为true
   - **示例**: `--cuda_se false`
 
+- `--cuda_slab`:
+  - **描述**: 设置 CUDA 模型权重 slab 分配块大小，单位 MB。默认 `0` 表示关闭。将大量 MOE 专家权重放在 CUDA 上时，可用它减少小权重分别 `cudaMalloc` 带来的显存页对齐和碎片开销。
+  - **示例**: `--cuda_slab 1024`
+
 - `--port`:
   - **描述**: 指定服务运行的端口号。
   - **示例**: `--port 8080`

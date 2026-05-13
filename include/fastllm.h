@@ -67,6 +67,8 @@ namespace fastllm {
     bool GetLowMemMode();
     void SetCudaEmbedding(bool v);
     bool GetCudaEmbedding();
+    void SetCudaSlabMB(int mb);
+    int GetCudaSlabMB();
     int GetThreads();
     bool GetKVCacheInCPU();
     bool GetHistoryCacheInCPU();

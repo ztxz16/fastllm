@@ -88,6 +88,9 @@ namespace fastllm {
 
 #ifdef USE_CUDA
         static void *CudaMallocForData(const Data &data, uint64_t bytes) {
+            if (data.isModelWeight && !data.directMemory) {
+                return FastllmCudaMallocModelWeight(bytes);
+            }
             return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
         }
 
@@ -226,6 +229,7 @@ namespace fastllm {
     static bool historyCacheInCPU = false;
     static bool cudaEmbedding = false;
     static bool cudaSharedExpert = false;
+    static int cudaSlabMB = 0;
     static bool enableAMX = false;
     static int maxTokens = -1;
     static int defaultPageLen = 128;
@@ -322,6 +326,17 @@ namespace fastllm {
 
     bool GetCudaEmbedding() {
         return cudaEmbedding;
+    }
+
+    void SetCudaSlabMB(int mb) {
+        cudaSlabMB = std::max(0, mb);
+#ifdef USE_CUDA
+        FastllmCudaSetWeightSlabBytes((size_t)cudaSlabMB * 1024ULL * 1024ULL);
+#endif
+    }
+
+    int GetCudaSlabMB() {
+        return cudaSlabMB;
     }
 
     void SetCudaSharedExpert(bool v) {

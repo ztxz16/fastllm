@@ -10,8 +10,10 @@
 #include "utils/utils.h"
 
 #include <cstdlib>
+#include <mutex>
 #include <map>
 #include <random>
+#include <set>
 #include <type_traits>
 #include <vector>
 #include <cuda_fp8.h>
@@ -1610,6 +1612,124 @@ std::map<int, std::vector <CudaMemoryBuffer>> bigBuffersMap;
 static size_t fastllmCudaMemPoolAllocated = 0;
 static size_t fastllmCudaMemPoolPeak = 0;
 
+struct FastllmCudaWeightSlab {
+    void *base = nullptr;
+    size_t size = 0;
+    size_t used = 0;
+    int activeBlocks = 0;
+};
+
+struct FastllmCudaWeightSlabPtr {
+    int device = -1;
+    void *base = nullptr;
+};
+
+static std::mutex fastllmCudaWeightSlabMutex;
+static size_t fastllmCudaWeightSlabBytes = 0;
+static std::map<int, std::vector<FastllmCudaWeightSlab> > fastllmCudaWeightSlabs;
+static std::map<void*, FastllmCudaWeightSlabPtr> fastllmCudaWeightSlabPtrs;
+
+void FastllmCudaSetWeightSlabBytes(size_t bytes) {
+    std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
+    fastllmCudaWeightSlabBytes = bytes;
+}
+
+size_t FastllmCudaGetWeightSlabBytes() {
+    std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
+    return fastllmCudaWeightSlabBytes;
+}
+
+static size_t FastllmCudaAlignBytes(size_t size, size_t align) {
+    return ((size + align - 1) / align) * align;
+}
+
+void *FastllmCudaMallocModelWeight(size_t size) {
+    size_t slabBytes = FastllmCudaGetWeightSlabBytes();
+    if (slabBytes == 0 || size == 0 || size > slabBytes / 2) {
+        return FastllmCudaMalloc(size);
+    }
+
+    int id = -1;
+    cudaError_t state = cudaGetDevice(&id);
+    checkCudaErrors("Error: CUDA error when find device!", state);
+
+    const size_t align = 256;
+    size_t aligned = FastllmCudaAlignBytes(size, align);
+    std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
+
+    auto &slabs = fastllmCudaWeightSlabs[id];
+    int slabId = -1;
+    for (int i = 0; i < slabs.size(); i++) {
+        if (slabs[i].size >= slabs[i].used && slabs[i].size - slabs[i].used >= aligned) {
+            slabId = i;
+            break;
+        }
+    }
+
+    if (slabId < 0) {
+        void *base = nullptr;
+        state = cudaMalloc(&base, slabBytes);
+        if (cudaSuccess != state) {
+            printf("Error: CUDA error when allocating model weight slab %lu MB memory! maybe there's no enough memory left on device.",
+                   slabBytes >> 20);
+            checkCudaErrors("", state);
+            return nullptr;
+        }
+        FastllmCudaWeightSlab slab;
+        slab.base = base;
+        slab.size = slabBytes;
+        slab.used = 0;
+        slab.activeBlocks = 0;
+        slabs.push_back(slab);
+        slabId = (int)slabs.size() - 1;
+    }
+
+    FastllmCudaWeightSlab &slab = slabs[slabId];
+    void *ret = (void*)((uint8_t*)slab.base + slab.used);
+    slab.used += aligned;
+    slab.activeBlocks++;
+    fastllmCudaWeightSlabPtrs[ret] = {id, slab.base};
+    return ret;
+}
+
+static bool FastllmCudaTryFreeWeightSlabPtr(void *ret) {
+    if (ret == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
+    auto it = fastllmCudaWeightSlabPtrs.find(ret);
+    if (it == fastllmCudaWeightSlabPtrs.end()) {
+        return false;
+    }
+
+    int id = it->second.device;
+    void *base = it->second.base;
+    fastllmCudaWeightSlabPtrs.erase(it);
+
+    auto slabsIt = fastllmCudaWeightSlabs.find(id);
+    if (slabsIt != fastllmCudaWeightSlabs.end()) {
+        auto &slabs = slabsIt->second;
+        for (int i = 0; i < slabs.size(); i++) {
+            if (slabs[i].base == base) {
+                slabs[i].activeBlocks--;
+                if (slabs[i].activeBlocks <= 0) {
+                    int oriId = -1;
+                    cudaGetDevice(&oriId);
+                    cudaSetDevice(id);
+                    cudaError_t state = cudaFree(slabs[i].base);
+                    if (oriId >= 0 && oriId != id) {
+                        cudaSetDevice(oriId);
+                    }
+                    slabs.erase(slabs.begin() + i);
+                    checkCudaErrors("CUDA error when release model weight slab!", state);
+                }
+                return true;
+            }
+        }
+    }
+    return true;
+}
+
 #ifdef CUDA_MEM_DEBUG
 #include <execinfo.h>
 #include <cxxabi.h>
@@ -1929,6 +2049,9 @@ void * FastllmCudaMalloc(size_t size) {
 
 void FastllmCudaFree(void *ret) {
     if (ret == nullptr) {
+        return;
+    }
+    if (FastllmCudaTryFreeWeightSlabPtr(ret)) {
         return;
     }
     if (cudaBuffersMap.empty() && bigBuffersMap.empty())

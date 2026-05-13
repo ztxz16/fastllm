@@ -154,6 +154,10 @@ The following are common parameters when running the `ftllm` module:
   - **Description**: Specifies the number of experts to use in the MOE layer. If not set, it follows the model's configuration. Reducing the number of experts may speed up inference but could lower accuracy.  
   - **Example**: `--moe_experts 6`  
 
+- `--cuda_slab`:
+  - **Description**: Sets the CUDA model-weight slab size in MB. The default value `0` disables it. For MoE runs that place many expert weights on CUDA, it can reduce fragmentation and page-alignment overhead from many small weight allocations.
+  - **Example**: `--cuda_slab 1024`
+
 - `--port`:  
   - **Description**: Specifies the port number for the service.  
   - **Example**: `--port 8080`  

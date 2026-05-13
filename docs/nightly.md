@@ -186,6 +186,11 @@ ftllm server DeepSeek-V3-0324-Q4_K_M-00001-of-00009.gguf --ori DeepSeek-V3
   - **默认值**: `0.9`
   - **示例**: `--gpu_mem_ratio 0.8`
 
+- `--cuda_slab`:
+  - **描述**: 设置 CUDA 模型权重 slab 分配块大小，单位 MB。默认 `0` 表示关闭。对于将大量 MOE 专家权重放在 CUDA 上的场景，启用后可以减少大量小权重分别 `cudaMalloc` 带来的页对齐和碎片开销。
+  - **默认值**: `0`
+  - **示例**: `--cuda_slab 1024`
+
 ### 对话与模板参数
 
 - `--enable_thinking`:

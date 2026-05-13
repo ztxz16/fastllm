@@ -20,6 +20,7 @@ Configuration related to the model, OpenAI API Server, WebUI, and conversation d
   ```
 - **Device to Use (`--device`)**: Specifies the device used by the server. It can be specified as `cpu`, `cuda`, or other device types compiled additionally.
 - **CUDA Embedding (`--cuda_embedding`)**: If this configuration is included and the device is set to `cuda`, embedding operations will be performed on the cuda device, slightly increasing speed and GPU memory usage. It is recommended to use this when there is ample GPU memory.
+- **CUDA Weight Slab (`--cuda_slab`)**: Sets the CUDA model-weight slab size in MB. The default value `0` disables it. For MoE runs that place many expert weights on CUDA, a value such as `--cuda_slab 1024` can reduce fragmentation and page-alignment overhead from many small weight allocations.
 - **KV Cache Maximum Usage (`--kv_cache_limit`)**: Sets the maximum usage for the KV cache. If this parameter is not used or set to `auto`, the framework will handle it automatically. Manual settings examples are as follows:
   ```bash
   --kv_cache_limit 5G   # Sets to 5G

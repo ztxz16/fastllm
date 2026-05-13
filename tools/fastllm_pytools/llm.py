@@ -459,6 +459,9 @@ def get_cpu_historycache():
 def set_cuda_embedding(cuda_embedding):
     fastllm_lib.set_cuda_embedding(ctypes.c_bool(cuda_embedding));
 
+def set_cuda_slab(mb: int):
+    fastllm_lib.set_cuda_slab(ctypes.c_int(mb));
+
 def set_enable_amx(enable_amx):
     fastllm_lib.set_enable_amx(ctypes.c_bool(enable_amx));
 

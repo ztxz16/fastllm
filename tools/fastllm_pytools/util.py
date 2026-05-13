@@ -72,6 +72,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--tokens", type = int, default = -1, help = "设置总的token数量（用于计算paged cache的最大页数）")
     parser.add_argument("--page_size", type = int, default = 128, help = "设置paged cache每页的大小（token数）")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
+    parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
     
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
@@ -301,6 +302,8 @@ def make_normal_llm_model(args):
         llm.set_page_size(args.page_size)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
+    if (hasattr(args, 'cuda_slab')):
+        llm.set_cuda_slab(args.cuda_slab)
     graph = None
     if (args.custom != ""):
         import importlib.util
