@@ -230,7 +230,7 @@ namespace fastllm {
                 AttentionPagedBatch(qForAttention,
                     kCaches, vCaches,
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                    *attenOutput, qForAttention.dims[0] / kCaches.dims[0], 1.0 / sqrt(head_dim), 1, layerIdx > 0);
+                    *attenOutput, num_attention_heads / num_key_value_heads, 1.0 / sqrt(head_dim), 1, layerIdx > 0);
             }
 
             // 2.8 AttentionPagedBatch 输出形状为 [seqlen, num_heads, head_dim]
@@ -301,7 +301,7 @@ namespace fastllm {
             AttentionPagedBatch(qForAttention, 
                 kCaches, vCaches, 
                 *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                *attenOutput, qForAttention.dims[0] / kCaches.dims[0], 1.0 / sqrt(head_dim), 1, layerIdx > 0);
+                *attenOutput, num_attention_heads / num_key_value_heads, 1.0 / sqrt(head_dim), 1, layerIdx > 0);
 
             // 9. Reshape + Permute
             attenOutput->Reshape({seqlen, bsz, -1});

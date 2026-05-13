@@ -4786,8 +4786,8 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
     float *kNormWeight,      // [head_dim]
     float *positionIds,      // [bs, partStride]
     T *qOutputData,          // [bsz * q_heads, seqlen, head_dim] (permuted output)
-    uint8_t *pagedKData,     // paged K cache raw data
-    uint8_t *pagedVData,     // paged V cache raw data
+    TKV *pagedKData,         // paged K cache raw data
+    TKV *pagedVData,         // paged V cache raw data
     int32_t *insertIndexs,   // [batch] page index for each batch (逻辑 batch)
     int32_t *insertPositions,// [batch] page offset for each batch (逻辑 batch)
     int32_t *lastPageLens,   // optional [batch], filled with page offset after append
@@ -4920,7 +4920,7 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
             int pageOffset = insertPositions[batch_idx];
             int pageStride = pageLen * k_heads * head_dim;
             int tokenStride = k_heads * head_dim;
-            TKV *dst = (TKV*)pagedKData + (size_t)pageIdx * pageStride + pageOffset * tokenStride + kh * head_dim;
+            TKV *dst = pagedKData + (size_t)pageIdx * pageStride + pageOffset * tokenStride + kh * head_dim;
             for (int i = tid; i < head_dim; i += THREAD_PER_BLOCK) {
                 dst[i] = FastllmCudaFloatToValue<TKV>(FastllmCudaValueToFloat(base[i]));
             }
@@ -4933,7 +4933,7 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
         int pageOffset = insertPositions[batch_idx];
         int pageStride = pageLen * v_heads * head_dim;
         int tokenStride = v_heads * head_dim;
-        TKV *dst = (TKV*)pagedVData + (size_t)pageIdx * pageStride + pageOffset * tokenStride + vh * head_dim;
+        TKV *dst = pagedVData + (size_t)pageIdx * pageStride + pageOffset * tokenStride + vh * head_dim;
         for (int i = tid; i < head_dim; i += THREAD_PER_BLOCK) {
             dst[i] = FastllmCudaFloatToValue<TKV>(FastllmCudaValueToFloat(base[i]));
         }
@@ -4977,7 +4977,7 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
         FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel<decltype(TPB)::value, QT, KVT><<<grid_size, decltype(TPB)::value>>>(
             qkvPtr, (float*)qNormWeight.cudaData, (float*)kNormWeight.cudaData,
             cudaPositionIds, qOutputPtr,
-            pagedKData, pagedVData, insertIndexs, insertPositions, lastPageLens,
+            (KVT*)pagedKData, (KVT*)pagedVData, insertIndexs, insertPositions, lastPageLens,
             outer, total_dim, q_heads, k_heads, v_heads, head_dim,
             bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
     };

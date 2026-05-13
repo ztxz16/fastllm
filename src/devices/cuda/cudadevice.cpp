@@ -3681,78 +3681,40 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             posDataHost[b] = insertPos;
         }
 
-        struct CachedIntBuffer {
-            void *cudaData = nullptr;
-            size_t capacityBytes = 0;
-            std::vector<int> lastHost;
-        };
-        struct AppendPagedParamsCache {
-            CachedIntBuffer insertIndexs;
-            CachedIntBuffer insertPositions;
-        };
-        thread_local static std::map<int, AppendPagedParamsCache> appendParamsCache;
-
-        int currentDevice = FastllmCudaGetDevice();
-        AppendPagedParamsCache &cache = appendParamsCache[currentDevice];
-
-        auto ensureBuffer = [](CachedIntBuffer &buffer, size_t bytes) {
-            if (buffer.capacityBytes < bytes) {
-                if (buffer.cudaData != nullptr) {
-                    FastllmCudaFree(buffer.cudaData);
-                }
-                buffer.cudaData = FastllmCudaMalloc(bytes);
-                buffer.capacityBytes = bytes;
-                buffer.lastHost.clear();
-            }
-        };
-        auto syncIfChanged = [&](CachedIntBuffer &buffer, const std::vector<int> &host, size_t count, bool force) {
-            size_t bytes = count * sizeof(int32_t);
-            ensureBuffer(buffer, bytes);
-            bool changed = force || buffer.lastHost.size() != count;
-            if (!changed) {
-                for (size_t i = 0; i < count; i++) {
-                    if (buffer.lastHost[i] != host[i]) {
-                        changed = true;
-                        break;
-                    }
-                }
-            }
-            if (changed) {
-                FastllmCudaCopyFromHostToDevice(buffer.cudaData, (void*)host.data(), bytes);
-                buffer.lastHost.assign(host.begin(), host.begin() + count);
-            }
-        };
-        auto attachCachedBuffer = [&](Data &data, void *ptr, uint64_t count) {
-            if (!data.isFake && (data.cpuData != nullptr || data.cudaData != nullptr)) {
+        auto prepareCudaInt = [](Data &data, int count) {
+            int currentDevice = FastllmCudaGetDevice();
+            if (data.isFake) {
+                data.isFake = false;
+                data.cudaData = nullptr;
+                data.cpuData = nullptr;
+                data.expansionSize = 0;
+                data.expansionBytes = 0;
+            } else if (data.dataDevice != DataDevice::CUDA && (data.cpuData != nullptr || data.cudaData != nullptr)) {
                 data.FreeSpace();
+            } else if (data.dataDevice == DataDevice::CUDA && data.cudaData != nullptr) {
+                int ptrDevice = GetPointerDeviceId(data.cudaData);
+                if ((ptrDevice >= 0 && ptrDevice != currentDevice) ||
+                    (!data.dataDeviceIds.empty() && data.dataDeviceIds[0] != currentDevice)) {
+                    data.FreeSpace();
+                }
             }
-            data.isFake = true;
-            data.dataDevice = DataDevice::CUDA;
-            data.dataDeviceIds = {currentDevice};
-            data.cudaData = ptr;
-            data.cpuData = nullptr;
-            data.expansionSize = count;
-            data.expansionBytes = count * sizeof(int32_t);
-        };
-
-        // Keep append metadata fresh for every decode step. Stale insert
-        // positions can write K/V into the wrong page slot and surface later as
-        // an illegal access in an unrelated kernel.
-        syncIfChanged(cache.insertIndexs, idxDataHost, batch, true);
-        syncIfChanged(cache.insertPositions, posDataHost, batch, true);
-        attachCachedBuffer(insertIndexs, cache.insertIndexs.cudaData, batch);
-        attachCachedBuffer(insertPositions, cache.insertPositions.cudaData, batch);
-
-        auto invalidateReplicas = [](Data &d) {
-            for (auto &it : d.multiDeviceDatas) {
+            for (auto &it : data.multiDeviceDatas) {
                 delete it.second;
             }
-            d.multiDeviceDatas.clear();
-            d.multiDeviceData = false;
-            d.ClearTensorParallelLayout();
+            data.multiDeviceDatas.clear();
+            data.multiDeviceData = false;
+            data.ClearTensorParallelLayout();
+            data.dataType = DataType::INT32;
+            data.dataDevice = DataDevice::CUDA;
+            data.dataDeviceIds = {currentDevice};
+            data.Resize({count});
+            data.Allocate(false);
         };
-        invalidateReplicas(insertIndexs);
-        invalidateReplicas(insertPositions);
+
+        prepareCudaInt(insertIndexs, batch);
+        prepareCudaInt(insertPositions, batch);
+        FastllmCudaCopyFromHostToDevice(insertIndexs.cudaData, (void*)idxDataHost.data(), batch * sizeof(int32_t));
+        FastllmCudaCopyFromHostToDevice(insertPositions.cudaData, (void*)posDataHost.data(), batch * sizeof(int32_t));
     }
 
     void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens, Data &output, int group, float scale, int attentionType, bool inited) {
@@ -3858,104 +3820,48 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             lastPageLensHost[b] = pastKeys[b]->lastPageLen;
         }
 
-        if (seqLensSize == 0) {
-            struct CachedIntBuffer {
-                void *cudaData = nullptr;
-                size_t capacityBytes = 0;
-                std::vector<int> lastHost;
-            };
-            struct DecodePagedParamsCache {
-                CachedIntBuffer qSizes;
-                CachedIntBuffer pageSizes;
-                CachedIntBuffer pageIndexs;
-                CachedIntBuffer lastPageLens;
-            };
-            thread_local static std::map<int, DecodePagedParamsCache> decodeParamsCache;
-
+        auto prepareCudaInt = [](Data &data, int count) {
             int currentDevice = FastllmCudaGetDevice();
-            DecodePagedParamsCache &cache = decodeParamsCache[currentDevice];
-
-            auto ensureBuffer = [](CachedIntBuffer &buffer, size_t bytes) {
-                if (buffer.capacityBytes < bytes) {
-                    if (buffer.cudaData != nullptr) {
-                        FastllmCudaFree(buffer.cudaData);
-                    }
-                    buffer.cudaData = FastllmCudaMalloc(bytes);
-                    buffer.capacityBytes = bytes;
-                    buffer.lastHost.clear();
-                }
-            };
-            auto syncIfChanged = [&](CachedIntBuffer &buffer, const std::vector<int> &host, size_t count, bool force) {
-                size_t bytes = count * sizeof(int32_t);
-                ensureBuffer(buffer, bytes);
-                bool changed = force || buffer.lastHost.size() != count;
-                if (!changed) {
-                    for (size_t i = 0; i < count; i++) {
-                        if (buffer.lastHost[i] != host[i]) {
-                            changed = true;
-                            break;
-                        }
-                    }
-                }
-                if (changed) {
-                    FastllmCudaCopyFromHostToDevice(buffer.cudaData, (void*)host.data(), bytes);
-                    buffer.lastHost.assign(host.begin(), host.begin() + count);
-                }
-            };
-            auto attachCachedBuffer = [&](Data &data, void *ptr, uint64_t count) {
-                if (!data.isFake && (data.cpuData != nullptr || data.cudaData != nullptr)) {
+            if (data.isFake) {
+                data.isFake = false;
+                data.cudaData = nullptr;
+                data.cpuData = nullptr;
+                data.expansionSize = 0;
+                data.expansionBytes = 0;
+            } else if (data.dataDevice != DataDevice::CUDA && (data.cpuData != nullptr || data.cudaData != nullptr)) {
+                data.FreeSpace();
+            } else if (data.dataDevice == DataDevice::CUDA && data.cudaData != nullptr) {
+                int ptrDevice = GetPointerDeviceId(data.cudaData);
+                if ((ptrDevice >= 0 && ptrDevice != currentDevice) ||
+                    (!data.dataDeviceIds.empty() && data.dataDeviceIds[0] != currentDevice)) {
                     data.FreeSpace();
                 }
-                data.isFake = true;
-                data.dataDevice = DataDevice::CUDA;
-                data.dataDeviceIds = {currentDevice};
-                data.cudaData = ptr;
-                data.cpuData = nullptr;
-                data.expansionSize = count;
-                data.expansionBytes = count * sizeof(int32_t);
-            };
-
-            // FlashInfer may keep using these small metadata buffers across the
-            // decode step. Always refresh them before planning/launching to avoid
-            // stale device-side indptr/page data when the shape is unchanged.
-            syncIfChanged(cache.qSizes, qSizesHost, batch + 1, true);
-            syncIfChanged(cache.pageSizes, pageSizesHost, batch + 1, true);
-            syncIfChanged(cache.pageIndexs, pageIndexsHost, totalPageSlots, true);
-            if (!lastPageLensOnDevice) {
-                syncIfChanged(cache.lastPageLens, lastPageLensHost, batch, true);
             }
-
-            attachCachedBuffer(qSizes, cache.qSizes.cudaData, batch + 1);
-            attachCachedBuffer(pageSizes, cache.pageSizes.cudaData, batch + 1);
-            attachCachedBuffer(pageIndexs, cache.pageIndexs.cudaData, totalPageSlots);
-            if (!lastPageLensOnDevice) {
-                attachCachedBuffer(lastPageLens, cache.lastPageLens.cudaData, batch);
-            }
-        } else {
-            // 分配输出内存
-            qSizes.Allocate(false);
-            pageSizes.Allocate(false);
-            lastPageLens.Allocate(false);
-            pageIndexs.Allocate(false);
-
-            // 拷贝到对应设备
-            FastllmCudaCopyFromHostToDevice(qSizes.cudaData, qSizesHost.data(), (batch + 1) * sizeof(int32_t));
-            FastllmCudaCopyFromHostToDevice(pageSizes.cudaData, pageSizesHost.data(), (batch + 1) * sizeof(int32_t));
-            FastllmCudaCopyFromHostToDevice(lastPageLens.cudaData, lastPageLensHost.data(), batch * sizeof(int32_t));
-            FastllmCudaCopyFromHostToDevice(pageIndexs.cudaData, pageIndexsHost.data(), totalPageSlots * sizeof(int32_t));
-        }
-
-        auto invalidateReplicas = [](Data &d) {
-            for (auto &it : d.multiDeviceDatas) {
+            for (auto &it : data.multiDeviceDatas) {
                 delete it.second;
             }
-            d.multiDeviceDatas.clear();
-            d.multiDeviceData = false;
-            d.ClearTensorParallelLayout();
+            data.multiDeviceDatas.clear();
+            data.multiDeviceData = false;
+            data.ClearTensorParallelLayout();
+            data.dataType = DataType::INT32;
+            data.dataDevice = DataDevice::CUDA;
+            data.dataDeviceIds = {currentDevice};
+            data.Resize({count});
+            data.Allocate(false);
         };
-        invalidateReplicas(qSizes);
-        invalidateReplicas(pageSizes);
-        invalidateReplicas(pageIndexs);
-        invalidateReplicas(lastPageLens);
+
+        prepareCudaInt(qSizes, batch + 1);
+        prepareCudaInt(pageSizes, batch + 1);
+        prepareCudaInt(pageIndexs, totalPageSlots);
+        if (!lastPageLensOnDevice) {
+            prepareCudaInt(lastPageLens, batch);
+        }
+
+        FastllmCudaCopyFromHostToDevice(qSizes.cudaData, (void*)qSizesHost.data(), (batch + 1) * sizeof(int32_t));
+        FastllmCudaCopyFromHostToDevice(pageSizes.cudaData, (void*)pageSizesHost.data(), (batch + 1) * sizeof(int32_t));
+        FastllmCudaCopyFromHostToDevice(pageIndexs.cudaData, (void*)pageIndexsHost.data(), totalPageSlots * sizeof(int32_t));
+        if (!lastPageLensOnDevice) {
+            FastllmCudaCopyFromHostToDevice(lastPageLens.cudaData, (void*)lastPageLensHost.data(), batch * sizeof(int32_t));
+        }
     }
 }

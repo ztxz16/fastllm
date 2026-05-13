@@ -2607,7 +2607,7 @@ namespace fastllm {
                 *qSizes.multiDeviceDatas[device], *pageSizes.multiDeviceDatas[device],
                 *pageIndexs.multiDeviceDatas[device], *lastPageLens.multiDeviceDatas[device],
                 *output.multiDeviceDatas[device],
-                localQ->dims[0] / std::max(1, localKCache->dims[0]),
+                group,
                 scale, attentionType, inited, false
             );
         }
