@@ -22,6 +22,27 @@ namespace fastllm {
             return diff > 1e-6f || diff < -1e-6f;
         }
 
+        static std::vector<float>* CreatePendingResultLogits(const GenerationConfig &config) {
+            return config.output_logits ? new std::vector<float>() : nullptr;
+        }
+
+        static void QueueGeneratedResultLogits(ResponseContext *ctx,
+                                               std::vector<std::vector<float>*> &logits,
+                                               int index) {
+            if (ctx == nullptr || index < 0 || index >= (int)logits.size() || logits[index] == nullptr) {
+                return;
+            }
+            ctx->resultLogits.push(logits[index]);
+            logits[index] = nullptr;
+        }
+
+        static void ReleasePendingResultLogits(std::vector<std::vector<float>*> &logits) {
+            for (auto *&item : logits) {
+                delete item;
+                item = nullptr;
+            }
+        }
+
         static void ReleasePagedCachePages(Data &cache, bool clearDims = false) {
             auto releaseOne = [](Data &pagedCache) {
                 if (pagedCache.isPagedKVCache && pagedCache.pagedKVCacheData != nullptr &&
@@ -996,12 +1017,7 @@ namespace fastllm {
                     selectedNeedLastTokens |= ctxNeedRepeatPenalty ||
                                               (ctx->generationConfig.output_logits &&
                                                !ctx->generationConfig.IsSimpleGreedy());
-                    if (ctx->generationConfig.output_logits) {
-                        ctx->resultLogits.push(new std::vector<float>());
-                        logits.push_back(ctx->resultLogits.back());
-                    } else {
-                        logits.push_back(nullptr);
-                    }
+                    logits.push_back(CreatePendingResultLogits(ctx->generationConfig));
 
                     tokenContexts.push_back(ctx);
                     handles.push_back(ii.handle);
@@ -1323,6 +1339,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                             ctx->currentTokens.assign(1, curRet);
                         }
                         ctx->resultTokenQueue.push(curRet);
+                        QueueGeneratedResultLogits(ctx, logits, i);
                         ctx->allTokens.push_back(curRet);
                         if (NeedRepeatPenalty(ctx->generationConfig)) {
                             ctx->tokens.Push(curRet);
@@ -1341,6 +1358,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                         }
                     }
                 }
+                ReleasePendingResultLogits(logits);
             } else {
                 // 没有任何请求可以调度时，等待新请求
             }
@@ -1595,12 +1613,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                                 }
 
                                 generationConfigs.push_back(it.second->generationConfig);
-                                if (it.second->generationConfig.output_logits) {
-                                    it.second->resultLogits.push(new std::vector<float>());
-                                    logits.push_back(it.second->resultLogits.back());
-                                } else {
-                                    logits.push_back(nullptr);
-                                }
+                                logits.push_back(CreatePendingResultLogits(it.second->generationConfig));
 
                                 tokensManager.units.push_back(it.second->tokens);
                                 handles.push_back(it.first);
@@ -1777,6 +1790,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                                 if (it.second->isEnding == false) {
                                     it.second->currentTokens = std::vector<int>{curRet};
                                     it.second->resultTokenQueue.push(curRet);
+                                    QueueGeneratedResultLogits(it.second, logits, i);
                                     it.second->allTokens.push_back(curRet);
                                     it.second->tokens.Push(curRet);
                                     it.second->curTokens++;
@@ -1787,6 +1801,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                                     }
                                 }
                             }
+                            ReleasePendingResultLogits(logits);
                         } else {
                             int maxLen = -1, select = -1;
                             for (auto &it: model->responseContextDict.dicts) {
