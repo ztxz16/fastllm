@@ -4221,9 +4221,9 @@ namespace fastllm {
         curExecutor->PrintProfiler();
     }
 
-    void ApplyDeviceMap(const std::map <std::string, int> &deviceMap, int current, int total) {
-        if (deviceMap.size() == 0) {
-            return;
+    std::string SelectDeviceFromMap(const std::map <std::string, int> &deviceMap, int current, int total) {
+        if (deviceMap.size() == 0 || total <= 0) {
+            return "";
         }
         int sum = 0, cur = 0;
         for (auto &it : deviceMap) {
@@ -4237,6 +4237,14 @@ namespace fastllm {
                 curDevice = it.first;
                 break;
             }
+        }
+        return curDevice;
+    }
+
+    void ApplyDeviceMap(const std::map <std::string, int> &deviceMap, int current, int total) {
+        std::string curDevice = SelectDeviceFromMap(deviceMap, current, total);
+        if (curDevice.empty()) {
+            return;
         }
         curExecutor->SetFirstDevice(curDevice);
     }

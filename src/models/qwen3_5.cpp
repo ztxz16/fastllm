@@ -300,20 +300,24 @@ namespace fastllm {
         dst.isModelWeight = true;
     }
 
-    static void RegisterExpertLinearWeight(Data &data, const std::string &weightType) {
-        if (!GetFastllmEnv().activateNuma) {
+    static void RegisterExpertLinearWeight(Data &data, const std::string &weightType, bool registerFastllmData, bool registerNumas) {
+        if (!registerFastllmData && !registerNumas) {
             return;
         }
 
         data.CalcWeightSum();
 
 #if defined(USE_TFACC) || defined(USE_NUMA)
-        data.weightSum.resize(1);
-        RegisterFastllmData(&data, weightType);
+        if (registerFastllmData) {
+            data.weightSum.resize(1);
+            RegisterFastllmData(&data, weightType);
+        }
 #endif
 
 #if defined(USE_NUMAS)
-        RegisterNumas(&data, weightType);
+        if (registerNumas) {
+            RegisterNumas(&data, weightType);
+        }
 #endif
     }
 
@@ -766,8 +770,8 @@ namespace fastllm {
                     this->weightMergeRules.push_back(
                         WeightMergeRule({WeightMergeRuleSingle({expertGateWeightName, expertUpWeightName}, expertGateupWeightName, std::string("linearSwiglu"))})
                     );
-                    this->specialWeights[expertGateupWeightName] = "linearSwiglu";
-                    this->specialWeights[expertDownWeightName] = "linearColumn";
+                    this->AddSpecialWeight(expertGateupWeightName, "linearSwiglu", i);
+                    this->AddSpecialWeight(expertDownWeightName, "linearColumn", i);
                     this->moeLinears.insert(expertGateWeightName);
                     this->moeLinears.insert(expertUpWeightName);
                     this->moeLinears.insert(expertDownWeightName);
@@ -836,8 +840,12 @@ namespace fastllm {
             const std::string expertDownName = layerPrefix + "experts." + std::to_string(j) + ".down_proj.weight";
             SplitExpertLinearWeight(this->weight.weight[expertGateupName], fusedGateup, expertGateupName, j);
             SplitExpertLinearWeight(this->weight.weight[expertDownName], fusedDown, expertDownName, j);
-            RegisterExpertLinearWeight(this->weight.weight[expertGateupName], "linearSwiglu");
-            RegisterExpertLinearWeight(this->weight.weight[expertDownName], "linearColumn");
+            RegisterExpertLinearWeight(this->weight.weight[expertGateupName], "linearSwiglu",
+                                       this->ShouldRegisterSpecialWeightForDeviceTypes(expertGateupName, {"numa", "tfacc"}),
+                                       this->ShouldRegisterSpecialWeightForDeviceType(expertGateupName, "numa"));
+            RegisterExpertLinearWeight(this->weight.weight[expertDownName], "linearColumn",
+                                       this->ShouldRegisterSpecialWeightForDeviceTypes(expertDownName, {"numa", "tfacc"}),
+                                       this->ShouldRegisterSpecialWeightForDeviceType(expertDownName, "numa"));
         }
 
         this->weight.weight.erase(fusedGateupName);

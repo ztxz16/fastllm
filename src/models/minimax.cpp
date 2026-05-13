@@ -128,8 +128,8 @@ namespace fastllm {
                     WeightMergeRule({WeightMergeRuleSingle({w1WeightName, w3WeightName}, swigluWeightName, std::string("linearSwiglu"))})
                 );
 
-                this->specialWeights[swigluWeightName] = "linearSwiglu";
-                this->specialWeights[downWeightName] = "linearColumn";
+                this->AddSpecialWeight(swigluWeightName, "linearSwiglu", i);
+                this->AddSpecialWeight(downWeightName, "linearColumn", i);
                 
                 this->moeLinears.insert(w1WeightName);
                 this->moeLinears.insert(w3WeightName);

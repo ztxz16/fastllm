@@ -369,6 +369,7 @@ namespace fastllm {
 
         std::vector <WeightMergeRule> weightMergeRules;
         std::map <std::string, std::string> specialWeights; //一些特殊层，可以提前注册（一般用于TFACC）
+        std::map <std::string, int> specialWeightLayerIds;
         std::set <std::string> cantQuantLinears; // 不能量化的Linear层
         std::set <std::string> moeLinears;
 
@@ -389,6 +390,10 @@ namespace fastllm {
 
         std::map <std::string, int> deviceMap;
         std::map <std::string, int> moeDeviceMap;
+
+        void AddSpecialWeight(const std::string &weightName, const std::string &weightType, int layerId = -1);
+        bool ShouldRegisterSpecialWeightForDeviceType(const std::string &weightName, const std::string &deviceType) const;
+        bool ShouldRegisterSpecialWeightForDeviceTypes(const std::string &weightName, const std::vector<std::string> &deviceTypes) const;
 
         std::string adapterName;
 

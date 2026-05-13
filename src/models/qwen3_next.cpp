@@ -141,8 +141,8 @@ namespace fastllm {
                 );
 
                 if (j != -1) {
-                    this->specialWeights[swigluWeightName] = "linearSwiglu";
-                    this->specialWeights[downWeightName] = "linearColumn";
+                    this->AddSpecialWeight(swigluWeightName, "linearSwiglu", i);
+                    this->AddSpecialWeight(downWeightName, "linearColumn", i);
                 }
                 
                 if (j != -1) {

@@ -153,8 +153,8 @@ namespace fastllm {
                 );
 
                 if (j != -1 || !GetCudaSharedExpert()) {
-                    this->specialWeights[swigluWeightName] = "linearSwiglu";
-                    this->specialWeights[downWeightName] = "linearColumn";
+                    this->AddSpecialWeight(swigluWeightName, "linearSwiglu", i);
+                    this->AddSpecialWeight(downWeightName, "linearColumn", i);
                 }
                 
                 this->moeLinears.insert(w1WeightName);

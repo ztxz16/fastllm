@@ -193,6 +193,44 @@ namespace fastllm {
         this->moeDeviceMap = GetMoeDeviceMap();
     }
 
+    void basellm::AddSpecialWeight(const std::string &weightName, const std::string &weightType, int layerId) {
+        this->specialWeights[weightName] = weightType;
+        this->specialWeightLayerIds[weightName] = layerId;
+    }
+
+    static bool DeviceNameMatchesType(const std::string &deviceName, const std::string &deviceType) {
+        if (deviceName == deviceType) {
+            return true;
+        }
+        return deviceName.size() > deviceType.size() &&
+               deviceName.compare(0, deviceType.size(), deviceType) == 0 &&
+               deviceName[deviceType.size()] == ':';
+    }
+
+    bool basellm::ShouldRegisterSpecialWeightForDeviceType(const std::string &weightName, const std::string &deviceType) const {
+        return this->ShouldRegisterSpecialWeightForDeviceTypes(weightName, {deviceType});
+    }
+
+    bool basellm::ShouldRegisterSpecialWeightForDeviceTypes(const std::string &weightName, const std::vector<std::string> &deviceTypes) const {
+        if (!GetFastllmEnv().activateNuma || this->specialWeights.find(weightName) == this->specialWeights.end()) {
+            return false;
+        }
+        if (this->moeDeviceMap.empty()) {
+            return true;
+        }
+        auto layerIt = this->specialWeightLayerIds.find(weightName);
+        if (layerIt == this->specialWeightLayerIds.end() || layerIt->second < 0) {
+            return true;
+        }
+        std::string selectedDevice = SelectDeviceFromMap(this->moeDeviceMap, layerIt->second + 1, this->block_cnt);
+        for (auto &deviceType : deviceTypes) {
+            if (DeviceNameMatchesType(selectedDevice, deviceType)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void basellm::SaveLowBitModel(const std::string &fileName, int bit) {
         this->weight.SaveLowBitModel(fileName, bit);
     }
@@ -1811,12 +1849,10 @@ if (false) {
                                         }
 #if defined(USE_TFACC) || defined(USE_NUMA)
                                         try {
-                                            if (GetFastllmEnv().activateNuma) {
-                                            locker.lock();
-                                                if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
-                                                    mergeData.weightSum.resize(1);
-                                                    RegisterFastllmData(&mergeData, it.type);       
-                                                }
+                                            if (model->ShouldRegisterSpecialWeightForDeviceTypes(mergeName, {"numa", "tfacc"})) {
+                                                locker.lock();
+                                                mergeData.weightSum.resize(1);
+                                                RegisterFastllmData(&mergeData, it.type);
                                                 locker.unlock();
                                             }
                                         } catch (...) {
@@ -1824,11 +1860,9 @@ if (false) {
 #endif
 #if defined(USE_NUMAS)
                                         try {
-                                            if (GetFastllmEnv().activateNuma) {
-                                                if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
-                                                    mergeData.weightSum.resize(1);
-                                                    RegisterNumas(&mergeData, it.type);       
-                                                }
+                                            if (model->ShouldRegisterSpecialWeightForDeviceType(mergeName, "numa")) {
+                                                mergeData.weightSum.resize(1);
+                                                RegisterNumas(&mergeData, it.type);
                                             }
                                         } catch (...) {
                                         }
@@ -1844,24 +1878,20 @@ if (false) {
                             locker.unlock();
 #if defined(USE_TFACC) || defined(USE_NUMA)
                             try {
-                                if (GetFastllmEnv().activateNuma) {
-                                    if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
-                                        locker.lock();
-                                            model->weight.weight[weightName].weightSum.resize(1);
-                                            RegisterFastllmData(&model->weight.weight[weightName], model->specialWeights[weightName]);
-                                        locker.unlock();
-                                    }
+                                if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceTypes(weightName, {"numa", "tfacc"})) {
+                                    locker.lock();
+                                    model->weight.weight[weightName].weightSum.resize(1);
+                                    RegisterFastllmData(&model->weight.weight[weightName], model->specialWeights[weightName]);
+                                    locker.unlock();
                                 }
                             } catch (...) {
                             }
 #endif
 #if defined(USE_NUMAS)
                             try {
-                                if (GetFastllmEnv().activateNuma) {
-                                    if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
-                                        model->weight.weight[weightName].weightSum.resize(1);
-                                        RegisterNumas(&model->weight.weight[weightName], model->specialWeights[weightName]);       
-                                    }
+                                if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "numa")) {
+                                    model->weight.weight[weightName].weightSum.resize(1);
+                                    RegisterNumas(&model->weight.weight[weightName], model->specialWeights[weightName]);
                                 }
                             } catch (...) {
                             }
@@ -2504,12 +2534,10 @@ if (false) {
                                             mergeData.CalcWeightSum();
 #if defined(USE_TFACC) || defined(USE_NUMA)
                                             try {
-                                                if (GetFastllmEnv().activateNuma) {
+                                                if (model->ShouldRegisterSpecialWeightForDeviceTypes(mergeName, {"numa", "tfacc"})) {
                                                     locker.lock();
-                                                    if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
-                                                        mergeData.weightSum.resize(1);
-                                                        RegisterFastllmData(&mergeData, it.type);       
-                                                    }
+                                                    mergeData.weightSum.resize(1);
+                                                    RegisterFastllmData(&mergeData, it.type);
                                                     locker.unlock();
                                                 }
                                             } catch (...) {
@@ -2517,11 +2545,9 @@ if (false) {
 #endif
 #if defined(USE_NUMAS)
                                             try {
-                                                if (GetFastllmEnv().activateNuma) {
-                                                    if (model->specialWeights.find(mergeName) != model->specialWeights.end()) {
-                                                        mergeData.weightSum.resize(1);
-                                                        RegisterNumas(&mergeData, it.type);       
-                                                    }
+                                                if (model->ShouldRegisterSpecialWeightForDeviceType(mergeName, "numa")) {
+                                                    mergeData.weightSum.resize(1);
+                                                    RegisterNumas(&mergeData, it.type);
                                                 }
                                             } catch (...) {
                                             }
@@ -2538,24 +2564,20 @@ if (false) {
                             locker.unlock();
 #if defined(USE_TFACC) || defined(USE_NUMA)
                             try {
-                                if (GetFastllmEnv().activateNuma) {
-                                    if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
-                                        locker.lock();
-                                            model->weight.weight[weightName].weightSum.resize(1);
-                                            RegisterFastllmData(&model->weight.weight[weightName], model->specialWeights[weightName]);
-                                        locker.unlock();
-                                    }
+                                if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceTypes(weightName, {"numa", "tfacc"})) {
+                                    locker.lock();
+                                    model->weight.weight[weightName].weightSum.resize(1);
+                                    RegisterFastllmData(&model->weight.weight[weightName], model->specialWeights[weightName]);
+                                    locker.unlock();
                                 }
                             } catch (...) {
                             }
 #endif
 #if defined(USE_NUMAS)
                             try {
-                                if (GetFastllmEnv().activateNuma) {
-                                    if (!needMerge && model->specialWeights.find(weightName) != model->specialWeights.end()) {
-                                        model->weight.weight[weightName].weightSum.resize(1);
-                                        RegisterNumas(&model->weight.weight[weightName], model->specialWeights[weightName]);       
-                                    }
+                                if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "numa")) {
+                                    model->weight.weight[weightName].weightSum.resize(1);
+                                    RegisterNumas(&model->weight.weight[weightName], model->specialWeights[weightName]);
                                 }
                             } catch (...) {
                             }

@@ -54,6 +54,7 @@ namespace fastllm {
 
     std::map <std::string, int> GetDeviceMap();
     std::map <std::string, int> GetMoeDeviceMap();
+    std::string SelectDeviceFromMap(const std::map <std::string, int> &deviceMap, int current, int total);
 
     Data *GetEmptyData();
     void PrintInstructionInfo();
