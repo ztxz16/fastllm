@@ -1141,6 +1141,14 @@ namespace fastllm {
             for (int i = 0; i < len; i++) {
                 a[i] = float_to_half(b[i]);
             }
+        } else if (oriDataType == DataType::FLOAT32
+                && dataType == DataType::BFLOAT16) {
+            uint16_t *a = (uint16_t*)data.cpuData;
+            float *b = (float*)oriData;
+            int len = data.Count(0);
+            for (int i = 0; i < len; i++) {
+                a[i] = ((uint32_t*)&b[i])[0] >> 16;
+            }
         } else if ((oriDataType == DataType::FLOAT32 || oriDataType == DataType::BFLOAT16)
                 && dataType == DataType::INT4_GROUP) {
             int bit = (dataType == DataType::INT4_GROUP) ? 4 : 8;

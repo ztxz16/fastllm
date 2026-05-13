@@ -1446,6 +1446,36 @@ namespace fastllm {
         }        
     }
 
+    static bool IsExportLinearAutoDataType(DataType dataType) {
+        return dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV;
+    }
+
+    static bool IsExportFp8DataType(DataType dataType) {
+        return dataType == DataType::FP8_E4M3 ||
+               dataType == DataType::FP8_E4M3_BLOCK_128 ||
+               dataType == DataType::FP8_E4M3_PERCHANNEL;
+    }
+
+    static void ResolveExportDataTypeForTensor(const SafeTensorItem &tensor, bool isPackedFp4,
+                                               DataType linearDataType, DataType oriDataType,
+                                               DataType &dataType) {
+        if (dataType >= DATA_AUTO_NONE) {
+            DataType autoType = dataType;
+            dataType = IsExportLinearAutoDataType(autoType) ? linearDataType : oriDataType;
+            if (isPackedFp4 && !IsExportLinearAutoDataType(autoType)) {
+                dataType = DataType::NVFP4;
+            }
+        }
+        if (isPackedFp4 && dataType >= DATA_AUTO_NONE) {
+            dataType = DataType::NVFP4;
+        }
+        if (isPackedFp4 && IsExportFp8DataType(dataType)) {
+            dataType = DataType::FLOAT16;
+        } else if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
+            dataType = DataType::FLOAT16;
+        }
+    }
+
     std::vector<std::string> GenerateGGUFFileList(const std::string& filename) {
         std::vector<std::string> fileList;
         
@@ -2766,36 +2796,14 @@ if (false) {
                 auto oriDataType = DataType::FLOAT32;
                 auto dataType = tensorMap[tensor.tensorName][0].second;
                 auto weightName = tensor.tensorName;
+                bool isPackedFp4 = IsPackedFP4Tensor(safeTensors, tensor.tensorName);
                 int ggmlType = -1;
 
                 if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
                     int groupCnt = -1;
                     ParseDataType(weightName, dtypeRules, dataType, groupCnt, ggmlType);
-
-                    // 如果原始权重不是FP8_E4M3格式，目前不做转换
-                    if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
-                        dataType = DataType::FLOAT16;
-                    }
-                    if (IsPackedFP4Tensor(safeTensors, tensor.tensorName)) {
-                        dataType = DataType::NVFP4;
-                    }
                 }
-
-                if (dataType >= DATA_AUTO_NONE) {
-                    // AUTO类型
-                    dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
-
-                    // 如果原始权重不是FP8_E4M3格式，目前不做转换
-                    if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
-                        dataType = DataType::FLOAT16;
-                    }
-                    if (IsPackedFP4Tensor(safeTensors, tensor.tensorName)) {
-                        dataType = DataType::NVFP4;
-                    }
-                }
-                if (IsPackedFP4Tensor(safeTensors, tensor.tensorName)) {
-                    dataType = DataType::NVFP4;
-                }
+                ResolveExportDataTypeForTensor(tensor, isPackedFp4, linearDataType, oriDataType, dataType);
                 if (tensor.dtype == "I64") {
                     dataType = DataType::INT32PARAM;
                 }
@@ -2803,10 +2811,14 @@ if (false) {
                     std::vector <int> realShape = tensor.intShape;
                     std::swap(realShape[0], realShape[1]);
                     weights[weightName] = Data(dataType, realShape);
-                } else if (IsPackedFP4Tensor(safeTensors, tensor.tensorName)) {
+                } else if (isPackedFp4) {
                     std::vector<int> realShape = tensor.intShape;
                     realShape[1] *= 2;
-                    weights[weightName] = Data(dataType, realShape);
+                    if (dataType == DATA_GGUF_FORMAT) {
+                        weights[weightName] = Data(dataType, ggmlType, realShape);
+                    } else {
+                        weights[weightName] = Data(dataType, realShape);
+                    }
                 } else {
                     if (dataType == DATA_GGUF_FORMAT) {
                         weights[weightName] = Data(dataType, ggmlType, tensor.intShape);    
@@ -2837,6 +2849,7 @@ if (false) {
                             auto oriDataType = DataType::FLOAT32;
                             int ggmlType = -1;
                             int curGroupCnt = model->moeLinears.find(weightName) != model->moeLinears.end() ? moeGroupCnt : groupCnt;
+                            bool isPackedFp4 = IsPackedFP4Tensor(safeTensors, tensor.tensorName);
                             if ((dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) && dtypeRules.size() > 0) {
                                 ParseDataType(weightName, dtypeRules, dataType, curGroupCnt, ggmlType);
                                 if (dataType == DATA_GGUF_FORMAT) {
@@ -2850,16 +2863,7 @@ if (false) {
                                 }
                             }
 
-                            if (dataType >= DATA_AUTO_NONE) {
-                                // AUTO类型
-                                dataType = (dataType == DATA_AUTO_LINEAR || dataType == DATA_AUTO_CONV) ? linearDataType : oriDataType;
-                            }
-                            if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
-                                dataType = DataType::FLOAT16;
-                            }
-                            if (IsPackedFP4Tensor(safeTensors, tensor.tensorName)) {
-                                dataType = DataType::NVFP4;
-                            }
+                            ResolveExportDataTypeForTensor(tensor, isPackedFp4, linearDataType, oriDataType, dataType);
                             if (tensor.dtype == "I64") {
                                 dataType = DataType::INT32PARAM;
                                 oriDataType = DataType::INT32PARAM;
@@ -2882,8 +2886,8 @@ if (false) {
                                 oriDataType = DataType::FP8_E4M3;
                                 scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensor.tensorName);
                             }
-                            if (IsPackedFP4Tensor(safeTensors, tensor.tensorName)) {
-                                oriDataType = DataType::NVFP4;
+                            if (isPackedFp4) {
+                                oriDataType = dataType == DataType::NVFP4 ? DataType::NVFP4 : DataType::FLOAT32;
                                 scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensor.tensorName);
                             }
 
