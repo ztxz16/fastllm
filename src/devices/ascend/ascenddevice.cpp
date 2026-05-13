@@ -14,6 +14,7 @@ namespace fastllm {
         this->ops["Split"] = new AscendSplitOp();
         this->ops["Silu"] = new AscendSiluOp();
         this->ops["MulTo"] = new AscendMulToOp();
+        this->ops["Swiglu"] = new AscendSwigluOp();
         this->ops["AddTo"] = new AscendAddToOp();
     }
 
@@ -337,6 +338,80 @@ namespace fastllm {
         dynamicShapes["x2"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
         dynamicShapes["y"] = std::make_pair(std::vector<int32_t>({0, 1}), std::vector<std::vector<int64_t>>({{1,128}, {1,2048}}));
         deviceOk = CompileAndRunSingleOp(this->name, {{"x1", &input0}, {"x2", &input1}}, {{"y", &input0}}, dynamicShapes, {}, {}, {});
+    }
+
+    AscendSwigluOp::AscendSwigluOp() :
+        BaseAscendOperator("") {}
+
+    bool AscendSwigluOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!BaseAscendOperator::CanRun(opType, datas, floatParams, intParams))
+            return false;
+        float alpha = floatParams.find("alpha") != floatParams.end() ? floatParams.find("alpha")->second : 1.0f;
+        return alpha == 1.0f;
+    }
+
+    void AscendSwigluOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                                 const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+         Data &input = *(datas.find("input")->second);
+         Data &output = *(datas.find("output")->second);
+
+         std::vector <int> dims = input.dims;
+         dims[dims.size() - 1] /= 2;
+         output.dataType = input.dataType;
+         output.Resize(dims);
+    }
+
+    void AscendSwigluOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+
+        output.Allocate();
+        AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16,
+                        "Swiglu error: Data's type should be float32 or float16.\n");
+
+        Data mulHalf(output);
+        mulHalf.Allocate();
+
+        int dimsLen = input.dims.size();
+        std::vector <int32_t> offsetDims(dimsLen);
+        Data swishOffsets(DataType::FLOAT32, {dimsLen});
+        swishOffsets.Allocate();
+        for (int i = 0; i < dimsLen; i++) {
+            ((int32_t*)swishOffsets.cpuData)[i] = offsetDims[i];
+        }
+        Data mulOffsets(swishOffsets);
+        ((int32_t*)mulOffsets.cpuData)[dimsLen - 1] = input.dims.back() / 2;
+        swishOffsets.ToDevice(input.dataDevice);
+        swishOffsets.dataType = DataType::INT32PARAM;
+        mulOffsets.ToDevice(input.dataDevice);
+        mulOffsets.dataType = DataType::INT32PARAM;
+
+        Data swishSizes(DataType::FLOAT32, {dimsLen});
+        swishSizes.Allocate();
+        for (int i = 0; i < output.dims.size(); i++) {
+            ((int32_t*)swishSizes.cpuData)[i] = output.dims[i];
+        }
+        swishSizes.ToDevice(input.dataDevice);
+        swishSizes.dataType = DataType::INT32PARAM;
+        Data mulSizes(swishSizes);
+
+        std::vector<int32_t> shapeRangeDims = {0, 1};
+        std::vector<std::vector<int64_t>> shapeRanges = {{1L,128L}, {1L,2048L}};
+        DynamicShapeDict dynamicShapes;
+        dynamicShapes["x"] = std::make_pair(shapeRangeDims, shapeRanges);
+        dynamicShapes["y"] = std::make_pair(shapeRangeDims, shapeRanges);
+		deviceOk = CompileAndRunSingleOp("Slice", {{"x", &input}, {"offsets", &swishOffsets}, {"size", &swishSizes}}, {{"y", &output}}, dynamicShapes, {}, {}, {});
+
+		deviceOk = CompileAndRunSingleOp("Swish", {{"x", &output}}, {{"y", &output}}, dynamicShapes, {{"scale", 1.0}}, {}, {});
+
+		deviceOk = CompileAndRunSingleOp("Slice", {{"x", &input}, {"offsets", &mulOffsets}, {"size", &mulSizes}}, {{"y", &mulHalf}}, dynamicShapes, {}, {}, {});
+		dynamicShapes.clear();
+        dynamicShapes["x1"] = std::make_pair(shapeRangeDims, shapeRanges);
+        dynamicShapes["x2"] = std::make_pair(shapeRangeDims, shapeRanges);
+        dynamicShapes["y"] = std::make_pair(shapeRangeDims, shapeRanges);
+        deviceOk = CompileAndRunSingleOp("Mul", {{"x1", &output}, {"x2", &mulHalf}}, {{"y", &output}}, dynamicShapes, {}, {}, {});
     }
 
     AscendAddToOp::AscendAddToOp() :
