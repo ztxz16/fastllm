@@ -280,6 +280,23 @@ namespace fastllm {
         uint64_t dstOffset = 0;
         std::vector<uint8_t> buffer;
         for (auto &part : weight->diskWeightParts) {
+            if (part.isScalePart) {
+                AssertInFastLLM(weight->dataType == DataType::NVFP4 && weight->dims.size() == 2 &&
+                                weight->blockK > 0 && weight->blockM > 0,
+                                "Disk MoE compact NVFP4 scale metadata is invalid.\n");
+                size_t scaleBytes = GetNVFP4ScaleBytes(weight->dims[0], weight->dims[1], weight->blockK, weight->blockM);
+                AssertInFastLLM(part.scaleOffset + part.bytes <= scaleBytes &&
+                                loaded->expansionBytes >= GetNVFP4WeightBytes(weight->dims[0], weight->dims[1]) + scaleBytes,
+                                "Disk MoE compact NVFP4 scale bytes mismatch.\n");
+                ReadDiskPartBytes(part, loaded->cpuData + GetNVFP4WeightBytes(weight->dims[0], weight->dims[1]) + part.scaleOffset);
+                continue;
+            }
+            if (weight->dataType == DataType::NVFP4 && weight->scales.empty() &&
+                part.sourceDataType == DataType::NVFP4 && part.bytes == loaded->GetBytes()) {
+                ReadDiskPartBytes(part, loaded->cpuData);
+                dstOffset += GetNVFP4WeightBytes(weight->dims[0], weight->dims[1]);
+                continue;
+            }
             uint8_t *dst = loaded->cpuData + dstOffset;
             Data partData(weight->dataType, part.dims);
             uint64_t dstBytes = partData.GetBytes();
@@ -318,6 +335,9 @@ namespace fastllm {
             return weight.blockK > 0 && weight.blockM == 128;
         }
         if (weight.dataType == DataType::NVFP4) {
+            if (weight.scales.empty()) {
+                return weight.blockK > 0 && weight.blockM > 0;
+            }
             return weight.blockK > 0 && weight.blockM >= 16 &&
                    (weight.blockM % 16 == 0 || weight.blockM == weight.dims[1]);
         }
@@ -333,6 +353,9 @@ namespace fastllm {
             return weight.blockK > 0 && weight.blockM > 0;
         }
         if (weight.dataType == DataType::NVFP4) {
+            if (weight.scales.empty()) {
+                return weight.blockK > 0 && weight.blockM > 0;
+            }
             return weight.blockK > 0 && weight.blockM >= 16 &&
                    (weight.blockM % 16 == 0 || weight.blockM == weight.dims[1]);
         }
@@ -418,6 +441,15 @@ namespace fastllm {
         std::vector<uint8_t> reordered;
         CrossSwigluReorderRows(weight.cpuData, weight.dims[0], bytesPerRow, reordered);
         memcpy(weight.cpuData, reordered.data(), reordered.size());
+        if (weight.dataType == DataType::NVFP4 && weight.scales.empty() &&
+            weight.blockK > 0 && weight.blockM > 0) {
+            AssertInFastLLM(weight.blockK == 1,
+                            "Disk MoE compact NVFP4 CrossSwiglu reorder requires blockK = 1.\n");
+            int scaleMs = (weight.dims[1] - 1) / weight.blockM + 1;
+            uint8_t *scaleData = weight.cpuData + GetNVFP4WeightBytes(weight.dims[0], weight.dims[1]);
+            CrossSwigluReorderRows(scaleData, weight.dims[0], scaleMs, reordered);
+            memcpy(scaleData, reordered.data(), reordered.size());
+        }
     }
 
     static void PackFp8ToCudaBlock128(Data &weight) {
@@ -523,7 +555,9 @@ namespace fastllm {
                 prepared.insert(tempWeights[index]).second) {
                 Data &weight = *tempWeights[index];
                 PackFp8ToCudaBlock128(weight);
-                PackNvfp4ToCudaBlock16(weight);
+                if (weight.dataType == DataType::NVFP4 && !weight.scales.empty()) {
+                    PackNvfp4ToCudaBlock16(weight);
+                }
                 if (gateType != MoeGateGeglu && index % 2 == 0) {
                     CrossSwigluReorderWeightInPlace(weight);
                 }

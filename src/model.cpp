@@ -467,21 +467,42 @@ namespace fastllm {
                 if (dstType == DataType::NVFP4 && !isPackedFp4) {
                     ErrorInFastLLM("CreateBufferWithScale error: only packed FP4 I8 can be loaded as NVFP4.");
                 }
+                if (dstType == DataType::NVFP4 && scale.dtype != "F8_E8M0") {
+                    ErrorInFastLLM("CreateBufferWithScale error: NVFP4 scale should be F8_E8M0.");
+                }
                 this->blockK = blockN;
                 this->blockM = blockM;
-                size_t dataBytes = dstType == DataType::NVFP4 ? (size_t)n * (m / 2) : (size_t)n * m;
-                buffer = new uint8_t[dataBytes];
+                size_t dataBytes = dstType == DataType::NVFP4 ? GetNVFP4WeightBytes(n, m) : (size_t)n * m;
+                size_t scaleBytes = dstType == DataType::NVFP4 ? scale.bytes : 0;
+                buffer = new uint8_t[dataBytes + scaleBytes];
                 FILE *fi = fopen(this->fileName.c_str(), "rb");
 #if defined(_WIN32) || defined(_WIN64)
                 _fseeki64(fi, this->data_offsets[0], 0);
 #else
                 fseek(fi, this->data_offsets[0], 0);
 #endif
-                int ret = fread(buffer, 1, this->bytes, fi);
+                size_t ret = fread(buffer, 1, this->bytes, fi);
                 fclose(fi);
+                AssertInFastLLM(ret == this->bytes && this->bytes == dataBytes,
+                                "CreateBufferWithScale error: scaled data bytes mismatch.");
 
-                scalesBuffer = new float[ns * ms];
-                memcpy(scalesBuffer, scale.buffer, ns * ms * sizeof(float));
+                if (dstType == DataType::NVFP4) {
+                    AssertInFastLLM(scale.bytes == GetNVFP4ScaleBytes(n, m, blockN, blockM),
+                                    "CreateBufferWithScale error: NVFP4 scale bytes mismatch.");
+                    FILE *fs = fopen(scale.fileName.c_str(), "rb");
+#if defined(_WIN32) || defined(_WIN64)
+                    _fseeki64(fs, scale.data_offsets[0], 0);
+#else
+                    fseek(fs, scale.data_offsets[0], 0);
+#endif
+                    ret = fread(buffer + dataBytes, 1, scale.bytes, fs);
+                    fclose(fs);
+                    AssertInFastLLM(ret == scale.bytes,
+                                    "CreateBufferWithScale error: read NVFP4 scale failed.");
+                } else {
+                    scalesBuffer = new float[ns * ms];
+                    memcpy(scalesBuffer, scale.buffer, ns * ms * sizeof(float));
+                }
             } else {
                 buffer = new uint8_t[n * m * sizeof(float)];
                 float *floatBuffer = (float*)buffer;
@@ -945,8 +966,22 @@ namespace fastllm {
             }
             weight.blockK = blockK;
             weight.blockM = blockM;
-            weight.scales.resize(ns * ms);
-            memcpy(weight.scales.data(), scaleTensor->buffer, ns * ms * sizeof(float));
+            if (targetDataType == DataType::NVFP4 && scaleTensor->dtype == "F8_E8M0") {
+                AssertInFastLLM(scaleTensor->bytes == GetNVFP4ScaleBytes(n, m, blockK, blockM),
+                                "Disk MoE NVFP4 scale tensor bytes mismatch: " + weight.name + "\n");
+                DiskWeightPart scalePart;
+                scalePart.fileName = scaleTensor->fileName;
+                scalePart.fileOffset = (long long)scaleTensor->data_offsets[0];
+                scalePart.bytes = scaleTensor->bytes;
+                scalePart.sourceDataType = DataType::INT8;
+                scalePart.dims = {(int)scaleTensor->bytes};
+                scalePart.isScalePart = true;
+                weight.diskWeightParts.push_back(scalePart);
+                weight.scales.clear();
+            } else {
+                weight.scales.resize(ns * ms);
+                memcpy(weight.scales.data(), scaleTensor->buffer, ns * ms * sizeof(float));
+            }
         }
     }
 
@@ -956,7 +991,7 @@ namespace fastllm {
                             header.data(), header.size());
         size_t headerOffset = 0;
         int version = ReadDiskMetaInt(header, headerOffset);
-        if (version != 1) {
+        if (version != 1 && version != 2) {
             ErrorInFastLLM("Disk MoE only supports quantized fastllm expert weights: " + weight.name + "\n");
         }
         DataType dataType = (DataType)ReadDiskMetaInt(header, headerOffset);
@@ -974,6 +1009,7 @@ namespace fastllm {
         }
         ResetDiskWeightMeta(weight, dataType);
         uint64_t payloadOffset = sizeof(int) * 2;
+        bool compactFastllmNVFP4 = false;
 
         if (dataType == DataType::DATA_GGUF_FORMAT) {
             weight.ggmlType = fastllmGgmlType;
@@ -987,15 +1023,23 @@ namespace fastllm {
             weight.blockM = ReadDiskMetaInt(header, offset);
             int scaleLen = ReadDiskMetaInt(header, offset);
             AssertInFastLLM(scaleLen >= 0, "Disk MoE fastllm scale length is invalid: " + weight.name + "\n");
-            std::vector<uint8_t> meta(sizeof(int) * 5 + (uint64_t)scaleLen * sizeof(float));
-            ReadDiskTensorRange(tensor.fileName, (long long)tensor.data_offsets[0],
-                                meta.data(), meta.size());
-            size_t metaOffset = sizeof(int) * 5;
-            weight.scales.resize(scaleLen);
-            if (scaleLen > 0) {
-                memcpy(weight.scales.data(), meta.data() + metaOffset, (uint64_t)scaleLen * sizeof(float));
+            if (version == 2 && dataType == DataType::NVFP4) {
+                AssertInFastLLM(scaleLen == (int)GetNVFP4ScaleBytes(weight.dims[0], weight.dims[1], weight.blockK, weight.blockM),
+                                "Disk MoE fastllm NVFP4 compact scale length is invalid: " + weight.name + "\n");
+                weight.scales.clear();
+                payloadOffset = sizeof(int) * 5;
+                compactFastllmNVFP4 = true;
+            } else {
+                std::vector<uint8_t> meta(sizeof(int) * 5 + (uint64_t)scaleLen * sizeof(float));
+                ReadDiskTensorRange(tensor.fileName, (long long)tensor.data_offsets[0],
+                                    meta.data(), meta.size());
+                size_t metaOffset = sizeof(int) * 5;
+                weight.scales.resize(scaleLen);
+                if (scaleLen > 0) {
+                    memcpy(weight.scales.data(), meta.data() + metaOffset, (uint64_t)scaleLen * sizeof(float));
+                }
+                payloadOffset = meta.size();
             }
-            payloadOffset = meta.size();
         } else if (dataType == DataType::INT8 || dataType == DataType::INT4 ||
                    dataType == DataType::INT4_NOZERO) {
             size_t offset = sizeof(int) * 2;
@@ -1048,6 +1092,29 @@ namespace fastllm {
 
         AssertInFastLLM(payloadOffset <= tensor.bytes,
                         "Disk MoE fastllm payload offset is invalid: " + weight.name + "\n");
+        if (compactFastllmNVFP4) {
+            uint64_t weightBytes = GetNVFP4WeightBytes(weight.dims[0], weight.dims[1]);
+            uint64_t scaleBytes = GetNVFP4ScaleBytes(weight.dims[0], weight.dims[1], weight.blockK, weight.blockM);
+            AssertInFastLLM(payloadOffset + weightBytes + scaleBytes == tensor.bytes,
+                            "Disk MoE fastllm compact NVFP4 payload size mismatch: " + weight.name + "\n");
+            DiskWeightPart weightPart;
+            weightPart.fileName = tensor.fileName;
+            weightPart.fileOffset = (long long)tensor.data_offsets[0] + (long long)payloadOffset;
+            weightPart.bytes = weightBytes;
+            weightPart.sourceDataType = dataType;
+            weightPart.dims = weight.dims;
+            weight.diskWeightParts.push_back(weightPart);
+
+            DiskWeightPart scalePart;
+            scalePart.fileName = tensor.fileName;
+            scalePart.fileOffset = (long long)tensor.data_offsets[0] + (long long)payloadOffset + (long long)weightBytes;
+            scalePart.bytes = scaleBytes;
+            scalePart.sourceDataType = DataType::INT8;
+            scalePart.dims = {(int)scaleBytes};
+            scalePart.isScalePart = true;
+            weight.diskWeightParts.push_back(scalePart);
+            return;
+        }
         DiskWeightPart part;
         part.fileName = tensor.fileName;
         part.fileOffset = (long long)tensor.data_offsets[0] + (long long)payloadOffset;
@@ -1125,6 +1192,32 @@ namespace fastllm {
         return !inputs.empty();
     }
 
+    static bool IsCompactNVFP4Weight(const Data &data) {
+        return data.dataType == DataType::NVFP4 && data.scales.empty() &&
+               data.blockK > 0 && data.blockM > 0 && data.dims.size() == 2;
+    }
+
+    static void AppendCompactNVFP4Weight(Data &dst, const Data &src,
+                                         uint64_t &weightOffset, uint64_t &scaleOffset) {
+        AssertInFastLLM(IsCompactNVFP4Weight(dst) && IsCompactNVFP4Weight(src) &&
+                        dst.dims[1] == src.dims[1] &&
+                        dst.blockK == src.blockK && dst.blockM == src.blockM,
+                        "Compact NVFP4 merge metadata mismatch.");
+        AssertInFastLLM(src.dims[0] % src.blockK == 0,
+                        "Compact NVFP4 merge requires source rows aligned to blockK.");
+        uint64_t srcWeightBytes = GetNVFP4WeightBytes(src.dims[0], src.dims[1]);
+        uint64_t srcScaleBytes = GetNVFP4ScaleBytes(src.dims[0], src.dims[1], src.blockK, src.blockM);
+        uint64_t dstWeightBytes = GetNVFP4WeightBytes(dst.dims[0], dst.dims[1]);
+        uint64_t dstScaleBytes = GetNVFP4ScaleBytes(dst.dims[0], dst.dims[1], dst.blockK, dst.blockM);
+        AssertInFastLLM(weightOffset + srcWeightBytes <= dstWeightBytes &&
+                        scaleOffset + srcScaleBytes <= dstScaleBytes,
+                        "Compact NVFP4 merge payload overflow.");
+        memcpy(dst.cpuData + weightOffset, src.cpuData, srcWeightBytes);
+        memcpy(dst.cpuData + dstWeightBytes + scaleOffset, src.cpuData + srcWeightBytes, srcScaleBytes);
+        weightOffset += srcWeightBytes;
+        scaleOffset += srcScaleBytes;
+    }
+
     static void MergeDiskWeightMeta(const std::unordered_map<std::string, Data> &weights,
                                     const std::vector<std::string> &inputs,
                                     Data &mergeData) {
@@ -1140,6 +1233,7 @@ namespace fastllm {
         mergeData.zeros.clear();
         mergeData.halfScales.clear();
         mergeData.perChannelsConfigs.clear();
+        uint64_t compactNVFP4ScaleOffset = 0;
         for (auto &input : inputs) {
             auto it = weights.find(input);
             if (it == weights.end()) {
@@ -1151,9 +1245,24 @@ namespace fastllm {
             if (mergeData.blockM == -1) {
                 mergeData.blockM = it->second.blockM;
             }
-            mergeData.diskWeightParts.insert(mergeData.diskWeightParts.end(),
-                                             it->second.diskWeightParts.begin(),
-                                             it->second.diskWeightParts.end());
+            bool compactNVFP4 = it->second.dataType == DataType::NVFP4 &&
+                                it->second.scales.empty() &&
+                                it->second.blockK > 0 && it->second.blockM > 0 &&
+                                it->second.dims.size() == 2;
+            if (compactNVFP4 && inputs.size() > 1) {
+                AssertInFastLLM(it->second.dims[0] % it->second.blockK == 0,
+                                "Compact NVFP4 disk merge requires source rows aligned to blockK.");
+            }
+            for (auto part : it->second.diskWeightParts) {
+                if (compactNVFP4 && part.isScalePart) {
+                    part.scaleOffset += compactNVFP4ScaleOffset;
+                }
+                mergeData.diskWeightParts.push_back(part);
+            }
+            if (compactNVFP4) {
+                compactNVFP4ScaleOffset += GetNVFP4ScaleBytes(it->second.dims[0], it->second.dims[1],
+                                                              it->second.blockK, it->second.blockM);
+            }
             mergeData.scales.insert(mergeData.scales.end(),
                                     it->second.scales.begin(),
                                     it->second.scales.end());
@@ -1866,14 +1975,20 @@ if (false) {
                                         } else {
                                             mergeData.Allocate();
                                             uint64_t offset = 0;
+                                            uint64_t scaleOffset = 0;
+                                            bool compactNVFP4 = IsCompactNVFP4Weight(mergeData);
                                             for (auto input : it.inputs) {
                                                 mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, model->weight[input].perChannelsConfigs);
                                                 mergeData.zeros = AppendVector(mergeData.zeros, model->weight[input].zeros);
                                                 mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
                                                 mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
                                                 mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
-                                                memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
-                                                offset += model->weight[input].GetBytes();
+                                                if (compactNVFP4) {
+                                                    AppendCompactNVFP4Weight(mergeData, model->weight[input], offset, scaleOffset);
+                                                } else {
+                                                    memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
+                                                    offset += model->weight[input].GetBytes();
+                                                }
                                             }
                                             mergeData.CalcWeightSum();
                                         }
@@ -2353,7 +2468,9 @@ if (false) {
                                         scaleTensor = &safeTensors.itmeDict[scaleTensorName];
                                         AssertInFastLLM(scaleTensor->dtype == "F32" || scaleTensor->dtype == "BF16" || scaleTensor->dtype == "F8_E8M0",
                                                         "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
-                                        scaleTensor->CreateBuffer(DataType::FLOAT32);
+                                        if (!(diskDataType == DataType::NVFP4 && scaleTensor->dtype == "F8_E8M0")) {
+                                            scaleTensor->CreateBuffer(DataType::FLOAT32);
+                                        }
                                     }
                                     SetDiskWeightMeta(model->weight[weightName], tensor, diskDataType, scaleTensor);
                                     if (scaleTensor != nullptr) {
@@ -2367,7 +2484,9 @@ if (false) {
                                     auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
                                     AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" || scaleTensor.dtype == "F8_E8M0"
                                         , "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
-                                    scaleTensor.CreateBuffer(DataType::FLOAT32);
+                                    if (!(oriDataType == DataType::NVFP4 && scaleTensor.dtype == "F8_E8M0")) {
+                                        scaleTensor.CreateBuffer(DataType::FLOAT32);
+                                    }
                                     tensor.CreateBufferWithScale(oriDataType, scaleTensor);
                                 } else {
                                     auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
@@ -2551,14 +2670,20 @@ if (false) {
                                         } else {
                                             mergeData.Allocate();
                                             uint64_t offset = 0;
+                                            uint64_t scaleOffset = 0;
+                                            bool compactNVFP4 = IsCompactNVFP4Weight(mergeData);
                                             for (auto input : it.inputs) {
                                                 mergeData.perChannelsConfigs = AppendVector(mergeData.perChannelsConfigs, model->weight[input].perChannelsConfigs);
                                                 mergeData.zeros = AppendVector(mergeData.zeros, model->weight[input].zeros);
                                                 mergeData.scales = AppendVector(mergeData.scales, model->weight[input].scales);
                                                 mergeData.mins = AppendVector(mergeData.mins, model->weight[input].mins);
                                                 mergeData.halfScales = AppendVector(mergeData.halfScales, model->weight[input].halfScales);
-                                                memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
-                                                offset += model->weight[input].GetBytes();
+                                                if (compactNVFP4) {
+                                                    AppendCompactNVFP4Weight(mergeData, model->weight[input], offset, scaleOffset);
+                                                } else {
+                                                    memcpy(mergeData.cpuData + offset, model->weight[input].cpuData, model->weight[input].GetBytes());
+                                                    offset += model->weight[input].GetBytes();
+                                                }
                                             }
 
                                             mergeData.CalcWeightSum();
@@ -2897,7 +3022,9 @@ if (false) {
                                 auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
                                 AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" || scaleTensor.dtype == "F8_E8M0"
                                     , "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
-                                scaleTensor.CreateBuffer(DataType::FLOAT32);
+                                if (!(oriDataType == DataType::NVFP4 && scaleTensor.dtype == "F8_E8M0")) {
+                                    scaleTensor.CreateBuffer(DataType::FLOAT32);
+                                }
                                 tensor.CreateBufferWithScale(oriDataType, scaleTensor);
                             }
 

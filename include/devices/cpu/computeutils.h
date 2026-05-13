@@ -239,13 +239,14 @@ namespace fastllm {
         int n, m, k, st, end;
         int blockK, blockM;
         float *scales;
+        uint8_t *scaleBytes;
 
         MultiThreadLinearBFloat16NVFP4Op(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
                 int n, int m, int k, int st, int end,
-                float *scales, int blockK, int blockM) :
+                float *scales, uint8_t *scaleBytes, int blockK, int blockM) :
             inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData),
             n(n), m(m), k(k), st(st), end(end),
-            scales(scales), blockK(blockK), blockM(blockM) {}
+            scales(scales), scaleBytes(scaleBytes), blockK(blockK), blockM(blockM) {}
 
         void Run();
     };
@@ -257,13 +258,14 @@ namespace fastllm {
         int n, m, k, st, end;
         int blockK, blockM;
         float *scales;
+        uint8_t *scaleBytes;
 
         MultiThreadLinearFloat32NVFP4Op(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
                 int n, int m, int k, int st, int end,
-                float *scales, int blockK, int blockM) :
+                float *scales, uint8_t *scaleBytes, int blockK, int blockM) :
             inputData(inputData), weightData(weightData), biasData(biasData), outputData(outputData),
             n(n), m(m), k(k), st(st), end(end),
-            scales(scales), blockK(blockK), blockM(blockM) {}
+            scales(scales), scaleBytes(scaleBytes), blockK(blockK), blockM(blockM) {}
 
         void Run();
     };

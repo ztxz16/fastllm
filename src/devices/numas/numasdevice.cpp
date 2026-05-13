@@ -235,7 +235,8 @@ namespace fastllm {
         }
     }
 
-    void Nvfp4ToFastllmNVFP4_BLOCK16(int experts, int k, int m, uint8_t *nvfp4, float *scales, int blockK, int blockM, std::vector<uint8_t> &nvfp4Packed) {
+    void Nvfp4ToFastllmNVFP4_BLOCK16(int experts, int k, int m, uint8_t *nvfp4, float *scales, uint8_t *scaleBytes,
+                                     int blockK, int blockM, std::vector<uint8_t> &nvfp4Packed) {
         const int packBlockM = 16;
         const int fp4BytesPerBlock = packBlockM / 2;
         int scaleKs = (k - 1) / blockK + 1;
@@ -258,7 +259,7 @@ namespace fastllm {
 
                     int scaleCol = blockStart / blockM;
                     size_t scaleIdx = (size_t)e * scaleKs * scaleMs + (row / blockK) * scaleMs + scaleCol;
-                    float scale = scales[scaleIdx];
+                    float scale = scales != nullptr ? scales[scaleIdx] : NVFP4E8M0ScaleToFloat(scaleBytes[scaleIdx]);
                     memcpy(dst, &scale, sizeof(float));
                     dst += sizeof(float);
                 }
@@ -585,7 +586,11 @@ namespace fastllm {
                         ErrorInFastLLM("RegisterNumas can't support nvfp4 with blockM = " + std::to_string(data->blockM));
                     }
                     std::vector<uint8_t> nvfp4Packed;
-                    Nvfp4ToFastllmNVFP4_BLOCK16(1, k, m, (uint8_t*)data->cpuData, data->scales.data(), data->blockK, data->blockM, nvfp4Packed);
+                    float *scaleFloats = data->scales.empty() ? nullptr : data->scales.data();
+                    uint8_t *scaleBytes = GetNVFP4ScaleData(*data);
+                    AssertInFastLLM(scaleFloats != nullptr || scaleBytes != nullptr,
+                                    "RegisterNumas can't find nvfp4 scale data.");
+                    Nvfp4ToFastllmNVFP4_BLOCK16(1, k, m, (uint8_t*)data->cpuData, scaleFloats, scaleBytes, data->blockK, data->blockM, nvfp4Packed);
                     data->dataType = DataType::NVFP4_BLOCK_16;
                     size_t packedBytesPerRow = GetDataBytes(DataType::NVFP4_BLOCK_16, 1, m);
                     if (isCrossSwiglu) {

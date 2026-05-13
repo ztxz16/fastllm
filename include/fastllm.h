@@ -264,7 +264,7 @@ namespace fastllm {
         INT2_GROUP = 11, // 不用zeroPoint的int2, floatValue = min + uint2Value * scale, 且使用分组量化
         BASE3_GROUP = 12, // 三元量化，-1 0 1
         INT32 = 13, // int32
-        NVFP4 = 14, // packed fp4 e2m1 + block scale (e8m0 decoded to float)
+        NVFP4 = 14, // packed fp4 e2m1 + compact e8m0 block scales
         INT32PARAM = 100, // int32的参数，这种类型的数据永远存在CPU上
         FP8_E4M3_BLOCK_128 = 1000, // fp8e4m3, block = 128
         AWQ_4BIT_128 = 1001, // awq, bits = 4, group = 128
@@ -282,6 +282,12 @@ namespace fastllm {
     std::string GetDataTypeName(DataType type);
 
     size_t GetDataBytes(DataType type, size_t rows, size_t columns);
+    size_t GetNVFP4WeightBytes(size_t rows, size_t columns);
+    size_t GetNVFP4ScaleBytes(size_t rows, size_t columns, int blockK, int blockM);
+    size_t GetNVFP4StorageBytes(size_t rows, size_t columns, int blockK, int blockM);
+    uint8_t *GetNVFP4ScaleData(Data &data);
+    const uint8_t *GetNVFP4ScaleData(const Data &data);
+    float NVFP4E8M0ScaleToFloat(uint8_t v);
 
     enum DataDevice {
         CPU = 0, CUDA = 1
@@ -293,6 +299,8 @@ namespace fastllm {
         uint64_t bytes = 0;
         DataType sourceDataType = DataType::FLOAT32;
         std::vector <int> dims;
+        bool isScalePart = false;
+        uint64_t scaleOffset = 0;
     };
 
     enum WeightType {

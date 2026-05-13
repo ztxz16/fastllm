@@ -737,6 +737,24 @@ namespace fastllm {
     extern bool LinearBFloat16NVFP4_AVX2_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end, int blockK, int blockM, float *scales,
         int ks, int ms);
+    extern bool LinearFloat32NVFP4E8M0_AVX512BF16_Kernel(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
+        int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
+        int ks, int ms);
+    extern bool LinearFloat32NVFP4E8M0_AVX512F_Kernel(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
+        int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
+        int ks, int ms);
+    extern bool LinearFloat32NVFP4E8M0_AVX2_Kernel(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
+        int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
+        int ks, int ms);
+    extern bool LinearBFloat16NVFP4E8M0_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+        int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
+        int ks, int ms);
+    extern bool LinearBFloat16NVFP4E8M0_AVX512F_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+        int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
+        int ks, int ms);
+    extern bool LinearBFloat16NVFP4E8M0_AVX2_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
+        int n, int m, int k, int st, int end, int blockK, int blockM, uint8_t *scaleBytes,
+        int ks, int ms);
 
     void MultiThreadLinearBFloat16FP8E4M3Op::Run() {
         static struct FP8E4M3ToFP32Manager fp8e4m3tofp32;
@@ -938,82 +956,68 @@ namespace fastllm {
         return table[v & 0xF];
     }
 
-#ifdef __AVX2__
-    static inline __m256 _mm256_nvfp4_to_fp32_ps(const uint8_t *packed) {
-        uint32_t v;
-        memcpy(&v, packed, sizeof(uint32_t));
-        __m128i bytes = _mm_cvtsi32_si128(static_cast<int>(v));
-        const __m128i lowMask = _mm_set1_epi8(0x0F);
-        __m128i low = _mm_and_si128(bytes, lowMask);
-        __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), lowMask);
-        __m128i interleaved = _mm_unpacklo_epi8(low, high);
-
-        __m256i fp4 = _mm256_cvtepu8_epi32(interleaved);
-        __m256i sign = _mm256_slli_epi32(_mm256_and_si256(fp4, _mm256_set1_epi32(0x8)), 28);
-        __m256i body = _mm256_and_si256(fp4, _mm256_set1_epi32(0x7));
-        __m256i exp = _mm256_slli_epi32(_mm256_add_epi32(_mm256_srli_epi32(body, 1), _mm256_set1_epi32(126)), 23);
-        __m256i mant = _mm256_slli_epi32(_mm256_and_si256(body, _mm256_set1_epi32(1)), 22);
-        mant = _mm256_andnot_si256(_mm256_cmpeq_epi32(body, _mm256_set1_epi32(1)), mant);
-        __m256i bits = _mm256_or_si256(sign, _mm256_or_si256(exp, mant));
-        bits = _mm256_andnot_si256(_mm256_cmpeq_epi32(body, _mm256_setzero_si256()), bits);
-        return _mm256_castsi256_ps(bits);
-    }
-#endif
-
     void MultiThreadLinearBFloat16NVFP4Op::Run() {
         int ms = (m - 1) / blockM + 1;
-        int packedM = m / 2;
+        int ks = (k - 1) / blockK + 1;
+        int packedM = (m + 1) / 2;
 
         if (cpuInstructInfo.hasAVX512BF16) {
-            if (LinearBFloat16NVFP4_AVX512BF16_Kernel(inputData, weightData, biasData, outputData,
-                n, m, k, st, end, blockK, blockM, scales, (k - 1) / blockK + 1, ms)) {
-                return;
+            if (scales != nullptr) {
+                if (LinearBFloat16NVFP4_AVX512BF16_Kernel(inputData, weightData, biasData, outputData,
+                    n, m, k, st, end, blockK, blockM, scales, ks, ms)) {
+                    return;
+                }
+            } else if (scaleBytes != nullptr) {
+                if (LinearBFloat16NVFP4E8M0_AVX512BF16_Kernel(inputData, weightData, biasData, outputData,
+                    n, m, k, st, end, blockK, blockM, scaleBytes, ks, ms)) {
+                    return;
+                }
             }
         }
         if (cpuInstructInfo.hasAVX512F) {
-            if (LinearBFloat16NVFP4_AVX512F_Kernel(inputData, weightData, biasData, outputData,
-                n, m, k, st, end, blockK, blockM, scales, (k - 1) / blockK + 1, ms)) {
-                return;
+            if (scales != nullptr) {
+                if (LinearBFloat16NVFP4_AVX512F_Kernel(inputData, weightData, biasData, outputData,
+                    n, m, k, st, end, blockK, blockM, scales, ks, ms)) {
+                    return;
+                }
+            } else if (scaleBytes != nullptr) {
+                if (LinearBFloat16NVFP4E8M0_AVX512F_Kernel(inputData, weightData, biasData, outputData,
+                    n, m, k, st, end, blockK, blockM, scaleBytes, ks, ms)) {
+                    return;
+                }
             }
         }
         if (cpuInstructInfo.hasAVX2) {
-            if (LinearBFloat16NVFP4_AVX2_Kernel(inputData, weightData, biasData, outputData,
-                n, m, k, st, end, blockK, blockM, scales, (k - 1) / blockK + 1, ms)) {
-                return;
+            if (scales != nullptr) {
+                if (LinearBFloat16NVFP4_AVX2_Kernel(inputData, weightData, biasData, outputData,
+                    n, m, k, st, end, blockK, blockM, scales, ks, ms)) {
+                    return;
+                }
+            } else if (scaleBytes != nullptr) {
+                if (LinearBFloat16NVFP4E8M0_AVX2_Kernel(inputData, weightData, biasData, outputData,
+                    n, m, k, st, end, blockK, blockM, scaleBytes, ks, ms)) {
+                    return;
+                }
             }
         }
+        AssertInFastLLM(scales != nullptr || scaleBytes != nullptr,
+                        "NVFP4 scale data is missing.");
 
         for (int i = 0; i < n; i++) {
             for (int j = st; j < end; j++) {
                 float now = biasData ? biasData[j] : 0.0f;
                 int currentBlockK = j / blockK;
-#ifdef __AVX2__
-                __m256 scaledSum = _mm256_setzero_ps();
-#endif
                 for (int midx = 0; midx < ms; midx++) {
-                    float curScale = scales[currentBlockK * ms + midx];
+                    size_t scaleIdx = (size_t)currentBlockK * ms + midx;
+                    float curScale = scales != nullptr ? scales[scaleIdx] : NVFP4E8M0ScaleToFloat(scaleBytes[scaleIdx]);
                     int l = midx * blockM;
                     int blockEnd = std::min(m, (midx + 1) * blockM);
-#ifdef __AVX2__
-                    __m256 vsum = _mm256_setzero_ps();
-                    for (; l + 7 < blockEnd; l += 8) {
-                        __m128i bf16_vec_128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(inputData + i * m + l));
-                        __m256i bf16_extended_to_32 = _mm256_cvtepu16_epi32(bf16_vec_128);
-                        __m256 vi = _mm256_castsi256_ps(_mm256_slli_epi32(bf16_extended_to_32, 16));
-                        __m256 vw = _mm256_nvfp4_to_fp32_ps(weightData + j * packedM + (l >> 1));
-                        vsum = _mm256_fmadd_ps(vi, vw, vsum);
-                    }
-                    scaledSum = _mm256_fmadd_ps(vsum, _mm256_set1_ps(curScale), scaledSum);
-#endif
                     for (; l < blockEnd; l++) {
                         uint8_t packed = weightData[j * packedM + (l >> 1)];
                         uint8_t fp4 = (l & 1) ? (packed >> 4) : (packed & 0xF);
                         now += curScale * bf16tofp32.dict[inputData[i * m + l]] * NVFP4E2M1ToFloat(fp4);
                     }
                 }
-#ifdef __AVX2__
-                now += Floatsum(scaledSum);
-#endif
                 outputData[i * k + j] = now;
             }
         }
@@ -1021,56 +1025,66 @@ namespace fastllm {
 
     void MultiThreadLinearFloat32NVFP4Op::Run() {
         int ms = (m - 1) / blockM + 1;
-        int packedM = m / 2;
+        int ks = (k - 1) / blockK + 1;
+        int packedM = (m + 1) / 2;
 
         if (cpuInstructInfo.hasAVX512BF16) {
-            if (LinearFloat32NVFP4_AVX512BF16_Kernel(inputData, weightData, biasData, outputData,
-                n, m, k, st, end, blockK, blockM, scales, (k - 1) / blockK + 1, ms)) {
-                return;
+            if (scales != nullptr) {
+                if (LinearFloat32NVFP4_AVX512BF16_Kernel(inputData, weightData, biasData, outputData,
+                    n, m, k, st, end, blockK, blockM, scales, ks, ms)) {
+                    return;
+                }
+            } else if (scaleBytes != nullptr) {
+                if (LinearFloat32NVFP4E8M0_AVX512BF16_Kernel(inputData, weightData, biasData, outputData,
+                    n, m, k, st, end, blockK, blockM, scaleBytes, ks, ms)) {
+                    return;
+                }
             }
         }
         if (cpuInstructInfo.hasAVX512F) {
-            if (LinearFloat32NVFP4_AVX512F_Kernel(inputData, weightData, biasData, outputData,
-                n, m, k, st, end, blockK, blockM, scales, (k - 1) / blockK + 1, ms)) {
-                return;
+            if (scales != nullptr) {
+                if (LinearFloat32NVFP4_AVX512F_Kernel(inputData, weightData, biasData, outputData,
+                    n, m, k, st, end, blockK, blockM, scales, ks, ms)) {
+                    return;
+                }
+            } else if (scaleBytes != nullptr) {
+                if (LinearFloat32NVFP4E8M0_AVX512F_Kernel(inputData, weightData, biasData, outputData,
+                    n, m, k, st, end, blockK, blockM, scaleBytes, ks, ms)) {
+                    return;
+                }
             }
         }
         if (cpuInstructInfo.hasAVX2) {
-            if (LinearFloat32NVFP4_AVX2_Kernel(inputData, weightData, biasData, outputData,
-                n, m, k, st, end, blockK, blockM, scales, (k - 1) / blockK + 1, ms)) {
-                return;
+            if (scales != nullptr) {
+                if (LinearFloat32NVFP4_AVX2_Kernel(inputData, weightData, biasData, outputData,
+                    n, m, k, st, end, blockK, blockM, scales, ks, ms)) {
+                    return;
+                }
+            } else if (scaleBytes != nullptr) {
+                if (LinearFloat32NVFP4E8M0_AVX2_Kernel(inputData, weightData, biasData, outputData,
+                    n, m, k, st, end, blockK, blockM, scaleBytes, ks, ms)) {
+                    return;
+                }
             }
         }
+        AssertInFastLLM(scales != nullptr || scaleBytes != nullptr,
+                        "NVFP4 scale data is missing.");
 
         for (int i = 0; i < n; i++) {
             for (int j = st; j < end; j++) {
                 float now = biasData ? biasData[j] : 0.0f;
                 int currentBlockK = j / blockK;
-#ifdef __AVX2__
-                __m256 scaledSum = _mm256_setzero_ps();
-#endif
                 for (int midx = 0; midx < ms; midx++) {
-                    float curScale = scales[currentBlockK * ms + midx];
+                    size_t scaleIdx = (size_t)currentBlockK * ms + midx;
+                    float curScale = scales != nullptr ? scales[scaleIdx] : NVFP4E8M0ScaleToFloat(scaleBytes[scaleIdx]);
                     int l = midx * blockM;
                     int blockEnd = std::min(m, (midx + 1) * blockM);
-#ifdef __AVX2__
-                    __m256 vsum = _mm256_setzero_ps();
-                    for (; l + 7 < blockEnd; l += 8) {
-                        __m256 vi = _mm256_loadu_ps(inputData + i * m + l);
-                        __m256 vw = _mm256_nvfp4_to_fp32_ps(weightData + j * packedM + (l >> 1));
-                        vsum = _mm256_fmadd_ps(vi, vw, vsum);
-                    }
-                    scaledSum = _mm256_fmadd_ps(vsum, _mm256_set1_ps(curScale), scaledSum);
-#endif
                     for (; l < blockEnd; l++) {
                         uint8_t packed = weightData[j * packedM + (l >> 1)];
                         uint8_t fp4 = (l & 1) ? (packed >> 4) : (packed & 0xF);
                         now += curScale * inputData[i * m + l] * NVFP4E2M1ToFloat(fp4);
                     }
                 }
-#ifdef __AVX2__
-                now += Floatsum(scaledSum);
-#endif
                 outputData[i * k + j] = now;
             }
         }
@@ -1656,6 +1670,8 @@ namespace fastllm {
     void RunLinearBFloat16NVFP4(uint16_t *inputData, Data &weight, float *outputData, float *biasData,
                                 int n, int m, int k,
                                 AliveThreadPool *pool, int startTid, int threadNum) {
+        float *scaleFloats = weight.scales.empty() ? nullptr : weight.scales.data();
+        uint8_t *scaleBytes = GetNVFP4ScaleData(weight);
         int per = k / threadNum;
         int cur = 0;
         std::vector<fastllm::MultiThreadLinearBFloat16NVFP4Op*> ops;
@@ -1665,7 +1681,7 @@ namespace fastllm {
                 end = k;
             }
             ops.push_back(new MultiThreadLinearBFloat16NVFP4Op(inputData, weight.cpuData, biasData, outputData,
-                                                n, m, k, cur, end, weight.scales.data(), weight.blockK, weight.blockM));
+                                                n, m, k, cur, end, scaleFloats, scaleBytes, weight.blockK, weight.blockM));
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
@@ -1865,6 +1881,8 @@ namespace fastllm {
     void RunLinearFloat32NVFP4(float *inputData, Data &weight, float *outputData, float *biasData,
                     int n, int m, int k,
                     AliveThreadPool *pool, int startTid, int threadNum) {
+        float *scaleFloats = weight.scales.empty() ? nullptr : weight.scales.data();
+        uint8_t *scaleBytes = GetNVFP4ScaleData(weight);
         if (cpuInstructInfo.hasAVX512BF16) {
             std::vector <uint16_t> &bf16Input = fastllmBf16Manager.bf16Input;
             if (bf16Input.size() < n * m) {
@@ -1902,7 +1920,7 @@ namespace fastllm {
             for (int i = 0; i < threadNum; i++) {
                 int end = cur + per + (cur + per * (threadNum - i) < k);
                 ops.push_back(new MultiThreadLinearBFloat16NVFP4Op(bf16Input.data(), weight.cpuData, biasData, outputData,
-                                                        n, m, k, cur, end, weight.scales.data(), weight.blockK, weight.blockM));
+                                                        n, m, k, cur, end, scaleFloats, scaleBytes, weight.blockK, weight.blockM));
                 cur = end;
             }
             for (int i = 0; i < threadNum; i++) {
@@ -1921,7 +1939,7 @@ namespace fastllm {
         for (int i = 0; i < threadNum; i++) {
             int end = cur + per + (cur + per * (threadNum - i) < k);
             ops.push_back(new MultiThreadLinearFloat32NVFP4Op(inputData, weight.cpuData, biasData, outputData,
-                                                    n, m, k, cur, end, weight.scales.data(), weight.blockK, weight.blockM));
+                                                    n, m, k, cur, end, scaleFloats, scaleBytes, weight.blockK, weight.blockM));
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
@@ -1936,6 +1954,8 @@ namespace fastllm {
     void LaunchLinearFloat32NVFP4(float *inputData, Data &weight, float *outputData, float *biasData,
         int n, int m, int k,
         std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
+        float *scaleFloats = weight.scales.empty() ? nullptr : weight.scales.data();
+        uint8_t *scaleBytes = GetNVFP4ScaleData(weight);
         int per = k / threadNum;
         int cur = 0;
         for (int i = 0; i < threadNum; i++) {
@@ -1944,7 +1964,7 @@ namespace fastllm {
                 end = k;
             }
             ops[startTid + i] = new MultiThreadLinearFloat32NVFP4Op(inputData, weight.cpuData, biasData, outputData,
-                                    n, m, k, cur, end, weight.scales.data(), weight.blockK, weight.blockM);
+                                    n, m, k, cur, end, scaleFloats, scaleBytes, weight.blockK, weight.blockM);
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
@@ -1955,6 +1975,8 @@ namespace fastllm {
     void LaunchLinearBFloat16NVFP4(uint16_t *inputData, Data &weight, float *outputData, float *biasData,
         int n, int m, int k,
         std::vector<fastllm::MultiThreadBaseOp*> &ops, AliveThreadPool *pool, int startTid, int threadNum) {
+        float *scaleFloats = weight.scales.empty() ? nullptr : weight.scales.data();
+        uint8_t *scaleBytes = GetNVFP4ScaleData(weight);
         int per = k / threadNum;
         int cur = 0;
         for (int i = 0; i < threadNum; i++) {
@@ -1963,7 +1985,7 @@ namespace fastllm {
                 end = k;
             }
             ops[startTid + i] = new MultiThreadLinearBFloat16NVFP4Op(inputData, weight.cpuData, biasData, outputData,
-                                    n, m, k, cur, end, weight.scales.data(), weight.blockK, weight.blockM);
+                                    n, m, k, cur, end, scaleFloats, scaleBytes, weight.blockK, weight.blockM);
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {
@@ -2154,6 +2176,8 @@ namespace fastllm {
     void RunLinearFloat16NVFP4(uint16_t *inputData, Data &weight, uint16_t *outputData, float *biasData,
         int n, int m, int k,
         AliveThreadPool *pool, int startTid, int threadNum) {
+        float *scaleFloats = weight.scales.empty() ? nullptr : weight.scales.data();
+        uint8_t *scaleBytes = GetNVFP4ScaleData(weight);
         std::vector <float> floatOutput;
         floatOutput.resize(n * k);
 
@@ -2167,7 +2191,7 @@ namespace fastllm {
         for (int i = 0; i < threadNum; i++) {
             int end = cur + per + (cur + per * (threadNum - i) < k);
             ops.push_back(new MultiThreadLinearBFloat16NVFP4Op(bf16Input.data(), weight.cpuData, biasData, floatOutput.data(),
-                                                    n, m, k, cur, end, weight.scales.data(), weight.blockK, weight.blockM));
+                                                    n, m, k, cur, end, scaleFloats, scaleBytes, weight.blockK, weight.blockM));
             cur = end;
         }
         for (int i = 0; i < threadNum; i++) {

@@ -434,6 +434,49 @@ namespace fastllm {
         }
     }
 
+    size_t GetNVFP4WeightBytes(size_t rows, size_t columns) {
+        return rows * ((columns + 1) / 2);
+    }
+
+    size_t GetNVFP4ScaleBytes(size_t rows, size_t columns, int blockK, int blockM) {
+        if (rows == 0 || columns == 0 || blockK <= 0 || blockM <= 0) {
+            return 0;
+        }
+        return ((rows - 1) / blockK + 1) * ((columns - 1) / blockM + 1);
+    }
+
+    size_t GetNVFP4StorageBytes(size_t rows, size_t columns, int blockK, int blockM) {
+        return GetNVFP4WeightBytes(rows, columns) + GetNVFP4ScaleBytes(rows, columns, blockK, blockM);
+    }
+
+    float NVFP4E8M0ScaleToFloat(uint8_t v) {
+        return std::ldexp(1.0f, (int)v - 127);
+    }
+
+    uint8_t *GetNVFP4ScaleData(Data &data) {
+        if (data.dataType != DataType::NVFP4 || data.dims.size() != 2 ||
+            data.blockK <= 0 || data.blockM <= 0 || !data.scales.empty()) {
+            return nullptr;
+        }
+        uint64_t weightBytes = GetNVFP4WeightBytes(data.dims[0], data.dims[1]);
+        if (data.cpuData == nullptr || data.expansionBytes < weightBytes + GetNVFP4ScaleBytes(data.dims[0], data.dims[1], data.blockK, data.blockM)) {
+            return nullptr;
+        }
+        return data.cpuData + weightBytes;
+    }
+
+    const uint8_t *GetNVFP4ScaleData(const Data &data) {
+        if (data.dataType != DataType::NVFP4 || data.dims.size() != 2 ||
+            data.blockK <= 0 || data.blockM <= 0 || !data.scales.empty()) {
+            return nullptr;
+        }
+        uint64_t weightBytes = GetNVFP4WeightBytes(data.dims[0], data.dims[1]);
+        if (data.cpuData == nullptr || data.expansionBytes < weightBytes + GetNVFP4ScaleBytes(data.dims[0], data.dims[1], data.blockK, data.blockM)) {
+            return nullptr;
+        }
+        return data.cpuData + weightBytes;
+    }
+
     size_t GetDataBytes(DataType type, size_t rows, size_t columns) {
         if (type == DataType::FLOAT32) {
             return rows * columns * sizeof(float);
@@ -441,7 +484,7 @@ namespace fastllm {
             return rows * columns * sizeof(uint16_t);
         } else if (type == DataType::INT4_NOZERO || type == DataType::INT4 || type == DataType::INT4_GROUP ||
                    type == DataType::NVFP4) {
-            return rows * (columns / 2);
+            return type == DataType::NVFP4 ? GetNVFP4WeightBytes(rows, columns) : rows * (columns / 2);
         } else if (type == DataType::INT8) {
             return rows * columns;
         } else if (type == DataType::FP8_E4M3_BLOCK_128) {
@@ -1091,6 +1134,17 @@ namespace fastllm {
             int groupCnt, int blockK, int blockM) {
         auto &data = *this;
         data.weightType = weightType;
+        if (dataType == oriDataType && dataType == DataType::NVFP4) {
+            this->blockK = blockK;
+            this->blockM = blockM;
+            this->scales.clear();
+            data.UpdateUnitSize();
+            data.Allocate(false);
+            if (oriData != nullptr) {
+                memcpy(data.cpuData, oriData, data.GetBytes());
+            }
+            return;
+        }
         data.UpdateUnitSize();
         data.Allocate();
         if (dataType == oriDataType) {
@@ -1338,7 +1392,12 @@ namespace fastllm {
             this->unitSizeDiv = 1;
         }
 
-        this->expansionBytes = (this->expansionSize * this->unitSize - 1) / this->unitSizeDiv + 1;
+        if (this->dataType == DataType::NVFP4 && this->dims.size() == 2 &&
+            this->blockK > 0 && this->blockM > 0 && this->scales.empty()) {
+            this->expansionBytes = GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
+        } else {
+            this->expansionBytes = (this->expansionSize * this->unitSize - 1) / this->unitSizeDiv + 1;
+        }
     }
 
     void Data::Resize(const std::vector<int> &dims) {
@@ -1545,6 +1604,10 @@ namespace fastllm {
         if (this->dataType == DataType::DATA_GGUF_FORMAT) {
             return ggml_nbytes((ggml_tensor*)this->ggmlTensor);
         }
+        if (this->dataType == DataType::NVFP4 && this->dims.size() == 2 &&
+            this->blockK > 0 && this->blockM > 0 && this->scales.empty()) {
+            return GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
+        }
         if (this->dataType >= 1000 && this->dataType < DataType::DATA_GGUF_FORMAT 
             && this->dims.size() == 2) {
             return GetDataBytes(this->dataType, this->dims[0], this->dims[1]);
@@ -1554,7 +1617,13 @@ namespace fastllm {
 
     void Data::MallocSpace(uint64_t size, bool zero) {
         this->expansionSize = size;
-        this->expansionBytes = (size * this->unitSize - 1) / this->unitSizeDiv + 1;
+        if (this->dataType == DataType::NVFP4 && this->dims.size() == 2 &&
+            this->blockK > 0 && this->blockM > 0 && this->scales.empty() &&
+            size == this->Count(0)) {
+            this->expansionBytes = GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
+        } else {
+            this->expansionBytes = (size * this->unitSize - 1) / this->unitSizeDiv + 1;
+        }
         if (this->dataDevice == DataDevice::CPU) {
             this->cpuData = new uint8_t[this->expansionBytes];
             if (zero) {
@@ -2304,7 +2373,15 @@ namespace fastllm {
         } 
         uint64_t ret = 0;
         ret += sizeof(int) * 2;
-        if (this->dataType == FP8_E4M3 || this->dataType == NVFP4) {
+        bool compactNVFP4 = this->dataType == NVFP4 && this->scales.empty() &&
+                             this->dims.size() == 2 && this->blockK > 0 && this->blockM > 0;
+        if (this->dataType == NVFP4 && this->scales.empty() && !compactNVFP4) {
+            ErrorInFastLLM("ExportFastllmFormat Error: invalid compact NVFP4 metadata.");
+        }
+        if (compactNVFP4) {
+            ret += sizeof(int) * 3;
+            ret += this->GetBytes();
+        } else if (this->dataType == FP8_E4M3 || this->dataType == NVFP4) {
             ret += sizeof(int) * 3;
             ret += this->scales.size() * sizeof(float);
             ret += this->GetBytes();
@@ -2338,9 +2415,19 @@ namespace fastllm {
             writer.WriteBytes(this->cpuData, GetBytes());
             return;
         } 
-        writer.WriteInt(1); // 版本号
+        bool compactNVFP4 = this->dataType == NVFP4 && this->scales.empty() &&
+                             this->dims.size() == 2 && this->blockK > 0 && this->blockM > 0;
+        if (this->dataType == NVFP4 && this->scales.empty() && !compactNVFP4) {
+            ErrorInFastLLM("ExportFastllmFormat Error: invalid compact NVFP4 metadata.");
+        }
+        writer.WriteInt(compactNVFP4 ? 2 : 1); // 版本号
         writer.WriteInt((int)this->dataType);
-        if (this->dataType == FP8_E4M3 || this->dataType == NVFP4) {
+        if (compactNVFP4) {
+            writer.WriteInt(this->blockK);
+            writer.WriteInt(this->blockM);
+            writer.WriteInt((int)GetNVFP4ScaleBytes(this->dims[0], this->dims[1], this->blockK, this->blockM));
+            writer.WriteBytes(this->cpuData, this->GetBytes());
+        } else if (this->dataType == FP8_E4M3 || this->dataType == NVFP4) {
             writer.WriteInt(this->blockK);
             writer.WriteInt(this->blockM);
             writer.WriteInt((int)this->scales.size());
@@ -2451,6 +2538,22 @@ namespace fastllm {
             } else {
                 ErrorInFastLLM("CreateFromFastllmFormat Error: data type error.");
             }
+        } else if (version == 2) {
+            this->dataType = (DataType)reader.ReadInt();
+            if (this->dataType != NVFP4) {
+                ErrorInFastLLM("CreateFromFastllmFormat error: version 2 only supports NVFP4.");
+            }
+            this->blockK = reader.ReadInt();
+            this->blockM = reader.ReadInt();
+            int scaleLen = reader.ReadInt();
+            AssertInFastLLM(this->blockK > 0 && this->blockM > 0 && this->dims.size() == 2,
+                            "CreateFromFastllmFormat error: invalid compact NVFP4 metadata.");
+            this->scales.clear();
+            this->Resize(this->dims);
+            this->Allocate(false);
+            AssertInFastLLM(scaleLen == (int)GetNVFP4ScaleBytes(this->dims[0], this->dims[1], this->blockK, this->blockM),
+                            "CreateFromFastllmFormat error: NVFP4 scale length mismatch.");
+            reader.ReadBytes(this->cpuData, this->GetBytes());
         } else {
             ErrorInFastLLM("CreateFromFastllmFormat error: unsupport version " + std::to_string(version));
         }
