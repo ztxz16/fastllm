@@ -1,8 +1,10 @@
 #include "devices/disk/diskdevice.h"
+#include "blocks/baseblock.h"
 #include "gguf.h"
 #include "utils.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <cstdlib>
 #include <fcntl.h>
@@ -10,8 +12,21 @@
 #include <set>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
+
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
 
 namespace fastllm {
+#ifdef USE_CUDA
+    extern void DoCudaMergeMOEFromCPU(Data &input, Data &output, Data &index, Data &score,
+                                      Data &w1, Data &w2, Data &w3,
+                                      Data **weights, Data **biass, float sharedScale,
+                                      bool setZero, const std::unordered_set<int> &experts,
+                                      bool isCrossSwiglu, MoeGateType gateType);
+#endif
+
     DiskDevice::DiskDevice() {
         this->deviceType = "disk";
         this->ops["MergeMOE"] = (BaseOperator*)(new DiskMergeMOE());
@@ -56,6 +71,38 @@ namespace fastllm {
             return std::max(1, v);
         }();
         return threads;
+    }
+
+    static bool ParseEnvFlag(const char *env, bool defaultValue) {
+        if (env == nullptr) {
+            return defaultValue;
+        }
+        std::string value(env);
+        std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+        if (value == "0" || value == "false" || value == "off") {
+            return false;
+        }
+        if (value == "1" || value == "true" || value == "on") {
+            return true;
+        }
+        return defaultValue;
+    }
+
+    static bool DiskMoeGpuPrefillEnabled() {
+        static bool enabled = []() {
+            bool ret = ParseEnvFlag(std::getenv("FT_GPU_PREFILL"), true);
+            return ParseEnvFlag(std::getenv("FASTLLM_DISK_MOE_GPU_PREFILL"), ret);
+        }();
+        return enabled;
+    }
+
+    static int DiskMoeGpuPrefillMinTokens() {
+        static int minTokens = []() {
+            const char *env = std::getenv("FASTLLM_DISK_MOE_GPU_PREFILL_MIN_TOKENS");
+            int v = env == nullptr ? 32 : atoi(env);
+            return std::max(1, v);
+        }();
+        return minTokens;
     }
 
     class DiskFileCache {
@@ -224,9 +271,7 @@ namespace fastllm {
                 ReadDiskPartBytes(part, loaded->cpuData + dstOffset);
                 dstOffset += part.bytes;
             }
-            // Disk weights are temporary per token; repacking them every decode step
-            // costs more than the saved Q4_K_M read bandwidth. Use GGUF blocks as-is.
-            loaded->IsRepacked = true;
+            loaded->IsRepacked = false;
             return loaded;
         }
 
@@ -249,6 +294,263 @@ namespace fastllm {
         }
         return loaded;
     }
+
+    static bool CudaSupportsDiskMoeWeight(DataType inputType, DataType weightType) {
+        if (inputType != DataType::FLOAT32 &&
+            inputType != DataType::FLOAT16 &&
+            inputType != DataType::BFLOAT16) {
+            return false;
+        }
+        if (weightType == DataType::FLOAT32 ||
+            weightType == DataType::FLOAT16 ||
+            weightType == DataType::BFLOAT16 ||
+            weightType == DataType::FP8_E4M3 ||
+            weightType == DataType::FP8_E4M3_BLOCK_128 ||
+            weightType == DataType::NVFP4 ||
+            weightType == DataType::NVFP4_BLOCK_16) {
+            return true;
+        }
+        return false;
+    }
+
+    static bool CanPrepareCudaGateWeight(const Data &weight) {
+        if (weight.dataType == DataType::FP8_E4M3) {
+            return weight.blockK > 0 && weight.blockM == 128;
+        }
+        if (weight.dataType == DataType::NVFP4) {
+            return weight.blockK > 0 && weight.blockM >= 16 &&
+                   (weight.blockM % 16 == 0 || weight.blockM == weight.dims[1]);
+        }
+        return weight.dataType == DataType::FLOAT32 ||
+               weight.dataType == DataType::FLOAT16 ||
+               weight.dataType == DataType::BFLOAT16 ||
+               weight.dataType == DataType::FP8_E4M3_BLOCK_128 ||
+               weight.dataType == DataType::NVFP4_BLOCK_16;
+    }
+
+    static bool CanPrepareCudaDownWeight(const Data &weight) {
+        if (weight.dataType == DataType::FP8_E4M3) {
+            return weight.blockK > 0 && weight.blockM > 0;
+        }
+        if (weight.dataType == DataType::NVFP4) {
+            return weight.blockK > 0 && weight.blockM >= 16 &&
+                   (weight.blockM % 16 == 0 || weight.blockM == weight.dims[1]);
+        }
+        return true;
+    }
+
+    static bool CanUseCudaDiskMoe(Data &input, Data **weights, int weightsBatch,
+                                  const std::vector<int> &loadIndices,
+                                  const std::set<int> &selectedExperts,
+                                  MoeGateType gateType) {
+#ifndef USE_CUDA
+        (void)input;
+        (void)weights;
+        (void)weightsBatch;
+        (void)loadIndices;
+        (void)selectedExperts;
+        (void)gateType;
+        return false;
+#else
+        if (!DiskMoeGpuPrefillEnabled() || input.cudaData == nullptr ||
+            input.dims.size() < 2 || input.dims[0] < DiskMoeGpuPrefillMinTokens()) {
+            return false;
+        }
+        for (int expert : selectedExperts) {
+            int gate = expert * 2;
+            int down = gate + 1;
+            if (gate >= weightsBatch || down >= weightsBatch ||
+                weights[gate] == nullptr || weights[down] == nullptr) {
+                continue;
+            }
+            bool gateLoaded = std::find(loadIndices.begin(), loadIndices.end(), gate) != loadIndices.end();
+            bool downLoaded = std::find(loadIndices.begin(), loadIndices.end(), down) != loadIndices.end();
+            if ((weights[gate]->dataType == DataType::NVFP4 && !gateLoaded) ||
+                (weights[down]->dataType == DataType::NVFP4 && !downLoaded)) {
+                return false;
+            }
+            if (gateType != MoeGateGeglu) {
+                if (!gateLoaded || !CanPrepareCudaGateWeight(*weights[gate])) {
+                    return false;
+                }
+            }
+            if (!CanPrepareCudaDownWeight(*weights[down])) {
+                return false;
+            }
+            if (!CudaSupportsDiskMoeWeight(input.dataType, weights[gate]->dataType) ||
+                !CudaSupportsDiskMoeWeight(input.dataType, weights[down]->dataType)) {
+                return false;
+            }
+        }
+        return true;
+#endif
+    }
+
+    static void CrossSwigluReorderRows(const uint8_t *src, int rows, size_t bytesPerRow,
+                                       std::vector<uint8_t> &dst) {
+        AssertInFastLLM(rows % 2 == 0, "Disk MoE CrossSwiglu weight rows should be even.\n");
+        dst.resize((size_t)rows * bytesPerRow);
+        int half = rows / 2;
+        for (int i = 0; i < half; i++) {
+            memcpy(dst.data() + (size_t)(2 * i) * bytesPerRow,
+                   src + (size_t)i * bytesPerRow, bytesPerRow);
+            memcpy(dst.data() + (size_t)(2 * i + 1) * bytesPerRow,
+                   src + (size_t)(half + i) * bytesPerRow, bytesPerRow);
+        }
+    }
+
+    static size_t DiskWeightCudaRowBytes(const Data &weight) {
+        int m = weight.dims[1];
+        if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+            return GetDataBytes((DataType)((int)DataType::DATA_GGUF_FORMAT + weight.ggmlType), 1, m);
+        }
+        return GetDataBytes(weight.dataType, 1, m);
+    }
+
+    static void CrossSwigluReorderWeightInPlace(Data &weight) {
+        if (weight.dims.size() != 2 || weight.cpuData == nullptr) {
+            return;
+        }
+        size_t bytesPerRow = DiskWeightCudaRowBytes(weight);
+        size_t reorderBytes = (size_t)weight.dims[0] * bytesPerRow;
+        AssertInFastLLM(weight.expansionBytes == 0 || reorderBytes <= weight.expansionBytes,
+                        "Disk MoE CrossSwiglu weight storage is not row-contiguous.\n");
+        std::vector<uint8_t> reordered;
+        CrossSwigluReorderRows(weight.cpuData, weight.dims[0], bytesPerRow, reordered);
+        memcpy(weight.cpuData, reordered.data(), reordered.size());
+    }
+
+    static void PackFp8ToCudaBlock128(Data &weight) {
+        if (weight.dataType != DataType::FP8_E4M3) {
+            return;
+        }
+        if (weight.blockM != 128) {
+            return;
+        }
+        AssertInFastLLM(weight.dims.size() == 2 && weight.cpuData != nullptr &&
+                        weight.blockK > 0,
+                        "Disk MoE FP8 weight can't be prepared for CUDA.\n");
+        int k = weight.dims[0], m = weight.dims[1];
+        int scaleKs = (k - 1) / weight.blockK + 1;
+        int scaleMs = (m - 1) / weight.blockM + 1;
+        AssertInFastLLM((int)weight.scales.size() >= scaleKs * scaleMs,
+                        "Disk MoE FP8 scale metadata is invalid.\n");
+
+        size_t rawBytesPerRow = GetDataBytes(DataType::FP8_E4M3, 1, m);
+        size_t packedBytesPerRow = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, m);
+        int packedBlocks = (m - 1) / 128 + 1;
+        std::vector<uint8_t> packed((size_t)k * packedBytesPerRow, 0);
+
+        for (int row = 0; row < k; row++) {
+            uint8_t *dst = packed.data() + (size_t)row * packedBytesPerRow;
+            uint8_t *src = weight.cpuData + (size_t)row * rawBytesPerRow;
+            for (int block = 0; block < packedBlocks; block++) {
+                int blockStart = block * 128;
+                int blockElems = std::min(128, m - blockStart);
+                memcpy(dst, src + blockStart, blockElems);
+                dst += blockElems;
+
+                size_t scaleIdx = (size_t)(row / weight.blockK) * scaleMs + block;
+                float scale = weight.scales[scaleIdx];
+                memcpy(dst, &scale, sizeof(float));
+                dst += sizeof(float);
+            }
+        }
+
+        delete[] weight.cpuData;
+        weight.cpuData = new uint8_t[packed.size()];
+        memcpy(weight.cpuData, packed.data(), packed.size());
+        weight.dataType = DataType::FP8_E4M3_BLOCK_128;
+        weight.UpdateUnitSize();
+        weight.expansionSize = weight.Count(0);
+        weight.expansionBytes = packed.size();
+    }
+
+    static void PackNvfp4ToCudaBlock16(Data &weight) {
+        if (weight.dataType != DataType::NVFP4) {
+            return;
+        }
+        AssertInFastLLM(weight.dims.size() == 2 && weight.cpuData != nullptr &&
+                        weight.blockK > 0 && weight.blockM >= 16 &&
+                        (weight.blockM % 16 == 0 || weight.blockM == weight.dims[1]),
+                        "Disk MoE NVFP4 weight can't be prepared for CUDA.\n");
+        int k = weight.dims[0], m = weight.dims[1];
+        int scaleKs = (k - 1) / weight.blockK + 1;
+        int scaleMs = (m - 1) / weight.blockM + 1;
+        AssertInFastLLM((int)weight.scales.size() >= scaleKs * scaleMs,
+                        "Disk MoE NVFP4 scale metadata is invalid.\n");
+
+        const int packBlockM = 16;
+        const int fp4BytesPerBlock = packBlockM / 2;
+        int packedBlocks = (m - 1) / packBlockM + 1;
+        size_t rawBytesPerRow = GetDataBytes(DataType::NVFP4, 1, m);
+        size_t packedBytesPerRow = GetDataBytes(DataType::NVFP4_BLOCK_16, 1, m);
+        std::vector<uint8_t> packed((size_t)k * packedBytesPerRow, 0);
+
+        for (int row = 0; row < k; row++) {
+            uint8_t *dst = packed.data() + (size_t)row * packedBytesPerRow;
+            uint8_t *src = weight.cpuData + (size_t)row * rawBytesPerRow;
+            for (int block = 0; block < packedBlocks; block++) {
+                int blockStart = block * packBlockM;
+                int blockElems = std::min(packBlockM, m - blockStart);
+                int blockBytes = blockElems / 2;
+                memcpy(dst, src + blockStart / 2, blockBytes);
+                dst += fp4BytesPerBlock;
+
+                int scaleCol = blockStart / weight.blockM;
+                size_t scaleIdx = (size_t)(row / weight.blockK) * scaleMs + scaleCol;
+                float scale = weight.scales[scaleIdx];
+                memcpy(dst, &scale, sizeof(float));
+                dst += sizeof(float);
+            }
+        }
+
+        delete[] weight.cpuData;
+        weight.cpuData = new uint8_t[packed.size()];
+        memcpy(weight.cpuData, packed.data(), packed.size());
+        weight.dataType = DataType::NVFP4_BLOCK_16;
+        weight.UpdateUnitSize();
+        weight.expansionSize = weight.Count(0);
+        weight.expansionBytes = packed.size();
+    }
+
+    static void PrepareDiskWeightsForCuda(const std::vector<int> &loadIndices,
+                                          std::vector<Data*> &tempWeights,
+                                          MoeGateType gateType) {
+        std::set<Data*> prepared;
+        for (int index : loadIndices) {
+            if (index >= 0 && index < (int)tempWeights.size() && tempWeights[index] != nullptr &&
+                prepared.insert(tempWeights[index]).second) {
+                Data &weight = *tempWeights[index];
+                PackFp8ToCudaBlock128(weight);
+                PackNvfp4ToCudaBlock16(weight);
+                if (gateType != MoeGateGeglu && index % 2 == 0) {
+                    CrossSwigluReorderWeightInPlace(weight);
+                }
+            }
+        }
+    }
+
+#ifdef USE_CUDA
+    static void ReleaseDiskTempWeightCudaExtras(Data *weight) {
+        if (weight == nullptr) {
+            return;
+        }
+        std::set<void*> released;
+        for (void *ptr : weight->extraCudaData) {
+            if (ptr != nullptr && released.insert(ptr).second) {
+                FastllmCudaFree(ptr);
+            }
+        }
+        for (void *ptr : weight->extraCudaHalfData) {
+            if (ptr != nullptr && released.insert(ptr).second) {
+                FastllmCudaFree(ptr);
+            }
+        }
+        weight->extraCudaData.clear();
+        weight->extraCudaHalfData.clear();
+    }
+#endif
 
     struct LoadDiskWeightsOp : MultiThreadBaseOp {
         Data **weights;
@@ -336,8 +638,19 @@ namespace fastllm {
 
     void DiskMergeMOE::Run(const std::string &opType, const DataDict &datas,
                            const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
         Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        Data &w1 = *(datas.find("w1")->second);
+        Data &w2 = *(datas.find("w2")->second);
+        Data &w3 = *(datas.find("w3")->second);
         Data **weights = (Data**)datas.find("weights")->second;
+        Data **biass = (Data**)datas.find("biass")->second;
+        float sharedScale = floatParams.find("sharedScale") != floatParams.end() ?
+            floatParams.find("sharedScale")->second : 1.0f;
+        MoeGateType gateType = intParams.find("gateType") != intParams.end() ?
+            (MoeGateType)intParams.find("gateType")->second : MoeGateSwiglu;
         int topk = index.dims[1];
         int weightsBatch = intParams.find("weights___batch") != intParams.end() ?
             intParams.find("weights___batch")->second : (topk + 1) * 2;
@@ -395,6 +708,17 @@ namespace fastllm {
                 ownedWeights.push_back(tempWeights[index]);
             }
         }
+        auto releaseOwnedWeights = [&]() {
+            std::set<Data*> releasedWeights;
+            for (auto *weight : ownedWeights) {
+                if (releasedWeights.insert(weight).second) {
+#ifdef USE_CUDA
+                    ReleaseDiskTempWeightCudaExtras(weight);
+#endif
+                    delete weight;
+                }
+            }
+        };
         for (int i = 0; i < weightsBatch; i++) {
             if (tempWeights[i] != nullptr && tempWeights[i]->isDiskWeight) {
                 tempWeights[i] = nullptr;
@@ -402,6 +726,9 @@ namespace fastllm {
         }
         if (tempWeights[2] == nullptr) {
             for (int expert : selectedExperts) {
+                if (expert == 0) {
+                    continue;
+                }
                 int gate = expert * 2;
                 if (gate < weightsBatch && tempWeights[gate] != nullptr) {
                     // CpuMergeMOE uses weights[2] only as the representative dtype/shape
@@ -415,17 +742,27 @@ namespace fastllm {
             ErrorInFastLLM("Disk MoE failed to load representative expert weight.\n");
         }
 
+#ifdef USE_CUDA
+        if (CanUseCudaDiskMoe(input, tempWeights.data(), weightsBatch, loadIndices, selectedExperts, gateType)) {
+            PrepareDiskWeightsForCuda(loadIndices, tempWeights, gateType);
+            std::unordered_set<int> cudaExperts(selectedExperts.begin(), selectedExperts.end());
+            DoCudaMergeMOEFromCPU(input, output, index, score, w1, w2, w3,
+                                  tempWeights.data(), biass, sharedScale,
+                                  true, cudaExperts, true, gateType);
+            releaseOwnedWeights();
+            return;
+        }
+#endif
+
         DataDict diskDatas = datas;
         diskDatas["weights"] = (Data*)tempWeights.data();
         Data promotedInput, promotedOutput;
-        Data &input = *(datas.find("input")->second);
-        Data &output = *(datas.find("output")->second);
         DataType originalOutputType = output.dataType;
         bool promoteInput = tempWeights[2] != nullptr &&
                             (tempWeights[2]->dataType == DataType::BFLOAT16 ||
                              tempWeights[2]->dataType == DataType::FP8_E4M3 ||
                              tempWeights[2]->dataType == DataType::NVFP4) &&
-                            input.dataType != DataType::FLOAT32;
+                            input.dataType == DataType::FLOAT16;
         if (promoteInput) {
             ConvertInputToFloat32(input, promotedInput);
             promotedOutput.dataType = DataType::FLOAT32;
@@ -433,13 +770,25 @@ namespace fastllm {
             diskDatas["input"] = &promotedInput;
             diskDatas["output"] = &promotedOutput;
         }
+        Data sharedExpertOut;
+        bool hasSharedExpertOut = false;
+        if (tempWeights[0] != nullptr && tempWeights[1] != nullptr) {
+            Data sharedGateOut, sharedSwigluOut;
+            Data &mergeInput = promoteInput ? promotedInput : input;
+            LinearSwigluBlock(&mergeInput, tempWeights[0], GetEmptyData(), &sharedGateOut, &sharedSwigluOut);
+            Linear(sharedSwigluOut, *tempWeights[1], *GetEmptyData(), sharedExpertOut);
+            tempWeights[0] = tempWeights[1] = nullptr;
+            hasSharedExpertOut = true;
+        }
         CpuMergeMOE::Run(opType, diskDatas, floatParams, intParams);
+        if (hasSharedExpertOut) {
+            Data &mergeOutput = promoteInput ? promotedOutput : output;
+            AddTo(mergeOutput, sharedExpertOut, sharedScale);
+        }
         if (promoteInput) {
             ConvertFloat32ToOutput(promotedOutput, output, originalOutputType);
         }
 
-        for (auto *weight : ownedWeights) {
-            delete weight;
-        }
+        releaseOwnedWeights();
     }
 }

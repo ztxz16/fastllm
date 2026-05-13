@@ -98,7 +98,11 @@ namespace fastllm {
         static bool DeepSeekV4PreferCuda() {
 #ifdef USE_CUDA
             auto *executor = (Executor*)GetExecutor();
-            return executor != nullptr && executor->firstDevice == "cuda";
+            return executor != nullptr &&
+                   (executor->firstDevice == "cuda" ||
+                    executor->firstDevice.rfind("cuda:", 0) == 0 ||
+                    executor->firstDevice == "multicuda" ||
+                    executor->firstDevice.rfind("multicuda:", 0) == 0);
 #else
             return false;
 #endif
@@ -338,6 +342,33 @@ namespace fastllm {
                    (data.cpuData != nullptr || data.cudaData != nullptr);
         }
 
+        static bool IsDiskWeight(const Data *weight) {
+            return weight != nullptr && weight->isDiskWeight;
+        }
+
+#ifdef USE_CUDA
+        static std::vector<int> GetCudaDeviceIdsForData(const Data &data) {
+            if (data.cudaData != nullptr) {
+                int realDevice = GetPointerDeviceId(data.cudaData);
+                if (realDevice >= 0) {
+                    return {realDevice};
+                }
+            }
+            if (!data.dataDeviceIds.empty()) {
+                return data.dataDeviceIds;
+            }
+            return {FastllmCudaGetDevice()};
+        }
+
+        static void EnsureTensorOnSameCudaDevice(Data &data, const Data &reference) {
+            if (!DeepSeekV4PreferCuda() || reference.dataDevice != DataDevice::CUDA ||
+                !HasTensorData(data)) {
+                return;
+            }
+            data.ToDevice(DataDevice::CUDA, GetCudaDeviceIdsForData(reference));
+        }
+#endif
+
         static void CopyTensorData(Data &dst, const Data &src) {
             ResetData(dst);
             if (HasTensorData(src)) {
@@ -566,6 +597,9 @@ namespace fastllm {
                                         int startPos, int windowSize, Data &windowKV) {
             (void)bsz;
             (void)headDim;
+#ifdef USE_CUDA
+            EnsureTensorOnSameCudaDevice(windowKV, kv);
+#endif
             Executor &executor = *((Executor*)GetExecutor());
             executor.Run("DeepSeekV4UpdateWindowKVCache", {
                 {"input", (Data*)&kv}, {"cache", &windowKV}
@@ -1178,21 +1212,45 @@ namespace fastllm {
             ScopedExecutorProfiler executorProfile("DeepSeekV4SparseDecodeCached");
 #ifdef USE_CUDA
             if (q.dims[1] == 1) {
-                Data qCuda, compressedCuda;
+                Data qCuda, windowCuda, compressedCuda;
                 const Data *qForCuda = &q;
                 if (q.dataDevice != DataDevice::CUDA) {
                     qCuda.CopyFrom(q);
                     qCuda.ToDevice(DataDevice::CUDA);
                     qForCuda = &qCuda;
                 }
+                std::vector<int> targetDeviceIds = qForCuda->dataDeviceIds;
+                if (qForCuda->cudaData != nullptr) {
+                    int realQDevice = GetPointerDeviceId(qForCuda->cudaData);
+                    if (realQDevice >= 0) {
+                        targetDeviceIds = {realQDevice};
+                    }
+                }
+                const Data *windowForCuda = &windowKV;
+                bool needWindowCopy = windowKV.dataDevice != DataDevice::CUDA;
+                if (!needWindowCopy && windowKV.cudaData != nullptr && !targetDeviceIds.empty()) {
+                    int realWindowDevice = GetPointerDeviceId(windowKV.cudaData);
+                    needWindowCopy = realWindowDevice >= 0 && realWindowDevice != targetDeviceIds[0];
+                }
+                if (needWindowCopy) {
+                    windowCuda.CopyFrom(windowKV);
+                    windowCuda.ToDevice(DataDevice::CUDA, targetDeviceIds);
+                    windowForCuda = &windowCuda;
+                }
                 const Data *compressedForCuda = &compressedKV;
-                if (compressedCount > 0 && compressedKV.dataDevice != DataDevice::CUDA) {
+                bool needCompressedCopy = compressedCount > 0 && compressedKV.dataDevice != DataDevice::CUDA;
+                if (!needCompressedCopy && compressedCount > 0 &&
+                    compressedKV.cudaData != nullptr && !targetDeviceIds.empty()) {
+                    int realCompressedDevice = GetPointerDeviceId(compressedKV.cudaData);
+                    needCompressedCopy = realCompressedDevice >= 0 && realCompressedDevice != targetDeviceIds[0];
+                }
+                if (needCompressedCopy) {
                     compressedCuda.CopyFrom(compressedKV);
-                    compressedCuda.ToDevice(DataDevice::CUDA);
+                    compressedCuda.ToDevice(DataDevice::CUDA, targetDeviceIds);
                     compressedForCuda = &compressedCuda;
                 }
-                attnSink.ToDevice(DataDevice::CUDA);
-                if (FastllmCudaDeepSeekV4SparseAttentionDecodeCached(*qForCuda, windowKV,
+                attnSink.ToDevice(DataDevice::CUDA, targetDeviceIds);
+                if (FastllmCudaDeepSeekV4SparseAttentionDecodeCached(*qForCuda, *windowForCuda,
                                                                      *compressedForCuda,
                                                                      attnSink, windowSize, startPos,
                                                                      compressedCount, ropeDim, ropeBase,
@@ -3055,6 +3113,7 @@ namespace fastllm {
 
         for (int layer = 0; layer < block_cnt; layer++) {
             std::string pre = "layers." + std::to_string(layer);
+            ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
             int compressRatio = compress_ratios.size() > layer ? compress_ratios[layer] : 0;
             bool useCompressRope = compressRatio != 0;
             float layerRopeBase = useCompressRope ? compress_rope_theta : rope_base;
@@ -3106,6 +3165,9 @@ namespace fastllm {
                         ErrorInFastLLM("DeepSeekV4Model: decode cache is not initialized.");
                     }
                     if (seqlen > 1) {
+#ifdef USE_CUDA
+                        EnsureTensorOnSameCudaDevice(decodeCache->windowKV, kv);
+#endif
                         chunkPrefixLen = BuildWindowKVPrefixData(decodeCache->windowKV, bsz, head_dim_full,
                                                                  startPos, window_size, chunkPrefixKV);
                     }
@@ -3322,12 +3384,13 @@ namespace fastllm {
                 // MOE
                 Data sharedExpertOut;
                 bool hasSharedExpertOut = false;
-                if (cudaSe &&
-                    weight.weight.find(pre + ".ffn.shared_experts.gateup.weight") != weight.weight.end() &&
-                    weight.weight.find(pre + ".ffn.shared_experts.w2.weight") != weight.weight.end()) {
+                auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
+                auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
+                if (cudaSe && sharedGateupIt != weight.weight.end() && sharedDownIt != weight.weight.end() &&
+                    !IsDiskWeight(&sharedGateupIt->second) && !IsDiskWeight(&sharedDownIt->second)) {
                     Data ww1, ww3;
-                    LinearSwigluBlock(&ffnInput, &weight[pre + ".ffn.shared_experts.gateup.weight"], GetEmptyData(), &ww3, &ww1);
-                    Linear(ww1, weight[pre + ".ffn.shared_experts.w2.weight"], *GetEmptyData(), sharedExpertOut);
+                    LinearSwigluBlock(&ffnInput, &sharedGateupIt->second, GetEmptyData(), &ww3, &ww1);
+                    Linear(ww1, sharedDownIt->second, *GetEmptyData(), sharedExpertOut);
                     weights[layer][0] = weights[layer][1] = nullptr;
                     hasSharedExpertOut = true;
                 }
@@ -3520,6 +3583,7 @@ namespace fastllm {
 
         for (int layer = 0; layer < block_cnt; layer++) {
             std::string pre = "layers." + std::to_string(layer);
+            ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
             int compressRatio = compress_ratios.size() > layer ? compress_ratios[layer] : 0;
             bool useCompressRope = compressRatio != 0;
             float layerRopeBase = useCompressRope ? compress_rope_theta : rope_base;
@@ -3721,12 +3785,13 @@ namespace fastllm {
             {
                 Data sharedExpertOut;
                 bool hasSharedExpertOut = false;
-                if (cudaSe &&
-                    weight.weight.find(pre + ".ffn.shared_experts.gateup.weight") != weight.weight.end() &&
-                    weight.weight.find(pre + ".ffn.shared_experts.w2.weight") != weight.weight.end()) {
+                auto sharedGateupIt = weight.weight.find(pre + ".ffn.shared_experts.gateup.weight");
+                auto sharedDownIt = weight.weight.find(pre + ".ffn.shared_experts.w2.weight");
+                if (cudaSe && sharedGateupIt != weight.weight.end() && sharedDownIt != weight.weight.end() &&
+                    !IsDiskWeight(&sharedGateupIt->second) && !IsDiskWeight(&sharedDownIt->second)) {
                     Data ww1, ww3;
-                    LinearSwigluBlock(&ffnInput, &weight[pre + ".ffn.shared_experts.gateup.weight"], GetEmptyData(), &ww3, &ww1);
-                    Linear(ww1, weight[pre + ".ffn.shared_experts.w2.weight"], *GetEmptyData(), sharedExpertOut);
+                    LinearSwigluBlock(&ffnInput, &sharedGateupIt->second, GetEmptyData(), &ww3, &ww1);
+                    Linear(ww1, sharedDownIt->second, *GetEmptyData(), sharedExpertOut);
                     weights[layer][0] = weights[layer][1] = nullptr;
                     hasSharedExpertOut = true;
                 }

@@ -3980,6 +3980,19 @@ extern "C" bool FastllmCudaDeepSeekV4SparseAttentionDecodeCached(const fastllm::
         (compressedCount > 0 && compressedKV.Count(0) != (uint64_t)bsz * compressedCount * dim)) {
         return false;
     }
+    int curDevice = FastllmCudaGetDevice();
+    int qDevice = q.cudaData == nullptr ? -1 : GetPointerDeviceId(q.cudaData);
+    int windowDevice = windowKV.cudaData == nullptr ? -1 : GetPointerDeviceId(windowKV.cudaData);
+    int compressedDevice = compressedCount > 0 && compressedKV.cudaData != nullptr ?
+                           GetPointerDeviceId(compressedKV.cudaData) : qDevice;
+    int sinkDevice = attnSink.cudaData == nullptr ? -1 : GetPointerDeviceId(attnSink.cudaData);
+    int kernelDevice = qDevice >= 0 ? qDevice : curDevice;
+    if ((qDevice >= 0 && qDevice != curDevice) ||
+        (windowDevice >= 0 && windowDevice != kernelDevice) ||
+        (compressedCount > 0 && compressedDevice >= 0 && compressedDevice != kernelDevice) ||
+        (sinkDevice >= 0 && sinkDevice != kernelDevice)) {
+        return false;
+    }
     const float *cudaWindow = (const float *)windowKV.cudaData;
 
     if (!DeepSeekV4PrepareCudaOutput(output, fastllm::DataType::BFLOAT16, {bsz, 1, heads, dim})) {

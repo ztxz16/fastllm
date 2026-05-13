@@ -795,20 +795,15 @@ namespace fastllm {
         return dataType == DataType::FLOAT32 ||
                dataType == DataType::FLOAT16 ||
                dataType == DataType::BFLOAT16 ||
-               dataType == DataType::FP8_E4M3;
+               dataType == DataType::FP8_E4M3 ||
+               dataType == DataType::NVFP4;
     }
 
-    static void SetDiskWeightMeta(Data &weight, const SafeTensorItem &tensor, DataType targetDataType,
-                                  SafeTensorItem *scaleTensor = nullptr) {
-        DataType sourceDataType;
-        if (!GetDiskSourceDataType(tensor.dtype, sourceDataType) || !IsDiskTargetDataType(targetDataType)) {
-            ErrorInFastLLM("Disk MoE only supports F32/F16/BF16/FP8 safetensors: " + weight.name + "\n");
-        }
-        if (scaleTensor != nullptr && (sourceDataType != DataType::FP8_E4M3 || targetDataType != DataType::FP8_E4M3)) {
-            ErrorInFastLLM("Disk MoE only supports scaled weights for FP8 expert tensors: " + weight.name + "\n");
-        }
-        weight.dataType = sourceDataType;
+    static void ResetDiskWeightMeta(Data &weight, DataType dataType) {
+        std::vector<int> dims = weight.dims;
+        weight.dataType = dataType;
         weight.UpdateUnitSize();
+        weight.Resize(dims);
         weight.isDiskWeight = true;
         weight.diskWeightParts.clear();
         weight.weightType = WeightType::LINEAR;
@@ -823,13 +818,67 @@ namespace fastllm {
         weight.perChannelsConfigs.clear();
         weight.blockK = -1;
         weight.blockM = -1;
+        weight.perChannelAxis = -1;
+        weight.group = -1;
+        weight.groupCnt = -1;
+        weight.IsRepacked = false;
+    }
+
+    static void ReadDiskTensorRange(const std::string &fileName, long long offset,
+                                    uint8_t *dst, uint64_t bytes) {
+        std::ifstream fin(fileName, std::ios::binary);
+        if (!fin.good()) {
+            ErrorInFastLLM("Disk MoE can't open weight file: " + fileName + "\n");
+        }
+        fin.seekg(offset, std::ios::beg);
+        fin.read((char*)dst, bytes);
+        if ((uint64_t)fin.gcount() != bytes) {
+            ErrorInFastLLM("Disk MoE read weight metadata failed: " + fileName + "\n");
+        }
+    }
+
+    static int ReadDiskMetaInt(const std::vector<uint8_t> &buffer, size_t &offset) {
+        AssertInFastLLM(offset + sizeof(int) <= buffer.size(),
+                        "Disk MoE fastllm metadata is truncated.\n");
+        int value;
+        memcpy(&value, buffer.data() + offset, sizeof(int));
+        offset += sizeof(int);
+        return value;
+    }
+
+    static float ReadDiskMetaFloat(const std::vector<uint8_t> &buffer, size_t &offset) {
+        AssertInFastLLM(offset + sizeof(float) <= buffer.size(),
+                        "Disk MoE fastllm metadata is truncated.\n");
+        float value;
+        memcpy(&value, buffer.data() + offset, sizeof(float));
+        offset += sizeof(float);
+        return value;
+    }
+
+    static void SetDiskWeightMeta(Data &weight, const SafeTensorItem &tensor, DataType targetDataType,
+                                  SafeTensorItem *scaleTensor = nullptr) {
+        DataType sourceDataType;
+        if (tensor.dtype == "I8" && targetDataType == DataType::NVFP4) {
+            sourceDataType = DataType::NVFP4;
+        } else if (!GetDiskSourceDataType(tensor.dtype, sourceDataType)) {
+            ErrorInFastLLM("Disk MoE only supports F32/F16/BF16/FP8/NVFP4 safetensors: " + weight.name + "\n");
+        }
+        if (!IsDiskTargetDataType(targetDataType)) {
+            ErrorInFastLLM("Disk MoE unsupported target dtype: " + weight.name + "\n");
+        }
+        if (scaleTensor != nullptr &&
+            !((sourceDataType == DataType::FP8_E4M3 && targetDataType == DataType::FP8_E4M3) ||
+              (sourceDataType == DataType::NVFP4 && targetDataType == DataType::NVFP4))) {
+            ErrorInFastLLM("Disk MoE only supports scaled weights for FP8/NVFP4 expert tensors: " + weight.name + "\n");
+        }
+        ResetDiskWeightMeta(weight, sourceDataType);
 
         DiskWeightPart part;
         part.fileName = tensor.fileName;
         part.fileOffset = (long long)tensor.data_offsets[0];
         part.bytes = tensor.bytes;
         part.sourceDataType = sourceDataType;
-        part.dims = tensor.intShape;
+        part.dims = weight.dims;
         weight.diskWeightParts.push_back(part);
 
         if (scaleTensor != nullptr) {
@@ -843,7 +892,11 @@ namespace fastllm {
             AssertInFastLLM(n64 <= INT_MAX && ns64 <= INT_MAX &&
                             tensor.shape.back() <= INT_MAX && scaleTensor->shape.back() <= INT_MAX,
                             "Disk MoE scaled tensor shape is too large: " + weight.name + "\n");
-            int n = (int)n64, m = (int)tensor.shape.back();
+            int n = (int)n64;
+            int m = (int)tensor.shape.back();
+            if (targetDataType == DataType::NVFP4) {
+                m *= 2;
+            }
             int ns = (int)ns64, ms = (int)scaleTensor->shape.back();
             int blockK = n / ns, blockM = m / ms;
             while ((blockK & -blockK) != blockK && blockK < n) {
@@ -857,6 +910,113 @@ namespace fastllm {
             weight.scales.resize(ns * ms);
             memcpy(weight.scales.data(), scaleTensor->buffer, ns * ms * sizeof(float));
         }
+    }
+
+    static void SetDiskFastllmWeightMeta(Data &weight, const SafeTensorItem &tensor) {
+        std::vector<uint8_t> header(sizeof(int) * 5);
+        ReadDiskTensorRange(tensor.fileName, (long long)tensor.data_offsets[0],
+                            header.data(), header.size());
+        size_t headerOffset = 0;
+        int version = ReadDiskMetaInt(header, headerOffset);
+        if (version != 1) {
+            ErrorInFastLLM("Disk MoE only supports quantized fastllm expert weights: " + weight.name + "\n");
+        }
+        DataType dataType = (DataType)ReadDiskMetaInt(header, headerOffset);
+        if (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 ||
+            dataType == DataType::BFLOAT16 || dataType == DataType::INT32 ||
+            dataType == DataType::INT32PARAM) {
+            ErrorInFastLLM("Disk MoE unsupported fastllm expert dtype: " + weight.name + "\n");
+        }
+
+        int fastllmGgmlType = -1;
+        if (dataType == DataType::DATA_GGUF_FORMAT) {
+            size_t offset = sizeof(int) * 2;
+            fastllmGgmlType = ReadDiskMetaInt(header, offset);
+            weight.ggmlType = fastllmGgmlType;
+        }
+        ResetDiskWeightMeta(weight, dataType);
+        uint64_t payloadOffset = sizeof(int) * 2;
+
+        if (dataType == DataType::DATA_GGUF_FORMAT) {
+            weight.ggmlType = fastllmGgmlType;
+            weight.isGGUFData = true;
+            weight.Resize(weight.dims);
+            payloadOffset += sizeof(int);
+            weight.expansionBytes = weight.GetBytes();
+        } else if (dataType == DataType::FP8_E4M3 || dataType == DataType::NVFP4) {
+            size_t offset = sizeof(int) * 2;
+            weight.blockK = ReadDiskMetaInt(header, offset);
+            weight.blockM = ReadDiskMetaInt(header, offset);
+            int scaleLen = ReadDiskMetaInt(header, offset);
+            AssertInFastLLM(scaleLen >= 0, "Disk MoE fastllm scale length is invalid: " + weight.name + "\n");
+            std::vector<uint8_t> meta(sizeof(int) * 5 + (uint64_t)scaleLen * sizeof(float));
+            ReadDiskTensorRange(tensor.fileName, (long long)tensor.data_offsets[0],
+                                meta.data(), meta.size());
+            size_t metaOffset = sizeof(int) * 5;
+            weight.scales.resize(scaleLen);
+            if (scaleLen > 0) {
+                memcpy(weight.scales.data(), meta.data() + metaOffset, (uint64_t)scaleLen * sizeof(float));
+            }
+            payloadOffset = meta.size();
+        } else if (dataType == DataType::INT8 || dataType == DataType::INT4 ||
+                   dataType == DataType::INT4_NOZERO) {
+            size_t offset = sizeof(int) * 2;
+            weight.perChannelAxis = ReadDiskMetaInt(header, offset);
+            int k = weight.perChannelAxis == -1 ? 1 : weight.dims[weight.perChannelAxis];
+            std::vector<uint8_t> meta(sizeof(int) * 3 + (uint64_t)k * 2 * sizeof(float));
+            ReadDiskTensorRange(tensor.fileName, (long long)tensor.data_offsets[0],
+                                meta.data(), meta.size());
+            size_t metaOffset = sizeof(int) * 3;
+            weight.perChannelsConfigs.resize(k);
+            weight.mins.resize(k);
+            weight.scales.resize(k);
+            weight.zeros.resize(k);
+            int bit = dataType == DataType::INT4 ? 4 : 8;
+            for (int i = 0; i < k; i++) {
+                float minValue = ReadDiskMetaFloat(meta, metaOffset);
+                float second = ReadDiskMetaFloat(meta, metaOffset);
+                if (dataType == DataType::INT4_NOZERO) {
+                    weight.perChannelsConfigs[i] = LowBitConfig(minValue, minValue + 15 * second, 4, 1);
+                    weight.perChannelsConfigs[i].min = minValue;
+                    weight.perChannelsConfigs[i].scale = second;
+                } else {
+                    weight.perChannelsConfigs[i] = LowBitConfig(minValue, second, bit, 0);
+                }
+                weight.mins[i] = weight.perChannelsConfigs[i].min;
+                weight.scales[i] = weight.perChannelsConfigs[i].scale;
+                weight.zeros[i] = weight.perChannelsConfigs[i].zeroPoint;
+            }
+            payloadOffset = meta.size();
+        } else if (dataType == DataType::INT4_GROUP) {
+            size_t offset = sizeof(int) * 2;
+            weight.perChannelAxis = ReadDiskMetaInt(header, offset);
+            weight.group = ReadDiskMetaInt(header, offset);
+            weight.groupCnt = ReadDiskMetaInt(header, offset);
+            int k = weight.perChannelAxis == -1 ? 1 : weight.dims[weight.perChannelAxis];
+            std::vector<uint8_t> meta(sizeof(int) * 5 + (uint64_t)k * weight.group * 2 * sizeof(float));
+            ReadDiskTensorRange(tensor.fileName, (long long)tensor.data_offsets[0],
+                                meta.data(), meta.size());
+            size_t metaOffset = sizeof(int) * 5;
+            weight.mins.resize(k * weight.group);
+            weight.scales.resize(k * weight.group);
+            for (int i = 0; i < k * weight.group; i++) {
+                weight.mins[i] = ReadDiskMetaFloat(meta, metaOffset);
+                weight.scales[i] = ReadDiskMetaFloat(meta, metaOffset);
+            }
+            payloadOffset = meta.size();
+        } else {
+            ErrorInFastLLM("Disk MoE unsupported fastllm expert dtype: " + weight.name + "\n");
+        }
+
+        AssertInFastLLM(payloadOffset <= tensor.bytes,
+                        "Disk MoE fastllm payload offset is invalid: " + weight.name + "\n");
+        DiskWeightPart part;
+        part.fileName = tensor.fileName;
+        part.fileOffset = (long long)tensor.data_offsets[0] + (long long)payloadOffset;
+        part.bytes = tensor.bytes - payloadOffset;
+        part.sourceDataType = dataType;
+        part.dims = weight.dims;
+        weight.diskWeightParts.push_back(part);
     }
 
     static void UpdateGGUFTensorShape(ggml_tensor *tensor, const std::vector<int> &dims) {
@@ -2114,25 +2274,31 @@ if (false) {
 
                             bool diskLazyWeight = IsDiskMoeWeight(model, weightName, useDiskMoe);
                             if (diskLazyWeight) {
-                                if (isAwqModel || tensor.dtype == "fastllm" ||
-                                    loraDicts.find(weightName) != loraDicts.end()) {
-                                    ErrorInFastLLM("Disk MoE does not support scaled/AWQ/fastllm/lora expert weight yet: " + weightName + "\n");
+                                if (isAwqModel || loraDicts.find(weightName) != loraDicts.end()) {
+                                    ErrorInFastLLM("Disk MoE does not support AWQ/lora expert weight yet: " + weightName + "\n");
                                 }
-                                SafeTensorItem *scaleTensor = nullptr;
-                                DataType diskDataType = dataType;
-                                if (scaleTensorName != "") {
-                                    if (tensor.dtype != "F8_E4M3") {
-                                        ErrorInFastLLM("Disk MoE only supports scaled safetensors for FP8 expert weight: " + weightName + "\n");
+                                if (tensor.dtype == "fastllm") {
+                                    SetDiskFastllmWeightMeta(model->weight[weightName], tensor);
+                                } else {
+                                    SafeTensorItem *scaleTensor = nullptr;
+                                    DataType diskDataType = dataType;
+                                    if (scaleTensorName != "") {
+                                        if (tensor.dtype == "F8_E4M3") {
+                                            diskDataType = DataType::FP8_E4M3;
+                                        } else if (IsPackedFP4Tensor(safeTensors, tensorName)) {
+                                            diskDataType = DataType::NVFP4;
+                                        } else {
+                                            ErrorInFastLLM("Disk MoE only supports scaled safetensors for FP8/NVFP4 expert weight: " + weightName + "\n");
+                                        }
+                                        scaleTensor = &safeTensors.itmeDict[scaleTensorName];
+                                        AssertInFastLLM(scaleTensor->dtype == "F32" || scaleTensor->dtype == "BF16" || scaleTensor->dtype == "F8_E8M0",
+                                                        "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
+                                        scaleTensor->CreateBuffer(DataType::FLOAT32);
                                     }
-                                    diskDataType = DataType::FP8_E4M3;
-                                    scaleTensor = &safeTensors.itmeDict[scaleTensorName];
-                                    AssertInFastLLM(scaleTensor->dtype == "F32" || scaleTensor->dtype == "BF16" || scaleTensor->dtype == "F8_E8M0",
-                                                    "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
-                                    scaleTensor->CreateBuffer(DataType::FLOAT32);
-                                }
-                                SetDiskWeightMeta(model->weight[weightName], tensor, diskDataType, scaleTensor);
-                                if (scaleTensor != nullptr) {
-                                    scaleTensor->ClearBuffer();
+                                    SetDiskWeightMeta(model->weight[weightName], tensor, diskDataType, scaleTensor);
+                                    if (scaleTensor != nullptr) {
+                                        scaleTensor->ClearBuffer();
+                                    }
                                 }
                             } else {
                                 if (scaleTensorName == "") {
