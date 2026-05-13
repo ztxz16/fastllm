@@ -2328,3 +2328,197 @@ bool FastllmCudaBFloat16MatMulGGUF(const fastllm::Data &input, fastllm::Data &we
 
     return true;
 }
+
+template <typename T>
+struct FastllmMoeGGUFTraits;
+
+template <>
+struct FastllmMoeGGUFTraits<half> {
+    static constexpr fastllm::DataType dataType = fastllm::DataType::FLOAT16;
+    __device__ __forceinline__ static float toFloat(half value) {
+        return __half2float(value);
+    }
+    __device__ __forceinline__ static half fromFloat(float value) {
+        return __float2half_rn(value);
+    }
+};
+
+template <>
+struct FastllmMoeGGUFTraits<__nv_bfloat16> {
+    static constexpr fastllm::DataType dataType = fastllm::DataType::BFLOAT16;
+    __device__ __forceinline__ static float toFloat(__nv_bfloat16 value) {
+        return __bfloat162float(value);
+    }
+    __device__ __forceinline__ static __nv_bfloat16 fromFloat(float value) {
+        return __float2bfloat16_rn(value);
+    }
+};
+
+template <>
+struct FastllmMoeGGUFTraits<float> {
+    static constexpr fastllm::DataType dataType = fastllm::DataType::FLOAT32;
+    __device__ __forceinline__ static float toFloat(float value) {
+        return value;
+    }
+    __device__ __forceinline__ static float fromFloat(float value) {
+        return value;
+    }
+};
+
+template <typename T>
+static __global__ void FastllmMoeGGUFReduceKernel(const T *partOutput, T *output, const float *scores,
+                                                  int topk, int hidden) {
+    int st = blockIdx.x * blockDim.x + threadIdx.x;
+    if (st >= hidden) {
+        return;
+    }
+
+    float value = 0.0f;
+    for (int j = 0; j < topk; j++) {
+        value += FastllmMoeGGUFTraits<T>::toFloat(partOutput[(size_t)j * hidden + st]) * scores[j];
+    }
+    output[st] = FastllmMoeGGUFTraits<T>::fromFloat(value);
+}
+
+static size_t FastllmMoeGGUFQ8Bytes(int rows, int cols) {
+    return (size_t)rows * (cols / QK8_1) * sizeof(block_q8_1);
+}
+
+template <typename T>
+static void FastllmMoeGGUFMatMulQ8(ggml_type type, const void *weight, const block_q8_1 *q8Input,
+                                   T *output, int m, int k) {
+    ggml_backend_cuda_context ctx;
+    ggml_cuda_op_mul_mat_vec_q_impl(
+        ctx, type, m, k, 1,
+        0, 0, 0, 0,
+        (const char*)weight, (const char*)q8Input, output, nullptr,
+        0, k, 1, m, nullptr
+    );
+}
+
+static bool FastllmMoeGGUFCanRunWeight(const fastllm::Data *weight, int m, int k) {
+    if (weight == nullptr || weight->dataType != fastllm::DataType::DATA_GGUF_FORMAT ||
+        weight->ggmlType < 0 || weight->cudaData == nullptr ||
+        weight->dims.size() != 2 || weight->dims[0] != k || weight->dims[1] != m) {
+        return false;
+    }
+    ggml_type type = (ggml_type)weight->ggmlType;
+    return get_has_vec_dot_q_cuda(type) && m % ggml_blck_size(type) == 0;
+}
+
+template <typename T>
+static bool FastllmCudaTypedMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1,
+                                               fastllm::Data &output, fastllm::Data **gateups,
+                                               fastllm::Data **downs, const float *scores,
+                                               bool scoresOnCuda, int topk, int hidden, int inter) {
+    if (topk <= 0 || hidden <= 0 || inter <= 0 || scores == nullptr ||
+        gateups == nullptr || downs == nullptr ||
+        input.dataType != FastllmMoeGGUFTraits<T>::dataType ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        hidden % QK8_1 != 0 || inter % QK8_1 != 0) {
+        return false;
+    }
+
+    for (int j = 0; j < topk; j++) {
+        if (!FastllmMoeGGUFCanRunWeight(gateups[j], hidden, inter * 2) ||
+            !FastllmMoeGGUFCanRunWeight(downs[j], inter, hidden)) {
+            return false;
+        }
+    }
+
+    fastllm::Data gateOutput;
+    gateOutput.dataDevice = input.dataDevice;
+    gateOutput.dataDeviceIds = input.dataDeviceIds;
+    gateOutput.dataType = FastllmMoeGGUFTraits<T>::dataType;
+    gateOutput.Resize({topk, inter * 2});
+    gateOutput.Allocate(false);
+
+    w1.dataDevice = input.dataDevice;
+    w1.dataDeviceIds = input.dataDeviceIds;
+    w1.dataType = FastllmMoeGGUFTraits<T>::dataType;
+    w1.Resize({topk, inter});
+    w1.Allocate(false);
+
+    fastllm::Data downOutput;
+    downOutput.dataDevice = input.dataDevice;
+    downOutput.dataDeviceIds = input.dataDeviceIds;
+    downOutput.dataType = FastllmMoeGGUFTraits<T>::dataType;
+    downOutput.Resize({topk, hidden});
+    downOutput.Allocate(false);
+
+    output.dataDevice = input.dataDevice;
+    output.dataDeviceIds = input.dataDeviceIds;
+    output.dataType = FastllmMoeGGUFTraits<T>::dataType;
+    output.Resize({1, hidden});
+    output.Allocate(false);
+
+    T *cudaInput = (T*)FastllmCudaPrepareInput(input);
+    T *cudaGate = (T*)FastllmCudaPrepareOutput(gateOutput);
+    T *cudaW1 = (T*)FastllmCudaPrepareOutput(w1);
+    T *cudaDown = (T*)FastllmCudaPrepareOutput(downOutput);
+    T *cudaOutput = (T*)FastllmCudaPrepareOutput(output);
+
+    block_q8_1 *q8Input = (block_q8_1*)FastllmCudaMalloc(FastllmMoeGGUFQ8Bytes(1, hidden));
+    quantize_row_q8_1_cuda(cudaInput, q8Input, hidden, 1, 1, hidden, GGML_TYPE_Q8_1, nullptr);
+
+    for (int j = 0; j < topk; j++) {
+        FastllmMoeGGUFMatMulQ8((ggml_type)gateups[j]->ggmlType, gateups[j]->cudaData, q8Input,
+                               cudaGate + (size_t)j * inter * 2, hidden, inter * 2);
+    }
+
+    FastllmCudaSwiglu(gateOutput, w1);
+
+    block_q8_1 *q8W1 = (block_q8_1*)FastllmCudaMalloc(FastllmMoeGGUFQ8Bytes(topk, inter));
+    quantize_row_q8_1_cuda(cudaW1, q8W1, inter, topk, 1, inter, GGML_TYPE_Q8_1, nullptr);
+    for (int j = 0; j < topk; j++) {
+        FastllmMoeGGUFMatMulQ8((ggml_type)downs[j]->ggmlType, downs[j]->cudaData,
+                               q8W1 + (size_t)j * (inter / QK8_1),
+                               cudaDown + (size_t)j * hidden, inter, hidden);
+    }
+
+    const float *cudaScores = scores;
+    float *ownedCudaScores = nullptr;
+    if (!scoresOnCuda) {
+        ownedCudaScores = (float*)FastllmCudaMalloc((size_t)topk * sizeof(float));
+        FastllmCudaCopyFromHostToDevice(ownedCudaScores, (void*)scores, (size_t)topk * sizeof(float));
+        cudaScores = ownedCudaScores;
+    }
+
+    int threadPerBlock = 256;
+    FastllmMoeGGUFReduceKernel<T><<<(hidden - 1) / threadPerBlock + 1, threadPerBlock>>>(
+        cudaDown, cudaOutput, cudaScores, topk, hidden);
+
+    FastllmCudaFinishInput(input, cudaInput);
+    FastllmCudaFinishOutput(output, cudaOutput);
+
+    if (ownedCudaScores != nullptr) {
+        FastllmCudaFree(ownedCudaScores);
+    }
+    FastllmCudaFree(q8W1);
+    FastllmCudaFree(q8Input);
+    return true;
+}
+
+bool FastllmCudaFloatMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1,
+                                        fastllm::Data &output, fastllm::Data **gateups,
+                                        fastllm::Data **downs, const float *scores,
+                                        bool scoresOnCuda, int topk, int hidden, int inter) {
+    return FastllmCudaTypedMergeMOEGGUFBatch1<float>(
+        input, w1, output, gateups, downs, scores, scoresOnCuda, topk, hidden, inter);
+}
+
+bool FastllmCudaHalfMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1,
+                                       fastllm::Data &output, fastllm::Data **gateups,
+                                       fastllm::Data **downs, const float *scores,
+                                       bool scoresOnCuda, int topk, int hidden, int inter) {
+    return FastllmCudaTypedMergeMOEGGUFBatch1<half>(
+        input, w1, output, gateups, downs, scores, scoresOnCuda, topk, hidden, inter);
+}
+
+bool FastllmCudaBFloat16MergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1,
+                                           fastllm::Data &output, fastllm::Data **gateups,
+                                           fastllm::Data **downs, const float *scores,
+                                           bool scoresOnCuda, int topk, int hidden, int inter) {
+    return FastllmCudaTypedMergeMOEGGUFBatch1<__nv_bfloat16>(
+        input, w1, output, gateups, downs, scores, scoresOnCuda, topk, hidden, inter);
+}

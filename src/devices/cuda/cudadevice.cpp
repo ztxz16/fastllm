@@ -2586,6 +2586,10 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         return dataType == DataType::FLOAT16 || dataType == DataType::BFLOAT16;
     }
 
+    static bool IsCudaMergeMoeGGUFInputType(DataType dataType) {
+        return dataType == DataType::FLOAT32 || IsCudaMergeMoeFp8InputType(dataType);
+    }
+
     static bool TryCudaMergeMOEBatch1Fp8(
         Data &input, Data &output, int32_t *indexData, const float *scoreData, bool scoresOnCuda, int topk,
         Data &w1, Data **weights, float sharedScale, MoeGateType gateType) {
@@ -2696,6 +2700,77 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         }
 
         return wroteOutput;
+    }
+
+    static bool TryCudaMergeMOEBatch1GGUF(
+        Data &input, Data &output, int32_t *indexData, const float *scoreData, bool scoresOnCuda, int topk,
+        Data &w1, Data **weights, int weightsBatch, float sharedScale, MoeGateType gateType) {
+        if (gateType != MoeGateSwiglu) {
+            return false;
+        }
+        if (!IsCudaMergeMoeGGUFInputType(input.dataType) || input.dataDevice != DataDevice::CUDA ||
+            input.dims.size() == 0) {
+            return false;
+        }
+        if (indexData == nullptr || scoreData == nullptr || topk <= 0) {
+            return false;
+        }
+        if (weights == nullptr || weightsBatch < 4) {
+            return false;
+        }
+        if (weights[0] != nullptr && sharedScale != 0.0f) {
+            return false;
+        }
+
+        const int hidden = input.dims.back();
+        std::vector<Data*> gateups(topk), downs(topk);
+        int inter = -1;
+        for (int j = 0; j < topk; j++) {
+            int expert = indexData[j];
+            int idx = expert + 1;
+            if (idx < 0 || idx * 2 + 1 >= weightsBatch) {
+                return false;
+            }
+            Data *gateup = weights[idx * 2];
+            Data *down = weights[idx * 2 + 1];
+            gateups[j] = gateup;
+            downs[j] = down;
+            if (gateup == nullptr || down == nullptr) {
+                return false;
+            }
+            if (gateup->dataType != DataType::DATA_GGUF_FORMAT ||
+                down->dataType != DataType::DATA_GGUF_FORMAT) {
+                return false;
+            }
+            if (gateup->dims.size() != 2 || down->dims.size() != 2 ||
+                gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 || down->dims[0] != hidden) {
+                return false;
+            }
+            if (gateup->ggmlType < 0 || down->ggmlType < 0) {
+                return false;
+            }
+            if (gateup->cudaData == nullptr || down->cudaData == nullptr) {
+                return false;
+            }
+            if (inter < 0) {
+                inter = down->dims[1];
+            } else if (inter != down->dims[1]) {
+                return false;
+            }
+        }
+        if (inter <= 0) {
+            return false;
+        }
+
+        if (input.dataType == DataType::FLOAT32) {
+            return FastllmCudaFloatMergeMOEGGUFBatch1(input, w1, output, gateups.data(), downs.data(),
+                                                      scoreData, scoresOnCuda, topk, hidden, inter);
+        } else if (input.dataType == DataType::FLOAT16) {
+            return FastllmCudaHalfMergeMOEGGUFBatch1(input, w1, output, gateups.data(), downs.data(),
+                                                     scoreData, scoresOnCuda, topk, hidden, inter);
+        }
+        return FastllmCudaBFloat16MergeMOEGGUFBatch1(input, w1, output, gateups.data(), downs.data(),
+                                                     scoreData, scoresOnCuda, topk, hidden, inter);
     }
 
     static bool TryCudaMergeMOEBatch1Fp8Indexed(
@@ -2893,6 +2968,11 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                     TryCudaMergeMOEBatch1Fp8(input, output, indexData, (float*)score.cudaData, true, topk, w1, weights, sharedScale, gateType)) {
                     return;
                 }
+                if (score.dataDevice == DataDevice::CUDA && score.dataType == DataType::FLOAT32 &&
+                    TryCudaMergeMOEBatch1GGUF(input, output, indexData, (float*)score.cudaData, true, topk,
+                                              w1, weights, weightsBatch, sharedScale, gateType)) {
+                    return;
+                }
             }
 
             score.ToDevice(DataDevice::CPU);
@@ -2901,6 +2981,10 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
 
             if (batch == 1) {
                 if (TryCudaMergeMOEBatch1Fp8(input, output, indexData, scoreData, false, topk, w1, weights, sharedScale, gateType)) {
+                    return;
+                }
+                if (TryCudaMergeMOEBatch1GGUF(input, output, indexData, scoreData, false, topk,
+                                              w1, weights, weightsBatch, sharedScale, gateType)) {
                     return;
                 }
                 std::vector <std::pair <int, float> > v;
