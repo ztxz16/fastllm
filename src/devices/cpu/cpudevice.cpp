@@ -235,6 +235,89 @@ namespace fastllm {
     }
 #endif
 
+    template <int COLS, bool INPUT_BF16>
+    static inline void GemmNVFP4Block16Cols_CPU(
+        const void *inputBase, const uint8_t *weightBase, long ldb, float *output,
+        int outputCol, int m
+    ) {
+        const float *inputF32 = reinterpret_cast<const float*>(inputBase);
+        const uint16_t *inputBF16 = reinterpret_cast<const uint16_t*>(inputBase);
+        const int blocks = (m - 1) / 16 + 1;
+        float now[COLS] = {};
+
+        for (int block = 0; block < blocks; block++) {
+            const uint8_t *blockStart[COLS];
+            float scale[COLS];
+            for (int c = 0; c < COLS; c++) {
+                blockStart[c] = weightBase + (size_t)(outputCol + c) * ldb + block * (8 + sizeof(float));
+                memcpy(scale + c, blockStart[c] + 8, sizeof(float));
+            }
+
+            int l = block * 16;
+            int blockEnd = std::min(m, l + 16);
+#ifdef __AVX2__
+            __m256 vsum[COLS];
+            for (int c = 0; c < COLS; c++) {
+                vsum[c] = _mm256_setzero_ps();
+            }
+            for (; l + 7 < blockEnd; l += 8) {
+                __m256 vi;
+                if constexpr (INPUT_BF16) {
+                    __m128i bf16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(inputBF16 + l));
+                    __m256i bf16_32 = _mm256_cvtepu16_epi32(bf16);
+                    vi = _mm256_castsi256_ps(_mm256_slli_epi32(bf16_32, 16));
+                } else {
+                    vi = _mm256_loadu_ps(inputF32 + l);
+                }
+                int offset = (l - block * 16) >> 1;
+                for (int c = 0; c < COLS; c++) {
+                    __m256 vw = _mm256_nvfp4_to_fp32_ps(blockStart[c] + offset);
+                    vsum[c] = _mm256_fmadd_ps(vi, vw, vsum[c]);
+                }
+            }
+            for (int c = 0; c < COLS; c++) {
+                now[c] += Floatsum(vsum[c]) * scale[c];
+            }
+#endif
+            for (; l < blockEnd; l++) {
+                float x = INPUT_BF16 ? bf16tofp32.dict[inputBF16[l]] : inputF32[l];
+                int offset = l - block * 16;
+                uint8_t shift = (offset & 1) ? 4 : 0;
+                for (int c = 0; c < COLS; c++) {
+                    uint8_t packed = blockStart[c][offset >> 1];
+                    now[c] += scale[c] * x * NVFP4E2M1ToFloat((packed >> shift) & 0xF);
+                }
+            }
+        }
+
+        for (int c = 0; c < COLS; c++) {
+            output[c] = now[c];
+        }
+    }
+
+    template <bool INPUT_BF16>
+    static inline void GemmNVFP4Block16_CPU_Run(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int st, int end
+    ) {
+        const uint8_t *aBytes = reinterpret_cast<const uint8_t*>(A);
+        const uint8_t *weightBase = reinterpret_cast<const uint8_t*>(B);
+        for (int i = 0; i < n; i++) {
+            const void *input = aBytes + (size_t)i * lda;
+            float *output = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(C) + (size_t)i * ldc);
+            int j = st;
+            for (; j + 3 < end; j += 4) {
+                GemmNVFP4Block16Cols_CPU<4, INPUT_BF16>(input, weightBase, ldb, output + j, j, m);
+            }
+            switch (end - j) {
+                case 0: break;
+                case 1: GemmNVFP4Block16Cols_CPU<1, INPUT_BF16>(input, weightBase, ldb, output + j, j, m); break;
+                case 2: GemmNVFP4Block16Cols_CPU<2, INPUT_BF16>(input, weightBase, ldb, output + j, j, m); break;
+                case 3: GemmNVFP4Block16Cols_CPU<3, INPUT_BF16>(input, weightBase, ldb, output + j, j, m); break;
+            }
+        }
+    }
+
     void Float16ToFloat32(uint16_t *float16, float *float32, int len) {
         int i = 0;
 #ifdef __ARM_FEATURE_FP16_VECTOR_ARITHMETIC
@@ -1270,38 +1353,7 @@ namespace fastllm {
                         finish = true;
                         return;
                     }
-                    int blocks = (m - 1) / 16 + 1;
-                    for (int i = 0; i < n; i++) {
-                        float *floatA = (float*)((uint8_t*)A + i * lda);
-                        float *floatC = (float*)((uint8_t*)C + i * ldc);
-                        for (int j = st; j < end; j++) {
-                            uint8_t *rowStart = (uint8_t*)B + j * ldb;
-                            float now = 0.0f;
-                            for (int block = 0; block < blocks; block++) {
-                                uint8_t *blockStart = rowStart + block * (8 + sizeof(float));
-                                float scale;
-                                memcpy(&scale, blockStart + 8, sizeof(float));
-                                int l = block * 16;
-                                int blockEnd = std::min(m, l + 16);
-#ifdef __AVX2__
-                                __m256 vsum = _mm256_setzero_ps();
-                                for (; l + 7 < blockEnd; l += 8) {
-                                    __m256 vi = _mm256_loadu_ps(floatA + l);
-                                    __m256 vw = _mm256_nvfp4_to_fp32_ps(blockStart + ((l - block * 16) >> 1));
-                                    vsum = _mm256_fmadd_ps(vi, vw, vsum);
-                                }
-                                now += Floatsum(vsum) * scale;
-#endif
-                                for (; l < blockEnd; l++) {
-                                    int offset = l - block * 16;
-                                    uint8_t packed = blockStart[offset >> 1];
-                                    uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
-                                    now += scale * floatA[l] * NVFP4E2M1ToFloat(fp4);
-                                }
-                            }
-                            floatC[j] = now;
-                        }
-                    }
+                    GemmNVFP4Block16_CPU_Run<false>(A, lda, B, ldb, C, ldc, n, m, st, end);
                     finish = true;
                 }
             }
@@ -1437,40 +1489,7 @@ namespace fastllm {
                         finish = true;
                         return;
                     }
-                    int blocks = (m - 1) / 16 + 1;
-                    for (int i = 0; i < n; i++) {
-                        uint16_t *bf16A = (uint16_t*)A + i * m;
-                        float *floatC = (float*)((uint8_t*)C + i * ldc);
-                        for (int j = st; j < end; j++) {
-                            uint8_t *rowStart = (uint8_t*)B + j * ldb;
-                            float now = 0.0f;
-                            for (int block = 0; block < blocks; block++) {
-                                uint8_t *blockStart = rowStart + block * (8 + sizeof(float));
-                                float scale;
-                                memcpy(&scale, blockStart + 8, sizeof(float));
-                                int l = block * 16;
-                                int blockEnd = std::min(m, l + 16);
-#ifdef __AVX2__
-                                __m256 vsum = _mm256_setzero_ps();
-                                for (; l + 7 < blockEnd; l += 8) {
-                                    __m128i bf16_vec_128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bf16A + l));
-                                    __m256i bf16_extended_to_32 = _mm256_cvtepu16_epi32(bf16_vec_128);
-                                    __m256 vi = _mm256_castsi256_ps(_mm256_slli_epi32(bf16_extended_to_32, 16));
-                                    __m256 vw = _mm256_nvfp4_to_fp32_ps(blockStart + ((l - block * 16) >> 1));
-                                    vsum = _mm256_fmadd_ps(vi, vw, vsum);
-                                }
-                                now += Floatsum(vsum) * scale;
-#endif
-                                for (; l < blockEnd; l++) {
-                                    int offset = l - block * 16;
-                                    uint8_t packed = blockStart[offset >> 1];
-                                    uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
-                                    now += scale * bf16tofp32.dict[bf16A[l]] * NVFP4E2M1ToFloat(fp4);
-                                }
-                            }
-                            floatC[j] = now;
-                        }
-                    }
+                    GemmNVFP4Block16_CPU_Run<true>(A, lda, B, ldb, C, ldc, n, m, st, end);
                     finish = true;
                 } else if (BType == AWQ_4BIT_128) {
                     // A是BFLOAT16, B是AWQ_4BIT_128格式（uint4权重+zero+scale）, C是FLOAT32

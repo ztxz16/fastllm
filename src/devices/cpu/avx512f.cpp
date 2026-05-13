@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <cstring>
 
 #if defined(__AVX2__) || defined(__AVX512F__)
 #include "immintrin.h"
@@ -163,6 +164,138 @@ namespace fastllm {
         __m256i bf16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input));
         __m512i fp32Bits = _mm512_slli_epi32(_mm512_cvtepu16_epi32(bf16), 16);
         return _mm512_castsi512_ps(fp32Bits);
+    }
+
+    static inline float NVFP4E8M0ScaleToFloatFast(uint8_t v) {
+        uint32_t bits = v == 0 ? 0x00400000u : ((uint32_t)v << 23);
+        float ret;
+        memcpy(&ret, &bits, sizeof(ret));
+        return ret;
+    }
+
+    static constexpr float NVFP4_E2M1_TABLE_AVX512F[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+       -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
+    };
+
+    template <int COLS, bool INPUT_BF16>
+    static inline void LinearNVFP4E8M0Cols_AVX512F(
+        const void *inputBase, const uint8_t *weightRows, const float *biasData, float *output,
+        int outputCol, int m, int blockK, int blockM, const uint8_t *scaleBytes,
+        int ms, int packedM
+    ) {
+        const float *inputF32 = reinterpret_cast<const float*>(inputBase);
+        const uint16_t *inputBF16 = reinterpret_cast<const uint16_t*>(inputBase);
+
+        __m512 acc[COLS];
+        float now[COLS];
+        for (int c = 0; c < COLS; c++) {
+            acc[c] = _mm512_setzero_ps();
+            now[c] = biasData ? biasData[outputCol + c] : 0.0f;
+        }
+
+        for (int midx = 0; midx < ms; midx++) {
+            __m512 scaleVec[COLS];
+            float scaleVal[COLS];
+            if (outputCol / blockK == (outputCol + COLS - 1) / blockK) {
+                float v = NVFP4E8M0ScaleToFloatFast(scaleBytes[(size_t)(outputCol / blockK) * ms + midx]);
+                __m512 vv = _mm512_set1_ps(v);
+                for (int c = 0; c < COLS; c++) {
+                    scaleVal[c] = v;
+                    scaleVec[c] = vv;
+                }
+            } else {
+                for (int c = 0; c < COLS; c++) {
+                    size_t scaleIdx = (size_t)((outputCol + c) / blockK) * ms + midx;
+                    scaleVal[c] = NVFP4E8M0ScaleToFloatFast(scaleBytes[scaleIdx]);
+                    scaleVec[c] = _mm512_set1_ps(scaleVal[c]);
+                }
+            }
+
+            int l = midx * blockM;
+            int blockEnd = std::min(m, (midx + 1) * blockM);
+            __m512 blockAcc[COLS];
+            for (int c = 0; c < COLS; c++) {
+                blockAcc[c] = _mm512_setzero_ps();
+            }
+            for (; l + 15 < blockEnd; l += 16) {
+                __m512 vi;
+                if constexpr (INPUT_BF16) {
+                    vi = BFloat16ToFloat32_AVX512(inputBF16 + l);
+                } else {
+                    vi = _mm512_loadu_ps(inputF32 + l);
+                }
+                for (int c = 0; c < COLS; c++) {
+                    __m512 vw = NVFP4ToFloat32_AVX512(weightRows + (size_t)c * packedM + (l >> 1));
+                    blockAcc[c] = _mm512_fmadd_ps(vi, vw, blockAcc[c]);
+                }
+            }
+            for (int c = 0; c < COLS; c++) {
+                acc[c] = _mm512_fmadd_ps(blockAcc[c], scaleVec[c], acc[c]);
+            }
+
+            for (; l < blockEnd; l++) {
+                float x;
+                if constexpr (INPUT_BF16) {
+                    uint32_t inputBits = static_cast<uint32_t>(inputBF16[l]) << 16;
+                    memcpy(&x, &inputBits, sizeof(x));
+                } else {
+                    x = inputF32[l];
+                }
+                uint8_t shift = (l & 1) ? 4 : 0;
+                for (int c = 0; c < COLS; c++) {
+                    uint8_t packed = weightRows[(size_t)c * packedM + (l >> 1)];
+                    now[c] += scaleVal[c] * x * NVFP4_E2M1_TABLE_AVX512F[(packed >> shift) & 0xF];
+                }
+            }
+        }
+
+        for (int c = 0; c < COLS; c++) {
+            output[c] = now[c] + _mm512_reduce_add_ps(acc[c]);
+        }
+    }
+
+    template <bool INPUT_BF16>
+    static inline bool LinearNVFP4E8M0_AVX512F_Run(
+        const void *inputData, uint8_t *weightData, float *biasData, float *outputData,
+        int n, int m, int k, int st, int end, int blockK, int blockM,
+        const uint8_t *scaleBytes, int ms
+    ) {
+        int packedM = m >> 1;
+        for (int i = 0; i < n; i++) {
+            const void *input;
+            if constexpr (INPUT_BF16) {
+                input = reinterpret_cast<const uint16_t*>(inputData) + (size_t)i * m;
+            } else {
+                input = reinterpret_cast<const float*>(inputData) + (size_t)i * m;
+            }
+
+            int j = st;
+            for (; j + 3 < end; j += 4) {
+                LinearNVFP4E8M0Cols_AVX512F<4, INPUT_BF16>(
+                    input, weightData + (size_t)j * packedM, biasData, outputData + (size_t)i * k + j,
+                    j, m, blockK, blockM, scaleBytes, ms, packedM);
+            }
+            switch (end - j) {
+                case 0: break;
+                case 1:
+                    LinearNVFP4E8M0Cols_AVX512F<1, INPUT_BF16>(
+                        input, weightData + (size_t)j * packedM, biasData, outputData + (size_t)i * k + j,
+                        j, m, blockK, blockM, scaleBytes, ms, packedM);
+                    break;
+                case 2:
+                    LinearNVFP4E8M0Cols_AVX512F<2, INPUT_BF16>(
+                        input, weightData + (size_t)j * packedM, biasData, outputData + (size_t)i * k + j,
+                        j, m, blockK, blockM, scaleBytes, ms, packedM);
+                    break;
+                case 3:
+                    LinearNVFP4E8M0Cols_AVX512F<3, INPUT_BF16>(
+                        input, weightData + (size_t)j * packedM, biasData, outputData + (size_t)i * k + j,
+                        j, m, blockK, blockM, scaleBytes, ms, packedM);
+                    break;
+            }
+        }
+        return true;
     }
 #endif
 
@@ -385,39 +518,8 @@ namespace fastllm {
         if (blockM % 16 != 0 || (m & 1)) {
             return false;
         }
-        static const float table[16] = {
-            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-           -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
-        };
-        int packedM = m >> 1;
-        for (int i = 0; i < n; i++) {
-            const float *input = inputData + i * m;
-            for (int j = st; j < end; j++) {
-                float now = biasData ? biasData[j] : 0.0f;
-                int currentBlockK = j / blockK;
-                __m512 scaledSum = _mm512_setzero_ps();
-                for (int midx = 0; midx < ms; midx++) {
-                    float curScale = NVFP4E8M0ScaleToFloat(scaleBytes[currentBlockK * ms + midx]);
-                    __m512 scale = _mm512_set1_ps(curScale);
-                    int l = midx * blockM;
-                    int blockEnd = std::min(m, (midx + 1) * blockM);
-                    __m512 sum = _mm512_setzero_ps();
-                    for (; l + 15 < blockEnd; l += 16) {
-                        __m512 vi = _mm512_loadu_ps(input + l);
-                        __m512 vw = NVFP4ToFloat32_AVX512(weightData + j * packedM + (l >> 1));
-                        sum = _mm512_fmadd_ps(vi, vw, sum);
-                    }
-                    scaledSum = _mm512_fmadd_ps(sum, scale, scaledSum);
-                    for (; l < blockEnd; l++) {
-                        uint8_t packed = weightData[j * packedM + (l >> 1)];
-                        uint8_t fp4 = (l & 1) ? (packed >> 4) : (packed & 0xF);
-                        now += curScale * input[l] * table[fp4];
-                    }
-                }
-                outputData[i * k + j] = now + _mm512_reduce_add_ps(scaledSum);
-            }
-        }
-        return true;
+        return LinearNVFP4E8M0_AVX512F_Run<false>(inputData, weightData, biasData, outputData,
+                                                  n, m, k, st, end, blockK, blockM, scaleBytes, ms);
 #else
         return false;
 #endif
@@ -431,41 +533,8 @@ namespace fastllm {
         if (blockM % 16 != 0 || (m & 1)) {
             return false;
         }
-        static const float table[16] = {
-            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-           -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
-        };
-        int packedM = m >> 1;
-        for (int i = 0; i < n; i++) {
-            const uint16_t *input = inputData + i * m;
-            for (int j = st; j < end; j++) {
-                float now = biasData ? biasData[j] : 0.0f;
-                int currentBlockK = j / blockK;
-                __m512 scaledSum = _mm512_setzero_ps();
-                for (int midx = 0; midx < ms; midx++) {
-                    float curScale = NVFP4E8M0ScaleToFloat(scaleBytes[currentBlockK * ms + midx]);
-                    __m512 scale = _mm512_set1_ps(curScale);
-                    int l = midx * blockM;
-                    int blockEnd = std::min(m, (midx + 1) * blockM);
-                    __m512 sum = _mm512_setzero_ps();
-                    for (; l + 15 < blockEnd; l += 16) {
-                        __m512 vi = BFloat16ToFloat32_AVX512(input + l);
-                        __m512 vw = NVFP4ToFloat32_AVX512(weightData + j * packedM + (l >> 1));
-                        sum = _mm512_fmadd_ps(vi, vw, sum);
-                    }
-                    scaledSum = _mm512_fmadd_ps(sum, scale, scaledSum);
-                    for (; l < blockEnd; l++) {
-                        uint8_t packed = weightData[j * packedM + (l >> 1)];
-                        uint8_t fp4 = (l & 1) ? (packed >> 4) : (packed & 0xF);
-                        uint32_t inputBits = static_cast<uint32_t>(input[l]) << 16;
-                        float inputFloat = *reinterpret_cast<float*>(&inputBits);
-                        now += curScale * inputFloat * table[fp4];
-                    }
-                }
-                outputData[i * k + j] = now + _mm512_reduce_add_ps(scaledSum);
-            }
-        }
-        return true;
+        return LinearNVFP4E8M0_AVX512F_Run<true>(inputData, weightData, biasData, outputData,
+                                                 n, m, k, st, end, blockK, blockM, scaleBytes, ms);
 #else
         return false;
 #endif

@@ -450,7 +450,10 @@ namespace fastllm {
     }
 
     float NVFP4E8M0ScaleToFloat(uint8_t v) {
-        return std::ldexp(1.0f, (int)v - 127);
+        uint32_t bits = v == 0 ? 0x00400000u : ((uint32_t)v << 23);
+        float ret;
+        memcpy(&ret, &bits, sizeof(ret));
+        return ret;
     }
 
     uint8_t *GetNVFP4ScaleData(Data &data) {

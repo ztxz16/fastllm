@@ -1241,7 +1241,8 @@ __device__ __forceinline__ float FastllmCudaNVFP4E2M1ToFloat(uint8_t v) {
 }
 
 __device__ __forceinline__ float FastllmCudaNVFP4E8M0ToFloat(uint8_t v) {
-    return ldexpf(1.0f, (int)v - 127);
+    uint32_t bits = v == 0 ? 0x00400000u : ((uint32_t)v << 23);
+    return __uint_as_float(bits);
 }
 
 __global__ void FastllmCudaNVFP42HalfKernel(uint8_t *packedWeight, uint8_t *scaleBytes,
