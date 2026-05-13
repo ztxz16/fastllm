@@ -2581,7 +2581,7 @@ namespace fastllm {
             return DataType::FLOAT32;
         } else if (this->dataType == DataType::NVFP4 ||
                    this->dataType == DataType::NVFP4_BLOCK_16) {
-            return DataType::FLOAT32;
+            return batchSize > 31 ? DataType::BFLOAT16 : DataType::FLOAT32;
         } else if (this->dataType == DataType::INT4_PERCHANNEL ||
                     this->dataType == DataType::INT8_PERCHANNEL) {
             return DataType::INF_INT8_PERCHANNEL;

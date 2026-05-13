@@ -219,6 +219,36 @@ namespace fastllm {
         return table[v & 0xF];
     }
 
+    static inline uint16_t FloatToBFloat16Trunc(float v) {
+        uint32_t bits;
+        memcpy(&bits, &v, sizeof(bits));
+        return (uint16_t)(bits >> 16);
+    }
+
+    static void NVFP4Block16RowsToBFloat16(
+        const void *B, long ldb, uint16_t *bf16B, int m, int st, int end
+    ) {
+        const int blockSize = 16;
+        const int blocks = (m - 1) / blockSize + 1;
+        for (int row = st; row < end; row++) {
+            const uint8_t *rowStart = (const uint8_t*)B + (size_t)row * ldb;
+            uint16_t *dstRow = bf16B + (size_t)(row - st) * m;
+            for (int block = 0; block < blocks; block++) {
+                const uint8_t *blockStart = rowStart + block * (8 + sizeof(float));
+                float scale;
+                memcpy(&scale, blockStart + 8, sizeof(float));
+                int l = block * blockSize;
+                int blockEnd = std::min(m, l + blockSize);
+                for (; l < blockEnd; l++) {
+                    int offset = l - block * blockSize;
+                    uint8_t packed = blockStart[offset >> 1];
+                    uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
+                    dstRow[l] = FloatToBFloat16Trunc(scale * NVFP4E2M1ToFloat(fp4));
+                }
+            }
+        }
+    }
+
 #ifdef __AVX2__
     static inline __m256 _mm256_nvfp4_to_fp32_ps(const uint8_t *packed) {
         static const float table[16] = {
@@ -1349,6 +1379,20 @@ namespace fastllm {
                     }
                     finish = true;
                 } else if (BType == DataType::NVFP4_BLOCK_16) {
+                    if (n > 31) {
+                        std::vector<uint16_t> bf16B_temp((size_t)(end - st) * m);
+                        NVFP4Block16RowsToBFloat16(B, ldb, bf16B_temp.data(), m, st, end);
+                        FastllmGemm(
+                            n, m, end - st,
+                            A, lda,
+                            bf16B_temp.data(), GetDataBytes(DataType::BFLOAT16, 1, m),
+                            ((float*)C) + st, ldc,
+                            0, end - st,
+                            DataType::FLOAT32, DataType::BFLOAT16, DataType::FLOAT32
+                        );
+                        finish = true;
+                        return;
+                    }
                     if (FastllmGemmFloat32NVFP4Block16_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
                         finish = true;
                         return;
@@ -1485,6 +1529,16 @@ namespace fastllm {
                         finish = true;
                     }
                 } else if (BType == NVFP4_BLOCK_16) {
+                    if (n > 31) {
+                        std::vector<uint16_t> bf16B_temp((size_t)(end - st) * m);
+                        NVFP4Block16RowsToBFloat16(B, ldb, bf16B_temp.data(), m, st, end);
+                        MultiThreadLinearBFloat16BFloat16Op(
+                            (uint16_t*)A, bf16B_temp.data(), nullptr, ((float*)C) + st,
+                            n, m, ldc / sizeof(float), 0, end - st
+                        ).Run();
+                        finish = true;
+                        return;
+                    }
                     if (FastllmGemmBFloat16NVFP4Block16_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
                         finish = true;
                         return;
