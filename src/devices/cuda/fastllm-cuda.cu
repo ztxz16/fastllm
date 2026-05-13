@@ -10,6 +10,7 @@
 #include "utils/utils.h"
 
 #include <cstdlib>
+#include <atomic>
 #include <mutex>
 #include <map>
 #include <random>
@@ -1625,18 +1626,17 @@ struct FastllmCudaWeightSlabPtr {
 };
 
 static std::mutex fastllmCudaWeightSlabMutex;
-static size_t fastllmCudaWeightSlabBytes = 0;
+static std::atomic<size_t> fastllmCudaWeightSlabBytes(0);
+static std::atomic<size_t> fastllmCudaWeightSlabPtrCount(0);
 static std::map<int, std::vector<FastllmCudaWeightSlab> > fastllmCudaWeightSlabs;
 static std::map<void*, FastllmCudaWeightSlabPtr> fastllmCudaWeightSlabPtrs;
 
 void FastllmCudaSetWeightSlabBytes(size_t bytes) {
-    std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
-    fastllmCudaWeightSlabBytes = bytes;
+    fastllmCudaWeightSlabBytes.store(bytes, std::memory_order_relaxed);
 }
 
 size_t FastllmCudaGetWeightSlabBytes() {
-    std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
-    return fastllmCudaWeightSlabBytes;
+    return fastllmCudaWeightSlabBytes.load(std::memory_order_relaxed);
 }
 
 static size_t FastllmCudaAlignBytes(size_t size, size_t align) {
@@ -1689,11 +1689,15 @@ void *FastllmCudaMallocModelWeight(size_t size) {
     slab.used += aligned;
     slab.activeBlocks++;
     fastllmCudaWeightSlabPtrs[ret] = {id, slab.base};
+    fastllmCudaWeightSlabPtrCount.fetch_add(1, std::memory_order_relaxed);
     return ret;
 }
 
 static bool FastllmCudaTryFreeWeightSlabPtr(void *ret) {
     if (ret == nullptr) {
+        return false;
+    }
+    if (fastllmCudaWeightSlabPtrCount.load(std::memory_order_relaxed) == 0) {
         return false;
     }
     std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
@@ -1705,6 +1709,7 @@ static bool FastllmCudaTryFreeWeightSlabPtr(void *ret) {
     int id = it->second.device;
     void *base = it->second.base;
     fastllmCudaWeightSlabPtrs.erase(it);
+    fastllmCudaWeightSlabPtrCount.fetch_sub(1, std::memory_order_relaxed);
 
     auto slabsIt = fastllmCudaWeightSlabs.find(id);
     if (slabsIt != fastllmCudaWeightSlabs.end()) {

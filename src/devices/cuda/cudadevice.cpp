@@ -3692,10 +3692,13 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             } else if (data.dataDevice != DataDevice::CUDA && (data.cpuData != nullptr || data.cudaData != nullptr)) {
                 data.FreeSpace();
             } else if (data.dataDevice == DataDevice::CUDA && data.cudaData != nullptr) {
-                int ptrDevice = GetPointerDeviceId(data.cudaData);
-                if ((ptrDevice >= 0 && ptrDevice != currentDevice) ||
-                    (!data.dataDeviceIds.empty() && data.dataDeviceIds[0] != currentDevice)) {
+                if (!data.dataDeviceIds.empty() && data.dataDeviceIds[0] != currentDevice) {
                     data.FreeSpace();
+                } else if (data.dataDeviceIds.empty()) {
+                    int ptrDevice = GetPointerDeviceId(data.cudaData);
+                    if (ptrDevice >= 0 && ptrDevice != currentDevice) {
+                        data.FreeSpace();
+                    }
                 }
             }
             for (auto &it : data.multiDeviceDatas) {
@@ -3831,10 +3834,13 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             } else if (data.dataDevice != DataDevice::CUDA && (data.cpuData != nullptr || data.cudaData != nullptr)) {
                 data.FreeSpace();
             } else if (data.dataDevice == DataDevice::CUDA && data.cudaData != nullptr) {
-                int ptrDevice = GetPointerDeviceId(data.cudaData);
-                if ((ptrDevice >= 0 && ptrDevice != currentDevice) ||
-                    (!data.dataDeviceIds.empty() && data.dataDeviceIds[0] != currentDevice)) {
+                if (!data.dataDeviceIds.empty() && data.dataDeviceIds[0] != currentDevice) {
                     data.FreeSpace();
+                } else if (data.dataDeviceIds.empty()) {
+                    int ptrDevice = GetPointerDeviceId(data.cudaData);
+                    if (ptrDevice >= 0 && ptrDevice != currentDevice) {
+                        data.FreeSpace();
+                    }
                 }
             }
             for (auto &it : data.multiDeviceDatas) {
