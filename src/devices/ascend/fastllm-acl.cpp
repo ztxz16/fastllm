@@ -10,7 +10,7 @@
 #define checkAclErrorFormat(message, state, args...)                                 \
     if (ACL_SUCCESS != state) {                                                      \
         printf(message, ##args);                                                     \
-        printf("AsecndCL error = %d at %s:%d\n", state, "fastllm-acl.cpp", __LINE__);\
+        printf("AscendCL error = %d at %s:%d\n", state, "fastllm-acl.cpp", __LINE__);\
         if (state >= 500000) {                                                       \
             aclFinalize();                                                           \
             exit(state);                                                             \
@@ -22,7 +22,7 @@
 void showError(aclError state, char const* const message, const char* const file,
            int const line) {
     if (ACL_SUCCESS != state) {
-        printf("%s  AsecndCL error = %d at %s:%d\n", message, state, file, line);
+        printf("%s  AscendCL error = %d at %s:%d\n", message, state, file, line);
         if (state >= 500000) {
             aclFinalize();
             exit(state);
@@ -35,7 +35,7 @@ namespace npu {
 
 void FastllmAclInit() {
     aclError state = aclInit(NULL);
-    checkAclError("Error: Ascend CL error when init!", state);
+    checkAclError("Error: AscendCL error when init!", state);
 }
 
 static std::map<int32_t, aclrtContext> FastllmAclContextMap;
@@ -48,7 +48,7 @@ aclrtContext getFastllmAclContextHandle(int32_t id) {
     aclrtContext context = nullptr;
     aclError state = aclrtCreateContext(&context, id);
     if (state != ACL_SUCCESS) {
-        printf("Error: Acl Create Context Failed state %d.\n", state);
+        printf("Error: AscendCL Create Context Failed state %d.\n", state);
         exit(state);
     } else {
         FastllmAclContextMap[id] = context;
@@ -60,22 +60,36 @@ static int32_t curDeviceId = -1;
 
 static aclrtStream stream = nullptr;
 
+static thread_local bool aclInitialized = false;
+
+static inline void EnsureAclContext() {
+    // 如果当前线程还没初始化过，且主线程已经初始化过
+    if (!aclInitialized && curDeviceId != -1) {
+        // 在新线程中调用 SetDevice，这是 ACL 的强制要求
+        aclError state = aclrtSetDevice(curDeviceId);
+        checkAclError("Error: AscendCL error when set device in new thread!", state);
+        state = aclrtSetCurrentContext(getFastllmAclContextHandle(curDeviceId));
+        checkAclError("Error: AscendCL error when switch context!", state);
+        aclInitialized = true; // 标记新线程已初始化，后续不再重复调用
+    }
+}
+
 void FastllmAclFinalize() {
     if (stream != nullptr) {
         aclError state = aclrtSynchronizeStream(stream);
         state = aclrtDestroyStream(stream);
-        checkAclError("Error: Ascend CL error when destroy stream!", state);
+        checkAclError("Error: AscendCL error when destroy stream!", state);
         stream = nullptr;
     }
     for (auto &it : FastllmAclContextMap) {
         aclError state = aclrtDestroyContext(it.second);
-        checkAclError("Error: Ascend CL error when destory context!", state);
+        checkAclError("Error: AscendCL error when destory context!", state);
         // state = aclrtResetDevice(it.first);
         // checkAclError("Error: Ascend CL reset device failed", state);
     }
     FastllmAclContextMap.clear();
     aclError state = aclFinalize();
-    checkAclError("Error: Ascend CL error when finalize!", state);
+    checkAclError("Error: AscendCL error when finalize!", state);
 }
 
 void FastllmAclSetDevice(int32_t device_id) {
@@ -85,16 +99,17 @@ void FastllmAclSetDevice(int32_t device_id) {
         return;
     if (curDeviceId != -1 || device_id == -1) {
         state = aclrtDestroyStream(&stream);
-        checkAclError("Error: Ascend CL error when destroy stream!", state);
+        checkAclError("Error: AscendCL error when destroy stream!", state);
     }
     if (device_id == -1)
         device_id = curDeviceId;
     aclrtContext context = getFastllmAclContextHandle(device_id);
     state = aclrtSetCurrentContext(context);
-    checkAclError("Error: Ascend CL error when set device!", state);
+    checkAclError("Error: AscendCL error when set device!", state);
     state = aclrtCreateStream(&stream);
-    checkAclError("Error: Ascend CL error when create stream!", state);
+    checkAclError("Error: AscendCL error when create stream!", state);
     curDeviceId = device_id;
+    aclInitialized = true;
 }
 
 void DeviceSync() {
@@ -175,6 +190,7 @@ void FastllmAclDirectFree(void *ret) {
 void * FastllmAclMalloc(size_t size) {
     int32_t id = -1;
     aclError state = ACL_SUCCESS;
+    EnsureAclContext();
     state = aclrtGetDevice(&id);
     checkAclError("Error: AscendCL error when find device!", state);
     if (size > 1024 * 1024) {
@@ -273,6 +289,7 @@ void FastllmAclFree(void *ret) {
 
 void FastllmAclMallocBigBuffer(size_t size) {
     void * ret;
+    EnsureAclContext();
     int32_t id = -1;
     aclrtGetDevice(&id);
     auto &bigBuffers = bigBuffersMap[id];
@@ -284,6 +301,7 @@ void FastllmAclMallocBigBuffer(size_t size) {
 }
 
 void FastllmAclClearBigBuffer() {
+    EnsureAclContext();
     int32_t id = -1;
     aclrtGetDevice(&id);
     if (bigBuffersMap.empty())
@@ -311,6 +329,7 @@ void FastllmAclClearBigBuffer() {
 
 
 void FastllmAclClearBuffer() {
+    EnsureAclContext();
     int32_t id = -1;
     aclrtGetDevice(&id);
     if (bigBuffersMap.empty())
@@ -337,18 +356,21 @@ void FastllmAclClearBuffer() {
 }
 
 int FastllmAclCopyFromHostToDevice(void *dst, void *src, size_t size) {
+    EnsureAclContext();
     aclError state = aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_HOST_TO_DEVICE);
     checkAclError("Error: AscendCL error when copy from memory to NPU!", state);
     return (int) state;
 }
 
 int FastllmAclCopyFromDeviceToHost(void *dst, void *src, size_t size) {
+    EnsureAclContext();
     aclError state = aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_DEVICE_TO_HOST);
     checkAclError("Error: AscendCL error when copy from NPU to memory!", state);
     return (int) state;
 }
 
 void FastllmAclCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
+    EnsureAclContext();
     aclError state = aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_DEVICE_TO_DEVICE);
     checkAclError("Error: AscendCL error when copy on NPU!", state);
 }
@@ -505,6 +527,7 @@ bool FastllmAclExecuteAfterInit(std::string name, std::vector<aclTensorDesc *> &
                                 std::vector<aclTensorDesc *> &outputTensors,
                                 std::vector<aclDataBuffer *> &outputBuffers, aclopAttr *opAttr) {
     aclError state = ACL_SUCCESS;
+    EnsureAclContext();
     if (stream == nullptr) {
         state = aclrtCreateStream(&stream);
         checkAclError("Error: AscendCL error when creating stream!", state);

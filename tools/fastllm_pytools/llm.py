@@ -1502,6 +1502,9 @@ class model:
     def get_type(self):
         return fastllm_lib.get_type_llm_model(self.model).decode()
 
+    def __del__(self):
+        self.release_memory()
+
     def embedding_sentence(self, input: str, normalize = True):
         embedding_len = ctypes.c_int(0)
         if (self.hf_tokenizer != None):

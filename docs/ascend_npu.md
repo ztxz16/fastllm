@@ -135,14 +135,14 @@ dcmi model initialized failed, because the device is used. ret is -8020
 
 # 性能测试
 ./benchmark -p model.flm -b 1 -t 16
+ 
+# 简易webui, 使用流式输出 + 动态batch，可多路并发访问
+./webui -p model.flm --port 1234
+
+# python版本的命令行聊天程序，使用了模型创建以及流式对话效果
+python tools/cli_demo.py -p model.flm
 ```
 
-> ~~\# 简易webui, 使用流式输出 + 动态batch，可多路并发访问~~
-> ~~./webui -p model.flm --port 1234~~
-> 
-> ~~\# python版本的命令行聊天程序，使用了模型创建以及流式对话效果~~
-> ~~python tools/cli_demo.py -p model.flm~~ 
-> 
 > ~~\# python版本的简易webui，需要先安装streamlit-chat~~
 > ~~streamlit run tools/web_demo.py model.flm~~ 
 > 
