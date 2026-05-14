@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <climits>
+#include <algorithm>
 
 #include "chatglm.h"
 #include "moss.h"
@@ -207,6 +208,42 @@ namespace fastllm {
                deviceName[deviceType.size()] == ':';
     }
 
+    static std::string GetSpecialWeightSelectedDevice(const basellm *model, const std::string &weightName) {
+        if (model->specialWeights.find(weightName) == model->specialWeights.end() || model->moeDeviceMap.empty()) {
+            return "";
+        }
+        auto layerIt = model->specialWeightLayerIds.find(weightName);
+        if (layerIt == model->specialWeightLayerIds.end() || layerIt->second < 0) {
+            return "";
+        }
+        return SelectDeviceFromMap(model->moeDeviceMap, layerIt->second + 1, model->block_cnt);
+    }
+
+    static std::string GetMoeWeightSelectedDevice(const basellm *model, const std::string &weightName) {
+        if (model == nullptr || model->moeDeviceMap.empty()) {
+            return "";
+        }
+        std::string selectedDevice = GetSpecialWeightSelectedDevice(model, weightName);
+        if (!selectedDevice.empty()) {
+            return selectedDevice;
+        }
+        if (model->moeLinears.find(weightName) == model->moeLinears.end()) {
+            return "";
+        }
+        for (auto &mergeRule : model->weightMergeRules) {
+            for (auto &rule : mergeRule.rules) {
+                if (std::find(rule.inputs.begin(), rule.inputs.end(), weightName) == rule.inputs.end()) {
+                    continue;
+                }
+                selectedDevice = GetSpecialWeightSelectedDevice(model, rule.output);
+                if (!selectedDevice.empty()) {
+                    return selectedDevice;
+                }
+            }
+        }
+        return "";
+    }
+
     bool basellm::ShouldRegisterSpecialWeightForDeviceType(const std::string &weightName, const std::string &deviceType) const {
         return this->ShouldRegisterSpecialWeightForDeviceTypes(weightName, {deviceType});
     }
@@ -215,20 +252,33 @@ namespace fastllm {
         if (!GetFastllmEnv().activateNuma || this->specialWeights.find(weightName) == this->specialWeights.end()) {
             return false;
         }
-        if (this->moeDeviceMap.empty()) {
+        std::string selectedDevice = GetSpecialWeightSelectedDevice(this, weightName);
+        if (selectedDevice.empty()) {
             return true;
         }
-        auto layerIt = this->specialWeightLayerIds.find(weightName);
-        if (layerIt == this->specialWeightLayerIds.end() || layerIt->second < 0) {
-            return true;
-        }
-        std::string selectedDevice = SelectDeviceFromMap(this->moeDeviceMap, layerIt->second + 1, this->block_cnt);
         for (auto &deviceType : deviceTypes) {
             if (DeviceNameMatchesType(selectedDevice, deviceType)) {
                 return true;
             }
         }
         return false;
+    }
+
+    bool basellm::MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const {
+        std::string selectedDevice = GetSpecialWeightSelectedDevice(this, weightName);
+        if (!DeviceNameMatchesType(selectedDevice, "cuda")) {
+            return false;
+        }
+#ifdef USE_CUDA
+        if (data.isDiskWeight || (data.dataDevice == DataDevice::CPU && data.cpuData == nullptr && data.numasData.empty())) {
+            return false;
+        }
+        std::map <int, int> ratios;
+        data.ToDevice(DataDevice::CUDA, ParseDeviceIds(selectedDevice, "cuda", ratios));
+        return true;
+#else
+        return false;
+#endif
     }
 
     void basellm::SaveLowBitModel(const std::string &fileName, int bit) {
@@ -941,18 +991,10 @@ namespace fastllm {
         return "";
     }
 
-    static bool UseDiskMoeDevice() {
-        auto moeDeviceMap = GetMoeDeviceMap();
-        for (auto &it : moeDeviceMap) {
-            if (StartWith(it.first, "disk")) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    static bool IsDiskMoeWeight(basellm *model, const std::string &weightName, bool useDiskMoe) {
-        return useDiskMoe && model != nullptr && model->moeLinears.find(weightName) != model->moeLinears.end();
+    static bool IsDiskMoeWeight(basellm *model, const std::string &weightName) {
+        return model != nullptr &&
+               model->moeLinears.find(weightName) != model->moeLinears.end() &&
+               DeviceNameMatchesType(GetMoeWeightSelectedDevice(model, weightName), "disk");
     }
 
     static bool GetDiskSourceDataType(const std::string &dtype, DataType &dataType) {
@@ -1910,11 +1952,6 @@ namespace fastllm {
 
         // 3.0 更新模型信息
         model->InitParams();
-        bool useDiskMoe = UseDiskMoeDevice();
-        if (useDiskMoe && model->moeLinears.size() > 0) {
-            printf("Use disk MoE weights.\n");
-            fflush(stdout);
-        }
 
         int cur = 0;
         long long totalBytes = 0;
@@ -1983,7 +2020,7 @@ if (false) {
                         auto &weightName = tensors[i];
                         if (readGGUFTaskDict.find(weightName) != readGGUFTaskDict.end()) {
                             auto *task = readGGUFTaskDict[weightName];
-                            if (IsDiskMoeWeight(model, weightName, useDiskMoe) &&
+                            if (IsDiskMoeWeight(model, weightName) &&
                                 task->replaceType == GGUFWeightReplaceRule::GGUFWeightReplaceDirect) {
                                 SetDiskGGUFWeightMeta(*task->weight, task->tensor, task->fileName, task->offset);
                             } else {
@@ -2137,6 +2174,7 @@ if (false) {
                                         } catch (...) {
                                         }
 #endif
+                                        model->MoveSpecialWeightToCudaIfNeeded(mergeName, mergeData);
                                     }
 
                                     for (auto input : it.inputs) {
@@ -2166,6 +2204,9 @@ if (false) {
                             } catch (...) {
                             }
 #endif
+                            if (!needMerge) {
+                                model->MoveSpecialWeightToCudaIfNeeded(weightName, model->weight.weight[weightName]);
+                            }
                         }
 
                         if (tensors.size() != 0) {
@@ -2352,11 +2393,6 @@ if (false) {
         // tensorMap[name]代表本名为name的tensor，创建后的名字以及类型
         // 有些tensor被共享，可能需要创建多次
         auto tensorMap = model->GetTensorMap(tensors);
-        bool useDiskMoe = UseDiskMoeDevice();
-        if (useDiskMoe && model->moeLinears.size() > 0) {
-            printf("Use disk MoE weights.\n");
-            fflush(stdout);
-        }
 
         // 如果有需要，为moe设置特定的量化参数
         if (model->moeLinears.size() > 0 && useMoeDataType) {
@@ -2565,7 +2601,7 @@ if (false) {
                                 }
                             }
 
-                            bool diskLazyWeight = IsDiskMoeWeight(model, weightName, useDiskMoe);
+                            bool diskLazyWeight = IsDiskMoeWeight(model, weightName);
                             if (diskLazyWeight) {
                                 if (isAwqModel || loraDicts.find(weightName) != loraDicts.end()) {
                                     ErrorInFastLLM("Disk MoE does not support AWQ/lora expert weight yet: " + weightName + "\n");
@@ -2838,6 +2874,7 @@ if (false) {
                                             } catch (...) {
                                             }
 #endif
+                                            model->MoveSpecialWeightToCudaIfNeeded(mergeName, mergeData);
                                         }
                                     }
 
@@ -2868,6 +2905,9 @@ if (false) {
                             } catch (...) {
                             }
 #endif
+                            if (!needMerge) {
+                                model->MoveSpecialWeightToCudaIfNeeded(weightName, model->weight.weight[weightName]);
+                            }
                         }
 
                         locker.lock();

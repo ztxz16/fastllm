@@ -394,6 +394,7 @@ namespace fastllm {
         void AddSpecialWeight(const std::string &weightName, const std::string &weightType, int layerId = -1);
         bool ShouldRegisterSpecialWeightForDeviceType(const std::string &weightName, const std::string &deviceType) const;
         bool ShouldRegisterSpecialWeightForDeviceTypes(const std::string &weightName, const std::vector<std::string> &deviceTypes) const;
+        bool MoveSpecialWeightToCudaIfNeeded(const std::string &weightName, Data &data) const;
 
         std::string adapterName;
 

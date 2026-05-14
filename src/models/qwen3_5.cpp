@@ -843,9 +843,11 @@ namespace fastllm {
             RegisterExpertLinearWeight(this->weight.weight[expertGateupName], "linearSwiglu",
                                        this->ShouldRegisterSpecialWeightForDeviceTypes(expertGateupName, {"numa", "tfacc"}),
                                        this->ShouldRegisterSpecialWeightForDeviceType(expertGateupName, "numa"));
+            this->MoveSpecialWeightToCudaIfNeeded(expertGateupName, this->weight.weight[expertGateupName]);
             RegisterExpertLinearWeight(this->weight.weight[expertDownName], "linearColumn",
                                        this->ShouldRegisterSpecialWeightForDeviceTypes(expertDownName, {"numa", "tfacc"}),
                                        this->ShouldRegisterSpecialWeightForDeviceType(expertDownName, "numa"));
+            this->MoveSpecialWeightToCudaIfNeeded(expertDownName, this->weight.weight[expertDownName]);
         }
 
         this->weight.weight.erase(fusedGateupName);
