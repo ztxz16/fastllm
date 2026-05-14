@@ -9,7 +9,6 @@
 
 #include "utils.h"
 
-#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -37,20 +36,6 @@ namespace fastllm {
             return fallback;
         }
         return (int)value;
-    }
-
-    static void CudaMergeMoeDebugHit(const char *path, DataType weightType,
-                                     int batch, int topk, int hidden, int inter) {
-        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_MOE_DEBUG")) {
-            return;
-        }
-        static std::atomic<int> printed(0);
-        int old = printed.fetch_add(1);
-        if (old < 64) {
-            printf("[fastllm-cuda-moe] hit %s weightType=%d batch=%d topk=%d hidden=%d inter=%d\n",
-                   path, (int)weightType, batch, topk, hidden, inter);
-            fflush(stdout);
-        }
     }
 
     static void InvalidateCpuMirror(Data &data) {
@@ -2692,7 +2677,6 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                     FastllmCudaHalfMergeMOENVFP4Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter) :
                     FastllmCudaBFloat16MergeMOENVFP4Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter);
                 if (groupOk) {
-                    CudaMergeMoeDebugHit("nvfp4-batch1-selected", nvfp4Type, 1, topk, hidden, inter);
                     return true;
                 }
             }
@@ -2877,9 +2861,6 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             FastllmCudaBFloat16MergeMOENVFP4Batch1Indexed(input, w1, output, weights, weightsBatch,
                                                           (const int32_t*)index.cudaData, (const float*)score.cudaData,
                                                           topk, hidden, inter);
-        if (ok) {
-            CudaMergeMoeDebugHit("nvfp4-batch1-indexed", gateup->dataType, 1, topk, hidden, inter);
-        }
         return ok;
     }
 
@@ -2929,9 +2910,6 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             FastllmCudaBFloat16MergeMOENVFP4SmallBatchIndexed(input, w1, output, weights, weightsBatch,
                                                               (const int32_t*)index.cudaData, (const float*)score.cudaData,
                                                               batch, topk, hidden, inter);
-        if (ok) {
-            CudaMergeMoeDebugHit("nvfp4-smallbatch-indexed", gateup->dataType, batch, topk, hidden, inter);
-        }
         return ok;
     }
 
@@ -3016,9 +2994,6 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                     input, w1, w2, output, weights, weightsBatch,
                     routeRows.data(), routeScales.data(), routePositions.data(), expertStarts.data(), expertCounts.data(),
                     batch, topk, totalTasks, maxExpertTasks, hidden, inter);
-            if (ok && !isFp8) {
-                CudaMergeMoeDebugHit("nvfp4-grouped-indexed", gateup->dataType, batch, topk, hidden, inter);
-            }
             return ok;
         }
         bool ok = isFp8 ? FastllmCudaBFloat16MergeMOEFP8E4M3GroupedIndexed(
@@ -3029,9 +3004,6 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                     input, w1, w2, output, weights, weightsBatch,
                     routeRows.data(), routeScales.data(), routePositions.data(), expertStarts.data(), expertCounts.data(),
                     batch, topk, totalTasks, maxExpertTasks, hidden, inter);
-        if (ok && !isFp8) {
-            CudaMergeMoeDebugHit("nvfp4-grouped-indexed", gateup->dataType, batch, topk, hidden, inter);
-        }
         return ok;
     }
 
