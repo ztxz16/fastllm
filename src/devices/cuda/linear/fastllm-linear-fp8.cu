@@ -1245,6 +1245,309 @@ __device__ __forceinline__ float FastllmCudaNVFP4E8M0ToFloat(uint8_t v) {
     return __uint_as_float(bits);
 }
 
+__device__ __forceinline__ float FastllmCudaNVFP4MagicScale() {
+    return __uint_as_float(253u << 23);
+}
+
+__device__ __forceinline__ float FastllmCudaNVFP4PseudoBFloat16ToFloat(uint8_t v) {
+    uint32_t bits = ((uint32_t)(v & 0x8) << 28) | ((uint32_t)(v & 0x7) << 22);
+    return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ float FastllmCudaNVFP4E8M0ToMagicScale(uint8_t v) {
+    uint32_t exp = (uint32_t)v + 126u;
+    exp = exp >= 255u ? 255u : exp;
+    return __uint_as_float(exp << 23);
+}
+
+__device__ __forceinline__ float FastllmCudaNVFP4ValueToFloat(float value) {
+    return value;
+}
+
+__device__ __forceinline__ float FastllmCudaNVFP4ValueToFloat(half value) {
+    return __half2float(value);
+}
+
+__device__ __forceinline__ float FastllmCudaNVFP4ValueToFloat(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T FastllmCudaNVFP4FloatToValue(float value);
+
+template <>
+__device__ __forceinline__ float FastllmCudaNVFP4FloatToValue<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ half FastllmCudaNVFP4FloatToValue<half>(float value) {
+    return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 FastllmCudaNVFP4FloatToValue<__nv_bfloat16>(float value) {
+    return __float2bfloat16_rn(value);
+}
+
+template <typename BiasT>
+__device__ __forceinline__ float FastllmCudaNVFP4BiasValue(BiasT *bias, int idx) {
+    return bias == nullptr ? 0.0f : FastllmCudaNVFP4ValueToFloat(bias[idx]);
+}
+
+static inline bool FastllmCudaNVFP4UseGemv(int n) {
+    return n < 32;
+}
+
+template <int THREAD_PER_BLOCK, int PART, typename InputT, typename OutputT, typename BiasT>
+__global__ void FastllmGemvNVFP4Kernel1MultiRow(InputT *A, uint8_t *packedWeight, uint8_t *scaleBytes,
+                                                OutputT *C, BiasT *bias,
+                                                int m, int k, int blockK, int blockM,
+                                                int packedM, int scaleMs) {
+    __shared__ float sdata[PART][THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    int row = blockIdx.x;
+
+#pragma unroll
+    for (int x = 0; x < PART; x++) sdata[x][tid] = 0.0f;
+
+    const uint8_t *rowData = packedWeight + (size_t)row * packedM;
+    const size_t scaleRowOffset = (size_t)(row / blockK) * scaleMs;
+    for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
+        int scaleCol = i / blockM;
+        int remaining = min(4, m - i);
+        if (remaining == 4 && (scaleCol == (i + 3) / blockM)) {
+            uint8_t packed01 = rowData[i >> 1];
+            uint8_t packed23 = rowData[(i + 2) >> 1];
+            float w0 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed01 & 0xF);
+            float w1 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed01 >> 4);
+            float w2 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed23 & 0xF);
+            float w3 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed23 >> 4);
+            float scaleMagic = FastllmCudaNVFP4E8M0ToMagicScale(scaleBytes[scaleRowOffset + scaleCol]);
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                const InputT *inputRow = A + (size_t)x * m;
+                float blockSum = FastllmCudaNVFP4ValueToFloat(inputRow[i + 0]) * w0 +
+                                 FastllmCudaNVFP4ValueToFloat(inputRow[i + 1]) * w1 +
+                                 FastllmCudaNVFP4ValueToFloat(inputRow[i + 2]) * w2 +
+                                 FastllmCudaNVFP4ValueToFloat(inputRow[i + 3]) * w3;
+                sdata[x][tid] += blockSum * scaleMagic;
+            }
+        } else {
+            for (int j = 0; j < remaining; j++) {
+                int col = i + j;
+                uint8_t packed = rowData[col >> 1];
+                uint8_t fp4 = (col & 1) ? (packed >> 4) : (packed & 0xF);
+                float w = FastllmCudaNVFP4PseudoBFloat16ToFloat(fp4);
+                float scaleMagic = FastllmCudaNVFP4E8M0ToMagicScale(scaleBytes[scaleRowOffset + col / blockM]);
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    sdata[x][tid] += FastllmCudaNVFP4ValueToFloat(A[(size_t)x * m + col]) * w * scaleMagic;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                sdata[x][tid] += sdata[x][tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float biasValue = FastllmCudaNVFP4BiasValue(bias, row);
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            C[row + (size_t)k * x] = FastllmCudaNVFP4FloatToValue<OutputT>(sdata[x][0] + biasValue);
+        }
+    }
+}
+
+template <int THREAD_PER_BLOCK, int PART, bool SCALE_E8M0, typename InputT, typename OutputT, typename BiasT>
+__global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, OutputT *C,
+                                                       BiasT *bias, int m, int k, int perRow) {
+    __shared__ float sdata[PART][THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    int row = blockIdx.x;
+
+#pragma unroll
+    for (int x = 0; x < PART; x++) sdata[x][tid] = 0.0f;
+
+    const uint8_t *rowData = B + (size_t)row * perRow;
+    const int blockBytes = SCALE_E8M0 ? 9 : (8 + (int)sizeof(float));
+    for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
+        int block = i >> 4;
+        int blockStart = block * 16;
+        int blockEnd = min(blockStart + 16, m);
+        const uint8_t *blockData = rowData + block * blockBytes;
+        float scaleMagic = SCALE_E8M0 ? FastllmCudaNVFP4E8M0ToMagicScale(blockData[8])
+                                      : (*(float*)(blockData + 8)) * FastllmCudaNVFP4MagicScale();
+        int local = i - blockStart;
+        int remaining = min(4, blockEnd - i);
+        if (remaining == 4) {
+            uint8_t packed01 = blockData[local >> 1];
+            uint8_t packed23 = blockData[(local + 2) >> 1];
+            float w0 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed01 & 0xF);
+            float w1 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed01 >> 4);
+            float w2 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed23 & 0xF);
+            float w3 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed23 >> 4);
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                const InputT *inputRow = A + (size_t)x * m;
+                float blockSum = FastllmCudaNVFP4ValueToFloat(inputRow[i + 0]) * w0 +
+                                 FastllmCudaNVFP4ValueToFloat(inputRow[i + 1]) * w1 +
+                                 FastllmCudaNVFP4ValueToFloat(inputRow[i + 2]) * w2 +
+                                 FastllmCudaNVFP4ValueToFloat(inputRow[i + 3]) * w3;
+                sdata[x][tid] += blockSum * scaleMagic;
+            }
+        } else {
+            for (int j = 0; j < remaining; j++) {
+                int col = i + j;
+                int offset = col - blockStart;
+                uint8_t packed = blockData[offset >> 1];
+                uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
+                float w = FastllmCudaNVFP4PseudoBFloat16ToFloat(fp4);
+#pragma unroll
+                for (int x = 0; x < PART; x++) {
+                    sdata[x][tid] += FastllmCudaNVFP4ValueToFloat(A[(size_t)x * m + col]) * w * scaleMagic;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+#pragma unroll
+            for (int x = 0; x < PART; x++) {
+                sdata[x][tid] += sdata[x][tid + s];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float biasValue = FastllmCudaNVFP4BiasValue(bias, row);
+#pragma unroll
+        for (int x = 0; x < PART; x++) {
+            C[row + (size_t)k * x] = FastllmCudaNVFP4FloatToValue<OutputT>(sdata[x][0] + biasValue);
+        }
+    }
+}
+
+template <typename InputT, typename OutputT, typename BiasT>
+static void LaunchFastllmGemmNVFP4(InputT *input, uint8_t *packedWeight, uint8_t *scaleBytes,
+                                   OutputT *output, BiasT *bias,
+                                   int n, int m, int k, int blockK, int blockM,
+                                   int packedM, int scaleMs) {
+#define FASTLLM_LAUNCH_NVFP4_GEMV(PART, IN, OUT) \
+    FastllmGemvNVFP4Kernel1MultiRow<64, PART> <<< k, 64 >>>(IN, packedWeight, scaleBytes, OUT, bias, m, k, blockK, blockM, packedM, scaleMs)
+    if (n == 1) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(1, input, output);
+    } else if (n == 2) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(2, input, output);
+    } else if (n == 3) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(3, input, output);
+    } else if (n == 4) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(4, input, output);
+    } else if (n == 5) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(5, input, output);
+    } else if (n == 6) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(6, input, output);
+    } else if (n == 7) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(7, input, output);
+    } else if (n == 8) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(8, input, output);
+    } else if (n == 9) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(9, input, output);
+    } else if (n == 10) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(10, input, output);
+    } else if (n == 11) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(11, input, output);
+    } else if (n == 12) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(12, input, output);
+    } else if (n == 13) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(13, input, output);
+    } else if (n == 14) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(14, input, output);
+    } else if (n == 15) {
+        FASTLLM_LAUNCH_NVFP4_GEMV(15, input, output);
+    } else {
+        int i = 0;
+        for (; i + 15 < n; i += 16) {
+            FASTLLM_LAUNCH_NVFP4_GEMV(16, input + (size_t)i * m, output + (size_t)i * k);
+        }
+        for (; i + 7 < n; i += 8) {
+            FASTLLM_LAUNCH_NVFP4_GEMV(8, input + (size_t)i * m, output + (size_t)i * k);
+        }
+        for (; i + 3 < n; i += 4) {
+            FASTLLM_LAUNCH_NVFP4_GEMV(4, input + (size_t)i * m, output + (size_t)i * k);
+        }
+        for (; i < n; i++) {
+            FASTLLM_LAUNCH_NVFP4_GEMV(1, input + (size_t)i * m, output + (size_t)i * k);
+        }
+    }
+#undef FASTLLM_LAUNCH_NVFP4_GEMV
+}
+
+template <bool SCALE_E8M0, typename InputT, typename OutputT, typename BiasT>
+static void LaunchFastllmGemmNVFP4Block16(InputT *input, uint8_t *weight, OutputT *output,
+                                          BiasT *bias, int n, int m, int k, int perRow) {
+#define FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(PART, IN, OUT) \
+    FastllmGemvNVFP4Block16Kernel1MultiRow<64, PART, SCALE_E8M0> <<< k, 64 >>>(IN, weight, OUT, bias, m, k, perRow)
+    if (n == 1) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(1, input, output);
+    } else if (n == 2) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(2, input, output);
+    } else if (n == 3) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(3, input, output);
+    } else if (n == 4) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(4, input, output);
+    } else if (n == 5) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(5, input, output);
+    } else if (n == 6) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(6, input, output);
+    } else if (n == 7) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(7, input, output);
+    } else if (n == 8) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(8, input, output);
+    } else if (n == 9) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(9, input, output);
+    } else if (n == 10) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(10, input, output);
+    } else if (n == 11) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(11, input, output);
+    } else if (n == 12) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(12, input, output);
+    } else if (n == 13) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(13, input, output);
+    } else if (n == 14) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(14, input, output);
+    } else if (n == 15) {
+        FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(15, input, output);
+    } else {
+        int i = 0;
+        for (; i + 15 < n; i += 16) {
+            FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(16, input + (size_t)i * m, output + (size_t)i * k);
+        }
+        for (; i + 7 < n; i += 8) {
+            FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(8, input + (size_t)i * m, output + (size_t)i * k);
+        }
+        for (; i + 3 < n; i += 4) {
+            FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(4, input + (size_t)i * m, output + (size_t)i * k);
+        }
+        for (; i < n; i++) {
+            FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV(1, input + (size_t)i * m, output + (size_t)i * k);
+        }
+    }
+#undef FASTLLM_LAUNCH_NVFP4_BLOCK16_GEMV
+}
+
 __global__ void FastllmCudaNVFP42HalfKernel(uint8_t *packedWeight, uint8_t *scaleBytes,
                                             half *out, int rowOffset, int m,
                                             int blockK, int blockM, int packedM, int scaleMs) {
@@ -1303,6 +1606,19 @@ bool FastllmCudaMatMulFloatNVFP4(const fastllm::Data &input, fastllm::Data &weig
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
+    int packedM = (m + 1) / 2;
+    int scaleMs = (m - 1) / weight.blockM + 1;
+    uint8_t *packedWeight = (uint8_t*)weight.cudaData;
+    uint8_t *scaleBytes = packedWeight + fastllm::GetNVFP4WeightBytes(k, m);
+    if (FastllmCudaNVFP4UseGemv(n)) {
+        float *cudaBias = bias.dims.size() == 0 ? nullptr : cudaBiasData;
+        LaunchFastllmGemmNVFP4(cudaInput, packedWeight, scaleBytes, cudaOutput, cudaBias,
+                               n, m, k, weight.blockK, weight.blockM, packedM, scaleMs);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
     auto fastllmCublasHandle = getFastllmCublasHandle();
     half *cudaFp16Input = (half *) FastllmCudaMalloc((size_t)n * m * sizeof(half));
     half *cudaFp16Output = (half *) FastllmCudaMalloc((size_t)n * k * sizeof(half));
@@ -1317,10 +1633,6 @@ bool FastllmCudaMatMulFloatNVFP4(const fastllm::Data &input, fastllm::Data &weig
     int threadPerBlock = std::min(256, len);
     FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaInput, cudaFp16Input, len);
 
-    int packedM = (m + 1) / 2;
-    int scaleMs = (m - 1) / weight.blockM + 1;
-    uint8_t *packedWeight = (uint8_t*)weight.cudaData;
-    uint8_t *scaleBytes = packedWeight + fastllm::GetNVFP4WeightBytes(k, m);
     const __half h_alpha = __float2half_rn(1.0f);
     const __half h_beta = __float2half_rn(0.0f);
     cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
@@ -1374,6 +1686,18 @@ bool FastllmCudaHalfMatMulFloatNVFP4(const fastllm::Data &input, fastllm::Data &
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
 
+    int packedM = (m + 1) / 2;
+    int scaleMs = (m - 1) / weight.blockM + 1;
+    uint8_t *packedWeight = (uint8_t*)weight.cudaData;
+    uint8_t *scaleBytes = packedWeight + fastllm::GetNVFP4WeightBytes(k, m);
+    if (FastllmCudaNVFP4UseGemv(n)) {
+        LaunchFastllmGemmNVFP4(cudaInput, packedWeight, scaleBytes, cudaOutput, cudaBiasData,
+                               n, m, k, weight.blockK, weight.blockM, packedM, scaleMs);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
     auto fastllmCublasHandle = getFastllmCublasHandle();
     size_t wsBytes = 0;
     bool ownScratch = false;
@@ -1381,10 +1705,6 @@ bool FastllmCudaHalfMatMulFloatNVFP4(const fastllm::Data &input, fastllm::Data &
     size_t bytesPerRow = (size_t)m * sizeof(half);
     int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
 
-    int packedM = (m + 1) / 2;
-    int scaleMs = (m - 1) / weight.blockM + 1;
-    uint8_t *packedWeight = (uint8_t*)weight.cudaData;
-    uint8_t *scaleBytes = packedWeight + fastllm::GetNVFP4WeightBytes(k, m);
     const __half h_alpha = __float2half_rn(1.0f);
     const __half h_beta = __float2half_rn(0.0f);
     cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
@@ -1433,6 +1753,18 @@ bool FastllmCudaBFloat16MatMulNVFP4(const fastllm::Data &input, fastllm::Data &w
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
 
+    int packedM = (m + 1) / 2;
+    int scaleMs = (m - 1) / weight.blockM + 1;
+    uint8_t *packedWeight = (uint8_t*)weight.cudaData;
+    uint8_t *scaleBytes = packedWeight + fastllm::GetNVFP4WeightBytes(k, m);
+    if (FastllmCudaNVFP4UseGemv(n)) {
+        LaunchFastllmGemmNVFP4(cudaInput, packedWeight, scaleBytes, cudaOutput, cudaBiasData,
+                               n, m, k, weight.blockK, weight.blockM, packedM, scaleMs);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
     auto fastllmCublasHandle = getFastllmCublasHandle();
     size_t wsBytes = 0;
     bool ownScratch = false;
@@ -1440,10 +1772,6 @@ bool FastllmCudaBFloat16MatMulNVFP4(const fastllm::Data &input, fastllm::Data &w
     size_t bytesPerRow = (size_t)m * sizeof(__nv_bfloat16);
     int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
 
-    int packedM = (m + 1) / 2;
-    int scaleMs = (m - 1) / weight.blockM + 1;
-    uint8_t *packedWeight = (uint8_t*)weight.cudaData;
-    uint8_t *scaleBytes = packedWeight + fastllm::GetNVFP4WeightBytes(k, m);
     float h_alpha = 1.0f, h_beta = 0.0f;
     cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
     cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
@@ -1563,6 +1891,16 @@ bool FastllmCudaMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Dat
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
+    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16BytesPerRow(m);
+    if (FastllmCudaNVFP4UseGemv(n)) {
+        float *cudaBias = bias.dims.size() == 0 ? nullptr : cudaBiasData;
+        LaunchFastllmGemmNVFP4Block16<false>(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+                                             cudaBias, n, m, k, (int)packedBytesPerRow);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
     auto fastllmCublasHandle = getFastllmCublasHandle();
     half *cudaFp16Input = (half *) FastllmCudaMalloc((size_t)n * m * sizeof(half));
     half *cudaFp16Output = (half *) FastllmCudaMalloc((size_t)n * k * sizeof(half));
@@ -1577,7 +1915,6 @@ bool FastllmCudaMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm::Dat
     int threadPerBlock = std::min(256, len);
     FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaInput, cudaFp16Input, len);
 
-    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16BytesPerRow(m);
     const __half h_alpha = __float2half_rn(1.0f);
     const __half h_beta = __float2half_rn(0.0f);
     cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
@@ -1627,6 +1964,16 @@ bool FastllmCudaMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fastllm:
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
+    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16E8M0BytesPerRow(m);
+    if (FastllmCudaNVFP4UseGemv(n)) {
+        float *cudaBias = bias.dims.size() == 0 ? nullptr : cudaBiasData;
+        LaunchFastllmGemmNVFP4Block16<true>(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+                                            cudaBias, n, m, k, (int)packedBytesPerRow);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
     auto fastllmCublasHandle = getFastllmCublasHandle();
     half *cudaFp16Input = (half *) FastllmCudaMalloc((size_t)n * m * sizeof(half));
     half *cudaFp16Output = (half *) FastllmCudaMalloc((size_t)n * k * sizeof(half));
@@ -1641,7 +1988,6 @@ bool FastllmCudaMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fastllm:
     int threadPerBlock = std::min(256, len);
     FastllmCudaFloat2HalfKernel <<< (len - 1) / threadPerBlock + 1, threadPerBlock >>>(cudaInput, cudaFp16Input, len);
 
-    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16E8M0BytesPerRow(m);
     const __half h_alpha = __float2half_rn(1.0f);
     const __half h_beta = __float2half_rn(0.0f);
     cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
@@ -1691,6 +2037,15 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm:
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
 
+    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16BytesPerRow(m);
+    if (FastllmCudaNVFP4UseGemv(n)) {
+        LaunchFastllmGemmNVFP4Block16<false>(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+                                             cudaBiasData, n, m, k, (int)packedBytesPerRow);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
     auto fastllmCublasHandle = getFastllmCublasHandle();
     size_t wsBytes = 0;
     bool ownScratch = false;
@@ -1698,7 +2053,6 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16(const fastllm::Data &input, fastllm:
     size_t bytesPerRow = (size_t)m * sizeof(half);
     int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
 
-    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16BytesPerRow(m);
     const __half h_alpha = __float2half_rn(1.0f);
     const __half h_beta = __float2half_rn(0.0f);
     cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
@@ -1743,6 +2097,15 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fast
     half *cudaInput = (half*)FastllmCudaPrepareInput(input);
     half *cudaOutput = (half*)FastllmCudaPrepareOutput(output);
 
+    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16E8M0BytesPerRow(m);
+    if (FastllmCudaNVFP4UseGemv(n)) {
+        LaunchFastllmGemmNVFP4Block16<true>(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+                                            cudaBiasData, n, m, k, (int)packedBytesPerRow);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
     auto fastllmCublasHandle = getFastllmCublasHandle();
     size_t wsBytes = 0;
     bool ownScratch = false;
@@ -1750,7 +2113,6 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fast
     size_t bytesPerRow = (size_t)m * sizeof(half);
     int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
 
-    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16E8M0BytesPerRow(m);
     const __half h_alpha = __float2half_rn(1.0f);
     const __half h_beta = __float2half_rn(0.0f);
     cudaDataType_t AType = CUDA_R_16F, BType = CUDA_R_16F, CType = CUDA_R_16F, ComputeType = CUDA_R_16F;
@@ -1795,6 +2157,15 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
 
+    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16BytesPerRow(m);
+    if (FastllmCudaNVFP4UseGemv(n)) {
+        LaunchFastllmGemmNVFP4Block16<false>(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+                                             cudaBiasData, n, m, k, (int)packedBytesPerRow);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
     auto fastllmCublasHandle = getFastllmCublasHandle();
     size_t wsBytes = 0;
     bool ownScratch = false;
@@ -1802,7 +2173,6 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::
     size_t bytesPerRow = (size_t)m * sizeof(__nv_bfloat16);
     int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
 
-    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16BytesPerRow(m);
     float h_alpha = 1.0f, h_beta = 0.0f;
     cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
     cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
@@ -1846,6 +2216,15 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastl
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
 
+    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16E8M0BytesPerRow(m);
+    if (FastllmCudaNVFP4UseGemv(n)) {
+        LaunchFastllmGemmNVFP4Block16<true>(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
+                                            cudaBiasData, n, m, k, (int)packedBytesPerRow);
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
     auto fastllmCublasHandle = getFastllmCublasHandle();
     size_t wsBytes = 0;
     bool ownScratch = false;
@@ -1853,7 +2232,6 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16E8M0(const fastllm::Data &input, fastl
     size_t bytesPerRow = (size_t)m * sizeof(__nv_bfloat16);
     int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
 
-    const size_t packedBytesPerRow = FastllmCudaNVFP4Block16E8M0BytesPerRow(m);
     float h_alpha = 1.0f, h_beta = 0.0f;
     cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
     cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
