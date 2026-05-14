@@ -273,6 +273,7 @@ namespace fastllm {
         INT4_GROUP128 = 1004, // int4, per group量化，group = 128
         INT8_PERCHANNEL = 1005, // int8, per channel量化
         NVFP4_BLOCK_16 = 1006, // packed fp4 e2m1, blockM = 16, inline float scale per block
+        NVFP4_BLOCK_16_E8M0 = 1007, // packed fp4 e2m1, blockM = 16, inline e8m0 scale per block
         INF_INT8_PERCHANNEL = 2000, // 推理用的int8, per channel量化
         INF_INT8_GROUP128 = 2001, // 推理用的int8, per group量化，group = 128
         DATA_GGUF_FORMAT = 9999, DATA_GGUF_FORMAT_END = 19999, // [DATA_GGUF_FORMAT, DATA_GGUF_FORMAT_END]之间为GGUF格式的数据，ggml_type = type - DATA_FFUF_FORMAT

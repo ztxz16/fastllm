@@ -36,7 +36,13 @@ namespace fastllm {
     extern bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int k, int st, int end);
+    extern bool FastllmGemmBFloat16NVFP4Block16E8M0_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end);
     extern bool FastllmGemmFloat32NVFP4Block16_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end);
+    extern bool FastllmGemmFloat32NVFP4Block16E8M0_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int k, int st, int end);
 
@@ -226,17 +232,20 @@ namespace fastllm {
     }
 
     static void NVFP4Block16RowsToBFloat16(
-        const void *B, long ldb, uint16_t *bf16B, int m, int st, int end
+        const void *B, long ldb, uint16_t *bf16B, int m, int st, int end, bool scaleE8M0 = false
     ) {
         const int blockSize = 16;
+        const int packedBlockBytes = 8 + (scaleE8M0 ? (int)sizeof(uint8_t) : (int)sizeof(float));
         const int blocks = (m - 1) / blockSize + 1;
         for (int row = st; row < end; row++) {
             const uint8_t *rowStart = (const uint8_t*)B + (size_t)row * ldb;
             uint16_t *dstRow = bf16B + (size_t)(row - st) * m;
             for (int block = 0; block < blocks; block++) {
-                const uint8_t *blockStart = rowStart + block * (8 + sizeof(float));
-                float scale;
-                memcpy(&scale, blockStart + 8, sizeof(float));
+                const uint8_t *blockStart = rowStart + block * packedBlockBytes;
+                float scale = scaleE8M0 ? NVFP4E8M0ScaleToFloat(blockStart[8]) : 0.0f;
+                if (!scaleE8M0) {
+                    memcpy(&scale, blockStart + 8, sizeof(float));
+                }
                 int l = block * blockSize;
                 int blockEnd = std::min(m, l + blockSize);
                 for (; l < blockEnd; l++) {
@@ -265,7 +274,7 @@ namespace fastllm {
     }
 #endif
 
-    template <int COLS, bool INPUT_BF16>
+    template <int COLS, bool INPUT_BF16, bool SCALE_E8M0>
     static inline void GemmNVFP4Block16Cols_CPU(
         const void *inputBase, const uint8_t *weightBase, long ldb, float *output,
         int outputCol, int m
@@ -275,12 +284,17 @@ namespace fastllm {
         const int blocks = (m - 1) / 16 + 1;
         float now[COLS] = {};
 
+        const int packedBlockBytes = 8 + (SCALE_E8M0 ? (int)sizeof(uint8_t) : (int)sizeof(float));
         for (int block = 0; block < blocks; block++) {
             const uint8_t *blockStart[COLS];
             float scale[COLS];
             for (int c = 0; c < COLS; c++) {
-                blockStart[c] = weightBase + (size_t)(outputCol + c) * ldb + block * (8 + sizeof(float));
-                memcpy(scale + c, blockStart[c] + 8, sizeof(float));
+                blockStart[c] = weightBase + (size_t)(outputCol + c) * ldb + block * packedBlockBytes;
+                if constexpr (SCALE_E8M0) {
+                    scale[c] = NVFP4E8M0ScaleToFloat(blockStart[c][8]);
+                } else {
+                    memcpy(scale + c, blockStart[c] + 8, sizeof(float));
+                }
             }
 
             int l = block * 16;
@@ -325,7 +339,7 @@ namespace fastllm {
         }
     }
 
-    template <bool INPUT_BF16>
+    template <bool INPUT_BF16, bool SCALE_E8M0 = false>
     static inline void GemmNVFP4Block16_CPU_Run(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int st, int end
@@ -337,13 +351,13 @@ namespace fastllm {
             float *output = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(C) + (size_t)i * ldc);
             int j = st;
             for (; j + 3 < end; j += 4) {
-                GemmNVFP4Block16Cols_CPU<4, INPUT_BF16>(input, weightBase, ldb, output + j, j, m);
+                GemmNVFP4Block16Cols_CPU<4, INPUT_BF16, SCALE_E8M0>(input, weightBase, ldb, output + j, j, m);
             }
             switch (end - j) {
                 case 0: break;
-                case 1: GemmNVFP4Block16Cols_CPU<1, INPUT_BF16>(input, weightBase, ldb, output + j, j, m); break;
-                case 2: GemmNVFP4Block16Cols_CPU<2, INPUT_BF16>(input, weightBase, ldb, output + j, j, m); break;
-                case 3: GemmNVFP4Block16Cols_CPU<3, INPUT_BF16>(input, weightBase, ldb, output + j, j, m); break;
+                case 1: GemmNVFP4Block16Cols_CPU<1, INPUT_BF16, SCALE_E8M0>(input, weightBase, ldb, output + j, j, m); break;
+                case 2: GemmNVFP4Block16Cols_CPU<2, INPUT_BF16, SCALE_E8M0>(input, weightBase, ldb, output + j, j, m); break;
+                case 3: GemmNVFP4Block16Cols_CPU<3, INPUT_BF16, SCALE_E8M0>(input, weightBase, ldb, output + j, j, m); break;
             }
         }
     }
@@ -1378,10 +1392,12 @@ namespace fastllm {
                         }
                     }
                     finish = true;
-                } else if (BType == DataType::NVFP4_BLOCK_16) {
+                } else if (BType == DataType::NVFP4_BLOCK_16 ||
+                           BType == DataType::NVFP4_BLOCK_16_E8M0) {
+                    bool scaleE8M0 = BType == DataType::NVFP4_BLOCK_16_E8M0;
                     if (n > 31) {
                         std::vector<uint16_t> bf16B_temp((size_t)(end - st) * m);
-                        NVFP4Block16RowsToBFloat16(B, ldb, bf16B_temp.data(), m, st, end);
+                        NVFP4Block16RowsToBFloat16(B, ldb, bf16B_temp.data(), m, st, end, scaleE8M0);
                         FastllmGemm(
                             n, m, end - st,
                             A, lda,
@@ -1393,11 +1409,19 @@ namespace fastllm {
                         finish = true;
                         return;
                     }
-                    if (FastllmGemmFloat32NVFP4Block16_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                    if (scaleE8M0 && FastllmGemmFloat32NVFP4Block16E8M0_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
                         finish = true;
                         return;
                     }
-                    GemmNVFP4Block16_CPU_Run<false>(A, lda, B, ldb, C, ldc, n, m, st, end);
+                    if (!scaleE8M0 && FastllmGemmFloat32NVFP4Block16_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                        finish = true;
+                        return;
+                    }
+                    if (scaleE8M0) {
+                        GemmNVFP4Block16_CPU_Run<false, true>(A, lda, B, ldb, C, ldc, n, m, st, end);
+                    } else {
+                        GemmNVFP4Block16_CPU_Run<false>(A, lda, B, ldb, C, ldc, n, m, st, end);
+                    }
                     finish = true;
                 }
             }
@@ -1528,10 +1552,12 @@ namespace fastllm {
                         LinearBFloat16_FP8E4M3PERCHANNEL_Kernel((uint16_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
                         finish = true;
                     }
-                } else if (BType == NVFP4_BLOCK_16) {
+                } else if (BType == NVFP4_BLOCK_16 ||
+                           BType == NVFP4_BLOCK_16_E8M0) {
+                    bool scaleE8M0 = BType == DataType::NVFP4_BLOCK_16_E8M0;
                     if (n > 31) {
                         std::vector<uint16_t> bf16B_temp((size_t)(end - st) * m);
-                        NVFP4Block16RowsToBFloat16(B, ldb, bf16B_temp.data(), m, st, end);
+                        NVFP4Block16RowsToBFloat16(B, ldb, bf16B_temp.data(), m, st, end, scaleE8M0);
                         MultiThreadLinearBFloat16BFloat16Op(
                             (uint16_t*)A, bf16B_temp.data(), nullptr, ((float*)C) + st,
                             n, m, ldc / sizeof(float), 0, end - st
@@ -1539,11 +1565,19 @@ namespace fastllm {
                         finish = true;
                         return;
                     }
-                    if (FastllmGemmBFloat16NVFP4Block16_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                    if (scaleE8M0 && FastllmGemmBFloat16NVFP4Block16E8M0_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
                         finish = true;
                         return;
                     }
-                    GemmNVFP4Block16_CPU_Run<true>(A, lda, B, ldb, C, ldc, n, m, st, end);
+                    if (!scaleE8M0 && FastllmGemmBFloat16NVFP4Block16_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                        finish = true;
+                        return;
+                    }
+                    if (scaleE8M0) {
+                        GemmNVFP4Block16_CPU_Run<true, true>(A, lda, B, ldb, C, ldc, n, m, st, end);
+                    } else {
+                        GemmNVFP4Block16_CPU_Run<true>(A, lda, B, ldb, C, ldc, n, m, st, end);
+                    }
                     finish = true;
                 } else if (BType == AWQ_4BIT_128) {
                     // A是BFLOAT16, B是AWQ_4BIT_128格式（uint4权重+zero+scale）, C是FLOAT32

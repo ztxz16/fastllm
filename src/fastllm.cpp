@@ -419,6 +419,7 @@ namespace fastllm {
         {DataType::INT4_PERCHANNEL, {"int4_perchannel"}}, {DataType::FP8_E4M3_PERCHANNEL, {"fp8_e4m3_perchannel"}},
         {DataType::INT4_GROUP128, {"int4_group128"}}, {DataType::INT8_PERCHANNEL, {"int8_perchannel"}},
         {DataType::NVFP4_BLOCK_16, {"nvfp4_block_16"}},
+        {DataType::NVFP4_BLOCK_16_E8M0, {"nvfp4_block_16_e8m0"}},
         {DataType::INF_INT8_PERCHANNEL, {"inf_int8_perchannel"}}, {DataType::INF_INT8_GROUP128, {"inf_int8_group128"}},
         {DataType::DATA_AUTO_NONE, {"data_auto_none"}}, {DataType::DATA_AUTO_LINEAR, {"data_auto_linear"}},
         {DataType::DATA_AUTO_EMBEDDING, {"data_auto_embedding"}}, {DataType::DATA_AUTO_CONV, {"data_auto_conv"}}
@@ -498,6 +499,9 @@ namespace fastllm {
         } else if (type == DataType::NVFP4_BLOCK_16) {
             int blocks = (columns - 1) / 16 + 1;
             return rows * blocks * (8 + sizeof(float));
+        } else if (type == DataType::NVFP4_BLOCK_16_E8M0) {
+            int blocks = (columns - 1) / 16 + 1;
+            return rows * blocks * (8 + sizeof(uint8_t));
         } else if (type == DataType::FP8_E4M3) {
             return rows * columns * sizeof(uint8_t);
         } else if (type == DataType::INT4_PERCHANNEL) {
@@ -1374,6 +1378,10 @@ namespace fastllm {
         } else if (this->dataType == DataType::NVFP4) {
             this->unitSize = 1;
             this->unitSizeDiv = 2;
+        } else if (this->dataType == DataType::NVFP4_BLOCK_16 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E8M0) {
+            this->unitSize = 1;
+            this->unitSizeDiv = 1;
         } else if (this->dataType == DataType::INT4 
                 || this->dataType == DataType::INT4_NOZERO
                 || this->dataType == DataType::INT4_GROUP) {
@@ -1395,7 +1403,10 @@ namespace fastllm {
             this->unitSizeDiv = 1;
         }
 
-        if (this->dataType == DataType::NVFP4 && this->dims.size() == 2 &&
+        if ((this->dataType == DataType::NVFP4_BLOCK_16 ||
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() == 2) {
+            this->expansionBytes = GetDataBytes(this->dataType, this->dims[0], this->dims[1]);
+        } else if (this->dataType == DataType::NVFP4 && this->dims.size() == 2 &&
             this->blockK > 0 && this->blockM > 0 && this->scales.empty()) {
             this->expansionBytes = GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
         } else {
@@ -1620,7 +1631,10 @@ namespace fastllm {
 
     void Data::MallocSpace(uint64_t size, bool zero) {
         this->expansionSize = size;
-        if (this->dataType == DataType::NVFP4 && this->dims.size() == 2 &&
+        if ((this->dataType == DataType::NVFP4_BLOCK_16 ||
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() == 2) {
+            this->expansionBytes = GetDataBytes(this->dataType, this->dims[0], this->dims[1]);
+        } else if (this->dataType == DataType::NVFP4 && this->dims.size() == 2 &&
             this->blockK > 0 && this->blockM > 0 && this->scales.empty() &&
             size == this->Count(0)) {
             this->expansionBytes = GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
@@ -2174,17 +2188,40 @@ namespace fastllm {
                     }
                     if (copyData) {
                         uint8_t *cpuData = this->cpuData;
+                        bool ownedCpuDataCopy = false;
 #ifdef USE_MMAP
-                        cpuData = new uint8_t[expansionBytes];
-                        memcpy(cpuData, this->cpuData, expansionBytes);
+                        if (this->cpuData != nullptr) {
+                            cpuData = new uint8_t[expansionBytes];
+                            memcpy(cpuData, this->cpuData, expansionBytes);
+                            ownedCpuDataCopy = true;
+                        }
 #endif
                         if (this->cudaData == nullptr) {
                             this->cudaData = FastllmCudaMalloc(expansionBytes);
                         }
 
-                        FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
+                        if (cpuData != nullptr) {
+                            FastllmCudaCopyFromHostToDevice(this->cudaData, cpuData, expansionBytes);
+                        } else if (!this->numasData.empty() && this->dims.size() == 2) {
+                            int numaCnt = this->numasData.size();
+                            int k = this->dims[0], m = this->dims[1];
+                            int kPerNuma = k / numaCnt;
+                            size_t bytesPerRow = GetDataBytes(this->dataType, 1, m);
+                            if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+                                bytesPerRow = GetDataBytes((DataType)((int)this->dataType + this->ggmlType), 1, m);
+                            }
+                            for (int i = 0; i < numaCnt; i++) {
+                                FastllmCudaCopyFromHostToDevice(
+                                    (uint8_t*)this->cudaData + (size_t)i * kPerNuma * bytesPerRow,
+                                    this->numasData[i], (size_t)kPerNuma * bytesPerRow);
+                            }
+                        } else {
+                            ErrorInFastLLM("ToDevice Error: no CPU data to copy to CUDA.");
+                        }
 #ifdef USE_MMAP
-                        delete[] cpuData;
+                        if (ownedCpuDataCopy) {
+                            delete[] cpuData;
+                        }
 #else
                         if (this->isModelWeight || this->isKVCache) {
                             delete[] this->cpuData;
@@ -2580,7 +2617,8 @@ namespace fastllm {
         } else if (this->dataType == DataType::FLOAT16) {
             return DataType::FLOAT32;
         } else if (this->dataType == DataType::NVFP4 ||
-                   this->dataType == DataType::NVFP4_BLOCK_16) {
+                   this->dataType == DataType::NVFP4_BLOCK_16 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E8M0) {
             return batchSize > 31 ? DataType::BFLOAT16 : DataType::FLOAT32;
         } else if (this->dataType == DataType::INT4_PERCHANNEL ||
                     this->dataType == DataType::INT8_PERCHANNEL) {
