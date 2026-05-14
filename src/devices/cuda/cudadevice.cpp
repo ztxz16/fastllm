@@ -9,6 +9,7 @@
 
 #include "utils.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -36,6 +37,20 @@ namespace fastllm {
             return fallback;
         }
         return (int)value;
+    }
+
+    static void CudaMergeMoeDebugHit(const char *path, DataType weightType,
+                                     int batch, int topk, int hidden, int inter) {
+        if (!CudaEnvFlagEnabled("FASTLLM_CUDA_MOE_DEBUG")) {
+            return;
+        }
+        static std::atomic<int> printed(0);
+        int old = printed.fetch_add(1);
+        if (old < 64) {
+            printf("[fastllm-cuda-moe] hit %s weightType=%d batch=%d topk=%d hidden=%d inter=%d\n",
+                   path, (int)weightType, batch, topk, hidden, inter);
+            fflush(stdout);
+        }
     }
 
     static void InvalidateCpuMirror(Data &data) {
@@ -2602,6 +2617,11 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         return dataType == DataType::FLOAT32 || IsCudaMergeMoeFp8InputType(dataType);
     }
 
+    static bool IsCudaMergeMoeNVFP4WeightType(DataType dataType) {
+        return dataType == DataType::NVFP4_BLOCK_16 ||
+               dataType == DataType::NVFP4_BLOCK_16_E8M0;
+    }
+
     static bool TryCudaMergeMOEBatch1Fp8(
         Data &input, Data &output, int32_t *indexData, const float *scoreData, bool scoresOnCuda, int topk,
         Data &w1, Data **weights, float sharedScale, MoeGateType gateType) {
@@ -2617,6 +2637,8 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             std::vector<Data*> gateups(topk), downs(topk);
             int inter = -1;
             bool canGroupFp8 = true;
+            bool canGroupNVFP4 = true;
+            DataType nvfp4Type = DataType::FLOAT32;
             for (int j = 0; j < topk; j++) {
                 int idx = indexData[j] + 1;
                 Data *gateup = weights[idx * 2];
@@ -2624,20 +2646,35 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 gateups[j] = gateup;
                 downs[j] = down;
                 if (gateup == nullptr || down == nullptr ||
-                    gateup->dataType != DataType::FP8_E4M3 || down->dataType != DataType::FP8_E4M3 ||
                     gateup->dims.size() != 2 || down->dims.size() != 2 ||
                     gateup->dims[1] != hidden ||
                     gateup->dims[0] != down->dims[1] * 2 ||
-                    down->dims[0] != hidden ||
-                    gateup->blockM <= 0 || gateup->blockK <= 0 ||
+                    down->dims[0] != hidden) {
+                    canGroupFp8 = false;
+                    canGroupNVFP4 = false;
+                    break;
+                }
+                bool isFp8 = gateup->dataType == DataType::FP8_E4M3 && down->dataType == DataType::FP8_E4M3;
+                bool isNVFP4 = IsCudaMergeMoeNVFP4WeightType(gateup->dataType) && gateup->dataType == down->dataType;
+                if (!isFp8 || gateup->blockM <= 0 || gateup->blockK <= 0 ||
                     down->blockM <= 0 || down->blockK <= 0) {
                     canGroupFp8 = false;
+                }
+                if (!isNVFP4) {
+                    canGroupNVFP4 = false;
+                } else if (nvfp4Type == DataType::FLOAT32) {
+                    nvfp4Type = gateup->dataType;
+                } else if (nvfp4Type != gateup->dataType) {
+                    canGroupNVFP4 = false;
+                }
+                if (!canGroupFp8 && !canGroupNVFP4) {
                     break;
                 }
                 if (inter < 0) {
                     inter = down->dims[1];
                 } else if (inter != down->dims[1]) {
                     canGroupFp8 = false;
+                    canGroupNVFP4 = false;
                     break;
                 }
             }
@@ -2646,6 +2683,15 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                     FastllmCudaHalfMergeMOEFP8E4M3Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter) :
                     FastllmCudaBFloat16MergeMOEFP8E4M3Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter);
                 if (groupOk) {
+                    return true;
+                }
+            }
+            if (canGroupNVFP4 && inter > 0) {
+                bool groupOk = input.dataType == DataType::FLOAT16 ?
+                    FastllmCudaHalfMergeMOENVFP4Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter) :
+                    FastllmCudaBFloat16MergeMOENVFP4Batch1(input, w1, output, gateups.data(), downs.data(), scoreData, scoresOnCuda, topk, hidden, inter);
+                if (groupOk) {
+                    CudaMergeMoeDebugHit("nvfp4-batch1-selected", nvfp4Type, 1, topk, hidden, inter);
                     return true;
                 }
             }
@@ -2801,8 +2847,12 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         const int hidden = input.dims.back();
         Data *gateup = weights[2];
         Data *down = weights[3];
+        bool isFp8 = gateup != nullptr && down != nullptr &&
+                     gateup->dataType == DataType::FP8_E4M3 && down->dataType == DataType::FP8_E4M3;
+        bool isNVFP4 = gateup != nullptr && down != nullptr &&
+                       IsCudaMergeMoeNVFP4WeightType(gateup->dataType) && gateup->dataType == down->dataType;
         if (gateup == nullptr || down == nullptr ||
-            gateup->dataType != DataType::FP8_E4M3 || down->dataType != DataType::FP8_E4M3 ||
+            (!isFp8 && !isNVFP4) ||
             gateup->dims.size() != 2 || down->dims.size() != 2 ||
             gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
             down->dims[0] != hidden) {
@@ -2810,13 +2860,26 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         }
 
         int inter = down->dims[1];
-        return input.dataType == DataType::FLOAT16 ?
-            FastllmCudaHalfMergeMOEFP8E4M3Batch1Indexed(input, w1, output, weights, weightsBatch,
-                                                        (const int32_t*)index.cudaData, (const float*)score.cudaData,
-                                                        topk, hidden, inter) :
-            FastllmCudaBFloat16MergeMOEFP8E4M3Batch1Indexed(input, w1, output, weights, weightsBatch,
+        if (isFp8) {
+            return input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfMergeMOEFP8E4M3Batch1Indexed(input, w1, output, weights, weightsBatch,
                                                             (const int32_t*)index.cudaData, (const float*)score.cudaData,
-                                                            topk, hidden, inter);
+                                                            topk, hidden, inter) :
+                FastllmCudaBFloat16MergeMOEFP8E4M3Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                                (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                                topk, hidden, inter);
+        }
+        bool ok = input.dataType == DataType::FLOAT16 ?
+            FastllmCudaHalfMergeMOENVFP4Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                      (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                      topk, hidden, inter) :
+            FastllmCudaBFloat16MergeMOENVFP4Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                          (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                          topk, hidden, inter);
+        if (ok) {
+            CudaMergeMoeDebugHit("nvfp4-batch1-indexed", gateup->dataType, 1, topk, hidden, inter);
+        }
+        return ok;
     }
 
     static bool TryCudaMergeMOESmallBatchFp8Indexed(
@@ -2836,8 +2899,12 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         const int hidden = input.dims.back();
         Data *gateup = weights[2];
         Data *down = weights[3];
+        bool isFp8 = gateup != nullptr && down != nullptr &&
+                     gateup->dataType == DataType::FP8_E4M3 && down->dataType == DataType::FP8_E4M3;
+        bool isNVFP4 = gateup != nullptr && down != nullptr &&
+                       IsCudaMergeMoeNVFP4WeightType(gateup->dataType) && gateup->dataType == down->dataType;
         if (gateup == nullptr || down == nullptr ||
-            gateup->dataType != DataType::FP8_E4M3 || down->dataType != DataType::FP8_E4M3 ||
+            (!isFp8 && !isNVFP4) ||
             gateup->dims.size() != 2 || down->dims.size() != 2 ||
             gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
             down->dims[0] != hidden) {
@@ -2845,13 +2912,26 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         }
 
         int inter = down->dims[1];
-        return input.dataType == DataType::FLOAT16 ?
-            FastllmCudaHalfMergeMOEFP8E4M3SmallBatchIndexed(input, w1, output, weights, weightsBatch,
-                                                            (const int32_t*)index.cudaData, (const float*)score.cudaData,
-                                                            batch, topk, hidden, inter) :
-            FastllmCudaBFloat16MergeMOEFP8E4M3SmallBatchIndexed(input, w1, output, weights, weightsBatch,
+        if (isFp8) {
+            return input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfMergeMOEFP8E4M3SmallBatchIndexed(input, w1, output, weights, weightsBatch,
                                                                 (const int32_t*)index.cudaData, (const float*)score.cudaData,
-                                                                batch, topk, hidden, inter);
+                                                                batch, topk, hidden, inter) :
+                FastllmCudaBFloat16MergeMOEFP8E4M3SmallBatchIndexed(input, w1, output, weights, weightsBatch,
+                                                                    (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                                    batch, topk, hidden, inter);
+        }
+        bool ok = input.dataType == DataType::FLOAT16 ?
+            FastllmCudaHalfMergeMOENVFP4SmallBatchIndexed(input, w1, output, weights, weightsBatch,
+                                                          (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                          batch, topk, hidden, inter) :
+            FastllmCudaBFloat16MergeMOENVFP4SmallBatchIndexed(input, w1, output, weights, weightsBatch,
+                                                              (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                              batch, topk, hidden, inter);
+        if (ok) {
+            CudaMergeMoeDebugHit("nvfp4-smallbatch-indexed", gateup->dataType, batch, topk, hidden, inter);
+        }
+        return ok;
     }
 
     static bool TryCudaMergeMOELargeBatchFp8Grouped(
@@ -2870,8 +2950,12 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         const int hidden = input.dims.back();
         Data *gateup = weights[2];
         Data *down = weights[3];
+        bool isFp8 = gateup != nullptr && down != nullptr &&
+                     gateup->dataType == DataType::FP8_E4M3 && down->dataType == DataType::FP8_E4M3;
+        bool isNVFP4 = gateup != nullptr && down != nullptr &&
+                       IsCudaMergeMoeNVFP4WeightType(gateup->dataType) && gateup->dataType == down->dataType;
         if (gateup == nullptr || down == nullptr ||
-            gateup->dataType != DataType::FP8_E4M3 || down->dataType != DataType::FP8_E4M3 ||
+            (!isFp8 && !isNVFP4) ||
             gateup->dims.size() != 2 || down->dims.size() != 2 ||
             gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
             down->dims[0] != hidden) {
@@ -2923,15 +3007,31 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
             }
         }
         if (input.dataType == DataType::FLOAT16) {
-            return FastllmCudaHalfMergeMOEFP8E4M3GroupedIndexed(
+            bool ok = isFp8 ? FastllmCudaHalfMergeMOEFP8E4M3GroupedIndexed(
                 input, w1, w2, output, weights, weightsBatch,
                 routeRows.data(), routeScales.data(), routePositions.data(), expertStarts.data(), expertCounts.data(),
-                batch, topk, totalTasks, maxExpertTasks, hidden, inter);
+                batch, topk, totalTasks, maxExpertTasks, hidden, inter) :
+                FastllmCudaHalfMergeMOENVFP4GroupedIndexed(
+                    input, w1, w2, output, weights, weightsBatch,
+                    routeRows.data(), routeScales.data(), routePositions.data(), expertStarts.data(), expertCounts.data(),
+                    batch, topk, totalTasks, maxExpertTasks, hidden, inter);
+            if (ok && !isFp8) {
+                CudaMergeMoeDebugHit("nvfp4-grouped-indexed", gateup->dataType, batch, topk, hidden, inter);
+            }
+            return ok;
         }
-        return FastllmCudaBFloat16MergeMOEFP8E4M3GroupedIndexed(
+        bool ok = isFp8 ? FastllmCudaBFloat16MergeMOEFP8E4M3GroupedIndexed(
                 input, w1, w2, output, weights, weightsBatch,
                 routeRows.data(), routeScales.data(), routePositions.data(), expertStarts.data(), expertCounts.data(),
-                batch, topk, totalTasks, maxExpertTasks, hidden, inter);
+                batch, topk, totalTasks, maxExpertTasks, hidden, inter) :
+                FastllmCudaBFloat16MergeMOENVFP4GroupedIndexed(
+                    input, w1, w2, output, weights, weightsBatch,
+                    routeRows.data(), routeScales.data(), routePositions.data(), expertStarts.data(), expertCounts.data(),
+                    batch, topk, totalTasks, maxExpertTasks, hidden, inter);
+        if (ok && !isFp8) {
+            CudaMergeMoeDebugHit("nvfp4-grouped-indexed", gateup->dataType, batch, topk, hidden, inter);
+        }
+        return ok;
     }
 
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 

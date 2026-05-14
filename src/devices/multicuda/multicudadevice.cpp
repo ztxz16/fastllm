@@ -3861,7 +3861,8 @@ auto st = std::chrono::system_clock::now();
 
             output->Resize(input->dims);
             output->Allocate();
-            DoCudaMergeMOE(*input, *output, *index, *score, *w1, *w2, *w3, curWeights.data(), nullptr, sharedScale, gateType);
+            DoCudaMergeMOE(*input, *output, *index, *score, *w1, *w2, *w3,
+                           curWeights.data(), nullptr, sharedScale, gateType, wBatch);
 
             if (deviceId == rootDeviceId) {
                 FastllmCudaCopyFromDeviceToDevice(partOutput, output->cudaData, output->GetBytes());
@@ -4081,17 +4082,17 @@ auto st = std::chrono::system_clock::now();
             CopyToMultiDevices(input, devices, false);
         }
 
-        if (index.IsTensorParallelReplicated()) {
-            index.ClearTensorParallelLayout();
-        }
-        if (score.IsTensorParallelReplicated()) {
-            score.ClearTensorParallelLayout();
-        }
         FastllmCudaSetDevice(devices.empty() ? 0 : devices[0]);
-        index.ToDevice(DataDevice::CPU);
-        score.ToDevice(DataDevice::CPU);
-        ToDataType(index, DataType::INT32);
-        ToDataType(score, DataType::FLOAT32);
+        if (index.dataType != DataType::INT32) {
+            index.ToDevice(DataDevice::CPU);
+            ToDataType(index, DataType::INT32);
+        }
+        if (score.dataType != DataType::FLOAT32) {
+            score.ToDevice(DataDevice::CPU);
+            ToDataType(score, DataType::FLOAT32);
+        }
+        EnsureReplicatedMultiCudaTensor(index, devices, true);
+        EnsureReplicatedMultiCudaTensor(score, devices, true);
 
         CopyToMultiDevices(w1, devices, false);
         CopyToMultiDevices(w2, devices, false);
@@ -4118,7 +4119,8 @@ auto st = std::chrono::system_clock::now();
             if (specialId != "cpu") {
                 auto *op = new MultiCudaDoMergeMOEOp(
                     partOutput + output.GetBytes() * i,
-                    input.multiDeviceDatas[device], weights, &index, &score, 
+                    input.multiDeviceDatas[device], weights,
+                    index.multiDeviceDatas[device], score.multiDeviceDatas[device],
                     w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device], 
                     wBatch, sharedScale, 
                     curOutput.multiDeviceDatas[device], rootDeviceId, device
@@ -4152,7 +4154,8 @@ auto st = std::chrono::system_clock::now();
                 }
                 MultiCudaCpuDoMergeMOEOp op(
                     cpuInputBuf.data(), partOutput + output.GetBytes() * i,
-                    input.multiDeviceDatas[device], weights, &index, &score, 
+                    input.multiDeviceDatas[device], weights,
+                    index.multiDeviceDatas[device], score.multiDeviceDatas[device],
                     w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device], 
                     wBatch, sharedScale, 
                     curOutput.multiDeviceDatas[device], device);
