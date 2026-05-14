@@ -231,6 +231,57 @@ namespace fastllm {
         return (uint16_t)(bits >> 16);
     }
 
+#ifdef __AVX2__
+    static inline __m256 _mm256_nvfp4_to_fp32_ps(const uint8_t *packed) {
+        uint32_t raw;
+        memcpy(&raw, packed, sizeof(raw));
+        __m128i bytes = _mm_cvtsi32_si128(static_cast<int>(raw));
+        const __m128i lowMask = _mm_set1_epi8(0x0F);
+        __m128i low = _mm_and_si128(bytes, lowMask);
+        __m128i high = _mm_and_si128(_mm_srli_epi16(bytes, 4), lowMask);
+        __m128i interleaved = _mm_unpacklo_epi8(low, high);
+
+        __m256i fp4 = _mm256_cvtepu8_epi32(interleaved);
+        __m256i sign = _mm256_slli_epi32(_mm256_and_si256(fp4, _mm256_set1_epi32(0x8)), 28);
+        __m256i body = _mm256_and_si256(fp4, _mm256_set1_epi32(0x7));
+
+        __m256i exp = _mm256_slli_epi32(_mm256_add_epi32(_mm256_srli_epi32(body, 1), _mm256_set1_epi32(126)), 23);
+        __m256i mant = _mm256_slli_epi32(_mm256_and_si256(body, _mm256_set1_epi32(1)), 22);
+        mant = _mm256_andnot_si256(_mm256_cmpeq_epi32(body, _mm256_set1_epi32(1)), mant);
+
+        __m256i bits = _mm256_or_si256(sign, _mm256_or_si256(exp, mant));
+        bits = _mm256_andnot_si256(_mm256_cmpeq_epi32(body, _mm256_setzero_si256()), bits);
+        return _mm256_castsi256_ps(bits);
+    }
+
+    static inline __m128i _mm256_float_to_bf16_trunc(__m256 value) {
+        __m256i bits = _mm256_srli_epi32(_mm256_castps_si256(value), 16);
+        __m128i lo = _mm256_castsi256_si128(bits);
+        __m128i hi = _mm256_extracti128_si256(bits, 1);
+        return _mm_packus_epi32(lo, hi);
+    }
+
+    static inline void NVFP4Block16ToBFloat16_AVX2(const uint8_t *blockStart, uint16_t *dst, float scale, int blockElems) {
+        __m256 scaleVec = _mm256_set1_ps(scale);
+        int l = 0;
+        if (blockElems >= 8) {
+            __m256 values = _mm256_mul_ps(_mm256_nvfp4_to_fp32_ps(blockStart), scaleVec);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), _mm256_float_to_bf16_trunc(values));
+            l = 8;
+        }
+        if (blockElems >= 16) {
+            __m256 values = _mm256_mul_ps(_mm256_nvfp4_to_fp32_ps(blockStart + 4), scaleVec);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 8), _mm256_float_to_bf16_trunc(values));
+            l = 16;
+        }
+        for (; l < blockElems; l++) {
+            uint8_t packed = blockStart[l >> 1];
+            uint8_t fp4 = (l & 1) ? (packed >> 4) : (packed & 0xF);
+            dst[l] = FloatToBFloat16Trunc(scale * NVFP4E2M1ToFloat(fp4));
+        }
+    }
+#endif
+
     static void NVFP4Block16RowsToBFloat16(
         const void *B, long ldb, uint16_t *bf16B, int m, int st, int end, bool scaleE8M0 = false
     ) {
@@ -248,6 +299,12 @@ namespace fastllm {
                 }
                 int l = block * blockSize;
                 int blockEnd = std::min(m, l + blockSize);
+#ifdef __AVX2__
+                if (cpuInstructInfo.hasAVX2) {
+                    NVFP4Block16ToBFloat16_AVX2(blockStart, dstRow + l, scale, blockEnd - l);
+                    continue;
+                }
+#endif
                 for (; l < blockEnd; l++) {
                     int offset = l - block * blockSize;
                     uint8_t packed = blockStart[offset >> 1];
@@ -257,22 +314,6 @@ namespace fastllm {
             }
         }
     }
-
-#ifdef __AVX2__
-    static inline __m256 _mm256_nvfp4_to_fp32_ps(const uint8_t *packed) {
-        static const float table[16] = {
-            0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-           -0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f
-        };
-        uint32_t v;
-        memcpy(&v, packed, sizeof(uint32_t));
-        return _mm256_setr_ps(
-            table[v & 0xF], table[(v >> 4) & 0xF],
-            table[(v >> 8) & 0xF], table[(v >> 12) & 0xF],
-            table[(v >> 16) & 0xF], table[(v >> 20) & 0xF],
-            table[(v >> 24) & 0xF], table[(v >> 28) & 0xF]);
-    }
-#endif
 
     template <int COLS, bool INPUT_BF16, bool SCALE_E8M0>
     static inline void GemmNVFP4Block16Cols_CPU(
@@ -1398,24 +1439,26 @@ namespace fastllm {
                     if (n > 31) {
                         std::vector<uint16_t> bf16B_temp((size_t)(end - st) * m);
                         NVFP4Block16RowsToBFloat16(B, ldb, bf16B_temp.data(), m, st, end, scaleE8M0);
-                        FastllmGemm(
-                            n, m, end - st,
-                            A, lda,
-                            bf16B_temp.data(), GetDataBytes(DataType::BFLOAT16, 1, m),
-                            ((float*)C) + st, ldc,
-                            0, end - st,
-                            DataType::FLOAT32, DataType::BFLOAT16, DataType::FLOAT32
-                        );
+                        std::vector<uint16_t> bf16A_temp((size_t)n * m);
+                        for (int i = 0; i < n; i++) {
+                            Float32ToBFloat16((float*)((uint8_t*)A + (size_t)i * lda), bf16A_temp.data() + (size_t)i * m, m);
+                        }
+                        MultiThreadLinearBFloat16BFloat16Op(
+                            bf16A_temp.data(), bf16B_temp.data(), nullptr, ((float*)C) + st,
+                            n, m, ldc / sizeof(float), 0, end - st
+                        ).Run();
                         finish = true;
                         return;
                     }
-                    if (scaleE8M0 && FastllmGemmFloat32NVFP4Block16E8M0_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
-                        finish = true;
-                        return;
-                    }
-                    if (!scaleE8M0 && FastllmGemmFloat32NVFP4Block16_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
-                        finish = true;
-                        return;
+                    if (cpuInstructInfo.hasAVX512BF16) {
+                        if (scaleE8M0 && FastllmGemmFloat32NVFP4Block16E8M0_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                            finish = true;
+                            return;
+                        }
+                        if (!scaleE8M0 && FastllmGemmFloat32NVFP4Block16_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                            finish = true;
+                            return;
+                        }
                     }
                     if (scaleE8M0) {
                         GemmNVFP4Block16_CPU_Run<false, true>(A, lda, B, ldb, C, ldc, n, m, st, end);
@@ -1565,13 +1608,15 @@ namespace fastllm {
                         finish = true;
                         return;
                     }
-                    if (scaleE8M0 && FastllmGemmBFloat16NVFP4Block16E8M0_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
-                        finish = true;
-                        return;
-                    }
-                    if (!scaleE8M0 && FastllmGemmBFloat16NVFP4Block16_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
-                        finish = true;
-                        return;
+                    if (cpuInstructInfo.hasAVX512BF16) {
+                        if (scaleE8M0 && FastllmGemmBFloat16NVFP4Block16E8M0_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                            finish = true;
+                            return;
+                        }
+                        if (!scaleE8M0 && FastllmGemmBFloat16NVFP4Block16_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                            finish = true;
+                            return;
+                        }
                     }
                     if (scaleE8M0) {
                         GemmNVFP4Block16_CPU_Run<true, true>(A, lda, B, ldb, C, ldc, n, m, st, end);

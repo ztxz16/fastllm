@@ -2028,7 +2028,9 @@ namespace fastllm {
                 bf16Input.resize(n * m);
             }
 
-            if (!Float32ToBFloat16_AVX512BF16_RNE(inputData, bf16Input.data(), n * m)) {
+            bool convertedByAVX512BF16 = cpuInstructInfo.hasAVX512BF16 &&
+                                          Float32ToBFloat16_AVX512BF16_RNE(inputData, bf16Input.data(), n * m);
+            if (!convertedByAVX512BF16) {
                 if (n > 4) {
                     int per = n * m / threadNum;
                     int cur = 0;

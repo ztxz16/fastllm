@@ -208,13 +208,10 @@ namespace fastllm {
                     // AMX-TILE is the base requirement (EAX=7, ECX=0, EDX bit 24)
                     if(os_amx_enabled) {
                         bool hasAMX_TILE = (regs[3] & (1 << 24)) != 0;
-                        // Usually we also check for specific AMX arithmetic capabilities:
-                        // AMX-INT8 (EDX bit 25) or AMX-BF16 (EDX bit 22)
-                        bool hasAMX_INT8 = (regs[3] & (1 << 25)) != 0;
+                        // Current AMX kernels require AMX-BF16 (EDX bit 22).
                         bool hasAMX_BF16 = (regs[3] & (1 << 22)) != 0;
 
-                        // We set hasAMX to true if we have the tile architecture AND at least one compute capability
-                        hasAMX = hasAMX_TILE && (hasAMX_INT8 || hasAMX_BF16);
+                        hasAMX = hasAMX_TILE && hasAMX_BF16;
                     }
 
                     // AVX512_BF16: EAX=7, ECX=1, EAX bit 5
@@ -228,6 +225,8 @@ namespace fastllm {
                     // Dependencies
                     hasAVX512BF16 = hasAVX512BF16 && hasAVX512F;
                     hasAVX512VNNI = hasAVX512VNNI && hasAVX512F;
+                    // Current AMX kernels use BF16 tile compute and live in an AVX512BF16 target file.
+                    hasAMX = hasAMX && hasAVX512BF16;
                 }
             }
 #endif             

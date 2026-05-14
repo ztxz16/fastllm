@@ -34,6 +34,7 @@ typedef struct __tile_config {
 } __tilecfg;
 
 #include "fastllm.h"
+#include "utils.h"
 // ARCH_REQ_XCOMP_PERM 系统调用
 #define ARCH_GET_XCOMP_PERM     0x1022
 #define ARCH_REQ_XCOMP_PERM     0x1023
@@ -42,7 +43,23 @@ typedef struct __tile_config {
 #include <sys/syscall.h>
 
 namespace fastllm {
+    extern CPUInstructInfo cpuInstructInfo;
     extern void AddBiasAVX512(float *outputData, float *biasData, int n, int k, int st, int end);
+
+    static void AddBiasAMX(float *outputData, float *biasData, int n, int k, int st, int end) {
+        if (biasData == nullptr) {
+            return;
+        }
+        if (cpuInstructInfo.hasAVX512F) {
+            AddBiasAVX512(outputData, biasData, n, k, st, end);
+            return;
+        }
+        for (int i = 0; i < n; i++) {
+            for (int j = st; j < end; j++) {
+                outputData[i * k + j] += biasData[j];
+            }
+        }
+    }
 
     void InitAMX() {
 #if defined(__AMX_TILE__)
@@ -502,7 +519,7 @@ namespace fastllm {
 
 
         // 5. 添加偏置
-        AddBiasAVX512(outputData, biasData, n, k, st, end);
+        AddBiasAMX(outputData, biasData, n, k, st, end);
 
         // 6. 释放临时 buffer
         free(packedB);

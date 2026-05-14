@@ -366,10 +366,11 @@ namespace fastllm {
         return threads;
     }
 
+    extern CPUInstructInfo cpuInstructInfo;
     extern void InitAMX();
     void EnableAMX(bool enable) {
-        enableAMX = enable;
-        if (enable) {
+        enableAMX = enable && cpuInstructInfo.hasAMX;
+        if (enableAMX) {
             InitAMX();
         }
     }
@@ -2368,8 +2369,6 @@ namespace fastllm {
         ErrorInFastLLM("FreeCudaTemporary Error: don't support.");
 #endif
     }
-
-    extern CPUInstructInfo cpuInstructInfo;
 
     void Data::Repack() {
         if (this->IsRepacked || this->dataType != DATA_GGUF_FORMAT) {
