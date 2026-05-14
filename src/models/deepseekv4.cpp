@@ -2557,8 +2557,8 @@ namespace fastllm {
                             }
                         }
                         float kvUsage = maxTotalLens > 0 ? aliveLen * 100.0f / maxTotalLens : 0;
-                        printf("[Decode] alive = %d, pending = %d, context usages: %.1f%%, Speed: %f tokens / s.\n",
-                               alive, pending, kvUsage, (float)genTokens / spend);
+                        printf("[Decode] alive = %d, pending = %d, context len: %d, Speed: %f tokens / s.\n",
+                               alive, pending, aliveLen, (float)genTokens / spend);
                         lastRecordTime = nowTime;
                         genTokens = 0;
                     }
