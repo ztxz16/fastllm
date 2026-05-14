@@ -1,3 +1,15 @@
+## V0.1.6.4
+
+- 优化DeepSeek V4解码速度
+- 优化DeepSeek V4预填重速度
+- 优化DeepSeek V4并发速度
+- 优化DeepSeek V4 NVFP4算子的速度
+- DeepSeek V4模型支持多卡串行
+- 减少NVFP4模型的内存占用
+- 优化CUDA MOE速度
+- 支持多CUDA, NUMA, Disk一起混合推理
+- 支持Step3.5模型，补充Step3.5运行时和服务适配，优化Step3.5 MoE拆分与并发解码
+- 优化Qwen3.5批量解码吞吐
 
 ## V0.1.6.3
 
