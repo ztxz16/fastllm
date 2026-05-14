@@ -226,6 +226,14 @@ static int GetMultiCudaSplitUnit(const fastllm::Data &data) {
     if (data.dataType == fastllm::DataType::FP8_E4M3) {
         unit = data.blockM;
     }
+    if (data.dataType == fastllm::DataType::NVFP4) {
+        if (data.blockK > 0) {
+            unit = LcmInt(unit, data.blockK);
+        }
+        if (data.blockM > 0) {
+            unit = LcmInt(unit, data.blockM);
+        }
+    }
     if (IsGGUFTensor(data)) {
         unit = LcmInt(unit, GetGGUFBlockSize(data));
     }
@@ -578,6 +586,42 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     }
                     curLen += copyLen;
                 }
+            } else if (weight.dataType == fastllm::DataType::NVFP4 &&
+                       weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) {
+                size_t rowBytes = fastllm::GetNVFP4WeightBytes(1, m);
+                size_t srcWeightBytes = fastllm::GetNVFP4WeightBytes(k, m);
+                size_t dstWeightBytes = fastllm::GetNVFP4WeightBytes(len, m);
+                int scaleCols = (m - 1) / weight.blockM + 1;
+                if (mallocType == 0) {
+                    cudaSetDevice(rootDevice);
+                }
+                for (auto &it : div) {
+                    int copyLen = it.second - it.first;
+                    fastllm::AssertInFastLLM(it.first % weight.blockK == 0 && copyLen % weight.blockK == 0,
+                                             "NVFP4 tensor parallel row split should align to blockK.\n");
+                    state = cudaMemcpy((uint8_t*)deviceWeightData + (size_t)curLen * rowBytes,
+                                       (uint8_t*)weight.cudaData + (size_t)it.first * rowBytes,
+                                       (size_t)copyLen * rowBytes,
+                                       GetCudaMemcpyType(mallocType, 1));
+                    if (state != cudaSuccess) {
+                        break;
+                    }
+                    state = cudaMemcpy((uint8_t*)deviceWeightData + dstWeightBytes +
+                                           (size_t)(curLen / weight.blockK) * scaleCols,
+                                       (uint8_t*)weight.cudaData + srcWeightBytes +
+                                           (size_t)(it.first / weight.blockK) * scaleCols,
+                                       (size_t)(copyLen / weight.blockK) * scaleCols,
+                                       GetCudaMemcpyType(mallocType, 1));
+                    if (state != cudaSuccess) {
+                        break;
+                    }
+                    state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
+                                       (size_t)copyLen * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                    if (state != cudaSuccess) {
+                        break;
+                    }
+                    curLen += copyLen;
+                }
             } else {
                 for (auto &it : div) {
                     state = cudaMemcpy((uint8_t*)deviceWeightData + curLen * m * weight.unitSize / weight.unitSizeDiv, 
@@ -625,6 +669,37 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                                         copyBytes,
                                         k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
                     dstOffsetBytes += copyBytes;
+                    curLen += copyLen;
+                }
+            } else if (weight.dataType == fastllm::DataType::NVFP4 &&
+                       weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) {
+                size_t srcRowBytes = fastllm::GetNVFP4WeightBytes(1, m);
+                size_t dstRowBytes = fastllm::GetNVFP4WeightBytes(1, len);
+                size_t srcWeightBytes = fastllm::GetNVFP4WeightBytes(k, m);
+                size_t dstWeightBytes = fastllm::GetNVFP4WeightBytes(k, len);
+                int srcScaleCols = (m - 1) / weight.blockM + 1;
+                int dstScaleCols = (len - 1) / weight.blockM + 1;
+                int scaleRows = (k - 1) / weight.blockK + 1;
+                for (auto &it : div) {
+                    int copyLen = it.second - it.first;
+                    fastllm::AssertInFastLLM((it.first & 1) == 0 && (copyLen & 1) == 0 &&
+                                             it.first % weight.blockM == 0 && copyLen % weight.blockM == 0,
+                                             "NVFP4 tensor parallel column split should align to packed bytes and blockM.\n");
+                    if (mallocType == 0) {
+                        cudaSetDevice(rootDevice);
+                    }
+                    FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + (curLen >> 1),
+                                        dstRowBytes,
+                                        (uint8_t*)weight.cudaData + (it.first >> 1),
+                                        srcRowBytes,
+                                        (size_t)copyLen >> 1,
+                                        k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                    FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstWeightBytes + curLen / weight.blockM,
+                                        dstScaleCols,
+                                        (uint8_t*)weight.cudaData + srcWeightBytes + it.first / weight.blockM,
+                                        srcScaleCols,
+                                        (size_t)copyLen / weight.blockM,
+                                        scaleRows, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
                     curLen += copyLen;
                 }
             } else {

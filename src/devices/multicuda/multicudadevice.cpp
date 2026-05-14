@@ -198,6 +198,14 @@ namespace fastllm {
         if (data.dataType == fastllm::DataType::FP8_E4M3) {
             unit = data.blockM;
         }
+        if (data.dataType == fastllm::DataType::NVFP4) {
+            if (data.blockK > 0) {
+                unit = LcmInt(unit, data.blockK);
+            }
+            if (data.blockM > 0) {
+                unit = LcmInt(unit, data.blockM);
+            }
+        }
         if (IsGGUFTensor(data)) {
             unit = LcmInt(unit, GetGGUFBlockSize(data));
         }

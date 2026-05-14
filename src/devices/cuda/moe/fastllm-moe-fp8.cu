@@ -156,6 +156,44 @@ __device__ __forceinline__ void FastllmMoeNVFP4Block16Accumulate4(const T *A, in
     sum += FastllmMoeNVFP4ApplyScale<SCALE_E8M0>(blockSum, blockData);
 }
 
+template <typename T>
+__device__ __forceinline__ void FastllmMoeNVFP4CompactAccumulate4(const T *A, int offset,
+                                                                  const uint8_t *weightData, int row,
+                                                                  int rows, int m, int blockK, int blockM,
+                                                                  int scaleCols, float &sum) {
+    int remaining = min(4, m - offset);
+    if (remaining <= 0) {
+        return;
+    }
+    int packedPerRow = (m + 1) >> 1;
+    const uint8_t *rowData = weightData + (size_t)row * packedPerRow;
+    const uint8_t *scaleData = weightData + (size_t)rows * packedPerRow;
+    int scaleRow = row / blockK;
+    if (remaining == 4 && offset / blockM == (offset + 3) / blockM) {
+        uint8_t packed01 = rowData[offset >> 1];
+        uint8_t packed23 = rowData[(offset + 2) >> 1];
+        float scaleMagic = FastllmMoeNVFP4E8M0ToMagicScale(scaleData[(size_t)scaleRow * scaleCols + offset / blockM]);
+        float blockSum =
+            FastllmMoeFp8Traits<T>::toFloat(A[offset + 0]) * FastllmMoeNVFP4PseudoBFloat16ToFloat(packed01 & 0xF) +
+            FastllmMoeFp8Traits<T>::toFloat(A[offset + 1]) * FastllmMoeNVFP4PseudoBFloat16ToFloat(packed01 >> 4) +
+            FastllmMoeFp8Traits<T>::toFloat(A[offset + 2]) * FastllmMoeNVFP4PseudoBFloat16ToFloat(packed23 & 0xF) +
+            FastllmMoeFp8Traits<T>::toFloat(A[offset + 3]) * FastllmMoeNVFP4PseudoBFloat16ToFloat(packed23 >> 4);
+        sum += blockSum * scaleMagic;
+        return;
+    }
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        if (j < remaining) {
+            int col = offset + j;
+            uint8_t packed = rowData[col >> 1];
+            uint8_t fp4 = (col & 1) ? (packed >> 4) : (packed & 0xF);
+            float scaleMagic = FastllmMoeNVFP4E8M0ToMagicScale(scaleData[(size_t)scaleRow * scaleCols + col / blockM]);
+            sum += FastllmMoeFp8Traits<T>::toFloat(A[col]) *
+                   FastllmMoeNVFP4PseudoBFloat16ToFloat(fp4) * scaleMagic;
+        }
+    }
+}
+
 static inline size_t FastllmMoeNVFP4Block16BytesPerRow(int m, bool scaleE8M0) {
     return (size_t)((m - 1) / 16 + 1) * (scaleE8M0 ? 9 : (8 + (int)sizeof(float)));
 }
@@ -2159,6 +2197,184 @@ __global__ void FastllmGemvTypedNVFP4Block16SmallBatchTopKDownReduceIndexedKerne
     }
 }
 
+template <typename T, int THREAD_PER_BLOCK>
+__global__ void FastllmGemvTypedNVFP4CompactTopKSwigluIndexedKernel(T *A, const int32_t *indices,
+                                                                    uint8_t **weights, T *C,
+                                                                    int topk, int m, int k,
+                                                                    int blockK, int blockM, int scaleCols) {
+    __shared__ float sdataGate[THREAD_PER_BLOCK];
+    __shared__ float sdataUp[THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    int p = blockIdx.x;
+    int topkSlot = blockIdx.y;
+    if (topkSlot >= topk) {
+        return;
+    }
+    int expertIdx = indices[topkSlot];
+    uint8_t *B = weights[expertIdx];
+    int rows = k * 2;
+
+    sdataGate[tid] = 0.0f;
+    sdataUp[tid] = 0.0f;
+    for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
+        FastllmMoeNVFP4CompactAccumulate4(A, i, B, p, rows, m, blockK, blockM, scaleCols, sdataGate[tid]);
+        FastllmMoeNVFP4CompactAccumulate4(A, i, B, p + k, rows, m, blockK, blockM, scaleCols, sdataUp[tid]);
+    }
+    __syncthreads();
+
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdataGate[tid] += sdataGate[tid + s];
+            sdataUp[tid] += sdataUp[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float gate = FastllmMoeFp8Round<T>(sdataGate[0]);
+        float up = FastllmMoeFp8Round<T>(sdataUp[0]);
+        C[(size_t)topkSlot * k + p] = FastllmMoeFp8Traits<T>::fromFloat((gate / (1.0f + expf(-gate))) * up);
+    }
+}
+
+template <typename T, int THREAD_PER_BLOCK>
+__global__ void FastllmGemvTypedNVFP4CompactTopKDownReduceIndexedKernel(T *A, const int32_t *indices,
+                                                                        uint8_t **weights, T *C,
+                                                                        const float *scores, int topk,
+                                                                        int m, int k,
+                                                                        int blockK, int blockM, int scaleCols) {
+    __shared__ float sdata[THREAD_PER_BLOCK];
+    __shared__ float out;
+    unsigned int tid = threadIdx.x;
+    int st = blockIdx.x;
+
+    if (tid == 0) {
+        out = 0.0f;
+    }
+    __syncthreads();
+
+    for (int topkSlot = 0; topkSlot < topk; topkSlot++) {
+        int expertIdx = indices[topkSlot];
+        uint8_t *B = weights[expertIdx];
+        T *expertInput = A + (size_t)topkSlot * m;
+
+        sdata[tid] = 0.0f;
+        for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
+            FastllmMoeNVFP4CompactAccumulate4(expertInput, i, B, st, k, m, blockK, blockM, scaleCols, sdata[tid]);
+        }
+        __syncthreads();
+
+        for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            out += FastllmMoeFp8Round<T>(sdata[0]) * scores[topkSlot];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        C[st] = FastllmMoeFp8Traits<T>::fromFloat(out);
+    }
+}
+
+template <typename T, int THREAD_PER_BLOCK>
+__global__ void FastllmGemvTypedNVFP4CompactSmallBatchTopKSwigluIndexedKernel(T *A, const int32_t *indices,
+                                                                              uint8_t **weights, T *C,
+                                                                              int batch, int topk, int m, int k,
+                                                                              int blockK, int blockM, int scaleCols) {
+    __shared__ float sdataGate[THREAD_PER_BLOCK];
+    __shared__ float sdataUp[THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    int p = blockIdx.x;
+    int task = blockIdx.y;
+    int token = task / topk;
+    if (token >= batch) {
+        return;
+    }
+
+    int expertIdx = indices[task];
+    uint8_t *B = weights[expertIdx];
+    T *tokenInput = A + (size_t)token * m;
+    int rows = k * 2;
+
+    sdataGate[tid] = 0.0f;
+    sdataUp[tid] = 0.0f;
+    for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
+        FastllmMoeNVFP4CompactAccumulate4(tokenInput, i, B, p, rows, m, blockK, blockM, scaleCols, sdataGate[tid]);
+        FastllmMoeNVFP4CompactAccumulate4(tokenInput, i, B, p + k, rows, m, blockK, blockM, scaleCols, sdataUp[tid]);
+    }
+    __syncthreads();
+
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdataGate[tid] += sdataGate[tid + s];
+            sdataUp[tid] += sdataUp[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float gate = FastllmMoeFp8Round<T>(sdataGate[0]);
+        float up = FastllmMoeFp8Round<T>(sdataUp[0]);
+        C[(size_t)task * k + p] = FastllmMoeFp8Traits<T>::fromFloat((gate / (1.0f + expf(-gate))) * up);
+    }
+}
+
+template <typename T, int THREAD_PER_BLOCK>
+__global__ void FastllmGemvTypedNVFP4CompactSmallBatchTopKDownReduceIndexedKernel(T *A, const int32_t *indices,
+                                                                                  uint8_t **weights, T *C,
+                                                                                  const float *scores, int batch, int topk,
+                                                                                  int m, int k,
+                                                                                  int blockK, int blockM, int scaleCols) {
+    __shared__ float sdata[THREAD_PER_BLOCK];
+    __shared__ float out;
+    unsigned int tid = threadIdx.x;
+    int st = blockIdx.x;
+    int token = blockIdx.y;
+    if (token >= batch) {
+        return;
+    }
+
+    if (tid == 0) {
+        out = 0.0f;
+    }
+    __syncthreads();
+
+    for (int topkSlot = 0; topkSlot < topk; topkSlot++) {
+        int task = token * topk + topkSlot;
+        int expertIdx = indices[task];
+        uint8_t *B = weights[expertIdx];
+        T *expertInput = A + (size_t)task * m;
+
+        sdata[tid] = 0.0f;
+        for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
+            FastllmMoeNVFP4CompactAccumulate4(expertInput, i, B, st, k, m, blockK, blockM, scaleCols, sdata[tid]);
+        }
+        __syncthreads();
+
+        for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            out += FastllmMoeFp8Round<T>(sdata[0]) * scores[task];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        C[(size_t)token * k + st] = FastllmMoeFp8Traits<T>::fromFloat(out);
+    }
+}
+
 template <bool SCALE_E8M0, typename T, int THREAD_PER_BLOCK, int PART>
 __global__ void FastllmGemvTypedNVFP4Block16GroupedTopKSwigluIndexedKernel(T *A, const int *routeRows,
                                                                            const int *expertStarts, const int *expertCounts,
@@ -2564,6 +2780,46 @@ static void LaunchFastllmGemmTypedNVFP4SmallBatchTopKDownReduceIndexed(T *input,
     dim3 grid(k, batch);
     FastllmGemvTypedNVFP4Block16SmallBatchTopKDownReduceIndexedKernel<SCALE_E8M0, T, 64> <<< grid, 64 >>>(
         input, indices, weights, output, scores, batch, topk, m, k, perRow);
+}
+
+template <typename T>
+static void LaunchFastllmGemmTypedNVFP4CompactTopKSwigluIndexed(T *input, const int32_t *indices,
+                                                                uint8_t **weights, T *output,
+                                                                int topk, int m, int k,
+                                                                int blockK, int blockM, int scaleCols) {
+    dim3 grid(k, topk);
+    FastllmGemvTypedNVFP4CompactTopKSwigluIndexedKernel<T, 64> <<< grid, 64 >>>(
+        input, indices, weights, output, topk, m, k, blockK, blockM, scaleCols);
+}
+
+template <typename T>
+static void LaunchFastllmGemmTypedNVFP4CompactTopKDownReduceIndexed(T *input, const int32_t *indices,
+                                                                    uint8_t **weights, T *output,
+                                                                    const float *scores, int topk, int m, int k,
+                                                                    int blockK, int blockM, int scaleCols) {
+    FastllmGemvTypedNVFP4CompactTopKDownReduceIndexedKernel<T, 64> <<< k, 64 >>>(
+        input, indices, weights, output, scores, topk, m, k, blockK, blockM, scaleCols);
+}
+
+template <typename T>
+static void LaunchFastllmGemmTypedNVFP4CompactSmallBatchTopKSwigluIndexed(T *input, const int32_t *indices,
+                                                                          uint8_t **weights, T *output,
+                                                                          int batch, int topk, int m, int k,
+                                                                          int blockK, int blockM, int scaleCols) {
+    dim3 grid(k, batch * topk);
+    FastllmGemvTypedNVFP4CompactSmallBatchTopKSwigluIndexedKernel<T, 64> <<< grid, 64 >>>(
+        input, indices, weights, output, batch, topk, m, k, blockK, blockM, scaleCols);
+}
+
+template <typename T>
+static void LaunchFastllmGemmTypedNVFP4CompactSmallBatchTopKDownReduceIndexed(T *input, const int32_t *indices,
+                                                                              uint8_t **weights, T *output,
+                                                                              const float *scores, int batch, int topk,
+                                                                              int m, int k,
+                                                                              int blockK, int blockM, int scaleCols) {
+    dim3 grid(k, batch);
+    FastllmGemvTypedNVFP4CompactSmallBatchTopKDownReduceIndexedKernel<T, 64> <<< grid, 64 >>>(
+        input, indices, weights, output, scores, batch, topk, m, k, blockK, blockM, scaleCols);
 }
 
 template <bool SCALE_E8M0, typename T, int PART>
@@ -2991,12 +3247,14 @@ static bool FastllmGetMoeFp8ExpertTable(fastllm::Data **weights, int weightsBatc
 }
 
 static inline bool FastllmMoeNVFP4IsWeightType(fastllm::DataType type) {
-    return type == fastllm::DataType::NVFP4_BLOCK_16 ||
+    return type == fastllm::DataType::NVFP4 ||
+           type == fastllm::DataType::NVFP4_BLOCK_16 ||
            type == fastllm::DataType::NVFP4_BLOCK_16_E8M0;
 }
 
 static inline bool FastllmMoeNVFP4ScaleE8M0(fastllm::DataType type) {
-    return type == fastllm::DataType::NVFP4_BLOCK_16_E8M0;
+    return type == fastllm::DataType::NVFP4 ||
+           type == fastllm::DataType::NVFP4_BLOCK_16_E8M0;
 }
 
 struct FastllmMoeNVFP4Batch1Scratch {
@@ -3023,12 +3281,19 @@ static FastllmMoeNVFP4Batch1Scratch &FastllmGetMoeNVFP4Batch1Scratch(int topk) {
 
 struct FastllmMoeNVFP4ExpertTable {
     bool inited = false;
+    bool compact = false;
     bool scaleE8M0 = false;
     int experts = 0;
     int hidden = 0;
     int inter = 0;
     int gatePerRow = 0;
     int downPerRow = 0;
+    int gateBlockK = 0;
+    int gateBlockM = 0;
+    int gateScaleCols = 0;
+    int downBlockK = 0;
+    int downBlockM = 0;
+    int downScaleCols = 0;
     uint8_t **gateWeights = nullptr;
     uint8_t **downWeights = nullptr;
 };
@@ -3053,14 +3318,27 @@ static bool FastllmGetMoeNVFP4ExpertTable(fastllm::Data **weights, int weightsBa
         return false;
     }
     fastllm::DataType weightType = firstGate->dataType;
+    bool compact = weightType == fastllm::DataType::NVFP4;
     bool scaleE8M0 = FastllmMoeNVFP4ScaleE8M0(weightType);
+    int gateBlockK = compact ? firstGate->blockK : 0;
+    int gateBlockM = compact ? firstGate->blockM : 0;
+    int downBlockK = compact ? firstDown->blockK : 0;
+    int downBlockM = compact ? firstDown->blockM : 0;
+    if (compact && (gateBlockK <= 0 || gateBlockM <= 0 || downBlockK <= 0 || downBlockM <= 0 ||
+                    !firstGate->scales.empty() || !firstDown->scales.empty())) {
+        return false;
+    }
+    int gateScaleCols = compact ? ((hidden - 1) / gateBlockM + 1) : 0;
+    int downScaleCols = compact ? ((inter - 1) / downBlockM + 1) : 0;
 
     int deviceId = FastllmCudaGetDevice();
     auto key = std::make_pair(deviceId, (const void*)weights[2]);
     FastllmMoeNVFP4ExpertTable &cached = fastllmMoeNVFP4ExpertTables[key];
     if (cached.inited) {
         if (cached.experts != experts || cached.hidden != hidden || cached.inter != inter ||
-            cached.scaleE8M0 != scaleE8M0) {
+            cached.compact != compact || cached.scaleE8M0 != scaleE8M0 ||
+            cached.gateBlockK != gateBlockK || cached.gateBlockM != gateBlockM ||
+            cached.downBlockK != downBlockK || cached.downBlockM != downBlockM) {
             return false;
         }
         table = &cached;
@@ -3080,6 +3358,11 @@ static bool FastllmGetMoeNVFP4ExpertTable(fastllm::Data **weights, int weightsBa
             gateup->cudaData == nullptr || down->cudaData == nullptr) {
             return false;
         }
+        if (compact && (gateup->blockK != gateBlockK || gateup->blockM != gateBlockM ||
+                        down->blockK != downBlockK || down->blockM != downBlockM ||
+                        !gateup->scales.empty() || !down->scales.empty())) {
+            return false;
+        }
         hGateWeights[e] = (uint8_t*)gateup->cudaData;
         hDownWeights[e] = (uint8_t*)down->cudaData;
     }
@@ -3095,12 +3378,19 @@ static bool FastllmGetMoeNVFP4ExpertTable(fastllm::Data **weights, int weightsBa
     checkCudaErrors("Error: CUDA error when caching NVFP4 MoE down pointer table!", state);
 
     cached.inited = true;
+    cached.compact = compact;
     cached.scaleE8M0 = scaleE8M0;
     cached.experts = experts;
     cached.hidden = hidden;
     cached.inter = inter;
     cached.gatePerRow = (int)FastllmMoeNVFP4Block16BytesPerRow(hidden, scaleE8M0);
     cached.downPerRow = (int)FastllmMoeNVFP4Block16BytesPerRow(inter, scaleE8M0);
+    cached.gateBlockK = gateBlockK;
+    cached.gateBlockM = gateBlockM;
+    cached.gateScaleCols = gateScaleCols;
+    cached.downBlockK = downBlockK;
+    cached.downBlockM = downBlockM;
+    cached.downScaleCols = downScaleCols;
     table = &cached;
     return true;
 }
@@ -3134,7 +3424,14 @@ static bool FastllmCudaTypedMergeMOENVFP4Batch1Indexed(const fastllm::Data &inpu
     T *cudaW1 = (T*)FastllmCudaPrepareOutput(w1);
     T *cudaOutput = (T*)FastllmCudaPrepareOutput(output);
 
-    if (table->scaleE8M0) {
+    if (table->compact) {
+        LaunchFastllmGemmTypedNVFP4CompactTopKSwigluIndexed(cudaInput, indices, table->gateWeights, cudaW1,
+                                                            topk, hidden, inter,
+                                                            table->gateBlockK, table->gateBlockM, table->gateScaleCols);
+        LaunchFastllmGemmTypedNVFP4CompactTopKDownReduceIndexed(cudaW1, indices, table->downWeights, cudaOutput, scores,
+                                                                topk, inter, hidden,
+                                                                table->downBlockK, table->downBlockM, table->downScaleCols);
+    } else if (table->scaleE8M0) {
         LaunchFastllmGemmTypedNVFP4TopKSwigluIndexed<true>(cudaInput, indices, table->gateWeights, cudaW1,
                                                            topk, hidden, inter, table->gatePerRow);
         LaunchFastllmGemmTypedNVFP4TopKDownReduceIndexed<true>(cudaW1, indices, table->downWeights, cudaOutput, scores,
@@ -3194,7 +3491,14 @@ static bool FastllmCudaTypedMergeMOENVFP4SmallBatchIndexed(const fastllm::Data &
     T *cudaW1 = (T*)FastllmCudaPrepareOutput(w1);
     T *cudaOutput = (T*)FastllmCudaPrepareOutput(output);
 
-    if (table->scaleE8M0) {
+    if (table->compact) {
+        LaunchFastllmGemmTypedNVFP4CompactSmallBatchTopKSwigluIndexed(cudaInput, indices, table->gateWeights, cudaW1,
+                                                                      batch, topk, hidden, inter,
+                                                                      table->gateBlockK, table->gateBlockM, table->gateScaleCols);
+        LaunchFastllmGemmTypedNVFP4CompactSmallBatchTopKDownReduceIndexed(cudaW1, indices, table->downWeights, cudaOutput, scores,
+                                                                          batch, topk, inter, hidden,
+                                                                          table->downBlockK, table->downBlockM, table->downScaleCols);
+    } else if (table->scaleE8M0) {
         LaunchFastllmGemmTypedNVFP4SmallBatchTopKSwigluIndexed<true>(cudaInput, indices, table->gateWeights, cudaW1,
                                                                      batch, topk, hidden, inter, table->gatePerRow);
         LaunchFastllmGemmTypedNVFP4SmallBatchTopKDownReduceIndexed<true>(cudaW1, indices, table->downWeights, cudaOutput, scores,
@@ -3240,6 +3544,9 @@ static bool FastllmCudaTypedMergeMOENVFP4GroupedIndexed(const fastllm::Data &inp
 
     FastllmMoeNVFP4ExpertTable *table = nullptr;
     if (!FastllmGetMoeNVFP4ExpertTable(weights, weightsBatch, hidden, inter, table)) {
+        return false;
+    }
+    if (table->compact) {
         return false;
     }
 
@@ -3672,7 +3979,8 @@ static bool FastllmCudaTypedMergeMOENVFP4Batch1(const fastllm::Data &input, fast
     if (topk <= 0 || hidden <= 0 || inter <= 0 || scores == nullptr ||
         input.dataType != FastllmMoeFp8Traits<T>::dataType || input.dataDevice != fastllm::DataDevice::CUDA ||
         gateups == nullptr || downs == nullptr || gateups[0] == nullptr || downs[0] == nullptr ||
-        !FastllmMoeNVFP4IsWeightType(gateups[0]->dataType) || gateups[0]->dataType != downs[0]->dataType) {
+        !FastllmMoeNVFP4IsWeightType(gateups[0]->dataType) || gateups[0]->dataType != downs[0]->dataType ||
+        gateups[0]->dataType == fastllm::DataType::NVFP4) {
         return false;
     }
 
