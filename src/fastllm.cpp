@@ -1142,10 +1142,14 @@ namespace fastllm {
             int groupCnt, int blockK, int blockM) {
         auto &data = *this;
         data.weightType = weightType;
-        if (dataType == oriDataType && dataType == DataType::NVFP4) {
+        if (dataType == oriDataType &&
+            (dataType == DataType::NVFP4 || dataType == DataType::NVFP4_BLOCK_16 ||
+             dataType == DataType::NVFP4_BLOCK_16_E8M0)) {
             this->blockK = blockK;
             this->blockM = blockM;
-            this->scales.clear();
+            if (dataType == DataType::NVFP4) {
+                this->scales.clear();
+            }
             data.UpdateUnitSize();
             data.Allocate(false);
             if (oriData != nullptr) {

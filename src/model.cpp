@@ -386,6 +386,8 @@ namespace fastllm {
 
     static std::string FindSafeTensorScaleTensorName(const SafeTensors &safeTensors,
                                                      const std::string &tensorName);
+    static std::string FindSafeTensorScale2TensorName(const SafeTensors &safeTensors,
+                                                      const std::string &tensorName);
     static bool IsPackedFP4Tensor(const SafeTensors &safeTensors, const std::string &name);
 
     struct SafeTensorItem {
@@ -429,13 +431,13 @@ namespace fastllm {
 
         struct FP8E4M3ToFP32Manager fp8e4m3tofp32;
 
-        void CreateBufferWithScale(DataType dstType, SafeTensorItem &scale) {
+        void CreateBufferWithScale(DataType dstType, SafeTensorItem &scale, SafeTensorItem *scale2 = nullptr) {
             AssertInFastLLM(this->shape.size() >= 2 && scale.shape.size() >= 2,
                             "CreateBufferWithScale error: shape.size() should be >= 2.");
             bool isFp8 = this->dtype == "F8_E4M3";
-            bool isPackedFp4 = this->dtype == "I8";
+            bool isPackedFp4 = this->dtype == "I8" || this->dtype == "U8";
             if (!isFp8 && !isPackedFp4) {
-                ErrorInFastLLM("CreateBufferWithScale error: dtype should be FP8_E4M3 or packed FP4 I8");
+                ErrorInFastLLM("CreateBufferWithScale error: dtype should be FP8_E4M3 or packed FP4 I8/U8");
             }
             long long n64 = 1, ns64 = 1;
             for (int i = 0; i + 1 < (int)this->shape.size(); i++) {
@@ -460,7 +462,8 @@ namespace fastllm {
             }
             ClearBuffer();
 
-            if (dstType == DataType::FP8_E4M3 || dstType == DataType::NVFP4) {
+            if (dstType == DataType::FP8_E4M3 || dstType == DataType::NVFP4 ||
+                dstType == DataType::NVFP4_BLOCK_16 || dstType == DataType::NVFP4_BLOCK_16_E8M0) {
                 if (dstType == DataType::FP8_E4M3 && !isFp8) {
                     ErrorInFastLLM("CreateBufferWithScale error: packed FP4 cannot be loaded as FP8_E4M3.");
                 }
@@ -470,8 +473,77 @@ namespace fastllm {
                 if (dstType == DataType::NVFP4 && scale.dtype != "F8_E8M0") {
                     ErrorInFastLLM("CreateBufferWithScale error: NVFP4 scale should be F8_E8M0.");
                 }
+                if ((dstType == DataType::NVFP4_BLOCK_16 || dstType == DataType::NVFP4_BLOCK_16_E8M0) && !isPackedFp4) {
+                    ErrorInFastLLM("CreateBufferWithScale error: only packed FP4 I8/U8 can be loaded as NVFP4_BLOCK_16.");
+                }
                 this->blockK = blockN;
                 this->blockM = blockM;
+                if (dstType == DataType::NVFP4_BLOCK_16 || dstType == DataType::NVFP4_BLOCK_16_E8M0) {
+                    AssertInFastLLM(blockM == 16,
+                                    "CreateBufferWithScale error: NVFP4_BLOCK_16 requires blockM = 16.");
+                    AssertInFastLLM(scale.bytes == (size_t)ns * ms,
+                                    "CreateBufferWithScale error: NVFP4_BLOCK_16 scale bytes mismatch.");
+                    if (dstType == DataType::NVFP4_BLOCK_16 && scale.dtype != "F8_E4M3") {
+                        ErrorInFastLLM("CreateBufferWithScale error: NVFP4_BLOCK_16 scale should be F8_E4M3.");
+                    }
+                    if (dstType == DataType::NVFP4_BLOCK_16_E8M0 && scale.dtype != "F8_E8M0") {
+                        ErrorInFastLLM("CreateBufferWithScale error: NVFP4_BLOCK_16_E8M0 scale should be F8_E8M0.");
+                    }
+                    float scale2Value = 1.0f;
+                    if (scale2 != nullptr) {
+                        scale2->CreateBuffer(DataType::FLOAT32);
+                        AssertInFastLLM(scale2->len == 1,
+                                        "CreateBufferWithScale error: NVFP4 scale2 should be scalar.");
+                        scale2Value = ((float*)scale2->buffer)[0];
+                    }
+
+                    size_t blockBytes = dstType == DataType::NVFP4_BLOCK_16 ? 8 + sizeof(float) : 9;
+                    size_t scaleCols = (m - 1) / 16 + 1;
+                    size_t outputBytes = GetDataBytes(dstType, n, m);
+                    std::vector<uint8_t> packed(this->bytes);
+                    std::vector<uint8_t> scaleBytes(scale.bytes);
+                    FILE *fw = fopen(this->fileName.c_str(), "rb");
+#if defined(_WIN32) || defined(_WIN64)
+                    _fseeki64(fw, this->data_offsets[0], 0);
+#else
+                    fseek(fw, this->data_offsets[0], 0);
+#endif
+                    size_t ret = fread(packed.data(), 1, this->bytes, fw);
+                    fclose(fw);
+                    AssertInFastLLM(ret == this->bytes,
+                                    "CreateBufferWithScale error: read NVFP4_BLOCK_16 weight failed.");
+                    FILE *fs = fopen(scale.fileName.c_str(), "rb");
+#if defined(_WIN32) || defined(_WIN64)
+                    _fseeki64(fs, scale.data_offsets[0], 0);
+#else
+                    fseek(fs, scale.data_offsets[0], 0);
+#endif
+                    ret = fread(scaleBytes.data(), 1, scale.bytes, fs);
+                    fclose(fs);
+                    AssertInFastLLM(ret == scale.bytes,
+                                    "CreateBufferWithScale error: read NVFP4_BLOCK_16 scale failed.");
+
+                    buffer = new uint8_t[outputBytes];
+                    memset(buffer, 0, outputBytes);
+                    for (int i = 0; i < n; i++) {
+                        const uint8_t *srcRow = packed.data() + (size_t)i * packedM;
+                        uint8_t *dstRow = buffer + (size_t)i * scaleCols * blockBytes;
+                        for (size_t bj = 0; bj < scaleCols; bj++) {
+                            uint8_t *dstBlock = dstRow + bj * blockBytes;
+                            size_t srcOffset = bj * 8;
+                            size_t copyBytes = std::min((size_t)8, (size_t)packedM - srcOffset);
+                            memcpy(dstBlock, srcRow + srcOffset, copyBytes);
+                            uint8_t scaleByte = scaleBytes[(size_t)i * ms + bj];
+                            if (dstType == DataType::NVFP4_BLOCK_16_E8M0) {
+                                dstBlock[8] = scaleByte;
+                            } else {
+                                float curScale = fp8e4m3tofp32.dict[scaleByte] * scale2Value;
+                                memcpy(dstBlock + 8, &curScale, sizeof(float));
+                            }
+                        }
+                    }
+                    return;
+                }
                 size_t dataBytes = dstType == DataType::NVFP4 ? GetNVFP4WeightBytes(n, m) : (size_t)n * m;
                 size_t scaleBytes = dstType == DataType::NVFP4 ? scale.bytes : 0;
                 buffer = new uint8_t[dataBytes + scaleBytes];
@@ -765,14 +837,43 @@ namespace fastllm {
         }
     };
 
-    static bool IsPackedFP4Tensor(const SafeTensors &safeTensors, const std::string &name) {
+    static bool IsPackedFP4StorageDType(const std::string &dtype) {
+        return dtype == "I8" || dtype == "U8";
+    }
+
+    static bool TryGetPackedFP4DataType(const SafeTensors &safeTensors, const std::string &name,
+                                        DataType &dataType) {
         auto it = safeTensors.itmeDict.find(name);
-        if (it == safeTensors.itmeDict.end() || it->second.dtype != "I8") {
+        if (it == safeTensors.itmeDict.end() || !IsPackedFP4StorageDType(it->second.dtype)) {
             return false;
         }
         std::string scaleName = FindSafeTensorScaleTensorName(safeTensors, name);
         auto scaleIt = safeTensors.itmeDict.find(scaleName);
-        return scaleIt != safeTensors.itmeDict.end() && scaleIt->second.dtype == "F8_E8M0";
+        if (scaleIt == safeTensors.itmeDict.end()) {
+            return false;
+        }
+        if (scaleIt->second.dtype == "F8_E8M0") {
+            dataType = DataType::NVFP4;
+            return true;
+        }
+        if (scaleIt->second.dtype == "F8_E4M3") {
+            dataType = DataType::NVFP4_BLOCK_16;
+            return true;
+        }
+        return false;
+    }
+
+    static bool IsPackedFP4Tensor(const SafeTensors &safeTensors, const std::string &name) {
+        DataType dataType;
+        return TryGetPackedFP4DataType(safeTensors, name, dataType);
+    }
+
+    static void ResolvePackedFP4DataType(const SafeTensors &safeTensors, const std::string &name,
+                                         DataType &dataType) {
+        DataType packedDataType;
+        if (TryGetPackedFP4DataType(safeTensors, name, packedDataType)) {
+            dataType = packedDataType;
+        }
     }
 
     static bool IsSafeTensorQuantScaleTensorName(const SafeTensors &safeTensors,
@@ -780,7 +881,7 @@ namespace fastllm {
         auto isQuantTensor = [&](const std::string &candidate) {
             auto it = safeTensors.itmeDict.find(candidate);
             return it != safeTensors.itmeDict.end() &&
-                   (it->second.dtype == "F8_E4M3" || it->second.dtype == "I8");
+                   (it->second.dtype == "F8_E4M3" || IsPackedFP4StorageDType(it->second.dtype));
         };
         if (StringEndWith(name, "_scale_inv")) {
             return isQuantTensor(name.substr(0, name.size() - strlen("_scale_inv")));
@@ -793,6 +894,12 @@ namespace fastllm {
         }
         if (StringEndWith(name, ".scale")) {
             return isQuantTensor(name.substr(0, name.size() - strlen(".scale")) + ".weight");
+        }
+        if (StringEndWith(name, ".weight_scale")) {
+            return isQuantTensor(name.substr(0, name.size() - strlen(".weight_scale")) + ".weight");
+        }
+        if (StringEndWith(name, ".weight_scale_2")) {
+            return isQuantTensor(name.substr(0, name.size() - strlen(".weight_scale_2")) + ".weight");
         }
         return false;
     }
@@ -807,6 +914,24 @@ namespace fastllm {
             std::string prefix = tensorName.substr(0, tensorName.size() - strlen(".weight"));
             candidates.push_back(prefix + ".scale_inv");
             candidates.push_back(prefix + ".scale");
+            candidates.push_back(prefix + ".weight_scale");
+        }
+        for (auto &candidate : candidates) {
+            if (safeTensors.itmeDict.find(candidate) != safeTensors.itmeDict.end()) {
+                return candidate;
+            }
+        }
+        return "";
+    }
+
+    static std::string FindSafeTensorScale2TensorName(const SafeTensors &safeTensors,
+                                                      const std::string &tensorName) {
+        std::vector<std::string> candidates = {
+            tensorName + "_scale_2",
+        };
+        if (StringEndWith(tensorName, ".weight")) {
+            std::string prefix = tensorName.substr(0, tensorName.size() - strlen(".weight"));
+            candidates.push_back(prefix + ".weight_scale_2");
         }
         for (auto &candidate : candidates) {
             if (safeTensors.itmeDict.find(candidate) != safeTensors.itmeDict.end()) {
@@ -917,7 +1042,7 @@ namespace fastllm {
     static void SetDiskWeightMeta(Data &weight, const SafeTensorItem &tensor, DataType targetDataType,
                                   SafeTensorItem *scaleTensor = nullptr) {
         DataType sourceDataType;
-        if (tensor.dtype == "I8" && targetDataType == DataType::NVFP4) {
+        if (IsPackedFP4StorageDType(tensor.dtype) && targetDataType == DataType::NVFP4) {
             sourceDataType = DataType::NVFP4;
         } else if (!GetDiskSourceDataType(tensor.dtype, sourceDataType)) {
             ErrorInFastLLM("Disk MoE only supports F32/F16/BF16/FP8/NVFP4 safetensors: " + weight.name + "\n");
@@ -2284,9 +2409,7 @@ if (false) {
                     if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
                         dataType = DataType::FLOAT16;
                     }
-                    if (IsPackedFP4Tensor(safeTensors, tensorName)) {
-                        dataType = DataType::NVFP4;
-                    }
+                    ResolvePackedFP4DataType(safeTensors, tensorName, dataType);
                 }
 
                 if (dataType >= DATA_AUTO_NONE) {
@@ -2297,13 +2420,9 @@ if (false) {
                     if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
                         dataType = DataType::FLOAT16;
                     }
-                    if (IsPackedFP4Tensor(safeTensors, tensorName)) {
-                        dataType = DataType::NVFP4;
-                    }
+                    ResolvePackedFP4DataType(safeTensors, tensorName, dataType);
                 }
-                if (IsPackedFP4Tensor(safeTensors, tensorName)) {
-                    dataType = DataType::NVFP4;
-                }
+                ResolvePackedFP4DataType(safeTensors, tensorName, dataType);
                 if (tensor.dtype == "I64") {
                     dataType = DataType::INT32PARAM;
                 }
@@ -2400,9 +2519,7 @@ if (false) {
                             if (tensor.dtype != "F8_E4M3" && dataType == DataType::FP8_E4M3) {
                                 dataType = DataType::FLOAT16;
                             }
-                            if (IsPackedFP4Tensor(safeTensors, tensorName)) {
-                                dataType = DataType::NVFP4;
-                            }
+                            ResolvePackedFP4DataType(safeTensors, tensorName, dataType);
                             if (tensor.dtype == "I64") {
                                 dataType = DataType::INT32PARAM;
                                 oriDataType = DataType::INT32PARAM;
@@ -2429,8 +2546,9 @@ if (false) {
                                 oriDataType = DataType::FP8_E4M3;
                                 scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensorName);
                             }
-                            if (IsPackedFP4Tensor(safeTensors, tensorName)) {
-                                oriDataType = DataType::NVFP4;
+                            DataType packedFp4DataType;
+                            if (TryGetPackedFP4DataType(safeTensors, tensorName, packedFp4DataType)) {
+                                oriDataType = packedFp4DataType;
                                 scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensorName);
                             }
 
@@ -2460,15 +2578,17 @@ if (false) {
                                     if (scaleTensorName != "") {
                                         if (tensor.dtype == "F8_E4M3") {
                                             diskDataType = DataType::FP8_E4M3;
-                                        } else if (IsPackedFP4Tensor(safeTensors, tensorName)) {
-                                            diskDataType = DataType::NVFP4;
+                                        } else if (TryGetPackedFP4DataType(safeTensors, tensorName, packedFp4DataType)) {
+                                            diskDataType = packedFp4DataType;
                                         } else {
                                             ErrorInFastLLM("Disk MoE only supports scaled safetensors for FP8/NVFP4 expert weight: " + weightName + "\n");
                                         }
                                         scaleTensor = &safeTensors.itmeDict[scaleTensorName];
-                                        AssertInFastLLM(scaleTensor->dtype == "F32" || scaleTensor->dtype == "BF16" || scaleTensor->dtype == "F8_E8M0",
-                                                        "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
-                                        if (!(diskDataType == DataType::NVFP4 && scaleTensor->dtype == "F8_E8M0")) {
+                                        AssertInFastLLM(scaleTensor->dtype == "F32" || scaleTensor->dtype == "BF16" ||
+                                                        scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "F8_E4M3",
+                                                        "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0 or F8_E4M3.");
+                                        if (!((diskDataType == DataType::NVFP4 && scaleTensor->dtype == "F8_E8M0") ||
+                                              (diskDataType == DataType::NVFP4_BLOCK_16 && scaleTensor->dtype == "F8_E4M3"))) {
                                             scaleTensor->CreateBuffer(DataType::FLOAT32);
                                         }
                                     }
@@ -2482,12 +2602,23 @@ if (false) {
                                     tensor.CreateBuffer(oriDataType);
                                 } else if(!isAwqModel) {
                                     auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
-                                    AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" || scaleTensor.dtype == "F8_E8M0"
-                                        , "Tensor scale error: scale's dtype should be F32, BF16 or F8_E8M0.");
-                                    if (!(oriDataType == DataType::NVFP4 && scaleTensor.dtype == "F8_E8M0")) {
+                                    AssertInFastLLM(scaleTensor.dtype == "F32" || scaleTensor.dtype == "BF16" ||
+                                                    scaleTensor.dtype == "F8_E8M0" || scaleTensor.dtype == "F8_E4M3"
+                                        , "Tensor scale error: scale's dtype should be F32, BF16, F8_E8M0 or F8_E4M3.");
+                                    bool keepScalePacked = (oriDataType == DataType::NVFP4 && scaleTensor.dtype == "F8_E8M0") ||
+                                                           (oriDataType == DataType::NVFP4_BLOCK_16 && scaleTensor.dtype == "F8_E4M3");
+                                    if (!keepScalePacked) {
                                         scaleTensor.CreateBuffer(DataType::FLOAT32);
                                     }
-                                    tensor.CreateBufferWithScale(oriDataType, scaleTensor);
+                                    SafeTensorItem *scale2Tensor = nullptr;
+                                    std::string scale2TensorName = FindSafeTensorScale2TensorName(safeTensors, tensorName);
+                                    if (oriDataType == DataType::NVFP4_BLOCK_16 && scale2TensorName != "") {
+                                        scale2Tensor = &safeTensors.itmeDict[scale2TensorName];
+                                    }
+                                    tensor.CreateBufferWithScale(oriDataType, scaleTensor, scale2Tensor);
+                                    if (scale2Tensor != nullptr) {
+                                        scale2Tensor->ClearBuffer();
+                                    }
                                 } else {
                                     auto &scaleTensor = safeTensors.itmeDict[scaleTensorName];
                                     auto &qzeroTensor = safeTensors.itmeDict[qzeroTensorName];
