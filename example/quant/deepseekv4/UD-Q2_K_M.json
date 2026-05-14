@@ -7,7 +7,7 @@
     {
         "key" : "^((layers|mtp)\\.[0-9]+\\.attn\\.(wq_a|wq_b|wkv|wo_b)|layers\\.[0-9]+\\.attn\\.indexer\\.wq_b|mtp\\.[0-9]+\\.(e_proj|h_proj))\\.weight$",
         "dtype" : "ggml_q4_k",
-        "comment": "keep original FP8 non-expert weights in FP8"
+        "comment": "keep original FP8 non-expert weights in ggml_q4_k"
     },
     {
         "key" : "^(layers|mtp)\\.[0-9]+\\.ffn\\.experts\\.[0-9]+\\.w[13]\\.weight$",
@@ -21,7 +21,7 @@
     },
     {
         "key" : "^(layers|mtp)\\.[0-9]+\\.ffn\\.shared_experts\\.w[123]\\.weight$",
-        "dtype" : "ggml_q4_k",
+        "dtype" : "ggml_q2_k",
         "comment": "keep original FP8 shared experts in FP8"
     }
 ]
