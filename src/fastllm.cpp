@@ -1681,7 +1681,7 @@ namespace fastllm {
             return;
         this->expansionSize = 0;
         this->expansionBytes = 0;
-        if (this->dataDevice == DataDevice::CPU) {
+        if (this->cpuData != nullptr) {
 #ifdef USE_MMAP
             if (this->name.empty())
                 delete[] this->cpuData;
@@ -1689,18 +1689,17 @@ namespace fastllm {
             delete[] this->cpuData;
 #endif
             this->cpuData = nullptr;
-        } else if (this->dataDevice == DataDevice::CUDA) {
+        }
 #ifdef USE_CUDA
+        if (this->cudaData != nullptr) {
             if (this->directMemory) {
                 FastllmCudaDirectFree(this->cudaData);
             } else {
                 FastllmCudaFree(this->cudaData);
             }
             this->cudaData = nullptr;
-#else
-            ErrorInFastLLM("Error: cuda is not supported.\n");
-#endif
         }
+#endif
     }
 
     void Data::Allocate() {
