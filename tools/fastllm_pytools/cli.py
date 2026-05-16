@@ -40,11 +40,16 @@ def save_defaults_to_json(parser, filename):
     print("Create config to -> \"" + filename + "\"")
 
 def args_parser():
-    parser = argparse.ArgumentParser(description = "fastllm")
+    global_shared_parser = make_normal_parser("fastllm", add_help = False,
+                                              include_model = False,
+                                              suppress_defaults = True)
+    parser = argparse.ArgumentParser(description = "fastllm",
+                                     parents = [global_shared_parser])
     subparsers = parser.add_subparsers(dest='command', help='子命令')
 
     # 创建共享的解析器
-    shared_parser = make_normal_parser("fastllm", add_help = False)
+    shared_parser = make_normal_parser("fastllm", add_help = False,
+                                       suppress_defaults = True)
 
     # 下载解析器
     from ftllm.download import make_download_parser
@@ -83,8 +88,17 @@ def args_parser():
 
     return parser
 
+
+def parse_args(argv = None):
+    args = args_parser().parse_args(argv)
+    shared_defaults = vars(make_normal_parser("fastllm", add_help = False).parse_args([]))
+    for key, value in shared_defaults.items():
+        if not hasattr(args, key):
+            setattr(args, key, value)
+    return args
+
 def main():
-    args = args_parser().parse_args()
+    args = parse_args()
     if (args.version):
         from . import __version__
         print("ftllm version: " + __version__)
