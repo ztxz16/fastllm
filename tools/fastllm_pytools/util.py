@@ -302,7 +302,7 @@ def make_normal_llm_model(args):
         llm.set_page_size(args.page_size)
     if (hasattr(args, 'gpu_mem_ratio')):
         llm.set_gpu_mem_ratio(args.gpu_mem_ratio)
-    if (hasattr(args, 'cuda_slab')):
+    if (hasattr(args, 'cuda_slab') and hasattr(llm, 'set_cuda_slab')):
         llm.set_cuda_slab(args.cuda_slab)
     graph = None
     if (args.custom != ""):
