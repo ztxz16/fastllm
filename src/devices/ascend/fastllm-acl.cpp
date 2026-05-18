@@ -58,7 +58,22 @@ aclrtContext getFastllmAclContextHandle(int32_t id) {
 
 static int32_t curDeviceId = -1;
 
-static aclrtStream stream = nullptr;
+static std::map<int32_t, aclrtStream> FastllmAclStreamMap;
+aclrtStream getFastllmAclStream(int32_t id) {
+    // aclrtGetDevice(&id);
+    auto it = FastllmAclStreamMap.find(id);
+    if (it != FastllmAclStreamMap.end()) {
+        return it->second;
+    }
+    aclrtStream stream = nullptr;
+    aclError state = aclrtCreateStream(&stream);
+    if (state != ACL_SUCCESS) {
+        printf("Error: AscendCL error when create stream! state %d.\n", state);
+    } else {
+        FastllmAclStreamMap[id] = stream;
+    }
+    return stream;
+}
 
 static thread_local bool aclInitialized = false;
 
@@ -75,20 +90,22 @@ static inline void EnsureAclContext() {
 }
 
 void FastllmAclFinalize() {
-    if (stream != nullptr) {
-        aclError state = aclrtSynchronizeStream(stream);
-        state = aclrtDestroyStream(stream);
+    aclError state = ACL_SUCCESS;
+    for (auto &it : FastllmAclStreamMap) {
+        state = aclrtSetCurrentContext(getFastllmAclContextHandle(it.first));
+        state = aclrtSynchronizeStream(it.second);
+        state = aclrtDestroyStream(it.second);
         checkAclError("Error: AscendCL error when destroy stream!", state);
-        stream = nullptr;
     }
+    FastllmAclStreamMap.clear();
     for (auto &it : FastllmAclContextMap) {
-        aclError state = aclrtDestroyContext(it.second);
+        state = aclrtDestroyContext(it.second);
         checkAclError("Error: AscendCL error when destory context!", state);
         // state = aclrtResetDevice(it.first);
         // checkAclError("Error: Ascend CL reset device failed", state);
     }
     FastllmAclContextMap.clear();
-    aclError state = aclFinalize();
+    state = aclFinalize();
     checkAclError("Error: AscendCL error when finalize!", state);
 }
 
@@ -97,17 +114,16 @@ void FastllmAclSetDevice(int32_t device_id) {
     aclError state;
     if (curDeviceId == device_id)
         return;
-    if (curDeviceId != -1 || device_id == -1) {
-        state = aclrtDestroyStream(&stream);
-        checkAclError("Error: AscendCL error when destroy stream!", state);
+    if (curDeviceId != -1 && device_id != -1) {
+        state = aclrtSynchronizeStream(FastllmAclStreamMap[curDeviceId]);
+        checkAclError("Error: AscendCL error when Synchronize stream!", state);
     }
     if (device_id == -1)
         device_id = curDeviceId;
     aclrtContext context = getFastllmAclContextHandle(device_id);
     state = aclrtSetCurrentContext(context);
     checkAclError("Error: AscendCL error when set device!", state);
-    state = aclrtCreateStream(&stream);
-    checkAclError("Error: AscendCL error when create stream!", state);
+    aclrtStream stream = getFastllmAclStream(device_id);
     curDeviceId = device_id;
     aclInitialized = true;
 }
@@ -245,6 +261,7 @@ void FastllmAclFree(void *ret) {
     if (buffersMap.empty())
         return;
     aclError state = ACL_SUCCESS;
+    EnsureAclContext();
     for (auto &it: buffersMap) {
         if (noBusyCnt[it.first] > 1024 * 1024 * 1024) {
             auto &buffers = it.second;
@@ -528,10 +545,7 @@ bool FastllmAclExecuteAfterInit(std::string name, std::vector<aclTensorDesc *> &
                                 std::vector<aclDataBuffer *> &outputBuffers, aclopAttr *opAttr) {
     aclError state = ACL_SUCCESS;
     EnsureAclContext();
-    if (stream == nullptr) {
-        state = aclrtCreateStream(&stream);
-        checkAclError("Error: AscendCL error when creating stream!", state);
-    }
+    aclrtStream stream = getFastllmAclStream(curDeviceId);
     state = aclopExecuteV2(name.c_str(),
                            inputTensors.size(),
                            inputTensors.data(),
@@ -547,6 +561,22 @@ bool FastllmAclExecuteAfterInit(std::string name, std::vector<aclTensorDesc *> &
         return false;
     }
     checkAclErrorFormat("Error: AscendCL error: execute op [%s] failed.", state, name.c_str());
+    if (state != ACL_SUCCESS) {
+        for (aclTensorDesc* tensor : inputTensors) {
+            printf("%s %d: ", aclGetTensorDescName(tensor), aclGetTensorDescType(tensor));
+            size_t dims = aclGetTensorDescNumDims(tensor);
+            if (dims != ACL_UNKNOWN_RANK) {
+                int64_t dimSize = 0;
+                for (size_t i=0; i<dims; i++) {
+                    state = aclGetTensorDescDimV2(tensor, i, &dimSize);
+                    printf("%lu ", dimSize);
+                }
+            }
+            printf("\n");
+        }
+    }
+    if (state != ACL_SUCCESS)
+        return false;
     state = aclrtSynchronizeStream(stream);
     checkAclError("Error: AscendCL error when synchronize stream.", state);
     return (state == ACL_SUCCESS);
@@ -557,10 +587,8 @@ bool FastllmAclExecute(std::string name, std::vector<aclTensorDesc *> &inputTens
                        std::vector<aclTensorDesc *> &outputTensors,
                        std::vector<aclDataBuffer *> &outputBuffers, aclopAttr* opAttr) {
     aclError state = ACL_SUCCESS;
-    if (stream == nullptr) {
-        state = aclrtCreateStream(&stream);
-        checkAclError("Error: AscendCL error when creating stream!", state);
-    }
+    EnsureAclContext();
+    aclrtStream stream = getFastllmAclStream(curDeviceId);
     state = aclopCompileAndExecuteV2(name.c_str(),
                                      inputTensors.size(),
                                      inputTensors.data(),

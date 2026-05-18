@@ -156,7 +156,7 @@ namespace fastllm {
                 }
 #endif
 #ifdef USE_ASCEND_NPU
-                if (device->deviceType == "npu" && device->deviceIds.size() > 0) {
+                if (device->deviceType == "acl" && device->deviceIds.size() > 0) {
                     npu::FastllmAclSetDevice(device->deviceIds[0]);
                 }
 #endif

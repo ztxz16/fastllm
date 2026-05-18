@@ -1187,7 +1187,7 @@ namespace fastllm {
 #endif
         } else if (this->dataDevice == DataDevice::NPU) {
 #ifdef USE_ASCEND_NPU
-            npu::FastllmAclSetDevice(0);
+            // npu::FastllmAclSetDevice(0);
             if (this->directMemory) {
                 this->deviceData = npu::FastllmAclDirectMalloc(this->expansionBytes);
             } else {
