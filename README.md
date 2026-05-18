@@ -115,6 +115,15 @@ ftllm webui Qwen/Qwen3-0.6B
 ftllm server Qwen/Qwen3-0.6B
 ```
 
+#### 终端部署向导:
+
+```
+ftllm
+ftllm tui
+```
+
+`ftllm` 不带参数时会进入终端部署向导，等价于 `ftllm tui`。它会保存部署配置到本机用户配置目录，首页可通过键盘选择已保存命令进行新建、编辑、启动或删除。部署表单默认只显示基础配置，更多参数放在高级选项中；模型路径必须填写为已存在的本地目录，可按 Tab 补全目录；也可以从常用 ModelScope 模型列表中选择模型并下载到指定目录。
+
 ## 使用指南
 
 ### 1. 如何启动模型
@@ -125,6 +134,7 @@ ftllm server Qwen/Qwen3-0.6B
 ftllm run Qwen/Qwen3-0.6B # 启动本地对话
 ftllm webui Qwen/Qwen3-0.6B # 启动WebUI
 ftllm server Qwen/Qwen3-0.6B # 启动API Server
+ftllm # 通过终端命令列表选择/编辑/启动部署配置，模型路径必须是已存在目录
 ```
 
 根据你需要开启的服务，选择相应的命令。以 `server` 命令为例，格式如下：

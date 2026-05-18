@@ -53,6 +53,10 @@ def args_parser():
     # 打开ui界面
     ui_parser_ = subparsers.add_parser('ui', parents = [shared_parser], help = 'ui模式')
 
+    # 打开终端部署向导
+    tui_parser_ = subparsers.add_parser('tui', help = '终端部署向导')
+    tui_parser_.add_argument('--plain', action = 'store_true', help = '使用普通问答模式，不启用curses界面')
+
     # 创建chat子命令（使用共享解析器）
     chat_parser_ = subparsers.add_parser('chat', parents = [shared_parser], help = '聊天模式')
 
@@ -90,10 +94,16 @@ def main():
         print("ftllm version: " + __version__)
         return
     # 根据不同的子命令执行不同的操作
-    if args.command == 'ui':
+    if args.command is None:
+        from .tui import FastllmTUI
+        raise SystemExit(FastllmTUI())
+    elif args.command == 'ui':
         from .ui import FastllmStartUI
         FastllmStartUI()
-    if args.command == 'config':
+    elif args.command == 'tui':
+        from .tui import FastllmTUI
+        raise SystemExit(FastllmTUI(plain = args.plain))
+    elif args.command == 'config':
         file = args.file
         if not(file) or file == '':
             file = "config.json"
