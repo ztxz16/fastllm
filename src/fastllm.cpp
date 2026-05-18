@@ -1688,7 +1688,14 @@ namespace fastllm {
                 this->cudaData = FastllmCudaMalloc(this->expansionBytes);
             }
             if (this->cudaData == nullptr) {
-                ErrorInFastLLM("Error: cuda malloc failed in Data::MallocSpace, maybe no enough GPU memory.\n");
+                std::string msg = "Error: cuda malloc failed in Data::MallocSpace. requestBytes = " +
+                                  std::to_string(this->expansionBytes) +
+                                  ", dataType = " + GetDataTypeName(this->dataType) + ", dims = [";
+                for (int i = 0; i < (int)this->dims.size(); i++) {
+                    msg += (i == 0 ? "" : ", ") + std::to_string(this->dims[i]);
+                }
+                msg += "].\n";
+                ErrorInFastLLM(msg);
             }
             if (this->multiDeviceData && this->tpLayout == TP_LAYOUT_NONE) {
                 for (auto it : this->multiDeviceDatas) {

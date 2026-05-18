@@ -254,7 +254,7 @@ namespace fastllm {
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        output.Allocate();
+        output.Allocate(false);
         if (input.dataType == DataType::FLOAT16) {
             FastllmCudaCopyFromDeviceToDevice(output.cudaData, input.cudaData, input.GetBytes());
             return;
@@ -283,7 +283,7 @@ namespace fastllm {
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        output.Allocate();
+        output.Allocate(false);
         if (input.dataType == DataType::FLOAT32) {
             FastllmCudaCopyFromDeviceToDevice(output.cudaData, input.cudaData, input.GetBytes());
             return;
@@ -344,7 +344,7 @@ namespace fastllm {
                            const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        output.Allocate();
+        output.Allocate(false);
         if (input.dataType == DataType::BFLOAT16) {
             FastllmCudaCopyFromDeviceToDevice(output.cudaData, input.cudaData, input.GetBytes());
             return;
@@ -1549,7 +1549,7 @@ namespace fastllm {
                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        output.Allocate();
+        output.Allocate(false);
 
         AssertInFastLLM(input.dataType == DataType::FLOAT32 || input.dataType == DataType::FLOAT16, 
                         "Softmax error: Data's type should be float32 or float16.\n");
@@ -1922,8 +1922,8 @@ namespace fastllm {
         bool needNorm = intParams.find("needNorm") != intParams.end() ? (intParams.find("needNorm")->second != 0) : false;
         float routeScale = floatParams.find("routeScale") != floatParams.end() ? floatParams.find("routeScale")->second : 1.0f;
         
-        index.Allocate();
-        score.Allocate();
+        index.Allocate(false);
+        score.Allocate(false);
         
         bool success = FastllmCudaSelectExpert(logits, gateBias, index, score, topk, needNorm, routeScale);
         if (!success) {

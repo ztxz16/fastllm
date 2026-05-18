@@ -25,6 +25,7 @@ void showError(cudaError_t result, char const* const message, const char* const 
     if (cudaSuccess != result) {
         printf("%s\n  CUDA error = %d, %s at %s:%d\n  '%s'\n",
             message, result, cudaGetErrorName(result), file, line, cudaGetErrorString(result));
+        fflush(stdout);
     }  
 }
 
@@ -1559,10 +1560,14 @@ void *FastllmCudaPrepareInput(const fastllm::Data &input) {
     if (input.dataDevice == fastllm::DataDevice::CUDA) {
         ret = (void*)input.cudaData;
     } else {
-        ret = (void*)(input.expansionBytes);
+        ret = FastllmCudaMalloc(input.expansionBytes);
+        if (ret == nullptr) {
+            return nullptr;
+        }
         auto state = cudaMemcpy(ret, input.cpuData, input.expansionBytes, cudaMemcpyHostToDevice);
         if (cudaSuccess != state) {
             checkCudaErrors("Error: CUDA error when copy from memory to GPU!", state);
+            FastllmCudaFree(ret);
             return nullptr;
         }
     }
@@ -2014,7 +2019,12 @@ void * FastllmCudaMalloc(size_t size) {
         void * ret;
         state = cudaMalloc(&ret, size);
         if (cudaSuccess != state) {
-            printf("Error: CUDA error when allocating %lu MB memory! maybe there's no enough memory left on device.", size >> 20);
+            size_t freeMem = 0, totalMem = 0;
+            cudaMemGetInfo(&freeMem, &totalMem);
+            printf("Error: CUDA error when allocating %lu MB memory on device %d! "
+                   "gpuFree: %lu MB / %lu MB.\n",
+                   size >> 20, id, freeMem >> 20, totalMem >> 20);
+            fflush(stdout);
             checkCudaErrors("", state);
             return nullptr;
         }
@@ -2041,7 +2051,12 @@ void * FastllmCudaMalloc(size_t size) {
     void * ret;
     state = cudaMalloc(&ret, size);
     if (cudaSuccess != state) {
-        printf("Error: CUDA error when allocating %lu KB memory! maybe there's no enough memory left on device.", size >> 10);
+        size_t freeMem = 0, totalMem = 0;
+        cudaMemGetInfo(&freeMem, &totalMem);
+        printf("Error: CUDA error when allocating %lu KB memory on device %d! "
+               "gpuFree: %lu MB / %lu MB.\n",
+               size >> 10, id, freeMem >> 20, totalMem >> 20);
+        fflush(stdout);
         checkCudaErrors("", state);
         return nullptr;
     }
@@ -2237,21 +2252,56 @@ void FastllmCudaCopyFromDeviceToDevice(void *dst, void *src, size_t size) {
 }
 
 void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src, size_t size) {
+    if (size == 0 || dst == src) {
+        return;
+    }
+    int oriId = FastllmCudaGetDevice();
     int canPeerAccess = 0;
-    cudaError_t state = cudaDeviceCanAccessPeer(&canPeerAccess, srcId, dstId);
+    cudaError_t state = cudaDeviceCanAccessPeer(&canPeerAccess, dstId, srcId);
+    if (state != cudaSuccess) {
+        cudaGetLastError();
+        canPeerAccess = 0;
+    }
+    const char *failedStage = "cudaMemcpyPeer";
     if (canPeerAccess) {
         state = cudaMemcpyPeer(dst, dstId, src, srcId, size);
-    } else {
-        uint8_t *cpuData = new uint8_t[size];
-        state = cudaSetDevice(srcId);
-        state = cudaMemcpy(cpuData, src, size, cudaMemcpyDeviceToHost);
+        if (state == cudaSuccess) {
+            FastllmCudaSetDevice(dstId);
+            DeviceSync();
+            FastllmCudaSetDevice(oriId);
+            return;
+        }
+        cudaGetLastError();
+    }
 
+    uint8_t *cpuData = new uint8_t[size];
+    state = cudaSetDevice(srcId);
+    failedStage = "cudaSetDevice(src)";
+    if (state == cudaSuccess) {
+        state = cudaMemcpy(cpuData, src, size, cudaMemcpyDeviceToHost);
+        failedStage = "cudaMemcpyDeviceToHost";
+    }
+    if (state == cudaSuccess) {
         state = cudaSetDevice(dstId);
+        failedStage = "cudaSetDevice(dst)";
+    }
+    if (state == cudaSuccess) {
         state = cudaMemcpy(dst, cpuData, size, cudaMemcpyHostToDevice);
-        delete[] cpuData;
+        failedStage = "cudaMemcpyHostToDevice";
+    }
+    delete[] cpuData;
+    if (state != cudaSuccess) {
+        printf("Error: CUDA copy Between GPUs failed in %s. dstId = %d, srcId = %d, "
+               "dst = %p, src = %p, size = %lu, canPeerAccess = %d.\n",
+               failedStage, dstId, srcId, dst, src, size, canPeerAccess);
+        fflush(stdout);
     }
     checkCudaErrors("Error: CUDA error when copy Between GPUs!", state);
-    DeviceSync();
+    if (state == cudaSuccess) {
+        FastllmCudaSetDevice(dstId);
+        DeviceSync();
+    }
+    FastllmCudaSetDevice(oriId);
 }
 
 void FastllmCudaMemcpy2DDeviceToDevice(void * 	dst, size_t 	dpitch, const void * 	src,
