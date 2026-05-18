@@ -10,6 +10,9 @@
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #endif
+#ifdef USE_ASCEND_NPU
+#include "executor.h"
+#endif
 
 namespace fastllm {
     int ResponseContextDict::CreateHandle() {
@@ -1307,7 +1310,24 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         } else {
             ErrorInFastLLM("SetDataType Error: datatype should be float32 or float16");
         }
+#ifdef USE_ASCEND_NPU
+        DataType oriDataType = this->dataType;
+#endif
         this->dataType = dataType;
+        if (lastKeyValues != nullptr) {
+            lastPrompt = "";
+            lastPromptTokens = 0;
+            delete lastKeyValues;
+            lastKeyValues = nullptr;
+        }
+#ifdef USE_ASCEND_NPU
+        if (dataType != oriDataType) {
+            Executor *executor = (Executor *) GetExecutor();
+            executor->setWarmUpMode(true);
+            WarmUp();
+            executor->setWarmUpMode(false);
+        }
+#endif
     }
 
     void basellm::UpdateRotaryPtr(Data **sinDataPtr, Data **cosDataPtr, const std::string &device) {

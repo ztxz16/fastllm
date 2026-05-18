@@ -18,6 +18,7 @@
 void signal_handler(int signal) {
     if (signal == SIGINT) {
         printf("into exit\n");
+        fastllm::Finalize();
         exit(0);
     }
 }
