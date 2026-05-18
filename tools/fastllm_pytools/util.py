@@ -29,6 +29,21 @@ def _uses_cuda_device(device) -> bool:
         return False
     return "cuda" in str(device).lower() or str(device).lower().startswith("cudapp=")
 
+def _uses_multicuda_device(device) -> bool:
+    if not device:
+        return False
+    return "multicuda" in str(device).lower()
+
+def apply_page_size_default(args):
+    if (getattr(args, "page_size", -1) <= 0 and
+        (_uses_multicuda_device(getattr(args, "device", "")) or
+         _uses_multicuda_device(getattr(args, "moe_device", "")))):
+        try:
+            args.page_size = int(os.environ.get("FASTLLM_MULTICUDA_PAGE_SIZE", "16"))
+        except:
+            args.page_size = 16
+    return args
+
 def _is_moe_architecture(architecture: str, model_type: str = "", text_model_type: str = "") -> bool:
     return (architecture in [
         "DeepseekV3ForCausalLM",
@@ -70,7 +85,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument("--cuda_shared_expert", "--cuda_se", type = str, default = "true", help = "是否使用cuda来执行共享专家")
     parser.add_argument("--enable_amx", "--amx", type = str, default = "false", help = "是否开启amx加速")
     parser.add_argument("--tokens", type = int, default = -1, help = "设置总的token数量（用于计算paged cache的最大页数）")
-    parser.add_argument("--page_size", type = int, default = 128, help = "设置paged cache每页的大小（token数）")
+    parser.add_argument("--page_size", type = int, default = -1, help = "设置paged cache每页的大小（token数），默认multicuda为16，其它设备使用后端默认值")
     parser.add_argument("--gpu_mem_ratio", type = float, default = 0.9, help = "GPU显存使用比例，如0.9表示使用90%%的显存")
     parser.add_argument("--cuda_slab", type = int, default = 0, help = "CUDA模型权重slab大小（MB），0表示关闭")
     
@@ -298,6 +313,7 @@ def make_normal_llm_model(args):
         llm.set_enable_amx(True)
     if (args.tokens > 0):
         llm.set_max_tokens(args.tokens)
+    apply_page_size_default(args)
     if (args.page_size > 0):
         llm.set_page_size(args.page_size)
     if (hasattr(args, 'gpu_mem_ratio')):

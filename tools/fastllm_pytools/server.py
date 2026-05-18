@@ -15,6 +15,7 @@ from .openai_server.fastllm_reranker import FastLLmReranker
 from .openai_server.fastllm_model import FastLLmModel
 from .util import make_normal_parser
 from .util import add_server_args
+from .util import apply_page_size_default
 global fastllm_completion
 global fastllm_embed
 global fastllm_reranker
@@ -55,7 +56,7 @@ def set_ulimit(target_soft_limit: int = 65535):
 def parse_args():
     parser = make_normal_parser("OpenAI-compatible API server")
     add_server_args(parser)
-    return parser.parse_args()
+    return apply_page_size_default(parser.parse_args())
 
 app = fastapi.FastAPI()
 # 设置允许的请求来源, 生产环境请做对应变更
@@ -221,6 +222,7 @@ def fastllm_server(args):
     if dev_mode_enabled:
         logging.info("Development mode enabled - conversation management APIs are active")
     
+    apply_page_size_default(args)
     init_logging()
     logging.info(args)
     from .util import make_normal_llm_model
