@@ -50,9 +50,6 @@ def args_parser():
     from ftllm.download import make_download_parser
     download_parser = make_download_parser(add_help = False)
 
-    # 打开ui界面
-    ui_parser_ = subparsers.add_parser('ui', parents = [shared_parser], help = 'ui模式')
-
     # 打开终端部署向导
     tui_parser_ = subparsers.add_parser('tui', help = '终端部署向导')
     tui_parser_.add_argument('--plain', action = 'store_true', help = '使用普通问答模式，不启用curses界面')
@@ -97,9 +94,6 @@ def main():
     if args.command is None:
         from .tui import FastllmTUI
         raise SystemExit(FastllmTUI())
-    elif args.command == 'ui':
-        from .ui import FastllmStartUI
-        FastllmStartUI()
     elif args.command == 'tui':
         from .tui import FastllmTUI
         raise SystemExit(FastllmTUI(plain = args.plain))
