@@ -54,4 +54,28 @@ ftllm server fastllm/DeepSeek-V4-Flash --device cuda --moe_device "{'multicuda:0
 
 这样能进一步提升decode速度
 
+## multicuda调优环境变量
+
+multicuda会为每张CUDA卡维护专用worker线程来执行多卡任务，减少通用线程池调度和线程唤醒开销。下面这些环境变量可以用来排查或调优专用worker行为：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `FASTLLM_DISABLE_MULTICUDA_DEDICATED_WORKERS` | 未设置 | 设为`1`、`true`等有效值时关闭multicuda专用worker，回退到通用线程池执行多卡任务。设为`0`、`false`或`off`等价于未设置。 |
+| `FASTLLM_MULTICUDA_WORKER_CPU_BASE` | `0` | 专用worker绑核的起始CPU编号。第`i`个worker会绑定到`(CPU_BASE + i) % CPU数量`。 |
+| `FASTLLM_MULTICUDA_WORKER_SPIN_ITERS` | `262144` | worker没有新任务时的忙等轮数，超过后进入条件变量等待。数值越大，任务延迟可能更低，但空闲CPU占用更高；设为`0`可以尽量减少忙等。 |
+
+例如希望worker从CPU 16开始绑核，并减少空闲忙等：
+
+```
+export FASTLLM_MULTICUDA_WORKER_CPU_BASE=16
+export FASTLLM_MULTICUDA_WORKER_SPIN_ITERS=4096
+ftllm server fastllm/DeepSeek-V4-Flash --device cuda --moe_device "{'multicuda:0,1':15,'numa':85}"
+```
+
+如果怀疑专用worker导致调度或绑核问题，可以临时关闭：
+
+```
+export FASTLLM_DISABLE_MULTICUDA_DEDICATED_WORKERS=1
+ftllm server fastllm/DeepSeek-V4-Flash --device cuda --moe_device "{'multicuda:0,1':15,'numa':85}"
+```
 

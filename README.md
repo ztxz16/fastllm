@@ -247,6 +247,8 @@ ftllm server deepseek-ai/DeepSeek-V3-0324 --dtype fp8 --moe_dtype int4
 
 对于发烧友而言，如果想更进一步榨干硬件，可以参考 [混合推理指南](docs/mixforward.md)
 
+multicuda专用worker线程的调优环境变量见 [混合推理指南：multicuda调优环境变量](docs/mixforward.md#multicuda调优环境变量)
+
 ### 4. 如何设定运行参数
 
 可以通过下列参数设置运行参数。
