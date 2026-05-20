@@ -987,11 +987,16 @@ namespace fastllm {
 
                         // Prefill后已用分页不能超过pagesLimit（除非单个请求就超过了）
                         if (pagesLimit > 0 && curBusyPages + thisPages > pagesLimit) {
-                            if (seqLens.size() > 0 || thisPages <= pagesLimit) {
-                                continue;
-                            }
-                            if (currentActivate > 0) {
-                                continue;
+                            bool noActiveRequests = currentActivate == 0 && seqLens.empty();
+                            // pagesLimit is a soft prefill throttle. Do not let cached or
+                            // stale page accounting leave pending requests unscheduled forever.
+                            if (!noActiveRequests) {
+                                if (seqLens.size() > 0 || thisPages <= pagesLimit) {
+                                    continue;
+                                }
+                                if (currentActivate > 0) {
+                                    continue;
+                                }
                             }
                         }
 
