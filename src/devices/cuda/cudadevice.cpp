@@ -3109,6 +3109,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 }
                 v.back() = (std::make_pair(0, sharedScale));
 // ForceDeviceSync(); mergeMoeTimeCnt["get_experts"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                bool wroteOutput = false;
                 for (int j = 0; j < v.size(); j++) {
                     int idx = v[j].first;
                     float value = v[j].second;
@@ -3126,14 +3127,21 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                     DoCudaLinearReshape(w1, *weights[idx * 2 + 1], w2);
                     DoCudaLinear(w1, *weights[idx * 2 + 1], *GetEmptyData(), w2);
 // ForceDeviceSync(); mergeMoeTimeCnt["linear2"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
-                    if (j == 0) {
+                    if (!wroteOutput) {
                         output.dataType = w2.dataType;
                         output.Resize(w2.dims);
                         FastllmCudaMul(w2, value, output);
+                        wroteOutput = true;
                     } else {
                         FastllmCudaAddTo(output, w2, value);
                     }
 // ForceDeviceSync(); mergeMoeTimeCnt["mul_add"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
+                }
+                if (!wroteOutput) {
+                    output.dataType = input.dataType;
+                    output.Resize(input.dims);
+                    output.Allocate(false);
+                    FastllmCudaMemset0(output.cudaData, output.GetBytes());
                 }
             } else {
 
@@ -3188,18 +3196,32 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 FastllmCudaCopyFromHostToDevice(cudaScales, scales.data(), scales.size() * sizeof(float));
 // ForceDeviceSync(); mergeMoeTimeCnt["copy_index"] += GetSpan(st, std::chrono::system_clock::now()); st = std::chrono::system_clock::now();
 
+                Data *firstLocalGate = nullptr;
+                int localWeightsBatch = weightsBatch > 0 ? weightsBatch : (int)expertTasks.size() * 2;
+                for (int i = 0; i < expertTasks.size(); i++) {
+                    if (i * 2 + 1 < localWeightsBatch && weights[i * 2] != nullptr && weights[i * 2 + 1] != nullptr) {
+                        firstLocalGate = weights[i * 2];
+                        break;
+                    }
+                }
+                if (firstLocalGate == nullptr) {
+                    FastllmCudaFree(cudaIndex);
+                    FastllmCudaFree(cudaScales);
+                    return;
+                }
+
                 Data tempInput, tempMiddle, tempSwiglu, tempOutput;
                 tempInput.Resize(input.dims);
                 tempInput.dataType = input.dataType;
                 tempInput.ToDevice(input.dataDevice);
                 tempInput.Allocate();
 
-                tempMiddle.Resize({input.dims[0], weights[2]->dims[0]});
+                tempMiddle.Resize({input.dims[0], firstLocalGate->dims[0]});
                 tempMiddle.dataType = input.dataType;
                 tempMiddle.ToDevice(input.dataDevice);
                 tempMiddle.Allocate();
 
-                tempSwiglu.Resize({input.dims[0], weights[2]->dims[0] / 2});
+                tempSwiglu.Resize({input.dims[0], firstLocalGate->dims[0] / 2});
                 tempSwiglu.dataType = input.dataType;
                 tempSwiglu.ToDevice(input.dataDevice);
                 tempSwiglu.Allocate();

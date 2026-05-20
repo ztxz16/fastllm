@@ -865,6 +865,71 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
     return true;
 }
 
+bool PlaceMultiCudaWeightOnDevice(fastllm::Data &weight, std::vector <int> &multiCudaCurrentDevices, int targetDevice) {
+    int deviceNum = multiCudaCurrentDevices.size();
+    int rootDevice = deviceNum > 0 ? multiCudaCurrentDevices[0] : 0;
+    fastllm::AssertInFastLLM(weight.dataType != fastllm::DataType::DATA_GGUF_FORMAT || weight.ggmlType >= 0,
+                             "GGUF weight \"" + weight.name + "\" is missing ggmlType before multicuda placement.\n");
+    if (weight.multiDeviceData) {
+        return true;
+    }
+    if (weight.dataDevice != fastllm::DataDevice::CUDA || weight.cudaData == nullptr ||
+        weight.dataDeviceIds.size() == 0 || weight.dataDeviceIds[0] != rootDevice) {
+        weight.ToDevice(fastllm::DataDevice::CUDA, {rootDevice}, true);
+    }
+
+    int oriId = FastllmCudaGetDevice();
+    int mallocType = 0;
+    std::string specialId = "";
+    SwitchDeviceAndGetInfos(targetDevice, specialId, mallocType);
+    fastllm::DataDevice dataDevice = (mallocType == 0 ? fastllm::DataDevice::CPU : fastllm::DataDevice::CUDA);
+
+    auto *local = CreateMultiCudaLocalTensor(weight, weight.dims);
+    local->dataDevice = dataDevice;
+    local->dataDeviceIds = {targetDevice};
+    local->group = weight.group;
+    local->groupCnt = weight.groupCnt;
+    local->scales = weight.scales;
+    local->mins = weight.mins;
+    local->zeros = weight.zeros;
+    local->halfScales = weight.halfScales;
+    local->perChannelsConfigs = weight.perChannelsConfigs;
+    local->Allocate();
+
+    size_t bytes = weight.GetBytes();
+    cudaError_t state = cudaSuccess;
+    if (mallocType == 0) {
+        cudaSetDevice(rootDevice);
+        state = cudaMemcpy(local->cpuData, weight.cudaData, bytes, cudaMemcpyDeviceToHost);
+    } else if (targetDevice == rootDevice) {
+        cudaSetDevice(rootDevice);
+        state = cudaMemcpy(local->cudaData, weight.cudaData, bytes, cudaMemcpyDeviceToDevice);
+    } else {
+        FastllmCudaMemcpyBetweenDevices(targetDevice, local->cudaData, rootDevice, weight.cudaData, bytes);
+    }
+    if (state != cudaSuccess) {
+        checkCudaErrors("Error: CUDA error when placing weight on multicuda device!", state);
+        delete local;
+        FastllmCudaSetDevice(oriId);
+        return false;
+    }
+
+    weight.multiDeviceData = true;
+    weight.multiDeviceDatas[targetDevice] = local;
+    weight.tpLayout = fastllm::TP_LAYOUT_NONE;
+    weight.tpAxis = -1;
+    weight.tpGlobalDims.clear();
+    weight.tpRanges.clear();
+
+    cudaSetDevice(rootDevice);
+    FastllmCudaFree(weight.cudaData);
+    ClearGGUFExtraCudaCaches(weight);
+    weight.cudaData = nullptr;
+    weight.weightSum.clear();
+    FastllmCudaSetDevice(oriId);
+    return true;
+}
+
 bool SplitMultiCudaWeight1D(fastllm::Data &bias, std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme) {
     int deviceNum = multiCudaCurrentDevices.size();
     int rootDevice = deviceNum > 0 ? multiCudaCurrentDevices[0] : 0;

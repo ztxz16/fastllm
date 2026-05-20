@@ -24,6 +24,7 @@ void FastllmGetMulticudaDeviceAndRatio(std::vector <int> &devices, std::map <int
 bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias, 
     std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme, int splitAxis);
 bool SplitMultiCudaWeight1D(fastllm::Data &bias, std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme); // 1维的多卡切分
+bool PlaceMultiCudaWeightOnDevice(fastllm::Data &weight, std::vector <int> &multiCudaCurrentDevices, int targetDevice);
 void CopyToMultiDevices(fastllm::Data &data, std::vector <int> devices, bool copyData);
 void PrepareMultiCudaReplicatedData(fastllm::Data &data, std::vector <int> devices, bool copyData);
 void PrepareMultiCudaShardedData(fastllm::Data &data, std::vector <int> devices,

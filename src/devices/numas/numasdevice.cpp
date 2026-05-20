@@ -45,6 +45,44 @@ namespace fastllm {
         return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
     }
 
+    static void CopyTensorToCPU(const Data &src, Data &dst, const char *name) {
+        dst.dataType = src.dataType;
+        dst.Resize(src.dims);
+        dst.Allocate(false);
+
+        if (src.dataDevice == DataDevice::CPU && src.cpuData != nullptr) {
+            memcpy(dst.cpuData, src.cpuData, src.GetBytes());
+            return;
+        }
+
+#ifdef USE_CUDA
+        const Data *cudaSrc = &src;
+        int deviceId = src.dataDeviceIds.empty() ? FastllmCudaGetDevice() : src.dataDeviceIds[0];
+        if (src.multiDeviceData && !src.multiDeviceDatas.empty()) {
+            auto it = src.multiDeviceDatas.begin();
+            if (it->second != nullptr) {
+                deviceId = it->first;
+                cudaSrc = it->second;
+            }
+        }
+        if (cudaSrc != nullptr && cudaSrc->cudaData != nullptr) {
+            FastllmCudaSetDevice(deviceId);
+            FastllmCudaCopyFromDeviceToHost(dst.cpuData, cudaSrc->cudaData, dst.GetBytes());
+            return;
+        }
+#endif
+
+        ErrorInFastLLM(std::string("NumasMergeMOE: tensor ") + name + " has no readable CPU/CUDA data.\n");
+    }
+
+    static Data *GetCpuTensor(Data &src, Data &scratch, const char *name) {
+        if (src.dataDevice == DataDevice::CPU && src.cpuData != nullptr) {
+            return &src;
+        }
+        CopyTensorToCPU(src, scratch, name);
+        return &scratch;
+    }
+
     class MoeEnvConfig {
     public:
         static MoeEnvConfig& GetInstance() {
@@ -1662,10 +1700,15 @@ namespace fastllm {
  // auto ttt = std::chrono::system_clock::now();
  // std::vector <std::pair <std::string, float> > record;
   auto st = std::chrono::system_clock::now();
-        Data &input = *(datas.find("input")->second);
+        Data &rawInput = *(datas.find("input")->second);
+        Data cpuInput;
+        Data &input = *GetCpuTensor(rawInput, cpuInput, "input");
         Data &output = *(datas.find("output")->second);
-        Data &index = *(datas.find("index")->second);
-        Data &score = *(datas.find("score")->second);
+        Data &rawIndex = *(datas.find("index")->second);
+        Data &rawScore = *(datas.find("score")->second);
+        Data cpuIndex, cpuScore;
+        Data &index = *GetCpuTensor(rawIndex, cpuIndex, "index");
+        Data &score = *GetCpuTensor(rawScore, cpuScore, "score");
         Data &w1 = *(datas.find("w1")->second);
         Data &w2 = *(datas.find("w2")->second);
         Data &w3 = *(datas.find("w3")->second);
