@@ -14,13 +14,15 @@ except ImportError:
 
 
 Choice = Tuple[str, str]
+ModelGroup = Tuple[str, str, Sequence[Choice]]
 PATH_COMPLETION_FIELDS = {"model", "cache_dir", "ori"}
 DIRECTORY_COMPLETION_FIELDS = {"model", "cache_dir", "ori"}
 CONTENT_MAX_WIDTH = 96
 PANEL_MAX_HEIGHT = 28
 PANEL_PADDING_X = 2
 PANEL_PADDING_Y = 1
-MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
+DEFAULT_ESCDELAY_MS = 25
+QWEN_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
     ("Qwen/Qwen3-0.6B", "Qwen3-0.6B"),
     ("Qwen/Qwen3-1.7B", "Qwen3-1.7B"),
     ("Qwen/Qwen3-4B", "Qwen3-4B"),
@@ -29,11 +31,53 @@ MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
     ("Qwen/Qwen3-32B", "Qwen3-32B"),
     ("Qwen/Qwen3-30B-A3B", "Qwen3-30B-A3B"),
     ("Qwen/Qwen3-235B-A22B", "Qwen3-235B-A22B"),
+)
+DEEPSEEK_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
     ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "DeepSeek-R1-Distill-Qwen-7B"),
     ("deepseek-ai/DeepSeek-R1-Distill-Qwen-14B", "DeepSeek-R1-Distill-Qwen-14B"),
     ("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B", "DeepSeek-R1-Distill-Qwen-32B"),
+)
+MINIMAX_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
+    ("MiniMax/MiniMax-Text-01", "MiniMax-Text-01"),
+    ("MiniMax/MiniMax-M1-40k", "MiniMax-M1-40k"),
+    ("MiniMax/MiniMax-M1-80k", "MiniMax-M1-80k"),
+)
+HOT_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
+    ("Qwen/Qwen3-0.6B", "Qwen3-0.6B"),
+    ("Qwen/Qwen3-8B", "Qwen3-8B"),
+    ("Qwen/Qwen3-30B-A3B", "Qwen3-30B-A3B"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "DeepSeek-R1-Distill-Qwen-7B"),
+    ("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B", "DeepSeek-R1-Distill-Qwen-32B"),
+    ("MiniMax/MiniMax-M1-40k", "MiniMax-M1-40k"),
+)
+CUSTOM_MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = (
     ("custom", "自定义模型ID"),
 )
+MODELSCOPE_MODEL_GROUPS: Sequence[ModelGroup] = (
+    ("hot", "热门模型", HOT_MODELSCOPE_MODEL_CHOICES),
+    ("qwen", "千问系列", QWEN_MODELSCOPE_MODEL_CHOICES),
+    ("deepseek", "DeepSeek系列", DEEPSEEK_MODELSCOPE_MODEL_CHOICES),
+    ("minimax", "MiniMax系列", MINIMAX_MODELSCOPE_MODEL_CHOICES),
+    ("custom", "自定义", CUSTOM_MODELSCOPE_MODEL_CHOICES),
+)
+MODELSCOPE_MODEL_GROUP_CHOICES: Sequence[Choice] = tuple(
+    (group_key, group_label) for group_key, group_label, _ in MODELSCOPE_MODEL_GROUPS
+)
+
+
+def _flatten_modelscope_model_choices() -> Sequence[Choice]:
+    choices: List[Choice] = []
+    seen = set()
+    for _, _, group_choices in MODELSCOPE_MODEL_GROUPS:
+        for value, label in group_choices:
+            if value in seen:
+                continue
+            choices.append((value, label))
+            seen.add(value)
+    return tuple(choices)
+
+
+MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = _flatten_modelscope_model_choices()
 
 
 @dataclass
@@ -135,6 +179,7 @@ MOE_DTYPE_CHOICES: Sequence[Choice] = (
 
 
 FIELDS: Sequence[FormField] = (
+    FormField("model", "模型路径", "text", "必填，必须是已存在的本地模型目录；可选择已下载模型，或按 Tab 补全目录。"),
     FormField("name", "配置名称", "text", "保存在首页命令列表中的名称；新建时自动生成，可按需修改。"),
     FormField(
         "command",
@@ -143,7 +188,6 @@ FIELDS: Sequence[FormField] = (
         "server 提供 OpenAI API；webui 启动网页聊天；run 启动本地终端聊天。",
         COMMAND_CHOICES,
     ),
-    FormField("model", "模型路径", "text", "必填，必须是已存在的本地模型目录；可按 Tab 补全目录。"),
     FormField(
         "model_name",
         "API模型名",
@@ -255,7 +299,7 @@ DOWNLOAD_FIELDS: Sequence[FormField] = (
         "填写 ModelScope 模型ID，例如 Qwen/Qwen3-0.6B。",
         visible=lambda c: c.model_id == "custom",
     ),
-    FormField("target_dir", "下载目录", "text", "模型下载到的本地目录，支持 Tab 补全。"),
+    FormField("target_dir", "下载目录", "text", "默认使用系统缓存目录，支持 Tab 补全。"),
     FormField("max_workers", "下载并发", "text", "ModelScope SDK 下载线程数，填写正整数。"),
     FormField(
         "custom_args",
@@ -271,6 +315,13 @@ def _choice_label(choices: Sequence[Choice], value: str) -> str:
         if choice_value == value:
             return label
     return value
+
+
+def _modelscope_group_index_for_model(model_id: str) -> int:
+    for group_index, (_, _, choices) in enumerate(MODELSCOPE_MODEL_GROUPS):
+        if any(value == model_id for value, _ in choices):
+            return group_index
+    return 0
 
 
 def _resolve_custom(value: str, custom_value: str) -> str:
@@ -319,6 +370,17 @@ def _pad_display(text: str, width: int) -> str:
 
 def _expand_user_path(value: str) -> str:
     return os.path.expanduser(value) if value.startswith("~") else value
+
+
+def get_fastllm_cache_dir() -> str:
+    if os.name == "nt":
+        cache_home = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
+    elif sys.platform == "darwin":
+        cache_home = os.path.expanduser("~/Library/Caches")
+    else:
+        cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    cache_home = os.path.expanduser(os.path.expandvars(cache_home))
+    return os.path.join(cache_home, "fastllm")
 
 
 def default_model_name_from_path(model_path: str) -> str:
@@ -407,7 +469,43 @@ def validate_modelscope_download(config: ModelScopeDownloadConfig) -> List[str]:
 
 def default_modelscope_target_dir(model_id: str) -> str:
     name = model_id.split("/")[-1] if model_id else "model"
-    return os.path.join(os.getcwd(), name)
+    return os.path.join(get_modelscope_cache_dir(), name)
+
+
+def get_modelscope_cache_dir() -> str:
+    return os.path.join(get_fastllm_cache_dir(), "modelscope")
+
+
+def list_downloaded_model_dirs() -> List[Choice]:
+    cache_dir = get_modelscope_cache_dir()
+    if not os.path.isdir(cache_dir):
+        return []
+    try:
+        names = os.listdir(cache_dir)
+    except OSError:
+        return []
+
+    choices: List[Choice] = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        path = os.path.join(cache_dir, name)
+        if os.path.isdir(path):
+            choices.append((path, name))
+    choices.sort(key=lambda item: item[1].lower())
+    return choices
+
+
+def update_default_modelscope_target_dir(config: ModelScopeDownloadConfig, old_model_id: str = ""):
+    model_id = _resolve_modelscope_model_id(config)
+    current_target = config.target_dir.strip()
+    old_default = default_modelscope_target_dir(old_model_id) if old_model_id else ""
+    if not model_id:
+        if old_default and _expand_user_path(current_target) == _expand_user_path(old_default):
+            config.target_dir = ""
+        return
+    if not current_target or (old_default and _expand_user_path(current_target) == _expand_user_path(old_default)):
+        config.target_dir = default_modelscope_target_dir(model_id)
 
 
 def download_modelscope_model(config: ModelScopeDownloadConfig) -> str:
@@ -463,6 +561,11 @@ def next_config_name(configs: Sequence[DeployConfig]) -> str:
         index += 1
 
 
+def is_default_config_name(name: str) -> bool:
+    name = name.strip()
+    return name.startswith("配置") and name[2:].isdigit()
+
+
 def new_deploy_config(configs: Sequence[DeployConfig]) -> DeployConfig:
     config = DeployConfig()
     config.name = next_config_name(configs)
@@ -476,6 +579,16 @@ def apply_command_defaults(config: DeployConfig, old_command: str, new_command: 
         config.port = "8080"
     elif new_command == "webui" and config.port in ("", "8080"):
         config.port = "1616"
+
+
+def apply_model_name_default(config: DeployConfig, old_model: str, new_model: str):
+    if old_model == new_model:
+        return
+    if not is_default_config_name(config.name):
+        return
+    default_name = default_model_name_from_path(new_model)
+    if default_name:
+        config.name = default_name
 
 
 def load_saved_configs(path: Optional[str] = None) -> List[DeployConfig]:
@@ -630,6 +743,26 @@ def validate_config(config: DeployConfig) -> List[str]:
     return errors
 
 
+def _tui_escdelay_ms() -> int:
+    raw_value = os.environ.get("FASTLLM_TUI_ESCDELAY", os.environ.get("ESCDELAY", str(DEFAULT_ESCDELAY_MS)))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return DEFAULT_ESCDELAY_MS
+    return max(0, min(value, 1000))
+
+
+def _configure_curses_keys(stdscr):
+    try:
+        curses.set_escdelay(_tui_escdelay_ms())
+    except (AttributeError, curses.error):
+        pass
+    try:
+        stdscr.notimeout(False)
+    except curses.error:
+        pass
+
+
 class FastllmCursesTUI:
     def __init__(self, config: Optional[DeployConfig] = None):
         self.config = config or DeployConfig()
@@ -649,6 +782,7 @@ class FastllmCursesTUI:
     def _main(self, stdscr) -> Tuple[str, DeployConfig]:
         curses.curs_set(0)
         stdscr.keypad(True)
+        _configure_curses_keys(stdscr)
         return self._home_loop(stdscr)
 
     def _home_loop(self, stdscr) -> Tuple[str, DeployConfig]:
@@ -877,9 +1011,10 @@ class FastllmCursesTUI:
 
     def _download_loop(self, stdscr) -> Tuple[str, Union[ModelScopeDownloadConfig, DeployConfig]]:
         config = ModelScopeDownloadConfig()
+        update_default_modelscope_target_dir(config)
         field_selected = 0
         self.download_button_selected = 0
-        self.status = "从模型列表选择模型，填写下载目录后执行下载。"
+        self.status = "从模型列表选择模型；下载目录默认使用系统缓存路径。"
         while True:
             visible_fields = [field for field in DOWNLOAD_FIELDS if field.is_visible(config)]
             field_selected = min(field_selected, len(visible_fields) - 1)
@@ -931,20 +1066,22 @@ class FastllmCursesTUI:
         if action == "edit":
             field = visible_fields[field_selected]
             if field.kind == "choice":
+                old_model_id = _resolve_modelscope_model_id(config)
                 value = self._choose_download(stdscr, field, config)
                 if value is None:
                     return None
                 setattr(config, field.key, value)
                 if field.key == "model_id":
-                    model_id = _resolve_modelscope_model_id(config)
-                    if model_id and not config.target_dir.strip():
-                        config.target_dir = default_modelscope_target_dir(model_id)
+                    update_default_modelscope_target_dir(config, old_model_id)
                 self.status = f"{field.label}已更新。"
                 return None
             else:
+                old_model_id = _resolve_modelscope_model_id(config)
                 value = self._input_download_text(stdscr, field, config)
                 if value is not None:
                     setattr(config, field.key, value)
+                    if field.key == "model_id_custom":
+                        update_default_modelscope_target_dir(config, old_model_id)
                     self.status = f"{field.label}已更新。"
             return None
         if action == "download":
@@ -1009,6 +1146,8 @@ class FastllmCursesTUI:
         return self._input_text_for_value(stdscr, field, str(getattr(config, field.key)))
 
     def _choose_download(self, stdscr, field: FormField, config: ModelScopeDownloadConfig) -> Optional[str]:
+        if field.key == "model_id":
+            return self._choose_modelscope_model(stdscr, field, config)
         choices = list(field.choices)
         current = getattr(config, field.key)
         index = next((i for i, (value, _) in enumerate(choices) if value == current), 0)
@@ -1025,6 +1164,73 @@ class FastllmCursesTUI:
                 self.status = "已取消选择。"
                 return None
 
+    def _choose_modelscope_model(self, stdscr, field: FormField, config: ModelScopeDownloadConfig) -> Optional[str]:
+        current = getattr(config, field.key)
+        group_index = _modelscope_group_index_for_model(current)
+        while True:
+            group_index = self._choose_modelscope_group(stdscr, field, config, group_index)
+            if group_index is None:
+                return None
+            _, group_label, choices = MODELSCOPE_MODEL_GROUPS[group_index]
+            model_index = next((i for i, (value, _) in enumerate(choices) if value == current), 0)
+            selected = self._choose_modelscope_model_in_group(
+                stdscr,
+                field,
+                config,
+                group_label,
+                choices,
+                model_index,
+            )
+            if selected == "__back__":
+                continue
+            return selected
+
+    def _choose_modelscope_group(
+        self,
+        stdscr,
+        field: FormField,
+        config: ModelScopeDownloadConfig,
+        selected: int,
+    ) -> Optional[int]:
+        choices = list(MODELSCOPE_MODEL_GROUP_CHOICES)
+        while True:
+            self._draw_download_choice_popup(stdscr, field, choices, selected, config, "选择模型分类")
+            key = stdscr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                selected = max(0, selected - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                selected = min(len(choices) - 1, selected + 1)
+            elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                return selected
+            elif key in (27, ord("q"), ord("Q")):
+                self.status = "已取消选择。"
+                return None
+
+    def _choose_modelscope_model_in_group(
+        self,
+        stdscr,
+        field: FormField,
+        config: ModelScopeDownloadConfig,
+        group_label: str,
+        choices: Sequence[Choice],
+        selected: int,
+    ) -> str:
+        choices = list(choices)
+        while True:
+            self._draw_download_choice_popup(stdscr, field, choices, selected, config, group_label)
+            key = stdscr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                selected = max(0, selected - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                selected = min(len(choices) - 1, selected + 1)
+            elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                return choices[selected][0]
+            elif key in (curses.KEY_LEFT, curses.KEY_BACKSPACE, 127, ord("b"), ord("B")):
+                return "__back__"
+            elif key in (27, ord("q"), ord("Q")):
+                self.status = "已返回模型分类。"
+                return "__back__"
+
     def _draw_download_choice_popup(
         self,
         stdscr,
@@ -1032,21 +1238,22 @@ class FastllmCursesTUI:
         choices: Sequence[Choice],
         selected: int,
         config: ModelScopeDownloadConfig,
+        title: Optional[str] = None,
     ):
         visible_fields = [item for item in DOWNLOAD_FIELDS if item.is_visible(config)]
         selected_field = next((i for i, item in enumerate(visible_fields) if item.key == field.key), 0)
         self._draw_download(stdscr, config, visible_fields, selected_field)
         height, width = stdscr.getmaxyx()
-        box_width = min(max(48, max(len(label) for _, label in choices) + 8), width - 4)
+        box_width = min(max(48, max(_display_width(label) for _, label in choices) + 8), width - 4)
         box_height = min(len(choices) + 4, height - 4)
         top = max(1, (height - box_height) // 2)
         left = max(2, (width - box_width) // 2)
         self._safe_addstr(stdscr, top, left, "+" + "-" * (box_width - 2) + "+", curses.A_BOLD)
-        self._safe_addstr(stdscr, top + 1, left, f"| {field.label}".ljust(box_width - 1) + "|", curses.A_BOLD)
+        self._safe_addstr(stdscr, top + 1, left, "| " + _pad_display(title or field.label, box_width - 4) + " |", curses.A_BOLD)
         for row, (_, label) in enumerate(choices[: box_height - 4], start=top + 2):
             choice_index = row - top - 2
             attr = curses.A_REVERSE if choice_index == selected else curses.A_NORMAL
-            self._safe_addstr(stdscr, row, left, "| " + label.ljust(box_width - 4) + " |", attr)
+            self._safe_addstr(stdscr, row, left, "| " + _pad_display(label, box_width - 4) + " |", attr)
         self._safe_addstr(stdscr, top + box_height - 1, left, "+" + "-" * (box_width - 2) + "+", curses.A_BOLD)
         self._refresh(stdscr)
 
@@ -1245,9 +1452,12 @@ class FastllmCursesTUI:
                     self._apply_command_defaults(old_command, value)
                 self.status = f"{field.label}已更新。"
         else:
+            old_model = self.config.model
             value = self._input_text(stdscr, field)
             if value is not None:
                 setattr(self.config, field.key, value)
+                if field.key == "model":
+                    apply_model_name_default(self.config, old_model, value)
                 self.status = f"{field.label}已更新。"
 
     def _apply_command_defaults(self, old_command: str, new_command: str):
@@ -1287,6 +1497,8 @@ class FastllmCursesTUI:
         self._refresh(stdscr)
 
     def _input_text(self, stdscr, field: FormField) -> Optional[str]:
+        if field.key == "model":
+            return self._input_model_path(stdscr, field)
         if _is_path_completion_field(field):
             return self._input_text_with_completion_for_value(
                 stdscr,
@@ -1295,6 +1507,76 @@ class FastllmCursesTUI:
                 directories_only=_is_directory_completion_field(field),
             )
         return self._input_text_for_value(stdscr, field, str(getattr(self.config, field.key)))
+
+    def _input_model_path(self, stdscr, field: FormField) -> Optional[str]:
+        downloaded_models = list_downloaded_model_dirs()
+        current = _expand_user_path(str(getattr(self.config, field.key)).strip())
+        if not downloaded_models:
+            self.status = f"未找到已下载模型，将手动输入: {get_modelscope_cache_dir()}"
+            return self._input_text_with_completion_for_value(
+                stdscr,
+                field,
+                str(getattr(self.config, field.key)),
+                directories_only=True,
+            )
+
+        choices = downloaded_models + [("__manual__", "手动输入路径")]
+        selected = next(
+            (
+                index
+                for index, (path, _) in enumerate(choices)
+                if path != "__manual__" and _expand_user_path(path) == current
+            ),
+            len(choices) - 1 if current else 0,
+        )
+        while True:
+            self._draw_model_path_popup(stdscr, field, choices, selected)
+            key = stdscr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                selected = max(0, selected - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                selected = min(len(choices) - 1, selected + 1)
+            elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+                value = choices[selected][0]
+                if value == "__manual__":
+                    return self._input_text_with_completion_for_value(
+                        stdscr,
+                        field,
+                        str(getattr(self.config, field.key)),
+                        directories_only=True,
+                    )
+                return value
+            elif key in (27, ord("q"), ord("Q")):
+                self.status = "已取消选择模型路径。"
+                return None
+
+    def _draw_model_path_popup(self, stdscr, field: FormField, choices: Sequence[Choice], selected: int):
+        self._draw(stdscr, self._visible_fields())
+        height, width = stdscr.getmaxyx()
+        label_width = max(_display_width(label) for _, label in choices)
+        box_width = min(max(58, label_width + 8), width - 4)
+        box_height = min(len(choices) + 5, height - 4)
+        visible_count = max(1, box_height - 5)
+        top_index = 0
+        if selected >= visible_count:
+            top_index = selected - visible_count + 1
+        bottom_index = min(len(choices), top_index + visible_count)
+        top = max(1, (height - box_height) // 2)
+        left = max(2, (width - box_width) // 2)
+        inner_width = max(1, box_width - 4)
+
+        self._safe_addstr(stdscr, top, left, "+" + "-" * (box_width - 2) + "+", curses.A_BOLD)
+        self._safe_addstr(stdscr, top + 1, left, "| " + _pad_display("选择已下载模型", inner_width) + " |", curses.A_BOLD)
+        for row, index in enumerate(range(top_index, bottom_index), start=top + 2):
+            _, label = choices[index]
+            attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
+            self._safe_addstr(stdscr, row, left, "| " + _pad_display(label, inner_width) + " |", attr)
+
+        selected_path, _ = choices[selected]
+        hint = "手动输入路径，支持 Tab 补全。" if selected_path == "__manual__" else selected_path
+        self._safe_addstr(stdscr, top + box_height - 2, left, "| " + _pad_display(_clip_display(hint, inner_width), inner_width) + " |", curses.A_DIM)
+        self._safe_addstr(stdscr, top + box_height - 1, left, "+" + "-" * (box_width - 2) + "+", curses.A_BOLD)
+        self._refresh(stdscr)
 
     def _input_text_for_value(self, stdscr, field: FormField, current: str) -> Optional[str]:
         return self._input_text_popup(stdscr, field, current)
@@ -1489,6 +1771,11 @@ def _prompt_choice(field: FormField, config: DeployConfig) -> str:
 
 
 def _prompt_text(field: FormField, config: DeployConfig) -> str:
+    if field.key == "model":
+        selected_model = _prompt_downloaded_model_path()
+        if selected_model is not None:
+            return selected_model
+
     current = str(getattr(config, field.key))
     prompt = f"{field.label} [{current or '空'}]，输入 - 清空"
     if _is_path_completion_field(field):
@@ -1502,6 +1789,29 @@ def _prompt_text(field: FormField, config: DeployConfig) -> str:
     if raw == "-":
         return ""
     return raw
+
+
+def _prompt_downloaded_model_path() -> Optional[str]:
+    choices = list_downloaded_model_dirs()
+    if not choices:
+        return None
+
+    print("\n已下载模型:")
+    print(f"缓存目录: {get_modelscope_cache_dir()}")
+    for index, (path, label) in enumerate(choices, start=1):
+        print(f"  {index}. {label} ({path})")
+    raw = _read_line("选择已下载模型编号，留空手动输入路径: ").strip()
+    if raw == "":
+        return None
+    try:
+        index = int(raw) - 1
+    except ValueError:
+        print("输入无效，改为手动输入路径。")
+        return None
+    if 0 <= index < len(choices):
+        return choices[index][0]
+    print("编号不存在，改为手动输入路径。")
+    return None
 
 
 def _read_line(prompt: str) -> str:
@@ -1563,7 +1873,11 @@ def _prompt_deploy_field(config: DeployConfig, field: FormField):
         elif raw in ("n", "no", "0", "false", "off"):
             setattr(config, field.key, False)
     else:
-        setattr(config, field.key, _prompt_text(field, config))
+        old_model = config.model
+        value = _prompt_text(field, config)
+        setattr(config, field.key, value)
+        if field.key == "model":
+            apply_model_name_default(config, old_model, value)
 
 
 def run_plain_form(
@@ -1664,16 +1978,31 @@ def run_plain_wizard(config: Optional[DeployConfig] = None) -> Tuple[str, Union[
 def run_plain_modelscope_download() -> Tuple[str, Union[ModelScopeDownloadConfig, DeployConfig]]:
     config = ModelScopeDownloadConfig()
     print("ModelScope 模型下载")
-    for index, (model_id, label) in enumerate(MODELSCOPE_MODEL_CHOICES, start=1):
-        print(f"{index}. {label} ({model_id})")
-    raw = _read_line("选择模型编号，留空使用默认: ").strip()
+    for index, (_, label, _) in enumerate(MODELSCOPE_MODEL_GROUPS, start=1):
+        print(f"{index}. {label}")
+    raw = _read_line("选择模型分类，留空使用热门模型: ").strip()
+    group_index = 0
     if raw:
         try:
-            index = int(raw) - 1
+            group_index = int(raw) - 1
         except ValueError:
-            index = -1
-        if 0 <= index < len(MODELSCOPE_MODEL_CHOICES):
-            config.model_id = MODELSCOPE_MODEL_CHOICES[index][0]
+            group_index = 0
+        if not (0 <= group_index < len(MODELSCOPE_MODEL_GROUPS)):
+            group_index = 0
+    _, group_label, model_choices = MODELSCOPE_MODEL_GROUPS[group_index]
+    print(f"{group_label}:")
+    for index, (model_id, label) in enumerate(model_choices, start=1):
+        print(f"{index}. {label} ({model_id})")
+    raw = _read_line("选择模型编号，留空使用第一个: ").strip()
+    model_index = 0
+    if raw:
+        try:
+            model_index = int(raw) - 1
+        except ValueError:
+            model_index = 0
+        if not (0 <= model_index < len(model_choices)):
+            model_index = 0
+    config.model_id = model_choices[model_index][0]
     if config.model_id == "custom":
         config.model_id_custom = _read_line("自定义模型ID: ").strip()
     model_id = _resolve_modelscope_model_id(config)
