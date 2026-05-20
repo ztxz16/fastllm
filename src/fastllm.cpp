@@ -4149,6 +4149,16 @@ namespace fastllm {
         return it->second;
     }
 
+    static bool IsMultiCudaShardedPagedCacheDesc(const Data &cacheData) {
+#ifdef USE_CUDA
+        return cacheData.dataDevice == DataDevice::CUDA &&
+               cacheData.dataDeviceIds.size() > 1 &&
+               cacheData.IsTensorParallelSharded();
+#else
+        return false;
+#endif
+    }
+
     PagedCacheManager* AllocatePagedCacheManager(int layerIndex, 
         PagedCacheManager::PagedCacheManagerType type, 
         const Data &cacheData, 
@@ -4168,11 +4178,12 @@ namespace fastllm {
         if (pageLen <= 0) {
             pageLen = GetPageLen();
         }
+        bool metadataOnlyMultiCudaRoot = IsMultiCudaShardedPagedCacheDesc(cacheData);
         auto it = layerPagedCacheManagers.find(layerIndex);
         if (it != layerPagedCacheManagers.end()) {
             PagedCacheManager *manager = it->second;
 #ifdef USE_CUDA
-            if (targetDevice >= 0 && manager->cudaData != nullptr) {
+            if (targetDevice >= 0 && manager->cudaData != nullptr && !metadataOnlyMultiCudaRoot) {
                 int ptrDevice = GetPointerDeviceId(manager->cudaData);
                 if (ptrDevice >= 0 && ptrDevice != targetDevice) {
                     ((Data*)manager)->ToDevice(cacheData.dataDevice, cacheData.dataDeviceIds, false);
@@ -4219,7 +4230,9 @@ namespace fastllm {
 
         // Resize manager: [maxPages, pageLen, numHeads, headDim]
         ((Data*)manager)->Resize({maxPages, pageLen, numHeads, headDim});
-        ((Data*)manager)->Allocate();
+        if (!metadataOnlyMultiCudaRoot) {
+            ((Data*)manager)->Allocate();
+        }
 
         // 初始化 pageLen 和 unusedPageIndex
         manager->pageLen = pageLen;

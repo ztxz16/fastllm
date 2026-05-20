@@ -180,6 +180,11 @@ namespace fastllm {
                 desc.strides = src.strides;
                 desc.dataDevice = src.dataDevice;
                 desc.dataDeviceIds = src.dataDeviceIds;
+                desc.multiDeviceData = src.multiDeviceData;
+                desc.tpLayout = src.tpLayout;
+                desc.tpAxis = src.tpAxis;
+                desc.tpGlobalDims = src.tpGlobalDims;
+                desc.tpRanges = src.tpRanges;
                 desc.UpdateUnitSize();
                 return desc;
             };

@@ -1102,9 +1102,14 @@ namespace fastllm {
             return;
         }
         if (cache.pageIndex.empty() && manager.FreePageCount() == manager.maxPages) {
+            bool metadataOnlyRoot = manager.dataDevice == DataDevice::CUDA &&
+                                    manager.dataDeviceIds.size() > 1 &&
+                                    manager.cudaData == nullptr;
             manager.SetMaxPages(neededPages);
             manager.Resize({neededPages, manager.pageLen, manager.dims[2], manager.dims[3]});
-            manager.Allocate();
+            if (!metadataOnlyRoot) {
+                manager.Allocate();
+            }
         }
     }
 

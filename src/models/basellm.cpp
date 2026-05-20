@@ -2632,8 +2632,6 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             long long bytesPerPage = 0;
             std::map <int, long long> deviceBytesPerPage;
             std::map <int, int> deviceLayerCount;
-            std::map <int, long long> deviceRootBytesPerPage;
-            std::map <int, int> deviceRootLayerCount;
             for (int i = 0; i < block_cnt; i++) {
                 if (layerElementsPerToken[i] <= 0) {
                     continue;
@@ -2667,24 +2665,6 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                         deviceBytesPerPage[id] += localBytesPerPage;
                         deviceLayerCount[id]++;
                         accountedByLocalShard = true;
-                    }
-
-                    // Multi-cuda keeps a root paged cache manager on the root device in
-                    // addition to the per-device local shard managers. Count that extra
-                    // global allocation on the root device, or GPU 0 pages will be overestimated.
-                    int rootDeviceId = -1;
-                    if (pastKey.multiDeviceDatas.size() > 1 || pastValue.multiDeviceDatas.size() > 1) {
-                        if (pastKey.dataDevice == DataDevice::CUDA && !pastKey.dataDeviceIds.empty()) {
-                            rootDeviceId = pastKey.dataDeviceIds[0];
-                        } else if (pastValue.dataDevice == DataDevice::CUDA && !pastValue.dataDeviceIds.empty()) {
-                            rootDeviceId = pastValue.dataDeviceIds[0];
-                        }
-                    }
-                    if (rootDeviceId >= 0) {
-                        deviceIds.insert(rootDeviceId);
-                        deviceBytesPerPage[rootDeviceId] += layerBytesPerPage;
-                        deviceRootBytesPerPage[rootDeviceId] += layerBytesPerPage;
-                        deviceRootLayerCount[rootDeviceId]++;
                     }
                 }
 
@@ -2732,13 +2712,10 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                         long long reserved = (long long)(totalSizes[id] * (1.0 - fastllm::GetGpuMemRatio()));
                         long long avail = freeSizes[id] - reserved;
                         long long perPageOnDevice = it.second;
-                        long long rootBytesPerPage = deviceRootBytesPerPage.count(id) ? deviceRootBytesPerPage[id] : 0;
-                        long long localBytesPerPage = perPageOnDevice - rootBytesPerPage;
-                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, availForKV=%.2f GB, localKVPerPage=%.2f MB, rootKVPerPage=%.2f MB, totalKVPerPage=%.2f MB, tokenGrowingLayers=%d, rootManagers=%d.\n",
+                        printf("[Fastllm] AutoWarmup GPU %d: free=%.2f GB, total=%.2f GB, reserved=%.2f GB, availForKV=%.2f GB, localKVPerPage=%.2f MB, tokenGrowingLayers=%d.\n",
                                id, freeSizes[id] / 1e9, totalSizes[id] / 1e9, reserved / 1e9,
-                               avail / 1e9, localBytesPerPage / 1e6, rootBytesPerPage / 1e6, perPageOnDevice / 1e6,
-                               deviceLayerCount.count(id) ? deviceLayerCount[id] : 0,
-                               deviceRootLayerCount.count(id) ? deviceRootLayerCount[id] : 0);
+                               avail / 1e9, perPageOnDevice / 1e6,
+                               deviceLayerCount.count(id) ? deviceLayerCount[id] : 0);
                         if (perPageOnDevice > 0 && avail > 0) {
                             int pages = (int)(avail / perPageOnDevice);
                             maxPages = std::min(maxPages, pages);
