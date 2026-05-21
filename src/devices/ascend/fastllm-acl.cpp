@@ -114,7 +114,7 @@ void FastllmAclSetDevice(int32_t device_id) {
     aclError state;
     if (curDeviceId == device_id)
         return;
-    if (curDeviceId != -1 && device_id != -1) {
+    if (curDeviceId != -1 && device_id != -1 && aclInitialized) {
         state = aclrtSynchronizeStream(FastllmAclStreamMap[curDeviceId]);
         checkAclError("Error: AscendCL error when Synchronize stream!", state);
     }
@@ -189,6 +189,7 @@ std::map<int32_t, std::vector <AscendMemoryBuffer>> bigBuffersMap;
 
 void * FastllmAclDirectMalloc(size_t size) {
     void * ret;
+    EnsureAclContext();
     aclError state = aclrtMalloc(&ret, size, ACL_MEM_MALLOC_HUGE_FIRST);
     if (ACL_SUCCESS != state) {
         printf("Error: AscendCL error when allocating %lu kB memory! maybe there's no enough memory left on device.", size >> 10);
@@ -199,6 +200,7 @@ void * FastllmAclDirectMalloc(size_t size) {
 }
 
 void FastllmAclDirectFree(void *ret) {
+    EnsureAclContext();
     aclError state = aclrtFree(ret);
     //checkAclError("Error: AscendCL error when release memory!", state);
 }
@@ -396,7 +398,11 @@ void FastllmAclMemcpyBetweenDevices(int32_t dstId, void *dst, int32_t srcId, voi
     int canAccessPeer = 0;
     aclError state = aclrtDeviceCanAccessPeer(&canAccessPeer, srcId, dstId);
     if (canAccessPeer && state == ACL_SUCCESS) {
+        state = aclrtDeviceEnablePeerAccess(srcId, 0);
+        FastllmAclSetDevice(srcId);
         state = aclrtDeviceEnablePeerAccess(dstId, 0);
+        FastllmAclSetDevice(dstId);
+        checkAclError("Error: AscendCL error when enabling peer access!", state);
         state = aclrtMemcpy(dst, size, src, size, ACL_MEMCPY_DEVICE_TO_DEVICE);
     } else {
         uint8_t *cpuData = new uint8_t[size];
@@ -561,20 +567,6 @@ bool FastllmAclExecuteAfterInit(std::string name, std::vector<aclTensorDesc *> &
         return false;
     }
     checkAclErrorFormat("Error: AscendCL error: execute op [%s] failed.", state, name.c_str());
-    if (state != ACL_SUCCESS) {
-        for (aclTensorDesc* tensor : inputTensors) {
-            printf("%s %d: ", aclGetTensorDescName(tensor), aclGetTensorDescType(tensor));
-            size_t dims = aclGetTensorDescNumDims(tensor);
-            if (dims != ACL_UNKNOWN_RANK) {
-                int64_t dimSize = 0;
-                for (size_t i=0; i<dims; i++) {
-                    state = aclGetTensorDescDimV2(tensor, i, &dimSize);
-                    printf("%lu ", dimSize);
-                }
-            }
-            printf("\n");
-        }
-    }
     if (state != ACL_SUCCESS)
         return false;
     state = aclrtSynchronizeStream(stream);
