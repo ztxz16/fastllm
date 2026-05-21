@@ -123,7 +123,7 @@ DrvMngGetConsoleLogLevel failed. (g_conLogLevel=3)
 dcmi model initialized failed, because the device is used. ret is -8020
 ```
 
-我们假设已经获取了名为`model.flm`的模型（参照 [模型获取](#模型获取)，初次使用可以先下载转换好的模型)
+我们假设已经获取了名为`model.flm`的模型（参照 [模型获取](docs/models.md)，初次使用可以先下载转换好的模型)
 
 编译完成之后在build目录下可以使用下列demo:
 
@@ -142,9 +142,31 @@ dcmi model initialized failed, because the device is used. ret is -8020
 # python版本的命令行聊天程序，使用了模型创建以及流式对话效果
 python tools/cli_demo.py -p model.flm
 ```
+### 安装运行ftllm
 
-> ~~\# python版本的简易webui，需要先安装streamlit-chat~~
-> ~~streamlit run tools/web_demo.py model.flm~~ 
-> 
+使用如下命令编译及安装：
+
+```shell
+bash install.sh -DUSE_ASCEND_NPU=ON
+```
+
+可以运行一个较小模型测试安装是否成功。以Qwen/Qwen3-0.6B模型为例
+
+```shell
+# 命令行对话
+ftllm run Qwen/Qwen3-0.6B
+
+# WebUI:
+ftllm webui Qwen/Qwen3-0.6B
+
+# 运行API Server
+ftllm server Qwen/Qwen3-0.6B --dtype float16 
+```
 
 更多功能及接口请参照[详细文档](../README.md)
+
+## 说明与限制
+
+* 需要指定NPU设备，使用`acl:0`指定当前环境的0号NPU（`npu-smi info`命令中的`Device`列）
+* 当指定 --atype float16时，会触发两次算子编译
+* 目前，仅支持fp16、fp32精度的模型，即`--dtype float16`
