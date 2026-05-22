@@ -11,6 +11,7 @@
 #include "cmath"
 
 #include <iostream>
+#include <unordered_map>
 
 namespace fastllm {
     class Qwen3MOEModel : public basellm {
@@ -39,6 +40,17 @@ namespace fastllm {
                     const std::vector <GenerationConfig> &generationConfigs,
                     const LastTokensManager &lastTokens,
                     std::vector <std::vector <float>*> *retLogits);
+
+        virtual std::vector <int> ForwardGPU(
+                    int batch,
+                    const Data &inputIds,
+                    const std::vector <Data*> &attentionMask,
+                    const std::vector <Data*> &positionIds,
+                    const std::vector <int> &seqLens,
+                    std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                    const std::vector <GenerationConfig> &generationConfigs,
+                    const LastTokensManager &lastTokens,
+                    std::vector <std::vector <float>*> *retLogits);
                 
         // 根据输入的tokens生成LLM推理的输入
         virtual void FillLLMInputsBatch(std::vector <std::vector <float> > &inputTokens,
@@ -55,6 +67,49 @@ namespace fastllm {
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
 
     protected:
+        bool IsThreadTensorParallelEnabled() const;
+
+        std::vector <int> ForwardV2ThreadTensorParallel(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *logits = nullptr);
+
+        void ForwardSingleGPU(
+                int gpuId,
+                std::map <int, int> ratios,
+                int batch,
+                const Data &inputIds,
+                const Data &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                bool all1,
+                bool isPrefill,
+                bool tensorParallel,
+                int pagedCacheLayerOffset,
+                Data &logits);
+
+        bool ForwardSingleGPUDecodeGraph(
+                int gpuId,
+                std::map <int, int> ratios,
+                int batch,
+                const Data &inputIds,
+                const Data &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                bool all1,
+                bool isPrefill,
+                bool tensorParallel,
+                int pagedCacheLayerOffset,
+                Data &logits);
+
+        Data &GetThreadTensorParallelBias(const std::string &name);
+
         RoPEType rope_type = RoPEType::BASE;
 
         float rope_base = 10000.f;
@@ -70,8 +125,13 @@ namespace fastllm {
 
         std::vector <std::vector <Data*> > weights;
         std::vector <std::vector <Data*> > biass;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeBiass;
 
         float routed_scaling_factor = 1.0f;
+
+        std::unordered_map <std::string, Data> threadTpEmptyBiases;
+        int threadTpPagedCacheBase = -1;
     };
 }
 
