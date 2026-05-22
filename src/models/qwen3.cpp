@@ -242,6 +242,16 @@ namespace fastllm {
             return local;
         }
 
+        static void PrepareQwen3SingleCudaCache(Data &cache, int device, DataType localDataType) {
+            cache.isKVCache = true;
+            cache.lockInCPU = false;
+            if (cache.dataType != localDataType && cache.dims.empty()) {
+                cache.dataType = localDataType;
+                cache.UpdateUnitSize();
+            }
+            cache.ToDevice(DataDevice::CUDA, {device}, false);
+        }
+
         static void SyncQwen3ThreadTpRootCacheMeta(Data &root,
                                                    const std::vector<int> &devices,
                                                    const DivisionScheme &kvHeadScheme,
@@ -2027,6 +2037,7 @@ namespace fastllm {
         const std::vector <GenerationConfig> &generationConfigs,
         const LastTokensManager &lastTokens,
         std::vector <std::vector <float>*> *retLogits) {
+// auto startTime = std::chrono::system_clock::now();
 #ifndef USE_CUDA
         return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                          pastKeyValues, generationConfigs, lastTokens, retLogits);
@@ -2081,12 +2092,14 @@ namespace fastllm {
             }
             allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, (int)vPositionIds.size()}, vPositionIds));
         }
+// printf("prepare 0 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         Data gpuInputIds;
         gpuInputIds.CopyFrom(inputIds);
         if (tensorParallel) {
             PrepareMultiCudaReplicatedData(gpuInputIds, devices, true);
             PrepareMultiCudaReplicatedData(allPositionIds, devices, true);
         }
+// printf("prepare 1 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         std::vector<DivisionScheme> kvHeadSchemes;
         DivisionScheme lmHeadScheme;
         Data &lmHead = weight["lm_head.weight"];
@@ -2175,45 +2188,63 @@ namespace fastllm {
             kvHeadSchemes = threadTpKVHeadSchemes;
             lmHeadScheme = threadTpLmHeadScheme;
         } else {
-            kvHeadSchemes.assign(block_cnt, DivisionScheme());
-            for (int i = 0; i < block_cnt; i++) {
-                std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
-                std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
-                AssertInFastLLM(weight.weight.find(mergeQkvWeightName) != weight.weight.end(),
-                                "Qwen3 ForwardGPU requires merged qkv weight.\n");
-                AssertInFastLLM(weight.weight.find(swigluWeightName) != weight.weight.end(),
-                                "Qwen3 ForwardGPU requires merged gateup weight.\n");
-                Data &mergeW = weight[mergeQkvWeightName];
-                mergeW.tpPackType = TP_PACK_QKV;
-                mergeW.tpQHeads = num_attention_heads;
-                mergeW.tpKVHeads = num_key_value_heads;
-                mergeW.tpHeadDim = head_dim;
-                weight[swigluWeightName].tpPackType = TP_PACK_GATEUP;
-                kvHeadSchemes[i][devices[0]].push_back({0, num_key_value_heads});
+            if (!singleGpuWeightsPrepared.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
+                if (!singleGpuWeightsPrepared.load(std::memory_order_relaxed)) {
+                    for (int i = 0; i < block_cnt; i++) {
+                        std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+                        std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+                        AssertInFastLLM(weight.weight.find(mergeQkvWeightName) != weight.weight.end(),
+                                        "Qwen3 ForwardGPU requires merged qkv weight.\n");
+                        AssertInFastLLM(weight.weight.find(swigluWeightName) != weight.weight.end(),
+                                        "Qwen3 ForwardGPU requires merged gateup weight.\n");
+                        Data &mergeW = weight[mergeQkvWeightName];
+                        mergeW.tpPackType = TP_PACK_QKV;
+                        mergeW.tpQHeads = num_attention_heads;
+                        mergeW.tpKVHeads = num_key_value_heads;
+                        mergeW.tpHeadDim = head_dim;
+                        weight[swigluWeightName].tpPackType = TP_PACK_GATEUP;
+                    }
+                    singleGpuWeightsPrepared.store(true, std::memory_order_release);
+                }
             }
             lmHeadScheme[devices[0]].push_back({0, lmHead.dims[0]});
         }
         const DataType computeType = ResolveQwen3ThreadTpComputeType(this->dataType);
-        std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues(devices.size());
-        for (int r = 0; r < (int)devices.size(); r++) {
-            int device = devices[r];
-            localPastKeyValues[r].resize(pastKeyValues.size());
+        std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues;
+        if (tensorParallel) {
+            localPastKeyValues.resize(devices.size());
+            for (int r = 0; r < (int)devices.size(); r++) {
+                int device = devices[r];
+                localPastKeyValues[r].resize(pastKeyValues.size());
+                for (int i = 0; i < (int)pastKeyValues.size(); i++) {
+                    DataType keyCacheType = ResolveQwen3ThreadTpCacheType(
+                        pastKeyValues[i].first->dataType, computeType);
+                    DataType valueCacheType = ResolveQwen3ThreadTpCacheType(
+                        pastKeyValues[i].second->dataType, computeType);
+                    localPastKeyValues[r][i].first = EnsureQwen3ThreadTpLocalCache(
+                        *pastKeyValues[i].first, device, keyCacheType);
+                    localPastKeyValues[r][i].second = EnsureQwen3ThreadTpLocalCache(
+                        *pastKeyValues[i].second, device, valueCacheType);
+                }
+            }
+        } else {
+            int device = devices[0];
             for (int i = 0; i < (int)pastKeyValues.size(); i++) {
                 DataType keyCacheType = ResolveQwen3ThreadTpCacheType(
                     pastKeyValues[i].first->dataType, computeType);
                 DataType valueCacheType = ResolveQwen3ThreadTpCacheType(
                     pastKeyValues[i].second->dataType, computeType);
-                localPastKeyValues[r][i].first = EnsureQwen3ThreadTpLocalCache(
-                    *pastKeyValues[i].first, device, keyCacheType);
-                localPastKeyValues[r][i].second = EnsureQwen3ThreadTpLocalCache(
-                    *pastKeyValues[i].second, device, valueCacheType);
+                PrepareQwen3SingleCudaCache(*pastKeyValues[i].first, device, keyCacheType);
+                PrepareQwen3SingleCudaCache(*pastKeyValues[i].second, device, valueCacheType);
             }
         }
         std::vector<std::exception_ptr> errors(devices.size());
         std::vector<Data> localLogits(devices.size());
+// printf("prepare 2 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         if (devices.size() == 1) {
             ForwardSingleGPU(devices[0], ratios, batch, gpuInputIds, allPositionIds,
-                             seqLens, localPastKeyValues[0], all1, isPrefill,
+                             seqLens, pastKeyValues, all1, isPrefill,
                              false, true, threadTpPagedCacheBase, localLogits[0]);
         } else {
             std::vector<std::thread> threads;
@@ -2244,13 +2275,15 @@ namespace fastllm {
             }
         }
 
-        for (int b = 0; b < batch; b++) {
-            for (int i = 0; i < block_cnt; i++) {
-                int idx = b * block_cnt + i;
-                SyncQwen3ThreadTpRootCacheMeta(*pastKeyValues[idx].first, devices, kvHeadSchemes[i],
-                                               num_key_value_heads, head_dim);
-                SyncQwen3ThreadTpRootCacheMeta(*pastKeyValues[idx].second, devices, kvHeadSchemes[i],
-                                               num_key_value_heads, head_dim);
+        if (tensorParallel) {
+            for (int b = 0; b < batch; b++) {
+                for (int i = 0; i < block_cnt; i++) {
+                    int idx = b * block_cnt + i;
+                    SyncQwen3ThreadTpRootCacheMeta(*pastKeyValues[idx].first, devices, kvHeadSchemes[i],
+                                                   num_key_value_heads, head_dim);
+                    SyncQwen3ThreadTpRootCacheMeta(*pastKeyValues[idx].second, devices, kvHeadSchemes[i],
+                                                   num_key_value_heads, head_dim);
+                }
             }
         }
 

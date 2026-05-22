@@ -8,6 +8,7 @@
 #include "basellm.h"
 #include "cmath"
 
+#include <atomic>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -153,6 +154,7 @@ namespace fastllm {
         std::unordered_map <std::string, Data> threadTpEmptyBiases;
         int threadTpPagedCacheBase = -1;
         std::mutex threadTpWeightPrepareLock;
+        std::atomic<bool> singleGpuWeightsPrepared{false};
         bool threadTpWeightsPrepared = false;
         std::vector <int> threadTpPreparedDevices;
         std::map <int, int> threadTpPreparedRatios;
