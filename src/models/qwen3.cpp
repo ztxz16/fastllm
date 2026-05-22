@@ -623,6 +623,42 @@ namespace fastllm {
             }
         }
 
+        static void Qwen3CudaLinearResidualReduce(
+                Qwen3CudaDirectRunner &runner,
+                Data &input, Data &weight, Data &bias,
+                Data &middle, Data &hiddenStates,
+                bool tensorParallel, bool firstTensorParallelRank,
+                int gpuId) {
+            DataType residualType = hiddenStates.dataType;
+            bool canAddDirectly = input.dataType == residualType;
+
+            if (tensorParallel) {
+                if (firstTensorParallelRank) {
+                    if (canAddDirectly) {
+                        Qwen3CudaLinearAddBlock(runner, &input, &weight, &bias, &middle, &hiddenStates);
+                    } else {
+                        Qwen3CudaLinear(runner, input, weight, bias, middle);
+                        Qwen3CudaToDataType(runner, middle, residualType);
+                        Qwen3CudaAddTo(runner, hiddenStates, middle);
+                    }
+                } else {
+                    Qwen3CudaLinear(runner, input, weight, bias, hiddenStates);
+                    Qwen3CudaToDataType(runner, hiddenStates, residualType);
+                }
+                FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
+                                     hiddenStates.Count(0), hiddenStates.dataType, gpuId);
+                return;
+            }
+
+            if (canAddDirectly) {
+                Qwen3CudaLinearAddBlock(runner, &input, &weight, &bias, &middle, &hiddenStates);
+            } else {
+                Qwen3CudaLinear(runner, input, weight, bias, middle);
+                Qwen3CudaToDataType(runner, middle, residualType);
+                Qwen3CudaAddTo(runner, hiddenStates, middle);
+            }
+        }
+
         static void Qwen3CudaConvertToDataType(Qwen3CudaDirectRunner &runner,
                                                const Data &input, Data &output, DataType dataType) {
             if (dataType == DataType::FLOAT32) {
@@ -1247,6 +1283,7 @@ namespace fastllm {
             bool all1,
             bool isPrefill,
             bool tensorParallel,
+            bool firstTensorParallelRank,
             int pagedCacheLayerOffset,
             Data &logits) {
 #ifndef USE_CUDA
@@ -1349,6 +1386,7 @@ namespace fastllm {
         std::ostringstream signature;
         signature << "gpu=" << gpuId
                   << ";tp=" << (tensorParallel ? 1 : 0)
+                  << ";tpRank0=" << (firstTensorParallelRank ? 1 : 0)
                   << ";pages=" << pageIndexHost.size()
                   << ";inputType=" << (int)state.inputIds.dataType
                   << ";posType=" << (int)state.positionIds.dataType
@@ -1442,18 +1480,12 @@ namespace fastllm {
                     true
                 );
 
-                Qwen3CudaLinear(cudaRunner, buf.attenOutput,
-                                *requireLocal(weight[oWeightName], oWeightName),
-                                *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
-                                buf.attenLastOutput);
-                if (tensorParallel) {
-                    FastllmNcclAllReduce(buf.attenLastOutput.cudaData, buf.attenLastOutput.cudaData,
-                                         buf.attenLastOutput.Count(0), buf.attenLastOutput.dataType, gpuId);
-                }
-                if (buf.attenLastOutput.dataType != buf.hiddenStates.dataType) {
-                    Qwen3CudaToDataType(cudaRunner, buf.attenLastOutput, buf.hiddenStates.dataType);
-                }
-                Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, buf.attenLastOutput);
+                Qwen3CudaLinearResidualReduce(
+                    cudaRunner, buf.attenOutput,
+                    *requireLocal(weight[oWeightName], oWeightName),
+                    *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                    buf.attenLastOutput, buf.hiddenStates,
+                    tensorParallel, firstTensorParallelRank, gpuId);
 
                 Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
                                  *requireLocal(weight[postRmsName], postRmsName),
@@ -1463,18 +1495,12 @@ namespace fastllm {
                                       *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
                                                     swigluWeightName + ".tp_bias"),
                                       buf.gateupResult, buf.swigluResult);
-                Qwen3CudaLinear(cudaRunner, buf.swigluResult,
-                                *requireLocal(weight[downWeightName], downWeightName),
-                                *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName),
-                                buf.mlpPart);
-                if (tensorParallel) {
-                    FastllmNcclAllReduce(buf.mlpPart.cudaData, buf.mlpPart.cudaData,
-                                         buf.mlpPart.Count(0), buf.mlpPart.dataType, gpuId);
-                }
-                if (buf.mlpPart.dataType != buf.hiddenStates.dataType) {
-                    Qwen3CudaToDataType(cudaRunner, buf.mlpPart, buf.hiddenStates.dataType);
-                }
-                Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, buf.mlpPart);
+                Qwen3CudaLinearResidualReduce(
+                    cudaRunner, buf.swigluResult,
+                    *requireLocal(weight[downWeightName], downWeightName),
+                    *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName),
+                    buf.mlpPart, buf.hiddenStates,
+                    tensorParallel, firstTensorParallelRank, gpuId);
             }
 
             Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
@@ -1575,6 +1601,7 @@ namespace fastllm {
             bool all1,
             bool isPrefill,
             bool tensorParallel,
+            bool firstTensorParallelRank,
             int pagedCacheLayerOffset,
             Data &logits) {
 #ifndef USE_CUDA
@@ -1585,7 +1612,8 @@ namespace fastllm {
         FastllmCudaSetDevice(gpuId);
         if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
                                         seqLens, pastKeyValues, all1, isPrefill,
-                                        tensorParallel, pagedCacheLayerOffset, logits)) {
+                                        tensorParallel, firstTensorParallelRank,
+                                        pagedCacheLayerOffset, logits)) {
             return;
         }
         Qwen3CudaDirectRunner cudaRunner(gpuId);
@@ -1676,18 +1704,12 @@ namespace fastllm {
                 false
             );
 
-            Qwen3CudaLinear(cudaRunner, attenOutput,
-                            *requireLocal(weight[oWeightName], oWeightName),
-                            *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
-                            attenLastOutput);
-            if (tensorParallel) {
-                FastllmNcclAllReduce(attenLastOutput.cudaData, attenLastOutput.cudaData,
-                                     attenLastOutput.Count(0), attenLastOutput.dataType, gpuId);
-            }
-            if (attenLastOutput.dataType != hiddenStates.dataType) {
-                Qwen3CudaToDataType(cudaRunner, attenLastOutput, hiddenStates.dataType);
-            }
-            Qwen3CudaAddTo(cudaRunner, hiddenStates, attenLastOutput);
+            Qwen3CudaLinearResidualReduce(
+                cudaRunner, attenOutput,
+                *requireLocal(weight[oWeightName], oWeightName),
+                *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                attenLastOutput, hiddenStates,
+                tensorParallel, firstTensorParallelRank, gpuId);
 
             Qwen3CudaRMSNorm(cudaRunner, hiddenStates,
                              *requireLocal(weight[postRmsName], postRmsName),
@@ -1697,18 +1719,12 @@ namespace fastllm {
                                   *requireLocal(GetThreadTensorParallelBias(swigluWeightName + ".tp_bias"),
                                                 swigluWeightName + ".tp_bias"),
                                   gateupResult, swigluResult);
-            Qwen3CudaLinear(cudaRunner, swigluResult,
-                            *requireLocal(weight[downWeightName], downWeightName),
-                            *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName),
-                            mlpPart);
-            if (tensorParallel) {
-                FastllmNcclAllReduce(mlpPart.cudaData, mlpPart.cudaData,
-                                     mlpPart.Count(0), mlpPart.dataType, gpuId);
-            }
-            if (mlpPart.dataType != hiddenStates.dataType) {
-                Qwen3CudaToDataType(cudaRunner, mlpPart, hiddenStates.dataType);
-            }
-            Qwen3CudaAddTo(cudaRunner, hiddenStates, mlpPart);
+            Qwen3CudaLinearResidualReduce(
+                cudaRunner, swigluResult,
+                *requireLocal(weight[downWeightName], downWeightName),
+                *requireLocal(GetThreadTensorParallelBias(downBiasName), downBiasName),
+                mlpPart, hiddenStates,
+                tensorParallel, firstTensorParallelRank, gpuId);
         }
 
         Data lastHiddenStates;
@@ -2147,7 +2163,7 @@ namespace fastllm {
         if (devices.size() == 1) {
             ForwardSingleGPU(devices[0], ratios, batch, gpuInputIds, allPositionIds,
                              seqLens, localPastKeyValues[0], all1, isPrefill,
-                             false, threadTpPagedCacheBase, localLogits[0]);
+                             false, true, threadTpPagedCacheBase, localLogits[0]);
         } else {
             std::vector<std::thread> threads;
             threads.reserve(devices.size());
@@ -2156,7 +2172,7 @@ namespace fastllm {
                     try {
                         ForwardSingleGPU(devices[r], ratios, batch, gpuInputIds, allPositionIds,
                                          seqLens, localPastKeyValues[r], all1, isPrefill,
-                                         tensorParallel, threadTpPagedCacheBase + r * block_cnt,
+                                         tensorParallel, r == 0, threadTpPagedCacheBase + r * block_cnt,
                                          localLogits[r]);
                     } catch (...) {
                         errors[r] = std::current_exception();

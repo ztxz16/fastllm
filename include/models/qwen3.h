@@ -114,6 +114,7 @@ namespace fastllm {
                 bool all1,
                 bool isPrefill,
                 bool tensorParallel,
+                bool firstTensorParallelRank,
                 int pagedCacheLayerOffset,
                 Data &logits);
 
@@ -128,6 +129,7 @@ namespace fastllm {
                 bool all1,
                 bool isPrefill,
                 bool tensorParallel,
+                bool firstTensorParallelRank,
                 int pagedCacheLayerOffset,
                 Data &logits);
 
