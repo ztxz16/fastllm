@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <vector>
 #include <chrono>
+#include <algorithm>
+#include <cstdint>
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
@@ -36,7 +38,7 @@ using namespace nvcuda;
 #define checkCudaErrors(message, val) showError(val, message, __FILE__, __LINE__)
 extern void showError(cudaError_t result, char const* const message, const char* const file, int const line);
 
-void FastllmCudaMemcpy2D(void* dst, size_t dpitch, const void* src,
+cudaError_t FastllmCudaMemcpy2D(void* dst, size_t dpitch, const void* src,
     size_t spitch, size_t width, size_t height, cudaMemcpyKind type, 
     int dstDeviceId, int srcDeviceId) {
 #if defined(USE_ROCM) && defined(USE_MI50_WORKAROUND)
@@ -44,21 +46,58 @@ void FastllmCudaMemcpy2D(void* dst, size_t dpitch, const void* src,
     if (type == cudaMemcpyDeviceToDevice && srcDeviceId != dstDeviceId) {
         std::vector <uint8_t> hostBuffer(height * width);
         cudaSetDevice(srcDeviceId);
-        cudaMemcpy2D(hostBuffer.data(), width, src, spitch, width, height, cudaMemcpyDeviceToHost);
+        cudaError_t workaroundState =
+            cudaMemcpy2D(hostBuffer.data(), width, src, spitch, width, height, cudaMemcpyDeviceToHost);
 
-        cudaSetDevice(dstDeviceId);
-        cudaMemcpy2D(dst, dpitch, hostBuffer.data(), width, width, height, cudaMemcpyHostToDevice);
+        if (workaroundState == cudaSuccess) {
+            cudaSetDevice(dstDeviceId);
+            workaroundState = cudaMemcpy2D(dst, dpitch, hostBuffer.data(), width, width, height, cudaMemcpyHostToDevice);
+        }
 
         cudaDeviceSynchronize();
-        return;
+        if (workaroundState != cudaSuccess) {
+            checkCudaErrors("Error: CUDA error when memcpy2D!", workaroundState);
+        }
+        return workaroundState;
     }
 #endif
 
     cudaError_t state = cudaSuccess;
     if (type == cudaMemcpyDeviceToDevice) {
         cudaSetDevice(dstDeviceId);
+        if (dstDeviceId != srcDeviceId) {
+            state = cudaMemcpy2D(dst, dpitch, src, spitch,
+                                 width, height, cudaMemcpyDeviceToDevice);
+            if (state != cudaSuccess) {
+                cudaGetLastError();
+                size_t maxStagingBytes = 16 * 1024 * 1024;
+                size_t chunkRows = std::max<size_t>(1, std::min(height, maxStagingBytes / std::max<size_t>(1, width)));
+                std::vector<uint8_t> hostBuffer(chunkRows * width);
+                for (size_t base = 0; base < height && state == cudaSuccess; base += chunkRows) {
+                    size_t curRows = std::min(chunkRows, height - base);
+                    cudaSetDevice(srcDeviceId);
+                    for (size_t row = 0; row < curRows; row++) {
+                        state = cudaMemcpy(hostBuffer.data() + row * width,
+                                           (const uint8_t*)src + (base + row) * spitch,
+                                           width, cudaMemcpyDeviceToHost);
+                        if (state != cudaSuccess) {
+                            break;
+                        }
+                    }
+                    if (state == cudaSuccess) {
+                        cudaSetDevice(dstDeviceId);
+                        state = cudaMemcpy2D((uint8_t*)dst + base * dpitch, dpitch,
+                                             hostBuffer.data(), width,
+                                             width, curRows, cudaMemcpyHostToDevice);
+                    }
+                }
+            }
+        } else {
+            state = cudaMemcpy2D(dst, dpitch, src, spitch, width, height, type);
+        }
+    } else {
+        state = cudaMemcpy2D(dst, dpitch, src, spitch, width, height, type);
     }
-    state = cudaMemcpy2D(dst, dpitch, src, spitch, width, height, type);
 
 #ifdef USE_ROCM
     cudaDeviceSynchronize();
@@ -67,6 +106,7 @@ void FastllmCudaMemcpy2D(void* dst, size_t dpitch, const void* src,
     if (state != cudaSuccess) {
         checkCudaErrors("Error: CUDA error when memcpy2D!", state);
     }
+    return state;
 }
 
 void FastllmCudaMemcpy2DDeviceToDeviceAuto(void * 	dst, size_t 	dpitch, const void * 	src,
@@ -160,24 +200,54 @@ void FastllmGetMulticudaDeviceAndRatio(std::vector <int> &devices, std::map <int
 std::vector <int> FastllmMultiCudaGetSplitPoints(std::vector <int> &multiCudaCurrentDevices, 
                                 std::map <int, int> &multiCudaCurrentRatios, int total, int unit = 1) {
     int deviceNum = multiCudaCurrentDevices.size();
+    std::vector <int> ret;
+    if (deviceNum <= 0) {
+        return ret;
+    }
+    if (total <= 0) {
+        ret.resize(deviceNum + 1, 0);
+        return ret;
+    }
     unit = std::max(1, total > 0 ? std::min(unit, total) : unit);
     int nodes = total / unit;
     int totalRatio = 0;
     if (multiCudaCurrentRatios.size() > 0) {
         for (auto &it : multiCudaCurrentRatios) {
-            totalRatio += it.second;
+            totalRatio += std::max(0, it.second);
         }
-    } else {
+    }
+    if (totalRatio <= 0) {
         totalRatio = deviceNum;
     }
-    std::vector <int> ret;
+
+    std::vector<int> ratios(deviceNum, 1);
+    std::vector<int> units(deviceNum, 0);
+    std::vector<long long> remainders(deviceNum, 0);
+    int usedNodes = 0;
+    for (int i = 0; i < deviceNum; i++) {
+        auto ratioIt = multiCudaCurrentRatios.find(multiCudaCurrentDevices[i]);
+        ratios[i] = ratioIt == multiCudaCurrentRatios.end() ? 1 : std::max(0, ratioIt->second);
+        long long scaled = (long long)nodes * ratios[i];
+        units[i] = (int)(scaled / totalRatio);
+        remainders[i] = scaled % totalRatio;
+        usedNodes += units[i];
+    }
+    while (usedNodes < nodes) {
+        int best = 0;
+        for (int i = 1; i < deviceNum; i++) {
+            if (remainders[i] > remainders[best] ||
+                (remainders[i] == remainders[best] && ratios[i] > ratios[best])) {
+                best = i;
+            }
+        }
+        units[best]++;
+        remainders[best] = -1;
+        usedNodes++;
+    }
+
     int cur = 0;
     for (int i = 0; i < deviceNum; i++) {
-        int curRatio = 1;
-        if (multiCudaCurrentRatios.find(multiCudaCurrentDevices[i]) != multiCudaCurrentRatios.end()) {
-            curRatio = multiCudaCurrentRatios[multiCudaCurrentDevices[i]];
-        }
-        int now = std::max(1, nodes * curRatio / totalRatio) * unit;
+        int now = units[i] * unit;
         int end = (i == deviceNum - 1 ? total : cur + now);
         ret.push_back(cur);
         if (i == deviceNum - 1) {
@@ -225,6 +295,8 @@ static int GetMultiCudaSplitUnit(const fastllm::Data &data) {
     int unit = data.groupCnt <= 0 ? 128 : data.groupCnt;
     if (data.dataType == fastllm::DataType::FP8_E4M3) {
         unit = data.blockM;
+    } else if (data.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128) {
+        unit = 128;
     }
     if (data.dataType == fastllm::DataType::NVFP4) {
         if (data.blockK > 0) {
@@ -247,6 +319,32 @@ static int GetGGUFHeadSplitUnit(const fastllm::Data &data, int widthPerHead) {
     int blockSize = GetGGUFBlockSize(data);
     int gcd = GcdInt(blockSize, std::max(1, widthPerHead));
     return std::max(1, blockSize / gcd);
+}
+
+static void SetLocalQKVPackMeta(fastllm::Data *local, const fastllm::Data &weight,
+                                const std::vector<std::pair<int, int> > &div) {
+    if (local == nullptr || weight.tpPackType != fastllm::TP_PACK_QKV) {
+        return;
+    }
+    int headDim = std::max(1, weight.tpHeadDim);
+    int qWidth = weight.tpQHeads * headDim;
+    int kvWidth = weight.tpKVHeads * headDim;
+    int qRows = 0, kRows = 0, vRows = 0;
+    for (auto &range : div) {
+        if (range.first >= 0 && range.second <= qWidth) {
+            qRows += range.second - range.first;
+        } else if (range.first >= qWidth && range.second <= qWidth + kvWidth) {
+            kRows += range.second - range.first;
+        } else if (range.first >= qWidth + kvWidth && range.second <= qWidth + 2 * kvWidth) {
+            vRows += range.second - range.first;
+        }
+    }
+    if (qRows > 0 && kRows > 0 && kRows == vRows &&
+        qRows % headDim == 0 && kRows % headDim == 0) {
+        local->tpQHeads = qRows / headDim;
+        local->tpKVHeads = kRows / headDim;
+        local->tpHeadDim = headDim;
+    }
 }
 
 static void InitMultiCudaLocalTensorMeta(const fastllm::Data &src, fastllm::Data &dst) {
@@ -444,9 +542,45 @@ DivisionScheme BuildMultiCudaRowSplitScheme(fastllm::Data &weight, std::vector <
         int qWidth = qHeads * headDim;
         int kvWidth = kvHeads * headDim;
         int headUnit = GetGGUFHeadSplitUnit(weight, group * headDim);
+        fastllm::AssertInFastLLM(kvHeads > 0 && qHeads > 0 && headDim > 0 && qHeads % kvHeads == 0,
+                                 "QKV tensor parallel requires valid q/kv head metadata.\n");
         fastllm::AssertInFastLLM(!IsGGUFTensor(weight) || kvHeads % headUnit == 0,
                                  "GGUF QKV tensor parallel requires kv heads aligned to head unit " +
                                  std::to_string(headUnit) + ".\n");
+        if ((int)devices.size() > kvHeads) {
+            fastllm::AssertInFastLLM(!IsGGUFTensor(weight),
+                                     "GGUF QKV tensor parallel doesn't support splitting one KV head across devices.\n");
+            fastllm::AssertInFastLLM((int)devices.size() <= qHeads,
+                                     "QKV tensor parallel has more devices than query heads.\n");
+            int offset = 0;
+            for (int kv = 0; kv < kvHeads; kv++) {
+                int leftDevices = (int)devices.size() - offset;
+                int leftGroups = kvHeads - kv;
+                int take = (leftDevices + leftGroups - 1) / leftGroups;
+                std::vector<int> groupDevices;
+                std::map<int, int> groupRatios;
+                for (int j = 0; j < take; j++) {
+                    int deviceId = devices[offset + j];
+                    groupDevices.push_back(deviceId);
+                    groupRatios[deviceId] = ratios.find(deviceId) == ratios.end() ? 1 : ratios[deviceId];
+                }
+                std::vector<int> qPoints = FastllmMultiCudaGetSplitPoints(groupDevices, groupRatios, group, 1);
+                for (int j = 0; j < take; j++) {
+                    int deviceId = groupDevices[j];
+                    int qSt = kv * group + qPoints[j];
+                    int qEnd = kv * group + qPoints[j + 1];
+                    fastllm::AssertInFastLLM(qSt < qEnd && qEnd <= (kv + 1) * group,
+                                             "QKV tensor parallel got invalid query head split.\n");
+                    divisionScheme[deviceId].push_back({qSt * headDim, qEnd * headDim});
+                    divisionScheme[deviceId].push_back({qWidth + kv * headDim, qWidth + (kv + 1) * headDim});
+                    divisionScheme[deviceId].push_back({qWidth + kvWidth + kv * headDim,
+                                                        qWidth + kvWidth + (kv + 1) * headDim});
+                }
+                offset += take;
+            }
+            return divisionScheme;
+        }
+
         std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, kvHeads, headUnit);
         for (int i = 0; i < devices.size(); i++) {
             int deviceId = devices[i];
@@ -488,16 +622,45 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme, int splitAxis) {
     int deviceNum = multiCudaCurrentDevices.size();
     int rootDevice = deviceNum > 0 ? multiCudaCurrentDevices[0] : 0;
+    auto hasRequestedLocalTensors = [&]() {
+        if (!weight.multiDeviceData) {
+            return false;
+        }
+        for (int deviceId : multiCudaCurrentDevices) {
+            auto weightIt = weight.multiDeviceDatas.find(deviceId);
+            if (weightIt == weight.multiDeviceDatas.end() || weightIt->second == nullptr) {
+                return false;
+            }
+            if (bias.multiDeviceData || bias.dims.size() > 0) {
+                auto biasIt = bias.multiDeviceDatas.find(deviceId);
+                if (biasIt == bias.multiDeviceDatas.end() || biasIt->second == nullptr) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+    if (hasRequestedLocalTensors()) {
+        return true;
+    }
     fastllm::AssertInFastLLM(weight.dataType != fastllm::DataType::DATA_GGUF_FORMAT || weight.ggmlType >= 0,
                              "GGUF weight \"" + weight.name + "\" is missing ggmlType before multicuda split.\n");
     if (weight.dataDevice != fastllm::DataDevice::CUDA || weight.cudaData == nullptr ||
         weight.dataDeviceIds.size() == 0 || weight.dataDeviceIds[0] != rootDevice) {
         weight.ToDevice(fastllm::DataDevice::CUDA, {rootDevice}, true);
+        if (weight.cudaData == nullptr) {
+            fastllm::ErrorInFastLLM("SplitMultiCudaWeight failed to move weight \"" + weight.name +
+                                    "\" to CUDA root device " + std::to_string(rootDevice) + ".\n");
+        }
     }
     if (bias.dims.size() > 0 &&
         (bias.dataDevice != fastllm::DataDevice::CUDA || bias.cudaData == nullptr ||
          bias.dataDeviceIds.size() == 0 || bias.dataDeviceIds[0] != rootDevice)) {
         bias.ToDevice(fastllm::DataDevice::CUDA, {rootDevice}, true);
+        if (bias.cudaData == nullptr) {
+            fastllm::ErrorInFastLLM("SplitMultiCudaWeight failed to move bias \"" + bias.name +
+                                    "\" to CUDA root device " + std::to_string(rootDevice) + ".\n");
+        }
     }
 
     for (int i = 0; i < deviceNum; i++) {
@@ -531,10 +694,21 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
     int k = weight.dims[0], m = weight.dims[1];
     cudaError_t state = cudaSuccess;
     float *cudaBiasData = (float*)FastllmCudaMalloc(k * sizeof(float));
+    if (cudaBiasData == nullptr) {
+        fastllm::ErrorInFastLLM("SplitMultiCudaWeight failed to allocate temporary bias for \"" +
+                                weight.name + "\".\n");
+    }
     if (bias.dims.size() > 0) {
         state = cudaMemcpy(cudaBiasData, (uint8_t *) bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
     } else {
         state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
+    }
+    if (state != cudaSuccess) {
+        FastllmCudaFree(cudaBiasData);
+        ResetMultiDeviceData(weight);
+        ResetMultiDeviceData(bias);
+        checkCudaErrors("Error: CUDA error when split weight!", state);
+        return false;
     }
         
     for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
@@ -559,14 +733,73 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
             bias.multiDeviceDatas[deviceId] = CreateMultiCudaLocalTensor(bias, {len});
             bias.multiDeviceDatas[deviceId]->dataDevice = dataDevice;
             bias.multiDeviceDatas[deviceId]->dataDeviceIds = {deviceId};
+            SetLocalQKVPackMeta(weight.multiDeviceDatas[deviceId], weight, div);
             weight.multiDeviceDatas[deviceId]->Allocate();
             bias.multiDeviceDatas[deviceId]->Allocate();
 
             deviceWeightData = mallocType == 0 ? weight.multiDeviceDatas[deviceId]->cpuData : weight.multiDeviceDatas[deviceId]->cudaData;
             deviceBiasData = (float*)(mallocType == 0 ? bias.multiDeviceDatas[deviceId]->cpuData : bias.multiDeviceDatas[deviceId]->cudaData);
+            bool emptyShard = len == 0;
+            if (!emptyShard && (deviceWeightData == nullptr || deviceBiasData == nullptr)) {
+                state = cudaErrorMemoryAllocation;
+            }
             int curLen = 0;
-            if (IsGGUFTensor(weight)) {
+            bool sourceCrossGateUp = weight.tpPackType == fastllm::TP_PACK_GATEUP &&
+                                     weight.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128 &&
+                                     !weight.numasData.empty();
+            if (state != cudaSuccess) {
+                // handled by the common error path below
+            } else if (emptyShard) {
+                // This can happen when the number of GPUs is larger than the number of aligned TP blocks.
+            } else if (sourceCrossGateUp) {
+                int mid = k / 2;
+                size_t rowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
+                for (auto &it : div) {
+                    int copyLen = it.second - it.first;
+                    int srcRow = it.first < mid ? it.first * 2 : (it.first - mid) * 2 + 1;
+                    state = FastllmCudaMemcpy2D(
+                        (uint8_t*)deviceWeightData + (size_t)curLen * rowBytes,
+                        rowBytes,
+                        (uint8_t*)weight.cudaData + (size_t)srcRow * rowBytes,
+                        rowBytes * 2,
+                        rowBytes,
+                        copyLen,
+                        GetCudaMemcpyType(mallocType, 1),
+                        deviceId,
+                        rootDevice);
+                    if (state != cudaSuccess) {
+                        break;
+                    }
+                    state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
+                                       (size_t)copyLen * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                    if (state != cudaSuccess) {
+                        break;
+                    }
+                    curLen += copyLen;
+                }
+            } else if (IsGGUFTensor(weight)) {
                 size_t rowBytes = GetGGUFRowBytes(weight, m);
+                if (mallocType == 0) {
+                    cudaSetDevice(rootDevice);
+                }
+                for (auto &it : div) {
+                    int copyLen = it.second - it.first;
+                    state = cudaMemcpy((uint8_t*)deviceWeightData + (size_t)curLen * rowBytes,
+                                       (uint8_t*)weight.cudaData + (size_t)it.first * rowBytes,
+                                       (size_t)copyLen * rowBytes,
+                                       GetCudaMemcpyType(mallocType, 1));
+                    if (state != cudaSuccess) {
+                        break;
+                    }
+                    state = cudaMemcpy(deviceBiasData + curLen, cudaBiasData + it.first,
+                                       (size_t)copyLen * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                    if (state != cudaSuccess) {
+                        break;
+                    }
+                    curLen += copyLen;
+                }
+            } else if (weight.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128) {
+                size_t rowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
                 if (mallocType == 0) {
                     cudaSetDevice(rootDevice);
                 }
@@ -649,9 +882,17 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
 
             deviceWeightData = mallocType == 0 ? weight.multiDeviceDatas[deviceId]->cpuData : weight.multiDeviceDatas[deviceId]->cudaData;
             deviceBiasData = (float*)(mallocType == 0 ? bias.multiDeviceDatas[deviceId]->cpuData : bias.multiDeviceDatas[deviceId]->cudaData);
+            bool emptyShard = len == 0;
+            if (!emptyShard && (deviceWeightData == nullptr || deviceBiasData == nullptr)) {
+                state = cudaErrorMemoryAllocation;
+            }
 
             int curLen = 0;
-            if (IsGGUFTensor(weight)) {
+            if (state != cudaSuccess) {
+                // handled by the common error path below
+            } else if (emptyShard) {
+                // This can happen when the number of GPUs is larger than the number of aligned TP blocks.
+            } else if (IsGGUFTensor(weight)) {
                 size_t srcRowBytes = GetGGUFRowBytes(weight, m);
                 size_t dstRowBytes = GetGGUFRowBytes(*weight.multiDeviceDatas[deviceId], len);
                 size_t dstOffsetBytes = 0;
@@ -662,12 +903,41 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     int copyLen = it.second - it.first;
                     size_t srcOffsetBytes = GetGGUFRowBytes(weight, it.first);
                     size_t copyBytes = GetGGUFRowBytes(weight, copyLen);
-                    FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstOffsetBytes,
-                                        dstRowBytes,
-                                        (uint8_t*)weight.cudaData + srcOffsetBytes,
-                                        srcRowBytes,
-                                        copyBytes,
-                                        k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstOffsetBytes,
+                                                dstRowBytes,
+                                                (uint8_t*)weight.cudaData + srcOffsetBytes,
+                                                srcRowBytes,
+                                                copyBytes,
+                                                k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                    if (state != cudaSuccess) {
+                        break;
+                    }
+                    dstOffsetBytes += copyBytes;
+                    curLen += copyLen;
+                }
+            } else if (weight.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128) {
+                size_t srcRowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
+                size_t dstRowBytes = fastllm::GetDataBytes(weight.dataType, 1, len);
+                size_t dstOffsetBytes = 0;
+                for (auto &it : div) {
+                    int copyLen = it.second - it.first;
+                    fastllm::AssertInFastLLM(it.first % 128 == 0 && copyLen % 128 == 0,
+                                             "FP8 block128 tensor parallel column split should align to 128.\n");
+                    if (mallocType == 0) {
+                        cudaSetDevice(rootDevice);
+                    }
+                    size_t blockBytes = 128 + sizeof(float);
+                    size_t srcOffsetBytes = (size_t)(it.first / 128) * blockBytes;
+                    size_t copyBytes = (size_t)(copyLen / 128) * blockBytes;
+                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstOffsetBytes,
+                                                dstRowBytes,
+                                                (uint8_t*)weight.cudaData + srcOffsetBytes,
+                                                srcRowBytes,
+                                                copyBytes,
+                                                k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                    if (state != cudaSuccess) {
+                        break;
+                    }
                     dstOffsetBytes += copyBytes;
                     curLen += copyLen;
                 }
@@ -688,18 +958,24 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     if (mallocType == 0) {
                         cudaSetDevice(rootDevice);
                     }
-                    FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + (curLen >> 1),
-                                        dstRowBytes,
-                                        (uint8_t*)weight.cudaData + (it.first >> 1),
-                                        srcRowBytes,
-                                        (size_t)copyLen >> 1,
-                                        k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
-                    FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstWeightBytes + curLen / weight.blockM,
-                                        dstScaleCols,
-                                        (uint8_t*)weight.cudaData + srcWeightBytes + it.first / weight.blockM,
-                                        srcScaleCols,
-                                        (size_t)copyLen / weight.blockM,
-                                        scaleRows, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + (curLen >> 1),
+                                                dstRowBytes,
+                                                (uint8_t*)weight.cudaData + (it.first >> 1),
+                                                srcRowBytes,
+                                                (size_t)copyLen >> 1,
+                                                k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                    if (state != cudaSuccess) {
+                        break;
+                    }
+                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstWeightBytes + curLen / weight.blockM,
+                                                dstScaleCols,
+                                                (uint8_t*)weight.cudaData + srcWeightBytes + it.first / weight.blockM,
+                                                srcScaleCols,
+                                                (size_t)copyLen / weight.blockM,
+                                                scaleRows, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                    if (state != cudaSuccess) {
+                        break;
+                    }
                     curLen += copyLen;
                 }
             } else {
@@ -707,27 +983,36 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     if (mallocType == 0) {
                         cudaSetDevice(rootDevice);
                     }
-                    FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + curLen * weight.unitSize / weight.unitSizeDiv,
-                                        (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
-                                        (uint8_t*)weight.cudaData + it.first * weight.unitSize / weight.unitSizeDiv, 
-                                        m * weight.unitSize / weight.unitSizeDiv, 
-                                        (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
-                                        k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + curLen * weight.unitSize / weight.unitSizeDiv,
+                                                (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
+                                                (uint8_t*)weight.cudaData + it.first * weight.unitSize / weight.unitSizeDiv,
+                                                m * weight.unitSize / weight.unitSizeDiv,
+                                                (it.second - it.first) * weight.unitSize / weight.unitSizeDiv,
+                                                k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                    if (state != cudaSuccess) {
+                        break;
+                    }
                     curLen += (it.second - it.first);
                 }
             }
-            if (i == 0) {
-                state = cudaMemcpy(deviceBiasData, cudaBiasData, k * sizeof(float), GetCudaMemcpyType(mallocType, 1));
-            } else {
-                state = AutoMemset(deviceBiasData, 0, k * sizeof(float), mallocType);
+            if (state == cudaSuccess && !emptyShard) {
+                if (i == 0) {
+                    state = cudaMemcpy(deviceBiasData, cudaBiasData, k * sizeof(float), GetCudaMemcpyType(mallocType, 1));
+                } else {
+                    state = AutoMemset(deviceBiasData, 0, k * sizeof(float), mallocType);
+                }
             }
         }
 
         if (cudaSuccess != state) {
+            FastllmCudaFree(cudaBiasData);
+            ResetMultiDeviceData(weight);
+            ResetMultiDeviceData(bias);
             checkCudaErrors("Error: CUDA error when split weight!", state);
             return false;
         }
     }
+    FastllmCudaFree(cudaBiasData);
 
     if (weight.dataType == fastllm::DataType::FP8_E4M3) {
         for (int i = 0; i < multiCudaCurrentDevices.size(); i++) {
@@ -1036,13 +1321,44 @@ cudaStream_t *GetFastllmStream(int id) {
 // Key: deviceId, Value: ncclComm_t
 static std::map<int, ncclComm_t> g_ncclComms;
 static bool g_ncclInitialized = false;
+static int g_ncclWorldSize = 0;
+
+static std::vector<int> FastllmUniqueNcclDevices(const std::vector<int> &devices) {
+    std::vector<int> uniqueDevices;
+    uniqueDevices.reserve(devices.size());
+    for (int device : devices) {
+        if (device >= 0 && std::find(uniqueDevices.begin(), uniqueDevices.end(), device) == uniqueDevices.end()) {
+            uniqueDevices.push_back(device);
+        }
+    }
+    return uniqueDevices;
+}
+
+static size_t FastllmNcclDataTypeBytes(int dataType) {
+    if (dataType == fastllm::DataType::FLOAT32) {
+        return sizeof(float);
+    } else if (dataType == fastllm::DataType::FLOAT16 || dataType == fastllm::DataType::BFLOAT16) {
+        return sizeof(uint16_t);
+    }
+    return 0;
+}
+
+static ncclComm_t FindNcclCommNoLog(int deviceId) {
+    auto it = g_ncclComms.find(deviceId);
+    return it == g_ncclComms.end() ? nullptr : it->second;
+}
 
 bool FastllmInitNccl(const std::vector<int>& devices) {
-    if (devices.empty()) return false;
+    std::vector<int> uniqueDevices = FastllmUniqueNcclDevices(devices);
+    if (uniqueDevices.size() <= 1) {
+        return false;
+    }
 
-    bool ready = g_ncclInitialized;
+    int numGPUs = uniqueDevices.size();
+    bool ready = g_ncclInitialized && g_ncclWorldSize == numGPUs &&
+                 (int)g_ncclComms.size() == numGPUs;
     if (ready) {
-        for (int device : devices) {
+        for (int device : uniqueDevices) {
             auto it = g_ncclComms.find(device);
             if (it == g_ncclComms.end() || it->second == nullptr) {
                 ready = false;
@@ -1061,18 +1377,18 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     }
     g_ncclComms.clear();
     g_ncclInitialized = false;
+    g_ncclWorldSize = 0;
 
-    int numGPUs = devices.size();
     std::vector<ncclComm_t> comms(numGPUs);
 
-    for (int device : devices) {
+    for (int device : uniqueDevices) {
         cudaSetDevice(device);
         cudaFree(0);
     }
 
     // ncclCommInitAll 会在这一组设备之间建立通信域
     // 注意：这会阻塞，直到所有卡都就绪
-    ncclResult_t initRes = ncclCommInitAll(comms.data(), numGPUs, devices.data());
+    ncclResult_t initRes = ncclCommInitAll(comms.data(), numGPUs, uniqueDevices.data());
     if (initRes != ncclSuccess) {
         printf("Error: ncclCommInitAll failed: %s\n", ncclGetErrorString(initRes));
         return false;
@@ -1080,10 +1396,11 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
 
     // 将生成的 comms 存入 map，方便后续通过 deviceId 查找
     for(int i = 0; i < numGPUs; ++i) {
-        g_ncclComms[devices[i]] = comms[i];
+        g_ncclComms[uniqueDevices[i]] = comms[i];
     }
         
     g_ncclInitialized = true;
+    g_ncclWorldSize = numGPUs;
     printf("NCCL Initialized for %d devices.\n", numGPUs);
     return true;
 }
@@ -1103,14 +1420,20 @@ ncclComm_t GetNcclComm(int deviceId) {
 // root: 源数据的 deviceId
 // deviceId: 当前调用线程所属的 deviceId
 void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int deviceId) {
+    if (data == nullptr || count <= 0) {
+        return;
+    }
+
     // 1. 获取当前设备的通信器
-    ncclComm_t comm = GetNcclComm(deviceId);
+    ncclComm_t comm = FindNcclCommNoLog(deviceId);
     if (comm == nullptr) {
         std::vector<int> devices;
         std::map<int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
-        FastllmInitNccl(devices);
-        comm = GetNcclComm(deviceId);
+        if (FastllmUniqueNcclDevices(devices).size() <= 1 || !FastllmInitNccl(devices)) {
+            return;
+        }
+        comm = FindNcclCommNoLog(deviceId);
     }
     if (comm == nullptr) {
         printf("Error: FastllmNcclBroadcast failed, comm is null for device %d\n", deviceId);
@@ -1131,7 +1454,7 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
     // 3. 执行 Broadcast
     // ncclBroadcast(sendbuff, recvbuff, ...);
     // 对于 In-place 操作，sendbuff 和 recvbuff 传同一个地址即可
-    cudaStream_t stream = 0; // 使用默认流
+    cudaStream_t stream = cudaStreamPerThread;
     
     ncclResult_t res = ncclBroadcast(data, data, count, ncclType, root, comm, stream);
     
@@ -1142,14 +1465,26 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
 
 // 功能：将所有卡上的 data 数据进行 Sum 求和，结果保存在 dest 中 (支持 in-place，即 data == dest)
 void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int deviceId) {
+    if (data == nullptr || dest == nullptr || count <= 0) {
+        return;
+    }
+
     // 1. 获取当前设备的通信器
-    ncclComm_t comm = GetNcclComm(deviceId);
+    ncclComm_t comm = FindNcclCommNoLog(deviceId);
     if (comm == nullptr) {
         std::vector<int> devices;
         std::map<int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
-        FastllmInitNccl(devices);
-        comm = GetNcclComm(deviceId);
+        if (FastllmUniqueNcclDevices(devices).size() <= 1 || !FastllmInitNccl(devices)) {
+            if (data != dest) {
+                size_t bytes = (size_t)count * FastllmNcclDataTypeBytes(dataType);
+                if (bytes > 0) {
+                    FastllmCudaCopyFromDeviceToDevice(dest, data, bytes);
+                }
+            }
+            return;
+        }
+        comm = FindNcclCommNoLog(deviceId);
     }
     if (comm == nullptr) {
         printf("Error: FastllmNcclAllReduce failed, comm is null for device %d\n", deviceId);
@@ -1157,11 +1492,12 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
     }
 
     // 2. 映射数据类型 (Fastllm DataType -> NCCL type)
-    // 假设 dataType: 0 -> float32, 1 -> float16/half (具体需根据 fastllm 的 DataType 枚举调整)
     ncclDataType_t ncclType = ncclFloat; 
-    if (dataType == 7) { // 假设 1 代表 float16
+    if (dataType == fastllm::DataType::FLOAT16) {
         ncclType = ncclHalf;
-    } else if (dataType == 0) { // 假设 0 代表 float32
+    } else if (dataType == fastllm::DataType::BFLOAT16) {
+        ncclType = ncclBfloat16;
+    } else if (dataType == fastllm::DataType::FLOAT32) {
         ncclType = ncclFloat;
     } else {
         // 如果有其他类型，需在此补充
@@ -1171,9 +1507,7 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 
     // 3. 执行 AllReduce
     // op: ncclSum (求和)
-    // stream: 使用当前 CUDA流，通常 fastllm 默认使用 0 流。
-    // 如果 fastllm 使用了特定流，需通过 cudaStream_t 参数传入。
-    cudaStream_t stream = 0; 
+    cudaStream_t stream = cudaStreamPerThread;
     
     // 注意：NCCL调用是异步的
     ncclResult_t res = ncclAllReduce(data, dest, count, ncclType, ncclSum, comm, stream);

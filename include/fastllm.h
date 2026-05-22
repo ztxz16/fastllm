@@ -785,6 +785,8 @@ namespace fastllm {
 
     void *GetExecutor();
 
+    void SetCurrentThreadExecutor(void *executor);
+
     bool HasDeviceType(const std::string &deviceType);
 
     void ClearProfiler();

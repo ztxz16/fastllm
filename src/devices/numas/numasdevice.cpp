@@ -746,6 +746,7 @@ namespace fastllm {
                     ErrorInFastLLM("RegisterNumas can't support data type " + GetDataTypeName(data->dataType));
                 }
             }
+            data->expansionBytes = data->GetBytes();
             data->isPinned = usePinned;
         }
 

@@ -223,6 +223,17 @@ namespace fastllm {
                 const std::vector <GenerationConfig> &generationConfigs,
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
+
+        virtual std::vector <int> ForwardGPU(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens = LastTokensManager(),
+                std::vector <std::vector <float>*> *logits = nullptr);
         
         virtual std::vector <int> ForwardMultimodal(
                 const Data &inputIds,
@@ -431,6 +442,8 @@ namespace fastllm {
 
         // 新推理引擎的主循环
         void NewMainLoop();
+        void GPUMainLoop();
+        void RunNewMainLoop(bool useGPUForward);
     };
 }
 

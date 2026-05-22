@@ -46,7 +46,10 @@ namespace fastllm {
         bool isPrefill,
         Data *hiddenStates,
         bool doQKNorm,
-        bool doPostQKNorm
+        bool doPostQKNorm,
+        int pagedCacheLayerOffset,
+        bool skipOutputProjection,
+        bool externalDecodeMeta
     ) {
         // 1. Linear QKV projection
         bool mergedQkv = (mergeQkvWeight->dims.size() > 0);
@@ -191,10 +194,11 @@ namespace fastllm {
             if (batch == 1) {
                 Data kCacheDesc = makeCacheDesc(k, (*batchPastKeys)[0]->dataType);
                 Data vCacheDesc = makeCacheDesc(v, (*batchPastValues)[0]->dataType);
+                int cacheLayerIdx = pagedCacheLayerOffset + layerIdx;
                 PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                    layerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
+                    cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                 PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                    layerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                    cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
                 AppendPagedCache(*pagedCacheKManager, *(*batchPastKeys)[0], k);
                 AppendPagedCache(*pagedCacheVManager, *(*batchPastValues)[0], v);
             } else  {
@@ -210,10 +214,11 @@ namespace fastllm {
 
                     Data kCacheDesc = makeCacheDesc(curK, pastKey.dataType);
                     Data vCacheDesc = makeCacheDesc(curV, pastValue.dataType);
+                    int cacheLayerIdx = pagedCacheLayerOffset + layerIdx;
                     PagedCacheManager *pagedCacheKManager = AllocatePagedCacheManager(
-                        layerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
+                        cacheLayerIdx * 2, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, kCacheDesc);
                     PagedCacheManager *pagedCacheVManager = AllocatePagedCacheManager(
-                        layerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
+                        cacheLayerIdx * 2 + 1, PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE, vCacheDesc);
                     AppendPagedCache(*pagedCacheKManager, pastKey, curK);
                     AppendPagedCache(*pagedCacheVManager, pastValue, curV);
 
@@ -242,7 +247,9 @@ namespace fastllm {
             // Reshape 为 [1, seqlen, num_heads * head_dim]
             attenOutput->Reshape({1, seqlen, -1});
             // 2.9 output += Linear(attenOutput, oWeight, oBias)
-            LinearAddBlock(attenOutput, oWeight, oBias, attenLastOutput, hiddenStates);
+            if (!skipOutputProjection) {
+                LinearAddBlock(attenOutput, oWeight, oBias, attenLastOutput, hiddenStates);
+            }
         } else {
             // ===== Decode 路径：使用融合算子批量处理 =====
 
@@ -253,7 +260,7 @@ namespace fastllm {
             PagedCacheManager *pagedCacheVManager = vCaches.pagedKVCacheData;
 
             // 5. 生成分页批量参数（insertIndexs/insertPositions 在所有层共享）
-            if (!(*generatedAppendParams)) {
+            if (!externalDecodeMeta && !(*generatedAppendParams)) {
                 GenerateAppendPagedCacheBatchParams(*pagedCacheKManager, *batchPastKeys, batch, 
                     *insertIndexs, *insertPositions);
                 *generatedAppendParams = true;
@@ -267,6 +274,7 @@ namespace fastllm {
             int curPageLen = kCaches.pageLen;
             bool fillLastPageLensOnDevice = qkv->dataDevice == DataDevice::CUDA &&
                                              !qkv->multiDeviceData &&
+                                             !externalDecodeMeta &&
                                              !(*generatedDecodeParams);
             QKVRMSNormRopeSplitAppendPagedCache(*qkv,
                 *qNormWeight, *kNormWeight,
@@ -280,21 +288,23 @@ namespace fastllm {
                 fillLastPageLensOnDevice ? lastPageLens : nullptr);
 
             // 7. 更新 pastKey/pastValue 的 pageIndex 和 lastPageLen
-            for (int b = 0; b < batch; b++) {
-                auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
-                    if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
-                        cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
-                        cache->lastPageLen = 1;
-                    } else {
-                        cache->lastPageLen++;
-                    }
-                };
-                updatePageMeta((*batchPastKeys)[b], pagedCacheKManager);
-                updatePageMeta((*batchPastValues)[b], pagedCacheVManager);
+            if (!externalDecodeMeta) {
+                for (int b = 0; b < batch; b++) {
+                    auto updatePageMeta = [](Data *cache, PagedCacheManager *mgr) {
+                        if (cache->pageIndex.empty() || cache->lastPageLen >= cache->pageLen) {
+                            cache->pageIndex.push_back(mgr->GetUnusedPageIndex(true));
+                            cache->lastPageLen = 1;
+                        } else {
+                            cache->lastPageLen++;
+                        }
+                    };
+                    updatePageMeta((*batchPastKeys)[b], pagedCacheKManager);
+                    updatePageMeta((*batchPastValues)[b], pagedCacheVManager);
+                }
             }
 
             // 8. 生成分页批量参数并执行 AttentionPagedBatch
-            if (!(*generatedDecodeParams)) {
+            if (!externalDecodeMeta && !(*generatedDecodeParams)) {
                 Data qForAttentionHolder;
                 Data &qForAttention = preparePagedAttentionQ(*q, kCaches.dataType, qForAttentionHolder);
                 GeneratePagedBatchParams(qForAttention, *batchPastKeys, batch, 
@@ -313,7 +323,9 @@ namespace fastllm {
             PermuteSelf(*attenOutput, {1, 0, 2});
 
             // 10. output += Linear(attenOutput, oWeight, oBias)
-            LinearAddBlock(attenOutput, oWeight, oBias, attenLastOutput, hiddenStates);
+            if (!skipOutputProjection) {
+                LinearAddBlock(attenOutput, oWeight, oBias, attenLastOutput, hiddenStates);
+            }
         }
     }
 }

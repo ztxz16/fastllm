@@ -15,6 +15,7 @@
 #include <map>
 #include <random>
 #include <set>
+#include <string>
 #include <type_traits>
 #include <vector>
 #include <cuda_fp8.h>
@@ -66,6 +67,7 @@ cublasHandle_t getFastllmCublasHandle() {
     cudaGetDevice(&id);
     auto it = s_fastllmCublasHandleMap.find(id);
     if (it != s_fastllmCublasHandleMap.end()) {
+        cublasSetStream(it->second, cudaStreamPerThread);
         return it->second;
     }
     cublasHandle_t handler = nullptr;
@@ -75,6 +77,7 @@ cublasHandle_t getFastllmCublasHandle() {
         printf ("Error: CUBLAS initialization failed. state %d.\n", stat);
         exit(0);
     } else {
+        cublasSetStream(handler, cudaStreamPerThread);
         s_fastllmCublasHandleMap[id] = handler;
     }
 
@@ -227,6 +230,61 @@ void FastllmCudaEventSynchronize(void *event) {
 void FastllmCudaStreamWaitEvent(void *stream, void *event) {
     cudaError_t state = cudaStreamWaitEvent((cudaStream_t)stream, (cudaEvent_t)event, 0);
     checkCudaErrors("Error: CUDA error when stream waiting event!", state);
+}
+
+static thread_local std::string fastllmCudaGraphLastError;
+
+static bool FastllmCudaGraphSetError(const char *stage, cudaError_t err) {
+    if (err == cudaSuccess) {
+        fastllmCudaGraphLastError.clear();
+        return true;
+    }
+    fastllmCudaGraphLastError = std::string(stage) + ": " + cudaGetErrorString(err);
+    return false;
+}
+
+bool FastllmCudaGraphBeginCapture() {
+    cudaError_t state = cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+    return FastllmCudaGraphSetError("cudaStreamBeginCapture", state);
+}
+
+bool FastllmCudaGraphEndCapture(void **graph) {
+    cudaGraph_t cudaGraph = nullptr;
+    cudaError_t state = cudaStreamEndCapture(cudaStreamPerThread, &cudaGraph);
+    if (graph != nullptr) {
+        *graph = (void*)cudaGraph;
+    }
+    return FastllmCudaGraphSetError("cudaStreamEndCapture", state);
+}
+
+bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
+    cudaGraphExec_t cudaExec = nullptr;
+    cudaError_t state = cudaGraphInstantiate(&cudaExec, (cudaGraph_t)graph, nullptr, nullptr, 0);
+    if (exec != nullptr) {
+        *exec = (void*)cudaExec;
+    }
+    return FastllmCudaGraphSetError("cudaGraphInstantiate", state);
+}
+
+bool FastllmCudaGraphLaunch(void *exec) {
+    cudaError_t state = cudaGraphLaunch((cudaGraphExec_t)exec, cudaStreamPerThread);
+    return FastllmCudaGraphSetError("cudaGraphLaunch", state);
+}
+
+void FastllmCudaGraphDestroy(void *graph) {
+    if (graph != nullptr) {
+        cudaGraphDestroy((cudaGraph_t)graph);
+    }
+}
+
+void FastllmCudaGraphExecDestroy(void *exec) {
+    if (exec != nullptr) {
+        cudaGraphExecDestroy((cudaGraphExec_t)exec);
+    }
+}
+
+const char *FastllmCudaGraphLastError() {
+    return fastllmCudaGraphLastError.c_str();
 }
 
 double GetSpan(std::chrono::system_clock::time_point time1, std::chrono::system_clock::time_point time2) {

@@ -15,6 +15,7 @@
 #include <climits>
 #include <thread>
 #include <algorithm>
+#include <queue>
 
 #ifdef USE_MMAP
 #include <sys/mman.h>
@@ -219,7 +220,7 @@ namespace fastllm {
 
     std::map <std::string, int> defaultDeviceMap, defaultMoeDeviceMap;
     Executor defaultExecutor;
-    Executor *curExecutor = &defaultExecutor;
+    thread_local Executor *curExecutor = &defaultExecutor;
 
     static std::mutex globalLocker;
     static int threads = 4;
@@ -1412,7 +1413,8 @@ namespace fastllm {
         } else if (this->dataType == DataType::NVFP4) {
             this->unitSize = 1;
             this->unitSizeDiv = 2;
-        } else if (this->dataType == DataType::NVFP4_BLOCK_16 ||
+        } else if (this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16 ||
                    this->dataType == DataType::NVFP4_BLOCK_16_E8M0) {
             this->unitSize = 1;
             this->unitSizeDiv = 1;
@@ -1437,7 +1439,8 @@ namespace fastllm {
             this->unitSizeDiv = 1;
         }
 
-        if ((this->dataType == DataType::NVFP4_BLOCK_16 ||
+        if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+             this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() == 2) {
             this->expansionBytes = GetDataBytes(this->dataType, this->dims[0], this->dims[1]);
         } else if (this->dataType == DataType::NVFP4 && this->dims.size() == 2 &&
@@ -1665,7 +1668,8 @@ namespace fastllm {
 
     void Data::MallocSpace(uint64_t size, bool zero) {
         this->expansionSize = size;
-        if ((this->dataType == DataType::NVFP4_BLOCK_16 ||
+        if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+             this->dataType == DataType::NVFP4_BLOCK_16 ||
              this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() == 2) {
             this->expansionBytes = GetDataBytes(this->dataType, this->dims[0], this->dims[1]);
         } else if (this->dataType == DataType::NVFP4 && this->dims.size() == 2 &&
@@ -2741,16 +2745,51 @@ namespace fastllm {
             }
         }
         float invTemp = 1.0f / config.temperature;
-        std::vector <std::pair <float, int> > v;
-        for (int i = 0; i < vocabSize; i++) {
-            v.push_back(std::make_pair(-base[i] * invTemp, i));
-        }
         int topk = std::min(vocabSize, config.top_k);
-        std::partial_sort(v.begin(), v.begin() + topk, v.end());
-        float psum = 0.0, maxValue = -v.begin()->first;
+        if (topk <= 0) {
+            topk = 1;
+        }
+        std::vector <std::pair <float, int> > v;
+        if (topk <= 64) {
+            v.reserve(topk);
+            auto betterThan = [](const std::pair<float, int> &a,
+                                  const std::pair<float, int> &b) {
+                return a.first > b.first || (a.first == b.first && a.second < b.second);
+            };
+            std::priority_queue<
+                std::pair<float, int>,
+                std::vector<std::pair<float, int> >,
+                decltype(betterThan)> heap(betterThan);
+            for (int i = 0; i < vocabSize; i++) {
+                std::pair<float, int> cur = std::make_pair(base[i] * invTemp, i);
+                if ((int)heap.size() < topk) {
+                    heap.push(cur);
+                    continue;
+                }
+                if (betterThan(cur, heap.top())) {
+                    heap.pop();
+                    heap.push(cur);
+                }
+            }
+            while (!heap.empty()) {
+                v.push_back(heap.top());
+                heap.pop();
+            }
+            std::sort(v.begin(), v.end(), betterThan);
+        } else {
+            v.reserve(vocabSize);
+            for (int i = 0; i < vocabSize; i++) {
+                v.push_back(std::make_pair(-base[i] * invTemp, i));
+            }
+            std::partial_sort(v.begin(), v.begin() + topk, v.end());
+            for (int i = 0; i < topk; i++) {
+                v[i].first = -v[i].first;
+            }
+        }
+        float psum = 0.0, maxValue = v.begin()->first;
         std::vector <float> ps;
         for (int i = 0; i < topk; i++) {
-            ps.push_back(expf(-v[i].first - maxValue));
+            ps.push_back(expf(v[i].first - maxValue));
             psum += ps.back();
         }
         float curSum = 0.0;
@@ -2908,7 +2947,7 @@ namespace fastllm {
             } else {
 #ifdef USE_MMAP
                 weight[name].SetMapFile(mapped_file);
-                weight[name].expansionBytes = (weight[name].Count(0) * weight[name].unitSize - 1) / weight[name].unitSizeDiv + 1;
+                weight[name].expansionBytes = weight[name].GetBytes();
 #else
                 weight[name].Allocate();
 #endif
@@ -4140,8 +4179,10 @@ namespace fastllm {
     }
 
     static std::unordered_map<int, PagedCacheManager*> layerPagedCacheManagers;
+    static std::mutex layerPagedCacheManagersMutex;
 
     PagedCacheManager* GetPagedCacheManager(int layerIndex) {
+        std::lock_guard<std::mutex> guard(layerPagedCacheManagersMutex);
         auto it = layerPagedCacheManagers.find(layerIndex);
         if (it == layerPagedCacheManagers.end()) {
             return nullptr;
@@ -4179,21 +4220,24 @@ namespace fastllm {
             pageLen = GetPageLen();
         }
         bool metadataOnlyMultiCudaRoot = IsMultiCudaShardedPagedCacheDesc(cacheData);
-        auto it = layerPagedCacheManagers.find(layerIndex);
-        if (it != layerPagedCacheManagers.end()) {
-            PagedCacheManager *manager = it->second;
+        {
+            std::lock_guard<std::mutex> guard(layerPagedCacheManagersMutex);
+            auto it = layerPagedCacheManagers.find(layerIndex);
+            if (it != layerPagedCacheManagers.end()) {
+                PagedCacheManager *manager = it->second;
 #ifdef USE_CUDA
-            if (targetDevice >= 0 && manager->cudaData != nullptr && !metadataOnlyMultiCudaRoot) {
-                int ptrDevice = GetPointerDeviceId(manager->cudaData);
-                if (ptrDevice >= 0 && ptrDevice != targetDevice) {
-                    ((Data*)manager)->ToDevice(cacheData.dataDevice, cacheData.dataDeviceIds, false);
+                if (targetDevice >= 0 && manager->cudaData != nullptr && !metadataOnlyMultiCudaRoot) {
+                    int ptrDevice = GetPointerDeviceId(manager->cudaData);
+                    if (ptrDevice >= 0 && ptrDevice != targetDevice) {
+                        ((Data*)manager)->ToDevice(cacheData.dataDevice, cacheData.dataDeviceIds, false);
+                    }
                 }
-            }
-            if (oriDevice >= 0 && oriDevice != targetDevice) {
-                FastllmCudaSetDevice(oriDevice);
-            }
+                if (oriDevice >= 0 && oriDevice != targetDevice) {
+                    FastllmCudaSetDevice(oriDevice);
+                }
 #endif
-            return manager;
+                return manager;
+            }
         }
 
         // 创建新的 PagedCacheManager
@@ -4239,7 +4283,22 @@ namespace fastllm {
         manager->SetMaxPages(maxPages);
 
         // 记录到静态 map 中
-        layerPagedCacheManagers[layerIndex] = manager;
+        {
+            std::lock_guard<std::mutex> guard(layerPagedCacheManagersMutex);
+            auto it = layerPagedCacheManagers.find(layerIndex);
+            if (it != layerPagedCacheManagers.end()) {
+                PagedCacheManager *existing = it->second;
+                manager->FreeSpace();
+                delete manager;
+#ifdef USE_CUDA
+                if (oriDevice >= 0 && oriDevice != targetDevice) {
+                    FastllmCudaSetDevice(oriDevice);
+                }
+#endif
+                return existing;
+            }
+            layerPagedCacheManagers[layerIndex] = manager;
+        }
 
 #ifdef USE_CUDA
         if (oriDevice >= 0 && oriDevice != targetDevice) {
@@ -4251,6 +4310,7 @@ namespace fastllm {
     }
 
     void ClearAllPagedCacheManagers() {
+        std::lock_guard<std::mutex> guard(layerPagedCacheManagersMutex);
         for (auto &it : layerPagedCacheManagers) {
             it.second->FreeSpace();
             delete it.second;
@@ -4415,6 +4475,10 @@ namespace fastllm {
 
     void *GetExecutor() {
         return (void*)curExecutor;
+    }
+
+    void SetCurrentThreadExecutor(void *executor) {
+        curExecutor = executor == nullptr ? &defaultExecutor : (Executor*)executor;
     }
 
     bool HasDeviceType(const std::string &deviceType) {

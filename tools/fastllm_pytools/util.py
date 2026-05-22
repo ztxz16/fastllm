@@ -77,6 +77,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = int, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如 8192')
     parser.add_argument('--device', type = str, help = '使用的设备')
+    parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备，如 0,1 或 auto')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
     parser.add_argument("--cache_history", type = str, default = "", help = "缓存历史对话")
@@ -266,6 +267,7 @@ def make_normal_llm_model(args):
             args.threads = max(1, min(32, os.cpu_count() - 2))
     if ("FT_THREADS" not in os.environ and "FASTLLM_NUMA_THREADS" not in os.environ):
         os.environ["FT_THREADS"] = str(args.threads)
+    atype_was_auto = (args.atype == "auto")
     if (args.atype == "auto"):
         if (args.device in ["cpu", "numa", "tfacc"]):
             args.atype = "float32"
@@ -273,7 +275,22 @@ def make_normal_llm_model(args):
         args.dtype = "float16"
     if (args.moe_device == ""):
         args.moe_device = args.device
-    if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3" and _uses_cuda_device(args.moe_device)):
+    if (getattr(args, "tp", "") != ""):
+        os.environ["FASTLLM_TP"] = args.tp
+        if (atype_was_auto):
+            args.atype = "float16"
+        if (not(args.device and args.device != "")):
+            first_tp_device = "0"
+            if args.tp.lower() not in ["auto", "true", "on", "1"]:
+                first_part = args.tp.split(",")[0].strip()
+                if first_part.lower().startswith("multicuda:"):
+                    first_part = first_part.split(":", 1)[1]
+                if first_part.lower().startswith("cuda:"):
+                    first_part = first_part.split(":", 1)[1]
+                first_tp_device = first_part.split(":")[0].strip()
+            args.device = "cuda:" + first_tp_device
+    if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3" and
+        (_uses_cuda_device(args.moe_device) or getattr(args, "tp", "") != "")):
         args.moe_atype = "float16"
     if (args.device and args.device != ""):
         expanded = expand_cudapp_device(args.device)

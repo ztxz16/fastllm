@@ -10,6 +10,7 @@
 #include <climits>
 #include <algorithm>
 #include <chrono>
+#include <set>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -44,19 +45,30 @@ namespace fastllm {
         }
 
         static void ReleasePagedCachePages(Data &cache, bool clearDims = false) {
-            auto releaseOne = [](Data &pagedCache) {
-                if (pagedCache.isPagedKVCache && pagedCache.pagedKVCacheData != nullptr &&
-                    !pagedCache.pageIndex.empty()) {
-                    pagedCache.pagedKVCacheData->ReleasePageIndices(pagedCache.pageIndex);
-                    pagedCache.pageIndex.clear();
-                    pagedCache.lastPageLen = 0;
+            std::set<std::pair<PagedCacheManager*, int> > releasedPages;
+            auto releaseUnique = [&](Data &pagedCache) {
+                if (!pagedCache.isPagedKVCache || pagedCache.pagedKVCacheData == nullptr ||
+                    pagedCache.pageIndex.empty()) {
+                    return;
                 }
+                std::vector<int> uniquePages;
+                for (int page : pagedCache.pageIndex) {
+                    std::pair<PagedCacheManager*, int> key = {pagedCache.pagedKVCacheData, page};
+                    if (releasedPages.insert(key).second) {
+                        uniquePages.push_back(page);
+                    }
+                }
+                if (!uniquePages.empty()) {
+                    pagedCache.pagedKVCacheData->ReleasePageIndices(uniquePages);
+                }
+                pagedCache.pageIndex.clear();
+                pagedCache.lastPageLen = 0;
             };
-            releaseOne(cache);
+            releaseUnique(cache);
             if (cache.multiDeviceData) {
                 for (auto &it : cache.multiDeviceDatas) {
                     if (it.second != nullptr) {
-                        releaseOne(*it.second);
+                        releaseUnique(*it.second);
                         if (clearDims) {
                             it.second->dims.clear();
                         }
@@ -66,6 +78,58 @@ namespace fastllm {
             if (clearDims) {
                 cache.dims.clear();
             }
+        }
+
+        static bool IsPureGpuDeviceSpec(const std::string &device) {
+#ifndef USE_CUDA
+            return false;
+#else
+            std::map<int, int> ratios;
+            std::vector<int> devices;
+            if (device == "cuda") {
+                return true;
+            }
+            if (device == "multicuda") {
+                return true;
+            }
+            if (device.rfind("cuda:", 0) == 0) {
+                devices = ParseDeviceIds(device, "cuda", ratios);
+            } else if (device.rfind("multicuda:", 0) == 0) {
+                devices = ParseDeviceIds(device, "multicuda", ratios);
+            } else {
+                return false;
+            }
+            if (devices.empty()) {
+                return false;
+            }
+            for (int id : devices) {
+                if (id == 99999) {
+                    return false;
+                }
+            }
+            return true;
+#endif
+        }
+
+        static bool IsPureGpuDeviceMap(const std::map<std::string, int> &deviceMap) {
+            bool hasGpuDevice = false;
+            for (auto &it : deviceMap) {
+                if (it.second <= 0) {
+                    continue;
+                }
+                if (!IsPureGpuDeviceSpec(it.first)) {
+                    return false;
+                }
+                hasGpuDevice = true;
+            }
+            return hasGpuDevice;
+        }
+
+        static bool IsPureGpuMode(const basellm *model) {
+            if (model == nullptr || !IsPureGpuDeviceMap(model->deviceMap)) {
+                return false;
+            }
+            return model->moeDeviceMap.empty() || IsPureGpuDeviceMap(model->moeDeviceMap);
         }
     }
 
@@ -708,6 +772,17 @@ namespace fastllm {
         exit(0);
     }
 
+    std::vector<int> basellm::ForwardGPU(int batch, const fastllm::Data &inputIds,
+                                           const std::vector<Data *> &attentionMask,
+                          const std::vector<Data *> &positionIds, const std::vector<int> &seqLens,
+                          std::vector<std::pair<Data *, Data *>> &pastKeyValues,
+                          const std::vector<GenerationConfig> &generationConfigs,
+                          const fastllm::LastTokensManager &lastTokens,
+                          std::vector <std::vector <float>*> *logits) {
+        return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
+                         pastKeyValues, generationConfigs, lastTokens, logits);
+    }
+
     std::vector <int> basellm::ForwardMultimodal(
                 const Data &inputIds,
                 const Data &attentionMask,
@@ -722,6 +797,14 @@ namespace fastllm {
     }
 
     void basellm::NewMainLoop() {
+        RunNewMainLoop(false);
+    }
+
+    void basellm::GPUMainLoop() {
+        RunNewMainLoop(true);
+    }
+
+    void basellm::RunNewMainLoop(bool useGPUForward) {
         basellm *model = this;
         int maxTotalLens = 0;
         int totalPages = 0;
@@ -762,6 +845,21 @@ namespace fastllm {
             if (model->verbose) {
                 printf("Fastllm KV Cache Token limit: %d tokens (totalPages=%d, pageLen=%d).\n", maxTotalLens, totalPages, pageLen);
                 printf("Fastllm AddPrefill Pages limit: %d pages (80%% of %d).\n", pagesLimit, totalPages);
+                printf("Fastllm Batch limit: %d.\n", maxBatch);
+            }
+        } else if (model->tokensLimit > 0) {
+            maxTotalLens = model->tokensLimit;
+            totalPages = std::max(1, maxTotalLens / pageLen);
+            pagesLimit = model->promptLimit > 0 ?
+                std::max(1, (model->promptLimit + pageLen - 1) / pageLen) :
+                totalPages * 4 / 5;
+            maxBatch = std::max(1, std::min(maxBatch, maxTotalLens / 128));
+            if (model->promptLimit <= 0) {
+                model->promptLimit = pagesLimit * pageLen;
+            }
+            if (model->verbose) {
+                printf("Fastllm KV Cache Token limit: %d tokens (pageLen=%d).\n", maxTotalLens, pageLen);
+                printf("Fastllm AddPrefill Pages limit: %d pages.\n", pagesLimit);
                 printf("Fastllm Batch limit: %d.\n", maxBatch);
             }
         }
@@ -1257,9 +1355,15 @@ namespace fastllm {
                             curPastKeyValues.push_back(std::make_pair(&(*pastKeyValue1)[i].first,
                                                                       &(*pastKeyValue1)[i].second));
                         }
-                        ret = model->ForwardV2(1, curInput, curAttentionMasks,
-                                                  curPositionIdsVec, curSeqLens, curPastKeyValues, generationConfigs,
-                                                  tokensManager, &logits);
+                        if (useGPUForward) {
+                            ret = model->ForwardGPU(1, curInput, curAttentionMasks,
+                                                     curPositionIdsVec, curSeqLens, curPastKeyValues, generationConfigs,
+                                                     tokensManager, &logits);
+                        } else {
+                            ret = model->ForwardV2(1, curInput, curAttentionMasks,
+                                                   curPositionIdsVec, curSeqLens, curPastKeyValues, generationConfigs,
+                                                   tokensManager, &logits);
+                        }
                         st += curLen;
                         if (model->verbose) {
                             auto chunkEndTime = std::chrono::system_clock::now();
@@ -1273,9 +1377,15 @@ namespace fastllm {
                     }
                 } else {
                     auto batchStartTime = std::chrono::system_clock::now();
-                    ret = model->ForwardV2(seqLens.size(), inputIds, attentionMasks,
-                                              positionIds, seqLens, pastKeyValues, generationConfigs,
-                                              tokensManager, &logits);
+                    if (useGPUForward) {
+                        ret = model->ForwardGPU(seqLens.size(), inputIds, attentionMasks,
+                                                positionIds, seqLens, pastKeyValues, generationConfigs,
+                                                tokensManager, &logits);
+                    } else {
+                        ret = model->ForwardV2(seqLens.size(), inputIds, attentionMasks,
+                                               positionIds, seqLens, pastKeyValues, generationConfigs,
+                                               tokensManager, &logits);
+                    }
                     if (model->verbose) {
                         int prefillTokens = 0;
                         for (int i = 0; i < seqLens.size(); i++) {
@@ -1406,9 +1516,15 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                         }
                     }
                     if (useNewEngine) {
-                        mainLoop = new std::thread([](basellm *model) {
-                            model->NewMainLoop();
-                        }, this);
+                        if (IsPureGpuMode(this)) {
+                            mainLoop = new std::thread([](basellm *model) {
+                                model->GPUMainLoop();
+                            }, this);
+                        } else {
+                            mainLoop = new std::thread([](basellm *model) {
+                                model->NewMainLoop();
+                            }, this);
+                        }
                     } else {
                 mainLoop = new std::thread([](basellm *model) {
                     long long kvCacheLimit = 16LL << 30;
@@ -2512,6 +2628,32 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         int len = this->GetChunkedPrefillSize();
         bool autoCalcPages = (fastllm::GetMaxTokens() <= 0);
         int minPages = -1;
+        PagedCacheManager *autoWarmupPagedCacheManager = nullptr;
+        bool useGPUForwardForWarmup = IsPureGpuMode(this);
+
+        auto runWarmupForward = [&](int batch,
+                                    const Data &warmupInputIds,
+                                    const std::vector <Data*> &warmupAttentionMasks,
+                                    const std::vector <Data*> &warmupPositionIds,
+                                    const std::vector <int> &warmupSeqLens,
+                                    std::vector <std::pair <Data*, Data*> > &warmupPastKeyValues,
+                                    const std::vector <GenerationConfig> &warmupGenerationConfigs,
+                                    const LastTokensManager &warmupLastTokens) -> std::vector<int> {
+            if (useGPUForwardForWarmup) {
+                return ForwardGPU(batch, warmupInputIds, warmupAttentionMasks, warmupPositionIds,
+                                  warmupSeqLens, warmupPastKeyValues, warmupGenerationConfigs,
+                                  warmupLastTokens, nullptr);
+            }
+            return ForwardV2(batch, warmupInputIds, warmupAttentionMasks, warmupPositionIds,
+                             warmupSeqLens, warmupPastKeyValues, warmupGenerationConfigs,
+                             warmupLastTokens, nullptr);
+        };
+
+        auto captureWarmupPagedCacheManager = [&](std::vector <std::pair <Data, Data> > &storage) {
+            if (this->kvCacheId >= 0 && this->kvCacheId < (int)storage.size()) {
+                autoWarmupPagedCacheManager = storage[this->kvCacheId].first.pagedKVCacheData;
+            }
+        };
 
         if (autoCalcPages) {
             minPages = len / pageLen + 2;
@@ -2544,9 +2686,9 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             GenerationConfig weightWarmupGenerationConfig;
             std::vector <GenerationConfig> weightWarmupGenerationConfigs = {weightWarmupGenerationConfig};
             LastTokensManager weightWarmupLastTokens;
-            ForwardV2(1, weightWarmupInputIds, weightWarmupAttentionMasks, weightWarmupPositionIdsVec,
-                      weightWarmupSeqLens, weightWarmupPastKeyValues, weightWarmupGenerationConfigs,
-                      weightWarmupLastTokens, nullptr);
+            runWarmupForward(1, weightWarmupInputIds, weightWarmupAttentionMasks, weightWarmupPositionIdsVec,
+                             weightWarmupSeqLens, weightWarmupPastKeyValues, weightWarmupGenerationConfigs,
+                             weightWarmupLastTokens);
 
             for (auto &kv : weightWarmupPastKeyValuesStorage) {
                 kv.first.pageIndex.clear();
@@ -2584,7 +2726,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         GenerationConfig generationConfig;
         std::vector <GenerationConfig> generationConfigs = {generationConfig};
         LastTokensManager lastTokens;
-        ForwardV2(1, inputIds, attentionMasks, positionIdsVec, seqLens, pastKeyValues, generationConfigs, lastTokens, nullptr);
+        runWarmupForward(1, inputIds, attentionMasks, positionIdsVec, seqLens, pastKeyValues, generationConfigs, lastTokens);
 
         this->kvCacheId = 0;
         elementsInKVCachePerToken = 0;
@@ -2624,6 +2766,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                    tokenGrowingLayerCount, linearLayerCount, linearFixedBytes / 1e6,
                    bytesPerToken / 1024.0, this->kvCacheId);
         }
+        captureWarmupPagedCacheManager(pastKeyValuesStorage);
 
         if (autoCalcPages) {
 #ifdef USE_CUDA
@@ -2699,6 +2842,7 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             // their destructors will release page indices through dangling managers.
             pastKeyValuesStorage.clear();
             pastKeyValues.clear();
+            autoWarmupPagedCacheManager = nullptr;
             ClearAllPagedCacheManagers();
 
             auto freeSizes = FastllmCudaGetFreeSizes();
@@ -2798,7 +2942,9 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
             std::vector <Data*> shortAttentionMasks = {nullptr};
             std::vector <Data*> shortPositionIdsVec = {&shortPositionIds};
             std::vector <int> shortSeqLens = {1};
-            ForwardV2(1, shortInputIds, shortAttentionMasks, shortPositionIdsVec, shortSeqLens, pastKeyValues, generationConfigs, lastTokens, nullptr);
+            runWarmupForward(1, shortInputIds, shortAttentionMasks, shortPositionIdsVec,
+                             shortSeqLens, pastKeyValues, generationConfigs, lastTokens);
+            captureWarmupPagedCacheManager(pastKeyValuesStorage);
             for (auto &kv : pastKeyValuesStorage) {
                 kv.first.pageIndex.clear();
                 kv.first.pagedKVCacheData = nullptr;
@@ -2811,7 +2957,8 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         }
         printf("finish.\n");
 
-        auto *pcm = GetPagedCacheManager(this->kvCacheId * 2);
+        auto *pcm = autoWarmupPagedCacheManager != nullptr ?
+            autoWarmupPagedCacheManager : GetPagedCacheManager(this->kvCacheId * 2);
         if (pcm != nullptr) {
             int totalPages = pcm->maxPages;
             int cachePageLen = pcm->pageLen;

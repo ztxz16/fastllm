@@ -25,6 +25,17 @@ namespace fastllm {
                strcmp(v, "off") != 0 && strcmp(v, "OFF") != 0;
     }
 
+    static bool CudaTpSpecPresent(const char *name) {
+        const char *v = std::getenv(name);
+        if (v == nullptr || v[0] == '\0') {
+            return false;
+        }
+        return strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0 &&
+               strcmp(v, "off") != 0 && strcmp(v, "OFF") != 0 &&
+               strcmp(v, "none") != 0 && strcmp(v, "NONE") != 0 &&
+               strcmp(v, "disable") != 0 && strcmp(v, "DISABLE") != 0;
+    }
+
     static int CudaEnvInt(const char *name, int fallback) {
         const char *v = std::getenv(name);
         if (v == nullptr || v[0] == '\0') {
@@ -540,7 +551,10 @@ namespace fastllm {
     }
 
     bool CudaEmbeddingDirect::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
-        if (GetLowMemMode() || !GetCudaEmbedding()) {
+        bool forceGpuEmbedding = CudaTpSpecPresent("FASTLLM_TP") ||
+                                 CudaTpSpecPresent("FASTLLM_QWEN3_MOE_TP") ||
+                                 CudaTpSpecPresent("FASTLLM_QWEN3_THREAD_TP");
+        if (GetLowMemMode() || (!GetCudaEmbedding() && !forceGpuEmbedding)) {
             return false;
         }
         Data &input = *(datas.find("input")->second);
@@ -2861,10 +2875,13 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         Data *down = weights[3];
         bool isFp8 = gateup != nullptr && down != nullptr &&
                      gateup->dataType == DataType::FP8_E4M3 && down->dataType == DataType::FP8_E4M3;
+        bool isFp8Block128 = gateup != nullptr && down != nullptr &&
+                             gateup->dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                             down->dataType == DataType::FP8_E4M3_BLOCK_128;
         bool isNVFP4 = gateup != nullptr && down != nullptr &&
                        IsCudaMergeMoeNVFP4WeightType(gateup->dataType) && gateup->dataType == down->dataType;
         if (gateup == nullptr || down == nullptr ||
-            (!isFp8 && !isNVFP4) ||
+            (!isFp8 && !isFp8Block128 && !isNVFP4) ||
             gateup->dims.size() != 2 || down->dims.size() != 2 ||
             gateup->dims[1] != hidden || gateup->dims[0] != down->dims[1] * 2 ||
             down->dims[0] != hidden) {
@@ -2880,6 +2897,15 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 FastllmCudaBFloat16MergeMOEFP8E4M3Batch1Indexed(input, w1, output, weights, weightsBatch,
                                                                 (const int32_t*)index.cudaData, (const float*)score.cudaData,
                                                                 topk, hidden, inter);
+        }
+        if (isFp8Block128) {
+            return input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfMergeMOEFP8E4M3Block128Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                                    (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                                    topk, hidden, inter) :
+                FastllmCudaBFloat16MergeMOEFP8E4M3Block128Batch1Indexed(input, w1, output, weights, weightsBatch,
+                                                                        (const int32_t*)index.cudaData, (const float*)score.cudaData,
+                                                                        topk, hidden, inter);
         }
         bool ok = input.dataType == DataType::FLOAT16 ?
             FastllmCudaHalfMergeMOENVFP4Batch1Indexed(input, w1, output, weights, weightsBatch,
@@ -3742,8 +3768,8 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         FastllmCudaCopyFromHostToDevice(insertPositions.cudaData, (void*)posDataHost.data(), batch * sizeof(int32_t));
     }
 
-    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens, Data &output, int group, float scale, int attentionType, bool inited) {
-        FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited);
+    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens, Data &output, int group, float scale, int attentionType, bool inited, bool sync = true) {
+        FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync);
     }
 
     void CudaAttentionPagedBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -3760,8 +3786,9 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0;
         int attentionType = intParams.find("attentionType") != intParams.end() ? intParams.find("attentionType")->second : 0;
         bool inited = intParams.find("inited") != intParams.end() ? (intParams.find("inited")->second != 0) : false;
+        bool sync = intParams.find("sync") != intParams.end() ? (intParams.find("sync")->second != 0) : true;
         output.Allocate(false);
-        DoCudaAttentionPagedBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited);  
+        DoCudaAttentionPagedBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync);
     }
 
     void CudaGeneratePagedBatchParamsOp::Run(const std::string &opType, const fastllm::DataDict &datas,
