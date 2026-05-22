@@ -1296,6 +1296,14 @@ namespace fastllm {
         }
 
         auto requireLocal = [&](Data &data, const std::string &name) -> Data* {
+            if (!tensorParallel) {
+                if (!data.dims.empty() &&
+                    (data.dataDevice != DataDevice::CUDA || data.cudaData == nullptr ||
+                     data.dataDeviceIds.empty() || data.dataDeviceIds[0] != gpuId)) {
+                    data.ToDevice(DataDevice::CUDA, {gpuId}, true);
+                }
+                return &data;
+            }
             auto it = data.multiDeviceDatas.find(gpuId);
             AssertInFastLLM(it != data.multiDeviceDatas.end() && it->second != nullptr,
                             "Qwen3 ForwardSingleGPU graph missing local tensor: " + name + ".\n");
@@ -1619,6 +1627,14 @@ namespace fastllm {
         Qwen3CudaDirectRunner cudaRunner(gpuId);
 
         auto requireLocal = [&](Data &data, const std::string &name) -> Data* {
+            if (!tensorParallel) {
+                if (!data.dims.empty() &&
+                    (data.dataDevice != DataDevice::CUDA || data.cudaData == nullptr ||
+                     data.dataDeviceIds.empty() || data.dataDeviceIds[0] != gpuId)) {
+                    data.ToDevice(DataDevice::CUDA, {gpuId}, true);
+                }
+                return &data;
+            }
             auto it = data.multiDeviceDatas.find(gpuId);
             AssertInFastLLM(it != data.multiDeviceDatas.end() && it->second != nullptr,
                             "Qwen3 ForwardSingleGPU missing local tensor: " + name + ".\n");
@@ -2011,7 +2027,6 @@ namespace fastllm {
         const std::vector <GenerationConfig> &generationConfigs,
         const LastTokensManager &lastTokens,
         std::vector <std::vector <float>*> *retLogits) {
-// auto startTime = std::chrono::system_clock::now();
 #ifndef USE_CUDA
         return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                          pastKeyValues, generationConfigs, lastTokens, retLogits);
@@ -2022,7 +2037,7 @@ namespace fastllm {
             return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
-// printf("step 0 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
+        bool tensorParallel = devices.size() > 1;
         AssertInFastLLM((int)pastKeyValues.size() >= batch * block_cnt,
                         "Qwen3 ForwardGPU: pastKeyValues size mismatch.\n");
         AssertInFastLLM((int)generationConfigs.size() >= batch,
@@ -2031,7 +2046,7 @@ namespace fastllm {
                         "Qwen3 ForwardGPU: positionIds size mismatch.\n");
         AssertInFastLLM(!GetKVCacheInCPU(),
                         "Qwen3 ForwardGPU doesn't support CPU KV cache.\n");
-        if (devices.size() > 1) {
+        if (tensorParallel) {
             AssertInFastLLM(FastllmInitNccl(devices),
                             "Qwen3 ForwardGPU requires NCCL initialization.\n");
         }
@@ -2040,7 +2055,6 @@ namespace fastllm {
             threadTpPagedCacheBase = qwen3ThreadTpNextPagedCacheBase.fetch_add(
                 std::max(1, block_cnt * ((int)devices.size() + 1)));
         }
-// printf("step 1 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         int seqLen = inputIds.dims[1];
         bool all1 = true;
         for (int i = 0; i < batch; i++) {
@@ -2067,16 +2081,16 @@ namespace fastllm {
             }
             allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, (int)vPositionIds.size()}, vPositionIds));
         }
-// printf("step 2 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         Data gpuInputIds;
         gpuInputIds.CopyFrom(inputIds);
-        PrepareMultiCudaReplicatedData(gpuInputIds, devices, true);
-        PrepareMultiCudaReplicatedData(allPositionIds, devices, true);
-// printf("step 3 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
+        if (tensorParallel) {
+            PrepareMultiCudaReplicatedData(gpuInputIds, devices, true);
+            PrepareMultiCudaReplicatedData(allPositionIds, devices, true);
+        }
         std::vector<DivisionScheme> kvHeadSchemes;
         DivisionScheme lmHeadScheme;
-// printf("step 4 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
-        {
+        Data &lmHead = weight["lm_head.weight"];
+        if (tensorParallel) {
             std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
             if (threadTpWeightsPrepared) {
                 AssertInFastLLM(threadTpPreparedDevices == devices && threadTpPreparedRatios == ratios,
@@ -2148,7 +2162,6 @@ namespace fastllm {
                                     "Qwen3 ForwardGPU failed to split " + downWeightName + ".\n");
                 }
 
-                Data &lmHead = weight["lm_head.weight"];
                 Data &lmHeadBias = GetThreadTensorParallelBias("lm_head.weight.tp_bias");
                 std::vector<int> devCopy = devices;
                 threadTpLmHeadScheme = BuildMultiCudaRowSplitScheme(lmHead, devCopy, ratios);
@@ -2161,10 +2174,25 @@ namespace fastllm {
             }
             kvHeadSchemes = threadTpKVHeadSchemes;
             lmHeadScheme = threadTpLmHeadScheme;
+        } else {
+            kvHeadSchemes.assign(block_cnt, DivisionScheme());
+            for (int i = 0; i < block_cnt; i++) {
+                std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+                std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+                AssertInFastLLM(weight.weight.find(mergeQkvWeightName) != weight.weight.end(),
+                                "Qwen3 ForwardGPU requires merged qkv weight.\n");
+                AssertInFastLLM(weight.weight.find(swigluWeightName) != weight.weight.end(),
+                                "Qwen3 ForwardGPU requires merged gateup weight.\n");
+                Data &mergeW = weight[mergeQkvWeightName];
+                mergeW.tpPackType = TP_PACK_QKV;
+                mergeW.tpQHeads = num_attention_heads;
+                mergeW.tpKVHeads = num_key_value_heads;
+                mergeW.tpHeadDim = head_dim;
+                weight[swigluWeightName].tpPackType = TP_PACK_GATEUP;
+                kvHeadSchemes[i][devices[0]].push_back({0, num_key_value_heads});
+            }
+            lmHeadScheme[devices[0]].push_back({0, lmHead.dims[0]});
         }
-// printf("step 5 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
-        Data &lmHead = weight["lm_head.weight"];
-// printf("step 6 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         const DataType computeType = ResolveQwen3ThreadTpComputeType(this->dataType);
         std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues(devices.size());
         for (int r = 0; r < (int)devices.size(); r++) {
@@ -2181,11 +2209,8 @@ namespace fastllm {
                     *pastKeyValues[i].second, device, valueCacheType);
             }
         }
-// printf("step 7 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         std::vector<std::exception_ptr> errors(devices.size());
         std::vector<Data> localLogits(devices.size());
-        bool tensorParallel = devices.size() > 1;
-// printf("step 8 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         if (devices.size() == 1) {
             ForwardSingleGPU(devices[0], ratios, batch, gpuInputIds, allPositionIds,
                              seqLens, localPastKeyValues[0], all1, isPrefill,
