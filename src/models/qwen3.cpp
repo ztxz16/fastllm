@@ -2011,6 +2011,7 @@ namespace fastllm {
         const std::vector <GenerationConfig> &generationConfigs,
         const LastTokensManager &lastTokens,
         std::vector <std::vector <float>*> *retLogits) {
+// auto startTime = std::chrono::system_clock::now();
 #ifndef USE_CUDA
         return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                          pastKeyValues, generationConfigs, lastTokens, retLogits);
@@ -2021,7 +2022,7 @@ namespace fastllm {
             return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
-
+// printf("step 0 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         AssertInFastLLM((int)pastKeyValues.size() >= batch * block_cnt,
                         "Qwen3 ForwardGPU: pastKeyValues size mismatch.\n");
         AssertInFastLLM((int)generationConfigs.size() >= batch,
@@ -2039,7 +2040,7 @@ namespace fastllm {
             threadTpPagedCacheBase = qwen3ThreadTpNextPagedCacheBase.fetch_add(
                 std::max(1, block_cnt * ((int)devices.size() + 1)));
         }
-
+// printf("step 1 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         int seqLen = inputIds.dims[1];
         bool all1 = true;
         for (int i = 0; i < batch; i++) {
@@ -2066,80 +2067,104 @@ namespace fastllm {
             }
             allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, (int)vPositionIds.size()}, vPositionIds));
         }
-
+// printf("step 2 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         Data gpuInputIds;
         gpuInputIds.CopyFrom(inputIds);
         PrepareMultiCudaReplicatedData(gpuInputIds, devices, true);
         PrepareMultiCudaReplicatedData(allPositionIds, devices, true);
+// printf("step 3 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
+        std::vector<DivisionScheme> kvHeadSchemes;
+        DivisionScheme lmHeadScheme;
+// printf("step 4 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
+        {
+            std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
+            if (threadTpWeightsPrepared) {
+                AssertInFastLLM(threadTpPreparedDevices == devices && threadTpPreparedRatios == ratios,
+                                "Qwen3 ForwardGPU thread TP device config changed after weights were prepared.\n");
+                AssertInFastLLM((int)threadTpKVHeadSchemes.size() == block_cnt && !threadTpLmHeadScheme.empty(),
+                                "Qwen3 ForwardGPU thread TP cached weight schemes are incomplete.\n");
+            } else {
+                auto prepareReplicated = [&](const std::string &name) {
+                    PrepareMultiCudaReplicatedData(this->weight[name], devices, true);
+                };
+                prepareReplicated("model.embed_tokens.weight");
+                prepareReplicated("model.norm.weight");
 
-        std::vector<DivisionScheme> kvHeadSchemes(block_cnt);
+                threadTpKVHeadSchemes.assign(block_cnt, DivisionScheme());
+                for (int i = 0; i < block_cnt; i++) {
+                    std::string inputRmsName = "model.layers." + std::to_string(i) + ".input_layernorm.weight";
+                    std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+                    std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
+                    std::string qNormName = "model.layers." + std::to_string(i) + ".self_attn.q_norm.weight";
+                    std::string kNormName = "model.layers." + std::to_string(i) + ".self_attn.k_norm.weight";
+                    std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
+                    std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
+                    std::string postRmsName = "model.layers." + std::to_string(i) + ".post_attention_layernorm.weight";
+                    std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+                    std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
+                    std::string downBiasName = "model.layers." + std::to_string(i) + ".mlp.down_proj.bias";
 
-        auto prepareReplicated = [&](const std::string &name) {
-            PrepareMultiCudaReplicatedData(this->weight[name], devices, true);
-        };
+                    AssertInFastLLM(weight.weight.find(mergeQkvWeightName) != weight.weight.end(),
+                                    "Qwen3 ForwardGPU requires merged qkv weight.\n");
+                    AssertInFastLLM(weight.weight.find(swigluWeightName) != weight.weight.end(),
+                                    "Qwen3 ForwardGPU requires merged gateup weight.\n");
 
-        prepareReplicated("model.embed_tokens.weight");
-        prepareReplicated("model.norm.weight");
+                    prepareReplicated(inputRmsName);
+                    prepareReplicated(qNormName);
+                    prepareReplicated(kNormName);
+                    prepareReplicated(postRmsName);
 
-        for (int i = 0; i < block_cnt; i++) {
-            std::string inputRmsName = "model.layers." + std::to_string(i) + ".input_layernorm.weight";
-            std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
-            std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
-            std::string qNormName = "model.layers." + std::to_string(i) + ".self_attn.q_norm.weight";
-            std::string kNormName = "model.layers." + std::to_string(i) + ".self_attn.k_norm.weight";
-            std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
-            std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
-            std::string postRmsName = "model.layers." + std::to_string(i) + ".post_attention_layernorm.weight";
-            std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
-            std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
-            std::string downBiasName = "model.layers." + std::to_string(i) + ".mlp.down_proj.bias";
+                    Data &mergeW = weight[mergeQkvWeightName];
+                    Data &mergeB = GetThreadTensorParallelBias(mergeQkvBiasName);
+                    mergeW.tpPackType = TP_PACK_QKV;
+                    mergeW.tpQHeads = num_attention_heads;
+                    mergeW.tpKVHeads = num_key_value_heads;
+                    mergeW.tpHeadDim = head_dim;
+                    std::vector<int> devCopy = devices;
+                    DivisionScheme qkvScheme = BuildMultiCudaRowSplitScheme(mergeW, devCopy, ratios);
+                    AssertInFastLLM(SplitMultiCudaWeight(mergeW, mergeB, devCopy, qkvScheme, 0),
+                                    "Qwen3 ForwardGPU failed to split " + mergeQkvWeightName + ".\n");
 
-            AssertInFastLLM(weight.weight.find(mergeQkvWeightName) != weight.weight.end(),
-                            "Qwen3 ForwardGPU requires merged qkv weight.\n");
-            AssertInFastLLM(weight.weight.find(swigluWeightName) != weight.weight.end(),
-                            "Qwen3 ForwardGPU requires merged gateup weight.\n");
+                    int qWidth = num_attention_heads * head_dim;
+                    DivisionScheme qScheme = ExtractQwen3FirstRangeScheme(qkvScheme);
+                    threadTpKVHeadSchemes[i] = ExtractQwen3KVHeadScheme(qkvScheme, qWidth, head_dim);
+                    Data &oB = GetThreadTensorParallelBias(oBiasName);
+                    devCopy = devices;
+                    AssertInFastLLM(SplitMultiCudaWeight(weight[oWeightName], oB, devCopy, qScheme, 1),
+                                    "Qwen3 ForwardGPU failed to split " + oWeightName + ".\n");
 
-            prepareReplicated(inputRmsName);
-            prepareReplicated(qNormName);
-            prepareReplicated(kNormName);
-            prepareReplicated(postRmsName);
+                    Data &gateup = weight[swigluWeightName];
+                    Data &gateupBias = GetThreadTensorParallelBias(swigluWeightName + ".tp_bias");
+                    gateup.tpPackType = TP_PACK_GATEUP;
+                    devCopy = devices;
+                    DivisionScheme gateScheme = BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
+                    AssertInFastLLM(SplitMultiCudaWeight(gateup, gateupBias, devCopy, gateScheme, 0),
+                                    "Qwen3 ForwardGPU failed to split " + swigluWeightName + ".\n");
 
-            Data &mergeW = weight[mergeQkvWeightName];
-            Data &mergeB = GetThreadTensorParallelBias(mergeQkvBiasName);
-            mergeW.tpPackType = TP_PACK_QKV;
-            mergeW.tpQHeads = num_attention_heads;
-            mergeW.tpKVHeads = num_key_value_heads;
-            mergeW.tpHeadDim = head_dim;
-            std::vector<int> devCopy = devices;
-            DivisionScheme qkvScheme = BuildMultiCudaRowSplitScheme(mergeW, devCopy, ratios);
-            SplitMultiCudaWeight(mergeW, mergeB, devCopy, qkvScheme, 0);
+                    Data &downBias = GetThreadTensorParallelBias(downBiasName);
+                    DivisionScheme downScheme = ExtractQwen3FirstRangeScheme(gateScheme);
+                    devCopy = devices;
+                    AssertInFastLLM(SplitMultiCudaWeight(weight[downWeightName], downBias, devCopy, downScheme, 1),
+                                    "Qwen3 ForwardGPU failed to split " + downWeightName + ".\n");
+                }
 
-            int qWidth = num_attention_heads * head_dim;
-            DivisionScheme qScheme = ExtractQwen3FirstRangeScheme(qkvScheme);
-            kvHeadSchemes[i] = ExtractQwen3KVHeadScheme(qkvScheme, qWidth, head_dim);
-            Data &oB = GetThreadTensorParallelBias(oBiasName);
-            devCopy = devices;
-            SplitMultiCudaWeight(weight[oWeightName], oB, devCopy, qScheme, 1);
+                Data &lmHead = weight["lm_head.weight"];
+                Data &lmHeadBias = GetThreadTensorParallelBias("lm_head.weight.tp_bias");
+                std::vector<int> devCopy = devices;
+                threadTpLmHeadScheme = BuildMultiCudaRowSplitScheme(lmHead, devCopy, ratios);
+                AssertInFastLLM(SplitMultiCudaWeight(lmHead, lmHeadBias, devCopy, threadTpLmHeadScheme, 0),
+                                "Qwen3 ForwardGPU failed to split lm_head.weight.\n");
 
-            Data &gateup = weight[swigluWeightName];
-            Data &gateupBias = GetThreadTensorParallelBias(swigluWeightName + ".tp_bias");
-            gateup.tpPackType = TP_PACK_GATEUP;
-            devCopy = devices;
-            DivisionScheme gateScheme = BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
-            SplitMultiCudaWeight(gateup, gateupBias, devCopy, gateScheme, 0);
-
-            Data &downBias = GetThreadTensorParallelBias(downBiasName);
-            DivisionScheme downScheme = ExtractQwen3FirstRangeScheme(gateScheme);
-            devCopy = devices;
-            SplitMultiCudaWeight(weight[downWeightName], downBias, devCopy, downScheme, 1);
+                threadTpPreparedDevices = devices;
+                threadTpPreparedRatios = ratios;
+                threadTpWeightsPrepared = true;
+            }
+            kvHeadSchemes = threadTpKVHeadSchemes;
+            lmHeadScheme = threadTpLmHeadScheme;
         }
-
+// printf("step 5 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         Data &lmHead = weight["lm_head.weight"];
-        Data &lmHeadBias = GetThreadTensorParallelBias("lm_head.weight.tp_bias");
-        std::vector<int> devCopy = devices;
-        DivisionScheme lmHeadScheme = BuildMultiCudaRowSplitScheme(lmHead, devCopy, ratios);
-        SplitMultiCudaWeight(lmHead, lmHeadBias, devCopy, lmHeadScheme, 0);
-
+// printf("step 6 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         const DataType computeType = ResolveQwen3ThreadTpComputeType(this->dataType);
         std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues(devices.size());
         for (int r = 0; r < (int)devices.size(); r++) {
@@ -2156,10 +2181,11 @@ namespace fastllm {
                     *pastKeyValues[i].second, device, valueCacheType);
             }
         }
-
+// printf("step 7 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         std::vector<std::exception_ptr> errors(devices.size());
         std::vector<Data> localLogits(devices.size());
         bool tensorParallel = devices.size() > 1;
+// printf("step 8 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         if (devices.size() == 1) {
             ForwardSingleGPU(devices[0], ratios, batch, gpuInputIds, allPositionIds,
                              seqLens, localPastKeyValues[0], all1, isPrefill,

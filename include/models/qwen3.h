@@ -9,6 +9,8 @@
 #include "cmath"
 
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <unordered_map>
 
 namespace fastllm {
@@ -150,6 +152,12 @@ namespace fastllm {
 
         std::unordered_map <std::string, Data> threadTpEmptyBiases;
         int threadTpPagedCacheBase = -1;
+        std::mutex threadTpWeightPrepareLock;
+        bool threadTpWeightsPrepared = false;
+        std::vector <int> threadTpPreparedDevices;
+        std::map <int, int> threadTpPreparedRatios;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpKVHeadSchemes;
+        std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
     };
 }
 
