@@ -34,6 +34,33 @@ def _uses_multicuda_device(device) -> bool:
         return False
     return "multicuda" in str(device).lower()
 
+def _uses_thread_tp(tp) -> bool:
+    if tp is None:
+        return False
+    spec = str(tp).strip().lower()
+    return spec not in ["", "false", "off", "none", "disable"]
+
+def _first_thread_tp_cuda_device(tp) -> str:
+    spec = str(tp or "").strip()
+    lower = spec.lower()
+    if lower in ["", "auto", "true", "on", "1"]:
+        return "cuda:0"
+
+    first_part = spec.split(",")[0].strip()
+    first_lower = first_part.lower()
+    if first_lower.startswith("multicuda:") or first_lower.startswith("cuda:"):
+        first_part = first_part.split(":", 1)[1].strip()
+    elif first_lower in ["multicuda", "cuda"]:
+        return "cuda:0"
+
+    device_id = ""
+    for ch in first_part:
+        if ch.isdigit():
+            device_id += ch
+        elif device_id:
+            break
+    return "cuda:" + (device_id if device_id != "" else "0")
+
 def apply_page_size_default(args):
     if (getattr(args, "page_size", -1) <= 0 and
         (_uses_multicuda_device(getattr(args, "device", "")) or
@@ -136,7 +163,10 @@ def make_normal_llm_model(args):
                     if (it == "FASTLLM_USE_NUMA" or it == "FASTLLM_NUMA_THREADS"):
                         os.environ[it] = str(args_config[it])
                     setattr(args, it, args_config[it])
-                
+
+    user_set_device = bool(args.device and args.device != "")
+    user_set_moe_device = bool(args.moe_device and args.moe_device != "")
+
     usenuma = False
     try:
         from ftllm.env import env
@@ -214,9 +244,10 @@ def make_normal_llm_model(args):
                     args.cache_history = "true"
                 if ((not(args.device and args.device != ""))):
                     args.device = "cuda"
-                    args.moe_device = "cpu"
-                    if (usenuma):
-                        args.moe_device = "numa"
+                    if (not user_set_moe_device):
+                        args.moe_device = "cpu"
+                        if (usenuma):
+                            args.moe_device = "numa"
             if ("quantization_config" in config):
                 quantization_config = config["quantization_config"]
                 try:
@@ -237,6 +268,12 @@ def make_normal_llm_model(args):
                     pass
         except:
             pass
+    if (_uses_thread_tp(getattr(args, "tp", ""))):
+        tp_device = _first_thread_tp_cuda_device(args.tp)
+        if (not user_set_device):
+            args.device = tp_device
+        if (not user_set_moe_device):
+            args.moe_device = args.device
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"
@@ -275,22 +312,16 @@ def make_normal_llm_model(args):
         args.dtype = "float16"
     if (args.moe_device == ""):
         args.moe_device = args.device
-    if (getattr(args, "tp", "") != ""):
-        os.environ["FASTLLM_TP"] = args.tp
-        if (atype_was_auto):
-            args.atype = "float16"
-        if (not(args.device and args.device != "")):
-            first_tp_device = "0"
-            if args.tp.lower() not in ["auto", "true", "on", "1"]:
-                first_part = args.tp.split(",")[0].strip()
-                if first_part.lower().startswith("multicuda:"):
-                    first_part = first_part.split(":", 1)[1]
-                if first_part.lower().startswith("cuda:"):
-                    first_part = first_part.split(":", 1)[1]
-                first_tp_device = first_part.split(":")[0].strip()
-            args.device = "cuda:" + first_tp_device
+    tp_arg = getattr(args, "tp", "")
+    if (tp_arg != ""):
+        os.environ["FASTLLM_TP"] = tp_arg
+        if (_uses_thread_tp(tp_arg)):
+            if (atype_was_auto):
+                args.atype = "float16"
+            if (not(args.device and args.device != "")):
+                args.device = _first_thread_tp_cuda_device(tp_arg)
     if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3" and
-        (_uses_cuda_device(args.moe_device) or getattr(args, "tp", "") != "")):
+        (_uses_cuda_device(args.moe_device) or _uses_thread_tp(tp_arg))):
         args.moe_atype = "float16"
     if (args.device and args.device != ""):
         expanded = expand_cudapp_device(args.device)
