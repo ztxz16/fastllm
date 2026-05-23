@@ -78,6 +78,9 @@ namespace fastllm {
         std::vector <std::vector <Data*> > moeGateWeights;
         std::vector <std::vector <Data*> > moeUpWeights;
         std::vector <std::vector <Data*> > moeDownWeights;
+        std::vector <Data*> moeGate3DWeights;
+        std::vector <Data*> moeUp3DWeights;
+        std::vector <Data*> moeDown3DWeights;
         std::vector <std::vector <Data*> > weights;
         std::vector <std::vector <Data*> > biass;
 

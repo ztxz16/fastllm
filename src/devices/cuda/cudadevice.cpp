@@ -137,6 +137,7 @@ namespace fastllm {
         this->ops["RepeatPenalty"] = (BaseOperator*)(new CudaRepeatPenaltyOp());
         this->ops["ApplyLognAttn"] = (BaseOperator*)(new CudaApplyLognAttnOp());
         this->ops["MergeMOE"] = (BaseOperator*)(new CudaMergeMOE());
+        this->ops["FusedMOE"] = (BaseOperator*)(new CudaFusedMOE());
         this->ops["MergeMLA"] = (BaseOperator*)(new CudaMergeMLA());
         this->ops["MergeMLAPaged"] = (BaseOperator*)(new CudaMergeMLAPaged());
         this->ops["RecurrentGatedDeltaRule"] = (BaseOperator*)(new CudaRecurrentGatedDeltaRuleOp());
@@ -3329,6 +3330,120 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         DoCudaMergeMOE (
             input, output, index, score, w1, w2, w3, weights, biass, sharedScale, gateType, weightsBatch
         );
+    }
+
+    void DoCudaFusedMOE(Data &input, Data &output, Data &index, Data &score,
+                        Data &gate, Data &up, Data &down, Data &w1,
+                        MoeGateType gateType, float swigluLimit) {
+        if (gateType != MoeGateSwiglu) {
+            ErrorInFastLLM("CudaFusedMOE only supports swiglu gate type.\n");
+        }
+        if (swigluLimit < 0.0f) {
+            ErrorInFastLLM("CudaFusedMOE swigluLimit should be non-negative.\n");
+        }
+        bool isFp8 = gate.dataType == DataType::FP8_E4M3 &&
+                     up.dataType == DataType::FP8_E4M3 &&
+                     down.dataType == DataType::FP8_E4M3;
+        bool isFp8Block128 = gate.dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                             up.dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                             down.dataType == DataType::FP8_E4M3_BLOCK_128;
+        if (!IsCudaMergeMoeFp8InputType(input.dataType) || input.dataDevice != DataDevice::CUDA ||
+            index.dataDevice != DataDevice::CUDA || index.dataType != DataType::INT32 ||
+            score.dataDevice != DataDevice::CUDA || score.dataType != DataType::FLOAT32 ||
+            gate.dataDevice != DataDevice::CUDA || up.dataDevice != DataDevice::CUDA || down.dataDevice != DataDevice::CUDA ||
+            (!isFp8 && !isFp8Block128) ||
+            input.dims.size() < 2 || index.dims.size() < 2 ||
+            gate.dims.size() != 3 || up.dims.size() != 3 || down.dims.size() != 3) {
+            ErrorInFastLLM("CudaFusedMOE only supports CUDA fp16/bf16 input, CUDA int32 index, CUDA fp32 score and 3D FP8 weights.\n");
+        }
+
+        int hidden = input.dims.back();
+        int batch = input.Count(0) / hidden;
+        int topk = index.dims.back();
+        int experts = gate.dims[0];
+        int inter = gate.dims[1];
+        if (batch <= 0 || topk <= 0 || experts <= 0 || inter <= 0 ||
+            index.Count(0) != (uint64_t)batch * topk ||
+            score.Count(0) != (uint64_t)batch * topk ||
+            gate.dims[2] != hidden ||
+            up.dims[0] != experts || up.dims[1] != inter || up.dims[2] != hidden ||
+            down.dims[0] != experts || down.dims[1] != hidden || down.dims[2] != inter) {
+            ErrorInFastLLM("CudaFusedMOE input/index/weight shapes mismatch.\n");
+        }
+        if (isFp8) {
+            if (gate.blockM <= 0 || gate.blockK <= 0 ||
+                up.blockM != gate.blockM || up.blockK != gate.blockK ||
+                down.blockM <= 0 || down.blockK <= 0 ||
+                gate.extraCudaData.empty() || up.extraCudaData.empty() || down.extraCudaData.empty()) {
+                ErrorInFastLLM("CudaFusedMOE FP8 scales should be prepared on CUDA before running the operator.\n");
+            }
+        }
+
+        int curDeviceId = FastllmCudaGetDevice();
+        auto clearIfOnOtherDevice = [curDeviceId](Data &data) {
+            if (data.cudaData == nullptr) {
+                return;
+            }
+            int ptrDevice = GetPointerDeviceId(data.cudaData);
+            if (ptrDevice >= 0 && ptrDevice != curDeviceId) {
+                FastllmCudaSetDevice(ptrDevice);
+                FastllmCudaFree(data.cudaData);
+                FastllmCudaSetDevice(curDeviceId);
+                data.cudaData = nullptr;
+            }
+        };
+        clearIfOnOtherDevice(w1);
+        clearIfOnOtherDevice(output);
+
+        bool ok = false;
+        if (isFp8Block128) {
+            ok = input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfFusedMOEFP8E4M3Block128(input, gate, up, down, index, score, w1, output,
+                                                       batch, topk, hidden, inter, experts, swigluLimit) :
+                FastllmCudaBFloat16FusedMOEFP8E4M3Block128(input, gate, up, down, index, score, w1, output,
+                                                           batch, topk, hidden, inter, experts, swigluLimit);
+        } else {
+            ok = input.dataType == DataType::FLOAT16 ?
+                FastllmCudaHalfFusedMOEFP8E4M3(input, gate, up, down, index, score, w1, output,
+                                               batch, topk, hidden, inter, experts, swigluLimit) :
+                FastllmCudaBFloat16FusedMOEFP8E4M3(input, gate, up, down, index, score, w1, output,
+                                                   batch, topk, hidden, inter, experts, swigluLimit);
+        }
+        if (!ok) {
+            ErrorInFastLLM("CudaFusedMOE failed.\n");
+        }
+    }
+
+    void CudaFusedMOE::Reshape(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &gate = *(datas.find("gate")->second);
+        Data &w1 = *(datas.find("w1")->second);
+        Data &output = *(datas.find("output")->second);
+        output.dataType = input.dataType;
+        output.Resize(input.dims);
+        if (index.dims.size() >= 2 && gate.dims.size() == 3) {
+            w1.dataType = input.dataType;
+            w1.Resize({(int)index.Count(0), gate.dims[1]});
+        }
+    }
+
+    void CudaFusedMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
+                    const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        Data &index = *(datas.find("index")->second);
+        Data &score = *(datas.find("score")->second);
+        Data &gate = *(datas.find("gate")->second);
+        Data &up = *(datas.find("up")->second);
+        Data &down = *(datas.find("down")->second);
+        Data &w1 = *(datas.find("w1")->second);
+        MoeGateType gateType = intParams.find("gateType") != intParams.end() ?
+            (MoeGateType) intParams.find("gateType")->second : MoeGateSwiglu;
+        float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
+            floatParams.find("swigluLimit")->second : 0.0f;
+        DoCudaFusedMOE(input, output, index, score, gate, up, down, w1, gateType, swigluLimit);
     }
 
     void CudaMergeAttention::Reshape(const std::string &opType, const fastllm::DataDict &datas,

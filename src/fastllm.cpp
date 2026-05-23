@@ -558,8 +558,20 @@ namespace fastllm {
             return rows * colBytes;
         } else {
             ErrorInFastLLM("GetDataBytes failed. " + GetDataTypeName(type) + "\n");
-            return 0;
         }
+        return 0;
+    }
+
+    static bool FastllmGetPackedRowsCols(const std::vector<int> &dims, size_t &rows, size_t &columns) {
+        if (dims.size() < 2) {
+            return false;
+        }
+        rows = 1;
+        for (int i = 0; i + 1 < (int)dims.size(); i++) {
+            rows *= dims[i];
+        }
+        columns = dims.back();
+        return true;
     }
     
 #ifdef USE_MMAP
@@ -1441,8 +1453,10 @@ namespace fastllm {
 
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
-             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() == 2) {
-            this->expansionBytes = GetDataBytes(this->dataType, this->dims[0], this->dims[1]);
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
+            size_t rows = 0, columns = 0;
+            FastllmGetPackedRowsCols(this->dims, rows, columns);
+            this->expansionBytes = GetDataBytes(this->dataType, rows, columns);
         } else if (this->dataType == DataType::NVFP4 && this->dims.size() == 2 &&
             this->blockK > 0 && this->blockM > 0 && this->scales.empty()) {
             this->expansionBytes = GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
@@ -1659,6 +1673,13 @@ namespace fastllm {
             this->blockK > 0 && this->blockM > 0 && this->scales.empty()) {
             return GetNVFP4StorageBytes(this->dims[0], this->dims[1], this->blockK, this->blockM);
         }
+        if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+             this->dataType == DataType::NVFP4_BLOCK_16 ||
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
+            size_t rows = 0, columns = 0;
+            FastllmGetPackedRowsCols(this->dims, rows, columns);
+            return GetDataBytes(this->dataType, rows, columns);
+        }
         if (this->dataType >= 1000 && this->dataType < DataType::DATA_GGUF_FORMAT 
             && this->dims.size() == 2) {
             return GetDataBytes(this->dataType, this->dims[0], this->dims[1]);
@@ -1670,8 +1691,10 @@ namespace fastllm {
         this->expansionSize = size;
         if ((this->dataType == DataType::FP8_E4M3_BLOCK_128 ||
              this->dataType == DataType::NVFP4_BLOCK_16 ||
-             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() == 2) {
-            this->expansionBytes = GetDataBytes(this->dataType, this->dims[0], this->dims[1]);
+             this->dataType == DataType::NVFP4_BLOCK_16_E8M0) && this->dims.size() >= 2) {
+            size_t rows = 0, columns = 0;
+            FastllmGetPackedRowsCols(this->dims, rows, columns);
+            this->expansionBytes = GetDataBytes(this->dataType, rows, columns);
         } else if (this->dataType == DataType::NVFP4 && this->dims.size() == 2 &&
             this->blockK > 0 && this->blockM > 0 && this->scales.empty() &&
             size == this->Count(0)) {
@@ -1723,7 +1746,7 @@ namespace fastllm {
         this->expansionBytes = 0;
         if (this->cpuData != nullptr) {
 #ifdef USE_MMAP
-            if (this->name.empty())
+            if (this->mapFile == nullptr)
                 delete[] this->cpuData;
 #else
             delete[] this->cpuData;
@@ -1876,7 +1899,7 @@ namespace fastllm {
         }
         if (this->cpuData != nullptr)
 #ifdef USE_MMAP
-            if (this->name.empty())
+            if (this->mapFile == nullptr)
                 delete[] this->cpuData;
 #else
            delete[] this->cpuData;
@@ -2234,7 +2257,7 @@ namespace fastllm {
                         uint8_t *cpuData = this->cpuData;
                         bool ownedCpuDataCopy = false;
 #ifdef USE_MMAP
-                        if (this->cpuData != nullptr) {
+                        if (this->cpuData != nullptr && this->mapFile != nullptr) {
                             cpuData = new uint8_t[expansionBytes];
                             memcpy(cpuData, this->cpuData, expansionBytes);
                             ownedCpuDataCopy = true;
@@ -2265,6 +2288,10 @@ namespace fastllm {
 #ifdef USE_MMAP
                         if (ownedCpuDataCopy) {
                             delete[] cpuData;
+                        }
+                        if ((this->isModelWeight || this->isKVCache) && this->mapFile == nullptr) {
+                            delete[] this->cpuData;
+                            this->cpuData = nullptr;
                         }
 #else
                         if (this->isModelWeight || this->isKVCache) {
@@ -3535,6 +3562,16 @@ namespace fastllm {
                 {"output", (Data*)&output}
         }, {{"sharedScale", sharedScale}}, 
                                         {{"weights___batch", (int)weights.size()}, {"biass___batch", (int)biass.size()}, {"layer", layer}, {"gateType", (int)gateType}});
+    }
+
+    void FusedMOE(const Data &input, const Data &index, const Data &score,
+                Data &gate, Data &up, Data &down, Data &w1,
+                Data &output, int layer, MoeGateType gateType, float swigluLimit) {
+        curExecutor->Run("FusedMOE", {
+                {"input", (Data*)&input}, {"index", (Data*)&index}, {"score", (Data*)&score},
+                {"gate", (Data*)&gate}, {"up", (Data*)&up}, {"down", (Data*)&down},
+                {"w1", (Data*)&w1}, {"output", (Data*)&output}
+        }, {{"swigluLimit", swigluLimit}}, {{"layer", layer}, {"gateType", (int)gateType}});
     }
 
     void MergeMLA(Data &qNope, Data &qPe, Data &kvCache, Data &peCache, const Data &mask, Data &output, float softmaxScale) {

@@ -5,13 +5,18 @@
 #include "step3p5.h"
 #include "utils.h"
 #include "json11.hpp"
+#ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
+#endif
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 #include <sstream>
+#include <thread>
 
 namespace fastllm {
     static const std::string STEP3P5_BOS = "<｜begin▁of▁sentence｜>";
@@ -23,6 +28,16 @@ namespace fastllm {
         std::transform(lowered.begin(), lowered.end(), lowered.begin(),
                        [](unsigned char c) { return std::tolower(c); });
         return lowered == "1" || lowered == "true" || lowered == "on";
+    }
+
+    static bool Step3p5DisableFusedMoe() {
+        const char *env = getenv("FASTLLM_STEP3P5_DISABLE_FUSED_MOE");
+        return env != nullptr && Step3p5IsTrueString(env);
+    }
+
+    static bool Step3p5EnableFusedMoeSwigluLimit() {
+        const char *env = getenv("FASTLLM_STEP3P5_ENABLE_FUSED_MOE_SWIGLU_LIMIT");
+        return env != nullptr && Step3p5IsTrueString(env);
     }
 
     static bool Step3p5DeviceMapUsesCuda(const std::map<std::string, int> &deviceMap) {
@@ -141,6 +156,99 @@ namespace fastllm {
         for (int i = 0; i < len; i++) {
             v[i] += 1.0f;
         }
+    }
+
+    static void Step3p5PackFp8MoeWeightToBlock128(Data &weight) {
+        if (weight.dataType == DataType::FP8_E4M3_BLOCK_128) {
+            return;
+        }
+        if (weight.dataType != DataType::FP8_E4M3) {
+            return;
+        }
+        AssertInFastLLM(weight.dims.size() == 3, "Step3p5 FusedMOE fp8 weight should be 3D.");
+        AssertInFastLLM(weight.blockK > 0 && weight.blockM == 128 && !weight.scales.empty(),
+                        "Step3p5 FusedMOE fp8 weight should have block-128 scales.");
+        weight.ToDevice(DataDevice::CPU);
+        AssertInFastLLM(weight.cpuData != nullptr, "Step3p5 FusedMOE fp8 weight should be in CPU memory before packing.");
+
+        int experts = weight.dims[0];
+        int rows = weight.dims[1];
+        int cols = weight.dims[2];
+        const int blockSize = 128;
+        AssertInFastLLM(cols % blockSize == 0,
+                        "Step3p5 FusedMOE block128 pack currently requires columns aligned to 128.");
+        size_t totalRows = (size_t)experts * rows;
+        int scaleRows = (int)((totalRows - 1) / weight.blockK + 1);
+        int scaleCols = (cols - 1) / weight.blockM + 1;
+        AssertInFastLLM((size_t)scaleRows * scaleCols <= weight.scales.size(),
+                        "Step3p5 FusedMOE fp8 scale range is out of bounds.");
+
+        size_t rawBytesPerRow = GetDataBytes(DataType::FP8_E4M3, 1, cols);
+        size_t packedBytesPerRow = GetDataBytes(DataType::FP8_E4M3_BLOCK_128, 1, cols);
+        size_t packedBytes = totalRows * packedBytesPerRow;
+        uint8_t *packed = new uint8_t[packedBytes];
+        memset(packed, 0, packedBytes);
+        int blocks = (cols - 1) / blockSize + 1;
+
+        int threadNum = (int)std::thread::hardware_concurrency();
+        if (const char *env = getenv("FT_THREADS")) {
+            threadNum = atoi(env);
+        }
+        threadNum = std::max(1, std::min({threadNum, 32, (int)totalRows}));
+        auto packRows = [&](int rowStart, int rowEnd) {
+            for (int globalRowInt = rowStart; globalRowInt < rowEnd; globalRowInt++) {
+                size_t globalRow = (size_t)globalRowInt;
+                const uint8_t *src = weight.cpuData + globalRow * rawBytesPerRow;
+                uint8_t *dst = packed + globalRow * packedBytesPerRow;
+                for (int blk = 0; blk < blocks; blk++) {
+                    int colStart = blk * blockSize;
+                    int colsInBlock = std::min(blockSize, cols - colStart);
+                    uint8_t *dstBlock = dst + blk * (blockSize + (int)sizeof(float));
+                    memcpy(dstBlock, src + colStart, colsInBlock);
+                    size_t scaleIndex = (globalRow / weight.blockK) * scaleCols + blk;
+                    memcpy(dstBlock + blockSize, &weight.scales[scaleIndex], sizeof(float));
+                }
+            }
+        };
+        if (threadNum == 1) {
+            packRows(0, totalRows);
+        } else {
+            std::vector<std::thread> threads;
+            threads.reserve(threadNum);
+            for (int t = 0; t < threadNum; t++) {
+                int rowStart = (long long)totalRows * t / threadNum;
+                int rowEnd = (long long)totalRows * (t + 1) / threadNum;
+                threads.emplace_back(packRows, rowStart, rowEnd);
+            }
+            for (auto &thread : threads) {
+                thread.join();
+            }
+        }
+
+        if (weight.mapFile) {
+            weight.mapFile.reset();
+        } else {
+            delete[] weight.cpuData;
+        }
+        weight.cpuData = packed;
+        weight.dataType = DataType::FP8_E4M3_BLOCK_128;
+        weight.scales.clear();
+        weight.UpdateUnitSize();
+        weight.expansionSize = weight.Count(0);
+        weight.expansionBytes = packedBytes;
+    }
+
+    static void Step3p5PrepareFusedMoeWeightForCuda(Data &weight, int biasK) {
+#ifdef USE_CUDA
+        weight.ToDevice(DataDevice::CUDA);
+        if (weight.dataType == DataType::FP8_E4M3 && weight.extraCudaData.empty()) {
+            Data emptyBias;
+            FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, emptyBias, biasK);
+        }
+#else
+        (void)weight;
+        (void)biasK;
+#endif
     }
 
     static void Step3p5MakeExpertView(Data &dst, const Data &src, const std::string &name, int expert) {
@@ -548,10 +656,15 @@ namespace fastllm {
         moeGateWeights.resize(block_cnt);
         moeUpWeights.resize(block_cnt);
         moeDownWeights.resize(block_cnt);
+        moeGate3DWeights.assign(block_cnt, nullptr);
+        moeUp3DWeights.assign(block_cnt, nullptr);
+        moeDown3DWeights.assign(block_cnt, nullptr);
         weights.clear();
         biass.clear();
         weights.resize(block_cnt);
         biass.resize(block_cnt);
+        bool disableFusedMoe = Step3p5DisableFusedMoe();
+        bool enableFusedMoeLimit = Step3p5EnableFusedMoeSwigluLimit();
         for (int i = 0; i < block_cnt; i++) {
             if (!IsMoeLayer(i)) {
                 continue;
@@ -569,6 +682,43 @@ namespace fastllm {
             Data &upSource = weight[upSourceName];
             Data &downSource = weight[downSourceName];
             bool useDiskMergedMoe = gateSource.isDiskWeight || upSource.isDiskWeight || downSource.isDiskWeight;
+            std::string selectedMoeDevice = SelectDeviceFromMap(this->moeDeviceMap, i + 1, block_cnt);
+            bool selectedCudaMoe = selectedMoeDevice.rfind("cuda", 0) == 0;
+            float expertLimit = Step3p5LayerLimit(swiglu_limits, i);
+            if (!disableFusedMoe && selectedCudaMoe && !useDiskMergedMoe &&
+                (expertLimit == 0.0f || enableFusedMoeLimit)) {
+                AssertInFastLLM(gateSource.dims.size() == 3 && upSource.dims.size() == 3 &&
+                                downSource.dims.size() == 3,
+                                "Step3p5 FusedMOE source weights should be 3D.");
+                AssertInFastLLM(gateSource.dims[0] == num_experts &&
+                                upSource.dims[0] == num_experts &&
+                                downSource.dims[0] == num_experts &&
+                                gateSource.dims[1] == upSource.dims[1] &&
+                                gateSource.dims[2] == upSource.dims[2] &&
+                                downSource.dims[0] == gateSource.dims[0] &&
+                                downSource.dims[1] == gateSource.dims[2] &&
+                                downSource.dims[2] == gateSource.dims[1],
+                                "Step3p5 FusedMOE source weight shapes mismatch.");
+                bool isFp8 = gateSource.dataType == DataType::FP8_E4M3 &&
+                              upSource.dataType == DataType::FP8_E4M3 &&
+                              downSource.dataType == DataType::FP8_E4M3;
+                bool isFp8Block128 = gateSource.dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                                      upSource.dataType == DataType::FP8_E4M3_BLOCK_128 &&
+                                      downSource.dataType == DataType::FP8_E4M3_BLOCK_128;
+                AssertInFastLLM(isFp8 || isFp8Block128,
+                                "Step3p5 FusedMOE only supports 3D FP8_E4M3 or FP8_E4M3_BLOCK_128 weights.");
+                if (isFp8) {
+                    AssertInFastLLM(gateSource.blockM > 0 && gateSource.blockK > 0 &&
+                                    upSource.blockM == gateSource.blockM && upSource.blockK == gateSource.blockK &&
+                                    downSource.blockM > 0 && downSource.blockK > 0 &&
+                                    !gateSource.scales.empty() && !upSource.scales.empty() && !downSource.scales.empty(),
+                                    "Step3p5 FusedMOE FP8 weights should have block scales.");
+                }
+                moeGate3DWeights[i] = &gateSource;
+                moeUp3DWeights[i] = &upSource;
+                moeDown3DWeights[i] = &downSource;
+                continue;
+            }
             moeGateWeights[i].resize(num_experts);
             moeUpWeights[i].resize(num_experts);
             moeDownWeights[i].resize(num_experts);
@@ -821,6 +971,7 @@ namespace fastllm {
         Data w1, w2, w3, routerLogits, routerProb, expertIndex, expertScore;
         Data attenPart, moePart, moeFinal, shareOutput;
         Data tempInput, tempOutput;
+        bool enableFusedMoeLimit = Step3p5EnableFusedMoeSwigluLimit();
         std::vector<Data*> batchPastKeys(batch), batchPastValues(batch);
         Data qSizes, pageSizes, pageIndexs, lastPageLens, insertIndexs, insertPositions;
         bool generatedBatchDecodeParams = false;
@@ -989,71 +1140,90 @@ namespace fastllm {
                 SelectExpert(routerProb, expertIndex, expertScore, num_experts_per_tok, norm_topk_prob,
                              routed_scaling_factor, gateBias);
 
-                routerProb.ToDevice(DataDevice::CPU);
-                expertIndex.ToDevice(DataDevice::CPU);
-                expertScore.ToDevice(DataDevice::CPU);
-                ToDataType(expertScore, DataType::FLOAT32);
                 bool useCudaMoe = Step3p5DeviceMapUsesCuda(this->moeDeviceMap);
                 bool useDiskMoe = Step3p5DeviceMapUsesDisk(this->moeDeviceMap);
-                if (i < (int)weights.size() && !weights[i].empty() && (useCudaMoe || useDiskMoe)) {
+                std::string selectedMoeDevice = SelectDeviceFromMap(this->moeDeviceMap, i + 1, block_cnt);
+                bool selectedCudaMoe = selectedMoeDevice.rfind("cuda", 0) == 0;
+                bool useFusedCudaMoe = selectedCudaMoe && !useDiskMoe &&
+                    (expertLimit == 0.0f || enableFusedMoeLimit) &&
+                    i < (int)moeGate3DWeights.size() &&
+                    moeGate3DWeights[i] != nullptr && moeUp3DWeights[i] != nullptr && moeDown3DWeights[i] != nullptr;
+                if (useFusedCudaMoe) {
                     Data expertInput;
                     expertInput.CopyFrom(attenInput);
                     ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
-                    MergeMOE(expertInput, expertIndex, expertScore,
-                             weights[i], biass[i],
-                             w1, w2, w3, tempInput, tempOutput,
-                             1.0f, moeFinal, i);
+                    Step3p5PrepareFusedMoeWeightForCuda(*moeGate3DWeights[i], moeGate3DWeights[i]->dims[1]);
+                    Step3p5PrepareFusedMoeWeightForCuda(*moeUp3DWeights[i], moeUp3DWeights[i]->dims[1]);
+                    Step3p5PrepareFusedMoeWeightForCuda(*moeDown3DWeights[i], moeDown3DWeights[i]->dims[1]);
+                    FusedMOE(expertInput, expertIndex, expertScore,
+                             *moeGate3DWeights[i], *moeUp3DWeights[i], *moeDown3DWeights[i],
+                             w1, moeFinal, i, MoeGateSwiglu, expertLimit);
                     ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
                 } else {
-                int32_t *indexData = (int32_t*)expertIndex.cpuData;
-                float *scoreData = (float*)expertScore.cpuData;
+                    routerProb.ToDevice(DataDevice::CPU);
+                    expertIndex.ToDevice(DataDevice::CPU);
+                    expertScore.ToDevice(DataDevice::CPU);
+                    ToDataType(expertScore, DataType::FLOAT32);
+                    if (i < (int)weights.size() && !weights[i].empty() && (useCudaMoe || useDiskMoe)) {
+                        Data expertInput;
+                        expertInput.CopyFrom(attenInput);
+                        ApplyDeviceMap(this->moeDeviceMap, i + 1, block_cnt);
+                        MergeMOE(expertInput, expertIndex, expertScore,
+                                 weights[i], biass[i],
+                                 w1, w2, w3, tempInput, tempOutput,
+                                 1.0f, moeFinal, i);
+                        ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
+                    } else {
+                        int32_t *indexData = (int32_t*)expertIndex.cpuData;
+                        float *scoreData = (float*)expertScore.cpuData;
 
-                std::map<std::string, int> cpuDeviceMap = {{"cpu", 1}};
-                Data expertInput;
-                expertInput.CopyFrom(attenInput);
-                expertInput.ToDevice(DataDevice::CPU);
-                moeFinal.dataType = hiddenStates.dataType;
-                moeFinal.dataDevice = expertInput.dataDevice;
-                moeFinal.dataDeviceIds = expertInput.dataDeviceIds;
-                moeFinal.UpdateUnitSize();
-                moeFinal.Resize({0, expertInput.dims[1]});
-                moeFinal.Expansion(expertInput.dims);
-                ApplyDeviceMap(cpuDeviceMap, 1, 1);
-                for (int b = 0; b < flatBatch * flatLen; b++) {
-                    Data *currentData = &expertInput;
-                    if (flatBatch * flatLen != 1) {
-                        Split(expertInput, 0, b, b + 1, attenPart);
-                        currentData = &attenPart;
-                    }
-                    moePart.dataType = hiddenStates.dataType;
-                    moePart.dataDevice = currentData->dataDevice;
-                    moePart.dataDeviceIds = currentData->dataDeviceIds;
-                    moePart.UpdateUnitSize();
-                    moePart.Resize(currentData->dims);
-                    moePart.Allocate(0.0f);
-                    for (int j = 0; j < num_experts_per_tok; j++) {
-                        int expert = indexData[b * num_experts_per_tok + j];
-                        float score = scoreData[b * num_experts_per_tok + j];
-                        Linear(*currentData, *moeGateWeights[i][expert], Data(), w1);
-                        Silu(w1, w1);
-                        Linear(*currentData, *moeUpWeights[i][expert], Data(), w3);
-                        if (expertLimit != 0.0f) {
-                            Step3p5Clamp(w1, false, 0.0f, true, expertLimit);
-                            Step3p5Clamp(w3, true, -expertLimit, true, expertLimit);
+                        std::map<std::string, int> cpuDeviceMap = {{"cpu", 1}};
+                        Data expertInput;
+                        expertInput.CopyFrom(attenInput);
+                        expertInput.ToDevice(DataDevice::CPU);
+                        moeFinal.dataType = hiddenStates.dataType;
+                        moeFinal.dataDevice = expertInput.dataDevice;
+                        moeFinal.dataDeviceIds = expertInput.dataDeviceIds;
+                        moeFinal.UpdateUnitSize();
+                        moeFinal.Resize({0, expertInput.dims[1]});
+                        moeFinal.Expansion(expertInput.dims);
+                        ApplyDeviceMap(cpuDeviceMap, 1, 1);
+                        for (int b = 0; b < flatBatch * flatLen; b++) {
+                            Data *currentData = &expertInput;
+                            if (flatBatch * flatLen != 1) {
+                                Split(expertInput, 0, b, b + 1, attenPart);
+                                currentData = &attenPart;
+                            }
+                            moePart.dataType = hiddenStates.dataType;
+                            moePart.dataDevice = currentData->dataDevice;
+                            moePart.dataDeviceIds = currentData->dataDeviceIds;
+                            moePart.UpdateUnitSize();
+                            moePart.Resize(currentData->dims);
+                            moePart.Allocate(0.0f);
+                            for (int j = 0; j < num_experts_per_tok; j++) {
+                                int expert = indexData[b * num_experts_per_tok + j];
+                                float score = scoreData[b * num_experts_per_tok + j];
+                                Linear(*currentData, *moeGateWeights[i][expert], Data(), w1);
+                                Silu(w1, w1);
+                                Linear(*currentData, *moeUpWeights[i][expert], Data(), w3);
+                                if (expertLimit != 0.0f) {
+                                    Step3p5Clamp(w1, false, 0.0f, true, expertLimit);
+                                    Step3p5Clamp(w3, true, -expertLimit, true, expertLimit);
+                                }
+                                MulTo(w1, w3);
+                                Linear(w1, *moeDownWeights[i][expert], Data(), w2);
+                                if (w2.dataType != moePart.dataType) {
+                                    ToDataType(w2, moePart.dataType);
+                                }
+                                AddTo(moePart, w2, score);
+                            }
+                            if (moePart.dataType != moeFinal.dataType) {
+                                ToDataType(moePart, moeFinal.dataType);
+                            }
+                            CatDirect(moeFinal, moePart, 0);
                         }
-                        MulTo(w1, w3);
-                        Linear(w1, *moeDownWeights[i][expert], Data(), w2);
-                        if (w2.dataType != moePart.dataType) {
-                            ToDataType(w2, moePart.dataType);
-                        }
-                        AddTo(moePart, w2, score);
+                        ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
                     }
-                    if (moePart.dataType != moeFinal.dataType) {
-                        ToDataType(moePart, moeFinal.dataType);
-                    }
-                    CatDirect(moeFinal, moePart, 0);
-                }
-                ApplyDeviceMap(this->deviceMap, i + 1, block_cnt);
                 }
                 moeFinal.expansionDims.clear();
                 moeFinal.Reshape(hiddenStates.dims);

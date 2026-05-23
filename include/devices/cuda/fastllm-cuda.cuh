@@ -406,6 +406,14 @@ bool FastllmCudaHalfMergeMOEFP8E4M3Batch1Indexed(const fastllm::Data &input, fas
 bool FastllmCudaHalfMergeMOEFP8E4M3Block128Batch1Indexed(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                                          fastllm::Data **weights, int weightsBatch, const int32_t *indices,
                                                          const float *scores, int topk, int hidden, int inter);
+bool FastllmCudaHalfFusedMOEFP8E4M3(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
+                                    fastllm::Data &down, const fastllm::Data &index, const fastllm::Data &score,
+                                    fastllm::Data &w1, fastllm::Data &output,
+                                    int batch, int topk, int hidden, int inter, int experts, float swigluLimit);
+bool FastllmCudaHalfFusedMOEFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
+                                            fastllm::Data &down, const fastllm::Data &index, const fastllm::Data &score,
+                                            fastllm::Data &w1, fastllm::Data &output,
+                                            int batch, int topk, int hidden, int inter, int experts, float swigluLimit);
 bool FastllmCudaHalfMergeMOEFP8E4M3SmallBatchIndexed(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                                      fastllm::Data **weights, int weightsBatch, const int32_t *indices,
                                                      const float *scores, int batch, int topk, int hidden, int inter);
@@ -455,6 +463,14 @@ bool FastllmCudaBFloat16MergeMOEFP8E4M3Batch1Indexed(const fastllm::Data &input,
 bool FastllmCudaBFloat16MergeMOEFP8E4M3Block128Batch1Indexed(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                                              fastllm::Data **weights, int weightsBatch, const int32_t *indices,
                                                              const float *scores, int topk, int hidden, int inter);
+bool FastllmCudaBFloat16FusedMOEFP8E4M3(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
+                                        fastllm::Data &down, const fastllm::Data &index, const fastllm::Data &score,
+                                        fastllm::Data &w1, fastllm::Data &output,
+                                        int batch, int topk, int hidden, int inter, int experts, float swigluLimit);
+bool FastllmCudaBFloat16FusedMOEFP8E4M3Block128(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
+                                                fastllm::Data &down, const fastllm::Data &index, const fastllm::Data &score,
+                                                fastllm::Data &w1, fastllm::Data &output,
+                                                int batch, int topk, int hidden, int inter, int experts, float swigluLimit);
 bool FastllmCudaBFloat16MergeMOEFP8E4M3SmallBatchIndexed(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                                          fastllm::Data **weights, int weightsBatch, const int32_t *indices,
                                                          const float *scores, int batch, int topk, int hidden, int inter);

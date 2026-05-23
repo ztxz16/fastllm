@@ -2752,6 +2752,480 @@ __global__ void FastllmGemvTypedFP8E4M3Block128TopKDownReduceIndexedKernel(
     }
 }
 
+template <typename T, int THREAD_PER_BLOCK>
+__global__ void FastllmGemvTypedFP8E4M3FusedTopKSwigluKernel(
+        const T *A, const int32_t *indices, const uint8_t *gateWeight, const uint8_t *upWeight,
+        const float *gateScales, const float *upScales, T *C,
+        int batch, int topk, int hidden, int inter, int experts, int blockM, int blockK, float swigluLimit) {
+    __shared__ float sdataGate[THREAD_PER_BLOCK];
+    __shared__ float sdataUp[THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    int p = blockIdx.x;
+    int task = blockIdx.y;
+    int token = task / topk;
+    if (token >= batch) {
+        return;
+    }
+
+    int expertIdx = indices[task];
+    if (expertIdx < 0 || expertIdx >= experts) {
+        if (tid == 0) {
+            C[(size_t)task * inter + p] = FastllmMoeFp8Traits<T>::fromFloat(0.0f);
+        }
+        return;
+    }
+
+    int ms = (hidden - 1) / blockM + 1;
+    int ks = (inter - 1) / blockK + 1;
+    const float magicScaleConstant = FastllmMoeFp8Traits<T>::magicScale();
+    const T *tokenInput = A + (size_t)token * hidden;
+    const uint8_t *baseGate = gateWeight + ((size_t)expertIdx * inter + p) * hidden;
+    const uint8_t *baseUp = upWeight + ((size_t)expertIdx * inter + p) * hidden;
+    const float *gateRowScales = gateScales + ((size_t)expertIdx * ks + p / blockK) * ms;
+    const float *upRowScales = upScales + ((size_t)expertIdx * ks + p / blockK) * ms;
+
+    sdataGate[tid] = 0.0f;
+    sdataUp[tid] = 0.0f;
+    for (int i = tid * 4; i < hidden; i += THREAD_PER_BLOCK * 4) {
+        int remaining = hidden - i;
+        float gateScale = gateRowScales[i / blockM];
+        float upScale = upRowScales[i / blockM];
+        if (remaining >= 4) {
+            FastllmMoeFp8Accumulate4(tokenInput, i, *(uint32_t*)(baseGate + i), gateScale, sdataGate[tid]);
+            FastllmMoeFp8Accumulate4(tokenInput, i, *(uint32_t*)(baseUp + i), upScale, sdataUp[tid]);
+        } else {
+            FastllmMoeFp8AccumulateRemainder(tokenInput, baseGate, i, remaining, gateScale, sdataGate[tid]);
+            FastllmMoeFp8AccumulateRemainder(tokenInput, baseUp, i, remaining, upScale, sdataUp[tid]);
+        }
+    }
+    __syncthreads();
+
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdataGate[tid] += sdataGate[tid + s];
+            sdataUp[tid] += sdataUp[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float gate = FastllmMoeFp8Round<T>(sdataGate[0] * magicScaleConstant);
+        float up = FastllmMoeFp8Round<T>(sdataUp[0] * magicScaleConstant);
+        float gateAct = gate / (1.0f + expf(-gate));
+        if (swigluLimit > 0.0f) {
+            gateAct = gateAct > swigluLimit ? swigluLimit : gateAct;
+            up = up < -swigluLimit ? -swigluLimit : (up > swigluLimit ? swigluLimit : up);
+        }
+        C[(size_t)task * inter + p] = FastllmMoeFp8Traits<T>::fromFloat(gateAct * up);
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmGemvHalfFP8E4M3FusedTopKSwigluKernel(
+        half *A, const int32_t *indices, uint8_t *gateWeight, uint8_t *upWeight,
+        float *gateScales, float *upScales, half *C,
+        int batch, int topk, int hidden, int inter, int experts, int blockM, int blockK, float swigluLimit) {
+    __shared__ float sdataGate[THREAD_PER_BLOCK];
+    __shared__ float sdataUp[THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    int p = blockIdx.x;
+    int task = blockIdx.y;
+    int token = task / topk;
+    if (token >= batch) {
+        return;
+    }
+
+    int expertIdx = indices[task];
+    if (expertIdx < 0 || expertIdx >= experts) {
+        if (tid == 0) {
+            C[(size_t)task * inter + p] = (half)0.0f;
+        }
+        return;
+    }
+
+    int ms = (hidden - 1) / blockM + 1;
+    int ks = (inter - 1) / blockK + 1;
+    const float magicScaleConstant = exp2f(8.0f);
+    half *tokenInput = A + (size_t)token * hidden;
+    const uint8_t *baseGate = gateWeight + ((size_t)expertIdx * inter + p) * hidden;
+    const uint8_t *baseUp = upWeight + ((size_t)expertIdx * inter + p) * hidden;
+    float *gateRowScales = gateScales + ((size_t)expertIdx * ks + p / blockK) * ms;
+    float *upRowScales = upScales + ((size_t)expertIdx * ks + p / blockK) * ms;
+    union_half4 regA;
+
+    sdataGate[tid] = 0.0f;
+    sdataUp[tid] = 0.0f;
+    for (int i = tid * 4; i < hidden; i += THREAD_PER_BLOCK * 4) {
+        int remaining = hidden - i;
+        float gateScale = gateRowScales[i / blockM];
+        float upScale = upRowScales[i / blockM];
+        if (remaining >= 4) {
+            uint32_t gateBytes = *(uint32_t*)(baseGate + i);
+            uint32_t upBytes = *(uint32_t*)(baseUp + i);
+            __half2 gate01 = make_half2(__short_as_half((((gateBytes >> 0) & 0x80) << 8) | (((gateBytes >> 0) & 0x7F) << 7)),
+                                        __short_as_half((((gateBytes >> 8) & 0x80) << 8) | (((gateBytes >> 8) & 0x7F) << 7)));
+            __half2 gate23 = make_half2(__short_as_half((((gateBytes >> 16) & 0x80) << 8) | (((gateBytes >> 16) & 0x7F) << 7)),
+                                        __short_as_half((((gateBytes >> 24) & 0x80) << 8) | (((gateBytes >> 24) & 0x7F) << 7)));
+            __half2 up01 = make_half2(__short_as_half((((upBytes >> 0) & 0x80) << 8) | (((upBytes >> 0) & 0x7F) << 7)),
+                                      __short_as_half((((upBytes >> 8) & 0x80) << 8) | (((upBytes >> 8) & 0x7F) << 7)));
+            __half2 up23 = make_half2(__short_as_half((((upBytes >> 16) & 0x80) << 8) | (((upBytes >> 16) & 0x7F) << 7)),
+                                      __short_as_half((((upBytes >> 24) & 0x80) << 8) | (((upBytes >> 24) & 0x7F) << 7)));
+            regA.in = *reinterpret_cast<const uint2 *>(tokenInput + i);
+#if (CUDART_VERSION < 12000) || defined(CUDA_NO_TENSOR_CORE)
+            sdataGate[tid] += ((float)regA.out[0] * (float)gate01.x +
+                               (float)regA.out[1] * (float)gate01.y +
+                               (float)regA.out[2] * (float)gate23.x +
+                               (float)regA.out[3] * (float)gate23.y) * gateScale;
+            sdataUp[tid] += ((float)regA.out[0] * (float)up01.x +
+                             (float)regA.out[1] * (float)up01.y +
+                             (float)regA.out[2] * (float)up23.x +
+                             (float)regA.out[3] * (float)up23.y) * upScale;
+#else
+            __half2 gateProd01 = __hmul2(regA.out2[0], gate01);
+            __half2 gateProd23 = __hmul2(regA.out2[1], gate23);
+            __half2 gatePair = __hadd2(gateProd01, gateProd23);
+            __half gateSum = __hadd(gatePair.x, gatePair.y);
+            sdataGate[tid] += __half2float(gateSum) * gateScale;
+
+            __half2 upProd01 = __hmul2(regA.out2[0], up01);
+            __half2 upProd23 = __hmul2(regA.out2[1], up23);
+            __half2 upPair = __hadd2(upProd01, upProd23);
+            __half upSum = __hadd(upPair.x, upPair.y);
+            sdataUp[tid] += __half2float(upSum) * upScale;
+#endif
+        } else {
+            for (int j = 0; j < remaining; j++) {
+                half gateVal = __float2half((float)__ushort_as_half(((baseGate[i + j] & 0x80) << 8) | ((baseGate[i + j] & 0x7F) << 7)) * gateScale);
+                half upVal = __float2half((float)__ushort_as_half(((baseUp[i + j] & 0x80) << 8) | ((baseUp[i + j] & 0x7F) << 7)) * upScale);
+                float aVal = __half2float(tokenInput[i + j]);
+                sdataGate[tid] += aVal * __half2float(gateVal);
+                sdataUp[tid] += aVal * __half2float(upVal);
+            }
+        }
+    }
+    __syncthreads();
+
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdataGate[tid] += sdataGate[tid + s];
+            sdataUp[tid] += sdataUp[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float gate = (float)(half)(sdataGate[0] * magicScaleConstant);
+        float up = (float)(half)(sdataUp[0] * magicScaleConstant);
+        float gateAct = gate / (1.0f + expf(-gate));
+        if (swigluLimit > 0.0f) {
+            gateAct = gateAct > swigluLimit ? swigluLimit : gateAct;
+            up = up < -swigluLimit ? -swigluLimit : (up > swigluLimit ? swigluLimit : up);
+        }
+        C[(size_t)task * inter + p] = (half)(gateAct * up);
+    }
+}
+
+template <typename T, int THREAD_PER_BLOCK>
+__global__ void FastllmGemvTypedFP8E4M3FusedTopKDownReduceKernel(
+        const T *A, const int32_t *indices, const uint8_t *downWeight, const float *downScales,
+        T *C, const float *scores, int batch, int topk, int inter, int hidden, int experts,
+        int blockM, int blockK) {
+    __shared__ float sdata[THREAD_PER_BLOCK];
+    __shared__ float out;
+    unsigned int tid = threadIdx.x;
+    int st = blockIdx.x;
+    int token = blockIdx.y;
+    if (token >= batch) {
+        return;
+    }
+
+    int ms = (inter - 1) / blockM + 1;
+    int ks = (hidden - 1) / blockK + 1;
+    const float magicScaleConstant = FastllmMoeFp8Traits<T>::magicScale();
+
+    if (tid == 0) {
+        out = 0.0f;
+    }
+    __syncthreads();
+
+    for (int topkSlot = 0; topkSlot < topk; topkSlot++) {
+        int task = token * topk + topkSlot;
+        int expertIdx = indices[task];
+        if (expertIdx < 0 || expertIdx >= experts) {
+            continue;
+        }
+        const uint8_t *baseB = downWeight + ((size_t)expertIdx * hidden + st) * inter;
+        const float *rowScales = downScales + ((size_t)expertIdx * ks + st / blockK) * ms;
+        const T *expertInput = A + (size_t)task * inter;
+
+        sdata[tid] = 0.0f;
+        for (int i = tid * 4; i < inter; i += THREAD_PER_BLOCK * 4) {
+            int remaining = inter - i;
+            float curScale = rowScales[i / blockM];
+            if (remaining >= 4) {
+                FastllmMoeFp8Accumulate4(expertInput, i, *(uint32_t*)(baseB + i), curScale, sdata[tid]);
+            } else {
+                FastllmMoeFp8AccumulateRemainder(expertInput, baseB, i, remaining, curScale, sdata[tid]);
+            }
+        }
+        __syncthreads();
+
+        for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            out += FastllmMoeFp8Round<T>(sdata[0] * magicScaleConstant) * scores[task];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        C[(size_t)token * hidden + st] = FastllmMoeFp8Traits<T>::fromFloat(out);
+    }
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmGemvHalfFP8E4M3FusedTopKDownReduceKernel(
+        half *A, const int32_t *indices, uint8_t *downWeight, float *downScales,
+        half *C, const float *scores, int batch, int topk, int inter, int hidden, int experts,
+        int blockM, int blockK) {
+    __shared__ float sdata[THREAD_PER_BLOCK];
+    __shared__ float out;
+    unsigned int tid = threadIdx.x;
+    int st = blockIdx.x;
+    int token = blockIdx.y;
+    if (token >= batch) {
+        return;
+    }
+
+    int ms = (inter - 1) / blockM + 1;
+    int ks = (hidden - 1) / blockK + 1;
+    const float magicScaleConstant = exp2f(8.0f);
+    union_half4 regA;
+
+    if (tid == 0) {
+        out = 0.0f;
+    }
+    __syncthreads();
+
+    for (int topkSlot = 0; topkSlot < topk; topkSlot++) {
+        int task = token * topk + topkSlot;
+        int expertIdx = indices[task];
+        if (expertIdx < 0 || expertIdx >= experts) {
+            continue;
+        }
+        const uint8_t *baseB = downWeight + ((size_t)expertIdx * hidden + st) * inter;
+        float *rowScales = downScales + ((size_t)expertIdx * ks + st / blockK) * ms;
+        half *expertInput = A + (size_t)task * inter;
+
+        sdata[tid] = 0.0f;
+        for (int i = tid * 4; i < inter; i += THREAD_PER_BLOCK * 4) {
+            int remaining = inter - i;
+            float curScale = rowScales[i / blockM];
+            if (remaining >= 4) {
+                uint32_t bb = *(uint32_t*)(baseB + i);
+                __half2 B01 = make_half2(__short_as_half((((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 7)),
+                                         __short_as_half((((bb >> 8) & 0x80) << 8) | (((bb >> 8) & 0x7F) << 7)));
+                __half2 B23 = make_half2(__short_as_half((((bb >> 16) & 0x80) << 8) | (((bb >> 16) & 0x7F) << 7)),
+                                         __short_as_half((((bb >> 24) & 0x80) << 8) | (((bb >> 24) & 0x7F) << 7)));
+                regA.in = *reinterpret_cast<const uint2 *>(expertInput + i);
+#if (CUDART_VERSION < 12000) || defined(CUDA_NO_TENSOR_CORE)
+                sdata[tid] += ((float)regA.out[0] * (float)B01.x +
+                               (float)regA.out[1] * (float)B01.y +
+                               (float)regA.out[2] * (float)B23.x +
+                               (float)regA.out[3] * (float)B23.y) * curScale;
+#else
+                __half2 p01 = __hmul2(regA.out2[0], B01);
+                __half2 p23 = __hmul2(regA.out2[1], B23);
+                __half2 sumHalvesVec = __hadd2(p01, p23);
+                __half sumH = __hadd(sumHalvesVec.x, sumHalvesVec.y);
+                sdata[tid] += __half2float(sumH) * curScale;
+#endif
+            } else {
+                for (int j = 0; j < remaining; j++) {
+                    half bVal = __float2half((float)__ushort_as_half(((baseB[i + j] & 0x80) << 8) | ((baseB[i + j] & 0x7F) << 7)) * curScale);
+                    sdata[tid] += __half2float(expertInput[i + j]) * __half2float(bVal);
+                }
+            }
+        }
+        __syncthreads();
+
+        for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            out += (float)(half)(sdata[0] * magicScaleConstant) * scores[task];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        C[(size_t)token * hidden + st] = (half)out;
+    }
+}
+
+template <typename T, int THREAD_PER_BLOCK>
+__global__ void FastllmGemvTypedFP8E4M3Block128FusedTopKSwigluKernel(
+        const T *A, const int32_t *indices, const uint8_t *gateWeight, const uint8_t *upWeight,
+        T *C, int batch, int topk, int hidden, int inter, int experts, int perRow, float swigluLimit) {
+    __shared__ float sdataGate[THREAD_PER_BLOCK];
+    __shared__ float sdataUp[THREAD_PER_BLOCK];
+    unsigned int tid = threadIdx.x;
+    int p = blockIdx.x;
+    int topkSlot = blockIdx.y;
+    int token = blockIdx.z;
+    if (token >= batch || topkSlot >= topk) {
+        return;
+    }
+
+    int task = token * topk + topkSlot;
+    int expertIdx = indices[task];
+    if (expertIdx < 0 || expertIdx >= experts) {
+        if (tid == 0) {
+            C[(size_t)task * inter + p] = FastllmMoeFp8Traits<T>::fromFloat(0.0f);
+        }
+        return;
+    }
+
+    const int blockSize = 128;
+    const float magicScaleConstant = FastllmMoeFp8Traits<T>::magicScale();
+    const T *tokenInput = A + (size_t)token * hidden;
+    const uint8_t *baseGate = gateWeight + ((size_t)expertIdx * inter + p) * perRow;
+    const uint8_t *baseUp = upWeight + ((size_t)expertIdx * inter + p) * perRow;
+    int numBlocks = (hidden - 1) / blockSize + 1;
+
+    sdataGate[tid] = 0.0f;
+    sdataUp[tid] = 0.0f;
+    for (int blk = 0; blk < numBlocks; blk++) {
+        int blkStart = blk * blockSize;
+        int blkEnd = min(blkStart + blockSize, hidden);
+        const uint8_t *gateBlock = baseGate + blk * (blockSize + sizeof(float));
+        const uint8_t *upBlock = baseUp + blk * (blockSize + sizeof(float));
+        float gateScale = *(float*)(gateBlock + blockSize);
+        float upScale = *(float*)(upBlock + blockSize);
+
+        for (int i = blkStart + tid * 4; i < blkEnd; i += THREAD_PER_BLOCK * 4) {
+            int localIdx = i - blkStart;
+            int remaining = blkEnd - i;
+            if (remaining >= 4) {
+                FastllmMoeFp8Accumulate4(tokenInput, i, *(uint32_t*)(gateBlock + localIdx), gateScale, sdataGate[tid]);
+                FastllmMoeFp8Accumulate4(tokenInput, i, *(uint32_t*)(upBlock + localIdx), upScale, sdataUp[tid]);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    if (j < remaining) {
+                        float aVal = FastllmMoeFp8Traits<T>::toFloat(tokenInput[i + j]);
+                        sdataGate[tid] += aVal * FastllmMoeFp8Traits<T>::fp8ToFloat(gateBlock[localIdx + j]) * gateScale;
+                        sdataUp[tid] += aVal * FastllmMoeFp8Traits<T>::fp8ToFloat(upBlock[localIdx + j]) * upScale;
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdataGate[tid] += sdataGate[tid + s];
+            sdataUp[tid] += sdataUp[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float gate = FastllmMoeFp8Round<T>(sdataGate[0] * magicScaleConstant);
+        float up = FastllmMoeFp8Round<T>(sdataUp[0] * magicScaleConstant);
+        float gateAct = gate / (1.0f + expf(-gate));
+        if (swigluLimit > 0.0f) {
+            gateAct = gateAct > swigluLimit ? swigluLimit : gateAct;
+            up = up < -swigluLimit ? -swigluLimit : (up > swigluLimit ? swigluLimit : up);
+        }
+        C[(size_t)task * inter + p] = FastllmMoeFp8Traits<T>::fromFloat(gateAct * up);
+    }
+}
+
+template <typename T, int THREAD_PER_BLOCK>
+__global__ void FastllmGemvTypedFP8E4M3Block128FusedTopKDownReduceKernel(
+        const T *A, const int32_t *indices, const uint8_t *downWeight, T *C, const float *scores,
+        int batch, int topk, int inter, int hidden, int experts, int perRow) {
+    __shared__ float sdata[THREAD_PER_BLOCK];
+    __shared__ float out;
+    unsigned int tid = threadIdx.x;
+    int st = blockIdx.x;
+    int token = blockIdx.y;
+    if (token >= batch) {
+        return;
+    }
+
+    const int blockSize = 128;
+    const float magicScaleConstant = FastllmMoeFp8Traits<T>::magicScale();
+    int numBlocks = (inter - 1) / blockSize + 1;
+
+    if (tid == 0) {
+        out = 0.0f;
+    }
+    __syncthreads();
+
+    for (int topkSlot = 0; topkSlot < topk; topkSlot++) {
+        int task = token * topk + topkSlot;
+        int expertIdx = indices[task];
+        if (expertIdx < 0 || expertIdx >= experts) {
+            continue;
+        }
+        const uint8_t *baseB = downWeight + ((size_t)expertIdx * hidden + st) * perRow;
+        const T *expertInput = A + (size_t)task * inter;
+
+        sdata[tid] = 0.0f;
+        for (int blk = 0; blk < numBlocks; blk++) {
+            int blkStart = blk * blockSize;
+            int blkEnd = min(blkStart + blockSize, inter);
+            const uint8_t *blkData = baseB + blk * (blockSize + sizeof(float));
+            float blkScale = *(float*)(blkData + blockSize);
+
+            for (int i = blkStart + tid * 4; i < blkEnd; i += THREAD_PER_BLOCK * 4) {
+                int localIdx = i - blkStart;
+                int remaining = blkEnd - i;
+                if (remaining >= 4) {
+                    FastllmMoeFp8Accumulate4(expertInput, i, *(uint32_t*)(blkData + localIdx), blkScale, sdata[tid]);
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        if (j < remaining) {
+                            sdata[tid] += FastllmMoeFp8Traits<T>::toFloat(expertInput[i + j]) *
+                                          FastllmMoeFp8Traits<T>::fp8ToFloat(blkData[localIdx + j]) * blkScale;
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            out += FastllmMoeFp8Round<T>(sdata[0] * magicScaleConstant) * scores[task];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        C[(size_t)token * hidden + st] = FastllmMoeFp8Traits<T>::fromFloat(out);
+    }
+}
+
 void LaunchFastllmGemmBF16FP8E4M3Swiglu(__nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output,
                                         float *scales, int m, int k, int blockM, int blockK) {
     FastllmGemvTypedFP8E4M3SwigluKernel<__nv_bfloat16, 64> <<< k, 64 >>>(input, weight, output, scales, m, k, blockM, blockK);
@@ -2875,6 +3349,58 @@ static void LaunchFastllmGemmTypedFP8E4M3Block128TopKDownReduceIndexed(
         int topk, int m, int k, int perRow) {
     FastllmGemvTypedFP8E4M3Block128TopKDownReduceIndexedKernel<T, 64> <<< k, 64 >>>(
         input, indices, weights, output, scores, topk, m, k, perRow);
+}
+
+template <typename T>
+static void LaunchFastllmGemmTypedFP8E4M3FusedTopKSwiglu(
+        T *input, const int32_t *indices, uint8_t *gateWeight, uint8_t *upWeight,
+        float *gateScales, float *upScales, T *output,
+        int batch, int topk, int hidden, int inter, int experts, int blockM, int blockK, float swigluLimit) {
+    dim3 grid(inter, batch * topk);
+    if constexpr (std::is_same_v<T, half>) {
+        FastllmGemvHalfFP8E4M3FusedTopKSwigluKernel<64> <<< grid, 64 >>>(
+            input, indices, gateWeight, upWeight, gateScales, upScales, output,
+            batch, topk, hidden, inter, experts, blockM, blockK, swigluLimit);
+    } else {
+        FastllmGemvTypedFP8E4M3FusedTopKSwigluKernel<T, 64> <<< grid, 64 >>>(
+            input, indices, gateWeight, upWeight, gateScales, upScales, output,
+            batch, topk, hidden, inter, experts, blockM, blockK, swigluLimit);
+    }
+}
+
+template <typename T>
+static void LaunchFastllmGemmTypedFP8E4M3FusedTopKDownReduce(
+        T *input, const int32_t *indices, uint8_t *downWeight, float *downScales,
+        T *output, const float *scores, int batch, int topk, int inter, int hidden, int experts,
+        int blockM, int blockK) {
+    dim3 grid(hidden, batch);
+    if constexpr (std::is_same_v<T, half>) {
+        FastllmGemvHalfFP8E4M3FusedTopKDownReduceKernel<64> <<< grid, 64 >>>(
+            input, indices, downWeight, downScales, output, scores,
+            batch, topk, inter, hidden, experts, blockM, blockK);
+    } else {
+        FastllmGemvTypedFP8E4M3FusedTopKDownReduceKernel<T, 64> <<< grid, 64 >>>(
+            input, indices, downWeight, downScales, output, scores,
+            batch, topk, inter, hidden, experts, blockM, blockK);
+    }
+}
+
+template <typename T>
+static void LaunchFastllmGemmTypedFP8E4M3Block128FusedTopKSwiglu(
+        const T *input, const int32_t *indices, const uint8_t *gateWeight, const uint8_t *upWeight,
+        T *output, int batch, int topk, int hidden, int inter, int experts, int perRow, float swigluLimit) {
+    dim3 grid(inter, topk, batch);
+    FastllmGemvTypedFP8E4M3Block128FusedTopKSwigluKernel<T, 64> <<< grid, 64 >>>(
+        input, indices, gateWeight, upWeight, output, batch, topk, hidden, inter, experts, perRow, swigluLimit);
+}
+
+template <typename T>
+static void LaunchFastllmGemmTypedFP8E4M3Block128FusedTopKDownReduce(
+        const T *input, const int32_t *indices, const uint8_t *downWeight, T *output, const float *scores,
+        int batch, int topk, int inter, int hidden, int experts, int perRow) {
+    dim3 grid(hidden, batch);
+    FastllmGemvTypedFP8E4M3Block128FusedTopKDownReduceKernel<T, 64> <<< grid, 64 >>>(
+        input, indices, downWeight, output, scores, batch, topk, inter, hidden, experts, perRow);
 }
 
 template <bool SCALE_E8M0, typename T>
@@ -3985,6 +4511,167 @@ bool FastllmCudaBFloat16MergeMOEFP8E4M3Block128Batch1Indexed(
         const float *scores, int topk, int hidden, int inter) {
     return FastllmCudaTypedMergeMOEFP8E4M3Block128Batch1Indexed<__nv_bfloat16>(
         input, w1, output, weights, weightsBatch, indices, scores, topk, hidden, inter);
+}
+
+template <typename T>
+static bool FastllmCudaTypedFusedMOEFP8E4M3(
+        const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up, fastllm::Data &down,
+        const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &w1, fastllm::Data &output,
+        int batch, int topk, int hidden, int inter, int experts, float swigluLimit) {
+    if (batch <= 0 || topk <= 0 || hidden <= 0 || inter <= 0 || experts <= 0 ||
+        input.dataType != FastllmMoeFp8Traits<T>::dataType ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        index.dataDevice != fastllm::DataDevice::CUDA || index.dataType != fastllm::DataType::INT32 ||
+        score.dataDevice != fastllm::DataDevice::CUDA || score.dataType != fastllm::DataType::FLOAT32 ||
+        gate.dataDevice != fastllm::DataDevice::CUDA ||
+        up.dataDevice != fastllm::DataDevice::CUDA ||
+        down.dataDevice != fastllm::DataDevice::CUDA ||
+        gate.dataType != fastllm::DataType::FP8_E4M3 ||
+        up.dataType != fastllm::DataType::FP8_E4M3 ||
+        down.dataType != fastllm::DataType::FP8_E4M3 ||
+        gate.cudaData == nullptr || up.cudaData == nullptr || down.cudaData == nullptr ||
+        index.cudaData == nullptr || score.cudaData == nullptr ||
+        gate.extraCudaData.empty() || up.extraCudaData.empty() || down.extraCudaData.empty()) {
+        return false;
+    }
+    if (gate.dims.size() != 3 || up.dims.size() != 3 || down.dims.size() != 3 ||
+        gate.dims[0] != experts || gate.dims[1] != inter || gate.dims[2] != hidden ||
+        up.dims[0] != experts || up.dims[1] != inter || up.dims[2] != hidden ||
+        down.dims[0] != experts || down.dims[1] != hidden || down.dims[2] != inter ||
+        gate.blockM <= 0 || gate.blockK <= 0 ||
+        up.blockM != gate.blockM || up.blockK != gate.blockK ||
+        down.blockM <= 0 || down.blockK <= 0) {
+        return false;
+    }
+
+    w1.dataDevice = input.dataDevice;
+    w1.dataDeviceIds = input.dataDeviceIds;
+    output.dataDevice = input.dataDevice;
+    output.dataDeviceIds = input.dataDeviceIds;
+    w1.dataType = FastllmMoeFp8Traits<T>::dataType;
+    w1.Resize({batch * topk, inter});
+    output.dataType = FastllmMoeFp8Traits<T>::dataType;
+    output.Resize(input.dims);
+    w1.Allocate(false);
+    output.Allocate(false);
+
+    T *cudaInput = (T*)FastllmCudaPrepareInput(input);
+    T *cudaW1 = (T*)FastllmCudaPrepareOutput(w1);
+    T *cudaOutput = (T*)FastllmCudaPrepareOutput(output);
+    const int32_t *cudaIndex = (const int32_t*)index.cudaData;
+    const float *cudaScore = (const float*)score.cudaData;
+    uint8_t *cudaGate = (uint8_t*)gate.cudaData;
+    uint8_t *cudaUp = (uint8_t*)up.cudaData;
+    uint8_t *cudaDown = (uint8_t*)down.cudaData;
+    float *cudaGateScales = (float*)gate.extraCudaData[0];
+    float *cudaUpScales = (float*)up.extraCudaData[0];
+    float *cudaDownScales = (float*)down.extraCudaData[0];
+
+    LaunchFastllmGemmTypedFP8E4M3FusedTopKSwiglu(
+        cudaInput, cudaIndex, cudaGate, cudaUp, cudaGateScales, cudaUpScales, cudaW1,
+        batch, topk, hidden, inter, experts, gate.blockM, gate.blockK, swigluLimit);
+    LaunchFastllmGemmTypedFP8E4M3FusedTopKDownReduce(
+        cudaW1, cudaIndex, cudaDown, cudaDownScales, cudaOutput, cudaScore,
+        batch, topk, inter, hidden, experts, down.blockM, down.blockK);
+
+    FastllmCudaFinishInput(input, cudaInput);
+    return true;
+}
+
+bool FastllmCudaHalfFusedMOEFP8E4M3(
+        const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
+        fastllm::Data &down, const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &w1, fastllm::Data &output,
+        int batch, int topk, int hidden, int inter, int experts, float swigluLimit) {
+    return FastllmCudaTypedFusedMOEFP8E4M3<half>(
+        input, gate, up, down, index, score, w1, output, batch, topk, hidden, inter, experts, swigluLimit);
+}
+
+bool FastllmCudaBFloat16FusedMOEFP8E4M3(
+        const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
+        fastllm::Data &down, const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &w1, fastllm::Data &output,
+        int batch, int topk, int hidden, int inter, int experts, float swigluLimit) {
+    return FastllmCudaTypedFusedMOEFP8E4M3<__nv_bfloat16>(
+        input, gate, up, down, index, score, w1, output, batch, topk, hidden, inter, experts, swigluLimit);
+}
+
+template <typename T>
+static bool FastllmCudaTypedFusedMOEFP8E4M3Block128(
+        const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up, fastllm::Data &down,
+        const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &w1, fastllm::Data &output,
+        int batch, int topk, int hidden, int inter, int experts, float swigluLimit) {
+    if (batch <= 0 || topk <= 0 || hidden <= 0 || inter <= 0 || experts <= 0 ||
+        input.dataType != FastllmMoeFp8Traits<T>::dataType ||
+        input.dataDevice != fastllm::DataDevice::CUDA ||
+        index.dataDevice != fastllm::DataDevice::CUDA || index.dataType != fastllm::DataType::INT32 ||
+        score.dataDevice != fastllm::DataDevice::CUDA || score.dataType != fastllm::DataType::FLOAT32 ||
+        gate.dataDevice != fastllm::DataDevice::CUDA ||
+        up.dataDevice != fastllm::DataDevice::CUDA ||
+        down.dataDevice != fastllm::DataDevice::CUDA ||
+        gate.dataType != fastllm::DataType::FP8_E4M3_BLOCK_128 ||
+        up.dataType != fastllm::DataType::FP8_E4M3_BLOCK_128 ||
+        down.dataType != fastllm::DataType::FP8_E4M3_BLOCK_128 ||
+        gate.cudaData == nullptr || up.cudaData == nullptr || down.cudaData == nullptr ||
+        index.cudaData == nullptr || score.cudaData == nullptr) {
+        return false;
+    }
+    if (gate.dims.size() != 3 || up.dims.size() != 3 || down.dims.size() != 3 ||
+        gate.dims[0] != experts || gate.dims[1] != inter || gate.dims[2] != hidden ||
+        up.dims[0] != experts || up.dims[1] != inter || up.dims[2] != hidden ||
+        down.dims[0] != experts || down.dims[1] != hidden || down.dims[2] != inter) {
+        return false;
+    }
+
+    w1.dataDevice = input.dataDevice;
+    w1.dataDeviceIds = input.dataDeviceIds;
+    output.dataDevice = input.dataDevice;
+    output.dataDeviceIds = input.dataDeviceIds;
+    w1.dataType = FastllmMoeFp8Traits<T>::dataType;
+    w1.Resize({batch * topk, inter});
+    output.dataType = FastllmMoeFp8Traits<T>::dataType;
+    output.Resize(input.dims);
+    w1.Allocate(false);
+    output.Allocate(false);
+
+    T *cudaInput = (T*)FastllmCudaPrepareInput(input);
+    T *cudaW1 = (T*)FastllmCudaPrepareOutput(w1);
+    T *cudaOutput = (T*)FastllmCudaPrepareOutput(output);
+    const int32_t *cudaIndex = (const int32_t*)index.cudaData;
+    const float *cudaScore = (const float*)score.cudaData;
+    const uint8_t *cudaGate = (const uint8_t*)gate.cudaData;
+    const uint8_t *cudaUp = (const uint8_t*)up.cudaData;
+    const uint8_t *cudaDown = (const uint8_t*)down.cudaData;
+
+    int gatePerRow = hidden + ((hidden - 1) / 128 + 1) * (int)sizeof(float);
+    int downPerRow = inter + ((inter - 1) / 128 + 1) * (int)sizeof(float);
+    LaunchFastllmGemmTypedFP8E4M3Block128FusedTopKSwiglu(
+        cudaInput, cudaIndex, cudaGate, cudaUp, cudaW1, batch, topk, hidden, inter, experts, gatePerRow, swigluLimit);
+    LaunchFastllmGemmTypedFP8E4M3Block128FusedTopKDownReduce(
+        cudaW1, cudaIndex, cudaDown, cudaOutput, cudaScore, batch, topk, inter, hidden, experts, downPerRow);
+
+    FastllmCudaFinishInput(input, cudaInput);
+    return true;
+}
+
+bool FastllmCudaHalfFusedMOEFP8E4M3Block128(
+        const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
+        fastllm::Data &down, const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &w1, fastllm::Data &output,
+        int batch, int topk, int hidden, int inter, int experts, float swigluLimit) {
+    return FastllmCudaTypedFusedMOEFP8E4M3Block128<half>(
+        input, gate, up, down, index, score, w1, output, batch, topk, hidden, inter, experts, swigluLimit);
+}
+
+bool FastllmCudaBFloat16FusedMOEFP8E4M3Block128(
+        const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &up,
+        fastllm::Data &down, const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &w1, fastllm::Data &output,
+        int batch, int topk, int hidden, int inter, int experts, float swigluLimit) {
+    return FastllmCudaTypedFusedMOEFP8E4M3Block128<__nv_bfloat16>(
+        input, gate, up, down, index, score, w1, output, batch, topk, hidden, inter, experts, swigluLimit);
 }
 
 template <typename T>
