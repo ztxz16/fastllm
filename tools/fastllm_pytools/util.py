@@ -229,7 +229,7 @@ def make_normal_llm_model(args):
                         args.moe_device = "disk"
                 if (args.chunked_prefill_size <= 0):
                     args.chunked_prefill_size = 128
-                if (args.tokens <= 0):
+                if (args.tokens <= 0 and not _uses_thread_tp(getattr(args, "tp", ""))):
                     args.tokens = 32768
 
             if (architecture == 'Qwen3ForCausalLM' or architecture == 'Qwen3MoeForCausalLM' or
