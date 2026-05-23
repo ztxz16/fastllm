@@ -7,8 +7,12 @@
 
 #include "basellm.h"
 
+#include <atomic>
+#include <map>
+#include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace fastllm {
@@ -28,6 +32,17 @@ namespace fastllm {
                 std::vector <float> *logits = nullptr);
 
         virtual std::vector <int> ForwardV2(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *retLogits);
+
+        virtual std::vector <int> ForwardGPU(
                 int batch,
                 const Data &inputIds,
                 const std::vector <Data*> &attentionMask,
@@ -83,6 +98,55 @@ namespace fastllm {
         std::vector <Data*> moeDown3DWeights;
         std::vector <std::vector <Data*> > weights;
         std::vector <std::vector <Data*> > biass;
+
+        bool IsThreadTensorParallelEnabled() const;
+        std::vector <int> ForwardV2ThreadTensorParallel(
+                int batch,
+                const Data &inputIds,
+                const std::vector <Data*> &attentionMask,
+                const std::vector <Data*> &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                const std::vector <GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector <std::vector <float>*> *retLogits);
+        void ForwardSingleGPU(
+                int gpuId,
+                std::map <int, int> ratios,
+                int batch,
+                const Data &inputIds,
+                const Data &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                bool all1,
+                bool isPrefill,
+                bool tensorParallel,
+                bool firstTensorParallelRank,
+                int pagedCacheLayerOffset,
+                Data &logits);
+        Data &GetThreadTensorParallelBias(const std::string &name);
+
+        std::unordered_map <std::string, Data> threadTpEmptyBiases;
+        int threadTpPagedCacheBase = -1;
+        std::mutex threadTpWeightPrepareLock;
+        std::atomic<bool> singleGpuWeightsPrepared{false};
+        bool threadTpWeightsPrepared = false;
+        std::vector <int> threadTpPreparedDevices;
+        std::map <int, int> threadTpPreparedRatios;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpKVHeadSchemes;
+        std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeBiass;
+        std::unordered_map <int, std::vector <std::vector <Data> > > threadTpOwnedMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpFusedMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data> > > threadTpOwnedFusedMoeWeights;
+        std::unordered_map <int, std::vector <std::pair <int, int> > > threadTpFusedMoeExpertRanges;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeBiass;
+        std::unordered_map <int, std::vector <std::vector <Data> > > singleGpuOwnedMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuFusedMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data> > > singleGpuOwnedFusedMoeWeights;
+        std::unordered_map <int, std::vector <std::pair <int, int> > > singleGpuFusedMoeExpertRanges;
 
         int LayerAttentionHeads(int layer) const;
         int LayerKeyValueHeads(int layer) const;
