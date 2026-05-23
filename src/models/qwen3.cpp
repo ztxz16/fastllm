@@ -24,10 +24,7 @@
 #include <thread>
 
 #ifdef USE_CUDA
-#include "fastllm-cuda.cuh"
-#include "devices/cpu/cpudevice.h"
-#include "devices/cuda/cudadevice.h"
-#include "devices/multicuda/fastllm-multicuda.cuh"
+#include "models/qwen3_cuda_common.h"
 #endif
 
 namespace fastllm {
@@ -292,86 +289,12 @@ namespace fastllm {
             root.pagedKVCacheData = firstLocal->pagedKVCacheData;
         }
 
-        static void Qwen3CudaClearMultiDeviceState(Data &data) {
-            for (auto &it : data.multiDeviceDatas) {
-                delete it.second;
-            }
-            data.multiDeviceDatas.clear();
-            data.multiDeviceData = false;
-            data.ClearTensorParallelLayout();
-        }
-
-        static void Qwen3CudaPrepareLocalOutput(Data &data, int device) {
-            if (data.isFake) {
-                data.isFake = false;
-                data.cpuData = nullptr;
-                data.cudaData = nullptr;
-                data.deviceData = nullptr;
-                data.expansionSize = 0;
-                data.expansionBytes = 0;
-            }
-
-            bool needFree = false;
-            if (data.dataDevice != DataDevice::CUDA) {
-                needFree = data.cpuData != nullptr || data.cudaData != nullptr ||
-                           data.deviceData != nullptr || data.expansionBytes != 0;
-            } else if (!data.dataDeviceIds.empty() && data.dataDeviceIds[0] != device) {
-                needFree = true;
-            } else if (data.cudaData != nullptr) {
-                int ptrDevice = GetPointerDeviceId(data.cudaData);
-                needFree = ptrDevice >= 0 && ptrDevice != device;
-            }
-            if (needFree) {
-                data.FreeSpace();
-            }
-            Qwen3CudaClearMultiDeviceState(data);
-            data.dataDevice = DataDevice::CUDA;
-            data.dataDeviceIds = {device};
-            data.lockInCPU = false;
-        }
-
-        class Qwen3CudaDirectRunner {
-        public:
-            explicit Qwen3CudaDirectRunner(int deviceId) : deviceId(deviceId), device((BaseDevice*)&cudaDevice) {
-                device->deviceIds = {deviceId};
-            }
-
-            int DeviceId() const {
-                return deviceId;
-            }
-
-            void Run(const std::string &opType,
-                     const DataDict &datas,
-                     const FloatDict &floatParams = FloatDict(),
-                     const IntDict &intParams = IntDict(),
-                     const std::vector<std::string> &outputs = std::vector<std::string>(),
-                     bool checkCanRun = true) {
-                FastllmCudaSetDevice(deviceId);
-                for (auto &name : outputs) {
-                    auto it = datas.find(name);
-                    if (it != datas.end() && it->second != nullptr) {
-                        Qwen3CudaPrepareLocalOutput(*it->second, deviceId);
-                    }
-                }
-                if (checkCanRun) {
-                    AssertInFastLLM(device->CanRun(opType, datas, floatParams, intParams),
-                                    "Qwen3 direct CUDA runner can't run " + opType + ".\n");
-                }
-                device->Reshape(opType, datas, floatParams, intParams);
-                device->Run(opType, datas, floatParams, intParams);
-            }
-
-        private:
-            int deviceId;
-            CudaDevice cudaDevice;
-            BaseDevice *device;
-        };
-
         struct Qwen3ForwardSingleBuffers {
             Data hiddenStates;
             Data attenInput;
             Data qkv;
             Data q;
+            Data qForAttentionHolder;
             Data attenOutput;
             Data attenLastOutput;
             Data gateupResult;
@@ -1478,7 +1401,7 @@ namespace fastllm {
                     &pastKeyValues,
                     &buf.batchPastKeys, &buf.batchPastValues,
                     &buf.qkv, &buf.q, &buf.attenOutput, &buf.attenLastOutput,
-                    nullptr,
+                    &buf.qForAttentionHolder,
                     &buf.insertIndexs, &buf.insertPositions,
                     &buf.qSizes, &buf.pageSizes, &buf.pageIndexs, &buf.lastPageLens,
                     &generatedAppendParams, &generatedDecodeParams,
@@ -1628,6 +1551,11 @@ namespace fastllm {
         AssertInFastLLM(ratios.find(gpuId) == ratios.end() || ratios[gpuId] > 0,
                         "Qwen3 ForwardSingleGPU got invalid GPU ratio.\n");
         FastllmCudaSetDevice(gpuId);
+        if (isPrefill && Qwen3CudaGraphEnabled()) {
+            Qwen3CudaGraphDecodeState &graphState = GetQwen3CudaGraphDecodeState(this, gpuId);
+            std::lock_guard<std::mutex> graphGuard(graphState.mutex);
+            Qwen3DestroyCudaGraph(graphState);
+        }
         if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
                                         seqLens, pastKeyValues, all1, isPrefill,
                                         tensorParallel, firstTensorParallelRank,
