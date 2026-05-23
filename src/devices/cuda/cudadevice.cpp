@@ -13,6 +13,17 @@
 #include <cstring>
 
 namespace fastllm {
+    // CUDA graph replay cannot reuse a MergeMOE path that picked experts on CPU.
+    static thread_local bool cudaMergeMOEUsedGraphUnsafeFallback = false;
+
+    void FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag() {
+        cudaMergeMOEUsedGraphUnsafeFallback = false;
+    }
+
+    bool FastllmCudaMergeMOEUsedGraphUnsafeFallback() {
+        return cudaMergeMOEUsedGraphUnsafeFallback;
+    }
+
     static uint64_t GetConvertedBufferBytes(const Data &data) {
         uint64_t elementCount = data.expansionSize > 0 ? data.expansionSize : data.Count(0);
         return (elementCount * data.unitSize - 1) / data.unitSizeDiv + 1;
@@ -3093,6 +3104,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                     return;
                 }
             }
+            cudaMergeMOEUsedGraphUnsafeFallback = true;
             // batch=1 fast path only needs index on CPU to choose expert weights;
             // scores can stay on CUDA and be consumed by the grouped down kernel.
             index.ToDevice(DataDevice::CPU);

@@ -20,15 +20,13 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <condition_variable>
 #include <set>
 #include <thread>
 
 #ifdef USE_CUDA
-#include "fastllm-cuda.cuh"
-#include "devices/cpu/cpudevice.h"
-#include "devices/cuda/cudadevice.h"
-#include "devices/multicuda/fastllm-multicuda.cuh"
+#include "models/qwen3_cuda_common.h"
 #endif
 
 namespace fastllm {
@@ -37,6 +35,8 @@ namespace fastllm {
 
 #ifdef USE_CUDA
     namespace {
+        using namespace qwen3cuda;
+
         static std::atomic<int> qwen3MoeThreadTpNextPagedCacheBase(3000000);
 
         static std::string Qwen3MoeTrimString(const std::string &s) {
@@ -62,20 +62,42 @@ namespace fastllm {
             return v.empty() || v == "false" || v == "off" || v == "none" || v == "disable";
         }
 
-        static bool GetQwen3MoeThreadTpDevices(std::vector<int> &devices, std::map<int, int> &ratios) {
-            devices.clear();
-            ratios.clear();
-            const char *env = std::getenv("FASTLLM_TP");
-            if (env == nullptr) {
-                env = std::getenv("FASTLLM_QWEN3_MOE_TP");
+        static bool AppendQwen3MoeCudaDevicesFromSpec(const std::string &spec,
+                                                       const std::string &type,
+                                                       int defaultRatio,
+                                                       std::vector<int> &devices,
+                                                       std::map<int, int> &ratios) {
+            std::map<int, int> parsedRatios;
+            std::vector<int> parsed = ParseDeviceIds(spec, type, parsedRatios);
+            if (parsed.empty() && (spec == "cuda" || spec == "multicuda")) {
+                parsed.push_back(0);
             }
-            if (env == nullptr) {
-                env = std::getenv("FASTLLM_QWEN3_THREAD_TP");
+            bool added = false;
+            for (int device : parsed) {
+                if (device < 0 || device == 99999) {
+                    continue;
+                }
+                int ratio = defaultRatio;
+                auto ratioIt = parsedRatios.find(device);
+                if (ratioIt != parsedRatios.end() && ratioIt->second > 0) {
+                    ratio = ratioIt->second;
+                }
+                if (ratio <= 0) {
+                    ratio = 1;
+                }
+                if (std::find(devices.begin(), devices.end(), device) == devices.end()) {
+                    devices.push_back(device);
+                }
+                ratios[device] += ratio;
+                added = true;
             }
-            if (env == nullptr) {
-                return false;
-            }
-            std::string spec = Qwen3MoeTrimString(env);
+            return added;
+        }
+
+        static bool ParseQwen3MoeGPUForwardSpec(const std::string &rawSpec,
+                                                std::vector<int> &devices,
+                                                std::map<int, int> &ratios) {
+            std::string spec = Qwen3MoeTrimString(rawSpec);
             if (Qwen3MoeIsDisabledTpSpec(spec)) {
                 return false;
             }
@@ -88,15 +110,55 @@ namespace fastllm {
                     devices.push_back(i);
                     ratios[i] = 1;
                 }
-            } else {
-                std::string parseSpec = spec;
-                std::string type = "cuda";
-                if (StartWith(lower, "multicuda")) {
-                    type = "multicuda";
-                } else if (!StartWith(lower, "cuda")) {
-                    parseSpec = "cuda:" + spec;
+                return !devices.empty();
+            }
+
+            std::string parseSpec = spec;
+            std::string type = "cuda";
+            if (StartWith(lower, "multicuda")) {
+                type = "multicuda";
+            } else if (!StartWith(lower, "cuda")) {
+                parseSpec = "cuda:" + spec;
+            }
+            return AppendQwen3MoeCudaDevicesFromSpec(parseSpec, type, 1, devices, ratios);
+        }
+
+        static bool GetQwen3MoeGPUForwardDevices(const std::map<std::string, int> &deviceMap,
+                                                 std::vector<int> &devices,
+                                                 std::map<int, int> &ratios) {
+            devices.clear();
+            ratios.clear();
+            const char *env = std::getenv("FASTLLM_TP");
+            if (env == nullptr || Qwen3MoeIsDisabledTpSpec(Qwen3MoeTrimString(env))) {
+                env = std::getenv("FASTLLM_QWEN3_MOE_TP");
+            }
+            if (env == nullptr || Qwen3MoeIsDisabledTpSpec(Qwen3MoeTrimString(env))) {
+                env = std::getenv("FASTLLM_QWEN3_THREAD_TP");
+            }
+            if (env != nullptr) {
+                ParseQwen3MoeGPUForwardSpec(env, devices, ratios);
+            }
+
+            if (devices.empty()) {
+                for (auto &it : deviceMap) {
+                    std::string lower = it.first;
+                    std::transform(lower.begin(), lower.end(), lower.begin(),
+                                   [](unsigned char c) { return (char)std::tolower(c); });
+                    if (StartWith(lower, "multicuda")) {
+                        AppendQwen3MoeCudaDevicesFromSpec(it.first, "multicuda", it.second, devices, ratios);
+                    }
                 }
-                devices = ParseDeviceIds(parseSpec, type, ratios);
+            }
+
+            if (devices.empty()) {
+                for (auto &it : deviceMap) {
+                    std::string lower = it.first;
+                    std::transform(lower.begin(), lower.end(), lower.begin(),
+                                   [](unsigned char c) { return (char)std::tolower(c); });
+                    if (StartWith(lower, "cuda")) {
+                        AppendQwen3MoeCudaDevicesFromSpec(it.first, "cuda", it.second, devices, ratios);
+                    }
+                }
             }
 
             std::vector<int> uniqueDevices;
@@ -104,13 +166,22 @@ namespace fastllm {
             for (int device : devices) {
                 if (device >= 0 && seen.insert(device).second) {
                     uniqueDevices.push_back(device);
-                    if (ratios.find(device) == ratios.end()) {
+                    if (ratios.find(device) == ratios.end() || ratios[device] <= 0) {
                         ratios[device] = 1;
                     }
                 }
             }
             devices.swap(uniqueDevices);
             return !devices.empty();
+        }
+
+        static bool GetQwen3MoeThreadTpDevices(const std::map<std::string, int> &deviceMap,
+                                               std::vector<int> &devices,
+                                               std::map<int, int> &ratios) {
+            if (!GetQwen3MoeGPUForwardDevices(deviceMap, devices, ratios)) {
+                return false;
+            }
+            return devices.size() > 1;
         }
 
         static DivisionScheme ExtractQwen3MoeFirstRangeScheme(const DivisionScheme &scheme) {
@@ -172,6 +243,16 @@ namespace fastllm {
             return local;
         }
 
+        static void PrepareQwen3MoeSingleCudaCache(Data &cache, int device, DataType localDataType) {
+            cache.isKVCache = true;
+            cache.lockInCPU = false;
+            if (cache.dataType != localDataType && cache.dims.empty()) {
+                cache.dataType = localDataType;
+                cache.UpdateUnitSize();
+            }
+            cache.ToDevice(DataDevice::CUDA, {device}, false);
+        }
+
         static void SyncQwen3MoeThreadTpRootCacheMeta(Data &root,
                                                       const std::vector<int> &devices,
                                                       const DivisionScheme &kvHeadScheme,
@@ -223,18 +304,12 @@ namespace fastllm {
             if (env == nullptr) {
                 env = std::getenv("FASTLLM_QWEN3_CUDA_GRAPH");
             }
-            return env == nullptr || !Qwen3MoeIsDisabledTpValue(Qwen3MoeTrimString(env));
+            return env != nullptr && !Qwen3MoeIsDisabledTpValue(Qwen3MoeTrimString(env));
         }
 
         static bool Qwen3MoeNeedRepeatPenalty(const GenerationConfig &config) {
             float diff = config.repeat_penalty - 1.0f;
             return diff > 1e-6f || diff < -1e-6f;
-        }
-
-        static bool Qwen3MoeIsNVFP4WeightType(DataType dataType) {
-            return dataType == DataType::NVFP4 ||
-                   dataType == DataType::NVFP4_BLOCK_16 ||
-                   dataType == DataType::NVFP4_BLOCK_16_E8M0;
         }
 
         static void Qwen3MoeCudaClearMultiDeviceState(Data &data) {
@@ -320,11 +395,19 @@ namespace fastllm {
             return false;
         }
 
+        static bool Qwen3MoeIsNVFP4WeightType(DataType dataType) {
+            return dataType == DataType::NVFP4 ||
+                   dataType == DataType::NVFP4_BLOCK_16 ||
+                   dataType == DataType::NVFP4_BLOCK_16_E8M0;
+        }
+
         struct Qwen3MoeForwardSingleBuffers {
+            Data embedOutput;
             Data hiddenStates;
             Data attenInput;
             Data qkv;
             Data q;
+            Data qForAttentionHolder;
             Data attenOutput;
             Data attenLastOutput;
             Data routerLogits;
@@ -351,6 +434,70 @@ namespace fastllm {
             Qwen3MoeForwardSingleBuffers() : batchPastKeys(1), batchPastValues(1) {}
         };
 
+        static void Qwen3MoeDetachFakeReusableTensor(Data &data) {
+            if (!data.isFake) {
+                return;
+            }
+            data.isFake = false;
+            data.cpuData = nullptr;
+            data.cudaData = nullptr;
+            data.deviceData = nullptr;
+            data.expansionSize = 0;
+            data.expansionBytes = 0;
+        }
+
+        static void Qwen3MoeFreeReusableTensor(Data &data) {
+            if (data.isFake) {
+                Qwen3MoeDetachFakeReusableTensor(data);
+            } else {
+                data.FreeSpace();
+            }
+            data.dims.clear();
+            data.strides.clear();
+            data.expansionDims.clear();
+            data.cpuIntDatas.clear();
+            data.dataDevice = DataDevice::CPU;
+            data.dataDeviceIds.clear();
+            data.weightType = WeightType::NONE;
+            data.lockInCPU = false;
+            Qwen3MoeCudaClearMultiDeviceState(data);
+        }
+
+        static void Qwen3MoeFreeForwardSingleBuffers(Qwen3MoeForwardSingleBuffers &buf) {
+            Qwen3MoeFreeReusableTensor(buf.embedOutput);
+            Qwen3MoeFreeReusableTensor(buf.hiddenStates);
+            Qwen3MoeFreeReusableTensor(buf.attenInput);
+            Qwen3MoeFreeReusableTensor(buf.qkv);
+            Qwen3MoeFreeReusableTensor(buf.q);
+            Qwen3MoeFreeReusableTensor(buf.qForAttentionHolder);
+            Qwen3MoeFreeReusableTensor(buf.attenOutput);
+            Qwen3MoeFreeReusableTensor(buf.attenLastOutput);
+            Qwen3MoeFreeReusableTensor(buf.routerLogits);
+            Qwen3MoeFreeReusableTensor(buf.routerLogitsTemp);
+            Qwen3MoeFreeReusableTensor(buf.expertIndex);
+            Qwen3MoeFreeReusableTensor(buf.expertScore);
+            Qwen3MoeFreeReusableTensor(buf.w1);
+            Qwen3MoeFreeReusableTensor(buf.w2);
+            Qwen3MoeFreeReusableTensor(buf.w3);
+            Qwen3MoeFreeReusableTensor(buf.tempInput);
+            Qwen3MoeFreeReusableTensor(buf.tempOutput);
+            Qwen3MoeFreeReusableTensor(buf.moeInputTemp);
+            Qwen3MoeFreeReusableTensor(buf.moeOutputTemp);
+            Qwen3MoeFreeReusableTensor(buf.moeFinal);
+            Qwen3MoeFreeReusableTensor(buf.qSizes);
+            Qwen3MoeFreeReusableTensor(buf.pageSizes);
+            Qwen3MoeFreeReusableTensor(buf.pageIndexs);
+            Qwen3MoeFreeReusableTensor(buf.lastPageLens);
+            Qwen3MoeFreeReusableTensor(buf.insertIndexs);
+            Qwen3MoeFreeReusableTensor(buf.insertPositions);
+        }
+
+        static void Qwen3MoeReinitializeForwardSingleBuffers(Qwen3MoeForwardSingleBuffers &buf) {
+            Qwen3MoeFreeForwardSingleBuffers(buf);
+            buf.~Qwen3MoeForwardSingleBuffers();
+            new (&buf) Qwen3MoeForwardSingleBuffers();
+        }
+
         struct Qwen3MoeCudaGraphDecodeState {
             std::mutex mutex;
             std::string signature;
@@ -362,6 +509,7 @@ namespace fastllm {
             Data inputIds;
             Data positionIds;
             Qwen3MoeForwardSingleBuffers buffers;
+            Qwen3MoeForwardSingleBuffers metaBuffers;
             Data logitsHalf;
             Data logits;
 
@@ -678,13 +826,9 @@ namespace fastllm {
             std::vector<int> lastRet;
             lastRet.reserve(batch);
 
+            Qwen3CudaDirectRunner cudaRunner(rootDevice);
             Data &topk = Qwen3MoeThreadLocalCudaSamplingTopK();
-            void *oldExecutor = GetExecutor();
-            Executor samplingExecutor;
-            samplingExecutor.SetFirstDevice("cuda:" + std::to_string(rootDevice));
-            SetCurrentThreadExecutor(&samplingExecutor);
-            TopK(fullLogits, topk, maxTopK);
-            SetCurrentThreadExecutor(oldExecutor);
+            Qwen3CudaTopK(cudaRunner, fullLogits, topk, maxTopK);
 
             Data &cpuTopK = Qwen3MoeThreadLocalCpuSamplingTopK();
             cpuTopK.dataType = DataType::FLOAT32;
@@ -717,63 +861,48 @@ namespace fastllm {
                 int blockCnt,
                 int hidden,
                 DataType moeAtype) {
-            auto reject = [](const std::string &) -> bool {
-                return false;
-            };
             if (moeAtype != DataType::FLOAT16 && moeAtype != DataType::BFLOAT16) {
-                return reject("moe atype is not fp16/bf16");
+                return false;
             }
-            auto it = deviceWeights.find(device);
-            if (it == deviceWeights.end() || (int)it->second.size() != blockCnt) {
-                std::ostringstream oss;
-                oss << "missing device weights device=" << device
-                    << " layers=" << (it == deviceWeights.end() ? -1 : (int)it->second.size())
-                    << " blockCnt=" << blockCnt;
-                return reject(oss.str());
+            auto deviceIt = deviceWeights.find(device);
+            if (deviceIt == deviceWeights.end() || (int)deviceIt->second.size() < blockCnt) {
+                return false;
             }
             for (int i = 0; i < blockCnt; i++) {
-                const auto &layerWeights = it->second[i];
-                if (layerWeights.size() < 4 || layerWeights[0] != nullptr) {
-                    std::ostringstream oss;
-                    oss << "layer " << i << " unsupported prefix size="
-                        << layerWeights.size() << " first=" << layerWeights[0];
-                    return reject(oss.str());
+                const std::vector<Data*> &layerWeights = deviceIt->second[i];
+                if ((int)layerWeights.size() < 4 || layerWeights[0] != nullptr) {
+                    return false;
                 }
+
+                bool hasShard = false;
                 for (int j = 2; j + 1 < (int)layerWeights.size(); j += 2) {
                     Data *gateup = layerWeights[j];
                     Data *down = layerWeights[j + 1];
+                    if (gateup == nullptr && down == nullptr) {
+                        continue;
+                    }
                     if (gateup == nullptr || down == nullptr ||
+                        gateup->dataDevice != DataDevice::CUDA ||
+                        down->dataDevice != DataDevice::CUDA ||
+                        gateup->cudaData == nullptr || down->cudaData == nullptr ||
                         gateup->dataType != down->dataType ||
                         gateup->dims.size() != 2 || down->dims.size() != 2 ||
-                        gateup->dims[1] != hidden || down->dims[0] != hidden ||
+                        gateup->dims[1] != hidden ||
+                        down->dims[0] != hidden ||
                         gateup->dims[0] != down->dims[1] * 2) {
-                        std::ostringstream oss;
-                        oss << "layer " << i << " expertSlot=" << ((j - 2) / 2)
-                            << " invalid dims/type gateup=" << gateup << " down=" << down;
-                        if (gateup != nullptr) {
-                            oss << " gateType=" << (int)gateup->dataType << " gateDims=";
-                            for (int d : gateup->dims) {
-                                oss << d << ",";
-                            }
-                        }
-                        if (down != nullptr) {
-                            oss << " downType=" << (int)down->dataType << " downDims=";
-                            for (int d : down->dims) {
-                                oss << d << ",";
-                            }
-                        }
-                        oss << " hidden=" << hidden;
-                        return reject(oss.str());
+                        return false;
                     }
-                    bool supportedWeight = gateup->dataType == DataType::FP8_E4M3 ||
-                                           gateup->dataType == DataType::FP8_E4M3_BLOCK_128 ||
-                                           Qwen3MoeIsNVFP4WeightType(gateup->dataType);
+                    bool supportedWeight =
+                        gateup->dataType == DataType::FP8_E4M3 ||
+                        gateup->dataType == DataType::FP8_E4M3_BLOCK_128 ||
+                        Qwen3MoeIsNVFP4WeightType(gateup->dataType);
                     if (!supportedWeight) {
-                        std::ostringstream oss;
-                        oss << "layer " << i << " expertSlot=" << ((j - 2) / 2)
-                            << " unsupported weight type=" << (int)gateup->dataType;
-                        return reject(oss.str());
+                        return false;
                     }
+                    hasShard = true;
+                }
+                if (!hasShard) {
+                    return false;
                 }
             }
             return true;
@@ -809,7 +938,7 @@ namespace fastllm {
 #ifdef USE_CUDA
         std::vector<int> devices;
         std::map<int, int> ratios;
-        return GetQwen3MoeThreadTpDevices(devices, ratios);
+        return GetQwen3MoeThreadTpDevices(this->deviceMap, devices, ratios);
 #else
         return false;
 #endif
@@ -898,7 +1027,7 @@ namespace fastllm {
                             const GenerationConfig &generationConfig, const LastTokensManager &lastTokens,
                             std::vector <float> *retLogits) {
         Data attentionMaskCopy(attentionMask), positionIdsCopy(positionIds);
-        std::vector <Data*> attentionMasks = {&attentionMaskCopy};
+        std::vector <Data*> attentionMasks = {attentionMaskCopy.dims.empty() ? nullptr : &attentionMaskCopy};
         std::vector <Data*> positionIdsVec = {&positionIdsCopy};
         std::vector <int> seqLens = {(int)inputIds.dims[1]};
         std::vector <GenerationConfig> generationConfigs = {generationConfig};
@@ -908,6 +1037,15 @@ namespace fastllm {
         }
         std::vector <std::vector <float>*> batchLogits;
         batchLogits.push_back(retLogits);
+#ifdef USE_CUDA
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        if (GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios)) {
+            return ForwardGPU(1, inputIds, attentionMasks, positionIdsVec, seqLens,
+                              pagedPastKeyValues, generationConfigs, lastTokens,
+                              &batchLogits)[0];
+        }
+#endif
         return ForwardV2(1, inputIds, attentionMasks, positionIdsVec, seqLens,
                          pagedPastKeyValues, generationConfigs, lastTokens, &batchLogits)[0];
     }
@@ -923,6 +1061,7 @@ namespace fastllm {
             bool all1,
             bool isPrefill,
             bool tensorParallel,
+            bool firstTensorParallelRank,
             int pagedCacheLayerOffset,
             Data &logits) {
 #ifndef USE_CUDA
@@ -951,6 +1090,8 @@ namespace fastllm {
 
         const DataType computeType = ResolveQwen3MoeThreadTpComputeType(this->dataType);
         const DataType threadTpMoeAtype = (this->moeAtype == DataType::FLOAT32) ? computeType : this->moeAtype;
+        auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
+        auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
         int graphHidden = embed_dim;
         auto embedIt = weight.weight.find("model.embed_tokens.weight");
         if (embedIt != weight.weight.end() && embedIt->second.dims.size() >= 2) {
@@ -961,7 +1102,7 @@ namespace fastllm {
                 graphHidden = normIt->second.dims[0];
             }
         }
-        bool indexedMoeOk = Qwen3MoeCanGraphIndexedMoe(threadTpMoeWeights, gpuId, block_cnt,
+        bool indexedMoeOk = Qwen3MoeCanGraphIndexedMoe(moeWeightsByDevice, gpuId, block_cnt,
                                                        graphHidden, threadTpMoeAtype);
         if (!syncGraphPeers(indexedMoeOk)) {
             return rejectGraph("unsupported indexed moe layout");
@@ -1073,16 +1214,17 @@ namespace fastllm {
 
         std::vector<int> pageIndexHost = firstKey->pageIndex;
         int lastPageLen = firstKey->lastPageLen;
-        Qwen3MoePrepareGraphIntTensor(state.buffers.insertIndexs, gpuId, {insertIndex});
-        Qwen3MoePrepareGraphIntTensor(state.buffers.insertPositions, gpuId, {insertPosition});
-        Qwen3MoePrepareGraphIntTensor(state.buffers.qSizes, gpuId, {0, 1});
-        Qwen3MoePrepareGraphIntTensor(state.buffers.pageSizes, gpuId, {0, (int)pageIndexHost.size()});
-        Qwen3MoePrepareGraphIntTensor(state.buffers.pageIndexs, gpuId, pageIndexHost);
-        Qwen3MoePrepareGraphIntTensor(state.buffers.lastPageLens, gpuId, {lastPageLen});
+        Qwen3MoePrepareGraphIntTensor(state.metaBuffers.insertIndexs, gpuId, {insertIndex});
+        Qwen3MoePrepareGraphIntTensor(state.metaBuffers.insertPositions, gpuId, {insertPosition});
+        Qwen3MoePrepareGraphIntTensor(state.metaBuffers.qSizes, gpuId, {0, 1});
+        Qwen3MoePrepareGraphIntTensor(state.metaBuffers.pageSizes, gpuId, {0, (int)pageIndexHost.size()});
+        Qwen3MoePrepareGraphIntTensor(state.metaBuffers.pageIndexs, gpuId, pageIndexHost);
+        Qwen3MoePrepareGraphIntTensor(state.metaBuffers.lastPageLens, gpuId, {lastPageLen});
 
         std::ostringstream signature;
         signature << "gpu=" << gpuId
                   << ";tp=" << (tensorParallel ? 1 : 0)
+                  << ";tpRank0=" << (firstTensorParallelRank ? 1 : 0)
                   << ";pages=" << pageIndexHost.size()
                   << ";inputType=" << (int)state.inputIds.dataType
                   << ";posType=" << (int)state.positionIds.dataType
@@ -1096,24 +1238,19 @@ namespace fastllm {
             state.signature = newSignature;
         }
 
-        auto runGraphBody = [&]() {
-            void *oldExecutor = GetExecutor();
-            Executor localExecutor;
-            localExecutor.SetFirstDevice("cuda:" + std::to_string(gpuId));
-            SetCurrentThreadExecutor(&localExecutor);
-            try {
-                Qwen3MoeForwardSingleBuffers &buf = state.buffers;
+        auto runGraphBodyWithBuffers = [&](Qwen3MoeForwardSingleBuffers &workBuf,
+                                           Qwen3MoeForwardSingleBuffers &metaBuf) {
+            Qwen3CudaDirectRunner cudaRunner(gpuId);
+                Qwen3MoeForwardSingleBuffers &buf = workBuf;
                 if ((int)buf.batchPastKeys.size() != batch) {
                     buf.batchPastKeys.resize(batch);
                     buf.batchPastValues.resize(batch);
                 }
 
-                EmbeddingDirect(state.inputIds,
-                                *requireLocal(weight["model.embed_tokens.weight"], "model.embed_tokens.weight"),
-                                buf.hiddenStates);
-                if (buf.hiddenStates.dataType != computeType) {
-                    ToDataType(buf.hiddenStates, computeType);
-                }
+                Qwen3CudaEmbeddingDirect(cudaRunner, state.inputIds,
+                                         *requireLocal(weight["model.embed_tokens.weight"], "model.embed_tokens.weight"),
+                                         buf.embedOutput);
+                Qwen3CudaConvertToDataType(cudaRunner, buf.embedOutput, buf.hiddenStates, computeType);
 
                 bool generatedAppendParams = false;
                 bool generatedDecodeParams = false;
@@ -1129,8 +1266,9 @@ namespace fastllm {
                     std::string gateWeightName = "model.layers." + std::to_string(i) + ".mlp.gate.weight";
                     std::string gateBiasName = "model.layers." + std::to_string(i) + ".mlp.gate.e_score_correction_bias";
 
-                    RMSNorm(buf.hiddenStates, *requireLocal(weight[inputRmsName], inputRmsName),
-                            rms_norm_eps, buf.attenInput);
+                    Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
+                                     *requireLocal(weight[inputRmsName], inputRmsName),
+                                     rms_norm_eps, buf.attenInput);
 
                     Data *localMergeW = requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName);
                     int group = num_attention_heads / num_key_value_heads;
@@ -1141,7 +1279,8 @@ namespace fastllm {
                     AssertInFastLLM(localKVHeads > 0 && localQHeads > 0,
                                     "Qwen3-MOE ForwardSingleGPU graph got empty local attention shard.\n");
 
-                    AttentionPagedBlock(
+                    Qwen3CudaAttentionPagedBlock(
+                        cudaRunner,
                         &buf.attenInput,
                         localMergeW, requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
                         GetEmptyData(), GetEmptyData(),
@@ -1156,8 +1295,9 @@ namespace fastllm {
                         &pastKeyValues,
                         &buf.batchPastKeys, &buf.batchPastValues,
                         &buf.qkv, &buf.q, &buf.attenOutput, &buf.attenLastOutput,
-                        &buf.insertIndexs, &buf.insertPositions,
-                        &buf.qSizes, &buf.pageSizes, &buf.pageIndexs, &buf.lastPageLens,
+                        &buf.qForAttentionHolder,
+                        &metaBuf.insertIndexs, &metaBuf.insertPositions,
+                        &metaBuf.qSizes, &metaBuf.pageSizes, &metaBuf.pageIndexs, &metaBuf.lastPageLens,
                         &generatedAppendParams, &generatedDecodeParams,
                         batch, block_cnt, i,
                         seqLens,
@@ -1175,85 +1315,119 @@ namespace fastllm {
                         true
                     );
 
-                    Linear(buf.attenOutput,
-                           *requireLocal(weight[oWeightName], oWeightName),
-                           *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
-                           buf.attenLastOutput);
                     if (tensorParallel) {
-                        FastllmNcclAllReduce(buf.attenLastOutput.cudaData, buf.attenLastOutput.cudaData,
-                                             buf.attenLastOutput.Count(0), buf.attenLastOutput.dataType, gpuId);
+                        DataType residualType = buf.hiddenStates.dataType;
+                        if (firstTensorParallelRank) {
+                            if (buf.attenOutput.dataType == residualType) {
+                                Qwen3CudaLinearAddBlock(cudaRunner, &buf.attenOutput,
+                                                       requireLocal(weight[oWeightName], oWeightName),
+                                                       requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                                                       &buf.attenLastOutput, &buf.hiddenStates);
+                            } else {
+                                Qwen3CudaLinear(cudaRunner, buf.attenOutput,
+                                                *requireLocal(weight[oWeightName], oWeightName),
+                                                *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                                                buf.attenLastOutput);
+                                if (buf.attenLastOutput.dataType != residualType) {
+                                    Qwen3CudaToDataType(cudaRunner, buf.attenLastOutput, residualType);
+                                }
+                                Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, buf.attenLastOutput);
+                            }
+                        } else {
+                            Qwen3CudaLinear(cudaRunner, buf.attenOutput,
+                                            *requireLocal(weight[oWeightName], oWeightName),
+                                            *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                                            buf.hiddenStates);
+                            if (buf.hiddenStates.dataType != residualType) {
+                                Qwen3CudaToDataType(cudaRunner, buf.hiddenStates, residualType);
+                            }
+                        }
+                        FastllmNcclAllReduce(buf.hiddenStates.cudaData, buf.hiddenStates.cudaData,
+                                             buf.hiddenStates.Count(0), buf.hiddenStates.dataType, gpuId);
+                    } else {
+                        Qwen3CudaLinear(cudaRunner, buf.attenOutput,
+                                        *requireLocal(weight[oWeightName], oWeightName),
+                                        *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                                        buf.attenLastOutput);
+                        if (buf.attenLastOutput.dataType != buf.hiddenStates.dataType) {
+                            Qwen3CudaToDataType(cudaRunner, buf.attenLastOutput, buf.hiddenStates.dataType);
+                        }
+                        Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, buf.attenLastOutput);
                     }
-                    if (buf.attenLastOutput.dataType != buf.hiddenStates.dataType) {
-                        ToDataType(buf.attenLastOutput, buf.hiddenStates.dataType);
-                    }
-                    AddTo(buf.hiddenStates, buf.attenLastOutput);
 
-                    RMSNorm(buf.hiddenStates,
-                            *requireLocal(weight[postRmsName], postRmsName),
-                            rms_norm_eps, buf.attenInput);
+                    Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
+                                     *requireLocal(weight[postRmsName], postRmsName),
+                                     rms_norm_eps, buf.attenInput);
                     int localBatch = buf.attenInput.dims[0];
                     int localLen = buf.attenInput.dims[1];
                     buf.attenInput.Reshape({localBatch * localLen, buf.attenInput.dims[2]});
-                    Linear(buf.attenInput,
-                           *requireLocal(weight[gateWeightName], gateWeightName),
-                           *GetEmptyData(), buf.routerLogits, true);
-                    ToDataType(buf.routerLogits, buf.routerLogitsTemp, DataType::FLOAT32);
-                    Softmax(buf.routerLogitsTemp, buf.routerLogitsTemp, -1);
+                    Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                    *requireLocal(weight[gateWeightName], gateWeightName),
+                                    *GetEmptyData(), buf.routerLogits, true);
+                    Qwen3CudaConvertToDataType(cudaRunner, buf.routerLogits,
+                                               buf.routerLogitsTemp, DataType::FLOAT32);
+                    Qwen3CudaSoftmax(cudaRunner, buf.routerLogitsTemp, buf.routerLogitsTemp, -1);
                     Data *localGateBias = nullptr;
                     if (weight.weight.find(gateBiasName) != weight.weight.end()) {
                         localGateBias = requireLocal(weight[gateBiasName], gateBiasName);
                     }
-                    SelectExpert(buf.routerLogitsTemp, buf.expertIndex, buf.expertScore,
-                                 this->num_experts_per_tok, true,
-                                 this->routed_scaling_factor, localGateBias);
+                    Qwen3CudaSelectExpert(cudaRunner, buf.routerLogitsTemp, buf.expertIndex, buf.expertScore,
+                                          this->num_experts_per_tok, true,
+                                          this->routed_scaling_factor, localGateBias);
 
-	                    auto &localWeights = threadTpMoeWeights.at(gpuId)[i];
-	                    auto &localBiass = threadTpMoeBiass.at(gpuId)[i];
-	                    if (Qwen3MoeHasLocalMoeShard(localWeights)) {
-	                        MergeMOEBlock(&buf.attenInput, &buf.expertIndex, &buf.expertScore,
-	                            &localWeights, &localBiass,
-	                            &buf.w1, &buf.w2, &buf.w3,
-	                            &buf.tempInput, &buf.tempOutput,
-	                            1.0f, &buf.moeFinal, i,
-	                            computeType, threadTpMoeAtype,
-	                            &buf.moeInputTemp, &buf.moeOutputTemp);
-	                    } else {
-	                        Qwen3MoeZeroCudaLike(buf.moeFinal, buf.hiddenStates, gpuId);
-	                    }
-	                    buf.moeFinal.Reshape(buf.hiddenStates.dims);
-                    if (tensorParallel) {
-                        FastllmNcclAllReduce(buf.moeFinal.cudaData, buf.moeFinal.cudaData,
-                                             buf.moeFinal.Count(0), buf.moeFinal.dataType, gpuId);
+                    auto &localWeights = moeWeightsByDevice.at(gpuId)[i];
+                    auto &localBiass = moeBiassByDevice.at(gpuId)[i];
+                    if (Qwen3MoeHasLocalMoeShard(localWeights)) {
+                        Qwen3CudaMergeMOEBlock(cudaRunner, &buf.attenInput, &buf.expertIndex, &buf.expertScore,
+                            &localWeights, &localBiass,
+                            &buf.w1, &buf.w2, &buf.w3,
+                            &buf.tempInput, &buf.tempOutput,
+                            1.0f, &buf.moeFinal, i,
+                            computeType, threadTpMoeAtype,
+                            &buf.moeInputTemp, &buf.moeOutputTemp);
+                    } else {
+                        Qwen3MoeZeroCudaLike(buf.moeFinal, buf.hiddenStates, gpuId);
                     }
+                    buf.moeFinal.Reshape(buf.hiddenStates.dims);
                     if (buf.moeFinal.dataType != buf.hiddenStates.dataType) {
-                        ToDataType(buf.moeFinal, buf.hiddenStates.dataType);
+                        Qwen3CudaToDataType(cudaRunner, buf.moeFinal, buf.hiddenStates.dataType);
                     }
-                    AddTo(buf.hiddenStates, buf.moeFinal);
+                    if (tensorParallel) {
+                        if (firstTensorParallelRank) {
+                            Qwen3CudaAddTo(cudaRunner, buf.moeFinal, buf.hiddenStates);
+                        }
+                        FastllmNcclAllReduce(buf.moeFinal.cudaData, buf.hiddenStates.cudaData,
+                                             buf.moeFinal.Count(0), buf.moeFinal.dataType, gpuId);
+                    } else {
+                        Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, buf.moeFinal);
+                    }
                 }
 
-                RMSNorm(buf.hiddenStates,
-                        *requireLocal(weight["model.norm.weight"], "model.norm.weight"),
-                        rms_norm_eps, buf.hiddenStates);
-                Linear(buf.hiddenStates,
-                       *requireLocal(weight["lm_head.weight"], "lm_head.weight"),
-                       *requireLocal(GetThreadTensorParallelBias("lm_head.weight.tp_bias"),
-                                     "lm_head.weight.tp_bias"),
-                       state.logitsHalf);
-                ToDataType(state.logitsHalf, state.logits, DataType::FLOAT32);
-                SetCurrentThreadExecutor(oldExecutor);
-            } catch (...) {
-                SetCurrentThreadExecutor(oldExecutor);
-                throw;
-            }
+                Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
+                                 *requireLocal(weight["model.norm.weight"], "model.norm.weight"),
+                                 rms_norm_eps, buf.hiddenStates);
+                Qwen3CudaLinear(cudaRunner, buf.hiddenStates,
+                                *requireLocal(weight["lm_head.weight"], "lm_head.weight"),
+                                *requireLocal(GetThreadTensorParallelBias("lm_head.weight.tp_bias"),
+                                              "lm_head.weight.tp_bias"),
+                                state.logitsHalf);
+	                Qwen3CudaConvertToDataType(cudaRunner, state.logitsHalf, state.logits, DataType::FLOAT32);
+        };
+
+        auto runGraphBody = [&]() {
+            runGraphBodyWithBuffers(state.buffers, state.metaBuffers);
         };
 
         auto finishWithLogits = [&]() {
             Qwen3MoePrepareGraphCudaTensor(logits, state.logits, gpuId);
         };
 
-        auto runWithoutGraph = [&]() {
+        auto runWithoutGraph = [&]() -> bool {
+            FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
             runGraphBody();
+            bool usedUnsafeMoeFallback = FastllmCudaMergeMOEUsedGraphUnsafeFallback();
             finishWithLogits();
+            return usedUnsafeMoeFallback;
         };
 
         if (state.captured) {
@@ -1271,7 +1445,16 @@ namespace fastllm {
         }
 
         if (!state.warmed) {
-            runWithoutGraph();
+            bool usedUnsafeMoeFallback = runWithoutGraph();
+            if (!syncGraphPeers(!usedUnsafeMoeFallback)) {
+                if (usedUnsafeMoeFallback) {
+                    printf("Warning: Qwen3-MOE CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during warmup.\n",
+                           gpuId);
+                    fflush(stdout);
+                }
+                Qwen3MoeDisableCudaGraphState(this, state);
+                return true;
+            }
             state.warmed = true;
             return true;
         }
@@ -1289,7 +1472,20 @@ namespace fastllm {
             runWithoutGraph();
             return true;
         }
+        FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
         runGraphBody();
+        bool usedUnsafeMoeFallback = FastllmCudaMergeMOEUsedGraphUnsafeFallback();
+        if (!syncGraphPeers(!usedUnsafeMoeFallback)) {
+            if (usedUnsafeMoeFallback) {
+                printf("Warning: Qwen3-MOE CUDA graph disabled on gpu %d because MergeMOE used CPU expert routing fallback during capture.\n",
+                       gpuId);
+                fflush(stdout);
+            }
+            Qwen3MoeAbortCudaGraphCapture();
+            Qwen3MoeDisableCudaGraphState(this, state);
+            runWithoutGraph();
+            return true;
+        }
         syncGraphPeers();
         bool endOk = FastllmCudaGraphEndCapture(&capturedGraph) && capturedGraph != nullptr;
         if (!Qwen3MoeSyncCudaGraphStage(this, state, graphParticipants,
@@ -1342,6 +1538,7 @@ namespace fastllm {
             bool all1,
             bool isPrefill,
             bool tensorParallel,
+            bool firstTensorParallelRank,
             int pagedCacheLayerOffset,
             Data &logits) {
 #ifndef USE_CUDA
@@ -1350,42 +1547,47 @@ namespace fastllm {
         AssertInFastLLM(ratios.find(gpuId) == ratios.end() || ratios[gpuId] > 0,
                         "Qwen3-MOE ForwardSingleGPU got invalid GPU ratio.\n");
         FastllmCudaSetDevice(gpuId);
+        if (isPrefill && Qwen3MoeCudaGraphEnabled()) {
+            Qwen3MoeCudaGraphDecodeState &graphState = GetQwen3MoeCudaGraphDecodeState(this, gpuId);
+            std::lock_guard<std::mutex> graphGuard(graphState.mutex);
+            Qwen3MoeDestroyCudaGraph(graphState);
+            Qwen3MoeReinitializeForwardSingleBuffers(graphState.buffers);
+            Qwen3MoeReinitializeForwardSingleBuffers(graphState.metaBuffers);
+        }
         if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
                                         seqLens, pastKeyValues, all1, isPrefill,
-                                        tensorParallel, pagedCacheLayerOffset, logits)) {
+                                        tensorParallel, firstTensorParallelRank,
+                                        pagedCacheLayerOffset, logits)) {
             return;
         }
 
-        void *oldExecutor = GetExecutor();
-        Executor localExecutor;
-        localExecutor.SetFirstDevice("cuda:" + std::to_string(gpuId));
-        SetCurrentThreadExecutor(&localExecutor);
-        try {
-            auto requireLocal = [&](Data &data, const std::string &name) -> Data* {
-                auto it = data.multiDeviceDatas.find(gpuId);
-                if (it != data.multiDeviceDatas.end() && it->second != nullptr) {
-                    return it->second;
+        Qwen3CudaDirectRunner cudaRunner(gpuId);
+        auto requireLocal = [&](Data &data, const std::string &name) -> Data* {
+            auto it = data.multiDeviceDatas.find(gpuId);
+            if (it != data.multiDeviceDatas.end() && it->second != nullptr) {
+                return it->second;
+            }
+            if (!tensorParallel) {
+                if (!data.dims.empty() &&
+                    (data.dataDevice != DataDevice::CUDA || data.cudaData == nullptr ||
+                     data.dataDeviceIds.empty() || data.dataDeviceIds[0] != gpuId)) {
+                    data.ToDevice(DataDevice::CUDA, {gpuId}, true);
                 }
-                if (!tensorParallel) {
-                    if (!data.dims.empty() &&
-                        (data.dataDevice != DataDevice::CUDA || data.cudaData == nullptr ||
-                         data.dataDeviceIds.empty() || data.dataDeviceIds[0] != gpuId)) {
-                        data.ToDevice(DataDevice::CUDA, {gpuId}, true);
-                    }
-                    return &data;
-                }
-                ErrorInFastLLM("Qwen3-MOE ForwardSingleGPU missing local tensor: " + name + ".\n");
-                return nullptr;
-            };
+                return &data;
+            }
+            ErrorInFastLLM("Qwen3-MOE ForwardSingleGPU missing local tensor: " + name + ".\n");
+            return nullptr;
+        };
 
-            Data hiddenStates;
-            EmbeddingDirect(*requireLocal((Data&)inputIds, "inputIds"),
-                            *requireLocal(weight["model.embed_tokens.weight"], "model.embed_tokens.weight"),
-                            hiddenStates);
+        Data hiddenStates;
+        Qwen3CudaEmbeddingDirect(cudaRunner,
+                                 *requireLocal((Data&)inputIds, "inputIds"),
+                                 *requireLocal(weight["model.embed_tokens.weight"], "model.embed_tokens.weight"),
+                                 hiddenStates);
             const DataType computeType = ResolveQwen3MoeThreadTpComputeType(this->dataType);
             const DataType threadTpMoeAtype = (this->moeAtype == DataType::FLOAT32) ? computeType : this->moeAtype;
             if (hiddenStates.dataType != computeType) {
-                ToDataType(hiddenStates, computeType);
+                Qwen3CudaToDataType(cudaRunner, hiddenStates, computeType);
             }
 
             Data attenInput, qkv, q, attenOutput, attenLastOutput;
@@ -1395,6 +1597,8 @@ namespace fastllm {
             std::vector<Data*> batchPastKeys(batch), batchPastValues(batch);
             bool generatedAppendParams = false;
             bool generatedDecodeParams = false;
+            auto &moeWeightsByDevice = tensorParallel ? threadTpMoeWeights : singleGpuMoeWeights;
+            auto &moeBiassByDevice = tensorParallel ? threadTpMoeBiass : singleGpuMoeBiass;
 
             for (int i = 0; i < block_cnt; i++) {
                 std::string inputRmsName = "model.layers." + std::to_string(i) + ".input_layernorm.weight";
@@ -1408,9 +1612,9 @@ namespace fastllm {
                 std::string gateWeightName = "model.layers." + std::to_string(i) + ".mlp.gate.weight";
                 std::string gateBiasName = "model.layers." + std::to_string(i) + ".mlp.gate.e_score_correction_bias";
 
-                RMSNorm(hiddenStates, *requireLocal(weight[inputRmsName], inputRmsName),
-                        rms_norm_eps, attenInput);
-
+                Qwen3CudaRMSNorm(cudaRunner, hiddenStates,
+                                 *requireLocal(weight[inputRmsName], inputRmsName),
+                                 rms_norm_eps, attenInput);
                 Data *localMergeW = requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName);
                 int group = num_attention_heads / num_key_value_heads;
                 int localKVHeads = localMergeW->tpKVHeads > 0 ?
@@ -1419,8 +1623,8 @@ namespace fastllm {
                     localMergeW->tpQHeads : localKVHeads * group;
                 AssertInFastLLM(localKVHeads > 0 && localQHeads > 0,
                                 "Qwen3-MOE ForwardSingleGPU got empty local attention shard.\n");
-
-                AttentionPagedBlock(
+                Qwen3CudaAttentionPagedBlock(
+                    cudaRunner,
                     &attenInput,
                     localMergeW, requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
                     GetEmptyData(), GetEmptyData(),
@@ -1435,6 +1639,7 @@ namespace fastllm {
                     &pastKeyValues,
                     &batchPastKeys, &batchPastValues,
                     &qkv, &q, &attenOutput, &attenLastOutput,
+                    nullptr,
                     &insertIndexs, &insertPositions,
                     &qSizes, &pageSizes, &pageIndexs, &lastPageLens,
                     &generatedAppendParams, &generatedDecodeParams,
@@ -1453,60 +1658,92 @@ namespace fastllm {
                     true,
                     false
                 );
-
-                Linear(attenOutput,
-                       *requireLocal(weight[oWeightName], oWeightName),
-                       *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
-                       attenLastOutput);
                 if (tensorParallel) {
-                    FastllmNcclAllReduce(attenLastOutput.cudaData, attenLastOutput.cudaData,
-                                         attenLastOutput.Count(0), attenLastOutput.dataType, gpuId);
+                    DataType residualType = hiddenStates.dataType;
+                    if (firstTensorParallelRank) {
+                        if (attenOutput.dataType == residualType) {
+                            Qwen3CudaLinearAddBlock(cudaRunner, &attenOutput,
+                                                   requireLocal(weight[oWeightName], oWeightName),
+                                                   requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                                                   &attenLastOutput, &hiddenStates);
+                        } else {
+                            Qwen3CudaLinear(cudaRunner, attenOutput,
+                                            *requireLocal(weight[oWeightName], oWeightName),
+                                            *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                                            attenLastOutput);
+                            if (attenLastOutput.dataType != residualType) {
+                                Qwen3CudaToDataType(cudaRunner, attenLastOutput, residualType);
+                            }
+                            Qwen3CudaAddTo(cudaRunner, hiddenStates, attenLastOutput);
+                        }
+                    } else {
+                        Qwen3CudaLinear(cudaRunner, attenOutput,
+                                        *requireLocal(weight[oWeightName], oWeightName),
+                                        *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                                        hiddenStates);
+                        if (hiddenStates.dataType != residualType) {
+                            Qwen3CudaToDataType(cudaRunner, hiddenStates, residualType);
+                        }
+                    }
+                } else {
+                    Qwen3CudaLinear(cudaRunner, attenOutput,
+                                    *requireLocal(weight[oWeightName], oWeightName),
+                                    *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                                    attenLastOutput);
                 }
-                if (attenLastOutput.dataType != hiddenStates.dataType) {
-                    ToDataType(attenLastOutput, hiddenStates.dataType);
+                if (tensorParallel) {
+                    FastllmNcclAllReduce(hiddenStates.cudaData, hiddenStates.cudaData,
+                                         hiddenStates.Count(0), hiddenStates.dataType, gpuId);
+                } else {
+                    if (attenLastOutput.dataType != hiddenStates.dataType) {
+                        Qwen3CudaToDataType(cudaRunner, attenLastOutput, hiddenStates.dataType);
+                    }
+                    Qwen3CudaAddTo(cudaRunner, hiddenStates, attenLastOutput);
                 }
-                AddTo(hiddenStates, attenLastOutput);
-
-                RMSNorm(hiddenStates,
-                        *requireLocal(weight[postRmsName], postRmsName),
-                        rms_norm_eps, attenInput);
+                Qwen3CudaRMSNorm(cudaRunner, hiddenStates,
+                                 *requireLocal(weight[postRmsName], postRmsName),
+                                 rms_norm_eps, attenInput);
                 int localBatch = attenInput.dims[0];
                 int localLen = attenInput.dims[1];
                 attenInput.Reshape({localBatch * localLen, attenInput.dims[2]});
-                Linear(attenInput,
-                       *requireLocal(weight[gateWeightName], gateWeightName),
-                       *GetEmptyData(), routerLogits, true);
-                ToDataType(routerLogits, routerLogitsTemp, DataType::FLOAT32);
-                Softmax(routerLogitsTemp, routerLogitsTemp, -1);
+                Qwen3CudaLinear(cudaRunner, attenInput,
+                                *requireLocal(weight[gateWeightName], gateWeightName),
+                                *GetEmptyData(), routerLogits, true);
+                Qwen3CudaConvertToDataType(cudaRunner, routerLogits, routerLogitsTemp, DataType::FLOAT32);
+                Qwen3CudaSoftmax(cudaRunner, routerLogitsTemp, routerLogitsTemp, -1);
                 Data *localGateBias = nullptr;
                 if (weight.weight.find(gateBiasName) != weight.weight.end()) {
                     localGateBias = requireLocal(weight[gateBiasName], gateBiasName);
                 }
-                SelectExpert(routerLogitsTemp, expertIndex, expertScore, this->num_experts_per_tok,
-                             true, this->routed_scaling_factor, localGateBias);
-
-	                auto &localWeights = threadTpMoeWeights.at(gpuId)[i];
-	                auto &localBiass = threadTpMoeBiass.at(gpuId)[i];
-	                if (Qwen3MoeHasLocalMoeShard(localWeights)) {
-	                    MergeMOEBlock(&attenInput, &expertIndex, &expertScore,
-	                        &localWeights, &localBiass,
-	                        &w1, &w2, &w3,
-	                        &tempInput, &tempOutput,
-	                        1.0f, &moeFinal, i,
-	                        computeType, threadTpMoeAtype,
-	                        &moeInputTemp, &moeOutputTemp);
-	                } else {
-	                    Qwen3MoeZeroCudaLike(moeFinal, hiddenStates, gpuId);
-	                }
-	                moeFinal.Reshape(hiddenStates.dims);
-                if (tensorParallel) {
-                    FastllmNcclAllReduce(moeFinal.cudaData, moeFinal.cudaData,
-                                         moeFinal.Count(0), moeFinal.dataType, gpuId);
+                Qwen3CudaSelectExpert(cudaRunner, routerLogitsTemp, expertIndex, expertScore,
+                                      this->num_experts_per_tok, true,
+                                      this->routed_scaling_factor, localGateBias);
+                auto &localWeights = moeWeightsByDevice.at(gpuId)[i];
+                auto &localBiass = moeBiassByDevice.at(gpuId)[i];
+                if (Qwen3MoeHasLocalMoeShard(localWeights)) {
+                    Qwen3CudaMergeMOEBlock(cudaRunner, &attenInput, &expertIndex, &expertScore,
+                        &localWeights, &localBiass,
+                        &w1, &w2, &w3,
+                        &tempInput, &tempOutput,
+                        1.0f, &moeFinal, i,
+                        computeType, threadTpMoeAtype,
+                        &moeInputTemp, &moeOutputTemp);
+                } else {
+                    Qwen3MoeZeroCudaLike(moeFinal, hiddenStates, gpuId);
                 }
+                moeFinal.Reshape(hiddenStates.dims);
                 if (moeFinal.dataType != hiddenStates.dataType) {
-                    ToDataType(moeFinal, hiddenStates.dataType);
+                    Qwen3CudaToDataType(cudaRunner, moeFinal, hiddenStates.dataType);
                 }
-                AddTo(hiddenStates, moeFinal);
+                if (tensorParallel) {
+                    if (firstTensorParallelRank) {
+                        Qwen3CudaAddTo(cudaRunner, moeFinal, hiddenStates);
+                    }
+                    FastllmNcclAllReduce(moeFinal.cudaData, hiddenStates.cudaData,
+                                         moeFinal.Count(0), moeFinal.dataType, gpuId);
+                } else {
+                    Qwen3CudaAddTo(cudaRunner, hiddenStates, moeFinal);
+                }
             }
 
             Data lastHiddenStates;
@@ -1517,28 +1754,25 @@ namespace fastllm {
                 std::vector<Data*> lastTokPointers;
                 lastTokPointers.reserve(seqLens.size());
                 for (int b = 0; b < (int)seqLens.size(); b++) {
-                    Split(hiddenStates, 1, total + seqLens[b] - 1, total + seqLens[b], lastToks[b]);
+                    Qwen3CudaSplit(cudaRunner, hiddenStates, 1,
+                                   total + seqLens[b] - 1, total + seqLens[b],
+                                   lastToks[b]);
                     total += seqLens[b];
                     lastTokPointers.push_back(&lastToks[b]);
                 }
-                CatBatch(lastTokPointers, 1, lastHiddenStates);
+                Qwen3CudaCatBatch(cudaRunner, lastTokPointers, 1, lastHiddenStates);
                 headInput = &lastHiddenStates;
             }
 
-            RMSNorm(*headInput,
-                    *requireLocal(weight["model.norm.weight"], "model.norm.weight"),
-                    rms_norm_eps, *headInput);
-            Linear(*headInput,
-                   *requireLocal(weight["lm_head.weight"], "lm_head.weight"),
-                   *requireLocal(GetThreadTensorParallelBias("lm_head.weight.tp_bias"),
-                                 "lm_head.weight.tp_bias"),
-                   logits);
-            ToDataType(logits, DataType::FLOAT32);
-            SetCurrentThreadExecutor(oldExecutor);
-        } catch (...) {
-            SetCurrentThreadExecutor(oldExecutor);
-            throw;
-        }
+            Qwen3CudaRMSNorm(cudaRunner, *headInput,
+                             *requireLocal(weight["model.norm.weight"], "model.norm.weight"),
+                             rms_norm_eps, *headInput);
+            Qwen3CudaLinear(cudaRunner, *headInput,
+                            *requireLocal(weight["lm_head.weight"], "lm_head.weight"),
+                            *requireLocal(GetThreadTensorParallelBias("lm_head.weight.tp_bias"),
+                                          "lm_head.weight.tp_bias"),
+                            logits);
+            Qwen3CudaToDataType(cudaRunner, logits, DataType::FLOAT32);
 #endif
     }
 
@@ -1558,10 +1792,11 @@ namespace fastllm {
 #else
         std::vector<int> devices;
         std::map<int, int> ratios;
-        if (!GetQwen3MoeThreadTpDevices(devices, ratios)) {
+        if (!GetQwen3MoeGPUForwardDevices(this->deviceMap, devices, ratios)) {
             return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
+        bool tensorParallel = devices.size() > 1;
 
         AssertInFastLLM((int)pastKeyValues.size() >= batch * block_cnt,
                         "Qwen3-MOE ForwardGPU: pastKeyValues size mismatch.\n");
@@ -1571,7 +1806,7 @@ namespace fastllm {
                         "Qwen3-MOE ForwardGPU: positionIds size mismatch.\n");
         AssertInFastLLM(!GetKVCacheInCPU(),
                         "Qwen3-MOE ForwardGPU doesn't support CPU KV cache.\n");
-        if (devices.size() > 1) {
+        if (tensorParallel) {
             AssertInFastLLM(FastllmInitNccl(devices),
                             "Qwen3-MOE ForwardGPU requires NCCL initialization.\n");
         }
@@ -1610,26 +1845,22 @@ namespace fastllm {
 
         Data gpuInputIds;
         gpuInputIds.CopyFrom(inputIds);
-        PrepareMultiCudaReplicatedData(gpuInputIds, devices, true);
-        PrepareMultiCudaReplicatedData(allPositionIds, devices, true);
-
-        bool tensorParallel = devices.size() > 1;
-        std::vector<DivisionScheme> kvHeadSchemes(block_cnt);
-        auto prepareReplicated = [&](const std::string &name) {
-            PrepareMultiCudaReplicatedData(this->weight[name], devices, true);
-        };
-
         if (tensorParallel) {
-            prepareReplicated("model.embed_tokens.weight");
-            prepareReplicated("model.norm.weight");
+            PrepareMultiCudaReplicatedData(gpuInputIds, devices, true);
+            PrepareMultiCudaReplicatedData(allPositionIds, devices, true);
         }
 
-        auto hasThreadTpMoeCache = [&]() {
+        std::vector<DivisionScheme> kvHeadSchemes;
+        DivisionScheme lmHeadScheme;
+        Data &lmHead = weight["lm_head.weight"];
+
+        auto hasMoeCache = [&](const std::unordered_map<int, std::vector<std::vector<Data*> > > &weightCache,
+                               const std::unordered_map<int, std::vector<std::vector<Data*> > > &biasCache) {
             int expectedSize = this->num_experts * 2 + 2;
             for (int device : devices) {
-                auto weightIt = threadTpMoeWeights.find(device);
-                auto biasIt = threadTpMoeBiass.find(device);
-                if (weightIt == threadTpMoeWeights.end() || biasIt == threadTpMoeBiass.end() ||
+                auto weightIt = weightCache.find(device);
+                auto biasIt = biasCache.find(device);
+                if (weightIt == weightCache.end() || biasIt == biasCache.end() ||
                     (int)weightIt->second.size() != block_cnt || (int)biasIt->second.size() != block_cnt) {
                     return false;
                 }
@@ -1647,97 +1878,15 @@ namespace fastllm {
             }
             return true;
         };
-        bool rebuildThreadTpMoeCache = !hasThreadTpMoeCache();
 
-        for (int i = 0; i < block_cnt; i++) {
-            std::string inputRmsName = "model.layers." + std::to_string(i) + ".input_layernorm.weight";
-            std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
-            std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
-            std::string qNormName = "model.layers." + std::to_string(i) + ".self_attn.q_norm.weight";
-            std::string kNormName = "model.layers." + std::to_string(i) + ".self_attn.k_norm.weight";
-            std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
-            std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
-            std::string postRmsName = "model.layers." + std::to_string(i) + ".post_attention_layernorm.weight";
-            std::string gateWeightName = "model.layers." + std::to_string(i) + ".mlp.gate.weight";
-            std::string gateBiasName = "model.layers." + std::to_string(i) + ".mlp.gate.e_score_correction_bias";
-
-            AssertInFastLLM(weight.weight.find(mergeQkvWeightName) != weight.weight.end(),
-                            "Qwen3-MOE ForwardGPU requires merged qkv weight.\n");
-            AssertInFastLLM(weight.weight.find(gateWeightName) != weight.weight.end(),
-                            "Qwen3-MOE ForwardGPU requires router gate weight.\n");
-
-            if (tensorParallel) {
-                prepareReplicated(inputRmsName);
-                prepareReplicated(qNormName);
-                prepareReplicated(kNormName);
-                prepareReplicated(postRmsName);
-                prepareReplicated(gateWeightName);
-                if (weight.weight.find(gateBiasName) != weight.weight.end()) {
-                    prepareReplicated(gateBiasName);
-                }
-            }
-
-            Data &mergeW = weight[mergeQkvWeightName];
-            Data &mergeB = GetThreadTensorParallelBias(mergeQkvBiasName);
-            mergeW.tpPackType = TP_PACK_QKV;
-            mergeW.tpQHeads = num_attention_heads;
-            mergeW.tpKVHeads = num_key_value_heads;
-            mergeW.tpHeadDim = head_dim;
-            std::vector<int> devCopy = devices;
-            DivisionScheme gateScheme;
-            if (tensorParallel) {
-                DivisionScheme qkvScheme = BuildMultiCudaRowSplitScheme(mergeW, devCopy, ratios);
-                AssertInFastLLM(SplitMultiCudaWeight(mergeW, mergeB, devCopy, qkvScheme, 0),
-                                "Qwen3-MOE ForwardGPU failed to split " + mergeQkvWeightName + ".\n");
-
-                int qWidth = num_attention_heads * head_dim;
-                DivisionScheme qScheme = ExtractQwen3MoeFirstRangeScheme(qkvScheme);
-                kvHeadSchemes[i] = ExtractQwen3MoeKVHeadScheme(qkvScheme, qWidth, head_dim);
-                Data &oB = GetThreadTensorParallelBias(oBiasName);
-                devCopy = devices;
-                AssertInFastLLM(SplitMultiCudaWeight(weight[oWeightName], oB, devCopy, qScheme, 1),
-                                "Qwen3-MOE ForwardGPU failed to split " + oWeightName + ".\n");
-            } else {
-                kvHeadSchemes[i][devices[0]].push_back({0, num_key_value_heads});
-            }
-
-            if (rebuildThreadTpMoeCache) {
-                for (int j = 0; j < this->num_experts; j++) {
-                    std::string gateupWeightName = "model.layers." + std::to_string(i) + ".mlp.experts." +
-                                                    std::to_string(j) + ".gateup_proj.weight";
-                    std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.experts." +
-                                                  std::to_string(j) + ".down_proj.weight";
-                    AssertInFastLLM(weight.weight.find(gateupWeightName) != weight.weight.end(),
-                                    "Qwen3-MOE ForwardGPU requires merged expert gateup weight.\n");
-                    AssertInFastLLM(weight.weight.find(downWeightName) != weight.weight.end(),
-                                    "Qwen3-MOE ForwardGPU requires expert down weight.\n");
-
-                    Data &gateup = weight[gateupWeightName];
-                    Data &gateupBias = GetThreadTensorParallelBias(gateupWeightName + ".tp_bias");
-                    gateup.tpLinearType = TP_LINEAR_ROW;
-                    gateup.tpPackType = TP_PACK_GATEUP;
-                    devCopy = devices;
-                    gateScheme = BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
-                    AssertInFastLLM(SplitMultiCudaWeight(gateup, gateupBias, devCopy, gateScheme, 0),
-                                    "Qwen3-MOE ForwardGPU failed to split " + gateupWeightName + ".\n");
-
-                    Data &down = weight[downWeightName];
-                    Data &downBias = GetThreadTensorParallelBias(downWeightName + ".tp_bias");
-                    down.tpLinearType = TP_LINEAR_COLUMN;
-                    DivisionScheme downScheme = ExtractQwen3MoeFirstRangeScheme(gateScheme);
-                    devCopy = devices;
-                    AssertInFastLLM(SplitMultiCudaWeight(down, downBias, devCopy, downScheme, 1),
-                                    "Qwen3-MOE ForwardGPU failed to split " + downWeightName + ".\n");
-                }
-            }
-        }
-
-        if (rebuildThreadTpMoeCache) {
-            threadTpMoeWeights.clear();
-            threadTpMoeBiass.clear();
+        auto fillMoeCache = [&](std::unordered_map<int, std::vector<std::vector<Data*> > > &weightCache,
+                                std::unordered_map<int, std::vector<std::vector<Data*> > > &biasCache,
+                                bool useLocalShards) {
+            weightCache.clear();
+            biasCache.clear();
             for (int device : devices) {
-                auto &deviceWeights = threadTpMoeWeights[device];
-                auto &deviceBiass = threadTpMoeBiass[device];
+                auto &deviceWeights = weightCache[device];
+                auto &deviceBiass = biasCache[device];
                 deviceWeights.resize(block_cnt);
                 deviceBiass.resize(block_cnt);
                 for (int i = 0; i < block_cnt; i++) {
@@ -1755,9 +1904,11 @@ namespace fastllm {
                         std::string downWeightName = "model.layers." + std::to_string(i) +
                             ".mlp.experts." + std::to_string(j) + ".down_proj.weight";
                         auto getLocalOrRoot = [&](Data &data) -> Data* {
-                            auto it = data.multiDeviceDatas.find(device);
-                            if (it != data.multiDeviceDatas.end() && it->second != nullptr) {
-                                return it->second;
+                            if (useLocalShards) {
+                                auto it = data.multiDeviceDatas.find(device);
+                                if (it != data.multiDeviceDatas.end() && it->second != nullptr) {
+                                    return it->second;
+                                }
                             }
                             return &data;
                         };
@@ -1768,34 +1919,188 @@ namespace fastllm {
                     }
                 }
             }
-        }
+        };
 
-        Data &lmHead = weight["lm_head.weight"];
-        Data &lmHeadBias = GetThreadTensorParallelBias("lm_head.weight.tp_bias");
-        std::vector<int> devCopy = devices;
-        DivisionScheme lmHeadScheme;
         if (tensorParallel) {
-            lmHeadScheme = BuildMultiCudaRowSplitScheme(lmHead, devCopy, ratios);
-            AssertInFastLLM(SplitMultiCudaWeight(lmHead, lmHeadBias, devCopy, lmHeadScheme, 0),
-                            "Qwen3-MOE ForwardGPU failed to split lm_head.weight.\n");
+            std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
+            if (threadTpWeightsPrepared) {
+                AssertInFastLLM(threadTpPreparedDevices == devices && threadTpPreparedRatios == ratios,
+                                "Qwen3-MOE ForwardGPU thread TP device config changed after weights were prepared.\n");
+                AssertInFastLLM((int)threadTpKVHeadSchemes.size() == block_cnt &&
+                                !threadTpLmHeadScheme.empty() &&
+                                hasMoeCache(threadTpMoeWeights, threadTpMoeBiass),
+                                "Qwen3-MOE ForwardGPU thread TP cached weight schemes are incomplete.\n");
+            } else {
+                auto prepareReplicated = [&](const std::string &name) {
+                    PrepareMultiCudaReplicatedData(this->weight[name], devices, true);
+                };
+                prepareReplicated("model.embed_tokens.weight");
+                prepareReplicated("model.norm.weight");
+
+                threadTpKVHeadSchemes.assign(block_cnt, DivisionScheme());
+                for (int i = 0; i < block_cnt; i++) {
+                    std::string inputRmsName = "model.layers." + std::to_string(i) + ".input_layernorm.weight";
+                    std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+                    std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
+                    std::string qNormName = "model.layers." + std::to_string(i) + ".self_attn.q_norm.weight";
+                    std::string kNormName = "model.layers." + std::to_string(i) + ".self_attn.k_norm.weight";
+                    std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
+                    std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
+                    std::string postRmsName = "model.layers." + std::to_string(i) + ".post_attention_layernorm.weight";
+                    std::string gateWeightName = "model.layers." + std::to_string(i) + ".mlp.gate.weight";
+                    std::string gateBiasName = "model.layers." + std::to_string(i) + ".mlp.gate.e_score_correction_bias";
+
+                    AssertInFastLLM(weight.weight.find(mergeQkvWeightName) != weight.weight.end(),
+                                    "Qwen3-MOE ForwardGPU requires merged qkv weight.\n");
+                    AssertInFastLLM(weight.weight.find(gateWeightName) != weight.weight.end(),
+                                    "Qwen3-MOE ForwardGPU requires router gate weight.\n");
+
+                    prepareReplicated(inputRmsName);
+                    prepareReplicated(qNormName);
+                    prepareReplicated(kNormName);
+                    prepareReplicated(postRmsName);
+                    prepareReplicated(gateWeightName);
+                    if (weight.weight.find(gateBiasName) != weight.weight.end()) {
+                        prepareReplicated(gateBiasName);
+                    }
+
+                    Data &mergeW = weight[mergeQkvWeightName];
+                    Data &mergeB = GetThreadTensorParallelBias(mergeQkvBiasName);
+                    mergeW.tpPackType = TP_PACK_QKV;
+                    mergeW.tpQHeads = num_attention_heads;
+                    mergeW.tpKVHeads = num_key_value_heads;
+                    mergeW.tpHeadDim = head_dim;
+                    std::vector<int> devCopy = devices;
+                    DivisionScheme qkvScheme = BuildMultiCudaRowSplitScheme(mergeW, devCopy, ratios);
+                    AssertInFastLLM(SplitMultiCudaWeight(mergeW, mergeB, devCopy, qkvScheme, 0),
+                                    "Qwen3-MOE ForwardGPU failed to split " + mergeQkvWeightName + ".\n");
+
+                    int qWidth = num_attention_heads * head_dim;
+                    DivisionScheme qScheme = ExtractQwen3MoeFirstRangeScheme(qkvScheme);
+                    threadTpKVHeadSchemes[i] = ExtractQwen3MoeKVHeadScheme(qkvScheme, qWidth, head_dim);
+                    Data &oB = GetThreadTensorParallelBias(oBiasName);
+                    devCopy = devices;
+                    AssertInFastLLM(SplitMultiCudaWeight(weight[oWeightName], oB, devCopy, qScheme, 1),
+                                    "Qwen3-MOE ForwardGPU failed to split " + oWeightName + ".\n");
+
+                    DivisionScheme gateScheme;
+                    for (int j = 0; j < this->num_experts; j++) {
+                        std::string gateupWeightName = "model.layers." + std::to_string(i) + ".mlp.experts." +
+                                                        std::to_string(j) + ".gateup_proj.weight";
+                        std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.experts." +
+                                                      std::to_string(j) + ".down_proj.weight";
+                        AssertInFastLLM(weight.weight.find(gateupWeightName) != weight.weight.end(),
+                                        "Qwen3-MOE ForwardGPU requires merged expert gateup weight.\n");
+                        AssertInFastLLM(weight.weight.find(downWeightName) != weight.weight.end(),
+                                        "Qwen3-MOE ForwardGPU requires expert down weight.\n");
+
+                        Data &gateup = weight[gateupWeightName];
+                        Data &gateupBias = GetThreadTensorParallelBias(gateupWeightName + ".tp_bias");
+                        gateup.tpLinearType = TP_LINEAR_ROW;
+                        gateup.tpPackType = TP_PACK_GATEUP;
+                        devCopy = devices;
+                        gateScheme = BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
+                        AssertInFastLLM(SplitMultiCudaWeight(gateup, gateupBias, devCopy, gateScheme, 0),
+                                        "Qwen3-MOE ForwardGPU failed to split " + gateupWeightName + ".\n");
+
+                        Data &down = weight[downWeightName];
+                        Data &downBias = GetThreadTensorParallelBias(downWeightName + ".tp_bias");
+                        down.tpLinearType = TP_LINEAR_COLUMN;
+                        DivisionScheme downScheme = ExtractQwen3MoeFirstRangeScheme(gateScheme);
+                        devCopy = devices;
+                        AssertInFastLLM(SplitMultiCudaWeight(down, downBias, devCopy, downScheme, 1),
+                                        "Qwen3-MOE ForwardGPU failed to split " + downWeightName + ".\n");
+                    }
+                }
+
+                fillMoeCache(threadTpMoeWeights, threadTpMoeBiass, true);
+
+                Data &lmHeadBias = GetThreadTensorParallelBias("lm_head.weight.tp_bias");
+                std::vector<int> devCopy = devices;
+                threadTpLmHeadScheme = BuildMultiCudaRowSplitScheme(lmHead, devCopy, ratios);
+                AssertInFastLLM(SplitMultiCudaWeight(lmHead, lmHeadBias, devCopy, threadTpLmHeadScheme, 0),
+                                "Qwen3-MOE ForwardGPU failed to split lm_head.weight.\n");
+
+                threadTpPreparedDevices = devices;
+                threadTpPreparedRatios = ratios;
+                threadTpWeightsPrepared = true;
+            }
+            kvHeadSchemes = threadTpKVHeadSchemes;
+            lmHeadScheme = threadTpLmHeadScheme;
         } else {
+            std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
+            if (!singleGpuWeightsPrepared.load(std::memory_order_relaxed) ||
+                !hasMoeCache(singleGpuMoeWeights, singleGpuMoeBiass)) {
+                int device = devices[0];
+                for (int i = 0; i < block_cnt; i++) {
+                    std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+                    std::string gateWeightName = "model.layers." + std::to_string(i) + ".mlp.gate.weight";
+                    AssertInFastLLM(weight.weight.find(mergeQkvWeightName) != weight.weight.end(),
+                                    "Qwen3-MOE ForwardGPU requires merged qkv weight.\n");
+                    AssertInFastLLM(weight.weight.find(gateWeightName) != weight.weight.end(),
+                                    "Qwen3-MOE ForwardGPU requires router gate weight.\n");
+
+                    Data &mergeW = weight[mergeQkvWeightName];
+                    mergeW.tpPackType = TP_PACK_QKV;
+                    mergeW.tpQHeads = num_attention_heads;
+                    mergeW.tpKVHeads = num_key_value_heads;
+                    mergeW.tpHeadDim = head_dim;
+
+                    for (int j = 0; j < this->num_experts; j++) {
+                        std::string gateupWeightName = "model.layers." + std::to_string(i) +
+                            ".mlp.experts." + std::to_string(j) + ".gateup_proj.weight";
+                        std::string downWeightName = "model.layers." + std::to_string(i) +
+                            ".mlp.experts." + std::to_string(j) + ".down_proj.weight";
+                        AssertInFastLLM(weight.weight.find(gateupWeightName) != weight.weight.end(),
+                                        "Qwen3-MOE ForwardGPU requires merged expert gateup weight.\n");
+                        AssertInFastLLM(weight.weight.find(downWeightName) != weight.weight.end(),
+                                        "Qwen3-MOE ForwardGPU requires expert down weight.\n");
+                        Data &gateup = weight[gateupWeightName];
+                        Data &down = weight[downWeightName];
+                        gateup.tpLinearType = TP_LINEAR_ROW;
+                        gateup.tpPackType = TP_PACK_GATEUP;
+                        down.tpLinearType = TP_LINEAR_COLUMN;
+                        gateup.ToDevice(DataDevice::CUDA, {device}, true);
+                        down.ToDevice(DataDevice::CUDA, {device}, true);
+                    }
+                }
+                fillMoeCache(singleGpuMoeWeights, singleGpuMoeBiass, false);
+                singleGpuWeightsPrepared.store(true, std::memory_order_release);
+            }
+            kvHeadSchemes.assign(block_cnt, DivisionScheme());
+            for (int i = 0; i < block_cnt; i++) {
+                kvHeadSchemes[i][devices[0]].push_back({0, num_key_value_heads});
+            }
             lmHeadScheme[devices[0]].push_back({0, lmHead.dims[0]});
         }
 
         const DataType computeType = ResolveQwen3MoeThreadTpComputeType(this->dataType);
-        std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues(devices.size());
-        for (int r = 0; r < (int)devices.size(); r++) {
-            int device = devices[r];
-            localPastKeyValues[r].resize(pastKeyValues.size());
+        std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues;
+        if (tensorParallel) {
+            localPastKeyValues.resize(devices.size());
+            for (int r = 0; r < (int)devices.size(); r++) {
+                int device = devices[r];
+                localPastKeyValues[r].resize(pastKeyValues.size());
+                for (int i = 0; i < (int)pastKeyValues.size(); i++) {
+                    DataType keyCacheType = ResolveQwen3MoeThreadTpCacheType(
+                        pastKeyValues[i].first->dataType, computeType);
+                    DataType valueCacheType = ResolveQwen3MoeThreadTpCacheType(
+                        pastKeyValues[i].second->dataType, computeType);
+                    localPastKeyValues[r][i].first = EnsureQwen3MoeThreadTpLocalCache(
+                        *pastKeyValues[i].first, device, keyCacheType);
+                    localPastKeyValues[r][i].second = EnsureQwen3MoeThreadTpLocalCache(
+                        *pastKeyValues[i].second, device, valueCacheType);
+                }
+            }
+        } else {
+            int device = devices[0];
             for (int i = 0; i < (int)pastKeyValues.size(); i++) {
                 DataType keyCacheType = ResolveQwen3MoeThreadTpCacheType(
                     pastKeyValues[i].first->dataType, computeType);
                 DataType valueCacheType = ResolveQwen3MoeThreadTpCacheType(
                     pastKeyValues[i].second->dataType, computeType);
-                localPastKeyValues[r][i].first = EnsureQwen3MoeThreadTpLocalCache(
-                    *pastKeyValues[i].first, device, keyCacheType);
-                localPastKeyValues[r][i].second = EnsureQwen3MoeThreadTpLocalCache(
-                    *pastKeyValues[i].second, device, valueCacheType);
+                PrepareQwen3MoeSingleCudaCache(*pastKeyValues[i].first, device, keyCacheType);
+                PrepareQwen3MoeSingleCudaCache(*pastKeyValues[i].second, device, valueCacheType);
             }
         }
 
@@ -1803,8 +2108,8 @@ namespace fastllm {
         std::vector<Data> localLogits(devices.size());
         if (devices.size() == 1) {
             ForwardSingleGPU(devices[0], ratios, batch, gpuInputIds, allPositionIds,
-                             seqLens, localPastKeyValues[0], all1, isPrefill,
-                             false, threadTpPagedCacheBase, localLogits[0]);
+                             seqLens, pastKeyValues, all1, isPrefill,
+                             false, true, threadTpPagedCacheBase, localLogits[0]);
         } else {
             std::vector<std::thread> threads;
             threads.reserve(devices.size());
@@ -1813,7 +2118,8 @@ namespace fastllm {
                     try {
                         ForwardSingleGPU(devices[r], ratios, batch, gpuInputIds, allPositionIds,
                                          seqLens, localPastKeyValues[r], all1, isPrefill,
-                                         tensorParallel, threadTpPagedCacheBase + r * block_cnt,
+                                         tensorParallel, r == 0,
+                                         threadTpPagedCacheBase + r * block_cnt,
                                          localLogits[r]);
                     } catch (...) {
                         errors[r] = std::current_exception();
@@ -1834,13 +2140,15 @@ namespace fastllm {
             }
         }
 
-        for (int b = 0; b < batch; b++) {
-            for (int i = 0; i < block_cnt; i++) {
-                int idx = b * block_cnt + i;
-                SyncQwen3MoeThreadTpRootCacheMeta(*pastKeyValues[idx].first, devices, kvHeadSchemes[i],
-                                                  num_key_value_heads, head_dim);
-                SyncQwen3MoeThreadTpRootCacheMeta(*pastKeyValues[idx].second, devices, kvHeadSchemes[i],
-                                                  num_key_value_heads, head_dim);
+        if (tensorParallel) {
+            for (int b = 0; b < batch; b++) {
+                for (int i = 0; i < block_cnt; i++) {
+                    int idx = b * block_cnt + i;
+                    SyncQwen3MoeThreadTpRootCacheMeta(*pastKeyValues[idx].first, devices, kvHeadSchemes[i],
+                                                      num_key_value_heads, head_dim);
+                    SyncQwen3MoeThreadTpRootCacheMeta(*pastKeyValues[idx].second, devices, kvHeadSchemes[i],
+                                                      num_key_value_heads, head_dim);
+                }
             }
         }
 

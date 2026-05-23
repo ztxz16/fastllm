@@ -10,7 +10,10 @@
 
 #include "cmath"
 
+#include <atomic>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <unordered_map>
 
 namespace fastllm {
@@ -91,6 +94,7 @@ namespace fastllm {
                 bool all1,
                 bool isPrefill,
                 bool tensorParallel,
+                bool firstTensorParallelRank,
                 int pagedCacheLayerOffset,
                 Data &logits);
 
@@ -105,6 +109,7 @@ namespace fastllm {
                 bool all1,
                 bool isPrefill,
                 bool tensorParallel,
+                bool firstTensorParallelRank,
                 int pagedCacheLayerOffset,
                 Data &logits);
 
@@ -127,11 +132,20 @@ namespace fastllm {
         std::vector <std::vector <Data*> > biass;
         std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeWeights;
         std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeBiass;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeWeights;
+        std::unordered_map <int, std::vector <std::vector <Data*> > > singleGpuMoeBiass;
 
         float routed_scaling_factor = 1.0f;
 
         std::unordered_map <std::string, Data> threadTpEmptyBiases;
         int threadTpPagedCacheBase = -1;
+        std::mutex threadTpWeightPrepareLock;
+        std::atomic<bool> singleGpuWeightsPrepared{false};
+        bool threadTpWeightsPrepared = false;
+        std::vector <int> threadTpPreparedDevices;
+        std::map <int, int> threadTpPreparedRatios;
+        std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpKVHeadSchemes;
+        std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
     };
 }
 

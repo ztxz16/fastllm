@@ -28,6 +28,8 @@ namespace fastllm {
     void DoCudaFusedMOE(Data &input, Data &output, Data &index, Data &score,
         Data &gate, Data &up, Data &down, Data &w1,
         MoeGateType gateType = MoeGateSwiglu, float swigluLimit = 0.0f);
+    void FastllmCudaMergeMOEClearGraphUnsafeFallbackFlag();
+    bool FastllmCudaMergeMOEUsedGraphUnsafeFallback();
     void DoCudaAttentionPaged(Data &q, Data &k, Data &v, Data &output, int group, float scale, bool inited = false);
     
     class CudaDevice : BaseDevice {
