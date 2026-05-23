@@ -1991,7 +1991,8 @@ static void FastllmCudaPagedCacheCopyBatchTyped(
     int batch,
     int numHeads,
     int headDim,
-    uint8_t *inputData) {
+    uint8_t *inputData,
+    bool sync) {
     int totalElements = batch * numHeads * headDim;
     if (totalElements == 0) {
         return;
@@ -2004,7 +2005,9 @@ static void FastllmCudaPagedCacheCopyBatchTyped(
         pagedData, pageIdxArray, pageOffsetArray, pageLen, batch, numHeads, headDim, inputData
     );
 
-    DeviceSync();
+    if (sync) {
+        DeviceSync();
+    }
 }
 
 // Host function to launch the batch kernel
@@ -2018,52 +2021,53 @@ void FastllmCudaPagedCacheCopyBatch(
     int headDim,
     fastllm::DataType dstType,
     uint8_t *inputData,
-    fastllm::DataType srcType) {
+    fastllm::DataType srcType,
+    bool sync) {
     if (srcType == fastllm::DataType::FLOAT32) {
         if (dstType == fastllm::DataType::FLOAT32) {
             FastllmCudaPagedCacheCopyBatchTyped<float, float>(pagedData, pageIdxArray, pageOffsetArray,
-                                                              pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FLOAT16) {
             FastllmCudaPagedCacheCopyBatchTyped<float, half>(pagedData, pageIdxArray, pageOffsetArray,
-                                                             pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::BFLOAT16) {
             FastllmCudaPagedCacheCopyBatchTyped<float, __nv_bfloat16>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                      pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FP8_E4M3) {
             FastllmCudaPagedCacheCopyBatchTyped<float, __nv_fp8_e4m3>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                      pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else {
             fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: unsupported dstType.\n");
         }
     } else if (srcType == fastllm::DataType::FLOAT16) {
         if (dstType == fastllm::DataType::FLOAT32) {
             FastllmCudaPagedCacheCopyBatchTyped<half, float>(pagedData, pageIdxArray, pageOffsetArray,
-                                                             pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FLOAT16) {
             FastllmCudaPagedCacheCopyBatchTyped<half, half>(pagedData, pageIdxArray, pageOffsetArray,
-                                                            pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::BFLOAT16) {
             FastllmCudaPagedCacheCopyBatchTyped<half, __nv_bfloat16>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                     pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FP8_E4M3) {
             FastllmCudaPagedCacheCopyBatchTyped<half, __nv_fp8_e4m3>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                     pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else {
             fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: unsupported dstType.\n");
         }
     } else if (srcType == fastllm::DataType::BFLOAT16) {
         if (dstType == fastllm::DataType::FLOAT32) {
             FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, float>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                      pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FLOAT16) {
             FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, half>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                     pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::BFLOAT16) {
             FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, __nv_bfloat16>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                              pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else if (dstType == fastllm::DataType::FP8_E4M3) {
             FastllmCudaPagedCacheCopyBatchTyped<__nv_bfloat16, __nv_fp8_e4m3>(pagedData, pageIdxArray, pageOffsetArray,
-                                                                              pageLen, batch, numHeads, headDim, inputData);
+                pageLen, batch, numHeads, headDim, inputData, sync);
         } else {
             fastllm::ErrorInFastLLM("FastllmCudaPagedCacheCopyBatch: unsupported dstType.\n");
         }

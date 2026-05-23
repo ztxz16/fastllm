@@ -2655,6 +2655,7 @@ namespace fastllm {
         float scale = floatParams.find("scale") != floatParams.end() ? floatParams.find("scale")->second : 1.0f;
         int attentionType = intParams.find("attentionType") != intParams.end() ? intParams.find("attentionType")->second : 0;
         bool inited = intParams.find("inited") != intParams.end() ? (intParams.find("inited")->second != 0) : false;
+        bool sync = intParams.find("sync") != intParams.end() ? (intParams.find("sync")->second != 0) : true;
 
         std::vector <int> devices;
         std::map <int, int> ratios;
@@ -2662,7 +2663,7 @@ namespace fastllm {
         if (devices.size() <= 1 || !q.multiDeviceData) {
             output.Allocate();
             FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
-                                               output, group, scale, attentionType, inited);
+                                               output, group, scale, attentionType, inited, sync);
             return;
         }
 
@@ -2751,7 +2752,9 @@ namespace fastllm {
                 scale, attentionType, inited, false
             );
         }
-        SyncCudaAndCheckAll(devices, "MultiCudaAttentionPagedBatchOp");
+        if (sync) {
+            SyncCudaAndCheckAll(devices, "MultiCudaAttentionPagedBatchOp");
+        }
     }
 
     void MultiCudaAttentionPagedBatchOp::Reshape(const std::string &opType, const DataDict &datas,

@@ -175,7 +175,8 @@ void FastllmCudaPagedCacheCopy(uint8_t *pagedData, int pageIdx, int pageLen, int
                                int seqLen, int inputOffset, int copyLen, int pageOffset);
 void FastllmCudaPagedCacheCopyBatch(uint8_t *pagedData, int32_t *pageIdxArray, int32_t *pageOffsetArray,
                                     int pageLen, int batch, int numHeads, int headDim,
-                                    fastllm::DataType dstType, uint8_t *inputData, fastllm::DataType srcType);
+                                    fastllm::DataType dstType, uint8_t *inputData, fastllm::DataType srcType,
+                                    bool sync = true);
 
 bool FastllmFloatToHalf(void *a, void *b, int len);
 bool FastllmHalfToFloat(void *a, void *b, int len);

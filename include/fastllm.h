@@ -1099,7 +1099,7 @@ namespace fastllm {
     // lastPageLens: 是INT32PARAM，长度为(batch), 第i个询问的最后一个page的长度为lastPageLens[i]
     void AttentionPagedBatch(const Data &q, const Data &kCaches, const Data &vCaches, 
         const Data &qSizes, const Data &pageSizes, const Data &pageIndexs, const Data &lastPageLens, 
-        Data &output, int group, float scale, int attentionType, bool inited = false);
+        Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true);
 
     // 从batch个pastKey中生成AttentionPagedBatch所需要的qSizes, pageSizes, pageIndexs, lastPageLens
     // pastKeys: batch个pastKey的列表，每个元素是一个Data*

@@ -4409,11 +4409,11 @@ namespace fastllm {
     // lastPageLens: 是INT32PARAM，长度为(batch), 第i个询问的最后一个page的长度为lastPageLens[i]
     void AttentionPagedBatch(const Data &q, const Data &kCaches, const Data &vCaches, 
         const Data &qSizes, const Data &pageSizes, const Data &pageIndexs, const Data &lastPageLens, 
-        Data &output, int group, float scale, int attentionType, bool inited) {
+        Data &output, int group, float scale, int attentionType, bool inited, bool sync) {
         curExecutor->Run("AttentionPagedBatch", {
             {"q", (Data*)&q}, {"kCaches", (Data*)&kCaches}, {"vCaches", (Data*)&vCaches}, {"output", &output},
             {"qSizes", (Data*)&qSizes}, {"pageSizes", (Data*)&pageSizes}, {"pageIndexs", (Data*)&pageIndexs}, {"lastPageLens", (Data*)&lastPageLens}
-        }, {{"scale", scale}}, {{"group", group}, {"attentionType", attentionType}, {"inited", (int)inited}});
+        }, {{"scale", scale}}, {{"group", group}, {"attentionType", attentionType}, {"inited", (int)inited}, {"sync", (int)sync}});
     }
 
     // 从batch个pastKey中生成AttentionPagedBatch所需要的qSizes, pageSizes, pageIndexs, lastPageLens

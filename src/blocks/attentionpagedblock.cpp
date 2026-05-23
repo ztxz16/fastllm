@@ -49,7 +49,8 @@ namespace fastllm {
         bool doPostQKNorm,
         int pagedCacheLayerOffset,
         bool skipOutputProjection,
-        bool externalDecodeMeta
+        bool externalDecodeMeta,
+        bool attentionPagedBatchSync
     ) {
         // 1. Linear QKV projection
         bool mergedQkv = (mergeQkvWeight->dims.size() > 0);
@@ -240,7 +241,8 @@ namespace fastllm {
                 AttentionPagedBatch(qForAttention,
                     kCaches, vCaches,
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                    *attenOutput, num_attention_heads / num_key_value_heads, 1.0 / sqrt(head_dim), 1, layerIdx > 0);
+                    *attenOutput, num_attention_heads / num_key_value_heads, 1.0 / sqrt(head_dim), 1,
+                    layerIdx > 0, attentionPagedBatchSync);
             }
 
             // 2.8 AttentionPagedBatch 输出形状为 [seqlen, num_heads, head_dim]
@@ -316,7 +318,8 @@ namespace fastllm {
             AttentionPagedBatch(qForAttention, 
                 kCaches, vCaches, 
                 *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                *attenOutput, num_attention_heads / num_key_value_heads, 1.0 / sqrt(head_dim), 1, layerIdx > 0);
+                *attenOutput, num_attention_heads / num_key_value_heads, 1.0 / sqrt(head_dim), 1,
+                layerIdx > 0, attentionPagedBatchSync);
 
             // 9. Reshape + Permute
             attenOutput->Reshape({seqlen, bsz, -1});
