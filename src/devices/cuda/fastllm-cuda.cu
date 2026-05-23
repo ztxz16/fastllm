@@ -184,7 +184,8 @@ void DeviceSync() {
 }
 
 void ForceDeviceSync() {
-    cudaDeviceSynchronize();
+    cudaError_t state = cudaDeviceSynchronize();
+    checkCudaErrors("Error: CUDA error when synchronizing device!", state);
 }
 
 void *FastllmCudaStreamCreate(bool nonBlocking) {
@@ -4092,6 +4093,44 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
     }
     FastllmCudaFinishOutput(index, cudaIndex);
     FastllmCudaFinishOutput(score, cudaScore);
+    return true;
+}
+
+__global__ void FastllmCudaMaskAndRemapExpertsKernel(int32_t *index, float *score,
+                                                     int total, int expertStart, int expertEnd) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) {
+        return;
+    }
+    int expert = index[tid];
+    if (expert >= expertStart && expert < expertEnd) {
+        index[tid] = expert - expertStart;
+    } else {
+        index[tid] = 0;
+        score[tid] = 0.0f;
+    }
+}
+
+bool FastllmCudaMaskAndRemapExpertsForLocalRange(fastllm::Data &index, fastllm::Data &score,
+                                                 int expertStart, int expertEnd) {
+    if (expertStart < 0 || expertStart >= expertEnd ||
+        index.dataDevice != fastllm::DataDevice::CUDA ||
+        score.dataDevice != fastllm::DataDevice::CUDA ||
+        index.dataType != fastllm::DataType::INT32 ||
+        score.dataType != fastllm::DataType::FLOAT32 ||
+        index.cudaData == nullptr || score.cudaData == nullptr ||
+        index.Count(0) != score.Count(0)) {
+        return false;
+    }
+    int total = index.Count(0);
+    if (total <= 0) {
+        return true;
+    }
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    FastllmCudaMaskAndRemapExpertsKernel <<< blocks, threads, 0, cudaStreamPerThread >>> (
+        (int32_t*)index.cudaData, (float*)score.cudaData, total, expertStart, expertEnd);
+    DeviceSync();
     return true;
 }
 
