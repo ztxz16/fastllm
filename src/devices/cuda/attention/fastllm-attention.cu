@@ -2609,8 +2609,9 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
         uint32_t total_num_rows = qSizes.cpuIntDatas[batch_size];
 
         cudaStream_t stream = nullptr;
-        thread_local static std::map<int, PrefillPlanInfo> plan_info_map;
-        thread_local static std::map<int, std::vector<uint32_t>> plan_key_map;
+        static std::mutex plan_cache_mutex;
+        static std::map<int, PrefillPlanInfo> plan_info_map;
+        static std::map<int, std::vector<uint32_t>> plan_key_map;
         int current_device_id = -1;
         cudaGetDevice(&current_device_id);
 
@@ -2632,25 +2633,28 @@ bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches
             plan_key.push_back((uint32_t)pageSizes.cpuIntDatas[i]);
         }
 
-        if (plan_key_map.find(current_device_id) == plan_key_map.end() ||
-            plan_key_map[current_device_id] != plan_key) {
-            cudaError_t plan_status = PrefillPlan<uint32_t>(
-                workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
-                workspace.int_workspace_size, plan_info_map[current_device_id], 
-                (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(), 
-                total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim, 
-                pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(QType), 
-                /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false, 
-                /*num_colocated_ctas=*/0, stream);
-            
-            if (plan_status != cudaSuccess) {
-                printf("FastllmCudaHalfPagedAttentionBatch: PrefillPlan failed: %s\n", cudaGetErrorString(plan_status));
-                cudaStreamSynchronize(stream);
-                exit(0);
+        PrefillPlanInfo plan_info;
+        {
+            std::lock_guard<std::mutex> guard(plan_cache_mutex);
+            if (plan_key_map.find(current_device_id) == plan_key_map.end() ||
+                plan_key_map[current_device_id] != plan_key) {
+                cudaError_t plan_status = PrefillPlan<uint32_t>(
+                    workspace.d_float_workspace, workspace.float_workspace_size, workspace.d_int_workspace, workspace.h_page_locked_int_workspace,
+                    workspace.int_workspace_size, plan_info_map[current_device_id],
+                    (uint32_t*)qSizes.cpuIntDatas.data(), (uint32_t*)pageSizes.cpuIntDatas.data(),
+                    total_num_rows, batch_size, num_qo_heads_per_batch, numHeads, headDim, headDim,
+                    pageLen, /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/sizeof(QType),
+                    /*window_left=*/-1, /*fixed_split_size=*/-1, /*disable_split_kv=*/false,
+                    /*num_colocated_ctas=*/0, stream);
+
+                if (plan_status != cudaSuccess) {
+                    printf("FastllmCudaHalfPagedAttentionBatch: PrefillPlan failed: %s\n", cudaGetErrorString(plan_status));
+                    exit(0);
+                }
+                plan_key_map[current_device_id] = plan_key;
             }
-            plan_key_map[current_device_id] = std::move(plan_key);
+            plan_info = plan_info_map[current_device_id];
         }
-        PrefillPlanInfo &plan_info = plan_info_map[current_device_id];
         
         uint32_t q_stride_n = (q.dims.size() >= 2 && q.strides.size() >= 2) ? q.strides[1] : q2;
         uint32_t q_stride_h = (q.dims.size() >= 3 && q.strides.size() >= 1) ? q.strides[0] : (q1 * q2);

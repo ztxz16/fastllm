@@ -12,12 +12,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <condition_variable>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
 #include <exception>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -899,6 +901,350 @@ namespace fastllm {
             }
         }
 
+        struct Step3p5ForwardSingleBuffers {
+            Data hiddenStates;
+            Data attenInput;
+            Data qkv;
+            Data q;
+            Data k;
+            Data v;
+            Data qForAttentionHolder;
+            Data attenOutput;
+            Data attenLastOutput;
+            Data gate;
+            Data gateRep;
+            Data ffMiddle;
+            Data ffAct;
+            Data ffUp;
+            Data ffOut;
+            Data routerLogits;
+            Data routerProb;
+            Data expertIndex;
+            Data expertScore;
+            Data w1;
+            Data w2;
+            Data w3;
+            Data tempInput;
+            Data tempOutput;
+            Data moeInputTemp;
+            Data moeOutputTemp;
+            Data moeFinal;
+            Data shareOutput;
+            Data qSizes;
+            Data pageSizes;
+            Data pageIndexs;
+            Data lastPageLens;
+            Data insertIndexs;
+            Data insertPositions;
+            std::vector<Data*> batchPastKeys;
+            std::vector<Data*> batchPastValues;
+
+            Step3p5ForwardSingleBuffers() : batchPastKeys(1), batchPastValues(1) {}
+        };
+
+        static void Step3p5DetachFakeReusableTensor(Data &data) {
+            if (!data.isFake) {
+                return;
+            }
+            data.isFake = false;
+            data.cpuData = nullptr;
+            data.cudaData = nullptr;
+            data.deviceData = nullptr;
+            data.expansionSize = 0;
+            data.expansionBytes = 0;
+        }
+
+        static void Step3p5FreeReusableTensor(Data &data) {
+            if (data.isFake) {
+                Step3p5DetachFakeReusableTensor(data);
+            } else {
+                data.FreeSpace();
+            }
+            data.dims.clear();
+            data.strides.clear();
+            data.expansionDims.clear();
+            data.cpuIntDatas.clear();
+            data.dataDevice = DataDevice::CPU;
+            data.dataDeviceIds.clear();
+            data.weightType = WeightType::NONE;
+            data.lockInCPU = false;
+            Qwen3CudaClearMultiDeviceState(data);
+        }
+
+        static void Step3p5FreeForwardSingleBuffers(Step3p5ForwardSingleBuffers &buf) {
+            Step3p5FreeReusableTensor(buf.hiddenStates);
+            Step3p5FreeReusableTensor(buf.attenInput);
+            Step3p5FreeReusableTensor(buf.qkv);
+            Step3p5FreeReusableTensor(buf.q);
+            Step3p5FreeReusableTensor(buf.k);
+            Step3p5FreeReusableTensor(buf.v);
+            Step3p5FreeReusableTensor(buf.qForAttentionHolder);
+            Step3p5FreeReusableTensor(buf.attenOutput);
+            Step3p5FreeReusableTensor(buf.attenLastOutput);
+            Step3p5FreeReusableTensor(buf.gate);
+            Step3p5FreeReusableTensor(buf.gateRep);
+            Step3p5FreeReusableTensor(buf.ffMiddle);
+            Step3p5FreeReusableTensor(buf.ffAct);
+            Step3p5FreeReusableTensor(buf.ffUp);
+            Step3p5FreeReusableTensor(buf.ffOut);
+            Step3p5FreeReusableTensor(buf.routerLogits);
+            Step3p5FreeReusableTensor(buf.routerProb);
+            Step3p5FreeReusableTensor(buf.expertIndex);
+            Step3p5FreeReusableTensor(buf.expertScore);
+            Step3p5FreeReusableTensor(buf.w1);
+            Step3p5FreeReusableTensor(buf.w2);
+            Step3p5FreeReusableTensor(buf.w3);
+            Step3p5FreeReusableTensor(buf.tempInput);
+            Step3p5FreeReusableTensor(buf.tempOutput);
+            Step3p5FreeReusableTensor(buf.moeInputTemp);
+            Step3p5FreeReusableTensor(buf.moeOutputTemp);
+            Step3p5FreeReusableTensor(buf.moeFinal);
+            Step3p5FreeReusableTensor(buf.shareOutput);
+            Step3p5FreeReusableTensor(buf.qSizes);
+            Step3p5FreeReusableTensor(buf.pageSizes);
+            Step3p5FreeReusableTensor(buf.pageIndexs);
+            Step3p5FreeReusableTensor(buf.lastPageLens);
+            Step3p5FreeReusableTensor(buf.insertIndexs);
+            Step3p5FreeReusableTensor(buf.insertPositions);
+        }
+
+        static void Step3p5ReinitializeForwardSingleBuffers(Step3p5ForwardSingleBuffers &buf) {
+            Step3p5FreeForwardSingleBuffers(buf);
+            buf.~Step3p5ForwardSingleBuffers();
+            new (&buf) Step3p5ForwardSingleBuffers();
+        }
+
+        struct Step3p5CudaGraphDecodeState {
+            std::mutex mutex;
+            std::string signature;
+            bool warmed = false;
+            bool captured = false;
+            bool disabled = false;
+            void *graph = nullptr;
+            void *exec = nullptr;
+            Data inputIds;
+            Data positionIds;
+            Step3p5ForwardSingleBuffers buffers;
+            Step3p5ForwardSingleBuffers metaBuffers;
+            Data logits;
+
+            ~Step3p5CudaGraphDecodeState() {
+                if (exec != nullptr) {
+                    FastllmCudaGraphExecDestroy(exec);
+                    exec = nullptr;
+                }
+                if (graph != nullptr) {
+                    FastllmCudaGraphDestroy(graph);
+                    graph = nullptr;
+                }
+            }
+        };
+
+        struct Step3p5CudaGraphSyncState {
+            std::mutex mutex;
+            std::condition_variable cv;
+            int arrived = 0;
+            int generation = 0;
+            bool phaseOk = true;
+            bool lastPhaseOk = true;
+            bool disabled = false;
+        };
+
+        static bool Step3p5CudaGraphEnabled() {
+            const char *env = std::getenv("FASTLLM_STEP3P5_CUDA_GRAPH");
+            if (env == nullptr) {
+                env = std::getenv("FASTLLM_QWEN3_CUDA_GRAPH");
+            }
+            return env != nullptr && !Step3p5IsDisabledTpSpec(Step3p5TrimString(env));
+        }
+
+        static Step3p5CudaGraphSyncState &GetStep3p5CudaGraphSyncState(const Step3p5Model *model) {
+            static std::mutex syncsMutex;
+            static std::map<const Step3p5Model*, std::unique_ptr<Step3p5CudaGraphSyncState> > syncs;
+            std::lock_guard<std::mutex> guard(syncsMutex);
+            auto &sync = syncs[model];
+            if (sync == nullptr) {
+                sync.reset(new Step3p5CudaGraphSyncState());
+            }
+            return *sync;
+        }
+
+        static bool Step3p5CudaGraphSyncPhase(const Step3p5Model *model, int participants, bool ok = true) {
+            if (participants <= 1) {
+                return ok;
+            }
+            Step3p5CudaGraphSyncState &sync = GetStep3p5CudaGraphSyncState(model);
+            std::unique_lock<std::mutex> lock(sync.mutex);
+            int generation = sync.generation;
+            if (sync.arrived == 0) {
+                sync.phaseOk = true;
+            }
+            sync.phaseOk = sync.phaseOk && ok && !sync.disabled;
+            sync.arrived++;
+            if (sync.arrived == participants) {
+                sync.lastPhaseOk = sync.phaseOk;
+                sync.arrived = 0;
+                sync.generation++;
+                sync.cv.notify_all();
+                return sync.lastPhaseOk;
+            }
+            sync.cv.wait(lock, [&]() {
+                return sync.generation != generation;
+            });
+            return sync.lastPhaseOk;
+        }
+
+        static bool Step3p5CudaGraphIsDisabled(const Step3p5Model *model) {
+            Step3p5CudaGraphSyncState &sync = GetStep3p5CudaGraphSyncState(model);
+            std::lock_guard<std::mutex> guard(sync.mutex);
+            return sync.disabled;
+        }
+
+        static void Step3p5DisableCudaGraph(const Step3p5Model *model) {
+            Step3p5CudaGraphSyncState &sync = GetStep3p5CudaGraphSyncState(model);
+            {
+                std::lock_guard<std::mutex> guard(sync.mutex);
+                sync.disabled = true;
+            }
+            sync.cv.notify_all();
+        }
+
+        static void Step3p5DestroyCudaGraph(Step3p5CudaGraphDecodeState &state) {
+            if (state.exec != nullptr) {
+                FastllmCudaGraphExecDestroy(state.exec);
+                state.exec = nullptr;
+            }
+            if (state.graph != nullptr) {
+                FastllmCudaGraphDestroy(state.graph);
+                state.graph = nullptr;
+            }
+            state.captured = false;
+            state.warmed = false;
+        }
+
+        static void Step3p5AbortCudaGraphCapture() {
+            void *capturedGraph = nullptr;
+            if (FastllmCudaGraphEndCapture(&capturedGraph) && capturedGraph != nullptr) {
+                FastllmCudaGraphDestroy(capturedGraph);
+            }
+        }
+
+        static void Step3p5DisableCudaGraphState(
+                const Step3p5Model *model,
+                Step3p5CudaGraphDecodeState &state) {
+            Step3p5DestroyCudaGraph(state);
+            state.disabled = true;
+            Step3p5DisableCudaGraph(model);
+        }
+
+        static void Step3p5WarnCudaGraphStage(
+                const char *stage,
+                int gpuId,
+                bool localOk) {
+            if (!localOk) {
+                printf("Warning: Step3p5 CUDA graph %s failed on gpu %d: %s. Disable graph for this model.\n",
+                       stage, gpuId, FastllmCudaGraphLastError());
+                fflush(stdout);
+            }
+        }
+
+        static bool Step3p5SyncCudaGraphStage(
+                const Step3p5Model *model,
+                Step3p5CudaGraphDecodeState &state,
+                int participants,
+                const char *stage,
+                int gpuId,
+                bool localOk) {
+            bool allOk = Step3p5CudaGraphSyncPhase(model, participants, localOk);
+            if (!allOk) {
+                Step3p5WarnCudaGraphStage(stage, gpuId, localOk);
+                Step3p5DisableCudaGraphState(model, state);
+            }
+            return allOk;
+        }
+
+        static Step3p5CudaGraphDecodeState &GetStep3p5CudaGraphDecodeState(
+                const Step3p5Model *model, int gpuId) {
+            static std::mutex statesMutex;
+            static std::map<std::pair<const Step3p5Model*, int>,
+                            std::unique_ptr<Step3p5CudaGraphDecodeState> > states;
+            std::lock_guard<std::mutex> guard(statesMutex);
+            auto key = std::make_pair(model, gpuId);
+            auto &state = states[key];
+            if (state == nullptr) {
+                state.reset(new Step3p5CudaGraphDecodeState());
+            }
+            return *state;
+        }
+
+        static void Step3p5PrepareGraphCudaTensor(Data &dst, const Data &src, int device) {
+            AssertInFastLLM(src.dataDevice == DataDevice::CUDA && src.cudaData != nullptr,
+                            "Step3p5 CUDA graph requires CUDA source tensor.\n");
+            FastllmCudaSetDevice(device);
+
+            bool needReset = dst.isFake || dst.dataDevice != DataDevice::CUDA ||
+                             dst.dataType != src.dataType || dst.dims != src.dims ||
+                             (!dst.dataDeviceIds.empty() && dst.dataDeviceIds[0] != device);
+            if (!needReset && dst.cudaData != nullptr) {
+                int ptrDevice = GetPointerDeviceId(dst.cudaData);
+                needReset = ptrDevice >= 0 && ptrDevice != device;
+            }
+            if (needReset) {
+                if (dst.isFake) {
+                    dst.isFake = false;
+                    dst.cpuData = nullptr;
+                    dst.cudaData = nullptr;
+                    dst.deviceData = nullptr;
+                    dst.expansionSize = 0;
+                    dst.expansionBytes = 0;
+                } else {
+                    dst.FreeSpace();
+                }
+                Qwen3CudaClearMultiDeviceState(dst);
+                dst.dataType = src.dataType;
+                dst.UpdateUnitSize();
+                dst.dataDevice = DataDevice::CUDA;
+                dst.dataDeviceIds = {device};
+                dst.Resize(src.dims);
+            }
+            dst.Allocate(false);
+            FastllmCudaCopyFromDeviceToDevice(dst.cudaData, src.cudaData, src.GetBytes());
+        }
+
+        static void Step3p5PrepareGraphIntTensor(Data &dst, int device, const std::vector<int> &host) {
+            AssertInFastLLM(!host.empty(), "Step3p5 CUDA graph got empty int metadata.\n");
+            FastllmCudaSetDevice(device);
+            bool needReset = dst.isFake || dst.dataDevice != DataDevice::CUDA ||
+                             dst.dataType != DataType::INT32 ||
+                             dst.dims != std::vector<int>{(int)host.size()} ||
+                             (!dst.dataDeviceIds.empty() && dst.dataDeviceIds[0] != device);
+            if (!needReset && dst.cudaData != nullptr) {
+                int ptrDevice = GetPointerDeviceId(dst.cudaData);
+                needReset = ptrDevice >= 0 && ptrDevice != device;
+            }
+            if (needReset) {
+                if (dst.isFake) {
+                    dst.isFake = false;
+                    dst.cpuData = nullptr;
+                    dst.cudaData = nullptr;
+                    dst.deviceData = nullptr;
+                    dst.expansionSize = 0;
+                    dst.expansionBytes = 0;
+                } else {
+                    dst.FreeSpace();
+                }
+                Qwen3CudaClearMultiDeviceState(dst);
+                dst.dataType = DataType::INT32;
+                dst.UpdateUnitSize();
+                dst.dataDevice = DataDevice::CUDA;
+                dst.dataDeviceIds = {device};
+                dst.Resize({(int)host.size()});
+            }
+            dst.Allocate(false);
+            FastllmCudaCopyFromHostToDevice(dst.cudaData, (void*)host.data(), host.size() * sizeof(int32_t));
+            dst.cpuIntDatas = host;
+        }
+
         static bool Step3p5HasLocalMoeShard(const std::vector<Data*> &localWeights) {
             for (int i = 2; i + 1 < (int)localWeights.size(); i += 2) {
                 Data *gateup = localWeights[i];
@@ -1071,6 +1417,10 @@ namespace fastllm {
             if (!hasMin && !hasMax) {
                 return;
             }
+            if (input.dataDevice == DataDevice::CUDA && input.cudaData != nullptr &&
+                FastllmCudaClamp(input, hasMin, minValue, hasMax, maxValue)) {
+                return;
+            }
             input.ToDevice(DataDevice::CPU, true);
             Step3p5Clamp(input, hasMin, minValue, hasMax, maxValue);
             input.ToDevice(DataDevice::CUDA, {device}, true);
@@ -1098,9 +1448,11 @@ namespace fastllm {
                 std::vector<std::pair<Data*, Data*>> *pastKeyValues,
                 std::vector<Data*> *batchPastKeys,
                 std::vector<Data*> *batchPastValues,
-                Data *qkv, Data *q, Data *attenOutput,
+                Data *qkv, Data *q, Data *kBuffer, Data *vBuffer, Data *attenOutput,
                 Data *qForAttentionHolder,
+                Data *insertIndexs, Data *insertPositions,
                 Data *qSizes, Data *pageSizes, Data *pageIndexs, Data *lastPageLens,
+                bool *generatedAppendParams, bool *generatedDecodeParams,
                 int batch, int blockCnt, int layerIdx,
                 const std::vector<int> &seqLens,
                 int numAttentionHeads, int numKeyValueHeads, int headDim,
@@ -1111,7 +1463,11 @@ namespace fastllm {
                 float llama3LowFreqFactor,
                 float llama3HighFreqFactor,
                 bool kvCacheInCPU,
-                int pagedCacheLayerOffset) {
+                int pagedCacheLayerOffset,
+                bool isPrefill,
+                bool externalDecodeMeta) {
+            (void)generatedAppendParams;
+            (void)generatedDecodeParams;
             mergeQkvWeight->tpPackType = TP_PACK_QKV;
             mergeQkvWeight->tpQHeads = numAttentionHeads;
             mergeQkvWeight->tpKVHeads = numKeyValueHeads;
@@ -1150,9 +1506,81 @@ namespace fastllm {
             }
 
             int bsz = attenInput->dims[0], seqlen = attenInput->dims[1];
+            if (!isPrefill && externalDecodeMeta) {
+                AssertInFastLLM(batch == 1 && seqlen == 1 &&
+                                insertIndexs != nullptr && insertPositions != nullptr &&
+                                qSizes != nullptr && pageSizes != nullptr &&
+                                pageIndexs != nullptr && lastPageLens != nullptr,
+                                "Step3p5 CUDA graph attention requires external single-token decode metadata.\n");
+                Data &pastKey = *(*batchPastKeys)[0];
+                Data &pastValue = *(*batchPastValues)[0];
+                PagedCacheManager *pagedCacheKManager = pastKey.pagedKVCacheData;
+                PagedCacheManager *pagedCacheVManager = pastValue.pagedKVCacheData;
+                AssertInFastLLM(pagedCacheKManager != nullptr && pagedCacheVManager != nullptr,
+                                "Step3p5 CUDA graph requires paged KV cache managers.\n");
+
+                Data &pagedKData = *(Data*)pagedCacheKManager;
+                Data &pagedVData = *(Data*)pagedCacheVManager;
+                AssertInFastLLM(pagedKData.dims.size() == 4 && pagedVData.dims.size() == 4 &&
+                                pagedKData.cudaData != nullptr && pagedVData.cudaData != nullptr,
+                                "Step3p5 CUDA graph requires allocated paged KV cache data.\n");
+
+                q->dataType = qkv->dataType;
+                q->UpdateUnitSize();
+                Qwen3CudaPrepareLocalOutput(*q, runner.DeviceId());
+                q->Resize({bsz * numAttentionHeads, seqlen, headDim});
+                q->Allocate(false);
+
+                FastllmCudaSetDevice(runner.DeviceId());
+                AssertInFastLLM(
+                    FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
+                        *qkv, *qNormWeight, *kNormWeight, *allPositionIds,
+                        *q,
+                        (uint8_t*)pagedKData.cudaData,
+                        (uint8_t*)pagedVData.cudaData,
+                        (int32_t*)insertIndexs->cudaData,
+                        (int32_t*)insertPositions->cudaData,
+                        nullptr,
+                        numAttentionHeads, numKeyValueHeads, headDim,
+                        rotaryDim, rmsNormEps, ropeTheta, 1.0f,
+                        pagedKData.dims[1], pagedKData.dataType, batch, 1,
+                        useLlama3 ? 1 : 0, ropeFactor,
+                        llama3OriginalMaxPosition,
+                        llama3LowFreqFactor,
+                        llama3HighFreqFactor),
+                    "Step3p5 CUDA graph fused QKV append failed.\n");
+
+                Data &kCaches = *(*batchPastKeys)[0];
+                Data &vCaches = *(*batchPastValues)[0];
+                auto resolvePagedAttentionQType = [&](DataType cacheType, DataType queryType) -> DataType {
+                    if (cacheType == DataType::FP8_E4M3) {
+                        return queryType == DataType::BFLOAT16 ? DataType::BFLOAT16 : DataType::FLOAT16;
+                    }
+                    if (queryType == DataType::FLOAT16 || queryType == DataType::BFLOAT16) {
+                        return queryType;
+                    }
+                    return DataType::FLOAT16;
+                };
+                DataType targetType = resolvePagedAttentionQType(kCaches.dataType, q->dataType);
+                Data *qForAttention = q;
+                if (q->dataType != targetType) {
+                    Qwen3CudaConvertToDataType(runner, *q, *qForAttentionHolder, targetType);
+                    qForAttention = qForAttentionHolder;
+                }
+                Qwen3CudaAttentionPagedBatch(runner, *qForAttention,
+                    kCaches, vCaches,
+                    *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
+                    *attenOutput, numAttentionHeads / numKeyValueHeads,
+                    1.0f / std::sqrt((float)headDim), 1, layerIdx > 0);
+                attenOutput->Reshape({1, seqlen, -1});
+                return;
+            }
+
             int per = qkv->dims.back() / (numAttentionHeads / numKeyValueHeads + 2);
             int qdim = per * (numAttentionHeads / numKeyValueHeads);
-            Data k, v;
+            Data localK, localV;
+            Data &k = kBuffer == nullptr ? localK : *kBuffer;
+            Data &v = vBuffer == nullptr ? localV : *vBuffer;
             Qwen3CudaSplit(runner, *qkv, -1, 0, qdim, *q);
             Qwen3CudaSplit(runner, *qkv, -1, qdim, qdim + per, k);
             Qwen3CudaSplit(runner, *qkv, -1, qdim + per, qdim + per * 2, v);
@@ -1310,6 +1738,541 @@ namespace fastllm {
         return this->threadTpEmptyBiases[name];
     }
 
+    bool Step3p5Model::ForwardSingleGPUDecodeGraph(
+            int gpuId,
+            std::map <int, int> ratios,
+            int batch,
+            const Data &inputIds,
+            const Data &positionIds,
+            const std::vector <int> &seqLens,
+            std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+            bool all1,
+            bool isPrefill,
+            bool tensorParallel,
+            bool firstTensorParallelRank,
+            int pagedCacheLayerOffset,
+            Data &logits) {
+#ifndef USE_CUDA
+        return false;
+#else
+        auto rejectGraph = [](const std::string &) -> bool {
+            return false;
+        };
+        if (!Step3p5CudaGraphEnabled()) {
+            return rejectGraph("disabled");
+        }
+        if (batch != 1 || !all1 || isPrefill ||
+            seqLens.size() != 1 || seqLens[0] != 1 ||
+            (int)pastKeyValues.size() < block_cnt) {
+            return rejectGraph("not single-token decode");
+        }
+
+        int graphParticipants = tensorParallel ? std::max(2, (int)ratios.size()) : 1;
+        auto syncGraphPeers = [&](bool ok = true) {
+            return Step3p5CudaGraphSyncPhase(this, graphParticipants, ok);
+        };
+
+        auto &fusedMoeByDevice = tensorParallel ? threadTpFusedMoeWeights : singleGpuFusedMoeWeights;
+        auto &fusedMoeRangesByDevice = tensorParallel ?
+            threadTpFusedMoeExpertRanges : singleGpuFusedMoeExpertRanges;
+        auto canUseFusedMoeGraph = [&]() -> bool {
+            auto fusedIt = fusedMoeByDevice.find(gpuId);
+            auto rangeIt = fusedMoeRangesByDevice.find(gpuId);
+            if (fusedIt == fusedMoeByDevice.end() || rangeIt == fusedMoeRangesByDevice.end()) {
+                return false;
+            }
+            for (int i = 0; i < block_cnt; i++) {
+                if (!IsMoeLayer(i)) {
+                    continue;
+                }
+                if (i >= (int)fusedIt->second.size() || i >= (int)rangeIt->second.size()) {
+                    return false;
+                }
+                auto &localFusedWeights = fusedIt->second[i];
+                std::pair<int, int> expertRange = rangeIt->second[i];
+                if ((int)localFusedWeights.size() != 3 ||
+                    localFusedWeights[0] == nullptr ||
+                    localFusedWeights[1] == nullptr ||
+                    localFusedWeights[2] == nullptr ||
+                    expertRange.first < 0 ||
+                    expertRange.first >= expertRange.second ||
+                    expertRange.second > num_experts) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (!syncGraphPeers(canUseFusedMoeGraph())) {
+            return rejectGraph("missing fused moe graph weights");
+        }
+
+        auto requireLocal = [&](Data &data, const std::string &name) -> Data* {
+            auto it = data.multiDeviceDatas.find(gpuId);
+            if (it != data.multiDeviceDatas.end() && it->second != nullptr) {
+                return it->second;
+            }
+            if (!tensorParallel) {
+                if (!data.dims.empty() &&
+                    (data.dataDevice != DataDevice::CUDA || data.cudaData == nullptr ||
+                     data.dataDeviceIds.empty() || data.dataDeviceIds[0] != gpuId)) {
+                    data.ToDevice(DataDevice::CUDA, {gpuId}, true);
+                }
+                return &data;
+            }
+            ErrorInFastLLM("Step3p5 ForwardSingleGPU graph missing local tensor: " + name + ".\n");
+            return nullptr;
+        };
+
+        Data *localInputIds = requireLocal((Data&)inputIds, "inputIds");
+        Data *localPositionIds = requireLocal((Data&)positionIds, "positionIds");
+        bool inputOk = localInputIds->dims.size() == 2 &&
+                       localInputIds->dims[0] == 1 &&
+                       localInputIds->dims[1] == 1 &&
+                       !localPositionIds->dims.empty() &&
+                       localPositionIds->Count(0) == 1;
+        if (!syncGraphPeers(inputOk)) {
+            return rejectGraph("input/position dims mismatch");
+        }
+
+        bool kvMetaOk = true;
+        for (int i = 0; i < block_cnt; i++) {
+            Data *pastKey = pastKeyValues[i].first;
+            Data *pastValue = pastKeyValues[i].second;
+            if (pastKey == nullptr || pastValue == nullptr ||
+                pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
+                pastKey->pageIndex.empty() || pastValue->pageIndex.empty() ||
+                pastKey->dataDevice != DataDevice::CUDA || pastValue->dataDevice != DataDevice::CUDA ||
+                pastKey->dataDeviceIds.empty() || pastValue->dataDeviceIds.empty() ||
+                pastKey->dataDeviceIds[0] != gpuId || pastValue->dataDeviceIds[0] != gpuId ||
+                pastKey->dataType == DataType::FP8_E4M3 || pastValue->dataType == DataType::FP8_E4M3 ||
+                pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
+                pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
+                pastKey->lastPageLen != pastValue->lastPageLen) {
+                kvMetaOk = false;
+                break;
+            }
+        }
+        if (!syncGraphPeers(kvMetaOk)) {
+            return rejectGraph("unsupported kv cache metadata");
+        }
+
+        Step3p5CudaGraphDecodeState &state = GetStep3p5CudaGraphDecodeState(this, gpuId);
+        std::unique_lock<std::mutex> graphLock(state.mutex);
+        if (!syncGraphPeers(!Step3p5CudaGraphIsDisabled(this))) {
+            return false;
+        }
+        if (!syncGraphPeers(!state.disabled)) {
+            if (state.disabled) {
+                Step3p5DisableCudaGraph(this);
+            }
+            return false;
+        }
+
+        FastllmCudaSetDevice(gpuId);
+        Step3p5PrepareGraphCudaTensor(state.inputIds, *localInputIds, gpuId);
+        Step3p5PrepareGraphCudaTensor(state.positionIds, *localPositionIds, gpuId);
+
+        Data *firstKey = pastKeyValues[0].first;
+        bool needNewPage = firstKey->pageIndex.empty() || firstKey->lastPageLen >= firstKey->pageLen;
+        int insertIndex = needNewPage ? -1 : firstKey->pageIndex.back();
+        int insertPosition = needNewPage ? 0 : firstKey->lastPageLen;
+
+        for (int i = 0; i < block_cnt; i++) {
+            Data *pastKey = pastKeyValues[i].first;
+            Data *pastValue = pastKeyValues[i].second;
+            bool layerNeedNewPage = pastKey->pageIndex.empty() || pastKey->lastPageLen >= pastKey->pageLen;
+            AssertInFastLLM(layerNeedNewPage == needNewPage,
+                            "Step3p5 CUDA graph requires aligned paged cache layout across layers.\n");
+            if (needNewPage) {
+                int keyPage = pastKey->pagedKVCacheData->GetUnusedPageIndex(true);
+                int valuePage = pastValue->pagedKVCacheData->GetUnusedPageIndex(true);
+                if (insertIndex < 0) {
+                    insertIndex = keyPage;
+                }
+                AssertInFastLLM(keyPage == insertIndex && valuePage == insertIndex,
+                                "Step3p5 CUDA graph requires aligned K/V page indices across layers.\n");
+                pastKey->pageIndex.push_back(keyPage);
+                pastValue->pageIndex.push_back(valuePage);
+                pastKey->lastPageLen = 1;
+                pastValue->lastPageLen = 1;
+            } else {
+                AssertInFastLLM(pastKey->pageIndex.back() == insertIndex &&
+                                pastValue->pageIndex.back() == insertIndex &&
+                                pastKey->lastPageLen == insertPosition &&
+                                pastValue->lastPageLen == insertPosition,
+                                "Step3p5 CUDA graph requires aligned paged cache positions across layers.\n");
+                pastKey->lastPageLen++;
+                pastValue->lastPageLen++;
+            }
+        }
+
+        std::vector<int> pageIndexHost = firstKey->pageIndex;
+        int lastPageLen = firstKey->lastPageLen;
+        Step3p5PrepareGraphIntTensor(state.metaBuffers.insertIndexs, gpuId, {insertIndex});
+        Step3p5PrepareGraphIntTensor(state.metaBuffers.insertPositions, gpuId, {insertPosition});
+        Step3p5PrepareGraphIntTensor(state.metaBuffers.qSizes, gpuId, {0, 1});
+        Step3p5PrepareGraphIntTensor(state.metaBuffers.pageSizes, gpuId, {0, (int)pageIndexHost.size()});
+        Step3p5PrepareGraphIntTensor(state.metaBuffers.pageIndexs, gpuId, pageIndexHost);
+        Step3p5PrepareGraphIntTensor(state.metaBuffers.lastPageLens, gpuId, {lastPageLen});
+
+        std::ostringstream signature;
+        signature << "gpu=" << gpuId
+                  << ";tp=" << (tensorParallel ? 1 : 0)
+                  << ";tpRank0=" << (firstTensorParallelRank ? 1 : 0)
+                  << ";pages=" << pageIndexHost.size()
+                  << ";inputType=" << (int)state.inputIds.dataType
+                  << ";posType=" << (int)state.positionIds.dataType
+                  << ";kCache=" << pastKeyValues[0].first->pagedKVCacheData->cudaData
+                  << ";vCache=" << pastKeyValues[0].second->pagedKVCacheData->cudaData
+                  << ";lmLocal=" << requireLocal(weight["lm_head.weight"], "lm_head.weight")->dims[0];
+        std::string newSignature = signature.str();
+        if (state.signature != newSignature) {
+            Step3p5DestroyCudaGraph(state);
+            state.signature = newSignature;
+        }
+
+        const DataType computeType = ResolveStep3p5ThreadTpComputeType(this->dataType);
+        auto runGraphBodyWithBuffers = [&](Step3p5ForwardSingleBuffers &buf,
+                                           Step3p5ForwardSingleBuffers &metaBuf) {
+            Qwen3CudaDirectRunner cudaRunner(gpuId);
+            if ((int)buf.batchPastKeys.size() != batch) {
+                buf.batchPastKeys.resize(batch);
+                buf.batchPastValues.resize(batch);
+            }
+
+            Qwen3CudaEmbeddingDirect(cudaRunner,
+                                     state.inputIds,
+                                     *requireLocal(weight["model.embed_tokens.weight"], "model.embed_tokens.weight"),
+                                     buf.hiddenStates);
+            if (buf.hiddenStates.dataType != computeType) {
+                Qwen3CudaToDataType(cudaRunner, buf.hiddenStates, computeType);
+            }
+
+            auto runFeedForwardOutput = [&](Data &input,
+                                            const std::string &gateupName,
+                                            const std::string &gateName,
+                                            const std::string &upName,
+                                            const std::string &downName,
+                                            float limit,
+                                            Data &middle,
+                                            Data &act,
+                                            Data &upOut,
+                                            Data &output) {
+                if (limit == 0.0f && weight.weight.find(gateupName) != weight.weight.end()) {
+                    Qwen3CudaLinearSwiglu(cudaRunner, input,
+                                          *requireLocal(weight[gateupName], gateupName),
+                                          *requireLocal(GetThreadTensorParallelBias(gateupName + ".tp_bias"),
+                                                        gateupName + ".tp_bias"),
+                                          middle, act);
+                } else {
+                    Qwen3CudaLinear(cudaRunner, input,
+                                    *requireLocal(weight[gateName], gateName),
+                                    *requireLocal(GetThreadTensorParallelBias(gateName + ".tp_bias"),
+                                                  gateName + ".tp_bias"),
+                                    act);
+                    Step3p5CudaSilu(cudaRunner, act, act);
+                    Qwen3CudaLinear(cudaRunner, input,
+                                    *requireLocal(weight[upName], upName),
+                                    *requireLocal(GetThreadTensorParallelBias(upName + ".tp_bias"),
+                                                  upName + ".tp_bias"),
+                                    upOut);
+                    if (limit != 0.0f) {
+                        Step3p5CudaClamp(act, false, 0.0f, true, limit, gpuId);
+                        Step3p5CudaClamp(upOut, true, -limit, true, limit, gpuId);
+                    }
+                    if (upOut.dataType != act.dataType) {
+                        Qwen3CudaToDataType(cudaRunner, upOut, act.dataType);
+                    }
+                    Step3p5CudaMulTo(cudaRunner, act, upOut);
+                }
+                Qwen3CudaLinear(cudaRunner, act,
+                                *requireLocal(weight[downName], downName),
+                                *requireLocal(GetThreadTensorParallelBias(downName + ".tp_bias"),
+                                              downName + ".tp_bias"),
+                                output);
+            };
+
+            auto addPartialToResidualReduce = [&](Data &partial) {
+                if (partial.dataType != buf.hiddenStates.dataType) {
+                    Qwen3CudaToDataType(cudaRunner, partial, buf.hiddenStates.dataType);
+                }
+                if (tensorParallel) {
+                    if (firstTensorParallelRank) {
+                        Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, partial);
+                    } else {
+                        Step3p5CudaCopyTensor(cudaRunner, partial, buf.hiddenStates);
+                    }
+                    FastllmNcclAllReduce(buf.hiddenStates.cudaData, buf.hiddenStates.cudaData,
+                                         buf.hiddenStates.Count(0), buf.hiddenStates.dataType, gpuId);
+                } else {
+                    Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, partial);
+                }
+            };
+
+            bool generatedAppendParams = false;
+            bool generatedDecodeParams = false;
+            for (int i = 0; i < block_cnt; i++) {
+                std::string prefix = "model.layers." + std::to_string(i) + ".";
+                std::string inputRmsName = prefix + "input_layernorm.weight";
+                std::string postRmsName = prefix + "post_attention_layernorm.weight";
+                std::string mergeQkvWeightName = prefix + "self_attn.mergeqkv.weight";
+                std::string mergeQkvBiasName = prefix + "self_attn.mergeqkv.bias";
+                std::string qNormName = prefix + "self_attn.q_norm.weight";
+                std::string kNormName = prefix + "self_attn.k_norm.weight";
+                std::string gProjName = prefix + "self_attn.g_proj.weight";
+                std::string oWeightName = prefix + "self_attn.o_proj.weight";
+                std::string oBiasName = prefix + "self_attn.o_proj.bias";
+                int qHeads = LayerAttentionHeads(i);
+                int kvHeads = LayerKeyValueHeads(i);
+                int curRotaryDim = i < (int)layer_rotary_dims.size() ? layer_rotary_dims[i] : head_dim;
+                float curTheta = i < (int)layer_rope_thetas.size() ? layer_rope_thetas[i] : rope_base;
+
+                Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
+                                 *requireLocal(weight[inputRmsName], inputRmsName),
+                                 rms_norm_eps, buf.attenInput);
+
+                Data *localMergeW = requireLocal(weight[mergeQkvWeightName], mergeQkvWeightName);
+                int group = qHeads / kvHeads;
+                int localKVHeads = localMergeW->tpKVHeads > 0 ?
+                    localMergeW->tpKVHeads : localMergeW->dims[0] / ((group + 2) * head_dim);
+                int localQHeads = localMergeW->tpQHeads > 0 ?
+                    localMergeW->tpQHeads : localKVHeads * group;
+                AssertInFastLLM(localKVHeads > 0 && localQHeads > 0,
+                                "Step3p5 ForwardSingleGPU graph got empty local attention shard.\n");
+
+                Step3p5CudaAttentionPagedBlock(
+                    cudaRunner,
+                    &buf.attenInput,
+                    localMergeW, requireLocal(GetThreadTensorParallelBias(mergeQkvBiasName), mergeQkvBiasName),
+                    requireLocal(weight[qNormName], qNormName),
+                    requireLocal(weight[kNormName], kNormName),
+                    &state.positionIds,
+                    &pastKeyValues,
+                    &buf.batchPastKeys, &buf.batchPastValues,
+                    &buf.qkv, &buf.q, &buf.k, &buf.v, &buf.attenOutput,
+                    &buf.qForAttentionHolder,
+                    &metaBuf.insertIndexs, &metaBuf.insertPositions,
+                    &metaBuf.qSizes, &metaBuf.pageSizes, &metaBuf.pageIndexs, &metaBuf.lastPageLens,
+                    &generatedAppendParams, &generatedDecodeParams,
+                    batch, block_cnt, i,
+                    seqLens,
+                    localQHeads, localKVHeads, head_dim,
+                    curRotaryDim, rms_norm_eps,
+                    curTheta, rope_factor, UseLlama3Rope(i),
+                    llama3_original_max_position_embeddings,
+                    llama3_low_freq_factor,
+                    llama3_high_freq_factor,
+                    GetKVCacheInCPU(),
+                    pagedCacheLayerOffset,
+                    false,
+                    true
+                );
+                if (buf.attenOutput.dataType != computeType) {
+                    Qwen3CudaToDataType(cudaRunner, buf.attenOutput, computeType);
+                }
+
+                Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                *requireLocal(weight[gProjName], gProjName),
+                                *GetEmptyData(), buf.gate);
+                Step3p5CudaSigmoid(cudaRunner, buf.gate, buf.gate);
+                int bsz = buf.attenInput.dims[0], seqlen = buf.attenInput.dims[1];
+                buf.gate.Reshape({bsz, seqlen, localQHeads, 1});
+                Step3p5CudaRepeat(cudaRunner, buf.gate, 3, head_dim, buf.gateRep);
+                if (buf.gateRep.dataType != buf.attenOutput.dataType) {
+                    Qwen3CudaToDataType(cudaRunner, buf.gateRep, buf.attenOutput.dataType);
+                }
+                buf.attenOutput.Reshape({bsz, seqlen, localQHeads, head_dim});
+                Step3p5CudaMulTo(cudaRunner, buf.attenOutput, buf.gateRep);
+                buf.attenOutput.Reshape({bsz, seqlen, localQHeads * head_dim});
+
+                Qwen3CudaLinearResidualReduce(
+                    cudaRunner, buf.attenOutput,
+                    *requireLocal(weight[oWeightName], oWeightName),
+                    *requireLocal(GetThreadTensorParallelBias(oBiasName), oBiasName),
+                    buf.attenLastOutput, buf.hiddenStates,
+                    tensorParallel, firstTensorParallelRank, gpuId);
+
+                Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
+                                 *requireLocal(weight[postRmsName], postRmsName),
+                                 rms_norm_eps, buf.attenInput);
+                if (!IsMoeLayer(i)) {
+                    runFeedForwardOutput(buf.attenInput,
+                                         prefix + "mlp.gateup_proj.weight",
+                                         prefix + "mlp.gate_proj.weight",
+                                         prefix + "mlp.up_proj.weight",
+                                         prefix + "mlp.down_proj.weight",
+                                         Step3p5LayerLimit(swiglu_limits_shared, i),
+                                         buf.ffMiddle, buf.ffAct, buf.ffUp, buf.ffOut);
+                    addPartialToResidualReduce(buf.ffOut);
+                } else {
+                    runFeedForwardOutput(buf.attenInput,
+                                         prefix + "share_expert.gateup_proj.weight",
+                                         prefix + "share_expert.gate_proj.weight",
+                                         prefix + "share_expert.up_proj.weight",
+                                         prefix + "share_expert.down_proj.weight",
+                                         Step3p5LayerLimit(swiglu_limits_shared, i),
+                                         buf.ffMiddle, buf.ffAct, buf.ffUp, buf.shareOutput);
+                    if (buf.shareOutput.dataType != buf.hiddenStates.dataType) {
+                        Qwen3CudaToDataType(cudaRunner, buf.shareOutput, buf.hiddenStates.dataType);
+                    }
+                    if (tensorParallel) {
+                        FastllmNcclAllReduce(buf.shareOutput.cudaData, buf.shareOutput.cudaData,
+                                             buf.shareOutput.Count(0), buf.shareOutput.dataType, gpuId);
+                    }
+                    Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, buf.shareOutput);
+
+                    int flatBatch = buf.attenInput.dims[0];
+                    int flatLen = buf.attenInput.dims[1];
+                    buf.attenInput.Reshape({flatBatch * flatLen, buf.attenInput.dims[2]});
+                    Qwen3CudaLinear(cudaRunner, buf.attenInput,
+                                    *requireLocal(weight[prefix + "moe.gate.weight"], prefix + "moe.gate.weight"),
+                                    *GetEmptyData(), buf.routerLogits, true);
+                    Qwen3CudaConvertToDataType(cudaRunner, buf.routerLogits, buf.routerProb, DataType::FLOAT32);
+                    Step3p5CudaSigmoid(cudaRunner, buf.routerProb, buf.routerProb);
+                    Data *localGateBias = nullptr;
+                    if (use_moe_router_bias &&
+                        weight.weight.find(prefix + "moe.router_bias") != weight.weight.end()) {
+                        localGateBias = requireLocal(weight[prefix + "moe.router_bias"], prefix + "moe.router_bias");
+                    }
+                    Qwen3CudaSelectExpert(cudaRunner, buf.routerProb, buf.expertIndex, buf.expertScore,
+                                          num_experts_per_tok, norm_topk_prob,
+                                          routed_scaling_factor, localGateBias);
+
+                    auto &localFusedWeights = fusedMoeByDevice.at(gpuId)[i];
+                    std::pair<int, int> expertRange = fusedMoeRangesByDevice.at(gpuId)[i];
+                    AssertInFastLLM((int)localFusedWeights.size() == 3 &&
+                                    localFusedWeights[0] != nullptr &&
+                                    localFusedWeights[1] != nullptr &&
+                                    localFusedWeights[2] != nullptr &&
+                                    Step3p5MaskAndRemapExpertsForLocalRange(
+                                        buf.expertIndex, buf.expertScore,
+                                        expertRange.first, expertRange.second,
+                                        num_experts, gpuId, true),
+                                    "Step3p5 CUDA graph requires local fused MoE expert weights.\n");
+                    Step3p5CudaFusedMOE(cudaRunner, buf.attenInput, buf.expertIndex, buf.expertScore,
+                                        *localFusedWeights[0], *localFusedWeights[1],
+                                        *localFusedWeights[2], buf.w1, buf.moeFinal, i,
+                                        Step3p5LayerLimit(swiglu_limits, i));
+                    buf.moeFinal.Reshape(buf.hiddenStates.dims);
+                    if (buf.moeFinal.dataType != buf.hiddenStates.dataType) {
+                        Qwen3CudaToDataType(cudaRunner, buf.moeFinal, buf.hiddenStates.dataType);
+                    }
+                    if (tensorParallel) {
+                        FastllmNcclAllReduce(buf.moeFinal.cudaData, buf.moeFinal.cudaData,
+                                             buf.moeFinal.Count(0), buf.moeFinal.dataType, gpuId);
+                    }
+                    Qwen3CudaAddTo(cudaRunner, buf.hiddenStates, buf.moeFinal);
+                }
+            }
+
+            Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
+                             *requireLocal(weight["model.norm.weight"], "model.norm.weight"),
+                             rms_norm_eps, buf.hiddenStates);
+            Qwen3CudaLinear(cudaRunner, buf.hiddenStates,
+                            *requireLocal(weight["lm_head.weight"], "lm_head.weight"),
+                            *requireLocal(GetThreadTensorParallelBias("lm_head.weight.tp_bias"),
+                                          "lm_head.weight.tp_bias"),
+                            state.logits);
+            Qwen3CudaToDataType(cudaRunner, state.logits, DataType::FLOAT32);
+        };
+
+        auto runGraphBody = [&]() {
+            runGraphBodyWithBuffers(state.buffers, state.metaBuffers);
+        };
+
+        auto finishWithLogits = [&]() {
+            Step3p5PrepareGraphCudaTensor(logits, state.logits, gpuId);
+        };
+
+        auto runWithoutGraph = [&]() {
+            runGraphBody();
+            finishWithLogits();
+        };
+
+        if (state.captured) {
+            if (!syncGraphPeers()) {
+                return false;
+            }
+            bool launchOk = FastllmCudaGraphLaunch(state.exec);
+            if (Step3p5SyncCudaGraphStage(this, state, graphParticipants,
+                                          "replay", gpuId, launchOk)) {
+                finishWithLogits();
+                return true;
+            }
+            runWithoutGraph();
+            return true;
+        }
+
+        if (!state.warmed) {
+            runWithoutGraph();
+            if (!syncGraphPeers()) {
+                Step3p5DisableCudaGraphState(this, state);
+                return true;
+            }
+            state.warmed = true;
+            return true;
+        }
+
+        void *capturedGraph = nullptr;
+        if (!syncGraphPeers()) {
+            return false;
+        }
+        bool beginOk = FastllmCudaGraphBeginCapture();
+        if (!Step3p5SyncCudaGraphStage(this, state, graphParticipants,
+                                       "begin capture", gpuId, beginOk)) {
+            if (beginOk) {
+                Step3p5AbortCudaGraphCapture();
+            }
+            runWithoutGraph();
+            return true;
+        }
+        runGraphBody();
+        if (!syncGraphPeers()) {
+            Step3p5AbortCudaGraphCapture();
+            Step3p5DisableCudaGraphState(this, state);
+            runWithoutGraph();
+            return true;
+        }
+        bool endOk = FastllmCudaGraphEndCapture(&capturedGraph) && capturedGraph != nullptr;
+        if (!Step3p5SyncCudaGraphStage(this, state, graphParticipants,
+                                       "end capture", gpuId, endOk)) {
+            if (capturedGraph != nullptr) {
+                FastllmCudaGraphDestroy(capturedGraph);
+            }
+            runWithoutGraph();
+            return true;
+        }
+
+        void *capturedExec = nullptr;
+        bool instantiateOk = FastllmCudaGraphInstantiate(capturedGraph, &capturedExec) &&
+                             capturedExec != nullptr;
+        if (!Step3p5SyncCudaGraphStage(this, state, graphParticipants,
+                                       "instantiate", gpuId, instantiateOk)) {
+            if (capturedExec != nullptr) {
+                FastllmCudaGraphExecDestroy(capturedExec);
+            }
+            FastllmCudaGraphDestroy(capturedGraph);
+            runWithoutGraph();
+            return true;
+        }
+
+        state.graph = capturedGraph;
+        state.exec = capturedExec;
+        state.captured = true;
+        if (!syncGraphPeers()) {
+            return false;
+        }
+        bool firstLaunchOk = FastllmCudaGraphLaunch(state.exec);
+        if (!Step3p5SyncCudaGraphStage(this, state, graphParticipants,
+                                       "first launch", gpuId, firstLaunchOk)) {
+            runWithoutGraph();
+            return true;
+        }
+        finishWithLogits();
+        return true;
+#endif
+    }
+
     void Step3p5Model::ForwardSingleGPU(
             int gpuId,
             std::map <int, int> ratios,
@@ -1327,10 +2290,22 @@ namespace fastllm {
 #ifndef USE_CUDA
         ErrorInFastLLM("Step3p5 ForwardSingleGPU requires CUDA.\n");
 #else
-        (void)isPrefill;
         AssertInFastLLM(ratios.find(gpuId) == ratios.end() || ratios[gpuId] > 0,
                         "Step3p5 ForwardSingleGPU got invalid GPU ratio.\n");
         FastllmCudaSetDevice(gpuId);
+        if (isPrefill && Step3p5CudaGraphEnabled()) {
+            Step3p5CudaGraphDecodeState &graphState = GetStep3p5CudaGraphDecodeState(this, gpuId);
+            std::lock_guard<std::mutex> graphGuard(graphState.mutex);
+            Step3p5DestroyCudaGraph(graphState);
+            Step3p5ReinitializeForwardSingleBuffers(graphState.buffers);
+            Step3p5ReinitializeForwardSingleBuffers(graphState.metaBuffers);
+        }
+        if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
+                                        seqLens, pastKeyValues, all1, isPrefill,
+                                        tensorParallel, firstTensorParallelRank,
+                                        pagedCacheLayerOffset, logits)) {
+            return;
+        }
         Qwen3CudaDirectRunner cudaRunner(gpuId);
 
         auto requireLocal = [&](Data &data, const std::string &name) -> Data* {
@@ -1474,9 +2449,11 @@ namespace fastllm {
                 requireLocal((Data&)positionIds, "positionIds"),
                 &pastKeyValues,
                 &batchPastKeys, &batchPastValues,
-                &qkv, &q, &attenOutput,
+                &qkv, &q, nullptr, nullptr, &attenOutput,
                 &qForAttentionHolder,
+                nullptr, nullptr,
                 &qSizes, &pageSizes, &pageIndexs, &lastPageLens,
+                nullptr, nullptr,
                 batch, block_cnt, i,
                 seqLens,
                 localQHeads, localKVHeads, head_dim,
@@ -1486,7 +2463,9 @@ namespace fastllm {
                 llama3_low_freq_factor,
                 llama3_high_freq_factor,
                 GetKVCacheInCPU(),
-                pagedCacheLayerOffset
+                pagedCacheLayerOffset,
+                isPrefill,
+                false
             );
             Step3p5DebugSync(gpuId, i, "after_attention");
             if (attenOutput.dataType != computeType) {

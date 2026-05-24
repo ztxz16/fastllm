@@ -124,6 +124,20 @@ namespace fastllm {
                 bool firstTensorParallelRank,
                 int pagedCacheLayerOffset,
                 Data &logits);
+        bool ForwardSingleGPUDecodeGraph(
+                int gpuId,
+                std::map <int, int> ratios,
+                int batch,
+                const Data &inputIds,
+                const Data &positionIds,
+                const std::vector <int> &seqLens,
+                std::vector <std::pair <Data*, Data*> > &pastKeyValues,
+                bool all1,
+                bool isPrefill,
+                bool tensorParallel,
+                bool firstTensorParallelRank,
+                int pagedCacheLayerOffset,
+                Data &logits);
         Data &GetThreadTensorParallelBias(const std::string &name);
 
         std::unordered_map <std::string, Data> threadTpEmptyBiases;

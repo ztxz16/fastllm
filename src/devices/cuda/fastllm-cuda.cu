@@ -2843,6 +2843,51 @@ __device__ __forceinline__ __nv_fp8_e4m3 FastllmCudaFloatToValue<__nv_fp8_e4m3>(
     return __nv_fp8_e4m3(value);
 }
 
+template <typename T>
+__global__ void FastllmClampKernel(T *data, int len, bool hasMin, float minValue, bool hasMax, float maxValue) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= len) {
+        return;
+    }
+    float x = FastllmCudaValueToFloat(data[idx]);
+    if (hasMin && x < minValue) {
+        x = minValue;
+    }
+    if (hasMax && x > maxValue) {
+        x = maxValue;
+    }
+    data[idx] = FastllmCudaFloatToValue<T>(x);
+}
+
+bool FastllmCudaClamp(fastllm::Data &input, bool hasMin, float minValue, bool hasMax, float maxValue) {
+    if (!hasMin && !hasMax) {
+        return true;
+    }
+    if (input.dataDevice != fastllm::DataDevice::CUDA || input.cudaData == nullptr) {
+        return false;
+    }
+    int len = input.Count(0);
+    if (len <= 0) {
+        return true;
+    }
+    int threadPerBlock = std::min(1024, len);
+    int blocks = (len - 1) / threadPerBlock + 1;
+    if (input.dataType == fastllm::DataType::FLOAT32) {
+        FastllmClampKernel <<< blocks, threadPerBlock >>> (
+            (float*)input.cudaData, len, hasMin, minValue, hasMax, maxValue);
+    } else if (input.dataType == fastllm::DataType::FLOAT16) {
+        FastllmClampKernel <<< blocks, threadPerBlock >>> (
+            (half*)input.cudaData, len, hasMin, minValue, hasMax, maxValue);
+    } else if (input.dataType == fastllm::DataType::BFLOAT16) {
+        FastllmClampKernel <<< blocks, threadPerBlock >>> (
+            (__nv_bfloat16*)input.cudaData, len, hasMin, minValue, hasMax, maxValue);
+    } else {
+        return false;
+    }
+    DeviceSync();
+    return true;
+}
+
 template<typename T>
 __global__ void TransferAttnKernelFused(T *data, int n, int m, int outer) {
     extern __shared__ float shared[];
@@ -4958,7 +5003,12 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
     float ropeScale,
     int pageLen,             // page length for paged cache
     int batch,               // 逻辑 batch 数（= insertIndexs 长度）
-    int doQKNorm             // 是否做 QK RMSNorm（0 = 跳过）
+    int doQKNorm,            // 是否做 QK RMSNorm（0 = 跳过）
+    int useLlama3,
+    float llama3Factor,
+    float llama3OriginalMaxPosition,
+    float llama3LowFreqFactor,
+    float llama3HighFreqFactor
 ) {
     int total_heads = q_heads + k_heads + v_heads;
     int block_id = blockIdx.x;
@@ -5041,9 +5091,19 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
         int half_rotate = rotateDim / 2;
         if ((int)tid < half_rotate) {
             int j = tid;
-            int index = (int)(positionIds[phys_b * partStride + phys_l]);
-            float position = (float)index / ropeScale;
-            float freq = position / powf(ropeTheta, (float)(2 * j) / rotateDim);
+            float rawPosition = positionIds[phys_b * partStride + phys_l];
+            float invFreq = 1.0f / powf(ropeTheta, (float)(2 * j) / rotateDim);
+            float freq;
+            if (useLlama3) {
+                invFreq = FastllmLlama3InvFreq(invFreq, llama3Factor,
+                                                llama3OriginalMaxPosition,
+                                                llama3LowFreqFactor,
+                                                llama3HighFreqFactor);
+                freq = rawPosition * invFreq;
+            } else {
+                float position = (float)((int)rawPosition) / ropeScale;
+                freq = position * invFreq;
+            }
             float curSin = sinf(freq);
             float curCos = cosf(freq);
 
@@ -5106,7 +5166,11 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     int q_heads, int k_heads, int head_dim,
     int rotateDim, float eps, float ropeTheta, float ropeScale,
     int pageLen, fastllm::DataType pagedDataType, int batch,
-    int doQKNorm
+    int doQKNorm,
+    int useLlama3, float llama3Factor,
+    float llama3OriginalMaxPosition,
+    float llama3LowFreqFactor,
+    float llama3HighFreqFactor
 ) {
     float *cudaQKV = (float *) FastllmCudaPrepareInput(qkv);
     float *cudaPositionIds = (float *) FastllmCudaPrepareInput(positionIds);
@@ -5131,7 +5195,9 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
             cudaPositionIds, qOutputPtr,
             (KVT*)pagedKData, (KVT*)pagedVData, insertIndexs, insertPositions, lastPageLens,
             outer, total_dim, q_heads, k_heads, v_heads, head_dim,
-            bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm);
+            bs, seqlen, partStride, rotateDim, eps, ropeTheta, ropeScale, pageLen, batch, doQKNorm,
+            useLlama3, llama3Factor, llama3OriginalMaxPosition,
+            llama3LowFreqFactor, llama3HighFreqFactor);
     };
 
     auto launchByPagedType = [&](auto TPB, auto *qkvPtr, auto *qOutputPtr) {
@@ -5165,6 +5231,12 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     }
 
     FastllmCudaFinishInput(positionIds, cudaPositionIds);
+    cudaError_t launchError = cudaGetLastError();
+    if (launchError != cudaSuccess) {
+        printf("FastllmCudaQKVRMSNormRopeSplitAppendPagedCache: kernel launch failed: %s\n",
+               cudaGetErrorString(launchError));
+        return false;
+    }
     // 注意: 不需要 FinishOutput qkv，因为 qkv 内容已经不再需要
     return true;
 }
