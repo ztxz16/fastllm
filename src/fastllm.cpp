@@ -272,6 +272,7 @@ namespace fastllm {
 
         this->printLogits = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_PRINT_LOGITS"));
         this->skipWarmup = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_SKIP_WARMUP"));
+        this->cudaGraph = IsEnvValueTrueIgnoreCase(std::getenv("FASTLLM_CUDA_GRAPH"));
 
         const char *useFusedTransferAttnEnv = std::getenv("FASTLLM_USE_FUSED_TRANSFER_ATTN");
         if (useFusedTransferAttnEnv != nullptr && std::strcmp(useFusedTransferAttnEnv, "0") == 0) {

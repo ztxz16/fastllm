@@ -42,6 +42,7 @@ namespace fastllm {
         bool cudaSync = false;
         bool printLogits = false;
         bool skipWarmup = false;
+        bool cudaGraph = false;
         bool useFusedTransferAttn = true;
         bool useFusedGdnPrefill = true;
         std::string debugTokenId;

@@ -50,12 +50,6 @@ namespace fastllm {
             return s.substr(l, r - l);
         }
 
-        static bool Qwen3MoeIsDisabledTpValue(const std::string &value) {
-            std::string v = value;
-            std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-            return v.empty() || v == "0" || v == "false" || v == "off" || v == "none" || v == "disable";
-        }
-
         static bool Qwen3MoeIsDisabledTpSpec(const std::string &value) {
             std::string v = value;
             std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char)std::tolower(c); });
@@ -300,11 +294,7 @@ namespace fastllm {
         }
 
         static bool Qwen3MoeCudaGraphEnabled() {
-            const char *env = std::getenv("FASTLLM_QWEN3_MOE_CUDA_GRAPH");
-            if (env == nullptr) {
-                env = std::getenv("FASTLLM_QWEN3_CUDA_GRAPH");
-            }
-            return env != nullptr && !Qwen3MoeIsDisabledTpValue(Qwen3MoeTrimString(env));
+            return GetFastllmEnv().cudaGraph;
         }
 
         static bool Qwen3MoeNeedRepeatPenalty(const GenerationConfig &config) {

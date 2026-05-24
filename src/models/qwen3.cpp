@@ -46,12 +46,6 @@ namespace fastllm {
             return s.substr(l, r - l);
         }
 
-        static bool IsDisabledTpValue(const std::string &value) {
-            std::string v = value;
-            std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-            return v.empty() || v == "0" || v == "false" || v == "off" || v == "none" || v == "disable";
-        }
-
         static bool IsDisabledQwen3TpSpec(const std::string &value) {
             std::string v = value;
             std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return (char)std::tolower(c); });
@@ -363,8 +357,7 @@ namespace fastllm {
         }
 
         static bool Qwen3CudaGraphEnabled() {
-            const char *env = std::getenv("FASTLLM_QWEN3_CUDA_GRAPH");
-            return env == nullptr || !IsDisabledTpValue(TrimString(env));
+            return GetFastllmEnv().cudaGraph;
         }
 
         static void Qwen3PrepareGraphCudaTensor(Data &dst, const Data &src, int device) {

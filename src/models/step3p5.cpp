@@ -1051,11 +1051,7 @@ namespace fastllm {
         };
 
         static bool Step3p5CudaGraphEnabled() {
-            const char *env = std::getenv("FASTLLM_STEP3P5_CUDA_GRAPH");
-            if (env == nullptr) {
-                env = std::getenv("FASTLLM_QWEN3_CUDA_GRAPH");
-            }
-            return env != nullptr && !Step3p5IsDisabledTpSpec(Step3p5TrimString(env));
+            return GetFastllmEnv().cudaGraph;
         }
 
         static Step3p5CudaGraphSyncState &GetStep3p5CudaGraphSyncState(const Step3p5Model *model) {
