@@ -285,6 +285,7 @@ namespace fastllm {
         }
 
         struct Qwen3ForwardSingleBuffers {
+            Data embedOutput;
             Data hiddenStates;
             Data attenInput;
             Data qkv;
@@ -318,6 +319,7 @@ namespace fastllm {
             Data inputIds;
             Data positionIds;
             Qwen3ForwardSingleBuffers buffers;
+            Data logitsHalf;
             Data logits;
 
             ~Qwen3CudaGraphDecodeState() {
@@ -1433,13 +1435,13 @@ namespace fastllm {
                 buf.batchPastValues.resize(batch);
             }
 
-            Qwen3CudaEmbeddingDirect(cudaRunner,
-                                     state.inputIds,
-                                     *requireLocal(weight["model.embed_tokens.weight"], "model.embed_tokens.weight"),
-                                     buf.hiddenStates);
+            Data *embedWeight = requireLocal(weight["model.embed_tokens.weight"], "model.embed_tokens.weight");
             const DataType computeType = ResolveQwen3ThreadTpComputeType(this->dataType);
-            if (buf.hiddenStates.dataType != computeType) {
-                Qwen3CudaToDataType(cudaRunner, buf.hiddenStates, computeType);
+            if (embedWeight->dataType == computeType) {
+                Qwen3CudaEmbeddingDirect(cudaRunner, state.inputIds, *embedWeight, buf.hiddenStates);
+            } else {
+                Qwen3CudaEmbeddingDirect(cudaRunner, state.inputIds, *embedWeight, buf.embedOutput);
+                Qwen3CudaConvertToDataType(cudaRunner, buf.embedOutput, buf.hiddenStates, computeType);
             }
 
             bool generatedAppendParams = false;
@@ -1532,12 +1534,13 @@ namespace fastllm {
             Qwen3CudaRMSNorm(cudaRunner, buf.hiddenStates,
                              *requireLocal(weight["model.norm.weight"], "model.norm.weight"),
                              rms_norm_eps, buf.hiddenStates);
+            // Keep graph-captured buffers stable; in-place dtype conversion can realloc/free logits.
             Qwen3CudaLinear(cudaRunner, buf.hiddenStates,
                             *requireLocal(weight["lm_head.weight"], "lm_head.weight"),
                             *requireLocal(GetThreadTensorParallelBias("lm_head.weight.tp_bias"),
                                           "lm_head.weight.tp_bias"),
-                            state.logits);
-            Qwen3CudaToDataType(cudaRunner, state.logits, DataType::FLOAT32);
+                            state.logitsHalf);
+            Qwen3CudaConvertToDataType(cudaRunner, state.logitsHalf, state.logits, DataType::FLOAT32);
         };
 
         auto finishWithLogits = [&]() {
