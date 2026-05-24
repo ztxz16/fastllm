@@ -23,6 +23,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <tuple>
 
 namespace fastllm {
     static const std::string STEP3P5_BOS = "<｜begin▁of▁sentence｜>";
@@ -1159,18 +1160,42 @@ namespace fastllm {
             return allOk;
         }
 
-        static Step3p5CudaGraphDecodeState &GetStep3p5CudaGraphDecodeState(
-                const Step3p5Model *model, int gpuId) {
+        using Step3p5CudaGraphStateKey = std::tuple<const Step3p5Model*, int, int>;
+
+        static std::mutex &Step3p5CudaGraphStatesMutex() {
             static std::mutex statesMutex;
-            static std::map<std::pair<const Step3p5Model*, int>,
-                            std::unique_ptr<Step3p5CudaGraphDecodeState> > states;
-            std::lock_guard<std::mutex> guard(statesMutex);
-            auto key = std::make_pair(model, gpuId);
+            return statesMutex;
+        }
+
+        static std::map<Step3p5CudaGraphStateKey, std::unique_ptr<Step3p5CudaGraphDecodeState> > &Step3p5CudaGraphStates() {
+            static std::map<Step3p5CudaGraphStateKey, std::unique_ptr<Step3p5CudaGraphDecodeState> > states;
+            return states;
+        }
+
+        static Step3p5CudaGraphDecodeState &GetStep3p5CudaGraphDecodeState(
+                const Step3p5Model *model, int gpuId, int batch) {
+            std::lock_guard<std::mutex> guard(Step3p5CudaGraphStatesMutex());
+            auto &states = Step3p5CudaGraphStates();
+            auto key = std::make_tuple(model, gpuId, batch);
             auto &state = states[key];
             if (state == nullptr) {
                 state.reset(new Step3p5CudaGraphDecodeState());
             }
             return *state;
+        }
+
+        static void Step3p5DestroyCudaGraphDecodeStates(const Step3p5Model *model, int gpuId) {
+            std::lock_guard<std::mutex> guard(Step3p5CudaGraphStatesMutex());
+            auto &states = Step3p5CudaGraphStates();
+            for (auto &it : states) {
+                if (std::get<0>(it.first) == model && std::get<1>(it.first) == gpuId &&
+                    it.second != nullptr) {
+                    std::lock_guard<std::mutex> stateGuard(it.second->mutex);
+                    Step3p5DestroyCudaGraph(*it.second);
+                    Step3p5ReinitializeForwardSingleBuffers(it.second->buffers);
+                    Step3p5ReinitializeForwardSingleBuffers(it.second->metaBuffers);
+                }
+            }
         }
 
         static void Step3p5PrepareGraphCudaTensor(Data &dst, const Data &src, int device) {
@@ -1503,11 +1528,11 @@ namespace fastllm {
 
             int bsz = attenInput->dims[0], seqlen = attenInput->dims[1];
             if (!isPrefill && externalDecodeMeta) {
-                AssertInFastLLM(batch == 1 && seqlen == 1 &&
+                AssertInFastLLM(bsz * seqlen == batch &&
                                 insertIndexs != nullptr && insertPositions != nullptr &&
                                 qSizes != nullptr && pageSizes != nullptr &&
                                 pageIndexs != nullptr && lastPageLens != nullptr,
-                                "Step3p5 CUDA graph attention requires external single-token decode metadata.\n");
+                                "Step3p5 CUDA graph attention requires external single-token batch decode metadata.\n");
                 Data &pastKey = *(*batchPastKeys)[0];
                 Data &pastValue = *(*batchPastValues)[0];
                 PagedCacheManager *pagedCacheKManager = pastKey.pagedKVCacheData;
@@ -1568,7 +1593,8 @@ namespace fastllm {
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
                     *attenOutput, numAttentionHeads / numKeyValueHeads,
                     1.0f / std::sqrt((float)headDim), 1, layerIdx > 0);
-                attenOutput->Reshape({1, seqlen, -1});
+                attenOutput->Reshape({seqlen, bsz, -1});
+                Qwen3CudaPermuteSelf(runner, *attenOutput, {1, 0, 2});
                 return;
             }
 
@@ -1757,10 +1783,19 @@ namespace fastllm {
         if (!Step3p5CudaGraphEnabled()) {
             return rejectGraph("disabled");
         }
-        if (batch != 1 || !all1 || isPrefill ||
-            seqLens.size() != 1 || seqLens[0] != 1 ||
-            (int)pastKeyValues.size() < block_cnt) {
+        const int maxCudaGraphDecodeBatch = 16;
+        if (batch <= 0 || batch > maxCudaGraphDecodeBatch ||
+            !all1 || isPrefill || (int)seqLens.size() < batch ||
+            (int)pastKeyValues.size() < batch * block_cnt) {
             return rejectGraph("not single-token decode");
+        }
+        for (int b = 0; b < batch; b++) {
+            if (seqLens[b] != 1) {
+                return rejectGraph("not single-token decode");
+            }
+        }
+        if (inputIds.Count(0) != (uint64_t)batch || positionIds.Count(0) != (uint64_t)batch) {
+            return rejectGraph("input/position count mismatch");
         }
 
         int graphParticipants = tensorParallel ? std::max(2, (int)ratios.size()) : 1;
@@ -1822,29 +1857,43 @@ namespace fastllm {
         Data *localInputIds = requireLocal((Data&)inputIds, "inputIds");
         Data *localPositionIds = requireLocal((Data&)positionIds, "positionIds");
         bool inputOk = localInputIds->dims.size() == 2 &&
-                       localInputIds->dims[0] == 1 &&
-                       localInputIds->dims[1] == 1 &&
+                       localInputIds->Count(0) == (uint64_t)batch &&
                        !localPositionIds->dims.empty() &&
-                       localPositionIds->Count(0) == 1;
+                       localPositionIds->Count(0) == (uint64_t)batch;
         if (!syncGraphPeers(inputOk)) {
             return rejectGraph("input/position dims mismatch");
         }
 
         bool kvMetaOk = true;
         for (int i = 0; i < block_cnt; i++) {
-            Data *pastKey = pastKeyValues[i].first;
-            Data *pastValue = pastKeyValues[i].second;
-            if (pastKey == nullptr || pastValue == nullptr ||
-                pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
-                pastKey->pageIndex.empty() || pastValue->pageIndex.empty() ||
-                pastKey->dataDevice != DataDevice::CUDA || pastValue->dataDevice != DataDevice::CUDA ||
-                pastKey->dataDeviceIds.empty() || pastValue->dataDeviceIds.empty() ||
-                pastKey->dataDeviceIds[0] != gpuId || pastValue->dataDeviceIds[0] != gpuId ||
-                pastKey->dataType == DataType::FP8_E4M3 || pastValue->dataType == DataType::FP8_E4M3 ||
-                pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
-                pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
-                pastKey->lastPageLen != pastValue->lastPageLen) {
+            Data *firstBatchKey = pastKeyValues[i].first;
+            Data *firstBatchValue = pastKeyValues[i].second;
+            if (firstBatchKey == nullptr || firstBatchValue == nullptr ||
+                firstBatchKey->pagedKVCacheData == nullptr ||
+                firstBatchValue->pagedKVCacheData == nullptr) {
                 kvMetaOk = false;
+                break;
+            }
+            for (int b = 0; b < batch; b++) {
+                Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                if (pastKey == nullptr || pastValue == nullptr ||
+                    pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
+                    pastKey->pagedKVCacheData != firstBatchKey->pagedKVCacheData ||
+                    pastValue->pagedKVCacheData != firstBatchValue->pagedKVCacheData ||
+                    pastKey->pageIndex.empty() || pastValue->pageIndex.empty() ||
+                    pastKey->dataDevice != DataDevice::CUDA || pastValue->dataDevice != DataDevice::CUDA ||
+                    pastKey->dataDeviceIds.empty() || pastValue->dataDeviceIds.empty() ||
+                    pastKey->dataDeviceIds[0] != gpuId || pastValue->dataDeviceIds[0] != gpuId ||
+                    pastKey->dataType == DataType::FP8_E4M3 || pastValue->dataType == DataType::FP8_E4M3 ||
+                    pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
+                    pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
+                    pastKey->lastPageLen != pastValue->lastPageLen) {
+                    kvMetaOk = false;
+                    break;
+                }
+            }
+            if (!kvMetaOk) {
                 break;
             }
         }
@@ -1852,7 +1901,7 @@ namespace fastllm {
             return rejectGraph("unsupported kv cache metadata");
         }
 
-        Step3p5CudaGraphDecodeState &state = GetStep3p5CudaGraphDecodeState(this, gpuId);
+        Step3p5CudaGraphDecodeState &state = GetStep3p5CudaGraphDecodeState(this, gpuId, batch);
         std::unique_lock<std::mutex> graphLock(state.mutex);
         if (!syncGraphPeers(!Step3p5CudaGraphIsDisabled(this))) {
             return false;
@@ -1868,54 +1917,102 @@ namespace fastllm {
         Step3p5PrepareGraphCudaTensor(state.inputIds, *localInputIds, gpuId);
         Step3p5PrepareGraphCudaTensor(state.positionIds, *localPositionIds, gpuId);
 
-        Data *firstKey = pastKeyValues[0].first;
-        bool needNewPage = firstKey->pageIndex.empty() || firstKey->lastPageLen >= firstKey->pageLen;
-        int insertIndex = needNewPage ? -1 : firstKey->pageIndex.back();
-        int insertPosition = needNewPage ? 0 : firstKey->lastPageLen;
+        std::vector<int> insertIndexHost(batch, -1);
+        std::vector<int> insertPositionHost(batch, 0);
+        std::vector<int> lastPageLensHost(batch, 0);
+        std::vector<int> qSizesHost(batch + 1, 0);
+        std::vector<int> pageSizesHost(batch + 1, 0);
+        std::vector<int> pageIndexHost;
+        std::vector<char> needNewPage(batch, 0);
 
-        for (int i = 0; i < block_cnt; i++) {
-            Data *pastKey = pastKeyValues[i].first;
-            Data *pastValue = pastKeyValues[i].second;
-            bool layerNeedNewPage = pastKey->pageIndex.empty() || pastKey->lastPageLen >= pastKey->pageLen;
-            AssertInFastLLM(layerNeedNewPage == needNewPage,
-                            "Step3p5 CUDA graph requires aligned paged cache layout across layers.\n");
-            if (needNewPage) {
-                int keyPage = pastKey->pagedKVCacheData->GetUnusedPageIndex(true);
-                int valuePage = pastValue->pagedKVCacheData->GetUnusedPageIndex(true);
-                if (insertIndex < 0) {
-                    insertIndex = keyPage;
-                }
-                AssertInFastLLM(keyPage == insertIndex && valuePage == insertIndex,
-                                "Step3p5 CUDA graph requires aligned K/V page indices across layers.\n");
-                pastKey->pageIndex.push_back(keyPage);
-                pastValue->pageIndex.push_back(valuePage);
-                pastKey->lastPageLen = 1;
-                pastValue->lastPageLen = 1;
-            } else {
-                AssertInFastLLM(pastKey->pageIndex.back() == insertIndex &&
-                                pastValue->pageIndex.back() == insertIndex &&
-                                pastKey->lastPageLen == insertPosition &&
-                                pastValue->lastPageLen == insertPosition,
-                                "Step3p5 CUDA graph requires aligned paged cache positions across layers.\n");
-                pastKey->lastPageLen++;
-                pastValue->lastPageLen++;
+        for (int b = 0; b < batch; b++) {
+            Data *firstKey = pastKeyValues[b * block_cnt].first;
+            bool need = firstKey->pageIndex.empty() || firstKey->lastPageLen >= firstKey->pageLen;
+            needNewPage[b] = need ? 1 : 0;
+            if (!need) {
+                insertIndexHost[b] = firstKey->pageIndex.back();
+                insertPositionHost[b] = firstKey->lastPageLen;
             }
         }
 
-        std::vector<int> pageIndexHost = firstKey->pageIndex;
-        int lastPageLen = firstKey->lastPageLen;
-        Step3p5PrepareGraphIntTensor(state.metaBuffers.insertIndexs, gpuId, {insertIndex});
-        Step3p5PrepareGraphIntTensor(state.metaBuffers.insertPositions, gpuId, {insertPosition});
-        Step3p5PrepareGraphIntTensor(state.metaBuffers.qSizes, gpuId, {0, 1});
-        Step3p5PrepareGraphIntTensor(state.metaBuffers.pageSizes, gpuId, {0, (int)pageIndexHost.size()});
+        for (int i = 0; i < block_cnt; i++) {
+            for (int b = 0; b < batch; b++) {
+                Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                bool layerNeedNewPage = pastKey->pageIndex.empty() || pastKey->lastPageLen >= pastKey->pageLen;
+                AssertInFastLLM(layerNeedNewPage == (needNewPage[b] != 0),
+                                "Step3p5 CUDA graph requires aligned paged cache layout across layers.\n");
+                if (needNewPage[b]) {
+                    int keyPage = pastKey->pagedKVCacheData->GetUnusedPageIndex(true);
+                    int valuePage = pastValue->pagedKVCacheData->GetUnusedPageIndex(true);
+                    if (insertIndexHost[b] < 0) {
+                        insertIndexHost[b] = keyPage;
+                    }
+                    AssertInFastLLM(keyPage == insertIndexHost[b] && valuePage == insertIndexHost[b],
+                                    "Step3p5 CUDA graph requires aligned K/V page indices across layers.\n");
+                    pastKey->pageIndex.push_back(keyPage);
+                    pastValue->pageIndex.push_back(valuePage);
+                    pastKey->lastPageLen = 1;
+                    pastValue->lastPageLen = 1;
+                } else {
+                    AssertInFastLLM(pastKey->pageIndex.back() == insertIndexHost[b] &&
+                                    pastValue->pageIndex.back() == insertIndexHost[b] &&
+                                    pastKey->lastPageLen == insertPositionHost[b] &&
+                                    pastValue->lastPageLen == insertPositionHost[b],
+                                    "Step3p5 CUDA graph requires aligned paged cache positions across layers.\n");
+                    pastKey->lastPageLen++;
+                    pastValue->lastPageLen++;
+                }
+            }
+        }
+
+        pageIndexHost.reserve(batch);
+        for (int b = 0; b < batch; b++) {
+            qSizesHost[b + 1] = qSizesHost[b] + 1;
+            Data *firstKey = pastKeyValues[b * block_cnt].first;
+            Data *firstValue = pastKeyValues[b * block_cnt].second;
+            lastPageLensHost[b] = firstKey->lastPageLen;
+            pageSizesHost[b + 1] = pageSizesHost[b] + (int)firstKey->pageIndex.size();
+            pageIndexHost.insert(pageIndexHost.end(), firstKey->pageIndex.begin(), firstKey->pageIndex.end());
+            AssertInFastLLM(firstKey->pageIndex.size() == firstValue->pageIndex.size() &&
+                            firstKey->lastPageLen == firstValue->lastPageLen,
+                            "Step3p5 CUDA graph requires aligned K/V page metadata.\n");
+            for (int i = 1; i < block_cnt; i++) {
+                Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                AssertInFastLLM(pastKey->pageIndex == firstKey->pageIndex &&
+                                pastValue->pageIndex == firstKey->pageIndex &&
+                                pastKey->lastPageLen == firstKey->lastPageLen &&
+                                pastValue->lastPageLen == firstKey->lastPageLen,
+                                "Step3p5 CUDA graph requires aligned paged cache pages across layers.\n");
+            }
+        }
+
+        Step3p5PrepareGraphIntTensor(state.metaBuffers.insertIndexs, gpuId, insertIndexHost);
+        Step3p5PrepareGraphIntTensor(state.metaBuffers.insertPositions, gpuId, insertPositionHost);
+        Step3p5PrepareGraphIntTensor(state.metaBuffers.qSizes, gpuId, qSizesHost);
+        Step3p5PrepareGraphIntTensor(state.metaBuffers.pageSizes, gpuId, pageSizesHost);
         Step3p5PrepareGraphIntTensor(state.metaBuffers.pageIndexs, gpuId, pageIndexHost);
-        Step3p5PrepareGraphIntTensor(state.metaBuffers.lastPageLens, gpuId, {lastPageLen});
+        Step3p5PrepareGraphIntTensor(state.metaBuffers.lastPageLens, gpuId, lastPageLensHost);
 
         std::ostringstream signature;
         signature << "gpu=" << gpuId
                   << ";tp=" << (tensorParallel ? 1 : 0)
                   << ";tpRank0=" << (firstTensorParallelRank ? 1 : 0)
-                  << ";pages=" << pageIndexHost.size()
+                  << ";batch=" << batch
+                  << ";inputDims=";
+        for (int dim : state.inputIds.dims) {
+            signature << dim << ",";
+        }
+        signature << ";posDims=";
+        for (int dim : state.positionIds.dims) {
+            signature << dim << ",";
+        }
+        signature << ";pageSizes=";
+        for (int pageSize : pageSizesHost) {
+            signature << pageSize << ",";
+        }
+        signature << ";pages=" << pageIndexHost.size()
                   << ";inputType=" << (int)state.inputIds.dataType
                   << ";posType=" << (int)state.positionIds.dataType
                   << ";kCache=" << pastKeyValues[0].first->pagedKVCacheData->cudaData
@@ -2290,11 +2387,7 @@ namespace fastllm {
                         "Step3p5 ForwardSingleGPU got invalid GPU ratio.\n");
         FastllmCudaSetDevice(gpuId);
         if (isPrefill && Step3p5CudaGraphEnabled()) {
-            Step3p5CudaGraphDecodeState &graphState = GetStep3p5CudaGraphDecodeState(this, gpuId);
-            std::lock_guard<std::mutex> graphGuard(graphState.mutex);
-            Step3p5DestroyCudaGraph(graphState);
-            Step3p5ReinitializeForwardSingleBuffers(graphState.buffers);
-            Step3p5ReinitializeForwardSingleBuffers(graphState.metaBuffers);
+            Step3p5DestroyCudaGraphDecodeStates(this, gpuId);
         }
         if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
                                         seqLens, pastKeyValues, all1, isPrefill,

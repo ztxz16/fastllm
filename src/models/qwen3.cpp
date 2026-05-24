@@ -22,6 +22,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <tuple>
 
 #ifdef USE_CUDA
 #include "models/qwen3_cuda_common.h"
@@ -344,16 +345,39 @@ namespace fastllm {
             state.warmed = false;
         }
 
-        static Qwen3CudaGraphDecodeState &GetQwen3CudaGraphDecodeState(const Qwen3Model *model, int gpuId) {
+        using Qwen3CudaGraphStateKey = std::tuple<const Qwen3Model*, int, int>;
+
+        static std::mutex &Qwen3CudaGraphStatesMutex() {
             static std::mutex statesMutex;
-            static std::map<std::pair<const Qwen3Model*, int>, std::unique_ptr<Qwen3CudaGraphDecodeState> > states;
-            std::lock_guard<std::mutex> guard(statesMutex);
-            auto key = std::make_pair(model, gpuId);
+            return statesMutex;
+        }
+
+        static std::map<Qwen3CudaGraphStateKey, std::unique_ptr<Qwen3CudaGraphDecodeState> > &Qwen3CudaGraphStates() {
+            static std::map<Qwen3CudaGraphStateKey, std::unique_ptr<Qwen3CudaGraphDecodeState> > states;
+            return states;
+        }
+
+        static Qwen3CudaGraphDecodeState &GetQwen3CudaGraphDecodeState(const Qwen3Model *model, int gpuId, int batch) {
+            std::lock_guard<std::mutex> guard(Qwen3CudaGraphStatesMutex());
+            auto &states = Qwen3CudaGraphStates();
+            auto key = std::make_tuple(model, gpuId, batch);
             auto &state = states[key];
             if (state == nullptr) {
                 state.reset(new Qwen3CudaGraphDecodeState());
             }
             return *state;
+        }
+
+        static void Qwen3DestroyCudaGraphDecodeStates(const Qwen3Model *model, int gpuId) {
+            std::lock_guard<std::mutex> guard(Qwen3CudaGraphStatesMutex());
+            auto &states = Qwen3CudaGraphStates();
+            for (auto &it : states) {
+                if (std::get<0>(it.first) == model && std::get<1>(it.first) == gpuId &&
+                    it.second != nullptr) {
+                    std::lock_guard<std::mutex> stateGuard(it.second->mutex);
+                    Qwen3DestroyCudaGraph(*it.second);
+                }
+            }
         }
 
         static bool Qwen3CudaGraphEnabled() {
@@ -1215,9 +1239,18 @@ namespace fastllm {
 #ifndef USE_CUDA
         return false;
 #else
-        if (!Qwen3CudaGraphEnabled() || batch != 1 || !all1 || isPrefill ||
-            seqLens.size() != 1 || seqLens[0] != 1 ||
-            (int)pastKeyValues.size() < block_cnt) {
+        const int maxCudaGraphDecodeBatch = 16;
+        if (!Qwen3CudaGraphEnabled() || batch <= 0 || batch > maxCudaGraphDecodeBatch ||
+            !all1 || isPrefill || (int)seqLens.size() < batch ||
+            (int)pastKeyValues.size() < batch * block_cnt) {
+            return false;
+        }
+        for (int b = 0; b < batch; b++) {
+            if (seqLens[b] != 1) {
+                return false;
+            }
+        }
+        if (inputIds.Count(0) != (uint64_t)batch || positionIds.Count(0) != (uint64_t)batch) {
             return false;
         }
 
@@ -1238,33 +1271,44 @@ namespace fastllm {
 
         Data *localInputIds = requireLocal((Data&)inputIds, "inputIds");
         Data *localPositionIds = requireLocal((Data&)positionIds, "positionIds");
-        if (localInputIds->dims.size() != 2 || localInputIds->dims[0] != 1 || localInputIds->dims[1] != 1 ||
-            localPositionIds->dims.empty() || localPositionIds->Count(0) != 1) {
+        if (localInputIds->dims.size() != 2 || localInputIds->Count(0) != (uint64_t)batch ||
+            localPositionIds->dims.empty() || localPositionIds->Count(0) != (uint64_t)batch) {
             return false;
         }
 
         int currentTokens = 0;
         for (int i = 0; i < block_cnt; i++) {
-            Data *pastKey = pastKeyValues[i].first;
-            Data *pastValue = pastKeyValues[i].second;
-            if (pastKey == nullptr || pastValue == nullptr ||
-                pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
-                pastKey->pageIndex.empty() || pastValue->pageIndex.empty() ||
-                pastKey->dataDevice != DataDevice::CUDA || pastValue->dataDevice != DataDevice::CUDA ||
-                pastKey->dataType == DataType::FP8_E4M3 || pastValue->dataType == DataType::FP8_E4M3 ||
-                pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
-                pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
-                pastKey->lastPageLen != pastValue->lastPageLen) {
+            Data *firstBatchKey = pastKeyValues[i].first;
+            Data *firstBatchValue = pastKeyValues[i].second;
+            if (firstBatchKey == nullptr || firstBatchValue == nullptr ||
+                firstBatchKey->pagedKVCacheData == nullptr ||
+                firstBatchValue->pagedKVCacheData == nullptr) {
                 return false;
             }
-            int layerTokens = ((int)pastKey->pageIndex.size() - 1) * pastKey->pageLen + pastKey->lastPageLen;
-            currentTokens = std::max(currentTokens, layerTokens);
+            for (int b = 0; b < batch; b++) {
+                Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                if (pastKey == nullptr || pastValue == nullptr ||
+                    pastKey->pagedKVCacheData == nullptr || pastValue->pagedKVCacheData == nullptr ||
+                    pastKey->pagedKVCacheData != firstBatchKey->pagedKVCacheData ||
+                    pastValue->pagedKVCacheData != firstBatchValue->pagedKVCacheData ||
+                    pastKey->pageIndex.empty() || pastValue->pageIndex.empty() ||
+                    pastKey->dataDevice != DataDevice::CUDA || pastValue->dataDevice != DataDevice::CUDA ||
+                    pastKey->dataType == DataType::FP8_E4M3 || pastValue->dataType == DataType::FP8_E4M3 ||
+                    pastKey->pageLen <= 0 || pastKey->pageLen != pastValue->pageLen ||
+                    pastKey->pageIndex.size() != pastValue->pageIndex.size() ||
+                    pastKey->lastPageLen != pastValue->lastPageLen) {
+                    return false;
+                }
+                int layerTokens = ((int)pastKey->pageIndex.size() - 1) * pastKey->pageLen + pastKey->lastPageLen;
+                currentTokens = std::max(currentTokens, layerTokens);
+            }
         }
         if (rope_type == RoPEType::DYMAMIC_NTK && currentTokens + 1 >= max_positions) {
             return false;
         }
 
-        Qwen3CudaGraphDecodeState &state = GetQwen3CudaGraphDecodeState(this, gpuId);
+        Qwen3CudaGraphDecodeState &state = GetQwen3CudaGraphDecodeState(this, gpuId, batch);
         std::unique_lock<std::mutex> graphLock(state.mutex);
         if (state.disabled) {
             return false;
@@ -1274,54 +1318,102 @@ namespace fastllm {
         Qwen3PrepareGraphCudaTensor(state.inputIds, *localInputIds, gpuId);
         Qwen3PrepareGraphCudaTensor(state.positionIds, *localPositionIds, gpuId);
 
-        Data *firstKey = pastKeyValues[0].first;
-        bool needNewPage = firstKey->pageIndex.empty() || firstKey->lastPageLen >= firstKey->pageLen;
-        int insertIndex = needNewPage ? -1 : firstKey->pageIndex.back();
-        int insertPosition = needNewPage ? 0 : firstKey->lastPageLen;
+        std::vector<int> insertIndexHost(batch, -1);
+        std::vector<int> insertPositionHost(batch, 0);
+        std::vector<int> lastPageLensHost(batch, 0);
+        std::vector<int> qSizesHost(batch + 1, 0);
+        std::vector<int> pageSizesHost(batch + 1, 0);
+        std::vector<int> pageIndexHost;
+        std::vector<char> needNewPage(batch, 0);
 
-        for (int i = 0; i < block_cnt; i++) {
-            Data *pastKey = pastKeyValues[i].first;
-            Data *pastValue = pastKeyValues[i].second;
-            bool layerNeedNewPage = pastKey->pageIndex.empty() || pastKey->lastPageLen >= pastKey->pageLen;
-            AssertInFastLLM(layerNeedNewPage == needNewPage,
-                            "Qwen3 CUDA graph requires aligned paged cache layout across layers.\n");
-            if (needNewPage) {
-                int keyPage = pastKey->pagedKVCacheData->GetUnusedPageIndex(true);
-                int valuePage = pastValue->pagedKVCacheData->GetUnusedPageIndex(true);
-                if (insertIndex < 0) {
-                    insertIndex = keyPage;
-                }
-                AssertInFastLLM(keyPage == insertIndex && valuePage == insertIndex,
-                                "Qwen3 CUDA graph requires aligned K/V page indices across layers.\n");
-                pastKey->pageIndex.push_back(keyPage);
-                pastValue->pageIndex.push_back(valuePage);
-                pastKey->lastPageLen = 1;
-                pastValue->lastPageLen = 1;
-            } else {
-                AssertInFastLLM(pastKey->pageIndex.back() == insertIndex &&
-                                pastValue->pageIndex.back() == insertIndex &&
-                                pastKey->lastPageLen == insertPosition &&
-                                pastValue->lastPageLen == insertPosition,
-                                "Qwen3 CUDA graph requires aligned paged cache positions across layers.\n");
-                pastKey->lastPageLen++;
-                pastValue->lastPageLen++;
+        for (int b = 0; b < batch; b++) {
+            Data *firstKey = pastKeyValues[b * block_cnt].first;
+            bool need = firstKey->pageIndex.empty() || firstKey->lastPageLen >= firstKey->pageLen;
+            needNewPage[b] = need ? 1 : 0;
+            if (!need) {
+                insertIndexHost[b] = firstKey->pageIndex.back();
+                insertPositionHost[b] = firstKey->lastPageLen;
             }
         }
 
-        std::vector<int> pageIndexHost = firstKey->pageIndex;
-        int lastPageLen = firstKey->lastPageLen;
-        Qwen3PrepareGraphIntTensor(state.buffers.insertIndexs, gpuId, {insertIndex});
-        Qwen3PrepareGraphIntTensor(state.buffers.insertPositions, gpuId, {insertPosition});
-        Qwen3PrepareGraphIntTensor(state.buffers.qSizes, gpuId, {0, 1});
-        Qwen3PrepareGraphIntTensor(state.buffers.pageSizes, gpuId, {0, (int)pageIndexHost.size()});
+        for (int i = 0; i < block_cnt; i++) {
+            for (int b = 0; b < batch; b++) {
+                Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                bool layerNeedNewPage = pastKey->pageIndex.empty() || pastKey->lastPageLen >= pastKey->pageLen;
+                AssertInFastLLM(layerNeedNewPage == (needNewPage[b] != 0),
+                                "Qwen3 CUDA graph requires aligned paged cache layout across layers.\n");
+                if (needNewPage[b]) {
+                    int keyPage = pastKey->pagedKVCacheData->GetUnusedPageIndex(true);
+                    int valuePage = pastValue->pagedKVCacheData->GetUnusedPageIndex(true);
+                    if (insertIndexHost[b] < 0) {
+                        insertIndexHost[b] = keyPage;
+                    }
+                    AssertInFastLLM(keyPage == insertIndexHost[b] && valuePage == insertIndexHost[b],
+                                    "Qwen3 CUDA graph requires aligned K/V page indices across layers.\n");
+                    pastKey->pageIndex.push_back(keyPage);
+                    pastValue->pageIndex.push_back(valuePage);
+                    pastKey->lastPageLen = 1;
+                    pastValue->lastPageLen = 1;
+                } else {
+                    AssertInFastLLM(pastKey->pageIndex.back() == insertIndexHost[b] &&
+                                    pastValue->pageIndex.back() == insertIndexHost[b] &&
+                                    pastKey->lastPageLen == insertPositionHost[b] &&
+                                    pastValue->lastPageLen == insertPositionHost[b],
+                                    "Qwen3 CUDA graph requires aligned paged cache positions across layers.\n");
+                    pastKey->lastPageLen++;
+                    pastValue->lastPageLen++;
+                }
+            }
+        }
+
+        pageIndexHost.reserve(batch);
+        for (int b = 0; b < batch; b++) {
+            qSizesHost[b + 1] = qSizesHost[b] + 1;
+            Data *firstKey = pastKeyValues[b * block_cnt].first;
+            Data *firstValue = pastKeyValues[b * block_cnt].second;
+            lastPageLensHost[b] = firstKey->lastPageLen;
+            pageSizesHost[b + 1] = pageSizesHost[b] + (int)firstKey->pageIndex.size();
+            pageIndexHost.insert(pageIndexHost.end(), firstKey->pageIndex.begin(), firstKey->pageIndex.end());
+            AssertInFastLLM(firstKey->pageIndex.size() == firstValue->pageIndex.size() &&
+                            firstKey->lastPageLen == firstValue->lastPageLen,
+                            "Qwen3 CUDA graph requires aligned K/V page metadata.\n");
+            for (int i = 1; i < block_cnt; i++) {
+                Data *pastKey = pastKeyValues[b * block_cnt + i].first;
+                Data *pastValue = pastKeyValues[b * block_cnt + i].second;
+                AssertInFastLLM(pastKey->pageIndex == firstKey->pageIndex &&
+                                pastValue->pageIndex == firstKey->pageIndex &&
+                                pastKey->lastPageLen == firstKey->lastPageLen &&
+                                pastValue->lastPageLen == firstKey->lastPageLen,
+                                "Qwen3 CUDA graph requires aligned paged cache pages across layers.\n");
+            }
+        }
+
+        Qwen3PrepareGraphIntTensor(state.buffers.insertIndexs, gpuId, insertIndexHost);
+        Qwen3PrepareGraphIntTensor(state.buffers.insertPositions, gpuId, insertPositionHost);
+        Qwen3PrepareGraphIntTensor(state.buffers.qSizes, gpuId, qSizesHost);
+        Qwen3PrepareGraphIntTensor(state.buffers.pageSizes, gpuId, pageSizesHost);
         Qwen3PrepareGraphIntTensor(state.buffers.pageIndexs, gpuId, pageIndexHost);
-        Qwen3PrepareGraphIntTensor(state.buffers.lastPageLens, gpuId, {lastPageLen});
+        Qwen3PrepareGraphIntTensor(state.buffers.lastPageLens, gpuId, lastPageLensHost);
 
         std::ostringstream signature;
         signature << "gpu=" << gpuId
                   << ";tp=" << (tensorParallel ? 1 : 0)
                   << ";tpRank0=" << (firstTensorParallelRank ? 1 : 0)
-                  << ";pages=" << pageIndexHost.size()
+                  << ";batch=" << batch
+                  << ";inputDims=";
+        for (int dim : state.inputIds.dims) {
+            signature << dim << ",";
+        }
+        signature << ";posDims=";
+        for (int dim : state.positionIds.dims) {
+            signature << dim << ",";
+        }
+        signature << ";pageSizes=";
+        for (int pageSize : pageSizesHost) {
+            signature << pageSize << ",";
+        }
+        signature << ";pages=" << pageIndexHost.size()
                   << ";inputType=" << (int)state.inputIds.dataType
                   << ";posType=" << (int)state.positionIds.dataType
                   << ";kCache=" << pastKeyValues[0].first->pagedKVCacheData->cudaData
@@ -1545,9 +1637,7 @@ namespace fastllm {
                         "Qwen3 ForwardSingleGPU got invalid GPU ratio.\n");
         FastllmCudaSetDevice(gpuId);
         if (isPrefill && Qwen3CudaGraphEnabled()) {
-            Qwen3CudaGraphDecodeState &graphState = GetQwen3CudaGraphDecodeState(this, gpuId);
-            std::lock_guard<std::mutex> graphGuard(graphState.mutex);
-            Qwen3DestroyCudaGraph(graphState);
+            Qwen3DestroyCudaGraphDecodeStates(this, gpuId);
         }
         if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
                                         seqLens, pastKeyValues, all1, isPrefill,
