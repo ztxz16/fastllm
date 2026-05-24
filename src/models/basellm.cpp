@@ -223,21 +223,19 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache() {
-        auto recordPagedCache = [&](Data &cache, PagedCacheManager *manager) {
+        auto recordPagedCache = [&](Data &cache) {
             if (cache.multiDeviceData) {
                 return;
             }
-            if (manager != nullptr && !cache.pageIndex.empty()) {
-                manager->Record(this->allTokens, cache.pageIndex);
+            if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty()) {
+                cache.pagedKVCacheData->Record(this->allTokens, cache.pageIndex);
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
             auto &kvFirst = this->pastKeyValues[i].first;
             auto &kvSecond = this->pastKeyValues[i].second;
-            PagedCacheManager *kManager = GetPagedCacheManager(i * 2);
-            PagedCacheManager *vManager = GetPagedCacheManager(i * 2 + 1);
-            recordPagedCache(kvFirst, kManager);
-            recordPagedCache(kvSecond, vManager);
+            recordPagedCache(kvFirst);
+            recordPagedCache(kvSecond);
         }
     }
 
@@ -833,6 +831,87 @@ namespace fastllm {
             ctx->intParams.clear();
         };
 
+        auto getPagedManagerFromCache = [](Data &cache) -> PagedCacheManager* {
+            if (cache.multiDeviceData) {
+                for (auto &it : cache.multiDeviceDatas) {
+                    if (it.second != nullptr && it.second->pagedKVCacheData != nullptr) {
+                        return it.second->pagedKVCacheData;
+                    }
+                }
+            }
+            return cache.pagedKVCacheData;
+        };
+
+        auto findRuntimePagedManager = [&]() -> PagedCacheManager* {
+            if (model->kvCacheId >= 0) {
+                for (auto &it : model->responseContextDict.dicts) {
+                    ResponseContext *ctx = it.second;
+                    if (ctx == nullptr || model->kvCacheId >= (int)ctx->pastKeyValues.size()) {
+                        continue;
+                    }
+                    PagedCacheManager *manager =
+                        getPagedManagerFromCache(ctx->pastKeyValues[model->kvCacheId].first);
+                    if (manager != nullptr) {
+                        return manager;
+                    }
+                }
+            }
+            return GetPagedCacheManager(model->kvCacheId * 2);
+        };
+
+        auto collectDecodePageNeeds =
+                [&](const std::vector<ResponseContext*> &contexts) -> std::map<PagedCacheManager*, int> {
+            std::map<PagedCacheManager*, int> needs;
+            std::function<void(Data&)> addCacheNeed = [&](Data &cache) {
+                if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
+                    bool usedLocal = false;
+                    for (auto &it : cache.multiDeviceDatas) {
+                        if (it.second != nullptr) {
+                            addCacheNeed(*it.second);
+                            usedLocal = true;
+                        }
+                    }
+                    if (usedLocal) {
+                        return;
+                    }
+                }
+                if (!cache.isPagedKVCache || cache.pagedKVCacheData == nullptr) {
+                    return;
+                }
+                if (cache.pageIndex.empty() || cache.lastPageLen >= cache.pageLen) {
+                    needs[cache.pagedKVCacheData]++;
+                }
+            };
+            for (auto *ctx : contexts) {
+                if (ctx == nullptr) {
+                    continue;
+                }
+                for (int i = 0; i < model->block_cnt && i < (int)ctx->pastKeyValues.size(); i++) {
+                    addCacheNeed(ctx->pastKeyValues[i].first);
+                    addCacheNeed(ctx->pastKeyValues[i].second);
+                }
+            }
+            return needs;
+        };
+
+        auto hasPagedManagerShortage = [](const std::map<PagedCacheManager*, int> &needs) -> bool {
+            for (auto &it : needs) {
+                PagedCacheManager *manager = it.first;
+                if (manager == nullptr || it.second <= 0) {
+                    continue;
+                }
+                int freePages = 0;
+                {
+                    std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                    freePages = manager->FreePageCount();
+                }
+                if (freePages < it.second) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         auto *pcm = GetPagedCacheManager(model->kvCacheId * 2);
         if (pcm != nullptr) {
             totalPages = pcm->maxPages;
@@ -953,10 +1032,14 @@ namespace fastllm {
 
             // 通过PagedCacheManager获取实际使用的物理页数（复用的页只算一次）
             if (totalPages > 0) {
-                PagedCacheManager *probeManager = GetPagedCacheManager(model->kvCacheId * 2);
+                PagedCacheManager *probeManager = findRuntimePagedManager();
                 if (probeManager != nullptr) {
                     std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
                     busyPages = probeManager->maxPages - probeManager->FreePageCount();
+                    totalPages = probeManager->maxPages;
+                    pageLen = probeManager->pageLen;
+                    maxTotalLens = totalPages * pageLen;
+                    pagesLimit = totalPages * 4 / 5;
                 }
             }
 
@@ -1202,31 +1285,9 @@ namespace fastllm {
 
             // Decode阶段：检查空闲分页是否足够，不够时释放资源
             if (seqLens.size() > 0 && seqLens[0] == 1) {
-                PagedCacheManager *pagedManager = nullptr;
-                int newPagesNeeded = 0;
-                for (int i = 0; i < (int)handles.size(); i++) {
-                    auto &ctx = *tokenContexts[i];
-                    auto &kvFirst = ctx.pastKeyValues[model->kvCacheId].first;
-                    if (kvFirst.isPagedKVCache) {
-                        if (pagedManager == nullptr) {
-                            pagedManager = kvFirst.pagedKVCacheData;
-                        }
-                        if (kvFirst.pageLen == kvFirst.lastPageLen) {
-                            newPagesNeeded++;
-                        }
-                    }
-                }
-                if (pagedManager != nullptr && newPagesNeeded > 0) {
-                    int freePages;
-                    {
-                        std::lock_guard<std::mutex> guard(pagedManager->pageIndexLocker);
-                        freePages = pagedManager->FreePageCount();
-                    }
-                    // if (freePages < newPagesNeeded) {
-                    //    printf("[Decode] Page shortage: newPagesNeeded=%d, freePages=%d, maxPages=%d, batchSize=%d\n",
-                    //           newPagesNeeded, freePages, pagedManager->maxPages, (int)handles.size());
-                    // }
-                    while (freePages < newPagesNeeded) {
+                auto pageNeeds = collectDecodePageNeeds(tokenContexts);
+                if (!pageNeeds.empty()) {
+                    while (hasPagedManagerShortage(pageNeeds)) {
                         // 空闲分页不够，从本轮decode批次中选择上下文最长的请求驱逐
                         int maxLen = -1, evictIdx = -1;
                         for (int i = 0; i < (int)handles.size(); i++) {
@@ -1266,21 +1327,11 @@ namespace fastllm {
                         pastKeyValues.erase(pastKeyValues.begin() + evictIdx * model->block_cnt,
                                             pastKeyValues.begin() + (evictIdx + 1) * model->block_cnt);
 
-                        // 重新统计newPagesNeeded和freePages
-                        newPagesNeeded = 0;
-                        for (int i = 0; i < (int)handles.size(); i++) {
-                            auto &ctx = *tokenContexts[i];
-                            auto &kvFirst = ctx.pastKeyValues[model->kvCacheId].first;
-                            if (kvFirst.isPagedKVCache && kvFirst.pageLen == kvFirst.lastPageLen) {
-                                newPagesNeeded++;
-                            }
-                        }
-                        {
-                            std::lock_guard<std::mutex> guard(pagedManager->pageIndexLocker);
-                            freePages = pagedManager->FreePageCount();
-                        }
+                        // 重新统计所有层 K/V manager 的需求。CUDA graph 会在进入
+                        // forward 前为所有层预分配 page，单看代表层不够。
+                        pageNeeds = collectDecodePageNeeds(tokenContexts);
                     }
-                    if (freePages >= newPagesNeeded && newPagesNeeded > 0) {
+                    if (!pageNeeds.empty() && !hasPagedManagerShortage(pageNeeds)) {
                         // 重新计算ids
                         ids.clear();
                         for (int i = 0; i < (int)tokenContexts.size(); i++) {
@@ -1289,6 +1340,25 @@ namespace fastllm {
                                 ids.push_back((float)t);
                             }
                         }
+                    } else if (hasPagedManagerShortage(pageNeeds)) {
+                        for (auto *ctx : tokenContexts) {
+                            if (ctx != nullptr) {
+                                releaseAndReinitRequest(ctx);
+                            }
+                        }
+                        handles.clear();
+                        tokenContexts.clear();
+                        seqLens.clear();
+                        generationConfigs.clear();
+                        if (!tokensManager.units.empty()) {
+                            tokensManager.units.clear();
+                        }
+                        ReleasePendingResultLogits(logits);
+                        logits.clear();
+                        attentionMasks.clear();
+                        positionIds.clear();
+                        pastKeyValues.clear();
+                        ids.clear();
                     }
                 }
                 if (handles.empty()) {
