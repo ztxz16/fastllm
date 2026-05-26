@@ -5087,11 +5087,16 @@ __global__ void FastllmQKVRMSNormRopeSplitAppendPagedCacheKernel(
         }
 
         // Step 2: RoPE Encoding
-        // positionIds 用物理索引 [phys_b * partStride + phys_l]
+        // Single-token batch decode may arrive as either [1, batch] or [batch, 1].
+        // The logical token order is still token_id, matching insertIndexs/insertPositions.
         int half_rotate = rotateDim / 2;
         if ((int)tid < half_rotate) {
             int j = tid;
-            float rawPosition = positionIds[phys_b * partStride + phys_l];
+            int positionOffset = phys_b * partStride + phys_l;
+            if (outer == batch && batch > 1) {
+                positionOffset = (partStride == 1) ? phys_b : batch_idx;
+            }
+            float rawPosition = positionIds[positionOffset];
             float invFreq = 1.0f / powf(ropeTheta, (float)(2 * j) / rotateDim);
             float freq;
             if (useLlama3) {

@@ -2686,6 +2686,22 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         if (GetFastllmEnv().skipWarmup) {
             return;
         }
+        struct AutoWarmupFinishGuard {
+            basellm *model;
+            AutoWarmupFinishGuard(basellm *model) : model(model) {}
+            ~AutoWarmupFinishGuard() {
+                model->OnAutoWarmupFinished();
+            }
+        } autoWarmupFinishGuard(this);
+        struct AutoWarmupRunningGuard {
+            basellm *model;
+            AutoWarmupRunningGuard(basellm *model) : model(model) {
+                model->autoWarmupRunning.store(true);
+            }
+            ~AutoWarmupRunningGuard() {
+                model->autoWarmupRunning.store(false);
+            }
+        } autoWarmupRunningGuard(this);
         if (!this->use_new_engine) {
             WarmUp();
             return;
@@ -2734,7 +2750,14 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
         if (len > 1) {
             // Load long-lived weights before the large prefill warmup creates
             // sequence-length-sized activation blocks in the CUDA pool.
-            const int weightWarmupLen = 1;
+            // Step3.5 CUDA graph must avoid a len=1 warmup here: that enters the
+            // decode path and leaves decode-side CUDA state incompatible with the
+            // later batch graph capture.
+            const int weightWarmupLen =
+                (GetFastllmEnv().cudaGraph && this->model_type == "step3p5") ? 2 : 1;
+            if (weightWarmupLen > 1) {
+                printf("[Fastllm] Step3.5 CUDA graph: use AutoWarmup weight prefill forward.\n");
+            }
             std::vector <float> weightWarmupIds(weightWarmupLen, 1.0f);
             Data weightWarmupInputIds = Data(DataType::FLOAT32, {1, weightWarmupLen}, weightWarmupIds);
             std::vector <float> weightWarmupPosData(weightWarmupLen);
@@ -2999,29 +3022,35 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                        calculatedMaxPages, minPages);
             }
 
-            for (int i = 0; i < block_cnt; i++) {
-                pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
-                pastKeyValuesStorage.back().first.SetKVCache();
-                pastKeyValuesStorage.back().second.SetKVCache();
-            }
-            for (int i = 0; i < block_cnt; i++) {
-                pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage[i].first, &pastKeyValuesStorage[i].second));
-            }
-            Data shortInputIds = Data(DataType::FLOAT32, {1, 1}, {1.0f});
-            Data shortPositionIds = Data(this->dataType, {1, 1}, {0.0f});
-            std::vector <Data*> shortAttentionMasks = {nullptr};
-            std::vector <Data*> shortPositionIdsVec = {&shortPositionIds};
-            std::vector <int> shortSeqLens = {1};
-            runWarmupForward(1, shortInputIds, shortAttentionMasks, shortPositionIdsVec,
-                             shortSeqLens, pastKeyValues, generationConfigs, lastTokens);
-            captureWarmupPagedCacheManager(pastKeyValuesStorage);
-            for (auto &kv : pastKeyValuesStorage) {
-                kv.first.pageIndex.clear();
-                kv.first.pagedKVCacheData = nullptr;
-                kv.first.isPagedKVCache = false;
-                kv.second.pageIndex.clear();
-                kv.second.pagedKVCacheData = nullptr;
-                kv.second.isPagedKVCache = false;
+            bool skipShortWarmupForward =
+                GetFastllmEnv().cudaGraph && this->model_type == "step3p5";
+            if (skipShortWarmupForward) {
+                printf("[Fastllm] Step3.5 CUDA graph: skip AutoWarmup short decode forward.\n");
+            } else {
+                for (int i = 0; i < block_cnt; i++) {
+                    pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType), Data(this->kvCacheDataType)));
+                    pastKeyValuesStorage.back().first.SetKVCache();
+                    pastKeyValuesStorage.back().second.SetKVCache();
+                }
+                for (int i = 0; i < block_cnt; i++) {
+                    pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage[i].first, &pastKeyValuesStorage[i].second));
+                }
+                Data shortInputIds = Data(DataType::FLOAT32, {1, 1}, {1.0f});
+                Data shortPositionIds = Data(this->dataType, {1, 1}, {0.0f});
+                std::vector <Data*> shortAttentionMasks = {nullptr};
+                std::vector <Data*> shortPositionIdsVec = {&shortPositionIds};
+                std::vector <int> shortSeqLens = {1};
+                runWarmupForward(1, shortInputIds, shortAttentionMasks, shortPositionIdsVec,
+                                 shortSeqLens, pastKeyValues, generationConfigs, lastTokens);
+                captureWarmupPagedCacheManager(pastKeyValuesStorage);
+                for (auto &kv : pastKeyValuesStorage) {
+                    kv.first.pageIndex.clear();
+                    kv.first.pagedKVCacheData = nullptr;
+                    kv.first.isPagedKVCache = false;
+                    kv.second.pageIndex.clear();
+                    kv.second.pagedKVCacheData = nullptr;
+                    kv.second.isPagedKVCache = false;
+                }
             }
 #endif
         }
@@ -3045,6 +3074,20 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
                 printf("[Fastllm] AddPrefill Pages limit: %d pages (80%% of %d).\n", totalPages * 4 / 5, totalPages);
                 printf("[Fastllm] Batch limit: %d.\n", mBatch);
             }
+        } else if (fastllm::GetMaxTokens() > 0) {
+            int totalPages = fastllm::GetMaxTokens() / pageLen + 1;
+            int cachePageLen = pageLen;
+            this->tokensLimit = totalPages * cachePageLen;
+            this->promptLimit = (totalPages * 4 / 5) * cachePageLen;
+            int mBatch = 512;
+            if (this->maxBatch > 0) {
+                mBatch = this->maxBatch;
+            }
+            mBatch = NormalizeMaxBatchByModelCapability(this, mBatch);
+            mBatch = std::max(1, std::min(mBatch, this->tokensLimit / 128));
+            printf("[Fastllm] KV Cache Token limit: %d tokens (totalPages=%d, pageLen=%d).\n", this->tokensLimit, totalPages, cachePageLen);
+            printf("[Fastllm] AddPrefill Pages limit: %d pages (80%% of %d).\n", totalPages * 4 / 5, totalPages);
+            printf("[Fastllm] Batch limit: %d.\n", mBatch);
         }
     }
 }

@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <tuple>
@@ -1027,6 +1028,7 @@ namespace fastllm {
             Data positionIds;
             Step3p5ForwardSingleBuffers buffers;
             Step3p5ForwardSingleBuffers metaBuffers;
+            Data logitsHalf;
             Data logits;
 
             ~Step3p5CudaGraphDecodeState() {
@@ -1051,8 +1053,9 @@ namespace fastllm {
             bool disabled = false;
         };
 
-        static bool Step3p5CudaGraphEnabled() {
-            return GetFastllmEnv().cudaGraph;
+        static bool Step3p5CudaGraphEnabled(const Step3p5Model *model) {
+            return GetFastllmEnv().cudaGraph &&
+                   (model == nullptr || !model->autoWarmupRunning.load());
         }
 
         static Step3p5CudaGraphSyncState &GetStep3p5CudaGraphSyncState(const Step3p5Model *model) {
@@ -1198,13 +1201,20 @@ namespace fastllm {
             }
         }
 
-        static void Step3p5PrepareGraphCudaTensor(Data &dst, const Data &src, int device) {
+        static void Step3p5PrepareGraphCudaTensorWithDims(
+                Data &dst, const Data &src, int device, const std::vector<int> &dims) {
             AssertInFastLLM(src.dataDevice == DataDevice::CUDA && src.cudaData != nullptr,
                             "Step3p5 CUDA graph requires CUDA source tensor.\n");
+            uint64_t count = 1;
+            for (int dim : dims) {
+                count *= dim;
+            }
+            AssertInFastLLM(count == src.Count(0),
+                            "Step3p5 CUDA graph tensor reshape changes element count.\n");
             FastllmCudaSetDevice(device);
 
             bool needReset = dst.isFake || dst.dataDevice != DataDevice::CUDA ||
-                             dst.dataType != src.dataType || dst.dims != src.dims ||
+                             dst.dataType != src.dataType || dst.dims != dims ||
                              (!dst.dataDeviceIds.empty() && dst.dataDeviceIds[0] != device);
             if (!needReset && dst.cudaData != nullptr) {
                 int ptrDevice = GetPointerDeviceId(dst.cudaData);
@@ -1226,10 +1236,14 @@ namespace fastllm {
                 dst.UpdateUnitSize();
                 dst.dataDevice = DataDevice::CUDA;
                 dst.dataDeviceIds = {device};
-                dst.Resize(src.dims);
+                dst.Resize(dims);
             }
             dst.Allocate(false);
             FastllmCudaCopyFromDeviceToDevice(dst.cudaData, src.cudaData, src.GetBytes());
+        }
+
+        static void Step3p5PrepareGraphCudaTensor(Data &dst, const Data &src, int device) {
+            Step3p5PrepareGraphCudaTensorWithDims(dst, src, device, src.dims);
         }
 
         static void Step3p5PrepareGraphIntTensor(Data &dst, int device, const std::vector<int> &host) {
@@ -1752,6 +1766,113 @@ namespace fastllm {
 #endif
     }
 
+    void Step3p5Model::OnAutoWarmupFinished() {
+#ifdef USE_CUDA
+        if (GetFastllmEnv().cudaGraph) {
+            if (threadTpWorkerGroup.HasWorkers()) {
+                printf("[Fastllm] Step3.5 CUDA graph: stop tensor-parallel warmup workers before graph capture.\n");
+                threadTpWorkerGroup.Stop();
+            }
+            printf("[Fastllm] Step3.5 CUDA graph: clear warmup paged cache managers before graph capture.\n");
+            ClearAllPagedCacheManagers();
+            FastllmCudaClearBigBuffer();
+            PreCaptureCudaGraphAfterWarmup();
+        }
+#endif
+    }
+
+    static std::vector<int> GetStep3p5CudaGraphWarmupBatches() {
+        const int maxCudaGraphDecodeBatch = 16;
+        std::vector<int> ret;
+        std::set<int> seen;
+        const char *env = std::getenv("FASTLLM_CUDA_GRAPH_WARMUP_BATCHES");
+        std::string config = env == nullptr ? "" : env;
+        if (config.empty()) {
+            config = "1,2";
+        }
+        std::string lowered = config;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (lowered == "0" || lowered == "off" || lowered == "false" || lowered == "none") {
+            return ret;
+        }
+
+        for (char &c : config) {
+            if (!std::isdigit((unsigned char)c)) {
+                c = ' ';
+            }
+        }
+        std::stringstream ss(config);
+        int batch = 0;
+        while (ss >> batch) {
+            if (batch >= 1 && batch <= maxCudaGraphDecodeBatch &&
+                seen.insert(batch).second) {
+                ret.push_back(batch);
+            }
+        }
+        return ret;
+    }
+
+    void Step3p5Model::PreCaptureCudaGraphAfterWarmup() {
+#ifdef USE_CUDA
+        if (!GetFastllmEnv().cudaGraph || autoWarmupRunning.load() || GetKVCacheInCPU()) {
+            return;
+        }
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        if (!GetStep3p5GPUForwardDevices(this->deviceMap, devices, ratios) || devices.empty()) {
+            return;
+        }
+
+        std::vector<int> batches = GetStep3p5CudaGraphWarmupBatches();
+        if (batches.empty()) {
+            return;
+        }
+
+        for (int batch : batches) {
+            if (this->maxBatch > 0 && batch > this->maxBatch) {
+                continue;
+            }
+
+            printf("[Fastllm] Step3.5 CUDA graph: pre-capture decode batch=%d.\n", batch);
+            std::vector<float> inputIdsHost(batch, 1.0f);
+            Data inputIds(DataType::FLOAT32, {1, batch}, inputIdsHost);
+            std::vector<Data*> attentionMasks(batch, nullptr);
+            std::vector<int> seqLens(batch, 1);
+            std::vector<GenerationConfig> generationConfigs(batch);
+            LastTokensManager lastTokens;
+
+            std::vector<std::pair<Data, Data> > pastKeyValuesStorage;
+            std::vector<std::pair<Data*, Data*> > pastKeyValues;
+            pastKeyValuesStorage.reserve(batch * block_cnt);
+            pastKeyValues.reserve(batch * block_cnt);
+            for (int b = 0; b < batch; b++) {
+                for (int i = 0; i < block_cnt; i++) {
+                    pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType),
+                                                                  Data(this->kvCacheDataType)));
+                    pastKeyValuesStorage.back().first.SetKVCache();
+                    pastKeyValuesStorage.back().second.SetKVCache();
+                    pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage.back().first,
+                                                           &pastKeyValuesStorage.back().second));
+                }
+            }
+
+            for (int step = 0; step < 2; step++) {
+                std::vector<Data> positionIdsStorage;
+                std::vector<Data*> positionIds;
+                positionIdsStorage.reserve(batch);
+                positionIds.reserve(batch);
+                for (int b = 0; b < batch; b++) {
+                    positionIdsStorage.push_back(Data(DataType::FLOAT32, {1, 1}, {(float)step}));
+                    positionIds.push_back(&positionIdsStorage.back());
+                }
+                ForwardGPU(batch, inputIds, attentionMasks, positionIds, seqLens,
+                           pastKeyValues, generationConfigs, lastTokens, nullptr);
+            }
+        }
+#endif
+    }
+
     Data &Step3p5Model::GetThreadTensorParallelBias(const std::string &name) {
         auto it = this->weight.weight.find(name);
         if (it != this->weight.weight.end()) {
@@ -1780,7 +1901,7 @@ namespace fastllm {
         auto rejectGraph = [](const std::string &) -> bool {
             return false;
         };
-        if (!Step3p5CudaGraphEnabled()) {
+        if (!Step3p5CudaGraphEnabled(this)) {
             return rejectGraph("disabled");
         }
         const int maxCudaGraphDecodeBatch = 16;
@@ -1914,8 +2035,9 @@ namespace fastllm {
         }
 
         FastllmCudaSetDevice(gpuId);
-        Step3p5PrepareGraphCudaTensor(state.inputIds, *localInputIds, gpuId);
-        Step3p5PrepareGraphCudaTensor(state.positionIds, *localPositionIds, gpuId);
+        std::vector<int> graphTokenDims = {1, batch};
+        Step3p5PrepareGraphCudaTensorWithDims(state.inputIds, *localInputIds, gpuId, graphTokenDims);
+        Step3p5PrepareGraphCudaTensorWithDims(state.positionIds, *localPositionIds, gpuId, graphTokenDims);
 
         std::vector<int> insertIndexHost(batch, -1);
         std::vector<int> insertPositionHost(batch, 0);
@@ -2265,8 +2387,8 @@ namespace fastllm {
                             *requireLocal(weight["lm_head.weight"], "lm_head.weight"),
                             *requireLocal(GetThreadTensorParallelBias("lm_head.weight.tp_bias"),
                                           "lm_head.weight.tp_bias"),
-                            state.logits);
-            Qwen3CudaToDataType(cudaRunner, state.logits, DataType::FLOAT32);
+                            state.logitsHalf);
+            Qwen3CudaConvertToDataType(cudaRunner, state.logitsHalf, state.logits, DataType::FLOAT32);
         };
 
         auto runGraphBody = [&]() {
@@ -2386,9 +2508,6 @@ namespace fastllm {
         AssertInFastLLM(ratios.find(gpuId) == ratios.end() || ratios[gpuId] > 0,
                         "Step3p5 ForwardSingleGPU got invalid GPU ratio.\n");
         FastllmCudaSetDevice(gpuId);
-        if (isPrefill && Step3p5CudaGraphEnabled()) {
-            Step3p5DestroyCudaGraphDecodeStates(this, gpuId);
-        }
         if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
                                         seqLens, pastKeyValues, all1, isPrefill,
                                         tensorParallel, firstTensorParallelRank,
@@ -3064,6 +3183,9 @@ namespace fastllm {
         std::vector<int> devices;
         std::map<int, int> ratios;
         if (!GetStep3p5GPUForwardDevices(this->deviceMap, devices, ratios)) {
+            if (threadTpWorkerGroup.HasWorkers()) {
+                threadTpWorkerGroup.Stop();
+            }
             return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
@@ -3516,28 +3638,20 @@ namespace fastllm {
         std::vector<std::exception_ptr> errors(devices.size());
         std::vector<Data> localLogits(devices.size());
         if (devices.size() == 1) {
+            if (threadTpWorkerGroup.HasWorkers()) {
+                threadTpWorkerGroup.Stop();
+            }
             ForwardSingleGPU(devices[0], ratios, batch, gpuInputIds, allPositionIds,
                              seqLens, pastKeyValues, all1, isPrefill,
                              false, true, threadTpPagedCacheBase, localLogits[0]);
         } else {
-            std::vector<std::thread> threads;
-            threads.reserve(devices.size());
-            for (int r = 0; r < (int)devices.size(); r++) {
-                threads.emplace_back([&, r]() {
-                    try {
-                        ForwardSingleGPU(devices[r], ratios, batch, gpuInputIds, allPositionIds,
-                                         seqLens, localPastKeyValues[r], all1, isPrefill,
-                                         tensorParallel, r == 0,
-                                         threadTpPagedCacheBase + r * block_cnt,
-                                         localLogits[r]);
-                    } catch (...) {
-                        errors[r] = std::current_exception();
-                    }
-                });
-            }
-            for (auto &thread : threads) {
-                thread.join();
-            }
+            threadTpWorkerGroup.Run(devices, [&](int r) {
+                ForwardSingleGPU(devices[r], ratios, batch, gpuInputIds, allPositionIds,
+                                 seqLens, localPastKeyValues[r], all1, isPrefill,
+                                 tensorParallel, r == 0,
+                                 threadTpPagedCacheBase + r * block_cnt,
+                                 localLogits[r]);
+            }, errors);
             for (auto &error : errors) {
                 if (error) {
                     std::rethrow_exception(error);

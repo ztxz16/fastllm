@@ -6,6 +6,7 @@
 #include "baseblock.h"
 #include "template.h"
 
+#include <atomic>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -287,6 +288,8 @@ namespace fastllm {
 
         virtual void WarmUp() {}; // 预热
 
+        virtual void OnAutoWarmupFinished() {};
+
         void AutoWarmup(); // 自动预热：use_new_engine 时使用新引擎预热，否则调用 WarmUp
 
         virtual void AddPromptCache(const std::vector <int> &inputTokens);
@@ -353,6 +356,7 @@ namespace fastllm {
         bool is_multi_modal = false; // 是否是多模态模型
 
         bool use_new_engine = false; // 是否使用新的推理引擎，这是一个过渡变量，未来会删除
+        std::atomic<bool> autoWarmupRunning {false};
 
         std::string pre_prompt; // 最初对话的提示语
         std::string user_role, bot_role, history_sep; // 用于生成每一轮的prompt

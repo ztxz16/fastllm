@@ -6,6 +6,7 @@
 #define FASTLLM_STEP3P5_H
 
 #include "basellm.h"
+#include "utils/persistent_worker_group.h"
 
 #include <atomic>
 #include <map>
@@ -56,6 +57,10 @@ namespace fastllm {
         virtual bool NeedAttentionMask(int qlen, int klen);
 
         virtual void WarmUp();
+
+        virtual void OnAutoWarmupFinished();
+
+        void PreCaptureCudaGraphAfterWarmup();
 
         virtual std::string ApplyChatTemplate(const ChatMessages &messages);
 
@@ -149,6 +154,7 @@ namespace fastllm {
         std::map <int, int> threadTpPreparedRatios;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpKVHeadSchemes;
         std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
+        PersistentWorkerGroup threadTpWorkerGroup;
         std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeWeights;
         std::unordered_map <int, std::vector <std::vector <Data*> > > threadTpMoeBiass;
         std::unordered_map <int, std::vector <std::vector <Data> > > threadTpOwnedMoeWeights;
