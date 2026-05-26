@@ -149,7 +149,7 @@ namespace fastllm {
         int threadTpPagedCacheBase = -1;
         std::mutex threadTpWeightPrepareLock;
         std::atomic<bool> singleGpuWeightsPrepared{false};
-        bool threadTpWeightsPrepared = false;
+        std::atomic<bool> threadTpWeightsPrepared{false};
         std::vector <int> threadTpPreparedDevices;
         std::map <int, int> threadTpPreparedRatios;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpKVHeadSchemes;
