@@ -2656,6 +2656,8 @@ namespace fastllm {
         int attentionType = intParams.find("attentionType") != intParams.end() ? intParams.find("attentionType")->second : 0;
         bool inited = intParams.find("inited") != intParams.end() ? (intParams.find("inited")->second != 0) : false;
         bool sync = intParams.find("sync") != intParams.end() ? (intParams.find("sync")->second != 0) : true;
+        bool enableCudaGraph = intParams.find("enableCudaGraph") != intParams.end() ? (intParams.find("enableCudaGraph")->second != 0) : false;
+        int flashInferCudaGraph = intParams.find("flashInferCudaGraph") != intParams.end() ? intParams.find("flashInferCudaGraph")->second : -1;
 
         std::vector <int> devices;
         std::map <int, int> ratios;
@@ -2663,7 +2665,8 @@ namespace fastllm {
         if (devices.size() <= 1 || !q.multiDeviceData) {
             output.Allocate();
             FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens,
-                                               output, group, scale, attentionType, inited, sync);
+                                               output, group, scale, attentionType, inited, sync, enableCudaGraph,
+                                               flashInferCudaGraph);
             return;
         }
 
@@ -2749,7 +2752,7 @@ namespace fastllm {
                 *pageIndexs.multiDeviceDatas[device], *lastPageLens.multiDeviceDatas[device],
                 *output.multiDeviceDatas[device],
                 group,
-                scale, attentionType, inited, false
+                scale, attentionType, inited, false, enableCudaGraph, flashInferCudaGraph
             );
         }
         if (sync) {

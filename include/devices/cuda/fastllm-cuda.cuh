@@ -370,11 +370,19 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     float llama3OriginalMaxPosition = 131072.0f,
     float llama3LowFreqFactor = 1.0f,
     float llama3HighFreqFactor = 32.0f);
+bool FastllmCudaAdvanceDecodeMeta(
+    int32_t *insertPositions, int32_t *lastPageLens, int batch);
 bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fastllm::Data &penaltyScale);
 bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,
                                   int batch, int vocabSize);
+bool FastllmCudaGreedySampling(float *logits, int *output,
+                               int batch, int vocabSize);
+bool FastllmCudaSampleTopK(float *topk, float *temperatures,
+                           int *topKArr, float *topPArr, float *randoms,
+                           int *output,
+                           int batch, int maxTopK);
 bool FastllmCudaApplyLognAttn (fastllm::Data &input, fastllm::Data &lognAttn, fastllm::Data &positionIds);
 
 bool FastllmCudaAttentionBatch(fastllm::Data **q, fastllm::Data **k, fastllm::Data **v,
@@ -393,7 +401,7 @@ bool FastllmCudaBatchMatMulBatch(void **i0s, void **i1s, void **os,
 bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
                           const fastllm::Data &mask, const fastllm::Data &output, int group, float scale, int maskType);
 bool FastllmCudaHalfPagedAttention(fastllm::Data &q, fastllm::Data &k, fastllm::Data &v, fastllm::Data &output, int group, float scale, bool inited = false);
-bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true);
+bool FastllmCudaHalfPagedAttentionBatch(fastllm::Data &q, fastllm::Data &kCaches, fastllm::Data &vCaches, fastllm::Data &qSizes, fastllm::Data &pageSizes, fastllm::Data &pageIndexs, fastllm::Data &lastPageLens, fastllm::Data &output, int group, float scale, int attentionType, bool inited = false, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1);
 bool FastllmCudaHalfMatMulFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k, bool addTo = false);
 bool FastllmCudaHalfMatMulFloat16AddToNoBias(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaHalfMatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);

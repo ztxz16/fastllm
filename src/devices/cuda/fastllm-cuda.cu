@@ -5246,6 +5246,43 @@ bool FastllmCudaQKVRMSNormRopeSplitAppendPagedCache(
     return true;
 }
 
+__global__ void FastllmAdvanceDecodeMetaKernel(
+    int32_t *insertPositions,
+    int32_t *lastPageLens,
+    int batch) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) {
+        return;
+    }
+    int32_t oldLen = lastPageLens[b];
+    insertPositions[b] = oldLen;
+    lastPageLens[b] = oldLen + 1;
+}
+
+bool FastllmCudaAdvanceDecodeMeta(
+    int32_t *insertPositions,
+    int32_t *lastPageLens,
+    int batch) {
+    if (batch <= 0) {
+        return true;
+    }
+    if (insertPositions == nullptr || lastPageLens == nullptr) {
+        fastllm::ErrorInFastLLM("FastllmCudaAdvanceDecodeMeta: null metadata pointer.\n");
+        return false;
+    }
+    const int threads = 128;
+    int blocks = (batch + threads - 1) / threads;
+    FastllmAdvanceDecodeMetaKernel<<<blocks, threads, 0, cudaStreamPerThread>>>(
+        insertPositions, lastPageLens, batch);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        printf("FastllmCudaAdvanceDecodeMeta: kernel launch failed: %s\n",
+               cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
 bool FastllmCudaRopeEncoding(fastllm::Data &data, const fastllm::Data &positionIds, int rotaryDim, float ropeTheta, float ropeScale) {
     float *cudaData = (float *) FastllmCudaPrepareInput(data);
     float *cudaPositionIds = (float *) FastllmCudaPrepareInput(positionIds);
@@ -5409,22 +5446,34 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,
                                   int batch, int vocabSize) {
-    float *cudaProbs = (float *)FastllmCudaMalloc((long long)batch * vocabSize * sizeof(float));
+    size_t probsBytes = (size_t)batch * vocabSize * sizeof(float);
 
     // temperatures (float * batch) | topKArr (int * batch) | topPArr (float * batch) | output (int * batch)
     size_t paramBytes = batch * (sizeof(float) + sizeof(int) + sizeof(float) + sizeof(int));
-    uint8_t *cudaParamBuf = (uint8_t *)FastllmCudaMalloc(paramBytes);
+    size_t alignedProbsBytes = FastllmCudaAlignBytes(probsBytes, 256);
+    size_t alignedParamBytes = FastllmCudaAlignBytes(paramBytes, 256);
+    size_t scratchBytes = 0;
+    bool scratchOwn = false;
+    uint8_t *scratch = (uint8_t *)FastllmBorrowDequantScratch(
+        alignedProbsBytes + alignedParamBytes, &scratchBytes, &scratchOwn);
+    if (scratchBytes < alignedProbsBytes + alignedParamBytes) {
+        FastllmReleaseDequantScratch(scratch, scratchOwn);
+        scratch = (uint8_t *)FastllmCudaMalloc(alignedProbsBytes + alignedParamBytes);
+        scratchOwn = true;
+    }
+    float *cudaProbs = (float *)scratch;
+    uint8_t *cudaParamBuf = scratch + alignedProbsBytes;
     float *cudaTemperatures = (float *)(cudaParamBuf);
     int   *cudaTopKArr      = (int   *)(cudaParamBuf + batch * sizeof(float));
     float *cudaTopPArr      = (float *)(cudaParamBuf + batch * (sizeof(float) + sizeof(int)));
     int   *cudaOutput       = (int   *)(cudaParamBuf + batch * (sizeof(float) + sizeof(int) + sizeof(float)));
 
-    uint8_t *hostParamBuf = new uint8_t[batch * (sizeof(float) + sizeof(int) + sizeof(float))];
-    memcpy(hostParamBuf, temperatures, batch * sizeof(float));
-    memcpy(hostParamBuf + batch * sizeof(float), topKArr, batch * sizeof(int));
-    memcpy(hostParamBuf + batch * (sizeof(float) + sizeof(int)), topPArr, batch * sizeof(float));
-    FastllmCudaCopyFromHostToDevice(cudaParamBuf, hostParamBuf, batch * (sizeof(float) + sizeof(int) + sizeof(float)));
-    delete[] hostParamBuf;
+    static thread_local std::vector<uint8_t> hostParamBuf;
+    hostParamBuf.resize(batch * (sizeof(float) + sizeof(int) + sizeof(float)));
+    memcpy(hostParamBuf.data(), temperatures, batch * sizeof(float));
+    memcpy(hostParamBuf.data() + batch * sizeof(float), topKArr, batch * sizeof(int));
+    memcpy(hostParamBuf.data() + batch * (sizeof(float) + sizeof(int)), topPArr, batch * sizeof(float));
+    FastllmCudaCopyFromHostToDevice(cudaParamBuf, hostParamBuf.data(), hostParamBuf.size());
 
     FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(logits, cudaProbs, cudaTemperatures, vocabSize);
 
@@ -5440,8 +5489,122 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
     FastllmCudaCopyFromDeviceToHost(output, cudaOutput, batch * sizeof(int));
     DeviceSync();
 
-    FastllmCudaFree(cudaProbs);
-    FastllmCudaFree(cudaParamBuf);
+    FastllmReleaseDequantScratch(scratch, scratchOwn);
+    return true;
+}
+
+template <int THREAD_PER_BLOCK>
+__global__ void FastllmGreedySamplingKernel(float *logits, int *output, int vocabSize) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    float *row = logits + (long long)b * vocabSize;
+
+    __shared__ float maxData[THREAD_PER_BLOCK];
+    __shared__ int idData[THREAD_PER_BLOCK];
+    float localMax = -1.0e30f;
+    int localId = 0;
+    for (int i = tid; i < vocabSize; i += THREAD_PER_BLOCK) {
+        float v = row[i];
+        if (v > localMax) {
+            localMax = v;
+            localId = i;
+        }
+    }
+    maxData[tid] = localMax;
+    idData[tid] = localId;
+    __syncthreads();
+
+    for (int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s && maxData[tid] < maxData[tid + s]) {
+            maxData[tid] = maxData[tid + s];
+            idData[tid] = idData[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        output[b] = idData[0];
+    }
+}
+
+bool FastllmCudaGreedySampling(float *logits, int *output,
+                               int batch, int vocabSize) {
+    if (batch <= 0) {
+        return true;
+    }
+    if (logits == nullptr || output == nullptr || vocabSize <= 0) {
+        fastllm::ErrorInFastLLM("FastllmCudaGreedySampling: invalid input.\n");
+        return false;
+    }
+    FastllmGreedySamplingKernel<256><<<batch, 256>>>(logits, output, vocabSize);
+    cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        printf("FastllmCudaGreedySampling: kernel launch failed: %s\n",
+               cudaGetErrorString(status));
+        return false;
+    }
+    return true;
+}
+
+__global__ void FastllmSampleTopKKernel(float *topk, float *temperatures,
+                                        int *topKArr, float *topPArr,
+                                        float *randoms, int *output,
+                                        int maxTopK) {
+    int b = blockIdx.x;
+    float *base = topk + (long long)b * maxTopK * 2;
+    int curTopK = topKArr[b];
+    if (curTopK <= 1 || maxTopK <= 1 || temperatures[b] <= 1.0e-6f) {
+        output[b] = (int)(base[0] + 1.0e-3f);
+        return;
+    }
+    curTopK = min(curTopK, maxTopK);
+
+    float topP = topPArr[b];
+    float invTemp = 1.0f / temperatures[b];
+    float maxValue = base[1] * invTemp;
+    for (int i = 1; i < curTopK; i++) {
+        maxValue = max(maxValue, base[i * 2 + 1] * invTemp);
+    }
+
+    float sum = 0.0f;
+    for (int i = 0; i < curTopK; i++) {
+        sum += expf(base[i * 2 + 1] * invTemp - maxValue);
+    }
+    if (sum <= 0.0f || !isfinite(sum)) {
+        output[b] = (int)(base[0] + 1.0e-3f);
+        return;
+    }
+
+    float cutoffSum = 0.0f;
+    int cutoff = curTopK;
+    for (int i = 0; i < curTopK; i++) {
+        cutoffSum += expf(base[i * 2 + 1] * invTemp - maxValue) / sum;
+        if (cutoffSum > topP) {
+            cutoff = i + 1;
+            break;
+        }
+    }
+    cutoffSum = max(cutoffSum, 1.0e-20f);
+
+    float rnd = randoms[b];
+    rnd = min(max(rnd, 0.0f), 0.99999994f) * cutoffSum;
+    float curSum = 0.0f;
+    for (int i = 0; i < cutoff; i++) {
+        curSum += expf(base[i * 2 + 1] * invTemp - maxValue) / sum;
+        if (curSum > rnd || i == cutoff - 1) {
+            output[b] = (int)(base[i * 2] + 1.0e-3f);
+            return;
+        }
+    }
+    output[b] = (int)(base[0] + 1.0e-3f);
+}
+
+bool FastllmCudaSampleTopK(float *topk, float *temperatures,
+                           int *topKArr, float *topPArr, float *randoms,
+                           int *output,
+                           int batch, int maxTopK) {
+    FastllmSampleTopKKernel<<<batch, 1>>>(topk, temperatures, topKArr, topPArr,
+                                          randoms, output, maxTopK);
     return true;
 }
 

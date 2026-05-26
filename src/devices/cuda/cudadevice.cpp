@@ -3895,8 +3895,8 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         FastllmCudaCopyFromHostToDevice(insertPositions.cudaData, (void*)posDataHost.data(), batch * sizeof(int32_t));
     }
 
-    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens, Data &output, int group, float scale, int attentionType, bool inited, bool sync = true) {
-        FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync);
+    void DoCudaAttentionPagedBatch(Data &q, Data &kCaches, Data &vCaches, Data &qSizes, Data &pageSizes, Data &pageIndexs, Data &lastPageLens, Data &output, int group, float scale, int attentionType, bool inited, bool sync = true, bool enableCudaGraph = false, int flashInferCudaGraph = -1) {
+        FastllmCudaHalfPagedAttentionBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync, enableCudaGraph, flashInferCudaGraph);
     }
 
     void CudaAttentionPagedBatchOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -3914,8 +3914,10 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
         int attentionType = intParams.find("attentionType") != intParams.end() ? intParams.find("attentionType")->second : 0;
         bool inited = intParams.find("inited") != intParams.end() ? (intParams.find("inited")->second != 0) : false;
         bool sync = intParams.find("sync") != intParams.end() ? (intParams.find("sync")->second != 0) : true;
+        bool enableCudaGraph = intParams.find("enableCudaGraph") != intParams.end() ? (intParams.find("enableCudaGraph")->second != 0) : false;
+        int flashInferCudaGraph = intParams.find("flashInferCudaGraph") != intParams.end() ? intParams.find("flashInferCudaGraph")->second : -1;
         output.Allocate(false);
-        DoCudaAttentionPagedBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync);
+        DoCudaAttentionPagedBatch(q, kCaches, vCaches, qSizes, pageSizes, pageIndexs, lastPageLens, output, group, scale, attentionType, inited, sync, enableCudaGraph, flashInferCudaGraph);
     }
 
     void CudaGeneratePagedBatchParamsOp::Run(const std::string &opType, const fastllm::DataDict &datas,

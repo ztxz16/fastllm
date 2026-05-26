@@ -439,13 +439,17 @@ namespace fastllm {
             int group,
             float scale,
             int attentionType,
-            bool inited) {
+            bool inited,
+            bool enableCudaGraph = false,
+            int flashInferCudaGraph = -1) {
         runner.Run("AttentionPagedBatch",
                    DataDict{{"q", &q}, {"kCaches", &kCaches}, {"vCaches", &vCaches},
                             {"output", &output}, {"qSizes", &qSizes}, {"pageSizes", &pageSizes},
                             {"pageIndexs", &pageIndexs}, {"lastPageLens", &lastPageLens}},
                    FloatDict{{"scale", scale}},
-                   IntDict{{"group", group}, {"attentionType", attentionType}, {"inited", (int)inited}, {"sync", 0}},
+                   IntDict{{"group", group}, {"attentionType", attentionType}, {"inited", (int)inited},
+                           {"sync", 0}, {"enableCudaGraph", (int)enableCudaGraph},
+                           {"flashInferCudaGraph", flashInferCudaGraph}},
                    {"output"});
     }
 
@@ -528,7 +532,9 @@ namespace fastllm {
             bool doPostQKNorm,
             int pagedCacheLayerOffset,
             bool skipOutputProjection,
-            bool externalDecodeMeta) {
+            bool externalDecodeMeta,
+            bool enableFlashInferCudaGraph = false,
+            int flashInferCudaGraph = -1) {
         bool mergedQkv = (mergeQkvWeight->dims.size() > 0);
         if (mergedQkv) {
             mergeQkvWeight->tpPackType = TP_PACK_QKV;
@@ -713,7 +719,8 @@ namespace fastllm {
                 Qwen3CudaAttentionPagedBatch(runner, qForAttention,
                     kCaches, vCaches,
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                    *attenOutput, numAttentionHeads / numKeyValueHeads, 1.0f / std::sqrt((float)headDim), 1, layerIdx > 0);
+                    *attenOutput, numAttentionHeads / numKeyValueHeads, 1.0f / std::sqrt((float)headDim), 1,
+                    layerIdx > 0, enableFlashInferCudaGraph, flashInferCudaGraph);
             }
 
             attenOutput->Reshape({1, seqlen, -1});
@@ -779,7 +786,8 @@ namespace fastllm {
             Qwen3CudaAttentionPagedBatch(runner, qForAttention,
                 kCaches, vCaches,
                 *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                *attenOutput, numAttentionHeads / numKeyValueHeads, 1.0f / std::sqrt((float)headDim), 1, layerIdx > 0);
+                *attenOutput, numAttentionHeads / numKeyValueHeads, 1.0f / std::sqrt((float)headDim), 1,
+                layerIdx > 0, enableFlashInferCudaGraph, flashInferCudaGraph);
 
             attenOutput->Reshape({seqlen, bsz, -1});
             Qwen3CudaPermuteSelf(runner, *attenOutput, {1, 0, 2});
