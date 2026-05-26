@@ -243,6 +243,60 @@ namespace fastllm {
             cache.ToDevice(DataDevice::CUDA, {device}, false);
         }
 
+        static void SyncQwen3ThreadTpRootCacheMetaFromLocal(Data &root,
+                                                            Data *firstLocal,
+                                                            const std::vector<int> &devices,
+                                                            const DivisionScheme &kvHeadScheme,
+                                                            int globalKVHeads,
+                                                            int headDim) {
+            if (firstLocal == nullptr) {
+                return;
+            }
+            if (firstLocal->dims.size() < 3) {
+                return;
+            }
+
+            std::vector<int> globalDims = {globalKVHeads, firstLocal->dims[1], headDim};
+            bool samePageIndex = root.pageIndex.size() == firstLocal->pageIndex.size() &&
+                (root.pageIndex.empty() || root.pageIndex.back() == firstLocal->pageIndex.back());
+            bool fastMetaUpdate =
+                root.multiDeviceData &&
+                root.dataDevice == DataDevice::CUDA &&
+                root.tpLayout == TP_LAYOUT_SHARDED &&
+                root.tpAxis == 0 &&
+                root.isKVCache &&
+                root.isPagedKVCache == firstLocal->isPagedKVCache &&
+                root.pageLen == firstLocal->pageLen &&
+                root.pagedKVCacheData == firstLocal->pagedKVCacheData &&
+                root.tpGlobalDims == globalDims &&
+                root.dims == globalDims &&
+                samePageIndex;
+            if (fastMetaUpdate) {
+                root.lastPageLen = firstLocal->lastPageLen;
+                return;
+            }
+
+            root.multiDeviceData = true;
+            root.dataType = firstLocal->dataType;
+            root.UpdateUnitSize();
+            root.dataDevice = DataDevice::CUDA;
+            root.dataDeviceIds = devices;
+            root.tpLayout = TP_LAYOUT_SHARDED;
+            root.tpAxis = 0;
+            root.tpRanges = kvHeadScheme;
+            root.tpGlobalDims = globalDims;
+            if (root.dims != globalDims) {
+                root.Resize(globalDims);
+            }
+            root.cudaData = nullptr;
+            root.isKVCache = true;
+            root.isPagedKVCache = firstLocal->isPagedKVCache;
+            root.pageLen = firstLocal->pageLen;
+            root.pageIndex = firstLocal->pageIndex;
+            root.lastPageLen = firstLocal->lastPageLen;
+            root.pagedKVCacheData = firstLocal->pagedKVCacheData;
+        }
+
         static void SyncQwen3ThreadTpRootCacheMeta(Data &root,
                                                    const std::vector<int> &devices,
                                                    const DivisionScheme &kvHeadScheme,
@@ -260,27 +314,8 @@ namespace fastllm {
                     break;
                 }
             }
-            if (firstLocal == nullptr) {
-                return;
-            }
-
-            root.multiDeviceData = true;
-            root.dataType = firstLocal->dataType;
-            root.UpdateUnitSize();
-            root.dataDevice = DataDevice::CUDA;
-            root.dataDeviceIds = devices;
-            root.tpLayout = TP_LAYOUT_SHARDED;
-            root.tpAxis = 0;
-            root.tpRanges = kvHeadScheme;
-            root.tpGlobalDims = {globalKVHeads, firstLocal->dims[1], headDim};
-            root.Resize(root.tpGlobalDims);
-            root.cudaData = nullptr;
-            root.isKVCache = true;
-            root.isPagedKVCache = firstLocal->isPagedKVCache;
-            root.pageLen = firstLocal->pageLen;
-            root.pageIndex = firstLocal->pageIndex;
-            root.lastPageLen = firstLocal->lastPageLen;
-            root.pagedKVCacheData = firstLocal->pagedKVCacheData;
+            SyncQwen3ThreadTpRootCacheMetaFromLocal(root, firstLocal, devices,
+                                                    kvHeadScheme, globalKVHeads, headDim);
         }
 
         struct Qwen3ForwardSingleBuffers {
@@ -320,6 +355,11 @@ namespace fastllm {
             Qwen3ForwardSingleBuffers buffers;
             Data logitsHalf;
             Data logits;
+            std::vector<int> lastInsertIndexHost;
+            std::vector<int> lastPageSizesHost;
+            std::vector<int> lastPageIndexHost;
+            std::vector<int> lastDecodePageLensHost;
+            std::vector<const Data*> lastPastKeyHosts;
 
             ~Qwen3CudaGraphDecodeState() {
                 if (exec != nullptr) {
@@ -344,6 +384,11 @@ namespace fastllm {
             }
             state.captured = false;
             state.warmed = false;
+            state.lastInsertIndexHost.clear();
+            state.lastPageSizesHost.clear();
+            state.lastPageIndexHost.clear();
+            state.lastDecodePageLensHost.clear();
+            state.lastPastKeyHosts.clear();
         }
 
         using Qwen3CudaGraphStateKey = std::tuple<const Qwen3Model*, int, int>;
@@ -482,13 +527,6 @@ namespace fastllm {
             runner.Run("Linear",
                        DataDict{{"input", &input}, {"weight", &weight}, {"bias", (Data*)&bias}, {"output", &output}},
                        FloatDict(), IntDict(), {"output"});
-        }
-
-        static void Qwen3CudaTopK(Qwen3CudaDirectRunner &runner,
-                                  Data &input, Data &output, int topk) {
-            runner.Run("TopK",
-                       DataDict{{"input", &input}, {"output", &output}},
-                       FloatDict(), IntDict{{"topk", topk}}, {"output"});
         }
 
         static void Qwen3CudaLinearSwiglu(Qwen3CudaDirectRunner &runner,
@@ -699,13 +737,17 @@ namespace fastllm {
                 int group,
                 float scale,
                 int attentionType,
-                bool inited) {
+                bool inited,
+                bool enableCudaGraph = false,
+                int flashInferCudaGraph = -1) {
             runner.Run("AttentionPagedBatch",
                        DataDict{{"q", &q}, {"kCaches", &kCaches}, {"vCaches", &vCaches},
                                 {"output", &output}, {"qSizes", &qSizes}, {"pageSizes", &pageSizes},
                                 {"pageIndexs", &pageIndexs}, {"lastPageLens", &lastPageLens}},
                        FloatDict{{"scale", scale}},
-                       IntDict{{"group", group}, {"attentionType", attentionType}, {"inited", (int)inited}, {"sync", 0}},
+                       IntDict{{"group", group}, {"attentionType", attentionType}, {"inited", (int)inited},
+                               {"sync", 0}, {"enableCudaGraph", (int)enableCudaGraph},
+                               {"flashInferCudaGraph", flashInferCudaGraph}},
                        {"output"});
         }
 
@@ -788,7 +830,9 @@ namespace fastllm {
                 bool doPostQKNorm,
                 int pagedCacheLayerOffset,
                 bool skipOutputProjection,
-                bool externalDecodeMeta) {
+                bool externalDecodeMeta,
+                bool enableCudaGraph = false,
+                int flashInferCudaGraph = -1) {
             bool mergedQkv = (mergeQkvWeight->dims.size() > 0);
             if (mergedQkv) {
                 mergeQkvWeight->tpPackType = TP_PACK_QKV;
@@ -973,7 +1017,9 @@ namespace fastllm {
                     Qwen3CudaAttentionPagedBatch(runner, qForAttention,
                         kCaches, vCaches,
                         *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                        *attenOutput, numAttentionHeads / numKeyValueHeads, 1.0f / sqrt(headDim), 1, layerIdx > 0);
+                        *attenOutput, numAttentionHeads / numKeyValueHeads,
+                        1.0f / sqrt(headDim), 1, layerIdx > 0,
+                        enableCudaGraph, flashInferCudaGraph);
                 }
 
                 attenOutput->Reshape({1, seqlen, -1});
@@ -1039,7 +1085,9 @@ namespace fastllm {
                 Qwen3CudaAttentionPagedBatch(runner, qForAttention,
                     kCaches, vCaches,
                     *qSizes, *pageSizes, *pageIndexs, *lastPageLens,
-                    *attenOutput, numAttentionHeads / numKeyValueHeads, 1.0f / sqrt(headDim), 1, layerIdx > 0);
+                    *attenOutput, numAttentionHeads / numKeyValueHeads,
+                    1.0f / sqrt(headDim), 1, layerIdx > 0,
+                    enableCudaGraph, flashInferCudaGraph);
 
                 attenOutput->Reshape({seqlen, bsz, -1});
                 Qwen3CudaPermuteSelf(runner, *attenOutput, {1, 0, 2});
@@ -1075,7 +1123,7 @@ namespace fastllm {
                 }
                 maxTopK = std::max(maxTopK, curTopK);
             }
-            return allSimple;
+            return true;
         }
 
         static Data &Qwen3ThreadLocalCudaSamplingFullLogits() {
@@ -1083,14 +1131,9 @@ namespace fastllm {
             return fullLogits;
         }
 
-        static Data &Qwen3ThreadLocalCudaSamplingTopK() {
-            static thread_local Data topk(DataType::FLOAT32);
-            return topk;
-        }
-
-        static Data &Qwen3ThreadLocalCpuSamplingTopK() {
-            static thread_local Data topk(DataType::FLOAT32);
-            return topk;
+        static Data &Qwen3ThreadLocalCudaSamplingOutput() {
+            static thread_local Data data(DataType::INT32);
+            return data;
         }
 
         static void Qwen3GatherShardLogitsToRootCuda(
@@ -1153,31 +1196,40 @@ namespace fastllm {
             FastllmCudaSetDevice(rootDevice);
             std::vector<int> lastRet;
             lastRet.reserve(batch);
-            Qwen3CudaDirectRunner cudaRunner(rootDevice);
-            Data &topk = Qwen3ThreadLocalCudaSamplingTopK();
-            Qwen3CudaTopK(cudaRunner, fullLogits, topk, maxTopK);
-            Data &cpuTopK = Qwen3ThreadLocalCpuSamplingTopK();
-            cpuTopK.dataType = DataType::FLOAT32;
-            cpuTopK.UpdateUnitSize();
-            cpuTopK.Resize(topk.dims);
-            if (cpuTopK.dataDevice != DataDevice::CPU) {
-                cpuTopK.FreeSpace();
-                cpuTopK.dataDevice = DataDevice::CPU;
-                cpuTopK.dataDeviceIds = {0};
-            }
-            cpuTopK.Allocate();
-            FastllmCudaCopyFromDeviceToHost(cpuTopK.cpuData, topk.cudaData, topk.GetBytes());
-            int stride = cpuTopK.Count(0) / batch;
-            float *topkData = (float*)cpuTopK.cpuData;
-            if (allSimple) {
+            if (!allSimple) {
+                static thread_local std::vector<float> temperatures;
+                static thread_local std::vector<int> topKs;
+                static thread_local std::vector<float> topPs;
+                temperatures.resize(batch);
+                topKs.resize(batch);
+                topPs.resize(batch);
                 for (int b = 0; b < batch; b++) {
-                    lastRet.push_back((int)(topkData[(long long)b * stride] + 1e-3f));
+                    temperatures[b] = std::max(generationConfigs[b].temperature, 1.0e-6f);
+                    topKs[b] = generationConfigs[b].top_k;
+                    topPs[b] = generationConfigs[b].top_p;
                 }
-            } else {
-                for (int b = 0; b < batch; b++) {
-                    lastRet.push_back(LLMSamplingOnly(cpuTopK, b, generationConfigs[b]));
-                }
+                lastRet.resize(batch);
+                int vocabSize = fullLogits.dims.back();
+                FastllmCudaTopKTopPSampling((float*)fullLogits.cudaData,
+                                            temperatures.data(), topKs.data(), topPs.data(),
+                                            lastRet.data(), batch, vocabSize);
+                return lastRet;
             }
+
+            Data &cudaOutput = Qwen3ThreadLocalCudaSamplingOutput();
+            Qwen3CudaPrepareLocalOutput(cudaOutput, rootDevice);
+            cudaOutput.dataType = DataType::INT32;
+            cudaOutput.UpdateUnitSize();
+            cudaOutput.Resize({batch});
+            cudaOutput.Allocate();
+
+            int vocabSize = fullLogits.dims.back();
+            FastllmCudaGreedySampling((float*)fullLogits.cudaData,
+                                      (int*)cudaOutput.cudaData,
+                                      batch, vocabSize);
+            lastRet.resize(batch);
+            FastllmCudaCopyFromDeviceToHost(lastRet.data(), cudaOutput.cudaData,
+                                            (size_t)batch * sizeof(int));
             return lastRet;
         }
 #endif
@@ -1215,6 +1267,90 @@ namespace fastllm {
 #endif
     }
 
+    void Qwen3Model::OnAutoWarmupFinished() {
+#ifdef USE_CUDA
+        if (GetFastllmEnv().cudaGraph) {
+            if (threadTpWorkerGroup.HasWorkers()) {
+                threadTpWorkerGroup.Stop();
+            }
+            PreCaptureCudaGraphAfterWarmup();
+        }
+#endif
+    }
+
+    void Qwen3Model::PreCaptureCudaGraphAfterWarmup() {
+#ifdef USE_CUDA
+        if (!GetFastllmEnv().cudaGraph || autoWarmupRunning.load() || GetKVCacheInCPU()) {
+            return;
+        }
+        std::vector<int> devices;
+        std::map<int, int> ratios;
+        if (!GetQwen3GPUForwardDevices(this->deviceMap, devices, ratios) || devices.empty()) {
+            return;
+        }
+
+        const int maxCudaGraphDecodeBatch = 32;
+        int maxWarmupBatch = maxCudaGraphDecodeBatch;
+        if (this->maxBatch > 0) {
+            maxWarmupBatch = std::min(maxWarmupBatch, this->maxBatch);
+        }
+
+        auto printProgress = [](int done, int total, int batch) {
+            const int barWidth = 32;
+            int filled = total > 0 ? done * barWidth / total : barWidth;
+            printf("\r[Fastllm] Qwen3 CUDA graph warmup capture [");
+            for (int i = 0; i < barWidth; i++) {
+                putchar(i < filled ? '#' : '-');
+            }
+            printf("] %d/%d batch=%d%s", done, total, batch,
+                   done >= total ? " done" : "     ");
+            if (done >= total) {
+                printf("\n");
+            }
+            fflush(stdout);
+        };
+        printProgress(0, maxWarmupBatch, 0);
+
+        for (int batch = 1; batch <= maxWarmupBatch; batch++) {
+            std::vector<float> inputIdsHost(batch, 1.0f);
+            Data inputIds(DataType::FLOAT32, {1, batch}, inputIdsHost);
+            std::vector<Data*> attentionMasks(batch, nullptr);
+            std::vector<int> seqLens(batch, 1);
+            std::vector<GenerationConfig> generationConfigs(batch);
+            LastTokensManager lastTokens;
+
+            std::vector<std::pair<Data, Data> > pastKeyValuesStorage;
+            std::vector<std::pair<Data*, Data*> > pastKeyValues;
+            pastKeyValuesStorage.reserve(batch * block_cnt);
+            pastKeyValues.reserve(batch * block_cnt);
+            for (int b = 0; b < batch; b++) {
+                for (int i = 0; i < block_cnt; i++) {
+                    pastKeyValuesStorage.push_back(std::make_pair(Data(this->kvCacheDataType),
+                                                                  Data(this->kvCacheDataType)));
+                    pastKeyValuesStorage.back().first.SetKVCache();
+                    pastKeyValuesStorage.back().second.SetKVCache();
+                    pastKeyValues.push_back(std::make_pair(&pastKeyValuesStorage.back().first,
+                                                           &pastKeyValuesStorage.back().second));
+                }
+            }
+
+            for (int step = 0; step < 3; step++) {
+                std::vector<Data> positionIdsStorage;
+                std::vector<Data*> positionIds;
+                positionIdsStorage.reserve(batch);
+                positionIds.reserve(batch);
+                for (int b = 0; b < batch; b++) {
+                    positionIdsStorage.push_back(Data(DataType::FLOAT32, {1, 1}, {(float)step}));
+                    positionIds.push_back(&positionIdsStorage.back());
+                }
+                ForwardGPU(batch, inputIds, attentionMasks, positionIds, seqLens,
+                           pastKeyValues, generationConfigs, lastTokens, nullptr);
+            }
+            printProgress(batch, maxWarmupBatch, batch);
+        }
+#endif
+    }
+
     Data &Qwen3Model::GetThreadTensorParallelBias(const std::string &name) {
         auto it = this->weight.weight.find(name);
         if (it != this->weight.weight.end()) {
@@ -1240,7 +1376,7 @@ namespace fastllm {
 #ifndef USE_CUDA
         return false;
 #else
-        const int maxCudaGraphDecodeBatch = 16;
+        const int maxCudaGraphDecodeBatch = 32;
         if (!Qwen3CudaGraphEnabled() || batch <= 0 || batch > maxCudaGraphDecodeBatch ||
             !all1 || isPrefill || (int)seqLens.size() < batch ||
             (int)pastKeyValues.size() < batch * block_cnt) {
@@ -1308,7 +1444,6 @@ namespace fastllm {
         if (rope_type == RoPEType::DYMAMIC_NTK && currentTokens + 1 >= max_positions) {
             return false;
         }
-
         Qwen3CudaGraphDecodeState &state = GetQwen3CudaGraphDecodeState(this, gpuId, batch);
         std::unique_lock<std::mutex> graphLock(state.mutex);
         if (state.disabled) {
@@ -1319,18 +1454,33 @@ namespace fastllm {
         Qwen3PrepareGraphCudaTensor(state.inputIds, *localInputIds, gpuId);
         Qwen3PrepareGraphCudaTensor(state.positionIds, *localPositionIds, gpuId);
 
+        PagedCacheManager *graphPagedManager = pastKeyValues[0].first->pagedKVCacheData;
+        int graphMaxPagesPerRequest = graphPagedManager != nullptr ? graphPagedManager->maxPages : 0;
+        if (graphMaxPagesPerRequest <= 0 && graphPagedManager != nullptr && !graphPagedManager->dims.empty()) {
+            graphMaxPagesPerRequest = graphPagedManager->dims[0];
+        }
+        if (graphMaxPagesPerRequest <= 0) {
+            return false;
+        }
+
         std::vector<int> insertIndexHost(batch, -1);
         std::vector<int> insertPositionHost(batch, 0);
         std::vector<int> lastPageLensHost(batch, 0);
         std::vector<int> qSizesHost(batch + 1, 0);
         std::vector<int> pageSizesHost(batch + 1, 0);
+        std::vector<int> graphPlanPageSizesHost(batch + 1, 0);
         std::vector<int> pageIndexHost;
+        std::vector<const Data*> currentPastKeyHosts(batch, nullptr);
         std::vector<char> needNewPage(batch, 0);
+        bool anyNewPage = false;
+        int maxActualPagesPerRequest = 1;
 
         for (int b = 0; b < batch; b++) {
             Data *firstKey = pastKeyValues[b * block_cnt].first;
+            currentPastKeyHosts[b] = firstKey;
             bool need = firstKey->pageIndex.empty() || firstKey->lastPageLen >= firstKey->pageLen;
             needNewPage[b] = need ? 1 : 0;
+            anyNewPage = anyNewPage || need;
             if (!need) {
                 insertIndexHost[b] = firstKey->pageIndex.back();
                 insertPositionHost[b] = firstKey->lastPageLen;
@@ -1374,8 +1524,13 @@ namespace fastllm {
             Data *firstKey = pastKeyValues[b * block_cnt].first;
             Data *firstValue = pastKeyValues[b * block_cnt].second;
             lastPageLensHost[b] = firstKey->lastPageLen;
-            pageSizesHost[b + 1] = pageSizesHost[b] + (int)firstKey->pageIndex.size();
-            pageIndexHost.insert(pageIndexHost.end(), firstKey->pageIndex.begin(), firstKey->pageIndex.end());
+            int requestPages = (int)firstKey->pageIndex.size();
+            AssertInFastLLM(requestPages <= graphMaxPagesPerRequest,
+                            "Qwen3 CUDA graph page metadata exceeds captured capacity.\n");
+            maxActualPagesPerRequest = std::max(maxActualPagesPerRequest, requestPages);
+            pageSizesHost[b + 1] = pageSizesHost[b] + requestPages;
+            pageIndexHost.insert(pageIndexHost.end(),
+                                 firstKey->pageIndex.begin(), firstKey->pageIndex.end());
             AssertInFastLLM(firstKey->pageIndex.size() == firstValue->pageIndex.size() &&
                             firstKey->lastPageLen == firstValue->lastPageLen,
                             "Qwen3 CUDA graph requires aligned K/V page metadata.\n");
@@ -1389,13 +1544,17 @@ namespace fastllm {
                                 "Qwen3 CUDA graph requires aligned paged cache pages across layers.\n");
             }
         }
-
-        Qwen3PrepareGraphIntTensor(state.buffers.insertIndexs, gpuId, insertIndexHost);
-        Qwen3PrepareGraphIntTensor(state.buffers.insertPositions, gpuId, insertPositionHost);
-        Qwen3PrepareGraphIntTensor(state.buffers.qSizes, gpuId, qSizesHost);
-        Qwen3PrepareGraphIntTensor(state.buffers.pageSizes, gpuId, pageSizesHost);
-        Qwen3PrepareGraphIntTensor(state.buffers.pageIndexs, gpuId, pageIndexHost);
-        Qwen3PrepareGraphIntTensor(state.buffers.lastPageLens, gpuId, lastPageLensHost);
+        int graphPlanPagesPerRequest = 1;
+        while (graphPlanPagesPerRequest < maxActualPagesPerRequest &&
+               graphPlanPagesPerRequest < graphMaxPagesPerRequest) {
+            graphPlanPagesPerRequest <<= 1;
+        }
+        graphPlanPagesPerRequest = std::min(graphPlanPagesPerRequest, graphMaxPagesPerRequest);
+        for (int b = 0; b < batch; b++) {
+            graphPlanPageSizesHost[b + 1] =
+                graphPlanPageSizesHost[b] + graphPlanPagesPerRequest;
+        }
+        int pageIndexCapacity = batch * graphPlanPagesPerRequest;
 
         std::ostringstream signature;
         signature << "gpu=" << gpuId
@@ -1411,19 +1570,68 @@ namespace fastllm {
             signature << dim << ",";
         }
         signature << ";pageSizes=";
-        for (int pageSize : pageSizesHost) {
+        for (int pageSize : graphPlanPageSizesHost) {
             signature << pageSize << ",";
         }
-        signature << ";pages=" << pageIndexHost.size()
+        signature << ";pages=" << pageIndexCapacity
                   << ";inputType=" << (int)state.inputIds.dataType
                   << ";posType=" << (int)state.positionIds.dataType
                   << ";kCache=" << pastKeyValues[0].first->pagedKVCacheData->cudaData
                   << ";vCache=" << pastKeyValues[0].second->pagedKVCacheData->cudaData
                   << ";lmLocal=" << requireLocal(weight["lm_head.weight"], "lm_head.weight")->dims[0];
         std::string newSignature = signature.str();
-        if (state.signature != newSignature) {
+        bool signatureChanged = state.signature != newSignature;
+        if (signatureChanged) {
             Qwen3DestroyCudaGraph(state);
             state.signature = newSignature;
+        }
+
+        bool graphMetaMissing =
+            state.buffers.insertIndexs.cudaData == nullptr ||
+            state.buffers.insertPositions.cudaData == nullptr ||
+            state.buffers.qSizes.cudaData == nullptr ||
+            state.buffers.pageSizes.cudaData == nullptr ||
+            state.buffers.pageIndexs.cudaData == nullptr ||
+            state.buffers.lastPageLens.cudaData == nullptr;
+        bool metadataChanged =
+            state.lastInsertIndexHost != insertIndexHost ||
+            state.lastPageSizesHost != pageSizesHost ||
+            state.lastPageIndexHost != pageIndexHost ||
+            state.lastDecodePageLensHost != insertPositionHost ||
+            state.lastPastKeyHosts != currentPastKeyHosts;
+        bool needFullMetaCopy = graphMetaMissing || signatureChanged || anyNewPage || metadataChanged;
+        if (needFullMetaCopy) {
+            AssertInFastLLM((int)pageIndexHost.size() <= pageIndexCapacity,
+                            "Qwen3 CUDA graph page metadata exceeds fixed graph capacity.\n");
+            std::vector<int> paddedPageIndexHost = pageIndexHost;
+            paddedPageIndexHost.resize(pageIndexCapacity,
+                                       paddedPageIndexHost.empty() ? 0 : paddedPageIndexHost.back());
+
+            Qwen3PrepareGraphIntTensor(state.buffers.insertIndexs, gpuId, insertIndexHost);
+            Qwen3PrepareGraphIntTensor(state.buffers.insertPositions, gpuId, insertPositionHost);
+            Qwen3PrepareGraphIntTensor(state.buffers.qSizes, gpuId, qSizesHost);
+            Qwen3PrepareGraphIntTensor(state.buffers.pageSizes, gpuId, pageSizesHost);
+            // FlashInfer graph planning uses the CPU indptr; kernels still read the real CUDA indptr.
+            state.buffers.pageSizes.cpuIntDatas = graphPlanPageSizesHost;
+            Qwen3PrepareGraphIntTensor(state.buffers.pageIndexs, gpuId, paddedPageIndexHost);
+            Qwen3PrepareGraphIntTensor(state.buffers.lastPageLens, gpuId, lastPageLensHost);
+            state.lastInsertIndexHost = insertIndexHost;
+            state.lastPageSizesHost = pageSizesHost;
+            state.lastPageIndexHost = pageIndexHost;
+            state.lastDecodePageLensHost = lastPageLensHost;
+            state.lastPastKeyHosts = currentPastKeyHosts;
+        } else {
+            FastllmCudaSetDevice(gpuId);
+            if (!FastllmCudaAdvanceDecodeMeta(
+                    (int32_t*)state.buffers.insertPositions.cudaData,
+                    (int32_t*)state.buffers.lastPageLens.cudaData,
+                    batch)) {
+                return false;
+            }
+            state.buffers.insertPositions.cpuIntDatas = insertPositionHost;
+            state.buffers.lastPageLens.cpuIntDatas = lastPageLensHost;
+            state.lastDecodePageLensHost = lastPageLensHost;
+            state.lastPastKeyHosts = currentPastKeyHosts;
         }
 
         auto runGraphBody = [&]() {
@@ -1471,6 +1679,8 @@ namespace fastllm {
                 AssertInFastLLM(localKVHeads > 0 && localQHeads > 0,
                                 "Qwen3 ForwardSingleGPU graph got empty local attention shard.\n");
 
+                const bool enableStableFlashInferGraphPlan = true;
+                const int flashInferCudaGraph = 1;
                 Qwen3CudaAttentionPagedBlock(
                     cudaRunner,
                     &buf.attenInput,
@@ -1504,7 +1714,9 @@ namespace fastllm {
                     false,
                     pagedCacheLayerOffset,
                     true,
-                    true
+                    true,
+                    enableStableFlashInferGraphPlan,
+                    flashInferCudaGraph
                 );
 
                 Qwen3CudaLinearResidualReduce(
@@ -1552,7 +1764,8 @@ namespace fastllm {
         };
 
         if (state.captured) {
-            if (FastllmCudaGraphLaunch(state.exec)) {
+            bool replayOk = FastllmCudaGraphLaunch(state.exec);
+            if (replayOk) {
                 finishWithLogits();
                 return true;
             }
@@ -1565,7 +1778,8 @@ namespace fastllm {
         }
 
         if (!state.warmed) {
-            runWithoutGraph();
+            runGraphBody();
+            finishWithLogits();
             state.warmed = true;
             return true;
         }
@@ -1605,7 +1819,8 @@ namespace fastllm {
         state.graph = capturedGraph;
         state.exec = capturedExec;
         state.captured = true;
-        if (!FastllmCudaGraphLaunch(state.exec)) {
+        bool firstLaunchOk = FastllmCudaGraphLaunch(state.exec);
+        if (!firstLaunchOk) {
             printf("Warning: Qwen3 CUDA graph first launch failed on gpu %d: %s. Disable graph for this GPU.\n",
                    gpuId, FastllmCudaGraphLastError());
             Qwen3DestroyCudaGraph(state);
@@ -1638,9 +1853,6 @@ namespace fastllm {
         AssertInFastLLM(ratios.find(gpuId) == ratios.end() || ratios[gpuId] > 0,
                         "Qwen3 ForwardSingleGPU got invalid GPU ratio.\n");
         FastllmCudaSetDevice(gpuId);
-        if (isPrefill && Qwen3CudaGraphEnabled()) {
-            Qwen3DestroyCudaGraphDecodeStates(this, gpuId);
-        }
         if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
                                         seqLens, pastKeyValues, all1, isPrefill,
                                         tensorParallel, firstTensorParallelRank,
@@ -2050,7 +2262,6 @@ namespace fastllm {
         const std::vector <GenerationConfig> &generationConfigs,
         const LastTokensManager &lastTokens,
         std::vector <std::vector <float>*> *retLogits) {
-// auto startTime = std::chrono::system_clock::now();
 #ifndef USE_CUDA
         return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                          pastKeyValues, generationConfigs, lastTokens, retLogits);
@@ -2108,101 +2319,108 @@ namespace fastllm {
             }
             allPositionIds.CopyFrom(Data(DataType::FLOAT32, {1, (int)vPositionIds.size()}, vPositionIds));
         }
-// printf("prepare 0 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         Data gpuInputIds;
         gpuInputIds.CopyFrom(inputIds);
         if (tensorParallel) {
             PrepareMultiCudaReplicatedData(gpuInputIds, devices, true);
             PrepareMultiCudaReplicatedData(allPositionIds, devices, true);
         }
-// printf("prepare 1 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
-        std::vector<DivisionScheme> kvHeadSchemes;
-        DivisionScheme lmHeadScheme;
+        std::vector<DivisionScheme> localKvHeadSchemes;
+        DivisionScheme localLmHeadScheme;
+        const std::vector<DivisionScheme> *kvHeadSchemes = &localKvHeadSchemes;
+        const DivisionScheme *lmHeadScheme = &localLmHeadScheme;
         Data &lmHead = weight["lm_head.weight"];
         if (tensorParallel) {
-            std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
-            if (threadTpWeightsPrepared) {
+            auto usePreparedThreadTpSchemes = [&]() {
                 AssertInFastLLM(threadTpPreparedDevices == devices && threadTpPreparedRatios == ratios,
                                 "Qwen3 ForwardGPU thread TP device config changed after weights were prepared.\n");
                 AssertInFastLLM((int)threadTpKVHeadSchemes.size() == block_cnt && !threadTpLmHeadScheme.empty(),
                                 "Qwen3 ForwardGPU thread TP cached weight schemes are incomplete.\n");
+                kvHeadSchemes = &threadTpKVHeadSchemes;
+                lmHeadScheme = &threadTpLmHeadScheme;
+            };
+
+            if (threadTpWeightsPrepared.load(std::memory_order_acquire)) {
+                usePreparedThreadTpSchemes();
             } else {
-                auto prepareReplicated = [&](const std::string &name) {
-                    PrepareMultiCudaReplicatedData(this->weight[name], devices, true);
-                };
-                prepareReplicated("model.embed_tokens.weight");
-                prepareReplicated("model.norm.weight");
+                std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
+                if (!threadTpWeightsPrepared.load(std::memory_order_relaxed)) {
+                    auto prepareReplicated = [&](const std::string &name) {
+                        PrepareMultiCudaReplicatedData(this->weight[name], devices, true);
+                    };
+                    prepareReplicated("model.embed_tokens.weight");
+                    prepareReplicated("model.norm.weight");
 
-                threadTpKVHeadSchemes.assign(block_cnt, DivisionScheme());
-                for (int i = 0; i < block_cnt; i++) {
-                    std::string inputRmsName = "model.layers." + std::to_string(i) + ".input_layernorm.weight";
-                    std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
-                    std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
-                    std::string qNormName = "model.layers." + std::to_string(i) + ".self_attn.q_norm.weight";
-                    std::string kNormName = "model.layers." + std::to_string(i) + ".self_attn.k_norm.weight";
-                    std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
-                    std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
-                    std::string postRmsName = "model.layers." + std::to_string(i) + ".post_attention_layernorm.weight";
-                    std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
-                    std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
-                    std::string downBiasName = "model.layers." + std::to_string(i) + ".mlp.down_proj.bias";
+                    threadTpKVHeadSchemes.assign(block_cnt, DivisionScheme());
+                    for (int i = 0; i < block_cnt; i++) {
+                        std::string inputRmsName = "model.layers." + std::to_string(i) + ".input_layernorm.weight";
+                        std::string mergeQkvWeightName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight";
+                        std::string mergeQkvBiasName = "model.layers." + std::to_string(i) + ".self_attn.mergeqkv.bias";
+                        std::string qNormName = "model.layers." + std::to_string(i) + ".self_attn.q_norm.weight";
+                        std::string kNormName = "model.layers." + std::to_string(i) + ".self_attn.k_norm.weight";
+                        std::string oWeightName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.weight";
+                        std::string oBiasName = "model.layers." + std::to_string(i) + ".self_attn.o_proj.bias";
+                        std::string postRmsName = "model.layers." + std::to_string(i) + ".post_attention_layernorm.weight";
+                        std::string swigluWeightName = "model.layers." + std::to_string(i) + ".mlp.gateup_proj.weight";
+                        std::string downWeightName = "model.layers." + std::to_string(i) + ".mlp.down_proj.weight";
+                        std::string downBiasName = "model.layers." + std::to_string(i) + ".mlp.down_proj.bias";
 
-                    AssertInFastLLM(weight.weight.find(mergeQkvWeightName) != weight.weight.end(),
-                                    "Qwen3 ForwardGPU requires merged qkv weight.\n");
-                    AssertInFastLLM(weight.weight.find(swigluWeightName) != weight.weight.end(),
-                                    "Qwen3 ForwardGPU requires merged gateup weight.\n");
+                        AssertInFastLLM(weight.weight.find(mergeQkvWeightName) != weight.weight.end(),
+                                        "Qwen3 ForwardGPU requires merged qkv weight.\n");
+                        AssertInFastLLM(weight.weight.find(swigluWeightName) != weight.weight.end(),
+                                        "Qwen3 ForwardGPU requires merged gateup weight.\n");
 
-                    prepareReplicated(inputRmsName);
-                    prepareReplicated(qNormName);
-                    prepareReplicated(kNormName);
-                    prepareReplicated(postRmsName);
+                        prepareReplicated(inputRmsName);
+                        prepareReplicated(qNormName);
+                        prepareReplicated(kNormName);
+                        prepareReplicated(postRmsName);
 
-                    Data &mergeW = weight[mergeQkvWeightName];
-                    Data &mergeB = GetThreadTensorParallelBias(mergeQkvBiasName);
-                    mergeW.tpPackType = TP_PACK_QKV;
-                    mergeW.tpQHeads = num_attention_heads;
-                    mergeW.tpKVHeads = num_key_value_heads;
-                    mergeW.tpHeadDim = head_dim;
+                        Data &mergeW = weight[mergeQkvWeightName];
+                        Data &mergeB = GetThreadTensorParallelBias(mergeQkvBiasName);
+                        mergeW.tpPackType = TP_PACK_QKV;
+                        mergeW.tpQHeads = num_attention_heads;
+                        mergeW.tpKVHeads = num_key_value_heads;
+                        mergeW.tpHeadDim = head_dim;
+                        std::vector<int> devCopy = devices;
+                        DivisionScheme qkvScheme = BuildMultiCudaRowSplitScheme(mergeW, devCopy, ratios);
+                        AssertInFastLLM(SplitMultiCudaWeight(mergeW, mergeB, devCopy, qkvScheme, 0),
+                                        "Qwen3 ForwardGPU failed to split " + mergeQkvWeightName + ".\n");
+
+                        int qWidth = num_attention_heads * head_dim;
+                        DivisionScheme qScheme = ExtractQwen3FirstRangeScheme(qkvScheme);
+                        threadTpKVHeadSchemes[i] = ExtractQwen3KVHeadScheme(qkvScheme, qWidth, head_dim);
+                        Data &oB = GetThreadTensorParallelBias(oBiasName);
+                        devCopy = devices;
+                        AssertInFastLLM(SplitMultiCudaWeight(weight[oWeightName], oB, devCopy, qScheme, 1),
+                                        "Qwen3 ForwardGPU failed to split " + oWeightName + ".\n");
+
+                        Data &gateup = weight[swigluWeightName];
+                        Data &gateupBias = GetThreadTensorParallelBias(swigluWeightName + ".tp_bias");
+                        gateup.tpPackType = TP_PACK_GATEUP;
+                        devCopy = devices;
+                        DivisionScheme gateScheme = BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
+                        AssertInFastLLM(SplitMultiCudaWeight(gateup, gateupBias, devCopy, gateScheme, 0),
+                                        "Qwen3 ForwardGPU failed to split " + swigluWeightName + ".\n");
+
+                        Data &downBias = GetThreadTensorParallelBias(downBiasName);
+                        DivisionScheme downScheme = ExtractQwen3FirstRangeScheme(gateScheme);
+                        devCopy = devices;
+                        AssertInFastLLM(SplitMultiCudaWeight(weight[downWeightName], downBias, devCopy, downScheme, 1),
+                                        "Qwen3 ForwardGPU failed to split " + downWeightName + ".\n");
+                    }
+
+                    Data &lmHeadBias = GetThreadTensorParallelBias("lm_head.weight.tp_bias");
                     std::vector<int> devCopy = devices;
-                    DivisionScheme qkvScheme = BuildMultiCudaRowSplitScheme(mergeW, devCopy, ratios);
-                    AssertInFastLLM(SplitMultiCudaWeight(mergeW, mergeB, devCopy, qkvScheme, 0),
-                                    "Qwen3 ForwardGPU failed to split " + mergeQkvWeightName + ".\n");
+                    threadTpLmHeadScheme = BuildMultiCudaRowSplitScheme(lmHead, devCopy, ratios);
+                    AssertInFastLLM(SplitMultiCudaWeight(lmHead, lmHeadBias, devCopy, threadTpLmHeadScheme, 0),
+                                    "Qwen3 ForwardGPU failed to split lm_head.weight.\n");
 
-                    int qWidth = num_attention_heads * head_dim;
-                    DivisionScheme qScheme = ExtractQwen3FirstRangeScheme(qkvScheme);
-                    threadTpKVHeadSchemes[i] = ExtractQwen3KVHeadScheme(qkvScheme, qWidth, head_dim);
-                    Data &oB = GetThreadTensorParallelBias(oBiasName);
-                    devCopy = devices;
-                    AssertInFastLLM(SplitMultiCudaWeight(weight[oWeightName], oB, devCopy, qScheme, 1),
-                                    "Qwen3 ForwardGPU failed to split " + oWeightName + ".\n");
-
-                    Data &gateup = weight[swigluWeightName];
-                    Data &gateupBias = GetThreadTensorParallelBias(swigluWeightName + ".tp_bias");
-                    gateup.tpPackType = TP_PACK_GATEUP;
-                    devCopy = devices;
-                    DivisionScheme gateScheme = BuildMultiCudaRowSplitScheme(gateup, devCopy, ratios);
-                    AssertInFastLLM(SplitMultiCudaWeight(gateup, gateupBias, devCopy, gateScheme, 0),
-                                    "Qwen3 ForwardGPU failed to split " + swigluWeightName + ".\n");
-
-                    Data &downBias = GetThreadTensorParallelBias(downBiasName);
-                    DivisionScheme downScheme = ExtractQwen3FirstRangeScheme(gateScheme);
-                    devCopy = devices;
-                    AssertInFastLLM(SplitMultiCudaWeight(weight[downWeightName], downBias, devCopy, downScheme, 1),
-                                    "Qwen3 ForwardGPU failed to split " + downWeightName + ".\n");
+                    threadTpPreparedDevices = devices;
+                    threadTpPreparedRatios = ratios;
+                    threadTpWeightsPrepared.store(true, std::memory_order_release);
                 }
-
-                Data &lmHeadBias = GetThreadTensorParallelBias("lm_head.weight.tp_bias");
-                std::vector<int> devCopy = devices;
-                threadTpLmHeadScheme = BuildMultiCudaRowSplitScheme(lmHead, devCopy, ratios);
-                AssertInFastLLM(SplitMultiCudaWeight(lmHead, lmHeadBias, devCopy, threadTpLmHeadScheme, 0),
-                                "Qwen3 ForwardGPU failed to split lm_head.weight.\n");
-
-                threadTpPreparedDevices = devices;
-                threadTpPreparedRatios = ratios;
-                threadTpWeightsPrepared = true;
+                usePreparedThreadTpSchemes();
             }
-            kvHeadSchemes = threadTpKVHeadSchemes;
-            lmHeadScheme = threadTpLmHeadScheme;
         } else {
             if (!singleGpuWeightsPrepared.load(std::memory_order_acquire)) {
                 std::lock_guard<std::mutex> guard(threadTpWeightPrepareLock);
@@ -2224,7 +2442,7 @@ namespace fastllm {
                     singleGpuWeightsPrepared.store(true, std::memory_order_release);
                 }
             }
-            lmHeadScheme[devices[0]].push_back({0, lmHead.dims[0]});
+            localLmHeadScheme[devices[0]].push_back({0, lmHead.dims[0]});
         }
         const DataType computeType = ResolveQwen3ThreadTpComputeType(this->dataType);
         std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues;
@@ -2257,7 +2475,6 @@ namespace fastllm {
         }
         std::vector<std::exception_ptr> errors(devices.size());
         std::vector<Data> localLogits(devices.size());
-// printf("prepare 2 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         if (devices.size() == 1) {
             if (threadTpWorkerGroup.HasWorkers()) {
                 threadTpWorkerGroup.Stop();
@@ -2272,26 +2489,51 @@ namespace fastllm {
                                  tensorParallel, r == 0,
                                  threadTpPagedCacheBase + r * block_cnt,
                                  localLogits[r]);
+                FastllmCudaSetDevice(devices[r]);
+                ForceDeviceSync();
             }, errors);
             for (auto &error : errors) {
                 if (error) {
                     std::rethrow_exception(error);
                 }
             }
-            for (int device : devices) {
-                FastllmCudaSetDevice(device);
-                ForceDeviceSync();
-            }
         }
 
         if (tensorParallel) {
+            auto validLocalMeta = [](Data *data) {
+                return data != nullptr && data->dims.size() >= 3;
+            };
             for (int b = 0; b < batch; b++) {
                 for (int i = 0; i < block_cnt; i++) {
                     int idx = b * block_cnt + i;
-                    SyncQwen3ThreadTpRootCacheMeta(*pastKeyValues[idx].first, devices, kvHeadSchemes[i],
-                                                   num_key_value_heads, head_dim);
-                    SyncQwen3ThreadTpRootCacheMeta(*pastKeyValues[idx].second, devices, kvHeadSchemes[i],
-                                                   num_key_value_heads, head_dim);
+                    Data *localKeyMeta = !localPastKeyValues.empty() &&
+                        idx < (int)localPastKeyValues[0].size() ? localPastKeyValues[0][idx].first : nullptr;
+                    Data *localValueMeta = !localPastKeyValues.empty() &&
+                        idx < (int)localPastKeyValues[0].size() ? localPastKeyValues[0][idx].second : nullptr;
+                    if ((!validLocalMeta(localKeyMeta) || !validLocalMeta(localValueMeta)) &&
+                         localPastKeyValues.size() > 1) {
+                        for (auto &rankPastKeyValues : localPastKeyValues) {
+                            if (idx < (int)rankPastKeyValues.size()) {
+                                Data *candidateKey = rankPastKeyValues[idx].first;
+                                Data *candidateValue = rankPastKeyValues[idx].second;
+                                if (!validLocalMeta(localKeyMeta) && validLocalMeta(candidateKey)) {
+                                    localKeyMeta = candidateKey;
+                                }
+                                if (!validLocalMeta(localValueMeta) && validLocalMeta(candidateValue)) {
+                                    localValueMeta = candidateValue;
+                                }
+                                if (validLocalMeta(localKeyMeta) && validLocalMeta(localValueMeta)) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    SyncQwen3ThreadTpRootCacheMetaFromLocal(*pastKeyValues[idx].first, localKeyMeta,
+                                                            devices, (*kvHeadSchemes)[i],
+                                                            num_key_value_heads, head_dim);
+                    SyncQwen3ThreadTpRootCacheMetaFromLocal(*pastKeyValues[idx].second, localValueMeta,
+                                                            devices, (*kvHeadSchemes)[i],
+                                                            num_key_value_heads, head_dim);
                 }
             }
         }
@@ -2302,13 +2544,14 @@ namespace fastllm {
         if (Qwen3CanUseCudaFullLogitsSampling(generationConfigs, retLogits, batch,
                                               allSimpleCudaSampling, cudaSamplingTopK)) {
             Data &fullCudaLogits = Qwen3ThreadLocalCudaSamplingFullLogits();
-            Qwen3GatherShardLogitsToRootCuda(devices[0], devices, lmHeadScheme,
+            Qwen3GatherShardLogitsToRootCuda(devices[0], devices, *lmHeadScheme,
                                              localLogits, batch, vocabSize,
                                              fullCudaLogits);
             ResetLogitsOfEOS(batch, &fullCudaLogits, pastKeyValues, generationConfigs);
-            return Qwen3SampleFromRootCudaLogits(devices[0], fullCudaLogits, batch,
-                                                 cudaSamplingTopK, allSimpleCudaSampling,
-                                                 generationConfigs);
+            std::vector<int> lastRet = Qwen3SampleFromRootCudaLogits(devices[0], fullCudaLogits, batch,
+                                                                      cudaSamplingTopK, allSimpleCudaSampling,
+                                                                      generationConfigs);
+            return lastRet;
         }
 
         Data fullLogits(DataType::FLOAT32);
@@ -2327,7 +2570,10 @@ namespace fastllm {
             float *src = (float*)localLogits[r].cpuData;
             float *dst = (float*)fullLogits.cpuData;
             int localOffset = 0;
-            for (auto &range : lmHeadScheme[device]) {
+            auto schemeIt = lmHeadScheme->find(device);
+            AssertInFastLLM(schemeIt != lmHeadScheme->end(),
+                            "Qwen3 ForwardGPU: missing lm_head split scheme.\n");
+            for (auto &range : schemeIt->second) {
                 int len = range.second - range.first;
                 AssertInFastLLM(range.first >= 0 && range.second <= vocabSize &&
                                 localOffset + len <= localVocab,

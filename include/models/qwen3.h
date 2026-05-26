@@ -87,6 +87,8 @@ namespace fastllm {
 
         virtual void WarmUp(); // 预热
 
+        virtual void OnAutoWarmupFinished() override;
+
         virtual std::string MakeInput(const std::string &history, int round, const std::string &input); // 根据历史信息和当前输入生成prompt
 
         virtual std::string MakeHistory(const std::string &history, int round, const std::string &input, const std::string &output); // 根据当前回复更新history
@@ -137,6 +139,8 @@ namespace fastllm {
                 int pagedCacheLayerOffset,
                 Data &logits);
 
+        void PreCaptureCudaGraphAfterWarmup();
+
         Data &GetThreadTensorParallelBias(const std::string &name);
 
         RoPEType rope_type = RoPEType::BASE;
@@ -156,7 +160,7 @@ namespace fastllm {
         int threadTpPagedCacheBase = -1;
         std::mutex threadTpWeightPrepareLock;
         std::atomic<bool> singleGpuWeightsPrepared{false};
-        bool threadTpWeightsPrepared = false;
+        std::atomic<bool> threadTpWeightsPrepared{false};
         std::vector <int> threadTpPreparedDevices;
         std::map <int, int> threadTpPreparedRatios;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpKVHeadSchemes;
