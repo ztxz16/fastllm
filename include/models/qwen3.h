@@ -7,6 +7,7 @@
 
 #include "basellm.h"
 #include "cmath"
+#include "utils/persistent_worker_group.h"
 
 #include <atomic>
 #include <iostream>
@@ -17,7 +18,7 @@
 namespace fastllm {
     class Qwen3Model: public basellm {
     public:
-    Qwen3Model (); // 构造函数
+        Qwen3Model (); // 构造函数
 
         virtual void InitParams(); // 初始化参数信息
 
@@ -160,6 +161,7 @@ namespace fastllm {
         std::map <int, int> threadTpPreparedRatios;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpKVHeadSchemes;
         std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
+        PersistentWorkerGroup threadTpWorkerGroup;
     };
 }
 

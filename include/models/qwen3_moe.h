@@ -7,6 +7,7 @@
 
 #include "basellm.h"
 #include "llama.h"
+#include "utils/persistent_worker_group.h"
 
 #include "cmath"
 
@@ -146,6 +147,7 @@ namespace fastllm {
         std::map <int, int> threadTpPreparedRatios;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpKVHeadSchemes;
         std::map <int, std::vector <std::pair <int, int> > > threadTpLmHeadScheme;
+        PersistentWorkerGroup threadTpWorkerGroup;
     };
 }
 

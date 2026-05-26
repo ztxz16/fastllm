@@ -21,7 +21,6 @@
 #include <memory>
 #include <mutex>
 #include <set>
-#include <thread>
 #include <tuple>
 
 #ifdef USE_CUDA
@@ -2059,6 +2058,9 @@ namespace fastllm {
         std::vector<int> devices;
         std::map<int, int> ratios;
         if (!GetQwen3GPUForwardDevices(this->deviceMap, devices, ratios)) {
+            if (threadTpWorkerGroup.HasWorkers()) {
+                threadTpWorkerGroup.Stop();
+            }
             return ForwardV2(batch, inputIds, attentionMask, positionIds, seqLens,
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
@@ -2257,27 +2259,20 @@ namespace fastllm {
         std::vector<Data> localLogits(devices.size());
 // printf("prepare 2 spend %f s.\n", GetSpan(startTime, std::chrono::system_clock::now()));
         if (devices.size() == 1) {
+            if (threadTpWorkerGroup.HasWorkers()) {
+                threadTpWorkerGroup.Stop();
+            }
             ForwardSingleGPU(devices[0], ratios, batch, gpuInputIds, allPositionIds,
                              seqLens, pastKeyValues, all1, isPrefill,
                              false, true, threadTpPagedCacheBase, localLogits[0]);
         } else {
-            std::vector<std::thread> threads;
-            threads.reserve(devices.size());
-            for (int r = 0; r < (int)devices.size(); r++) {
-                threads.emplace_back([&, r]() {
-                    try {
-                        ForwardSingleGPU(devices[r], ratios, batch, gpuInputIds, allPositionIds,
-                                         seqLens, localPastKeyValues[r], all1, isPrefill,
-                                         tensorParallel, r == 0, threadTpPagedCacheBase + r * block_cnt,
-                                         localLogits[r]);
-                    } catch (...) {
-                        errors[r] = std::current_exception();
-                    }
-                });
-            }
-            for (auto &thread : threads) {
-                thread.join();
-            }
+            threadTpWorkerGroup.Run(devices, [&](int r) {
+                ForwardSingleGPU(devices[r], ratios, batch, gpuInputIds, allPositionIds,
+                                 seqLens, localPastKeyValues[r], all1, isPrefill,
+                                 tensorParallel, r == 0,
+                                 threadTpPagedCacheBase + r * block_cnt,
+                                 localLogits[r]);
+            }, errors);
             for (auto &error : errors) {
                 if (error) {
                     std::rethrow_exception(error);
