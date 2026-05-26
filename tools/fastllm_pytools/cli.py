@@ -60,6 +60,13 @@ def args_parser():
     # 创建run子命令（使用相同的共享解析器）
     run_parser_ = subparsers.add_parser('run', parents = [shared_parser], help = '运行模式')
 
+    # 创建benchmark子命令（使用相同的共享解析器）
+    from ftllm.benchmark import add_benchmark_args
+    benchmark_parser_ = subparsers.add_parser('benchmark', aliases = ['bench'],
+                                              parents = [shared_parser],
+                                              help = '性能测试模式')
+    add_benchmark_args(benchmark_parser_)
+
     download_parser_ = subparsers.add_parser('download', parents = [download_parser], help = '下载模型')
 
     # 创建webui子命令（独立的解析器）
@@ -111,6 +118,9 @@ def main():
     elif args.command in ('chat', 'run'):
         from ftllm.chat import fastllm_chat
         fastllm_chat(args)
+    elif args.command in ('benchmark', 'bench'):
+        from ftllm.benchmark import fastllm_benchmark
+        fastllm_benchmark(args)
     elif args.command == "download":
         from ftllm.download import HFDDownloader
         HFDDownloader(args).run()

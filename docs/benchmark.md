@@ -2,6 +2,25 @@
 
 可以使用benchmark程序进行测速，根据不同配置、不同输入，推理速度也会有一些差别
 
+### ftllm benchmark
+
+Python 包安装后可以直接使用 `ftllm benchmark`，也可以简写为 `ftllm bench`：
+
+``` sh
+ftllm bench Qwen/Qwen3-0.6B --device cuda --input_tokens 512 --output_tokens 128 --batch 4
+```
+
+常用参数：
+
+- `--input_tokens`：构造 benchmark 输入的 token 长度。
+- `--output_tokens`：每个请求最多生成的 token 数。
+- `--batch`：同时启动的 benchmark 请求数量；如果未显式设置 `--max_batch`，会自动使用该值。
+- `--temperature`：生成温度，设置为 `0` 或负数时使用 greedy decoding。
+
+输出中会统计平均 TTFT、TPOP，以及 batch 总吞吐、首 token 后 decode 吞吐、单请求平均 token/s 等信息。
+
+### C++ benchmark
+
 例如:
 
 ``` sh
