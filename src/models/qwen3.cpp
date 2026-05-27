@@ -426,6 +426,18 @@ namespace fastllm {
             }
         }
 
+        static void Qwen3EraseCudaGraphDecodeStates(const Qwen3Model *model) {
+            std::lock_guard<std::mutex> guard(Qwen3CudaGraphStatesMutex());
+            auto &states = Qwen3CudaGraphStates();
+            for (auto it = states.begin(); it != states.end();) {
+                if (std::get<0>(it->first) == model) {
+                    it = states.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
         static bool Qwen3CudaGraphEnabled() {
             return GetFastllmEnv().cudaGraph;
         }
@@ -1257,6 +1269,12 @@ namespace fastllm {
         };
     }
 
+    Qwen3Model::~Qwen3Model() {
+#ifdef USE_CUDA
+        Qwen3EraseCudaGraphDecodeStates(this);
+#endif
+    }
+
     bool Qwen3Model::IsThreadTensorParallelEnabled() const {
 #ifdef USE_CUDA
         std::vector<int> devices;
@@ -1294,6 +1312,16 @@ namespace fastllm {
         if (this->maxBatch > 0) {
             maxWarmupBatch = std::min(maxWarmupBatch, this->maxBatch);
         }
+
+        struct CudaGraphPreCaptureScope {
+            std::atomic<bool> &flag;
+            explicit CudaGraphPreCaptureScope(std::atomic<bool> &flag) : flag(flag) {
+                flag.store(true, std::memory_order_release);
+            }
+            ~CudaGraphPreCaptureScope() {
+                flag.store(false, std::memory_order_release);
+            }
+        } preCaptureScope(cudaGraphPreCaptureRunning);
 
         auto printProgress = [](int done, int total, int batch) {
             const int barWidth = 32;
@@ -1449,6 +1477,11 @@ namespace fastllm {
         if (state.disabled) {
             return false;
         }
+        bool allowCapture = autoWarmupRunning.load(std::memory_order_acquire) ||
+                            cudaGraphPreCaptureRunning.load(std::memory_order_acquire);
+        if (!state.captured && !allowCapture) {
+            return false;
+        }
 
         FastllmCudaSetDevice(gpuId);
         Qwen3PrepareGraphCudaTensor(state.inputIds, *localInputIds, gpuId);
@@ -1544,12 +1577,9 @@ namespace fastllm {
                                 "Qwen3 CUDA graph requires aligned paged cache pages across layers.\n");
             }
         }
-        int graphPlanPagesPerRequest = 1;
-        while (graphPlanPagesPerRequest < maxActualPagesPerRequest &&
-               graphPlanPagesPerRequest < graphMaxPagesPerRequest) {
-            graphPlanPagesPerRequest <<= 1;
-        }
-        graphPlanPagesPerRequest = std::min(graphPlanPagesPerRequest, graphMaxPagesPerRequest);
+        // Capture once with the largest KV page plan so decode page growth only
+        // updates metadata buffers and does not force a new CUDA graph.
+        int graphPlanPagesPerRequest = graphMaxPagesPerRequest;
         for (int b = 0; b < batch; b++) {
             graphPlanPageSizesHost[b + 1] =
                 graphPlanPageSizesHost[b] + graphPlanPagesPerRequest;

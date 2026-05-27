@@ -20,6 +20,8 @@ namespace fastllm {
     public:
         Qwen3Model (); // 构造函数
 
+        virtual ~Qwen3Model() override;
+
         virtual void InitParams(); // 初始化参数信息
 
         // 推理
@@ -161,6 +163,7 @@ namespace fastllm {
         std::mutex threadTpWeightPrepareLock;
         std::atomic<bool> singleGpuWeightsPrepared{false};
         std::atomic<bool> threadTpWeightsPrepared{false};
+        std::atomic<bool> cudaGraphPreCaptureRunning{false};
         std::vector <int> threadTpPreparedDevices;
         std::map <int, int> threadTpPreparedRatios;
         std::vector <std::map <int, std::vector <std::pair <int, int> > > > threadTpKVHeadSchemes;
