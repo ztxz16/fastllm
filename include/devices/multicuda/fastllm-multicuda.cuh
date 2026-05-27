@@ -30,6 +30,7 @@ void PrepareMultiCudaReplicatedData(fastllm::Data &data, std::vector <int> devic
 void PrepareMultiCudaShardedData(fastllm::Data &data, std::vector <int> devices,
     const std::vector <int> &globalDims, int axis, DivisionScheme divisionScheme);
 DivisionScheme BuildMultiCudaRowSplitScheme(fastllm::Data &weight, std::vector <int> &devices, std::map <int, int> &ratios);
+DivisionScheme BuildMultiCudaColumnSplitScheme(fastllm::Data &weight, std::vector <int> &devices, std::map <int, int> &ratios);
 
 void FastllmMultiCudaSetDevice(std::vector <int> ids);
 void FastllmMultiCudaSetDeviceRatio(std::map <int, int> &deviceRatio);

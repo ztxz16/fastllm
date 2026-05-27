@@ -618,6 +618,20 @@ DivisionScheme BuildMultiCudaRowSplitScheme(fastllm::Data &weight, std::vector <
     return divisionScheme;
 }
 
+DivisionScheme BuildMultiCudaColumnSplitScheme(fastllm::Data &weight, std::vector <int> &devices, std::map <int, int> &ratios) {
+    DivisionScheme divisionScheme;
+    fastllm::AssertInFastLLM(weight.dims.size() == 2,
+                             "Column split requires 2D weight \"" + weight.name + "\".\n");
+    int unit = GetMultiCudaSplitUnit(weight);
+    fastllm::AssertInFastLLM(!IsGGUFTensor(weight) || weight.dims[1] % unit == 0,
+                             "GGUF column split requires aligned split unit " + std::to_string(unit) + ".\n");
+    std::vector <int> points = FastllmMultiCudaGetSplitPoints(devices, ratios, weight.dims[1], unit);
+    for (int i = 0; i < devices.size(); i++) {
+        divisionScheme[devices[i]].push_back({points[i], points[i + 1]});
+    }
+    return divisionScheme;
+}
+
 bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias, 
                     std::vector <int> &multiCudaCurrentDevices, DivisionScheme divisionScheme, int splitAxis) {
     int deviceNum = multiCudaCurrentDevices.size();

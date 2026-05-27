@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import subprocess
+import glob
 
 def _has_cuda_device() -> bool:
     if os.path.exists("/dev/nvidia0") or os.path.isdir("/proc/driver/nvidia/gpus"):
@@ -40,6 +41,22 @@ def _uses_thread_tp(tp) -> bool:
     spec = str(tp).strip().lower()
     return spec not in ["", "false", "off", "none", "disable"]
 
+def _cuda_device_count() -> int:
+    try:
+        result = subprocess.run(["nvidia-smi", "-L"],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL,
+                                text=True,
+                                timeout=8)
+        if result.returncode == 0:
+            return len([line for line in result.stdout.splitlines() if line.strip()])
+    except Exception:
+        pass
+    try:
+        return len(glob.glob("/dev/nvidia[0-9]*"))
+    except Exception:
+        return 0
+
 def _first_thread_tp_cuda_device(tp) -> str:
     spec = str(tp or "").strip()
     lower = spec.lower()
@@ -60,6 +77,23 @@ def _first_thread_tp_cuda_device(tp) -> str:
         elif device_id:
             break
     return "cuda:" + (device_id if device_id != "" else "0")
+
+def _thread_tp_cuda_device_spec(tp) -> str:
+    spec = str(tp or "").strip()
+    lower = spec.lower()
+    if lower in ["", "false", "off", "none", "disable"]:
+        return ""
+    if lower in ["auto", "true", "on", "1"]:
+        count = _cuda_device_count()
+        if count <= 1:
+            return "cuda:0"
+        return "cuda:" + ",".join(str(i) for i in range(count))
+
+    if lower.startswith("multicuda:") or lower.startswith("cuda:"):
+        spec = spec.split(":", 1)[1].strip()
+    elif lower in ["multicuda", "cuda"]:
+        return "cuda:0"
+    return "cuda:" + spec
 
 def apply_page_size_default(args):
     if (getattr(args, "page_size", -1) <= 0 and
@@ -200,6 +234,7 @@ def make_normal_llm_model(args):
     if (not(os.path.exists(config_path)) and args.ori != "" and os.path.exists(os.path.join(args.ori, "config.json"))):
         config_path = os.path.join(args.ori, "config.json")
     is_moe_model = False
+    is_thread_tp_moe_model = False
     if (os.path.exists(config_path)):
         try:
             import json
@@ -216,6 +251,7 @@ def make_normal_llm_model(args):
                           model_type == 'step3p5' or
                           text_model_type == 'step3p5')
             if is_step3p5:
+                is_thread_tp_moe_model = True
                 if (args.cache_history == ""):
                     args.cache_history = "true"
                 if (args.moe_device == "" and not(args.device and args.device != "")):
@@ -239,6 +275,8 @@ def make_normal_llm_model(args):
                 architecture == 'Glm4MoeForCausalLM'):
                 if (args.enable_thinking == ""):
                     args.enable_thinking = "true"
+            if (architecture == 'Qwen3MoeForCausalLM' or model_type == 'qwen3_moe'):
+                is_thread_tp_moe_model = True
             if (is_moe_model):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
@@ -273,7 +311,7 @@ def make_normal_llm_model(args):
         if (not user_set_device):
             args.device = tp_device
         if (not user_set_moe_device):
-            args.moe_device = args.device
+            args.moe_device = (_thread_tp_cuda_device_spec(args.tp) or args.device) if is_thread_tp_moe_model else args.device
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
         os.environ["FASTLLM_ACTIVATE_NUMA"] = "ON"

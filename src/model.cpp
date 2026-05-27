@@ -11,6 +11,8 @@
 #include <cmath>
 #include <climits>
 #include <algorithm>
+#include <cctype>
+#include <mutex>
 
 #include "chatglm.h"
 #include "moss.h"
@@ -51,6 +53,10 @@
 
 #ifdef USE_NUMA
 #include "fastllm-numa.h"
+#endif
+
+#ifdef USE_CUDA
+#include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
 namespace fastllm {
@@ -208,6 +214,78 @@ namespace fastllm {
                deviceName[deviceType.size()] == ':';
     }
 
+#ifdef USE_CUDA
+    static std::mutex multiCudaTpLoadSplitLock;
+
+    static std::string TrimAndLower(const std::string &s) {
+        int l = 0, r = (int)s.size();
+        while (l < r && std::isspace((unsigned char)s[l])) {
+            l++;
+        }
+        while (r > l && std::isspace((unsigned char)s[r - 1])) {
+            r--;
+        }
+        std::string ret = s.substr(l, r - l);
+        std::transform(ret.begin(), ret.end(), ret.begin(),
+                       [](unsigned char c) { return (char)std::tolower(c); });
+        return ret;
+    }
+
+    static bool IsDisabledTpSpec(const std::string &spec) {
+        return spec.empty() || spec == "false" || spec == "off" ||
+               spec == "none" || spec == "disable";
+    }
+
+    static bool IsThreadTensorParallelLoadEnabled() {
+        const char *envNames[] = {
+            "FASTLLM_TP",
+            "FASTLLM_QWEN3_MOE_TP",
+            "FASTLLM_QWEN3_THREAD_TP",
+            "FASTLLM_STEP3P5_TP"
+        };
+        for (auto envName : envNames) {
+            const char *env = std::getenv(envName);
+            if (env != nullptr && !IsDisabledTpSpec(TrimAndLower(env))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool SplitSpecialWeightToCudaTpDevices(const basellm *model,
+                                                  const std::string &weightName,
+                                                  Data &data,
+                                                  const std::vector<int> &deviceIds,
+                                                  std::map<int, int> &ratios) {
+        if ((model->model_type != "qwen3_moe" && model->model_type != "step3p5") ||
+            !IsThreadTensorParallelLoadEnabled() || deviceIds.size() <= 1 ||
+            data.isDiskWeight || data.dims.size() != 2 ||
+            (data.cpuData == nullptr && data.cudaData == nullptr && data.numasData.empty())) {
+            return false;
+        }
+        auto typeIt = model->specialWeights.find(weightName);
+        if (typeIt == model->specialWeights.end()) {
+            return false;
+        }
+
+        std::vector<int> devices = deviceIds;
+        Data emptyBias;
+        std::lock_guard<std::mutex> guard(multiCudaTpLoadSplitLock);
+        if (typeIt->second == "linearSwiglu") {
+            data.tpLinearType = TP_LINEAR_ROW;
+            data.tpPackType = TP_PACK_GATEUP;
+            DivisionScheme scheme = BuildMultiCudaRowSplitScheme(data, devices, ratios);
+            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 0);
+        }
+        if (typeIt->second == "linearColumn") {
+            data.tpLinearType = TP_LINEAR_COLUMN;
+            DivisionScheme scheme = BuildMultiCudaColumnSplitScheme(data, devices, ratios);
+            return SplitMultiCudaWeight(data, emptyBias, devices, scheme, 1);
+        }
+        return false;
+    }
+#endif
+
     static std::string GetSpecialWeightSelectedDevice(const basellm *model, const std::string &weightName) {
         if (model->specialWeights.find(weightName) == model->specialWeights.end() || model->moeDeviceMap.empty()) {
             return "";
@@ -274,7 +352,14 @@ namespace fastllm {
             return false;
         }
         std::map <int, int> ratios;
-        data.ToDevice(DataDevice::CUDA, ParseDeviceIds(selectedDevice, "cuda", ratios));
+        std::vector <int> deviceIds = ParseDeviceIds(selectedDevice, "cuda", ratios);
+        if (SplitSpecialWeightToCudaTpDevices(this, weightName, data, deviceIds, ratios)) {
+            return true;
+        }
+        if (deviceIds.size() > 1) {
+            deviceIds = {deviceIds[0]};
+        }
+        data.ToDevice(DataDevice::CUDA, deviceIds);
         return true;
 #else
         return false;
