@@ -15,6 +15,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <cmath>
+#include <climits>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
@@ -781,6 +782,108 @@ namespace fastllm {
                 return cacheType;
             }
             return computeType;
+        }
+
+        static void PrepareStep3p5EmbeddingWeightType(Data &embedWeight,
+                                                      DataType outputType,
+                                                      bool requireCpu) {
+            if (requireCpu || embedWeight.dataType != outputType) {
+                if (embedWeight.multiDeviceData) {
+                    embedWeight.ResetMultiDeviceState();
+                }
+                if (embedWeight.dataDevice != DataDevice::CPU) {
+                    embedWeight.ToDevice(DataDevice::CPU);
+                }
+            }
+            if (embedWeight.dataType != outputType) {
+                ToDataTypeForceCPU(embedWeight, outputType);
+            }
+        }
+
+        static void Step3p5CpuEmbeddingDirect(Data &inputIds, Data &embedWeight,
+                                              Data &hiddenStates, DataType outputType) {
+            PrepareStep3p5EmbeddingWeightType(embedWeight, outputType, true);
+            inputIds.ToDevice(DataDevice::CPU);
+            Executor *executor = (Executor*)GetExecutor();
+            executor->RunOnDevice("cpu", "EmbeddingDirect",
+                                  DataDict{{"input", &inputIds},
+                                           {"weight", &embedWeight},
+                                           {"output", &hiddenStates}},
+                                  FloatDict(), IntDict());
+        }
+
+        static void PrepareStep3p5CudaEmbeddingWeightType(Data &embedWeight,
+                                                          DataType outputType) {
+            if (embedWeight.dataType != outputType) {
+                embedWeight.ResetMultiDeviceState();
+                if (embedWeight.dataDevice != DataDevice::CPU) {
+                    embedWeight.ToDevice(DataDevice::CPU);
+                }
+                ToDataTypeForceCPU(embedWeight, outputType);
+            }
+        }
+
+        static Data *CreateStep3p5CudaReplicaLike(const Data &source, int device) {
+            Data *local = new Data(source.dataType);
+            local->Resize(source.dims);
+            local->dataDevice = DataDevice::CUDA;
+            local->dataDeviceIds = {device};
+            FastllmCudaSetDevice(device);
+            local->Allocate(false);
+            return local;
+        }
+
+        static void PrepareStep3p5CpuEmbeddingHiddenStates(Data &hiddenStates,
+                                                           const std::vector<int> &devices,
+                                                           PersistentWorkerGroup &workerGroup) {
+            AssertInFastLLM(!devices.empty(),
+                            "Step3p5 ForwardGPU CPU embedding got empty CUDA devices.\n");
+            hiddenStates.ToDevice(DataDevice::CPU);
+            AssertInFastLLM(hiddenStates.cpuData != nullptr,
+                            "Step3p5 ForwardGPU CPU embedding has no CPU data.\n");
+            if (devices.size() == 1) {
+                hiddenStates.ToDevice(DataDevice::CUDA, {devices[0]}, true);
+                return;
+            }
+
+            uint64_t count = hiddenStates.Count(0);
+            AssertInFastLLM(count <= (uint64_t)INT_MAX,
+                            "Step3p5 ForwardGPU CPU embedding result is too large for NCCL broadcast.\n");
+            hiddenStates.ResetMultiDeviceState();
+            hiddenStates.multiDeviceData = true;
+            hiddenStates.tpLayout = TP_LAYOUT_REPLICATED;
+            hiddenStates.tpAxis = -1;
+            hiddenStates.tpGlobalDims = hiddenStates.dims;
+            hiddenStates.dataDevice = DataDevice::CUDA;
+            hiddenStates.dataDeviceIds = devices;
+
+            int rootDevice = devices[0];
+            for (int device : devices) {
+                hiddenStates.multiDeviceDatas[device] =
+                    CreateStep3p5CudaReplicaLike(hiddenStates, device);
+            }
+            FastllmCudaSetDevice(rootDevice);
+            FastllmCudaCopyFromHostToDevice(hiddenStates.multiDeviceDatas[rootDevice]->cudaData,
+                                            hiddenStates.cpuData,
+                                            hiddenStates.GetBytes());
+
+            std::vector<std::exception_ptr> errors(devices.size());
+            workerGroup.Run(devices, [&](int r) {
+                int device = devices[r];
+                auto it = hiddenStates.multiDeviceDatas.find(device);
+                AssertInFastLLM(it != hiddenStates.multiDeviceDatas.end() && it->second != nullptr,
+                                "Step3p5 ForwardGPU CPU embedding missing local CUDA replica.\n");
+                FastllmCudaSetDevice(device);
+                FastllmNcclBroadcast(it->second->cudaData, (int)count,
+                                     (int)hiddenStates.dataType,
+                                     rootDevice, device);
+                ForceDeviceSync();
+            }, errors);
+            for (auto &error : errors) {
+                if (error) {
+                    std::rethrow_exception(error);
+                }
+            }
         }
 
         static Data *EnsureStep3p5ThreadTpLocalCache(Data &root, int device, DataType localDataType) {
@@ -2767,19 +2870,14 @@ namespace fastllm {
             bool tensorParallel,
             bool firstTensorParallelRank,
             int pagedCacheLayerOffset,
-            Data &logits) {
+            Data &logits,
+            Data *precomputedHiddenStates) {
 #ifndef USE_CUDA
         ErrorInFastLLM("Step3p5 ForwardSingleGPU requires CUDA.\n");
 #else
         AssertInFastLLM(ratios.find(gpuId) == ratios.end() || ratios[gpuId] > 0,
                         "Step3p5 ForwardSingleGPU got invalid GPU ratio.\n");
         FastllmCudaSetDevice(gpuId);
-        if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
-                                        seqLens, pastKeyValues, all1, isPrefill,
-                                        tensorParallel, firstTensorParallelRank,
-                                        pagedCacheLayerOffset, logits)) {
-            return;
-        }
         Qwen3CudaDirectRunner cudaRunner(gpuId);
 
         auto requireLocal = [&](Data &data, const std::string &name) -> Data* {
@@ -2800,11 +2898,24 @@ namespace fastllm {
         };
 
         const DataType computeType = ResolveStep3p5ThreadTpComputeType(this->dataType);
-        Data hiddenStates;
-        Qwen3CudaEmbeddingDirect(cudaRunner,
-                                 *requireLocal((Data&)inputIds, "inputIds"),
-                                 *requireLocal(weight["model.embed_tokens.weight"], "model.embed_tokens.weight"),
-                                 hiddenStates);
+        Data localHiddenStates;
+        Data *hiddenStatesPtr = nullptr;
+        if (precomputedHiddenStates != nullptr) {
+            hiddenStatesPtr = requireLocal(*precomputedHiddenStates, "precomputedHiddenStates");
+        } else {
+            if (ForwardSingleGPUDecodeGraph(gpuId, ratios, batch, inputIds, positionIds,
+                                            seqLens, pastKeyValues, all1, isPrefill,
+                                            tensorParallel, firstTensorParallelRank,
+                                            pagedCacheLayerOffset, logits)) {
+                return;
+            }
+            Qwen3CudaEmbeddingDirect(cudaRunner,
+                                     *requireLocal((Data&)inputIds, "inputIds"),
+                                     *requireLocal(weight["model.embed_tokens.weight"], "model.embed_tokens.weight"),
+                                     localHiddenStates);
+            hiddenStatesPtr = &localHiddenStates;
+        }
+        Data &hiddenStates = *hiddenStatesPtr;
         if (hiddenStates.dataType != computeType) {
             Qwen3CudaToDataType(cudaRunner, hiddenStates, computeType);
         }
@@ -3441,6 +3552,11 @@ namespace fastllm {
                              pastKeyValues, generationConfigs, lastTokens, retLogits);
         }
         bool tensorParallel = devices.size() > 1;
+        bool useCpuEmbedding = !GetCudaEmbedding() || GetLowMemMode();
+        const DataType computeType = ResolveStep3p5ThreadTpComputeType(this->dataType);
+        if (!useCpuEmbedding) {
+            PrepareStep3p5CudaEmbeddingWeightType(weight["model.embed_tokens.weight"], computeType);
+        }
         AssertInFastLLM((int)pastKeyValues.size() >= batch * block_cnt,
                         "Step3p5 ForwardGPU: pastKeyValues size mismatch.\n");
         AssertInFastLLM((int)generationConfigs.size() >= batch,
@@ -3738,7 +3854,9 @@ namespace fastllm {
                         }
                     };
 
-                    prepareReplicated("model.embed_tokens.weight");
+                    if (!useCpuEmbedding) {
+                        prepareReplicated("model.embed_tokens.weight");
+                    }
                     prepareReplicated("model.norm.weight");
                     threadTpKVHeadSchemes.assign(block_cnt, DivisionScheme());
 
@@ -3865,7 +3983,19 @@ namespace fastllm {
             localLmHeadScheme[devices[0]].push_back({0, lmHead.dims[0]});
         }
 
-        const DataType computeType = ResolveStep3p5ThreadTpComputeType(this->dataType);
+        if (tensorParallel && !useCpuEmbedding) {
+            PrepareMultiCudaReplicatedData(weight["model.embed_tokens.weight"], devices, true);
+        }
+        Data cpuEmbeddingHiddenStates;
+        Data *precomputedHiddenStates = nullptr;
+        if (useCpuEmbedding) {
+            Data cpuInputIds;
+            cpuInputIds.CopyFrom(inputIds);
+            Step3p5CpuEmbeddingDirect(cpuInputIds, weight["model.embed_tokens.weight"],
+                                      cpuEmbeddingHiddenStates, computeType);
+            PrepareStep3p5CpuEmbeddingHiddenStates(cpuEmbeddingHiddenStates, devices, threadTpWorkerGroup);
+            precomputedHiddenStates = &cpuEmbeddingHiddenStates;
+        }
         std::vector<std::vector<std::pair<Data*, Data*> > > localPastKeyValues;
         if (tensorParallel) {
             localPastKeyValues.resize(devices.size());
@@ -3903,14 +4033,15 @@ namespace fastllm {
             }
             ForwardSingleGPU(devices[0], ratios, batch, gpuInputIds, allPositionIds,
                              seqLens, pastKeyValues, all1, isPrefill,
-                             false, true, threadTpPagedCacheBase, localLogits[0]);
+                             false, true, threadTpPagedCacheBase, localLogits[0],
+                             precomputedHiddenStates);
         } else {
             threadTpWorkerGroup.Run(devices, [&](int r) {
                 ForwardSingleGPU(devices[r], ratios, batch, gpuInputIds, allPositionIds,
                                  seqLens, localPastKeyValues[r], all1, isPrefill,
                                  tensorParallel, r == 0,
                                  threadTpPagedCacheBase + r * block_cnt,
-                                 localLogits[r]);
+                                 localLogits[r], precomputedHiddenStates);
                 FastllmCudaSetDevice(devices[r]);
                 ForceDeviceSync();
             }, errors);

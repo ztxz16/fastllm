@@ -1320,6 +1320,7 @@ cudaStream_t *GetFastllmStream(int id) {
 // 全局变量存储通信器
 // Key: deviceId, Value: ncclComm_t
 static std::map<int, ncclComm_t> g_ncclComms;
+static std::map<int, int> g_ncclRanks;
 static bool g_ncclInitialized = false;
 static int g_ncclWorldSize = 0;
 
@@ -1376,6 +1377,7 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
         }
     }
     g_ncclComms.clear();
+    g_ncclRanks.clear();
     g_ncclInitialized = false;
     g_ncclWorldSize = 0;
 
@@ -1397,6 +1399,7 @@ bool FastllmInitNccl(const std::vector<int>& devices) {
     // 将生成的 comms 存入 map，方便后续通过 deviceId 查找
     for(int i = 0; i < numGPUs; ++i) {
         g_ncclComms[uniqueDevices[i]] = comms[i];
+        g_ncclRanks[uniqueDevices[i]] = i;
     }
         
     g_ncclInitialized = true;
@@ -1442,9 +1445,11 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
 
     // 2. 映射数据类型
     ncclDataType_t ncclType = ncclFloat; 
-    if (dataType == 7) { // float16
+    if (dataType == fastllm::DataType::FLOAT16) {
         ncclType = ncclHalf;
-    } else if (dataType == 0) { // float32
+    } else if (dataType == fastllm::DataType::BFLOAT16) {
+        ncclType = ncclBfloat16;
+    } else if (dataType == fastllm::DataType::FLOAT32) {
         ncclType = ncclFloat;
     } else {
         printf("Error: Unknown dataType %d for NCCL Broadcast\n", dataType);
@@ -1455,8 +1460,19 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
     // ncclBroadcast(sendbuff, recvbuff, ...);
     // 对于 In-place 操作，sendbuff 和 recvbuff 传同一个地址即可
     cudaStream_t stream = cudaStreamPerThread;
+    int rootRank = -1;
+    auto rootRankIt = g_ncclRanks.find(root);
+    if (rootRankIt != g_ncclRanks.end()) {
+        rootRank = rootRankIt->second;
+    } else if (root >= 0 && root < g_ncclWorldSize) {
+        rootRank = root;
+    }
+    if (rootRank < 0 || rootRank >= g_ncclWorldSize) {
+        printf("Error: invalid root %d for NCCL Broadcast on device %d\n", root, deviceId);
+        return;
+    }
     
-    ncclResult_t res = ncclBroadcast(data, data, count, ncclType, root, comm, stream);
+    ncclResult_t res = ncclBroadcast(data, data, count, ncclType, rootRank, comm, stream);
     
     if (res != ncclSuccess) {
         printf("Error: ncclBroadcast failed on device %d: %s\n", deviceId, ncclGetErrorString(res));

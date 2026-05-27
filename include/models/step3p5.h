@@ -128,7 +128,8 @@ namespace fastllm {
                 bool tensorParallel,
                 bool firstTensorParallelRank,
                 int pagedCacheLayerOffset,
-                Data &logits);
+                Data &logits,
+                Data *precomputedHiddenStates = nullptr);
         bool ForwardSingleGPUDecodeGraph(
                 int gpuId,
                 std::map <int, int> ratios,
